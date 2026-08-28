@@ -190,12 +190,17 @@ export function runLeaseGuardedWrite<T>(
     holderId: string,
     leaseKey: string,
     fn: () => T,
+    expectedGeneration?: number,
 ): T {
     return runImmediate(db, () => {
         // The lease is checked after BEGIN IMMEDIATE has acquired SQLite's write
         // lock. That removes the deferred-transaction gap where another process
         // could steal the lease after a peek but before the durable mutation.
-        if (!peekLeaseHolderAndExpiry(db, holderId, leaseKey)) {
+        if (
+            !peekLeaseHolderAndExpiry(db, holderId, leaseKey) ||
+            (expectedGeneration !== undefined &&
+                getLeaseGeneration(db, leaseKey) !== expectedGeneration)
+        ) {
             throw new Error("Dream lease lost before guarded write");
         }
         return fn();

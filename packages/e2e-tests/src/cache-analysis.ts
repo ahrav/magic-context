@@ -27,6 +27,10 @@
  */
 
 import { createHash } from "node:crypto";
+import {
+    INTERNAL_OPENCODE_AGENT_SIGNATURES,
+    MAGIC_CONTEXT_INTERNAL_AGENT_SIGNATURES,
+} from "../../plugin/src/hooks/magic-context/internal-agent-signatures";
 
 type Json = Record<string, unknown>;
 
@@ -63,6 +67,25 @@ export interface PassComparison {
 
 interface MinimalRequest {
     body: { system?: unknown; messages?: unknown; [k: string]: unknown };
+}
+
+const HIDDEN_AGENT_SIGNATURES: readonly string[] = [
+    ...INTERNAL_OPENCODE_AGENT_SIGNATURES,
+    ...MAGIC_CONTEXT_INTERNAL_AGENT_SIGNATURES,
+];
+
+/**
+ * Detect internal (non-main-agent) requests by their system-prompt openers:
+ * OpenCode's native title/summary/compaction agents plus Magic Context's own
+ * hidden children (historian/dreamer/sidekick/memory-migration). The signature
+ * literals are imported from the plugin's production classifier so the oracle
+ * cannot drift from what production actually skips.
+ */
+export function isInternalAgentRequest(request: MinimalRequest): boolean {
+    const system = request.body.system;
+    if (system === undefined || system === null) return false;
+    const systemText = typeof system === "string" ? system : JSON.stringify(system);
+    return HIDDEN_AGENT_SIGNATURES.some((signature) => systemText.includes(signature));
 }
 
 function sha(s: string): string {

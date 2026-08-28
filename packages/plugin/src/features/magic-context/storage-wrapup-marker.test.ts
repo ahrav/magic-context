@@ -1,9 +1,8 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, test } from "bun:test";
-import { Database } from "../../shared/sqlite";
+import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { initializeDatabase } from "./storage-db";
 import {
     acquireWrapupInProgress,
     getWrapupInProgressState,
@@ -12,11 +11,11 @@ import {
     updateWrapupInProgress,
     WRAPUP_IN_PROGRESS_TTL_MS,
 } from "./storage-meta-persisted";
+import { createDirectTestDatabase } from "./test-database";
 
 function withDb(run: (db: Database) => void): void {
-    const db = new Database(":memory:");
+    const db = createDirectTestDatabase().db;
     try {
-        initializeDatabase(db);
         run(db);
     } finally {
         closeQuietly(db);

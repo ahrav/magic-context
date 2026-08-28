@@ -11,8 +11,6 @@ import {
 } from "./git-commits/storage-git-commit-embeddings";
 import { upsertCommits } from "./git-commits/storage-git-commits";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-provider";
-import { insertMemory } from "./memory/storage-memory";
-import { loadAllEmbeddings, saveEmbedding } from "./memory/storage-memory-embeddings";
 import {
     _resetProjectEmbeddingRegistryForTests,
     _setTestProviderFactoryForProject,
@@ -102,12 +100,8 @@ function shadowModelId(projectIdentity: string): string {
     return getShadowEmbeddingMeasurementCohort(projectIdentity)?.modelId ?? "off";
 }
 
-function countShadowMemoryRows(
-    db: ReturnType<typeof openDatabase>,
-    projectIdentity: string,
-    modelId: string,
-): number {
-    return loadAllEmbeddings(db, projectIdentity, modelId).size;
+function commitSha(seed: string): string {
+    return seed.padEnd(40, seed);
 }
 
 describe("shadow embedding historical backfill", () => {
@@ -144,19 +138,16 @@ describe("shadow embedding historical backfill", () => {
         );
     }
 
-    function seedPrimaryMemories(
+    function seedPrimaryCommits(
         db: NonNullable<ReturnType<typeof openDatabase>>,
         projectIdentity: string,
         count: number,
     ): void {
         const modelId = primaryModelId(projectIdentity);
-        for (let i = 0; i < count; i++) {
-            const memory = insertMemory(db, {
-                projectPath: projectIdentity,
-                category: "CONSTRAINTS",
-                content: `historical memory ${i}`,
-            });
-            saveEmbedding(db, memory.id, new Float32Array([i, 1]), modelId);
+        const commits = Array.from({ length: count }, (_, i) => makeGitCommit(`s${i}x`, 1000 + i));
+        upsertCommits(db, projectIdentity, commits);
+        for (const commit of commits) {
+            saveCommitEmbedding(db, commit.sha, new Float32Array([1, 1]), modelId);
         }
     }
 
@@ -173,7 +164,7 @@ describe("shadow embedding historical backfill", () => {
         );
         // 150 > SHADOW_MAX_ITEMS_PER_TICK (64), so a single-transaction dump is
         // impossible: the drain must span multiple bounded worker passes.
-        seedPrimaryMemories(db, projectIdentity, 150);
+        seedPrimaryCommits(db, projectIdentity, 150);
 
         // Pre-rotation state: the corpus was already mirrored under identity A.
         registerProjectShadowEmbedding(
@@ -184,7 +175,7 @@ describe("shadow embedding historical backfill", () => {
         );
         const shadowA = shadowModelId(projectIdentity);
         await flushShadowEmbeddingBacklog(projectIdentity);
-        expect(countShadowMemoryRows(db, projectIdentity, shadowA)).toBe(150);
+        expect(countEmbeddedCommits(db, projectIdentity, shadowA)).toBe(150);
 
         // Rotation: a new fingerprint registers a brand-new shadow identity. The
         // historical corpus now lacks rows under it and must be re-embedded.
@@ -196,18 +187,18 @@ describe("shadow embedding historical backfill", () => {
         );
         const shadowB = shadowModelId(projectIdentity);
         expect(shadowB).not.toBe(shadowA);
-        expect(getShadowBackfillRemaining(db, projectIdentity).memory).toBe(150);
+        expect(getShadowBackfillRemaining(db, projectIdentity).commit).toBe(150);
 
         let passes = 0;
         const remainingSeen: number[] = [];
         await flushShadowEmbeddingBacklog(projectIdentity, () => {
             passes += 1;
-            remainingSeen.push(getShadowBackfillRemaining(db, projectIdentity).memory);
+            remainingSeen.push(getShadowBackfillRemaining(db, projectIdentity).commit);
         });
 
         // Drained to completion under the new identity...
-        expect(countShadowMemoryRows(db, projectIdentity, shadowB)).toBe(150);
-        expect(getShadowBackfillRemaining(db, projectIdentity).memory).toBe(0);
+        expect(countEmbeddedCommits(db, projectIdentity, shadowB)).toBe(150);
+        expect(getShadowBackfillRemaining(db, projectIdentity).commit).toBe(0);
         // ...incrementally (more than one bounded pass), never one big dump...
         expect(passes).toBeGreaterThanOrEqual(2);
         // ...with the outstanding count monotonically falling to zero.
@@ -218,7 +209,7 @@ describe("shadow embedding historical backfill", () => {
             );
         }
         // The old identity's rows coexist until the 14-day GC ages them out.
-        expect(countShadowMemoryRows(db, projectIdentity, shadowA)).toBe(150);
+        expect(countEmbeddedCommits(db, projectIdentity, shadowA)).toBe(150);
     });
 
     it("backfills commits alongside memories on rotation", async () => {
@@ -271,10 +262,10 @@ describe("shadow embedding historical backfill", () => {
             db,
             projectIdentity,
             localConfig("model-primary"),
-            { memoryEnabled: true, gitCommitEnabled: false },
+            { memoryEnabled: true, gitCommitEnabled: true },
             "/tmp/shadow-cold-start",
         );
-        seedPrimaryMemories(db, projectIdentity, 5);
+        seedPrimaryCommits(db, projectIdentity, 5);
 
         // No prior shadow registration exists in-memory (e.g. the plugin was down
         // when the fingerprint rotated), but historical primary rows do. Registering
@@ -286,11 +277,11 @@ describe("shadow embedding historical backfill", () => {
             "/tmp/shadow-cold-start",
         );
         const shadowModel = shadowModelId(projectIdentity);
-        expect(getShadowBackfillRemaining(db, projectIdentity).memory).toBe(5);
+        expect(getShadowBackfillRemaining(db, projectIdentity).commit).toBe(5);
 
         await flushShadowEmbeddingBacklog(projectIdentity);
-        expect(countShadowMemoryRows(db, projectIdentity, shadowModel)).toBe(5);
-        expect(getShadowBackfillRemaining(db, projectIdentity).memory).toBe(0);
+        expect(countEmbeddedCommits(db, projectIdentity, shadowModel)).toBe(5);
+        expect(getShadowBackfillRemaining(db, projectIdentity).commit).toBe(0);
     });
 
     it("does not enqueue a backfill when the shadow identity is unchanged", async () => {
@@ -301,10 +292,10 @@ describe("shadow embedding historical backfill", () => {
             db,
             projectIdentity,
             localConfig("model-primary"),
-            { memoryEnabled: true, gitCommitEnabled: false },
+            { memoryEnabled: true, gitCommitEnabled: true },
             "/tmp/shadow-unchanged",
         );
-        seedPrimaryMemories(db, projectIdentity, 5);
+        seedPrimaryCommits(db, projectIdentity, 5);
         registerProjectShadowEmbedding(
             db,
             projectIdentity,
@@ -313,7 +304,7 @@ describe("shadow embedding historical backfill", () => {
         );
         const shadowModel = shadowModelId(projectIdentity);
         await flushShadowEmbeddingBacklog(projectIdentity);
-        expect(countShadowMemoryRows(db, projectIdentity, shadowModel)).toBe(5);
+        expect(countEmbeddedCommits(db, projectIdentity, shadowModel)).toBe(5);
 
         // Re-registering the SAME identity (a routine boot/config reload) must not
         // re-arm a backfill: the corpus is already covered under it.
@@ -328,8 +319,8 @@ describe("shadow embedding historical backfill", () => {
             passes += 1;
         });
         expect(passes).toBe(0);
-        expect(getShadowBackfillRemaining(db, projectIdentity).memory).toBe(0);
-        expect(countShadowMemoryRows(db, projectIdentity, shadowModel)).toBe(5);
+        expect(getShadowBackfillRemaining(db, projectIdentity).commit).toBe(0);
+        expect(countEmbeddedCommits(db, projectIdentity, shadowModel)).toBe(5);
     });
 
     it("does not enqueue a backfill while the project's config load is untrusted", async () => {
@@ -340,10 +331,10 @@ describe("shadow embedding historical backfill", () => {
             db,
             projectIdentity,
             localConfig("model-primary"),
-            { memoryEnabled: true, gitCommitEnabled: false },
+            { memoryEnabled: true, gitCommitEnabled: true },
             "/tmp/shadow-untrusted",
         );
-        seedPrimaryMemories(db, projectIdentity, 5);
+        seedPrimaryCommits(db, projectIdentity, 5);
 
         // A degraded config load latches the project after the trusted primary
         // registration; the shadow backfill must respect that latch and not enqueue.
@@ -361,9 +352,9 @@ describe("shadow embedding historical backfill", () => {
             passes += 1;
         });
         expect(passes).toBe(0);
-        expect(countShadowMemoryRows(db, projectIdentity, shadowModel)).toBe(0);
+        expect(countEmbeddedCommits(db, projectIdentity, shadowModel)).toBe(0);
         // The gap is still outstanding; a later trusted registration would clear it.
-        expect(getShadowBackfillRemaining(db, projectIdentity).memory).toBe(5);
+        expect(getShadowBackfillRemaining(db, projectIdentity).commit).toBe(5);
     });
 
     it("is idempotent: re-detecting after a completed backfill enqueues no duplicates", async () => {
@@ -374,10 +365,10 @@ describe("shadow embedding historical backfill", () => {
             db,
             projectIdentity,
             localConfig("model-primary"),
-            { memoryEnabled: true, gitCommitEnabled: false },
+            { memoryEnabled: true, gitCommitEnabled: true },
             "/tmp/shadow-idempotent",
         );
-        seedPrimaryMemories(db, projectIdentity, 5);
+        seedPrimaryCommits(db, projectIdentity, 5);
         registerProjectShadowEmbedding(
             db,
             projectIdentity,
@@ -386,7 +377,7 @@ describe("shadow embedding historical backfill", () => {
         );
         const shadowModel = shadowModelId(projectIdentity);
         await flushShadowEmbeddingBacklog(projectIdentity);
-        expect(countShadowMemoryRows(db, projectIdentity, shadowModel)).toBe(5);
+        expect(countEmbeddedCommits(db, projectIdentity, shadowModel)).toBe(5);
 
         // Simulate a process restart: in-memory registrations are gone but the DB
         // (with the completed backfill) persists. Re-registering the same identity
@@ -397,7 +388,7 @@ describe("shadow embedding historical backfill", () => {
             db,
             projectIdentity,
             localConfig("model-primary"),
-            { memoryEnabled: true, gitCommitEnabled: false },
+            { memoryEnabled: true, gitCommitEnabled: true },
             "/tmp/shadow-idempotent",
         );
         let passes = 0;
@@ -411,8 +402,8 @@ describe("shadow embedding historical backfill", () => {
             passes += 1;
         });
         expect(passes).toBe(0);
-        expect(countShadowMemoryRows(db, projectIdentity, shadowModel)).toBe(5);
-        expect(getShadowBackfillRemaining(db, projectIdentity).memory).toBe(0);
+        expect(countEmbeddedCommits(db, projectIdentity, shadowModel)).toBe(5);
+        expect(getShadowBackfillRemaining(db, projectIdentity).commit).toBe(0);
     });
 
     it("GC protects the new shadow identity while the old one ages out", async () => {
@@ -424,10 +415,10 @@ describe("shadow embedding historical backfill", () => {
             db,
             projectIdentity,
             localConfig("model-primary"),
-            { memoryEnabled: true, gitCommitEnabled: false },
+            { memoryEnabled: true, gitCommitEnabled: true },
             "/tmp/shadow-gc",
         );
-        seedPrimaryMemories(db, projectIdentity, 3);
+        seedPrimaryCommits(db, projectIdentity, 3);
 
         // Mirror under identity A, then rotate to B and backfill it.
         registerProjectShadowEmbedding(
@@ -446,8 +437,8 @@ describe("shadow embedding historical backfill", () => {
         );
         const shadowB = shadowModelId(projectIdentity);
         await flushShadowEmbeddingBacklog(projectIdentity);
-        expect(countShadowMemoryRows(db, projectIdentity, shadowA)).toBe(3);
-        expect(countShadowMemoryRows(db, projectIdentity, shadowB)).toBe(3);
+        expect(countEmbeddedCommits(db, projectIdentity, shadowA)).toBe(3);
+        expect(countEmbeddedCommits(db, projectIdentity, shadowB)).toBe(3);
 
         // Age the OLD shadow identity past the 14-day grace. The new identity is
         // the live shadow registration and must stay protected.
@@ -456,10 +447,10 @@ describe("shadow embedding historical backfill", () => {
         ).run(now - 15 * 24 * 60 * 60 * 1000, projectIdentity, shadowA);
 
         const swept = sweepStaleEmbeddingIdentitiesForProject(db, projectIdentity, now);
-        expect(swept.memoryRowsDeleted).toBe(3);
+        expect(swept.commitRowsDeleted).toBe(3);
         // Old identity aged out; new identity (current shadow) is protected.
-        expect(countShadowMemoryRows(db, projectIdentity, shadowA)).toBe(0);
-        expect(countShadowMemoryRows(db, projectIdentity, shadowB)).toBe(3);
+        expect(countEmbeddedCommits(db, projectIdentity, shadowA)).toBe(0);
+        expect(countEmbeddedCommits(db, projectIdentity, shadowB)).toBe(3);
     });
 });
 
@@ -489,7 +480,7 @@ describe("shadow lane writes through versioned synapse receipts", () => {
         }
     });
 
-    it("shadow memory backfill applies groups atomically under the shadow lane identity", async () => {
+    it("shadow commit backfill applies groups atomically under the shadow lane identity", async () => {
         const host = new DetailedSynapseTestHost();
         _setTestProviderFactoryForProject((config) =>
             config.provider === "synapse"
@@ -498,19 +489,20 @@ describe("shadow lane writes through versioned synapse receipts", () => {
         );
         const db = useTempDb();
         const projectIdentity = "git:shadow-detailed";
-        const memory = insertMemory(db, {
-            projectPath: projectIdentity,
-            category: "CONSTRAINTS",
-            content: "Mirror me into the shadow lane.",
-        });
+        upsertCommits(db, projectIdentity, [makeGitCommit("d-a", 1000)]);
         registerProjectEmbedding(
             db,
             projectIdentity,
             localConfig("model-a"),
-            { memoryEnabled: true, gitCommitEnabled: false },
+            { memoryEnabled: true, gitCommitEnabled: true },
             "/tmp/shadow-detailed",
         );
-        saveEmbedding(db, memory.id, new Float32Array([1, 1]), primaryModelId(projectIdentity));
+        saveCommitEmbedding(
+            db,
+            commitSha("d-a"),
+            new Float32Array([1, 1]),
+            primaryModelId(projectIdentity),
+        );
 
         registerProjectShadowEmbedding(
             db,
@@ -521,7 +513,7 @@ describe("shadow lane writes through versioned synapse receipts", () => {
         await flushShadowEmbeddingBacklog(projectIdentity);
 
         expect(shadowModelId(projectIdentity)).toBe(SYNAPSE_TEST_LANE_IDENTITY);
-        expect(countShadowMemoryRows(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY)).toBe(1);
+        expect(countEmbeddedCommits(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY)).toBe(1);
         const ledger = db
             .prepare(
                 "SELECT session_id, lane_role, scope, state FROM synapse_batch_ledger ORDER BY id",
@@ -538,7 +530,7 @@ describe("shadow lane writes through versioned synapse receipts", () => {
                 (row) =>
                     row.lane_role === "shadow" &&
                     row.session_id === `shadow:${projectIdentity}` &&
-                    row.scope === "memory" &&
+                    row.scope === "commit" &&
                     row.state === "complete",
             ),
         ).toBe(true);
@@ -553,24 +545,25 @@ describe("shadow lane writes through versioned synapse receipts", () => {
         );
         const db = useTempDb();
         const projectIdentity = "git:shadow-detailed-fail";
-        const memory = insertMemory(db, {
-            projectPath: projectIdentity,
-            category: "CONSTRAINTS",
-            content: "Shadow mirror candidate.",
-        });
+        upsertCommits(db, projectIdentity, [makeGitCommit("f-a", 1000)]);
         registerProjectEmbedding(
             db,
             projectIdentity,
             localConfig("model-a"),
-            { memoryEnabled: true, gitCommitEnabled: false },
+            { memoryEnabled: true, gitCommitEnabled: true },
             "/tmp/shadow-detailed-fail",
         );
-        saveEmbedding(db, memory.id, new Float32Array([1, 1]), primaryModelId(projectIdentity));
+        saveCommitEmbedding(
+            db,
+            commitSha("f-a"),
+            new Float32Array([1, 1]),
+            primaryModelId(projectIdentity),
+        );
 
         host.resultPages = (_jobId, items) => {
-            db.prepare("UPDATE memories SET content = ? WHERE id = ?").run(
+            db.prepare("UPDATE git_commits SET message = ? WHERE sha = ?").run(
                 "edited before shadow apply",
-                memory.id,
+                commitSha("f-a"),
             );
             return {
                 result: {
@@ -592,7 +585,7 @@ describe("shadow lane writes through versioned synapse receipts", () => {
         );
         await flushShadowEmbeddingBacklog(projectIdentity);
 
-        expect(countShadowMemoryRows(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY)).toBe(0);
+        expect(countEmbeddedCommits(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY)).toBe(0);
         const ledger = db
             .prepare("SELECT state FROM synapse_batch_ledger ORDER BY id")
             .all() as Array<{ state: string }>;

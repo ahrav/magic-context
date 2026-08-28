@@ -92,11 +92,52 @@ async fn admission_count_boundary_is_exact_and_never_evicts_live_work() {
 }
 
 #[tokio::test]
+async fn batch_descriptor_and_pending_poll_keep_batch_retry_delay() {
+    let engine = DeterministicEngine::new();
+    engine.set_delay(Duration::from_millis(300));
+    let limits = SynapseLimits {
+        retry_after_ms: 73,
+        ..Default::default()
+    };
+    let host = SynapseHost::start(ready_component(engine, limits)).await;
+    let mut client = host.client().await;
+    let (channel, epoch) = open_synapse_route(&mut client).await;
+    let lane = test_lane();
+    let page = items(&[("a", "slow job")]);
+    let key = request_key(&lane, &page);
+
+    let descriptor = call(
+        &mut client,
+        channel,
+        epoch,
+        "embed.batch",
+        batch_params(&lane, &page),
+    )
+    .await
+    .json();
+    assert_eq!(descriptor["result"]["retry_after_ms"], 73);
+
+    let mut params = constraints(&lane);
+    params["job_id"] = descriptor["result"]["job_id"].clone();
+    params["request_key"] = key.into();
+    params["cursor"] = serde_json::Value::Null;
+    let pending = call(&mut client, channel, epoch, "embed.result", params)
+        .await
+        .json();
+    assert_eq!(pending["result"]["done"], false);
+    assert_eq!(pending["result"]["retry_after_ms"], 73);
+
+    host.shutdown().await.expect("graceful shutdown");
+}
+
+#[tokio::test]
 async fn queued_byte_boundary_is_exact_and_releases_on_completion() {
     let engine = DeterministicEngine::new();
     engine.set_delay(Duration::from_millis(200));
     let limits = SynapseLimits {
         max_queued_request_bytes: 8,
+        max_batch_text_bytes: 8,
+        max_text_bytes: 8,
         ..Default::default()
     };
     let host = SynapseHost::start(ready_component(engine.clone(), limits)).await;

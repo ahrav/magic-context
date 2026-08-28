@@ -39,7 +39,6 @@ regex = "1"
 tokio = { workspace = true, features = ["signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 sha2 = { workspace = true }
-hmac = "0.12"
 # Only the detached-exec module in `src/bin/ck-mc-host.rs` uses libc
 # (fork/setsid/fexecve); library code never does. commentlint: allow(JUDGE)
 libc = "0.2"

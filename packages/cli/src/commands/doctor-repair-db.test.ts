@@ -18,13 +18,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runInMemoryClaimsWriteTransaction } from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
-import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
+import { CURRENT_SCHEMA_COMPONENTS } from "@magic-context/core/features/magic-context/storage-current-schema";
 import {
-    initializeDatabase,
     inspectRpcServerDiscovery,
     LATEST_SUPPORTED_VERSION,
 } from "@magic-context/core/features/magic-context/storage-db";
+import { createDirectTestDatabase } from "@magic-context/core/features/magic-context/test-database";
 import { rpcPortFilePath } from "@magic-context/core/shared/rpc-utils";
 import { Database } from "@magic-context/core/shared/sqlite";
 
@@ -105,9 +104,7 @@ function digest(path: string): string {
 }
 
 function seedCurrentDatabase(dbPath: string): void {
-    const db = new Database(dbPath);
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase({ path: dbPath }).db;
     const insertTag = db.prepare(
         "INSERT INTO tags (session_id, type, status, byte_size, tag_number, harness) VALUES (?, 'message', 'active', ?, ?, 'opencode')",
     );
@@ -115,11 +112,6 @@ function seedCurrentDatabase(dbPath: string): void {
         `INSERT INTO compartments
             (session_id, sequence, start_message, end_message, title, content, created_at, harness)
          VALUES ('session-main', ?, ?, ?, ?, ?, ?, 'opencode')`,
-    );
-    const insertMemory = db.prepare(
-        `INSERT INTO memories
-            (project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at)
-         VALUES ('/project', 'CONSTRAINTS', ?, ?, ?, ?, ?, ?)`,
     );
     const insertNote = db.prepare(
         `INSERT INTO notes
@@ -131,7 +123,7 @@ function seedCurrentDatabase(dbPath: string): void {
             (project_path, started_at, finished_at, holder_id, tasks_json)
          VALUES ('/project', ?, ?, 'test-holder', '[]')`,
     );
-    runInMemoryClaimsWriteTransaction(db, () => {
+    db.transaction(() => {
         for (let index = 1; index <= 300; index++) {
             const content = `tag-${index}-${"t".repeat(700)}`;
             insertTag.run("session-main", Buffer.byteLength(content), index);
@@ -149,19 +141,9 @@ function seedCurrentDatabase(dbPath: string): void {
                 index,
             );
         }
-        for (let index = 1; index <= 26; index++) {
-            insertMemory.run(
-                `memory-${index}-${"m".repeat(200)}`,
-                `hash-${index}`,
-                index,
-                index,
-                index,
-                index,
-            );
-        }
         for (let index = 1; index <= 4; index++) insertNote.run(`note-${index}`, index, index);
         for (let index = 1; index <= 3; index++) insertDreamRun.run(index, index);
-    });
+    }).immediate();
     db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
     db.exec("PRAGMA journal_mode=DELETE");
     db.close();
@@ -328,8 +310,24 @@ describe("doctor repair-db", () => {
                 "SELECT MAX(version) AS version FROM schema_migrations WHERE version < 1000000",
             )
             .get() as { version: number };
+        const applicationId = Object.values(
+            recovered.prepare("PRAGMA application_id").get() as Record<string, unknown>,
+        )[0];
+        const userVersion = Object.values(
+            recovered.prepare("PRAGMA user_version").get() as Record<string, unknown>,
+        )[0];
+        const directMarker = recovered
+            .prepare(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mc_format_marker'",
+            )
+            .get();
         recovered.close();
         expect(version.version).toBe(LATEST_SUPPORTED_VERSION);
+        expect({ applicationId, userVersion, directMarker }).toEqual({
+            applicationId: 0,
+            userVersion: 0,
+            directMarker: null,
+        });
 
         const files = readdirSync(storageDir);
         const backup = files.find((name) => name.startsWith("context.db.corrupt-backup-"));
@@ -388,6 +386,49 @@ describe("doctor repair-db", () => {
         expect(output).toContain("Row counts AFTER recovery");
         expect(output).toContain("Reset declined");
         expect(output).toContain(`Database remains unchanged: ${dbPath}`);
+    });
+
+    it("refuses an unsupported direct-format family and offers reset only", async () => {
+        const storageDir = tempStorage();
+        const dbPath = join(storageDir, "context.db");
+        const direct = createDirectTestDatabase({
+            path: dbPath,
+            components: [CURRENT_SCHEMA_COMPONENTS[0]],
+        });
+        direct.db.close();
+        const original = readFileSync(dbPath);
+        const prompts = new MockPrompts([true]);
+
+        const code = await runRepairDb({
+            dbPath,
+            storageDir,
+            prompts,
+            deps: { inspectHolders: () => ({ safe: true, blockers: [] }) },
+        });
+
+        expect(code).toBe(REPAIR_DB_EXIT.refused);
+        expect(readFileSync(dbPath)).toEqual(original);
+        expect(prompts.messages.join("\n")).toContain("only supported action is an explicit reset");
+        expect(prompts.messages.join("\n")).toContain("doctor reset-db");
+        expect(prompts.messages.join("\n")).not.toContain("Attempting SQLite .recover");
+        expect(prompts.messages.join("\n")).not.toContain("confirm:");
+        expect(readdirSync(storageDir).some((name) => name.includes("corrupt-backup"))).toBe(false);
+    });
+
+    it("refuses repair while a reset marker is pending", async () => {
+        const storageDir = tempStorage();
+        const dbPath = join(storageDir, "context.db");
+        writeFileSync(dbPath, "database");
+        writeFileSync(`${dbPath}.mc-reset`, "pending");
+        const original = readFileSync(dbPath);
+        const prompts = new MockPrompts();
+
+        const code = await runRepairDb({ dbPath, storageDir, prompts });
+
+        expect(code).toBe(REPAIR_DB_EXIT.refused);
+        expect(readFileSync(dbPath)).toEqual(original);
+        expect(prompts.messages.join("\n")).toContain("reset is pending");
+        expect(prompts.messages.join("\n")).not.toContain("Attempting SQLite .recover");
     });
 
     it("does not offer destructive reset when the .recover shell could not start", async () => {

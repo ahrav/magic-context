@@ -1,8 +1,6 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, test } from "bun:test";
-import { runMigrations } from "../../features/magic-context/migrations";
-import { initializeDatabase } from "../../features/magic-context/storage-db";
 import {
     getOrCreateSessionMeta,
     updateSessionMeta,
@@ -11,7 +9,8 @@ import {
     getOverflowState,
     recordOverflowDetected,
 } from "../../features/magic-context/storage-meta-persisted";
-import { Database } from "../../shared/sqlite";
+import { createDirectTestDatabase } from "../../features/magic-context/test-database";
+import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     createChatMessageHook,
@@ -20,9 +19,7 @@ import {
 } from "./hook-handlers";
 
 function createTestDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase().db;
     return db;
 }
 

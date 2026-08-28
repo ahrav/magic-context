@@ -964,6 +964,7 @@ fn broca_reservation() -> ResourceDeclaration {
         reserved_handler_tasks: 96,
         reserved_pending_requests: 96,
         retained_resident_bytes: 0,
+        general_task_hold_bound: 0,
         route_class: RouteClass::Reserved,
     }
 }

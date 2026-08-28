@@ -27,6 +27,21 @@
             ]
         },
         {
+            "path": "tests/claims-direct-cutover.test.ts",
+            "tier": "both-modes",
+            "invocation": {
+                "ts": true,
+                "rust": true
+            },
+            "rationale": "real OpenCode and Pi harnesses share one direct claims authority; Rust mode exercises the OpenCode staged-intent adapter while Pi remains the TS comparison surface",
+            "contract_refs": [
+                "DIRECT-CLAIMS-U8",
+                "AE3",
+                "R2",
+                "R6"
+            ]
+        },
+        {
             "path": "tests/compaction-off.test.ts",
             "tier": "ts-only",
             "invocation": {
@@ -133,6 +148,22 @@
             "rationale": "zero-compartment project-memory injection is shared across transform modes",
             "contract_refs": [
                 "S2-MIGRATION"
+            ]
+        },
+        {
+            "path": "tests/oracle-arms-demo.test.ts",
+            "tier": "ts-only",
+            "invocation": {
+                "ts": true,
+                "rust": false
+            },
+            "rationale": "oracle-arm capability matrix uses the TypeScript-authority-only direct memory seeding contract",
+            "contract_refs": [
+                "ORACLE-ARMS-U4",
+                "R8",
+                "KTD4",
+                "KTD6",
+                "KTD7"
             ]
         },
         {

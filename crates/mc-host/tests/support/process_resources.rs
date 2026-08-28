@@ -14,6 +14,7 @@
 //! descriptor itself; the bias is constant across samples, so deltas and
 //! envelope comparisons are unaffected. commentlint: allow(JUDGE)
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// One role-tagged observation of a process's OS resource counters.
@@ -71,6 +72,127 @@ pub fn observe(pid: u32) -> Result<ResourceCounts, ObserveError> {
         mapped_regions: count_mapped_regions(pid)?,
         threads: count_threads(pid)?,
     })
+}
+
+/// Linux scheduler/accounting counters for one task. Values are raw kernel
+/// clock ticks and context-switch counts, so deltas need no wall-clock
+/// conversion and retain exact `/proc` evidence.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct TaskCounters {
+    pub tid: u32,
+    pub name: String,
+    pub utime_ticks: u64,
+    pub stime_ticks: u64,
+    pub voluntary_context_switches: u64,
+    pub nonvoluntary_context_switches: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct TaskDelta {
+    pub tid: u32,
+    pub name: String,
+    pub role: &'static str,
+    pub utime_ticks: u64,
+    pub stime_ticks: u64,
+    pub voluntary_context_switches: u64,
+    pub nonvoluntary_context_switches: u64,
+}
+
+/// Enumerates every Linux task through the same `/proc/<pid>/task` authority
+/// used by the resource observer. Unsupported platforms fail explicitly.
+#[cfg(target_os = "linux")]
+pub fn observe_tasks(pid: u32) -> Result<BTreeMap<u32, TaskCounters>, ObserveError> {
+    let counter = "task_stat_status";
+    let entries = std::fs::read_dir(format!("/proc/{pid}/task")).map_err(|_| fail(counter))?;
+    let mut tasks = BTreeMap::new();
+    for entry in entries {
+        let entry = entry.map_err(|_| fail(counter))?;
+        let tid = entry
+            .file_name()
+            .to_string_lossy()
+            .parse::<u32>()
+            .map_err(|_| fail(counter))?;
+        let stat = std::fs::read_to_string(entry.path().join("stat")).map_err(|_| fail(counter))?;
+        let status =
+            std::fs::read_to_string(entry.path().join("status")).map_err(|_| fail(counter))?;
+        let (name, utime_ticks, stime_ticks) =
+            parse_task_stat(&stat).ok_or_else(|| fail(counter))?;
+        let voluntary_context_switches =
+            status_counter(&status, "voluntary_ctxt_switches").ok_or_else(|| fail(counter))?;
+        let nonvoluntary_context_switches =
+            status_counter(&status, "nonvoluntary_ctxt_switches").ok_or_else(|| fail(counter))?;
+        tasks.insert(
+            tid,
+            TaskCounters {
+                tid,
+                name,
+                utime_ticks,
+                stime_ticks,
+                voluntary_context_switches,
+                nonvoluntary_context_switches,
+            },
+        );
+    }
+    Ok(tasks)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn observe_tasks(_pid: u32) -> Result<BTreeMap<u32, TaskCounters>, ObserveError> {
+    Err(fail("task_stat_status"))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_task_stat(stat: &str) -> Option<(String, u64, u64)> {
+    let open = stat.find('(')?;
+    let close = stat.rfind(')')?;
+    let name = stat.get(open + 1..close)?.to_owned();
+    let fields: Vec<&str> = stat.get(close + 1..)?.split_whitespace().collect();
+    Some((
+        name,
+        fields.get(11)?.parse().ok()?,
+        fields.get(12)?.parse().ok()?,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn status_counter(status: &str, key: &str) -> Option<u64> {
+    status.lines().find_map(|line| {
+        let (actual, value) = line.split_once(':')?;
+        (actual == key).then(|| value.trim().parse().ok()).flatten()
+    })
+}
+
+pub fn task_deltas(
+    before: &BTreeMap<u32, TaskCounters>,
+    after: &BTreeMap<u32, TaskCounters>,
+) -> Vec<TaskDelta> {
+    after
+        .values()
+        .map(|end| {
+            let start = before.get(&end.tid);
+            TaskDelta {
+                tid: end.tid,
+                name: end.name.clone(),
+                role: if end.name.starts_with("host-") {
+                    "host_runtime"
+                } else {
+                    "generator"
+                },
+                utime_ticks: end
+                    .utime_ticks
+                    .saturating_sub(start.map_or(0, |task| task.utime_ticks)),
+                stime_ticks: end
+                    .stime_ticks
+                    .saturating_sub(start.map_or(0, |task| task.stime_ticks)),
+                voluntary_context_switches: end
+                    .voluntary_context_switches
+                    .saturating_sub(start.map_or(0, |task| task.voluntary_context_switches)),
+                nonvoluntary_context_switches: end
+                    .nonvoluntary_context_switches
+                    .saturating_sub(start.map_or(0, |task| task.nonvoluntary_context_switches)),
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

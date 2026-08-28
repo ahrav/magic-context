@@ -271,10 +271,10 @@ impl<P: PrimaryComponent, S: SecondaryComponent, B: SecondaryComponent> McHostHa
             Some(Child::Primary) => self.primary.handle(ctx).await,
             Some(Child::Secondary) => self.secondary.handle(ctx).await,
             Some(Child::Tertiary) => self.tertiary.handle(ctx).await,
-            None => RequestOutcome::Error {
-                code: crate::control::CODE_INTERNAL_ERROR.to_owned(),
-                message: "route is not mapped to a component".to_owned(),
-            },
+            None => RequestOutcome::error(
+                crate::control::CODE_INTERNAL_ERROR,
+                "route is not mapped to a component",
+            ),
         }
     }
 

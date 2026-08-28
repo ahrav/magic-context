@@ -4,10 +4,9 @@ import {
 	DreamerConfigSchema,
 } from "@magic-context/core/config/schema/magic-context";
 import { getTaskScheduleState } from "@magic-context/core/features/magic-context/dreamer/storage-task-schedule";
-import { insertMemory } from "@magic-context/core/features/magic-context/memory";
-import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
-import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
-import { Database } from "@magic-context/core/shared/sqlite";
+import { seedProjectMemoryClaim } from "@magic-context/core/features/magic-context/test-claim-database";
+import { createDirectTestDatabase } from "@magic-context/core/features/magic-context/test-database";
+import type { Database } from "@magic-context/core/shared/sqlite";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import {
 	__test,
@@ -35,10 +34,7 @@ function requireCapturedClient(
 }
 
 function createDb(): Database {
-	const database = new Database(":memory:");
-	initializeDatabase(database);
-	runMigrations(database);
-	return database;
+	return createDirectTestDatabase().db;
 }
 
 function enabledConfig() {
@@ -159,22 +155,24 @@ describe("Pi dreamer wiring", () => {
 	test("manual dreamer passes a directive-bearing system prompt when language is set", async () => {
 		db = createDb();
 		let capturedSystem = "";
+		const claim = seedProjectMemoryClaim(db, {
+			projectIdentity: "git:pi-manual-language",
+			category: "ARCHITECTURE",
+			content: "The Pi harness runs dreamer prompts through a subprocess.",
+		});
 		__test.setStartDreamScheduleTimerFactory(async () => mock(() => {}));
 		__test.setPiSubagentRunnerFactory(
 			() =>
 				({
 					run: mock(async (args: { systemPrompt?: string }) => {
 						capturedSystem = args.systemPrompt ?? "";
-						return { ok: true, assistantText: "done" };
+						return {
+							ok: true,
+							assistantText: `<curate><keep claim="${claim.publicClaimId}"/></curate>`,
+						};
 					}),
 				}) as never,
 		);
-		insertMemory(db, {
-			projectPath: "git:pi-manual-language",
-			category: "ARCHITECTURE",
-			content: "The Pi harness runs dreamer prompts through a subprocess.",
-		});
-
 		registerPiDreamerProject(
 			dreamerOptions({
 				database: db,
@@ -213,6 +211,11 @@ describe("Pi dreamer wiring", () => {
 	test("shared curate validation retries Pi pseudo-tool-call text with the fallback model", async () => {
 		db = createDb();
 		const attemptedModels: Array<string | undefined> = [];
+		const claim = seedProjectMemoryClaim(db, {
+			projectIdentity: "git:pi-curate-pseudo-tool-call",
+			category: "PROJECT_RULES",
+			content: "Use the shared release checklist before publishing.",
+		});
 		__test.setStartDreamScheduleTimerFactory(async () => mock(() => {}));
 		__test.setPiSubagentRunnerFactory(
 			() =>
@@ -224,17 +227,11 @@ describe("Pi dreamer wiring", () => {
 							assistantText:
 								attemptedModels.length === 1
 									? CURATE_PSEUDO_TOOL_CALL
-									: "curation complete",
+									: `<curate><keep claim="${claim.publicClaimId}"/></curate>`,
 						};
 					}),
 				}) as never,
 		);
-		insertMemory(db, {
-			projectPath: "git:pi-curate-pseudo-tool-call",
-			category: "PROJECT_RULES",
-			content: "Use the shared release checklist before publishing.",
-		});
-
 		registerPiDreamerProject(
 			dreamerOptions({
 				database: db,

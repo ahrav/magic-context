@@ -12,6 +12,414 @@ use mc_host::synapse::{protocol, SynapseLimits};
 
 const TY_ERROR: u8 = 5;
 
+async fn spawn_query(
+    host: &SynapseHost,
+    lane: &mc_host::synapse::LaneInfo,
+    text: &str,
+    deadline_ms: u64,
+) -> tokio::task::JoinHandle<support::raw_client::RawFrame> {
+    let mut client = host.client().await;
+    let (channel, epoch) = open_synapse_route(&mut client).await;
+    let mut params = constraints(lane);
+    params["text"] = text.into();
+    params["deadline_ms"] = deadline_ms.into();
+    tokio::spawn(async move { call(&mut client, channel, epoch, "embed.query", params).await })
+}
+
+async fn yield_until(predicate: impl Fn() -> bool) {
+    for _ in 0..10_000 {
+        if predicate() {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("condition did not become true");
+}
+
+/// Limits admitting `max_waiting_queries` waiters. Waiting queries and the
+/// queued-batch budget share one scratch pool; the default 64 MiB queued
+/// budget leaves no waiter headroom, so it is shrunk to 8 MiB.
+fn waiter_limits(max_waiting_queries: usize) -> SynapseLimits {
+    SynapseLimits {
+        max_waiting_queries,
+        max_queued_request_bytes: 8 * 1024 * 1024,
+        ..SynapseLimits::default()
+    }
+}
+
+fn keep_paused_clock_manual() -> (
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    tokio::task::JoinHandle<()>,
+) {
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let task_running = std::sync::Arc::clone(&running);
+    let task = tokio::spawn(async move {
+        while task_running.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    });
+    (running, task)
+}
+
+#[tokio::test(start_paused = true)]
+async fn bounded_query_waiters_are_fifo_and_reject_bound_plus_one() {
+    let engine = DeterministicEngine::new();
+    let gate = engine.block_calls();
+    let limits = SynapseLimits {
+        query_retry_after_ms: 73,
+        ..waiter_limits(2)
+    };
+    let host = SynapseHost::start(ready_component(engine.clone(), limits)).await;
+    let (clock_running, clock_task) = keep_paused_clock_manual();
+    let lane = test_lane();
+
+    let first = spawn_query(&host, &lane, "first", 30_000).await;
+    yield_until(|| engine.calls.load(std::sync::atomic::Ordering::SeqCst) == 1).await;
+    // Each waiter travels its own connection, so admission order follows when
+    // its task reaches the socket rather than the spawn order here. A waiter
+    // blocks before the engine, so `engine.calls` cannot witness its arrival
+    // and there is nothing for `yield_until` to observe; a single yield is one
+    // scheduler turn, which need not carry a spawn through write, dispatch,
+    // and semaphore acquisition. Draining the queue the way the rest of this
+    // suite does keeps the FIFO assertion below from depending on how many
+    // await points that path happens to contain.
+    let second = spawn_query(&host, &lane, "second", 30_000).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    let third = spawn_query(&host, &lane, "third", 30_000).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    let fourth = spawn_query(&host, &lane, "fourth", 30_000).await;
+    yield_until(|| fourth.is_finished()).await;
+    let rejected = fourth.await.expect("fourth query task");
+    assert_eq!(rejected.error_code(), "queue_full");
+    assert_eq!(rejected.json()["retry_after_ms"], 73);
+
+    DeterministicEngine::release_calls(&gate);
+    for query in [first, second, third] {
+        assert_eq!(
+            query.await.expect("query task").ty,
+            support::raw_client::TY_RESPONSE
+        );
+    }
+    assert_eq!(
+        *engine.call_texts.lock().expect("call text lock"),
+        ["first", "second", "third"]
+    );
+    host.shutdown().await.expect("graceful shutdown");
+    clock_running.store(false, std::sync::atomic::Ordering::SeqCst);
+    clock_task.await.expect("clock keeper task");
+}
+
+#[tokio::test(start_paused = true)]
+async fn expired_waiter_releases_its_slot_without_engine_work() {
+    let engine = DeterministicEngine::new();
+    let gate = engine.block_calls();
+    let limits = waiter_limits(1);
+    let host = SynapseHost::start(ready_component(engine.clone(), limits)).await;
+    let (clock_running, clock_task) = keep_paused_clock_manual();
+    let lane = test_lane();
+
+    let first = spawn_query(&host, &lane, "running", 30_000).await;
+    yield_until(|| engine.calls.load(std::sync::atomic::Ordering::SeqCst) == 1).await;
+    let expired = spawn_query(&host, &lane, "expired", 10).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(std::time::Duration::from_millis(11)).await;
+    yield_until(|| expired.is_finished()).await;
+    let expired_terminal = expired.await.expect("expired query task");
+    assert_eq!(expired_terminal.error_code(), "timeout");
+    // The queued-waiter arm (the worker's deadline while waiting for the
+    // CPU permit) and the awaiting-result arm carry distinct messages; a
+    // waiter that never started must report the queued expiry.
+    assert_eq!(
+        expired_terminal.json()["message"],
+        "the query deadline expired while queued"
+    );
+    assert_eq!(engine.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let replacement = spawn_query(&host, &lane, "replacement", 30_000).await;
+    tokio::task::yield_now().await;
+    DeterministicEngine::release_calls(&gate);
+    assert_eq!(
+        first.await.expect("first query task").ty,
+        support::raw_client::TY_RESPONSE
+    );
+    assert_eq!(
+        replacement.await.expect("replacement query task").ty,
+        support::raw_client::TY_RESPONSE
+    );
+    assert_eq!(
+        *engine.call_texts.lock().expect("call text lock"),
+        ["running", "replacement"]
+    );
+    host.shutdown().await.expect("graceful shutdown");
+    clock_running.store(false, std::sync::atomic::Ordering::SeqCst);
+    clock_task.await.expect("clock keeper task");
+}
+
+#[tokio::test(start_paused = true)]
+async fn mixed_batch_and_query_waiters_share_fifo_cpu_without_starvation() {
+    let engine = DeterministicEngine::new();
+    let gate = engine.block_calls();
+    let limits = waiter_limits(2);
+    let host = SynapseHost::start(ready_component(engine.clone(), limits)).await;
+    let (clock_running, clock_task) = keep_paused_clock_manual();
+    let lane = test_lane();
+
+    let first = spawn_query(&host, &lane, "query-first", 30_000).await;
+    yield_until(|| engine.calls.load(std::sync::atomic::Ordering::SeqCst) == 1).await;
+    let second = spawn_query(&host, &lane, "query-second", 30_000).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+
+    let mut batch_client = host.client().await;
+    let (batch_channel, batch_epoch) = open_synapse_route(&mut batch_client).await;
+    let batch = call(
+        &mut batch_client,
+        batch_channel,
+        batch_epoch,
+        "embed.batch",
+        batch_params(&lane, &items(&[("batch", "batch-middle")])),
+    )
+    .await;
+    assert!(batch.json()["result"]["job_id"].is_string());
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    let third = spawn_query(&host, &lane, "query-third", 30_000).await;
+
+    DeterministicEngine::release_calls(&gate);
+    for query in [first, second, third] {
+        assert_eq!(
+            query.await.expect("query task").ty,
+            support::raw_client::TY_RESPONSE
+        );
+    }
+    yield_until(|| engine.calls.load(std::sync::atomic::Ordering::SeqCst) == 4).await;
+    assert_eq!(
+        *engine.call_texts.lock().expect("call text lock"),
+        ["query-first", "query-second", "batch-middle", "query-third"]
+    );
+
+    host.shutdown().await.expect("graceful shutdown");
+    clock_running.store(false, std::sync::atomic::Ordering::SeqCst);
+    clock_task.await.expect("clock keeper task");
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_cancels_waiters_but_drains_started_query() {
+    let engine = DeterministicEngine::new();
+    let gate = engine.block_calls();
+    let limits = waiter_limits(1);
+    let host = SynapseHost::start(ready_component(engine.clone(), limits)).await;
+    let (clock_running, clock_task) = keep_paused_clock_manual();
+    let lane = test_lane();
+
+    let started = spawn_query(&host, &lane, "started", 30_000).await;
+    yield_until(|| engine.calls.load(std::sync::atomic::Ordering::SeqCst) == 1).await;
+    let waiting = spawn_query(&host, &lane, "waiting", 30_000).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+
+    let shutdown = tokio::spawn(host.shutdown());
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !shutdown.is_finished(),
+        "shutdown must drain the started call"
+    );
+    assert_eq!(engine.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    DeterministicEngine::release_calls(&gate);
+    shutdown
+        .await
+        .expect("shutdown task")
+        .expect("graceful shutdown");
+    let _started_terminal = started.await.expect("started query task");
+    let waiting_terminal = waiting.await.expect("waiting query task");
+    assert_eq!(waiting_terminal.error_code(), "cancelled");
+    // Two producers emit `cancelled`: route settlement's generation cancel
+    // ("request cancelled") and the component's own shutdown arm ("the host
+    // is shutting down"). Host shutdown settles routes — cancelling admitted
+    // work — before the composite's shutdown callback cancels the synapse
+    // closing token, so the dispatcher's message is the one a client
+    // observes; pinning it keeps this test honest about which producer
+    // cancelled the waiter.
+    assert_eq!(waiting_terminal.json()["message"], "request cancelled");
+    assert_eq!(
+        *engine.call_texts.lock().expect("call text lock"),
+        ["started"]
+    );
+    clock_running.store(false, std::sync::atomic::Ordering::SeqCst);
+    clock_task.await.expect("clock keeper task");
+}
+
+#[tokio::test(start_paused = true)]
+async fn route_loss_drops_queued_query_without_engine_work_and_releases_slot() {
+    let engine = DeterministicEngine::new();
+    let gate = engine.block_calls();
+    let limits = waiter_limits(1);
+    let host = SynapseHost::start(ready_component(engine.clone(), limits)).await;
+    let (clock_running, clock_task) = keep_paused_clock_manual();
+    let lane = test_lane();
+
+    let started = spawn_query(&host, &lane, "started", 30_000).await;
+    yield_until(|| engine.calls.load(std::sync::atomic::Ordering::SeqCst) == 1).await;
+
+    let mut lost = host.client().await;
+    let (channel, epoch) = open_synapse_route(&mut lost).await;
+    let mut params = constraints(&lane);
+    params["text"] = "lost".into();
+    params["deadline_ms"] = 30_000.into();
+    let corr = lost.next_corr();
+    let body = serde_json::to_vec(&serde_json::json!({"method": "embed.query", "params": params}))
+        .expect("request serializes");
+    lost.send_frame(
+        support::raw_client::TY_REQUEST,
+        support::raw_client::FLAGS_INTERACTIVE,
+        channel,
+        epoch,
+        corr,
+        &body,
+    )
+    .await
+    .expect("send queued query");
+    // Positive occupancy proof: with two permits (one running, one waiter),
+    // a third query rejecting `queue_full` proves the lost query was
+    // admitted and holds the waiter slot — without it, a scheduling race
+    // could kill the route before admission and pass this test vacuously.
+    // (An admitted probe would park behind the gated engine, so a vacuous
+    // run now fails loudly instead of passing.)
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    let probe = spawn_query(&host, &lane, "probe", 30_000).await;
+    let probe_terminal = probe.await.expect("probe query task");
+    assert_eq!(probe_terminal.ty, TY_ERROR);
+    assert_eq!(probe_terminal.error_code(), "queue_full");
+    lost.send_frame(support::raw_client::TY_GOODBYE, 0, channel, epoch, 0, b"")
+        .await
+        .expect("close queued query route");
+    drop(lost);
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(engine.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let replacement = spawn_query(&host, &lane, "replacement", 30_000).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    DeterministicEngine::release_calls(&gate);
+    let _ = started.await.expect("started query task");
+    assert_eq!(
+        replacement.await.expect("replacement query task").ty,
+        support::raw_client::TY_RESPONSE
+    );
+    assert_eq!(
+        *engine.call_texts.lock().expect("call text lock"),
+        ["started", "replacement"]
+    );
+
+    host.shutdown().await.expect("graceful shutdown");
+    clock_running.store(false, std::sync::atomic::Ordering::SeqCst);
+    clock_task.await.expect("clock keeper task");
+}
+
+/// The startup scratch formula's promise holds at runtime: at the largest
+/// feasible `max_waiting_queries` for these limits, boundary+1 concurrent
+/// queries each carrying a maximal text are all admitted — none is rejected
+/// `queue_full` by resident accounting — and each returns a response.
+#[tokio::test(start_paused = true)]
+async fn boundary_waiters_with_maximal_texts_are_all_admitted() {
+    let engine = DeterministicEngine::new();
+    let gate = engine.block_calls();
+    // The feasible boundary under the startup scratch formula, pinned so a
+    // formula or pool change must recompute it deliberately:
+    //   reservable = SCRATCH_RESERVED_BYTES (184,616,192)
+    //              - RETAINED_METADATA_RESERVED_BYTES (2,097,152) = 182,519,040
+    //   per waiter slot   = 2 * max_text_bytes + 256          =   2,097,408
+    //   queued text bytes = max_queued_request_bytes          =   8,388,608
+    //   queued metadata   = 64 jobs * (2*64 + 64 * 960)       =   3,940,352
+    //   worst parse       = 3 * 32 MiB + 64 * 640 + 4096      = 100,708,352
+    //   K + 1 <= (182,519,040 - 113,037,312) / 2,097,408 = 33.13 -> K = 32
+    const BOUNDARY: usize = 32;
+    mc_host::synapse::SynapseComponent::ready_with_engine(
+        test_lane(),
+        engine.clone(),
+        waiter_limits(BOUNDARY),
+    )
+    .expect("the boundary configuration is feasible");
+    let error = match mc_host::synapse::SynapseComponent::ready_with_engine(
+        test_lane(),
+        engine.clone(),
+        waiter_limits(BOUNDARY + 1),
+    ) {
+        Ok(_) => panic!("one waiter past the boundary must fail validation"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("query admission capacity requires"));
+
+    let host = SynapseHost::start(ready_component(engine.clone(), waiter_limits(BOUNDARY))).await;
+    let (clock_running, clock_task) = keep_paused_clock_manual();
+    let lane = test_lane();
+    let text = "x".repeat(lane.max_text_bytes);
+
+    let first = spawn_query(&host, &lane, &text, 30_000).await;
+    yield_until(|| engine.calls.load(std::sync::atomic::Ordering::SeqCst) == 1).await;
+    let mut waiters = Vec::new();
+    for _ in 0..BOUNDARY {
+        waiters.push(spawn_query(&host, &lane, &text, 30_000).await);
+        tokio::task::yield_now().await;
+    }
+    // Every waiter holds its decoded maximal text while the engine gate is
+    // closed, so all boundary+1 charges coexist in the scratch pool here.
+    for _ in 0..1_000 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        engine.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "queued queries must not reach inference while the gate is closed"
+    );
+
+    DeterministicEngine::release_calls(&gate);
+    let terminal = first.await.expect("first query task");
+    assert_eq!(
+        terminal.ty,
+        support::raw_client::TY_RESPONSE,
+        "first query rejected: {}",
+        String::from_utf8_lossy(&terminal.body)
+    );
+    for waiter in waiters {
+        let terminal = waiter.await.expect("waiter query task");
+        assert_eq!(
+            terminal.ty,
+            support::raw_client::TY_RESPONSE,
+            "an admitted maximal query was rejected: {}",
+            String::from_utf8_lossy(&terminal.body)
+        );
+    }
+    assert_eq!(
+        engine.calls.load(std::sync::atomic::Ordering::SeqCst),
+        BOUNDARY + 1,
+        "every admitted query runs inference exactly once"
+    );
+
+    host.shutdown().await.expect("graceful shutdown");
+    clock_running.store(false, std::sync::atomic::Ordering::SeqCst);
+    clock_task.await.expect("clock keeper task");
+}
+
 #[tokio::test]
 async fn models_list_returns_exactly_the_certified_entry() {
     let engine = DeterministicEngine::new();
@@ -90,10 +498,13 @@ async fn embed_query_returns_a_bound_vector() {
 async fn query_overload_preserves_tool_provider_capacity() {
     let engine = DeterministicEngine::new();
     engine.set_delay(std::time::Duration::from_secs(2));
-    let host = SynapseHost::start_with(
-        ready_component(engine.clone(), SynapseLimits::default()),
-        |config| config.limits.max_handler_tasks = 2,
-    )
+    let limits = SynapseLimits {
+        query_retry_after_ms: 73,
+        ..SynapseLimits::default()
+    };
+    let host = SynapseHost::start_with(ready_component(engine.clone(), limits), |config| {
+        config.limits.max_handler_tasks = 2
+    })
     .await;
     let lane = test_lane();
 
@@ -140,6 +551,7 @@ async fn query_overload_preserves_tool_provider_capacity() {
     .await
     .expect("query overload must reject promptly");
     assert_eq!(overloaded.error_code(), "queue_full");
+    assert_eq!(overloaded.json()["retry_after_ms"], 73);
     assert_eq!(
         engine.calls.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -341,28 +753,20 @@ async fn batch_result_over_retention_cap_is_rejected_before_inference() {
         max_retained_result_bytes: 8 * 4 + 1 + 64,
         ..SynapseLimits::default()
     };
-    let host = SynapseHost::start(ready_component(engine.clone(), limits)).await;
-    let mut client = host.client().await;
-    let (channel, epoch) = open_synapse_route(&mut client).await;
-    let lane = test_lane();
-    let page = items(&[("ab", "text")]);
-
-    let frame = call(
-        &mut client,
-        channel,
-        epoch,
-        "embed.batch",
-        batch_params(&lane, &page),
-    )
-    .await;
-    assert_eq!(frame.error_code(), "schema_violation");
+    let error = match mc_host::synapse::SynapseComponent::ready_with_engine(
+        test_lane(),
+        engine.clone(),
+        limits,
+    ) {
+        Ok(_) => panic!("an unservable retained-result cap must fail startup"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("maximum batch result"));
     assert_eq!(
         engine.calls.load(std::sync::atomic::Ordering::SeqCst),
         0,
         "oversized result must be rejected before inference"
     );
-
-    host.shutdown().await.expect("graceful shutdown");
 }
 
 #[tokio::test]
@@ -898,77 +1302,32 @@ async fn a_routed_depth_nine_request_is_a_schema_violation() {
     host.shutdown().await.expect("graceful shutdown");
 }
 
-/// A protocol-valid request whose body plus parse reservation exceeds the
-/// host's whole resident capacity can never be served at this configuration,
-/// so it is refused as a permanent size violation rather than the retryable
-/// `queue_full` a client would resubmit forever. No engine call, no job, and
-/// capacity is untouched for later requests.
+/// A configuration advertising a request whose parse reservation exceeds the
+/// fixed scratch ceiling is rejected before the ready-engine seam publishes.
 #[tokio::test]
 async fn a_body_above_resident_capacity_is_a_permanent_size_violation() {
     let engine = DeterministicEngine::new();
     let limits = SynapseLimits {
-        // The scratch pool funds only the parse reservation (the body is
-        // charged to the ingress pool), so a body is unservable only when
-        // its reservation alone exceeds the fixed scratch ceiling. At
-        // default limits that can never happen — the worst-case reservation
-        // is sized to fit — so this config inflates the per-item term: an
-        // absurd item cap lets the body-derived item bound (~one item per
-        // 64 body bytes at 640 bytes of headroom each) push a ~12 MiB
-        // body's reservation past the ~96 MiB scratch pool.
+        // Inflating the per-item term pushes the maximal advertised body's
+        // reservation past the fixed scratch pool.
         max_batch_items: 10_000_000,
         max_text_bytes: 30 * 1024 * 1024,
+        max_batch_text_bytes: 30 * 1024 * 1024,
+        max_retained_result_bytes: u64::MAX,
         ..SynapseLimits::default()
     };
-    let host = SynapseHost::start_with(ready_component(engine.clone(), limits), |config| {
-        // The extra 1 MiB lets the linked catalog fit.
-        config.limits.max_resident_bytes = mc_host::config::MIN_RESIDENT_BYTES + (1 << 20);
-        config.timing.frame_deadline = std::time::Duration::from_secs(30);
-    })
-    .await;
-    let mut client = host.client().await;
-    let (channel, epoch) = open_synapse_route(&mut client).await;
-    let lane = test_lane();
-
-    let mut params = constraints(&lane);
-    params["text"] = "x".repeat(12 * 1024 * 1024).into();
-    let frame = call(&mut client, channel, epoch, "embed.query", params).await;
-    // Permanent, not retryable: draining traffic can never free enough,
-    // because the requirement is above the pool's ceiling, not its level.
-    assert_eq!(frame.error_code(), "schema_violation");
-    let message = frame.json()["message"]
-        .as_str()
-        .expect("error message")
-        .to_owned();
-    assert!(
-        message.contains("resident bytes") && message.contains("resident capacity"),
-        "the rejection must name what it needed and the ceiling it exceeded: {message}"
-    );
+    let error = match mc_host::synapse::SynapseComponent::ready_with_engine(
+        test_lane(),
+        engine.clone(),
+        limits,
+    ) {
+        Ok(_) => panic!("an unservable parse reservation must fail startup"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("parse reservation"));
     assert_eq!(
         engine.calls.load(std::sync::atomic::Ordering::SeqCst),
         0,
-        "a capacity-rejected request must not reach inference"
+        "a startup-rejected lane must not reach inference"
     );
-
-    // No charge leaked: a non-query operation and then a small query both
-    // succeed on the same lane.
-    let frame = call(
-        &mut client,
-        channel,
-        epoch,
-        "models.list",
-        serde_json::json!({}),
-    )
-    .await;
-    assert_eq!(
-        frame.json()["result"]["models"].as_array().map(Vec::len),
-        Some(1)
-    );
-
-    let mut params = constraints(&lane);
-    params["text"] = "small query".into();
-    let frame = call(&mut client, channel, epoch, "embed.query", params).await;
-    assert_eq!(frame.json()["result"]["done"], true);
-    assert_eq!(engine.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-
-    host.shutdown().await.expect("graceful shutdown");
 }

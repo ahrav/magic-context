@@ -5,15 +5,14 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Database } from "../../../shared/sqlite";
+import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { evaluateSmartNotes } from "../dreamer/evaluate-smart-notes";
 import { acquireLease } from "../dreamer/lease";
 import { createDreamTaskExecutor } from "../dreamer/task-executor";
 import { leaseKeyFor } from "../dreamer/task-registry";
-import { runMigrations } from "../migrations";
-import { initializeDatabase } from "../storage-db";
 import { addNote, getPendingSmartNotes } from "../storage-notes";
+import { createDirectTestDatabase } from "../test-database";
 import { runDueCompiledSmartNoteChecks } from "./runner";
 import { SMART_NOTE_CHECK_POLICY_VERSION } from "./types";
 import { __wakePlaneTest, WAKE_PLANE_CAPABILITY, wakePlaneStatus } from "./wake-plane";
@@ -21,9 +20,7 @@ import { __wakePlaneTest, WAKE_PLANE_CAPABILITY, wakePlaneStatus } from "./wake-
 const PROJECT = "git:wake-plane-test";
 
 function freshDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase().db;
     return db;
 }
 

@@ -57,12 +57,12 @@ Magic Context control metadata is not reply syntax. Never reproduce \`<system-re
  *  misleading busywork. Identical in both ctx_reduce modes. ctx_search guidance
  *  stays regardless (it still recalls conversation + git commits when memory is
  *  off, it just won't return memory hits). */
-const MEMORY_GUIDANCE = `Use \`ctx_memory\` for durable project knowledge: write what future sessions must know, update/archive/merge the memories you see in \`<project-memory>\` when they drift. Memories persist across sessions and every new session starts with them.
-Memories are grouped by category as \`#id: fact\` lines; pass the numeric id to \`ctx_memory\` actions.
-**Save to memory proactively**: If you spent multiple turns finding something (a file path, a DB location, a config pattern, a workaround), save it with \`ctx_memory\` so future sessions don't repeat the search. Examples:
-- Found a project's source code path after searching → \`ctx_memory(action="write", category="CONFIG_VALUES", content="OpenCode source is at ~/Work/OSS/opencode")\`
-- Discovered a non-obvious build/test command → \`ctx_memory(action="write", category="PROJECT_RULES", content="Always run the full release checklist before publishing")\`
-- Learned a constraint the hard way → \`ctx_memory(action="write", category="CONSTRAINTS", content="Dashboard Tauri build needs RGBA PNGs, not grayscale")\``;
+const MEMORY_GUIDANCE = `Use \`ctx_memory\` for durable project knowledge: create what future sessions must know, then revise, archive, restore, or merge claims shown in \`<project-memory>\` when they drift. Claims persist across sessions and every new session starts with them.
+Claims use opaque \`mcm_…\` public IDs. Pass the current mutation token returned by create/get/list when changing a claim; stale tokens make no change.
+**Save durable knowledge proactively**: If you spent multiple turns finding something (a file path, a DB location, a config pattern, a workaround), create a claim so future sessions don't repeat the search. Examples:
+- Found a project's source code path after searching → \`ctx_memory(action="create", category="CONFIG_VALUES", content="OpenCode source is at ~/Work/OSS/opencode")\`
+- Discovered a non-obvious build/test command → \`ctx_memory(action="create", category="PROJECT_RULES", content="Always run the full release checklist before publishing")\`
+- Learned a constraint the hard way → \`ctx_memory(action="create", category="CONSTRAINTS", content="Dashboard Tauri build needs RGBA PNGs, not grayscale")\``;
 
 /** Renders MEMORY_GUIDANCE + trailing newline when memory is on, else "". Placed
  *  before the ctx_search line so turning memory off removes the block without

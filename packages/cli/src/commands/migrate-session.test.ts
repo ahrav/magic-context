@@ -3,10 +3,8 @@ import {
     AUTHORITY_DOMAINS,
     type AuthorityState,
 } from "@magic-context/core/features/magic-context/context-authority";
-import { insertMemory as insertMemoryThroughKernel } from "@magic-context/core/features/magic-context/memory/storage-memory";
-import { getCurrentMemoryClaimByLegacyMemoryId } from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
-import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
-import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
+import { seedProjectMemoryClaim } from "@magic-context/core/features/magic-context/test-claim-database";
+import { createDirectTestDatabase } from "@magic-context/core/features/magic-context/test-database";
 import { Database } from "@magic-context/core/shared/sqlite";
 
 import {
@@ -236,8 +234,6 @@ describe("planMigrateSession", () => {
         expect(plan.sessionPath).toBe(""); // relative(worktree, dir) when equal
         expect(plan.fromMcIdentity).toBe(FROM);
         expect(plan.toMcIdentity).toBe(TO);
-        expect(plan.injectableMemoryCount).toBe(2);
-        expect(plan.originatedMemoryCount).toBe(1);
     });
 
     it("falls back to global (with flag) when a git target has no registered project (empty repo)", () => {
@@ -371,7 +367,7 @@ describe("assertMigrateSessionIsSafeToRehome", () => {
         ).resolves.toEqual({
             warnings: [],
         });
-        applyMigrateSession(plan, "leave", makeDeps(oc, ctx));
+        applyMigrateSession(plan, makeDeps(oc, ctx));
         expect(
             (
                 ctx
@@ -392,7 +388,7 @@ describe("applyMigrateSession — OpenCode + context re-stamp", () => {
         );
         seedSession(oc, ctx);
         const plan = planMigrateSession(SID, "/home/u/benchmarks", makeDeps(oc, ctx, true));
-        const res = applyMigrateSession(plan, "leave", makeDeps(oc, ctx, true));
+        const res = applyMigrateSession(plan, makeDeps(oc, ctx, true));
 
         const session = oc.prepare("SELECT * FROM session WHERE id = ?").get(SID) as {
             project_id: string;
@@ -421,8 +417,7 @@ describe("applyMigrateSession — OpenCode + context re-stamp", () => {
             .prepare("SELECT cached_m0_bytes FROM session_meta WHERE session_id = ?")
             .get(SID) as { cached_m0_bytes: unknown };
         expect(meta.cached_m0_bytes).toBeNull();
-        // "leave" → no memory movement, no epoch bump.
-        expect(res.epochsBumped).toEqual([]);
+        expect(res.dryRun).toBe(false);
     });
 
     it("only updates session columns that exist (schema-resilient)", () => {
@@ -439,7 +434,7 @@ describe("applyMigrateSession — OpenCode + context re-stamp", () => {
         ).run(SID, FROM);
         const plan = planMigrateSession(SID, "/home/u/benchmarks", makeDeps(oc, ctx, false));
         // Must not throw even though project_id/path/workspace_id columns are absent.
-        applyMigrateSession(plan, "leave", makeDeps(oc, ctx, false));
+        applyMigrateSession(plan, makeDeps(oc, ctx, false));
         const row = oc.prepare("SELECT directory FROM session WHERE id = ?").get(SID) as {
             directory: string;
         };
@@ -458,159 +453,27 @@ describe("applyMigrateSession — memory actions", () => {
         return { oc, ctx };
     }
 
-    it("move-originated: only this session's memories move; source loses them; both epochs bump", () => {
+    it("scenario 7: session re-home leaves project memory rows and embeddings unchanged", () => {
         const { oc, ctx } = setup();
         insertMemory(ctx, FROM, SID, { withEmbedding: true });
-        insertMemory(ctx, FROM, SID);
-        insertMemory(ctx, FROM, OTHER_SID); // not this session
-        const plan = planMigrateSession(SID, "/home/u/benchmarks", makeDeps(oc, ctx));
-        const res = applyMigrateSession(plan, "move-originated", makeDeps(oc, ctx));
-
-        expect(res.memoriesRelocated).toBe(2);
-        expect(
-            (
-                ctx
-                    .prepare("SELECT COUNT(*) AS c FROM memories WHERE project_path = ?")
-                    .get(TO) as { c: number }
-            ).c,
-        ).toBe(2);
-        expect(
-            (
-                ctx
-                    .prepare("SELECT COUNT(*) AS c FROM memories WHERE project_path = ?")
-                    .get(FROM) as { c: number }
-            ).c,
-        ).toBe(1);
-        // embedding followed the moved row (memory_id unchanged on rekey)
-        expect(
-            (ctx.prepare("SELECT COUNT(*) AS c FROM memory_embeddings").get() as { c: number }).c,
-        ).toBe(1);
-        expect(res.epochsBumped.sort()).toEqual([FROM, TO].sort());
-    });
-
-    it("move-all: every injectable memory moves regardless of origin", () => {
-        const { oc, ctx } = setup();
-        insertMemory(ctx, FROM, SID);
         insertMemory(ctx, FROM, OTHER_SID);
-        insertMemory(ctx, FROM, null, { status: "archived" }); // archived excluded
+        const before = {
+            memories: ctx.prepare("SELECT * FROM memories ORDER BY id").all(),
+            embeddings: ctx.prepare("SELECT * FROM memory_embeddings ORDER BY memory_id").all(),
+            projectState: ctx.prepare("SELECT * FROM project_state ORDER BY project_path").all(),
+        };
         const plan = planMigrateSession(SID, "/home/u/benchmarks", makeDeps(oc, ctx));
-        const res = applyMigrateSession(plan, "move-all", makeDeps(oc, ctx));
-        expect(res.memoriesRelocated).toBe(2);
-        // archived stays under source
-        expect(
-            (
-                ctx
-                    .prepare(
-                        "SELECT COUNT(*) AS c FROM memories WHERE project_path = ? AND status='archived'",
-                    )
-                    .get(FROM) as { c: number }
-            ).c,
-        ).toBe(1);
-    });
 
-    it("copy-originated: rows duplicated under target, source intact, embeddings duplicated", () => {
-        const { oc, ctx } = setup();
-        insertMemory(ctx, FROM, SID, { withEmbedding: true });
-        const plan = planMigrateSession(SID, "/home/u/benchmarks", makeDeps(oc, ctx));
-        const res = applyMigrateSession(plan, "copy-originated", makeDeps(oc, ctx));
-        expect(res.memoriesRelocated).toBe(1);
-        expect(
-            (
-                ctx
-                    .prepare("SELECT COUNT(*) AS c FROM memories WHERE project_path = ?")
-                    .get(FROM) as { c: number }
-            ).c,
-        ).toBe(1);
-        expect(
-            (
-                ctx
-                    .prepare("SELECT COUNT(*) AS c FROM memories WHERE project_path = ?")
-                    .get(TO) as { c: number }
-            ).c,
-        ).toBe(1);
-        expect(
-            (ctx.prepare("SELECT COUNT(*) AS c FROM memory_embeddings").get() as { c: number }).c,
-        ).toBe(2);
-        // copy bumps only the target epoch
-        expect(res.epochsBumped).toEqual([TO]);
-    });
+        applyMigrateSession(plan, makeDeps(oc, ctx));
 
-    it("move collision: an equivalent memory already at target merges instead of aborting", () => {
-        const { oc, ctx } = setup();
-        // same category+hash exists at BOTH from and to
-        insertMemory(ctx, FROM, SID, { category: "NAMING", content: "dup", withEmbedding: false });
-        ctx.prepare(
-            `INSERT INTO memories (project_path, category, content, normalized_hash, importance, source_session_id, seen_count, status, created_at)
-             VALUES (?, 'NAMING', 'dup', ?, 50, NULL, 5, 'active', 0)`,
-        ).run(TO, `hash-${hashCounter}`); // same hash as the FROM row just inserted
-        const plan = planMigrateSession(SID, "/home/u/benchmarks", makeDeps(oc, ctx));
-        const res = applyMigrateSession(plan, "move-originated", makeDeps(oc, ctx));
-        expect(res.memoriesMerged).toBe(1);
-        // source row deleted, target keeps the larger seen_count
+        expect({
+            memories: ctx.prepare("SELECT * FROM memories ORDER BY id").all(),
+            embeddings: ctx.prepare("SELECT * FROM memory_embeddings ORDER BY memory_id").all(),
+            projectState: ctx.prepare("SELECT * FROM project_state ORDER BY project_path").all(),
+        }).toEqual(before);
         expect(
-            (
-                ctx
-                    .prepare("SELECT COUNT(*) AS c FROM memories WHERE project_path = ?")
-                    .get(FROM) as { c: number }
-            ).c,
-        ).toBe(0);
-        expect(
-            (
-                ctx
-                    .prepare(
-                        "SELECT seen_count FROM memories WHERE project_path = ? AND normalized_hash = ?",
-                    )
-                    .get(TO, `hash-${hashCounter}`) as { seen_count: number }
-            ).seen_count,
-        ).toBe(5);
-    });
-
-    it("copy collision: equivalent already at target is skipped (no duplicate)", () => {
-        const { oc, ctx } = setup();
-        insertMemory(ctx, FROM, SID, { category: "NAMING", content: "dup" });
-        ctx.prepare(
-            `INSERT INTO memories (project_path, category, content, normalized_hash, importance, source_session_id, seen_count, status, created_at)
-             VALUES (?, 'NAMING', 'dup', ?, 50, NULL, 1, 'active', 0)`,
-        ).run(TO, `hash-${hashCounter}`);
-        const plan = planMigrateSession(SID, "/home/u/benchmarks", makeDeps(oc, ctx));
-        const res = applyMigrateSession(plan, "copy-originated", makeDeps(oc, ctx));
-        expect(res.memoriesSkipped).toBe(1);
-        expect(res.memoriesRelocated).toBe(0);
-        expect(
-            (
-                ctx
-                    .prepare("SELECT COUNT(*) AS c FROM memories WHERE project_path = ?")
-                    .get(TO) as { c: number }
-            ).c,
-        ).toBe(1);
-    });
-
-    it("move collision: source embedding is preserved on the surviving target (no silent loss)", () => {
-        const { oc, ctx } = setup();
-        // FROM row HAS an embedding; the equivalent TO row does NOT.
-        insertMemory(ctx, FROM, SID, { category: "NAMING", content: "dup", withEmbedding: true });
-        const targetId = Number(
-            (
-                ctx
-                    .prepare(
-                        `INSERT INTO memories (project_path, category, content, normalized_hash, importance, source_session_id, seen_count, status, created_at)
-                         VALUES (?, 'NAMING', 'dup', ?, 50, NULL, 1, 'active', 0) RETURNING id`,
-                    )
-                    .get(TO, `hash-${hashCounter}`) as { id: number }
-            ).id,
-        );
-        const plan = planMigrateSession(SID, "/home/u/benchmarks", makeDeps(oc, ctx));
-        const res = applyMigrateSession(plan, "move-originated", makeDeps(oc, ctx));
-        expect(res.memoriesMerged).toBe(1);
-        // The surviving target row must now carry an embedding adopted from the
-        // deleted source — without the transfer the FK-cascade would lose it.
-        expect(
-            (
-                ctx
-                    .prepare("SELECT COUNT(*) AS c FROM memory_embeddings WHERE memory_id = ?")
-                    .get(targetId) as { c: number }
-            ).c,
-        ).toBe(1);
+            ctx.prepare("SELECT project_path FROM session_projects WHERE session_id = ?").get(SID),
+        ).toEqual({ project_path: TO });
     });
 
     it("compensates the OpenCode move when the context.db transaction fails (no split-brain)", () => {
@@ -619,7 +482,7 @@ describe("applyMigrateSession — memory actions", () => {
         // dropping a table its transaction writes to.
         ctx.exec("DROP TABLE compartment_chunk_embeddings");
         const plan = planMigrateSession(SID, "/home/u/benchmarks", makeDeps(oc, ctx));
-        expect(() => applyMigrateSession(plan, "leave", makeDeps(oc, ctx))).toThrow();
+        expect(() => applyMigrateSession(plan, makeDeps(oc, ctx))).toThrow();
         // OpenCode must be restored to its pre-migration values.
         const session = oc
             .prepare("SELECT directory, project_id FROM session WHERE id = ?")
@@ -633,7 +496,7 @@ describe("applyMigrateSession — memory actions", () => {
         const plan = planMigrateSession(SID, "/home/u/benchmarks", makeDeps(oc, ctx));
         // Session vanishes between plan and apply (e.g. deleted while we worked).
         oc.prepare("DELETE FROM session WHERE id = ?").run(SID);
-        expect(() => applyMigrateSession(plan, "leave", makeDeps(oc, ctx))).toThrow(/not found/i);
+        expect(() => applyMigrateSession(plan, makeDeps(oc, ctx))).toThrow(/not found/i);
         // Context.db must be untouched — ownership stays on the source identity.
         const ownership = ctx
             .prepare("SELECT project_path FROM session_projects WHERE session_id = ?")
@@ -642,104 +505,54 @@ describe("applyMigrateSession — memory actions", () => {
     });
 });
 
-describe("applyMigrateSession — claims (v84)", () => {
-    it("routes a session-relocation move through claim-aware identity adoption", () => {
+describe("applyMigrateSession — direct claims", () => {
+    it("scenario 7: re-homes session runtime without remapping durable claim identity", () => {
         const oc = makeOpencodeDb();
-        const ctx = new Database(":memory:");
+        const ctx = createDirectTestDatabase().db;
         databases.push(ctx);
-        ctx.exec("PRAGMA foreign_keys=ON");
-        initializeDatabase(ctx);
-        runMigrations(ctx);
         oc.prepare(
             "INSERT INTO session (id, project_id, directory, path) VALUES (?, 'global', '/old/dir', 'old/dir')",
         ).run(SID);
         ctx.prepare(
             "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, 'opencode', ?, 0)",
         ).run(SID, FROM);
-        const moving = insertMemoryThroughKernel(ctx, {
-            projectPath: FROM,
-            category: "CONSTRAINTS",
-            content: "session-scoped fact",
-            sourceSessionId: SID,
+        seedProjectMemoryClaim(ctx, {
+            projectIdentity: FROM,
+            content: "Session provenance stays durable.",
+            operationKey: "u7-session-rehome",
+            provenance: { sourceSessionId: SID },
         });
-        // Registers the target as its own numeric project before the move.
-        insertMemoryThroughKernel(ctx, {
-            projectPath: TO,
-            category: "CONSTRAINTS",
-            content: "target resident fact",
-        });
-        const sourceClaimBefore = getCurrentMemoryClaimByLegacyMemoryId(ctx, moving.id);
-        expect(sourceClaimBefore?.state).toBe("active");
+        const before = {
+            claims: ctx.prepare("SELECT * FROM claims ORDER BY id").all(),
+            revisions: ctx.prepare("SELECT * FROM claim_revisions ORDER BY id").all(),
+            evidence: ctx
+                .prepare("SELECT * FROM claim_evidence ORDER BY revision_id, observation_id")
+                .all(),
+            receipts: ctx.prepare("SELECT * FROM claim_operation_receipts ORDER BY id").all(),
+            derivations: ctx.prepare("SELECT * FROM claim_derivations ORDER BY id").all(),
+            generations: ctx
+                .prepare("SELECT * FROM claim_project_generations ORDER BY project_id")
+                .all(),
+        };
 
         const deps = makeDeps(oc, ctx);
         const plan = planMigrateSession(SID, "/home/u/benchmarks", deps);
-        const result = applyMigrateSession(plan, "move-originated", deps);
+        applyMigrateSession(plan, deps);
 
-        expect(result.memoriesRelocated).toBe(1);
-        const movedRow = ctx
-            .prepare(
-                "SELECT id FROM memories WHERE project_path = ? AND content = 'session-scoped fact'",
-            )
-            .get(TO) as { id: number };
-        expect(movedRow).toBeDefined();
-        const movedClaim = getCurrentMemoryClaimByLegacyMemoryId(ctx, movedRow.id);
-        expect(movedClaim?.state).toBe("active");
-        expect(movedClaim?.content).toBe("session-scoped fact");
-        // The source claim retired through the authorized move; its durable
-        // crosswalk link survives the projection removal.
-        expect(
-            ctx
-                .prepare("SELECT state FROM claims WHERE id = ?")
-                .get(sourceClaimBefore?.claimId ?? 0),
-        ).toEqual({ state: "archived" });
-        expect(
-            ctx
-                .prepare("SELECT COUNT(*) AS c FROM legacy_memory_claims WHERE memory_id = ?")
-                .get(moving.id),
-        ).toEqual({ c: 1 });
-        expect(ctx.prepare("SELECT COUNT(*) AS c FROM claim_merge_lineage").get()).toEqual({
-            c: 1,
-        });
         expect(
             ctx.prepare("SELECT project_path FROM session_projects WHERE session_id = ?").get(SID),
         ).toEqual({ project_path: TO });
-    });
-
-    it("copy-originated creates target claims and leaves source rows and claims intact", () => {
-        const oc = makeOpencodeDb();
-        const ctx = new Database(":memory:");
-        databases.push(ctx);
-        ctx.exec("PRAGMA foreign_keys=ON");
-        initializeDatabase(ctx);
-        runMigrations(ctx);
-        oc.prepare(
-            "INSERT INTO session (id, project_id, directory, path) VALUES (?, 'global', '/old/dir', 'old/dir')",
-        ).run(SID);
-        ctx.prepare(
-            "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, 'opencode', ?, 0)",
-        ).run(SID, FROM);
-        const source = insertMemoryThroughKernel(ctx, {
-            projectPath: FROM,
-            category: "CONSTRAINTS",
-            content: "copyable fact",
-            sourceSessionId: SID,
-        });
-
-        const deps = makeDeps(oc, ctx);
-        const plan = planMigrateSession(SID, "/home/u/benchmarks", deps);
-        const result = applyMigrateSession(plan, "copy-originated", deps);
-
-        expect(result.memoriesRelocated).toBe(1);
-        expect(
-            ctx.prepare("SELECT COUNT(*) AS c FROM memories WHERE id = ?").get(source.id),
-        ).toEqual({ c: 1 });
-        const sourceClaim = getCurrentMemoryClaimByLegacyMemoryId(ctx, source.id);
-        expect(sourceClaim?.state).toBe("active");
-        const copied = ctx.prepare("SELECT id FROM memories WHERE project_path = ?").get(TO) as {
-            id: number;
-        };
-        const copiedClaim = getCurrentMemoryClaimByLegacyMemoryId(ctx, copied.id);
-        expect(copiedClaim?.state).toBe("active");
-        expect(copiedClaim?.claimId).not.toBe(sourceClaim?.claimId);
+        expect({
+            claims: ctx.prepare("SELECT * FROM claims ORDER BY id").all(),
+            revisions: ctx.prepare("SELECT * FROM claim_revisions ORDER BY id").all(),
+            evidence: ctx
+                .prepare("SELECT * FROM claim_evidence ORDER BY revision_id, observation_id")
+                .all(),
+            receipts: ctx.prepare("SELECT * FROM claim_operation_receipts ORDER BY id").all(),
+            derivations: ctx.prepare("SELECT * FROM claim_derivations ORDER BY id").all(),
+            generations: ctx
+                .prepare("SELECT * FROM claim_project_generations ORDER BY project_id")
+                .all(),
+        }).toEqual(before);
     });
 });

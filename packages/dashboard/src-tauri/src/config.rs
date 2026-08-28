@@ -338,9 +338,7 @@ pub fn discover_project_configs_with_db(
                 for p in &projects {
                     if let Some(path) = &p.path {
                         if !path.is_empty() {
-                            worktree_map
-                                .entry(path.clone())
-                                .or_insert(p.label.clone());
+                            worktree_map.entry(path.clone()).or_insert(p.label.clone());
                         }
                     }
                 }
@@ -353,8 +351,7 @@ pub fn discover_project_configs_with_db(
     if let Some(ref opencode_path) = opencode_db {
         if let Ok(conn) = rusqlite::Connection::open_with_flags(
             opencode_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         ) {
             collect_opencode_db_projects(&conn, &mut worktree_map);
         }
@@ -615,10 +612,7 @@ mod tests {
 
         // Set up opencode.db with the project
         let oc_path = data_home.join("opencode").join("opencode.db");
-        let oc = create_test_opencode_db(
-            &oc_path,
-            &[("My Project", proj_str.as_str())],
-        );
+        let oc = create_test_opencode_db(&oc_path, &[("My Project", proj_str.as_str())]);
         drop(oc);
 
         // No context.db — simulate Desktop scenario
@@ -668,14 +662,14 @@ mod tests {
         // Set up opencode.db with the project (so enumerate_projects can
         // resolve the identity → path mapping)
         let oc_path = data_home.join("opencode").join("opencode.db");
-        let oc = create_test_opencode_db(
-            &oc_path,
-            &[("My Project", proj_str.as_str())],
-        );
+        let oc = create_test_opencode_db(&oc_path, &[("My Project", proj_str.as_str())]);
         drop(oc);
 
         // Set up context.db with a memory row for the same project
-        let ctx_path = data_home.join("cortexkit").join("magic-context").join("context.db");
+        let ctx_path = data_home
+            .join("cortexkit")
+            .join("magic-context")
+            .join("context.db");
         std::fs::create_dir_all(ctx_path.parent().unwrap()).unwrap();
         let ctx_conn = rusqlite::Connection::open(&ctx_path).unwrap();
         ctx_conn

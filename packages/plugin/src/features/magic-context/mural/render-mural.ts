@@ -34,7 +34,7 @@ export type MuralCategory = string;
  *  pre-ordered flat list (category band → importance DESC → id ASC) and the
  *  renderer packs it deterministically into the capped image. */
 export interface MuralRenderEntry {
-    id: number;
+    id: string;
     category: MuralCategory;
     importance: number;
     cue: string;
@@ -53,11 +53,11 @@ export interface MuralRenderResult {
     dataUrl: string;
     muralText: string;
     sha256Input: string;
-    placements: Map<number, { category: MuralCategory; column: number; line: number }>;
+    placements: Map<string, { category: MuralCategory; column: number; line: number }>;
     layoutItems: MuralLayoutItem[];
-    renderedIds: number[];
+    renderedIds: string[];
     /** Entries trimmed because the capped image filled before reaching them. */
-    droppedIds: number[];
+    droppedIds: string[];
     categoryLineUsage: Record<string, number>;
     /** Content lines actually placed in the grid (excludes blank cells). Used to
      *  assert the three-column fill occupancy. */
@@ -144,7 +144,7 @@ function wrapCue(cue: string, width: number): string[] {
 interface PlannedLine {
     text: string;
     /** Entry ids whose body starts on this line (two for a shared pair). */
-    entryIds: number[];
+    entryIds: string[];
     isBanner: boolean;
     category: MuralCategory;
 }
@@ -285,8 +285,8 @@ interface LayoutResult {
     grid: string[][];
     placements: MuralRenderResult["placements"];
     layoutItems: MuralLayoutItem[];
-    renderedIds: number[];
-    droppedIds: number[];
+    renderedIds: string[];
+    droppedIds: string[];
     usage: Record<string, number>;
     filledLineCount: number;
     columnCount: number;
@@ -304,8 +304,8 @@ function renderLayout(
     );
     const placements: MuralRenderResult["placements"] = new Map();
     const layoutItems: MuralLayoutItem[] = [];
-    const renderedIds: number[] = [];
-    const placedIds = new Set<number>();
+    const renderedIds: string[] = [];
+    const placedIds = new Set<string>();
     const usage: Record<string, number> = {};
     let filledLineCount = 0;
 

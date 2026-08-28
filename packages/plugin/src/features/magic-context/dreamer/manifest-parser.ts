@@ -17,17 +17,20 @@ export function extractCompleteManifestBody(text: string, rootName: string): str
     throw new Error(`${rootName} manifest missing complete root element`);
 }
 
-export function assertNoDuplicateManifestIds(ids: readonly number[], rootName: string): void {
-    const seen = new Set<number>();
+export function assertNoDuplicateManifestIds(
+    ids: readonly (number | string)[],
+    rootName: string,
+): void {
+    const seen = new Set<number | string>();
     for (const id of ids) {
         if (seen.has(id)) throw new Error(`${rootName} manifest contains duplicate id ${id}`);
         seen.add(id);
     }
 }
 
-export function assertManifestCoversExactly(
-    ids: readonly number[],
-    expectedIds: ReadonlySet<number>,
+export function assertManifestCoversExactly<T extends number | string>(
+    ids: readonly T[],
+    expectedIds: ReadonlySet<T>,
     rootName: string,
 ): void {
     assertNoDuplicateManifestIds(ids, rootName);

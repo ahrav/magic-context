@@ -1,0 +1,232 @@
+{
+  "completed_utc": "2026-08-26T19:45:46.304268Z",
+  "derivation": "mean of retained per-block mean S; capacity=1e9/mean_ns; each factor rate=round_half_up(capacity*factor)",
+  "attempts": [
+    {
+      "phase": "calibration",
+      "sequence": 1,
+      "external_label": null,
+      "cell": {
+        "variant": "hygiene-only",
+        "arm": "query",
+        "shape": null,
+        "load": "closed",
+        "level": 1,
+        "delay_ms": 5,
+        "k": 0,
+        "seed": 1001,
+        "block": 1
+      },
+      "argv": [
+        "<repo>/target/release/examples/synapse_perf",
+        "--variant",
+        "hygiene-only",
+        "--arm",
+        "query",
+        "--seconds",
+        "1",
+        "--engine-delay-ms",
+        "5",
+        "--max-waiting-queries",
+        "0",
+        "--query-retry-after-ms",
+        "50",
+        "--seed",
+        "1001",
+        "--concurrency",
+        "1"
+      ],
+      "cwd": "<repo>",
+      "artifact_sha256": "3524f6744a8ddda4afebf876be6b85cd26ed34c15bd758c7280adef82a241ba7",
+      "started_utc": "2026-08-26T19:45:41.774810Z",
+      "ended_utc": "2026-08-26T19:45:42.892039Z",
+      "duration_seconds": 1.1172450610320084,
+      "exit_status": 0,
+      "timed_out": false,
+      "stdout": "calibration/raw/00001.ndjson",
+      "stderr": "calibration/raw/00001.stderr"
+    },
+    {
+      "phase": "calibration",
+      "sequence": 2,
+      "external_label": null,
+      "cell": {
+        "variant": "hygiene-only",
+        "arm": "query",
+        "shape": null,
+        "load": "closed",
+        "level": 1,
+        "delay_ms": 25,
+        "k": 0,
+        "seed": 1001,
+        "block": 1
+      },
+      "argv": [
+        "<repo>/target/release/examples/synapse_perf",
+        "--variant",
+        "hygiene-only",
+        "--arm",
+        "query",
+        "--seconds",
+        "1",
+        "--engine-delay-ms",
+        "25",
+        "--max-waiting-queries",
+        "0",
+        "--query-retry-after-ms",
+        "50",
+        "--seed",
+        "1001",
+        "--concurrency",
+        "1"
+      ],
+      "cwd": "<repo>",
+      "artifact_sha256": "3524f6744a8ddda4afebf876be6b85cd26ed34c15bd758c7280adef82a241ba7",
+      "started_utc": "2026-08-26T19:45:42.895352Z",
+      "ended_utc": "2026-08-26T19:45:44.012819Z",
+      "duration_seconds": 1.1174861519830301,
+      "exit_status": 0,
+      "timed_out": false,
+      "stdout": "calibration/raw/00002.ndjson",
+      "stderr": "calibration/raw/00002.stderr"
+    },
+    {
+      "phase": "calibration",
+      "sequence": 3,
+      "external_label": null,
+      "cell": {
+        "variant": "hygiene-only",
+        "arm": "query",
+        "shape": null,
+        "load": "closed",
+        "level": 1,
+        "delay_ms": 5,
+        "k": 0,
+        "seed": 1002,
+        "block": 2
+      },
+      "argv": [
+        "<repo>/target/release/examples/synapse_perf",
+        "--variant",
+        "hygiene-only",
+        "--arm",
+        "query",
+        "--seconds",
+        "1",
+        "--engine-delay-ms",
+        "5",
+        "--max-waiting-queries",
+        "0",
+        "--query-retry-after-ms",
+        "50",
+        "--seed",
+        "1002",
+        "--concurrency",
+        "1"
+      ],
+      "cwd": "<repo>",
+      "artifact_sha256": "3524f6744a8ddda4afebf876be6b85cd26ed34c15bd758c7280adef82a241ba7",
+      "started_utc": "2026-08-26T19:45:44.014456Z",
+      "ended_utc": "2026-08-26T19:45:45.131971Z",
+      "duration_seconds": 1.1175382799701765,
+      "exit_status": 0,
+      "timed_out": false,
+      "stdout": "calibration/raw/00003.ndjson",
+      "stderr": "calibration/raw/00003.stderr"
+    },
+    {
+      "phase": "calibration",
+      "sequence": 4,
+      "external_label": null,
+      "cell": {
+        "variant": "hygiene-only",
+        "arm": "query",
+        "shape": null,
+        "load": "closed",
+        "level": 1,
+        "delay_ms": 25,
+        "k": 0,
+        "seed": 1002,
+        "block": 2
+      },
+      "argv": [
+        "<repo>/target/release/examples/synapse_perf",
+        "--variant",
+        "hygiene-only",
+        "--arm",
+        "query",
+        "--seconds",
+        "1",
+        "--engine-delay-ms",
+        "25",
+        "--max-waiting-queries",
+        "0",
+        "--query-retry-after-ms",
+        "50",
+        "--seed",
+        "1002",
+        "--concurrency",
+        "1"
+      ],
+      "cwd": "<repo>",
+      "artifact_sha256": "3524f6744a8ddda4afebf876be6b85cd26ed34c15bd758c7280adef82a241ba7",
+      "started_utc": "2026-08-26T19:45:45.135336Z",
+      "ended_utc": "2026-08-26T19:45:46.302810Z",
+      "duration_seconds": 1.1674946830025874,
+      "exit_status": 0,
+      "timed_out": false,
+      "stdout": "calibration/raw/00004.ndjson",
+      "stderr": "calibration/raw/00004.stderr"
+    }
+  ],
+  "delays": {
+    "5": {
+      "block_mean_service_ns": [
+        5056469.663212435,
+        5056183.592783505
+      ],
+      "calibration_mean_service_ns": 5056326.62799797,
+      "capacity_per_second": 197.77203364647855,
+      "factors": [
+        0.25,
+        0.5,
+        0.75,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "rates_per_second": [
+        49,
+        99,
+        148,
+        198,
+        297,
+        396
+      ]
+    },
+    "25": {
+      "block_mean_service_ns": [
+        25060366.375,
+        25060740.875
+      ],
+      "calibration_mean_service_ns": 25060553.625,
+      "capacity_per_second": 39.903348304421186,
+      "factors": [
+        0.25,
+        0.5,
+        0.75,
+        1.0,
+        1.5,
+        2.0
+      ],
+      "rates_per_second": [
+        10,
+        20,
+        30,
+        40,
+        60,
+        80
+      ]
+    }
+  }
+}

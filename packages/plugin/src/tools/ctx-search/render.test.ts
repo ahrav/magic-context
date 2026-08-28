@@ -20,9 +20,10 @@ function memoryResult(id: number, content: string): MemorySearchResult {
         source: "memory",
         content,
         score: 0.9,
-        memoryId: id,
+        publicClaimId: `mcm_${id}`,
+        revisionLocator: `mcm_${id}/r1/${"0".repeat(64)}`,
         category: "decision",
-        matchType: "fts",
+        matchType: "exact",
     };
 }
 
@@ -73,7 +74,7 @@ describe("formatSearchResults", () => {
             [
                 'Found 2 results for "queue":',
                 "",
-                "[1] [memory] score=0.90 id=7 category=decision match=fts",
+                "[1] [memory] score=0.90 id=mcm_7 category=decision match=exact",
                 "always use bd for tracking",
                 "",
                 "[2] [message] score=0.80 ordinal=42 range=39-45 role=user",
@@ -216,10 +217,11 @@ describe("packSearchResults", () => {
         expect(packed.omittedCount).toBe(50 - shownBlocks);
         // Delivered blocks are fully rendered; omitted blocks are fully absent.
         for (const delivered of results.slice(0, shownBlocks)) {
-            expect(packed.text).toContain(`id=${delivered.memoryId}`);
+            expect(packed.text).toContain(`id=${delivered.publicClaimId}`);
         }
-        for (const omitted of results.slice(shownBlocks)) {
-            expect(packed.text).not.toContain(`tail-${omitted.memoryId - 1}`);
+        for (const [index, omitted] of results.slice(shownBlocks).entries()) {
+            void omitted;
+            expect(packed.text).not.toContain(`tail-${shownBlocks + index}`);
         }
     });
 });

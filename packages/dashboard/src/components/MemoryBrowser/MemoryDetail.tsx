@@ -1,50 +1,47 @@
-import { createEffect, createSignal, Show } from "solid-js";
+import { createEffect, createSignal, For, on, Show } from "solid-js";
 import { formatTimestamp } from "../../lib/api";
-import type { Memory } from "../../lib/types";
+import type { ClaimMemory } from "../../lib/types";
 import FilterSelect from "../shared/FilterSelect";
 import { SHARE_CATEGORY_OPTIONS } from "../WorkspacesPanel/workspace-staging";
 
 interface Props {
-  memory: Memory;
+  memory: ClaimMemory;
+  draft: string;
+  revisionAdvanced: boolean;
+  onDraftChange: (content: string) => void;
+  onDiscardDraft: () => void;
   onClose: () => void;
-  onStatusChange: (id: number, status: string) => Promise<void>;
-  onContentChange: (id: number, content: string) => Promise<void>;
-  onCategoryChange: (id: number, category: string) => Promise<void>;
-  onDelete: (id: number) => Promise<void>;
+  onLifecycleChange: (memory: ClaimMemory, state: "active" | "archived") => Promise<boolean>;
+  onContentChange: (memory: ClaimMemory, content: string) => Promise<boolean>;
+  onCategoryChange: (memory: ClaimMemory, category: string) => Promise<boolean>;
 }
 
 export default function MemoryDetail(props: Props) {
   const [editing, setEditing] = createSignal(false);
-  const [editContent, setEditContent] = createSignal(props.memory.content);
-  const [confirmDelete, setConfirmDelete] = createSignal(false);
 
-  // Sync editContent when the selected memory changes
-  createEffect(() => {
-    setEditContent(props.memory.content);
-    setEditing(false);
-  });
+  // Retirement is terminal in the adapter: `validate_target` refuses every
+  // mutation of a retired claim. Rendering the controls anyway offers the user
+  // actions that deterministically fail, and the Retired and all-lifecycle views
+  // both return such claims.
+  const retired = () => props.memory.lifecycleState === "retired";
 
-  const mergedFrom = () => {
-    if (!props.memory.merged_from) return null;
-    try {
-      return JSON.parse(props.memory.merged_from) as number[];
-    } catch {
-      return null;
-    }
-  };
+  // The parent renders this panel through a non-keyed `Show`, whose child
+  // callback re-runs only on falsy<->truthy transitions of its condition. This
+  // instance therefore survives a change of focused claim, so the editor has to
+  // close itself or clicking a second claim would open straight into an edit
+  // box holding the first claim's draft. Keyed on the public claim id rather
+  // than the object, so a refetch of the same claim leaves an open editor
+  // alone.
+  createEffect(
+    on(
+      () => props.memory.publicClaimId,
+      () => setEditing(false),
+      { defer: true },
+    ),
+  );
 
   const handleSave = async () => {
-    await props.onContentChange(props.memory.id, editContent());
-    setEditing(false);
-  };
-
-  const handleDelete = async () => {
-    if (!confirmDelete()) {
-      setConfirmDelete(true);
-      setTimeout(() => setConfirmDelete(false), 3000);
-      return;
-    }
-    await props.onDelete(props.memory.id);
+    if (await props.onContentChange(props.memory, props.draft)) setEditing(false);
   };
 
   return (
@@ -71,67 +68,85 @@ export default function MemoryDetail(props: Props) {
             "margin-bottom": "16px",
           }}
         >
-          <h2 style={{ "font-size": "15px", "font-weight": "600" }}>Memory #{props.memory.id}</h2>
+          <h2 style={{ "font-size": "15px", "font-weight": "600" }}>
+            {props.memory.publicClaimId}
+          </h2>
           <button type="button" class="btn sm" onClick={props.onClose}>
             ✕ Close
           </button>
         </div>
 
-        {/* Metadata */}
+        <Show when={props.revisionAdvanced}>
+          <div
+            class="card"
+            style={{ padding: "8px", "margin-bottom": "12px", color: "var(--warning)" }}
+          >
+            Claim advanced while this draft was open. Draft preserved. Review before saving.
+          </div>
+        </Show>
+
         <table class="kv-table" style={{ "margin-bottom": "16px" }}>
           <tbody>
             <tr>
               <td>Category</td>
               <td>
-                <FilterSelect
-                  compact
-                  value={props.memory.category}
-                  onChange={(v) => props.onCategoryChange(props.memory.id, v)}
-                  options={SHARE_CATEGORY_OPTIONS}
-                />
+                <Show when={!retired()} fallback={<span>{props.memory.category}</span>}>
+                  <FilterSelect
+                    compact
+                    value={props.memory.category}
+                    onChange={(category) => void props.onCategoryChange(props.memory, category)}
+                    options={SHARE_CATEGORY_OPTIONS}
+                  />
+                </Show>
               </td>
             </tr>
             <tr>
-              <td>Status</td>
+              <td>Lifecycle</td>
               <td>
-                <FilterSelect
-                  compact
-                  value={props.memory.status}
-                  onChange={(v) => props.onStatusChange(props.memory.id, v)}
-                  options={[
-                    { value: "active", label: "active" },
-                    { value: "permanent", label: "permanent" },
-                    { value: "archived", label: "archived" },
-                  ]}
-                />
+                <Show when={!retired()} fallback={<span>retired</span>}>
+                  <FilterSelect
+                    compact
+                    value={props.memory.lifecycleState}
+                    onChange={(state) =>
+                      void props.onLifecycleChange(props.memory, state as "active" | "archived")
+                    }
+                    options={[
+                      { value: "active", label: "active" },
+                      { value: "archived", label: "archived" },
+                    ]}
+                  />
+                </Show>
               </td>
             </tr>
             <tr>
-              <td>Source</td>
-              <td>{props.memory.source_type}</td>
+              <td>Revision</td>
+              <td>{props.memory.revision}</td>
+            </tr>
+            <tr>
+              <td>Project</td>
+              <td style={{ "word-break": "break-all" }}>{props.memory.projectIdentity}</td>
+            </tr>
+            <tr>
+              <td>Maturity</td>
+              <td>{props.memory.policy.effectiveMaturity}</td>
+            </tr>
+            <tr>
+              <td>Origin</td>
+              <td>{props.memory.policy.originTaint}</td>
             </tr>
             <tr>
               <td>Importance</td>
-              <td>
-                {props.memory.importance}
-                <span style={{ color: "var(--text-muted)" }}> / 100 · scored by classify</span>
-              </td>
+              <td>{props.memory.importance} / 100</td>
             </tr>
             <tr>
               <td>Scope</td>
               <td>
-                {props.memory.scope}
-                {props.memory.shareable ? " · shareable with teammates" : " · private"}
+                {props.memory.memoryScope} · {props.memory.sharing}
               </td>
-            </tr>
-            <tr>
-              <td>Project</td>
-              <td style={{ "word-break": "break-all" }}>{props.memory.project_path}</td>
             </tr>
           </tbody>
         </table>
 
-        {/* Content */}
         <div style={{ "margin-bottom": "16px" }}>
           <Show
             when={editing()}
@@ -154,22 +169,24 @@ export default function MemoryDetail(props: Props) {
                 >
                   {props.memory.content}
                 </div>
-                <button
-                  type="button"
-                  class="btn sm"
-                  style={{ "margin-top": "8px" }}
-                  onClick={() => setEditing(true)}
-                >
-                  Edit Content
-                </button>
+                <Show when={!retired()}>
+                  <button
+                    type="button"
+                    class="btn sm"
+                    style={{ "margin-top": "8px" }}
+                    onClick={() => setEditing(true)}
+                  >
+                    Edit Content
+                  </button>
+                </Show>
               </div>
             }
           >
             <textarea
               class="code-editor"
               style={{ "min-height": "150px" }}
-              value={editContent()}
-              onInput={(e) => setEditContent(e.currentTarget.value)}
+              value={props.draft}
+              onInput={(event) => props.onDraftChange(event.currentTarget.value)}
             />
             <div style={{ display: "flex", gap: "8px", "margin-top": "8px" }}>
               <button type="button" class="btn primary sm" onClick={handleSave}>
@@ -179,70 +196,45 @@ export default function MemoryDetail(props: Props) {
                 type="button"
                 class="btn sm"
                 onClick={() => {
+                  props.onDiscardDraft();
                   setEditing(false);
-                  setEditContent(props.memory.content);
                 }}
               >
-                Cancel
+                Discard Draft
               </button>
             </div>
           </Show>
         </div>
 
-        {/* Stats */}
-        <div class="category-header">Stats</div>
+        <div class="category-header">Evidence</div>
+        <div style={{ "margin-bottom": "16px", "font-size": "12px" }}>
+          <For each={props.memory.evidenceLabels}>
+            {(evidence) => (
+              <div>
+                {evidence.sourceTrustClass} · {evidence.extractor} · {evidence.independenceKey}
+              </div>
+            )}
+          </For>
+        </div>
+
+        <div class="category-header">Telemetry</div>
         <table class="kv-table" style={{ "margin-bottom": "16px" }}>
           <tbody>
             <tr>
               <td>Seen</td>
-              <td>{props.memory.seen_count} times</td>
+              <td>{props.memory.telemetry.seenCount} times</td>
             </tr>
             <tr>
               <td>Retrieved</td>
-              <td>{props.memory.retrieval_count} times</td>
+              <td>{props.memory.telemetry.retrievalCount} times</td>
             </tr>
             <tr>
-              <td>First seen</td>
-              <td>{formatTimestamp(props.memory.first_seen_at)}</td>
-            </tr>
-            <tr>
-              <td>Last seen</td>
-              <td>{formatTimestamp(props.memory.last_seen_at)}</td>
-            </tr>
-            <tr>
-              <td>Created</td>
-              <td>{formatTimestamp(props.memory.created_at)}</td>
-            </tr>
-            <tr>
-              <td>Updated</td>
-              <td>{formatTimestamp(props.memory.updated_at)}</td>
+              <td>Revision created</td>
+              <td>{formatTimestamp(props.memory.revisionCreatedAt)}</td>
             </tr>
           </tbody>
         </table>
 
-        {/* Embedding */}
-        <div class="category-header">Embedding</div>
-        <div style={{ "margin-bottom": "16px", "font-size": "12px" }}>
-          <Show
-            when={props.memory.has_embedding}
-            fallback={<span style={{ color: "var(--text-muted)" }}>○ No embedding</span>}
-          >
-            <span style={{ color: "var(--accent)" }}>● Embedded</span>
-          </Show>
-        </div>
-
-        {/* Merge History */}
-        <Show when={mergedFrom()}>
-          <div class="category-header">Merge History</div>
-          <div style={{ "margin-bottom": "16px", "font-size": "12px" }}>
-            Merged from:{" "}
-            {mergedFrom()
-              ?.map((id) => `#${id}`)
-              .join(", ")}
-          </div>
-        </Show>
-
-        {/* Actions */}
         <div
           style={{
             display: "flex",
@@ -251,18 +243,24 @@ export default function MemoryDetail(props: Props) {
             "border-top": "1px solid var(--border)",
           }}
         >
-          <Show when={props.memory.status !== "archived"}>
+          <Show when={props.memory.lifecycleState === "active"}>
             <button
               type="button"
               class="btn sm"
-              onClick={() => props.onStatusChange(props.memory.id, "archived")}
+              onClick={() => void props.onLifecycleChange(props.memory, "archived")}
             >
               Archive
             </button>
           </Show>
-          <button type="button" class="btn sm danger" onClick={handleDelete}>
-            {confirmDelete() ? "Click again to confirm" : "Delete"}
-          </button>
+          <Show when={props.memory.lifecycleState === "archived"}>
+            <button
+              type="button"
+              class="btn sm"
+              onClick={() => void props.onLifecycleChange(props.memory, "active")}
+            >
+              Restore
+            </button>
+          </Show>
         </div>
       </div>
     </div>

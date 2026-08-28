@@ -37,7 +37,7 @@
   "scripts": {
     "build": "tsc -p ../retina-local-fs/tsconfig.build.json && bun run build:tui && rm -f dist/index.js dist/*-*.js && bun build src/index.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --external @huggingface/transformers --external onnxruntime-web --external bun:sqlite --external node:sqlite && tsc --emitDeclarationOnly",
     "build:tui": "bun scripts/build-tui.ts",
-    "check:tui-compiled": "bun run build:tui && git diff --exit-code -- src/tui-compiled && test -z \"$(git status --porcelain -- src/tui-compiled)\"",
+    "check:tui-compiled": "tmp=$(mktemp -d) && cp -R src/tui-compiled/. \"$tmp\" && bun run build:tui && diff -ru \"$tmp\" src/tui-compiled; status=$?; rm -rf \"$tmp\"; exit $status",
     "typecheck": "tsc -p ../retina-local-fs/tsconfig.build.json && tsc --noEmit && tsc -p tsconfig.scripts.json",
     "test": "bun test",
     "test:mc-host-client:node": "bun scripts/run-mc-host-client-node.ts adversarial",
@@ -96,5 +96,8 @@
   ],
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.15.0"
+  },
+  "engines": {
+    "node": ">=24.15.0"
   }
 }

@@ -67,6 +67,31 @@ jobs:
         working-directory: packages/e2e-tests
         run: bun scripts/validate-shm-hardening-matrix.ts --allow-unresolved
 
+  release-contract-gate:
+    name: mc-host release contract drift gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # The contract is committed in four byte-coupled forms (canonical
+      # JSON, the include!-able Rust constants that feed production epoch
+      # values, and two TypeScript embeddings). This is the only gate that
+      # proves they were regenerated together.
+      - name: Check generated release contract for drift
+        run: bun run release:contract:check
+
   shm-crash-recovery:
     name: SHM crash isolation + recovery (Linux, provisional ring tuple)
     runs-on: ubuntu-latest
@@ -196,7 +221,7 @@ jobs:
       # under Node, not Bun. Node 24 also strips the smoke script's inline TS.
       - uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version: "24.18.0"
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -303,6 +328,73 @@ jobs:
       - name: E2E harness typecheck
         run: bun run --cwd packages/e2e-tests typecheck
 
+  release-qualification-gate:
+    name: Release contract + production-input qualification
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # The release-script suite asserts the mc-host -> mc-module dependency
+      # boundary through `cargo tree`, which needs a resolvable workspace.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Provision metadata-only sibling stubs
+        run: sh scripts/provision-rust-ci-stubs.sh
+
+      # Same script `check:all` runs, so a contributor's local pass covers
+      # exactly what this gate covers.
+      - name: Release script unit tests
+        run: bun run test:release
+
+      - name: U8 release contract drift
+        run: bun run release:contract:check
+
+      # Drift-only: byte verification needs the real production artifacts,
+      # which live on the qualifying host, so --check stays portable here and
+      # guards the committed lock/credentials/evidence digests.
+      - name: U9 production-input qualification drift
+        run: bun run release:qualify:check
+
+  # Its own job, not a step in prospective-release-holdout: steps in one job
+  # short-circuit, so an unrelated contract lane failing first would skip this
+  # one and leave the historian-eval gate silently unenforced — which is the
+  # state this job exists to end. Nothing invoked test:historian-eval-unit
+  # before: test:e2e selects --mode ts and test:opencode-e2e runs the green
+  # manifest, and neither reaches historianEvalUnitFiles(), so the contract and
+  # freeze lint could regress with every other lane green.
+  historian-eval-contracts:
+    name: Historian eval lane contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Historian eval unit contracts
+        run: bun run test:historian-eval-unit
+
   mc-host-client-interop:
     name: mc-host client interop (Bun + Node 24)
     runs-on: ubuntu-latest
@@ -316,7 +408,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version: "24.18.0"
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -338,14 +430,19 @@ jobs:
         with:
           bun-version: latest
 
+      # rustfmt and clippy are not in the action's default minimal profile, and
+      # the adapter gate below runs both.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      # Frontend-only checks (no Rust/Tauri needed). The key gate is the test
-      # step, which runs config-parity.test.ts — it fails the build if the
-      # plugin config schema gains/renames/removes a field the dashboard's
-      # ConfigEditor coverage manifest doesn't account for, so the form can't
-      # silently drift out of sync with the schema again.
+      # The frontend gate is the test step, which runs config-parity.test.ts —
+      # it fails the build if the plugin config schema gains/renames/removes a
+      # field the dashboard's ConfigEditor coverage manifest doesn't account
+      # for, so the form can't silently drift out of sync with the schema again.
       - name: TypeScript typecheck
         run: bun run --cwd packages/dashboard typecheck
 
@@ -357,6 +454,23 @@ jobs:
 
       - name: Build (frontend)
         run: bun run --cwd packages/dashboard build
+
+      # db-adapter declares its own [workspace], so the root `--workspace`
+      # commands never reach it. It is also the only place claim_adapter.rs and
+      # sqlite_runtime.rs compile under test: src-tauri needs the GTK/WebKit
+      # stack, so this crate re-includes both via #[path] to keep the adapter
+      # testable without a GUI. Skipping it leaves the dashboard's claim
+      # mutation, visibility, and direct-format verification paths uncovered.
+      # `cargo fmt` resolves the workspace from the working directory and walks
+      # up past this crate's own [workspace] to the repository root, which
+      # references the ../commons/* siblings, so the stub provisioning every
+      # other Rust job here performs is required even though this crate's own
+      # dependency graph excludes those crates.
+      - name: Provision metadata-only sibling stubs
+        run: sh scripts/provision-rust-ci-stubs.sh
+
+      - name: Dashboard adapter conformance (Rust)
+        run: sh scripts/test-dashboard-adapter.sh
 
   benchmark-retrieval-check:
     name: Benchmark (retrieval, deterministic CI profile)
