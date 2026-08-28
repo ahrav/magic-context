@@ -126,15 +126,23 @@ function checkMutationEvidence(
 }
 
 /**
- * Fingerprint of the whole manifest, including the approver strings. This is
- * the value an operator records out of band at promotion time and passes back
- * to `loadRelease` as `expectedManifestFingerprint`: nothing inside the
- * release directory can authenticate its own approvals, so without an external
- * anchor an editor can rewrite `approver` (or fabricate both approvals) and
- * still satisfy every in-directory consistency check.
+ * Fingerprint over BOTH published artifacts — the manifest (including approver
+ * strings) and the recomputed mutation evidence. This is the value an operator
+ * records out of band at promotion time and passes back to `loadRelease`:
+ * nothing inside the release directory can authenticate itself, so without an
+ * external anchor an editor can rewrite `approver`, or fabricate green evidence
+ * for a battery that never ran, and still satisfy every in-directory check.
+ *
+ * Both files are covered because they are separately mutable. Anchoring only
+ * the manifest would leave the evidence file forgeable: the parser proves an
+ * artifact is internally consistent and covers every mutation class, not that
+ * any mutation was ever executed.
  */
-export function manifestFingerprint(manifest: ReleaseManifest): string {
-    return canonicalFingerprint(manifest);
+export function releaseArtifactFingerprint(
+    manifest: ReleaseManifest,
+    evidence: MutationEvidenceArtifact,
+): string {
+    return canonicalFingerprint({ manifest, mutationEvidence: evidence });
 }
 
 /** Real regular file — not a symlink whose target lives outside the frozen tree. */
@@ -144,11 +152,11 @@ function assertRegularFile(path: string, label: string): void {
 
 export interface LoadReleaseOptions {
     /**
-     * Expected `manifestFingerprint`, from a trust anchor outside the release
-     * directory. Omit only when the caller already trusts the tree (the
+     * Expected `releaseArtifactFingerprint`, from a trust anchor outside the
+     * release directory. Omit only when the caller already trusts the tree (the
      * promoter's own read-back of bytes it just wrote).
      */
-    expectedManifestFingerprint?: string;
+    expectedArtifactFingerprint?: string;
 }
 
 /**
@@ -188,11 +196,17 @@ export function loadRelease(
     if (!lstatSync(scenariosDir).isDirectory()) fail(["release.scenarios: not-a-real-directory"]);
 
     const manifest = parseManifest(readReleaseJson(join(releaseDir, RELEASE_FILES.manifest), "release.manifest"));
+    const mutationEvidence = parseMutationEvidence(
+        readReleaseJson(join(releaseDir, RELEASE_FILES.evidence), "release.mutation-evidence"),
+    );
+    // Anchor check before any content is trusted, and over BOTH artifacts: the
+    // evidence file is separately mutable, and its parser proves internal
+    // consistency and full class coverage — not that the battery ever ran.
     if (
-        options.expectedManifestFingerprint !== undefined &&
-        manifestFingerprint(manifest) !== options.expectedManifestFingerprint
+        options.expectedArtifactFingerprint !== undefined &&
+        releaseArtifactFingerprint(manifest, mutationEvidence) !== options.expectedArtifactFingerprint
     ) {
-        fail(["release.manifest: fingerprint does not match the expected trust anchor"]);
+        fail(["release: artifact fingerprint does not match the expected trust anchor"]);
     }
     const scenarioFiles = readdirSync(scenariosDir).sort();
     for (const file of scenarioFiles) {
@@ -225,9 +239,6 @@ export function loadRelease(
     if (canonicalFingerprint(tuple) !== canonicalFingerprint(manifest.releaseTuple)) {
         fail(["release: corpus does not match the manifest release tuple"]);
     }
-    const mutationEvidence = parseMutationEvidence(
-        readReleaseJson(join(releaseDir, RELEASE_FILES.evidence), "release.mutation-evidence"),
-    );
     checkMutationEvidence(mutationEvidence, scenarios);
     return { manifest, scenarios, mutationEvidence };
 }
@@ -281,7 +292,7 @@ function inheritedTombstones(prior: readonly ReleaseManifest[]): string[] {
     return [...tombstones].sort();
 }
 
-export function promoteRelease(input: PromotionInput): { releaseDir: string; manifestFingerprint: string } {
+export function promoteRelease(input: PromotionInput): { releaseDir: string; artifactFingerprint: string } {
     if (!RELEASE_VERSION_RE.test(input.releaseVersion)) {
         fail(["release: version-invalid"]);
     }
@@ -293,10 +304,12 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string; man
     }
 
     // Privacy gate FIRST — before any parser, because schema diagnostics
-    // interpolate scenario ids and field paths. Approvals are scanned too:
-    // approver strings are published verbatim into the immutable manifest.
+    // interpolate scenario ids and field paths. Approvals and tombstones are
+    // scanned too: approver strings are published verbatim into the immutable
+    // manifest, and a tombstone id is an operator-authored string that every
+    // LATER manifest also carries forward.
     const privacyDiagnostics = scanForSensitiveContent(
-        { scenarios: input.scenarios, approvals: input.approvals },
+        { scenarios: input.scenarios, approvals: input.approvals, tombstones: input.tombstones ?? [] },
         {
             forbiddenTokens: input.forbiddenTokens,
             forbiddenIdentifiers: input.forbiddenIdentifiers,
@@ -321,6 +334,14 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string; man
     const prior = installedReleases(input.releasesRoot);
     const inherited = inheritedTombstones(prior);
     const tombstones = [...new Set([...inherited, ...(input.tombstones ?? [])])].sort();
+    // Inherited ids get scanned too, against THIS promotion's deny lists: they
+    // are about to be republished into a new immutable manifest, and the lists
+    // can name something no earlier promotion was told to reject.
+    const tombstonePrivacy = scanForSensitiveContent(
+        { tombstones },
+        { forbiddenTokens: input.forbiddenTokens, forbiddenIdentifiers: input.forbiddenIdentifiers },
+    ).map((violation) => `privacy.${violation.category}: ${violation.path}`);
+    if (tombstonePrivacy.length > 0) fail(tombstonePrivacy.sort());
     for (const id of tombstones) {
         if (ids.has(id)) fail([`release.scenarios.${id}: tombstoned`]);
     }
@@ -402,6 +423,6 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string; man
         throw error;
     }
     // The caller records this out of band; it is the only anchor that lets a
-    // later `loadRelease` detect an edited approver string.
-    return { releaseDir: destination, manifestFingerprint: manifestFingerprint(manifest) };
+    // later `loadRelease` detect an edited approver string or forged evidence.
+    return { releaseDir: destination, artifactFingerprint: releaseArtifactFingerprint(manifest, evidence) };
 }

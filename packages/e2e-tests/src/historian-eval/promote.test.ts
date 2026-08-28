@@ -504,7 +504,7 @@ describe("promoteRelease", () => {
         });
     });
 
-    test("an out-of-band manifest fingerprint detects an edited approver the tree cannot self-detect", () => {
+    test("an out-of-band artifact fingerprint detects edits the tree cannot self-detect", () => {
         withRoot((root) => {
             const scenarios = corpusRaw();
             const promoted = promoteRelease({
@@ -513,26 +513,74 @@ describe("promoteRelease", () => {
                 releasesRoot: root,
                 releaseVersion: "v1",
             });
-            const anchor = promoted.manifestFingerprint;
+            const anchor = promoted.artifactFingerprint;
             expect(anchor).toMatch(/^[0-9a-f]{64}$/);
             // The untampered release matches its recorded anchor.
             expect(
-                loadRelease(promoted.releaseDir, { expectedManifestFingerprint: anchor }).manifest.releaseVersion,
+                loadRelease(promoted.releaseDir, { expectedArtifactFingerprint: anchor }).manifest.releaseVersion,
             ).toBe("v1");
 
-            // Rewrite only the approver: the tuple fingerprint the approvals
-            // carry is unchanged, so every in-directory consistency check
-            // still passes and the release loads as approved.
+            // Rewrite only the approver: the release fingerprint the approvals
+            // carry is unchanged, so every in-directory consistency check still
+            // passes and the release loads as approved.
             const manifestPath = join(promoted.releaseDir, RELEASE_FILES.manifest);
             const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
             manifest.approvals.privacy.approver = "attacker";
             writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
             expect(loadRelease(promoted.releaseDir).manifest.approvals.privacy.approver).toBe("attacker");
-
-            // Only the external anchor catches it.
             expect(() =>
-                loadRelease(promoted.releaseDir, { expectedManifestFingerprint: anchor }),
-            ).toThrow(/does not match the expected trust anchor/);
+                loadRelease(promoted.releaseDir, { expectedArtifactFingerprint: anchor }),
+            ).toThrow(/artifact fingerprint does not match/);
+        });
+    });
+
+    test("the artifact anchor also covers the separately mutable evidence file", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            const promoted = promoteRelease({
+                scenarios,
+                approvals: approvalsFor(scenarios),
+                releasesRoot: root,
+                releaseVersion: "v1",
+            });
+            const evidencePath = join(promoted.releaseDir, RELEASE_FILES.evidence);
+            const evidence = JSON.parse(readFileSync(evidencePath, "utf8"));
+            // Every required class present, applicable, and green, with the
+            // scenario fingerprints preserved: internally consistent evidence
+            // for a battery that never ran. The parser cannot tell the
+            // difference, so only the anchor can.
+            for (const entry of evidence.scenarios) {
+                entry.results = entry.results.map((result: { mutationClass: string }) => ({
+                    mutationClass: result.mutationClass,
+                    applicable: true,
+                    green: true,
+                    detail: "fabricated",
+                }));
+            }
+            writeFileSync(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
+            expect(() => loadRelease(promoted.releaseDir)).not.toThrow();
+            expect(() =>
+                loadRelease(promoted.releaseDir, { expectedArtifactFingerprint: promoted.artifactFingerprint }),
+            ).toThrow(/artifact fingerprint does not match/);
+        });
+    });
+
+    test("a tombstone carrying a denied token is refused before publication", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            // Scenario-id shaped, so the schema accepts it; the id is then
+            // written verbatim into this and every later immutable manifest.
+            expect(() =>
+                promoteRelease({
+                    scenarios,
+                    approvals: approvalsFor(scenarios, "v1", ["hse-customer-acme"]),
+                    releasesRoot: root,
+                    releaseVersion: "v1",
+                    tombstones: ["hse-customer-acme"],
+                    forbiddenTokens: ["acme"],
+                }),
+            ).toThrow(/privacy\./);
+            expect(readdirSync(root)).toEqual([]);
         });
     });
 });
