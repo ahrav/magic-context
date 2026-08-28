@@ -776,6 +776,94 @@ describe("scoreRunRecord", () => {
         }
     });
 
+    test("an ERROR artifact under an unsupported schema is an integrity error, not its own stale reason", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario, {
+                error: { reason: "script-drift", detail: "2 scripted turns never consumed" },
+            });
+            // Identity precedes the stored-error passthrough, so a foreign or
+            // incompatible artifact cannot enter the report under its own reason.
+            const wrongSchema = scoreRunRecord(
+                { ...record, schema: "historian-eval-run-record/v0" as typeof RUN_RECORD_SCHEMA },
+                scenario,
+            );
+            expect(wrongSchema.errorReason).toBe("record-schema-unsupported");
+
+            const wrongScenario = scoreRunRecord({ ...record, scenarioId: "hse-other" }, scenario);
+            expect(wrongScenario.errorReason).toBe("record-scenario-mismatch");
+
+            // An ERROR record legitimately carries fewer runs than declared, so
+            // the inventory check must stay behind the passthrough.
+            const aborted = scoreRunRecord({ ...record, historianRuns: [] }, scenario);
+            expect(aborted.errorReason).toBe("script-drift");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("an edited recorded claim is caught even when its locator and public id still match", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario);
+            // Probe resolution runs matchesGold over the RECORDED claims, so
+            // repointing one at a gold claim's content/category forges an
+            // acceptable claim-id answer while recall stays complete.
+            const forged = {
+                ...record,
+                injectedClaims: record.injectedClaims.map((claim, index) =>
+                    index === 0
+                        ? { ...claim, content: "Session cache capacity is 4096 entries.", category: "CONFIG_VALUES" }
+                        : claim,
+                ),
+            };
+            const score = scoreRunRecord(forged, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("record-snapshot-mismatch");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("compartments outside the authored transcript do not satisfy the gold minimum", () => {
+        // Gold requires one compartment; the session carries two, but only the
+        // filler/padding one exists outside the authored ordinal span.
+        const fixture = makeSnapshot({
+            facts: goldFacts(),
+            compartments: [
+                { start: 1, end: 8 },
+                { start: 9, end: 20 },
+            ],
+        });
+        try {
+            const base = probeFreeScenario();
+            const scenario: HistorianEvalScenario = {
+                ...base,
+                gold: { ...base.gold, compartments: { minCount: 2 } },
+            };
+            const record = makeRecord(fixture, scenario, {
+                // Authored turns occupy 1..8; ordinals 9-20 are harness-owned.
+                authoredTurnOrdinals: [
+                    [1, 2],
+                    [3, 4],
+                    [5, 6],
+                    [7, 8],
+                ],
+            });
+            const score = scoreRunRecord(record, scenario);
+            expect(score.failReasons).toContain("structural");
+            expect(
+                score.structuralFindings.some((finding) =>
+                    finding.includes("1 persisted across the authored transcript"),
+                ),
+            ).toBe(true);
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
     test("an unsupported run-record schema is ERROR before any gold is compared", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {
@@ -1054,6 +1142,13 @@ describe("buildLaneReport", () => {
         };
         expect(JSON.stringify(permuted)).not.toBe(JSON.stringify(system));
         expect(() => buildLaneReport([{ ...passScore("hse-a"), system: permuted }], { system })).not.toThrow();
+    });
+
+    test("a duplicated scenario score is refused rather than double-weighted", () => {
+        expect(() => buildLaneReport([passScore("hse-a"), passScore("hse-b")])).not.toThrow();
+        expect(() => buildLaneReport([passScore("hse-a"), passScore("hse-a")])).toThrow(
+            /duplicate scenario score\(s\) \[hse-a\]/,
+        );
     });
 
     test("exit-code mapping (KTD8): green 0, red 1, false-authoritative run-fatal 2", () => {

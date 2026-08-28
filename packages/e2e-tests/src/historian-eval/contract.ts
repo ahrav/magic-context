@@ -718,6 +718,30 @@ function evidenceText(scenario: HistorianEvalScenario, startTurn: number, endTur
  * measurement surface, so its agreement with the harness is a contract.
  */
 /**
+ * Token usage the lane reports for one transcript turn carrying `tokens`.
+ *
+ * The count is reported as BOTH input and cache-write, and production's usage
+ * path sums input, cache-read, and cache-write — so a turn's effective pressure
+ * against the execution threshold is twice its declared number. This lives
+ * beside the threshold, and the runner builds its usage from it, because the
+ * freeze lint has to validate recipes against the pressure the runs actually
+ * produce: a second copy of this shape in the runner is exactly how a
+ * lint-clean recipe starts crossing the threshold on its build turns.
+ */
+export function triggerTurnUsage(tokens: number): {
+    input_tokens: number;
+    cache_creation_input_tokens: number;
+} {
+    return { input_tokens: tokens, cache_creation_input_tokens: tokens };
+}
+
+/** Threshold-relevant total of `triggerTurnUsage`, per production's summation. */
+export function effectiveTriggerUsageTokens(tokens: number): number {
+    const usage = triggerTurnUsage(tokens);
+    return usage.input_tokens + usage.cache_creation_input_tokens;
+}
+
+/**
  * Execution threshold the lane pins into every harness config, owned here
  * rather than by the runner because the freeze lint has to reason about it: a
  * trigger recipe is only valid relative to the threshold its runs will use.
@@ -895,8 +919,12 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
     // during filler or authored turns, before `driveHistorianRun` starts
     // counting, while a spike below it never launches and the scenario ends as
     // `run-never-fired`.
+    // Measured on EFFECTIVE usage, not the declared number: a turn's count is
+    // reported as both input and cache-write and production sums them, so a
+    // recipe between 20% and 40% of the limit reads as a safe build turn while
+    // actually crossing the threshold. See `triggerTurnUsage`.
     const thresholdPercentage = (tokens: number): number =>
-        (tokens / scenario.trigger.modelContextLimit) * 100;
+        (effectiveTriggerUsageTokens(tokens) / scenario.trigger.modelContextLimit) * 100;
     const buildPercentage = thresholdPercentage(scenario.trigger.usageTokensPerTurn);
     const spikePercentage = thresholdPercentage(scenario.trigger.spikeUsageTokens);
     if (buildPercentage >= EXECUTE_THRESHOLD_PERCENTAGE) {

@@ -12,6 +12,7 @@ import {
     MAX_TRANSCRIPT_TURNS,
     MAX_TURN_TEXT_CHARS,
     buildReleaseTuple,
+    effectiveTriggerUsageTokens,
     lintScenario,
     normalizeContent,
     parseManifest,
@@ -356,6 +357,17 @@ describe("parseScenario", () => {
 });
 
 describe("lintScenario", () => {
+    test("threshold ordering is measured on effective usage, including cache-write tokens", () => {
+        const raw = validScenarioRaw();
+        // 25% of the limit as a declared number, but the lane reports it as both
+        // input and cache-write and production sums them, so the build turn
+        // actually runs at 50% and crosses the threshold.
+        (raw.trigger as Record<string, unknown>).usageTokensPerTurn = 50_000;
+        expect(effectiveTriggerUsageTokens(50_000)).toBe(100_000);
+        const diagnostics = lintScenario(parseScenario(raw));
+        expect(diagnostics.some((entry) => entry.includes("build-turn-crosses-threshold"))).toBe(true);
+    });
+
     test("flags a trigger recipe whose build turns cross the execution threshold", () => {
         const raw = validScenarioRaw();
         // 50% of the context limit on every ordinary turn: the historian would

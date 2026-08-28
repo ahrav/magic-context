@@ -35,6 +35,7 @@ import {
     EXECUTE_THRESHOLD_PERCENTAGE,
     matchesGold,
     scenarioFingerprint,
+    triggerTurnUsage,
     type HistorianEvalScenario,
     type Probe,
 } from "./contract";
@@ -835,9 +836,8 @@ class ScenarioRunner {
      */
     private async driveTranscript(harness: TestHarness, sessionId: string, fillerCount: number): Promise<void> {
         const usage = {
-            input_tokens: this.scenario.trigger.usageTokensPerTurn,
+            ...triggerTurnUsage(this.scenario.trigger.usageTokensPerTurn),
             output_tokens: 40,
-            cache_creation_input_tokens: this.scenario.trigger.usageTokensPerTurn,
         };
         for (let index = 0; index < fillerCount; index += 1) {
             await this.scriptedTurn(
@@ -894,11 +894,7 @@ class ScenarioRunner {
             `Continuing. ${ballastProse(trigger.ballastTokensPerTurn)}`,
             {
                 text: "Acknowledged.",
-                usage: {
-                    input_tokens: trigger.spikeUsageTokens,
-                    output_tokens: 40,
-                    cache_creation_input_tokens: trigger.spikeUsageTokens,
-                },
+                usage: { ...triggerTurnUsage(trigger.spikeUsageTokens), output_tokens: 40 },
             },
         );
         await this.scriptedTurn(harness, sessionId, `Please continue with step ${runIndex} of the plan.`, {
@@ -937,6 +933,18 @@ class ScenarioRunner {
         // database regression to historian quality as FAIL:invalid-output,
         // which is exactly the attribution R6 forbids. An unexplained failure
         // is not evidence of model behavior either, so it takes this path too.
+        // A `noop` row means the pass ended without a historian request at all —
+        // no eligible head, drain quota exhausted. The inventory check cannot
+        // see it because the row occupies the expected index, so the declared
+        // run would be accepted as complete while its scripted output was never
+        // consumed; if an earlier run already covers the gold, probes and
+        // structural scoring could then PASS for a run that did not happen.
+        if (row.status === "noop") {
+            throw new RunAbort(
+                "run-never-fired",
+                `historian run ${runIndex} recorded a no-op (${row.failure_reason ?? "no reason recorded"}); no historian request was made`,
+            );
+        }
         if (row.status === "failed" && !(row.failure_reason ?? "").startsWith("validation: ")) {
             throw new RunAbort(
                 "harness-failure",
@@ -1193,7 +1201,7 @@ class ScenarioRunner {
         }
 
         const payloadText = this.capturedProbePayload(harness, requestCountBefore);
-        this.assertNoGoldRangeLeak(probe, payloadText);
+        this.assertNoGoldRangeLeak(probe, payloadText, buildProbePrompt(probe));
         return {
             probeId: probe.id,
             answerRaw,
@@ -1328,12 +1336,17 @@ class ScenarioRunner {
      * could hide a real leak. Such a scenario keeps the unstripped search, which
      * can over-report but never conceals surviving raw text.
      */
-    private assertNoGoldRangeLeak(probe: Probe, payloadText: string | null): void {
+    private assertNoGoldRangeLeak(probe: Probe, payloadText: string | null, probePrompt: string): void {
         if (payloadText === null) return;
         const authoredCarriesTag = this.scenario.transcript.turns.some(
             (turn) => carriesInjectedBlockTag(turn.user) || carriesInjectedBlockTag(turn.assistant),
         );
-        const rawHistory = authoredCarriesTag ? payloadText : stripInjectedBlocks(payloadText);
+        // The probe prompt the runner just sent is part of the captured payload
+        // by construction. A probe question may quote its own gold source turn,
+        // so leaving it in makes the gate report the question it just asked as
+        // surviving history even when every historical copy was removed.
+        const withoutPrompt = payloadText.split(probePrompt).join("\n");
+        const rawHistory = authoredCarriesTag ? withoutPrompt : stripInjectedBlocks(withoutPrompt);
         for (const claim of this.probeGoldClaims(probe)) {
             for (let turn = claim.sourceTurnRange[0]; turn <= claim.sourceTurnRange[1]; turn += 1) {
                 const authored = this.scenario.transcript.turns[turn];
@@ -1355,18 +1368,44 @@ class ScenarioRunner {
     }
 
 
+    /**
+     * Revision locators recorded as injected for the probe turn.
+     *
+     * A read or parse failure is NOT an empty injected set. Exact and
+     * multiple-choice probes that answer correctly pass before locator-based
+     * trimming is ever consulted, so swallowing the failure would let an
+     * exact/choice-only scenario PASS with its per-probe injection evidence
+     * never captured. An absent row or absent column value is a legitimate
+     * empty; anything else aborts.
+     */
     private visibleRevisionLocators(harness: TestHarness, sessionId: string): string[] {
+        let raw: string | null;
         try {
             const row = harness
                 .contextDb()
                 .prepare("SELECT memory_block_ids FROM session_meta WHERE session_id = ?")
                 .get(sessionId) as { memory_block_ids: string | null } | null;
-            if (!row?.memory_block_ids) return [];
-            const parsed = JSON.parse(row.memory_block_ids);
-            return Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === "string") : [];
-        } catch {
-            return [];
+            raw = row?.memory_block_ids ?? null;
+        } catch (error) {
+            throw new RunAbort(
+                "harness-failure",
+                `probe injection metadata unreadable: ${error instanceof Error ? error.message : String(error)}`,
+            );
         }
+        if (raw === null || raw.length === 0) return [];
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(raw);
+        } catch (error) {
+            throw new RunAbort(
+                "harness-failure",
+                `probe injection metadata is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+            );
+        }
+        if (!Array.isArray(parsed)) {
+            throw new RunAbort("harness-failure", `probe injection metadata is not an array: ${typeof parsed}`);
+        }
+        return parsed.filter((entry): entry is string => typeof entry === "string");
     }
 
     /**

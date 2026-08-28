@@ -136,6 +136,7 @@ function structuralFindingsFromRows(
     rows: Array<{ startMessage: number; endMessage: number }>,
     minCount: number,
     priorCoverage: { startMessage: number; endMessage: number } | null = null,
+    authoredSpan: { startMessage: number; endMessage: number } | null = null,
 ): string[] {
     const findings: string[] = [];
     // Production-precondition self-check (R9): the same invariant production
@@ -150,8 +151,21 @@ function structuralFindingsFromRows(
     // the compartments this output produced.
     const storedError = validateStoredCompartments(priorCoverage === null ? rows : [priorCoverage, ...rows]);
     if (storedError !== null) findings.push(`stored-compartments: ${storedError}`);
-    if (rows.length < minCount) {
-        findings.push(`compartment-count: ${rows.length} persisted, gold requires at least ${minCount}`);
+    // Contiguity is a whole-session property, but gold's minimum is a claim
+    // about the AUTHORED transcript: the session also carries harness-owned
+    // filler and post-epilogue padding, which gold and the contract's capacity
+    // lint both exclude. Counting those rows would let a historian satisfy the
+    // minimum with compartments sitting entirely in filler or padding while
+    // covering the authored transcript with one.
+    const counted =
+        authoredSpan === null
+            ? rows
+            : rows.filter(
+                  (row) => row.endMessage >= authoredSpan.startMessage && row.startMessage <= authoredSpan.endMessage,
+              );
+    if (counted.length < minCount) {
+        const scope = authoredSpan === null ? "persisted" : "persisted across the authored transcript";
+        findings.push(`compartment-count: ${counted.length} ${scope}, gold requires at least ${minCount}`);
     }
     return findings;
 }
@@ -449,6 +463,22 @@ function errorScore(
     };
 }
 
+/**
+ * Ordinal span the scenario's authored turns occupy in the rendered transcript,
+ * from the record's own `authoredTurnOrdinals`. Null when the record carries
+ * none, which leaves the count unscoped rather than silently empty.
+ */
+function authoredOrdinalSpan(
+    record: HistorianEvalRunRecord,
+): { startMessage: number; endMessage: number } | null {
+    const ordinals = record.authoredTurnOrdinals;
+    if (ordinals.length === 0) return null;
+    return {
+        startMessage: Math.min(...ordinals.map(([user]) => user)),
+        endMessage: Math.max(...ordinals.map(([, assistant]) => assistant)),
+    };
+}
+
 function errorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
 }
@@ -466,7 +496,7 @@ function errorMessage(error: unknown): string {
  * reach them, and a record missing a declared run would otherwise be scored
  * from whatever its retained snapshot happens to contain.
  */
-function recordIntegrityError(
+function recordIdentityError(
     record: HistorianEvalRunRecord,
     scenario: HistorianEvalScenario,
 ): ScenarioScore | null {
@@ -508,6 +538,17 @@ function recordIntegrityError(
             record.system,
         );
     }
+    return null;
+}
+
+/**
+ * Run inventory of a record that claims to have COMPLETED.
+ *
+ * Separate from identity because an ERROR record legitimately carries fewer
+ * runs than declared — it aborted partway and keeps whatever evidence it had —
+ * so this check applies only after the stored-error passthrough.
+ */
+function recordInventoryError(record: HistorianEvalRunRecord): ScenarioScore | null {
     const indices = record.historianRuns.map((run) => run.runIndex);
     const expected = Array.from({ length: record.expectedHistorianRuns }, (_, index) => index + 1);
     if (indices.length !== expected.length || indices.some((index, position) => index !== expected[position])) {
@@ -554,11 +595,21 @@ function probeCoverageError(
  * infrastructure: FAIL:invalid-output (KTD4/KTD8).
  */
 export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: HistorianEvalScenario): ScenarioScore {
+    // Identity precedes the stored-error passthrough. An ERROR artifact under an
+    // unsupported schema, or paired with a different scenario, would otherwise
+    // enter the lane report under its own stale identity and reason — reported
+    // as that scenario's infrastructure failure when the artifact is not that
+    // scenario's at all.
+    const identityError = recordIdentityError(record, scenario);
+    if (identityError !== null) return identityError;
+
     if (record.error !== null) {
         return errorScore(record.scenarioId, record.error.reason, record.error.detail, record.system);
     }
-    const integrityError = recordIntegrityError(record, scenario);
-    if (integrityError !== null) return integrityError;
+
+    // Only a record claiming completion is held to the full inventory.
+    const inventoryError = recordInventoryError(record);
+    if (inventoryError !== null) return inventoryError;
 
     const allAttemptsInvalid =
         record.historianRuns.length > 0 && record.historianRuns.every((run) => run.status === "failed");
@@ -684,13 +735,20 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
             );
         }
 
-        // Same locator must name the same claim in both. A cross-attempt pair
-        // whose locators happen to coincide is still a different claim.
-        const recordedById = new Map(record.injectedClaims.map((claim) => [claim.revisionLocator, claim]));
+        // A shared locator must name the same claim in both, compared over the
+        // WHOLE record rather than its public id.
+        //
+        // `content` and `category` are load-bearing, not decoration: probe
+        // resolution runs `matchesGold` over the RECORDED claims, so editing an
+        // unrelated recorded claim's content and category to match a gold claim
+        // makes its public id an accepted answer for a claim-id probe. With the
+        // real claim still visible, recall stays complete and precision does not
+        // fail on its own, so the scenario would PASS on a forged answer.
+        const recordedByLocator = new Map(record.injectedClaims.map((claim) => [claim.revisionLocator, claim]));
         const divergent = visible
             .filter((item) => {
-                const recorded = recordedById.get(item.revisionLocator);
-                return recorded !== undefined && recorded.publicClaimId !== item.publicClaimId;
+                const recorded = recordedByLocator.get(item.revisionLocator);
+                return recorded !== undefined && canonicalJson(recorded) !== canonicalJson(item);
             })
             .map((item) => item.revisionLocator);
         if (divergent.length > 0) {
@@ -715,7 +773,12 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
             scenarioId: record.scenarioId,
             facts: scoreFacts(scenario, visible),
             structuralFindings: [
-                ...structuralFindingsFromRows(rows, scenario.gold.compartments.minCount),
+                ...structuralFindingsFromRows(
+                    rows,
+                    scenario.gold.compartments.minCount,
+                    null,
+                    authoredOrdinalSpan(record),
+                ),
                 ...healingFindings(record),
             ],
             probeVerdicts,
@@ -796,6 +859,18 @@ export function buildLaneReport(
     options: { releaseVersion?: string; system?: SystemVersionTuple } = {},
 ): LaneReport {
     const system = resolveReportSystem(scores, options.system);
+    // One result per frozen scenario. A duplicate — an original plus a retry of
+    // the same scenario, say — is weighted twice in every micro-averaged rate
+    // and every failure count, so the report would describe a corpus that does
+    // not exist.
+    const duplicated = [...new Set(
+        scores
+            .map((score) => score.scenarioId)
+            .filter((id, index, ids) => ids.indexOf(id) !== index),
+    )].sort();
+    if (duplicated.length > 0) {
+        throw new Error(`historian-eval report: duplicate scenario score(s) [${duplicated.join(", ")}]`);
+    }
     const sorted = [...scores].sort((a, b) => a.scenarioId.localeCompare(b.scenarioId));
     const errors = sorted.filter((score) => score.verdict === "ERROR");
     const scored = sorted.filter((score) => score.verdict !== "ERROR");
