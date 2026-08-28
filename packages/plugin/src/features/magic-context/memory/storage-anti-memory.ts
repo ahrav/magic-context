@@ -248,6 +248,19 @@ export function createAntiMemory(
             ...producer,
             requestDigest: computeClaimOperationRequestDigest({
                 actor: input.actor,
+                // A caller-supplied expiry lands in the persisted revision
+                // attributes, so it belongs to the request for the same reason
+                // importance does: without it, a second call reusing the
+                // operation key with a different explicit expiry replays the
+                // first receipt and silently keeps the old TTL.
+                //
+                // Digest what the caller REQUESTED, not the resolved value. The
+                // default is `nowMs + ANTI_MEMORY_DEFAULT_TTL_MS`, which moves
+                // with the clock, so digesting the resolved expiry would make an
+                // honest replay compute a different digest and raise
+                // ClaimOperationKeyReuseError instead of replaying. An omitted
+                // expiry therefore always digests as null.
+                expiresAt: input.expiresAt ?? null,
                 // Importance lands in the persisted revision attributes, so it
                 // is part of the request: leaving it out lets a second call
                 // that reuses the operation key with a different importance

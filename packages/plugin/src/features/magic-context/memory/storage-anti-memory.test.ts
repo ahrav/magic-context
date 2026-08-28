@@ -504,6 +504,66 @@ describe("anti-memory typed operations", () => {
         }
     });
 
+    test("refuses an operation-key reuse that changes only an explicit expiry", () => {
+        const { db } = createDirectTestDatabase();
+        try {
+            const projectId = ensureProject(db, "git:anti-expiry-digest");
+            const request = {
+                projectId,
+                payload: payload(),
+                provenance: provenance("create"),
+                actor: "dreamer",
+                nowMs: 10,
+                expiresAt: 5_000,
+            };
+            createAntiMemory(db, { producer: "test", operationKey: "create" }, request);
+
+            // A caller-supplied expiry reaches the persisted attributes, so a
+            // different expiry is a different request: replaying the first
+            // receipt would silently keep the old TTL.
+            expect(() =>
+                createAntiMemory(
+                    db,
+                    { producer: "test", operationKey: "create" },
+                    { ...request, expiresAt: 9_000 },
+                ),
+            ).toThrow(/already committed for a different request digest/);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("replays an omitted-expiry retry whose default moved with the clock", () => {
+        const { db } = createDirectTestDatabase();
+        try {
+            const projectId = ensureProject(db, "git:anti-expiry-default-replay");
+            const request = {
+                projectId,
+                payload: payload(),
+                provenance: provenance("create"),
+                actor: "dreamer",
+            };
+            createAntiMemory(
+                db,
+                { producer: "test", operationKey: "create" },
+                { ...request, nowMs: 10 },
+            );
+
+            // The digest records the REQUESTED expiry, which is absent here. The
+            // resolved default is nowMs + TTL, so digesting the resolved value
+            // would make this honest retry a different request purely because
+            // the clock advanced.
+            const retry = createAntiMemory(
+                db,
+                { producer: "test", operationKey: "create" },
+                { ...request, nowMs: 12_345 },
+            );
+            expect(retry.replayed).toBe(true);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("normalizes blank optional payload fields to null instead of rejecting them", () => {
         const { db } = createDirectTestDatabase();
         try {

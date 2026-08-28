@@ -258,6 +258,38 @@ describe("historian trajectory-correction anti-memory harvest", () => {
         ).toEqual({ trust: "model_inference" });
     });
 
+    test("skips a correction with no authoritative span instead of persisting it unchecked", () => {
+        db = createClaimReaderTestDatabase();
+        const userText = "We must keep the cache offline capable for air-gapped installs";
+        seedSession(db, "ses-dangling", userText);
+        // compartment_id null is what an unresolved anchor stores, and what a
+        // compartment recomp leaves behind as a dangling id. Either way the
+        // compartment bounds are unknown, so there are no source texts and the
+        // source-overlap arm of the privacy gate cannot run.
+        db.prepare(
+            `INSERT INTO compartment_events
+                (session_id, compartment_id, kind, at_compartment, fields_json, created_at, harness)
+             VALUES (?, NULL, 'trajectory_correction', 1, ?, ?, 'opencode')`,
+        ).run(
+            "ses-dangling",
+            // A reason transcribed verbatim from the user, carrying no quote
+            // marks, date, or frustration marker, so every other privacy arm
+            // passes it.
+            JSON.stringify(correctionFields({ reason_for_change: userText })),
+            // Recent, so the event is inside its TTL and cannot be skipped as
+            // expired — the span guard has to be what rejects it.
+            Date.now(),
+        );
+
+        expect(runHarvest()).toEqual({ consumed: 0, skipped: 1, effects: [] });
+        expect(db.prepare("SELECT COUNT(*) AS count FROM claims").get()).toEqual({ count: 0 });
+        expect(
+            db
+                .prepare("SELECT COUNT(*) AS count FROM observations WHERE extracted_text LIKE ?")
+                .get("%air-gapped installs%"),
+        ).toEqual({ count: 0 });
+    });
+
     test("never harvests an event whose harness binds the session to another project", () => {
         db = createClaimReaderTestDatabase();
         // `session_projects` is keyed (session_id, harness), so one session id can

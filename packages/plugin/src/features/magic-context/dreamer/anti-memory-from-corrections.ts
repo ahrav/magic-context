@@ -203,11 +203,21 @@ export function harvestAntiMemoriesFromCorrections(args: {
         const payload = expiresAt > nowMs ? mappedPayload(event) : null;
         const span = payload ? eventSpan(event) : null;
         const userTexts = payload ? spanUserTexts(args.db, event, span) : [];
-        const reason = payload
-            ? validationReason(payload, userTexts)
-            : expiresAt > nowMs
-              ? "missing_warning_core"
-              : "expired";
+        // With no authoritative span there are no source texts, and
+        // `validateRetrospectiveLearningText` silently loses its source-overlap
+        // arm against an empty list: the quote, date, and frustration checks
+        // still run, but a field copied verbatim from a user message without
+        // quote marks passes. `compartment_id` is null for an unresolved anchor
+        // and dangles after compartment recomp, so this is reachable in normal
+        // operation, not just on malformed input. Skip rather than persist a
+        // payload whose transcription check could not run.
+        const reason = !payload
+            ? expiresAt > nowMs
+                ? "missing_warning_core"
+                : "expired"
+            : span === null
+              ? "unverifiable_span"
+              : validationReason(payload, userTexts);
         try {
             if (!payload || reason) {
                 const operation = runClaimOperationInCurrentTransaction(
