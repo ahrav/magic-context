@@ -38,6 +38,30 @@ import { V2_MEMORY_CATEGORIES } from "../../../plugin/src/features/magic-context
 import { ballastProse } from "../ballast";
 import { HEX64_RE, makeContractPrimitives } from "../contract-primitives";
 
+/**
+ * The fixed sentences `buildProbePrompt` wraps a probe's question in.
+ *
+ * Held here, not in the runner, because two consumers must agree on them: the
+ * runner renders them into the prompt it sends, and the freeze lint searches them
+ * for probe-answer collisions. A probe whose gold answer is a word this
+ * boilerplate uses — "project", "memory", "session", "value" — can be answered by
+ * echoing the very turn being scored, and a lint measuring only the transcript's
+ * harness text would not see it. Same reason `ballastProse` has a single
+ * implementation: the text a lint measures has to be the text a runner sends.
+ *
+ * Only the boilerplate. The rendered question and choices are per-probe and are
+ * checked by the self-answering and shared-surface guards instead; folding them in
+ * here would make every multiple-choice gold collide with its own prompt.
+ */
+export const PROBE_PROMPT_SHARED =
+    "Answer strictly from the project memory and session history already available to you in this conversation. " +
+    "Reply with the answer inside an <answer></answer> envelope. Put nothing else inside the envelope.";
+export const PROBE_PROMPT_EXACT_SUFFIX = "Answer with the exact value only.";
+export const PROBE_PROMPT_CHOICE_PREFIX = "Choose exactly one of:";
+export const PROBE_PROMPT_CLAIM_ID_SUFFIX =
+    "Answer with the id of the single project-memory claim (the identifier before the colon in the project-memory block) that records it.";
+export const PROBE_PROMPT_REASK_PREFIX = "Your previous reply had no valid <answer></answer> envelope.";
+
 export const SCENARIO_SCHEMA = "historian-eval-scenario/v1";
 export const MANIFEST_SCHEMA = "historian-eval-manifest/v1";
 export const RELEASE_VERSION_RE = /^v\d+$/;
@@ -376,27 +400,27 @@ function parseProbe(raw: unknown, label: string): Probe {
         }
         const goldAnswer = string(value.goldAnswer, `${label}.goldAnswer`);
         if (!choices.includes(goldAnswer)) fail(`${label}.goldAnswer: not-a-choice`);
-        // A multiple-choice question may restate the option list — the prompt renders
-        // every option anyway, so naming them exposes nothing the model was not about
-        // to be shown. Naming only SOME of them does not restate the list; it points
-        // at one, and "Redis is correct; which cache was selected?" over
-        // `Redis | LRU` hands over the selection.
+        // Same rule as `exact`: the question must not state its own gold answer.
         //
-        // The rule is therefore about the partition, not about mentioning the gold:
-        // refuse a question that states the gold choice while leaving any other choice
-        // unstated. A question naming every option is allowed; one naming a strict
-        // subset containing the gold is not.
+        // Two narrower rules were tried and both were bypassed. Exempting
+        // multiple-choice outright, on the grounds that the prompt renders every
+        // option anyway, accepted "Redis is correct; which cache was selected?".
+        // Refusing only a question that names the gold while leaving another choice
+        // unstated accepted "Redis, not Hazelcast, is correct; which cache was
+        // selected?" — every option named, the correct one still identified. No
+        // containment rule separates restating a list from pointing into it, because
+        // the distinction is in the surrounding words, not in which values appear.
         //
-        // This cannot see steering that does not name the option — "the obvious one" —
-        // and no substring rule can. It closes the case where the answer itself is in
-        // the prompt.
-        if (
-            containsCompleteValue(question, goldAnswer) &&
-            choices.some((choice) => !containsCompleteValue(question, choice))
-        ) {
-            fail(
-                `${label}.question: self-answering (the question states this probe's own gold answer without stating every other choice)`,
-            );
+        // So the exemption goes. It was never worth anything: the prompt renders
+        // `Choose exactly one of: ...` itself, so a question that also lists the
+        // options is redundant, and an author who hits this rewrites the question
+        // without the values. That trade — a redundant phrasing refused, in exchange
+        // for the whole class closed — is the right way round for a freeze gate.
+        //
+        // Steering that never names the option ("the obvious one") is still invisible
+        // here, as it is for `exact`. No substring rule reaches it.
+        if (containsCompleteValue(question, goldAnswer)) {
+            fail(`${label}.question: self-answering (the question states this probe's own gold answer)`);
         }
         return {
             id,
@@ -1271,6 +1295,15 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
         FILLER_TURN.user,
         FILLER_TURN.assistant,
         ballastProse(scenario.trigger.ballastTokensPerTurn),
+        // The probe prompt's own boilerplate, which is harness-owned text on the very
+        // turn being scored — the most direct copy of all. "project", "memory",
+        // "session", and "value" are all words it uses, so a probe whose gold answer
+        // is one of them can be answered by echoing the question's own wrapper.
+        PROBE_PROMPT_SHARED,
+        PROBE_PROMPT_EXACT_SUFFIX,
+        PROBE_PROMPT_CHOICE_PREFIX,
+        PROBE_PROMPT_CLAIM_ID_SUFFIX,
+        PROBE_PROMPT_REASK_PREFIX,
         ...Array.from({ length: paddingTurns }, (_, index) => `Wrap-up housekeeping note ${index + 1}.`),
         "Housekeeping acknowledged.",
         "Continuing.",

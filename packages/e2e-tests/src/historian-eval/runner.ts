@@ -37,6 +37,11 @@ import {
     MAX_PADDING_TURNS,
     MIN_BUILD_TURNS,
     PROBE_CHOICE_SEPARATOR,
+    PROBE_PROMPT_CHOICE_PREFIX,
+    PROBE_PROMPT_CLAIM_ID_SUFFIX,
+    PROBE_PROMPT_EXACT_SUFFIX,
+    PROBE_PROMPT_REASK_PREFIX,
+    PROBE_PROMPT_SHARED,
     containsCompleteValue,
     matchesGold,
     scenarioFingerprint,
@@ -188,33 +193,80 @@ export function probeResponseLeak(args: {
     probes: readonly Probe[];
     probeIndex: number;
     responseText: string | null;
-    /**
-     * Runtime public claim ids that would be accepted for each later claim-id probe.
-     *
-     * A claim-id answer has no authored value to compare against — it is assigned at
-     * promotion time — so the ids have to be resolved from the injection surface and
-     * supplied. Every earlier probe's payload renders them in its own
-     * `<project-memory>` block, so an earlier model can name one in its prose and the
-     * later claim-id probe can copy it: the same copy channel as an exact answer, one
-     * indirection away.
-     *
-     * Absent or empty for a probe means no id could be resolved, and nothing is
-     * checked for it — a caller with no view of the injected set cannot manufacture
-     * one, and guessing would either miss or fabricate a leak.
-     */
-    claimIdAnswers?: ReadonlyMap<string, readonly string[]>;
 }): string | null {
-    const { probes, probeIndex, responseText, claimIdAnswers } = args;
+    const { probes, probeIndex, responseText } = args;
     if (responseText === null) return null;
+    const outside = outsideAcceptedEnvelope(responseText);
+    for (const later of probes.slice(probeIndex + 1)) {
+        // Claim-id answers are not checked here. Their accepted value is a runtime id
+        // whose acceptance depends on the LATER probe's own injected set, which does not
+        // exist yet while this probe is being asked — resolving it from the whole
+        // surface flagged ids that probe could never have been credited with, turning a
+        // valid run into an ERROR. `probeResponseClaimIdLeak` does that half once every
+        // probe's injection evidence is captured.
+        if (later.answerType === "claim-id") continue;
+        if (containsCompleteValue(outside, later.goldAnswer)) {
+            return `response text outside the answer envelope states a later probe's (${later.id}) gold answer`;
+        }
+    }
+    return null;
+}
+
+/**
+ * The reply text a later probe can copy from: everything except the envelope this
+ * probe's answer was ACCEPTED from.
+ *
+ * Only the accepted envelope is exempt. `extractAnswerEnvelope` accepts a reply
+ * only when it carries exactly one non-empty envelope, so any other shape was
+ * rejected as an answer and re-asked — and it stays in the shared session all the
+ * same. Stripping every envelope would exempt text that is not this probe's answer
+ * and never will be.
+ */
+function outsideAcceptedEnvelope(responseText: string): string {
     const accepted = extractAnswerEnvelope(responseText);
     const envelope = accepted === null ? null : /<answer>[\s\S]*?<\/answer>/.exec(responseText);
-    const outside = envelope === null ? responseText : responseText.replace(envelope[0], " ");
-    for (const later of probes.slice(probeIndex + 1)) {
-        const values =
-            later.answerType === "claim-id" ? (claimIdAnswers?.get(later.id) ?? []) : [later.goldAnswer];
-        for (const value of values) {
-            if (containsCompleteValue(outside, value)) {
-                return `response text outside the answer envelope states a later probe's (${later.id}) accepted answer`;
+    return envelope === null ? responseText : responseText.replace(envelope[0], " ");
+}
+
+/**
+ * An earlier reply naming a runtime claim id that would be ACCEPTED for a later
+ * claim-id probe, or null.
+ *
+ * Deferred until every probe's injection evidence exists, because acceptance is
+ * per-probe: `compareProbeAnswer` credits a claim-id answer only when the claim
+ * matches that probe's gold AND its locator is in THAT probe's
+ * `injectedRevisionLocators`. A gold predicate can match several visible claims, and
+ * claim-memory budgeting can leave one of them out of the later probe's set — an id
+ * the later probe could never be credited with. Resolving from the whole injected
+ * surface therefore reported leaks that could not have produced a PASS, which charges
+ * a valid run as infrastructure.
+ *
+ * Shared by the runner (after its claim capture) and the scorer (over the stored
+ * record), so the live abort and the replay refusal resolve acceptance identically.
+ */
+export function probeResponseClaimIdLeak(args: {
+    scenario: HistorianEvalScenario;
+    exchanges: readonly ProbeExchange[];
+    injectedClaims: readonly InjectedClaimRecord[];
+}): string | null {
+    const { scenario, exchanges, injectedClaims } = args;
+    const exchangeById = new Map(exchanges.map((exchange) => [exchange.probeId, exchange]));
+    for (const [index, earlier] of scenario.probes.entries()) {
+        const earlierExchange = exchangeById.get(earlier.id);
+        if (earlierExchange?.responseText == null) continue;
+        const outside = outsideAcceptedEnvelope(earlierExchange.responseText);
+        for (const later of scenario.probes.slice(index + 1)) {
+            if (later.answerType !== "claim-id") continue;
+            const laterExchange = exchangeById.get(later.id);
+            if (laterExchange === undefined) continue;
+            const goldClaim = scenario.gold.expectedClaims.find((claim) => claim.id === later.expectedClaimRef);
+            if (goldClaim === undefined) continue;
+            const injectedForLater = new Set(laterExchange.injectedRevisionLocators);
+            const accepted = injectedClaims
+                .filter((item) => matchesGold(goldClaim, item) && injectedForLater.has(item.revisionLocator))
+                .map((item) => item.publicClaimId);
+            if (accepted.some((id) => containsCompleteValue(outside, id))) {
+                return `probe ${earlier.id}: response text outside the answer envelope states a claim id accepted for a later probe (${later.id})`;
             }
         }
     }
@@ -418,16 +470,16 @@ export function findOrdinalRange(body: Record<string, unknown>): { start: number
 }
 
 export function buildProbePrompt(probe: Probe): string {
-    const shared =
-        "Answer strictly from the project memory and session history already available to you in this conversation. " +
-        "Reply with the answer inside an <answer></answer> envelope. Put nothing else inside the envelope.";
+    // Composed from the contract's constants, not from literals here: the freeze
+    // lint searches those same strings for probe-answer collisions, and a copy would
+    // let the two drift so lint measures a prompt no runner sends.
     if (probe.answerType === "exact") {
-        return `${shared}\nQuestion: ${probe.question}\nAnswer with the exact value only.`;
+        return `${PROBE_PROMPT_SHARED}\nQuestion: ${probe.question}\n${PROBE_PROMPT_EXACT_SUFFIX}`;
     }
     if (probe.answerType === "multiple-choice") {
-        return `${shared}\nQuestion: ${probe.question}\nChoose exactly one of: ${probe.choices.join(PROBE_CHOICE_SEPARATOR)}.`;
+        return `${PROBE_PROMPT_SHARED}\nQuestion: ${probe.question}\n${PROBE_PROMPT_CHOICE_PREFIX} ${probe.choices.join(PROBE_CHOICE_SEPARATOR)}.`;
     }
-    return `${shared}\nQuestion: ${probe.question}\nAnswer with the id of the single project-memory claim (the identifier before the colon in the project-memory block) that records it.`;
+    return `${PROBE_PROMPT_SHARED}\nQuestion: ${probe.question}\n${PROBE_PROMPT_CLAIM_ID_SUFFIX}`;
 }
 
 /**
@@ -949,6 +1001,11 @@ class ScenarioRunner {
         // is time-independent (KTD1).
         const nowMs = Date.now();
         const { injectedClaims, perGoldPredicate } = this.captureClaimState(harness, nowMs);
+        // The claim-id half of the response-leak gate, deferred to here because
+        // acceptance is per-probe: it needs every probe's injected locator set and the
+        // captured claims, which is exactly the pair the scorer replays from.
+        const claimIdLeak = probeResponseClaimIdLeak({ scenario: this.scenario, exchanges: probes, injectedClaims });
+        if (claimIdLeak !== null) throw new RunAbort("probe-response-leak", claimIdLeak);
         const snapshotPath = this.snapshotContextDb(harness);
 
         return {
@@ -1595,18 +1652,18 @@ class ScenarioRunner {
         // and reaches the next probe. The record keeps only the final reply, so
         // replay can reapply this to that one alone — which is why the abort has to
         // happen here, where both are in hand.
-        this.assertNoProbeResponseLeak(harness, probe, probeIndex, first.responseText);
+        this.assertNoProbeResponseLeak(probe, probeIndex, first.responseText);
         if (answerRaw === null) {
             reAsked = true;
             const retry = await this.askProbe(
                 harness,
                 sessionId,
-                `Your previous reply had no valid <answer></answer> envelope. ${buildProbePrompt(probe)}`,
+                `${PROBE_PROMPT_REASK_PREFIX} ${buildProbePrompt(probe)}`,
             );
             answerRaw = retry.answerRaw;
             responseText = retry.responseText;
             for (const name of retry.toolNames) toolNames.add(name);
-            this.assertNoProbeResponseLeak(harness, probe, probeIndex, retry.responseText);
+            this.assertNoProbeResponseLeak(probe, probeIndex, retry.responseText);
             if (answerRaw === null) {
                 throw new RunAbort("probe-envelope-malformed", `probe ${probe.id} answered without a valid envelope twice`);
             }
@@ -1764,66 +1821,9 @@ class ScenarioRunner {
      * could hide a real leak. Such a scenario keeps the unstripped search, which
      * can over-report but never conceals surviving raw text.
      */
-    private assertNoProbeResponseLeak(
-        harness: TestHarness,
-        probe: Probe,
-        probeIndex: number,
-        responseText: string | null,
-    ): void {
-        const leak = probeResponseLeak({
-            probes: this.scenario.probes,
-            probeIndex,
-            responseText,
-            claimIdAnswers: this.claimIdAnswers(harness),
-        });
+    private assertNoProbeResponseLeak(probe: Probe, probeIndex: number, responseText: string | null): void {
+        const leak = probeResponseLeak({ probes: this.scenario.probes, probeIndex, responseText });
         if (leak !== null) throw new RunAbort("probe-response-leak", `probe ${probe.id}: ${leak}`);
-    }
-
-    /**
-     * Accepted runtime answers for each claim-id probe, resolved from the LIVE
-     * injection surface through the same `matchesGold` rule the scorer resolves them
-     * with — so the runtime leak scan looks for the ids that would actually be
-     * accepted, not for a guess at them.
-     *
-     * Read per probe rather than cached: promotion and verification can change the
-     * surface between probes, and a stale set would scan for ids no longer accepted
-     * while missing the ones that are. A read failure yields an empty map, which scans
-     * nothing for claim-id probes — the same conservative direction as an unresolvable
-     * id, since inventing one would fabricate a leak.
-     */
-    private claimIdAnswers(harness: TestHarness): ReadonlyMap<string, readonly string[]> {
-        const claimIdProbes = this.scenario.probes.filter((probe) => probe.answerType === "claim-id");
-        if (claimIdProbes.length === 0) return new Map();
-        let injected: InjectedClaimRecord[] | null;
-        try {
-            const db = openTestDb(harness.contextDbPath(), { readonly: true });
-            try {
-                injected = readInjectedClaims(
-                    db,
-                    resolveProjectIdentity(harness.opencode.env.workdir),
-                    this.scenario.id,
-                    Date.now(),
-                );
-            } finally {
-                db.close();
-            }
-        } catch {
-            return new Map();
-        }
-        if (injected === null) return new Map();
-        const answers = new Map<string, readonly string[]>();
-        for (const probe of claimIdProbes) {
-            if (probe.answerType !== "claim-id") continue;
-            const goldClaim = this.scenario.gold.expectedClaims.find(
-                (claim) => claim.id === probe.expectedClaimRef,
-            );
-            if (goldClaim === undefined) continue;
-            answers.set(
-                probe.id,
-                injected.filter((item) => matchesGold(goldClaim, item)).map((item) => item.publicClaimId),
-            );
-        }
-        return answers;
     }
 
     private assertNoGoldRangeLeak(probe: Probe, payloadText: string | null, probePrompt: string): void {

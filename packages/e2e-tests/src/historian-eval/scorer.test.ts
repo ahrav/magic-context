@@ -1270,6 +1270,62 @@ describe("scoreRunRecord", () => {
         }
     });
 
+    test("a reply naming a claim id accepted for a later probe is refused on replay", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = validScenario();
+            const record = makeRecord(fixture, scenario);
+            const lru = fixture.injectedClaims.find((claim) => claim.content.toLowerCase().includes("lru"));
+            if (lru === undefined) throw new Error("fixture lacks the LRU claim");
+            // probe-capacity volunteers the public id that probe-claim's answer resolves
+            // to. Probe turns are never compartment-covered, so that id is raw history
+            // for probe-claim, whose PASS would then be a copy.
+            record.probes = record.probes.map((exchange) =>
+                exchange.probeId === "probe-capacity"
+                    ? {
+                          ...exchange,
+                          answerRaw: "4096",
+                          responseText: `<answer>4096</answer> The architecture is recorded as ${lru.publicClaimId}.`,
+                      }
+                    : exchange,
+            );
+            const score = scoreRunRecord(record, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("probe-response-leak");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("an id the later probe was never credited with is not a leak", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = validScenario();
+            const record = makeRecord(fixture, scenario);
+            const lru = fixture.injectedClaims.find((claim) => claim.content.toLowerCase().includes("lru"));
+            if (lru === undefined) throw new Error("fixture lacks the LRU claim");
+            // Same reply, but the claim's locator is absent from probe-claim's injected
+            // set, so `compareProbeAnswer` would never credit that id — copying it
+            // cannot produce a PASS. Resolving against the whole injected surface
+            // instead of that probe's own set turned this valid run into an ERROR.
+            record.probes = record.probes.map((exchange) => {
+                if (exchange.probeId === "probe-capacity") {
+                    return {
+                        ...exchange,
+                        answerRaw: "4096",
+                        responseText: `<answer>4096</answer> The architecture is recorded as ${lru.publicClaimId}.`,
+                    };
+                }
+                if (exchange.probeId === "probe-claim") return withoutInjectedClaim(exchange, lru);
+                return exchange;
+            });
+            const score = scoreRunRecord(record, scenario);
+            expect(score.errorReason).not.toBe("probe-response-leak");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
     test("a chatty recorded reply that leaks nothing still scores", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {

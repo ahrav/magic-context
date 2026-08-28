@@ -533,14 +533,33 @@ describe("gold and probe freeze guards", () => {
         expect(() => parseScenario(raw)).toThrow(/self-answering/);
     });
 
-    test("accepts a multiple-choice question that restates every option", () => {
+    test("rejects a self-answering multiple-choice question that names every option too", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];
-        // The prompt renders both options anyway, so naming both exposes nothing the
-        // model was not about to be shown.
+        // Every choice named AND the correct one identified. A rule keyed on whether
+        // some choice went unstated accepts this; no containment rule separates
+        // restating a list from pointing into it, so the exemption is gone and any
+        // question stating its own gold answer is refused.
         probes.push({
-            id: "probe-store-both",
-            question: "Was it memcached or hazelcast?",
+            id: "probe-store-steered-all",
+            question: "memcached, not hazelcast, is correct; which cache was rejected second?",
+            answerType: "multiple-choice",
+            choices: ["memcached", "hazelcast"],
+            goldAnswer: "memcached",
+            sourceClaimRef: "exp-lru-cache",
+        });
+        expect(() => parseScenario(raw)).toThrow(/self-answering/);
+    });
+
+    test("a multiple-choice question that names no option value freezes", () => {
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Record<string, unknown>[];
+        // The prompt renders `Choose exactly one of: ...` itself, so the question does
+        // not need the values — which is why refusing the ones that carry them costs an
+        // author only a rewrite.
+        probes.push({
+            id: "probe-store-clean",
+            question: "Which cache was rejected second?",
             answerType: "multiple-choice",
             choices: ["memcached", "hazelcast"],
             goldAnswer: "memcached",
