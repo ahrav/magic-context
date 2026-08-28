@@ -258,6 +258,11 @@ export const MAX_PREDICATE_VALUE_CHARS = 2_000;
  * reply could ever have produced. Freezing such a value would bake a
  * permanently-wrong probe into the corpus.
  */
+function boundedAnswer(value: string, label: string): string {
+    if (value.length > MAX_PROBE_ANSWER_CHARS) fail(`${label}: above-operational-maximum`);
+    return value;
+}
+
 function envelopeSafeAnswer(value: string, label: string): string {
     if (value.includes("</answer>") || value.includes("<answer>")) {
         fail(`${label}: answer-envelope-delimiter`);
@@ -274,6 +279,21 @@ function envelopeSafeAnswer(value: string, label: string): string {
  * than this is also not one a model can usefully answer.
  */
 export const MAX_PROBE_CHOICES = 10;
+/**
+ * Character ceilings for authored probe text.
+ *
+ * Transcript turns and gold predicates are bounded already; probe questions, exact
+ * answers, and choice strings were not, and they now feed regex construction.
+ * `containsCompleteValue` escapes an answer into a `RegExp` and the freeze guards run
+ * that all-pairs across up to `MAX_EXPECTATION_ENTRIES` probes, so an unbounded value
+ * turns a malformed corpus entry into a memory blow-up or a native regex error instead
+ * of this contract's named diagnostic. Bounded here, before any scan reads them.
+ *
+ * The question shares the turn ceiling (it is authored prose of the same kind); an
+ * answer shares the predicate ceiling, since both are values matched against content.
+ */
+export const MAX_PROBE_QUESTION_CHARS = MAX_TURN_TEXT_CHARS;
+export const MAX_PROBE_ANSWER_CHARS = MAX_PREDICATE_VALUE_CHARS;
 
 /** Separator the probe prompt renders multiple-choice options with. */
 export const PROBE_CHOICE_SEPARATOR = " | ";
@@ -348,6 +368,7 @@ function parseProbe(raw: unknown, label: string): Probe {
     const answerType = enumeration(value.answerType, PROBE_ANSWER_TYPES, `${label}.answerType`);
     const id = staticId(value.id, `${label}.id`, PROBE_ID_RE);
     const question = string(value.question, `${label}.question`);
+    if (question.length > MAX_PROBE_QUESTION_CHARS) fail(`${label}.question: above-operational-maximum`);
     if (answerType === "exact") {
         // `sourceClaimRef` is required, not optional: it is the only thing that
         // gives a probe's gold answer a declared source range. Without it the
@@ -356,7 +377,10 @@ function parseProbe(raw: unknown, label: string): Probe {
         // unanswerable probe would be scored as a model failure and contaminate
         // probe accuracy.
         exact(value, ["id", "question", "answerType", "goldAnswer", "sourceClaimRef"], label);
-        const goldAnswer = envelopeSafeAnswer(string(value.goldAnswer, `${label}.goldAnswer`), `${label}.goldAnswer`);
+        const goldAnswer = boundedAnswer(
+            envelopeSafeAnswer(string(value.goldAnswer, `${label}.goldAnswer`), `${label}.goldAnswer`),
+            `${label}.goldAnswer`,
+        );
         // A question that states its own answer measures nothing: the value the
         // probe rewards is in the prompt the model is answering, so it needs
         // neither injected memory nor session history to reply correctly.
@@ -391,7 +415,7 @@ function parseProbe(raw: unknown, label: string): Probe {
         // with any of them, and a delimiter-bearing choice would be read back
         // truncated and scored wrong.
         for (const [index, choice] of choices.entries()) {
-            envelopeSafeAnswer(choice, `${label}.choices[${index}]`);
+            boundedAnswer(envelopeSafeAnswer(choice, `${label}.choices[${index}]`), `${label}.choices[${index}]`);
             // The prompt renders the options joined by this separator, so a
             // choice containing it makes the option count ambiguous — `["A | B",
             // "C"]` reads as three options — and a valid selection can be scored
@@ -1315,7 +1339,13 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
     // merely because the bank emits "4096". Choices are not checked — a distractor
     // appearing in filler reveals no answer.
     const paddingTurns = Math.min(MAX_PADDING_TURNS, paddingTurnsNeeded);
-    const harnessOwnedText = [
+    // Split into the text EVERY probe's turn carries and the per-type suffix, because
+    // one combined surface rejected on text the scored turn never renders: an exact
+    // probe whose gold is "choose" collided with the multiple-choice prefix its prompt
+    // never emits, and the reverse held for values unique to the exact suffix. A false
+    // refusal keeps a valid scenario out of the corpus, which is the one direction this
+    // lint must not err in.
+    const sharedHarnessText = [
         FILLER_TURN.user,
         FILLER_TURN.assistant,
         ballastProse(scenario.trigger.ballastTokensPerTurn),
@@ -1324,9 +1354,6 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
         // "session", and "value" are all words it uses, so a probe whose gold answer
         // is one of them can be answered by echoing the question's own wrapper.
         PROBE_PROMPT_SHARED,
-        PROBE_PROMPT_EXACT_SUFFIX,
-        PROBE_PROMPT_CHOICE_PREFIX,
-        PROBE_PROMPT_CLAIM_ID_SUFFIX,
         PROBE_PROMPT_REASK_PREFIX,
         PROBE_PROMPT_QUESTION_LABEL,
         ...Array.from({ length: paddingTurns }, (_, index) => `Wrap-up housekeeping note ${index + 1}.`),
@@ -1341,7 +1368,9 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
     ].join(" ");
     for (const probe of scenario.probes) {
         if (probe.answerType === "claim-id") continue;
-        if (containsCompleteValue(harnessOwnedText, probe.goldAnswer)) {
+        const ownSuffix =
+            probe.answerType === "exact" ? PROBE_PROMPT_EXACT_SUFFIX : PROBE_PROMPT_CHOICE_PREFIX;
+        if (containsCompleteValue(`${sharedHarnessText} ${ownSuffix}`, probe.goldAnswer)) {
             diagnostics.push(`${label}.probes.${probe.id}.goldAnswer: occurs-in-harness-owned-text`);
         }
     }

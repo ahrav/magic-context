@@ -788,15 +788,35 @@ function resolveRepoCommitSha(): string {
                 // produce the same identity, which is the collision this whole
                 // branch exists to prevent. `--exclude-standard` keeps ignored
                 // paths (build output, node_modules) out of the walk.
+                // Anchored at the repository root, because `git ls-files` walks from the
+                // CWD and the lane's own scripts run through
+                // `bun run --cwd packages/e2e-tests`. Unanchored, the walk covered that
+                // subtree ALONE: an untracked file anywhere else in the repository was
+                // named by the porcelain above — so the tree was not mistaken for clean —
+                // but its CONTENTS never reached the digest, and two trees whose
+                // root-level untracked files share names while differing in bytes carried
+                // the same dirty identity. That is exactly the collision the explicit
+                // content hashing exists to prevent, reached by the other route.
+                //
+                // `git status --porcelain` and `git diff HEAD` above are already
+                // whole-repository from any CWD, so only this walk needed anchoring.
+                // Paths come back root-relative under `-C`, hence the join.
+                const topLevel = Bun.spawnSync(["git", "rev-parse", "--show-toplevel"], {
+                    stdout: "pipe",
+                    stderr: "ignore",
+                });
+                const repoRoot = topLevel.success ? topLevel.stdout.toString().trim() : "";
                 const untracked = Bun.spawnSync(
-                    ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+                    repoRoot.length === 0
+                        ? ["git", "ls-files", "--others", "--exclude-standard", "-z"]
+                        : ["git", "-C", repoRoot, "ls-files", "--others", "--exclude-standard", "-z"],
                     { stdout: "pipe", stderr: "ignore" },
                 );
                 if (untracked.success) {
                     for (const path of untracked.stdout.toString().split("\0").filter((entry) => entry.length > 0)) {
                         hasher.update(path);
                         try {
-                            hasher.update(readFileSync(path));
+                            hasher.update(readFileSync(repoRoot.length === 0 ? path : join(repoRoot, path)));
                         } catch {
                             // Unreadable or vanished between listing and reading:
                             // the path is still in the digest, so the tree is not

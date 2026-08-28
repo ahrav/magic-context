@@ -942,6 +942,57 @@ describe("lintScenario", () => {
         );
     });
 
+    test("an exact probe is not rejected for text only a choice prompt renders", () => {
+        const raw = validScenarioRaw();
+        // "choose" appears in `Choose exactly one of:`, which an EXACT probe's prompt
+        // never emits. One combined surface refused this scenario on text the scored turn
+        // does not contain, and a false refusal keeps a valid scenario out of the corpus.
+        (raw.probes as Record<string, unknown>[])[0].goldAnswer = "choose";
+        const diagnostics = lintScenario(parseScenario(raw));
+        expect(diagnostics).not.toContain(
+            "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: occurs-in-harness-owned-text",
+        );
+    });
+
+    test("a multiple-choice probe IS rejected for its own prompt's choice wording", () => {
+        const raw = validScenarioRaw();
+        // The same word, for the probe type whose prompt does render it — so the split
+        // narrows the surface without losing the check.
+        const probes = raw.probes as Record<string, unknown>[];
+        const store = probes.find((probe) => probe.id === "probe-store") as Record<string, unknown>;
+        store.choices = ["choose", "memcached"];
+        store.goldAnswer = "choose";
+        const diagnostics = lintScenario(parseScenario(raw));
+        expect(diagnostics).toContain(
+            "hse-auth-rejected-redis.probes.probe-store.goldAnswer: occurs-in-harness-owned-text",
+        );
+    });
+
+    test("shared prompt wording is still checked for every probe type", () => {
+        const raw = validScenarioRaw();
+        // "memory" is in the shared boilerplate every probe's prompt carries, so the
+        // split must not have narrowed it out.
+        (raw.probes as Record<string, unknown>[])[0].goldAnswer = "memory";
+        const diagnostics = lintScenario(parseScenario(raw));
+        expect(diagnostics).toContain(
+            "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: occurs-in-harness-owned-text",
+        );
+    });
+
+    test("an oversized probe question is a named diagnostic, not a regex blow-up", () => {
+        const raw = validScenarioRaw();
+        (raw.probes as Record<string, unknown>[])[0].question = "x".repeat(20_001);
+        expect(() => parseScenario(raw)).toThrow(/question: above-operational-maximum/);
+    });
+
+    test("an oversized probe answer is a named diagnostic, not a regex blow-up", () => {
+        const raw = validScenarioRaw();
+        // The answer is escaped into a `RegExp` by `containsCompleteValue` and scanned
+        // all-pairs, so an unbounded value has to be refused before any scan reads it.
+        (raw.probes as Record<string, unknown>[])[0].goldAnswer = "y".repeat(2_001);
+        expect(() => parseScenario(raw)).toThrow(/goldAnswer: above-operational-maximum/);
+    });
+
     test("a gold answer merely contained in a harness word is not a collision", () => {
         const raw = validScenarioRaw();
         // The bank emits "session", never "sessio". Bare containment would refuse a
