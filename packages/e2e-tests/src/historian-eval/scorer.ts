@@ -31,6 +31,7 @@ import { createClaimReaderTestDatabase } from "../../../plugin/src/features/magi
 import { canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { openTestDb } from "../test-db";
 import {
+    containsCompleteValue,
     matchesGold,
     normalizeContent,
     predicateMatches,
@@ -250,9 +251,9 @@ function healingFindings(record: HistorianEvalRunRecord): string[] {
 }
 
 /**
- * Whether a compartment block in this probe's own captured payload states the gold
- * fact — the other surface a probe may answer from when the claim budget dropped its
- * claim.
+ * Whether a compartment block in this probe's own captured payload states the probe's
+ * gold ANSWER — the other surface a probe may answer from when the claim budget
+ * dropped its claim.
  *
  * Searched in the compartment blocks only, never the whole payload. A predicate like
  * "4096" can appear incidentally in prompt text, ordinals, or filler, and a false
@@ -269,15 +270,14 @@ function healingFindings(record: HistorianEvalRunRecord): string[] {
  * is no evidence the fact was reachable, and assuming it was would charge the model on
  * an absence of proof — the same live-mode capture gap the replayed leak gate carries.
  */
-function goldStatedInCompartments(
-    goldClaim: ExpectedClaim,
-    probe: Probe,
-    exchange: ProbeExchange,
-): boolean {
+function goldAnswerStatedInCompartments(probe: Probe, exchange: ProbeExchange): boolean {
     if (probe.answerType === "claim-id" || exchange.payloadText === null) return false;
-    return predicateMatches(
-        goldClaim.predicate,
+    // The ANSWER as a complete value, not the gold predicate. A summary matching a
+    // predicate broader than the answer states the topic without stating the value, so
+    // searching for the predicate reported an answer the probe could not have read.
+    return containsCompleteValue(
         injectedBlockContents(exchange.payloadText, COMPARTMENT_BLOCK_TAGS),
+        probe.goldAnswer,
     );
 }
 
@@ -320,8 +320,25 @@ export function compareProbeAnswer(args: {
     // it is ordinary model evidence.
     if (goldClaim !== null) {
         const promoted = claimsMatchingGold(goldClaim, injectedClaims);
-        const injectedForProbe = promoted.some((item) => injectedLocators.has(item.revisionLocator));
-        if (promoted.length > 0 && !injectedForProbe && !goldStatedInCompartments(goldClaim, probe, exchange)) {
+        // What the probe needs is its ANSWER, not merely a claim satisfying the gold
+        // predicate. A predicate is a substring matcher and can be broader than the
+        // answer — predicate "session cache" against gold "Redis" — so a claim reading
+        // "session cache configured" satisfies the expectation while supplying nothing
+        // the probe could answer from. Requiring only predicate-matching therefore let a
+        // correct guess through the gate as a PASS, which is the same hole this gate was
+        // added to close, one level in. `lintScenario` does not cover it either: it
+        // requires the answer and the predicate to occur in the same source RANGE, not
+        // in the same claim.
+        //
+        // Claim-id probes are the exception, and not by exemption: their answer IS the
+        // claim's identity, so a matching claim in the probe's injected set is exactly
+        // the evidence, and there is no separate value to look for.
+        const answerBearing = (item: InjectedClaimRecord): boolean =>
+            probe.answerType === "claim-id" || containsCompleteValue(item.content, probe.goldAnswer);
+        const injectedForProbe = promoted.some(
+            (item) => injectedLocators.has(item.revisionLocator) && answerBearing(item),
+        );
+        if (promoted.length > 0 && !injectedForProbe && !goldAnswerStatedInCompartments(probe, exchange)) {
             const expected =
                 probe.answerType === "claim-id" ? "<no injected gold claim>" : probe.goldAnswer;
             return { probeId: probe.id, outcome: "error-trimmed", expected, actual: exchange.answerRaw };
@@ -496,6 +513,11 @@ export function scoreRawOutput(
     }
     const hasAuthoredSpan =
         options.authoredStartOrdinal !== undefined || options.authoredEndOrdinal !== undefined;
+    if (hasRange && !hasAuthoredSpan) {
+        throw new Error(
+            "historian-eval scorer: a chunk range needs authoredStartOrdinal and authoredEndOrdinal; without them the gold compartment minimum would count harness filler and padding rows",
+        );
+    }
     if (hasAuthoredSpan && (options.authoredStartOrdinal === undefined || options.authoredEndOrdinal === undefined)) {
         throw new Error("historian-eval scorer: authoredStartOrdinal and authoredEndOrdinal must be supplied together");
     }
@@ -506,14 +528,25 @@ export function scoreRawOutput(
             : null,
     );
     // Default: the chunk is the authored transcript, so it is its own span.
+    // Never null, because the span decides which compartments count toward gold's
+    // `minCount` and a runtime chunk range covers harness filler and post-epilogue
+    // padding as well as the authored transcript. Leaving it absent let an output
+    // satisfy the minimum with compartments sitting entirely in padding — passing this
+    // seam while the same artifact failed `scoreRunRecord`, which always supplies it.
+    //
+    // Required from the caller rather than derived. Where the authored content sits
+    // inside a replayed chunk is not recoverable from the range: a captured artifact's
+    // ordinals depend on the filler count of the run that produced it, so deriving from
+    // this scenario's rendered layout would silently mis-scope a chunk captured under a
+    // different one. The caller replaying a `HistorianRunArtifact` has the bounds in
+    // that record's `authoredTurnOrdinals`. Same reasoning as the half-supplied range
+    // above: a caller error, not a silent fallback.
     const authoredSpan = hasAuthoredSpan
         ? {
               startMessage: options.authoredStartOrdinal as number,
               endMessage: options.authoredEndOrdinal as number,
           }
-        : hasRange
-          ? null
-          : { startMessage: chunk.startIndex, endMessage: chunk.endIndex };
+        : { startMessage: chunk.startIndex, endMessage: chunk.endIndex };
     const validated = validateHistorianOutput(rawOutput, RAW_OUTPUT_SESSION_ID, chunk, [], 1);
     if (!validated.ok) {
         return { stage: "validation-rejected", error: validated.error };

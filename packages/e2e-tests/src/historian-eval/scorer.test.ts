@@ -426,9 +426,15 @@ describe("scoreRawOutput (layered raw-output seam)", () => {
         const againstAuthoredSpace = scoreRawOutput(shifted, scenario);
         expect(againstAuthoredSpace.stage).toBe("validation-rejected");
 
+        // The authored bounds travel with the range: where authored content sits inside
+        // a replayed chunk depends on the filler count of the run that captured it, so
+        // the scorer refuses to guess. A real replay reads them from the record's
+        // `authoredTurnOrdinals`; here the whole chunk is the authored span.
         const againstRecordedChunk = scoreRawOutput(shifted, scenario, {
             chunkStartOrdinal: 21,
             chunkEndOrdinal: 28,
+            authoredStartOrdinal: 21,
+            authoredEndOrdinal: 28,
         });
         expect(againstRecordedChunk.stage).toBe("scored");
         if (againstRecordedChunk.stage !== "scored") return;
@@ -472,6 +478,15 @@ describe("scoreRawOutput (layered raw-output seam)", () => {
         expect(() => scoreRawOutput(goldenRawOutput(), validScenario(), { chunkStartOrdinal: 21 })).toThrow(
             /chunkStartOrdinal and chunkEndOrdinal must be supplied together/,
         );
+    });
+
+    test("a chunk range without authored bounds is a caller error, not a filler-counting fallback", () => {
+        // Without the bounds the gold minimum counted every persisted row, so an output
+        // whose compartments sit entirely in harness padding satisfied it here while the
+        // same artifact failed `scoreRunRecord`.
+        expect(() =>
+            scoreRawOutput(goldenRawOutput(), validScenario(), { chunkStartOrdinal: 21, chunkEndOrdinal: 40 }),
+        ).toThrow(/authoredStartOrdinal and authoredEndOrdinal/);
     });
 
     test("raw output failing validation is a stage outcome, not a crash", () => {
@@ -1909,6 +1924,40 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
             exchange: exchange(probe.id, "4096", ["loc-lru01"]),
             scenario,
             injectedClaims: injected,
+        });
+        expect(verdict.outcome).toBe("error-trimmed");
+    });
+
+    test("an injected claim that satisfies the predicate but not the answer is not availability", () => {
+        // A predicate is a substring matcher and can be broader than the answer. This
+        // claim satisfies "4096"'s expectation only in the sense that it is the same
+        // category and matches a broader predicate — it does not state the value, so the
+        // probe had nothing to read and a correct answer is a guess.
+        const broaderScenario: HistorianEvalScenario = {
+            ...scenario,
+            gold: {
+                ...scenario.gold,
+                expectedClaims: scenario.gold.expectedClaims.map((claim) =>
+                    claim.id === "exp-cache-capacity"
+                        ? { ...claim, predicate: { kind: "normalized-substring" as const, value: "session cache" } }
+                        : claim,
+                ),
+            },
+        };
+        const topicOnly: InjectedClaimRecord[] = [
+            {
+                publicClaimId: "mem-topic",
+                revisionLocator: "loc-topic",
+                content: "Session cache configured.",
+                category: "CONFIG_VALUES",
+                revision: 1,
+            },
+        ];
+        const verdict = compareProbeAnswer({
+            probe: broaderScenario.probes[0],
+            exchange: exchange(broaderScenario.probes[0].id, "4096", ["loc-topic"]),
+            scenario: broaderScenario,
+            injectedClaims: topicOnly,
         });
         expect(verdict.outcome).toBe("error-trimmed");
     });
