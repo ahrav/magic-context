@@ -227,8 +227,17 @@ class RunAbort extends Error {
     }
 }
 
+/**
+ * A historian request is identified by its SYSTEM prompt, never by its user
+ * content. The `<new_messages>` block is only a fallback for a request that
+ * carries no inspectable system prompt: a prompt-injection scenario may
+ * legitimately put the literal `<new_messages>` in an authored user turn to
+ * mimic the historian protocol, and treating that as a historian request
+ * would feed a historian output back as the main-agent reply, misaligning
+ * every later turn and reporting harness drift instead of scoring the
+ * scenario.
+ */
 function isHistorianRequest(body: Record<string, unknown>): boolean {
-    if (JSON.stringify(body.messages ?? "").includes("<new_messages>")) return true;
     const system = body.system;
     if (typeof system === "string") return system.includes(HISTORIAN_SYSTEM_MARKER);
     if (Array.isArray(system)) {
@@ -238,7 +247,7 @@ function isHistorianRequest(body: Record<string, unknown>): boolean {
                 ((block as { text: string }).text ?? "").includes(HISTORIAN_SYSTEM_MARKER),
         );
     }
-    return false;
+    return JSON.stringify(body.messages ?? "").includes("<new_messages>");
 }
 
 /**
@@ -408,6 +417,16 @@ class ScenarioRunner {
     }
 
     /**
+     * The spike turn's scripted usage. Reported in both `input_tokens` and
+     * `cache_creation_input_tokens` so the threshold transform sees a real
+     * prompt-cache write, the way a live provider reports one.
+     */
+    private spikeUsage(): { input_tokens: number; output_tokens: number; cache_creation_input_tokens: number } {
+        const spike = this.scenario.trigger.spikeUsageTokens;
+        return { input_tokens: spike, output_tokens: 40, cache_creation_input_tokens: spike };
+    }
+
+    /**
      * Harness-owned padding turns AFTER the authored epilogue (excluded from
      * gold and the fingerprint, R5/KTD3). The protected-tail boundary keeps
      * the newest ~N tokens of raw history away from the historian; without
@@ -421,6 +440,19 @@ class ScenarioRunner {
         const target = deriveProtectedTailTokenTarget({
             contextLimit: trigger.modelContextLimit,
             executeThresholdPercentage: EXECUTE_THRESHOLD_PERCENTAGE,
+            // The DECLARED spike value, not the prompt total the runtime
+            // observes. Production accounts usage as
+            // `input + cache.read + cache.write`, and `spikeUsage` reports the
+            // spike in both `input_tokens` and `cache_creation_input_tokens`,
+            // so the runtime sees roughly twice this percentage. Feeding that
+            // observed figure in here collapses the tail target to its floor
+            // (13.2K -> 6.4K at the checked-in recipe, four fewer padding
+            // turns) and the protected tail then reaches back into the
+            // authored transcript, so no run covers the gold ranges and every
+            // probe scenario ERRORs as `probe-gold-uncovered`. Matching the
+            // runtime tail at >= 80% observed usage requires modelling the
+            // force-band caps and `emergencyTailScale` that
+            // `deriveProtectedTailTokenTarget` alone does not capture.
             usagePercentage: (trigger.spikeUsageTokens / trigger.modelContextLimit) * 100,
         });
         const tokensPerTurn = Math.max(100, trigger.ballastTokensPerTurn);
@@ -733,11 +765,7 @@ class ScenarioRunner {
             `Continuing. ${ballastText(trigger.ballastTokensPerTurn, 100 + runIndex)}`,
             {
                 text: "Acknowledged.",
-                usage: {
-                    input_tokens: trigger.spikeUsageTokens,
-                    output_tokens: 40,
-                    cache_creation_input_tokens: trigger.spikeUsageTokens,
-                },
+                usage: this.spikeUsage(),
             },
         );
         await this.scriptedTurn(harness, sessionId, `Please continue with step ${runIndex} of the plan.`, {

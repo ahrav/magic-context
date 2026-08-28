@@ -69,26 +69,33 @@ export type TerminalRunClassification =
     | { kind: "infrastructure"; detail: string };
 
 /**
- * Classify a run set in which the historian produced nothing usable.
+ * Classify a run set for infrastructure damage and quality exhaustion.
  *
- * Every attempt failing is only a *quality* verdict when every failure was a
- * validation rejection; an API, runtime, or storage fault that lands as
- * `failed` is infrastructure and must be excluded from the rates. An
- * unrecognized reason is treated as infrastructure on purpose: a loud ERROR
+ * The two questions are independent, and conflating them hides failures: a
+ * two-run scenario whose first pass succeeded and whose second died on
+ * `exception:` is not a clean run just because one pass worked, so any failed
+ * pass with a non-validation reason makes the whole set infrastructure
+ * regardless of what the other passes did. Only once every pass failed *and*
+ * every reason was a validation rejection is the outcome a quality verdict.
+ *
+ * An unrecognized reason is treated as infrastructure on purpose: a loud ERROR
  * that excludes one scenario is recoverable, while silently booking an outage
  * as model failure corrupts the longitudinal quality numbers this lane exists
  * to produce — so if production grows a new terminal reason, this fails safe.
  */
 export function classifyTerminalRuns(runs: readonly HistorianRunArtifact[]): TerminalRunClassification {
-    if (runs.length === 0 || !runs.every((run) => run.status === "failed")) return { kind: "not-terminal" };
-    const nonValidation = runs.filter((run) => !VALIDATION_FAILURE_RE.test(run.failureReason?.trim() ?? ""));
-    if (nonValidation.length === 0) return { kind: "validation-exhausted" };
-    return {
-        kind: "infrastructure",
-        detail: nonValidation
-            .map((run) => `run ${run.runIndex}: ${run.failureReason ?? "<no failure reason recorded>"}`)
-            .join("; "),
-    };
+    const failed = runs.filter((run) => run.status === "failed");
+    const nonValidation = failed.filter((run) => !VALIDATION_FAILURE_RE.test(run.failureReason?.trim() ?? ""));
+    if (nonValidation.length > 0) {
+        return {
+            kind: "infrastructure",
+            detail: nonValidation
+                .map((run) => `run ${run.runIndex}: ${run.failureReason ?? "<no failure reason recorded>"}`)
+                .join("; "),
+        };
+    }
+    if (runs.length > 0 && failed.length === runs.length) return { kind: "validation-exhausted" };
+    return { kind: "not-terminal" };
 }
 
 /** KTD8 FAIL reason codes. */
@@ -525,13 +532,20 @@ export function scoreRunRecord(
         // whole probe tier is silently skipped and the scenario can score
         // PASS — the same archived-record hazard the pairing checks above
         // close, so it fails the same way.
-        const exchangedProbeIds = new Set(record.probes.map((exchange) => exchange.probeId));
-        const missingProbes = scenario.probes
-            .filter((probe) => !exchangedProbeIds.has(probe.id))
-            .map((probe) => probe.id);
+        const exchangeCounts = new Map<string, number>();
+        for (const exchange of record.probes) {
+            exchangeCounts.set(exchange.probeId, (exchangeCounts.get(exchange.probeId) ?? 0) + 1);
+        }
+        const missingProbes = scenario.probes.filter((probe) => !exchangeCounts.has(probe.id)).map((probe) => probe.id);
         if (missingProbes.length > 0) {
             throw new Error(
                 `historian-eval scorer: run record for ${record.scenarioId} is missing probe exchange(s) ${missingProbes.join(", ")}`,
+            );
+        }
+        const duplicated = [...exchangeCounts.entries()].filter(([, count]) => count > 1).map(([probeId]) => probeId);
+        if (duplicated.length > 0) {
+            throw new Error(
+                `historian-eval scorer: run record for ${record.scenarioId} has duplicate probe exchange(s) ${duplicated.join(", ")}`,
             );
         }
         const probeVerdicts = record.probes.map((exchange) => {

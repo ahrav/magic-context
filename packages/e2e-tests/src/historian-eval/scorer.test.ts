@@ -444,6 +444,11 @@ describe("scoreRunRecord", () => {
             expect(() => scoreRunRecord(truncated, scenario, { recordDir: fixture.dir })).toThrow(
                 /missing probe exchange\(s\)/,
             );
+            const duplicated = makeRecord(fixture, scenario);
+            duplicated.probes = [...duplicated.probes, duplicated.probes[0]];
+            expect(() => scoreRunRecord(duplicated, scenario, { recordDir: fixture.dir })).toThrow(
+                /duplicate probe exchange\(s\)/,
+            );
         } finally {
             fixture.cleanup();
         }
@@ -530,6 +535,33 @@ describe("scoreRunRecord", () => {
         }
     });
 
+    test("an infrastructure failure alongside a SUCCESSFUL pass is still infrastructure", () => {
+        // A two-run scenario whose first pass worked and whose second died on
+        // a non-validation reason is not a clean run: scoring the partially
+        // produced state would record PASS or a model-quality FAIL for an
+        // impaired run.
+        for (const failureReason of ["exception: storage unavailable", "chunk-coverage: chunk 1-8 not covered"]) {
+            const classification = classifyTerminalRuns([
+                goldenRun({ status: "success" }),
+                goldenRun({ runIndex: 2, status: "failed", failureReason }),
+            ]);
+            expect(classification.kind).toBe("infrastructure");
+            if (classification.kind !== "infrastructure") continue;
+            expect(classification.detail).toContain("run 2");
+        }
+    });
+
+    test("a validation rejection alongside a successful pass is not terminal", () => {
+        // Validation rejection on one pass with another pass succeeding is the
+        // ordinary repair path, not exhaustion and not infrastructure.
+        expect(
+            classifyTerminalRuns([
+                goldenRun({ status: "failed", failureReason: "validation: bad output" }),
+                goldenRun({ runIndex: 2, status: "success" }),
+            ]).kind,
+        ).toBe("not-terminal");
+    });
+
     test("a single infrastructure failure among validation rejections is still infrastructure", () => {
         const classification = classifyTerminalRuns([
             goldenRun({ status: "failed", failureReason: "validation: bad output" }),
@@ -549,14 +581,10 @@ describe("scoreRunRecord", () => {
         }
     });
 
-    test("a run set with any usable attempt is not terminal", () => {
+    test("an empty or fully successful run set is not terminal", () => {
         expect(classifyTerminalRuns([]).kind).toBe("not-terminal");
-        expect(
-            classifyTerminalRuns([
-                goldenRun({ status: "failed", failureReason: "validation: bad" }),
-                goldenRun({ runIndex: 2, status: "success" }),
-            ]).kind,
-        ).toBe("not-terminal");
+        expect(classifyTerminalRuns([goldenRun({ status: "success" })]).kind).toBe("not-terminal");
+        expect(classifyTerminalRuns([goldenRun({ status: "noop" })]).kind).toBe("not-terminal");
     });
 
     test("all historian attempts invalid scores FAIL:invalid-output (KTD4)", () => {
