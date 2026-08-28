@@ -814,15 +814,26 @@ function resolveRepoCommitSha(): string {
                 );
                 if (untracked.success) {
                     for (const path of untracked.stdout.toString().split("\0").filter((entry) => entry.length > 0)) {
-                        hasher.update(path);
+                        let contents: Buffer | string;
                         try {
-                            hasher.update(readFileSync(repoRoot.length === 0 ? path : join(repoRoot, path)));
+                            contents = readFileSync(repoRoot.length === 0 ? path : join(repoRoot, path));
                         } catch {
-                            // Unreadable or vanished between listing and reading:
-                            // the path is still in the digest, so the tree is not
-                            // mistaken for clean.
-                            hasher.update("<unreadable>");
+                            // Unreadable or vanished between listing and reading: the path
+                            // is still framed into the digest, so the tree is not mistaken
+                            // for clean.
+                            contents = "<unreadable>";
                         }
+                        // Length-framed, because concatenation alone is ambiguous. Feeding
+                        // path and contents as bare successive updates means files
+                        // (a="xb", b="y") and (a="x", b="by") produce the identical byte
+                        // stream `axbby` — with identical porcelain and tracked diff — so
+                        // two different trees carried one identity. Prefixing each field
+                        // with its byte length makes the boundaries unambiguous.
+                        const pathBytes = Buffer.from(path, "utf8");
+                        hasher.update(`${pathBytes.length}:`);
+                        hasher.update(pathBytes);
+                        hasher.update(`${contents.length}:`);
+                        hasher.update(contents);
                     }
                 }
                 sha = `${candidate}-dirty.${hasher.digest("hex").slice(0, 12)}`;
@@ -1062,6 +1073,7 @@ class ScenarioRunner {
                 error: null,
             };
         }
+        this.assertAuthoredEvidenceWasChunked(runs);
         this.assertPromotionNotSilentlySkipped(harness, sessionId, runs);
 
         // Lane-owned verification bridge: historian promotions land as
@@ -1643,6 +1655,45 @@ class ScenarioRunner {
     }
 
     /**
+     * Every pre-epilogue authored ordinal reached a declared run's chunk.
+     *
+     * A chunk is token-capped, and the budget the freeze lint measures against is the
+     * production FALLBACK context limit — the live historian's own limit is unknown at
+     * lint time. When the real budget is smaller, production returns a SUCCESSFUL chunk
+     * with `chunk.hasMore` and simply stops short, so a suffix of the authored transcript
+     * is never shown to the model. Nothing downstream notices: the artifact records only
+     * the range that WAS processed, gold ranges earlier in the transcript stay covered,
+     * probes still answer — and an `expectedAbsent` hard negative sitting in the omitted
+     * suffix passes vacuously, reporting a family as exercised that the model never saw.
+     *
+     * `hasMore` is not persisted to `historian_runs`, so this proves the equivalent from
+     * the recorded ranges instead: the union of the declared runs' chunks must cover
+     * every authored ordinal before the epilogue, which is where `lintScenario` requires
+     * absence predicates to be authored. A short union is a recipe-versus-model budget
+     * mismatch — infrastructure, not historian quality.
+     */
+    private assertAuthoredEvidenceWasChunked(runs: readonly HistorianRunArtifact[]): void {
+        const ordinals = this.authoredTurnOrdinals();
+        const preEpilogue = ordinals.slice(0, this.scenario.transcript.epilogueStartIndex);
+        if (preEpilogue.length === 0) return;
+        const required: [number, number] = [
+            preEpilogue[0][0],
+            Math.max(...preEpilogue.map(([, assistant]) => assistant)),
+        ];
+        const chunks = runs
+            .filter((run) => run.chunkStartOrdinal !== null && run.chunkEndOrdinal !== null)
+            .map((run) => ({ start: run.chunkStartOrdinal as number, end: run.chunkEndOrdinal as number }));
+        if (!rangeCoveredByCompartments(required, chunks)) {
+            throw new RunAbort(
+                "harness-failure",
+                `the declared runs' chunks do not cover authored ordinals ${required[0]}-${required[1]}: [${chunks
+                    .map((chunk) => `${chunk.start}-${chunk.end}`)
+                    .join(", ")}]. A token-capped chunk left part of the transcript unseen, so absence checks would pass vacuously`,
+            );
+        }
+    }
+
+    /**
      * Silent no-op promotion (R6): facts were emitted but no claim ever
      * reached the store. That is a plumbing loss (empty promotion directory,
      * skipped unanchored promotion on every run), not historian quality.
@@ -1819,7 +1870,7 @@ class ScenarioRunner {
             probeId: probe.id,
             answerRaw,
             reAsked,
-            injectedRevisionLocators: this.visibleRevisionLocators(harness, sessionId),
+            injectedRevisionLocators: this.injectedLocatorsForTurn(harness, sessionId, payloadText),
             payloadText,
             responseText,
             discardedResponseTexts,
@@ -1979,6 +2030,32 @@ class ScenarioRunner {
      * never captured. An absent row or absent column value is a legitimate
      * empty; anything else aborts.
      */
+    /**
+     * Locators injected for THIS probe turn, reconciled against the turn's own request.
+     *
+     * `session_meta.memory_block_ids` is a cache, not per-turn evidence: production
+     * skips the update when the claim lane is unstable (`inject-compartments`), so the
+     * row can still carry the PREVIOUS turn's locators while this request rendered no
+     * `<project-memory>` block at all. Reading it alone recorded those stale locators as
+     * this turn's injection, and the availability gate then accepted a correctly guessed
+     * answer on a request that carried no answer-bearing claim.
+     *
+     * The captured request settles it: no rendered block means nothing was injected,
+     * whatever the cache says. Scripted routes only — a live route captures no payload,
+     * so the cache is the sole evidence there and the recorded set stays as-is. That is
+     * the same live-mode capture gap the replayed leak and trimming gates already carry.
+     */
+    private injectedLocatorsForTurn(
+        harness: TestHarness,
+        sessionId: string,
+        payloadText: string | null,
+    ): string[] {
+        const cached = this.visibleRevisionLocators(harness, sessionId);
+        if (payloadText === null || cached.length === 0) return cached;
+        const renderedBlock = /<project-memory>[\s\S]*?<\/project-memory>/.test(payloadText);
+        return renderedBlock ? cached : [];
+    }
+
     private visibleRevisionLocators(harness: TestHarness, sessionId: string): string[] {
         let raw: string | null;
         try {

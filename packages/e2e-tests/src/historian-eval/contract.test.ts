@@ -942,15 +942,54 @@ describe("lintScenario", () => {
         );
     });
 
-    test("an exact probe is not rejected for text only a choice prompt renders", () => {
+    test("an exact probe is not rejected for a suffix no EARLIER prompt rendered", () => {
         const raw = validScenarioRaw();
-        // "choose" appears in `Choose exactly one of:`, which an EXACT probe's prompt
-        // never emits. One combined surface refused this scenario on text the scored turn
-        // does not contain, and a false refusal keeps a valid scenario out of the corpus.
+        // probe-capacity runs FIRST, so no `Choose exactly one of:` has been sent when it
+        // is asked and "choose" is in nothing its history carries. Refusing here would
+        // keep a valid scenario out of the corpus on text the session never held.
         (raw.probes as Record<string, unknown>[])[0].goldAnswer = "choose";
         const diagnostics = lintScenario(parseScenario(raw));
         expect(diagnostics).not.toContain(
             "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: occurs-in-harness-owned-text",
+        );
+    });
+
+    test("rejects a gold answer an EARLIER probe's suffix already rendered", () => {
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Record<string, unknown>[];
+        // Appended after the multiple-choice probe, so `Choose exactly one of:` is already
+        // in the resumed session's raw history when this exact probe is asked. Scoping the
+        // surface to the probe's OWN suffix fixed a false refusal and opened this mirror
+        // hole; the surface is ordered, so it holds every suffix rendered up to this probe.
+        probes.push({
+            id: "probe-choose-word",
+            question: "Which verb did the instructions use?",
+            answerType: "exact",
+            goldAnswer: "choose",
+            sourceClaimRef: "exp-cache-capacity",
+        });
+        const diagnostics = lintScenario(parseScenario(raw));
+        expect(diagnostics).toContain(
+            "hse-auth-rejected-redis.probes.probe-choose-word.goldAnswer: occurs-in-harness-owned-text",
+        );
+    });
+
+    test("rejects a gold answer an earlier claim-id prompt's suffix rendered", () => {
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Record<string, unknown>[];
+        // The canonical scenario's third probe is claim-id, whose suffix says
+        // "the identifier before the colon". A later exact probe answering "identifier"
+        // copies it from history.
+        probes.push({
+            id: "probe-identifier-word",
+            question: "What did the instructions call the id?",
+            answerType: "exact",
+            goldAnswer: "identifier",
+            sourceClaimRef: "exp-cache-capacity",
+        });
+        const diagnostics = lintScenario(parseScenario(raw));
+        expect(diagnostics).toContain(
+            "hse-auth-rejected-redis.probes.probe-identifier-word.goldAnswer: occurs-in-harness-owned-text",
         );
     });
 

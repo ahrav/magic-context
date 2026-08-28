@@ -1366,11 +1366,24 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
         ),
         "Standing by.",
     ].join(" ");
-    for (const probe of scenario.probes) {
+    // Ordered, not per-probe-in-isolation. Narrowing to the probe's OWN suffix fixed a
+    // false refusal but opened the mirror hole: probes share one resumed session, so
+    // every EARLIER prompt's suffix is in the raw history the later probe reads. A
+    // multiple-choice probe ahead of an exact probe whose gold is "choose" renders
+    // `Choose exactly one of:` first, and an earlier claim-id prompt exposes words like
+    // "identifier". So the surface for probe i is the shared wrapper plus the suffixes
+    // rendered by probes 0..i — its own and every one before it, and none after, since
+    // text that appears only later was never in that probe's history.
+    const suffixFor = (probe: Probe): string =>
+        probe.answerType === "exact"
+            ? PROBE_PROMPT_EXACT_SUFFIX
+            : probe.answerType === "multiple-choice"
+              ? PROBE_PROMPT_CHOICE_PREFIX
+              : PROBE_PROMPT_CLAIM_ID_SUFFIX;
+    for (const [index, probe] of scenario.probes.entries()) {
         if (probe.answerType === "claim-id") continue;
-        const ownSuffix =
-            probe.answerType === "exact" ? PROBE_PROMPT_EXACT_SUFFIX : PROBE_PROMPT_CHOICE_PREFIX;
-        if (containsCompleteValue(`${sharedHarnessText} ${ownSuffix}`, probe.goldAnswer)) {
+        const rendered = scenario.probes.slice(0, index + 1).map(suffixFor);
+        if (containsCompleteValue([sharedHarnessText, ...rendered].join(" "), probe.goldAnswer)) {
             diagnostics.push(`${label}.probes.${probe.id}.goldAnswer: occurs-in-harness-owned-text`);
         }
     }
