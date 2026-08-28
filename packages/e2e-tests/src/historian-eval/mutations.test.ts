@@ -196,6 +196,36 @@ describe("mutation battery (R13/KTD5)", () => {
         expect(() => parseMutationEvidence(forged)).toThrow(/green-with-skipped-required-class-wrong-category/);
     });
 
+    test("evidence parser rejects duplicate scenario entries that would mask a red result", () => {
+        // The masking shape: a real red entry followed by a green entry for the
+        // SAME scenario. `checkMutationEvidence` indexes by scenarioFingerprint
+        // into a Map, where the later duplicate wins, so the admission gate would
+        // read this scenario as green. Artifact-level `green` stays false and
+        // internally consistent throughout, so uniqueness is the only check that
+        // can see it.
+        const artifact = runMutationBattery([validScenario()]);
+        const green = JSON.parse(JSON.stringify(artifact.scenarios[0])) as Record<string, unknown>;
+        const red = JSON.parse(JSON.stringify(green)) as {
+            green: boolean;
+            results: Array<{ green: boolean }>;
+        };
+        red.green = false;
+        red.results[0].green = false;
+        const forged = {
+            schema: MUTATION_EVIDENCE_SCHEMA,
+            green: false,
+            scenarios: [red, green],
+        };
+        expect(() => parseMutationEvidence(forged)).toThrow(/scenarioId: duplicate/);
+
+        // Re-keying the duplicate to dodge the id check must not get through
+        // either: the fingerprint is what the promotion-side Map indexes on.
+        const renamed = { ...red, scenarioId: "hse-other" };
+        expect(() => parseMutationEvidence({ ...forged, scenarios: [renamed, green] })).toThrow(
+            /scenarioFingerprint: duplicate/,
+        );
+    });
+
     test("probe mutation exercises every probe, including the claim-id comparison path", () => {
         const scenario = validScenario();
         expect(scenario.probes.map((probe) => probe.answerType)).toEqual(["exact", "multiple-choice", "claim-id"]);

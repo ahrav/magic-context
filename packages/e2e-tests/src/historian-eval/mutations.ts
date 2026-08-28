@@ -448,6 +448,14 @@ export function parseMutationEvidence(raw: unknown): MutationEvidenceArtifact {
     if (root.schema !== MUTATION_EVIDENCE_SCHEMA) evidenceFail("schema-invalid");
     if (Object.keys(root).sort().join(",") !== "green,scenarios,schema") evidenceFail("fields-invalid");
     if (!Array.isArray(root.scenarios) || typeof root.green !== "boolean") evidenceFail("fields-invalid");
+    // One entry per scenario, keyed BOTH ways. `checkMutationEvidence` indexes
+    // entries by `scenarioFingerprint` into a Map, where a later duplicate wins,
+    // so a red entry followed by a green one for the same scenario reports green
+    // to the admission gate. The aggregate flags stay self-consistent under that
+    // forgery — they are derived from every entry, including the masked red one —
+    // so uniqueness is the only place it can be caught.
+    const seenIds = new Set<string>();
+    const seenFingerprints = new Set<string>();
     const scenarios = root.scenarios.map((entryRaw, index) => {
         if (typeof entryRaw !== "object" || entryRaw === null) evidenceFail(`scenarios[${index}]: object-required`);
         const entry = entryRaw as Record<string, unknown>;
@@ -460,6 +468,12 @@ export function parseMutationEvidence(raw: unknown): MutationEvidenceArtifact {
         if (typeof entry.scenarioFingerprint !== "string" || !HEX64_RE.test(entry.scenarioFingerprint)) {
             evidenceFail(`scenarios[${index}].scenarioFingerprint: fingerprint-invalid`);
         }
+        if (seenIds.has(entry.scenarioId)) evidenceFail(`scenarios[${index}].scenarioId: duplicate`);
+        seenIds.add(entry.scenarioId);
+        if (seenFingerprints.has(entry.scenarioFingerprint)) {
+            evidenceFail(`scenarios[${index}].scenarioFingerprint: duplicate`);
+        }
+        seenFingerprints.add(entry.scenarioFingerprint);
         if (typeof entry.green !== "boolean" || !Array.isArray(entry.results) || entry.results.length === 0) {
             evidenceFail(`scenarios[${index}]: fields-invalid`);
         }

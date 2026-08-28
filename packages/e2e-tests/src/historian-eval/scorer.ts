@@ -591,7 +591,13 @@ const RAW_OUTPUT_PROJECT_IDENTITY = "dir:/historian-eval/raw-output";
  */
 let scoringDbTemplate: Uint8Array | null = null;
 
-function freshScoringDatabase(): Database {
+/**
+ * One isolated, writable scoring database per call.
+ *
+ * Exported so a test can assert the connection configuration below: no caller on
+ * the scoring path can observe it, so nothing else would catch its loss.
+ */
+export function freshScoringDatabase(): Database {
     if (scoringDbTemplate === null) {
         const template = createClaimReaderTestDatabase();
         // SAFETY: E2E executes in Bun, so the plugin Database is bun:sqlite,
@@ -599,7 +605,16 @@ function freshScoringDatabase(): Database {
         scoringDbTemplate = (template as unknown as BunDatabase).serialize();
         template.close();
     }
-    return BunDatabase.deserialize(scoringDbTemplate) as unknown as Database;
+    const db = BunDatabase.deserialize(scoringDbTemplate);
+    // Serialization carries database BYTES, not connection state: a deserialized
+    // handle opens with SQLite's defaults (foreign keys off, no busy timeout),
+    // while `createClaimReaderTestDatabase` configures both. Left unset, a scorer
+    // write violating a claim relationship would be accepted and scored here
+    // while the factory-backed connection and production reject it — so a storage
+    // regression would score green. Values match the factory.
+    db.exec("PRAGMA busy_timeout=5000");
+    db.exec("PRAGMA foreign_keys=ON");
+    return db as unknown as Database;
 }
 
 /**

@@ -37,6 +37,7 @@ import {
     lintScenario,
     parseApproval,
     parseManifest,
+    parseReleaseLineage,
     parseScenario,
     releaseApprovalFingerprint,
     scenarioFingerprint,
@@ -209,8 +210,15 @@ export function loadRelease(
         fail(["release: artifact fingerprint does not match the expected trust anchor"]);
     }
     const scenarioFiles = readdirSync(scenariosDir).sort();
-    for (const file of scenarioFiles) {
-        assertRegularFile(join(scenariosDir, file), `release.scenarios.${file}`);
+    // Position-based labels, for the same reason the entry check above reports
+    // counts: a scenario filename from an externally assembled tree has not been
+    // through the privacy scan (which covers scenario values, not filesystem
+    // names). `parseScenario` prefixes every validation diagnostic with its
+    // label, so a filename there would push unreviewed text — a forbidden token,
+    // customer identifier, or local path — into logs on any malformed scenario.
+    // The index is enough to locate the file, since the list is sorted.
+    for (const [index, file] of scenarioFiles.entries()) {
+        assertRegularFile(join(scenariosDir, file), `release.scenarios[${index}]`);
     }
     // The same budget promotion enforces (R1): a separately assembled or
     // truncated release must not pass the strict path with a corpus that
@@ -220,13 +228,16 @@ export function loadRelease(
             `release: corpus size ${scenarioFiles.length} outside the ${CORPUS_SIZE_BUDGET.min}-${CORPUS_SIZE_BUDGET.max} budget (R1)`,
         ]);
     }
-    const scenarios = scenarioFiles.map((file) =>
-        parseScenario(readReleaseJson(join(scenariosDir, file), `release.scenarios.${file}`), file),
+    const scenarios = scenarioFiles.map((file, index) =>
+        parseScenario(
+            readReleaseJson(join(scenariosDir, file), `release.scenarios[${index}]`),
+            `release.scenarios[${index}]`,
+        ),
     );
     const diagnostics: string[] = [];
     for (const [index, scenario] of scenarios.entries()) {
         if (scenarioFiles[index] !== `${scenario.id}.json`) {
-            diagnostics.push(`release.scenarios.${scenarioFiles[index]}: filename-id-mismatch`);
+            diagnostics.push(`release.scenarios[${index}]: filename-id-mismatch`);
         }
         const lint = lintScenario(scenario);
         if (lint.length > 0) diagnostics.push(...lint);
@@ -265,11 +276,18 @@ function versionOrdinal(version: string): number {
  * read prior state: tombstone inheritance (R12) and succession, so they cannot
  * disagree about which releases exist.
  *
+ * Prior releases are read as LINEAGE, not re-certified as current manifests.
+ * `parseManifest` pins the scenario-schema, privacy-policy, and sanitizer
+ * versions to the ones this lane implements, so rotating any of them would make
+ * every already-installed manifest unparseable and block all further promotion —
+ * precisely when those releases' tombstones still have to be carried forward. A
+ * predecessor is consulted for what it retired, not approved again.
+ *
  * Fails closed on a version-named directory without a loadable manifest: a
  * corrupt releases root read as "carries no tombstones" would silently
  * re-admit a retracted scenario into vN+1.
  */
-function installedReleases(releasesRoot: string): ReleaseManifest[] {
+function installedReleases(releasesRoot: string): ReleaseLineage[] {
     if (!existsSync(releasesRoot)) return [];
     return readdirSync(releasesRoot)
         .filter((entry) => RELEASE_VERSION_RE.test(entry))
@@ -279,15 +297,30 @@ function installedReleases(releasesRoot: string): ReleaseManifest[] {
             if (!existsSync(manifestPath)) {
                 fail([`release: prior release ${entry} has no readable manifest; refusing to inherit tombstones`]);
             }
-            return parseManifest(readReleaseJson(manifestPath, `release.${entry}.manifest`));
+            const lineage = parseReleaseLineage(
+                readReleaseJson(manifestPath, `release.${entry}.manifest`),
+                `release.${entry}.manifest`,
+            );
+            // Ordering above is by DIRECTORY name, but succession is enforced
+            // against the manifest's own `releaseVersion`. A manifest copied into
+            // a differently named directory — a v1 manifest under v100 — would
+            // sort newest while reporting v1, so promoting v2 would be compared
+            // against v1 and admitted, leaving the numerically later, immutable
+            // v100 still serving a scenario v2 retired. Both names are
+            // `RELEASE_VERSION_RE`-bounded, so reporting them echoes no artifact
+            // content.
+            if (lineage.releaseVersion !== entry) {
+                fail([`release: prior release ${entry} declares version ${lineage.releaseVersion}`]);
+            }
+            return lineage;
         });
 }
 
 /** Prior releases' tombstones persist in every later release (R12). */
-function inheritedTombstones(prior: readonly ReleaseManifest[]): string[] {
+function inheritedTombstones(prior: readonly ReleaseLineage[]): string[] {
     const tombstones = new Set<string>();
-    for (const manifest of prior) {
-        for (const id of manifest.tombstones) tombstones.add(id);
+    for (const lineage of prior) {
+        for (const id of lineage.tombstones) tombstones.add(id);
     }
     return [...tombstones].sort();
 }

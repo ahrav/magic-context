@@ -18,6 +18,7 @@ import { RUN_RECORD_SCHEMA, authoredTurnOrdinalsFor, buildProbePrompt } from "./
 import {
     buildLaneReport,
     compareProbeAnswer,
+    freshScoringDatabase,
     laneExitCode,
     scoreRawOutput,
     scoreRunRecord,
@@ -2487,5 +2488,23 @@ describe("buildLaneReport", () => {
             falseAuthoritativeMatches: ["abs-x"],
         };
         expect(laneExitCode(buildLaneReport([fatal, passScore("hse-b")]))).toBe(2);
+    });
+});
+
+describe("scoring database provisioning", () => {
+    test("the deserialized scoring connection enforces foreign keys and keeps the busy timeout", () => {
+        // Bun serialization carries database BYTES, not connection state, so a
+        // deserialized handle comes up with SQLite's defaults: foreign keys off
+        // and no busy timeout. Left that way, a scorer write violating a claim
+        // relationship would be accepted and scored here while the
+        // factory-backed connection and production reject it — a storage
+        // regression would score green.
+        const db = freshScoringDatabase();
+        try {
+            expect(db.prepare("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
+            expect(db.prepare("PRAGMA busy_timeout").get()).toEqual({ timeout: 5000 });
+        } finally {
+            db.close();
+        }
     });
 });

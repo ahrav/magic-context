@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
@@ -284,6 +284,66 @@ describe("promoteRelease", () => {
             // A skipped v1 would silently drop its tombstones from every
             // later release, re-admitting retracted scenarios.
             expect(() => promote("v2")).toThrow(/no readable manifest/);
+        });
+    });
+
+    test("prior releases are read as lineage, so a policy-constant rotation cannot block promotion (R12)", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            promoteRelease({
+                scenarios,
+                approvals: approvalsFor(scenarios, "v1", ["hse-retired"]),
+                releasesRoot: root,
+                releaseVersion: "v1",
+                tombstones: ["hse-retired"],
+            });
+            // Stands in for a deliberate privacy or sanitizer bump: v1's manifest
+            // now carries a tuple this lane no longer implements. `parseManifest`
+            // pins those constants, so re-certifying v1 while promoting v2 would
+            // make it unparseable and block every later promotion — exactly when
+            // its tombstones still have to be carried forward.
+            const manifestPath = join(root, "v1", RELEASE_FILES.manifest);
+            const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+                releaseTuple: { privacyPolicyVersion: string };
+            };
+            manifest.releaseTuple.privacyPolicyVersion = "rotated-after-v1";
+            writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+            const next = corpusRaw();
+            const { releaseDir } = promoteRelease({
+                scenarios: next,
+                approvals: approvalsFor(next, "v2", ["hse-retired"]),
+                releasesRoot: root,
+                releaseVersion: "v2",
+            });
+            expect(loadRelease(releaseDir).manifest.tombstones).toEqual(["hse-retired"]);
+        });
+    });
+
+    test("a prior manifest whose version does not match its directory is rejected", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            promoteRelease({
+                scenarios,
+                approvals: approvalsFor(scenarios),
+                releasesRoot: root,
+                releaseVersion: "v1",
+            });
+            // v1's tree copied under a numerically later name. Prior releases are
+            // ordered by DIRECTORY, so v100 sorts newest while its manifest still
+            // reports v1; succession would compare v2 against v1 and admit it,
+            // leaving the immutable v100 numerically later than the release that
+            // supersedes it.
+            cpSync(join(root, "v1"), join(root, "v100"), { recursive: true });
+            const next = corpusRaw();
+            expect(() =>
+                promoteRelease({
+                    scenarios: next,
+                    approvals: approvalsFor(next, "v2"),
+                    releasesRoot: root,
+                    releaseVersion: "v2",
+                }),
+            ).toThrow(/prior release v100 declares version v1/);
         });
     });
 
