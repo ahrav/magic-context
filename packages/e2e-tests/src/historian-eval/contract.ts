@@ -1229,12 +1229,23 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
             evidenceText(scenario, claim.sourceTurnRange[0], claim.sourceTurnRange[1] + 1),
         ]),
     );
+    const claimById = new Map(scenario.gold.expectedClaims.map((claim) => [claim.id, claim]));
     for (const probe of scenario.probes) {
         if (probe.answerType === "claim-id") continue;
         const range = claimRangeById.get(probe.sourceClaimRef);
         if (range === undefined) continue;
         if (!containsCompleteValue(range, probe.goldAnswer)) {
             diagnostics.push(`${label}.probes.${probe.id}.goldAnswer: not-authored-in-source-range`);
+        }
+        // The range check proves the answer was SAID; this proves the backing gold
+        // claim REQUIRES it. Without it a historian satisfies the claim with
+        // content omitting the answer: facts recall is full, so no recall failure,
+        // and no injected claim bears the answer — which the probe tier reads as
+        // `error-trimmed`, an infrastructure-loss outcome excluded from scoring.
+        // A pure extraction omission would be silently absolved instead of failing.
+        const backing = claimById.get(probe.sourceClaimRef);
+        if (backing !== undefined && !containsCompleteValue(backing.predicate.value, probe.goldAnswer)) {
+            diagnostics.push(`${label}.probes.${probe.id}.goldAnswer: not-required-by-${backing.id}`);
         }
     }
 

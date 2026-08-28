@@ -23,11 +23,13 @@ import {
     validateStoredCompartments,
     type HistorianValidationChunk,
 } from "../../../plugin/src/hooks/magic-context/compartment-runner-validation";
+import { Database as BunDatabase } from "bun:sqlite";
 import { appendCompartments } from "../../../plugin/src/features/magic-context/compartment-storage";
 import { promoteSessionFactsDurable } from "../../../plugin/src/features/magic-context/memory/promotion";
 import { getProjectMemoryClaimByPublicId } from "../../../plugin/src/features/magic-context/memory/storage-claim-operations";
 import { resolveProjectIdsForIdentities } from "../../../plugin/src/features/magic-context/memory/storage-claim-current-state";
 import { createClaimReaderTestDatabase } from "../../../plugin/src/features/magic-context/test-claim-database";
+import type { Database } from "../../../plugin/src/shared/sqlite";
 import { canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { openTestDb } from "../test-db";
 import {
@@ -578,6 +580,44 @@ const RAW_OUTPUT_SESSION_ID = "historian-eval-raw-output";
 const RAW_OUTPUT_PROJECT_IDENTITY = "dir:/historian-eval/raw-output";
 
 /**
+ * Serialized bytes of one fully bootstrapped scoring database.
+ * `createClaimReaderTestDatabase` composes and stamps the whole direct
+ * schema, which costs two orders of magnitude more than the scoring it
+ * enables; the mutation battery calls `scoreRawOutput` several times per
+ * scenario and `promoteRelease` recomputes the battery per promotion.
+ * Deserializing this template yields an identical, isolated, writable
+ * in-memory copy per call without rebuilding the schema. Bun-only like the
+ * rest of the e2e lane (see `openTestDb` in ../test-db.ts).
+ */
+let scoringDbTemplate: Uint8Array | null = null;
+
+/**
+ * One isolated, writable scoring database per call.
+ *
+ * Exported so a test can assert the connection configuration below: no caller on
+ * the scoring path can observe it, so nothing else would catch its loss.
+ */
+export function freshScoringDatabase(): Database {
+    if (scoringDbTemplate === null) {
+        const template = createClaimReaderTestDatabase();
+        // SAFETY: E2E executes in Bun, so the plugin Database is bun:sqlite,
+        // which carries serialize/deserialize. commentlint: allow(JUDGE)
+        scoringDbTemplate = (template as unknown as BunDatabase).serialize();
+        template.close();
+    }
+    const db = BunDatabase.deserialize(scoringDbTemplate);
+    // Serialization carries database BYTES, not connection state: a deserialized
+    // handle opens with SQLite's defaults (foreign keys off, no busy timeout),
+    // while `createClaimReaderTestDatabase` configures both. Left unset, a scorer
+    // write violating a claim relationship would be accepted and scored here
+    // while the factory-backed connection and production reject it — so a storage
+    // regression would score green. Values match the factory.
+    db.exec("PRAGMA busy_timeout=5000");
+    db.exec("PRAGMA foreign_keys=ON");
+    return db as unknown as Database;
+}
+
+/**
  * Primary scorer entry point (KTD5): raw historian output artifact →
  * parse → validate → publish into a fresh temp DB → score. Validation
  * rejection is a stage outcome the mutation battery asserts on; it never
@@ -693,7 +733,7 @@ export function scoreRawOutput(
     const discardLast = shouldDiscardLastHistorianCompartment(validated.compartments, chunk);
     const persisted = discardLast ? validated.compartments.slice(0, -1) : validated.compartments;
 
-    const db = createClaimReaderTestDatabase();
+    const db = freshScoringDatabase();
     try {
         appendCompartments(db, RAW_OUTPUT_SESSION_ID, persisted);
         if (!discardLast) {

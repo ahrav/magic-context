@@ -1,0 +1,101 @@
+{
+  "schema": "historian-eval-scenario/v1",
+  "id": "hse-api-pagination-explored",
+  "title": "Explored pagination styles must not surface as an adopted decision",
+  "families": [
+    "explored-never-accepted"
+  ],
+  "transcript": {
+    "turns": [
+      {
+        "user": "For the v2 listing endpoints, what pagination styles could we use?",
+        "assistant": "Three candidates: offset-based, cursor-based, and keyset pagination. Cursor handles concurrent inserts best; keyset is fastest on large tables; offset is simplest. Each has tradeoffs."
+      },
+      {
+        "user": "Keep all three on the table — no decision until after the load test. What IS decided: every v2 endpoint lives under the path prefix api/v2.",
+        "assistant": "Noted: pagination style is undecided pending the load test. The api/v2 path prefix is locked in for all v2 endpoints."
+      },
+      {
+        "user": "Also cap the maximum page size at 200 items no matter which style wins.",
+        "assistant": "Recorded: maximum page size is 200 items."
+      },
+      {
+        "user": "That covers the API design session for today.",
+        "assistant": "Wrapping up; notes are captured."
+      }
+    ],
+    "epilogueStartIndex": 3
+  },
+  "trigger": {
+    "expectedHistorianRuns": 2,
+    "modelContextLimit": 200000,
+    "usageTokensPerTurn": 1000,
+    "spikeUsageTokens": 90000,
+    "ballastTokensPerTurn": 1500,
+    "headroomMarginTokens": 2000
+  },
+  "gold": {
+    "expectedClaims": [
+      {
+        "id": "exp-api-prefix",
+        "category": "PROJECT_RULES",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "api/v2"
+        },
+        "sourceTurnRange": [
+          1,
+          1
+        ]
+      },
+      {
+        "id": "exp-page-cap",
+        "category": "CONSTRAINTS",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "200 items"
+        },
+        "sourceTurnRange": [
+          2,
+          2
+        ]
+      }
+    ],
+    "expectedAbsent": [
+      {
+        "id": "abs-cursor-adopted",
+        "family": "explored-never-accepted",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "cursor-based"
+        }
+      },
+      {
+        "id": "abs-keyset-adopted",
+        "family": "explored-never-accepted",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "keyset"
+        }
+      }
+    ],
+    "compartments": {
+      "minCount": 1
+    }
+  },
+  "probes": [
+    {
+      "id": "probe-page-cap",
+      "question": "What is the maximum page size for v2 listing endpoints?",
+      "answerType": "exact",
+      "goldAnswer": "200",
+      "sourceClaimRef": "exp-page-cap"
+    },
+    {
+      "id": "probe-prefix",
+      "question": "Which claim records the v2 endpoint path prefix?",
+      "answerType": "claim-id",
+      "expectedClaimRef": "exp-api-prefix"
+    }
+  ]
+}

@@ -1,0 +1,110 @@
+{
+  "schema": "historian-eval-scenario/v1",
+  "id": "hse-test-runner-rejected",
+  "title": "Rejected Jest proposal must not surface as the adopted test runner",
+  "families": [
+    "proposed-but-rejected"
+  ],
+  "transcript": {
+    "turns": [
+      {
+        "user": "Proposal: switch the unit tests to Jest since most of the team already knows it.",
+        "assistant": "Jest could work, though its ESM support would need a transform layer in our workspace setup."
+      },
+      {
+        "user": "Rejected. Jest is rejected because the ESM transform layer breaks our workspace imports. We stay on Vitest.",
+        "assistant": "Recorded: Vitest remains the unit test runner. Jest rejected because the ESM transform breaks workspace imports."
+      },
+      {
+        "user": "Keep test files co-located with their sources, named with the .test.ts suffix.",
+        "assistant": "Noted: test files stay co-located and use the .test.ts suffix."
+      },
+      {
+        "user": "Good \u2014 testing conventions are settled.",
+        "assistant": "Wrapping up the testing thread."
+      }
+    ],
+    "epilogueStartIndex": 3
+  },
+  "trigger": {
+    "expectedHistorianRuns": 2,
+    "modelContextLimit": 200000,
+    "usageTokensPerTurn": 1000,
+    "spikeUsageTokens": 90000,
+    "ballastTokensPerTurn": 1500,
+    "headroomMarginTokens": 2000
+  },
+  "gold": {
+    "expectedClaims": [
+      {
+        "id": "exp-vitest",
+        "category": "PROJECT_RULES",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "vitest"
+        },
+        "sourceTurnRange": [
+          1,
+          1
+        ]
+      },
+      {
+        "id": "exp-jest-rejected",
+        "category": "CONSTRAINTS",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "Jest rejected because the ESM transform"
+        },
+        "sourceTurnRange": [
+          0,
+          1
+        ]
+      },
+      {
+        "id": "exp-test-suffix",
+        "category": "NAMING",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": ".test.ts"
+        },
+        "sourceTurnRange": [
+          2,
+          2
+        ]
+      }
+    ],
+    "expectedAbsent": [
+      {
+        "id": "abs-jest-active",
+        "family": "proposed-but-rejected",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "switch the unit tests to jest"
+        }
+      }
+    ],
+    "compartments": {
+      "minCount": 1
+    }
+  },
+  "probes": [
+    {
+      "id": "probe-runner",
+      "question": "Which unit test runner does the project use?",
+      "answerType": "multiple-choice",
+      "choices": [
+        "jest",
+        "vitest"
+      ],
+      "goldAnswer": "vitest",
+      "sourceClaimRef": "exp-vitest"
+    },
+    {
+      "id": "probe-suffix",
+      "question": "What suffix do test files use?",
+      "answerType": "exact",
+      "goldAnswer": ".test.ts",
+      "sourceClaimRef": "exp-test-suffix"
+    }
+  ]
+}

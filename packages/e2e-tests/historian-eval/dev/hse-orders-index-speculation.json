@@ -1,0 +1,106 @@
+{
+  "schema": "historian-eval-scenario/v1",
+  "id": "hse-orders-index-speculation",
+  "title": "Assistant index speculation must not be promoted as a schema decision",
+  "families": [
+    "assistant-speculation"
+  ],
+  "transcript": {
+    "turns": [
+      {
+        "user": "The orders query filtered by tenant is slow, around 900ms at p95.",
+        "assistant": "I suspect a covering index on tenant_id plus created_at would probably fix it, and we could probably also denormalize the totals column. Pure speculation until we see the query plan."
+      },
+      {
+        "user": "Hold off on the guesses. One thing IS decided and final: the orders table is partitioned by tenant_id.",
+        "assistant": "Understood: the orders table is partitioned by tenant_id. The index and denormalization ideas remain unverified speculation."
+      },
+      {
+        "user": "Also, database migrations live in db/migrations and run through the migrate script.",
+        "assistant": "Noted: migrations live in db/migrations and run through the migrate script."
+      },
+      {
+        "user": "Thanks, that closes the schema discussion.",
+        "assistant": "Closing out; everything is captured."
+      }
+    ],
+    "epilogueStartIndex": 3
+  },
+  "trigger": {
+    "expectedHistorianRuns": 2,
+    "modelContextLimit": 200000,
+    "usageTokensPerTurn": 1000,
+    "spikeUsageTokens": 90000,
+    "ballastTokensPerTurn": 1500,
+    "headroomMarginTokens": 2000
+  },
+  "gold": {
+    "expectedClaims": [
+      {
+        "id": "exp-tenant-partition",
+        "category": "ARCHITECTURE",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "partitioned by tenant_id"
+        },
+        "sourceTurnRange": [
+          1,
+          1
+        ]
+      },
+      {
+        "id": "exp-migrations-dir",
+        "category": "PROJECT_RULES",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "db/migrations"
+        },
+        "sourceTurnRange": [
+          2,
+          2
+        ]
+      }
+    ],
+    "expectedAbsent": [
+      {
+        "id": "abs-covering-index",
+        "family": "assistant-speculation",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "covering index on tenant_id"
+        }
+      },
+      {
+        "id": "abs-denormalize-totals",
+        "family": "assistant-speculation",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "denormalize the totals column"
+        }
+      }
+    ],
+    "compartments": {
+      "minCount": 1
+    }
+  },
+  "probes": [
+    {
+      "id": "probe-partition",
+      "question": "Which column partitions the orders table?",
+      "answerType": "exact",
+      "goldAnswer": "tenant_id",
+      "sourceClaimRef": "exp-tenant-partition"
+    },
+    {
+      "id": "probe-migrations",
+      "question": "Where do database migrations live?",
+      "answerType": "multiple-choice",
+      "choices": [
+        "db/migrations",
+        "sql/schema"
+      ],
+      "goldAnswer": "db/migrations",
+      "sourceClaimRef": "exp-migrations-dir"
+    }
+  ]
+}
