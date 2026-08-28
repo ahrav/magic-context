@@ -27,6 +27,7 @@ import { appendCompartments } from "../../../plugin/src/features/magic-context/c
 import { promoteSessionFactsDurable } from "../../../plugin/src/features/magic-context/memory/promotion";
 import { getProjectMemoryClaimByPublicId } from "../../../plugin/src/features/magic-context/memory/storage-claim-operations";
 import { createClaimReaderTestDatabase } from "../../../plugin/src/features/magic-context/test-claim-database";
+import { canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { openTestDb } from "../test-db";
 import {
     matchesGold,
@@ -762,7 +763,13 @@ function resolveReportSystem(
     scores: readonly ScenarioScore[],
     supplied: SystemVersionTuple | undefined,
 ): SystemVersionTuple | null {
-    const canonical = (system: SystemVersionTuple): string => JSON.stringify(system);
+    // Key-order-independent: `score.system` is deserialized from a run-record
+    // JSON while a supplied tuple is a caller literal, so the two never share a
+    // construction site and `JSON.stringify` would compare their insertion
+    // orders as well as their values — failing a run that is in fact
+    // consistent. `canonicalJson` sorts keys, and is the same canonicalizer the
+    // scenario fingerprint is built on.
+    const canonical = (system: SystemVersionTuple): string => canonicalJson(system);
     let agreed: SystemVersionTuple | null = null;
     for (const score of scores) {
         if (score.system === null) continue;

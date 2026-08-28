@@ -1042,6 +1042,18 @@ describe("buildLaneReport", () => {
 
         // A score with no run record behind it constrains nothing.
         expect(buildLaneReport([passScore("hse-a")], { system }).system).toEqual(system);
+
+        // Field order must not matter: a deserialized run-record tuple and a
+        // caller literal never share a construction site.
+        const permuted = {
+            chunkTokenBudget: system.chunkTokenBudget,
+            probeModelId: system.probeModelId,
+            parserImpl: system.parserImpl,
+            historianModelId: system.historianModelId,
+            repoCommitSha: system.repoCommitSha,
+        };
+        expect(JSON.stringify(permuted)).not.toBe(JSON.stringify(system));
+        expect(() => buildLaneReport([{ ...passScore("hse-a"), system: permuted }], { system })).not.toThrow();
     });
 
     test("exit-code mapping (KTD8): green 0, red 1, false-authoritative run-fatal 2", () => {
