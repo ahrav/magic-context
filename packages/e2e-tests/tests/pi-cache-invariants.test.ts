@@ -516,7 +516,7 @@ describe("pi cache invariants — m[0]/m[1] taxonomy", () => {
         }
     }, 260_000);
 
-    it("B11: non-additive memory mutations render <memory-updates> while m[0] stays byte-frozen", async () => {
+    it("B11: an in-place rewrite of a rendered memory HARD-refolds m[0] instead of replaying a stale frozen block", async () => {
         const h = await createHarness();
         try {
             await sendTurn(h, "pi B11 bootstrap: create the context DB before seeding memory.", "pi B11 bootstrap");
@@ -533,28 +533,37 @@ describe("pi cache invariants — m[0]/m[1] taxonomy", () => {
             await sendTurn(h, "pi B11 turn 4: high usage marks the next pass execute.", "pi B11 pressure", HIGH_USAGE);
             const epochBeforeUpdate = projectEpoch(h);
             queueMemoryUpdate(h, memId, "B11 revised rule: deploys go straight to production with a feature flag.");
-            // A content rewrite withdraws verification (the successor revision
-            // starts CANDIDATE); re-verify through the real API so the revised
-            // row stays render-eligible, then pin the epoch so the mutation
-            // rides the m[1] delta instead of HARD-refolding m[0].
+            // `sessionMemoryBlockStillEligible` compares each rendered id's
+            // render-time content digest against the row's current digest, so an
+            // in-place rewrite makes the cached block ineligible and m[0] must
+            // re-materialize. A content rewrite also withdraws verification (the
+            // successor revision starts CANDIDATE), so re-verify through the real
+            // API to keep the revised row render-eligible for the refold. Pinning
+            // the epoch back proves the refold comes from the digest gate rather
+            // than from a project_memory_change bump.
             writeDb(h, (db) => verifyAndSettle(db, memId));
             setProjectEpoch(h, epochBeforeUpdate);
-            await sendTurn(h, "pi B11 turn 5: execute pass renders the memory-updates delta.", "pi B11 reconcile");
+            await sendTurn(h, "pi B11 turn 5: execute pass refolds the revised bytes into m[0].", "pi B11 refold");
 
-            const reconcileReq = mainRequests(h).find((r) => extractM1(r.body)?.includes("<memory-updates>"));
-            expect(reconcileReq).toBeDefined();
-            const m1 = extractM1(reconcileReq!.body)!;
-            const m0 = extractM0(reconcileReq!.body)!;
-            expect(m1).toContain("<memory-updates>");
-            expect(m1).toContain(`<updated id="${memId}">`);
-            expect(m1).toContain("B11 revised rule");
-            expect(m0).toContain("B11 original rule");
-            expect(m0).not.toContain("B11 revised rule");
-            expect(m0).toBe(m0Baseline!);
+            const refoldReq = mainRequests(h)
+                .filter((r) => extractM0(r.body)?.includes("B11 revised rule"))
+                .at(-1);
+            expect(refoldReq).toBeDefined();
+            const m1 = extractM1(refoldReq!.body)!;
+            const m0 = extractM0(refoldReq!.body)!;
+            // Fail-closed invariant: a cached memory block never replays stale
+            // bytes, so m[0] carries the revised text and is not the frozen
+            // baseline.
+            expect(m0).toContain("B11 revised rule");
+            expect(m0).not.toContain("B11 original rule");
+            expect(m0).not.toBe(m0Baseline!);
+            // The refold folds the change into m[0] and advances the mutation
+            // cursor, so no <memory-updates> delta is left to render.
+            expect(m1).not.toContain("<memory-updates>");
 
             await sendTurn(h, "pi B11 turn 6: defer replay.", "pi B11 replay 1");
             await sendTurn(h, "pi B11 turn 7: defer replay again.", "pi B11 replay 2");
-            assertNoBusts("B11-supersede-delta-replay", mainRequests(h).slice(-2));
+            assertNoBusts("B11-in-place-rewrite-refold-replay", mainRequests(h).slice(-2));
         } finally {
             await h.dispose();
         }

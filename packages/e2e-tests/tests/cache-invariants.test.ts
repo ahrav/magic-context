@@ -30,6 +30,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { realpathSync } from "node:fs";
 import { join, resolve as pathResolve } from "node:path";
+import { reconcileCompatibilityVerifications } from "../../plugin/src/features/magic-context/claim-policy-backfill";
 import { insertMemory, updateMemoryContent, updateMemoryVerification } from "../../plugin/src/features/magic-context/memory";
 import { computeNormalizedHash } from "../../plugin/src/features/magic-context/memory/normalize-hash";
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
@@ -213,6 +214,18 @@ function writeContextDb<T>(fn: (db: ReturnType<typeof openTestDb>) => T): T {
     }
 }
 
+/** Promote a memory to verified and settle the epoch bump its verification
+ *  event queues. `reconcileCompatibilityVerifications` is the synchronous
+ *  reconciler the plugin itself runs during injection: draining it here makes
+ *  the write's ONE epoch bump land now instead of during the next turn, after
+ *  `setProjectEpoch` has already pinned. Without this the pin is silently
+ *  undone mid-turn and m[0] HARD-refolds (reason=project_memory_change), which
+ *  routes the write into m[0] and leaves the m[1] delta lanes untested. */
+function verifyAndSettle(db: unknown, memoryId: number): void {
+    updateMemoryVerification(db as never, memoryId, "verified");
+    reconcileCompatibilityVerifications(db as never);
+}
+
 function seedMemory(
     content: string,
     category: Memory["category"] = "PROJECT_RULES",
@@ -228,7 +241,7 @@ function seedMemory(
             // deterministic before the next turn materializes m[0].
             sourceType: "user",
         }).id;
-        updateMemoryVerification(db as never, id, "verified");
+        verifyAndSettle(db, id);
         return id;
     });
 }
@@ -659,9 +672,9 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
         });
     });
 
-    describe("#given a non-additive memory mutation (B11 — supersede-delta)", () => {
-        describe("#when a rendered memory is updated and an execute pass reconciles it", () => {
-            it("#then a <memory-updates> delta rides m[1] and m[0] stays byte-identical (stale-but-frozen)", async () => {
+    describe("#given a non-additive memory mutation (B11 — in-place rewrite)", () => {
+        describe("#when a rendered memory's content is rewritten in place", () => {
+            it("#then m[0] HARD-refolds onto the revised bytes rather than replaying a stale frozen block", async () => {
                 //#given — seed a memory and materialize m[0] WITH it in the
                 // baseline (so it's a rendered memory the mutation can target).
                 const sessionId = await h.createSession();
@@ -713,10 +726,12 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 const m0Baseline = extractM0(mainAgentRequests(h.mock.requests()).at(-1)!.body);
                 expect(m0Baseline).toContain("B11 original rule");
 
-                //#when — a non-additive mutation (update). This queues a
-                // memory_mutation_log row WITHOUT bumping the project epoch, so
-                // m[0] must NOT re-materialize: the stale baseline still shows the
-                // ORIGINAL text, and m[1] carries a <memory-updates> correction.
+                //#when — the rendered memory's content is rewritten IN PLACE.
+                // `sessionMemoryBlockStillEligible` compares each rendered id's
+                // render-time content digest against the row's current digest, so
+                // an in-place rewrite makes the cached block ineligible and m[0]
+                // must re-materialize. Pinning the epoch back proves the refold is
+                // driven by the digest gate, not by a project_memory_change bump.
                 // Turn 4 records high usage so turn 5 is the cache-busting pass.
                 h.mock.setDefault({
                     text: "B11 pressure",
@@ -733,30 +748,29 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 );
                 // A content rewrite withdraws verification (the successor revision
                 // starts CANDIDATE); re-verify through the real API so the revised
-                // row stays render-eligible, then pin the epoch so the mutation
-                // rides the m[1] delta instead of HARD-refolding m[0].
-                writeContextDb((db) =>
-                    updateMemoryVerification(db as never, memId, "verified"),
-                );
+                // row is render-eligible for the refold.
+                writeContextDb((db) => verifyAndSettle(db, memId));
                 setProjectEpoch(epochBeforeUpdate);
-                setDefer("B11 reconcile");
-                await h.sendPrompt(sessionId, "B11 turn 5: execute pass renders the memory-updates delta.");
+                setDefer("B11 refold");
+                await h.sendPrompt(sessionId, "B11 turn 5: execute pass refolds the revised bytes into m[0].");
 
                 //#then
                 const requests = mainAgentRequests(h.mock.requests());
-                const reconcileReq = requests.find((r) => extractM1(r.body)?.includes("<memory-updates>"));
-                expect(reconcileReq).toBeDefined();
-                const m1 = extractM1(reconcileReq!.body)!;
-                const m0 = extractM0(reconcileReq!.body)!;
-                // Delta invariant: m[1] carries the correction targeting this id.
-                expect(m1).toContain("<memory-updates>");
-                expect(m1).toContain(`<updated id="${memId}">`);
-                expect(m1).toContain("B11 revised rule");
-                // Stale-but-frozen invariant: m[0] is byte-identical and STILL
-                // shows the original text (the mutation did NOT HARD-refold m[0]).
-                expect(m0).toContain("B11 original rule");
-                expect(m0).not.toContain("B11 revised rule");
-                expect(m0).toBe(m0Baseline!);
+                const refoldReq = requests
+                    .filter((r) => extractM0(r.body)?.includes("B11 revised rule"))
+                    .at(-1);
+                expect(refoldReq).toBeDefined();
+                const m1 = extractM1(refoldReq!.body)!;
+                const m0 = extractM0(refoldReq!.body)!;
+                // Fail-closed invariant: the cached block never replays stale
+                // bytes, so m[0] carries the revised text and is NOT the frozen
+                // baseline.
+                expect(m0).toContain("B11 revised rule");
+                expect(m0).not.toContain("B11 original rule");
+                expect(m0).not.toBe(m0Baseline!);
+                // The refold folds the change into m[0] and advances the mutation
+                // cursor, so no <memory-updates> delta is left to render.
+                expect(m1).not.toContain("<memory-updates>");
 
                 // Trailing pure-defer replay pair must be byte-stable.
                 setDefer("B11 replay 1");
