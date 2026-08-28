@@ -3,7 +3,13 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import * as os from "node:os";
 import * as path from "node:path";
 import type { PlatformReaders } from "./bootstrap";
-import { McHostLifecyclePolicy, type WaiterDetachedError } from "./policy";
+import {
+    aggregateForTarget,
+    McHostLifecyclePolicy,
+    OUTER_AGGREGATE_MS,
+    OUTER_AGGREGATE_MS_DARWIN,
+    type WaiterDetachedError,
+} from "./policy";
 
 function tempDir(prefix: string): string {
     return mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -237,6 +243,40 @@ describe("native invocation mapping", () => {
             rmSync(root, { recursive: true, force: true });
         }
     });
+
+    test("each qualified target gets the aggregate it was qualified for", () => {
+        // release/mc-host-production-inputs.lock.json qualifies
+        // fresh_linux_transport_aggregate.hard at 60s and
+        // fresh_macos_transport_aggregate.hard at 15s. Applying the Linux
+        // aggregate on Darwin lets a hung startup run four times past its
+        // budget, so the value has to come from the gate's resolved target.
+        expect(aggregateForTarget("linux-x64-gnu")).toBe(60_000);
+        expect(aggregateForTarget("darwin-arm64")).toBe(15_000);
+        expect(aggregateForTarget("darwin-x64")).toBe(15_000);
+        expect(OUTER_AGGREGATE_MS_DARWIN).toBeLessThan(OUTER_AGGREGATE_MS);
+    });
+
+    test("an explicit aggregate still overrides the platform default", async () => {
+        // The override is what every other test in this file relies on, so it
+        // must keep winning over the platform-derived value.
+        const root = tempDir("mc-policy-aggregate-override-");
+        try {
+            const { binary } = fakeBinary(root, { sleepSeconds: 30 });
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                outerAggregateMs: 400,
+            });
+            const started = Date.now();
+            const result = await policy.start();
+            // 400ms beat both platform defaults, so the child was killed at the
+            // injected deadline rather than at 15s or 60s.
+            expect(Date.now() - started).toBeLessThan(10_000);
+            expect(result.reason).toBe("startup_timeout");
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 20_000);
 
     test("restart is one native transaction, never TS stop+start", async () => {
         const root = tempDir("mc-policy-restart-");

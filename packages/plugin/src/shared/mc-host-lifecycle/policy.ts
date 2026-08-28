@@ -40,6 +40,25 @@ import { type AdmissionIo, admitLifecycleFilesystem, resolveLifecycleDataRoot } 
 export const STORAGE_HARD_BUDGET_MS = 5_000;
 /** Fresh Linux request-to-authenticated-transport outer aggregate (hard). */
 export const OUTER_AGGREGATE_MS = 60_000;
+/**
+ * Fresh macOS request-to-authenticated-transport outer aggregate (hard).
+ *
+ * Darwin is qualified against a far tighter bound than Linux, so applying the
+ * Linux aggregate universally lets a hung macOS startup run four times past the
+ * budget it was qualified for. Both values mirror
+ * `release/mc-host-production-inputs.lock.json`
+ * (`fresh_linux_transport_aggregate.hard`, `fresh_macos_transport_aggregate.hard`);
+ * the generated contract does not carry them yet, so changing one there means
+ * changing it here.
+ */
+export const OUTER_AGGREGATE_MS_DARWIN = 15_000;
+
+/** The qualified outer aggregate for a platform-gate target. */
+export function aggregateForTarget(
+    target: "linux-x64-gnu" | "darwin-arm64" | "darwin-x64",
+): number {
+    return target === "linux-x64-gnu" ? OUTER_AGGREGATE_MS : OUTER_AGGREGATE_MS_DARWIN;
+}
 
 export type LifecycleCommand = "start" | "stop" | "restart" | "status" | "doctor";
 
@@ -157,7 +176,7 @@ export class McHostLifecyclePolicy {
     private readonly admissionIo: AdmissionIo | undefined;
     private readonly storageProbe: (budgetMs: number) => Promise<StorageReadiness>;
     private readonly payloadDir: string | undefined;
-    private readonly outerAggregateMs: number;
+    private readonly outerAggregateMs: number | undefined;
     private readonly inflightStarts = new Map<string, Promise<DaemonResultV1>>();
 
     constructor(options: LifecyclePolicyOptions = {}) {
@@ -168,7 +187,11 @@ export class McHostLifecyclePolicy {
         // Fail closed: an unwired probe must not assert readiness.
         this.storageProbe = options.storageProbe ?? (async () => "unavailable");
         this.payloadDir = options.payloadDir;
-        this.outerAggregateMs = options.outerAggregateMs ?? OUTER_AGGREGATE_MS;
+        // Left undefined when the caller does not pin it: the qualified default
+        // depends on the platform-gate target, which `preflight` resolves per
+        // command rather than in the constructor — `checkPlatform`'s darwin arm
+        // can shell out to `sw_vers`, which does not belong in a constructor.
+        this.outerAggregateMs = options.outerAggregateMs;
     }
 
     /** Count of live coalesced startups; test observability only. */
@@ -377,7 +400,7 @@ export class McHostLifecyclePolicy {
      */
     private preflight(
         command: LifecycleCommand,
-    ): { ok: true; root: string } | { ok: false; result: DaemonResultV1 } {
+    ): { ok: true; root: string; deadlineMs: number } | { ok: false; result: DaemonResultV1 } {
         const rootResolution = resolveLifecycleDataRoot(this.env);
         if (!rootResolution.ok) {
             return { ok: false, result: localResult(command, false, "unavailable", "no_data_dir") };
@@ -399,7 +422,13 @@ export class McHostLifecyclePolicy {
                 result: localResult(command, false, state, platform.reason),
             };
         }
-        return { ok: true, root };
+        // The gate already resolved which qualified target this host is, so the
+        // aggregate comes from that rather than from a Linux-shaped default.
+        return {
+            ok: true,
+            root,
+            deadlineMs: this.outerAggregateMs ?? aggregateForTarget(platform.target),
+        };
     }
 
     private async mutatingCommand(command: "start" | "stop" | "restart"): Promise<DaemonResultV1> {
@@ -412,7 +441,7 @@ export class McHostLifecyclePolicy {
         try {
             const native = await runNativeLifecycle(this.launchTarget, {
                 command: command as NativeLifecycleCommand,
-                deadlineMs: this.outerAggregateMs,
+                deadlineMs: preflight.deadlineMs,
                 env: this.nativeEnv(preflight.root),
                 ...(this.payloadDir !== undefined && command !== "stop"
                     ? { payloadDir: this.payloadDir }
@@ -437,7 +466,7 @@ export class McHostLifecyclePolicy {
         try {
             const native = await runNativeLifecycle(this.launchTarget, {
                 command: "probe",
-                deadlineMs: this.outerAggregateMs,
+                deadlineMs: preflight.deadlineMs,
                 env: this.nativeEnv(preflight.root),
             });
             return this.relabel(native, "status", command);
