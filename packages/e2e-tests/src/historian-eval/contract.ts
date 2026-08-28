@@ -654,9 +654,13 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
  * done. Both halves must be non-empty before the lane spends a token.
  */
 export function parseModelRoute(variable: string, value: string): { providerID: string; modelID: string } {
-    const [providerID, ...modelParts] = value.split("/");
-    const modelID = modelParts.join("/");
-    if (!providerID || providerID.trim().length === 0 || modelParts.length === 0 || modelID.trim().length === 0) {
+    const [rawProvider, ...modelParts] = value.split("/");
+    const providerID = (rawProvider ?? "").trim();
+    const modelID = modelParts.join("/").trim();
+    // Trimmed before the emptiness check *and* on the way out: these strings
+    // are handed to OpenCode as model identifiers, and `"anthropic / claude"`
+    // would otherwise resolve against a provider with a trailing space.
+    if (providerID.length === 0 || modelParts.length === 0 || modelID.length === 0) {
         throw new HistorianEvalContractError([
             `${variable}: expected provider/model with both parts non-empty (got "${value}")`,
         ]);

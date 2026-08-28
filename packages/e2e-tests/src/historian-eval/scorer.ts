@@ -520,6 +520,20 @@ export function scoreRunRecord(
             .all(record.sessionId) as Array<{ startMessage: number; endMessage: number }>;
 
         const probesById = new Map(scenario.probes.map((probe) => [probe.id, probe]));
+        // The runner drives every scenario probe or aborts, so a short probe
+        // set means the record was truncated or hand-edited. Without this the
+        // whole probe tier is silently skipped and the scenario can score
+        // PASS — the same archived-record hazard the pairing checks above
+        // close, so it fails the same way.
+        const exchangedProbeIds = new Set(record.probes.map((exchange) => exchange.probeId));
+        const missingProbes = scenario.probes
+            .filter((probe) => !exchangedProbeIds.has(probe.id))
+            .map((probe) => probe.id);
+        if (missingProbes.length > 0) {
+            throw new Error(
+                `historian-eval scorer: run record for ${record.scenarioId} is missing probe exchange(s) ${missingProbes.join(", ")}`,
+            );
+        }
         const probeVerdicts = record.probes.map((exchange) => {
             const probe = probesById.get(exchange.probeId);
             if (probe === undefined) {

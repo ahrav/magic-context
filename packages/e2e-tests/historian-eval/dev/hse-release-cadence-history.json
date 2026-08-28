@@ -49,6 +49,30 @@
         ]
       },
       {
+        "id": "exp-daily-cadence",
+        "category": "PROJECT_RULES",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "daily"
+        },
+        "sourceTurnRange": [
+          1,
+          1
+        ]
+      },
+      {
+        "id": "exp-canary-traffic",
+        "category": "PROJECT_RULES",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "5 percent"
+        },
+        "sourceTurnRange": [
+          1,
+          1
+        ]
+      },
+      {
         "id": "exp-auto-rollback",
         "category": "PROJECT_RULES",
         "predicate": {
@@ -67,7 +91,7 @@
         "family": "current-vs-historical",
         "predicate": {
           "kind": "normalized-substring",
-          "value": "release cadence is weekly"
+          "value": "weekly friday release train"
         }
       }
     ],
@@ -81,7 +105,7 @@
       "question": "How much traffic does the canary take in the first hour?",
       "answerType": "exact",
       "goldAnswer": "5 percent",
-      "sourceClaimRef": "exp-daily-canary"
+      "sourceClaimRef": "exp-canary-traffic"
     },
     {
       "id": "probe-cadence",
@@ -92,7 +116,7 @@
         "daily"
       ],
       "goldAnswer": "daily",
-      "sourceClaimRef": "exp-daily-canary"
+      "sourceClaimRef": "exp-daily-cadence"
     }
   ]
 }

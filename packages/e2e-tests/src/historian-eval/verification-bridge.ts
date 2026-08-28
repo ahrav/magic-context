@@ -30,7 +30,10 @@ export const LANE_VERIFIER = "historian-eval-lane";
 /**
  * Record a `verified` outcome for every active claim under the identity.
  * Returns the number of claims verified. Throws when the maintenance read
- * itself reports stale — a fresh lane environment cannot legitimately race.
+ * itself reports stale, or when any individual verification is not applied —
+ * a fresh lane environment cannot legitimately race, and a claim left
+ * CANDIDATE stays invisible on the injection read, which would surface as
+ * FAIL:recall against the historian for a bridge failure.
  */
 export function verifyAllActiveClaims(db: Database, projectIdentity: string, nowMs: number): number {
     const projectIds = resolveProjectIdsForIdentities(db, [projectIdentity]);
@@ -45,6 +48,7 @@ export function verifyAllActiveClaims(db: Database, projectIdentity: string, now
         throw new Error(`historian-eval verification bridge: maintenance read stale (${state.reasons.join(", ")})`);
     }
     let verified = 0;
+    const notApplied: string[] = [];
     for (const item of state.items) {
         const result = recordProjectMemoryVerification(
             db,
@@ -57,7 +61,16 @@ export function verifyAllActiveClaims(db: Database, projectIdentity: string, now
                 nowMs,
             },
         );
-        if (result.outcome === "applied") verified += 1;
+        if (result.outcome === "applied") {
+            verified += 1;
+            continue;
+        }
+        notApplied.push(`${item.revisionLocator} (${result.outcome})`);
+    }
+    if (notApplied.length > 0) {
+        throw new Error(
+            `historian-eval verification bridge: verification not applied for ${notApplied.join(", ")}`,
+        );
     }
     return verified;
 }

@@ -278,6 +278,15 @@ describe("parseModelRoute", () => {
         });
     });
 
+    test("trims surrounding whitespace off both components", () => {
+        // These strings go straight to OpenCode as model identifiers, so a
+        // provider of "anthropic " would fail to resolve.
+        expect(parseModelRoute("HISTORIAN_EVAL_MODEL", "anthropic / claude-sonnet-4-5")).toEqual({
+            providerID: "anthropic",
+            modelID: "claude-sonnet-4-5",
+        });
+    });
+
     test.each([
         ["empty model component", "anthropic/"],
         ["whitespace model component", "anthropic/   "],

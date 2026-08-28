@@ -158,6 +158,19 @@ function goldenRun(overrides: Partial<HistorianRunArtifact> = {}): HistorianRunA
     };
 }
 
+/**
+ * The reference scenario with its probe tier removed. Tests isolating a
+ * non-probe failure mode (recall, structural, expiry) use this rather than
+ * blanking a record's `probes`: the scorer requires a record's exchanges to
+ * cover the scenario's probes, and a scenario that declares probes with a
+ * record that has none is malformed, not a shortcut.
+ */
+function scenarioWithoutProbes(): HistorianEvalScenario {
+    const raw = validScenarioRaw();
+    raw.probes = [];
+    return parseScenario(raw);
+}
+
 function makeRecord(
     fixture: SnapshotFixture,
     scenario: HistorianEvalScenario,
@@ -327,10 +340,9 @@ describe("scoreRunRecord", () => {
     test("gold fact absent from the injection read scores FAIL:recall", () => {
         const fixture = makeSnapshot({ facts: goldFacts().slice(0, 1) });
         try {
-            const scenario = validScenario();
+            // No probe tier, so only recall can fail.
+            const scenario = scenarioWithoutProbes();
             const record = makeRecord(fixture, scenario);
-            // Keep probe answers consistent so only recall fails.
-            record.probes = [];
             const score = scoreRunRecord(record, scenario, { recordDir: fixture.dir });
             expect(score.verdict).toBe("FAIL");
             expect(score.failReasons).toEqual(["recall"]);
@@ -361,9 +373,8 @@ describe("scoreRunRecord", () => {
             },
         });
         try {
-            const scenario = validScenario();
+            const scenario = scenarioWithoutProbes();
             const record = makeRecord(fixture, scenario);
-            record.probes = [];
             const score = scoreRunRecord(record, scenario, { recordDir: fixture.dir });
             // Not visible on the injection read, so no false-authoritative match (R3/KTD1).
             expect(score.falseAuthoritativeMatches).toEqual([]);
@@ -382,9 +393,8 @@ describe("scoreRunRecord", () => {
             ],
         });
         try {
-            const scenario = validScenario();
+            const scenario = scenarioWithoutProbes();
             const record = makeRecord(fixture, scenario);
-            record.probes = [];
             const score = scoreRunRecord(record, scenario, { recordDir: fixture.dir });
             expect(score.verdict).toBe("FAIL");
             expect(score.failReasons).toContain("structural");
@@ -397,11 +407,10 @@ describe("scoreRunRecord", () => {
     test("healing evidence violation (final run kept provisional boundary) scores FAIL:structural", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {
-            const scenario = validScenario();
+            const scenario = scenarioWithoutProbes();
             const record = makeRecord(fixture, scenario, {
                 historianRuns: [goldenRun({ emittedCompartments: 2, persistedCompartments: 2, lookaheadMargin: 1 })],
             });
-            record.probes = [];
             const score = scoreRunRecord(record, scenario, { recordDir: fixture.dir });
             expect(score.failReasons).toContain("structural");
             expect(score.structuralFindings.some((finding) => finding.includes("healing"))).toBe(true);
@@ -413,13 +422,28 @@ describe("scoreRunRecord", () => {
     test("unhealed discard on the final run scores FAIL:structural", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {
-            const scenario = validScenario();
+            const scenario = scenarioWithoutProbes();
             const record = makeRecord(fixture, scenario, {
                 historianRuns: [goldenRun(), goldenRun({ runIndex: 2, discardedLast: true })],
             });
-            record.probes = [];
             const score = scoreRunRecord(record, scenario, { recordDir: fixture.dir });
             expect(score.failReasons).toContain("structural");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("refuses a run record missing probe exchanges for declared probes", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = validScenario();
+            const truncated = makeRecord(fixture, scenario);
+            // A truncated archive would otherwise skip the whole probe tier
+            // and score PASS on facts and structure alone.
+            truncated.probes = truncated.probes.slice(0, 1);
+            expect(() => scoreRunRecord(truncated, scenario, { recordDir: fixture.dir })).toThrow(
+                /missing probe exchange\(s\)/,
+            );
         } finally {
             fixture.cleanup();
         }
@@ -545,6 +569,9 @@ describe("scoreRunRecord", () => {
                     goldenRun({ runIndex: 2, status: "failed", failureReason: "validation failed", rawOutput: "garbage" }),
                 ],
             });
+            // The runner really does return `probes: []` here: with nothing
+            // published the probe tier is meaningless. Scoring short-circuits
+            // before the probe-cardinality check for exactly that reason.
             record.probes = [];
             const score = scoreRunRecord(record, scenario, { recordDir: fixture.dir });
             expect(score.verdict).toBe("FAIL");
@@ -583,9 +610,8 @@ describe("scoreRunRecord", () => {
             expiresAt: pinnedNowMs + 60_000,
         });
         try {
-            const scenario = validScenario();
+            const scenario = scenarioWithoutProbes();
             const record = makeRecord(fixture, scenario);
-            record.probes = [];
             const first = scoreRunRecord(record, scenario, { recordDir: fixture.dir });
             const second = scoreRunRecord(record, scenario, { recordDir: fixture.dir });
             expect(first.verdict).toBe("PASS");
