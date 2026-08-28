@@ -19,7 +19,10 @@ function startResultJson(command: string): string {
         state: "running",
         reason: command === "start" ? "started" : "healthy",
         remediation: null,
-        effects: null,
+        // A successful restart must carry its commit evidence, so a fixture that
+        // reported null here would be rejected by the parser and land as
+        // `internal_error` — passing any test that only checks `command`.
+        effects: command === "restart" ? { stop_committed: true, start_committed: true } : null,
         readiness: { transport: { state: "ready", reason: "healthy" } },
         checks: [],
         versions: {
@@ -54,6 +57,10 @@ function fakeBinary(
             // echoed `probe` back would only prove the client agrees with
             // itself.
             `  probe) echo '${startResultJson("status").replace("started", "healthy")}';;\n` +
+            // Restart is its own case rather than a sed of the start payload:
+            // it is the one command whose success must carry effects, and the
+            // rewrite could not add them.
+            `  restart) echo '${startResultJson("restart")}';;\n` +
             `  *) echo '${startResultJson("start")}' | sed "s/\\"command\\":\\"start\\"/\\"command\\":\\"$1\\"/";;\n` +
             "esac\nexit 0\n",
     );
@@ -241,6 +248,13 @@ describe("native invocation mapping", () => {
             });
             const result = await policy.restart();
             expect(result.command).toBe("restart");
+            // Asserting `command` alone would pass even when the native payload
+            // was rejected, because `launchFailure` also stamps the caller's
+            // command onto its `internal_error` result. The outcome fields are
+            // what prove the native restart was actually accepted.
+            expect(result.ok).toBe(true);
+            expect(result.reason).toBe("healthy");
+            expect(result.effects).toEqual({ stop_committed: true, start_committed: true });
             expect(invocations(invocationLog)).toEqual(["restart"]);
         } finally {
             rmSync(root, { recursive: true, force: true });
