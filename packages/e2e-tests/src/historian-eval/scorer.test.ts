@@ -235,8 +235,15 @@ function makeRecord(
             // The response the answer was extracted from; the scorer reproduces
             // the extraction and requires the two to agree.
             responseText: `<answer>${answerRaw}</answer>`,
-            // No re-ask in the golden fixture, so nothing was discarded.
+            // No re-ask in the golden fixture, so nothing was discarded and the only
+            // request IS the final one.
             discardedResponseTexts: [],
+            finalRequestPayloadText: [
+                buildProbePrompt(probe),
+                "<project-memory>",
+                ...fixture.injectedClaims.map((claim) => `${claim.publicClaimId}: ${claim.content}`),
+                "</project-memory>",
+            ].join("\n"),
         };
     });
     const record = buildRecord();
@@ -611,7 +618,10 @@ describe("scoreRunRecord", () => {
             facts: goldFacts(),
             compartments: [
                 { start: 1, end: 5 },
-                { start: 4, end: 8 },
+                // Overlaps the first range, which is the finding under test; extended to 18
+                // so the chunk the runs were handed still spans the authored transcript, as
+                // a lint-clean recipe's does.
+                { start: 4, end: 18 },
             ],
         });
         try {
@@ -1129,9 +1139,8 @@ describe("scoreRunRecord", () => {
         const fixture = makeSnapshot({
             facts: goldFacts(),
             compartments: [
-                { start: 1, end: 4 },
-                { start: 5, end: 8 },
-                { start: 9, end: 12 },
+                { start: 1, end: 12 },
+                { start: 13, end: 16 },
             ],
         });
         try {
@@ -1144,9 +1153,13 @@ describe("scoreRunRecord", () => {
                     goldenRun({ persistedCompartments: 1, emittedCompartments: 1 }),
                     goldenRun({
                         runIndex: 2,
-                        persistedCompartments: 2,
-                        emittedCompartments: 2,
-                        lookaheadMargin: 1,
+                        persistedCompartments: 1,
+                        emittedCompartments: 1,
+                        // Inside `HISTORIAN_BOUNDARY_HEALING_SLACK`, which is what makes this
+                        // a KEPT provisional boundary; it also puts the chunk end at 18, so
+                        // the runs were handed the authored span even though their
+                        // compartments stop at 16 and leave the capacity claim uncovered.
+                        lookaheadMargin: 2,
                         factsEmitted: 0,
                     }),
                 ],
@@ -1160,7 +1173,9 @@ describe("scoreRunRecord", () => {
     });
 
     test("an unhealed discard covering a probe's gold range stays a structural FAIL", () => {
-        const fixture = makeSnapshot({ facts: goldFacts(), compartments: [{ start: 1, end: 12 }] });
+        // Compartments reach 16, leaving the capacity claim's 17-18 uncovered — which is the
+        // premise — while the chunk the runs were handed still spans the authored transcript.
+        const fixture = makeSnapshot({ facts: goldFacts(), compartments: [{ start: 1, end: 16 }] });
         try {
             const scenario = validScenario();
             // The final run dropped its provisional tail, which is why the probe's
@@ -1176,6 +1191,9 @@ describe("scoreRunRecord", () => {
                         emittedCompartments: 1,
                         discardedLast: true,
                         factsEmitted: 0,
+                        // Puts this run's chunk end at 18, so the runs were handed the
+                        // authored span even though the discard left its tail uncovered.
+                        lookaheadMargin: 2,
                     }),
                 ],
             });
@@ -1619,7 +1637,7 @@ describe("scoreRunRecord", () => {
         // minCount is satisfied by the filler compartment, but the authored
         // range 13-20 is not covered, so the splice cannot have removed the raw
         // gold history the probe is supposed to be blind to.
-        const fixture = makeSnapshot({ facts: goldFacts(), compartments: [{ start: 1, end: 12 }] });
+        const fixture = makeSnapshot({ facts: goldFacts(), compartments: [{ start: 1, end: 16 }] });
         try {
             const scenario = validScenario();
             // One compartment row, so the two declared runs must account for
@@ -1627,7 +1645,15 @@ describe("scoreRunRecord", () => {
             const record = makeRecord(fixture, scenario, {
                 historianRuns: [
                     goldenRun({ persistedCompartments: 1, emittedCompartments: 1 }),
-                    goldenRun({ runIndex: 2, persistedCompartments: 0, emittedCompartments: 0, factsEmitted: 0 }),
+                    // `lookaheadMargin` puts the chunk end at 18: the runs were handed the
+                    // authored span, and the compartments simply stop short of it.
+                    goldenRun({
+                        runIndex: 2,
+                        persistedCompartments: 0,
+                        emittedCompartments: 0,
+                        factsEmitted: 0,
+                        lookaheadMargin: 2,
+                    }),
                 ],
             });
             const score = scoreRunRecord(record, scenario);
@@ -1952,6 +1978,7 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
         reAsked: false,
         injectedRevisionLocators: locators,
         payloadText: null,
+        finalRequestPayloadText: null,
         responseText: answerRaw === null ? null : `<answer>${answerRaw}</answer>`,
         discardedResponseTexts: [],
     });
@@ -2103,6 +2130,9 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
                 ...exchange(probe.id, "4096", ["loc-lru01"]),
                 payloadText:
                     "<new-compartments>\nCache decision: capacity set to 4096 entries.\n</new-compartments>",
+                // One request in this fixture, so the final request carries the same text.
+                finalRequestPayloadText:
+                    "<new-compartments>\nCache decision: capacity set to 4096 entries.\n</new-compartments>",
             },
             scenario,
             injectedClaims: injected,
@@ -2121,6 +2151,9 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
             exchange: {
                 ...exchange(probe.id, "wrong", ["loc-lru01"]),
                 payloadText:
+                    "<new-compartments>\nCache decision: capacity set to 4096 entries.\n</new-compartments>",
+                // One request in this fixture, so the final request carries the same text.
+                finalRequestPayloadText:
                     "<new-compartments>\nCache decision: capacity set to 4096 entries.\n</new-compartments>",
             },
             scenario,
@@ -2144,6 +2177,9 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
                 ...exchange(probe.id, "mem-lru01", ["loc-cap01"]),
                 payloadText:
                     "<new-compartments>\nSessions are cached by the in-process LRU cache.\n</new-compartments>",
+                // One request in this fixture, so the final request carries the same text.
+                finalRequestPayloadText:
+                    "<new-compartments>\nSessions are cached by the in-process LRU cache.\n</new-compartments>",
             },
             scenario,
             injectedClaims: injected,
@@ -2159,7 +2195,11 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
             probe,
             exchange: {
                 ...exchange(probe.id, "wrong", ["loc-lru01"]),
-                payloadText: "<new-compartments>\nCache decision: Redis was rejected.\n</new-compartments>",
+                payloadText:
+ "<new-compartments>\nCache decision: Redis was rejected.\n</new-compartments>",
+                // One request in this fixture, so the final request carries the same text.
+                finalRequestPayloadText:
+ "<new-compartments>\nCache decision: Redis was rejected.\n</new-compartments>",
             },
             scenario,
             injectedClaims: injected,
@@ -2175,7 +2215,11 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
             probe,
             exchange: {
                 ...exchange(probe.id, "wrong", ["loc-lru01"]),
-                payloadText: "<project-memory>\nmem-cap01: Session cache capacity is 4096 entries.\n</project-memory>",
+                payloadText:
+ "<project-memory>\nmem-cap01: Session cache capacity is 4096 entries.\n</project-memory>",
+                // One request in this fixture, so the final request carries the same text.
+                finalRequestPayloadText:
+ "<project-memory>\nmem-cap01: Session cache capacity is 4096 entries.\n</project-memory>",
             },
             scenario,
             injectedClaims: injected,

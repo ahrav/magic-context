@@ -937,14 +937,30 @@ function canonicalOrder<T>(entries: readonly T[]): T[] {
  * infrastructure. `&amp;` is decoded LAST so a doubly-escaped `&amp;lt;` becomes
  * `&lt;` rather than `<`, matching how a decoder consumes one layer.
  */
+/**
+ * One decoded code point, or the entity text unchanged when it names none.
+ *
+ * `String.fromCodePoint` THROWS a `RangeError` outside the Unicode range, and this
+ * decoder runs over model-authored text — so `<answer>&#999999999;</answer>` turned an
+ * ordinary wrong answer into a harness ERROR during the live scan, and could throw out
+ * of stored-record scoring entirely. An entity naming no character is not a decoding
+ * result; leaving it as written is both non-throwing and the honest reading.
+ */
+function codePointOrRaw(code: number, raw: string): string {
+    if (!Number.isSafeInteger(code) || code < 0 || code > 0x10ffff) return raw;
+    // Lone surrogates are in range for `fromCodePoint` but name no character.
+    if (code >= 0xd800 && code <= 0xdfff) return raw;
+    return String.fromCodePoint(code);
+}
+
 export function decodeXmlEntities(text: string): string {
     return text
         .replace(/&lt;/g, "<")
         .replace(/&gt;/g, ">")
         .replace(/&quot;/g, '"')
         .replace(/&apos;/g, "'")
-        .replace(/&#(\d+);/g, (_match, code: string) => String.fromCodePoint(Number(code)))
-        .replace(/&#x([0-9a-fA-F]+);/g, (_match, code: string) => String.fromCodePoint(Number.parseInt(code, 16)))
+        .replace(/&#(\d+);/g, (match, code: string) => codePointOrRaw(Number(code), match))
+        .replace(/&#x([0-9a-fA-F]+);/g, (match, code: string) => codePointOrRaw(Number.parseInt(code, 16), match))
         .replace(/&amp;/g, "&");
 }
 
@@ -981,6 +997,13 @@ export function matchesGold(
  * inside a sentence while `"4"` no longer matches inside `"4096"`.
  */
 export function containsCompleteValue(content: string, value: string): boolean {
+    // Both sides decoded first, so every collision guard uses the SAME equality
+    // `compareProbeAnswer` accepts on. Without it a gold of `A&B` was accepted when a
+    // model answered `A&amp;B`, while a question or an earlier reply containing
+    // `A&amp;B` passed these guards — so the escaped form could be copied out of the
+    // prompt or the shared history and still score.
+    content = decodeXmlEntities(content);
+    value = decodeXmlEntities(value);
     const needle = normalizeContent(value);
     if (needle.length === 0) return false;
     const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

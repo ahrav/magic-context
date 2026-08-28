@@ -341,6 +341,16 @@ export interface ProbeExchange {
     /** Captured probe-turn request payload (mock-captured; null on live routes). */
     payloadText: string | null;
     /**
+     * The FINAL captured request of the turn — the one that produced the accepted answer.
+     *
+     * `payloadText` spans every request in the probe's window, which the leak gate wants
+     * because each one's text reached the session. Per-turn EVIDENCE wants the opposite:
+     * on a re-ask, a claim or compartment block rendered for the discarded first attempt
+     * says nothing about what the answering request carried, and reading the combined
+     * text let a stale block suppress `error-trimmed` for a guessed retry.
+     */
+    finalRequestPayloadText: string | null;
+    /**
      * Assistant text the answer was extracted from.
      *
      * `answerRaw` is a derivation, and on its own an unfalsifiable one: rescoring
@@ -1368,6 +1378,18 @@ class ScenarioRunner {
                 `historian run ${runIndex} found ${rowsBeforeSpike} run row(s) before its spike turn; ${runIndex - 1} expected, so a pass fired against an undeclared trigger point`,
             );
         }
+        // Quiescent too, because the row is written only when an asynchronous pass
+        // FINISHES. An earlier turn's pass can already be in flight with the row count
+        // still correct — and then the declared spike cannot start its own pass, the wait
+        // below adopts the in-flight one as this run, and because that pass consumed the
+        // scripted output the drift check stays clean as well. The count proves no pass has
+        // completed; this proves none is running.
+        if (!this.historianQuiesced(harness, sessionId)) {
+            throw new RunAbort(
+                "harness-failure",
+                `historian run ${runIndex} found a pass already in flight before its spike turn; the declared run would adopt that pass's trigger point and chunk`,
+            );
+        }
         await this.scriptedTurn(
             harness,
             sessionId,
@@ -1896,6 +1918,7 @@ class ScenarioRunner {
             reAsked,
             injectedRevisionLocators: this.injectedLocatorsForTurn(harness, sessionId, finalRequestPayload),
             payloadText,
+            finalRequestPayloadText: finalRequestPayload,
             responseText,
             discardedResponseTexts,
         };

@@ -625,6 +625,38 @@ describe("gold and probe freeze guards", () => {
         expect(() => parseScenario(sharedSurface)).not.toThrow(/4096/);
     });
 
+    test("a question stating the ESCAPED form of its own answer is still self-answering", () => {
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Record<string, unknown>[];
+        // `compareProbeAnswer` accepts `A&amp;B` for an authored gold of `A&B`, so a raw
+        // collision check let the escaped form sit in the prompt and still score. Every
+        // guard canonicalizes through `containsCompleteValue` now, so the two agree.
+        probes.push({
+            id: "probe-escaped-self",
+            question: "The marker is A&amp;B — what is the marker?",
+            answerType: "exact",
+            goldAnswer: "A&B",
+            sourceClaimRef: "exp-cache-capacity",
+        });
+        expect(() => parseScenario(raw)).toThrow(/self-answering/);
+    });
+
+    test("an oversized numeric entity is refused, not a thrown RangeError", () => {
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Record<string, unknown>[];
+        // `String.fromCodePoint` throws outside the Unicode range, and the decoder runs over
+        // authored and model text alike — so an entity naming no character must pass through
+        // as written rather than crash the parse.
+        probes.push({
+            id: "probe-bad-entity",
+            question: "What does &#999999999; denote?",
+            answerType: "exact",
+            goldAnswer: "nothing",
+            sourceClaimRef: "exp-cache-capacity",
+        });
+        expect(() => parseScenario(raw)).not.toThrow(/RangeError|Invalid code point/);
+    });
+
     test("rejects an exact probe whose question states its own gold answer", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];

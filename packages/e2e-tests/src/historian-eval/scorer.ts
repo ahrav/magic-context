@@ -348,7 +348,13 @@ function healingFindings(record: HistorianEvalRunRecord): string[] {
  * an absence of proof — the same live-mode capture gap the replayed leak gate carries.
  */
 function goldAnswerStatedInCompartments(probe: Probe, exchange: ProbeExchange): boolean {
-    if (probe.answerType === "claim-id" || exchange.payloadText === null) return false;
+    // The FINAL request, not the concatenated window. A compartment rendered for a
+    // discarded first attempt says nothing about what the answering request carried, and
+    // reading the combined text let that stale block suppress `error-trimmed` for a
+    // guessed retry — the same staleness the locator evidence already binds to this
+    // request.
+    const payloadText = exchange.finalRequestPayloadText;
+    if (probe.answerType === "claim-id" || payloadText === null) return false;
     // The ANSWER as a complete value, not the gold predicate. A summary matching a
     // predicate broader than the answer states the topic without stating the value, so
     // searching for the predicate reported an answer the probe could not have read.
@@ -359,7 +365,7 @@ function goldAnswerStatedInCompartments(probe: Probe, exchange: ProbeExchange): 
     // probe into an infrastructure ERROR. Decoding also removes the reverse hazard, where
     // an answer of `amp` matched the entity text rather than any stated value.
     return containsCompleteValue(
-        decodeXmlEntities(injectedBlockContents(exchange.payloadText, COMPARTMENT_BLOCK_TAGS)),
+        injectedBlockContents(payloadText, COMPARTMENT_BLOCK_TAGS),
         probe.goldAnswer,
     );
 }
@@ -658,14 +664,23 @@ export function scoreRawOutput(
     // the validated result. Pre-discard, since the question is what the output covered,
     // not what production would persist. Bounded by the authored span, since filler and
     // padding carry no gold.
+    // BOTH ends. Checking only the reach let a later captured chunk — one starting after
+    // an early hard negative — form every later positive claim, reach the authored end, and
+    // still never see the negative, so its absence passed vacuously exactly as a truncated
+    // suffix did.
     const emittedReach = validated.compartments.reduce(
         (furthest, compartment) => Math.max(furthest, compartment.endMessage),
         0,
     );
-    if (emittedReach < authoredSpan.endMessage) {
+    const emittedStart = validated.compartments.reduce(
+        (earliest, compartment) => Math.min(earliest, compartment.startMessage),
+        Number.POSITIVE_INFINITY,
+    );
+    if (emittedReach < authoredSpan.endMessage || emittedStart > authoredSpan.startMessage) {
+        const covered = Number.isFinite(emittedStart) ? `${emittedStart}-${emittedReach}` : "nothing";
         return {
             stage: "authored-evidence-unprocessed",
-            error: `output covers up to ordinal ${emittedReach}, short of the authored span ${authoredSpan.startMessage}-${authoredSpan.endMessage}; gold and absence checks over the unprocessed suffix would pass vacuously`,
+            error: `output covers ${covered}, which does not span the authored ordinals ${authoredSpan.startMessage}-${authoredSpan.endMessage}; gold and absence checks over the uncovered part would pass vacuously`,
         };
     }
 
@@ -859,6 +874,8 @@ function recordShapeError(record: HistorianEvalRunRecord): ScenarioScore | null 
                 typeof exchange.probeId === "string" &&
                 (exchange.answerRaw === null || typeof exchange.answerRaw === "string") &&
                 (exchange.payloadText === null || typeof exchange.payloadText === "string") &&
+                (exchange.finalRequestPayloadText === null ||
+                    typeof exchange.finalRequestPayloadText === "string") &&
                 (exchange.responseText === null || typeof exchange.responseText === "string") &&
                 // Validated for the same reason `promotionEvidenceAdded` is: the deferred
                 // claim-id leak scan reads this array, and an omitted field would make it
@@ -1430,6 +1447,34 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
         // records no probe exchanges by design.
         const coverageError = probeCoverageError(record, scenario);
         if (coverageError !== null) return coverageError;
+
+        // The runner's authored-chunk-coverage proof, reapplied to a stored artifact. The
+        // live gate rejects a token-capped run before it writes a completed record, but a
+        // record scored independently never passes through it — and a v1 artifact whose
+        // successful chunks stop before a hard-negative suffix passes facts and the early
+        // probes while the absence check passes vacuously. The ranges are snapshot-bound by
+        // the telemetry cross-check above, and the ordinals by `recordIdentityError`, so
+        // both inputs are already proven.
+        const preEpilogue = record.authoredTurnOrdinals.slice(0, scenario.transcript.epilogueStartIndex);
+        if (preEpilogue.length > 0) {
+            const required: [number, number] = [
+                preEpilogue[0][0],
+                Math.max(...preEpilogue.map(([, assistant]) => assistant)),
+            ];
+            const chunkRanges = record.historianRuns
+                .filter((run) => run.chunkStartOrdinal !== null && run.chunkEndOrdinal !== null)
+                .map((run) => ({ start: run.chunkStartOrdinal as number, end: run.chunkEndOrdinal as number }));
+            if (!rangeCoveredByCompartments(required, chunkRanges)) {
+                return errorScore(
+                    record.scenarioId,
+                    "harness-failure",
+                    `the recorded chunks do not cover authored ordinals ${required[0]}-${required[1]}: [${chunkRanges
+                        .map((chunk) => `${chunk.start}-${chunk.end}`)
+                        .join(", ")}]. Part of the transcript was never shown to the model, so absence checks would pass vacuously`,
+                    record.system,
+                );
+            }
+        }
 
         // The runner's promotion-plumbing guard, reapplied to a stored artifact.
         // A run that emitted facts, kept its tail, and added no claim or evidence
