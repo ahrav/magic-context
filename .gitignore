@@ -97,6 +97,9 @@ packages/plugin/scripts/mural-test-output/
 # Interrupted benchmark-release promotions must never become committable.
 packages/plugin/scripts/fixtures/retrieval-benchmark/.staging-*/
 packages/e2e-tests/historian-eval/**/.staging-*/
+# Nor the promotion lock: it outlives a crashed promoter by design, and a tracked
+# copy would refuse every promotion in every checkout at the wx creation step.
+packages/e2e-tests/historian-eval/**/.promote.lock
 AgentLogs/
 .agent-logs/
 tests/docker/.generated/

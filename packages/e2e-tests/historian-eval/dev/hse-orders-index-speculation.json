@@ -69,6 +69,14 @@
           "kind": "normalized-substring",
           "value": "covering index on tenant_id"
         }
+      },
+      {
+        "id": "abs-denormalize-totals",
+        "family": "assistant-speculation",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "denormalize the totals column"
+        }
       }
     ],
     "compartments": {
