@@ -25,7 +25,7 @@ export default function StatusBar(props: Props) {
       </div>
       <Show when={props.health?.exists}>
         <div class="status-item">
-          <span>{count("memories")} memories</span>
+          <span>{count("claims")} memories</span>
         </div>
         <div class="status-item">
           <span>{count("compartments")} compartments</span>

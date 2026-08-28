@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -406,10 +406,21 @@ pub fn read_launcher_envelope() -> Result<LauncherEnvelope, &'static str> {
 }
 
 fn storage_init(root: &Path) -> Result<HostInit, &'static str> {
-    let managed = root.join("cortexkit");
-    std::fs::create_dir_all(&managed).map_err(|_| "managed directory creation failed")?;
-    std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o700))
-        .map_err(|_| "managed directory permissions failed")?;
+    // The managed segment is the library's definition, not a second copy: a
+    // rename here would otherwise leave the store outside the tree that
+    // `mc_host::run` creates and validates.
+    let managed =
+        mc_host::managed_dir_path(Some(root)).map_err(|_| "managed directory path failed")?;
+    // Mode is applied by mkdir(2) at creation rather than by a follow-up
+    // chmod: `set_permissions` follows symlinks, so on a pre-existing
+    // symlinked path it would change the mode of the target instead. The
+    // authoritative owner-only creation and ancestor validation of this tree
+    // stay with `mc_host::run`.
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&managed)
+        .map_err(|_| "managed directory creation failed")?;
     let descriptor = cortexkit_store_types::StorageDescriptor {
         module_id: "magic-context".to_owned(),
         storage_namespace: "mc_cache".to_owned(),
@@ -520,19 +531,31 @@ pub fn run() -> Result<(), &'static str> {
     let shutdown = CancellationToken::new();
     runtime.block_on(async {
         let signal_shutdown = shutdown.clone();
+        // Installed before the host future starts. Creating a stream inside the
+        // spawned task races `mc_host::run`: a signal arriving before
+        // registration takes the default disposition and kills the daemon
+        // outright, so the runtime never observes the cancellation and the
+        // fenced teardown in `mc_host::run` never runs. An installation failure
+        // is also fatal to the shutdown path, so it fails startup here rather
+        // than panicking a detached task and leaving `run` serving with no
+        // signal handling and nothing reporting it.
+        //
+        // SIGINT is handled alongside SIGTERM: the spawn path resets every
+        // inherited disposition to its default, so an interrupt from an operator
+        // or a process supervisor would otherwise terminate the daemon without
+        // draining routes and components.
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|_| "SIGTERM handler installation failed")?;
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .map_err(|_| "SIGINT handler installation failed")?;
         let signal_task = tokio::spawn(async move {
-            let mut terminate =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("SIGTERM handler installs");
-            let mut interrupt =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                    .expect("SIGINT handler installs");
-            if tokio::select! {
-                received = terminate.recv() => received,
-                received = interrupt.recv() => received,
-            }
-            .is_some()
-            {
+            let received = tokio::select! {
+                signal = terminate.recv() => signal,
+                signal = interrupt.recv() => signal,
+            };
+            if received.is_some() {
                 signal_shutdown.cancel();
             }
         });

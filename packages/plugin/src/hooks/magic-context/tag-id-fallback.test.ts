@@ -1,20 +1,16 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
-import { runMigrations } from "../../features/magic-context/migrations";
-import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getTagsBySession } from "../../features/magic-context/storage-tags";
 import { createTagger } from "../../features/magic-context/tagger";
+import { createDirectTestDatabase } from "../../features/magic-context/test-database";
 import type { Database as DatabaseType } from "../../shared/sqlite";
-import { Database } from "../../shared/sqlite";
 import { type MessageLike, tagMessages } from "./transform-operations";
 
 type TestPart = { type: "text"; text: string } | { type: "metadata"; value?: string };
 
 function openTestDb(): DatabaseType {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase().db;
     return db;
 }
 

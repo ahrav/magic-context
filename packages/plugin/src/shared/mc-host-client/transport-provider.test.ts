@@ -15,7 +15,7 @@ import { type ClientTransportProvider, sanitizedCandidateFactory } from "./trans
 
 function fakeProviderChannel(overrides: Partial<SetupFrameChannel>): SetupFrameChannel {
     return {
-        start: async () => ({ daemonVer: "fake" }),
+        start: async () => {},
         beginFrames: () => {},
         produce: () => ({ cancel: () => true }),
         reserve: () => {

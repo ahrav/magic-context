@@ -15,7 +15,7 @@ use mc_host::synapse::{SynapseComponent, SynapseConfig, SynapseLimits, SynapseSt
 use mc_host::{CompositeComponent, HostError, SecondaryComponent, StaticComposite};
 use sha2::{Digest, Sha256};
 
-use support::synapse::EchoPrimary;
+use support::synapse::{test_lane, DeterministicEngine, EchoPrimary};
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/synapse-tiny")
@@ -114,16 +114,88 @@ async fn expect_disabled_with(mutate: impl FnOnce(&Path), expected_fragment: &st
     );
 }
 
-async fn expect_limits_disabled(mutate: impl FnOnce(&mut SynapseLimits), expected_fragment: &str) {
+/// Infeasible limits are operator configuration error: startup must fail the
+/// host loudly rather than disable the lane while the host reports healthy.
+///
+/// The check runs in `activate`, not `initialize`: bundle verification, ORT
+/// load, and model construction are post-publication work, so `initialize`
+/// only records that the lane is starting. An `Err` from `activate` is a
+/// host-fatal invariant failure — the same loud outcome, one phase later —
+/// which is why both phases are driven here rather than just the first.
+async fn expect_limits_fail_startup(
+    mutate: impl FnOnce(&mut SynapseLimits),
+    expected_fragment: &str,
+) {
     let dir = tempfile::tempdir().expect("temp bundle dir");
     copy_fixture_to(dir.path());
     let mut config = config_for(dir.path(), &pre_ort_identity());
     mutate(&mut config.limits);
-    let reason = disabled_reason(&initialize(config).await);
+    let component = SynapseComponent::new(Some(config));
+    component
+        .initialize()
+        .await
+        .expect("bootstrap defers bundle work and cannot fail on limits");
+    assert!(
+        matches!(component.status(), SynapseStatus::Starting),
+        "bootstrap must leave the lane starting, not decided"
+    );
+    let error = component
+        .activate()
+        .await
+        .expect_err("infeasible limits must fail activation");
+    let reason = error.to_string();
     assert!(
         reason.contains(expected_fragment),
-        "reason {reason:?} does not mention {expected_fragment:?}"
+        "error {reason:?} does not mention {expected_fragment:?}"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn waiting_query_memory_bound_rejects_both_construction_paths() {
+    // The startup scratch formula at default limits, pinned so a formula or
+    // pool change must recompute this boundary deliberately:
+    //   reservable = SCRATCH_RESERVED_BYTES (184,616,192)
+    //              - RETAINED_METADATA_RESERVED_BYTES (2,097,152) = 182,519,040
+    //   per waiter slot   = 2 * max_text_bytes + 256          =   2,097,408
+    //   queued text bytes = max_queued_request_bytes          =  67,108,864
+    //   queued metadata   = 64 jobs * (2*64 + 64 * 960)       =   3,940,352
+    //   worst parse       = 3 * 32 MiB + 64 * 640 + 4096      = 100,708,352
+    //   K = 4: 182,244,608 <= 182,519,040 (feasible boundary)
+    //   K = 5: 184,342,016 >  182,519,040 (rejected)
+    const BOUNDARY: usize = 4;
+
+    // The accepted twin: the largest feasible K constructs on both paths.
+    let accepted = SynapseLimits {
+        max_waiting_queries: BOUNDARY,
+        ..SynapseLimits::default()
+    };
+    mc_host::synapse::bundle::load_bundle(&fixture_dir(), &accepted)
+        .expect("the boundary configuration loads through the bundle path");
+    SynapseComponent::ready_with_engine(test_lane(), DeterministicEngine::new(), accepted)
+        .expect("the boundary configuration constructs through the engine path");
+
+    // One waiter past the boundary fails both paths with the scratch bound.
+    expect_limits_fail_startup(
+        |limits| limits.max_waiting_queries = BOUNDARY + 1,
+        "query admission capacity requires",
+    )
+    .await;
+
+    let limits = SynapseLimits {
+        max_waiting_queries: BOUNDARY + 1,
+        ..SynapseLimits::default()
+    };
+    let error = match SynapseComponent::ready_with_engine(
+        test_lane(),
+        DeterministicEngine::new(),
+        limits,
+    ) {
+        Ok(_) => panic!("the ready-engine seam must apply serving-limit validation"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("query admission capacity requires"));
 }
 
 fn edit_manifest(dir: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
@@ -176,6 +248,27 @@ async fn unconfigured_component_is_disabled_not_fatal() {
         component.health().await.status,
         mc_host::HealthStatus::Degraded
     );
+    // A lane that rejects every bind never parks a general handler task on
+    // query admission, so it must not spend one of the host's general
+    // handler-task slots: a host reserving all but one slot still starts.
+    assert_eq!(
+        component.resources().general_task_hold_bound,
+        0,
+        "a disabled lane must declare no parked general handler tasks"
+    );
+    // The bound survives for a lane that can serve: the running query plus
+    // every allowed waiter.
+    let ready = SynapseComponent::ready_with_engine(
+        test_lane(),
+        DeterministicEngine::new(),
+        SynapseLimits {
+            max_waiting_queries: 2,
+            max_queued_request_bytes: 8 * 1024 * 1024,
+            ..SynapseLimits::default()
+        },
+    )
+    .expect("two waiters fit the default scratch pool");
+    assert_eq!(ready.resources().general_task_hold_bound, 3);
 }
 
 fn identity() -> mc_host::RouteIdentity {
@@ -343,11 +436,11 @@ async fn retained_result_cap_below_the_manifest_batch_bound_disables_before_ort(
 }
 
 #[tokio::test]
-async fn incoherent_host_serving_limits_disable_before_ort() {
-    expect_limits_disabled(|limits| limits.max_text_bytes = 3, "UTF-8 code point").await;
-    expect_limits_disabled(|limits| limits.max_batch_items = 0, "max batch items").await;
-    expect_limits_disabled(|limits| limits.max_retained_jobs = 0, "retained job count").await;
-    expect_limits_disabled(
+async fn incoherent_host_serving_limits_fail_startup_before_ort() {
+    expect_limits_fail_startup(|limits| limits.max_text_bytes = 3, "UTF-8 code point").await;
+    expect_limits_fail_startup(|limits| limits.max_batch_items = 0, "max batch items").await;
+    expect_limits_fail_startup(|limits| limits.max_retained_jobs = 0, "retained job count").await;
+    expect_limits_fail_startup(
         |limits| limits.max_queued_request_bytes = limits.max_batch_text_bytes as u64 - 1,
         "queued request bytes",
     )

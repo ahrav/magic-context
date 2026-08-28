@@ -1,10 +1,9 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { Database } from "../../../shared/sqlite";
+import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
-import { runMigrations } from "../migrations";
-import { initializeDatabase } from "../storage-db";
+import { createDirectTestDatabase } from "../test-database";
 import {
     getMostRecentTaskRunAt,
     getTaskScheduleState,
@@ -20,9 +19,7 @@ afterEach(() => {
 });
 
 function freshDb(): Database {
-    const d = new Database(":memory:");
-    initializeDatabase(d);
-    runMigrations(d);
+    const d = createDirectTestDatabase().db;
     return d;
 }
 

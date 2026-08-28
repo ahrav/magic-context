@@ -16,12 +16,11 @@
 
 import { createHash } from "node:crypto";
 import type { Database } from "../../../shared/sqlite.ts";
-import {
-    APPLICABILITY_STREAM_KEY_PROTOCOL,
-    type ApplicabilityOwnerKind,
-    type ApplicabilityPathKind,
-    type ApplicabilityPathsState,
-    type ApplicabilityState,
+import type {
+    ApplicabilityOwnerKind,
+    ApplicabilityPathKind,
+    ApplicabilityPathsState,
+    ApplicabilityState,
 } from "../storage-claim-applicability-schema.ts";
 
 export class ApplicabilityWriteError extends Error {
@@ -56,17 +55,28 @@ export function hasClaimApplicabilitySchema(db: Database): boolean {
  * Recursively key-sorted clone so the digest is independent of object-key
  * insertion order: semantically identical sources always hash to one value.
  */
-function sortKeysDeep(value: unknown): unknown {
+interface DigestArray extends Array<DigestValue> {}
+interface DigestObject {
+    [key: string]: DigestValue | undefined;
+}
+type DigestValue = null | boolean | number | string | DigestArray | DigestObject | undefined;
+
+function sortKeysDeep(value: unknown): DigestValue {
     if (Array.isArray(value)) return value.map(sortKeysDeep);
     if (value !== null && typeof value === "object") {
         const record = value as Record<string, unknown>;
         return Object.fromEntries(
             Object.keys(record)
-                .sort()
+                .sort((left, right) => left.localeCompare(right))
                 .map((key) => [key, sortKeysDeep(record[key])]),
         );
     }
-    return value;
+    if (value === null || ["boolean", "number", "string", "undefined"].includes(typeof value)) {
+        return value as null | boolean | number | string | undefined;
+    }
+    if (typeof value === "bigint")
+        throw new TypeError("Cannot serialize bigint applicability source");
+    return undefined;
 }
 
 /** Canonical SHA-256 digest over a JSON-serializable source description. */
@@ -74,11 +84,6 @@ export function computeApplicabilitySourceDigest(source: unknown): string {
     return createHash("sha256")
         .update(JSON.stringify(sortKeysDeep(source)) ?? "null", "utf8")
         .digest("hex");
-}
-
-/** Versioned deterministic stream key for a legacy memory link (KTD3). */
-export function legacyMemoryApplicabilityStreamKey(memoryId: number): string {
-    return `legacy-memory:${memoryId}:v1`;
 }
 
 function toRowId(result: unknown): number {
@@ -528,96 +533,6 @@ export function readApplicabilityIntervals(
 // Legacy-memory lineage helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Known path state from a raw file list. Single owner of the `""` no-file
- * sentinel exclusion rule: a sentinel-only (or empty) list reads as
- * known-empty (file-independent). Both the write-time mapping snapshot and
- * the `memory_verifications` read-time derivation go through here so the
- * two sides of a `pathsStateEquals` comparison can never drift.
- */
-export function knownPathsStateFromFiles(files: readonly string[]): ApplicabilityPathsInput {
-    const exact = [...new Set(files.filter((file) => file.length > 0))].sort();
-    return { state: "known", exact };
-}
-
-/**
- * Path knowledge for one legacy memory, derived from its
- * `memory_verifications` side table: no rows means unknown; rows mean known,
- * with the `""` no-file sentinel excluded so a sentinel-only mapping reads
- * as known-empty (file-independent).
- */
-export function readMemoryVerificationPathsState(
-    db: Database,
-    memoryId: number,
-): ApplicabilityPathsInput {
-    const hasTable = db
-        .prepare(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memory_verifications'",
-        )
-        .get();
-    if (!hasTable) return { state: "unknown" };
-    const rows = db
-        .prepare("SELECT file_path FROM memory_verifications WHERE memory_id = ?")
-        .all(memoryId) as Array<{ file_path: string }>;
-    if (rows.length === 0) return { state: "unknown" };
-    return knownPathsStateFromFiles(rows.map((row) => row.file_path));
-}
-
-export interface LegacyMemoryApplicabilitySource {
-    id: number;
-    first_seen_at: number;
-}
-
-/**
- * Latest plausible mapping time across a memory's verification rows. Rows
- * from before the mapping-time column carry the 0 default and are ignored.
- */
-function latestMemoryVerificationMappedAt(db: Database, memoryId: number): number | null {
-    const row = db
-        .prepare("SELECT MAX(mapped_at) AS max FROM memory_verifications WHERE memory_id = ?")
-        .get(memoryId) as { max: number | null } | undefined;
-    const max = row?.max;
-    return typeof max === "number" && Number.isSafeInteger(max) && max > 0 ? max : null;
-}
-
-/**
- * Source-stream applicability for a legacy-memory revision. A live write
- * learned its content now. A migration adoption timestamps the snapshot at
- * the latest plausible positive time the memory's content and path mappings
- * were known — first-seen for content, `mapped_at` for paths — and leaves
- * knowledge time unknown when neither is plausible: an as-of read must not
- * see a path selector before it was mapped.
- */
-export function legacyMemorySourceApplicability(
-    db: Database,
-    row: LegacyMemoryApplicabilitySource,
-    origin: "live" | "migration",
-): RevisionApplicabilityInput {
-    const retainedFirstSeen =
-        Number.isSafeInteger(row.first_seen_at) && row.first_seen_at > 0 ? row.first_seen_at : null;
-    const paths = readMemoryVerificationPathsState(db, row.id);
-    const retainedMappedAt =
-        paths.state === "unknown" ? null : latestMemoryVerificationMappedAt(db, row.id);
-    const retainedKnownFrom =
-        retainedFirstSeen != null && retainedMappedAt != null
-            ? Math.max(retainedFirstSeen, retainedMappedAt)
-            : (retainedMappedAt ?? retainedFirstSeen);
-    return {
-        ownerKind: "source",
-        streamKey: legacyMemoryApplicabilityStreamKey(row.id),
-        keyProtocol: APPLICABILITY_STREAM_KEY_PROTOCOL,
-        sourceDigest: computeApplicabilitySourceDigest({
-            kind: "legacy-memory",
-            memoryId: row.id,
-        }),
-        assertion: {
-            state: "unknown",
-            paths,
-            knownFrom: origin === "live" ? Date.now() : retainedKnownFrom,
-        },
-    };
-}
-
 function sameSortedValues(left: readonly string[], right: readonly string[]): boolean {
     return left.length === right.length && left.every((value, index) => value === right[index]);
 }
@@ -636,22 +551,23 @@ function pathsStateEquals(
 }
 
 /**
- * Append a successor assertion carrying the memory's current side-table path
- * knowledge onto the revision's legacy-memory source stream — only when that
- * knowledge differs from the stream head, so a replayed or no-op mapping
- * write appends nothing. Every non-path head field carries into the
- * successor unchanged: readers treat the head as the whole current snapshot,
- * so a path-only update must not erase anchors, dependency or verifier
- * metadata, or symbol selectors. Callers supply the desired path state and
- * knowledge time explicitly; a regressing knowledge time is clamped forward
- * to the stream maximum.
+ * Append a successor assertion carrying new path knowledge onto one of a
+ * revision's source streams — only when that knowledge differs from the
+ * stream head, so a replayed or no-op mapping write appends nothing. Every
+ * non-path head field carries into the successor unchanged: readers treat
+ * the head as the whole current snapshot, so a path-only update must not
+ * erase anchors, dependency or verifier metadata, or symbol selectors.
+ * Callers supply the desired path state and knowledge time explicitly; a
+ * regressing knowledge time is clamped forward to the stream maximum.
  */
-export function syncMemoryApplicabilityPathsInCurrentTransaction(
+export function syncRevisionApplicabilityPathsInCurrentTransaction(
     db: Database,
     args: {
         revisionId: number;
         projectId: number;
-        memoryId: number;
+        streamKey: string;
+        keyProtocol: string;
+        sourceDigest: string;
         paths: ApplicabilityPathsInput;
         knownFrom: number;
     },
@@ -660,12 +576,9 @@ export function syncMemoryApplicabilityPathsInCurrentTransaction(
         revisionId: args.revisionId,
         projectId: args.projectId,
         ownerKind: "source",
-        streamKey: legacyMemoryApplicabilityStreamKey(args.memoryId),
-        keyProtocol: APPLICABILITY_STREAM_KEY_PROTOCOL,
-        sourceDigest: computeApplicabilitySourceDigest({
-            kind: "legacy-memory",
-            memoryId: args.memoryId,
-        }),
+        streamKey: args.streamKey,
+        keyProtocol: args.keyProtocol,
+        sourceDigest: args.sourceDigest,
     });
     const heads = readCurrentApplicabilityAssertions(db, args.revisionId);
     const head = heads.find((candidate) => candidate.streamId === stream.streamId);

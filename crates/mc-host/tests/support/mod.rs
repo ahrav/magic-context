@@ -33,10 +33,7 @@ pub const CANARY_SESSION: &str = "CANARY-SESSION-9d3f";
 pub const CANARY_BODY: &[u8] = b"CANARY-BODY-51ab";
 
 fn output_error() -> RequestOutcome {
-    RequestOutcome::Error {
-        code: "internal_error".to_owned(),
-        message: "test handler could not reserve output".to_owned(),
-    }
+    RequestOutcome::error("internal_error", "test handler could not reserve output")
 }
 
 async fn response_from_slice(ctx: &RequestCtx, bytes: &[u8], binary: bool) -> RequestOutcome {
@@ -475,10 +472,10 @@ impl McHostHandler for TestHandler {
                 let _ = ctx.reserve_output(64 * 1024 * 1024 + 1).await;
                 output_error()
             }
-            "error" => RequestOutcome::Error {
-                code: request["code"].as_str().unwrap_or("app_error").to_owned(),
-                message: request["message"].as_str().unwrap_or("failed").to_owned(),
-            },
+            "error" => RequestOutcome::error(
+                request["code"].as_str().unwrap_or("app_error"),
+                request["message"].as_str().unwrap_or("failed"),
+            ),
             "stream" => {
                 let items = request["items"].as_u64().unwrap_or(3);
                 for index in 0..items {
@@ -529,10 +526,9 @@ impl McHostHandler for TestHandler {
                 response_from_slice(&ctx, b"slow-done", false).await
             }
             "panic" => panic!("{}", String::from_utf8_lossy(CANARY_BODY)),
-            other => RequestOutcome::Error {
-                code: "unknown_mode".to_owned(),
-                message: format!("unsupported test mode {other}"),
-            },
+            other => {
+                RequestOutcome::error("unknown_mode", format!("unsupported test mode {other}"))
+            }
         }
     }
 

@@ -1,8 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { Database } from "../../shared/sqlite";
+import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { runMigrations } from "./migrations";
-import { initializeDatabase } from "./storage-db";
+import { createDirectTestDatabase } from "./test-database";
 import {
     __resetToolDefinitionMeasurements,
     getMeasuredToolDefinitionTokens,
@@ -13,13 +12,7 @@ import {
 } from "./tool-definition-tokens";
 
 function createTestDb(): Database {
-    const db = new Database(":memory:");
-    // initializeDatabase creates session_meta + tags etc., needed by older
-    // migrations (v5 heal, v6 counter heal). Then runMigrations applies the
-    // versioned migrations including v9 (tool_definition_measurements).
-    initializeDatabase(db);
-    runMigrations(db);
-    return db;
+    return createDirectTestDatabase().db;
 }
 
 describe("tool-definition-tokens", () => {

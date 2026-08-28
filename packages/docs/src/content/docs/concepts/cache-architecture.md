@@ -52,7 +52,7 @@ A **pressure backstop** forces a fold when m[1] grows too large relative to m[0]
 
 When the agent writes a memory via `ctx_memory`, it does **not** trigger an m[0] rebuild. Additive writes surface in m[1] via the watermark. Non-additive mutations (update, delete, archive) record a mutation log entry that renders as a `<memory-updates>` delta in m[1]. Both reconcile into m[0] on the next natural HARD bust.
 
-Only **dashboard** memory edits and `/ctx-session-upgrade` migrations bump the project memory epoch, forcing an immediate m[0] re-materialize. These are external editors that can't otherwise signal a running session.
+Only **dashboard** memory edits bump the project memory epoch, forcing an immediate m[0] re-materialize. That is an external editor which can't otherwise signal a running session.
 
 ## Honest framing
 

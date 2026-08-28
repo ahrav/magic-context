@@ -27,11 +27,11 @@ import { join } from "node:path";
 import { listSessionCompactionMarkers } from "../../features/magic-context/compaction-marker";
 import { replaceAllCompartmentState } from "../../features/magic-context/compartment-storage";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage";
-import { initializeDatabase } from "../../features/magic-context/storage-db";
 import {
     type PersistedCompactionMarkerState,
     setPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
+import { createDirectTestDatabase } from "../../features/magic-context/test-database";
 import { _resetHarnessForTesting, setHarness } from "../../shared/harness";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
@@ -137,8 +137,7 @@ function userMessage(id: string, text: string): MessageLike {
 }
 
 function makeContextDb(): Database {
-    const d = new Database(":memory:");
-    initializeDatabase(d);
+    const d = createDirectTestDatabase().db;
     getOrCreateSessionMeta(d, SESSION_ID);
     return d;
 }

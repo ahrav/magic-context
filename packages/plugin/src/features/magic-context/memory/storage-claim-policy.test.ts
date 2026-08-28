@@ -1,10 +1,11 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, test } from "bun:test";
-import { Database } from "../../../shared/sqlite";
+import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
-import { runMigrations } from "../migrations";
-import { initializeDatabase } from "../storage-db";
+import { createDirectTestDatabase } from "../test-database";
+import { createAntiMemory } from "./storage-anti-memory";
+import { recordClaimUsage } from "./storage-claim-operations";
 import {
     advanceProjectorWatermarkInCurrentTransaction,
     appendMaturityAssertionInCurrentTransaction,
@@ -13,6 +14,7 @@ import {
     createPolicySubjectInCurrentTransaction,
     currentApprovalActionId,
     currentValidArtifactId,
+    EXPLICIT_USER_REVISION_PRODUCER,
     hasExplicitUserEvidence,
     readActiveDispositions,
     readMaturityHead,
@@ -24,6 +26,7 @@ import {
     refreshEffectivePolicyInCurrentTransaction,
     revokeEnforcementArtifactInCurrentTransaction,
 } from "./storage-claim-policy";
+import { ensureProject } from "./storage-claims";
 
 interface Fixture {
     db: Database;
@@ -32,10 +35,8 @@ interface Fixture {
 }
 
 function fixture(): Fixture {
-    const db = new Database(":memory:");
+    const db = createDirectTestDatabase().db;
     db.exec("PRAGMA foreign_keys=ON");
-    initializeDatabase(db);
-    runMigrations(db);
     const now = 1_000;
     db.prepare("INSERT INTO projects (canonical_identity, created_at) VALUES ('git:pol', ?)").run(
         now,
@@ -52,7 +53,14 @@ let uniq = 0;
 
 function addObservation(
     fx: Fixture,
-    args: Partial<{ independenceKey: string; runId: string; content: string; trust: string }> = {},
+    args: Partial<{
+        independenceKey: string;
+        runId: string;
+        content: string;
+        trust: string;
+        extractor: string;
+        contentSha256: string;
+    }> = {},
 ): number {
     uniq += 1;
     const key = args.independenceKey ?? `key-${uniq}`;
@@ -71,12 +79,13 @@ function addObservation(
         .prepare(
             `INSERT INTO observations (source_span_id, extracted_text, content_sha256, extractor,
                 extractor_version, extractor_run_id, independence_key, source_trust_class, created_at)
-             VALUES (?, ?, ?, 'extractor', '1', ?, ?, ?, 1)`,
+             VALUES (?, ?, ?, ?, '1', ?, ?, ?, 1)`,
         )
         .run(
             spanId,
             content,
-            content.padEnd(64, "0").slice(0, 64),
+            args.contentSha256 ?? content.padEnd(64, "0").slice(0, 64),
+            args.extractor ?? "extractor",
             runId,
             key,
             args.trust ?? "model_inference",
@@ -88,13 +97,13 @@ function addObservation(
 
 function addRevision(fx: Fixture, observationIds: readonly number[]): number {
     uniq += 1;
+    const subject = `subject-${uniq}`;
     fx.db
         .prepare(
             `INSERT INTO claims (project_id, subject, predicate, scope, state, created_at)
              VALUES (?, ?, 'states', '', 'active', 1)`,
         )
-        // pi-lens-ignore-next-line: sql-injection
-        .run(fx.projectId, `subject-${uniq}`);
+        .run(fx.projectId, subject);
     const claimId = Number(
         (fx.db.prepare("SELECT MAX(id) AS id FROM claims").get() as { id: number }).id,
     );
@@ -147,6 +156,76 @@ function approve(fx: Fixture, revisionId: number, identity: string) {
 }
 
 describe("claim policy storage kernel", () => {
+    test("anti-memory rejected disposition remains joinable to usage", () => {
+        const db = createDirectTestDatabase().db;
+        try {
+            const result = createAntiMemory(
+                db,
+                { producer: "policy-test", operationKey: "seed-retirement" },
+                {
+                    projectId: ensureProject(db, "git:retirement"),
+                    payload: {
+                        trigger: "session caching",
+                        rejectedStrategy: "Redis",
+                        rejectionReason: "split ownership",
+                    },
+                    provenance: {
+                        sourceLocator: "test://retirement",
+                        sourceContent: "Redis rejected",
+                        extractor: "test",
+                        extractorVersion: "1",
+                        extractorRunId: "seed",
+                        independenceKey: "retirement",
+                        sourceTrustClass: "explicit_user",
+                    },
+                    actor: "user:test",
+                },
+            );
+            const publicClaimId = (result.result.payload as { claim: { publicClaimId: string } })
+                .claim.publicClaimId;
+            const target = db
+                .prepare(
+                    `SELECT claims.current_revision_id AS revisionId, claims.project_id AS projectId
+                       FROM claim_public_ids public
+                       JOIN claims ON claims.id = public.claim_id
+                      WHERE public.public_id = ?`,
+                )
+                .get(publicClaimId) as { revisionId: number; projectId: number };
+
+            recordClaimUsage(db, { publicClaimIds: [publicClaimId], kind: "retrieved" });
+            const eventId = db
+                .transaction(() => {
+                    const id = recordDispositionEventInCurrentTransaction(db, {
+                        revisionId: target.revisionId,
+                        projectId: target.projectId,
+                        disposition: "rejected",
+                        action: "assert",
+                        actor: "user:test",
+                        reason: "false warning",
+                    });
+                    refreshEffectivePolicyInCurrentTransaction(db, target.revisionId);
+                    return id;
+                })
+                .immediate();
+            expect(eventId).toBeGreaterThan(0);
+            expect(
+                db
+                    .prepare(
+                        `SELECT usage.retrieval_count AS deliveries, dispositions.reason
+                           FROM claim_usage_stats usage
+                           JOIN claims ON claims.id = usage.claim_id
+                           JOIN claim_disposition_events dispositions
+                             ON dispositions.revision_id = claims.current_revision_id
+                          WHERE claims.id = (SELECT claim_id FROM claim_public_ids WHERE public_id = ?)
+                            AND dispositions.disposition = 'rejected'`,
+                    )
+                    .get(publicClaimId),
+            ).toEqual({ deliveries: 1, reason: "false warning" });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("policy subjects freeze once and replay idempotently", () => {
         const fx = fixture();
         try {
@@ -442,36 +521,7 @@ describe("claim policy storage kernel", () => {
         }
     });
 
-    test("retained user metadata counts as explicit-user evidence only at or below the seed boundary", () => {
-        const fx = fixture();
-        try {
-            const observationId = addObservation(fx);
-            const revisionId = addRevision(fx, [observationId]);
-            fx.db
-                .prepare(
-                    `INSERT INTO claim_revision_memory_metadata
-                        (revision_id, category, normalized_hash, importance, memory_scope,
-                         shareable, source_type, created_at)
-                     VALUES (?, 'CONSTRAINTS', 'hash', 50, 'project', 0, 'user', 1)`,
-                )
-                .run(revisionId);
-            // A fresh database initializes the boundary to 0.
-            expect(hasExplicitUserEvidence(fx.db, revisionId)).toBeFalse();
-            fx.db
-                .prepare(
-                    "UPDATE schema_migrations_meta SET value = ? WHERE key = 'claim_policy_seed_boundary_revision_id'",
-                )
-                .run(String(revisionId));
-            expect(hasExplicitUserEvidence(fx.db, revisionId)).toBeTrue();
-            // The observation trust class qualifies at any boundary.
-            const explicit = addRevision(fx, [addObservation(fx, { trust: "explicit_user" })]);
-            expect(hasExplicitUserEvidence(fx.db, explicit)).toBeTrue();
-        } finally {
-            closeQuietly(fx.db);
-        }
-    });
-
-    test("pre-boundary rewrite revisions cannot inherit explicit-user trust", () => {
+    test("a dashboard explicit-user edit keeps trust while a copied stamp on the same bytes does not", () => {
         const fx = fixture();
         try {
             const first = addRevision(fx, [addObservation(fx, { trust: "explicit_user" })]);
@@ -482,47 +532,88 @@ describe("claim policy storage kernel", () => {
                         .get(first) as { id: number }
                 ).id,
             );
-            // A v85 rewrite appended revision 2 with the retained `user`
-            // stamp on both the observation and the revision metadata even
-            // though the replacement bytes were model-authored.
+            const editedSha = "d".repeat(64);
             fx.db
                 .prepare(
                     `INSERT INTO claim_revisions (claim_id, revision, content, content_sha256, created_at)
-                     VALUES (?, 2, 'model rewrite', ?, 2)`,
+                     VALUES (?, 2, 'user rewrote this in the dashboard', ?, 2)`,
                 )
-                .run(claimId, "c".repeat(64));
-            const rewrite = Number(
+                .run(claimId, editedSha);
+            const edited = Number(
                 (fx.db.prepare("SELECT MAX(id) AS id FROM claim_revisions").get() as { id: number })
                     .id,
             );
+
+            // Matching bytes are insufficient when the producer cannot attest
+            // that a user authored the revision.
+            const copied = addObservation(fx, {
+                trust: "explicit_user",
+                extractor: "historian",
+                contentSha256: editedSha,
+            });
             fx.db
                 .prepare(
                     "INSERT INTO claim_evidence (revision_id, observation_id, relation, created_at) VALUES (?, ?, 'supports', 2)",
                 )
-                .run(rewrite, addObservation(fx, { trust: "explicit_user" }));
+                .run(edited, copied);
+            expect(hasExplicitUserEvidence(fx.db, edited)).toBeFalse();
+
+            // The dashboard's own observation for those bytes qualifies.
+            const dashboard = addObservation(fx, {
+                trust: "explicit_user",
+                extractor: EXPLICIT_USER_REVISION_PRODUCER,
+                contentSha256: editedSha,
+            });
             fx.db
                 .prepare(
-                    `INSERT INTO claim_revision_memory_metadata
-                        (revision_id, category, normalized_hash, importance, memory_scope,
-                         shareable, source_type, created_at)
-                     VALUES (?, 'CONSTRAINTS', 'hash-rewrite', 50, 'project', 0, 'user', 2)`,
+                    "INSERT INTO claim_evidence (revision_id, observation_id, relation, created_at) VALUES (?, ?, 'supports', 2)",
                 )
-                .run(rewrite);
-            fx.db
-                .prepare(
-                    "UPDATE schema_migrations_meta SET value = ? WHERE key = 'claim_policy_seed_boundary_revision_id'",
-                )
-                .run(String(rewrite));
-            // Below the boundary only the claim's first revision keeps its
-            // stated user provenance; the rewrite qualifies through neither
-            // the observation nor the retained metadata.
-            expect(hasExplicitUserEvidence(fx.db, rewrite)).toBeFalse();
-            expect(hasExplicitUserEvidence(fx.db, first)).toBeTrue();
+                .run(edited, dashboard);
+            expect(hasExplicitUserEvidence(fx.db, edited)).toBeTrue();
         } finally {
             closeQuietly(fx.db);
         }
     });
 
+    test("a dashboard stamp cannot credit bytes it did not observe", () => {
+        const fx = fixture();
+        try {
+            const first = addRevision(fx, [addObservation(fx, { trust: "explicit_user" })]);
+            const claimId = Number(
+                (
+                    fx.db
+                        .prepare("SELECT claim_id AS id FROM claim_revisions WHERE id = ?")
+                        .get(first) as { id: number }
+                ).id,
+            );
+            fx.db
+                .prepare(
+                    `INSERT INTO claim_revisions (claim_id, revision, content, content_sha256, created_at)
+                     VALUES (?, 2, 'model rewrite', ?, 2)`,
+                )
+                .run(claimId, "e".repeat(64));
+            const rewrite = Number(
+                (fx.db.prepare("SELECT MAX(id) AS id FROM claim_revisions").get() as { id: number })
+                    .id,
+            );
+            // Correct producer, but the observation describes different bytes.
+            fx.db
+                .prepare(
+                    "INSERT INTO claim_evidence (revision_id, observation_id, relation, created_at) VALUES (?, ?, 'supports', 2)",
+                )
+                .run(
+                    rewrite,
+                    addObservation(fx, {
+                        trust: "explicit_user",
+                        extractor: EXPLICIT_USER_REVISION_PRODUCER,
+                        contentSha256: "f".repeat(64),
+                    }),
+                );
+            expect(hasExplicitUserEvidence(fx.db, rewrite)).toBeFalse();
+        } finally {
+            closeQuietly(fx.db);
+        }
+    });
     test("the effective projection materializes the pure decision and rebuilds identically", () => {
         const fx = fixture();
         try {

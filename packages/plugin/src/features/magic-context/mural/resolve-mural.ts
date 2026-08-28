@@ -1,8 +1,9 @@
 import type { Database } from "../../../shared/sqlite";
+import { trimClaimSnapshotsToBudget } from "../memory/claim-memory-render";
 import { getMemoryCategoryOrder } from "../memory/constants";
-import type { Memory } from "../memory/types";
-import { DEFAULT_MURAL_MEMORY_BUDGET, muralOverflowMemories } from "./mural-selection";
-import { computeCueContentHash, getMuralCueState } from "./storage-mural-cues";
+import type { ProjectMemoryClaimSnapshot } from "../memory/storage-claim-current-state";
+import { DEFAULT_MURAL_MEMORY_BUDGET } from "./mural-selection";
+import { claimCueCurrent, getClaimMuralCueStates } from "./storage-mural-cues";
 
 /** Wire options for the m0 mural image injection: whether the feature is on,
  *  whether the fold's model accepts images, and (when both hold) the rendered
@@ -17,57 +18,51 @@ export interface MuralWireOptions {
 /** A single deterministic mural entry: a compressed cue plus the ordering
  *  facts. No rooms, no merges — flat category bands. */
 export interface ResolvedMuralEntry {
-    id: number;
+    publicClaimId: string;
+    revisionLocator: string;
     category: string;
     importance: number;
     cue: string;
 }
 
 export interface MuralCoverage {
-    /** Active and permanent memories eligible for mural cueing. */
+    /** Live claims eligible for mural cueing. */
     activeMemoryCount: number;
-    /** Eligible memories with a non-null compressed cue generated for current content. */
+    /** Eligible claims with a cue compressed for their current revision
+     * locator under the current renderer epoch. */
     cuedMemoryCount: number;
 }
 
 /**
- * The memory pool a mural is built from.
+ * The claim pool a mural is built from.
  *
  * Callers MUST pass a pool already filtered by the automatic-surface policy
  * gate (see `ensureMuralRendered`): the mural is folded into m[0] as an
  * image, so it is an automatic injection channel and may not carry
  * policy-hidden content. The parameter is required — no unfiltered fallback
  * read exists — so a new caller cannot silently bypass the gate. This module
- * stays a memories-only reader and never derives policy itself.
+ * stays a cue reader and never derives policy itself.
  */
-export type MuralMemoryPool = readonly Memory[];
+export type MuralMemoryPool = readonly ProjectMemoryClaimSnapshot[];
 
-/** Count current cues across the full active and permanent memory pool before
- * limiting it to the overflow subset used to build the mural. */
+/** Count current cues across the full eligible claim pool before limiting it
+ * to the overflow subset used to build the mural. */
 export function getMuralCoverage(
     db: Database,
-    projectIdentity: string,
+    _projectIdentity: string,
     pool: MuralMemoryPool,
 ): MuralCoverage {
-    const memories = pool;
-    const cueState = getMuralCueState(
+    const cueState = getClaimMuralCueStates(
         db,
-        memories.map((memory) => memory.id),
+        pool.map((item) => item.publicClaimId),
     );
     let cuedMemoryCount = 0;
-    for (const memory of memories) {
-        const state = cueState.get(memory.id);
-        if (
-            state &&
-            typeof state.cue === "string" &&
-            state.cue.trim() !== "" &&
-            state.hash !== null &&
-            state.hash === computeCueContentHash(memory.content)
-        ) {
+    for (const item of pool) {
+        if (claimCueCurrent(cueState.get(item.publicClaimId), item.revisionLocator)) {
             cuedMemoryCount += 1;
         }
     }
-    return { activeMemoryCount: memories.length, cuedMemoryCount };
+    return { activeMemoryCount: pool.length, cuedMemoryCount };
 }
 
 /**
@@ -75,42 +70,42 @@ export function getMuralCoverage(
  * of the cutover, callable any time.
  *
  * 1. SELECTION: the overflow set is the complement of the m0 budget trim (the
- *    memories that did NOT fit the injected memory budget). Same trim the m0
+ *    claims that did NOT fit the injected memory budget). Same trim the m0
  *    path uses, so the mural shows exactly what the budget dropped.
- * 2. FILTER: keep only overflow memories with a hash-CURRENT compressed cue
- *    (mural_cue set AND mural_cue_hash == sha256(content)). Uncompressed or
- *    stale memories are simply absent until the compress-cues trickle catches
+ * 2. FILTER: keep only overflow claims whose stored cue is keyed to their
+ *    current revision locator AND the current renderer epoch. Uncompressed or
+ *    stale claims are simply absent until the compress-cues trickle catches
  *    up — render what exists, never block on coverage.
- * 3. ORDER: category (MEMORY_CATEGORY_ORDER) → importance DESC → id ASC. The
- *    id-ASC tiebreak makes the order APPEND-STABLE: inserting a new memory never
- *    reshuffles the relative order of the existing ones within their band.
+ * 3. ORDER: category (MEMORY_CATEGORY_ORDER) → importance DESC → public claim
+ *    ID ASC (deterministic tiebreak).
  */
 export function resolveMural(
     db: Database,
-    projectIdentity: string,
+    _projectIdentity: string,
     budgetTokens: number = DEFAULT_MURAL_MEMORY_BUDGET,
     pool: MuralMemoryPool,
 ): ResolvedMuralEntry[] {
-    const memories = pool;
-    const overflow = muralOverflowMemories(memories, budgetTokens);
+    const selected = new Set(
+        trimClaimSnapshotsToBudget(pool, budgetTokens).selected.map((item) => item.publicClaimId),
+    );
+    const overflow = pool.filter((item) => !selected.has(item.publicClaimId));
     if (overflow.length === 0) return [];
 
-    const cueState = getMuralCueState(
+    const cueState = getClaimMuralCueStates(
         db,
-        overflow.map((memory) => memory.id),
+        overflow.map((item) => item.publicClaimId),
     );
     const entries: ResolvedMuralEntry[] = [];
-    for (const memory of overflow) {
-        const state = cueState.get(memory.id);
-        if (!state || state.cue === null || state.hash === null) continue;
-        // Hash-current only: a cue whose content hash no longer matches is stale
-        // (the memory was edited after compression) and must not render.
-        if (state.hash !== computeCueContentHash(memory.content)) continue;
+    for (const item of overflow) {
+        const state = cueState.get(item.publicClaimId);
+        if (!claimCueCurrent(state, item.revisionLocator)) continue;
         entries.push({
-            id: memory.id,
-            category: memory.category,
-            importance: memory.importance ?? 50,
-            cue: state.cue,
+            publicClaimId: item.publicClaimId,
+            revisionLocator: item.revisionLocator,
+            category: item.category,
+            importance: item.importance,
+            // claimCueCurrent proved cue is a nonempty string.
+            cue: state?.cue ?? "",
         });
     }
 
@@ -118,10 +113,10 @@ export function resolveMural(
     return entries;
 }
 
-/** category order → importance DESC → id ASC (append-stable). */
+/** category order → importance DESC → public claim ID ASC. */
 function compareMuralEntries(a: ResolvedMuralEntry, b: ResolvedMuralEntry): number {
     const categoryDelta = getMemoryCategoryOrder(a.category) - getMemoryCategoryOrder(b.category);
     if (categoryDelta !== 0) return categoryDelta;
     if (a.importance !== b.importance) return b.importance - a.importance;
-    return a.id - b.id;
+    return a.publicClaimId < b.publicClaimId ? -1 : 1;
 }

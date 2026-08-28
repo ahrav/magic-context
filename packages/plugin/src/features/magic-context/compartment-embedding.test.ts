@@ -2,28 +2,25 @@
 
 import { describe, expect, spyOn, test } from "bun:test";
 import * as loggerModule from "../../shared/logger";
-import { Database } from "../../shared/sqlite";
+import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { embedAndStoreCompartmentChunks } from "./compartment-embedding";
 import { appendCompartments, getCompartments } from "./compartment-storage";
-import { runMigrations } from "./migrations";
 import {
     _resetProjectEmbeddingRegistryForTests,
     _setTestProviderFactoryForProject,
     getProjectEmbeddingSnapshot,
     registerProjectEmbedding,
 } from "./project-embedding-registry";
-import { initializeDatabase } from "./storage-db";
 import {
     DetailedSynapseTestHost,
     detailedSynapseTestProvider,
     synapseTestConfig,
 } from "./synapse-detailed-test-support";
+import { createDirectTestDatabase } from "./test-database";
 
 function createDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase().db;
     return db;
 }
 

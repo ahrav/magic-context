@@ -111,7 +111,11 @@ export function createTrackedHarness(): TrackedHarness {
             const generation = new ConnectionGeneration({
                 host: "127.0.0.1",
                 port: peer.port,
-                credentials: { key: peer.key, daemonId: peer.daemonId },
+                credentials: {
+                    key: peer.key,
+                    daemonId: peer.daemonId,
+                    daemonVer: peer.daemonVer,
+                },
                 ...overrides,
             });
             generations.push(generation);
@@ -257,10 +261,9 @@ class FakeCandidateChannel implements SetupFrameChannel {
         private readonly options: FakeCandidateChannelOptions,
     ) {}
 
-    async start(_deadline: Deadline): Promise<{ daemonVer: string }> {
-        if (this.options.startHang) return new Promise(() => {});
+    async start(_deadline: Deadline): Promise<void> {
+        if (this.options.startHang) return new Promise<void>(() => {});
         if (this.options.startError) throw this.options.startError;
-        return { daemonVer: "fake-candidate/1" };
     }
 
     beginFrames(): void {

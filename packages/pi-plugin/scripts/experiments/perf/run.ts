@@ -93,15 +93,8 @@ async function main(): Promise<void> {
 	process.env.XDG_DATA_HOME = dataDir;
 	process.env.NODE_ENV = "test";
 
-	const [
-		{ Database },
-		{ initializeDatabase },
-		{ runMigrations },
-		{ setHarness },
-	] = await Promise.all([
-		import("@magic-context/core/shared/sqlite"),
-		import("@magic-context/core/features/magic-context/storage-db"),
-		import("@magic-context/core/features/magic-context/migrations"),
+	const [{ createDirectTestDatabase }, { setHarness }] = await Promise.all([
+		import("@magic-context/core/features/magic-context/test-database"),
 		import("@magic-context/core/shared/harness"),
 	]);
 	const [
@@ -118,9 +111,7 @@ async function main(): Promise<void> {
 
 	setHarness("pi");
 	const dbPath = join(dataDir, "context.db");
-	const rawDb = new Database(dbPath);
-	initializeDatabase(rawDb);
-	runMigrations(rawDb);
+	const rawDb = createDirectTestDatabase({ path: dbPath }).db;
 	const dbTimer = createDatabaseTimer(rawDb);
 	const timings = createTimingCollector();
 	const restoreObserver = setPiTransformTimingObserver((sample) =>
@@ -273,6 +264,7 @@ function fakeContext(
 	usagePercentage: number,
 ): ExtensionContext {
 	const byId = new Map(branchEntries.map((entry) => [entry.id, entry]));
+	// SAFETY: The partial ExtensionContext includes every member that registerPiContextHandler reads.
 	return {
 		cwd,
 		hasUI: false,

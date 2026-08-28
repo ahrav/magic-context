@@ -8,16 +8,15 @@ import {
     drainAuthority,
     ensureContextStoreUuid,
     prepareAuthority,
-    pullMemoryMirrorOnce,
     reconcileAuthorityProject,
 } from "../../features/magic-context/context-authority";
 import { DEFAULT_PROTECTED_TAGS } from "../../features/magic-context/defaults";
-import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
 import {
-    hasMemoryStatsTable,
-    MemoryStatsIntegrityError,
-} from "../../features/magic-context/memory/storage-memory";
-import { getMemoryVerifications } from "../../features/magic-context/memory/storage-memory-verifications";
+    canonicalSnapshotVector,
+    parseRevisionLocator,
+    type SnapshotVector,
+} from "../../features/magic-context/memory/claim-operation-contract";
+import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
 import { resolveMuralWire } from "../../features/magic-context/mural/render-trigger";
 import type { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import {
@@ -86,6 +85,18 @@ import {
 import { isModuleTransportGenerationChangedResult } from "./module-transport";
 import {
     buildPagedModuleTransformPayloads,
+    type ClaimEffectDeliveryRequest,
+    type ClaimEffectDeliveryResponse,
+    type ClaimIntentAckRequest,
+    type ClaimIntentAckResponse,
+    type ClaimIntentInspectRequest,
+    type ClaimIntentInspectResponse,
+    type ClaimIntentStageRequest,
+    type ClaimIntentStageResponse,
+    type ClaimMirrorReceiptRequest,
+    type ClaimMirrorReceiptResponse,
+    type ClaimMirrorSnapshotRequest,
+    type ClaimMirrorSnapshotResponse,
     encodeOpenCodeMessagesToCk,
     resolveOrdinalsForModule,
 } from "./module-wire";
@@ -197,6 +208,36 @@ export interface RustModeModuleClient extends ModuleStateSyncClient {
         sessionId: string,
         afterSequence: number,
     ): Promise<ModuleCompartmentMirrorResponse>;
+    claimIntentStage?(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimIntentStageRequest;
+    }): Promise<ClaimIntentStageResponse>;
+    claimIntentInspect?(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimIntentInspectRequest;
+    }): Promise<ClaimIntentInspectResponse>;
+    claimIntentAck?(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimIntentAckRequest;
+    }): Promise<ClaimIntentAckResponse>;
+    claimEffectsApply?(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimEffectDeliveryRequest;
+    }): Promise<ClaimEffectDeliveryResponse>;
+    claimMirrorReplace?(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimMirrorSnapshotRequest;
+    }): Promise<ClaimMirrorSnapshotResponse>;
+    claimMirrorApply?(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimMirrorReceiptRequest;
+    }): Promise<ClaimMirrorReceiptResponse>;
 }
 
 interface MessageContentSnapshot {
@@ -272,7 +313,6 @@ export interface RustModeTransformOptions {
     projectRoot?: string;
     notifyParked?: (sessionId: string, message: string) => void;
     moduleTimeoutMs?: number;
-    memorySyncRequestedSessions?: Set<string>;
     /**
      * Invoked with each project that reaches rust-mode authority preparation, so the
      * host can lazily register per-project services (the smart-note evaluator bridge)
@@ -639,28 +679,89 @@ function isTransformPageAttemptMismatch(error: unknown): boolean {
     return false;
 }
 
-function mirrorRustRenderedMemoryIds(args: {
+function isRustGenerationRecord(value: unknown): value is Record<string, number> {
+    return (
+        isRecord(value) &&
+        Object.entries(value).every(
+            ([projectId, generation]) =>
+                /^\d+$/.test(projectId) &&
+                typeof generation === "number" &&
+                Number.isSafeInteger(generation) &&
+                generation >= 0,
+        )
+    );
+}
+
+function rustSnapshotVector(value: unknown): SnapshotVector | null {
+    if (
+        !isRecord(value) ||
+        value.vectorVersion !== 1 ||
+        typeof value.databaseIncarnationId !== "string" ||
+        typeof value.workspaceEpoch !== "string" ||
+        !isRustGenerationRecord(value.projectGenerations) ||
+        !isRustGenerationRecord(value.policyGenerations)
+    ) {
+        return null;
+    }
+    return {
+        vectorVersion: 1,
+        databaseIncarnationId: value.databaseIncarnationId,
+        workspaceEpoch: value.workspaceEpoch,
+        projectGenerations: value.projectGenerations,
+        policyGenerations: value.policyGenerations,
+    };
+}
+
+function mirrorRustRenderedClaimState(args: {
     db: TransformDeps["db"];
     sessionId: string;
     response: Record<string, unknown>;
 }): void {
-    if (!("rendered_memory_ids" in args.response)) return;
-    const rawIds = args.response.rendered_memory_ids;
+    const hasLocators = "rendered_revision_locators" in args.response;
+    const hasVector = "memory_snapshot_vector" in args.response;
+    if (!hasLocators && !hasVector) return;
+    const rawLocators = args.response.rendered_revision_locators;
+    const vector = rustSnapshotVector(args.response.memory_snapshot_vector);
     if (
-        !Array.isArray(rawIds) ||
-        rawIds.some((id) => typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0)
+        !hasLocators ||
+        !hasVector ||
+        !Array.isArray(rawLocators) ||
+        rawLocators.some(
+            (locator) => typeof locator !== "string" || parseRevisionLocator(locator) === null,
+        ) ||
+        vector === null
     ) {
-        throw new Error("module transform returned an invalid rendered-memory manifest");
+        throw new Error("module transform returned an invalid rendered-claim state");
     }
-    const serialized = JSON.stringify(rawIds);
+    const locators = [...new Set(rawLocators as string[])].sort();
+    const serializedLocators = JSON.stringify(locators);
+    const serializedVector = canonicalSnapshotVector(vector);
     args.db
         .prepare(
             `UPDATE session_meta
-                SET memory_block_ids = ?, memory_block_count = ?
+                SET memory_block_ids = ?,
+                    memory_block_count = ?,
+                    cached_m0_rendered_revision_locators = ?,
+                    cached_m0_claim_snapshot_vector = ?
               WHERE session_id = ?
-                AND (COALESCE(memory_block_ids, '') <> ? OR COALESCE(memory_block_count, -1) <> ?)`,
+                AND (
+                    COALESCE(memory_block_ids, '') <> ?
+                    OR COALESCE(memory_block_count, -1) <> ?
+                    OR COALESCE(cached_m0_rendered_revision_locators, '') <> ?
+                    OR COALESCE(cached_m0_claim_snapshot_vector, '') <> ?
+                )`,
         )
-        .run(serialized, rawIds.length, args.sessionId, serialized, rawIds.length);
+        .run(
+            serializedLocators,
+            locators.length,
+            serializedLocators,
+            serializedVector,
+            args.sessionId,
+            serializedLocators,
+            locators.length,
+            serializedLocators,
+            serializedVector,
+        );
 }
 
 function noteDeliveryPassIds(response: Record<string, unknown>): string[] {
@@ -726,6 +827,9 @@ function ensureState(states: Map<string, RustSessionState>, sessionId: string): 
             memoryAuthorityRoot: null,
             memoryAuthorityReady: false,
             authorityMemorySyncSkipLogged: false,
+            claimMirrorSeeded: false,
+            claimMirrorSuppressed: true,
+            claimMirrorVector: null,
             lkgCaptureSequence: 0,
             lkgLastCapturedRowVersion: 0,
             lkgSyncCaptureRequired: false,
@@ -859,9 +963,27 @@ function isNeedFullSync(response: Record<string, unknown>): boolean {
     return response.status === "need_full_sync" || response.action === "NEED_FULL_SYNC";
 }
 
-function canonicalizeForChecksum(value: unknown): unknown {
+type ChecksumValue =
+    | null
+    | boolean
+    | number
+    | string
+    | undefined
+    | ChecksumValue[]
+    | { [key: string]: ChecksumValue };
+
+function canonicalizeForChecksum(value: unknown): ChecksumValue {
+    if (
+        value === null ||
+        value === undefined ||
+        typeof value === "boolean" ||
+        typeof value === "number" ||
+        typeof value === "string"
+    ) {
+        return value;
+    }
     if (Array.isArray(value)) return value.map(canonicalizeForChecksum);
-    if (!isRecord(value)) return value;
+    if (!isRecord(value)) throw new TypeError("checksum input is not JSON-compatible");
     return Object.fromEntries(
         Object.keys(value)
             .sort()
@@ -880,72 +1002,22 @@ function authoritySeedRows(
     projectPath: string,
     domain: "memories" | "notes",
 ): Record<string, unknown>[] {
-    const memoriesSeedSql = hasMemoryStatsTable(db)
-        ? `SELECT m.*,
-                  s.seen_count AS __stats_seen_count,
-                  s.retrieval_count AS __stats_retrieval_count,
-                  s.last_seen_at AS __stats_last_seen_at,
-                  s.last_retrieved_at AS __stats_last_retrieved_at,
-                  MAX(m.updated_at, s.updated_at) AS __stats_effective_updated_at
-             FROM memories m LEFT JOIN memory_stats s ON s.memory_id = m.id
-            WHERE m.project_path = ? ORDER BY m.id ASC`
-        : "SELECT * FROM memories WHERE project_path = ? ORDER BY id ASC";
-    const snapshots =
-        domain === "memories"
-            ? db
-                  .prepare(memoriesSeedSql)
-                  .all(projectPath)
-                  .map((raw) => {
-                      if (!isRecord(raw) || !("__stats_seen_count" in raw)) return raw;
-                      const {
-                          __stats_seen_count,
-                          __stats_retrieval_count,
-                          __stats_last_seen_at,
-                          __stats_last_retrieved_at,
-                          __stats_effective_updated_at,
-                          ...base
-                      } = raw as Record<string, unknown>;
-                      if (__stats_seen_count === null || __stats_seen_count === undefined) {
-                          throw new MemoryStatsIntegrityError(Number(base.id));
-                      }
-                      return {
-                          ...base,
-                          seen_count: __stats_seen_count,
-                          retrieval_count: __stats_retrieval_count,
-                          last_seen_at: __stats_last_seen_at,
-                          last_retrieved_at: __stats_last_retrieved_at,
-                          updated_at: __stats_effective_updated_at,
-                      };
-                  })
-            : db
-                  .prepare(
-                      `SELECT n.*
-                         FROM notes n
-                        WHERE n.project_path = ?
-                           OR (n.project_path IS NULL AND EXISTS (
-                               SELECT 1 FROM session_projects sp
-                                WHERE sp.session_id = n.session_id AND sp.project_path = ?
-                           ))
-                        ORDER BY n.id ASC`,
-                  )
-                  .all(projectPath, projectPath);
-    const memoryRows = snapshots.filter(isRecord);
-    const mappings =
-        domain === "memories"
-            ? getMemoryVerifications(
-                  db,
-                  memoryRows.map((row) => Number(row.id)),
-              )
-            : new Map<number, { files: string[]; hasSentinel: boolean }>();
-    return memoryRows.map((snapshot) => {
-        const id = Number(snapshot.id);
-        const mapping = mappings.get(id);
+    if (domain === "memories") return [];
+    const snapshots = db
+        .prepare(
+            `SELECT n.*
+               FROM notes n
+              WHERE n.project_path = ?
+                 OR (n.project_path IS NULL AND EXISTS (
+                     SELECT 1 FROM session_projects sp
+                      WHERE sp.session_id = n.session_id AND sp.project_path = ?
+                 ))
+              ORDER BY n.id ASC`,
+        )
+        .all(projectPath, projectPath);
+    return snapshots.filter(isRecord).map((snapshot) => {
         const seededSnapshot =
-            domain === "memories" && mapping
-                ? { ...snapshot, mapping: mapping.hasSentinel ? null : mapping.files }
-                : domain === "notes" && snapshot.project_path == null
-                  ? { ...snapshot, project_path: projectPath }
-                  : snapshot;
+            snapshot.project_path == null ? { ...snapshot, project_path: projectPath } : snapshot;
         return { source_row_id: snapshot.id, snapshot: seededSnapshot };
     });
 }
@@ -1046,12 +1118,14 @@ async function prepareRustMemoryAuthority(args: {
                 module: authorityModule,
                 checksum: () =>
                     checksumSeedRows(
-                        db
-                            .prepare(
-                                `SELECT * FROM ${domain === "memories" ? "memories" : "notes"} WHERE project_path = ? ORDER BY id ASC`,
-                            )
-                            .all(projectPath)
-                            .filter(isRecord),
+                        domain === "memories"
+                            ? []
+                            : db
+                                  .prepare(
+                                      "SELECT * FROM notes WHERE project_path = ? ORDER BY id ASC",
+                                  )
+                                  .all(projectPath)
+                                  .filter(isRecord),
                     ),
             });
             if (!("code" in drained)) break;
@@ -1316,6 +1390,7 @@ function buildTransformBody(args: {
         prompt_surface_guidance_override: args.passInputs.prompt_surface_guidance_override,
         mural: args.passInputs.mural,
         effective_execute_threshold: args.passInputs.effective_execute_threshold,
+        claim_lane: args.passInputs.claim_lane,
         auto_search_enabled: args.passInputs.auto_search_enabled === true,
         auto_search_score_threshold: args.passInputs.auto_search_score_threshold,
         auto_search_min_prompt_chars: args.passInputs.auto_search_min_prompt_chars,
@@ -2128,22 +2203,11 @@ export function createRustModeTransform(
                     allowProtocolBypassForTests: options.allowAuthorityProtocolBypassForTests,
                     onProjectPrepared: options.onProjectPrepared,
                 });
-                if (options.memorySyncRequestedSessions?.delete(sessionId)) {
-                    // A memory tool call can complete after the prior authority pass has
-                    // acknowledged its watermarks. Rewind only memory watermarks so the
-                    // next pass ships the mutation delta without reseeding compartments.
-                    const watermarks = state.lastAckedWatermarks;
-                    if (watermarks) {
-                        state.lastAckedWatermarks = {
-                            ...watermarks,
-                            memory_id: 0,
-                            memory_mutation_id: 0,
-                        };
-                    }
-                }
                 const getCachedStateSyncCapabilities =
                     options.moduleClient.getCachedStateSyncCapabilities;
                 const stateSyncCapabilities = options.moduleClient.stateSyncCapabilities;
+                const claimMirrorReplace = options.moduleClient.claimMirrorReplace;
+                const claimMirrorApply = options.moduleClient.claimMirrorApply;
                 const stateSyncResult = await syncModuleState({
                     client: {
                         call: callModule,
@@ -2153,6 +2217,14 @@ export function createRustModeTransform(
                         stateSyncCapabilities: stateSyncCapabilities
                             ? (capabilityArgs) =>
                                   stateSyncCapabilities.call(options.moduleClient, capabilityArgs)
+                            : undefined,
+                        claimMirrorReplace: claimMirrorReplace
+                            ? (mirrorArgs) =>
+                                  claimMirrorReplace.call(options.moduleClient, mirrorArgs)
+                            : undefined,
+                        claimMirrorApply: claimMirrorApply
+                            ? (mirrorArgs) =>
+                                  claimMirrorApply.call(options.moduleClient, mirrorArgs)
                             : undefined,
                     },
                     state,
@@ -2169,6 +2241,14 @@ export function createRustModeTransform(
             } finally {
                 logStage(sessionId, "stateSync", stateSyncStartedAt, timings);
             }
+            const claimLaneEnabled =
+                state.claimMirrorSeeded === true &&
+                state.claimMirrorSuppressed !== true &&
+                state.claimMirrorVector !== null;
+            passInputs.claim_lane = {
+                enabled: claimLaneEnabled,
+                snapshot_vector: claimLaneEnabled ? state.claimMirrorVector : null,
+            };
             const wireBuildStartedAt = performance.now();
             const encodedInput = encodeOpenCodeMessagesToCk(resolved.annotatedInput);
             timings.wireMessages = wireDelta
@@ -2683,7 +2763,7 @@ export function createRustModeTransform(
                 throw error;
             }
             try {
-                mirrorRustRenderedMemoryIds({ db: deps.db, sessionId, response });
+                mirrorRustRenderedClaimState({ db: deps.db, sessionId, response });
             } catch (error) {
                 sessionLog(sessionId, "rust rendered-memory mirror write failed (ignored):", error);
             }
@@ -2776,58 +2856,37 @@ export function createRustModeTransform(
             }
             wireCaches.set(sessionId, pendingWireCache);
             appliedAt = performance.now();
-            // Mirrors feed later RPC reads and tolerate seconds of staleness. Run the two pulls in
-            // their established order, but do not keep the transform hook pending while a backlog
-            // page or SQLite apply is slow. pullMemoryMirrorOnce still coalesces overlapping passes.
+            // The detached task prevents a slow mirror page from delaying the transform hook.
             const getCompartmentsAfter = options.moduleClient.getCompartmentsAfter;
-            if (options.moduleClient.mirrorPull || getCompartmentsAfter) {
+            if (getCompartmentsAfter) {
                 void (async () => {
-                    if (options.moduleClient.mirrorPull) {
-                        const mirrorPullStartedAt = performance.now();
-                        try {
-                            await pullMemoryMirrorOnce({
-                                db: deps.db,
-                                module: options.moduleClient as AuthorityModuleClient,
-                            });
-                        } catch (error) {
-                            sessionLog(
-                                sessionId,
-                                "rust memory mirror-back failed (ignored):",
-                                error,
-                            );
-                        } finally {
-                            logStage(sessionId, "mirrorPull", mirrorPullStartedAt, timings);
-                        }
-                    }
-                    if (getCompartmentsAfter) {
-                        const compartmentMirrorStartedAt = performance.now();
-                        try {
-                            await mirrorModuleCompartments({
-                                db: deps.db,
-                                sessionId,
-                                reader: {
-                                    getCompartmentsAfter: (mirroredSessionId, afterSequence) =>
-                                        getCompartmentsAfter.call(
-                                            options.moduleClient,
-                                            mirroredSessionId,
-                                            afterSequence,
-                                        ),
-                                } satisfies ModuleCompartmentReader,
-                            });
-                        } catch (error) {
-                            sessionLog(
-                                sessionId,
-                                "rust compartment mirror-back failed (ignored):",
-                                error,
-                            );
-                        } finally {
-                            logStage(
-                                sessionId,
-                                "compartmentMirror",
-                                compartmentMirrorStartedAt,
-                                timings,
-                            );
-                        }
+                    const compartmentMirrorStartedAt = performance.now();
+                    try {
+                        await mirrorModuleCompartments({
+                            db: deps.db,
+                            sessionId,
+                            reader: {
+                                getCompartmentsAfter: (mirroredSessionId, afterSequence) =>
+                                    getCompartmentsAfter.call(
+                                        options.moduleClient,
+                                        mirroredSessionId,
+                                        afterSequence,
+                                    ),
+                            } satisfies ModuleCompartmentReader,
+                        });
+                    } catch (error) {
+                        sessionLog(
+                            sessionId,
+                            "rust compartment mirror-back failed (ignored):",
+                            error,
+                        );
+                    } finally {
+                        logStage(
+                            sessionId,
+                            "compartmentMirror",
+                            compartmentMirrorStartedAt,
+                            timings,
+                        );
                     }
                 })();
             }

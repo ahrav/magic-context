@@ -1,6 +1,7 @@
 import { existsSync, statSync } from "node:fs";
 import path from "node:path";
 
+import type { ClaimMutationToken } from "../memory/claim-operation-contract";
 import {
     assertManifestCoversExactly,
     assertNoDuplicateManifestIds,
@@ -19,8 +20,8 @@ import {
  * verify would have to check the whole pool and time out, the cold-start trap).
  *
  * The agent only LOCATES backing files; the host parses its single XML manifest
- * and writes the mappings via recordMemoryMapping (mapped, not yet content-
- * verified). The prompt was calibrated in the shadow harness on real memory
+ * and appends exact-revision applicability paths (mapped, not yet content-
+ * verified). The prompt was calibrated in the shadow harness on real claim
  * pools (DeepSeek-v4-Flash); see .alfonso/plans/dreamer-v2-rework.md.
  */
 
@@ -36,12 +37,12 @@ For each memory decide ONE of:
 
 Output ONE XML manifest at the very end and NOTHING else — no narration, no per-memory commentary, no reasoning:
 <mappings>
-<memory id="N" files="path/a.ts,path/b.ts"/>
-<memory id="M" independent="true"/>
+<memory claim="mcm_..." files="path/a.ts,path/b.ts"/>
+<memory claim="mcm_..." independent="true"/>
 </mappings>
 
 Rules:
-- Every input memory id MUST appear exactly once.
+- Every input public claim id MUST appear exactly once.
 - files: repo-relative, comma-separated, no spaces inside a path. Only files that actually exist and genuinely back the memory.
 - A BACKING FILE is CODE that implements or handles the claim — not a file that merely mentions it. A markdown doc (.md), a PARITY/notes file, or a test that only DESCRIBES an external fact is NOT a backing file. If the only place a memory's fact appears is prose/docs/a test (no code implements or handles it), mark it independent="true".
 - Many CONSTRAINTS are HYBRID: "external system does X, and OUR code handles it here." Map those to the HANDLING code (you can verify the handling, even though you can't verify the external behavior). Only mark independent when there is NO local code that implements or handles the fact.
@@ -84,7 +85,10 @@ export function extractMemoryCandidatePaths(content: string, repoDir: string): s
 }
 
 export interface MapMemoryInput {
-    id: number;
+    publicClaimId: string;
+    revisionLocator: string;
+    contentDigest: string;
+    mutationToken: ClaimMutationToken;
     category: string;
     content: string;
     candidates: string[];
@@ -96,14 +100,14 @@ export function buildMapMemoriesPrompt(projectPath: string, memories: MapMemoryI
             const seed = m.candidates.length
                 ? `\nLikely files (named in the memory, confirmed to exist): ${m.candidates.join(", ")}`
                 : "";
-            return `[${m.id}] ${m.category}\n${m.content}${seed}`;
+            return `[${m.publicClaimId}] ${m.category} revision=${m.revisionLocator} digest=${m.contentDigest}\n${m.content}${seed}`;
         })
         .join("\n\n");
     return `## Map these memories to their backing files
 
 Project: ${projectPath}
 
-For each memory below, find the repo file(s) it makes a claim about, or mark it file-independent. When "Likely files" are listed, those paths are named in the memory and confirmed to exist — START there: confirm each actually backs the claim (a quick read/outline), drop any that don't, add others only if genuinely needed. Search from scratch only when no likely files are given. Then output ONE <mappings> manifest covering every id.
+For each memory below, find the repo file(s) it makes a claim about, or mark it file-independent. When "Likely files" are listed, those paths are named in the memory and confirmed to exist — START there: confirm each actually backs the claim (a quick read/outline), drop any that don't, add others only if genuinely needed. Search from scratch only when no likely files are given. Then output ONE <mappings> manifest covering every public claim id.
 
 <memories>
 ${list}
@@ -111,7 +115,7 @@ ${list}
 }
 
 export interface ParsedMemoryMapping {
-    id: number;
+    publicClaimId: string;
     files: string[];
     independent: boolean;
 }
@@ -153,10 +157,9 @@ export function parseMapMemoriesManifest(text: string): ParsedMemoryMapping[] {
     for (const m of body.matchAll(new RegExp(MEMORY_ELEMENT_PATTERN, "gi"))) {
         const attrs = m[1];
         const inner = m[2];
-        const idMatch = attrs.match(/\bid\s*=\s*"(\d+)"/);
-        if (!idMatch) throw new Error("mappings manifest entry missing numeric id");
-        const id = Number.parseInt(idMatch[1], 10);
-        if (!Number.isInteger(id)) throw new Error("mappings manifest entry missing numeric id");
+        const claimMatch = attrs.match(/\bclaim\s*=\s*"([^"]+)"/);
+        if (!claimMatch) throw new Error("mappings manifest entry missing public claim id");
+        const publicClaimId = claimMatch[1];
         const independent = /\bindependent\s*=\s*"(?:true|1)"/i.test(attrs);
         const filesMatch = attrs.match(/\bfiles\s*=\s*"([^"]*)"/);
         const attrFiles = filesMatch
@@ -169,11 +172,11 @@ export function parseMapMemoriesManifest(text: string): ParsedMemoryMapping[] {
         const files = attrFiles.length > 0 ? attrFiles : nestedFiles;
         if (!independent && files.length === 0) {
             throw new Error(
-                `mappings manifest entry ${id} has neither files nor independent="true"`,
+                `mappings manifest entry ${publicClaimId} has neither files nor independent="true"`,
             );
         }
         out.push({
-            id,
+            publicClaimId,
             files: independent && files.length === 0 ? [] : files,
             independent: independent && files.length === 0,
         });
@@ -182,7 +185,7 @@ export function parseMapMemoriesManifest(text: string): ParsedMemoryMapping[] {
         throw new Error(describeUnrecognizedManifestShape(text, "mappings", "memory"));
     }
     assertNoDuplicateManifestIds(
-        out.map((entry) => entry.id),
+        out.map((entry) => entry.publicClaimId),
         "mappings",
     );
     return out;
@@ -192,12 +195,12 @@ export function parseMapMemoriesManifest(text: string): ParsedMemoryMapping[] {
  *  re-asserts coverage as the final belt. */
 export function validateMapMemoriesManifest(
     text: string,
-    expectedIds: ReadonlySet<number>,
+    expectedIds: ReadonlySet<string>,
 ): ParsedMemoryMapping[] {
     const parsed = parseMapMemoriesManifest(text);
     assertParsedManifestNonEmpty(parsed.length, expectedIds.size, text, "mappings", "memory");
     assertManifestCoversExactly(
-        parsed.map((entry) => entry.id),
+        parsed.map((entry) => entry.publicClaimId),
         expectedIds,
         "mappings",
     );

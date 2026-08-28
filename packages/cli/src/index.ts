@@ -12,6 +12,7 @@
  *   doctor migrate-session  Re-home an OpenCode session to another directory/project.
  *   doctor merge-identity   Merge all project-scoped rows between identities.
  *   doctor repair-db        Back up and salvage a corrupted shared database.
+ *   doctor reset-db         Abandon an unsupported database family into quarantine.
  *
  * Common flags:
  *   --harness opencode|pi|omp   Target one harness (default: auto-detect / prompt)
@@ -40,16 +41,6 @@ function getVersion(): string {
     return "0.0.0";
 }
 
-function valueAfter(args: string[], flag: string): string | null {
-    const index = args.indexOf(flag);
-    if (index === -1) return null;
-    // Reject a flag-shaped value so `--rekey-v22-dir-identity --force` doesn't
-    // consume `--force` as the project path (see doctor-pi.ts valueAfter).
-    const next = args[index + 1];
-    if (next === undefined || next.startsWith("--")) return null;
-    return next;
-}
-
 function printUsage(): void {
     console.log("");
     console.log("  Magic Context CLI");
@@ -61,14 +52,6 @@ function printUsage(): void {
     console.log("    doctor --force   Force-clear plugin cache");
     console.log("    doctor --issue   Collect diagnostics and open a GitHub issue");
     console.log("    doctor --clear   Interactive cache cleanup picker");
-    console.log("    doctor --check-v22-backfill       Show v22 memory backfill status");
-    console.log("    doctor --retry-v22-backfill       Retry failed v22 memory backfill rows");
-    console.log("    doctor --rekey-v22-dir-identity <path>  Re-key legacy dir identity rows");
-    console.log("    doctor --check-claims-backfill    Show v84 claims backfill status");
-    console.log("    doctor --retry-claims-backfill    Repair and resume the v84 claims backfill");
-    console.log(
-        '    doctor --waive-claims-backfill-failure <id> --rationale "<why>"  Waive a reviewed lineage failure',
-    );
     console.log(
         "    doctor drain-authority <project>  Drain module memory/note authority back to TypeScript",
     );
@@ -78,6 +61,7 @@ function printUsage(): void {
         "    doctor merge-identity   Merge project rows (--from ID --to ID [--dry-run] [--yes])",
     );
     console.log("    doctor repair-db   Back up and salvage a corrupted shared database");
+    console.log("    doctor reset-db    Abandon an unsupported database family (--dry-run/--yes)");
     console.log("");
     console.log("  Harness selection:");
     console.log("    --harness opencode    Target OpenCode only");
@@ -143,6 +127,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
                 const { runRepairDbCli } = await import("./commands/doctor-repair-db");
                 return runRepairDbCli(rest.slice(1));
             }
+            if (rest[0] === "reset-db") {
+                const { runResetDbCli } = await import("./commands/doctor-reset-db");
+                return runResetDbCli(rest.slice(1));
+            }
             if (rest[0] === "migrate") {
                 const { runMigrateCli } = await import("./commands/migrate");
                 return runMigrateCli(rest.slice(1));
@@ -152,22 +140,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
                 return runMigrateSessionCli(rest.slice(1));
             }
             const { runDoctor } = await import("./commands/doctor");
-            const rekeyV22DirIdentity = valueAfter(rest, "--rekey-v22-dir-identity");
-            const waiveClaimsBackfillFailure = valueAfter(rest, "--waive-claims-backfill-failure");
-            const waiveRationale = valueAfter(rest, "--rationale");
             return runDoctor({
                 force: rest.includes("--force"),
                 issue: rest.includes("--issue"),
                 clear: rest.includes("--clear"),
-                checkV22Backfill: rest.includes("--check-v22-backfill"),
-                retryV22Backfill: rest.includes("--retry-v22-backfill"),
-                ...(rekeyV22DirIdentity !== null ? { rekeyV22DirIdentity } : {}),
-                checkClaimsBackfill: rest.includes("--check-claims-backfill"),
-                retryClaimsBackfill: rest.includes("--retry-claims-backfill"),
-                ...(rest.includes("--waive-claims-backfill-failure")
-                    ? { waiveClaimsBackfillFailure }
-                    : {}),
-                ...(waiveRationale !== null ? { waiveRationale } : {}),
                 argv: rest,
             });
         }

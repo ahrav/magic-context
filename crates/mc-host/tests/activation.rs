@@ -76,10 +76,7 @@ impl CompositeComponent for GatedActivation {
     }
 
     async fn handle(&self, _ctx: RequestCtx) -> RequestOutcome {
-        RequestOutcome::Error {
-            code: "unused".to_owned(),
-            message: "unused".to_owned(),
-        }
+        RequestOutcome::error("unused", "unused")
     }
 
     async fn route_gone(&self, _route: RouteHandle) {}
@@ -347,10 +344,7 @@ impl CompositeComponent for OrderingPrimary {
     }
 
     async fn handle(&self, _ctx: RequestCtx) -> RequestOutcome {
-        RequestOutcome::Error {
-            code: "unused".to_owned(),
-            message: "unused".to_owned(),
-        }
+        RequestOutcome::error("unused", "unused")
     }
 
     async fn route_gone(&self, _route: RouteHandle) {}

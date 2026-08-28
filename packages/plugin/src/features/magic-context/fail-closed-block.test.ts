@@ -20,17 +20,6 @@ const fenceReason: FailClosedReason = {
     supportedVersion: 64,
 };
 
-const migrationReason: FailClosedReason = {
-    kind: "migration_guard",
-    persistedVersion: 73,
-    supportedVersion: 74,
-    blockingProcesses: [
-        { kind: "OpenCode server", pid: 5736 },
-        { kind: "OpenCode server", pid: 5736 },
-        { kind: "OpenCode instance (TUI/CLI)", pid: 5737 },
-    ],
-};
-
 const storageReason: FailClosedReason = {
     kind: "storage_failure",
     cause: "disk full",
@@ -47,51 +36,14 @@ describe("formatFailClosedBlockingMessage", () => {
         expect(message).toContain(FAIL_CLOSED_DOCTOR_COMMAND);
     });
 
-    it("names the blocking processes and gives ordered recovery actions", () => {
-        const message = formatFailClosedBlockingMessage(migrationReason);
-        expect(message).toContain("OpenCode server (PID 5736)");
-        expect(message).toContain("OpenCode instance (TUI/CLI) (PID 5737)");
-        expect(message).toContain("an older Magic Context build");
-        expect(message).toContain("would fail against the migrated database");
-        expect(message).toContain(
-            "Restart the blocking process (it will pick up the new build and migrate on start), or shut it down and retry.",
-        );
-        expect(message).not.toContain("OpenCode server (PID 5737)");
-        expect(message).not.toContain("fence");
-        expect(message).toContain(FAIL_CLOSED_DOCTOR_COMMAND);
-    });
-
-    it("names an uncertain discovery file and gives safe I/O recovery guidance", () => {
-        const file = "/home/user/.local/share/cortexkit/magic-context/rpc/project/port";
+    it("gives explicit reset guidance for an unsupported direct-format family", () => {
         const message = formatFailClosedBlockingMessage({
-            kind: "migration_guard",
-            persistedVersion: 73,
-            supportedVersion: 74,
-            blockingProcesses: [],
-            unreadableFile: file,
-            unreadableArm: "io",
+            kind: "format_refusal",
+            family: "unsupported",
+            reasons: ["legacy migration schema"],
         });
-        expect(message).toContain(file);
-        expect(message).toContain("io arm");
-        expect(message).toContain("safe to delete");
-        expect(message).toContain("If none of these processes are running");
-        expect(message).not.toContain("If no OpenCode server is running");
-        expect(message).toContain(FAIL_CLOSED_DOCTOR_COMMAND);
-    });
-
-    it("names a fresh parse-invalid discovery file separately from I/O uncertainty", () => {
-        const file = "/home/user/.local/share/cortexkit/magic-context/rpc/project/port";
-        const message = formatFailClosedBlockingMessage({
-            kind: "migration_guard",
-            persistedVersion: 73,
-            supportedVersion: 74,
-            blockingProcesses: [],
-            unreadableFile: file,
-            unreadableArm: "parse",
-        });
-        expect(message).toContain(file);
-        expect(message).toContain("parse arm");
-        expect(message).not.toContain("safe to delete");
+        expect(message).toContain("No data was changed");
+        expect(message).toContain(`${FAIL_CLOSED_DOCTOR_COMMAND} reset-db`);
     });
 
     it("deduplicates and bounds the process list", () => {

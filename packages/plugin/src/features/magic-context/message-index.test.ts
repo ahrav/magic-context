@@ -14,11 +14,10 @@ import {
     indexSingleMessage,
     markMessageIndexDirty,
 } from "./message-index";
-import { initializeDatabase } from "./storage-db";
+import { createDirectTestDatabase } from "./test-database";
 
 function createTestDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
+    const db = createDirectTestDatabase().db;
     return db;
 }
 
@@ -92,10 +91,9 @@ describe("message-index", () => {
     it("preserves a dirty floor beyond a stale snapshot and fills it on the next pass", () => {
         const directory = mkdtempSync(join(tmpdir(), "message-index-gap-"));
         const dbPath = join(directory, "context.db");
-        const first = new Database(dbPath);
+        const first = createDirectTestDatabase({ path: dbPath }).db;
         const second = new Database(dbPath);
         try {
-            initializeDatabase(first);
             const messages: RawMessage[] = [
                 {
                     ordinal: 1,
