@@ -92,6 +92,42 @@ describe("parseDaemonResult", () => {
         expect(parsed.readiness).toBeNull();
     });
 
+    test("binds pass and fail checks to their reason classes, leaving warn and skip free", () => {
+        const withCheck = (status: string, reason: string, remediation: string | null) =>
+            JSON.stringify(
+                validResult({
+                    command: "doctor",
+                    ok: false,
+                    state: "wedged",
+                    reason: "wedged",
+                    remediation: "inspect_daemon_process",
+                    readiness: null,
+                    checks: [{ id: "platform.support", status, reason, remediation }],
+                }),
+            );
+        expect(() => parseDaemonResult(withCheck("pass", "internal_error", "report_bug"))).toThrow(
+            /passing check carries a failing reason/,
+        );
+        expect(() => parseDaemonResult(withCheck("fail", "healthy", null))).toThrow(
+            /failing check carries a non-failing reason/,
+        );
+        // warn and skip are not a class summary: a warn is degraded-but-usable
+        // and a skip is an absence of evidence, so neither is constrained.
+        for (const status of ["warn", "skip"]) {
+            const parsed = parseDaemonResult(withCheck(status, "internal_error", "report_bug"));
+            expect(parsed.checks[0]?.status).toBe(status);
+            const nonFailing = parseDaemonResult(withCheck(status, "healthy", null));
+            expect(nonFailing.checks[0]?.reason).toBe("healthy");
+        }
+        // The conforming pairings still parse.
+        expect(parseDaemonResult(withCheck("pass", "healthy", null)).checks[0]?.status).toBe(
+            "pass",
+        );
+        expect(
+            parseDaemonResult(withCheck("fail", "internal_error", "report_bug")).checks[0]?.status,
+        ).toBe("fail");
+    });
+
     test("rejects a successful restart carrying no effects at all", () => {
         // Requiring `start_committed` only inside the non-null branch left the
         // evidence-free case open, so a caller learned the restart succeeded but

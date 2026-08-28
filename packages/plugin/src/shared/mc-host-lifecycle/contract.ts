@@ -334,6 +334,22 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
         if (typeof checkReason !== "string" || !isDaemonReason(checkReason)) {
             fail("check reason is outside the closed union");
         }
+        // The same coupling the top-level `ok` gets: a check's status is the
+        // boolean summary of its reason's class, so a `pass` carrying an
+        // explicitly failing reason — or a `fail` carrying a non-failing one —
+        // hands diagnostic automation two contradictory answers about the same
+        // check, on a result that exit code 0 agrees with.
+        //
+        // Only `pass` and `fail` are constrained. `warn` and `skip` are not a
+        // class summary at all: a warn is a degraded-but-usable observation and
+        // a skip is an absence of evidence, and the contract does not fix which
+        // reason class either may carry.
+        if (status === "pass" && !NON_FAILING_REASONS.has(checkReason)) {
+            fail("a passing check carries a failing reason");
+        }
+        if (status === "fail" && NON_FAILING_REASONS.has(checkReason)) {
+            fail("a failing check carries a non-failing reason");
+        }
         const checkRemediation = check.remediation;
         if (
             checkRemediation !== null &&
