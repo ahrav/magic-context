@@ -1029,6 +1029,42 @@ describe("scoreRunRecord", () => {
         }
     });
 
+    test("a kept provisional boundary does not excuse an uncovered gold range", () => {
+        // Three rows, none reaching the authored span at 13-20, so the gold range
+        // is uncovered while every row is attributed to a run.
+        const fixture = makeSnapshot({
+            facts: goldFacts(),
+            compartments: [
+                { start: 1, end: 4 },
+                { start: 5, end: 8 },
+                { start: 9, end: 12 },
+            ],
+        });
+        try {
+            const scenario = validScenario();
+            // A KEPT boundary was PERSISTED — hence persistedCompartments 2, not 0 —
+            // so its range is covered and it explains no gap, unlike a discard. The
+            // coverage gate must still fire.
+            const record = makeRecord(fixture, scenario, {
+                historianRuns: [
+                    goldenRun({ persistedCompartments: 1, emittedCompartments: 1 }),
+                    goldenRun({
+                        runIndex: 2,
+                        persistedCompartments: 2,
+                        emittedCompartments: 2,
+                        lookaheadMargin: 1,
+                        factsEmitted: 0,
+                    }),
+                ],
+            });
+            const score = scoreRunRecord(record, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("probe-gold-uncovered");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
     test("an unhealed discard covering a probe's gold range stays a structural FAIL", () => {
         const fixture = makeSnapshot({ facts: goldFacts(), compartments: [{ start: 1, end: 12 }] });
         try {

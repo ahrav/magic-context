@@ -51,6 +51,7 @@ import {
 } from "./runner";
 import type {
     HistorianEvalRunRecord,
+    HistorianRunArtifact,
     InjectedClaimRecord,
     ProbeExchange,
     SystemVersionTuple,
@@ -199,13 +200,27 @@ function structuralFindingsFromRows(
  * means the forced-keep escape hatch (forbidden for facts-scored scenarios) or
  * equivalent skipped healing.
  */
+/**
+ * Runs whose discarded provisional compartment no later successful run healed.
+ *
+ * Extracted because two callers need exactly this subset: `healingFindings`
+ * reports it, and the probe-coverage gate stands down for it. Deriving it from
+ * the runs rather than filtering finding strings keeps the two from drifting on a
+ * message reword — and the OTHER healing class must not be included, since a KEPT
+ * provisional boundary leaves its range covered and therefore explains no gap.
+ */
+function unhealedDiscardRuns(record: HistorianEvalRunRecord): HistorianRunArtifact[] {
+    const runs = record.historianRuns;
+    return runs.filter(
+        (run, index) => run.discardedLast && !runs.slice(index + 1).some((later) => later.status === "success"),
+    );
+}
+
 function healingFindings(record: HistorianEvalRunRecord): string[] {
     const runs = record.historianRuns;
     if (runs.length === 0) return [];
     const findings: string[] = [];
-    for (const [index, run] of runs.entries()) {
-        if (!run.discardedLast) continue;
-        if (runs.slice(index + 1).some((later) => later.status === "success")) continue;
+    for (const run of unhealedDiscardRuns(record)) {
         findings.push(
             `healing: run ${run.runIndex} discarded its provisional last compartment and no later successful run healed it`,
         );
@@ -1177,15 +1192,19 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
         // this probe's own range was covered, and a stored record never passes
         // through the live gate.
         const compartmentRanges = rows.map((row) => ({ start: row.startMessage, end: row.endMessage }));
-        // A gap the recorded healing evidence already explains is NOT
-        // infrastructure. When the final run discarded its provisional tail and a
-        // probe's gold range lies in what it dropped, the range is uncovered
-        // precisely because of a forbidden boundary decision — which
-        // `healingFindings` classifies as a structural model FAIL. ERRORing here
-        // would take that verdict out of scored metrics and report the model's
-        // failure as a harness one.
+        // A gap an unhealed DISCARD explains is NOT infrastructure: the range is
+        // uncovered precisely because a run dropped the compartment that covered
+        // it, which `healingFindings` classifies as a structural model FAIL, and
+        // ERRORing here would move that verdict out of scored metrics.
+        //
+        // Scoped to the discard class only. A run that KEPT a provisional boundary
+        // persisted it, so its range is covered and it explains no gap — treating
+        // that finding as an excuse would let a genuinely uncovered range be scored
+        // as probe and structural FAILs instead of the ERROR this gate exists to
+        // produce.
         const healing = healingFindings(record);
-        for (const probe of healing.length > 0 ? [] : scenario.probes) {
+        const gateStandsDown = unhealedDiscardRuns(record).length > 0;
+        for (const probe of gateStandsDown ? [] : scenario.probes) {
             const reference = probe.answerType === "claim-id" ? probe.expectedClaimRef : probe.sourceClaimRef;
             const goldClaim = scenario.gold.expectedClaims.find((claim) => claim.id === reference);
             if (goldClaim === undefined) continue;
