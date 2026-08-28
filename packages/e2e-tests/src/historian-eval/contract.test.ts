@@ -746,6 +746,34 @@ describe("lintScenario", () => {
         );
     });
 
+    test("rejects a probe gold answer that collides with a generated padding index", () => {
+        const raw = validScenarioRaw();
+        // The runner numbers every padding turn — `Wrap-up housekeeping note 3.` —
+        // and those turns are the protected tail. A bare "3" is therefore stated in
+        // raw history the probe can read, and a surface that rendered index 1 alone
+        // would not see it.
+        (raw.probes as Record<string, unknown>[])[0].goldAnswer = "3";
+        const diagnostics = lintScenario(parseScenario(raw));
+        expect(diagnostics).toContain(
+            "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: occurs-in-harness-owned-text",
+        );
+    });
+
+    test("the generated-index surface spans every padding turn the runner sends", () => {
+        const raw = validScenarioRaw();
+        // The canonical recipe needs ten padding turns, so the last one says
+        // "Wrap-up housekeeping note 10." A surface built from a fixed sample of
+        // indices rather than from `paddingTurnCount()`'s own arithmetic would stop
+        // short and miss it. Run indices are rendered the same way ("step 1",
+        // "step 2"), but the canonical recipe's two runs fall inside the padding
+        // range, so no value separates the two sources here.
+        (raw.probes as Record<string, unknown>[])[0].goldAnswer = "10";
+        const diagnostics = lintScenario(parseScenario(raw));
+        expect(diagnostics).toContain(
+            "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: occurs-in-harness-owned-text",
+        );
+    });
+
     test("a gold answer merely contained in a harness word is not a collision", () => {
         const raw = validScenarioRaw();
         // The bank emits "session", never "sessio". Bare containment would refuse a

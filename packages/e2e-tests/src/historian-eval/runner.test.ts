@@ -136,6 +136,34 @@ describe("probeResponseLeak", () => {
         ).toBeNull();
     });
 
+    test("a REJECTED multi-envelope reply is scanned in full, envelopes included", () => {
+        // Two envelopes means `extractAnswerEnvelope` accepts neither, so the runner
+        // re-asks — but the reply is already in the shared session. Stripping every
+        // envelope would exempt text that is not this probe's answer and never will
+        // be, and the later probe's gold sitting inside the second one would be
+        // invisible to the scan.
+        expect(
+            probeResponseLeak({
+                probes,
+                probeIndex: capacityIndex,
+                responseText: "<answer>4096</answer><answer>in-process lru</answer>",
+            }),
+        ).toContain("probe-store");
+    });
+
+    test("an ACCEPTED envelope is still exempt when it is the only one", () => {
+        // The accepted answer is the point of the exchange; only that envelope is
+        // excluded, and here it is a later probe's value legitimately answered by
+        // this probe's own turn being asked first.
+        expect(
+            probeResponseLeak({
+                probes,
+                probeIndex: capacityIndex,
+                responseText: "<answer>in-process lru</answer>",
+            }),
+        ).toBeNull();
+    });
+
     test("a complete value is required, not a substring", () => {
         // "4096" contains "4"; a reply that mentions 4096 does not state an answer
         // of "4". Guards the same boundary `containsCompleteValue` exists for.
@@ -312,6 +340,58 @@ describe("runScenario (scripted historian)", () => {
                 expect(score.falseAuthoritativeMatches).toEqual([]);
                 expect(score.structuralFindings).toEqual([]);
                 expect(score.failReasons).toEqual(["probe"]);
+            } finally {
+                cleanup();
+            }
+        },
+        RUN_TIMEOUT_MS,
+    );
+
+    test(
+        "a scripted historian output no request ever asked for is script drift",
+        async () => {
+            const { dir, cleanup } = tempArtifactDir();
+            try {
+                const record = await runScenario(singleRunScenario(), {
+                    mode: {
+                        kind: "scripted",
+                        // Two outputs for a single run whose first attempt validates, so
+                        // the second is never requested. That is the shape a script has
+                        // after a parser or validator change makes an intended repair
+                        // unnecessary: the attempt would otherwise PASS while the repair
+                        // path the script exists to exercise never ran.
+                        outputs: [coveringOutput(), coveringOutput()],
+                        probeResponses: goldProbeResponses(),
+                    },
+                    artifactDir: dir,
+                });
+                expect(record.error?.reason).toBe("script-drift");
+                expect(record.error?.detail).toContain("never requested");
+            } finally {
+                cleanup();
+            }
+        },
+        RUN_TIMEOUT_MS,
+    );
+
+    test(
+        "a scripted probe response no probe ever consumed is script drift",
+        async () => {
+            const { dir, cleanup } = tempArtifactDir();
+            try {
+                const record = await runScenario(singleRunScenario(), {
+                    mode: {
+                        kind: "scripted",
+                        outputs: [coveringOutput()],
+                        // One more than the scenario's three probes need when none
+                        // re-asks. Running OUT already aborts as drift; having too many
+                        // was silent.
+                        probeResponses: [...goldProbeResponses(), "<answer>spare</answer>"],
+                    },
+                    artifactDir: dir,
+                });
+                expect(record.error?.reason).toBe("script-drift");
+                expect(record.error?.detail).toContain("probe response(s) never consumed");
             } finally {
                 cleanup();
             }

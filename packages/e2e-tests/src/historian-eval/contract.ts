@@ -1073,48 +1073,6 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
         }
     }
 
-    // The answer must also not be sitting in HARNESS-owned text. The runner wraps
-    // the authored transcript in filler, per-turn ballast, post-epilogue padding,
-    // and spike/kick turns, and `ballastProse` draws from a fixed word bank —
-    // "boundary", "session", "threshold", "snapshot", "budget" among them. A gold
-    // answer that collides with any of that, or with the harness's own turn text,
-    // is stated repeatedly in raw history, and the post-epilogue padding sits in
-    // the PROTECTED TAIL, which is never compartment-covered and therefore never
-    // spliced out. So the probe model can read the answer off recent raw history
-    // and PASS with the injected payload contributing nothing.
-    //
-    // Neither runtime gate covers this. `assertProbeGoldCovered` and
-    // `goldRangeLeak` are both scoped to the AUTHORED gold range — deliberately,
-    // since an uncovered non-gold tail is allowed to remain raw — so harness
-    // padding is outside what either inspects.
-    //
-    // Checked at freeze time because it is fully determined by the recipe:
-    // `ballastProse` output depends only on its token count, and the turn texts are
-    // constants. Complete values, so an answer of "4" is not reported merely
-    // because the bank emits "4096"-like digits. Choices are not checked — a
-    // distractor appearing in filler reveals no answer.
-    const ballast = ballastProse(scenario.trigger.ballastTokensPerTurn);
-    const harnessOwnedText = [
-        FILLER_TURN.user,
-        FILLER_TURN.assistant,
-        ballast,
-        // Padding and spike/kick turns, verbatim from `driveTranscript` and
-        // `driveHistorianRun`. Text only: which index each carries cannot change
-        // whether a word collides.
-        "Wrap-up housekeeping note 1.",
-        "Housekeeping acknowledged.",
-        "Continuing.",
-        "Acknowledged.",
-        "Please continue with step 1 of the plan.",
-        "Standing by.",
-    ].join(" ");
-    for (const probe of scenario.probes) {
-        if (probe.answerType === "claim-id") continue;
-        if (containsCompleteValue(harnessOwnedText, probe.goldAnswer)) {
-            diagnostics.push(`${label}.probes.${probe.id}.goldAnswer: occurs-in-harness-owned-text`);
-        }
-    }
-
     for (const absent of scenario.gold.expectedAbsent) {
         if (normalizeContent(absent.predicate.value).length === 0) {
             diagnostics.push(`${label}.gold.expectedAbsent.${absent.id}.predicate: empty-after-normalization`);
@@ -1234,6 +1192,56 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
         diagnostics.push(
             `${label}.trigger.ballastTokensPerTurn: padding-cannot-clear-protected-tail (${paddingTurnsNeeded} turns at ${paddingTokensPerTurn} token(s) needed for a ${tailTarget.N}-token tail, cap ${MAX_PADDING_TURNS})`,
         );
+    }
+
+    // The answer must also not be sitting in HARNESS-owned text. The runner wraps
+    // the authored transcript in filler, per-turn ballast, post-epilogue padding,
+    // and spike/kick turns, and `ballastProse` draws from a fixed word bank —
+    // "boundary", "session", "threshold", "snapshot", "budget" among them. A gold
+    // answer that collides with any of that, or with the harness's own turn text,
+    // is stated repeatedly in raw history, and the post-epilogue padding sits in
+    // the PROTECTED TAIL, which is never compartment-covered and therefore never
+    // spliced out. So the probe model can read the answer off recent raw history
+    // and PASS with the injected payload contributing nothing.
+    //
+    // Neither runtime gate covers this. `assertProbeGoldCovered` and
+    // `goldRangeLeak` are both scoped to the AUTHORED gold range — deliberately,
+    // since an uncovered non-gold tail is allowed to remain raw — so harness
+    // padding is outside what either inspects.
+    //
+    // Every GENERATED index is rendered, not just the first. The runner numbers each
+    // padding turn (`Wrap-up housekeeping note 3.`) and each historian run
+    // (`step 2 of the plan`), so those digits are part of the tail's text: a probe
+    // whose gold answer is a bare `2` or `3` is copyable from it, and a
+    // one-index sample would miss exactly that. The padding count mirrors
+    // `paddingTurnCount()` — the same ceiling arithmetic, capped the same way — so
+    // the surface is what the runner sends and not an estimate of it.
+    //
+    // Checked at freeze time because it is fully determined by the recipe:
+    // `ballastProse` output depends only on its token count, and the turn texts are
+    // otherwise constants. Complete values, so an answer of "4" is not reported
+    // merely because the bank emits "4096". Choices are not checked — a distractor
+    // appearing in filler reveals no answer.
+    const paddingTurns = Math.min(MAX_PADDING_TURNS, paddingTurnsNeeded);
+    const harnessOwnedText = [
+        FILLER_TURN.user,
+        FILLER_TURN.assistant,
+        ballastProse(scenario.trigger.ballastTokensPerTurn),
+        ...Array.from({ length: paddingTurns }, (_, index) => `Wrap-up housekeeping note ${index + 1}.`),
+        "Housekeeping acknowledged.",
+        "Continuing.",
+        "Acknowledged.",
+        ...Array.from(
+            { length: scenario.trigger.expectedHistorianRuns },
+            (_, index) => `Please continue with step ${index + 1} of the plan.`,
+        ),
+        "Standing by.",
+    ].join(" ");
+    for (const probe of scenario.probes) {
+        if (probe.answerType === "claim-id") continue;
+        if (containsCompleteValue(harnessOwnedText, probe.goldAnswer)) {
+            diagnostics.push(`${label}.probes.${probe.id}.goldAnswer: occurs-in-harness-owned-text`);
+        }
     }
 
     return diagnostics.sort();

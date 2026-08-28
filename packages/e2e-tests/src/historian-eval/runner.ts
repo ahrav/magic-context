@@ -174,6 +174,13 @@ export interface HistorianRunArtifact {
  * its envelope is the point of the exchange, and a probe already asked cannot be
  * influenced by a reply that comes after it.
  *
+ * The exemption is for the ACCEPTED envelope only, which is why `extractAnswerEnvelope`
+ * decides it rather than a blanket strip. A reply carrying two envelopes is REJECTED
+ * as an answer and re-asked, but it stays in the session all the same — so stripping
+ * every envelope would exempt text that is not this probe's answer and never will be,
+ * and `<answer>x</answer><answer>later-gold</answer>` would pass a scan that sees
+ * neither value. When nothing was accepted, nothing is exempt.
+ *
  * Complete values, so a reply mentioning "4096" does not count as stating the
  * answer "4".
  */
@@ -184,7 +191,9 @@ export function probeResponseLeak(args: {
 }): string | null {
     const { probes, probeIndex, responseText } = args;
     if (responseText === null) return null;
-    const outside = responseText.replace(/<answer>[\s\S]*?<\/answer>/g, " ");
+    const accepted = extractAnswerEnvelope(responseText);
+    const envelope = accepted === null ? null : /<answer>[\s\S]*?<\/answer>/.exec(responseText);
+    const outside = envelope === null ? responseText : responseText.replace(envelope[0], " ");
     for (const later of probes.slice(probeIndex + 1)) {
         if (later.answerType === "claim-id") continue;
         if (containsCompleteValue(outside, later.goldAnswer)) {
@@ -703,6 +712,7 @@ class ScenarioRunner {
     private probeResponseQueue: string[] = [];
     private turnScripts: Array<{ prompt: string; response: MockResponse; hits: number }> = [];
     private historianScriptExhausted = false;
+    private historianScriptQueue: Array<string | ((range: { start: number; end: number }) => string)> | null = null;
     private historianRangeUnparseable = false;
     // Partial evidence accumulated as the scenario progresses, so an ERROR
     // record still carries whatever the run produced before the abort (R6).
@@ -1022,7 +1032,15 @@ class ScenarioRunner {
      */
     private installMatchers(harness: TestHarness): void {
         const mode = this.options.mode;
-        const scripted = mode.kind === "scripted" ? [...mode.outputs] : null;
+        // Held on the runner, not in this closure: `assertNoScriptDrift` has to be
+        // able to see what is LEFT. Over-consumption already surfaces (the queue
+        // empties and `historianScriptExhausted` trips), but under-consumption was
+        // invisible — a scripted repair or fallback output that no request ever asked
+        // for stayed here silently, and the attempt PASSED without exercising the
+        // path the script was written to exercise. Main-agent turns were already
+        // checked for exactly this; the historian queue was the asymmetry.
+        this.historianScriptQueue = mode.kind === "scripted" ? [...mode.outputs] : null;
+        const scripted = this.historianScriptQueue;
         harness.mock.addMatcher((body) => {
             if (isHistorianRequest(body)) return this.historianResponse(body, scripted);
             if (isTitleRequest(body)) {
@@ -1396,6 +1414,16 @@ class ScenarioRunner {
         if (unconsumed > 0) {
             throw new RunAbort("script-drift", `${unconsumed} scripted main-agent turn(s) never consumed`);
         }
+        // Every declared run has been driven by the time this is reached, and probes
+        // consume a separate queue, so anything still here was scripted for a
+        // historian request that never happened.
+        const unconsumedHistorian = this.historianScriptQueue?.length ?? 0;
+        if (unconsumedHistorian > 0) {
+            throw new RunAbort(
+                "script-drift",
+                `${unconsumedHistorian} scripted historian output(s) never requested; the attempt did not exercise the path they script`,
+            );
+        }
         const defaultHits = harness.mock.defaultHits();
         if (defaultHits > 0) {
             throw new RunAbort("script-drift", `${defaultHits} request(s) fell through to the poison default response`);
@@ -1506,6 +1534,17 @@ class ScenarioRunner {
             throw new RunAbort(
                 "harness-failure",
                 `${runRowsAfter - runRowsBefore} undeclared historian run(s) fired during the probe phase; the scenario's declared schedule is ${this.scenario.trigger.expectedHistorianRuns}`,
+            );
+        }
+        // The probe queue's under-consumption, checked here for the same reason
+        // `assertNoScriptDrift` checks the historian queue's: every probe has been
+        // asked, and a re-ask consumes another entry, so a leftover response was
+        // scripted for an attempt that never happened. Running OUT already aborts as
+        // drift; having too many was silent.
+        if (this.probeResponseQueue.length > 0) {
+            throw new RunAbort(
+                "script-drift",
+                `${this.probeResponseQueue.length} scripted probe response(s) never consumed`,
             );
         }
         return exchanges;
