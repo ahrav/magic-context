@@ -6,10 +6,10 @@ export const CTX_MEMORY_DESCRIPTION = `Durable project claims shared across sess
 Claims use public IDs (mcm_<32hex>), immutable revision locators, and claim-local mutation tokens. Reuse the exact token returned by create/get/list when revising or changing lifecycle state.
 
 Actions:
-- create: create a claim (content + category).
+- create: create a claim (content + category, or antiMemory).
 - get: fetch up to 20 public claim IDs; hidden and missing claims have the same result.
 - list: enumerate visible active claims (dreamer maintenance only).
-- revise: append a revision (publicClaimId + mutationToken + content and/or category).
+- revise: append a revision (publicClaimId + mutationToken + content/category or antiMemory).
 - archive / restore: append lifecycle state (publicClaimId + mutationToken).
 - merge: same-project merge; mutationTokens are ordered [target, ...sources].
 

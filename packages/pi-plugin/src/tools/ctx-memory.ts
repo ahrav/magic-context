@@ -42,18 +42,24 @@ const MutationTokenSchema = Type.Object({
 	policyHeadsDigest: Type.String(),
 });
 
-const AntiMemorySchema = Type.Object({
-	trigger: Type.String(),
-	rejectedStrategy: Type.String(),
-	rejectionReason: Type.String(),
-	saferAlternative: Type.Optional(Type.Union([Type.String(), Type.Null()])),
-	preconditions: Type.Optional(Type.Union([Type.String(), Type.Null()])),
-	attemptedApproach: Type.Optional(Type.Union([Type.String(), Type.Null()])),
-	observedFailure: Type.Optional(Type.Union([Type.String(), Type.Null()])),
-	rootCause: Type.Optional(Type.Union([Type.String(), Type.Null()])),
-	recovery: Type.Optional(Type.Union([Type.String(), Type.Null()])),
-	nonApplicableWhen: Type.Optional(Type.Union([Type.String(), Type.Null()])),
-});
+const AntiMemorySchema = Type.Object(
+	{
+		trigger: Type.String(),
+		rejectedStrategy: Type.String(),
+		rejectionReason: Type.String(),
+		saferAlternative: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+		preconditions: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+		attemptedApproach: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+		observedFailure: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+		rootCause: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+		recovery: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+		nonApplicableWhen: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+	},
+	{
+		description:
+			"Rejected-approach payload. Required with category REJECTED_APPROACH, and content must be omitted; invalid with any other category.",
+	},
+);
 
 const ParamsSchema = Type.Object(
 	{

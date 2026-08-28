@@ -1172,7 +1172,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** A fact must survive this session.
 - **Mechanism:** Create one durable project claim with category and content.
 - **Consequence:** Future sessions can use the memory without reconstructing this conversation.
-- **Source evidence:** `create a claim (content + category)`
+- **Source evidence:** `create a claim (content + category, or antiMemory)`
 
 | Variant | Applicability status |
 | --- | --- |

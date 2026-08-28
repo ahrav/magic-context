@@ -1229,7 +1229,7 @@
       "operativeCondition": "A fact must survive this session.",
       "mechanism": "Create one durable project claim with category and content.",
       "consequence": "Future sessions can use the memory without reconstructing this conversation.",
-      "evidence": "create a claim (content + category)"
+      "evidence": "create a claim (content + category, or antiMemory)"
     },
     {
       "id": "T-014",
