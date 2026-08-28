@@ -36,6 +36,7 @@ import { TestHarness, type TestHarnessOptions } from "../harness";
 import { MockProvider, type MockResponse } from "../mock-provider/server";
 import {
     EXECUTE_THRESHOLD_PERCENTAGE,
+    FILLER_TURN,
     MAX_PADDING_TURNS,
     MIN_BUILD_TURNS,
     PROBE_CHOICE_SEPARATOR,
@@ -1019,8 +1020,8 @@ class ScenarioRunner {
             await this.scriptedTurn(
                 harness,
                 sessionId,
-                `Routine progress update. ${ballastProse(this.scenario.trigger.ballastTokensPerTurn)}`,
-                { text: "Noted; continuing with routine work.", usage },
+                `${FILLER_TURN.user} ${ballastProse(this.scenario.trigger.ballastTokensPerTurn)}`,
+                { text: FILLER_TURN.assistant, usage },
             );
         }
         for (const [index, turn] of this.scenario.transcript.turns.entries()) {

@@ -87,12 +87,21 @@ export interface ScenarioScore {
     structuralFindings: string[];
     probeVerdicts: ProbeVerdict[];
     /**
-     * System identity of the run this score came from, or null when the score
-     * has no run record behind it (the raw-output seam). Retained so
-     * `buildLaneReport` can prove one report describes one system rather than
-     * trusting the label its caller passes (KD4/KTD7).
+     * System identity of the run this score came from, or null when there is none
+     * to trust — the raw-output seam, or a record whose own system field is
+     * malformed. Retained so `buildLaneReport` can prove one report describes one
+     * system rather than trusting the label its caller passes (KD4/KTD7).
      */
     system: SystemVersionTuple | null;
+    /**
+     * Which entry point produced this score.
+     *
+     * The discriminator for lane membership. A null `system` cannot serve: an
+     * artifact-integrity ERROR for a malformed record also has none, and treating
+     * that as a seam result made one damaged artifact abort the whole report —
+     * undoing the per-scenario ERROR it was supposed to become.
+     */
+    source: "run-record" | "raw-output";
 }
 
 export type RawOutputStageResult =
@@ -280,8 +289,9 @@ function assembleScore(args: {
     probeVerdicts: ProbeVerdict[];
     allAttemptsInvalid: boolean;
     system: SystemVersionTuple | null;
+    source: ScenarioScore["source"];
 }): ScenarioScore {
-    const { scenarioId, facts, structuralFindings, probeVerdicts, allAttemptsInvalid, system } = args;
+    const { scenarioId, facts, structuralFindings, probeVerdicts, allAttemptsInvalid, system, source } = args;
     const failReasons = new Set<FailReason>();
     if (allAttemptsInvalid) failReasons.add("invalid-output");
     if (facts.falseAuthoritativeMatches.length > 0) failReasons.add("false-authoritative");
@@ -308,6 +318,7 @@ function assembleScore(args: {
                 "trimmed-by-injection-budget",
                 `probe ${trimmed.probeId}: gold claim promoted but absent from the injected set`,
                 system,
+                source,
             ),
             probeVerdicts,
         };
@@ -329,6 +340,7 @@ function assembleScore(args: {
         structuralFindings,
         probeVerdicts,
         system,
+        source,
     };
 }
 
@@ -473,6 +485,7 @@ export function scoreRawOutput(
                 probeVerdicts: [],
                 allAttemptsInvalid: false,
                 system: null,
+                source: "raw-output",
             }),
         };
     } finally {
@@ -485,6 +498,7 @@ function errorScore(
     reason: string,
     detail: string | null,
     system: SystemVersionTuple | null = null,
+    source: ScenarioScore["source"] = "run-record",
 ): ScenarioScore {
     return {
         scenarioId,
@@ -502,6 +516,7 @@ function errorScore(
         structuralFindings: [],
         probeVerdicts: [],
         system,
+        source,
     };
 }
 
@@ -550,6 +565,11 @@ function errorMessage(error: unknown): string {
  * blanket catch, so a genuine scorer bug still surfaces as a bug.
  */
 function recordShapeError(record: HistorianEvalRunRecord): ScenarioScore | null {
+    // The root itself: deserialized JSON can be null, an array, or a primitive,
+    // and every field access below would throw before reporting anything.
+    if (record === null || typeof record !== "object" || Array.isArray(record)) {
+        return errorScore("<unknown>", "record-malformed", `run record is not an object: ${typeof record}`, null);
+    }
     const isPair = (value: unknown): boolean =>
         Array.isArray(value) && value.length === 2 && value.every((entry) => typeof entry === "number");
     const problems: string[] = [];
@@ -564,7 +584,7 @@ function recordShapeError(record: HistorianEvalRunRecord): ScenarioScore | null 
         typeof record.system.repoCommitSha !== "string" ||
         typeof record.system.historianModelId !== "string" ||
         typeof record.system.probeModelId !== "string" ||
-        typeof record.system.parserImpl !== "string" ||
+        record.system.parserImpl !== "ts" ||
         !(record.system.chunkTokenBudget === null || typeof record.system.chunkTokenBudget === "number")
     ) {
         problems.push("system");
@@ -807,6 +827,17 @@ function telemetryMismatch(
 ): string | null {
     if (rows.length !== record.historianRuns.length) {
         return `snapshot holds ${rows.length} historian run row(s), record carries ${record.historianRuns.length}`;
+    }
+    // Every compartment row must belong to a recorded run. The prefix walk below
+    // ignores anything past the recorded total, but structural scoring and the
+    // probe-coverage gate consume every row — so an unattributed contiguous row
+    // could satisfy `minCount` or cover a probe's gold range.
+    const attributedCompartments = record.historianRuns.reduce(
+        (total, run) => total + run.persistedCompartments,
+        0,
+    );
+    if (compartmentEndsInSequence.length !== attributedCompartments) {
+        return `snapshot holds ${compartmentEndsInSequence.length} compartment row(s); the recorded runs account for ${attributedCompartments}`;
     }
     let persistedSoFar = 0;
     for (const [index, run] of record.historianRuns.entries()) {
@@ -1108,6 +1139,7 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
                 probeVerdicts: [],
                 allAttemptsInvalid: true,
                 system: record.system,
+                source: "run-record",
             });
         }
 
@@ -1145,7 +1177,15 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
         // this probe's own range was covered, and a stored record never passes
         // through the live gate.
         const compartmentRanges = rows.map((row) => ({ start: row.startMessage, end: row.endMessage }));
-        for (const probe of scenario.probes) {
+        // A gap the recorded healing evidence already explains is NOT
+        // infrastructure. When the final run discarded its provisional tail and a
+        // probe's gold range lies in what it dropped, the range is uncovered
+        // precisely because of a forbidden boundary decision — which
+        // `healingFindings` classifies as a structural model FAIL. ERRORing here
+        // would take that verdict out of scored metrics and report the model's
+        // failure as a harness one.
+        const healing = healingFindings(record);
+        for (const probe of healing.length > 0 ? [] : scenario.probes) {
             const reference = probe.answerType === "claim-id" ? probe.expectedClaimRef : probe.sourceClaimRef;
             const goldClaim = scenario.gold.expectedClaims.find((claim) => claim.id === reference);
             if (goldClaim === undefined) continue;
@@ -1244,11 +1284,12 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
                     null,
                     authoredOrdinalSpan(record),
                 ),
-                ...healingFindings(record),
+                ...healing,
             ],
             probeVerdicts,
             allAttemptsInvalid: false,
             system: record.system,
+            source: "run-record",
         });
     } finally {
         db.close();
@@ -1300,16 +1341,18 @@ function resolveReportSystem(
     const canonical = (system: SystemVersionTuple): string => canonicalJson(system);
     let agreed: SystemVersionTuple | null = null;
     for (const score of scores) {
-        if (score.system === null) {
-            // Raw-output seam results carry no system because no run produced
-            // them — and no probe tier ran either, so their empty `probeVerdicts`
-            // would let a scenario declaring hidden probes PASS. A lane report is
-            // a statement about executed runs, so the mutation battery's scores
-            // are refused rather than silently averaged in.
+        if (score.source === "raw-output") {
+            // No probe tier ran, so an empty `probeVerdicts` would let a scenario
+            // declaring hidden probes PASS. A lane report is a statement about
+            // executed runs, so the mutation battery's scores are refused rather
+            // than silently averaged in. Keyed on the source, not on a null
+            // system: an artifact-integrity ERROR has no trustworthy system either
+            // and must still be reportable.
             throw new Error(
-                `historian-eval report: score for ${score.scenarioId} carries no system identity; raw-output seam results are not lane results`,
+                `historian-eval report: score for ${score.scenarioId} came from the raw-output seam, which is not a lane result`,
             );
         }
+        if (score.system === null) continue;
         if (agreed === null) {
             agreed = score.system;
             continue;

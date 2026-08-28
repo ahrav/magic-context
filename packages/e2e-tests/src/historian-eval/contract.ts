@@ -262,6 +262,20 @@ export const MAX_PADDING_TURNS = 32;
 /** Build turns the runner prepends to reach its minimum; see `MIN_BUILD_TURNS`. */
 export const MIN_BUILD_TURNS = 10;
 
+/**
+ * The harness-owned filler exchange the runner prepends, without ballast.
+ *
+ * Owned here for the same reason as `renderedTranscriptBlocks`: the freeze lint's
+ * chunk-headroom check has to measure the bytes a runner actually sends, and
+ * filler turns consume the historian's chunk budget just as authored ones do. A
+ * copy of these strings in the runner is how the lint would come to measure a
+ * transcript no run produces.
+ */
+export const FILLER_TURN = {
+    user: "Routine progress update.",
+    assistant: "Noted; continuing with routine work.",
+} as const;
+
 function turnText(value: unknown, label: string): string {
     const result = string(value, label);
     if (result.length > MAX_TURN_TEXT_CHARS) fail(`${label}: above-operational-maximum`);
@@ -873,6 +887,32 @@ export function triggerTurnUsage(tokens: number): {
  */
 export const EXECUTE_THRESHOLD_PERCENTAGE = 40;
 
+/**
+ * Rendered blocks for the harness-owned filler turns that PRECEDE the authored
+ * transcript, in the same production text path `renderedTranscriptBlocks` uses.
+ *
+ * Separate from the authored renderer because that one is the lint's measurement
+ * surface for authored content and the fidelity tests bind to it; these turns are
+ * excluded from gold and the fingerprint but still occupy the chunk.
+ */
+export function renderedFillerBlocks(scenario: HistorianEvalScenario): string[] {
+    const fillerCount = Math.max(0, MIN_BUILD_TURNS - scenario.transcript.turns.length);
+    if (fillerCount === 0) return [];
+    const filler: HistorianEvalScenario = {
+        ...scenario,
+        transcript: {
+            ...scenario.transcript,
+            turns: Array.from({ length: fillerCount }, () => ({
+                user: FILLER_TURN.user,
+                assistant: FILLER_TURN.assistant,
+            })),
+        },
+    };
+    // Ballast comes from the scenario's own trigger inside the renderer, so the
+    // filler turns carry exactly what the runner attaches to them.
+    return renderedTranscriptBlocks(filler);
+}
+
 export function renderedTranscriptBlocks(scenario: HistorianEvalScenario): string[] {
     const ballast = ballastProse(scenario.trigger.ballastTokensPerTurn);
     // Built through the production text path, not from the raw authored strings:
@@ -1025,7 +1065,13 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
     // tokenizing one joined string: a joined estimate is a different number, and
     // near the budget with a small margin the difference decides whether the live
     // chunk splits.
-    const transcriptTokens = renderedTranscriptBlocks(scenario).reduce(
+    // Filler blocks included: the runner prepends them whenever the scenario is
+    // shorter than the build minimum, and they consume the same chunk budget. An
+    // authored-only measurement lets a short, ballast-heavy scenario pass while
+    // its filler pushes the gold into another chunk — surfacing at runtime as
+    // `run-never-fired` or `probe-gold-uncovered` rather than anything naming the
+    // recipe.
+    const transcriptTokens = [...renderedFillerBlocks(scenario), ...renderedTranscriptBlocks(scenario)].reduce(
         (total, blockText) => total + estimateTokens(blockText),
         0,
     );

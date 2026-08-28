@@ -18,6 +18,7 @@ import {
     parseScenario,
     predicateMatches,
     releaseApprovalFingerprint,
+    renderedFillerBlocks,
     renderedTranscriptBlocks,
     scenarioFingerprint,
 } from "./contract";
@@ -741,11 +742,15 @@ describe("lintScenario", () => {
 
     test("headroom lint accounts per block, as production budgets", () => {
         const scenario = validScenario();
-        const blocks = renderedTranscriptBlocks(scenario);
+        const authored = renderedTranscriptBlocks(scenario);
+        // Filler blocks are measured too: the runner prepends them and they consume
+        // the same chunk budget.
+        const blocks = [...renderedFillerBlocks(scenario), ...authored];
         // Production tokenizes each formatBlock result and accumulates the counts,
         // so the lint must sum the same per-block estimates. Estimation is not
         // additive across concatenation, which is what makes this observable.
-        expect(blocks).toHaveLength(scenario.transcript.turns.length * 2);
+        expect(authored).toHaveLength(scenario.transcript.turns.length * 2);
+        expect(renderedFillerBlocks(scenario)).toHaveLength((10 - scenario.transcript.turns.length) * 2);
         const summed = blocks.reduce((total, block) => total + estimateTokens(block), 0);
         const joined = estimateTokens(blocks.join("\n"));
         const reported = lintScenario(

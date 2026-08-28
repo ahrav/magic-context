@@ -54,12 +54,15 @@ function makeSnapshot(args: {
     const { db } = createDirectTestDatabase({ path: dbPath });
     const nowMs = args.nowMs ?? Date.now();
     // Rendered-space default: validScenario is shorter than the runner's
-    // MIN_BUILD_TURNS, so six harness-owned filler turns precede its four
-    // authored ones and the authored span is ordinals 13-20. A real run's
-    // compartments cover the chunk from ordinal 1, so one compartment spanning
-    // the whole rendered transcript is what the contiguity invariant expects;
-    // the authored-span scoping is what decides the gold minimum.
-    const compartments = args.compartments ?? [{ start: 1, end: 20 }];
+    // MIN_BUILD_TURNS, so six harness-owned filler turns precede its four authored
+    // ones and the authored span is ordinals 13-20. A real run's compartments
+    // cover the chunk from ordinal 1, and the scenario declares two historian
+    // runs each persisting one compartment — the scorer requires every compartment
+    // row to be attributed to a recorded run, so the count matches the runs.
+    const compartments = args.compartments ?? [
+        { start: 1, end: 12 },
+        { start: 13, end: 20 },
+    ];
     appendCompartments(
         db,
         SESSION_ID,
@@ -555,7 +558,16 @@ describe("scoreRunRecord", () => {
     });
 
     test("healing evidence violation (final run kept provisional boundary) scores FAIL:structural", () => {
-        const fixture = makeSnapshot({ facts: goldFacts() });
+        // Three rows, because run 2 persists two: every compartment row must be
+        // attributed to a recorded run.
+        const fixture = makeSnapshot({
+            facts: goldFacts(),
+            compartments: [
+                { start: 1, end: 8 },
+                { start: 9, end: 14 },
+                { start: 15, end: 20 },
+            ],
+        });
         try {
             const scenario = probeFreeScenario();
             const record = makeRecord(fixture, scenario, {
@@ -986,6 +998,82 @@ describe("scoreRunRecord", () => {
         }
     });
 
+    test("a non-object record root is one ERROR, not a thrown lane abort", () => {
+        const scenario = probeFreeScenario();
+        for (const root of [null, [], 7, "record"]) {
+            const score = scoreRunRecord(root as unknown as HistorianEvalRunRecord, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("record-malformed");
+        }
+    });
+
+    test("a compartment row no recorded run accounts for is a mismatch", () => {
+        const fixture = makeSnapshot({
+            facts: goldFacts(),
+            compartments: [
+                { start: 1, end: 12 },
+                { start: 13, end: 18 },
+                { start: 19, end: 20 },
+            ],
+        });
+        try {
+            const scenario = probeFreeScenario();
+            // Two runs persisting one compartment each cannot explain three rows,
+            // and structural scoring plus the coverage gate consume every row.
+            const record = makeRecord(fixture, scenario);
+            const score = scoreRunRecord(record, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("record-snapshot-mismatch");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("an unhealed discard covering a probe's gold range stays a structural FAIL", () => {
+        const fixture = makeSnapshot({ facts: goldFacts(), compartments: [{ start: 1, end: 12 }] });
+        try {
+            const scenario = validScenario();
+            // The final run dropped its provisional tail, which is why the probe's
+            // gold range is uncovered. That is a forbidden boundary decision the
+            // scorer classifies as a model failure, so the coverage gate must not
+            // pre-empt it with an infrastructure ERROR.
+            const record = makeRecord(fixture, scenario, {
+                historianRuns: [
+                    goldenRun({ persistedCompartments: 1, emittedCompartments: 1 }),
+                    goldenRun({
+                        runIndex: 2,
+                        persistedCompartments: 0,
+                        emittedCompartments: 1,
+                        discardedLast: true,
+                        factsEmitted: 0,
+                    }),
+                ],
+            });
+            const score = scoreRunRecord(record, scenario);
+            expect(score.verdict).toBe("FAIL");
+            expect(score.failReasons).toContain("structural");
+            expect(score.structuralFindings.some((finding) => finding.includes("discarded"))).toBe(true);
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("a record declaring a non-TS parser is refused", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario);
+            const score = scoreRunRecord(
+                { ...record, system: { ...record.system, parserImpl: "rust" as "ts" } },
+                scenario,
+            );
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("record-malformed");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
     test("a malformed nested entry is one ERROR, not a thrown lane abort", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {
@@ -1117,7 +1205,14 @@ describe("scoreRunRecord", () => {
         const fixture = makeSnapshot({ facts: goldFacts(), compartments: [{ start: 1, end: 12 }] });
         try {
             const scenario = validScenario();
-            const record = makeRecord(fixture, scenario);
+            // One compartment row, so the two declared runs must account for
+            // exactly one between them.
+            const record = makeRecord(fixture, scenario, {
+                historianRuns: [
+                    goldenRun({ persistedCompartments: 1, emittedCompartments: 1 }),
+                    goldenRun({ runIndex: 2, persistedCompartments: 0, emittedCompartments: 0, factsEmitted: 0 }),
+                ],
+            });
             const score = scoreRunRecord(record, scenario);
             expect(score.verdict).toBe("ERROR");
             expect(score.errorReason).toBe("probe-gold-uncovered");
@@ -1226,7 +1321,14 @@ describe("scoreRunRecord", () => {
     });
 
     test("an earlier run's kept provisional boundary is not repaired by a later success", () => {
-        const fixture = makeSnapshot({ facts: goldFacts() });
+        const fixture = makeSnapshot({
+            facts: goldFacts(),
+            compartments: [
+                { start: 1, end: 8 },
+                { start: 9, end: 14 },
+                { start: 15, end: 20 },
+            ],
+        });
         try {
             const scenario = probeFreeScenario();
             // Run 1 took the forbidden forced-keep path and PERSISTED that
@@ -1235,7 +1337,7 @@ describe("scoreRunRecord", () => {
             const record = makeRecord(fixture, scenario, {
                 historianRuns: [
                     goldenRun({ emittedCompartments: 2, persistedCompartments: 2, lookaheadMargin: 1 }),
-                    goldenRun({ runIndex: 2, status: "success" }),
+                    goldenRun({ runIndex: 2, status: "success", persistedCompartments: 1 }),
                 ],
             });
             const score = scoreRunRecord(record, scenario);
@@ -1536,9 +1638,10 @@ describe("buildLaneReport", () => {
             falseAuthoritativeMatches: [],
             structuralFindings: [],
             probeVerdicts: [],
-            // Lane scores come from runs, so they carry a system; a systemless
-            // score is a raw-output seam result and the report refuses it.
+            // Lane scores come from runs, so they carry a system and declare their
+            // source; the report refuses raw-output seam results.
             system: LANE_SYSTEM,
+            source: "run-record",
         };
     }
 
@@ -1597,10 +1700,14 @@ describe("buildLaneReport", () => {
         // Derived from the scores, not from the caller's label.
         expect(buildLaneReport([{ ...passScore("hse-a"), system }]).system).toEqual(system);
 
-        // A systemless score is a raw-output seam result, not a lane result.
-        expect(() => buildLaneReport([{ ...passScore("hse-a"), system: null }])).toThrow(
-            /carries no system identity/,
+        // A seam score is refused by SOURCE, not by a null system: an
+        // artifact-integrity ERROR also carries no system and must stay reportable.
+        expect(() => buildLaneReport([{ ...passScore("hse-a"), source: "raw-output" }])).toThrow(
+            /raw-output seam/,
         );
+        expect(() =>
+            buildLaneReport([{ ...passScore("hse-a"), system: null, errorReason: "record-malformed", verdict: "ERROR" }]),
+        ).not.toThrow();
 
         expect(() =>
             buildLaneReport([
