@@ -198,6 +198,48 @@ describe("runAutoSearchHintForPi", () => {
 		}
 	});
 
+	it("does not deliver a sub-threshold warning riding another lane's strong hit", async () => {
+		const db = createTestDb();
+		const warning: UnifiedSearchResult = {
+			source: "anti_memory",
+			score: 0.5,
+			publicClaimId: "mcm_weak_warning",
+			revisionLocator: "mcm_weak_warning/r1/digest",
+			contentDigest: "digest",
+			claimId: 99,
+			normalizedHash: "hash",
+			trigger: "session caching",
+			rejectedStrategy: "Redis",
+			rejectionReason: "it creates split ownership",
+			saferAlternative: "use SQLite",
+			matchType: "lexical",
+		};
+		const spy = spyOn(searchModule, "unifiedSearch").mockResolvedValue([
+			memoryResult(0.9),
+			warning,
+		]);
+		try {
+			const messages = [
+				userMessage("please add Redis backed session caching", 1),
+			];
+			await runAutoSearchHintForPi({
+				sessionId: "ses-auto",
+				db,
+				messages,
+				options: baseOptions,
+			});
+			expect(textOf(messages[0])).not.toContain("Previously rejected");
+			expect(textOf(messages[0])).toContain("<ctx-search-hint>");
+			expect(getAutoSearchHintDecisions(db, "ses-auto")[0]).toMatchObject({
+				decision: "hint",
+				memoryFragments: [],
+			});
+		} finally {
+			spy.mockRestore();
+			closeQuietly(db);
+		}
+	});
+
 	it("replays persisted hints but skips fresh decisions when strict entry ids fail", async () => {
 		const db = createTestDb();
 		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(

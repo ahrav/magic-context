@@ -43,6 +43,9 @@ export interface AutoSearchHintOptions {
     /** Reference clock for age wording; injectable so a fingerprinted
      *  benchmark scenario renders identical bytes on any day. */
     nowMs?: number;
+    /** Minimum score a warning must reach to claim the reserved first slot.
+     *  Defaults to 0, which reserves the slot for any warning present. */
+    warningScoreThreshold?: number;
 }
 
 function truncate(text: string, limit: number): string {
@@ -133,8 +136,12 @@ export interface PackedAutoSearchHint {
  * over-budget fragment yields a null text with an empty delivered list
  * rather than a partially emitted hint.
  *
- * This function does NOT enforce score thresholds or message-length rules —
- * callers (the transform-time auto-search wiring) apply those gates first.
+ * This function does NOT enforce the caller's general score or message-length
+ * gates — the transform-time auto-search wiring applies those first. The one
+ * exception is `warningScoreThreshold`, because the reserved warning slot is
+ * this function's own decision: it promotes a warning past the caller's
+ * ranking, so the bar that warning must clear has to be enforced where the
+ * promotion happens or every caller has to remember to pre-filter.
  */
 export function packAutoSearchHint(
     results: UnifiedSearchResult[],
@@ -143,14 +150,23 @@ export function packAutoSearchHint(
     const maxFragments = Math.max(1, options.maxFragments ?? MAX_FRAGMENTS);
     const fragmentCharCap = Math.max(20, options.fragmentCharCap ?? FRAGMENT_CHAR_CAP);
     const nowMs = options.nowMs ?? Date.now();
+    const warningScoreThreshold = options.warningScoreThreshold ?? 0;
 
-    const warning = results.find((result) => result.source === "anti_memory");
+    // A warning is a first-person claim about the reader's own prior decision,
+    // so a weak match is worse than no match: a warning below the bar is
+    // dropped outright rather than demoted into the tail, and the reserved slot
+    // goes to one that earned it on its own score — never to one riding another
+    // lane's strong hit past the caller's top-result gate.
+    const eligible = results.filter(
+        (result) => result.source !== "anti_memory" || result.score >= warningScoreThreshold,
+    );
+    const warning = eligible.find((result) => result.source === "anti_memory");
     const picks = warning
-        ? [warning, ...results.filter((result) => result.source !== "anti_memory")].slice(
+        ? [warning, ...eligible.filter((result) => result.source !== "anti_memory")].slice(
               0,
               maxFragments,
           )
-        : results.slice(0, maxFragments);
+        : eligible.slice(0, maxFragments);
     const kept: Array<{ result: UnifiedSearchResult; line: string }> = [];
 
     for (const result of picks) {

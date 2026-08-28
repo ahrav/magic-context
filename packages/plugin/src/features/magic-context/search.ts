@@ -973,7 +973,6 @@ async function searchAntiMemories(args: {
                   .slice(0, ANTI_MEMORY_MAX_SEMANTIC_CANDIDATES)
             : [];
     const vectorByCandidate = new Map<number, Float32Array | null>();
-    const awaitedEmbedding = Boolean(semanticQueryEmbedding) && embedIndices.length > 0;
     if (semanticQueryEmbedding && embedIndices.length > 0) {
         const vectors = await args
             .embedPassages(
@@ -1019,12 +1018,14 @@ async function searchAntiMemories(args: {
                 right.score - left.score || left.publicClaimId.localeCompare(right.publicClaimId),
         )
         .slice(0, args.limit);
-    // Revalidate before publishing, but only when the passage embedding above
-    // actually awaited: candidates were hydrated before a live provider call
-    // that can take seconds, and under WAL another process can retire, revise,
-    // expire, or quarantine a warning inside that window. The lexical-only path
-    // never yields, so its snapshot is still the one it read.
-    if (published.length === 0 || !awaitedEmbedding) return published;
+    // Revalidate before publishing, on every path. The awaited passage
+    // embedding opens the widest window — a live provider call that can take
+    // seconds, during which another process can retire, revise, expire, or
+    // quarantine a warning — but it is not the only one: the state read and the
+    // record read are separate autocommit statements, so even the lexical path
+    // publishes bytes assembled across two snapshots. The provider proves
+    // visibility at publication time, the same rule the locator lane applies.
+    if (published.length === 0) return published;
     const current = readAntiMemoryState(published.map((result) => result.publicClaimId));
     if (current === null) return [];
     const currentById = new Map(current.map((item) => [item.publicClaimId, item]));

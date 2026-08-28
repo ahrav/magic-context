@@ -404,7 +404,9 @@ export async function runAutoSearchHintForPi(args: {
 		return messages;
 	}
 
-	const packed = packAutoSearchHint(results);
+	const packed = packAutoSearchHint(results, {
+		warningScoreThreshold: scoreThreshold,
+	});
 	if (!packed.text) {
 		writeNoHintAndReconcile("empty");
 		return messages;

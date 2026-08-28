@@ -185,20 +185,14 @@ export async function executeAutoSearchDelivery(args: {
     if (results[0].score < args.scoreThreshold) {
         return emptyDelivery("below-threshold", results);
     }
-    // The gate above tests only the top result, and `packAutoSearchHint`
-    // reserves the first fragment for a warning regardless of that warning's
-    // own score. Together they let a strong hit from another lane promote a
-    // weakly matched rejection warning to the head of the hint. A warning is a
-    // user-facing assertion about the reader's own prior decision, so it has to
-    // clear the delivery bar on its own evidence; other sources keep riding the
-    // top-result gate.
-    const packable = results.filter(
-        (result) => result.source !== "anti_memory" || result.score >= args.scoreThreshold,
-    );
-    const packed = packAutoSearchHint(
-        packable,
-        args.packNowMs === undefined ? {} : { nowMs: args.packNowMs },
-    );
+    // The gate above tests only the top result, and the packer reserves the
+    // first fragment for a warning. Handing it the threshold is what stops a
+    // strong hit from another lane promoting a weakly matched rejection warning
+    // to the head of the hint; the packer owns it so both harnesses inherit it.
+    const packed = packAutoSearchHint(results, {
+        warningScoreThreshold: args.scoreThreshold,
+        ...(args.packNowMs === undefined ? {} : { nowMs: args.packNowMs }),
+    });
     if (packed.text === null) {
         return emptyDelivery("packer-empty", results);
     }
