@@ -58,6 +58,12 @@ function inHalfOpenRange(
  * Evaluate the authenticated `daemon_ver` (shape `mc-host/X.Y.Z`) against the
  * contract's half-open supported daemon range. Publication metadata must
  * never be passed here — only the handshake-retained value.
+ *
+ * The native binary gates the same value against the same contract range in
+ * `daemon_version_compatible` (`crates/mc-module/src/bin/ck-mc-host.rs`). The
+ * two implementations must accept exactly the same inputs; a divergence makes
+ * a native `probe`/`doctor` result and this policy verdict contradict each
+ * other for one daemon. Change both together, or neither.
  */
 export function evaluateDaemonCompatibility(authenticatedDaemonVer: string): CompatibilityVerdict {
     const raw = authenticatedDaemonVer.startsWith("mc-host/")

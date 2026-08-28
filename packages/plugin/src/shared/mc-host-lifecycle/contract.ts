@@ -9,8 +9,8 @@
  */
 
 import { lstatSync } from "node:fs";
-import * as path from "node:path";
 import { releaseContract } from "./generated-contract";
+import { coordinationDirPath, runtimeDirPath } from "./paths";
 
 export type DaemonCommand = (typeof releaseContract.cli.commands)[number];
 /** The native binary additionally emits `probe` for its read-only command. */
@@ -375,17 +375,21 @@ function probeEntry(entryPath: string): ProbeOutcome {
 
 /**
  * Classify the two roots that decide the no-probe verdict: the stable
- * coordination directory and the managed `cortexkit` subtree. Only two
+ * coordination directory and the daemon runtime directory. Only two
  * definitely absent roots classify as `absent` (reportable as `stopped`);
  * a symlink, special file, access error, or a presence flip between the two
  * bounded passes is a hazard, and anything else that exists is residual.
  * The classifier never creates, opens, follows, or mutates anything.
+ *
+ * Both roots must be daemon-owned. The enclosing `cortexkit` subtree is not:
+ * `data-path.ts` puts the application SQLite store at
+ * `<dataRoot>/cortexkit/magic-context`, so that directory exists on every
+ * install that has ever run the plugin and its presence says nothing about a
+ * daemon. Probing it would make `residual`/`wedged` the only reachable
+ * verdict in the field.
  */
 export function classifyPreNativeRoots(dataRoot: string): PreNativeRootsClassification {
-    const entries = [
-        path.join(dataRoot, releaseContract.coordination.directory),
-        path.join(dataRoot, "cortexkit"),
-    ];
+    const entries = [coordinationDirPath(dataRoot), runtimeDirPath(dataRoot)];
     const first = entries.map(probeEntry);
     const second = entries.map(probeEntry);
     for (let i = 0; i < entries.length; i++) {

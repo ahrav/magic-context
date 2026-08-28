@@ -2253,6 +2253,16 @@ describe("authenticated state retention (U3/KTD6)", () => {
         expect(client.authenticated?.daemonVer).toBe("mc-host/9.9.9-auth");
         expect(client.publication?.daemonVer).toBe("fake-peer/0.0.1");
     });
+
+    test("the getter hands out a copy, so a caller cannot poison the identity", async () => {
+        const { client, peer } = await connected();
+        const borrowed = client.authenticated?.daemonId;
+        expect(borrowed).not.toBeUndefined();
+        // The retained identity authorizes compatibility and fencing; mutating
+        // what the getter returned must not reach it.
+        (borrowed as Uint8Array).fill(0);
+        expect(Array.from(client.authenticated?.daemonId ?? [])).toEqual(Array.from(peer.daemonId));
+    });
 });
 
 describe("strict catalog parsing (U3 scenario 10)", () => {

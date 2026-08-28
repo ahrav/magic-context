@@ -56,11 +56,33 @@ export function managedSubtreePath(dataRoot: string): string {
 }
 
 export function runtimeDirPath(dataRoot: string): string {
-    return path.join(dataRoot, "cortexkit", "run");
+    return path.join(managedSubtreePath(dataRoot), "run");
 }
 
 export function connectionFilePath(dataRoot: string): string {
     return path.join(runtimeDirPath(dataRoot), CONNECTION_FILE_NAME);
+}
+
+/**
+ * The connection file a managed daemon publishes to.
+ *
+ * The lifecycle root is authoritative because `McHostLifecyclePolicy` launches
+ * the daemon with `XDG_DATA_HOME` set to exactly this root, so the publication
+ * lands here. Readers must not re-derive the path from `data-path.ts`'s
+ * `getDataDir()`: that resolver accepts a relative `XDG_DATA_HOME`, prefers
+ * bun's cached `os.homedir()` over `env.HOME`, and ignores
+ * `MAGIC_CONTEXT_TEST_DATA_DIR`, so under any of those it names a different
+ * file than the one the daemon just wrote.
+ *
+ * `fallbackRoot` covers only the `no_data_dir` case, where the policy cannot
+ * start a daemon at all and the legacy derivation is the best remaining guess.
+ */
+export function defaultConnectionFilePath(
+    fallbackRoot: string,
+    env: Record<string, string | undefined> = process.env,
+): string {
+    const resolution = resolveLifecycleDataRoot(env);
+    return connectionFilePath(resolution.ok ? resolution.root : fallbackRoot);
 }
 
 /**

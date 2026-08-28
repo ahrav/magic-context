@@ -188,4 +188,37 @@ describe("native launcher output handling (U3 scenario 17)", () => {
         }
         expect(error?.code).toBe("spawn_failed");
     });
+
+    test("a platform with no descriptor exec path is a platform failure, not a spawn error", async () => {
+        let error: NativeLaunchError | null = null;
+        try {
+            await runNativeLifecycle(
+                { kind: "retained-fd", fd: 0 },
+                { command: "probe", deadlineMs: 10_000, platform: "win32" },
+            );
+        } catch (caught) {
+            error = caught as NativeLaunchError;
+        }
+        // Neither procfs_self_fd_exec nor dev_fd_exec: report the real reason
+        // instead of spawning a path that cannot exist.
+        expect(error?.code).toBe("unsupported_platform");
+    });
+
+    test("darwin resolves the retained descriptor through /dev/fd, not procfs", async () => {
+        // The contract gives darwin `dev_fd_exec` and linux
+        // `procfs_self_fd_exec`; a darwin launch must not reach /proc.
+        let error: NativeLaunchError | null = null;
+        try {
+            await runNativeLifecycle(
+                { kind: "retained-fd", fd: 0 },
+                { command: "probe", deadlineMs: 10_000, platform: "darwin" },
+            );
+        } catch (caught) {
+            error = caught as NativeLaunchError;
+        }
+        // On this linux host /dev/fd/3 is not an executable image, so the
+        // spawn fails; the point is that it was attempted at all rather than
+        // rejected as an unsupported platform.
+        expect(error?.code).not.toBe("unsupported_platform");
+    });
 });

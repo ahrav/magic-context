@@ -273,11 +273,29 @@ describe("pre-native root classifier", () => {
         }
     });
 
-    test("a residual managed subtree alone is also wedged", () => {
+    test("a residual daemon runtime directory alone is also wedged", () => {
         const root = tempRoot();
         try {
-            mkdirSync(path.join(root, "cortexkit"));
+            mkdirSync(path.join(root, "cortexkit", "run"), { recursive: true });
             expect(classifyPreNativeRoots(root).kind).toBe("residual");
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("the shared cortexkit subtree alone is not daemon residue", () => {
+        const root = tempRoot();
+        try {
+            // `data-path.ts` puts the application SQLite store here on every
+            // install, so its presence must not imply a daemon ever ran.
+            mkdirSync(path.join(root, "cortexkit", "magic-context"), { recursive: true });
+            const classification = classifyPreNativeRoots(root);
+            expect(classification).toEqual({ kind: "absent" });
+            expect(preNativeState(classification)).toBe("stopped");
+            expect(probeFallbackVerdict(classification)).toEqual({
+                state: "stopped",
+                reason: "not_running",
+            });
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
@@ -288,7 +306,8 @@ describe("pre-native root classifier", () => {
         try {
             const target = path.join(root, "elsewhere");
             mkdirSync(target);
-            symlinkSync(target, path.join(root, "cortexkit"));
+            mkdirSync(path.join(root, "cortexkit"));
+            symlinkSync(target, path.join(root, "cortexkit", "run"));
             const classification = classifyPreNativeRoots(root);
             expect(classification).toEqual({ kind: "hazard", hazard: "symlink" });
             expect(probeFallbackVerdict(classification)).toEqual({

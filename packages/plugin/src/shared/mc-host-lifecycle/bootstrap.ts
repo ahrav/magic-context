@@ -7,6 +7,7 @@
  * lifecycle reason.
  */
 
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
     closeSync,
@@ -90,13 +91,51 @@ function detectProcSelfFd(): boolean {
     }
 }
 
+const MACOS_SYSTEM_VERSION_PLIST = "/System/Library/CoreServices/SystemVersion.plist";
+const MACOS_PRODUCT_VERSION_SHAPE = /^\d+(?:\.\d+)*$/;
+
+/**
+ * Read the macOS `ProductVersion` (for example `14.5`) that the darwin arm of
+ * {@link checkPlatform} compares against the contract's `os_min` floor.
+ *
+ * The system plist is tried first because it is a plain file read with no
+ * subprocess; `sw_vers` is the fallback for a host whose plist is unreadable
+ * or in a shape this parser does not recognize. `os.release()` is deliberately
+ * not consulted: it reports the Darwin kernel version (24.x), not the product
+ * version the contract floor is expressed in. Any failure returns `null`,
+ * which the caller treats as unverifiable and therefore unsupported, so an
+ * unreadable system fails closed instead of assuming it meets the floor.
+ */
+function detectMacosProductVersion(): string | null {
+    try {
+        const plist = readFileSync(MACOS_SYSTEM_VERSION_PLIST, "utf8");
+        const match = /<key>ProductVersion<\/key>\s*<string>([^<]+)<\/string>/.exec(plist);
+        const version = match?.[1]?.trim();
+        if (version !== undefined && MACOS_PRODUCT_VERSION_SHAPE.test(version)) return version;
+    } catch {
+        // fall through to the sw_vers fallback below
+    }
+    try {
+        const reported = execFileSync("/usr/bin/sw_vers", ["-productVersion"], {
+            encoding: "utf8",
+            timeout: 2_000,
+            stdio: ["ignore", "pipe", "ignore"],
+        }).trim();
+        return MACOS_PRODUCT_VERSION_SHAPE.test(reported) ? reported : null;
+    } catch {
+        return null;
+    }
+}
+
 export const defaultPlatformReaders: PlatformReaders = {
     platform: process.platform,
     arch: process.arch,
     kernelRelease: () => os.release(),
     glibcVersion: detectGlibcVersion,
     procSelfFdUsable: detectProcSelfFd,
-    macosProductVersion: () => null,
+    // Only the darwin arm of `checkPlatform` calls this, so no non-macOS host
+    // ever pays the plist read or the `sw_vers` fallback.
+    macosProductVersion: detectMacosProductVersion,
 };
 
 function parseVersionPair(value: string): [number, number] | null {

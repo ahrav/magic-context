@@ -230,6 +230,7 @@ describe("demand-start coalescing and detachment (U3 scenarios 15-16)", () => {
             const policy = policyFor({
                 env: { XDG_DATA_HOME: root },
                 launchTarget: { kind: "test-binary", path: binary },
+                storageProbe: async () => "ready",
             });
             const [a, b, c] = await Promise.all([
                 policy.demandStart({ origin: "managed-default", capability: "magic-context" }),
@@ -334,6 +335,120 @@ describe("demand-start coalescing and detachment (U3 scenarios 15-16)", () => {
             });
             expect(synapse.storage).toBeNull();
             expect(probes).toEqual([5_000]);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 20_000);
+
+    test("an unwired storage probe reports unavailable, never ready", async () => {
+        const root = tempDir("mc-policy-storage-default-");
+        const { binary } = fakeBinary(root);
+        try {
+            // No storageProbe: the gate must not authorize a body on a daemon
+            // whose storage state was never examined.
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+            });
+            const outcome = await policy.demandStart({
+                origin: "managed-default",
+                capability: "magic-context",
+            });
+            expect(outcome.result.ok).toBe(true);
+            expect(outcome.storage).toBe("unavailable");
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 20_000);
+
+    test("a hanging storage probe is bounded and degrades to unavailable", async () => {
+        const root = tempDir("mc-policy-storage-hang-");
+        const { binary } = fakeBinary(root);
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                // Never settles; the policy's own bound must end the wait.
+                storageProbe: () => new Promise<never>(() => {}),
+            });
+            const outcome = await policy.demandStart({
+                origin: "managed-default",
+                capability: "magic-context",
+                deadlineMs: 250,
+            });
+            expect(outcome.result.ok).toBe(true);
+            expect(outcome.storage).toBe("unavailable");
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 20_000);
+
+    test("a rejecting storage probe still returns the successful start result", async () => {
+        const root = tempDir("mc-policy-storage-reject-");
+        const { binary } = fakeBinary(root);
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                storageProbe: async () => {
+                    throw new Error("probe exploded");
+                },
+            });
+            const outcome = await policy.demandStart({
+                origin: "managed-default",
+                capability: "magic-context",
+            });
+            expect(outcome.result.reason).toBe("started");
+            expect(outcome.storage).toBe("unavailable");
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 20_000);
+});
+
+describe("native result labeling and indeterminate effects", () => {
+    test("a child answering a different command is internal_error, not relabeled", async () => {
+        const root = tempDir("mc-policy-mislabel-");
+        try {
+            // Always answers `probe`, whatever it was asked.
+            const binary = path.join(root, "mislabeling-host.sh");
+            writeFileSync(
+                binary,
+                `#!/bin/sh\necho '${startResultJson("probe").replace("started", "healthy")}'\nexit 0\n`,
+            );
+            chmodSync(binary, 0o700);
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+            });
+            const result = await policy.start();
+            expect(result.command).toBe("start");
+            expect(result.ok).toBe(false);
+            expect(result.reason).toBe("internal_error");
+            // Never a `restart` payload wearing a `start` label.
+            expect(result.effects).toBeNull();
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 20_000);
+
+    test("a restart killed at the deadline reports unknown effects, not false,false", async () => {
+        const root = tempDir("mc-policy-restart-timeout-");
+        try {
+            const binary = path.join(root, "hanging-host.sh");
+            writeFileSync(binary, "#!/bin/sh\nsleep 30\n");
+            chmodSync(binary, 0o700);
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                outerAggregateMs: 250,
+            });
+            const result = await policy.restart();
+            expect(result.command).toBe("restart");
+            expect(result.reason).toBe("startup_timeout");
+            // The native transaction was SIGKILLed mid-flight: the stop may
+            // already have committed, so its effects are unknown.
+            expect(result.effects).toBeNull();
         } finally {
             rmSync(root, { recursive: true, force: true });
         }

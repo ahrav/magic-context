@@ -66,8 +66,11 @@ export interface LifecyclePolicyOptions {
     admissionIo?: AdmissionIo;
     /**
      * Post-transport storage probe used by managed Magic Context demand.
-     * U4 wires the real Magic Context status call; the default reports
-     * `ready` so explicit CLI flows are unaffected.
+     * U4 wires the real Magic Context status call. There is deliberately no
+     * permissive default: an unset probe reports `unavailable`, because a
+     * default of `ready` would authorize application bodies against a daemon
+     * whose storage state was never examined. Explicit CLI flows are
+     * unaffected — they never reach `demandStart`.
      */
     storageProbe?: (budgetMs: number) => Promise<StorageReadiness>;
     /** Dev/test payload directory forwarded to native start/restart. */
@@ -75,11 +78,22 @@ export interface LifecyclePolicyOptions {
     outerAggregateMs?: number;
 }
 
+/**
+ * Synthesize a pre-native v1 result.
+ *
+ * `effectsKnown` distinguishes a failure that provably committed nothing —
+ * the native binary was never invoked — from one whose native transaction was
+ * killed mid-flight and whose outcome is therefore unknown. Only the former
+ * may state `stop_committed`/`start_committed`; the latter reports `null`,
+ * because asserting `false` for a SIGKILLed restart would tell an operator the
+ * old incarnation is still serving when the stop may already have committed.
+ */
 function localResult(
     command: LifecycleCommand,
     ok: boolean,
     state: DaemonState,
     reason: DaemonReason,
+    effectsKnown = true,
 ): DaemonResultV1 {
     return {
         schema: "magic-context.daemon/v1",
@@ -88,7 +102,10 @@ function localResult(
         state,
         reason,
         remediation: remediationForReason(reason),
-        effects: command === "restart" ? { stop_committed: false, start_committed: false } : null,
+        effects:
+            command === "restart" && effectsKnown
+                ? { stop_committed: false, start_committed: false }
+                : null,
         readiness: null,
         checks: [],
         versions: {
@@ -133,7 +150,8 @@ export class McHostLifecyclePolicy {
         this.launchTarget = options.launchTarget ?? null;
         this.platformReaders = options.platformReaders;
         this.admissionIo = options.admissionIo;
-        this.storageProbe = options.storageProbe ?? (async () => "ready");
+        // Fail closed: an unwired probe must not assert readiness.
+        this.storageProbe = options.storageProbe ?? (async () => "unavailable");
         this.payloadDir = options.payloadDir;
         this.outerAggregateMs = options.outerAggregateMs ?? OUTER_AGGREGATE_MS;
     }
@@ -176,6 +194,7 @@ export class McHostLifecyclePolicy {
         if (!mayDemandStart(request.origin)) {
             throw new Error(`connection origin ${request.origin} is lifecycle-neutral`);
         }
+        const startedAt = Date.now();
         const rootResolution = resolveLifecycleDataRoot(this.env);
         const key = `${rootResolution.ok ? rootResolution.root : "\u0000no-root"}\u0000${request.capability}`;
         let shared = this.inflightStarts.get(key);
@@ -192,8 +211,59 @@ export class McHostLifecyclePolicy {
         if (request.capability !== "magic-context" || !result.ok) {
             return { result, storage: null };
         }
-        const storage = await this.storageProbe(STORAGE_HARD_BUDGET_MS);
+        const storage = await this.boundedStorageProbe(request, startedAt);
         return { result, storage };
+    }
+
+    /**
+     * Run the storage probe under the policy's own bound rather than trusting
+     * it to honor the budget it is handed.
+     *
+     * `raceWaiter` has already cleared its timer and detached the abort
+     * listener by the time the start resolves, so without this the probe would
+     * be both unbounded and uncancellable: a hanging probe would keep
+     * `demandStart` pending forever with the caller's signal and deadline no
+     * longer watching. Expiry, abort, and rejection all degrade to
+     * `unavailable` — never to `ready` — and the already-successful start
+     * result is still returned.
+     */
+    private async boundedStorageProbe(
+        request: DemandStartRequest,
+        startedAt: number,
+    ): Promise<StorageReadiness> {
+        const remaining =
+            request.deadlineMs === undefined
+                ? STORAGE_HARD_BUDGET_MS
+                : Math.min(STORAGE_HARD_BUDGET_MS, request.deadlineMs - (Date.now() - startedAt));
+        if (remaining <= 0) return "unavailable";
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        let onAbort: (() => void) | null = null;
+        try {
+            return await new Promise<StorageReadiness>((resolve) => {
+                let settled = false;
+                const finish = (value: StorageReadiness): void => {
+                    if (settled) return;
+                    settled = true;
+                    resolve(value);
+                };
+                timer = setTimeout(() => finish("unavailable"), remaining);
+                if (request.signal) {
+                    if (request.signal.aborted) {
+                        finish("unavailable");
+                        return;
+                    }
+                    onAbort = () => finish("unavailable");
+                    request.signal.addEventListener("abort", onAbort, { once: true });
+                }
+                this.storageProbe(remaining).then(
+                    (value) => finish(value),
+                    () => finish("unavailable"),
+                );
+            });
+        } finally {
+            if (timer !== null) clearTimeout(timer);
+            if (onAbort !== null) request.signal?.removeEventListener("abort", onAbort);
+        }
     }
 
     private raceWaiter(
@@ -288,7 +358,7 @@ export class McHostLifecyclePolicy {
                     ? { payloadDir: this.payloadDir }
                     : {}),
             });
-            return { ...native, command };
+            return this.relabel(native, command, command);
         } catch (error) {
             return this.launchFailure(command, preflight.root, error);
         }
@@ -310,10 +380,33 @@ export class McHostLifecyclePolicy {
                 deadlineMs: this.outerAggregateMs,
                 env: this.nativeEnv(preflight.root),
             });
-            return { ...native, command };
+            return this.relabel(native, "probe", command);
         } catch (error) {
             return this.launchFailure(command, preflight.root, error);
         }
+    }
+
+    /**
+     * Restamp a native result with the caller-facing command, first proving the
+     * child answered the command it was actually sent.
+     *
+     * `parseDaemonResult` validates the restart-only `effects` invariant
+     * against the child's own `command`, so blindly overwriting that field can
+     * publish a `restart` result carrying `effects` under a `stop` or `start`
+     * label. A disagreement means the child answered a different command than
+     * requested — a real version-skew signal — so it becomes `internal_error`
+     * rather than being silently relabeled. Observational commands legitimately
+     * map the native read-only `probe` onto `status`/`doctor`.
+     */
+    private relabel(
+        native: DaemonResultV1,
+        sent: NativeLifecycleCommand,
+        command: LifecycleCommand,
+    ): DaemonResultV1 {
+        if (native.command !== sent) {
+            return localResult(command, false, "wedged", "internal_error", false);
+        }
+        return { ...native, command };
     }
 
     private nativeEnv(root: string): Record<string, string> {
@@ -328,17 +421,30 @@ export class McHostLifecyclePolicy {
         if (error instanceof NativeLaunchError) {
             switch (error.code) {
                 case "timeout":
+                    // The native transaction was SIGKILLed mid-flight, so its
+                    // committed effects are unknown, not `false`.
                     return localResult(
                         command,
                         false,
                         state === "stopped" ? "stopped" : "wedged",
                         command === "stop" ? "shutdown_timeout" : "startup_timeout",
+                        false,
                     );
-                case "spawn_failed":
+                case "unsupported_platform":
+                    // The platform has no retained-descriptor exec path; the
+                    // binary was never invoked, so nothing committed.
+                    return localResult(command, false, state, "unsupported_platform");
                 case "signal_exit":
-                case "malformed_output":
+                case "output_cap_exceeded":
                 case "exit_disagreement":
+                case "malformed_output":
+                    // The child ran and was cut short or disagreed with itself;
+                    // its effects are equally unknown.
+                    return localResult(command, false, state, "internal_error", false);
+                case "spawn_failed":
                 case "usage_error":
+                    // The binary never ran, or rejected its invocation before
+                    // touching anything, so nothing committed.
                     return localResult(command, false, state, "internal_error");
             }
         }

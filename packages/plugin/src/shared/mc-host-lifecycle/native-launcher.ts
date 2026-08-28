@@ -2,8 +2,9 @@
  * Bounded native lifecycle subprocess invocation.
  *
  * Production launch maps the retained verified launcher descriptor to one
- * fixed child fd through Node/Bun stdio numeric mapping and spawns
- * `/proc/self/fd/<n>` with `shell:false`, a minimal environment, and the
+ * fixed child fd through Node/Bun stdio numeric mapping and spawns the
+ * platform's descriptor exec path (`/proc/self/fd/<n>` on linux,
+ * `/dev/fd/<n>` on darwin) with `shell:false`, a minimal environment, and the
  * startup envelope on stdin only. A dev/test injection point spawns an
  * explicit binary path instead (this repo's cargo-built `ck-mc-host`);
  * production callers never take that branch with untrusted input because the
@@ -33,8 +34,10 @@ export type NativeLifecycleCommand = "start" | "stop" | "restart" | "probe";
 
 export type NativeLaunchFailureCode =
     | "spawn_failed"
+    | "unsupported_platform"
     | "timeout"
     | "signal_exit"
+    | "output_cap_exceeded"
     | "malformed_output"
     | "exit_disagreement"
     | "usage_error";
@@ -60,6 +63,8 @@ export interface NativeLaunchOptions {
     deadlineMs: number;
     /** Explicit environment for the child; defaults to a minimal set. */
     env?: Record<string, string>;
+    /** Host platform override for the retained-descriptor exec path; tests only. */
+    platform?: NodeJS.Platform;
 }
 
 const MAX_STDOUT_BYTES = 256 * 1024;
@@ -71,6 +76,22 @@ interface CollectedExit {
     signal: NodeJS.Signals | null;
     stdout: string;
     timedOut: boolean;
+    outputCapExceeded: boolean;
+}
+
+/**
+ * Resolve the exec path that re-opens the retained launcher descriptor.
+ *
+ * Linux reaches it through procfs and darwin through `/dev/fd`; the release
+ * contract records exactly this split as the `procfs_self_fd_exec` and
+ * `dev_fd_exec` platform capabilities. Any other platform has neither, so it
+ * gets no path and the caller fails with a real platform reason rather than a
+ * spawn error against a path that cannot exist.
+ */
+function retainedFdExecPath(platform: NodeJS.Platform): string | null {
+    if (platform === "linux") return `/proc/self/fd/${LAUNCHER_CHILD_FD}`;
+    if (platform === "darwin") return `/dev/fd/${LAUNCHER_CHILD_FD}`;
+    return null;
 }
 
 function collectChild(child: ChildProcess, deadlineMs: number): Promise<CollectedExit> {
@@ -79,6 +100,7 @@ function collectChild(child: ChildProcess, deadlineMs: number): Promise<Collecte
         let stderrLen = 0;
         const stdoutChunks: Buffer[] = [];
         let timedOut = false;
+        let outputCapExceeded = false;
         let settled = false;
         let stdioGrace: ReturnType<typeof setTimeout> | null = null;
         const timer = setTimeout(() => {
@@ -88,7 +110,11 @@ function collectChild(child: ChildProcess, deadlineMs: number): Promise<Collecte
         child.stdout?.on("data", (chunk: Buffer) => {
             stdoutLen += chunk.length;
             if (stdoutLen > MAX_STDOUT_BYTES) {
-                timedOut = false;
+                // Its own flag, never `timedOut = false`: buffered stdout can
+                // still arrive after the deadline timer's SIGKILL, and clearing
+                // `timedOut` there would report a real deadline expiry as a
+                // bare signal exit.
+                outputCapExceeded = true;
                 child.kill("SIGKILL");
                 return;
             }
@@ -125,6 +151,7 @@ function collectChild(child: ChildProcess, deadlineMs: number): Promise<Collecte
                 signal,
                 stdout: Buffer.concat(stdoutChunks).toString("utf8"),
                 timedOut,
+                outputCapExceeded,
             });
         });
     });
@@ -151,7 +178,14 @@ export async function runNativeLifecycle(
     let executable: string;
     if (target.kind === "retained-fd") {
         stdio[LAUNCHER_CHILD_FD] = target.fd;
-        executable = `/proc/self/fd/${LAUNCHER_CHILD_FD}`;
+        const execPath = retainedFdExecPath(options.platform ?? process.platform);
+        if (execPath === null) {
+            throw new NativeLaunchError(
+                "unsupported_platform",
+                "no retained-descriptor exec path on this platform",
+            );
+        }
+        executable = execPath;
     } else {
         executable = target.path;
     }
@@ -165,6 +199,11 @@ export async function runNativeLifecycle(
     } catch {
         throw new NativeLaunchError("spawn_failed", "native spawn threw synchronously");
     }
+    // A child that already exited or failed to exec makes this write raise
+    // EPIPE/ERR_STREAM_DESTROYED on stdin. Without a listener that stream
+    // `error` is an uncaught exception in the host, so an ordinary child-side
+    // failure would crash the process instead of surfacing as NativeLaunchError.
+    child.stdin?.on("error", () => {});
     if (options.envelope !== undefined && options.envelope !== null) {
         child.stdin?.end(JSON.stringify(options.envelope));
     } else {
@@ -173,6 +212,12 @@ export async function runNativeLifecycle(
     const collected = await collectChild(child, options.deadlineMs);
     if (collected.timedOut) {
         throw new NativeLaunchError("timeout", "native lifecycle command exceeded its deadline");
+    }
+    if (collected.outputCapExceeded) {
+        throw new NativeLaunchError(
+            "output_cap_exceeded",
+            "native lifecycle command exceeded its stdout cap",
+        );
     }
     if (collected.signal !== null) {
         throw new NativeLaunchError(

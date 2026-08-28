@@ -507,7 +507,10 @@ export class McHostClient {
         if (daemonVer === null) return null;
         return {
             daemonVer,
-            daemonId: active.generation.authenticatedDaemonId,
+            // Copied, like every other crossing of this value (`auth.ts`,
+            // `transport-provider.ts`): callers must not be able to mutate the
+            // retained identity that authorizes compatibility and fencing.
+            daemonId: active.generation.authenticatedDaemonId?.slice() ?? null,
             proof: "current",
         };
     }

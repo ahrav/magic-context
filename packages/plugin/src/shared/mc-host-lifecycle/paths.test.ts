@@ -5,6 +5,7 @@ import {
     CONNECTION_FILE_NAME,
     connectionFilePath,
     coordinationDirPath,
+    defaultConnectionFilePath,
     managedSubtreePath,
     parseMounts,
     redactLifecyclePath,
@@ -162,5 +163,34 @@ describe("path redaction roots (R35)", () => {
             "<data-root>/cortexkit/run",
         );
         expect(redactLifecyclePath("/elsewhere/file", roots)).toBe("/elsewhere/file");
+    });
+});
+
+describe("managed connection-file derivation", () => {
+    test("the lifecycle root, not the fallback, names the published file", () => {
+        // The policy launches the daemon with XDG_DATA_HOME set to the
+        // lifecycle root, so readers must resolve the same root.
+        expect(defaultConnectionFilePath("/legacy-root", { XDG_DATA_HOME: "/xdg-root" })).toBe(
+            path.join("/xdg-root", "cortexkit", "run", CONNECTION_FILE_NAME),
+        );
+    });
+
+    test("a relative XDG_DATA_HOME falls back to HOME, matching the daemon", () => {
+        // `data-path.ts` would join a relative value against cwd; the daemon
+        // ignores it, so this reader must ignore it too.
+        expect(
+            defaultConnectionFilePath("/legacy-root", {
+                XDG_DATA_HOME: "./relative",
+                HOME: "/home-root",
+            }),
+        ).toBe(
+            path.join("/home-root", ".local", "share", "cortexkit", "run", CONNECTION_FILE_NAME),
+        );
+    });
+
+    test("the fallback root applies only when no lifecycle root resolves", () => {
+        expect(defaultConnectionFilePath("/legacy-root", { HOME: "relative-home" })).toBe(
+            path.join("/legacy-root", "cortexkit", "run", CONNECTION_FILE_NAME),
+        );
     });
 });
