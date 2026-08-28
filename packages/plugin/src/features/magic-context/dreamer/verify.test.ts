@@ -228,6 +228,39 @@ describe("claim-native verification", () => {
         }
     });
 
+    test("update verdict renews the validity window of a corrected anti-memory", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:verify-anti-update-ttl";
+            const dir = tempProject();
+            const updatedId = seedAntiMemory(db, projectIdentity, "ttl");
+            const beforeExpiry = readAntiMemory(db, updatedId)?.expiresAt ?? 0;
+            const batch = promptBatch(db, projectIdentity);
+            const corrected = [
+                "Trigger: ttl session caching",
+                "Rejected strategy: Redis ttl",
+                "Rejection reason: split ownership still holds after review",
+                "Safer alternative: use SQLite",
+            ].join("\n");
+
+            expect(
+                await applyVerifyManifest(
+                    verifyArgs(db, dir, projectIdentity),
+                    batch,
+                    `<verify><update claim="${updatedId}" files="">${corrected}</update></verify>`,
+                ),
+            ).toEqual({ verified: 0, updated: 1, archived: 0 });
+
+            const revised = readAntiMemory(db, updatedId);
+            expect(revised?.payload.rejectionReason).toBe(
+                "split ownership still holds after review",
+            );
+            expect(revised?.expiresAt ?? 0).toBeGreaterThan(beforeExpiry);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("verified, update, and archive commit exact events under one receipt", async () => {
         const db = freshDb();
         try {

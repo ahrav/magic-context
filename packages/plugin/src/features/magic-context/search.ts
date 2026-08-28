@@ -844,20 +844,46 @@ async function searchAntiMemories(args: {
         Date.now(),
     );
     if (candidateIds.length === 0) return [];
-    const state = readProjectMemoryCurrentState(args.db, {
-        publicClaimIds: candidateIds,
-        projectIds,
-        workspaceAuthorization: {
-            ownProjectIds,
-            sharedCategories: workspace.shareCategories ?? [],
-        },
-        workspaceEpoch: computeWorkspaceEpochFingerprint(args.db, workspace.identities),
-        workspaceIdentities: workspace.identities,
-        surface: "explicit_search",
-        lifecycleStates: ["active"],
-    });
-    if (state.status !== "ok") return [];
-    const antiMemoryItems = state.items.filter((item) => item.category === ANTI_MEMORY_CATEGORY);
+    // One closure = one authorization/surface/lifecycle setting, shared by the
+    // hydration read and the post-embedding recheck below, so the two reads
+    // cannot drift: the provider stays the single authority on visibility.
+    const readAntiMemoryState = (publicClaimIds: readonly string[]) => {
+        const result = readProjectMemoryCurrentState(args.db, {
+            publicClaimIds: [...publicClaimIds],
+            projectIds,
+            workspaceAuthorization: {
+                ownProjectIds,
+                sharedCategories: workspace.shareCategories ?? [],
+            },
+            workspaceEpoch: computeWorkspaceEpochFingerprint(args.db, workspace.identities),
+            workspaceIdentities: workspace.identities,
+            surface: "explicit_search",
+            lifecycleStates: ["active"],
+        });
+        return result.status === "ok"
+            ? result.items.filter((item) => item.category === ANTI_MEMORY_CATEGORY)
+            : null;
+    };
+    // The state read uses the explicit-search surface (the only surface whose
+    // candidate query includes anti-memory), so the automatic-surface policy
+    // gates are applied here. A projection written under a newer policy version
+    // fails closed — its stored bits are not trustworthy — and anything below
+    // the automatic eligibility bar (effective VERIFIED+ with a present,
+    // supported policy subject) must not be auto-injected into user prompts.
+    // Dispositions are re-checked from the authoritative facts because the
+    // projection can lag a policy-unaware writer.
+    const eligibleForSurface = (item: ProjectMemoryClaimSnapshot): boolean => {
+        if (args.surface !== "auto_search") return true;
+        if (item.policy.policyVersion > CLAIM_POLICY_VERSION) return false;
+        if (!item.policy.autoEligible) return false;
+        return !(
+            item.dispositions.stale ||
+            item.dispositions.disputed ||
+            item.dispositions.superseded
+        );
+    };
+    const antiMemoryItems = readAntiMemoryState(candidateIds);
+    if (antiMemoryItems === null) return [];
     const records = readAntiMemories(
         args.db,
         antiMemoryItems.map((item) => item.publicClaimId),
@@ -870,26 +896,7 @@ async function searchAntiMemories(args: {
         lexicalScore: number | null;
     }> = [];
     for (const item of antiMemoryItems) {
-        if (args.surface === "auto_search") {
-            // The state read above uses the explicit-search surface (the only
-            // surface whose candidate query includes anti-memory), so the
-            // automatic-surface policy gates must be re-applied here. A
-            // projection written under a newer policy version fails closed —
-            // its stored bits are not trustworthy — and anything below the
-            // automatic eligibility bar (effective VERIFIED+ with a present,
-            // supported policy subject) must not be auto-injected into user
-            // prompts. Dispositions are re-checked from the authoritative
-            // facts because the projection can lag a policy-unaware writer.
-            if (item.policy.policyVersion > CLAIM_POLICY_VERSION) continue;
-            if (!item.policy.autoEligible) continue;
-            if (
-                item.dispositions.stale ||
-                item.dispositions.disputed ||
-                item.dispositions.superseded
-            ) {
-                continue;
-            }
-        }
+        if (!eligibleForSurface(item)) continue;
         const record = records.get(item.publicClaimId);
         if (record === undefined) continue;
         // Match against payload values only. The rendered `record.content`
@@ -960,6 +967,7 @@ async function searchAntiMemories(args: {
                   .slice(0, ANTI_MEMORY_MAX_SEMANTIC_CANDIDATES)
             : [];
     const vectorByCandidate = new Map<number, Float32Array | null>();
+    const awaitedEmbedding = Boolean(semanticQueryEmbedding) && embedIndices.length > 0;
     if (semanticQueryEmbedding && embedIndices.length > 0) {
         const vectors = await args
             .embedPassages(
@@ -989,16 +997,40 @@ async function searchAntiMemories(args: {
         const semanticWins = semanticMatch && semanticScore > (candidate.lexicalScore ?? 0);
         ranked.push({
             ...candidate.result,
-            score: Math.max(candidate.lexicalScore ?? 0, semanticScore),
+            // A cosine score below the threshold is noise, not evidence. Folding
+            // it into the score through `Math.max` would let an unrelated
+            // passage outrank a genuine lexical hit while still reporting
+            // `matchType: "lexical"`, so only a threshold-clearing score ranks.
+            score: semanticMatch
+                ? Math.max(candidate.lexicalScore ?? 0, semanticScore)
+                : (candidate.lexicalScore ?? 0),
             matchType: semanticWins ? "semantic" : "lexical",
         });
     }
-    return ranked
+    const published = ranked
         .sort(
             (left, right) =>
                 right.score - left.score || left.publicClaimId.localeCompare(right.publicClaimId),
         )
         .slice(0, args.limit);
+    // Revalidate before publishing, but only when the passage embedding above
+    // actually awaited: candidates were hydrated before a live provider call
+    // that can take seconds, and under WAL another process can retire, revise,
+    // expire, or quarantine a warning inside that window. The lexical-only path
+    // never yields, so its snapshot is still the one it read.
+    if (published.length === 0 || !awaitedEmbedding) return published;
+    const current = readAntiMemoryState(published.map((result) => result.publicClaimId));
+    if (current === null) return [];
+    const currentById = new Map(current.map((item) => [item.publicClaimId, item]));
+    return published.filter((result) => {
+        const item = currentById.get(result.publicClaimId);
+        // Absent means archived, expired, or no longer visible; a moved locator
+        // or digest means the payload copied above is pre-transition content.
+        if (item === undefined) return false;
+        if (item.revisionLocator !== result.revisionLocator) return false;
+        if (item.contentDigest !== result.contentDigest) return false;
+        return eligibleForSurface(item);
+    });
 }
 
 interface RankedNoteMatch {
@@ -1496,7 +1528,7 @@ function compareUnifiedResults(left: UnifiedSearchResult, right: UnifiedSearchRe
         (left.source === "memory" || left.source === "anti_memory") &&
         (right.source === "memory" || right.source === "anti_memory")
     ) {
-        return left.publicClaimId < right.publicClaimId ? -1 : 1;
+        return left.publicClaimId.localeCompare(right.publicClaimId);
     }
 
     if (left.source === "message" && right.source === "message") {
@@ -1854,13 +1886,23 @@ export function resolveClaimsByLocatorsForSearch(args: {
     const confirmed = ordered.filter((result) => {
         const item = currentByClaimId.get(result.publicClaimId);
         if (item === undefined) return false;
-        return (
-            item.revisionLocator === result.revisionLocator &&
-            item.contentDigest === result.contentDigest &&
-            (result.source === "anti_memory" || item.content === result.content) &&
-            (result.source === "anti_memory" || item.category === result.category) &&
-            (item.explicitLabel ?? undefined) === result.policyLabel
-        );
+        if (
+            item.revisionLocator !== result.revisionLocator ||
+            item.contentDigest !== result.contentDigest ||
+            (item.explicitLabel ?? undefined) !== result.policyLabel
+        ) {
+            return false;
+        }
+        // An anti-memory result carries payload fields, not `content`/`category`,
+        // so the equality checks above cannot cover it. The read spans
+        // `["active", "archived"]` and archiving moves neither the locator nor
+        // the digest, so the lifecycle and category gates hydration applied are
+        // re-applied here instead; otherwise a warning archived under us is
+        // still published.
+        if (result.source === "anti_memory") {
+            return item.category === ANTI_MEMORY_CATEGORY && item.lifecycleState === "active";
+        }
+        return item.content === result.content && item.category === result.category;
     });
     // Dropping is the same observable outcome as never resolving: `null` is
     // exactly what a missing or foreign-hidden locator returns, so a caller

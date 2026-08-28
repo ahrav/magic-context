@@ -143,6 +143,12 @@ export function renderAntiMemoryContent(payload: AntiMemoryPayload): string {
 export function parseAntiMemoryContent(content: string): AntiMemoryPayload {
     const fields = new Map<string, string>();
     for (const line of content.split(/\r?\n/)) {
+        // A blank line carries no field. `renderAntiMemoryContent` never emits
+        // one, but this parser also reads model-authored content from the
+        // verification manifest, where a trailing newline or a blank line
+        // between fields is ordinary formatting rather than corruption. Only a
+        // non-empty line missing a label is malformed.
+        if (line.trim().length === 0) continue;
         const separator = line.indexOf(":");
         if (separator <= 0) throw new ClaimOperationInputError("invalid anti-memory content line");
         const label = line.slice(0, separator).trim();

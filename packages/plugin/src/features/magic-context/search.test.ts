@@ -540,6 +540,75 @@ describe("unifiedSearch", () => {
         ).toEqual([]);
     });
 
+    it("keeps a sub-threshold passage similarity out of the anti-memory score", async () => {
+        const project = "git:anti-subthreshold";
+        seedAntiMemory(db, project, "subthreshold");
+        const query = "caching ownership alpha bravo charlie delta echo foxtrot golf hotel";
+
+        const lexicalOnly = await unifiedSearch(db, "session-anti", project, query, {
+            sources: ["memory"],
+            memoryEnabled: true,
+            embeddingEnabled: false,
+            memoryPolicySurface: "explicit_search",
+        });
+        expect(lexicalOnly).toHaveLength(1);
+        const lexicalScore = lexicalOnly[0].score;
+
+        // Cosine 0.65 sits below ANTI_MEMORY_SEMANTIC_THRESHOLD but above the
+        // lexical score, so folding it in would rank this warning on similarity
+        // the lane already judged too weak to count as a match.
+        queryEmbedding = new Float32Array([1, 0]);
+        const automatic = await unifiedSearch(db, "session-anti", project, query, {
+            sources: ["memory"],
+            memoryEnabled: true,
+            embeddingEnabled: true,
+            memoryPolicySurface: "auto_search",
+            embedQuery,
+            embedPassages: async (texts) =>
+                texts.map(() => new Float32Array([0.65, Math.sqrt(1 - 0.65 * 0.65)])),
+            isEmbeddingRuntimeEnabled,
+        });
+
+        expect(lexicalScore).toBeLessThan(0.65);
+        expect(automatic).toHaveLength(1);
+        expect(automatic[0]).toMatchObject({ source: "anti_memory", matchType: "lexical" });
+        expect(automatic[0].score).toBeCloseTo(lexicalScore, 10);
+    });
+
+    it("drops an anti-memory retired while its passage embedding was in flight", async () => {
+        const project = "git:anti-inflight-retire";
+        const anti = seedAntiMemory(db, project, "inflight");
+        queryEmbedding = new Float32Array([1, 0]);
+
+        const results = await unifiedSearch(db, "session-anti", project, "Redis session caching", {
+            sources: ["memory"],
+            memoryEnabled: true,
+            embeddingEnabled: true,
+            memoryPolicySurface: "auto_search",
+            embedQuery,
+            embedPassages: async (texts) => {
+                // A concurrent writer demotes the warning while this provider
+                // call is outstanding, so every candidate hydrated before the
+                // await is now pre-transition content.
+                const revision = db
+                    .prepare(
+                        `SELECT revisions.id AS id FROM claim_public_ids public
+                         JOIN claims ON claims.id = public.claim_id
+                         JOIN claim_revisions revisions ON revisions.id = claims.current_revision_id
+                         WHERE public.public_id = ?`,
+                    )
+                    .get(anti.publicClaimId) as { id: number };
+                db.prepare(
+                    "INSERT INTO verification_events (revision_id, outcome, verifier, created_at) VALUES (?, 'stale', 'test', ?)",
+                ).run(revision.id, Date.now());
+                return texts.map(() => new Float32Array([1, 0]));
+            },
+            isEmbeddingRuntimeEnabled,
+        });
+
+        expect(results).toEqual([]);
+    });
+
     it("suppresses the project-memory lane in unified search until retrieval activates", async () => {
         seedProjectMemoryClaim(db, {
             projectIdentity: "git:repo-project",

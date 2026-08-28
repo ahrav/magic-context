@@ -85,6 +85,24 @@ describe("anti-memory typed operations", () => {
         });
     });
 
+    test("parses content carrying a trailing newline and blank separator lines", () => {
+        const rendered = renderAntiMemoryContent({
+            trigger: "session caching",
+            rejectedStrategy: "Redis",
+            rejectionReason: "split ownership",
+            saferAlternative: "use SQLite",
+        });
+        const loose = `${rendered.split("\n").join("\n\n")}\n`;
+
+        expect(parseAntiMemoryContent(loose)).toEqual(parseAntiMemoryContent(rendered));
+    });
+
+    test("still rejects a non-empty line with no field label", () => {
+        expect(() => parseAntiMemoryContent("Trigger: caching\nno label here")).toThrow(
+            "invalid anti-memory content line",
+        );
+    });
+
     test("creates and reads a project-private record with a 90-day validity window", () => {
         const { db } = createDirectTestDatabase();
         try {

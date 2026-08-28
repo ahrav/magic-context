@@ -493,6 +493,32 @@ function stageVerificationItem(
                   ),
         );
         if (item.value.category === ANTI_MEMORY_CATEGORY) {
+            // The revision inherits the old deadline, so a warning corrected
+            // shortly before it expires would vanish right after the verifier
+            // confirmed its replacement content. Renew on the same rule the
+            // `verify` branch applies: an UPDATE is the stronger verdict and
+            // must not leave the shorter validity window.
+            const revised = readAntiMemory(db, item.binding.publicClaimId);
+            const extendBelow = nowMs + ANTI_MEMORY_DEFAULT_TTL_MS / 2;
+            if (revised !== null && revised.expiresAt !== null && revised.expiresAt < extendBelow) {
+                const renewed = freshTarget(db, item.binding.publicClaimId);
+                outcomes.push(
+                    stageExtendAntiMemoryTtlInCurrentTransaction(
+                        db,
+                        {
+                            token: renewed.token,
+                            expiresAt: nowMs + ANTI_MEMORY_DEFAULT_TTL_MS,
+                            provenance: dreamerInferenceProvenance({
+                                identity,
+                                binding: item.binding,
+                                sourceContent: item.value.content,
+                            }),
+                            actor: `dreamer:${identity.runId}`,
+                        },
+                        nowMs,
+                    ),
+                );
+            }
             return combineClaimOperationStageOutcomes(outcomes, {
                 kind: item.value.kind,
                 publicClaimId: item.binding.publicClaimId,
