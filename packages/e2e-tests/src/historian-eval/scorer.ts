@@ -40,7 +40,7 @@ import {
 } from "./contract";
 import { readInjectedClaims } from "./claim-read";
 import { verifyAllActiveClaims } from "./verification-bridge";
-import { RUN_RECORD_SCHEMA, authoredTurnOrdinalsFor } from "./runner";
+import { RUN_RECORD_SCHEMA, authoredTurnOrdinalsFor, rangeCoveredByCompartments } from "./runner";
 import type {
     HistorianEvalRunRecord,
     InjectedClaimRecord,
@@ -761,32 +761,6 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
     const inventoryError = recordInventoryError(record);
     if (inventoryError !== null) return inventoryError;
 
-    const allAttemptsInvalid =
-        record.historianRuns.length > 0 && record.historianRuns.every((run) => run.status === "failed");
-    if (allAttemptsInvalid) {
-        return assembleScore({
-            scenarioId: record.scenarioId,
-            facts: {
-                precision: null,
-                recall: null,
-                expectedClaimsMatched: 0,
-                expectedClaimsTotal: scenario.gold.expectedClaims.length,
-                visibleClaimsMatched: 0,
-                visibleClaimsTotal: 0,
-                falseAuthoritativeMatches: [],
-            },
-            structuralFindings: [],
-            probeVerdicts: [],
-            allAttemptsInvalid: true,
-            system: record.system,
-        });
-    }
-
-    // Checked after the all-invalid branch: nothing was published there, so the
-    // runner records no probe exchanges by design.
-    const coverageError = probeCoverageError(record, scenario);
-    if (coverageError !== null) return coverageError;
-
     // Snapshot storage is external run evidence and fails independently of
     // historian quality — a record copied without its SQLite file, a path that
     // moved, a truncated image. That is an infrastructure ERROR for this
@@ -950,6 +924,37 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
             return errorScore(record.scenarioId, "record-snapshot-mismatch", mismatch, record.system);
         }
 
+        // FAIL:invalid-output is a claim about model behavior, so it is made only
+        // after the persisted evidence backs it. Classifying first meant a deleted
+        // snapshot, or a copied record whose statuses were edited to validation
+        // failures, was charged to historian quality instead of surfacing as an
+        // artifact-integrity ERROR.
+        const allAttemptsInvalid =
+            record.historianRuns.length > 0 && record.historianRuns.every((run) => run.status === "failed");
+        if (allAttemptsInvalid) {
+            return assembleScore({
+                scenarioId: record.scenarioId,
+                facts: {
+                    precision: null,
+                    recall: null,
+                    expectedClaimsMatched: 0,
+                    expectedClaimsTotal: scenario.gold.expectedClaims.length,
+                    visibleClaimsMatched: 0,
+                    visibleClaimsTotal: 0,
+                    falseAuthoritativeMatches: [],
+                },
+                structuralFindings: [],
+                probeVerdicts: [],
+                allAttemptsInvalid: true,
+                system: record.system,
+            });
+        }
+
+        // After the all-invalid branch: nothing was published there, so the runner
+        // records no probe exchanges by design.
+        const coverageError = probeCoverageError(record, scenario);
+        if (coverageError !== null) return coverageError;
+
         // Per-probe locator sets must name claims the record actually recorded as
         // injected. Editing one converts a genuine wrong answer into
         // `error-trimmed` — excluding it from scored metrics — or admits a
@@ -970,6 +975,32 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
                 `probe injected-locator set names ${foreignProbeLocators.length} claim(s) absent from the record's injected claims: [${foreignProbeLocators.slice(0, 5).join(", ")}]`,
                 record.system,
             );
+        }
+
+        // The runner's leakage precondition, re-applied to a stored artifact: a
+        // probe whose gold source range is not compartment-covered cannot have had
+        // its raw history removed by the splice, so its answer proves nothing.
+        // `minCount` being satisfied elsewhere in the transcript does not imply
+        // this probe's own range was covered, and a stored record never passes
+        // through the live gate.
+        const compartmentRanges = rows.map((row) => ({ start: row.startMessage, end: row.endMessage }));
+        for (const probe of scenario.probes) {
+            const reference = probe.answerType === "claim-id" ? probe.expectedClaimRef : probe.sourceClaimRef;
+            const goldClaim = scenario.gold.expectedClaims.find((claim) => claim.id === reference);
+            if (goldClaim === undefined) continue;
+            const [startTurn, endTurn] = goldClaim.sourceTurnRange;
+            const range: [number, number] = [
+                record.authoredTurnOrdinals[startTurn][0],
+                record.authoredTurnOrdinals[endTurn][1],
+            ];
+            if (!rangeCoveredByCompartments(range, compartmentRanges)) {
+                return errorScore(
+                    record.scenarioId,
+                    "probe-gold-uncovered",
+                    `probe ${probe.id}: gold claim ${goldClaim.id} ordinal range ${range[0]}-${range[1]} not covered by the snapshot's compartments`,
+                    record.system,
+                );
+            }
         }
 
         const probesById = new Map(scenario.probes.map((probe) => [probe.id, probe]));

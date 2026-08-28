@@ -248,6 +248,9 @@ function envelopeSafeAnswer(value: string, label: string): string {
  */
 export const MAX_PROBE_CHOICES = 10;
 
+/** Separator the probe prompt renders multiple-choice options with. */
+export const PROBE_CHOICE_SEPARATOR = " | ";
+
 function turnText(value: unknown, label: string): string {
     const result = string(value, label);
     if (result.length > MAX_TURN_TEXT_CHARS) fail(`${label}: above-operational-maximum`);
@@ -326,6 +329,13 @@ function parseProbe(raw: unknown, label: string): Probe {
         // truncated and scored wrong.
         for (const [index, choice] of choices.entries()) {
             envelopeSafeAnswer(choice, `${label}.choices[${index}]`);
+            // The prompt renders the options joined by this separator, so a
+            // choice containing it makes the option count ambiguous — `["A | B",
+            // "C"]` reads as three options — and a valid selection can be scored
+            // wrong.
+            if (choice.includes(PROBE_CHOICE_SEPARATOR)) {
+                fail(`${label}.choices[${index}]: choice-separator`);
+            }
         }
         const goldAnswer = string(value.goldAnswer, `${label}.goldAnswer`);
         if (!choices.includes(goldAnswer)) fail(`${label}.goldAnswer: not-a-choice`);

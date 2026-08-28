@@ -389,6 +389,15 @@ describe("gold and probe freeze guards", () => {
         expect(() => parseScenario(raw)).toThrow(/answer-envelope-delimiter/);
     });
 
+    test("rejects a choice containing the option separator the prompt renders with", () => {
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Record<string, unknown>[];
+        // Rendered as "A | B | C", so the model cannot tell two options from three.
+        probes[1].choices = ["A | B", "in-process lru"];
+        probes[1].goldAnswer = "in-process lru";
+        expect(() => parseScenario(raw)).toThrow(/choice-separator/);
+    });
+
     test("rejects a delimiter-bearing multiple-choice option, not only the gold one", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];

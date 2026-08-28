@@ -926,6 +926,51 @@ describe("scoreRunRecord", () => {
         }
     });
 
+    test("an all-invalid record with an unreadable snapshot is an integrity ERROR, not a model FAIL", () => {
+        const fixture = makeSnapshot({ facts: [] });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario, {
+                historianRuns: [
+                    goldenRun({ status: "failed", failureReason: "validation: no parsable compartment" }),
+                    goldenRun({
+                        runIndex: 2,
+                        status: "failed",
+                        failureReason: "validation: no parsable compartment",
+                    }),
+                ],
+            });
+            // Backed by evidence: still FAIL:invalid-output.
+            expect(scoreRunRecord(record, scenario).failReasons).toEqual(["invalid-output"]);
+
+            // Snapshot gone: the claim about model quality has nothing behind it.
+            const score = scoreRunRecord(
+                { ...record, contextDbSnapshotPath: join(fixture.dbPath, "..", "absent.sqlite") },
+                scenario,
+            );
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("unreadable-snapshot");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("a probe whose gold range is uncovered in the snapshot is ERROR, not a scored answer", () => {
+        // minCount is satisfied by the filler compartment, but the authored
+        // range 13-20 is not covered, so the splice cannot have removed the raw
+        // gold history the probe is supposed to be blind to.
+        const fixture = makeSnapshot({ facts: goldFacts(), compartments: [{ start: 1, end: 12 }] });
+        try {
+            const scenario = validScenario();
+            const record = makeRecord(fixture, scenario);
+            const score = scoreRunRecord(record, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("probe-gold-uncovered");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
     test("a two-run artifact whose later run persists a further compartment is not a mismatch", () => {
         // Run 1's margin was recorded against the compartments that existed then
         // (prefix max 12); run 2's against the full set (max 20). Reconstructing

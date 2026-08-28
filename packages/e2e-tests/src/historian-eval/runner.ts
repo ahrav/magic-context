@@ -15,7 +15,7 @@
  * idempotency receipts and score first-attempt state.
  */
 
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
     extractLatestAssistantText,
@@ -33,6 +33,7 @@ import { TestHarness, type TestHarnessOptions } from "../harness";
 import { MockProvider, type MockResponse } from "../mock-provider/server";
 import {
     EXECUTE_THRESHOLD_PERCENTAGE,
+    PROBE_CHOICE_SEPARATOR,
     matchesGold,
     scenarioFingerprint,
     triggerTurnUsage,
@@ -320,16 +321,25 @@ function buildProbePrompt(probe: Probe): string {
         return `${shared}\nQuestion: ${probe.question}\nAnswer with the exact value only.`;
     }
     if (probe.answerType === "multiple-choice") {
-        return `${shared}\nQuestion: ${probe.question}\nChoose exactly one of: ${probe.choices.join(" | ")}.`;
+        return `${shared}\nQuestion: ${probe.question}\nChoose exactly one of: ${probe.choices.join(PROBE_CHOICE_SEPARATOR)}.`;
     }
     return `${shared}\nQuestion: ${probe.question}\nAnswer with the id of the single project-memory claim (the identifier before the colon in the project-memory block) that records it.`;
 }
 
+/**
+ * Contents of the response's single answer envelope, or null.
+ *
+ * Exactly one envelope is required. Taking the first of several would let
+ * `<answer>correct</answer><answer>wrong</answer>` pass on an ambiguous or
+ * self-contradictory reply, and because the extracted prefix is non-null the
+ * runner would not re-ask. Null sends the probe back through the re-ask path,
+ * and a second malformed reply is `probe-envelope-malformed`.
+ */
 export function extractAnswerEnvelope(text: string | null): string | null {
     if (text === null) return null;
-    const match = /<answer>([\s\S]*?)<\/answer>/.exec(text);
-    if (!match) return null;
-    const answer = match[1].trim();
+    const matches = [...text.matchAll(/<answer>([\s\S]*?)<\/answer>/g)];
+    if (matches.length !== 1) return null;
+    const answer = matches[0][1].trim();
     return answer.length > 0 ? answer : null;
 }
 
@@ -377,6 +387,27 @@ export function stripInjectedBlocks(text: string): string {
  */
 export function carriesInjectedBlockTag(text: string): boolean {
     return INJECTED_BLOCK_TAGS.some((tag) => text.includes(`<${tag}>`) || text.includes(`</${tag}>`));
+}
+
+/**
+ * Whether every ordinal in `range` lies inside some compartment.
+ *
+ * Union coverage, not containment: adjacent compartments legitimately tile a
+ * multi-turn gold range, so requiring one enclosing compartment would
+ * misclassify valid output as uncovered. Exported because the scorer applies the
+ * same precondition when rescoring a stored artifact, which never passes through
+ * the runner's live gate.
+ */
+export function rangeCoveredByCompartments(
+    range: readonly [number, number],
+    compartments: ReadonlyArray<{ start: number; end: number }>,
+): boolean {
+    for (let ordinal = range[0]; ordinal <= range[1]; ordinal += 1) {
+        if (!compartments.some((compartment) => compartment.start <= ordinal && compartment.end >= ordinal)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /** Ids of the messages in a session-messages response. */
@@ -449,12 +480,33 @@ function resolveRepoCommitSha(): string {
             const porcelain = status.success ? status.stdout.toString() : "";
             if (porcelain.trim().length > 0) {
                 const diff = Bun.spawnSync(["git", "diff", "HEAD"], { stdout: "pipe", stderr: "ignore" });
-                const digest = new Bun.CryptoHasher("sha256")
-                    .update(porcelain)
-                    .update(diff.success ? diff.stdout.toString() : "")
-                    .digest("hex")
-                    .slice(0, 12);
-                sha = `${candidate}-dirty.${digest}`;
+                const hasher = new Bun.CryptoHasher("sha256");
+                hasher.update(porcelain);
+                hasher.update(diff.success ? diff.stdout.toString() : "");
+                // `git diff HEAD` covers tracked modifications only, so untracked
+                // file CONTENTS have to be hashed explicitly: two trees whose
+                // untracked files share names but differ in bytes would otherwise
+                // produce the same identity, which is the collision this whole
+                // branch exists to prevent. `--exclude-standard` keeps ignored
+                // paths (build output, node_modules) out of the walk.
+                const untracked = Bun.spawnSync(
+                    ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+                    { stdout: "pipe", stderr: "ignore" },
+                );
+                if (untracked.success) {
+                    for (const path of untracked.stdout.toString().split("\0").filter((entry) => entry.length > 0)) {
+                        hasher.update(path);
+                        try {
+                            hasher.update(readFileSync(path));
+                        } catch {
+                            // Unreadable or vanished between listing and reading:
+                            // the path is still in the digest, so the tree is not
+                            // mistaken for clean.
+                            hasher.update("<unreadable>");
+                        }
+                    }
+                }
+                sha = `${candidate}-dirty.${hasher.digest("hex").slice(0, 12)}`;
             }
         }
     } catch {
@@ -1223,6 +1275,22 @@ class ScenarioRunner {
         for (const probe of this.scenario.probes) {
             exchanges.push(await this.driveProbe(harness, sessionId, probe));
         }
+        // Quiesce first. `startCompartmentAgent` launches asynchronously and
+        // `compartment-runner-incremental` writes its `historian_runs` row in a
+        // `finally`, so counting rows immediately can still read the pre-probe
+        // number while an undeclared pass is mid-flight — and then the snapshot is
+        // taken with its compartments present but its row absent.
+        try {
+            await harness.waitFor(() => this.historianQuiesced(harness, sessionId), {
+                timeoutMs: this.options.historianWaitMs ?? 90_000,
+                label: "historian quiescent after the probe phase",
+            });
+        } catch {
+            throw new RunAbort(
+                "harness-failure",
+                "a historian pass was still in flight after the probe phase; its run row cannot be accounted for",
+            );
+        }
         const runRowsAfter = this.historianRunRows(harness, sessionId).length;
         if (runRowsAfter !== runRowsBefore) {
             throw new RunAbort(
@@ -1338,19 +1406,10 @@ class ScenarioRunner {
             .prepare("SELECT start_message AS start, end_message AS end FROM compartments WHERE session_id = ?")
             .all(sessionId) as Array<{ start: number; end: number }>;
         const ordinals = this.authoredTurnOrdinals();
-        const covered = (range: [number, number]): boolean => {
-            // Union coverage: adjacent compartments legitimately tile a
-            // multi-turn gold range, so requiring one containing compartment
-            // would misclassify valid output as uncovered.
-            for (let ordinal = range[0]; ordinal <= range[1]; ordinal += 1) {
-                if (!compartments.some((c) => c.start <= ordinal && c.end >= ordinal)) return false;
-            }
-            return true;
-        };
         for (const claim of this.probeGoldClaims(probe)) {
             const [startTurn, endTurn] = claim.sourceTurnRange;
             const range: [number, number] = [ordinals[startTurn][0], ordinals[endTurn][1]];
-            if (!covered(range)) {
+            if (!rangeCoveredByCompartments(range, compartments)) {
                 throw new RunAbort(
                     "probe-gold-uncovered",
                     `probe ${probe.id}: gold claim ${claim.id} ordinal range ${range[0]}-${range[1]} not covered by the published compartments`,

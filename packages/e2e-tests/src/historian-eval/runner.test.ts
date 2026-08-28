@@ -73,6 +73,15 @@ describe("extractAnswerEnvelope", () => {
     });
 });
 
+describe("extractAnswerEnvelope: exactly one envelope", () => {
+    test("more than one envelope is not structured probe evidence", () => {
+        // Taking the first would pass an ambiguous reply, and because the prefix
+        // is non-null the runner would not re-ask.
+        expect(extractAnswerEnvelope("<answer>correct</answer><answer>wrong</answer>")).toBeNull();
+        expect(extractAnswerEnvelope("<answer>4096</answer>")).toBe("4096");
+    });
+});
+
 describe("findOrdinalRange", () => {
     test("parses the chunk header, ignoring bracketed numbers in transcript or repair content", () => {
         const body = {
