@@ -244,6 +244,59 @@ describe("native invocation mapping", () => {
         }
     });
 
+    test("preflight time is deducted from the native aggregate", async () => {
+        // The aggregate is a request-to-transport bound, so a slow synchronous
+        // preflight must shrink the child's share of it rather than being
+        // followed by a fresh full budget. Exhausting it entirely is this
+        // command's timeout, and nothing was spawned, so a restart reports no
+        // committed effects rather than unknown ones.
+        const root = tempDir("mc-policy-preflight-budget-");
+        try {
+            const { binary, invocationLog } = fakeBinary(root);
+            const SYNC_MS = 300;
+            const slowGate: PlatformReaders = {
+                platform: "linux",
+                arch: "x64",
+                kernelRelease: () => "6.1.0",
+                glibcVersion: () => {
+                    const until = Date.now() + SYNC_MS;
+                    while (Date.now() < until) {
+                        /* stand in for the darwin sw_vers fallback */
+                    }
+                    return "2.34";
+                },
+                procSelfFdUsable: () => true,
+                macosProductVersion: () => null,
+            };
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                platformReaders: slowGate,
+                // Smaller than the preflight cost, so the residual is exhausted.
+                outerAggregateMs: SYNC_MS / 3,
+            });
+            const result = await policy.start();
+            expect(result.reason).toBe("startup_timeout");
+            expect(result.ok).toBe(false);
+            // No child was spawned: the budget was gone before the launch.
+            expect(invocations(invocationLog)).toEqual([]);
+
+            // A restart on the same exhausted path reports nothing committed,
+            // not unknown effects.
+            const restartPolicy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                platformReaders: slowGate,
+                outerAggregateMs: SYNC_MS / 3,
+            });
+            const restart = await restartPolicy.restart();
+            expect(restart.reason).toBe("startup_timeout");
+            expect(restart.effects).toEqual({ stop_committed: false, start_committed: false });
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 20_000);
+
     test("each qualified target gets the aggregate it was qualified for", () => {
         // release/mc-host-production-inputs.lock.json qualifies
         // fresh_linux_transport_aggregate.hard at 60s and

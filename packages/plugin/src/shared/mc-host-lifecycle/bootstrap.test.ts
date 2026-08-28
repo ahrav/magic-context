@@ -627,6 +627,112 @@ describe("bootstrap staging (U3 scenarios 3 and 6)", () => {
         }
     });
 
+    test("a present but unopenable launcher source is invalid, not missing", () => {
+        // Only true absence earns `native_payload_missing` /
+        // `install_native_payload`. A source that is present but cannot be
+        // opened safely is an installed payload that cannot be trusted, and
+        // telling the operator to install it would send them to fix something
+        // that is already there.
+        const dir = tempDir("mc-stage-present-invalid-");
+        try {
+            const real = path.join(dir, "real-launcher");
+            writeFileSync(real, "bytes");
+            const link = path.join(dir, "launcher-link");
+            symlinkSync(real, link);
+            const reasonFor = (sourcePath: string): string | null => {
+                try {
+                    stageBootstrap({
+                        sourcePath,
+                        destDir: path.join(dir, "store"),
+                        expectedSha256: sha256("bytes"),
+                        availableBytesOverride: 1n << 40n,
+                    });
+                } catch (error) {
+                    return (error as BootstrapError).reason;
+                }
+                return null;
+            };
+            // O_NOFOLLOW rejects the symlink with ELOOP: present, untrustworthy.
+            expect(reasonFor(link)).toBe("native_payload_invalid");
+            // A genuinely absent source is still missing.
+            expect(reasonFor(path.join(dir, "no-such-launcher"))).toBe("native_payload_missing");
+            // ENOTDIR — a file used as a directory component — is also absence.
+            expect(reasonFor(path.join(real, "under-a-file"))).toBe("native_payload_missing");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test("a payload reached through a symlinked ancestor is not certified", () => {
+        // classifyEntry lstats only the final component, so the kernel has
+        // already followed every ancestor by the time it answers "dir". A
+        // node_modules or scope directory replaced by a symlink to another
+        // install would otherwise certify a foreign package as this install's.
+        const dir = tempDir("mc-layout-ancestor-");
+        try {
+            const pkg = "@cortexkit/mc-host-linux-x64-gnu";
+            const foreign = path.join(dir, "foreign");
+            mkdirSync(path.join(foreign, "node_modules", ...pkg.split("/")), { recursive: true });
+
+            // 1. node_modules itself is a symlink to a foreign install's.
+            const viaNodeModules = path.join(dir, "root-nm");
+            mkdirSync(viaNodeModules, { recursive: true });
+            symlinkSync(
+                path.join(foreign, "node_modules"),
+                path.join(viaNodeModules, "node_modules"),
+            );
+            const nmVerdict = resolvePayloadPackageDir({
+                declaringParentRoot: viaNodeModules,
+                packageName: pkg,
+            });
+            expect(nmVerdict.ok).toBe(false);
+            if (!nmVerdict.ok) expect(nmVerdict.reason).toBe("unsupported_install_layout");
+
+            // 2. The scope directory is the symlink instead.
+            const viaScope = path.join(dir, "root-scope");
+            mkdirSync(path.join(viaScope, "node_modules"), { recursive: true });
+            symlinkSync(
+                path.join(foreign, "node_modules", "@cortexkit"),
+                path.join(viaScope, "node_modules", "@cortexkit"),
+            );
+            const scopeVerdict = resolvePayloadPackageDir({
+                declaringParentRoot: viaScope,
+                packageName: pkg,
+            });
+            expect(scopeVerdict.ok).toBe(false);
+
+            // 3. An external root may not escape its own declared root either.
+            const extRoot = path.join(dir, "ext");
+            mkdirSync(extRoot, { recursive: true });
+            symlinkSync(path.join(foreign, "node_modules"), path.join(extRoot, "node_modules"));
+            const extVerdict = resolvePayloadPackageDir({
+                declaringParentRoot: path.join(dir, "unused"),
+                packageName: pkg,
+                explicitExternalRoot: extRoot,
+            });
+            expect(extVerdict.ok).toBe(false);
+
+            // A genuine same-install layout is still certified: containment, not
+            // canonical equality, so a symlinked ancestor that stays inside the
+            // install (macOS /var -> /private/var, symlinked homes) is fine.
+            const honest = path.join(dir, "root-ok");
+            mkdirSync(path.join(honest, "real", "node_modules", ...pkg.split("/")), {
+                recursive: true,
+            });
+            symlinkSync(
+                path.join(honest, "real", "node_modules"),
+                path.join(honest, "node_modules"),
+            );
+            const okVerdict = resolvePayloadPackageDir({
+                declaringParentRoot: honest,
+                packageName: pkg,
+            });
+            expect(okVerdict.ok).toBe(true);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
     test("the staging copy is bounded by the preflighted size, not the live EOF", () => {
         // `expectedBytes` is the size capacity was approved against, so passing a
         // value that disagrees with the file is exactly the concurrent-mutation

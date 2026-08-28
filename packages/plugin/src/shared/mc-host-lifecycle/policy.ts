@@ -401,6 +401,12 @@ export class McHostLifecyclePolicy {
     private preflight(
         command: LifecycleCommand,
     ): { ok: true; root: string; deadlineMs: number } | { ok: false; result: DaemonResultV1 } {
+        // The aggregate is a request-to-transport bound, so preflight's own cost
+        // counts against it. `checkPlatform`'s darwin arm can spend up to two
+        // seconds in `sw_vers`, and handing the child a fresh full aggregate
+        // afterwards let the operation overrun the budget its platform was
+        // qualified against — the same mistake the demand waiter had.
+        const startedAt = Date.now();
         const rootResolution = resolveLifecycleDataRoot(this.env);
         if (!rootResolution.ok) {
             return { ok: false, result: localResult(command, false, "unavailable", "no_data_dir") };
@@ -424,11 +430,20 @@ export class McHostLifecyclePolicy {
         }
         // The gate already resolved which qualified target this host is, so the
         // aggregate comes from that rather than from a Linux-shaped default.
-        return {
-            ok: true,
-            root,
-            deadlineMs: this.outerAggregateMs ?? aggregateForTarget(platform.target),
-        };
+        const aggregate = this.outerAggregateMs ?? aggregateForTarget(platform.target);
+        const deadlineMs = aggregate - (Date.now() - startedAt);
+        if (deadlineMs <= 0) {
+            // Preflight consumed the whole budget, so the operation is out of
+            // time before the child exists. That is this command's timeout, not
+            // an internal error: nothing was spawned, so a restart reports no
+            // committed effects rather than unknown ones.
+            const state = preNativeState(classifyPreNativeRoots(root));
+            return {
+                ok: false,
+                result: localResult(command, false, state, TIMEOUT_REASON[command]),
+            };
+        }
+        return { ok: true, root, deadlineMs };
     }
 
     private async mutatingCommand(command: "start" | "stop" | "restart"): Promise<DaemonResultV1> {

@@ -334,7 +334,22 @@ export function loadTrustIndex(indexPath: string): TrustIndex | null {
             throw new BootstrapError("native_payload_invalid", "trust index exceeds the byte cap");
         }
         text = readTrustIndexText(fd);
-        const after = lstatSync(indexPath);
+        // Path-addressed, unlike every check above it, so it can fail on its
+        // own: the index may be unlinked, or an ancestor may lose search
+        // permission, after the descriptor was opened and read. Left raw, that
+        // errno escapes as a bare Error with no `reason` and breaks the module's
+        // contract that every failure is one closed lifecycle reason. An index
+        // that vanished mid-read is exactly the drift the comparison below
+        // exists to catch, so it earns the same verdict.
+        let after: ReturnType<typeof lstatSync>;
+        try {
+            after = lstatSync(indexPath);
+        } catch {
+            throw new BootstrapError(
+                "native_payload_invalid",
+                "trust index identity could not be reconfirmed after the read",
+            );
+        }
         if (after.dev !== before.dev || after.ino !== before.ino) {
             throw new BootstrapError(
                 "native_payload_invalid",
@@ -467,6 +482,13 @@ export function resolvePayloadPackageDir(options: {
             ...packageName.split("/"),
         );
         if (classifyEntry(externalCandidate) === "dir") {
+            if (!containedWithin(options.explicitExternalRoot, externalCandidate)) {
+                return {
+                    ok: false,
+                    reason: "unsupported_install_layout",
+                    detail: "external payload directory resolves outside its declared root",
+                };
+            }
             return { ok: true, layout: "compiled_bun_external", packageDir: externalCandidate };
         }
         return {
@@ -482,6 +504,17 @@ export function resolvePayloadPackageDir(options: {
         const candidate = path.join(nodeModules, ...segments);
         const kind = classifyEntry(candidate);
         if (kind === "dir") {
+            // A real directory that resolves outside this install is a foreign
+            // payload reached through a symlinked ancestor, not this install's.
+            // It is present, so it does not license climbing either — only
+            // absence does.
+            if (!containedWithin(current, candidate)) {
+                return {
+                    ok: false,
+                    reason: "unsupported_install_layout",
+                    detail: "payload directory resolves outside the declaring install",
+                };
+            }
             return {
                 ok: true,
                 layout: depth === 0 ? "npm_nested" : "npm_hoisted",
@@ -489,7 +522,7 @@ export function resolvePayloadPackageDir(options: {
             };
         }
         if (kind === "symlink") {
-            const bunLayout = resolveBunLink(nodeModules, candidate, segments);
+            const bunLayout = resolveBunLink(current, nodeModules, candidate, segments);
             if (bunLayout) return bunLayout;
             return {
                 ok: false,
@@ -522,7 +555,40 @@ export function resolvePayloadPackageDir(options: {
     };
 }
 
+/**
+ * Prove `candidate` still resolves to somewhere inside `root`'s own tree.
+ *
+ * {@link classifyEntry} lstats only the final component, so by the time it
+ * answers `"dir"` the kernel has already followed every ancestor: a
+ * `node_modules`, scope directory, or `.bun` entry replaced by a symlink to a
+ * different install yields a final component that looks like a real directory
+ * belonging to this one. That defeats one level up the same cross-install
+ * redirection the symlink branch rejects at the final component.
+ *
+ * Canonical *equality* would be the wrong test. macOS resolves `/var` to
+ * `/private/var` and symlinked home directories are common, so requiring the
+ * resolved path to equal the literal one would reject benign installs.
+ * Containment is the property actually needed: wherever the declaring parent's
+ * tree really lives, the payload must be inside it.
+ *
+ * A resolution failure is not containment. This is a check-then-use, so an
+ * ancestor swapped afterwards is still not excluded — that needs the `*at`
+ * syscalls Node does not expose, and belongs to the native layer.
+ */
+function containedWithin(root: string, candidate: string): boolean {
+    let realRoot: string;
+    let realCandidate: string;
+    try {
+        realRoot = realpathSync(root);
+        realCandidate = realpathSync(candidate);
+    } catch {
+        return false;
+    }
+    return realCandidate === realRoot || realCandidate.startsWith(`${realRoot}${path.sep}`);
+}
+
 function resolveBunLink(
+    walkRoot: string,
     nodeModules: string,
     candidate: string,
     segments: string[],
@@ -541,6 +607,11 @@ function resolveBunLink(
     } catch {
         return null;
     }
+    // The store must belong to the install being walked. Without this the
+    // containment below is self-referential: a symlinked `node_modules` or
+    // `.bun` makes `bunStoreReal` the attacker's store, and every path under it
+    // then certifies as "the same install's" store.
+    if (!containedWithin(walkRoot, bunStoreReal)) return null;
     const withinStore = resolved.startsWith(`${bunStoreReal}${path.sep}`);
     // The suffix is anchored on a separator so only a real `node_modules`
     // path component certifies: a bare suffix match also accepts a sibling
@@ -704,7 +775,15 @@ export function revalidateRetainedBootstrap(
         if ((stat.mode & 0o100) === 0) throw invalid("retained bootstrap is not owner-executable");
         const digest = sha256OfFd(fd);
         if (digest !== expectedSha256) throw invalid("retained bootstrap digest mismatch");
-        const after = lstatSync(bootstrapPath);
+        // Same reasoning as the trust index: this is the one path-addressed stat
+        // in the sequence, so a bootstrap unlinked after its descriptor was read
+        // would otherwise escape as a raw errno with no lifecycle reason.
+        let after: ReturnType<typeof lstatSync>;
+        try {
+            after = lstatSync(bootstrapPath);
+        } catch {
+            throw invalid("retained bootstrap identity could not be reconfirmed");
+        }
         if (after.ino !== stat.ino || after.dev !== stat.dev || after.nlink !== 1) {
             throw invalid("retained bootstrap identity drifted during revalidation");
         }
@@ -787,8 +866,20 @@ export function stageBootstrap(options: {
             sourcePath,
             fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
         );
-    } catch {
-        throw new BootstrapError("native_payload_missing", "launcher source is not openable");
+    } catch (error) {
+        // Only true absence is "missing". A source that is present but cannot be
+        // opened safely — a symlink rejected by O_NOFOLLOW (ELOOP), an
+        // unreadable mode, an unsearchable parent — is an installed payload that
+        // cannot be trusted, which the contract calls `native_payload_invalid`
+        // with `reinstall_magic_context`. Reporting `install_native_payload`
+        // instead tells the operator to install what is already installed, and
+        // also lowers the reason's precedence. `loadTrustIndex` and
+        // `classifyEntry` already draw the line this way.
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT" || code === "ENOTDIR") {
+            throw new BootstrapError("native_payload_missing", "launcher source is absent");
+        }
+        throw invalid("launcher source is not openable");
     }
     let tempPath: string | null = null;
     let destFd: number | null = null;
