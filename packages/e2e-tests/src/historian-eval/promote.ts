@@ -109,19 +109,45 @@ function checkApprovals(rawApprovals: readonly unknown[], releaseFingerprint: st
     return { privacy: byKind.get("privacy") as Approval, goldIntent: byKind.get("gold-intent") as Approval };
 }
 
+/**
+ * Evidence must correspond EXACTLY to the corpus: one entry per scenario, filed
+ * under that scenario's own id, and no entries for anything else.
+ *
+ * Coverage alone is too weak in both directions. The fingerprint covers a
+ * scenario's content, not the id an entry files it under, so a producer or
+ * assembly regression can attribute a real result to the wrong scenario — and
+ * every diagnostic here, plus the published artifact itself, is keyed by id, so
+ * the mismatch would misdirect whoever reads it. In the other direction, entries
+ * for scenarios outside the release claim mutation coverage the release does not
+ * have, and `releaseArtifactFingerprint` would authenticate that claim rather
+ * than contradict it.
+ */
 function checkMutationEvidence(
     evidence: MutationEvidenceArtifact,
     scenarios: readonly HistorianEvalScenario[],
 ): void {
     const diagnostics: string[] = [];
     const byFingerprint = new Map(evidence.scenarios.map((entry) => [entry.scenarioFingerprint, entry]));
+    const matched = new Set<string>();
     for (const scenario of scenarios) {
-        const entry = byFingerprint.get(scenarioFingerprint(scenario));
+        const fingerprint = scenarioFingerprint(scenario);
+        const entry = byFingerprint.get(fingerprint);
         if (entry === undefined) {
             diagnostics.push(`mutation-evidence.${scenario.id}: missing`);
-        } else if (!entry.green) {
-            diagnostics.push(`mutation-evidence.${scenario.id}: not-green`);
+            continue;
         }
+        matched.add(fingerprint);
+        if (entry.scenarioId !== scenario.id) {
+            diagnostics.push(`mutation-evidence.${scenario.id}: scenario-id-mismatch`);
+        }
+        if (!entry.green) diagnostics.push(`mutation-evidence.${scenario.id}: not-green`);
+    }
+    // Count only: an evidence `scenarioId` is checked for being a non-empty
+    // string, not against `SCENARIO_ID_RE`, so an unmatched entry's id is
+    // arbitrary unreviewed text and naming it would put that in the logs.
+    const unrepresented = evidence.scenarios.filter((entry) => !matched.has(entry.scenarioFingerprint)).length;
+    if (unrepresented > 0) {
+        diagnostics.push(`mutation-evidence: ${unrepresented} of ${evidence.scenarios.length} entries not in the corpus`);
     }
     if (diagnostics.length > 0) fail(diagnostics);
 }
@@ -457,5 +483,16 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string; art
     }
     // The caller records this out of band; it is the only anchor that lets a
     // later `loadRelease` detect an edited approver string or forged evidence.
+    //
+    // Publication (the rename above) is not atomic with the caller's recording
+    // of this value, and cannot be — they are separate stores. A crash in
+    // between leaves vN installed with no recorded anchor, which is recoverable
+    // WITHOUT re-promoting: the anchor is a pure function of the published
+    // manifest and evidence, so passing a `loadRelease` of the installed tree
+    // back through `releaseArtifactFingerprint` reproduces it exactly.
+    // Recording before the rename would only invert the exposure, leaving an
+    // anchor on file for a release that was never published. Recompute promptly:
+    // recomputation trusts the bytes on disk, so it can only certify a tree
+    // nobody has edited since the crash.
     return { releaseDir: destination, artifactFingerprint: releaseArtifactFingerprint(manifest, evidence) };
 }

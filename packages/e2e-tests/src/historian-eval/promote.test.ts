@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { buildReleaseTuple, parseScenario, releaseApprovalFingerprint } from "./contract";
-import { RELEASE_FILES, loadRelease, promoteRelease } from "./promote";
+import { RELEASE_FILES, loadRelease, promoteRelease, releaseArtifactFingerprint } from "./promote";
 import { validScenarioRaw } from "./test-support";
 
 function corpusRaw(count = 10): Record<string, unknown>[] {
@@ -344,6 +344,88 @@ describe("promoteRelease", () => {
                     releaseVersion: "v2",
                 }),
             ).toThrow(/prior release v100 declares version v1/);
+        });
+    });
+
+    test("load rejects mutation evidence filed under the wrong scenario id", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            const { releaseDir } = promoteRelease({
+                scenarios,
+                approvals: approvalsFor(scenarios),
+                releasesRoot: root,
+                releaseVersion: "v1",
+            });
+            const evidencePath = join(releaseDir, RELEASE_FILES.evidence);
+            const evidence = JSON.parse(readFileSync(evidencePath, "utf8")) as {
+                scenarios: Array<{ scenarioId: string }>;
+            };
+            // The fingerprint still matches the scenario's content, so a
+            // fingerprint-only lookup accepts the entry — while every id-keyed
+            // diagnostic, and the published artifact itself, now attributes this
+            // scenario's mutation results to a different one.
+            evidence.scenarios[0].scenarioId = "hse-mislabeled";
+            writeFileSync(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
+            expect(() => loadRelease(releaseDir)).toThrow(/scenario-id-mismatch/);
+        });
+    });
+
+    test("load rejects mutation evidence carrying entries for scenarios outside the release", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            const { releaseDir } = promoteRelease({
+                scenarios,
+                approvals: approvalsFor(scenarios),
+                releasesRoot: root,
+                releaseVersion: "v1",
+            });
+            const evidencePath = join(releaseDir, RELEASE_FILES.evidence);
+            const evidence = JSON.parse(readFileSync(evidencePath, "utf8")) as {
+                scenarios: Array<Record<string, unknown>>;
+            };
+            // Cloning a real entry keeps full class coverage and stays green, so
+            // the per-entry parser and the artifact-level green flag both accept
+            // it; only its identity is new. That is phantom mutation coverage the
+            // artifact anchor would authenticate rather than contradict.
+            evidence.scenarios.push({
+                ...evidence.scenarios[0],
+                scenarioId: "hse-phantom",
+                scenarioFingerprint: "f".repeat(64),
+            });
+            writeFileSync(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
+            expect(() => loadRelease(releaseDir)).toThrow(/1 of 11 entries not in the corpus/);
+        });
+    });
+
+    test("the artifact anchor is recomputable from the published tree, so a lost anchor is recoverable", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            const promoted = promoteRelease({
+                scenarios,
+                approvals: approvalsFor(scenarios),
+                releasesRoot: root,
+                releaseVersion: "v1",
+            });
+            // Publication and the caller's out-of-band recording are separate
+            // stores, so a crash between them can leave v1 installed with no
+            // anchor recorded. Re-promoting cannot recover it — the version is
+            // occupied and releases are immutable — but the anchor is a pure
+            // function of the published manifest and evidence, so it can be
+            // recomputed from the installed tree.
+            const reread = loadRelease(promoted.releaseDir);
+            const recomputed = releaseArtifactFingerprint(reread.manifest, reread.mutationEvidence);
+            expect(recomputed).toBe(promoted.artifactFingerprint);
+            expect(
+                loadRelease(promoted.releaseDir, { expectedArtifactFingerprint: recomputed }).manifest.releaseVersion,
+            ).toBe("v1");
+            expect(() =>
+                promoteRelease({
+                    scenarios,
+                    approvals: approvalsFor(scenarios),
+                    releasesRoot: root,
+                    releaseVersion: "v1",
+                }),
+            ).toThrow(/version already installed/);
         });
     });
 
