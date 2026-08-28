@@ -434,6 +434,81 @@ describe("gold and probe freeze guards", () => {
         expect(() => parseScenario(validScenarioRaw())).not.toThrow();
     });
 
+    test("rejects an earlier probe whose question states a later probe's answer", () => {
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Record<string, unknown>[];
+        // The gold answers are "yes" and "4096" — no overlap, so the answer-surface
+        // comparison exempts the pair. But this question puts "4096" into raw
+        // history ahead of the probe whose answer it is, and probes share one
+        // resumed session.
+        probes.unshift({
+            id: "probe-capacity-confirm",
+            question: "Was the session cache capacity set to 4096 entries?",
+            answerType: "multiple-choice",
+            choices: ["yes", "no"],
+            goldAnswer: "yes",
+            sourceClaimRef: "exp-cache-capacity",
+        });
+        expect(() => parseScenario(raw)).toThrow(/question-exposed-answer/);
+    });
+
+    test("accepts the same pair when the exposing question runs LAST", () => {
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Record<string, unknown>[];
+        // Identical to the pair above with the order reversed. Probes run in array
+        // order, so a question appended after the probe it would expose is never in
+        // that probe's history — refusing it would cost a legitimate probe.
+        probes.push({
+            id: "probe-capacity-confirm",
+            question: "Was the session cache capacity set to 4096 entries?",
+            answerType: "multiple-choice",
+            choices: ["yes", "no"],
+            goldAnswer: "yes",
+            sourceClaimRef: "exp-cache-capacity",
+        });
+        expect(() => parseScenario(raw)).not.toThrow();
+    });
+
+    test("rejects an exact probe whose question states its own gold answer", () => {
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Record<string, unknown>[];
+        // No history needed at all: the value the probe rewards is in the prompt it
+        // is answering, so a correct reply proves nothing about injected memory.
+        probes.push({
+            id: "probe-capacity-restated",
+            question: "The capacity is 4096 entries — what is the session cache capacity?",
+            answerType: "exact",
+            goldAnswer: "4096",
+            sourceClaimRef: "exp-cache-capacity",
+        });
+        expect(() => parseScenario(raw)).toThrow(/self-answering/);
+    });
+
+    test("a question that shares only a digit prefix with an answer is not exposure", () => {
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Record<string, unknown>[];
+        // Appended after probe-capacity, so its mention of 4096 exposes nothing.
+        probes.push({
+            id: "probe-capacity-confirm",
+            question: "Was the session cache capacity set to 4096 entries?",
+            answerType: "multiple-choice",
+            choices: ["yes", "no"],
+            goldAnswer: "yes",
+            sourceClaimRef: "exp-cache-capacity",
+        });
+        // "4096" contains the characters of "4", and the question above runs first.
+        // Matching by bare substring would refuse this pair; the answer is a
+        // complete value, and "4" is stated nowhere.
+        probes.push({
+            id: "probe-replica-count",
+            question: "How many cache replicas were configured?",
+            answerType: "exact",
+            goldAnswer: "4",
+            sourceClaimRef: "exp-lru-cache",
+        });
+        expect(() => parseScenario(raw)).not.toThrow();
+    });
+
     test("rejects same-category predicate subsumption, which credits one fact to two golds", () => {
         const raw = validScenarioRaw();
         // "LRU cache" is contained in the existing "in-process LRU cache", so any

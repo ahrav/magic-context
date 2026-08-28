@@ -330,11 +330,23 @@ function parseProbe(raw: unknown, label: string): Probe {
         // unanswerable probe would be scored as a model failure and contaminate
         // probe accuracy.
         exact(value, ["id", "question", "answerType", "goldAnswer", "sourceClaimRef"], label);
+        const goldAnswer = envelopeSafeAnswer(string(value.goldAnswer, `${label}.goldAnswer`), `${label}.goldAnswer`);
+        // A question that states its own answer measures nothing: the value the
+        // probe rewards is in the prompt the model is answering, so it needs
+        // neither injected memory nor session history to reply correctly.
+        //
+        // Only for `exact`. A multiple-choice prompt renders every option anyway,
+        // so a question that restates them exposes nothing the model was not
+        // going to be shown; and a claim-id answer is a runtime id no authored
+        // question can contain.
+        if (containsCompleteValue(question, goldAnswer)) {
+            fail(`${label}.question: self-answering (states its own gold answer ${JSON.stringify(goldAnswer)})`);
+        }
         return {
             id,
             question,
             answerType,
-            goldAnswer: envelopeSafeAnswer(string(value.goldAnswer, `${label}.goldAnswer`), `${label}.goldAnswer`),
+            goldAnswer,
             sourceClaimRef: staticId(value.sourceClaimRef, `${label}.sourceClaimRef`, EXPECTED_CLAIM_ID_RE),
         };
     }
@@ -532,12 +544,13 @@ export function parseScenario(raw: unknown, label = "scenario"): HistorianEvalSc
         `${label}.probes.identity`,
     );
     // Probes run sequentially in ONE resumed session, so a later probe sees every
-    // earlier probe's prompt and answer as recent raw history. That is only
-    // exploitable when an earlier answer IS a correct answer to the later probe,
-    // which needs both to rest on the same gold claim — so a pair whose answer
-    // surfaces overlap is refused at freeze time.
+    // earlier probe's prompt and answer as recent raw history. That is exploitable
+    // whenever the later probe's answer appears anywhere in that history, which is
+    // two distinct surfaces: the earlier probe's ANSWER (its gold value and, for
+    // multiple-choice, its options) and the earlier probe's QUESTION text. Both are
+    // refused per ordered pair below.
     //
-    // Probe uniqueness does not cover this: it includes the question text and
+    // Probe uniqueness does not cover either: it includes the question text and
     // answer type, so "which cache backs sessions" as multiple-choice and a
     // differently worded exact probe on the same claim are distinct probes whose
     // answers are the same string.
@@ -575,6 +588,28 @@ export function parseScenario(raw: unknown, label = "scenario"): HistorianEvalSc
             if (shared.length > 0) {
                 fail(
                     `${label}.probes: shared-answer-surface (${left.id} and ${right.id} share the answer value ${JSON.stringify(shared[0])}, so the earlier exchange answers the later probe)`,
+                );
+            }
+            // Answer surfaces are not the only part of an earlier exchange the
+            // later model reads. The QUESTION text is in the same raw history, and
+            // a question can state another probe's answer while asking about
+            // something else: "Was the limit 4096?" with gold `yes`, followed by a
+            // probe whose gold is `4096`. The surface comparison above cannot see
+            // that pair because `yes` and `4096` do not overlap.
+            //
+            // Directional, because the leak is: probes run in `probes` order, so
+            // only the EARLIER question reaches the later model. Comparing both
+            // ways would refuse pairs whose exposing text the answering model never
+            // saw.
+            //
+            // Matched as a complete value for the same reason `containsCompleteValue`
+            // exists at all: a question that only ever says "4096" must not count as
+            // exposing the answer "4". Choices are not compared — a later
+            // multiple-choice prompt renders its own options regardless, so an
+            // earlier question naming one exposes nothing new.
+            if (right.answerType !== "claim-id" && containsCompleteValue(left.question, right.goldAnswer)) {
+                fail(
+                    `${label}.probes: question-exposed-answer (${left.id} runs first and its question states ${JSON.stringify(right.goldAnswer)}, which is ${right.id}'s gold answer)`,
                 );
             }
         }
@@ -620,6 +655,30 @@ export function scenarioFingerprint(scenario: HistorianEvalScenario): string {
         gold: scenario.gold,
         probes: scenario.probes,
     });
+}
+
+/**
+ * The complete trigger recipe as a fingerprint, for binding a stored run record
+ * to the pressure settings it actually executed under.
+ *
+ * Deliberately separate from `scenarioFingerprint`, which excludes everything
+ * here but `expectedHistorianRuns` because trigger pressure is harness-owned and
+ * must not move a release-facing semantic identity or invalidate an approval.
+ * That exclusion leaves the values unbound to any artifact, and they are not
+ * inert: `modelContextLimit` with the per-turn and spike usage decides WHEN the
+ * historian fires, `headroomMarginTokens` decides where the protected-tail
+ * boundary falls, and `ballastTokensPerTurn` decides how much filler the
+ * evaluated chunk carries. Change any of them without touching the run count and
+ * an artifact captured under the previous recipe still matches the scenario, so a
+ * report can claim the revised recipe was executed while scoring a snapshot the
+ * old one produced.
+ *
+ * Covers the whole recipe including `expectedHistorianRuns`, so the record binds
+ * to one object rather than to a hand-maintained subset that a later field
+ * addition silently leaves out.
+ */
+export function triggerFingerprint(scenario: HistorianEvalScenario): string {
+    return canonicalFingerprint(scenario.trigger);
 }
 
 /**

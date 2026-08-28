@@ -21,10 +21,7 @@ import {
     extractLatestAssistantText,
 } from "../../../plugin/src/shared/assistant-message-extractor";
 import { extractLatestHistorianReasoning } from "../../../plugin/src/hooks/magic-context/compartment-runner-historian";
-import {
-    hasClaimMemoryFragment,
-    resolveProjectIdsForIdentities,
-} from "../../../plugin/src/features/magic-context/memory/storage-claim-current-state";
+import { hasClaimMemoryFragment } from "../../../plugin/src/features/magic-context/memory/storage-claim-current-state";
 import { resolveProjectIdentity } from "../../../plugin/src/features/magic-context/memory/project-identity";
 import { createClaimMemorySchema } from "../../../plugin/src/features/magic-context/storage-claim-memory-schema";
 import {
@@ -42,6 +39,7 @@ import {
     PROBE_CHOICE_SEPARATOR,
     matchesGold,
     scenarioFingerprint,
+    triggerFingerprint,
     triggerTurnUsage,
     type HistorianEvalScenario,
     type Probe,
@@ -52,7 +50,7 @@ import {
     deriveHistorianChunkTokens,
     resolveHistorianContextLimit,
 } from "../../../plugin/src/hooks/magic-context/derive-budgets";
-import { readInjectedClaims, type InjectedClaimRecord } from "./claim-read";
+import { promotionEvidenceCount, readInjectedClaims, type InjectedClaimRecord } from "./claim-read";
 import { verifyAllActiveClaims } from "./verification-bridge";
 
 export type { InjectedClaimRecord } from "./claim-read";
@@ -194,6 +192,17 @@ export interface HistorianEvalRunRecord {
     schema: typeof RUN_RECORD_SCHEMA;
     scenarioId: string;
     scenarioFingerprint: string;
+    /**
+     * Fingerprint of the trigger recipe this attempt executed under.
+     *
+     * Stored beside `scenarioFingerprint` rather than folded into it: the
+     * scenario fingerprint is the release-facing semantic identity approvals bind
+     * to, and trigger pressure is harness-owned, so moving it there would
+     * invalidate approvals on a pressure retune. Recorded separately, the values
+     * still bind an artifact to the recipe that produced it. See
+     * `triggerFingerprint`.
+     */
+    triggerFingerprint: string;
     sessionId: string;
     /** Workspace identity claims were promoted under; scoring reads need it. */
     projectIdentity: string;
@@ -681,6 +690,7 @@ class ScenarioRunner {
             schema: RUN_RECORD_SCHEMA,
             scenarioId: this.scenario.id,
             scenarioFingerprint: scenarioFingerprint(this.scenario),
+            triggerFingerprint: triggerFingerprint(this.scenario),
             sessionId: this.sessionId,
             system: this.systemTuple(),
             expectedHistorianRuns: this.scenario.trigger.expectedHistorianRuns,
@@ -1181,54 +1191,14 @@ class ScenarioRunner {
     }
 
     /**
-     * Promotion evidence under the scenario's project: claims plus the evidence
-     * rows attached to their revisions.
-     *
-     * Scoped, not global, because the verification bridge and the authoritative
-     * claim read are both scoped this way — claims promoted under a different
-     * identity would satisfy a global count while leaving those reads empty.
-     *
-     * Evidence rows are counted alongside claims because a promotion does not
-     * always create one. `stageCreateProjectMemoryClaimInCurrentTransaction`
-     * matches on a normalized content hash and, for a fact an earlier run already
-     * promoted, attaches evidence to the existing claim instead — so counting
-     * claims alone reads a successful re-promotion as a lost one, which is a
-     * false plumbing failure on exactly the repeated-fact transcript a two-run
-     * scenario produces.
+     * Promotion evidence under the scenario's project, read from the LIVE
+     * database. Sampled before and after each run so the difference is that run's
+     * own contribution; see `promotionEvidenceCount` for what counts and why.
      */
     private scopedPromotionEvidenceCount(harness: TestHarness): number {
         const db = openTestDb(harness.contextDbPath(), { readonly: true });
         try {
-            const projectIds = resolveProjectIdsForIdentities(db, [
-                resolveProjectIdentity(harness.opencode.env.workdir),
-            ]);
-            if (projectIds.length === 0) return 0;
-            const placeholders = projectIds.map(() => "?").join(", ");
-            const claims =
-                (
-                    db
-                        .prepare(`SELECT COUNT(*) AS n FROM claims WHERE project_id IN (${placeholders})`)
-                        .get(...projectIds) as { n: number } | null
-                )?.n ?? 0;
-            let evidence = 0;
-            try {
-                evidence =
-                    (
-                        db
-                            .prepare(
-                                `SELECT COUNT(*) AS n FROM claim_evidence
-                                   JOIN claim_revisions ON claim_revisions.id = claim_evidence.revision_id
-                                   JOIN claims ON claims.id = claim_revisions.claim_id
-                                  WHERE claims.project_id IN (${placeholders})`,
-                            )
-                            .get(...projectIds) as { n: number } | null
-                    )?.n ?? 0;
-            } catch {
-                // Older fragment without the evidence tables: the claim count alone
-                // still detects a first promotion, which is the common case.
-                evidence = 0;
-            }
-            return claims + evidence;
+            return promotionEvidenceCount(db, resolveProjectIdentity(harness.opencode.env.workdir));
         } finally {
             db.close();
         }

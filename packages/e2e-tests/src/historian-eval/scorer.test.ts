@@ -11,7 +11,7 @@ import type { Database } from "../../../plugin/src/shared/sqlite";
 import { readInjectedClaims } from "./claim-read";
 import { verifyAllActiveClaims } from "./verification-bridge";
 import type { HistorianEvalScenario } from "./contract";
-import { scenarioFingerprint } from "./contract";
+import { scenarioFingerprint, triggerFingerprint } from "./contract";
 import { buildMockHistorianOutput, type MockHistorianFact } from "../mock-historian";
 import type { HistorianEvalRunRecord, HistorianRunArtifact, InjectedClaimRecord, ProbeExchange } from "./runner";
 import { RUN_RECORD_SCHEMA, authoredTurnOrdinalsFor, buildProbePrompt } from "./runner";
@@ -141,6 +141,33 @@ function withAnswer(exchange: ProbeExchange, answerRaw: string): ProbeExchange {
     return { ...exchange, answerRaw, responseText: `<answer>${answerRaw}</answer>` };
 }
 
+/**
+ * Model a claim the injection budget trimmed out of ONE probe turn: drop its
+ * locator and the line the captured payload rendered for it.
+ *
+ * Both, for the same reason `withAnswer` rewrites the response alongside the
+ * answer. The plugin writes `memory_block_ids` from exactly the claims it rendered
+ * into `<project-memory>`, so a payload that still renders a claim the locator set
+ * omits describes no run the runner can produce — and the scorer refuses it as a
+ * forged record rather than reading it as a trimmed probe. Editing the locator set
+ * alone would therefore test the integrity gate, not trimming.
+ */
+function withoutInjectedClaim(exchange: ProbeExchange, claim: InjectedClaimRecord): ProbeExchange {
+    return {
+        ...exchange,
+        injectedRevisionLocators: exchange.injectedRevisionLocators.filter(
+            (locator) => locator !== claim.revisionLocator,
+        ),
+        payloadText:
+            exchange.payloadText === null
+                ? null
+                : exchange.payloadText
+                      .split("\n")
+                      .filter((line) => !line.startsWith(`${claim.publicClaimId}:`))
+                      .join("\n"),
+    };
+}
+
 function goldenRun(overrides: Partial<HistorianRunArtifact> = {}): HistorianRunArtifact {
     const run: HistorianRunArtifact = {
         runIndex: 1,
@@ -243,6 +270,9 @@ function makeRecord(
         schema: RUN_RECORD_SCHEMA,
         scenarioId: scenario.id,
         scenarioFingerprint: scenarioFingerprint(scenario),
+        // Bound separately from the semantic fingerprint, which excludes trigger
+        // pressure; the scorer refuses a record whose recipe is not the scenario's.
+        triggerFingerprint: triggerFingerprint(scenario),
         sessionId: SESSION_ID,
         projectIdentity: PROJECT_IDENTITY,
         nowMs: fixture.nowMs,
@@ -701,16 +731,11 @@ describe("scoreRunRecord", () => {
             // Trim the capacity claim out of the injected set and answer its
             // probe wrongly: without FA priority this would be swallowed as
             // trimmed-by-injection-budget ERROR and exit 1 instead of 2.
-            const trimmedLocator = fixture.injectedClaims.find((claim) => claim.content.includes("4096"))
-                ?.revisionLocator;
+            const trimmed = fixture.injectedClaims.find((claim) => claim.content.includes("4096"));
+            if (trimmed === undefined) throw new Error("fixture lacks the capacity claim");
             record.probes = record.probes.map((exchange) =>
                 exchange.probeId === "probe-capacity"
-                    ? {
-                          ...withAnswer(exchange, "wrong"),
-                          injectedRevisionLocators: exchange.injectedRevisionLocators.filter(
-                              (locator) => locator !== trimmedLocator,
-                          ),
-                      }
+                    ? withoutInjectedClaim(withAnswer(exchange, "wrong"), trimmed)
                     : exchange,
             );
             const score = scoreRunRecord(record, scenario);
@@ -750,16 +775,11 @@ describe("scoreRunRecord", () => {
             // is missing from the visible set (recall < 1). Recall evidence
             // comes from the facts read, independent of the probe tier, so
             // the trimmed probe must not swallow it into an ERROR.
-            const trimmedLocator = fixture.injectedClaims.find((claim) => claim.content.includes("4096"))
-                ?.revisionLocator;
+            const trimmed = fixture.injectedClaims.find((claim) => claim.content.includes("4096"));
+            if (trimmed === undefined) throw new Error("fixture lacks the capacity claim");
             record.probes = record.probes.map((exchange) =>
                 exchange.probeId === "probe-capacity"
-                    ? {
-                          ...withAnswer(exchange, "wrong"),
-                          injectedRevisionLocators: exchange.injectedRevisionLocators.filter(
-                              (locator) => locator !== trimmedLocator,
-                          ),
-                      }
+                    ? withoutInjectedClaim(withAnswer(exchange, "wrong"), trimmed)
                     : exchange,
             );
             const score = scoreRunRecord(record, scenario);
@@ -858,8 +878,8 @@ describe("scoreRunRecord", () => {
         try {
             const scenario = validScenario();
             const record = makeRecord(fixture, scenario);
-            const trimmedLocator = fixture.injectedClaims.find((claim) => claim.content.includes("4096"))
-                ?.revisionLocator;
+            const trimmed = fixture.injectedClaims.find((claim) => claim.content.includes("4096"));
+            if (trimmed === undefined) throw new Error("fixture lacks the capacity claim");
             // probe-capacity is trimmed (its gold claim was promoted but is not
             // in its injected set) while probe-store fails on its own merits and
             // is fully injected. `failReasons` collapses both into one "probe"
@@ -867,12 +887,7 @@ describe("scoreRunRecord", () => {
             // scenario to ERROR and drops the real failure.
             record.probes = record.probes.map((exchange) => {
                 if (exchange.probeId === "probe-capacity") {
-                    return {
-                        ...withAnswer(exchange, "wrong"),
-                        injectedRevisionLocators: exchange.injectedRevisionLocators.filter(
-                            (locator) => locator !== trimmedLocator,
-                        ),
-                    };
+                    return withoutInjectedClaim(withAnswer(exchange, "wrong"), trimmed);
                 }
                 if (exchange.probeId === "probe-store") return withAnswer(exchange, "redis");
                 return exchange;
@@ -1089,6 +1104,100 @@ describe("scoreRunRecord", () => {
             expect(score.verdict).toBe("FAIL");
             expect(score.failReasons).toContain("structural");
             expect(score.structuralFindings.some((finding) => finding.includes("discarded"))).toBe(true);
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("a record captured under a different trigger recipe is refused", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario);
+            // Retuned pressure with the declared run count untouched: the context
+            // limit decides when the historian fires and what the evaluated chunk
+            // contains, but `scenarioFingerprint` excludes it, so nothing else in the
+            // record would notice that this artifact predates the change.
+            const retuned: HistorianEvalScenario = {
+                ...scenario,
+                trigger: { ...scenario.trigger, modelContextLimit: scenario.trigger.modelContextLimit * 2 },
+            };
+            const score = scoreRunRecord(record, retuned);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("record-scenario-mismatch");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("a run that emitted facts but added no promotion evidence is no-op-promotion, not recall", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            // The fact reached the historian's output and never reached the store, so
+            // the missing claim is a plumbing loss. The live runner aborts on this;
+            // a record scored independently must reach the same verdict rather than
+            // charging the loss to historian recall.
+            //
+            // Charged to the SECOND run: run 1 promoted, so a scenario-wide total is
+            // non-zero and only the per-run field exposes the loss.
+            const record = makeRecord(fixture, scenario, {
+                historianRuns: [
+                    goldenRun({ runIndex: 1 }),
+                    goldenRun({ runIndex: 2, promotionEvidenceAdded: 0 }),
+                ],
+            });
+            const score = scoreRunRecord(record, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("no-op-promotion");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("a run record omitting promotionEvidenceAdded is malformed, not silently exempt", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario);
+            // `undefined === 0` is false, so an absent field would pass the plumbing
+            // guard vacuously — the omission has to be refused at the shape gate.
+            const stripped = record.historianRuns.map((run) => {
+                const { promotionEvidenceAdded: _dropped, ...rest } = run;
+                return rest as HistorianRunArtifact;
+            });
+            const score = scoreRunRecord({ ...record, historianRuns: stripped }, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("record-malformed");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("a probe omitting a locator its own payload rendered is refused, not read as trimmed", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = validScenario();
+            const record = makeRecord(fixture, scenario);
+            const trimmed = fixture.injectedClaims.find((claim) => claim.content.includes("4096"));
+            if (trimmed === undefined) throw new Error("fixture lacks the capacity claim");
+            // Only the locator set is edited; the captured payload still renders the
+            // claim. That is the shape a hand-edited record has when a wrong answer is
+            // laundered into `error-trimmed` — the plugin writes the locator set from
+            // exactly the claims it rendered, so no real run produces this pair.
+            record.probes = record.probes.map((exchange) =>
+                exchange.probeId === "probe-capacity"
+                    ? {
+                          ...withAnswer(exchange, "wrong"),
+                          injectedRevisionLocators: exchange.injectedRevisionLocators.filter(
+                              (locator) => locator !== trimmed.revisionLocator,
+                          ),
+                      }
+                    : exchange,
+            );
+            const score = scoreRunRecord(record, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("record-snapshot-mismatch");
         } finally {
             fixture.cleanup();
         }
@@ -1626,17 +1735,11 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {
             const record = makeRecord(fixture, scenario);
+            const trimmed = fixture.injectedClaims.find((claim) => claim.content.includes("4096"));
+            if (trimmed === undefined) throw new Error("fixture lacks the capacity claim");
             record.probes = record.probes.map((probeExchange) =>
                 probeExchange.probeId === "probe-capacity"
-                    ? {
-                          ...withAnswer(probeExchange, "wrong"),
-                          injectedRevisionLocators: probeExchange.injectedRevisionLocators.filter(
-                              (locator) =>
-                                  locator !==
-                                  fixture.injectedClaims.find((claim) => claim.content.includes("4096"))
-                                      ?.revisionLocator,
-                          ),
-                      }
+                    ? withoutInjectedClaim(withAnswer(probeExchange, "wrong"), trimmed)
                     : probeExchange,
             );
             const score = scoreRunRecord(record, scenario);

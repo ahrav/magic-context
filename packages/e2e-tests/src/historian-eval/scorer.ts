@@ -35,11 +35,12 @@ import {
     normalizeContent,
     predicateMatches,
     scenarioFingerprint,
+    triggerFingerprint,
     type ExpectedClaim,
     type HistorianEvalScenario,
     type Probe,
 } from "./contract";
-import { readInjectedClaims } from "./claim-read";
+import { promotionEvidenceCount, readInjectedClaims } from "./claim-read";
 import { verifyAllActiveClaims } from "./verification-bridge";
 import {
     RUN_RECORD_SCHEMA,
@@ -590,6 +591,7 @@ function recordShapeError(record: HistorianEvalRunRecord): ScenarioScore | null 
     const problems: string[] = [];
     if (typeof record.scenarioId !== "string" || record.scenarioId.length === 0) problems.push("scenarioId");
     if (typeof record.scenarioFingerprint !== "string") problems.push("scenarioFingerprint");
+    if (typeof record.triggerFingerprint !== "string") problems.push("triggerFingerprint");
     if (typeof record.sessionId !== "string") problems.push("sessionId");
     if (typeof record.projectIdentity !== "string") problems.push("projectIdentity");
     if (typeof record.nowMs !== "number" || !Number.isFinite(record.nowMs)) problems.push("nowMs");
@@ -621,6 +623,11 @@ function recordShapeError(record: HistorianEvalRunRecord): ScenarioScore | null 
                 typeof run.emittedCompartments === "number" &&
                 typeof run.persistedCompartments === "number" &&
                 typeof run.factsEmitted === "number" &&
+                // Checked, not tolerated as optional: the replay guard below reads
+                // `factsEmitted > 0 && promotionEvidenceAdded === 0`, and an omitted
+                // field makes that comparison `undefined === 0` — false — so a
+                // record that simply drops the field would pass the guard vacuously.
+                typeof run.promotionEvidenceAdded === "number" &&
                 (run.failureReason === null || typeof run.failureReason === "string") &&
                 (run.lookaheadMargin === null || typeof run.lookaheadMargin === "number") &&
                 (run.chunkStartOrdinal === null || typeof run.chunkStartOrdinal === "number") &&
@@ -707,6 +714,23 @@ function recordIdentityError(
             record.scenarioId,
             "record-scenario-mismatch",
             `run record fingerprint ${record.scenarioFingerprint} does not match scenario ${scenario.id} (${fingerprint})`,
+            record.system,
+        );
+    }
+    // The trigger recipe is deliberately outside `scenarioFingerprint` (pressure is
+    // harness-owned and must not move a release-facing identity), which leaves it
+    // bound to nothing unless the record carries it separately. It is not inert:
+    // the context limit and usage decide when the historian fires, the headroom
+    // margin decides where the protected tail falls, and the ballast decides what
+    // the evaluated chunk contains. Without this an artifact captured under the
+    // previous recipe scores clean against the revised one, and the report claims a
+    // recipe that never ran.
+    const trigger = triggerFingerprint(scenario);
+    if (record.triggerFingerprint !== trigger) {
+        return errorScore(
+            record.scenarioId,
+            "record-scenario-mismatch",
+            `run record trigger fingerprint ${record.triggerFingerprint} does not match scenario ${scenario.id}'s trigger recipe (${trigger})`,
             record.system,
         );
     }
@@ -892,6 +916,32 @@ function telemetryMismatch(
         }
     }
     return null;
+}
+
+/**
+ * Public claim ids named in the LAST `<project-memory>` block of a captured probe
+ * payload, or `null` when the payload carries no complete block.
+ *
+ * `null` and the empty set are different answers and callers must not conflate
+ * them: no block means no per-turn evidence was captured (nothing injected, or a
+ * block whose closing tag budget trimming removed), while an empty complete block
+ * cannot occur — `renderClaimMemoryBlock` returns "" for zero items.
+ *
+ * Ids are read from line starts, not by substring: `renderClaimMemoryLine` emits
+ * `<publicClaimId>: <content>` (with an optional ` [source]` between them), so a
+ * claim whose CONTENT quotes another claim's id would otherwise be read as
+ * rendering it. Anchoring on the separator also stops one id being matched inside
+ * a longer one that shares its prefix.
+ */
+function renderedClaimIdsInLastMemoryBlock(payloadText: string): Set<string> | null {
+    const blocks = [...payloadText.matchAll(/<project-memory>([\s\S]*?)<\/project-memory>/g)];
+    if (blocks.length === 0) return null;
+    const ids = new Set<string>();
+    for (const line of blocks[blocks.length - 1][1].split("\n")) {
+        const separator = /^([^\s:]+)(?: \[[^\]]*\])?: /.exec(line);
+        if (separator !== null) ids.add(separator[1]);
+    }
+    return ids;
 }
 
 /**
@@ -1163,13 +1213,74 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
         const coverageError = probeCoverageError(record, scenario);
         if (coverageError !== null) return coverageError;
 
+        // The runner's promotion-plumbing guard, reapplied to a stored artifact.
+        // A run that emitted facts, kept its tail, and added no claim or evidence
+        // lost the promotion in plumbing — the fact never reached the store — so
+        // its missing claim is not a historian recall miss. The live guard aborts
+        // that attempt, but a record scored independently never passes through it,
+        // and without this the same artifact reports FAIL:recall and charges the
+        // loss to the model.
+        //
+        // Per run, not scenario-wide: run 1 promoting successfully leaves the total
+        // non-zero, so run 2's silently skipped promotion would pass a summed
+        // check. Ordered after the telemetry cross-check so `factsEmitted` and
+        // `discardedLast` are already snapshot-bound; `promotionEvidenceAdded` is a
+        // live-database delta with no per-run row to compare against, which is why
+        // the aggregate check below binds the claim to the snapshot.
+        const lostPromotion = record.historianRuns.filter(
+            (run) => !run.discardedLast && run.factsEmitted > 0 && run.promotionEvidenceAdded === 0,
+        );
+        if (lostPromotion.length > 0) {
+            return errorScore(
+                record.scenarioId,
+                "no-op-promotion",
+                lostPromotion
+                    .map(
+                        (run) =>
+                            `run ${run.runIndex} emitted ${run.factsEmitted} fact(s) but added no claim or evidence`,
+                    )
+                    .join("; "),
+                record.system,
+            );
+        }
+        // The other half of the runner's guard, and the part that is snapshot-backed:
+        // facts were emitted, so the snapshot must hold promotion evidence under the
+        // record's own project identity. This is what stops the check above from
+        // being defeated by editing `promotionEvidenceAdded` to a non-zero lie —
+        // a record claiming promotions its snapshot never received is refused
+        // regardless of the per-run numbers. Scoped to the identity the record
+        // declares, matching the runner: claims promoted under a different one leave
+        // the authoritative read empty while satisfying a global count.
+        const totalFacts = record.historianRuns
+            .filter((run) => !run.discardedLast)
+            .reduce((sum, run) => sum + run.factsEmitted, 0);
+        if (totalFacts > 0) {
+            let promotionEvidence: number;
+            try {
+                promotionEvidence = promotionEvidenceCount(db, record.projectIdentity);
+            } catch (error) {
+                return errorScore(
+                    record.scenarioId,
+                    "unreadable-snapshot",
+                    `context DB snapshot ${record.contextDbSnapshotPath} could not be queried for promotion evidence: ${errorMessage(error)}`,
+                    record.system,
+                );
+            }
+            if (promotionEvidence === 0) {
+                return errorScore(
+                    record.scenarioId,
+                    "no-op-promotion",
+                    `${totalFacts} fact(s) emitted across runs but the snapshot holds no claim or evidence under ${record.projectIdentity}`,
+                    record.system,
+                );
+            }
+        }
+
         // Per-probe locator sets must name claims the record actually recorded as
         // injected. Editing one converts a genuine wrong answer into
         // `error-trimmed` — excluding it from scored metrics — or admits a
         // claim-id answer for a claim that was never injected. This bounds the
-        // set to real, snapshot-backed claims; it cannot prove a locator was
-        // injected for THIS turn, which needs per-probe evidence the runner does
-        // not persist verifiably today.
+        // set to real, snapshot-backed claims.
         const recordedLocatorSet = new Set(record.injectedClaims.map((claim) => claim.revisionLocator));
         const foreignProbeLocators = record.probes.flatMap((exchange) =>
             exchange.injectedRevisionLocators
@@ -1183,6 +1294,48 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
                 `probe injected-locator set names ${foreignProbeLocators.length} claim(s) absent from the record's injected claims: [${foreignProbeLocators.slice(0, 5).join(", ")}]`,
                 record.system,
             );
+        }
+
+        // Membership in the recorded set is necessary but not sufficient: it bounds
+        // the locator set from above and says nothing about what THIS probe's turn
+        // actually carried, so removing a locator whose claim was injected still
+        // passes. That removal is not inert — `compareProbeAnswer` reads the gold
+        // claim as promoted-but-not-injected and returns `error-trimmed`, which
+        // `assembleScore` converts into an infrastructure ERROR, taking a genuine
+        // wrong answer out of scored metrics.
+        //
+        // The probe turn's own captured request is the per-turn evidence. The
+        // plugin writes `session_meta.memory_block_ids` from exactly the claims it
+        // rendered into `<project-memory>` for that request, so a claim named in the
+        // block was injected on that turn by construction, and its locator must be
+        // in the recorded set. Read from the LAST block in the payload, which is the
+        // request `visibleRevisionLocators` was sampled after — a re-asked probe
+        // captures two requests, and an earlier one's block may predate a trim.
+        //
+        // One-directional deliberately. The converse — every recorded locator must
+        // be named in the block — has legitimate counter-examples: the plugin skips
+        // the `memory_block_ids` update when the claim lane is unstable, leaving the
+        // previous turn's locators recorded with no block rendered, and a block whose
+        // closing tag was lost to budget trimming is not matched here at all. Both
+        // would become spurious ERRORs.
+        for (const exchange of record.probes) {
+            if (exchange.payloadText === null) continue;
+            const rendered = renderedClaimIdsInLastMemoryBlock(exchange.payloadText);
+            if (rendered === null) continue;
+            const injectedForTurn = new Set(exchange.injectedRevisionLocators);
+            const unclaimed = record.injectedClaims
+                .filter(
+                    (claim) => rendered.has(claim.publicClaimId) && !injectedForTurn.has(claim.revisionLocator),
+                )
+                .map((claim) => claim.publicClaimId);
+            if (unclaimed.length > 0) {
+                return errorScore(
+                    record.scenarioId,
+                    "record-snapshot-mismatch",
+                    `probe ${exchange.probeId} omits ${unclaimed.length} claim(s) its own captured payload rendered as injected: [${unclaimed.slice(0, 5).join(", ")}]`,
+                    record.system,
+                );
+            }
         }
 
         // The runner's leakage precondition, re-applied to a stored artifact: a
@@ -1202,6 +1355,21 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
         // that finding as an excuse would let a genuinely uncovered range be scored
         // as probe and structural FAILs instead of the ERROR this gate exists to
         // produce.
+        //
+        // Known limitation: this stand-down is not reachable from a live attempt.
+        // `driveProbe` applies the same coverage check against the live database
+        // before the probe is asked, so a run whose gold range the discard left
+        // uncovered aborts as `ERROR:probe-gold-uncovered`, and the stored-error
+        // passthrough above returns that reason before `healingFindings` is
+        // consulted. Standing the live gate down does not reach here either: an
+        // uncovered range is precisely a range the injection splice did NOT remove,
+        // so its raw text survives in the probe payload and the leak gate below
+        // aborts with `gold-range-leak` instead — a different reason for the same
+        // physical run, with the structural verdict still out of scored metrics.
+        // Recovering it needs the probe tier to record a per-probe unmeasurable
+        // outcome rather than abort the whole attempt, so structural and facts
+        // scoring survive a probe precondition failure. Until then this branch
+        // guards only records whose payload no longer carries the raw range.
         const healing = healingFindings(record);
         const gateStandsDown = unhealedDiscardRuns(record).length > 0;
         for (const probe of gateStandsDown ? [] : scenario.probes) {
