@@ -355,6 +355,58 @@ describe("demand-start coalescing and detachment (U3 scenarios 15-16)", () => {
         }
     }, 20_000);
 
+    test("the waiter budget is spent from the call, not from after preflight", async () => {
+        // `start()` is async, but its synchronous prefix — root resolution,
+        // filesystem admission, and the platform gate — runs inside the
+        // `this.start()` call, before the promise reaches the waiter. If the
+        // waiter armed the full `deadlineMs` at that point, a caller whose
+        // budget was already spent would still be handed a successful result.
+        const root = tempDir("mc-policy-residual-");
+        try {
+            const { binary } = fakeBinary(root, {});
+            const SYNC_MS = 400;
+            const slowGate: PlatformReaders = {
+                platform: "linux",
+                arch: "x64",
+                kernelRelease: () => "6.1.0",
+                glibcVersion: () => {
+                    // Synchronous, like the darwin `sw_vers` fallback this
+                    // stands in for.
+                    const until = Date.now() + SYNC_MS;
+                    while (Date.now() < until) {
+                        /* burn the caller's budget before the waiter attaches */
+                    }
+                    return "2.34";
+                },
+                procSelfFdUsable: () => true,
+                macosProductVersion: () => null,
+            };
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                platformReaders: slowGate,
+            });
+            let kind: string | null = null;
+            let accepted: string | null = null;
+            try {
+                const outcome = await policy.demandStart({
+                    origin: "managed-default",
+                    capability: "magic-context",
+                    deadlineMs: SYNC_MS / 4,
+                });
+                accepted = outcome.result.reason;
+            } catch (error) {
+                kind = (error as WaiterDetachedError).cause_kind;
+            }
+            // The budget was already gone when the waiter attached, so it must
+            // detach rather than accept the start that lands right after.
+            expect(accepted).toBeNull();
+            expect(kind).toBe("deadline");
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 20_000);
+
     test("an already-expired deadline detaches instead of taking a settled result", async () => {
         // This root resolution fails synchronously, so the shared start is
         // already settled when the waiter attaches and only the guard can stop

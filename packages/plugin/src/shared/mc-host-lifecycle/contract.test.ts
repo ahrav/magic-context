@@ -92,6 +92,47 @@ describe("parseDaemonResult", () => {
         expect(parsed.readiness).toBeNull();
     });
 
+    test("rejects a successful restart carrying no effects at all", () => {
+        // Requiring `start_committed` only inside the non-null branch left the
+        // evidence-free case open, so a caller learned the restart succeeded but
+        // not that the stop and successor start committed. Every native
+        // cmd_restart() return path supplies effects.
+        expect(() =>
+            parseDaemonResult(
+                JSON.stringify(
+                    validResult({
+                        command: "restart",
+                        ok: true,
+                        state: "running",
+                        reason: "started",
+                        remediation: null,
+                        readiness: null,
+                        checks: [],
+                        effects: null,
+                    }),
+                ),
+            ),
+        ).toThrow(/successful restart must carry its effects/);
+        // A failed restart may omit them: a killed transaction's outcome is
+        // genuinely unknown, and the policy reports null rather than claiming
+        // nothing committed.
+        const killed = parseDaemonResult(
+            JSON.stringify(
+                validResult({
+                    command: "restart",
+                    ok: false,
+                    state: "wedged",
+                    reason: "internal_error",
+                    remediation: "report_bug",
+                    readiness: null,
+                    checks: [],
+                    effects: null,
+                }),
+            ),
+        );
+        expect(killed.effects).toBeNull();
+    });
+
     test("rejects a successful restart that committed no start", () => {
         // `ok` for a restart is the successor start's outcome, so this pair is
         // self-contradictory and exit 0 agrees with it.

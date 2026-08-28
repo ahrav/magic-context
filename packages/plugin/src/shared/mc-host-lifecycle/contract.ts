@@ -292,6 +292,18 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
         if (record.ok && !effects.start_committed) {
             fail("a successful restart must report a committed start");
         }
+    } else if (command === "restart" && record.ok) {
+        // Guarding only the non-null branch left the evidence-free case open:
+        // `{command:"restart", ok:true, effects:null}` would parse and agree
+        // with exit 0, so a caller learned the restart succeeded but not that
+        // the stop and successor start committed. Every return path in the
+        // native `cmd_restart()` supplies effects, so their absence on a
+        // successful restart is skew rather than a reticent implementation.
+        //
+        // Only successful restarts are required to carry them: a killed
+        // transaction's outcome is genuinely unknown, and the policy's local
+        // results report `effects:null` precisely to avoid claiming otherwise.
+        fail("a successful restart must carry its effects");
     }
     let readiness: DaemonReadiness | null = null;
     if (record.readiness !== null) {

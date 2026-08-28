@@ -226,7 +226,7 @@ export class McHostLifecyclePolicy {
                     if (this.inflightStarts.get(key) === shared) this.inflightStarts.delete(key);
                 });
         }
-        const result = await this.raceWaiter(shared, request);
+        const result = await this.raceWaiter(shared, request, startedAt);
         if (request.capability !== "magic-context" || !result.ok) {
             return { result, storage: null };
         }
@@ -295,8 +295,22 @@ export class McHostLifecyclePolicy {
     private raceWaiter(
         shared: Promise<DaemonResultV1>,
         request: DemandStartRequest,
+        startedAt: number,
     ): Promise<DaemonResultV1> {
-        const { signal, deadlineMs } = request;
+        const { signal } = request;
+        // The caller's budget is spent from `startedAt`, not from here.
+        // `start()` is async, but its synchronous prefix — data-root
+        // resolution, filesystem admission, and the platform gate, whose darwin
+        // arm can fall back to a `sw_vers` call bounded at 2s — runs inside the
+        // `this.start()` call *before* the promise reaches this method. Arming
+        // the full `deadlineMs` here would grant the waiter its whole budget
+        // after that work had already consumed the caller's, so a 100ms caller
+        // could block for seconds and then accept a result it had no time left
+        // to wait for.
+        const deadlineMs =
+            request.deadlineMs === undefined
+                ? undefined
+                : request.deadlineMs - (Date.now() - startedAt);
         if (!signal && deadlineMs === undefined) return shared;
         return new Promise<DaemonResultV1>((resolve, reject) => {
             let settled = false;
