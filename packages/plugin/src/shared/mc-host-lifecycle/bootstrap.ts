@@ -97,13 +97,30 @@ function detectGlibcVersion(): string | null {
 }
 
 function detectProcSelfFd(): boolean {
+    // Probing `/proc/self/fd/0` would report the caller's *stdin state* rather
+    // than the procfs capability this gate is about: a process that closed fd 0
+    // has no `/proc/self/fd/0` entry, so readlink answers ENOENT on a fully
+    // usable procfs and every lifecycle command is refused as
+    // `unsupported_platform`. Open a descriptor this check owns and resolve
+    // that instead. `/` is used because it is the one path guaranteed to be
+    // openable wherever the gate can run at all.
+    let fd: number | null = null;
     try {
-        // A real procfs resolves an open descriptor's link target; a masked
-        // or absent /proc throws here and the gate fails closed.
-        readlinkSync("/proc/self/fd/0");
-        return true;
+        fd = openSync("/", fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
+        // A real procfs resolves an open descriptor's link target; a masked or
+        // absent /proc throws here and the gate fails closed.
+        return readlinkSync(`/proc/self/fd/${fd}`).length > 0;
     } catch {
         return false;
+    } finally {
+        if (fd !== null) {
+            try {
+                closeSync(fd);
+            } catch {
+                // The probe descriptor's close is best-effort: the capability
+                // answer is already decided and a close error cannot change it.
+            }
+        }
     }
 }
 

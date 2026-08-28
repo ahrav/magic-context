@@ -279,6 +279,19 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
             stop_committed: rawEffects.stop_committed,
             start_committed: rawEffects.start_committed,
         };
+        // A restart's `ok` is the successor start's outcome — the native
+        // implementation derives `start_committed` from exactly that value — so
+        // `ok:true` with no committed start is self-contradictory, and exit 0
+        // agrees with it, handing callers a successful restart whose own
+        // transaction record says no successor came up.
+        //
+        // The converse is deliberately allowed: `ok:false` with
+        // `start_committed:true` is an honest report that the start committed
+        // before something later failed, and rejecting it would suppress
+        // evidence of a committed effect, which is the more dangerous error.
+        if (record.ok && !effects.start_committed) {
+            fail("a successful restart must report a committed start");
+        }
     }
     let readiness: DaemonReadiness | null = null;
     if (record.readiness !== null) {

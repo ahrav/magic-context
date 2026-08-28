@@ -92,6 +92,44 @@ describe("parseDaemonResult", () => {
         expect(parsed.readiness).toBeNull();
     });
 
+    test("rejects a successful restart that committed no start", () => {
+        // `ok` for a restart is the successor start's outcome, so this pair is
+        // self-contradictory and exit 0 agrees with it.
+        expect(() =>
+            parseDaemonResult(
+                JSON.stringify(
+                    validResult({
+                        command: "restart",
+                        ok: true,
+                        state: "running",
+                        reason: "started",
+                        remediation: null,
+                        readiness: null,
+                        checks: [],
+                        effects: { stop_committed: true, start_committed: false },
+                    }),
+                ),
+            ),
+        ).toThrow(/successful restart must report a committed start/);
+        // The converse stays legal: a failed restart whose start did commit is
+        // evidence of a committed effect, not a contradiction.
+        const partial = parseDaemonResult(
+            JSON.stringify(
+                validResult({
+                    command: "restart",
+                    ok: false,
+                    state: "wedged",
+                    reason: "wedged",
+                    remediation: "inspect_daemon_process",
+                    readiness: null,
+                    checks: [],
+                    effects: { stop_committed: true, start_committed: true },
+                }),
+            ),
+        );
+        expect(partial.effects).toEqual({ stop_committed: true, start_committed: true });
+    });
+
     test("rejects a remediation borrowed from another reason", () => {
         // Both values are inside their own closed unions; only the pairing is
         // wrong. Accepting it sends an operator to free storage when the native

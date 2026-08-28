@@ -171,6 +171,18 @@ export async function runNativeLifecycle(
         args.push("--payload-dir", options.payloadDir);
     }
     const env = options.env ?? {};
+    // Validated before anything is spawned, for the same reason the envelope is:
+    // an exhausted or malformed budget must produce a typed error with no child
+    // in flight. `setTimeout` coerces a nonpositive or non-finite delay to 1ms,
+    // so without this a mutating lifecycle transaction would start and then be
+    // SIGKILLed a millisecond later — filesystem and daemon effects from a call
+    // that had no execution budget at all.
+    if (!Number.isFinite(options.deadlineMs) || options.deadlineMs <= 0) {
+        throw new NativeLaunchError(
+            "usage_error",
+            "native lifecycle deadline is not a positive finite duration",
+        );
+    }
     // The envelope is serialized before anything is spawned: a value with no
     // JSON form must fail as a typed error with no child in flight, and the
     // stdin `error` listener below only sees stream errors, never a synchronous

@@ -152,6 +152,28 @@ describe("native launcher output handling (U3 scenario 17)", () => {
         expect(Date.now() - started).toBeLessThan(5_000);
     }, 10_000);
 
+    test("an exhausted deadline is rejected before any child is spawned", async () => {
+        // setTimeout coerces a nonpositive or non-finite delay to 1ms, so
+        // without a pre-spawn check a mutating transaction would start and be
+        // SIGKILLed a millisecond later, leaving effects behind for a call that
+        // had no budget. The sentinel proves no child ran.
+        const sentinel = path.join(dir, "exhausted-deadline-ran");
+        const binary = scriptBinary(dir, `touch ${sentinel}`);
+        for (const deadlineMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+            let error: NativeLaunchError | null = null;
+            try {
+                await runNativeLifecycle(
+                    { kind: "test-binary", path: binary },
+                    { command: "start", deadlineMs },
+                );
+            } catch (caught) {
+                error = caught as NativeLaunchError;
+            }
+            expect(error?.code).toBe("usage_error");
+        }
+        expect(existsSync(sentinel)).toBe(false);
+    }, 10_000);
+
     test("usage exits (2) are a typed contract failure with no lifecycle result", async () => {
         const binary = scriptBinary(dir, `exit 2`);
         let error: NativeLaunchError | null = null;
