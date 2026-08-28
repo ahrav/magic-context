@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
-import { buildReleaseTuple, parseScenario } from "./contract";
+import { buildReleaseTuple, parseScenario, releaseApprovalFingerprint } from "./contract";
 import { RELEASE_FILES, loadRelease, promoteRelease } from "./promote";
 import { validScenarioRaw } from "./test-support";
 
@@ -12,16 +12,34 @@ function corpusRaw(count = 10): Record<string, unknown>[] {
     return Array.from({ length: count }, (_, index) => {
         const raw = validScenarioRaw();
         raw.id = `hse-scenario-${index}`;
+        // The release tuple rejects duplicate SEMANTIC fingerprints, not just
+        // duplicate ids: a scenario copied under a new name would silently
+        // double-weight one evaluation in every aggregate. So each clone needs
+        // distinct semantic content. Appending to the opening turn keeps the
+        // gold and hard-negative spans (which the freeze lint requires to be
+        // authored before the epilogue) intact.
+        const turns = (raw.transcript as { turns: Array<{ user: string }> }).turns;
+        turns[0].user = `${turns[0].user} Filed under ticket ${index}.`;
         return raw;
     });
 }
 
-function approvalsFor(scenariosRaw: Record<string, unknown>[]): Record<string, unknown>[] {
-    const tuple = buildReleaseTuple(scenariosRaw.map((raw) => parseScenario(raw)));
-    const fingerprint = canonicalFingerprint(tuple);
+/**
+ * Approvals bound to the WHOLE release under review — version, tuple, and
+ * tombstones — which is what `parseApproval`/`parseManifest` verify. The two
+ * approvers must differ: one actor holding both seats collapses two reviews
+ * into one judgement.
+ */
+function approvalsFor(
+    scenariosRaw: Record<string, unknown>[],
+    releaseVersion = "v1",
+    tombstones: readonly string[] = [],
+): Record<string, unknown>[] {
+    const releaseTuple = buildReleaseTuple(scenariosRaw.map((raw) => parseScenario(raw)));
+    const fingerprint = releaseApprovalFingerprint({ releaseVersion, releaseTuple, tombstones });
     return [
-        { kind: "privacy", approver: "operator-a", releaseTupleFingerprint: fingerprint },
-        { kind: "gold-intent", approver: "operator-b", releaseTupleFingerprint: fingerprint },
+        { kind: "privacy", approver: "operator-a", releaseFingerprint: fingerprint },
+        { kind: "gold-intent", approver: "operator-b", releaseFingerprint: fingerprint },
     ];
 }
 
@@ -83,8 +101,8 @@ describe("promoteRelease", () => {
                 /duplicate-kind/,
             );
             const stale = JSON.parse(JSON.stringify(approvals));
-            stale[0].releaseTupleFingerprint = "0".repeat(64);
-            expect(() => promoteRelease({ ...base, approvals: stale })).toThrow(/stale-or-foreign-tuple/);
+            stale[0].releaseFingerprint = "0".repeat(64);
+            expect(() => promoteRelease({ ...base, approvals: stale })).toThrow(/stale-or-foreign-release/);
             // Free-form approval metadata rejects (exact keys).
             const noisy = JSON.parse(JSON.stringify(approvals));
             noisy[1].note = "lgtm";
@@ -104,7 +122,7 @@ describe("promoteRelease", () => {
             turns[0].user = `${turns[0].user} Edited after approval.`;
             expect(() =>
                 promoteRelease({ scenarios, approvals, releasesRoot: root, releaseVersion: "v1" }),
-            ).toThrow(/stale-or-foreign-tuple/);
+            ).toThrow(/stale-or-foreign-release/);
         });
     });
 
@@ -112,12 +130,14 @@ describe("promoteRelease", () => {
         withRoot((root) => {
             const scenarios = corpusRaw();
             const approvals = approvalsFor(scenarios);
+            // Still an authored span in the claim's source range, so the freeze
+            // lint stays clean and the approval binding is what rejects.
             (
                 scenarios[0].gold as { expectedClaims: Array<{ predicate: { value: string } }> }
-            ).expectedClaims[0].predicate.value = "weakened predicate";
+            ).expectedClaims[0].predicate.value = "in-process LRU";
             expect(() =>
                 promoteRelease({ scenarios, approvals, releasesRoot: root, releaseVersion: "v1" }),
-            ).toThrow(/stale-or-foreign-tuple/);
+            ).toThrow(/stale-or-foreign-release/);
         });
     });
 
@@ -207,10 +227,18 @@ describe("promoteRelease", () => {
     test("never modifies an existing release (whole-tree byte identity); tombstones persist into vN+1", () => {
         withRoot((root) => {
             const scenarios = corpusRaw();
-            const promote = (version: string, tombstones?: string[], corpus = scenarios): { releaseDir: string } =>
+            // `effective` is the tombstone set the manifest will actually carry
+            // (inherited ∪ new), which is what approvals bind to — for v3 that
+            // is v2's inherited id even though the caller passes none.
+            const promote = (
+                version: string,
+                tombstones: string[] = [],
+                corpus = scenarios,
+                effective: string[] = tombstones,
+            ): { releaseDir: string } =>
                 promoteRelease({
                     scenarios: corpus,
-                    approvals: approvalsFor(corpus),
+                    approvals: approvalsFor(corpus, version, effective),
                     releasesRoot: root,
                     releaseVersion: version,
                     tombstones,
@@ -232,11 +260,11 @@ describe("promoteRelease", () => {
 
             // v3 promoted with NO explicit tombstones still inherits v2's:
             // the success path of tombstone persistence (R12).
-            promote("v3", [], v2Corpus);
+            promote("v3", [], v2Corpus, ["hse-scenario-0"]);
             expect(loadRelease(join(root, "v3")).manifest.tombstones).toEqual(["hse-scenario-0"]);
 
             // A corpus resurrecting the tombstoned scenario is rejected.
-            expect(() => promote("v4", [], corpusRaw())).toThrow(/tombstoned/);
+            expect(() => promote("v4", [], corpusRaw(), ["hse-scenario-0"])).toThrow(/tombstoned/);
             expect(treeDigest(join(root, "v1"))).toBe(v1Digest);
         });
     });
@@ -360,7 +388,7 @@ describe("promoteRelease", () => {
             const promote = (version: string): unknown =>
                 promoteRelease({
                     scenarios,
-                    approvals: approvalsFor(scenarios),
+                    approvals: approvalsFor(scenarios, version),
                     releasesRoot: root,
                     releaseVersion: version,
                 });
@@ -368,7 +396,7 @@ describe("promoteRelease", () => {
             // Installing v1 after v2 would let a later tombstone-carrying
             // release sit BELOW an immutable release that still serves the
             // retired scenario, so the vN+1 errata rule could never retire it.
-            expect(() => promote("v1")).toThrow(/not later than the installed v2/);
+            expect(() => promote("v1")).toThrow(/not-later-than-previous/);
             expect(readdirSync(root)).toEqual(["v2"]);
             // Forward is still allowed.
             promote("v3");

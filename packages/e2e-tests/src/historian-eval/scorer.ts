@@ -29,6 +29,7 @@ import { promoteSessionFactsDurable } from "../../../plugin/src/features/magic-c
 import { getProjectMemoryClaimByPublicId } from "../../../plugin/src/features/magic-context/memory/storage-claim-operations";
 import { resolveProjectIdsForIdentities } from "../../../plugin/src/features/magic-context/memory/storage-claim-current-state";
 import { createClaimReaderTestDatabase } from "../../../plugin/src/features/magic-context/test-claim-database";
+import type { Database } from "../../../plugin/src/shared/sqlite";
 import { canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { openTestDb } from "../test-db";
 import {

@@ -11,6 +11,7 @@
  * migration).
  */
 
+import { HISTORIAN_BOUNDARY_HEALING_SLACK } from "../../../plugin/src/hooks/magic-context/compartment-runner-validation";
 import { V2_MEMORY_CATEGORIES } from "../../../plugin/src/features/magic-context/memory/constants";
 import {
     HEX64_RE,
@@ -19,11 +20,14 @@ import {
     type ExpectedClaim,
     type HistorianEvalScenario,
 } from "./contract";
-import { buildHistorianPayload, type PayloadCompartment, type PayloadFact } from "./payload";
+import { buildMockHistorianOutput, type MockHistorianCompartment, type MockHistorianFact } from "../mock-historian";
 import type { ProbeExchange } from "./runner";
 import { compareProbeAnswer, scoreRawOutput, type FailReason } from "./scorer";
 
 export const MUTATION_EVIDENCE_SCHEMA = "historian-eval-mutation-evidence/v1";
+
+/** The deliberately wrong answer every probe mutation sends. */
+const WRONG_PROBE_ANSWER = "historian-eval-mutation-wrong-answer";
 
 export const MUTATION_CLASSES = [
     "speculation-promoted",
@@ -74,7 +78,7 @@ export interface MutationEvidenceArtifact {
 }
 
 /** Gold-satisfying synthetic facts: one per expected claim. */
-function goldSatisfyingFacts(scenario: HistorianEvalScenario): PayloadFact[] {
+function goldSatisfyingFacts(scenario: HistorianEvalScenario): MockHistorianFact[] {
     return scenario.gold.expectedClaims.map((claim) => ({
         category: claim.category,
         content: `Recorded decision: ${claim.predicate.value}.`,
@@ -83,19 +87,19 @@ function goldSatisfyingFacts(scenario: HistorianEvalScenario): PayloadFact[] {
 
 /**
  * Baseline compartments: `gold.compartments.minCount` contiguous,
- * non-overlapping segments covering the whole synthetic chunk. A fixed single
+ * non-overlapping segments covering the authored transcript. A fixed single
  * compartment would trip the scorer's `compartment-count` structural finding
  * for every scenario declaring a minimum above one, so `assertBaselineValidates`
  * would report a baseline FAIL — and promotion would reject the scenario —
  * before any mutation ran. The count is clamped to the message count because a
  * segment must cover at least one message.
  */
-function baselineCompartments(scenario: HistorianEvalScenario): PayloadCompartment[] {
+function baselineCompartments(scenario: HistorianEvalScenario): MockHistorianCompartment[] {
     const messageCount = scenario.transcript.turns.length * 2;
     const count = Math.max(1, Math.min(scenario.gold.compartments.minCount, messageCount));
     const span = Math.floor(messageCount / count);
     const remainder = messageCount % count;
-    const compartments: PayloadCompartment[] = [];
+    const compartments: MockHistorianCompartment[] = [];
     let start = 1;
     for (let index = 0; index < count; index += 1) {
         const end = start + span + (index < remainder ? 1 : 0) - 1;
@@ -110,8 +114,36 @@ function baselineCompartments(scenario: HistorianEvalScenario): PayloadCompartme
     return compartments;
 }
 
-function baselineOutput(scenario: HistorianEvalScenario, facts: PayloadFact[]): string {
-    return buildHistorianPayload({ compartments: baselineCompartments(scenario), facts });
+/**
+ * Chunk the battery scores against: the authored transcript plus trailing
+ * lookahead. The scorer's default synthetic chunk ends exactly at the authored
+ * end, which no real run ever does — the runner always appends post-epilogue
+ * padding — and that difference is load-bearing. Production treats a last
+ * compartment within `HISTORIAN_BOUNDARY_HEALING_SLACK` of the chunk end as
+ * provisional: it discards that compartment AND skips fact promotion for the
+ * whole pass. Scored against a chunk ending at the authored end, therefore, any
+ * multi-compartment output loses every fact and reports recall 0 for a purely
+ * structural reason, which is what made scenarios declaring a compartment
+ * minimum above one unpromotable. The authored span stays explicit so
+ * `compartment-count` still measures only compartments over authored content.
+ */
+function batteryScoringOptions(scenario: HistorianEvalScenario): {
+    chunkStartOrdinal: number;
+    chunkEndOrdinal: number;
+    authoredStartOrdinal: number;
+    authoredEndOrdinal: number;
+} {
+    const messageCount = scenario.transcript.turns.length * 2;
+    return {
+        chunkStartOrdinal: 1,
+        chunkEndOrdinal: messageCount + HISTORIAN_BOUNDARY_HEALING_SLACK + 1,
+        authoredStartOrdinal: 1,
+        authoredEndOrdinal: messageCount,
+    };
+}
+
+function baselineOutput(scenario: HistorianEvalScenario, facts: MockHistorianFact[]): string {
+    return buildMockHistorianOutput({ compartments: baselineCompartments(scenario), facts });
 }
 
 /**
@@ -151,7 +183,7 @@ export function checkMutationOutcome(
     scenario: HistorianEvalScenario,
 ): { green: boolean; detail: string } {
     const expected = EXPECTED_OUTCOMES[mutationClass];
-    const result = scoreRawOutput(output, scenario);
+    const result = scoreRawOutput(output, scenario, batteryScoringOptions(scenario));
     if (expected.stage === "validation-rejected") {
         if (result.stage !== "validation-rejected") {
             return { green: false, detail: `expected stage validation-rejected but landed at ${result.stage}` };
@@ -177,7 +209,7 @@ export function checkMutationOutcome(
     return { green: true, detail: `FAIL:${result.score.failReasons.join(",")} as expected` };
 }
 
-function absentTargets(scenario: HistorianEvalScenario, families: readonly string[]): PayloadFact[] {
+function absentTargets(scenario: HistorianEvalScenario, families: readonly string[]): MockHistorianFact[] {
     return scenario.gold.expectedAbsent
         .filter((absent) => families.includes(absent.family))
         .map((absent) => ({
@@ -242,7 +274,7 @@ function runNearMiss(scenario: HistorianEvalScenario): MutationResult {
 
 function runStructuralOverlap(scenario: HistorianEvalScenario): MutationResult {
     const messageCount = scenario.transcript.turns.length * 2;
-    const overlapping = buildHistorianPayload({
+    const overlapping = buildMockHistorianOutput({
         compartments: [
             { start: 1, end: Math.max(2, messageCount - 2), title: "A", body: "a" },
             { start: Math.max(1, messageCount - 3), end: messageCount, title: "B", body: "b" },
@@ -276,10 +308,15 @@ function runProbeWrongAnswer(scenario: HistorianEvalScenario): MutationResult {
     const failures = scenario.probes.flatMap((probe) => {
         const exchange: ProbeExchange = {
             probeId: probe.id,
-            answerRaw: "historian-eval-mutation-wrong-answer",
+            answerRaw: WRONG_PROBE_ANSWER,
             reAsked: false,
             injectedRevisionLocators: [],
             payloadText: null,
+            // Synthetic exchange: there is no captured request, the answer came
+            // straight from the marker reply, and nothing was re-asked.
+            finalRequestPayloadText: null,
+            responseText: `<answer>${WRONG_PROBE_ANSWER}</answer>`,
+            discardedResponseTexts: [],
         };
         const verdict = compareProbeAnswer({ probe, exchange, scenario, injectedClaims: [] });
         return verdict.outcome === expected.outcome
@@ -300,7 +337,11 @@ function runProbeWrongAnswer(scenario: HistorianEvalScenario): MutationResult {
 
 /** Construction invariant: semantic-class fixtures must be validator-clean. */
 function assertBaselineValidates(scenario: HistorianEvalScenario): MutationResult | null {
-    const result = scoreRawOutput(baselineOutput(scenario, goldSatisfyingFacts(scenario)), scenario);
+    const result = scoreRawOutput(
+        baselineOutput(scenario, goldSatisfyingFacts(scenario)),
+        scenario,
+        batteryScoringOptions(scenario),
+    );
     if (result.stage !== "scored") {
         return {
             mutationClass: "baseline-fixture",

@@ -10,13 +10,13 @@ import {
     runScenarioMutationBattery,
 } from "./mutations";
 import { normalizeContent, predicateMatches } from "./contract";
-import { buildHistorianPayload } from "./payload";
+import { buildMockHistorianOutput } from "../mock-historian";
 import { goldFacts, goldenRawOutput, validScenario } from "./test-support";
 
 function overlappingPayload(): string {
     const scenario = validScenario();
     const messageCount = scenario.transcript.turns.length * 2;
-    return buildHistorianPayload({
+    return buildMockHistorianOutput({
         compartments: [
             { start: 1, end: messageCount - 2, title: "A", body: "a" },
             { start: messageCount - 3, end: messageCount, title: "B", body: "b" },
@@ -218,6 +218,7 @@ describe("mutation battery (R13/KTD5)", () => {
             question: "Which marker does the battery send?",
             answerType: "exact" as const,
             goldAnswer: "historian-eval-mutation-wrong-answer",
+            sourceClaimRef: "exp-cache-capacity",
         };
         const evidence = runScenarioMutationBattery({ ...scenario, probes: [...scenario.probes, colliding] });
         const probe = evidence.results.find((result) => result.mutationClass === "probe-wrong-answer");

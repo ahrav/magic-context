@@ -32,15 +32,18 @@ import {
     HistorianEvalContractError,
     MANIFEST_SCHEMA,
     RELEASE_VERSION_RE,
+    assertReleaseSuccession,
     buildReleaseTuple,
     lintScenario,
     parseApproval,
     parseManifest,
     parseScenario,
+    releaseApprovalFingerprint,
     scenarioFingerprint,
     type Approval,
     type ApprovalKind,
     type HistorianEvalScenario,
+    type ReleaseLineage,
     type ReleaseManifest,
 } from "./contract";
 import { parseMutationEvidence, runMutationBattery, type MutationEvidenceArtifact } from "./mutations";
@@ -84,15 +87,18 @@ function readReleaseJson(path: string, label: string): unknown {
     return readCanonicalJsonFile(path, (code) => new HistorianEvalContractError([`${label}: ${code}`]));
 }
 
-function checkApprovals(rawApprovals: readonly unknown[], tupleFingerprint: string): { privacy: Approval; goldIntent: Approval } {
+function checkApprovals(rawApprovals: readonly unknown[], releaseFingerprint: string): { privacy: Approval; goldIntent: Approval } {
     const approvals = rawApprovals.map((raw, index) => parseApproval(raw, `approvals[${index}]`));
     const byKind = new Map<ApprovalKind, Approval>();
     const diagnostics: string[] = [];
     for (const approval of approvals) {
         if (byKind.has(approval.kind)) diagnostics.push(`approvals.${approval.kind}: duplicate-kind`);
         byKind.set(approval.kind, approval);
-        if (approval.releaseTupleFingerprint !== tupleFingerprint) {
-            diagnostics.push(`approvals.${approval.kind}: stale-or-foreign-tuple`);
+        // Bound to the WHOLE release — version, tuple, and tombstones — so a
+        // prior release's approvals cannot be replayed on a manifest that drops
+        // a tombstone.
+        if (approval.releaseFingerprint !== releaseFingerprint) {
+            diagnostics.push(`approvals.${approval.kind}: stale-or-foreign-release`);
         }
     }
     for (const kind of APPROVAL_KINDS) {
@@ -244,33 +250,32 @@ function versionOrdinal(version: string): number {
 }
 
 /**
- * Installed release ordinals. Publication must move strictly forward: the
- * tombstone rule is "errata go into vN+1", which only retires a scenario if
- * every later release also carries the tombstone. Rejecting just the exact
- * destination version would allow promoting v2 and then v1-with-X-tombstoned,
- * leaving the numerically later — and immutable — v2 still serving X.
+ * Every installed release, newest last. One pass serves both obligations that
+ * read prior state: tombstone inheritance (R12) and succession, so they cannot
+ * disagree about which releases exist.
+ *
+ * Fails closed on a version-named directory without a loadable manifest: a
+ * corrupt releases root read as "carries no tombstones" would silently
+ * re-admit a retracted scenario into vN+1.
  */
-function installedVersionOrdinals(releasesRoot: string): number[] {
+function installedReleases(releasesRoot: string): ReleaseManifest[] {
     if (!existsSync(releasesRoot)) return [];
     return readdirSync(releasesRoot)
         .filter((entry) => RELEASE_VERSION_RE.test(entry))
-        .map(versionOrdinal);
+        .sort((left, right) => versionOrdinal(left) - versionOrdinal(right))
+        .map((entry) => {
+            const manifestPath = join(releasesRoot, entry, RELEASE_FILES.manifest);
+            if (!existsSync(manifestPath)) {
+                fail([`release: prior release ${entry} has no readable manifest; refusing to inherit tombstones`]);
+            }
+            return parseManifest(readReleaseJson(manifestPath, `release.${entry}.manifest`));
+        });
 }
 
 /** Prior releases' tombstones persist in every later release (R12). */
-function inheritedTombstones(releasesRoot: string): string[] {
-    if (!existsSync(releasesRoot)) return [];
+function inheritedTombstones(prior: readonly ReleaseManifest[]): string[] {
     const tombstones = new Set<string>();
-    for (const entry of readdirSync(releasesRoot)) {
-        if (!RELEASE_VERSION_RE.test(entry)) continue;
-        const manifestPath = join(releasesRoot, entry, RELEASE_FILES.manifest);
-        // Fail closed: a version-named directory without a loadable manifest
-        // is a corrupt releases root, and skipping it would silently drop its
-        // tombstones — re-admitting a retracted scenario into vN+1.
-        if (!existsSync(manifestPath)) {
-            fail([`release: prior release ${entry} has no readable manifest; refusing to inherit tombstones`]);
-        }
-        const manifest = parseManifest(readReleaseJson(manifestPath, `release.${entry}.manifest`));
+    for (const manifest of prior) {
         for (const id of manifest.tombstones) tombstones.add(id);
     }
     return [...tombstones].sort();
@@ -313,26 +318,38 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string; man
     // Cheap rejection gates run before the battery: tombstone conflicts,
     // approval binding, and version collisions each reject in microseconds,
     // while the recomputed battery costs seconds per promotion.
-    const inherited = inheritedTombstones(input.releasesRoot);
+    const prior = installedReleases(input.releasesRoot);
+    const inherited = inheritedTombstones(prior);
     const tombstones = [...new Set([...inherited, ...(input.tombstones ?? [])])].sort();
     for (const id of tombstones) {
         if (ids.has(id)) fail([`release.scenarios.${id}: tombstoned`]);
     }
 
     const releaseTuple = buildReleaseTuple(scenarios);
-    const tupleFingerprint = canonicalFingerprint(releaseTuple);
-    const approvals = checkApprovals(input.approvals, tupleFingerprint);
+    const nextLineage: ReleaseLineage = { releaseVersion: input.releaseVersion, tombstones };
+    const releaseFingerprint = releaseApprovalFingerprint({
+        releaseVersion: input.releaseVersion,
+        releaseTuple,
+        tombstones,
+    });
+    const approvals = checkApprovals(input.approvals, releaseFingerprint);
 
     const destination = join(input.releasesRoot, input.releaseVersion);
     if (existsSync(destination)) {
         // Immutability: an existing release is never modified; errata go
-        // into vN+1 (R12).
+        // into vN+1 (R12). Checked before succession so re-promoting the
+        // newest version reports the collision rather than the weaker
+        // "not later than" diagnostic.
         fail(["release: version already installed"]);
     }
-    const installed = installedVersionOrdinals(input.releasesRoot);
-    const newest = installed.length === 0 ? 0 : Math.max(...installed);
-    if (versionOrdinal(input.releaseVersion) <= newest) {
-        fail([`release: version ${input.releaseVersion} is not later than the installed v${newest}`]);
+    // Succession against the newest installed release, not just the exact
+    // destination: publishing v1 after v2 would leave the numerically later —
+    // and immutable — v2 still serving a scenario v1 retired, so the vN+1
+    // errata rule could never retire it. The contract owns this rule (it also
+    // refuses dropped tombstones) so promotion and manifest audit agree.
+    const newest = prior.at(-1);
+    if (newest !== undefined) {
+        assertReleaseSuccession(newest, nextLineage);
     }
 
     // Admission gate (R13): the battery is recomputed here rather than
