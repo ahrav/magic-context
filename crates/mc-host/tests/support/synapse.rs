@@ -10,6 +10,8 @@ use std::time::Duration;
 
 use super::raw_client::{self, Discovered, RawFrame};
 use mc_host::synapse::inference::InferenceError;
+#[cfg(feature = "bench-topology")]
+use mc_host::synapse::BenchTopology;
 use mc_host::synapse::{
     EmbeddingEngine, LaneInfo, SynapseComponent, SynapseLimits, SYNAPSE_MODULE_ID,
 };
@@ -407,4 +409,18 @@ pub fn ready_component(
         .min(u32::try_from(limits.max_batch_items).unwrap_or(u32::MAX));
     SynapseComponent::ready_with_engine(lane, engine, limits)
         .expect("test Synapse limits must be valid")
+}
+
+#[cfg(feature = "bench-topology")]
+pub fn ready_topology(
+    engine: Arc<dyn EmbeddingEngine>,
+    limits: SynapseLimits,
+    topology: BenchTopology,
+) -> SynapseComponent {
+    let mut lane = test_lane();
+    lane.recommended_rows = lane
+        .recommended_rows
+        .min(u32::try_from(limits.max_batch_items).unwrap_or(u32::MAX));
+    SynapseComponent::ready_with_engine_bench(lane, engine, limits, topology, None)
+        .expect("test Synapse topology must be valid")
 }

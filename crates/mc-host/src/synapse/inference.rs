@@ -187,6 +187,28 @@ impl Backend {
     /// bytes, then runs the structural probe and semantic certification
     /// before returning a usable backend.
     pub fn load(bundle: VerifiedBundle, ort: &OrtIdentity) -> Result<Self, InferenceError> {
+        Self::load_with_threads(bundle, ort, 1)
+    }
+
+    #[cfg(feature = "bench-topology")]
+    pub fn load_bench(
+        bundle: VerifiedBundle,
+        ort: &OrtIdentity,
+        intra_threads: usize,
+    ) -> Result<Self, InferenceError> {
+        Self::load_with_threads(bundle, ort, intra_threads)
+    }
+
+    fn load_with_threads(
+        bundle: VerifiedBundle,
+        ort: &OrtIdentity,
+        intra_threads: usize,
+    ) -> Result<Self, InferenceError> {
+        if intra_threads == 0 {
+            return Err(InferenceError::Artifact(
+                "intra-op thread count must be nonzero".to_owned(),
+            ));
+        }
         ensure_ort(ort)?;
 
         // The bundle is consumed so every weight buffer moves into the model
@@ -251,8 +273,7 @@ impl Backend {
 
         let options = InitOptionsUserDefined::new()
             .with_max_length(manifest.max_tokens as usize)
-            // One intra-op thread matches the single CPU inference permit.
-            .with_intra_threads(1);
+            .with_intra_threads(intra_threads);
         let embedder = TextEmbedding::try_new_from_user_defined(model, options)
             .map_err(|e| InferenceError::Artifact(format!("model construction failed: {e}")))?;
 

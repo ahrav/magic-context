@@ -315,7 +315,7 @@ impl JobTable {
         seq.parse().ok()
     }
 
-    /// Whether `key` currently names a retained job.
+    /// Whether `key` names a retained job.
     pub fn key_is_retained(&self, key: &str) -> bool {
         // Declared before the guard so it drops after it: permits release
         // outside the table lock.
@@ -457,13 +457,24 @@ impl JobTable {
     /// Claims the queued inputs for inference. `None` means the job was
     /// cancelled by shutdown before its worker started.
     pub fn start(&self, seq: u64) -> Option<Vec<BatchItem>> {
+        self.start_reserving(seq, false)
+    }
+
+    pub(crate) fn start_reserving(&self, seq: u64, reserve_result: bool) -> Option<Vec<BatchItem>> {
         let mut jobs = self.lock_jobs();
         let job = jobs.by_seq.get_mut(&seq)?;
         let JobState::Queued { items } = &mut job.state else {
             return None;
         };
         let items = std::mem::take(items);
+        let reserved = if reserve_result {
+            job.reserved_result_bytes
+        } else {
+            0
+        };
+        job.result_bytes = reserved;
         job.state = JobState::Running;
+        jobs.retained_result_bytes += reserved;
         Some(items)
     }
 
@@ -505,6 +516,7 @@ impl JobTable {
             return;
         }
         let result_bytes = job.reserved_result_bytes;
+        let needs_result_charge = job.result_bytes == 0;
         let text_bytes = job.text_bytes;
         job.text_bytes = 0;
 
@@ -521,8 +533,10 @@ impl JobTable {
         let retained = job.retained_input_bytes();
         let excess = job.charge.split_excess(retained);
         released.charge(excess);
+        if needs_result_charge {
+            jobs.retained_result_bytes += result_bytes;
+        }
         jobs.queued_text_bytes -= text_bytes;
-        jobs.retained_result_bytes += result_bytes;
         self.enforce_retention(&mut jobs, Some(seq), &mut released);
     }
 
@@ -554,6 +568,8 @@ impl JobTable {
         }
         let text_bytes = job.text_bytes;
         job.text_bytes = 0;
+        jobs.retained_result_bytes -= job.result_bytes;
+        job.result_bytes = 0;
         job.state = JobState::Failed { code, message };
         job.completed_at = Some(Instant::now());
         // Queued items (if the worker never started) and worker-owned texts
@@ -1108,6 +1124,69 @@ mod tests {
         jobs.clear();
         assert_eq!(first.vectors[0].2.len(), 256 * 1024);
         assert_eq!(second.vectors[0].2[0], 0.5);
+    }
+
+    #[test]
+    fn concurrent_topologies_reserve_result_bytes_at_start_without_double_charging() {
+        let jobs = JobTable::new(SynapseLimits::default());
+        let batch = vec![BatchItem {
+            id: "item".to_owned(),
+            content_sha256: "0".repeat(CONTENT_SHA256_BYTES),
+            text: "alpha".to_owned(),
+        }];
+        let AdmitOutcome::Admitted { seq, .. } =
+            jobs.admit_uncharged_for_tests("key".to_owned(), batch, 2)
+        else {
+            panic!("job is admitted");
+        };
+        let reserved = jobs
+            .lock_jobs()
+            .by_seq
+            .get(&seq)
+            .expect("job exists")
+            .reserved_result_bytes;
+
+        jobs.start_reserving(seq, true).expect("job starts");
+        assert_eq!(jobs.lock_jobs().retained_result_bytes, reserved);
+        jobs.publish_ready(seq, vec![vec![0.5; 2]]);
+        assert_eq!(jobs.lock_jobs().retained_result_bytes, reserved);
+
+        jobs.clear();
+        assert_eq!(jobs.lock_jobs().retained_result_bytes, 0);
+    }
+
+    #[test]
+    fn concurrent_result_reservations_never_evict_running_jobs() {
+        let dimensions = 2;
+        let one_result =
+            result_bytes(1, dimensions, 1 + CONTENT_SHA256_BYTES).expect("small result size");
+        let jobs = JobTable::new(SynapseLimits {
+            max_retained_result_bytes: one_result,
+            ..SynapseLimits::default()
+        });
+        let item = |id: &str| {
+            vec![BatchItem {
+                id: id.to_owned(),
+                content_sha256: "0".repeat(CONTENT_SHA256_BYTES),
+                text: "alpha".to_owned(),
+            }]
+        };
+        let AdmitOutcome::Admitted { seq: first, .. } =
+            jobs.admit_uncharged_for_tests("first".to_owned(), item("a"), dimensions)
+        else {
+            panic!("first job is admitted");
+        };
+        let AdmitOutcome::Admitted { seq: second, .. } =
+            jobs.admit_uncharged_for_tests("second".to_owned(), item("b"), dimensions)
+        else {
+            panic!("second job is admitted");
+        };
+
+        jobs.start_reserving(first, true).expect("first starts");
+        jobs.start_reserving(second, true).expect("second starts");
+        let state = jobs.lock_jobs();
+        assert_eq!(state.by_seq.len(), 2);
+        assert_eq!(state.retained_result_bytes, one_result * 2);
     }
 
     #[test]

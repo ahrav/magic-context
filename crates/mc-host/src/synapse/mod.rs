@@ -16,6 +16,7 @@ pub mod bundle;
 pub mod inference;
 pub mod jobs;
 pub mod protocol;
+mod topology;
 
 use std::path::PathBuf;
 #[cfg(feature = "bench-topology")]
@@ -33,6 +34,7 @@ use crate::handler::{
 use inference::{Backend, InferenceError, OrtIdentity};
 use jobs::{AdmitOutcome, JobTable, PollOutcome};
 use protocol::{Request, RequestError};
+use topology::{Topology, WorkClass};
 
 pub const SYNAPSE_MODULE_ID: &str = "synapse";
 
@@ -142,7 +144,17 @@ pub struct LaneInfo {
 }
 
 impl LaneInfo {
+    #[cfg(feature = "bench-topology")]
+    pub fn from_bundle(bundle: &bundle::VerifiedBundle) -> Self {
+        Self::from_verified_bundle(bundle)
+    }
+
+    #[cfg(not(feature = "bench-topology"))]
     fn from_bundle(bundle: &bundle::VerifiedBundle) -> Self {
+        Self::from_verified_bundle(bundle)
+    }
+
+    fn from_verified_bundle(bundle: &bundle::VerifiedBundle) -> Self {
         let manifest = &bundle.manifest;
         Self {
             model: manifest.model.clone(),
@@ -204,13 +216,7 @@ struct SynapseInner {
     limits: SynapseLimits,
     state: Mutex<LaneState>,
     jobs: JobTable,
-    /// One permit: at most one native inference call runs at a time. Tokio's
-    /// semaphore is fair, so waiters are served in the order they register on
-    /// it. That order is what bounds a waiter's wait and rules out starvation;
-    /// it is not a claim that it matches the order the host admitted the
-    /// queries, because each admitted query registers from its own task and
-    /// concurrent requests have no wire-level total order to be faithful to.
-    cpu: Arc<tokio::sync::Semaphore>,
+    topology: Topology,
     /// One running query plus at most `max_waiting_queries` waiters may use the
     /// serialized CPU lane. Admission is a non-blocking count: it decides
     /// whether a query may wait at all, never where in the queue it lands.
@@ -222,6 +228,32 @@ struct SynapseInner {
     closing: CancellationToken,
     #[cfg(feature = "bench-topology")]
     observer: Option<Arc<SynapseObserver>>,
+}
+
+#[cfg(feature = "bench-topology")]
+#[derive(Clone, Copy, Debug)]
+pub enum BenchTopology {
+    B0,
+    T1 { intra_threads: usize },
+    T2,
+    T3 { chunk_rows: usize },
+    T4 { permits: usize },
+    T5 { permits: usize },
+}
+
+#[cfg(feature = "bench-topology")]
+impl BenchTopology {
+    fn validate(self) -> Result<Self, bundle::BundleError> {
+        let valid = match self {
+            Self::B0 | Self::T2 => true,
+            Self::T1 { intra_threads } => intra_threads > 0,
+            Self::T3 { chunk_rows } => chunk_rows > 0,
+            Self::T4 { permits } | Self::T5 { permits } => permits > 0,
+        };
+        valid
+            .then_some(self)
+            .ok_or_else(|| bundle::BundleError("topology values must be nonzero".to_owned()))
+    }
 }
 
 #[cfg(feature = "bench-topology")]
@@ -356,6 +388,27 @@ impl ObservationGuard {
         update_peak(peak, holding.fetch_add(1, Ordering::Relaxed) + 1);
         self.holding = true;
     }
+
+    fn requeue(&mut self) {
+        let Some(observer) = &self.observer else {
+            return;
+        };
+        let (queued, queued_peak, holding) = match self.class {
+            ObservedClass::Query => (
+                &observer.query_queued,
+                &observer.query_queued_peak,
+                &observer.query_holding,
+            ),
+            ObservedClass::Batch => (
+                &observer.batch_queued,
+                &observer.batch_queued_peak,
+                &observer.batch_holding,
+            ),
+        };
+        holding.fetch_sub(1, Ordering::Relaxed);
+        update_peak(queued_peak, queued.fetch_add(1, Ordering::Relaxed) + 1);
+        self.holding = false;
+    }
 }
 
 #[cfg(feature = "bench-topology")]
@@ -401,7 +454,7 @@ impl SynapseComponent {
                 state: Mutex::new(LaneState::Disabled {
                     reason: "not initialized".to_owned(),
                 }),
-                cpu: Arc::new(tokio::sync::Semaphore::new(1)),
+                topology: Topology::production(),
                 query_admission: Arc::new(tokio::sync::Semaphore::new(query_admission_permits)),
                 tracker: TaskTracker::new(),
                 closing: CancellationToken::new(),
@@ -439,7 +492,7 @@ impl SynapseComponent {
                     backend: engine,
                     lane,
                 }))),
-                cpu: Arc::new(tokio::sync::Semaphore::new(1)),
+                topology: Topology::production(),
                 query_admission: Arc::new(tokio::sync::Semaphore::new(query_admission_permits)),
                 tracker: TaskTracker::new(),
                 closing: CancellationToken::new(),
@@ -456,11 +509,38 @@ impl SynapseComponent {
         limits: SynapseLimits,
         observer: Arc<SynapseObserver>,
     ) -> Result<Self, bundle::BundleError> {
-        let mut component = Self::ready_with_engine(lane, engine, limits)?;
-        Arc::get_mut(&mut component.inner)
-            .expect("newly constructed component has one owner")
-            .observer = Some(observer);
-        Ok(component)
+        Self::ready_with_engine_bench(lane, engine, limits, BenchTopology::B0, Some(observer))
+    }
+
+    #[cfg(feature = "bench-topology")]
+    pub fn ready_with_engine_bench(
+        mut lane: LaneInfo,
+        engine: Arc<dyn EmbeddingEngine>,
+        limits: SynapseLimits,
+        topology: BenchTopology,
+        observer: Option<Arc<SynapseObserver>>,
+    ) -> Result<Self, bundle::BundleError> {
+        bundle::validate_serving_limits(lane.dims, lane.recommended_rows as usize, &limits)?;
+        let query_admission_permits = limits
+            .query_admission_permits()
+            .expect("validate_serving_limits proves the permit count");
+        lane.max_text_bytes = limits.max_text_bytes;
+        Ok(Self {
+            inner: Arc::new(SynapseInner {
+                config: None,
+                jobs: JobTable::new(limits.clone()),
+                limits,
+                state: Mutex::new(LaneState::Ready(Arc::new(ReadyLane {
+                    backend: engine,
+                    lane,
+                }))),
+                topology: Topology::benchmark(topology.validate()?),
+                query_admission: Arc::new(tokio::sync::Semaphore::new(query_admission_permits)),
+                tracker: TaskTracker::new(),
+                closing: CancellationToken::new(),
+                observer,
+            }),
+        })
     }
 
     pub fn status(&self) -> SynapseStatus {
@@ -566,23 +646,42 @@ enum QueryFault {
 struct AbandonGuard {
     inner: Arc<SynapseInner>,
     seq: u64,
-    armed: bool,
+    disposition: Option<AbandonDisposition>,
+}
+
+enum AbandonDisposition {
+    InternalError,
+    Cancelled,
+}
+
+impl AbandonGuard {
+    fn cancelled(&mut self) {
+        self.disposition = Some(AbandonDisposition::Cancelled);
+    }
+
+    fn disarm(&mut self) {
+        self.disposition = None;
+    }
 }
 
 impl Drop for AbandonGuard {
     fn drop(&mut self) {
-        if self.armed {
+        if let Some(disposition) = self.disposition.take() {
             // A worker that exits without publishing is a host task
             // failure, not a lane fault: the bundle is fine and every other
             // job on this lane still works. `artifact_invalid` would be read
             // as a permanent lane fault and take the whole component down
             // with it, so this stays the host-generic task-failure code
             // (protocol §7.4) that leaves the lane serving.
-            self.inner.jobs.publish_failed(
-                self.seq,
-                "internal_error".to_owned(),
-                "batch worker exited before publication".to_owned(),
-            );
+            let (code, message) = match disposition {
+                AbandonDisposition::InternalError => {
+                    ("internal_error", "batch worker exited before publication")
+                }
+                AbandonDisposition::Cancelled => ("cancelled", "the host is shutting down"),
+            };
+            self.inner
+                .jobs
+                .publish_failed(self.seq, code.to_owned(), message.to_owned());
         }
     }
 }
@@ -769,12 +868,17 @@ impl SynapseComponent {
                     let _ = tx.send(Err(QueryFault::Timeout));
                     return;
                 }
-                permit = Arc::clone(&inner.cpu).acquire_owned() => permit,
+                permit = inner.topology.acquire(WorkClass::Query) => permit,
             };
             let Ok(_permit) = permit else {
-                let _ = tx.send(Err(QueryFault::Engine(InferenceError::Invariant(
-                    "cpu semaphore closed".to_owned(),
-                ))));
+                let fault = if inner.closing.is_cancelled() {
+                    QueryFault::Cancelled
+                } else {
+                    QueryFault::Engine(InferenceError::Invariant(
+                        "inference topology closed".to_owned(),
+                    ))
+                };
+                let _ = tx.send(Err(fault));
                 return;
             };
             #[cfg(feature = "bench-topology")]
@@ -930,9 +1034,9 @@ impl SynapseComponent {
                 // A queued wrapper is cancellable; a started native call is
                 // not. close_admission already dropped the queued job.
                 () = inner.closing.cancelled() => return,
-                permit = Arc::clone(&inner.cpu).acquire_owned() => permit,
+                permit = inner.topology.acquire(WorkClass::Batch) => permit,
             };
-            let Ok(_permit) = permit else { return };
+            let Ok(mut permit) = permit else { return };
             #[cfg(feature = "bench-topology")]
             observation.hold();
             // A queued batch inherits the same hazard as a queued query: the
@@ -945,7 +1049,10 @@ impl SynapseComponent {
                     .publish_failed(seq, "artifact_invalid".to_owned(), reason);
                 return;
             }
-            let Some(items) = inner.jobs.start(seq) else {
+            let Some(items) = inner
+                .jobs
+                .start_reserving(seq, inner.topology.reserve_result_at_start())
+            else {
                 return;
             };
             // `fail_job` is idempotent, so a normal publication wins even if
@@ -953,28 +1060,68 @@ impl SynapseComponent {
             let mut settle_guard = AbandonGuard {
                 inner: Arc::clone(&inner),
                 seq,
-                armed: true,
+                disposition: Some(AbandonDisposition::InternalError),
             };
-            let lane_blocking = Arc::clone(&lane);
-            let joined = tokio::task::spawn_blocking(move || {
-                let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
-                lane_blocking.backend.embed(&texts)
-            })
-            .await;
-            match settle_inference(&inner, joined) {
-                Ok(vectors) => inner.jobs.publish_ready(seq, vectors),
-                Err(InferenceError::Input(reason)) => {
-                    inner
-                        .jobs
-                        .publish_failed(seq, "schema_violation".to_owned(), reason);
+            let chunk_rows = inner.topology.chunk_rows().unwrap_or(items.len()).max(1);
+            let mut vectors = Vec::with_capacity(items.len());
+            for (index, chunk) in items.chunks(chunk_rows).enumerate() {
+                if index != 0 {
+                    #[cfg(feature = "bench-topology")]
+                    observation.requeue();
+                    drop(permit);
+                    permit = tokio::select! {
+                        biased;
+                        () = inner.closing.cancelled() => {
+                            settle_guard.cancelled();
+                            return;
+                        }
+                        permit = inner.topology.acquire(WorkClass::Batch) => match permit {
+                            Ok(permit) => permit,
+                            Err(_) if inner.closing.is_cancelled() => {
+                                settle_guard.cancelled();
+                                return;
+                            }
+                            Err(_) => return,
+                        },
+                    };
+                    #[cfg(feature = "bench-topology")]
+                    observation.hold();
+                    if let Some(reason) = lane_failure_reason(&inner) {
+                        inner
+                            .jobs
+                            .publish_failed(seq, "artifact_invalid".to_owned(), reason);
+                        settle_guard.disarm();
+                        return;
+                    }
                 }
-                Err(InferenceError::Artifact(reason)) | Err(InferenceError::Invariant(reason)) => {
-                    inner
-                        .jobs
-                        .publish_failed(seq, "artifact_invalid".to_owned(), reason);
+                let texts: Vec<String> = chunk.iter().map(|item| item.text.clone()).collect();
+                let lane_blocking = Arc::clone(&lane);
+                let joined = tokio::task::spawn_blocking(move || {
+                    let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+                    lane_blocking.backend.embed(&texts)
+                })
+                .await;
+                match settle_inference(&inner, joined) {
+                    Ok(chunk_vectors) => vectors.extend(chunk_vectors),
+                    Err(InferenceError::Input(reason)) => {
+                        inner
+                            .jobs
+                            .publish_failed(seq, "schema_violation".to_owned(), reason);
+                        settle_guard.disarm();
+                        return;
+                    }
+                    Err(InferenceError::Artifact(reason))
+                    | Err(InferenceError::Invariant(reason)) => {
+                        inner
+                            .jobs
+                            .publish_failed(seq, "artifact_invalid".to_owned(), reason);
+                        settle_guard.disarm();
+                        return;
+                    }
                 }
             }
-            settle_guard.armed = false;
+            inner.jobs.publish_ready(seq, vectors);
+            settle_guard.disarm();
         });
     }
 
@@ -1247,6 +1394,7 @@ impl CompositeComponent for SynapseComponent {
         }
         self.inner.closing.cancel();
         self.inner.jobs.close_admission();
+        self.inner.topology.close();
         self.inner.tracker.close();
         self.inner.tracker.wait().await;
         self.inner.jobs.clear();

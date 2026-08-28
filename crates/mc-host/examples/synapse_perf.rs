@@ -11,16 +11,18 @@ mod perf_measurement;
 mod process_resources;
 #[path = "../tests/support/raw_client.rs"]
 mod raw_client;
+#[path = "../tests/support/synapse_pool.rs"]
+mod synapse_pool;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use mc_host::synapse::inference::InferenceError;
+use mc_host::synapse::inference::{Backend, InferenceError, OrtIdentity};
 use mc_host::synapse::jobs::BatchItem;
 use mc_host::synapse::{
-    EmbeddingEngine, LaneInfo, SynapseComponent, SynapseLimits, SynapseObserver,
+    BenchTopology, EmbeddingEngine, LaneInfo, SynapseComponent, SynapseLimits, SynapseObserver,
     SynapseObserverSnapshot, SYNAPSE_MODULE_ID,
 };
 use mc_host::{
@@ -104,6 +106,11 @@ enum Arm {
 #[serde(rename_all = "snake_case")]
 enum TopologyId {
     B0,
+    T1(usize),
+    T2,
+    T3,
+    T4(usize),
+    T5(usize),
 }
 
 #[derive(Clone, Copy, Debug, serde::Serialize)]
@@ -147,7 +154,7 @@ enum Load {
     },
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Opts {
     variant: SynapseVariant,
     topology: TopologyId,
@@ -160,6 +167,22 @@ struct Opts {
     seed: u64,
     transport_floor_ns: u64,
     observer: bool,
+    engine: EngineOpts,
+}
+
+#[derive(Clone, Debug)]
+enum EngineOpts {
+    Delay,
+    Real {
+        bundle_dir: std::path::PathBuf,
+        ort_library: std::path::PathBuf,
+        ort_sha256: String,
+        ort_version: String,
+        corpus: std::path::PathBuf,
+        corpus_sha256: String,
+        commit: String,
+        cpu_budget: usize,
+    },
 }
 
 fn parse_opts() -> Result<Opts, String> {
@@ -183,6 +206,15 @@ fn parse_opts_from(args: impl IntoIterator<Item = String>) -> Result<Opts, Strin
     let mut transport_floor_ns = 0;
     let mut topology = TopologyId::B0;
     let mut observer = true;
+    let mut engine = "delay".to_owned();
+    let mut bundle_dir = None;
+    let mut ort_library = None;
+    let mut ort_sha256 = None;
+    let mut ort_version = None;
+    let mut corpus = None;
+    let mut corpus_sha256 = None;
+    let mut commit = None;
+    let mut cpu_budget = None;
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         let value = args
@@ -199,15 +231,35 @@ fn parse_opts_from(args: impl IntoIterator<Item = String>) -> Result<Opts, Strin
             "--ratio" => ratio = Some(RateRatio::parse(&value)?),
             "--seconds" => seconds = parse(&value, "seconds")?,
             "--engine-delay-ms" => engine_delay_ms = parse(&value, "engine delay")?,
+            "--engine" => engine = value,
+            "--bundle-dir" => bundle_dir = Some(std::path::PathBuf::from(value)),
+            "--ort-library" => ort_library = Some(std::path::PathBuf::from(value)),
+            "--ort-sha256" => ort_sha256 = Some(value),
+            "--ort-version" => ort_version = Some(value),
+            "--corpus" => corpus = Some(std::path::PathBuf::from(value)),
+            "--corpus-sha256" => corpus_sha256 = Some(value),
+            "--commit" => commit = Some(value),
+            "--cpu-budget" => cpu_budget = Some(parse(&value, "cpu budget")?),
             "--max-waiting-queries" => max_waiting_queries = parse(&value, "max waiting queries")?,
             "--query-retry-after-ms" => query_retry_after_ms = parse(&value, "query retry after")?,
             "--seed" => seed = parse(&value, "seed")?,
             "--transport-floor-ns" => transport_floor_ns = parse(&value, "transport floor")?,
             "--topology" => {
-                topology = match value.as_str() {
-                    "b0" => TopologyId::B0,
-                    _ => return Err("topology must be b0".to_owned()),
-                }
+                topology = if value == "b0" {
+                    TopologyId::B0
+                } else if value == "t2" {
+                    TopologyId::T2
+                } else if value == "t3" {
+                    TopologyId::T3
+                } else if let Some(value) = value.strip_prefix("t1-") {
+                    TopologyId::T1(parse_nonzero(value, "T1 intra-op threads")?)
+                } else if let Some(value) = value.strip_prefix("t4-") {
+                    TopologyId::T4(parse_nonzero(value, "T4 pool size")?)
+                } else if let Some(value) = value.strip_prefix("t5-") {
+                    TopologyId::T5(parse_nonzero(value, "T5 permits")?)
+                } else {
+                    return Err("topology must be b0, t1-N, t2, t3, t4-N, or t5-N".to_owned());
+                };
             }
             "--observer" => {
                 observer = match value.as_str() {
@@ -314,6 +366,46 @@ fn parse_opts_from(args: impl IntoIterator<Item = String>) -> Result<Opts, Strin
             .filter(|count| *count > 0)
             .ok_or_else(|| "offered request count is zero or overflows".to_owned())?;
     }
+    let real_inputs = (
+        bundle_dir,
+        ort_library,
+        ort_sha256,
+        ort_version,
+        corpus,
+        corpus_sha256,
+        commit,
+        cpu_budget,
+    );
+    let engine = match (engine.as_str(), real_inputs) {
+        ("delay", (None, None, None, None, None, None, None, None)) => EngineOpts::Delay,
+        ("delay", _) => return Err("delay engine rejects real-engine provenance inputs".to_owned()),
+        (
+            "real",
+            (
+                Some(bundle_dir),
+                Some(ort_library),
+                Some(ort_sha256),
+                Some(ort_version),
+                Some(corpus),
+                Some(corpus_sha256),
+                Some(commit),
+                Some(cpu_budget),
+            ),
+        ) if cpu_budget > 0 => EngineOpts::Real {
+            bundle_dir,
+            ort_library,
+            ort_sha256,
+            ort_version,
+            corpus,
+            corpus_sha256,
+            commit,
+            cpu_budget,
+        },
+        ("real", _) => {
+            return Err("real engine requires --bundle-dir, --ort-library, --ort-sha256, --ort-version, --corpus, --corpus-sha256, --commit, and nonzero --cpu-budget".to_owned())
+        }
+        _ => return Err("engine must be delay or real".to_owned()),
+    };
     Ok(Opts {
         variant,
         topology,
@@ -326,6 +418,7 @@ fn parse_opts_from(args: impl IntoIterator<Item = String>) -> Result<Opts, Strin
         seed,
         transport_floor_ns,
         observer,
+        engine,
     })
 }
 
@@ -356,12 +449,43 @@ fn parse<T: std::str::FromStr>(value: &str, name: &str) -> Result<T, String> {
     value.parse().map_err(|_| format!("invalid {name}"))
 }
 
+fn parse_nonzero(value: &str, name: &str) -> Result<usize, String> {
+    parse(value, name).and_then(|value| {
+        (value > 0)
+            .then_some(value)
+            .ok_or_else(|| format!("{name} must be nonzero"))
+    })
+}
+
 struct DelayEngine {
     delay: Duration,
     /// Shared with the wire clock so a service sample's start instant is
     /// directly comparable to the hold window's boundaries.
     origin: Instant,
     service: Arc<StdMutex<Vec<ServiceSample>>>,
+}
+
+struct MeasuredEngine {
+    inner: Arc<dyn EmbeddingEngine>,
+    origin: Instant,
+    service: Arc<StdMutex<Vec<ServiceSample>>>,
+}
+
+impl EmbeddingEngine for MeasuredEngine {
+    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, InferenceError> {
+        let start = Instant::now();
+        let result = self.inner.embed(texts);
+        self.service
+            .lock()
+            .expect("service samples")
+            .push(ServiceSample {
+                started_ns: u64::try_from(start.saturating_duration_since(self.origin).as_nanos())
+                    .unwrap_or(u64::MAX),
+                service_ns: u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                window: WindowClass::Measured,
+            });
+        result
+    }
 }
 
 impl EmbeddingEngine for DelayEngine {
@@ -400,6 +524,88 @@ fn lane() -> LaneInfo {
         recommended_rows: 64,
         recommended_token_budget: 8192,
     }
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum EvidenceScope {
+    DelayMechanism,
+    SynapseTinyMechanism,
+    ProductionModel,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct Provenance {
+    evidence_scope: EvidenceScope,
+    bundle_dir: Option<String>,
+    model: String,
+    fingerprint: String,
+    dims: usize,
+    max_tokens: u32,
+    pooling: Option<String>,
+    quantization: Option<String>,
+    recommended_rows: u32,
+    recommended_token_budget: u32,
+    model_sha256: Option<String>,
+    corpus_path: Option<String>,
+    corpus_sha256: Option<String>,
+    ort_library: Option<String>,
+    ort_version: Option<String>,
+    ort_sha256: Option<String>,
+    commit: Option<String>,
+    cpu_budget: Option<usize>,
+}
+
+fn delay_provenance(lane: &LaneInfo) -> Provenance {
+    Provenance {
+        evidence_scope: EvidenceScope::DelayMechanism,
+        bundle_dir: None,
+        model: lane.model.clone(),
+        fingerprint: lane.fingerprint.clone(),
+        dims: lane.dims,
+        max_tokens: lane.max_tokens,
+        pooling: None,
+        quantization: None,
+        recommended_rows: lane.recommended_rows,
+        recommended_token_budget: lane.recommended_token_budget,
+        model_sha256: None,
+        corpus_path: None,
+        corpus_sha256: None,
+        ort_library: None,
+        ort_version: None,
+        ort_sha256: None,
+        commit: HOST_BUILD_ID.map(str::to_owned),
+        cpu_budget: None,
+    }
+}
+
+fn corpus_texts(path: &std::path::Path, expected_sha256: &str) -> Result<Vec<String>, String> {
+    let bytes = std::fs::read(path).map_err(|error| format!("read corpus: {error}"))?;
+    let actual = perf_measurement::sha256_hex(&bytes);
+    if actual != expected_sha256 {
+        return Err(format!(
+            "corpus SHA-256 mismatch: expected {expected_sha256}, got {actual}"
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("corpus must be certification JSON: {error}"))?;
+    let mut texts: Vec<String> = value["items"]
+        .as_array()
+        .ok_or_else(|| "corpus items must be an array".to_owned())?
+        .iter()
+        .map(|item| {
+            item["text"]
+                .as_str()
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| "corpus item text must be nonempty".to_owned())
+        })
+        .collect::<Result<_, _>>()?;
+    texts.sort_by_key(|text| text.split_whitespace().count());
+    if texts.is_empty() {
+        return Err("corpus contains no texts".to_owned());
+    }
+    Ok(texts)
 }
 
 struct PerfPrimary;
@@ -835,6 +1041,8 @@ struct RunContext {
     fatal_errors: Arc<Mutex<Vec<String>>>,
     connection_loss: Arc<AtomicU64>,
     batch_pages: Arc<Mutex<Vec<BatchPageRecord>>>,
+    lane: Arc<LaneInfo>,
+    corpus: Arc<Vec<String>>,
     opts: Opts,
 }
 
@@ -955,11 +1163,11 @@ fn request(method: &str, params: serde_json::Value) -> Result<Vec<u8>, String> {
         .map_err(|error| format!("serialize {method}: {error}"))
 }
 
-fn constraints() -> serde_json::Value {
+fn constraints(lane: &LaneInfo) -> serde_json::Value {
     serde_json::json!({
-        "model": MODEL,
-        "required_fingerprint": FINGERPRINT,
-        "required_epoch": 1,
+        "model": lane.model,
+        "required_fingerprint": lane.fingerprint,
+        "required_epoch": lane.table_epoch,
         "allow_equivalent": false,
         "accept_declared": false
     })
@@ -1019,8 +1227,10 @@ async fn execute_query(
     let mut attempts = 0u32;
     loop {
         attempts += 1;
-        let mut params = constraints();
-        params["text"] = QUERY_TEXT.into();
+        let mut params = constraints(&ctx.lane);
+        params["text"] = ctx.corpus[logical_id as usize % ctx.corpus.len()]
+            .clone()
+            .into();
         // Mirrors the plugin's pre-attempt guard: a remaining budget under
         // one millisecond truncates to the out-of-contract `deadline_ms: 0`
         // (`parse_query` rejects zero), so it is an exhausted deadline, not
@@ -1107,7 +1317,7 @@ async fn execute_query(
         };
         first_send.get_or_insert(reply.sent_ns);
         if reply.frame.ty == raw_client::TY_RESPONSE {
-            validate_vectors(&json, 1)?;
+            validate_vectors(&json, 1, &ctx.lane)?;
             return Ok(terminal_record(
                 logical_id,
                 scheduled_start_ns,
@@ -1187,10 +1397,10 @@ async fn execute_query(
     }
 }
 
-fn batch_items(logical_id: u64, shape: BatchShape) -> Vec<BatchItem> {
+fn batch_items(logical_id: u64, shape: BatchShape, corpus: &[String]) -> Vec<BatchItem> {
     (0..shape.item_count())
         .map(|index| {
-            let text = format!("batch {logical_id} item {index}");
+            let text = corpus[(logical_id as usize + index) % corpus.len()].clone();
             BatchItem {
                 id: format!("{logical_id}:{index}"),
                 content_sha256: perf_measurement::sha256_hex(text.as_bytes()),
@@ -1207,9 +1417,9 @@ async fn execute_batch(
     shape: BatchShape,
 ) -> Result<LogicalRecord, String> {
     let deadline = Instant::now() + BATCH_DEADLINE;
-    let items = batch_items(logical_id, shape);
-    let request_key = mc_host::synapse::protocol::canonical_request_key(&lane(), &items);
-    let mut params = constraints();
+    let items = batch_items(logical_id, shape, &ctx.corpus);
+    let request_key = mc_host::synapse::protocol::canonical_request_key(&ctx.lane, &items);
+    let mut params = constraints(&ctx.lane);
     params["request_key"] = request_key.clone().into();
     params["items"] = items
         .iter()
@@ -1433,7 +1643,7 @@ async fn execute_batch(
                         polls,
                     ));
                 }
-                let mut poll = constraints();
+                let mut poll = constraints(&ctx.lane);
                 poll["job_id"] = job_id.clone().into();
                 poll["request_key"] = request_key.clone().into();
                 poll["cursor"] = cursor.clone();
@@ -1581,7 +1791,7 @@ async fn execute_batch(
             }
             let result = &json["result"];
             if let Some(vectors) = result["vectors"].as_array() {
-                validate_batch_page(&json, &expected_items)?;
+                validate_batch_page(&json, &expected_items, &ctx.lane)?;
                 ctx.batch_pages.lock().await.push(BatchPageRecord {
                     logical_id,
                     generation,
@@ -1679,14 +1889,18 @@ async fn execute_batch(
     }
 }
 
-fn validate_vectors(json: &serde_json::Value, expected: usize) -> Result<(), String> {
+fn validate_vectors(
+    json: &serde_json::Value,
+    expected: usize,
+    lane: &LaneInfo,
+) -> Result<(), String> {
     let result = &json["result"];
     let vectors = result["vectors"]
         .as_array()
         .ok_or_else(|| format!("response omitted vectors: {json}"))?;
     if result["done"] != true
-        || result["model"] != MODEL
-        || result["fingerprint"] != FINGERPRINT
+        || result["model"] != lane.model
+        || result["fingerprint"] != lane.fingerprint
         || result["table_epoch"] != 1
         || result["dims"] != 8
         || vectors.len() != expected
@@ -1713,10 +1927,11 @@ fn validate_vectors(json: &serde_json::Value, expected: usize) -> Result<(), Str
 fn validate_batch_page(
     json: &serde_json::Value,
     expected: &std::collections::BTreeMap<&str, &str>,
+    lane: &LaneInfo,
 ) -> Result<(), String> {
     let result = &json["result"];
-    if result["model"] != MODEL
-        || result["fingerprint"] != FINGERPRINT
+    if result["model"] != lane.model
+        || result["fingerprint"] != lane.fingerprint
         || result["table_epoch"] != 1
         || result["dims"] != 8
     {
@@ -2325,6 +2540,7 @@ struct Summary {
     seconds: u64,
     seed: u64,
     engine_delay_ms: u64,
+    provenance: Provenance,
     max_waiting_queries: usize,
     query_retry_after_ms: u64,
     /// Subtracted from every permit-wait sample, so two runs with otherwise
@@ -2524,12 +2740,6 @@ async fn run(
     // for the wire would put service samples and window boundaries on different
     // zeros, shifting every service classification by the startup interval.
     let origin = Instant::now();
-    let service = Arc::new(StdMutex::new(Vec::new()));
-    let engine = Arc::new(DelayEngine {
-        delay: Duration::from_millis(opts.engine_delay_ms),
-        origin,
-        service: Arc::clone(&service),
-    });
     let mut limits = SynapseLimits {
         max_waiting_queries: opts.max_waiting_queries,
         query_retry_after_ms: opts.query_retry_after_ms,
@@ -2544,16 +2754,127 @@ async fn run(
     if let Arm::Batch(shape) | Arm::Mixed(shape) = opts.arm {
         limits.max_page_vectors = shape.page_vectors();
     }
+    let service = Arc::new(StdMutex::new(Vec::new()));
     let observer = opts.observer.then(|| Arc::new(SynapseObserver::new()));
-    let component = match &observer {
-        Some(observer) => SynapseComponent::ready_with_engine_observed(
-            lane(),
-            engine,
-            limits,
-            Arc::clone(observer),
-        ),
-        None => SynapseComponent::ready_with_engine(lane(), engine, limits),
-    }
+    let (lane, corpus, provenance, engine): (
+        LaneInfo,
+        Vec<String>,
+        Provenance,
+        Arc<dyn EmbeddingEngine>,
+    ) = match &opts.engine {
+        EngineOpts::Delay => {
+            let lane = lane();
+            let provenance = delay_provenance(&lane);
+            (
+                lane,
+                vec![QUERY_TEXT.to_owned()],
+                provenance,
+                Arc::new(DelayEngine {
+                    delay: Duration::from_millis(opts.engine_delay_ms),
+                    origin,
+                    service: Arc::clone(&service),
+                }),
+            )
+        }
+        EngineOpts::Real {
+            bundle_dir,
+            ort_library,
+            ort_sha256,
+            ort_version,
+            corpus,
+            corpus_sha256,
+            commit,
+            cpu_budget,
+        } => {
+            let texts = corpus_texts(corpus, corpus_sha256)?;
+            let ort = OrtIdentity {
+                library: ort_library.clone(),
+                sha256: ort_sha256.clone(),
+            };
+            let (lane, raw_engine, manifest) = match opts.topology {
+                TopologyId::T4(size) => {
+                    let (lane, engine, permits, manifest) =
+                        synapse_pool::load_pool(bundle_dir, &ort, &limits, size)?;
+                    if permits != size {
+                        return Err("pool constructor returned a divergent permit count".to_owned());
+                    }
+                    (lane, engine, manifest)
+                }
+                _ => {
+                    let bundle = mc_host::synapse::bundle::load_bundle(bundle_dir, &limits)
+                        .map_err(|error| error.to_string())?;
+                    let lane = LaneInfo::from_bundle(&bundle);
+                    let manifest = bundle.manifest.clone();
+                    let threads = match opts.topology {
+                        TopologyId::T1(threads) => threads,
+                        _ => 1,
+                    };
+                    let backend = Backend::load_bench(bundle, &ort, threads)
+                        .map_err(|error| error.to_string())?;
+                    (
+                        lane,
+                        Arc::new(backend) as Arc<dyn EmbeddingEngine>,
+                        manifest,
+                    )
+                }
+            };
+            if manifest.corpus.sha256 != *corpus_sha256 {
+                return Err("corpus SHA-256 does not match the bundle manifest".to_owned());
+            }
+            let scope = if manifest.model == "tiny-test-model" {
+                EvidenceScope::SynapseTinyMechanism
+            } else {
+                EvidenceScope::ProductionModel
+            };
+            let provenance = Provenance {
+                evidence_scope: scope,
+                bundle_dir: Some(bundle_dir.display().to_string()),
+                model: manifest.model,
+                fingerprint: manifest.fingerprint,
+                dims: manifest.dims as usize,
+                max_tokens: manifest.max_tokens as u32,
+                pooling: Some(manifest.pooling),
+                quantization: Some(manifest.quantization),
+                recommended_rows: manifest.recommended_batch.rows,
+                recommended_token_budget: manifest.recommended_batch.token_budget,
+                model_sha256: Some(manifest.model_file.sha256),
+                corpus_path: Some(corpus.display().to_string()),
+                corpus_sha256: Some(corpus_sha256.clone()),
+                ort_library: Some(ort_library.display().to_string()),
+                ort_version: Some(ort_version.clone()),
+                ort_sha256: Some(ort_sha256.clone()),
+                commit: Some(commit.clone()),
+                cpu_budget: Some(*cpu_budget),
+            };
+            (
+                lane,
+                texts,
+                provenance,
+                Arc::new(MeasuredEngine {
+                    inner: raw_engine,
+                    origin,
+                    service: Arc::clone(&service),
+                }),
+            )
+        }
+    };
+    let topology = match opts.topology {
+        TopologyId::B0 => BenchTopology::B0,
+        TopologyId::T1(intra_threads) => BenchTopology::T1 { intra_threads },
+        TopologyId::T2 => BenchTopology::T2,
+        TopologyId::T3 => BenchTopology::T3 {
+            chunk_rows: lane.recommended_rows.max(1) as usize,
+        },
+        TopologyId::T4(permits) => BenchTopology::T4 { permits },
+        TopologyId::T5(permits) => BenchTopology::T5 { permits },
+    };
+    let component = SynapseComponent::ready_with_engine_bench(
+        lane.clone(),
+        engine,
+        limits,
+        topology,
+        observer.clone(),
+    )
     .map_err(|error| format!("validate Synapse limits: {error}"))?;
     let host = HostThread::start(component, data_root.path().to_path_buf())?;
     let publication = data_root
@@ -2578,7 +2899,9 @@ async fn run(
         fatal_errors: Arc::new(Mutex::new(Vec::new())),
         connection_loss: Arc::new(AtomicU64::new(0)),
         batch_pages: Arc::new(Mutex::new(Vec::new())),
-        opts,
+        lane: Arc::new(lane),
+        corpus: Arc::new(corpus),
+        opts: opts.clone(),
     };
     warm(&ctx).await?;
     service.lock().expect("service samples").clear();
@@ -2772,6 +3095,7 @@ async fn run(
         seconds: opts.seconds,
         seed: opts.seed,
         engine_delay_ms: opts.engine_delay_ms,
+        provenance,
         max_waiting_queries: opts.max_waiting_queries,
         query_retry_after_ms: opts.query_retry_after_ms,
         transport_floor_ns: opts.transport_floor_ns,
@@ -2824,6 +3148,7 @@ async fn run(
         observer_enabled: opts.observer,
         observer: observer_snapshot,
         observer_overhead_control: matches!(opts.topology, TopologyId::B0)
+            && matches!(opts.engine, EngineOpts::Delay)
             && opts.engine_delay_ms == 0,
         repetition_class,
         invalid_causes,
@@ -3357,5 +3682,70 @@ mod tests {
         ]))
         .expect_err("mismatched ratio")
         .contains("do not match"));
+    }
+
+    #[test]
+    fn real_engine_requires_complete_provenance_and_parses_topology() {
+        let base = [
+            "--variant",
+            "current-plugin",
+            "--arm",
+            "query",
+            "--concurrency",
+            "1",
+            "--max-waiting-queries",
+            "1",
+            "--engine",
+            "real",
+        ];
+        assert!(parse_opts_from(args(&base))
+            .expect_err("real engine inputs are mandatory")
+            .contains("real engine requires"));
+
+        let mut complete = base.to_vec();
+        complete.extend([
+            "--bundle-dir",
+            "/bundle",
+            "--ort-library",
+            "/lib/libonnxruntime.so",
+            "--ort-sha256",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--ort-version",
+            "test",
+            "--corpus",
+            "/bundle/corpus.json",
+            "--corpus-sha256",
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            "--commit",
+            "deadbeef",
+            "--cpu-budget",
+            "4",
+            "--topology",
+            "t4-2",
+        ]);
+        let parsed = parse_opts_from(args(&complete)).expect("complete real-engine inputs");
+        assert!(matches!(
+            parsed.engine,
+            EngineOpts::Real { cpu_budget: 4, .. }
+        ));
+        assert!(matches!(parsed.topology, TopologyId::T4(2)));
+    }
+
+    #[test]
+    fn corpus_hash_is_verified_and_texts_are_length_stratified() {
+        let dir = tempfile::tempdir().expect("temp corpus dir");
+        let path = dir.path().join("corpus.json");
+        let bytes =
+            br#"{"items":[{"text":"three token text"},{"text":"one"},{"text":"two tokens"}]}"#;
+        std::fs::write(&path, bytes).expect("write corpus");
+        let hash = perf_measurement::sha256_hex(bytes);
+
+        assert_eq!(
+            corpus_texts(&path, &hash).expect("matching corpus hash"),
+            ["one", "two tokens", "three token text"]
+        );
+        assert!(corpus_texts(&path, &"0".repeat(64))
+            .expect_err("wrong corpus hash")
+            .contains("SHA-256 mismatch"));
     }
 }
