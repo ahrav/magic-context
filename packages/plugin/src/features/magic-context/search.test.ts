@@ -136,7 +136,12 @@ function seedAntiMemory(
     projectIdentity: string,
     key: string,
     nowMs = Date.now(),
-    pair: { trigger: string; rejectedStrategy: string } = {
+    pair: {
+        trigger: string;
+        rejectedStrategy: string;
+        nonApplicableWhen?: string;
+        rootCause?: string;
+    } = {
         trigger: "session caching",
         rejectedStrategy: "Redis",
     },
@@ -538,6 +543,78 @@ describe("unifiedSearch", () => {
                 memoryPolicySurface: "explicit_search",
             }),
         ).toEqual([]);
+    });
+
+    it("does not match a prompt on the exception where the rejection does not apply", async () => {
+        const project = "git:anti-nonapplicable";
+        seedAntiMemory(db, project, "nonapplicable", Date.now(), {
+            trigger: "session caching",
+            rejectedStrategy: "Redis",
+            nonApplicableWhen: "the deployment is a single ephemeral preview box",
+        });
+
+        // The warning is not rendered with its exception, so retrieving it for
+        // the prompt that states the exception would assert the opposite of the
+        // stored guidance.
+        expect(
+            await unifiedSearch(
+                db,
+                "session-anti",
+                project,
+                "single ephemeral preview box deployment",
+                {
+                    sources: ["memory"],
+                    memoryEnabled: true,
+                    embeddingEnabled: false,
+                    memoryPolicySurface: "explicit_search",
+                },
+            ),
+        ).toEqual([]);
+
+        const onTrigger = await unifiedSearch(
+            db,
+            "session-anti",
+            project,
+            "Redis session caching",
+            {
+                sources: ["memory"],
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                memoryPolicySurface: "explicit_search",
+            },
+        );
+        expect(onTrigger).toHaveLength(1);
+        expect(onTrigger[0].source).toBe("anti_memory");
+    });
+
+    it("bounds the bytes of each anti-memory passage sent to the embedder", async () => {
+        const project = "git:anti-passage-bytes";
+        seedAntiMemory(db, project, "oversized", Date.now(), {
+            trigger: "session caching",
+            rejectedStrategy: "Redis",
+            rootCause: "why ".repeat(20_000),
+        });
+        const embedded: string[][] = [];
+        queryEmbedding = new Float32Array([1, 0]);
+
+        await unifiedSearch(db, "session-anti", project, "Redis session caching", {
+            sources: ["memory"],
+            memoryEnabled: true,
+            embeddingEnabled: true,
+            memoryPolicySurface: "auto_search",
+            embedQuery,
+            embedPassages: async (texts) => {
+                embedded.push(texts);
+                return texts.map(() => new Float32Array([1, 0]));
+            },
+            isEmbeddingRuntimeEnabled,
+        });
+
+        expect(embedded).toHaveLength(1);
+        expect(embedded[0]).toHaveLength(1);
+        for (const text of embedded[0]) {
+            expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(2048);
+        }
     });
 
     it("keeps a sub-threshold passage similarity out of the anti-memory score", async () => {

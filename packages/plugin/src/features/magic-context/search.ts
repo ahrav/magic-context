@@ -38,6 +38,7 @@ import {
     normalizeSearchResultLimit,
     prepareExplicitQuery,
     QueryBoundsError,
+    truncateUtf8Bytes,
 } from "./search-bounds";
 import { recordShadowMeasurement } from "./search-measurement";
 import {
@@ -92,6 +93,12 @@ const ANTI_MEMORY_SEMANTIC_THRESHOLD = 0.7;
  *  must not scale with the record population. Lexically matched candidates
  *  keep priority; the remainder of the budget goes to the newest records. */
 const ANTI_MEMORY_MAX_SEMANTIC_CANDIDATES = 32;
+/** Ceiling on the bytes of one anti-memory passage handed to the embedding
+ *  provider and scanned for lexical overlap. Payload fields are normalized but
+ *  not length-limited at write time, so without this a single oversized record
+ *  could exceed the provider's input budget or spend the whole per-prompt
+ *  deadline. Paired with the candidate ceiling above, it bounds a batch. */
+const ANTI_MEMORY_MAX_PASSAGE_BYTES = 2048;
 
 interface MessageSearchRow {
     messageOrdinal?: number | string;
@@ -908,21 +915,35 @@ async function searchAntiMemories(args: {
         // Match against payload values only. The rendered `record.content`
         // carries constant field labels ("Rejected strategy", "Root cause",
         // …) whose tokens would let unrelated prompts match every record.
-        const text = [
-            record.payload.trigger,
-            record.payload.rejectedStrategy,
-            record.payload.rejectionReason,
-            record.payload.saferAlternative,
-            record.payload.preconditions,
-            record.payload.attemptedApproach,
-            record.payload.observedFailure,
-            record.payload.rootCause,
-            record.payload.recovery,
-            record.payload.nonApplicableWhen,
-        ]
-            .filter((value): value is string => value !== null)
-            .join("\n")
-            .toLowerCase();
+        //
+        // `nonApplicableWhen` is deliberately absent: it records the exception
+        // where the rejection does NOT hold, and it is not rendered in the
+        // warning. Matching on it would retrieve the warning for exactly the
+        // prompt it disclaims and then show text asserting the opposite. It
+        // belongs in an exclusion test, which does not exist yet.
+        //
+        // Payload fields carry no write-side length limit, so the assembled
+        // text is capped: it feeds both the token scan below and a live
+        // provider batch, and one oversized record must not be able to blow the
+        // embedding request or the per-prompt time budget. Field order puts the
+        // load-bearing values first, so truncation drops context, not identity.
+        const text = truncateUtf8Bytes(
+            [
+                record.payload.trigger,
+                record.payload.rejectedStrategy,
+                record.payload.rejectionReason,
+                record.payload.saferAlternative,
+                record.payload.preconditions,
+                record.payload.attemptedApproach,
+                record.payload.observedFailure,
+                record.payload.rootCause,
+                record.payload.recovery,
+            ]
+                .filter((value): value is string => value !== null)
+                .join("\n")
+                .toLowerCase(),
+            ANTI_MEMORY_MAX_PASSAGE_BYTES,
+        );
         const exact = text.includes(normalizedQuery);
         const textTokens = new Set(tokenizeKeywordNeedle(text));
         const matched = queryTokens.filter((token) => textTokens.has(token)).length;
@@ -1036,6 +1057,12 @@ async function searchAntiMemories(args: {
         if (item === undefined) return false;
         if (item.revisionLocator !== result.revisionLocator) return false;
         if (item.contentDigest !== result.contentDigest) return false;
+        // A disposition landing between the two reads changes the label without
+        // touching the revision, so the label is the only signal that a warning
+        // went stale, disputed, or superseded under an explicit search — where
+        // the surface policy below deliberately does not gate on dispositions.
+        // Publishing the pre-transition copy would render it as unqualified.
+        if ((item.explicitLabel ?? undefined) !== result.policyLabel) return false;
         return eligibleForSurface(item);
     });
 }
