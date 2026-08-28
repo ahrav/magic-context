@@ -95,6 +95,12 @@ function context() {
     return loadReleaseContext(repoRoot);
 }
 
+function successorContext() {
+    const ctx = structuredClone(context());
+    (ctx.contract.release as { version: string }).version = "0.39.0";
+    return ctx;
+}
+
 function targetFor(name: string) {
     const target = PAYLOAD_TARGETS.find((t) => t.target === name);
     if (target === undefined) throw new Error(`missing target ${name}`);
@@ -485,7 +491,7 @@ describe("stop-provenance record", () => {
     });
 
     test("a predecessor record on the genesis release fails", () => {
-        const ctx = context();
+        const ctx = successorContext();
         expect(() =>
             validateStopRecord(predecessorRecord(), ctx, "0.38.0"),
         ).not.toThrow();
@@ -495,26 +501,26 @@ describe("stop-provenance record", () => {
     });
 
     test("reservation versions can never be ancestry", () => {
-        const ctx = context();
+        const ctx = successorContext();
         const record = predecessorRecord();
         record.predecessor_release_version = "0.0.1-reserved.0";
         expect(() =>
             validateStopRecord(record, ctx, "0.0.1-reserved.0"),
-        ).toThrow(/reservation version/);
+        ).toThrow(/exact semver/);
     });
 
     test("self-authored, N-2, unknown-target, and modified-manifest records fail", () => {
-        const ctx = context();
+        const ctx = successorContext();
 
         const selfAuthored = predecessorRecord();
-        selfAuthored.predecessor_release_version = "0.38.0";
+        selfAuthored.predecessor_release_version = "0.39.0";
         expect(() =>
             validateStopRecord(
-                { ...selfAuthored, release_version: "0.38.0" },
+                selfAuthored,
                 ctx,
-                "0.38.0",
+                "0.39.0",
             ),
-        ).toThrow(/cite itself/);
+        ).toThrow(/older than the current release/);
 
         const nMinusTwo = predecessorRecord();
         nMinusTwo.predecessor_release_version = "0.37.0";
@@ -525,7 +531,7 @@ describe("stop-provenance record", () => {
         const badTarget = predecessorRecord();
         badTarget.target = "win32-x64";
         expect(() => validateStopRecord(badTarget, ctx, "0.38.0")).toThrow(
-            /unsupported target/,
+            /not a supported platform/,
         );
 
         const modified = predecessorRecord();
@@ -540,7 +546,7 @@ describe("stop-provenance record", () => {
         const badProof = predecessorRecord();
         badProof.legacy_proof_version = 2;
         expect(() => validateStopRecord(badProof, ctx, "0.38.0")).toThrow(
-            /legacy proof version/,
+            /legacy stop-only proof version/,
         );
     });
 });
