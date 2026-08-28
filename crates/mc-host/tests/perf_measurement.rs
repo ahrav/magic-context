@@ -285,17 +285,45 @@ fn current_plugin_policy_pins_split_caps_and_escalating_fallback() {
     assert_eq!(CurrentPluginPolicy::fallback_base_ms(1), 200);
     assert_eq!(CurrentPluginPolicy::fallback_base_ms(4), 1_600);
     assert_eq!(CurrentPluginPolicy::fallback_base_ms(5), 1_600);
+
+    let current = perf_measurement::SynapseVariant::CurrentPlugin;
+    assert_eq!(current.attempt_limit("queue_full"), Some(64));
+    assert_eq!(current.attempt_limit("timeout"), Some(4));
+    let mut expected = perf_measurement::DeterministicRng::new(17);
+    let mut actual = perf_measurement::DeterministicRng::new(17);
+    assert_eq!(
+        current.retry_delay_ms(None, 3, &mut actual),
+        expected.retry_delay_ms(800)
+    );
+    let mut expected = perf_measurement::DeterministicRng::new(23);
+    let mut actual = perf_measurement::DeterministicRng::new(23);
+    assert_eq!(
+        current.retry_delay_ms(Some(7), 3, &mut actual),
+        expected.retry_delay_ms(7)
+    );
 }
 
 #[test]
-fn method_rng_derivation_is_stable_and_stream_independent() {
+fn every_method_rng_is_stable_and_independent_across_multiple_draws() {
     use perf_measurement::{rng_for_logical, SynapseMethod};
 
-    let query = rng_for_logical(7, SynapseMethod::Query, 11).unit();
-    let batch = rng_for_logical(7, SynapseMethod::Batch, 11).unit();
-    assert_ne!(query, batch);
-    assert_eq!(query, rng_for_logical(7, SynapseMethod::Query, 11).unit());
-    assert_ne!(query, rng_for_logical(7, SynapseMethod::Query, 12).unit());
+    let methods = [
+        SynapseMethod::Query,
+        SynapseMethod::Batch,
+        SynapseMethod::Result,
+    ];
+    let stream = |method, logical_id| {
+        let mut rng = rng_for_logical(41, method, logical_id);
+        (0..4).map(|_| rng.unit()).collect::<Vec<_>>()
+    };
+    let streams: Vec<Vec<f64>> = methods.iter().map(|method| stream(*method, 9)).collect();
+    for (method, expected) in methods.iter().zip(&streams) {
+        assert_eq!(&stream(*method, 9), expected);
+    }
+    assert_ne!(streams[0], streams[1]);
+    assert_ne!(streams[0], streams[2]);
+    assert_ne!(streams[1], streams[2]);
+    assert_ne!(streams[0], stream(SynapseMethod::Query, 10));
 }
 
 #[test]
@@ -327,26 +355,71 @@ fn batch_deadline_goodput_excludes_late_pages_but_retains_them() {
             deadline_ns: 100,
             published: false,
         },
+        BatchPageRecord {
+            logical_id: 2,
+            generation: 0,
+            item_count: 2,
+            receipt_ns: 100,
+            deadline_ns: 100,
+            published: true,
+        },
     ];
     let summary = summarize_batch_pages(&pages, 20).expect("nonzero elapsed");
-    assert_eq!(summary.received_items, 16);
-    assert_eq!(summary.deadline_items, 8);
-    assert_eq!(summary.page_count, 3);
-    assert_eq!(summary.deadline_goodput_items_per_sec, 400_000_000.0);
+    assert_eq!(summary.received_items, 18);
+    assert_eq!(summary.deadline_items, 10);
+    assert_eq!(summary.page_count, 4);
+    assert_eq!(summary.deadline_goodput_items_per_sec, 500_000_000.0);
 }
 
 #[test]
 fn cancellation_cause_splits_invalid_measurement_from_adverse_outcome() {
-    use perf_measurement::{classify_repetition, CancellationCause, RepetitionClass};
+    use perf_measurement::{classify_repetition, RepetitionClass};
 
+    assert_eq!(classify_repetition(&[]), RepetitionClass::Valid);
     assert_eq!(
-        classify_repetition(&[], &[CancellationCause::Candidate]),
-        RepetitionClass::AdverseTreatment
-    );
-    assert_eq!(
-        classify_repetition(&[], &[CancellationCause::HarnessTeardown]),
+        classify_repetition(&["bad clock".to_owned()]),
         RepetitionClass::MeasurementInvalid
     );
+}
+
+#[test]
+fn cancelled_attempt_invalidates_the_frozen_attempt_ledger() {
+    use perf_measurement::{
+        validate_synapse_ledgers, AttemptDisposition, AttemptRecord, LogicalDisposition,
+        LogicalRecord, SynapseMethod,
+    };
+    let logical = LogicalRecord {
+        logical_id: 1,
+        scheduled_start_ns: None,
+        actual_first_send_ns: 0,
+        terminal_ns: 1,
+        latency_ns: 1,
+        disposition: LogicalDisposition::Cancelled,
+        terminal_code: Some("cancelled".to_owned()),
+        attempts: 1,
+        polls: 0,
+        window: WindowClass::Measured,
+    };
+    let attempt = AttemptRecord {
+        logical_id: 1,
+        attempt_id: 1,
+        method: SynapseMethod::Query,
+        disposition: AttemptDisposition::Failure,
+        code: Some("cancelled".to_owned()),
+        retry_after_ms: None,
+        actual_send_ns: 0,
+        terminal_ns: 1,
+        latency_ns: 1,
+        window: WindowClass::Measured,
+    };
+    let ledger = validate_synapse_ledgers(&[logical], &[attempt]);
+    assert!(!ledger.valid);
+    assert!(ledger
+        .errors
+        .iter()
+        .any(|error| error.contains("attempt ledger: 1 != 0 + 0 + 0 + 0")));
+    assert_eq!(ledger.cancelled, 1);
+    assert_eq!(ledger.failures, 1);
 }
 
 #[test]

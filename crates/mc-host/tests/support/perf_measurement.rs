@@ -256,14 +256,6 @@ pub fn rng_for_logical(seed: u64, method: SynapseMethod, logical_id: u64) -> Det
     DeterministicRng::new(seed ^ method_salt ^ logical_id.wrapping_mul(0x9E37_79B9_7F4A_7C15))
 }
 
-/// Why a logical cancellation reached the harness ledger.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CancellationCause {
-    Candidate,
-    HarnessTeardown,
-}
-
 /// Top-level KTD7 classification retained with every repetition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -273,14 +265,9 @@ pub enum RepetitionClass {
     MeasurementInvalid,
 }
 
-pub fn classify_repetition(
-    invalid_causes: &[String],
-    cancellations: &[CancellationCause],
-) -> RepetitionClass {
-    if !invalid_causes.is_empty() || cancellations.contains(&CancellationCause::HarnessTeardown) {
+pub fn classify_repetition(invalid_causes: &[String]) -> RepetitionClass {
+    if !invalid_causes.is_empty() {
         RepetitionClass::MeasurementInvalid
-    } else if cancellations.contains(&CancellationCause::Candidate) {
-        RepetitionClass::AdverseTreatment
     } else {
         RepetitionClass::Valid
     }
@@ -338,9 +325,8 @@ pub const ATTEMPT_TIMEOUT_CODE: &str = "attempt_timeout";
 /// polls`. [`Self::Failure`] is the out-of-vocabulary bucket: a non-poll wire
 /// call answered with an error the client policy cannot act on
 /// (`artifact_invalid`, `schema_violation`, `cancelled`, ...). Those terminals
-/// only occur when the run is already invalid, and
-/// [`validate_synapse_ledgers`] reports any nonzero count as a ledger error,
-/// so every retained repetition still satisfies the frozen four-way identity.
+/// are classified separately before publication. Validation rejects every
+/// failure because none belongs to the frozen attempt partition.
 /// Recording them as successes instead would corrupt the raw evidence that
 /// diagnoses the invalid run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -780,24 +766,17 @@ pub fn validate_synapse_ledgers(
         ));
     }
     let attempt_total = attempts.len() as u64;
-    if attempt_total != successes + retryable_rejections + attempt_timeouts + polls + failures {
+    if attempt_total != successes + retryable_rejections + attempt_timeouts + polls {
         errors.push(format!(
-            "attempt ledger: {attempt_total} != {successes} + {retryable_rejections} + {attempt_timeouts} + {polls} + {failures}"
+            "attempt ledger: {attempt_total} != {successes} + {retryable_rejections} + {attempt_timeouts} + {polls}"
         ));
     }
     // The frozen attempt vocabulary has four categories. A recorded failure
     // is a wire error the client policy cannot act on, so the repetition
     // carries an instrumentation or host fault and is inadmissible.
-    let non_candidate_failures = attempts
-        .iter()
-        .filter(|attempt| {
-            attempt.disposition == AttemptDisposition::Failure
-                && attempt.code.as_deref() != Some("cancelled")
-        })
-        .count();
-    if non_candidate_failures != 0 {
+    if failures != 0 {
         errors.push(format!(
-            "attempt ledger: {non_candidate_failures} non-poll attempts ended in an error outside the frozen vocabulary"
+            "attempt ledger: {failures} non-poll attempts ended in an error outside the frozen vocabulary"
         ));
     }
     for request in logical {

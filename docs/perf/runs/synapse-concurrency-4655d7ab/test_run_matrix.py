@@ -244,7 +244,47 @@ class DriverTests(unittest.TestCase):
         self.assertNotEqual(interrupted.returncode, 0)
         before = json.loads((out / "manifest.json").read_text())
         old_slots = {slot["id"] for slot in before["slots"]}
+        old_raw = {
+            path.relative_to(out): digest(path)
+            for path in (out / "raw").iterdir()
+            if path.is_file()
+        }
         self.assertEqual(before["blocks"][0]["status"], "incomplete")
+
+        resumed = self.run_driver("execute", out, "--resume")
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        after = json.loads((out / "manifest.json").read_text())
+        after_slots = {slot["id"] for slot in after["slots"]}
+        new_slots = after_slots - old_slots
+        self.assertTrue(new_slots)
+        self.assertTrue(old_slots.issubset(after_slots))
+        self.assertTrue(old_slots.isdisjoint(new_slots))
+        self.assertEqual(
+            old_raw,
+            {relative: digest(out / relative) for relative in old_raw},
+            "resume must not overwrite any raw file from the incomplete generation",
+        )
+        self.assertEqual(
+            {slot["generation"] for slot in after["slots"] if slot["id"] in new_slots},
+            {2},
+        )
+        self.assertEqual(after["blocks"][-1]["status"], "complete")
+        self.assertEqual(after["blocks"][-1]["generation"], 2)
+
+    def test_resume_after_abrupt_exit_preserves_running_generation(self) -> None:
+        out = self.root / "abrupt-resume"
+        interrupted = self.run_driver("execute", out, "--max-letters", "1")
+        self.assertNotEqual(interrupted.returncode, 0)
+        before = json.loads((out / "manifest.json").read_text())
+        before["blocks"][0]["status"] = "running"
+        before["status"] = "running"
+        (out / "manifest.json").write_text(json.dumps(before))
+        old_slots = {slot["id"] for slot in before["slots"]}
+        old_raw = {
+            path.relative_to(out): digest(path)
+            for path in (out / "raw").iterdir()
+            if path.is_file()
+        }
 
         resumed = self.run_driver("execute", out, "--resume")
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
@@ -252,8 +292,15 @@ class DriverTests(unittest.TestCase):
         new_slots = {slot["id"] for slot in after["slots"]} - old_slots
         self.assertTrue(new_slots)
         self.assertTrue(old_slots.isdisjoint(new_slots))
-        self.assertEqual(after["blocks"][-1]["status"], "complete")
-        self.assertEqual(after["blocks"][-1]["generation"], 2)
+        self.assertEqual(
+            old_raw,
+            {relative: digest(out / relative) for relative in old_raw},
+            "resume must not overwrite raw files from an abruptly stopped generation",
+        )
+        self.assertEqual(
+            {slot["generation"] for slot in after["slots"] if slot["id"] in new_slots},
+            {2},
+        )
 
 
 if __name__ == "__main__":

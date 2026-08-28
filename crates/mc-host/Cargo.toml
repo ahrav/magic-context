@@ -12,6 +12,7 @@ bench-topology = []
 [[example]]
 name = "synapse_perf"
 required-features = ["bench-topology"]
+test = true
 
 [lints.clippy]
 # Shared integration helpers are intentionally compiled into independent test targets.

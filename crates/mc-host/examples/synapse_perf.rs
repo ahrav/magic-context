@@ -1043,7 +1043,7 @@ struct RunContext {
     batch_pages: Arc<Mutex<Vec<BatchPageRecord>>>,
     lane: Arc<LaneInfo>,
     corpus: Arc<Vec<String>>,
-    opts: Opts,
+    opts: Arc<Opts>,
 }
 
 /// Outcome of a recorded wire call that the caller has to tell apart.
@@ -1105,9 +1105,9 @@ impl RunContext {
                 } else if is_error && code.as_deref() == Some("timeout") {
                     AttemptDisposition::Timeout
                 } else if is_error {
-                    // Any other error terminal is outside the client policy's
-                    // vocabulary. The caller turns it into a harness error and
-                    // invalidates the repetition, so the retained attempt row
+                    // Any other error terminal is outside the retry policy's
+                    // vocabulary. The caller records cancellation explicitly
+                    // or invalidates an unexpected failure, so the attempt row
                     // must not claim a successful wire call.
                     AttemptDisposition::Failure
                 } else {
@@ -2731,6 +2731,7 @@ async fn run(
     ),
     String,
 > {
+    let opts = Arc::new(opts);
     let data_root = tempfile::tempdir().map_err(|error| format!("temporary data root: {error}"))?;
     // One origin for the engine and the wire: service samples and logical rows
     // are only comparable to the hold window if they share a clock. Taken
@@ -2901,7 +2902,7 @@ async fn run(
         batch_pages: Arc::new(Mutex::new(Vec::new())),
         lane: Arc::new(lane),
         corpus: Arc::new(corpus),
-        opts: opts.clone(),
+        opts: Arc::clone(&opts),
     };
     warm(&ctx).await?;
     service.lock().expect("service samples").clear();
@@ -3055,16 +3056,14 @@ async fn run(
     if ledger.offered == 0 || logical_latency.is_none() {
         invalid_causes.push("empty measured window".to_owned());
     }
-    let cancellation_causes = (ledger.cancelled != 0)
-        .then_some(perf_measurement::CancellationCause::Candidate)
-        .into_iter()
-        .collect::<Vec<_>>();
-    let mut repetition_class =
-        perf_measurement::classify_repetition(&invalid_causes, &cancellation_causes);
-    let mut adverse_outcomes = Vec::new();
     if ledger.cancelled != 0 {
-        adverse_outcomes.push(format!("candidate_cancelled={}", ledger.cancelled));
+        invalid_causes.push(format!(
+            "host cancelled {} requests without a candidate cancellation source",
+            ledger.cancelled
+        ));
     }
+    let mut repetition_class = perf_measurement::classify_repetition(&invalid_causes);
+    let mut adverse_outcomes = Vec::new();
     let queue_full = ledger
         .rejected_by_method_code
         .iter()
@@ -3293,42 +3292,10 @@ fn main() {
                 eprintln!("synapse_perf failed: emit: {error}");
                 std::process::exit(1);
             }
-            let censored = censored_count(&summary.ledger);
-            let censoring_invalid = u128::from(censored) * 1_000
-                > u128::from(summary.ledger.offered) * MAX_CENSORED_PER_MILLE;
-            let poll_ceiling_exceeded = summary
-                .poll_distribution
-                .as_ref()
-                .is_some_and(|polls| polls.max > MAX_POLLS_PER_LOGICAL);
-            // An empty measured window is internally consistent — the ledger
-            // balances, censoring divides to zero, and no missed-slot gate
-            // applies to closed loop — so nothing above rejects it. A cell with
-            // no measured request carries no estimate at all and must not be
-            // consumable as admissible evidence. A closed-loop repetition
-            // reaches this state whenever every request it opened fell in the
-            // warmup prefix or spanned the whole hold.
-            let empty_window = summary.ledger.offered == 0 || summary.logical_latency.is_none();
-            if !summary.ledger.valid
-                || !summary.fatal_errors.is_empty()
-                || summary.missed_slots != 0
-                || censoring_invalid
-                || poll_ceiling_exceeded
-                || summary.overdeadline_writes != 0
-                || empty_window
-            {
+            if !summary.invalid_causes.is_empty() {
                 eprintln!(
-                    "synapse_perf failed: invalid repetition (ledger={}, fatal={}, missed_slots={}, censored_per_mille={:.3}, poll_max={} vs ceiling {}, overdeadline_writes={}, measured_offered={})",
-                    summary.ledger.valid,
-                    summary.fatal_errors.len(),
-                    summary.missed_slots,
-                    summary.censored_per_mille,
-                    summary
-                        .poll_distribution
-                        .as_ref()
-                        .map_or(0, |polls| polls.max),
-                    MAX_POLLS_PER_LOGICAL,
-                    summary.overdeadline_writes,
-                    summary.ledger.offered
+                    "synapse_perf failed: invalid repetition ({})",
+                    summary.invalid_causes.join("; ")
                 );
                 std::process::exit(1);
             }
@@ -3377,6 +3344,43 @@ mod tests {
         assert_eq!(censored_count(&ledger), 1);
         assert!(!is_censored(LogicalDisposition::TimedOut));
         assert!(is_censored(LogicalDisposition::InFlight));
+    }
+
+    #[test]
+    fn missed_slot_boundary_and_mixed_stream_parity_are_exact() {
+        let completed = |logical_id, scheduled_start_ns, actual_first_send_ns, terminal_ns| {
+            terminal_record(
+                logical_id,
+                scheduled_start_ns,
+                actual_first_send_ns,
+                terminal_ns,
+                LogicalDisposition::Completed,
+                None,
+                0,
+                0,
+            )
+        };
+        let at_boundary = completed(1, Some(0), 100, 101);
+        let below_boundary = completed(2, Some(100), 199, 200);
+        assert_eq!(
+            open_loop_send_lag(&[at_boundary, below_boundary], 10_000_000),
+            (100, 1)
+        );
+
+        let records = [
+            completed(1, Some(0), 100, 101),
+            completed(2, Some(0), 99, 100),
+            completed(3, Some(100), 199, 200),
+            completed(4, Some(100), 200, 201),
+        ];
+        assert_eq!(
+            mixed_stream_send_lag(&records, 10_000_000, SynapseMethod::Query),
+            (100, 1)
+        );
+        assert_eq!(
+            mixed_stream_send_lag(&records, 10_000_000, SynapseMethod::Batch),
+            (100, 1)
+        );
     }
 
     #[test]

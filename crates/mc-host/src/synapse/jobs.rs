@@ -95,7 +95,8 @@ struct Job {
     text_bytes: u64,
     dimensions: usize,
     reserved_result_bytes: u64,
-    result_bytes: u64,
+    in_flight_result_bytes: u64,
+    retained_result_bytes: u64,
     state: JobState,
     completed_at: Option<Instant>,
     /// Resident-byte charge for this job's request inputs. Sized by
@@ -137,6 +138,7 @@ struct Jobs {
     by_seq: HashMap<u64, Job>,
     next_seq: u64,
     queued_text_bytes: u64,
+    in_flight_result_bytes: u64,
     retained_result_bytes: u64,
     closed: bool,
 }
@@ -289,6 +291,7 @@ impl JobTable {
                 by_seq: HashMap::new(),
                 next_seq: 1,
                 queued_text_bytes: 0,
+                in_flight_result_bytes: 0,
                 retained_result_bytes: 0,
                 closed: false,
             }),
@@ -442,7 +445,8 @@ impl JobTable {
                 text_bytes,
                 dimensions,
                 reserved_result_bytes: result_bytes,
-                result_bytes: 0,
+                in_flight_result_bytes: 0,
+                retained_result_bytes: 0,
                 state: JobState::Queued { items },
                 completed_at: None,
                 charge: charge.split_or_take(input_bytes),
@@ -472,9 +476,9 @@ impl JobTable {
         } else {
             0
         };
-        job.result_bytes = reserved;
+        job.in_flight_result_bytes = reserved;
         job.state = JobState::Running;
-        jobs.retained_result_bytes += reserved;
+        jobs.in_flight_result_bytes += reserved;
         Some(items)
     }
 
@@ -490,6 +494,9 @@ impl JobTable {
         let Some(job) = jobs.by_seq.get_mut(&seq) else {
             return;
         };
+        if job.is_completed() {
+            return;
+        }
         // An engine that returns the wrong item count must fail this one
         // job: pairing vectors with item_meta below indexes by position, and
         // a panic here would poison the table lock for every later caller,
@@ -516,7 +523,7 @@ impl JobTable {
             return;
         }
         let result_bytes = job.reserved_result_bytes;
-        let needs_result_charge = job.result_bytes == 0;
+        let in_flight_result_bytes = job.in_flight_result_bytes;
         let text_bytes = job.text_bytes;
         job.text_bytes = 0;
 
@@ -525,7 +532,8 @@ impl JobTable {
             vectors,
             boundaries,
         };
-        job.result_bytes = result_bytes;
+        job.in_flight_result_bytes = 0;
+        job.retained_result_bytes = result_bytes;
         job.completed_at = Some(Instant::now());
         // The queued texts died with the worker's items; only the retained
         // key and metadata stay charged. The freed permits leave the lock
@@ -533,9 +541,8 @@ impl JobTable {
         let retained = job.retained_input_bytes();
         let excess = job.charge.split_excess(retained);
         released.charge(excess);
-        if needs_result_charge {
-            jobs.retained_result_bytes += result_bytes;
-        }
+        jobs.in_flight_result_bytes -= in_flight_result_bytes;
+        jobs.retained_result_bytes += result_bytes;
         jobs.queued_text_bytes -= text_bytes;
         self.enforce_retention(&mut jobs, Some(seq), &mut released);
     }
@@ -568,8 +575,10 @@ impl JobTable {
         }
         let text_bytes = job.text_bytes;
         job.text_bytes = 0;
-        jobs.retained_result_bytes -= job.result_bytes;
-        job.result_bytes = 0;
+        jobs.in_flight_result_bytes -= job.in_flight_result_bytes;
+        jobs.retained_result_bytes -= job.retained_result_bytes;
+        job.in_flight_result_bytes = 0;
+        job.retained_result_bytes = 0;
         job.state = JobState::Failed { code, message };
         job.completed_at = Some(Instant::now());
         // Queued items (if the worker never started) and worker-owned texts
@@ -769,7 +778,8 @@ impl JobTable {
     fn remove(jobs: &mut Jobs, seq: u64) -> Option<Job> {
         let job = jobs.by_seq.remove(&seq)?;
         jobs.queued_text_bytes -= job.text_bytes;
-        jobs.retained_result_bytes -= job.result_bytes;
+        jobs.in_flight_result_bytes -= job.in_flight_result_bytes;
+        jobs.retained_result_bytes -= job.retained_result_bytes;
         jobs.by_key.remove(&job.key);
         Some(job)
     }
@@ -807,6 +817,7 @@ impl JobTable {
             .extend(jobs.by_seq.drain().map(|(_, job)| job));
         jobs.by_key.clear();
         jobs.queued_text_bytes = 0;
+        jobs.in_flight_result_bytes = 0;
         jobs.retained_result_bytes = 0;
     }
 }
@@ -1147,16 +1158,35 @@ mod tests {
             .reserved_result_bytes;
 
         jobs.start_reserving(seq, true).expect("job starts");
-        assert_eq!(jobs.lock_jobs().retained_result_bytes, reserved);
+        assert_eq!(jobs.lock_jobs().in_flight_result_bytes, reserved);
+        assert_eq!(jobs.lock_jobs().retained_result_bytes, 0);
         jobs.publish_ready(seq, vec![vec![0.5; 2]]);
+        assert_eq!(jobs.lock_jobs().in_flight_result_bytes, 0);
         assert_eq!(jobs.lock_jobs().retained_result_bytes, reserved);
 
         jobs.clear();
+        assert_eq!(jobs.lock_jobs().in_flight_result_bytes, 0);
+        assert_eq!(jobs.lock_jobs().retained_result_bytes, 0);
+
+        let retry = vec![BatchItem {
+            id: "retry".to_owned(),
+            content_sha256: "0".repeat(CONTENT_SHA256_BYTES),
+            text: "beta".to_owned(),
+        }];
+        let AdmitOutcome::Admitted { seq, .. } =
+            jobs.admit_uncharged_for_tests("retry".to_owned(), retry, 2)
+        else {
+            panic!("retry is admitted");
+        };
+        jobs.start_reserving(seq, true).expect("retry starts");
+        assert!(jobs.lock_jobs().in_flight_result_bytes > 0);
+        jobs.publish_failed(seq, "internal_error".to_owned(), "failed".to_owned());
+        assert_eq!(jobs.lock_jobs().in_flight_result_bytes, 0);
         assert_eq!(jobs.lock_jobs().retained_result_bytes, 0);
     }
 
     #[test]
-    fn concurrent_result_reservations_never_evict_running_jobs() {
+    fn publishing_under_two_result_reservations_keeps_the_new_result() {
         let dimensions = 2;
         let one_result =
             result_bytes(1, dimensions, 1 + CONTENT_SHA256_BYTES).expect("small result size");
@@ -1184,9 +1214,36 @@ mod tests {
 
         jobs.start_reserving(first, true).expect("first starts");
         jobs.start_reserving(second, true).expect("second starts");
+        assert_eq!(jobs.lock_jobs().in_flight_result_bytes, one_result * 2);
+        jobs.publish_ready(first, vec![vec![0.25; dimensions]]);
+
         let state = jobs.lock_jobs();
-        assert_eq!(state.by_seq.len(), 2);
-        assert_eq!(state.retained_result_bytes, one_result * 2);
+        assert_eq!(
+            state.by_seq.len(),
+            2,
+            "running reservations are not evictable"
+        );
+        assert_eq!(state.retained_result_bytes, one_result);
+        assert_eq!(state.in_flight_result_bytes, one_result);
+        drop(state);
+        assert!(matches!(
+            jobs.poll(&jobs.job_id(first), "first", None),
+            PollOutcome::Page(ResultPage { done: true, .. })
+        ));
+
+        jobs.publish_ready(second, vec![vec![0.5; dimensions]]);
+        let state = jobs.lock_jobs();
+        assert_eq!(state.in_flight_result_bytes, 0);
+        assert_eq!(state.retained_result_bytes, one_result);
+        drop(state);
+        assert!(matches!(
+            jobs.poll(&jobs.job_id(first), "first", None),
+            PollOutcome::Restarted
+        ));
+        assert!(matches!(
+            jobs.poll(&jobs.job_id(second), "second", None),
+            PollOutcome::Page(ResultPage { done: true, .. })
+        ));
     }
 
     #[test]

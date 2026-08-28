@@ -1064,7 +1064,9 @@ impl SynapseComponent {
             };
             let chunk_rows = inner.topology.chunk_rows().unwrap_or(items.len()).max(1);
             let mut vectors = Vec::with_capacity(items.len());
-            for (index, chunk) in items.chunks(chunk_rows).enumerate() {
+            let chunk_count = items.len().div_ceil(chunk_rows);
+            let mut items = items.into_iter();
+            for index in 0..chunk_count {
                 if index != 0 {
                     #[cfg(feature = "bench-topology")]
                     observation.requeue();
@@ -1094,10 +1096,10 @@ impl SynapseComponent {
                         return;
                     }
                 }
-                let texts: Vec<String> = chunk.iter().map(|item| item.text.clone()).collect();
+                let chunk: Vec<_> = items.by_ref().take(chunk_rows).collect();
                 let lane_blocking = Arc::clone(&lane);
                 let joined = tokio::task::spawn_blocking(move || {
-                    let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+                    let texts: Vec<&str> = chunk.iter().map(|item| item.text.as_str()).collect();
                     lane_blocking.backend.embed(&texts)
                 })
                 .await;

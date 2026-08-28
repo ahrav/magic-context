@@ -134,6 +134,24 @@ async fn t2_alternates_classes_when_both_are_waiting() {
     .await;
     wait_for_calls(&engine, 1).await;
     let info = host.info.clone();
+    let batch = tokio::spawn(async move {
+        let mut client = support::raw_client::RawClient::connect(&info)
+            .await
+            .expect("batch client");
+        let (channel, epoch) = open_synapse_route(&mut client).await;
+        call(
+            &mut client,
+            channel,
+            epoch,
+            "embed.batch",
+            batch_params(&test_lane(), &items(&[("second", "second batch")])),
+        )
+        .await
+    });
+    while observer.snapshot().batch_queued == 0 {
+        tokio::task::yield_now().await;
+    }
+    let info = host.info.clone();
     let query = tokio::spawn(async move {
         let mut client = support::raw_client::RawClient::connect(&info)
             .await
@@ -147,19 +165,9 @@ async fn t2_alternates_classes_when_both_are_waiting() {
     while observer.snapshot().query_queued == 0 {
         tokio::task::yield_now().await;
     }
-    call(
-        &mut batch_client,
-        batch_channel,
-        batch_epoch,
-        "embed.batch",
-        batch_params(&lane, &items(&[("second", "second batch")])),
-    )
-    .await;
-    while observer.snapshot().batch_queued == 0 {
-        tokio::task::yield_now().await;
-    }
     DeterministicEngine::release_calls(&gate);
     query.await.expect("query task");
+    batch.await.expect("batch task");
     wait_for_calls(&engine, 3).await;
 
     assert_eq!(
@@ -205,7 +213,7 @@ async fn t3_reenters_the_lane_for_every_chunk() {
     wait_for_calls(&engine, 3).await;
 
     let deadline = tokio::time::Instant::now() + BUDGET;
-    loop {
+    let result = loop {
         let mut params = constraints(&lane);
         params["job_id"] = job_id.clone().into();
         params["request_key"] = key.clone().into();
@@ -214,10 +222,22 @@ async fn t3_reenters_the_lane_for_every_chunk() {
             .await
             .json();
         if result["result"]["vectors"].is_array() {
-            break;
+            break result;
         }
         assert!(tokio::time::Instant::now() < deadline, "job result timeout");
         tokio::task::yield_now().await;
+    };
+    let vectors = result["result"]["vectors"].as_array().expect("vectors");
+    assert_eq!(vectors.len(), page.len());
+    for (actual, (expected_id, expected_text)) in vectors.iter().zip(&page) {
+        assert_eq!(actual["id"], expected_id.as_str());
+        assert_eq!(
+            actual["content_sha256"],
+            support::synapse::sha256_hex(expected_text)
+        );
+        let actual_vector: Vec<f32> =
+            serde_json::from_value(actual["vector"].clone()).expect("vector components");
+        assert_eq!(actual_vector, engine.vector_for(expected_text));
     }
     assert_eq!(engine.calls.load(Ordering::SeqCst), 3);
     host.shutdown().await.expect("graceful shutdown");
@@ -352,6 +372,7 @@ struct ConcurrentEngine {
     calls: AtomicUsize,
     active: AtomicUsize,
     peak: AtomicUsize,
+    completed: AtomicUsize,
 }
 
 impl ConcurrentEngine {
@@ -361,6 +382,7 @@ impl ConcurrentEngine {
             calls: AtomicUsize::new(0),
             active: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
+            completed: AtomicUsize::new(0),
         })
     }
 
@@ -382,6 +404,7 @@ impl EmbeddingEngine for ConcurrentEngine {
             released = wake.wait(released).expect("release wait");
         }
         self.active.fetch_sub(1, Ordering::SeqCst);
+        self.completed.fetch_add(1, Ordering::SeqCst);
         Ok(texts.iter().map(|_| vec![1.0; 8]).collect())
     }
 }
@@ -415,14 +438,20 @@ async fn t4_serves_two_calls_concurrently_and_shutdown_joins_both() {
     }
     assert_eq!(engine.peak.load(Ordering::SeqCst), 2);
 
-    let shutdown = tokio::spawn(host.shutdown());
-    tokio::task::yield_now().await;
-    assert!(!shutdown.is_finished(), "shutdown must join native calls");
+    let mut shutdown = tokio::spawn(host.shutdown());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut shutdown)
+            .await
+            .is_err(),
+        "shutdown must remain pending while both native calls are blocked"
+    );
+    assert_eq!(engine.completed.load(Ordering::SeqCst), 0);
     engine.release();
     shutdown
         .await
         .expect("shutdown task joins")
         .expect("graceful shutdown");
+    assert_eq!(engine.completed.load(Ordering::SeqCst), 2);
 }
 
 impl SerializingEngine {

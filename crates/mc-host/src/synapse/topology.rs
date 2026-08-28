@@ -100,7 +100,6 @@ impl Topology {
 #[cfg(feature = "bench-topology")]
 enum Gate {
     Serialized,
-    #[cfg(feature = "bench-topology")]
     ClassAware(Arc<ClassGate>),
 }
 
@@ -122,6 +121,7 @@ struct Waiter {
 #[cfg(any(feature = "bench-topology", test))]
 struct ClassState {
     active: bool,
+    granted: Option<(WorkClass, u64)>,
     closed: bool,
     next: WorkClass,
     next_id: u64,
@@ -140,6 +140,7 @@ impl ClassGate {
         Arc::new(Self {
             state: Mutex::new(ClassState {
                 active: false,
+                granted: None,
                 closed: false,
                 next: WorkClass::Query,
                 next_id: 0,
@@ -175,6 +176,7 @@ impl ClassGate {
         };
         rx.await.map_err(|_| AcquireError)?;
         registration.armed = false;
+        self.acknowledge(class, id);
         Ok(ClassTurn {
             gate: Arc::clone(self),
         })
@@ -182,6 +184,11 @@ impl ClassGate {
 
     fn release(&self) {
         let mut state = self.state.lock().expect("class gate lock");
+        state.granted = None;
+        Self::grant_next(&mut state);
+    }
+
+    fn grant_next(state: &mut ClassState) {
         if state.closed {
             state.active = false;
             return;
@@ -202,6 +209,7 @@ impl ClassGate {
                 .queue_mut(class)
                 .pop_front()
                 .expect("queue is nonempty");
+            state.granted = Some((class, waiter.id));
             if waiter.tx.send(()).is_ok() {
                 state.active = true;
                 if both {
@@ -209,23 +217,34 @@ impl ClassGate {
                 }
                 return;
             }
+            state.granted = None;
         }
     }
 
-    fn deregister(&self, class: WorkClass, id: u64) -> bool {
+    fn cancel(&self, class: WorkClass, id: u64) {
         let mut state = self.state.lock().expect("class gate lock");
         let queue = state.queue_mut(class);
         if let Some(index) = queue.iter().position(|waiter| waiter.id == id) {
             queue.remove(index);
-            true
-        } else {
-            false
+            return;
+        }
+        if state.granted == Some((class, id)) {
+            state.granted = None;
+            Self::grant_next(&mut state);
+        }
+    }
+
+    fn acknowledge(&self, class: WorkClass, id: u64) {
+        let mut state = self.state.lock().expect("class gate lock");
+        if state.granted == Some((class, id)) {
+            state.granted = None;
         }
     }
 
     fn close(&self) {
         let mut state = self.state.lock().expect("class gate lock");
         state.closed = true;
+        state.granted = None;
         state.query.clear();
         state.batch.clear();
     }
@@ -253,12 +272,7 @@ struct Registration {
 impl Drop for Registration {
     fn drop(&mut self) {
         if self.armed {
-            // A waiter may be cancelled after its sender grants the baton but
-            // before its future is polled again. Its queue entry is gone in
-            // that case, so cancellation must pass the baton onward.
-            if !self.gate.deregister(self.class, self.id) {
-                self.gate.release();
-            }
+            self.gate.cancel(self.class, self.id);
         }
     }
 }
@@ -335,6 +349,45 @@ mod tests {
             .await
             .expect("baton survives cancelled grant");
         drop(next);
+    }
+
+    #[tokio::test]
+    async fn cancelled_sender_failure_does_not_grant_two_live_waiters() {
+        let gate = ClassGate::new();
+        let first = gate.acquire(WorkClass::Query).await.expect("first");
+        let (dead_tx, dead_rx) = oneshot::channel();
+        drop(dead_rx);
+        let (first_live_tx, mut first_live_rx) = oneshot::channel();
+        let (second_live_tx, mut second_live_rx) = oneshot::channel();
+        {
+            let mut state = gate.state.lock().expect("class gate lock");
+            state.query.push_back(Waiter {
+                id: 10,
+                tx: dead_tx,
+            });
+            state.query.push_back(Waiter {
+                id: 11,
+                tx: first_live_tx,
+            });
+            state.query.push_back(Waiter {
+                id: 12,
+                tx: second_live_tx,
+            });
+        }
+        let dead_registration = Registration {
+            gate: Arc::clone(&gate),
+            class: WorkClass::Query,
+            id: 10,
+            armed: true,
+        };
+
+        drop(first);
+        assert_eq!(first_live_rx.try_recv(), Ok(()));
+        drop(dead_registration);
+        assert!(matches!(
+            second_live_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

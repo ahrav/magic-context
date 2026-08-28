@@ -8,15 +8,11 @@ set -e
 if cargo nextest --version >/dev/null 2>&1; then
     cargo nextest run --workspace
     cargo nextest run -p mc-host --features bench-topology
-    cargo nextest run -p mc-host --test synapse_protocol --test synapse_jobs
-    cargo nextest run -p mc-host --features bench-topology --test synapse_protocol --test synapse_jobs
     cargo test --workspace --doc
 else
     echo "cargo-nextest not found (install: cargo install cargo-nextest --locked); using cargo test" >&2
     cargo test --workspace
     cargo test -p mc-host --features bench-topology
-    cargo test -p mc-host --test synapse_protocol --test synapse_jobs
-    cargo test -p mc-host --features bench-topology --test synapse_protocol --test synapse_jobs
 fi
 
 # packages/dashboard/db-adapter declares its own [workspace], so none of the

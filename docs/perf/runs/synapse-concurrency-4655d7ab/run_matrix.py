@@ -402,7 +402,7 @@ def next_block_record(manifest, logical_block):
     current = records[-1]
     if current["status"] == "complete":
         return None
-    if current["status"] == "incomplete":
+    if current["status"] in ("incomplete", "running"):
         current = {"logical_block": logical_block, "generation": current["generation"] + 1, "status": "planned"}
         manifest["blocks"].append(current)
     return current
