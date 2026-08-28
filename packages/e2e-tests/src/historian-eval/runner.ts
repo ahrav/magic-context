@@ -188,16 +188,34 @@ export function probeResponseLeak(args: {
     probes: readonly Probe[];
     probeIndex: number;
     responseText: string | null;
+    /**
+     * Runtime public claim ids that would be accepted for each later claim-id probe.
+     *
+     * A claim-id answer has no authored value to compare against — it is assigned at
+     * promotion time — so the ids have to be resolved from the injection surface and
+     * supplied. Every earlier probe's payload renders them in its own
+     * `<project-memory>` block, so an earlier model can name one in its prose and the
+     * later claim-id probe can copy it: the same copy channel as an exact answer, one
+     * indirection away.
+     *
+     * Absent or empty for a probe means no id could be resolved, and nothing is
+     * checked for it — a caller with no view of the injected set cannot manufacture
+     * one, and guessing would either miss or fabricate a leak.
+     */
+    claimIdAnswers?: ReadonlyMap<string, readonly string[]>;
 }): string | null {
-    const { probes, probeIndex, responseText } = args;
+    const { probes, probeIndex, responseText, claimIdAnswers } = args;
     if (responseText === null) return null;
     const accepted = extractAnswerEnvelope(responseText);
     const envelope = accepted === null ? null : /<answer>[\s\S]*?<\/answer>/.exec(responseText);
     const outside = envelope === null ? responseText : responseText.replace(envelope[0], " ");
     for (const later of probes.slice(probeIndex + 1)) {
-        if (later.answerType === "claim-id") continue;
-        if (containsCompleteValue(outside, later.goldAnswer)) {
-            return `response text outside the answer envelope states ${JSON.stringify(later.goldAnswer)}, which is a later probe's (${later.id}) gold answer`;
+        const values =
+            later.answerType === "claim-id" ? (claimIdAnswers?.get(later.id) ?? []) : [later.goldAnswer];
+        for (const value of values) {
+            if (containsCompleteValue(outside, value)) {
+                return `response text outside the answer envelope states a later probe's (${later.id}) accepted answer`;
+            }
         }
     }
     return null;
@@ -918,6 +936,14 @@ class ScenarioRunner {
         const verifiedClaimCount = this.runVerificationBridge(harness);
 
         const probes = await this.driveProbes(harness, sessionId);
+        // Again, because the probe phase is provider traffic too. The call before the
+        // all-failed branch covers only the transcript and run phases; `driveProbes`
+        // registers its own turn scripts and can draw auxiliary requests, so a request
+        // falling through to the poison default during the probe phase — while each
+        // probe still received its correct scripted reply — raised `defaultHits` after
+        // the earlier check had already passed. Re-running it closes the attempt rather
+        // than a prefix of it.
+        this.assertNoScriptDrift(harness);
 
         // Pin the clock before the authoritative snapshot read so re-scoring
         // is time-independent (KTD1).
@@ -1569,7 +1595,7 @@ class ScenarioRunner {
         // and reaches the next probe. The record keeps only the final reply, so
         // replay can reapply this to that one alone — which is why the abort has to
         // happen here, where both are in hand.
-        this.assertNoProbeResponseLeak(probe, probeIndex, first.responseText);
+        this.assertNoProbeResponseLeak(harness, probe, probeIndex, first.responseText);
         if (answerRaw === null) {
             reAsked = true;
             const retry = await this.askProbe(
@@ -1580,7 +1606,7 @@ class ScenarioRunner {
             answerRaw = retry.answerRaw;
             responseText = retry.responseText;
             for (const name of retry.toolNames) toolNames.add(name);
-            this.assertNoProbeResponseLeak(probe, probeIndex, retry.responseText);
+            this.assertNoProbeResponseLeak(harness, probe, probeIndex, retry.responseText);
             if (answerRaw === null) {
                 throw new RunAbort("probe-envelope-malformed", `probe ${probe.id} answered without a valid envelope twice`);
             }
@@ -1738,9 +1764,66 @@ class ScenarioRunner {
      * could hide a real leak. Such a scenario keeps the unstripped search, which
      * can over-report but never conceals surviving raw text.
      */
-    private assertNoProbeResponseLeak(probe: Probe, probeIndex: number, responseText: string | null): void {
-        const leak = probeResponseLeak({ probes: this.scenario.probes, probeIndex, responseText });
+    private assertNoProbeResponseLeak(
+        harness: TestHarness,
+        probe: Probe,
+        probeIndex: number,
+        responseText: string | null,
+    ): void {
+        const leak = probeResponseLeak({
+            probes: this.scenario.probes,
+            probeIndex,
+            responseText,
+            claimIdAnswers: this.claimIdAnswers(harness),
+        });
         if (leak !== null) throw new RunAbort("probe-response-leak", `probe ${probe.id}: ${leak}`);
+    }
+
+    /**
+     * Accepted runtime answers for each claim-id probe, resolved from the LIVE
+     * injection surface through the same `matchesGold` rule the scorer resolves them
+     * with — so the runtime leak scan looks for the ids that would actually be
+     * accepted, not for a guess at them.
+     *
+     * Read per probe rather than cached: promotion and verification can change the
+     * surface between probes, and a stale set would scan for ids no longer accepted
+     * while missing the ones that are. A read failure yields an empty map, which scans
+     * nothing for claim-id probes — the same conservative direction as an unresolvable
+     * id, since inventing one would fabricate a leak.
+     */
+    private claimIdAnswers(harness: TestHarness): ReadonlyMap<string, readonly string[]> {
+        const claimIdProbes = this.scenario.probes.filter((probe) => probe.answerType === "claim-id");
+        if (claimIdProbes.length === 0) return new Map();
+        let injected: InjectedClaimRecord[] | null;
+        try {
+            const db = openTestDb(harness.contextDbPath(), { readonly: true });
+            try {
+                injected = readInjectedClaims(
+                    db,
+                    resolveProjectIdentity(harness.opencode.env.workdir),
+                    this.scenario.id,
+                    Date.now(),
+                );
+            } finally {
+                db.close();
+            }
+        } catch {
+            return new Map();
+        }
+        if (injected === null) return new Map();
+        const answers = new Map<string, readonly string[]>();
+        for (const probe of claimIdProbes) {
+            if (probe.answerType !== "claim-id") continue;
+            const goldClaim = this.scenario.gold.expectedClaims.find(
+                (claim) => claim.id === probe.expectedClaimRef,
+            );
+            if (goldClaim === undefined) continue;
+            answers.set(
+                probe.id,
+                injected.filter((item) => matchesGold(goldClaim, item)).map((item) => item.publicClaimId),
+            );
+        }
+        return answers;
     }
 
     private assertNoGoldRangeLeak(probe: Probe, payloadText: string | null, probePrompt: string): void {

@@ -340,7 +340,7 @@ function parseProbe(raw: unknown, label: string): Probe {
         // going to be shown; and a claim-id answer is a runtime id no authored
         // question can contain.
         if (containsCompleteValue(question, goldAnswer)) {
-            fail(`${label}.question: self-answering (states its own gold answer ${JSON.stringify(goldAnswer)})`);
+            fail(`${label}.question: self-answering (the question states this probe's own gold answer)`);
         }
         return {
             id,
@@ -376,6 +376,28 @@ function parseProbe(raw: unknown, label: string): Probe {
         }
         const goldAnswer = string(value.goldAnswer, `${label}.goldAnswer`);
         if (!choices.includes(goldAnswer)) fail(`${label}.goldAnswer: not-a-choice`);
+        // A multiple-choice question may restate the option list — the prompt renders
+        // every option anyway, so naming them exposes nothing the model was not about
+        // to be shown. Naming only SOME of them does not restate the list; it points
+        // at one, and "Redis is correct; which cache was selected?" over
+        // `Redis | LRU` hands over the selection.
+        //
+        // The rule is therefore about the partition, not about mentioning the gold:
+        // refuse a question that states the gold choice while leaving any other choice
+        // unstated. A question naming every option is allowed; one naming a strict
+        // subset containing the gold is not.
+        //
+        // This cannot see steering that does not name the option — "the obvious one" —
+        // and no substring rule can. It closes the case where the answer itself is in
+        // the prompt.
+        if (
+            containsCompleteValue(question, goldAnswer) &&
+            choices.some((choice) => !containsCompleteValue(question, choice))
+        ) {
+            fail(
+                `${label}.question: self-answering (the question states this probe's own gold answer without stating every other choice)`,
+            );
+        }
         return {
             id,
             question,
@@ -589,7 +611,7 @@ export function parseScenario(raw: unknown, label = "scenario"): HistorianEvalSc
             const shared = leftSurface.filter((value) => rightSurface.includes(value));
             if (shared.length > 0) {
                 fail(
-                    `${label}.probes: shared-answer-surface (${left.id} and ${right.id} share the answer value ${JSON.stringify(shared[0])}, so the earlier exchange answers the later probe)`,
+                    `${label}.probes: shared-answer-surface (${left.id} and ${right.id} share an answer value, so the earlier exchange answers the later probe)`,
                 );
             }
             // Equality is not the only way an earlier surface hands over a later
@@ -606,10 +628,9 @@ export function parseScenario(raw: unknown, label = "scenario"): HistorianEvalSc
             // check below: only the earlier reply reaches the later model, and an
             // earlier answer of "4096" must not count as stating a later answer of "4".
             if (right.answerType !== "claim-id") {
-                const containing = leftSurface.find((value) => containsCompleteValue(value, right.goldAnswer));
-                if (containing !== undefined) {
+                if (leftSurface.some((value) => containsCompleteValue(value, right.goldAnswer))) {
                     fail(
-                        `${label}.probes: shared-answer-surface (${left.id} runs first and its answer surface value ${JSON.stringify(containing)} states ${right.id}'s gold answer ${JSON.stringify(right.goldAnswer)})`,
+                        `${label}.probes: shared-answer-surface (${left.id} runs first and one of its answer surface values states ${right.id}'s gold answer)`,
                     );
                 }
             }
@@ -632,7 +653,7 @@ export function parseScenario(raw: unknown, label = "scenario"): HistorianEvalSc
             // earlier question naming one exposes nothing new.
             if (right.answerType !== "claim-id" && containsCompleteValue(left.question, right.goldAnswer)) {
                 fail(
-                    `${label}.probes: question-exposed-answer (${left.id} runs first and its question states ${JSON.stringify(right.goldAnswer)}, which is ${right.id}'s gold answer)`,
+                    `${label}.probes: question-exposed-answer (${left.id} runs first and its question states ${right.id}'s gold answer)`,
                 );
             }
         }

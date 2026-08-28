@@ -164,6 +164,34 @@ describe("probeResponseLeak", () => {
         ).toBeNull();
     });
 
+    test("prose naming a later claim-id probe's accepted id is a leak", () => {
+        // A claim-id answer has no authored value, so the ids have to be resolved from
+        // the injection surface. Every earlier probe's payload renders them in its own
+        // `<project-memory>` block, so the earlier model can name one and the later
+        // claim-id probe can copy it — the same channel as an exact answer, one
+        // indirection away.
+        expect(
+            probeResponseLeak({
+                probes,
+                probeIndex: capacityIndex,
+                responseText: "<answer>4096</answer> The architecture is recorded as mem-lru01.",
+                claimIdAnswers: new Map([["probe-claim", ["mem-lru01"]]]),
+            }),
+        ).toContain("probe-claim");
+    });
+
+    test("an unresolvable claim-id answer scans for nothing rather than guessing", () => {
+        // No id supplied means none could be resolved. Inventing one would fabricate a
+        // leak; the conservative direction is to check nothing for that probe.
+        expect(
+            probeResponseLeak({
+                probes,
+                probeIndex: capacityIndex,
+                responseText: "<answer>4096</answer> The architecture is recorded as mem-lru01.",
+            }),
+        ).toBeNull();
+    });
+
     test("a complete value is required, not a substring", () => {
         // "4096" contains "4"; a reply that mentions 4096 does not state an answer
         // of "4". Guards the same boundary `containsCompleteValue` exists for.

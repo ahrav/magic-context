@@ -968,6 +968,31 @@ function telemetryMismatch(
 }
 
 /**
+ * Accepted runtime answers for each claim-id probe, resolved from the recorded
+ * injected set through the same `matchesGold` rule `compareProbeAnswer` uses.
+ *
+ * The replay half of the runtime resolution: an earlier probe's prose can name a
+ * later claim-id probe's answer, and that answer is a runtime id with no authored
+ * value to compare against, so it has to be resolved before the leak scan can look
+ * for it. Resolved from `record.injectedClaims` because that is what
+ * `compareProbeAnswer` accepts as the answer, so the scan looks for exactly the ids
+ * a PASS could be built from.
+ */
+function claimIdAnswersFor(
+    scenario: HistorianEvalScenario,
+    injectedClaims: readonly InjectedClaimRecord[],
+): ReadonlyMap<string, readonly string[]> {
+    const answers = new Map<string, readonly string[]>();
+    for (const probe of scenario.probes) {
+        if (probe.answerType !== "claim-id") continue;
+        const goldClaim = scenario.gold.expectedClaims.find((claim) => claim.id === probe.expectedClaimRef);
+        if (goldClaim === undefined) continue;
+        answers.set(probe.id, claimsMatchingGold(goldClaim, injectedClaims).map((item) => item.publicClaimId));
+    }
+    return answers;
+}
+
+/**
  * Public claim ids named in the LAST `<project-memory>` block of a captured probe
  * payload, or `null` when the payload carries no complete block.
  *
@@ -1514,6 +1539,7 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
                     probes: scenario.probes,
                     probeIndex,
                     responseText: exchange.responseText,
+                    claimIdAnswers: claimIdAnswersFor(scenario, record.injectedClaims),
                 });
                 if (responseLeak !== null) {
                     return errorScore(

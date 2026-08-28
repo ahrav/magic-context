@@ -517,6 +517,61 @@ describe("gold and probe freeze guards", () => {
         expect(() => parseScenario(raw)).not.toThrow();
     });
 
+    test("rejects a multiple-choice question that points at its own correct option", () => {
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Record<string, unknown>[];
+        // Naming the gold option while leaving another choice unstated does not restate
+        // the option list — it points at one, and the prompt then carries the selection.
+        probes.push({
+            id: "probe-store-steered",
+            question: "memcached is correct; which cache was rejected second?",
+            answerType: "multiple-choice",
+            choices: ["memcached", "hazelcast"],
+            goldAnswer: "memcached",
+            sourceClaimRef: "exp-lru-cache",
+        });
+        expect(() => parseScenario(raw)).toThrow(/self-answering/);
+    });
+
+    test("accepts a multiple-choice question that restates every option", () => {
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Record<string, unknown>[];
+        // The prompt renders both options anyway, so naming both exposes nothing the
+        // model was not about to be shown.
+        probes.push({
+            id: "probe-store-both",
+            question: "Was it memcached or hazelcast?",
+            answerType: "multiple-choice",
+            choices: ["memcached", "hazelcast"],
+            goldAnswer: "memcached",
+            sourceClaimRef: "exp-lru-cache",
+        });
+        expect(() => parseScenario(raw)).not.toThrow();
+    });
+
+    test("probe diagnostics name the failure class and ids, never the answer text", () => {
+        // The contract's parsing rule is that diagnostics never echo artifact values,
+        // so a freeze log or CI transcript cannot leak corpus content.
+        const selfAnswering = validScenarioRaw();
+        (selfAnswering.probes as Record<string, unknown>[])[0].question = "What limit was set to 4096?";
+        expect(() => parseScenario(selfAnswering)).toThrow(/self-answering/);
+        expect(() => parseScenario(selfAnswering)).not.toThrow(/4096/);
+
+        // Probe ids are deliberately digit-free here: an id echoed in the message is
+        // fine (ids are what the diagnostic is FOR), so an id carrying the value would
+        // make this assertion pass or fail for the wrong reason.
+        const sharedSurface = validScenarioRaw();
+        (sharedSurface.probes as Record<string, unknown>[]).push({
+            id: "probe-capacity-again",
+            question: "How many entries does the cache hold?",
+            answerType: "exact",
+            goldAnswer: "4096",
+            sourceClaimRef: "exp-lru-cache",
+        });
+        expect(() => parseScenario(sharedSurface)).toThrow(/shared-answer-surface/);
+        expect(() => parseScenario(sharedSurface)).not.toThrow(/4096/);
+    });
+
     test("rejects an exact probe whose question states its own gold answer", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];
