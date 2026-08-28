@@ -3,7 +3,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { insertCompartmentEvents } from "../compartment-events";
-import { readAntiMemory } from "../memory/storage-anti-memory";
+import { ANTI_MEMORY_DEFAULT_TTL_MS, readAntiMemory } from "../memory/storage-anti-memory";
 import { createClaimReaderTestDatabase } from "../test-claim-database";
 import {
     countPendingCorrectionEvents,
@@ -18,7 +18,12 @@ afterEach(() => {
     db = null;
 });
 
-function seedSession(database: Database, sessionId: string, userText: string): number {
+function seedSession(
+    database: Database,
+    sessionId: string,
+    userText: string,
+    userOrdinal = 1,
+): number {
     database
         .prepare(
             "INSERT INTO session_projects (session_id, project_path, updated_at, harness) VALUES (?, ?, ?, 'opencode')",
@@ -41,9 +46,34 @@ function seedSession(database: Database, sessionId: string, userText: string): n
     );
     database
         .prepare(
-            "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, 1, 'u1', 'user', ?)",
+            "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, 'u1', 'user', ?)",
         )
-        .run(sessionId, userText);
+        .run(sessionId, userOrdinal, userText);
+    // Production indexes both tables together (`message-index.ts`), and
+    // corroboration joins them to scope message text by harness, so a fixture
+    // that seeds only the FTS side would silently supply no user texts.
+    database
+        .prepare(
+            `INSERT INTO message_history_source
+                (session_id, message_id, message_ordinal, source_version,
+                 normalized_content_hash, role, harness, updated_at)
+             VALUES (?, 'u1', ?, 'v1', ?, 'user', 'opencode', 1)`,
+        )
+        .run(sessionId, userOrdinal, `hash-${sessionId}-${userOrdinal}`);
+    // The indexer also records how far it has reconciled. Corroboration refuses
+    // to trust a span the index has not reached, so a fixture that leaves this
+    // row absent reads as "nothing indexed" and every event skips.
+    database
+        .prepare(
+            `INSERT INTO message_history_index
+                (session_id, last_indexed_ordinal, dirty_floor_ordinal, updated_at, harness)
+             VALUES (?, ?, 0, 1, 'opencode')
+             ON CONFLICT(session_id) DO UPDATE SET
+                 last_indexed_ordinal = MAX(message_history_index.last_indexed_ordinal, excluded.last_indexed_ordinal)`,
+        )
+        // Cover the whole compartment span (end_message = 2), not just this
+        // message, so the reconciliation check sees the span as searchable.
+        .run(sessionId, Math.max(userOrdinal, 2));
     return compartmentId;
 }
 
@@ -55,12 +85,25 @@ function correctionFields(overrides: Record<string, string> = {}): Record<string
         correction_signal: 'U: "Never persist this quote"',
         after_strategy: "Use the existing SQLite store",
         evidence: "The cache must remain offline capable",
+        reason_for_change: "Redis would add a network dependency this project cannot assume",
         ...overrides,
     };
 }
 
+function runHarvest(nowMs?: number) {
+    return db
+        ?.transaction(() =>
+            harvestAntiMemoriesFromCorrections({
+                db: db as Database,
+                projectIdentity: PROJECT,
+                ...(nowMs === undefined ? {} : { nowMs }),
+            }),
+        )
+        .immediate();
+}
+
 describe("historian trajectory-correction anti-memory harvest", () => {
-    test("corroborates explicit user trust without persisting correction_signal", () => {
+    test("corroborates explicit user trust without persisting correction_signal or the evidence quote", () => {
         db = createClaimReaderTestDatabase();
         const compartmentId = seedSession(
             db,
@@ -75,14 +118,7 @@ describe("historian trajectory-correction anti-memory harvest", () => {
         );
         expect(countPendingCorrectionEvents(db, PROJECT)).toBe(1);
 
-        const result = db
-            .transaction(() =>
-                harvestAntiMemoriesFromCorrections({
-                    db: db as Database,
-                    projectIdentity: PROJECT,
-                }),
-            )
-            .immediate();
+        const result = runHarvest();
         expect(result).toMatchObject({ consumed: 1, skipped: 0 });
         expect(countPendingCorrectionEvents(db, PROJECT)).toBe(0);
         const publicClaimId = (
@@ -91,15 +127,13 @@ describe("historian trajectory-correction anti-memory harvest", () => {
             }
         ).id;
         const anti = readAntiMemory(db, publicClaimId);
-        expect(anti?.payload.rejectionReason).toBe("The cache must remain offline capable");
-        const persisted = db
-            .prepare(
-                `SELECT o.extracted_text AS extractedText
-                   FROM claim_evidence e JOIN observations o ON o.id = e.observation_id
-                  WHERE e.revision_id = (SELECT current_revision_id FROM claims LIMIT 1)`,
-            )
-            .get();
-        expect(JSON.stringify(persisted)).not.toContain("Never persist this quote");
+        expect(anti?.payload.rejectionReason).toBe(
+            "Redis would add a network dependency this project cannot assume",
+        );
+        // The user's own words corroborate trust but must never be persisted:
+        // not the correction signal, and not the verbatim evidence quote.
+        expect(JSON.stringify(anti)).not.toContain("Never persist this quote");
+        expect(JSON.stringify(anti)).not.toContain("must remain offline capable");
         expect(
             db
                 .prepare(
@@ -111,32 +145,111 @@ describe("historian trajectory-correction anti-memory harvest", () => {
         ).toEqual({ trust: "explicit_user" });
     });
 
-    test("keeps non-user corrections as model inference despite matching user evidence", () => {
+    test("rejects a rejection reason transcribed from the user's own words", () => {
         db = createClaimReaderTestDatabase();
         const compartmentId = seedSession(
             db,
-            "ses-tool-source",
+            "ses-transcribed",
             "The cache must remain offline capable, so use SQLite.",
         );
         insertCompartmentEvents(
             db,
-            "ses-tool-source",
+            "ses-transcribed",
             [
                 {
                     kind: "trajectory_correction",
                     atCompartment: 1,
-                    fields: correctionFields({ correction_source: "tool_result" }),
+                    // A causal reason IS present, so the payload maps; it is a
+                    // verbatim run of the user's message, so the source-overlap
+                    // privacy gate is what must reject it.
+                    fields: correctionFields({
+                        reason_for_change: "The cache must remain offline capable",
+                    }),
                 },
             ],
             [compartmentId],
         );
+        expect(runHarvest()).toEqual({ consumed: 0, skipped: 1, effects: [] });
+        expect(db.prepare("SELECT COUNT(*) AS count FROM claims").get()).toEqual({ count: 0 });
+    });
 
-        db.transaction(() =>
-            harvestAntiMemoriesFromCorrections({ db: db as Database, projectIdentity: PROJECT }),
-        ).immediate();
+    test("skips a correction carrying proof of the pivot but no causal reason", () => {
+        db = createClaimReaderTestDatabase();
+        const compartmentId = seedSession(
+            db,
+            "ses-no-reason",
+            "Some unrelated user message that overlaps nothing.",
+        );
+        insertCompartmentEvents(
+            db,
+            "ses-no-reason",
+            [
+                {
+                    kind: "trajectory_correction",
+                    atCompartment: 1,
+                    // `evidence` is contractually proof that the pivot happened,
+                    // never why the old strategy was wrong. With no
+                    // `reason_for_change` there is no causal reason to persist, so
+                    // this must skip rather than record the proof as the reason.
+                    fields: correctionFields({
+                        reason_for_change: "",
+                        evidence: "The final implementation now uses the existing SQLite store",
+                    }),
+                },
+            ],
+            [compartmentId],
+        );
+        expect(runHarvest()).toEqual({ consumed: 0, skipped: 1, effects: [] });
+        expect(db.prepare("SELECT COUNT(*) AS count FROM claims").get()).toEqual({ count: 0 });
+        // The proof text must not have reached storage by any route.
+        expect(
+            db
+                .prepare("SELECT COUNT(*) AS count FROM observations WHERE extracted_text LIKE ?")
+                .get("%final implementation now uses%"),
+        ).toEqual({ count: 0 });
+    });
+
+    test("does not let a forged ord_span widen corroboration beyond the compartment", () => {
+        db = createClaimReaderTestDatabase();
+        // The corroborating user message sits at ordinal 5, outside the
+        // compartment's host-recorded 1-2 message range.
+        const compartmentId = seedSession(
+            db,
+            "ses-span",
+            "The cache must remain offline capable, so use SQLite.",
+            5,
+        );
+        insertCompartmentEvents(
+            db,
+            "ses-span",
+            [
+                {
+                    kind: "trajectory_correction",
+                    atCompartment: 1,
+                    fields: correctionFields({ ord_span: "1-9007199254740991" }),
+                },
+            ],
+            [compartmentId],
+        );
+        expect(runHarvest()).toMatchObject({ consumed: 1, skipped: 0 });
         expect(
             db.prepare("SELECT source_trust_class AS trust FROM observations LIMIT 1").get(),
         ).toEqual({ trust: "model_inference" });
+    });
+
+    test("skips events whose event-anchored TTL already expired", () => {
+        db = createClaimReaderTestDatabase();
+        const compartmentId = seedSession(db, "ses-expired", "Unrelated user request");
+        insertCompartmentEvents(
+            db,
+            "ses-expired",
+            [{ kind: "trajectory_correction", atCompartment: 1, fields: correctionFields() }],
+            [compartmentId],
+        );
+        const afterExpiry = Date.now() + ANTI_MEMORY_DEFAULT_TTL_MS + 1;
+        expect(runHarvest(afterExpiry)).toEqual({ consumed: 0, skipped: 1, effects: [] });
+        expect(db.prepare("SELECT COUNT(*) AS count FROM claims").get()).toEqual({ count: 0 });
+        expect(countPendingCorrectionEvents(db, PROJECT)).toBe(0);
     });
 
     test("downgrades forged user source and receipts poison skips without blocking", () => {
@@ -159,18 +272,9 @@ describe("historian trajectory-correction anti-memory harvest", () => {
             ],
             [compartmentId],
         );
-        const run = () =>
-            db
-                ?.transaction(() =>
-                    harvestAntiMemoriesFromCorrections({
-                        db: db as Database,
-                        projectIdentity: PROJECT,
-                    }),
-                )
-                .immediate();
-        const first = run();
+        const first = runHarvest();
         expect(first).toMatchObject({ consumed: 1, skipped: 1 });
-        expect(run()).toEqual({ consumed: 0, skipped: 0, effects: [] });
+        expect(runHarvest()).toEqual({ consumed: 0, skipped: 0, effects: [] });
         expect(db.prepare("SELECT COUNT(*) AS count FROM claim_operation_receipts").get()).toEqual({
             count: 2,
         });
@@ -179,33 +283,135 @@ describe("historian trajectory-correction anti-memory harvest", () => {
         ).toEqual({ trust: "model_inference" });
     });
 
-    test("harvests a bounded batch and leaves later events pending", () => {
+    test("skips a correction whose span the message index has not reconciled", () => {
         db = createClaimReaderTestDatabase();
-        const compartmentId = seedSession(db, "ses-batch", "Unrelated user request");
+        const userText = "keep the cache offline capable for air-gapped installs";
+        const compartmentId = seedSession(db, "ses-unindexed", userText);
+        // Simulate "indexer has not reached this span yet": the FTS rows are not
+        // there, and the index still has a dirty floor outstanding over the span.
+        // The span itself is valid, so only the reconciliation check can catch
+        // this — and without it the empty text list makes source-overlap pass
+        // vacuously and the transcription gets persisted.
+        db.prepare("DELETE FROM message_history_fts WHERE session_id = ?").run("ses-unindexed");
+        db.prepare("DELETE FROM message_history_source WHERE session_id = ?").run("ses-unindexed");
+        db.prepare(
+            "UPDATE message_history_index SET dirty_floor_ordinal = 1 WHERE session_id = ?",
+        ).run("ses-unindexed");
         insertCompartmentEvents(
             db,
-            "ses-batch",
-            Array.from({ length: 101 }, (_, index) => ({
-                kind: "trajectory_correction",
-                atCompartment: 1,
-                fields: correctionFields({ summary: `Correction ${index}` }),
-            })),
+            "ses-unindexed",
+            [
+                {
+                    kind: "trajectory_correction",
+                    atCompartment: 1,
+                    // Verbatim from the user, with no quote marks, date, or
+                    // frustration marker, so only source-overlap could reject it —
+                    // and source-overlap is exactly what an unindexed span defeats.
+                    fields: correctionFields({ reason_for_change: userText }),
+                },
+            ],
             [compartmentId],
         );
 
-        const run = () =>
+        expect(runHarvest()).toEqual({ consumed: 0, skipped: 1, effects: [] });
+        expect(db.prepare("SELECT COUNT(*) AS count FROM claims").get()).toEqual({ count: 0 });
+    });
+
+    test("skips a correction with no authoritative span instead of persisting it unchecked", () => {
+        db = createClaimReaderTestDatabase();
+        const userText = "We must keep the cache offline capable for air-gapped installs";
+        seedSession(db, "ses-dangling", userText);
+        // compartment_id null is what an unresolved anchor stores, and what a
+        // compartment recomp leaves behind as a dangling id. Either way the
+        // compartment bounds are unknown, so there are no source texts and the
+        // source-overlap arm of the privacy gate cannot run.
+        db.prepare(
+            `INSERT INTO compartment_events
+                (session_id, compartment_id, kind, at_compartment, fields_json, created_at, harness)
+             VALUES (?, NULL, 'trajectory_correction', 1, ?, ?, 'opencode')`,
+        ).run(
+            "ses-dangling",
+            // A reason transcribed verbatim from the user, carrying no quote
+            // marks, date, or frustration marker, so every other privacy arm
+            // passes it.
+            JSON.stringify(correctionFields({ reason_for_change: userText })),
+            // Recent, so the event is inside its TTL and cannot be skipped as
+            // expired — the span guard has to be what rejects it.
+            Date.now(),
+        );
+
+        expect(runHarvest()).toEqual({ consumed: 0, skipped: 1, effects: [] });
+        expect(db.prepare("SELECT COUNT(*) AS count FROM claims").get()).toEqual({ count: 0 });
+        expect(
             db
-                ?.transaction(() =>
-                    harvestAntiMemoriesFromCorrections({
-                        db: db as Database,
-                        projectIdentity: PROJECT,
-                    }),
-                )
-                .immediate();
-        expect(countPendingCorrectionEvents(db, PROJECT)).toBe(101);
-        expect(run()).toMatchObject({ consumed: 100, skipped: 0 });
-        expect(countPendingCorrectionEvents(db, PROJECT)).toBe(1);
-        expect(run()).toMatchObject({ consumed: 1, skipped: 0 });
+                .prepare("SELECT COUNT(*) AS count FROM observations WHERE extracted_text LIKE ?")
+                .get("%air-gapped installs%"),
+        ).toEqual({ count: 0 });
+    });
+
+    test("never corroborates trust from another harness's messages on the same session id", () => {
+        db = createClaimReaderTestDatabase();
+        const evidenceQuote = "the cache must remain offline capable for air-gapped installs";
+        // The event belongs to opencode and its own span carries no user message.
+        const compartmentId = seedSession(db, "ses-xh", "unrelated opencode chatter", 1);
+        db.prepare("DELETE FROM message_history_fts WHERE session_id = ?").run("ses-xh");
+        db.prepare("DELETE FROM message_history_source WHERE session_id = ?").run("ses-xh");
+        // A pi message on the SAME session id sits inside the same ordinal span
+        // and contains the evidence quote verbatim. It must not be visible here.
+        db.prepare(
+            "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, 1, 'pi1', 'user', ?)",
+        ).run("ses-xh", evidenceQuote);
+        db.prepare(
+            `INSERT INTO message_history_source
+                (session_id, message_id, message_ordinal, source_version,
+                 normalized_content_hash, role, harness, updated_at)
+             VALUES (?, 'pi1', 1, 'v1', 'h', 'user', 'pi', 1)`,
+        ).run("ses-xh");
+        insertCompartmentEvents(
+            db,
+            "ses-xh",
+            [
+                {
+                    kind: "trajectory_correction",
+                    atCompartment: 1,
+                    fields: correctionFields({ evidence: evidenceQuote }),
+                },
+            ],
+            [compartmentId],
+        );
+
+        expect(runHarvest()).toMatchObject({ consumed: 1, skipped: 0 });
+        // Trust must stay model_inference: the only message matching the
+        // evidence quote belongs to the other harness.
+        expect(
+            db.prepare("SELECT source_trust_class AS trust FROM observations LIMIT 1").get(),
+        ).toEqual({ trust: "model_inference" });
+    });
+
+    test("never harvests an event whose harness binds the session to another project", () => {
+        db = createClaimReaderTestDatabase();
+        // `session_projects` is keyed (session_id, harness), so one session id can
+        // bind to a different project per harness. This session is this project
+        // under opencode and a DIFFERENT project under pi.
+        const compartmentId = seedSession(db, "ses-shared", "Unrelated user message.");
+        db.prepare(
+            "INSERT INTO session_projects (session_id, project_path, updated_at, harness) VALUES (?, ?, ?, 'pi')",
+        ).run("ses-shared", "git:someone-elses-project", 1);
+        // The event belongs to the pi binding, so it is the other project's event.
+        db.prepare(
+            `INSERT INTO compartment_events
+                (session_id, compartment_id, kind, at_compartment, fields_json, created_at, harness)
+             VALUES (?, ?, 'trajectory_correction', 1, ?, 1, 'pi')`,
+        ).run("ses-shared", compartmentId, JSON.stringify(correctionFields()));
+
         expect(countPendingCorrectionEvents(db, PROJECT)).toBe(0);
+        expect(runHarvest()).toEqual({ consumed: 0, skipped: 0, effects: [] });
+        expect(db.prepare("SELECT COUNT(*) AS count FROM claims").get()).toEqual({ count: 0 });
+        // The other project's event must still be unconsumed: a global
+        // `event:<id>` receipt here would starve its real owner.
+        expect(db.prepare("SELECT COUNT(*) AS count FROM claim_operation_receipts").get()).toEqual({
+            count: 0,
+        });
+        expect(countPendingCorrectionEvents(db, "git:someone-elses-project")).toBe(1);
     });
 });

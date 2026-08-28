@@ -70,7 +70,9 @@ const ctxMemoryArgsShape = {
     antiMemory: tool.schema
         .object(antiMemoryShape)
         .optional()
-        .describe("Structured rejected-approach payload; valid only with REJECTED_APPROACH"),
+        .describe(
+            "Rejected-approach payload. Required with category REJECTED_APPROACH, and content must be omitted; invalid with any other category.",
+        ),
     publicClaimId: tool.schema
         .string()
         .optional()

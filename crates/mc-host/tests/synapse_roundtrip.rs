@@ -90,10 +90,7 @@ async fn corrupt_bundle_degrades_synapse_and_keeps_magic_context_routable() {
     // excluded so wake-plane probes fail open (AE10).
     support::assert_control_ops(&body["modules"], &[]);
 
-    let err = client
-        .route_open_target("management_surface", "synapse", ROOT, "opencode", "s1")
-        .await
-        .expect_err("corrupt bundles reject the synapse bind");
+    let err = support::synapse::open_synapse_route_rejection(&mut client).await;
     assert_eq!(err, "artifact_invalid");
 
     // Magic Context requests still complete.

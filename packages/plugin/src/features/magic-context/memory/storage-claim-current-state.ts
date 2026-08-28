@@ -42,16 +42,54 @@ import {
     computeProjectMemoryMutationToken,
 } from "./storage-claim-operations.ts";
 import { readActiveDispositions } from "./storage-claim-policy.ts";
-import { uniformlyAbsentClaimSql } from "./storage-claim-visibility.ts";
+import { antiMemoryClaimSql, uniformlyAbsentClaimSql } from "./storage-claim-visibility.ts";
 import { ClaimGraphCorruptionError, resolveProjectId } from "./storage-claims.ts";
 import type { MemoryScope } from "./types.ts";
 
 export type ProjectMemorySurface =
     | "auto_inject"
-    | "auto_search"
     | "explicit_search"
     | "maintenance_hygiene"
     | "maintenance_verification";
+
+/**
+ * The only surfaces a rejected approach may reach.
+ *
+ * Anti-memory rows are stored warnings: approaches the user rejected. Two
+ * invariants keep a warning from being laundered back into positive guidance,
+ * and this set is the whole of the first one.
+ *
+ * VISIBILITY — this set is the sole authority for which surfaces may see an
+ * anti-memory row, enforced twice below: once in the candidate query so hot
+ * surfaces do not hydrate rows they cannot use, and once in `surfaceDecision`,
+ * which is authoritative. A reader must not source anti-memory rows for a
+ * surface absent from this set by going around the provider.
+ *   - `explicit_search`: the user asked for warnings; showing them is the point.
+ *   - `maintenance_verification`: re-judges a row IN PLACE — renews its TTL,
+ *     demotes it to stale, or revises its content under the SAME category
+ *     through the typed writer, which never passes a category. It cannot mint a
+ *     positive-category copy, so it cannot launder. It is already the one lane
+ *     trusted to see `stale` and `disputed` rows below, for the same reason.
+ *     Denying it would leave a warning un-re-judged until its TTL lapsed, which
+ *     is worse: a user-corroborated warning reaches VERIFIED maturity from its
+ *     evidence alone (`automaticMaturityTarget`), so it would keep auto-injecting
+ *     long after the rejection stopped being true.
+ *   - `auto_inject` and `maintenance_hygiene` are denied. Curate and hygiene
+ *     passes re-create content into NEW rows, and a rewrite can drop the
+ *     negation and resurrect the rejected approach under a positive category.
+ *
+ * MUTATION — the second invariant, enforced elsewhere: every write to an
+ * anti-memory row goes through the typed API in `storage-anti-memory.ts`, which
+ * preserves the category and the TTL and outcome vocabulary. Generic revision
+ * paths refuse the category (`refuseGenericAntiMemoryRevisionAccess`).
+ *
+ * Adding a surface here grants it sight of rejected approaches. Never add one
+ * whose lane can re-create content under a different category.
+ */
+const ANTI_MEMORY_VISIBLE_SURFACES: ReadonlySet<ProjectMemorySurface> = new Set([
+    "explicit_search",
+    "maintenance_verification",
+]);
 
 export interface ProjectMemoryWorkspaceAuthorization {
     /** Projects owned by the active workspace member. */
@@ -167,6 +205,13 @@ function resolveCandidates(
         throw new ClaimOperationInputError(
             "current-state reads require public locators or an authorized project set",
         );
+    }
+    // Anti-memory is reachable through explicit search and the verification
+    // lane only; filtering it in the candidate query keeps the hot automatic
+    // surfaces from paying full hydration for rows `surfaceDecision` (the
+    // authoritative check, kept as defence in depth) would discard anyway.
+    if (!ANTI_MEMORY_VISIBLE_SURFACES.has(request.surface ?? "explicit_search")) {
+        clauses.push(`NOT ${antiMemoryClaimSql("claims.current_revision_id")}`);
     }
     return db
         .prepare(
@@ -368,6 +413,13 @@ function surfaceDecision(
     if (item.expiresAt !== null && item.expiresAt <= nowMs) {
         return { eligible: false, label: null };
     }
+    // Rejected approaches reach only the surfaces in
+    // ANTI_MEMORY_VISIBLE_SURFACES; that set carries the reasoning. This is the
+    // authoritative check, and the candidate query filters the same set early so
+    // hot surfaces do not pay hydration for rows discarded here.
+    if (item.category === ANTI_MEMORY_CATEGORY && !ANTI_MEMORY_VISIBLE_SURFACES.has(surface)) {
+        return { eligible: false, label: null };
+    }
     const facts = item.dispositions;
     if (item.policy.hardHidden || facts.contradicted || facts.quarantined || facts.rejected) {
         return { eligible: false, label: null };
@@ -387,13 +439,9 @@ function surfaceDecision(
     // provider has to agree, or an older process still attached to the database
     // keeps auto-injecting content it cannot reason about.
     const versionUnsupported = item.policy.policyVersion > CLAIM_POLICY_VERSION;
-    if (surface === "auto_inject" || surface === "auto_search") {
+    if (surface === "auto_inject") {
         return {
-            eligible:
-                item.category !== ANTI_MEMORY_CATEGORY &&
-                !versionUnsupported &&
-                item.policy.autoEligible &&
-                !softHidden,
+            eligible: !versionUnsupported && item.policy.autoEligible && !softHidden,
             label: null,
         };
     }
@@ -665,6 +713,7 @@ export function countProjectMemoryClaims(
                JOIN claim_memory_lifecycle_heads heads ON heads.claim_id = claims.id
               WHERE claims.project_id IN (${request.projectIds.map(() => "?").join(", ")})
                 AND heads.state IN (${lifecycleStates.map(() => "?").join(", ")})
+                AND NOT ${antiMemoryClaimSql("claims.current_revision_id")}
                 AND NOT ${uniformlyAbsentClaimSql("claims.current_revision_id", "unixepoch('subsec') * 1000")}`,
         )
         .get(...request.projectIds, ...lifecycleStates) as { cnt: number } | undefined;

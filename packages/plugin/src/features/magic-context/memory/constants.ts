@@ -14,8 +14,21 @@ export const V2_MEMORY_CATEGORIES = [
     "NAMING",
 ] as const satisfies readonly MemoryCategory[];
 
+/**
+ * Rejected approaches live outside the writable taxonomy on purpose: the
+ * generic claim operations refuse this category, and the only write path is
+ * the typed API in `storage-anti-memory.ts`.
+ */
 export const ANTI_MEMORY_CATEGORY = "REJECTED_APPROACH" as const satisfies AntiMemoryCategory;
 
+/**
+ * The category enum the `ctx_memory` tool exposes to agents. Deliberately wider
+ * than `V2_MEMORY_CATEGORIES`: naming the anti-memory category is how an agent
+ * selects the typed rejected-approach write arm, which the tool dispatches to
+ * `storage-anti-memory.ts`. That keeps the storage-side refusal above intact —
+ * this set governs what an agent may ASK for, not what the generic claim
+ * operations accept — so the two must not be collapsed into one constant.
+ */
 export const WRITABLE_MEMORY_CATEGORIES = [
     ...V2_MEMORY_CATEGORIES,
     ANTI_MEMORY_CATEGORY,

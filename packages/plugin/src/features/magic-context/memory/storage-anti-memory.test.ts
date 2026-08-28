@@ -4,6 +4,10 @@ import { describe, expect, test } from "bun:test";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { createDirectTestDatabase } from "../test-database";
 import {
+    computeClaimOperationRequestDigest,
+    formatRevisionLocator,
+} from "./claim-operation-contract";
+import {
     createAgentAntiMemory,
     createAntiMemory,
     extendAntiMemoryTtl,
@@ -13,9 +17,14 @@ import {
     reviseAntiMemory,
 } from "./storage-anti-memory";
 import {
+    applyProjectMemoryMapping,
     computeProjectMemoryMutationToken,
+    getProjectMemoryClaimByPublicId,
     mergeProjectMemoryClaims,
+    recordProjectMemoryVerification,
     reviseProjectMemoryClaim,
+    runClaimOperation,
+    stageReviseProjectMemoryClaimInCurrentTransaction,
 } from "./storage-claim-operations";
 import { ensureProject } from "./storage-claims";
 
@@ -279,6 +288,116 @@ describe("anti-memory typed operations", () => {
         }
     });
 
+    test("replays an identical TTL extension instead of rejecting the retry", () => {
+        const { db } = createDirectTestDatabase();
+        try {
+            const projectId = ensureProject(db, "git:anti-replay");
+            const created = createAntiMemory(
+                db,
+                { producer: "test", operationKey: "create" },
+                {
+                    projectId,
+                    payload: payload(),
+                    provenance: provenance("create"),
+                    actor: "dreamer",
+                    nowMs: 10,
+                },
+            );
+            const publicClaimId = publicIdOf(created);
+            const token = computeProjectMemoryMutationToken(db, publicClaimId);
+            const extendInput = {
+                token,
+                expiresAt: 200 * DAY_MS,
+                provenance: provenance("extend"),
+                actor: "verifier",
+                nowMs: 20,
+            };
+            const first = extendAntiMemoryTtl(
+                db,
+                { producer: "test", operationKey: "extend" },
+                extendInput,
+            );
+            expect(first.outcome).toBe("applied");
+            expect(first.replayed).toBe(false);
+
+            // The stored expiry now equals the request's, so a pre-transaction
+            // forward-progress check would throw here; the receipt must win.
+            const retry = extendAntiMemoryTtl(
+                db,
+                { producer: "test", operationKey: "extend" },
+                extendInput,
+            );
+            expect(retry.outcome).toBe("applied");
+            expect(retry.replayed).toBe(true);
+            expect(readAntiMemory(db, publicClaimId)?.expiresAt).toBe(200 * DAY_MS);
+
+            // A fresh operation that does not move expiry forward still fails.
+            expect(() =>
+                extendAntiMemoryTtl(
+                    db,
+                    { producer: "test", operationKey: "extend-again" },
+                    {
+                        ...extendInput,
+                        token: computeProjectMemoryMutationToken(db, publicClaimId),
+                        provenance: provenance("extend-again"),
+                    },
+                ),
+            ).toThrow(/move expiry forward/);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("refuses a generic staging revise so a payload-less revision cannot be minted", () => {
+        const { db } = createDirectTestDatabase();
+        try {
+            const projectId = ensureProject(db, "git:anti-stage-guard");
+            const created = createAntiMemory(
+                db,
+                { producer: "test", operationKey: "create" },
+                {
+                    projectId,
+                    payload: payload(),
+                    provenance: provenance("create"),
+                    actor: "dreamer",
+                    nowMs: 1,
+                },
+            );
+            const publicClaimId = publicIdOf(created);
+            // Mimics an in-transaction maintenance caller (dreamer curate /
+            // classify / verify) that reaches the stage function directly,
+            // bypassing the typed anti-memory API.
+            expect(() =>
+                runClaimOperation(
+                    db,
+                    {
+                        producer: "test",
+                        operationKey: "stage-bypass",
+                        requestDigest: computeClaimOperationRequestDigest({
+                            operationKey: "stage-bypass",
+                        }),
+                    },
+                    () =>
+                        stageReviseProjectMemoryClaimInCurrentTransaction(
+                            db,
+                            {
+                                token: computeProjectMemoryMutationToken(db, publicClaimId),
+                                content: "rewritten by a generic maintenance pass",
+                                provenance: provenance("stage-bypass"),
+                                actor: "dreamer",
+                            },
+                            2,
+                        ),
+                    2,
+                ),
+            ).toThrow(/anti-memory/);
+            // The typed reader must still work: no payload-less revision landed.
+            expect(readAntiMemory(db, publicClaimId)?.revision).toBe(1);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("rejects malformed payloads, category conversion, merge, and agent explicit-user trust", () => {
         const { db } = createDirectTestDatabase();
         try {
@@ -368,6 +487,295 @@ describe("anti-memory typed operations", () => {
                     )
                     .get(agentId),
             ).toEqual({ trust: "model_inference" });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+    test("replays a TTL extension retry after an unrelated revision changed the payload", () => {
+        const { db } = createDirectTestDatabase();
+        try {
+            const projectId = ensureProject(db, "git:anti-replay-drift");
+            const created = createAntiMemory(
+                db,
+                { producer: "test", operationKey: "create" },
+                {
+                    projectId,
+                    payload: payload(),
+                    provenance: provenance("create"),
+                    actor: "dreamer",
+                    nowMs: 10,
+                },
+            );
+            const publicClaimId = publicIdOf(created);
+            const extendInput = {
+                token: computeProjectMemoryMutationToken(db, publicClaimId),
+                expiresAt: 200 * DAY_MS,
+                provenance: provenance("extend"),
+                actor: "verifier",
+                nowMs: 20,
+            };
+            const first = extendAntiMemoryTtl(
+                db,
+                { producer: "test", operationKey: "extend" },
+                extendInput,
+            );
+            expect(first.replayed).toBe(false);
+
+            // An unrelated revise moves the stored payload away from the bytes
+            // the extension happened to re-state.
+            reviseAntiMemory(
+                db,
+                { producer: "test", operationKey: "revise" },
+                {
+                    token: computeProjectMemoryMutationToken(db, publicClaimId),
+                    payload: payload("Redis adds operational cost and a new failure domain"),
+                    provenance: provenance("revise"),
+                    actor: "curator",
+                    nowMs: 30,
+                },
+            );
+
+            // The extension request itself never carried a payload, so its
+            // digest must not have drifted with the row: this retry replays
+            // rather than raising ClaimOperationKeyReuseError.
+            const retry = extendAntiMemoryTtl(
+                db,
+                { producer: "test", operationKey: "extend" },
+                extendInput,
+            );
+            expect(retry.replayed).toBe(true);
+            expect(retry.outcome).toBe("applied");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("refuses an operation-key reuse that changes only importance", () => {
+        const { db } = createDirectTestDatabase();
+        try {
+            const projectId = ensureProject(db, "git:anti-importance-digest");
+            const request = {
+                projectId,
+                payload: payload(),
+                provenance: provenance("create"),
+                actor: "dreamer",
+                nowMs: 10,
+            };
+            createAntiMemory(db, { producer: "test", operationKey: "create" }, request);
+
+            // Importance reaches the persisted attributes, so a different
+            // importance is a different request: replaying the first receipt
+            // would silently drop the new value.
+            expect(() =>
+                createAntiMemory(
+                    db,
+                    { producer: "test", operationKey: "create" },
+                    { ...request, importance: 90 },
+                ),
+            ).toThrow(/already committed for a different request digest/);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("refuses an operation-key reuse that changes only an explicit expiry", () => {
+        const { db } = createDirectTestDatabase();
+        try {
+            const projectId = ensureProject(db, "git:anti-expiry-digest");
+            const request = {
+                projectId,
+                payload: payload(),
+                provenance: provenance("create"),
+                actor: "dreamer",
+                nowMs: 10,
+                expiresAt: 5_000,
+            };
+            createAntiMemory(db, { producer: "test", operationKey: "create" }, request);
+
+            // A caller-supplied expiry reaches the persisted attributes, so a
+            // different expiry is a different request: replaying the first
+            // receipt would silently keep the old TTL.
+            expect(() =>
+                createAntiMemory(
+                    db,
+                    { producer: "test", operationKey: "create" },
+                    { ...request, expiresAt: 9_000 },
+                ),
+            ).toThrow(/already committed for a different request digest/);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("replays an omitted-expiry retry whose default moved with the clock", () => {
+        const { db } = createDirectTestDatabase();
+        try {
+            const projectId = ensureProject(db, "git:anti-expiry-default-replay");
+            const request = {
+                projectId,
+                payload: payload(),
+                provenance: provenance("create"),
+                actor: "dreamer",
+            };
+            createAntiMemory(
+                db,
+                { producer: "test", operationKey: "create" },
+                { ...request, nowMs: 10 },
+            );
+
+            // The digest records the REQUESTED expiry, which is absent here. The
+            // resolved default is nowMs + TTL, so digesting the resolved value
+            // would make this honest retry a different request purely because
+            // the clock advanced.
+            const retry = createAntiMemory(
+                db,
+                { producer: "test", operationKey: "create" },
+                { ...request, nowMs: 12_345 },
+            );
+            expect(retry.replayed).toBe(true);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("normalizes blank optional payload fields to null instead of rejecting them", () => {
+        const { db } = createDirectTestDatabase();
+        try {
+            const projectId = ensureProject(db, "git:anti-blank-optional");
+            const created = createAntiMemory(
+                db,
+                { producer: "test", operationKey: "create" },
+                {
+                    projectId,
+                    payload: { ...payload(), saferAlternative: "", preconditions: "   " },
+                    provenance: provenance("create"),
+                    actor: "dreamer",
+                    nowMs: 10,
+                },
+            );
+            const record = readAntiMemory(db, publicIdOf(created));
+
+            expect(record?.payload.saferAlternative).toBeNull();
+            expect(record?.payload.preconditions).toBeNull();
+            // A blank optional is absence, so the renderer omits its line.
+            expect(record?.content).not.toContain("Safer alternative");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("refuses generic verification and applicability mapping against anti-memory", () => {
+        const { db } = createDirectTestDatabase();
+        try {
+            const projectId = ensureProject(db, "git:anti-revision-state-guard");
+            const created = createAntiMemory(
+                db,
+                { producer: "test", operationKey: "create" },
+                {
+                    projectId,
+                    payload: payload(),
+                    provenance: provenance("create"),
+                    actor: "dreamer",
+                    nowMs: 10,
+                },
+            );
+            const publicClaimId = publicIdOf(created);
+            const claim = getProjectMemoryClaimByPublicId(db, publicClaimId);
+            if (claim === null) throw new Error("unreachable");
+            const revisionLocator = formatRevisionLocator(claim);
+
+            // Both attach to one exact revision, and the typed writer appends a
+            // fresh revision on every extension without carrying them over, so
+            // a verified path-scoped warning would lose its authority and scope
+            // on its next TTL extension. Refuse rather than downgrade silently.
+            expect(() =>
+                recordProjectMemoryVerification(
+                    db,
+                    { producer: "test", operationKey: "verify" },
+                    {
+                        token: computeProjectMemoryMutationToken(db, publicClaimId),
+                        revisionLocator,
+                        outcome: "verified",
+                        verifier: "test",
+                        nowMs: 20,
+                    },
+                ),
+            ).toThrow(/generic anti-memory verification is refused/);
+
+            expect(() =>
+                applyProjectMemoryMapping(
+                    db,
+                    { producer: "test", operationKey: "map" },
+                    {
+                        token: computeProjectMemoryMutationToken(db, publicClaimId),
+                        revisionLocator,
+                        paths: { exact: ["src/cache.ts"] },
+                        nowMs: 20,
+                    },
+                ),
+            ).toThrow(/generic anti-memory applicability mapping is refused/);
+
+            expect(
+                db
+                    .prepare(
+                        "SELECT COUNT(*) AS count FROM verification_events WHERE revision_id = ?",
+                    )
+                    .get(claim.currentRevisionId),
+            ).toEqual({ count: 0 });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+    test("reports a losing concurrent extension as stale, not a caller defect", () => {
+        const { db } = createDirectTestDatabase();
+        try {
+            const projectId = ensureProject(db, "git:anti-extend-race");
+            const created = createAntiMemory(
+                db,
+                { producer: "test", operationKey: "create" },
+                {
+                    projectId,
+                    payload: payload(),
+                    provenance: provenance("create"),
+                    actor: "dreamer",
+                    nowMs: 10,
+                },
+            );
+            const publicClaimId = publicIdOf(created);
+            // Both clients start from the same snapshot.
+            const sharedToken = computeProjectMemoryMutationToken(db, publicClaimId);
+
+            const winner = extendAntiMemoryTtl(
+                db,
+                { producer: "test", operationKey: "extend-winner" },
+                {
+                    token: sharedToken,
+                    expiresAt: 300 * DAY_MS,
+                    provenance: provenance("winner"),
+                    actor: "verifier",
+                    nowMs: 20,
+                },
+            );
+            expect(winner.outcome).toBe("applied");
+
+            // Forward progress from the loser's snapshot, behind the winner's
+            // expiry. Its token is now superseded, so this is a lost race and
+            // the contract's stale outcome — not bad input.
+            const loser = extendAntiMemoryTtl(
+                db,
+                { producer: "test", operationKey: "extend-loser" },
+                {
+                    token: sharedToken,
+                    expiresAt: 200 * DAY_MS,
+                    provenance: provenance("loser"),
+                    actor: "verifier",
+                    nowMs: 21,
+                },
+            );
+
+            expect(loser.outcome).toBe("stale");
+            expect(loser.result.effects).toEqual([]);
+            expect(readAntiMemory(db, publicClaimId)?.expiresAt).toBe(300 * DAY_MS);
         } finally {
             closeQuietly(db);
         }

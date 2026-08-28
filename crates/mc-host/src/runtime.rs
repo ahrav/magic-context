@@ -476,6 +476,10 @@ impl<H: McHostHandler> Drop for AbandonGuard<H> {
 struct Reservations {
     pending: usize,
     tasks: usize,
+    /// Checked sum of every module's declared bound on concurrently parked
+    /// general-class handler tasks. Not a carve-out — validated against the
+    /// general task pool so declared parking can never consume every slot.
+    general_task_holds: usize,
     retained_bytes: u64,
 }
 
@@ -500,6 +504,7 @@ fn build_target_index(
     let mut reservations = Reservations {
         pending: 0,
         tasks: 0,
+        general_task_holds: 0,
         retained_bytes: 0,
     };
     let mut target_entries: Vec<(Box<str>, Vec<TargetKind>, RouteClass)> =
@@ -552,6 +557,12 @@ fn build_target_index(
             .checked_add(declaration.reserved_handler_tasks)
             .ok_or_else(|| {
                 HostError::InitFailed("reserved handler-task sum overflows".to_owned())
+            })?;
+        reservations.general_task_holds = reservations
+            .general_task_holds
+            .checked_add(declaration.general_task_hold_bound)
+            .ok_or_else(|| {
+                HostError::InitFailed("general handler-task hold sum overflows".to_owned())
             })?;
         reservations.retained_bytes = reservations
             .retained_bytes
@@ -669,6 +680,19 @@ pub async fn run<H: McHostHandler>(
         return Err(HostError::InitFailed(
             "reserved handler tasks leave no general handler-task slot".to_owned(),
         ));
+    }
+    // Declared long-parked general tasks (for example Synapse's running
+    // query plus its FIFO waiters) draw on the general pool. If they could
+    // fill it, one module's waiting traffic would starve every other route,
+    // so the sum must leave at least one free general task slot.
+    let general_task_slots = config.limits.max_handler_tasks - reservations.tasks;
+    if reservations.general_task_holds >= general_task_slots {
+        return Err(HostError::InitFailed(format!(
+            "declared parked handler tasks ({}) leave no free general handler-task slot \
+             ({general_task_slots} available); lower max_waiting_queries or raise \
+             max_handler_tasks",
+            reservations.general_task_holds
+        )));
     }
     // Bounded during serialization, not after: an over-limit manifest must be
     // refused without ever materializing a full copy of its catalog.
@@ -869,6 +893,7 @@ pub async fn run<H: McHostHandler>(
     let mut abandon_guard = AbandonGuard {
         inner: Some((Arc::clone(&shared), guard)),
     };
+    spawn_activation_task(&shared);
     spawn_health_task(&shared);
     accept_loop(&shared, listener).await;
     let graceful = shutdown_sequence(&shared, abandon_guard.guard_mut()).await;
@@ -901,6 +926,52 @@ pub async fn run<H: McHostHandler>(
 /// Delay before retrying a failed `accept()`, preventing a tight error loop
 /// when the listener stays ready under persistent resource exhaustion.
 const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Runs the handler's post-publication activation exactly once, tracked but
+/// never awaited by startup: transport is already published and the accept
+/// loop starts regardless of activation progress. An `Err`, panic, or task
+/// loss trips the fatal latch; shutdown abandons an unfinished activation
+/// future at the inner select, and the component-owned trackers it started
+/// are drained by the handler shutdown callback.
+fn spawn_activation_task<H: McHostHandler>(shared: &Arc<HostShared<H>>) {
+    let outer = Arc::clone(shared);
+    let shared = Arc::clone(shared);
+    outer.spawn_tracked(async move {
+        let handler = Arc::clone(&shared.handler);
+        let watchdog = Arc::clone(&shared);
+        // Abort-exempt: forced-shutdown `abort_all` must not turn an
+        // in-flight activation into a spurious task loss. The inner select
+        // self-bounds on the shutdown token instead; there is deliberately
+        // no lifecycle deadline here because model construction and
+        // certification own separate post-publication budgets.
+        let task = shared.spawn_lifecycle(async move {
+            let callback = crate::panic_boundary::redact_sync(|| handler.activate());
+            tokio::select! {
+                biased;
+                () = watchdog.shutdown.cancelled() => {}
+                result = crate::panic_boundary::redact(callback) => {
+                    if let Err(err) = result {
+                        // The handler-authored message can carry component
+                        // detail; fatal diagnostics get bounded structure
+                        // only (protocol V24).
+                        watchdog.fatal.trip(
+                            &watchdog.shutdown,
+                            format!(
+                                "activation invariant failure ({} bytes of detail redacted)",
+                                err.0.len()
+                            ),
+                        );
+                    }
+                }
+            }
+        });
+        if task.await.is_err() {
+            shared
+                .fatal
+                .trip(&shared.shutdown, "activation task lost".to_owned());
+        }
+    });
+}
 
 /// Accepts sockets until shutdown. Each accept result is synchronously
 /// registered with the task tracker before the next await — the

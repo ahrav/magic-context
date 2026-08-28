@@ -32,6 +32,8 @@ import {
     type ClaimOperationStageOutcome,
     computeProjectMemoryMutationToken,
     getProjectMemoryClaimByPublicId,
+    type RecordProjectMemoryVerificationInput,
+    stageAntiMemoryVerificationInCurrentTransaction,
     stageApplyProjectMemoryMappingInCurrentTransaction,
     stageRecordProjectMemoryVerificationInCurrentTransaction,
     stageReviseProjectMemoryClaimInCurrentTransaction,
@@ -382,6 +384,26 @@ function validateVerifyBatch(
     };
 }
 
+/**
+ * Route a verification outcome to the writer that owns the claim's category.
+ *
+ * The generic recorder refuses anti-memory because generic revision paths drop
+ * the TTL, outcome, and scope invariants the typed writer maintains. A
+ * verification event carries none of that state, so the typed API exposes its
+ * own recorder; routing here keeps every outcome in this file going through one
+ * call shape instead of each branch remembering which writer applies.
+ */
+function stageVerificationOutcome(
+    db: Database,
+    category: string,
+    input: RecordProjectMemoryVerificationInput,
+    nowMs: number,
+): ClaimOperationStageOutcome {
+    return category === ANTI_MEMORY_CATEGORY
+        ? stageAntiMemoryVerificationInCurrentTransaction(db, input, nowMs)
+        : stageRecordProjectMemoryVerificationInCurrentTransaction(db, input, nowMs);
+}
+
 function stageVerificationItem(
     db: Database,
     identity: AutonomousManifestIdentity,
@@ -416,8 +438,9 @@ function stageVerificationItem(
             }
             const current = freshTarget(db, item.binding.publicClaimId);
             outcomes.push(
-                stageRecordProjectMemoryVerificationInCurrentTransaction(
+                stageVerificationOutcome(
                     db,
+                    item.value.category,
                     {
                         token: current.token,
                         revisionLocator: current.revisionLocator,
@@ -445,8 +468,9 @@ function stageVerificationItem(
         );
         const current = freshTarget(db, item.binding.publicClaimId);
         outcomes.push(
-            stageRecordProjectMemoryVerificationInCurrentTransaction(
+            stageVerificationOutcome(
                 db,
+                item.value.category,
                 {
                     token: current.token,
                     revisionLocator: current.revisionLocator,
@@ -458,8 +482,9 @@ function stageVerificationItem(
         );
     } else if (item.value.kind === "update") {
         outcomes.push(
-            stageRecordProjectMemoryVerificationInCurrentTransaction(
+            stageVerificationOutcome(
                 db,
+                item.value.category,
                 {
                     token: item.binding.token,
                     revisionLocator: item.binding.revisionLocator,
@@ -539,8 +564,9 @@ function stageVerificationItem(
     } else {
         if (item.value.category === ANTI_MEMORY_CATEGORY) {
             outcomes.push(
-                stageRecordProjectMemoryVerificationInCurrentTransaction(
+                stageVerificationOutcome(
                     db,
+                    item.value.category,
                     {
                         token: item.binding.token,
                         revisionLocator: item.binding.revisionLocator,
@@ -556,8 +582,9 @@ function stageVerificationItem(
             });
         }
         outcomes.push(
-            stageRecordProjectMemoryVerificationInCurrentTransaction(
+            stageVerificationOutcome(
                 db,
+                item.value.category,
                 {
                     token: item.binding.token,
                     revisionLocator: item.binding.revisionLocator,

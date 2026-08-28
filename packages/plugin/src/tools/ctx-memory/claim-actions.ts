@@ -477,11 +477,10 @@ export function executeCtxMemoryClaimAction(input: ExecuteCtxMemoryClaimActionAr
             });
             return mutationResult(action, operation);
         }
-        const content = args.content?.trim();
-        const category = requireTaxonomyCategory(args.category?.trim());
-        if (!content || !category) {
-            throw new ClaimOperationInputError("create requires non-empty content and category");
-        }
+        // assertCtxMemoryWriteShape above already rejected this arm unless it
+        // carries non-empty content and a positive taxonomy category.
+        const content = (args.content as string).trim();
+        const category = requireTaxonomyCategory(args.category?.trim()) as string;
         const operation = createProjectMemoryClaim(db, producer, {
             projectId: ownProjectId,
             content,

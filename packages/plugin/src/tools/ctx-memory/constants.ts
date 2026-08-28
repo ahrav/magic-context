@@ -6,10 +6,10 @@ export const CTX_MEMORY_DESCRIPTION = `Durable project claims shared across sess
 Claims use public IDs (mcm_<32hex>), immutable revision locators, and claim-local mutation tokens. Reuse the exact token returned by create/get/list when revising or changing lifecycle state.
 
 Actions:
-- create: create a claim (content + category).
+- create: create a claim (content + category, or antiMemory).
 - get: fetch up to 20 public claim IDs; hidden and missing claims have the same result.
 - list: enumerate visible active claims (dreamer maintenance only).
-- revise: append a revision (publicClaimId + mutationToken + content and/or category).
+- revise: append a revision (publicClaimId + mutationToken + content/category or antiMemory).
 - archive / restore: append lifecycle state (publicClaimId + mutationToken).
 - merge: same-project merge; mutationTokens are ordered [target, ...sources].
 
@@ -39,6 +39,13 @@ export const CTX_MEMORY_MUTATION_TOKEN_RULE: ImitatedArgRule = {
     },
 };
 
+/**
+ * Shape of a rejected-approach payload for reduced-argument decoding, shared by
+ * every adapter so no adapter's decode schema can drift from the advertised
+ * antiMemory schema. Must list every field the tool schemas advertise: a decode
+ * rule that omits an optional field (e.g. saferAlternative) rejects the whole
+ * imitated call and loses the action.
+ */
 export const CTX_MEMORY_ANTI_MEMORY_RULE: ImitatedArgRule = {
     type: "object",
     fields: {
@@ -46,15 +53,13 @@ export const CTX_MEMORY_ANTI_MEMORY_RULE: ImitatedArgRule = {
         rejectedStrategy: "string",
         rejectionReason: "string",
     },
-    optionalFields: Object.fromEntries(
-        [
-            "saferAlternative",
-            "preconditions",
-            "attemptedApproach",
-            "observedFailure",
-            "rootCause",
-            "recovery",
-            "nonApplicableWhen",
-        ].map((field) => [field, { type: "nullable", value: "string" }]),
-    ),
+    optionalFields: {
+        saferAlternative: "string",
+        preconditions: "string",
+        attemptedApproach: "string",
+        observedFailure: "string",
+        rootCause: "string",
+        recovery: "string",
+        nonApplicableWhen: "string",
+    },
 };

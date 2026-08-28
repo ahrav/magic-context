@@ -232,17 +232,14 @@ describe("claim-current verify gate", () => {
             // The archive verdict for an anti-memory records outcome "stale"
             // and leaves the record lifecycle-active until its TTL lapses.
             // The gate must treat that as terminal, not as never-verified.
-            recordProjectMemoryVerification(
-                db,
-                { producer: "gate-test", operationKey: `demote-${anti}` },
-                {
-                    token: computeProjectMemoryMutationToken(db, anti),
-                    revisionLocator: `${anti}/r${claim.revision}/${claim.contentDigest}`,
-                    outcome: "stale",
-                    verifier: "gate-test",
-                    nowMs: 2_000,
-                },
-            );
+            //
+            // Written directly because the generic operation refuses this
+            // category: production records it through the typed staging path
+            // inside the verification transaction. What this test pins is how
+            // the gate READS a stale outcome, not how the event was produced.
+            db.prepare(
+                "INSERT INTO verification_events (revision_id, outcome, verifier, created_at) VALUES (?, 'stale', 'gate-test', ?)",
+            ).run(claim.currentRevisionId, 2_000);
             __setVerificationPathsTestHooks({
                 execFile: async () => Promise.reject(new Error("git unavailable")),
             });

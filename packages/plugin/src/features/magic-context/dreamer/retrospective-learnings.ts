@@ -5,6 +5,7 @@ import type {
 } from "../memory/claim-operation-contract";
 import {
     type AntiMemoryPayload,
+    normalizeAntiMemoryPayload,
     renderAntiMemoryContent,
     stageCreateAntiMemoryInCurrentTransaction,
 } from "../memory/storage-anti-memory";
@@ -25,12 +26,12 @@ import { insertUserMemoryCandidates } from "../user-memory/storage-user-memory";
 const FRUSTRATION_MARKER_REGEX =
     /\b(?:not what i asked|i already (?:said|told you|explained)|you (?:ignored|missed)|that'?s wrong|this is wrong|stop (?:doing|claiming|using)|(?:no|wrong|again|stop)(?:\W+\b(?:no|wrong|again|stop)\b)+)\b|[!?]{3,}/i;
 
-export type RetrospectiveLearningRoute = "memory" | "observation" | "anti_memory";
-
 export type ParsedRetrospectiveLearning =
     | { route: "memory"; content: string; category: MemoryCategory }
     | { route: "observation"; content: string }
     | { route: "anti_memory"; payload: AntiMemoryPayload };
+
+export type RetrospectiveLearningRoute = ParsedRetrospectiveLearning["route"];
 
 export interface RetrospectiveApplyResult {
     memoryWritten: number;
@@ -107,8 +108,17 @@ export function parseRetrospectiveLearnings(text: string): ParsedRetrospectiveLe
     return learnings;
 }
 
+/**
+ * Extract one child element's text.
+ *
+ * The open tag tolerates attributes and trailing whitespace (`<trigger >`,
+ * `<safer_alternative note="...">`) because a missed match on a REQUIRED field
+ * silently discards the whole learning at the caller, turning ordinary model
+ * formatting variance into lost memory. `\b` keeps the tolerance from matching a
+ * longer tag that merely starts with this name (`recovery` vs `recovery_plan`).
+ */
 function childText(inner: string, tag: string): string | null {
-    const match = inner.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, "i"));
+    const match = inner.match(new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}\\s*>`, "i"));
     if (!match) return null;
     const value = unescapeXml(match[1] ?? "")
         .replace(/\s+/g, " ")
@@ -218,20 +228,14 @@ export function applyRetrospectiveLearnings(args: {
         const dedupeKey = `${learning.route}:${category}:${content}`;
         if (seenContent.has(dedupeKey)) continue;
         seenContent.add(dedupeKey);
+        // Derive the privacy-gated field set from the normalized payload itself:
+        // a hand-kept field list fails OPEN when a payload field is added, letting
+        // unvalidated text reach a durable claim.
         const fields =
             learning.route === "anti_memory"
-                ? [
-                      learning.payload.trigger,
-                      learning.payload.rejectedStrategy,
-                      learning.payload.rejectionReason,
-                      learning.payload.saferAlternative,
-                      learning.payload.preconditions,
-                      learning.payload.attemptedApproach,
-                      learning.payload.observedFailure,
-                      learning.payload.rootCause,
-                      learning.payload.recovery,
-                      learning.payload.nonApplicableWhen,
-                  ].filter((value): value is string => typeof value === "string")
+                ? Object.values(normalizeAntiMemoryPayload(learning.payload)).filter(
+                      (value): value is string => typeof value === "string",
+                  )
                 : [content];
         const rejectReason = fields
             .map((field) => validateRetrospectiveLearningText(field, sourceUserTexts))
@@ -260,18 +264,9 @@ export function applyRetrospectiveLearnings(args: {
     for (const learning of args.learnings) {
         if (learning.route === "anti_memory") {
             manifest.push({
-                payload: {
-                    attemptedApproach: learning.payload.attemptedApproach ?? null,
-                    nonApplicableWhen: learning.payload.nonApplicableWhen ?? null,
-                    observedFailure: learning.payload.observedFailure ?? null,
-                    preconditions: learning.payload.preconditions ?? null,
-                    recovery: learning.payload.recovery ?? null,
-                    rejectedStrategy: learning.payload.rejectedStrategy,
-                    rejectionReason: learning.payload.rejectionReason,
-                    rootCause: learning.payload.rootCause ?? null,
-                    saferAlternative: learning.payload.saferAlternative ?? null,
-                    trigger: learning.payload.trigger,
-                },
+                // Normalization pins every payload field (absent optionals become
+                // null), so the manifest shape cannot drift from the payload type.
+                payload: { ...normalizeAntiMemoryPayload(learning.payload) },
                 route: learning.route,
             });
         } else {

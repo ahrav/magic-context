@@ -1227,9 +1227,9 @@
       "scope": "ctx_memory tool users",
       "polarity": "contract",
       "operativeCondition": "A fact must survive this session.",
-      "mechanism": "Create one durable project claim with category and content.",
+      "mechanism": "Create one durable project claim: content plus a positive category, or category REJECTED_APPROACH plus an antiMemory payload and no content.",
       "consequence": "Future sessions can use the memory without reconstructing this conversation.",
-      "evidence": "create a claim (content + category)"
+      "evidence": "create a claim (content + category, or antiMemory)"
     },
     {
       "id": "T-014",

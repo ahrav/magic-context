@@ -309,6 +309,7 @@ mod unix {
             Arc::new(DeterministicEngine),
             limits,
         )
+        .expect("fixture Synapse limits are valid")
     }
 
     #[derive(Deserialize)]
