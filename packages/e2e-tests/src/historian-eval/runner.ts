@@ -37,6 +37,7 @@ import {
     MAX_PADDING_TURNS,
     MIN_BUILD_TURNS,
     PROBE_CHOICE_SEPARATOR,
+    containsCompleteValue,
     matchesGold,
     scenarioFingerprint,
     triggerFingerprint,
@@ -114,6 +115,7 @@ export type RunErrorReason =
     | "run-never-fired"
     | "probe-envelope-malformed"
     | "probe-gold-uncovered"
+    | "probe-response-leak"
     | "probe-tool-use"
     | "harness-failure";
 
@@ -151,6 +153,45 @@ export interface HistorianRunArtifact {
      * than creating another.
      */
     promotionEvidenceAdded: number;
+}
+
+/**
+ * A later probe's gold answer stated in the text OUTSIDE this response's answer
+ * envelope, or null.
+ *
+ * `extractAnswerEnvelope` requires exactly one envelope and ignores everything
+ * around it, which is deliberate — a model that prefixes "Sure, here you go" has
+ * still answered, and failing the turn on that would convert ordinary chattiness
+ * into `probe-envelope-malformed`. But probes share one resumed session and probe
+ * turns are not compartment-covered, so an assistant reply stays raw in the
+ * history the NEXT probe reads. Commentary that happens to state a later probe's
+ * answer therefore hands it over, and no other gate covers it: `goldRangeLeak`
+ * searches for authored TRANSCRIPT text, and the freeze-time probe guards cannot
+ * know what the model will volunteer.
+ *
+ * Scoped to the answer's own envelope being excluded and to LATER probes only,
+ * for the same reasons the freeze-time guard is: this probe's own answer inside
+ * its envelope is the point of the exchange, and a probe already asked cannot be
+ * influenced by a reply that comes after it.
+ *
+ * Complete values, so a reply mentioning "4096" does not count as stating the
+ * answer "4".
+ */
+export function probeResponseLeak(args: {
+    probes: readonly Probe[];
+    probeIndex: number;
+    responseText: string | null;
+}): string | null {
+    const { probes, probeIndex, responseText } = args;
+    if (responseText === null) return null;
+    const outside = responseText.replace(/<answer>[\s\S]*?<\/answer>/g, " ");
+    for (const later of probes.slice(probeIndex + 1)) {
+        if (later.answerType === "claim-id") continue;
+        if (containsCompleteValue(outside, later.goldAnswer)) {
+            return `response text outside the answer envelope states ${JSON.stringify(later.goldAnswer)}, which is a later probe's (${later.id}) gold answer`;
+        }
+    }
+    return null;
 }
 
 export interface ProbeExchange {
@@ -1406,8 +1447,8 @@ class ScenarioRunner {
         // appearing in the run inventory. The declared schedule is the experiment,
         // so an extra pass invalidates the run rather than adding to it.
         const runRowsBefore = this.historianRunRows(harness, sessionId).length;
-        for (const probe of this.scenario.probes) {
-            exchanges.push(await this.driveProbe(harness, sessionId, probe));
+        for (const [probeIndex, probe] of this.scenario.probes.entries()) {
+            exchanges.push(await this.driveProbe(harness, sessionId, probe, probeIndex));
         }
         // Quiesce first. `startCompartmentAgent` launches asynchronously and
         // `compartment-runner-incremental` writes its `historian_runs` row in a
@@ -1435,7 +1476,12 @@ class ScenarioRunner {
         return exchanges;
     }
 
-    private async driveProbe(harness: TestHarness, sessionId: string, probe: Probe): Promise<ProbeExchange> {
+    private async driveProbe(
+        harness: TestHarness,
+        sessionId: string,
+        probe: Probe,
+        probeIndex: number,
+    ): Promise<ProbeExchange> {
         this.assertProbeGoldCovered(harness, sessionId, probe);
         const requestCountBefore = harness.mock.requests().length;
 
@@ -1444,6 +1490,12 @@ class ScenarioRunner {
         let responseText = first.responseText;
         const toolNames = new Set(first.toolNames);
         let reAsked = false;
+        // Every attempt's reply, not only the recorded one: a malformed first
+        // attempt is discarded as an answer but its text still lands in the session
+        // and reaches the next probe. The record keeps only the final reply, so
+        // replay can reapply this to that one alone — which is why the abort has to
+        // happen here, where both are in hand.
+        this.assertNoProbeResponseLeak(probe, probeIndex, first.responseText);
         if (answerRaw === null) {
             reAsked = true;
             const retry = await this.askProbe(
@@ -1454,6 +1506,7 @@ class ScenarioRunner {
             answerRaw = retry.answerRaw;
             responseText = retry.responseText;
             for (const name of retry.toolNames) toolNames.add(name);
+            this.assertNoProbeResponseLeak(probe, probeIndex, retry.responseText);
             if (answerRaw === null) {
                 throw new RunAbort("probe-envelope-malformed", `probe ${probe.id} answered without a valid envelope twice`);
             }
@@ -1611,6 +1664,11 @@ class ScenarioRunner {
      * could hide a real leak. Such a scenario keeps the unstripped search, which
      * can over-report but never conceals surviving raw text.
      */
+    private assertNoProbeResponseLeak(probe: Probe, probeIndex: number, responseText: string | null): void {
+        const leak = probeResponseLeak({ probes: this.scenario.probes, probeIndex, responseText });
+        if (leak !== null) throw new RunAbort("probe-response-leak", `probe ${probe.id}: ${leak}`);
+    }
+
     private assertNoGoldRangeLeak(probe: Probe, payloadText: string | null, probePrompt: string): void {
         const leak = goldRangeLeak({
             scenario: this.scenario,

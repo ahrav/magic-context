@@ -720,6 +720,43 @@ describe("lintScenario", () => {
         );
     });
 
+    test("rejects a probe gold answer the harness's own ballast emits", () => {
+        const raw = validScenarioRaw();
+        // "boundary" is in `ballastProse`'s word bank, so every filler, authored,
+        // padding, and spike turn states it. The post-epilogue padding sits in the
+        // protected tail, which is never compartment-covered and so never spliced
+        // out — the probe model can read the answer off raw history and PASS with
+        // the injected payload contributing nothing. Both runtime gates are scoped
+        // to the authored gold range and cannot see it.
+        (raw.probes as Record<string, unknown>[])[0].goldAnswer = "boundary";
+        const diagnostics = lintScenario(parseScenario(raw));
+        expect(diagnostics).toContain(
+            "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: occurs-in-harness-owned-text",
+        );
+    });
+
+    test("rejects a probe gold answer the harness's own turn text states", () => {
+        const raw = validScenarioRaw();
+        // Not only ballast: the runner's padding turns say "Housekeeping
+        // acknowledged." verbatim, and those turns are the protected tail.
+        (raw.probes as Record<string, unknown>[])[0].goldAnswer = "housekeeping";
+        const diagnostics = lintScenario(parseScenario(raw));
+        expect(diagnostics).toContain(
+            "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: occurs-in-harness-owned-text",
+        );
+    });
+
+    test("a gold answer merely contained in a harness word is not a collision", () => {
+        const raw = validScenarioRaw();
+        // The bank emits "session", never "sessio". Bare containment would refuse a
+        // legitimate answer here; the check matches complete values.
+        (raw.probes as Record<string, unknown>[])[0].goldAnswer = "sessio";
+        const diagnostics = lintScenario(parseScenario(raw));
+        expect(diagnostics).not.toContain(
+            "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: occurs-in-harness-owned-text",
+        );
+    });
+
     test("rejects a probe gold answer absent from its claim's source range", () => {
         const raw = validScenarioRaw();
         // Valid reference, unsupported answer: the frozen probe would reward a

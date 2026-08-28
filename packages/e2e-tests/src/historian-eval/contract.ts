@@ -844,7 +844,7 @@ export function matchesGold(
  * The boundary is letter-or-digit adjacency, so `"in-process lru"` still matches
  * inside a sentence while `"4"` no longer matches inside `"4096"`.
  */
-function containsCompleteValue(content: string, value: string): boolean {
+export function containsCompleteValue(content: string, value: string): boolean {
     const needle = normalizeContent(value);
     if (needle.length === 0) return false;
     const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -1070,6 +1070,48 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
         if (range === undefined) continue;
         if (!containsCompleteValue(range, probe.goldAnswer)) {
             diagnostics.push(`${label}.probes.${probe.id}.goldAnswer: not-authored-in-source-range`);
+        }
+    }
+
+    // The answer must also not be sitting in HARNESS-owned text. The runner wraps
+    // the authored transcript in filler, per-turn ballast, post-epilogue padding,
+    // and spike/kick turns, and `ballastProse` draws from a fixed word bank —
+    // "boundary", "session", "threshold", "snapshot", "budget" among them. A gold
+    // answer that collides with any of that, or with the harness's own turn text,
+    // is stated repeatedly in raw history, and the post-epilogue padding sits in
+    // the PROTECTED TAIL, which is never compartment-covered and therefore never
+    // spliced out. So the probe model can read the answer off recent raw history
+    // and PASS with the injected payload contributing nothing.
+    //
+    // Neither runtime gate covers this. `assertProbeGoldCovered` and
+    // `goldRangeLeak` are both scoped to the AUTHORED gold range — deliberately,
+    // since an uncovered non-gold tail is allowed to remain raw — so harness
+    // padding is outside what either inspects.
+    //
+    // Checked at freeze time because it is fully determined by the recipe:
+    // `ballastProse` output depends only on its token count, and the turn texts are
+    // constants. Complete values, so an answer of "4" is not reported merely
+    // because the bank emits "4096"-like digits. Choices are not checked — a
+    // distractor appearing in filler reveals no answer.
+    const ballast = ballastProse(scenario.trigger.ballastTokensPerTurn);
+    const harnessOwnedText = [
+        FILLER_TURN.user,
+        FILLER_TURN.assistant,
+        ballast,
+        // Padding and spike/kick turns, verbatim from `driveTranscript` and
+        // `driveHistorianRun`. Text only: which index each carries cannot change
+        // whether a word collides.
+        "Wrap-up housekeeping note 1.",
+        "Housekeeping acknowledged.",
+        "Continuing.",
+        "Acknowledged.",
+        "Please continue with step 1 of the plan.",
+        "Standing by.",
+    ].join(" ");
+    for (const probe of scenario.probes) {
+        if (probe.answerType === "claim-id") continue;
+        if (containsCompleteValue(harnessOwnedText, probe.goldAnswer)) {
+            diagnostics.push(`${label}.probes.${probe.id}.goldAnswer: occurs-in-harness-owned-text`);
         }
     }
 

@@ -16,6 +16,7 @@ import {
     carriesInjectedBlockTag,
     extractAnswerEnvelope,
     findOrdinalRange,
+    probeResponseLeak,
     runScenario,
     stripInjectedBlocks,
     type ScriptedHistorianMode,
@@ -79,6 +80,75 @@ describe("extractAnswerEnvelope: exactly one envelope", () => {
         // is non-null the runner would not re-ask.
         expect(extractAnswerEnvelope("<answer>correct</answer><answer>wrong</answer>")).toBeNull();
         expect(extractAnswerEnvelope("<answer>4096</answer>")).toBe("4096");
+    });
+});
+
+describe("probeResponseLeak", () => {
+    const probes = parseScenario(validScenarioRaw()).probes;
+    const capacityIndex = probes.findIndex((probe) => probe.id === "probe-capacity");
+    const storeIndex = probes.findIndex((probe) => probe.id === "probe-store");
+
+    test("prose outside the envelope that states a later probe's answer is a leak", () => {
+        // Probes share one resumed session and probe turns are never
+        // compartment-covered, so this commentary stays raw in the history
+        // probe-store reads — and it hands over that probe's gold answer.
+        expect(
+            probeResponseLeak({
+                probes,
+                probeIndex: capacityIndex,
+                responseText: "<answer>4096</answer> For context, sessions are backed by the in-process lru cache.",
+            }),
+        ).toContain("probe-store");
+    });
+
+    test("an answer inside the envelope is not a leak, however chatty the reply", () => {
+        // The envelope is the point of the exchange, and refusing ordinary preamble
+        // would turn model chattiness into `probe-envelope-malformed`.
+        expect(
+            probeResponseLeak({
+                probes,
+                probeIndex: capacityIndex,
+                responseText: "Sure, happy to help.\n<answer>4096</answer>\nLet me know if you need more.",
+            }),
+        ).toBeNull();
+    });
+
+    test("a later probe's own answer inside its envelope is not a leak", () => {
+        // probe-store answering with its own gold value is a correct answer, not a
+        // leak: only the surrounding prose is searched.
+        expect(
+            probeResponseLeak({
+                probes,
+                probeIndex: storeIndex,
+                responseText: "<answer>in-process lru</answer>",
+            }),
+        ).toBeNull();
+    });
+
+    test("stating an EARLIER probe's answer is not a leak", () => {
+        // probe-capacity was already asked, so a later reply cannot influence it.
+        expect(
+            probeResponseLeak({
+                probes,
+                probeIndex: storeIndex,
+                responseText: "<answer>in-process lru</answer> The capacity was 4096, as established earlier.",
+            }),
+        ).toBeNull();
+    });
+
+    test("a complete value is required, not a substring", () => {
+        // "4096" contains "4"; a reply that mentions 4096 does not state an answer
+        // of "4". Guards the same boundary `containsCompleteValue` exists for.
+        const withShortAnswer = probes.map((probe) =>
+            probe.id === "probe-store" ? { ...probe, answerType: "exact" as const, goldAnswer: "4", sourceClaimRef: "exp-lru-cache" } : probe,
+        );
+        expect(
+            probeResponseLeak({
+                probes: withShortAnswer,
+                probeIndex: capacityIndex,
+                responseText: "<answer>x</answer> the configured capacity is 4096 entries",
+            }),
+        ).toBeNull();
     });
 });
 

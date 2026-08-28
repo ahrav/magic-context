@@ -48,6 +48,7 @@ import {
     buildProbePrompt,
     extractAnswerEnvelope,
     goldRangeLeak,
+    probeResponseLeak,
     rangeCoveredByCompartments,
 } from "./runner";
 import type {
@@ -1449,6 +1450,31 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
                     `probe ${exchange.probeId}: recorded answer ${JSON.stringify(exchange.answerRaw)} is not what its recorded response yields (${JSON.stringify(extracted)})`,
                     record.system,
                 );
+            }
+            // The runner's response-leak gate, reapplied to the recorded reply.
+            // Commentary outside the envelope stays raw in the shared session, so a
+            // reply that volunteers a later probe's answer hands it over — and a
+            // stored record never passes through the live gate, so a copied or older
+            // artifact would score that later probe's PASS from the leak.
+            //
+            // Indexed by the SCENARIO's probe order, not the record's array order:
+            // the runner asks in scenario order, and that order is what decides
+            // which probes could still read this reply.
+            const probeIndex = scenario.probes.findIndex((probe) => probe.id === exchange.probeId);
+            if (probeIndex !== -1) {
+                const responseLeak = probeResponseLeak({
+                    probes: scenario.probes,
+                    probeIndex,
+                    responseText: exchange.responseText,
+                });
+                if (responseLeak !== null) {
+                    return errorScore(
+                        record.scenarioId,
+                        "probe-response-leak",
+                        `probe ${exchange.probeId}: ${responseLeak}`,
+                        record.system,
+                    );
+                }
             }
         }
 

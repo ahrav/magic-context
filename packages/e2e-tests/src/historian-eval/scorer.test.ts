@@ -1203,6 +1203,56 @@ describe("scoreRunRecord", () => {
         }
     });
 
+    test("a recorded reply that volunteers a later probe's answer is refused on replay", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = validScenario();
+            const record = makeRecord(fixture, scenario);
+            // probe-capacity answers correctly, then volunteers probe-store's gold
+            // value outside the envelope. Probe turns are never compartment-covered,
+            // so that prose is raw history for probe-store — whose PASS would then
+            // be a copy. `answerRaw` still matches the extraction, so the
+            // reproducibility check above cannot catch it.
+            record.probes = record.probes.map((exchange) =>
+                exchange.probeId === "probe-capacity"
+                    ? {
+                          ...exchange,
+                          answerRaw: "4096",
+                          responseText: "<answer>4096</answer> For context, sessions are backed by the in-process lru cache.",
+                      }
+                    : exchange,
+            );
+            const score = scoreRunRecord(record, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("probe-response-leak");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("a chatty recorded reply that leaks nothing still scores", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = validScenario();
+            const record = makeRecord(fixture, scenario);
+            // Preamble and sign-off around the envelope are ordinary model
+            // behaviour; refusing them would convert chattiness into an ERROR.
+            record.probes = record.probes.map((exchange) =>
+                exchange.probeId === "probe-capacity"
+                    ? {
+                          ...exchange,
+                          answerRaw: "4096",
+                          responseText: "Sure, happy to help.\n<answer>4096</answer>\nLet me know if you need anything else.",
+                      }
+                    : exchange,
+            );
+            const score = scoreRunRecord(record, scenario);
+            expect(score.verdict).toBe("PASS");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
     test("a record declaring a non-TS parser is refused", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {
