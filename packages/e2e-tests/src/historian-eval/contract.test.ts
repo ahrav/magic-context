@@ -12,7 +12,6 @@ import {
     MAX_TRANSCRIPT_TURNS,
     MAX_TURN_TEXT_CHARS,
     buildReleaseTuple,
-    effectiveTriggerUsageTokens,
     lintScenario,
     normalizeContent,
     parseManifest,
@@ -357,6 +356,21 @@ describe("parseScenario", () => {
 });
 
 describe("gold and probe freeze guards", () => {
+    test("rejects two claim-id probes on one claim, whose runtime answer is identical", () => {
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Record<string, unknown>[];
+        // Both answer with the same public claim id, so the earlier exchange hands
+        // the later probe its answer verbatim — and both answer surfaces are empty,
+        // which is why the surface comparison alone exempted this pair.
+        probes.push({
+            id: "probe-claim-again",
+            question: "Which claim id records the cache architecture?",
+            answerType: "claim-id",
+            expectedClaimRef: "exp-lru-cache",
+        });
+        expect(() => parseScenario(raw)).toThrow(/shared-answer-surface/);
+    });
+
     test("rejects two probes on one claim whose answer surfaces overlap", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];
@@ -430,17 +444,6 @@ describe("gold and probe freeze guards", () => {
 });
 
 describe("lintScenario", () => {
-    test("threshold ordering is measured on effective usage, including cache-write tokens", () => {
-        const raw = validScenarioRaw();
-        // 25% of the limit as a declared number, but the lane reports it as both
-        // input and cache-write and production sums them, so the build turn
-        // actually runs at 50% and crosses the threshold.
-        (raw.trigger as Record<string, unknown>).usageTokensPerTurn = 50_000;
-        expect(effectiveTriggerUsageTokens(50_000)).toBe(100_000);
-        const diagnostics = lintScenario(parseScenario(raw));
-        expect(diagnostics.some((entry) => entry.includes("build-turn-crosses-threshold"))).toBe(true);
-    });
-
     test("flags a trigger recipe whose build turns cross the execution threshold", () => {
         const raw = validScenarioRaw();
         // 50% of the context limit on every ordinary turn: the historian would

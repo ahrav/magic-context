@@ -140,6 +140,15 @@ export interface HistorianRunArtifact {
     factsEmitted: number;
     chunkStartOrdinal: number | null;
     chunkEndOrdinal: number | null;
+    /**
+     * Claims under the scenario's project that this run added.
+     *
+     * Recorded per run because a scenario-wide count cannot separate them: run 1
+     * promoting successfully leaves the total non-zero, so run 2's silently
+     * skipped promotion passes the plumbing guard and its missing fact is then
+     * charged to historian recall instead.
+     */
+    claimsAdded: number;
 }
 
 export interface ProbeExchange {
@@ -618,6 +627,14 @@ class ScenarioRunner {
     ) {}
 
     async run(): Promise<HistorianEvalRunRecord> {
+        // Resolve the checkout identity BEFORE anything is written. The DB
+        // snapshot and logs land in `artifactDir`, which may sit inside the
+        // checkout, so they would be untracked files feeding the dirty-worktree
+        // digest — making two runs from the same clean commit record different
+        // SHAs, and making the value depend on where in the flow `baseRecord()`
+        // happened to be reached first. Cached per process, so this call fixes it
+        // for every later reader.
+        resolveRepoCommitSha();
         const recordPath = join(this.options.artifactDir, "run-record.json");
         if (existsSync(recordPath)) {
             // Fresh-environment invariant (KTD9): a reused attempt directory
@@ -1041,6 +1058,7 @@ class ScenarioRunner {
         const trigger = this.scenario.trigger;
         const invocationsBefore = this.countHistorianInvocations(harness, sessionId);
         const markerHitsBefore = this.historianMarkerMockHits;
+        const claimsBefore = this.scopedClaimCount(harness);
 
         await this.scriptedTurn(
             harness,
@@ -1154,7 +1172,36 @@ class ScenarioRunner {
             factsEmitted: row.facts_emitted ?? 0,
             chunkStartOrdinal: row.chunk_start_ordinal,
             chunkEndOrdinal: row.chunk_end_ordinal,
+            claimsAdded: Math.max(0, this.scopedClaimCount(harness) - claimsBefore),
         };
+    }
+
+    /**
+     * Claims under the scenario's project identity.
+     *
+     * Scoped, not global: the verification bridge and the authoritative claim read
+     * are both scoped this way, so claims promoted under a different identity would
+     * satisfy a global count while leaving those reads empty.
+     */
+    private scopedClaimCount(harness: TestHarness): number {
+        const db = openTestDb(harness.contextDbPath(), { readonly: true });
+        try {
+            const projectIds = resolveProjectIdsForIdentities(db, [
+                resolveProjectIdentity(harness.opencode.env.workdir),
+            ]);
+            if (projectIds.length === 0) return 0;
+            return (
+                (
+                    db
+                        .prepare(
+                            `SELECT COUNT(*) AS n FROM claims WHERE project_id IN (${projectIds.map(() => "?").join(", ")})`,
+                        )
+                        .get(...projectIds) as { n: number } | null
+                )?.n ?? 0
+            );
+        } finally {
+            db.close();
+        }
     }
 
     private historianRunRows(
@@ -1297,6 +1344,21 @@ class ScenarioRunner {
         sessionId: string,
         runs: HistorianRunArtifact[],
     ): void {
+        // Per run, not scenario-wide. A run that emitted facts without discarding
+        // its provisional tail must have changed the claim state; checking only
+        // whether the scenario ended with any claims lets an earlier success mask a
+        // later run's lost promotion.
+        const lostPromotion = runs.filter(
+            (run) => !run.discardedLast && run.factsEmitted > 0 && run.claimsAdded === 0,
+        );
+        if (lostPromotion.length > 0) {
+            throw new RunAbort(
+                "no-op-promotion",
+                lostPromotion
+                    .map((run) => `run ${run.runIndex} emitted ${run.factsEmitted} fact(s) but added no claim`)
+                    .join("; "),
+            );
+        }
         const totalFacts = runs
             .filter((run) => !run.discardedLast)
             .reduce((sum, run) => sum + run.factsEmitted, 0);
@@ -1308,29 +1370,7 @@ class ScenarioRunner {
             // session-directory or identity-normalization drift — satisfy a global
             // count while leaving those reads empty. The scorer would then report
             // FAIL:recall, charging a project-routing fault to the historian.
-            // Opened through `openTestDb` rather than `harness.contextDb()`:
-            // `resolveProjectIdsForIdentities` is a production reader and takes the
-            // plugin's Database type, which the harness handle is not.
-            const db = openTestDb(harness.contextDbPath(), { readonly: true });
-            let claimCount: number;
-            try {
-                const projectIds = resolveProjectIdsForIdentities(db, [
-                    resolveProjectIdentity(harness.opencode.env.workdir),
-                ]);
-                claimCount =
-                    projectIds.length === 0
-                        ? 0
-                        : ((
-                              db
-                                  .prepare(
-                                      `SELECT COUNT(*) AS n FROM claims WHERE project_id IN (${projectIds.map(() => "?").join(", ")})`,
-                                  )
-                                  .get(...projectIds) as { n: number } | null
-                          )?.n ?? 0);
-            } finally {
-                db.close();
-            }
-            if (claimCount === 0) {
+            if (this.scopedClaimCount(harness) === 0) {
                 throw new RunAbort(
                     "no-op-promotion",
                     `${totalFacts} fact(s) emitted across runs but zero claims reached the store`,

@@ -542,6 +542,14 @@ export function parseScenario(raw: unknown, label = "scenario"): HistorianEvalSc
             const leftRef = left.answerType === "claim-id" ? left.expectedClaimRef : left.sourceClaimRef;
             const rightRef = right.answerType === "claim-id" ? right.expectedClaimRef : right.sourceClaimRef;
             if (leftRef !== rightRef) continue;
+            // Two claim-id probes on one claim have EMPTY answer surfaces and the
+            // identical runtime answer — the same public id — so the surface
+            // comparison alone would exempt the most direct copy of all.
+            if (left.answerType === "claim-id" && right.answerType === "claim-id") {
+                fail(
+                    `${label}.probes: shared-answer-surface (${left.id} and ${right.id} both resolve ${leftRef} to the same runtime claim id)`,
+                );
+            }
             const leftSurface = answerSurface(left);
             const rightSurface = answerSurface(right);
             const shared = leftSurface.filter((value) => rightSurface.includes(value));
@@ -836,25 +844,20 @@ function evidenceText(scenario: HistorianEvalScenario, startTurn: number, endTur
 /**
  * Token usage the lane reports for one transcript turn carrying `tokens`.
  *
- * The count is reported as BOTH input and cache-write, and production's usage
- * path sums input, cache-read, and cache-write — so a turn's effective pressure
- * against the execution threshold is twice its declared number. This lives
- * beside the threshold, and the runner builds its usage from it, because the
- * freeze lint has to validate recipes against the pressure the runs actually
- * produce: a second copy of this shape in the runner is exactly how a
- * lint-clean recipe starts crossing the threshold on its build turns.
+ * The count is reported as BOTH input and cache-write. Owned here, and built from
+ * here by the runner, so the shape has one definition rather than a literal
+ * repeated at each usage site.
+ *
+ * It does NOT follow that the threshold sees twice the declared number: the
+ * percentage the protected-tail boundary consumes matches the declared count, as
+ * the harness suite demonstrates, so the lint's threshold math uses the declared
+ * value.
  */
 export function triggerTurnUsage(tokens: number): {
     input_tokens: number;
     cache_creation_input_tokens: number;
 } {
     return { input_tokens: tokens, cache_creation_input_tokens: tokens };
-}
-
-/** Threshold-relevant total of `triggerTurnUsage`, per production's summation. */
-export function effectiveTriggerUsageTokens(tokens: number): number {
-    const usage = triggerTurnUsage(tokens);
-    return usage.input_tokens + usage.cache_creation_input_tokens;
 }
 
 /**
@@ -1035,12 +1038,13 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
     // during filler or authored turns, before `driveHistorianRun` starts
     // counting, while a spike below it never launches and the scenario ends as
     // `run-never-fired`.
-    // Measured on EFFECTIVE usage, not the declared number: a turn's count is
-    // reported as both input and cache-write and production sums them, so a
-    // recipe between 20% and 40% of the limit reads as a safe build turn while
-    // actually crossing the threshold. See `triggerTurnUsage`.
+    // Declared tokens over the declared limit. An earlier revision doubled these
+    // on the theory that production sums input and cache-write, which the tail
+    // target above refutes: the boundary that consumes this same
+    // `usagePercentage` matches the declared value, so doubling here would reject
+    // recipes whose build turns are genuinely below the threshold.
     const thresholdPercentage = (tokens: number): number =>
-        (effectiveTriggerUsageTokens(tokens) / scenario.trigger.modelContextLimit) * 100;
+        (tokens / scenario.trigger.modelContextLimit) * 100;
     const buildPercentage = thresholdPercentage(scenario.trigger.usageTokensPerTurn);
     const spikePercentage = thresholdPercentage(scenario.trigger.spikeUsageTokens);
     if (buildPercentage >= EXECUTE_THRESHOLD_PERCENTAGE) {
@@ -1060,6 +1064,13 @@ export function lintScenario(scenario: HistorianEvalScenario): string[] {
     // ballast against a large tail target cannot build the tail it needs — and the
     // symptom is an unrelated-looking `run-never-fired` or `probe-gold-uncovered`
     // rather than anything naming the recipe.
+    // The DECLARED spike percentage, not a doubled "effective" one. The runner
+    // passes the same value and the harness suite is the evidence: doubling it
+    // moves this target from 13,200 to 6,400 tokens for the canonical recipe,
+    // which drops the padding from ten turns to six, and the historian's chunk
+    // then stops short of the authored gold — `probe-gold-uncovered` on scenarios
+    // that pass with the declared value. Whatever production sums elsewhere, the
+    // percentage that predicts THIS boundary is the declared one.
     const tailTarget = deriveProtectedTailTokenTarget({
         contextLimit: scenario.trigger.modelContextLimit,
         executeThresholdPercentage: EXECUTE_THRESHOLD_PERCENTAGE,

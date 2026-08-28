@@ -26,6 +26,7 @@ import {
 import { appendCompartments } from "../../../plugin/src/features/magic-context/compartment-storage";
 import { promoteSessionFactsDurable } from "../../../plugin/src/features/magic-context/memory/promotion";
 import { getProjectMemoryClaimByPublicId } from "../../../plugin/src/features/magic-context/memory/storage-claim-operations";
+import { resolveProjectIdsForIdentities } from "../../../plugin/src/features/magic-context/memory/storage-claim-current-state";
 import { createClaimReaderTestDatabase } from "../../../plugin/src/features/magic-context/test-claim-database";
 import { canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { openTestDb } from "../test-db";
@@ -557,11 +558,75 @@ function recordShapeError(record: HistorianEvalRunRecord): ScenarioScore | null 
     if (typeof record.sessionId !== "string") problems.push("sessionId");
     if (typeof record.projectIdentity !== "string") problems.push("projectIdentity");
     if (typeof record.nowMs !== "number" || !Number.isFinite(record.nowMs)) problems.push("nowMs");
-    if (record.system === null || typeof record.system !== "object") problems.push("system");
+    if (
+        record.system === null ||
+        typeof record.system !== "object" ||
+        typeof record.system.repoCommitSha !== "string" ||
+        typeof record.system.historianModelId !== "string" ||
+        typeof record.system.probeModelId !== "string" ||
+        typeof record.system.parserImpl !== "string" ||
+        !(record.system.chunkTokenBudget === null || typeof record.system.chunkTokenBudget === "number")
+    ) {
+        problems.push("system");
+    }
     if (typeof record.expectedHistorianRuns !== "number") problems.push("expectedHistorianRuns");
-    if (!Array.isArray(record.historianRuns)) problems.push("historianRuns");
-    if (!Array.isArray(record.probes)) problems.push("probes");
-    if (!Array.isArray(record.injectedClaims)) problems.push("injectedClaims");
+    // Nested entries too: a container check alone leaves `historianRuns: [null]`
+    // to throw on the first field dereference, which is the same lane-aborting
+    // failure one level down.
+    if (!Array.isArray(record.historianRuns)) {
+        problems.push("historianRuns");
+    } else if (
+        !record.historianRuns.every(
+            (run) =>
+                run !== null &&
+                typeof run === "object" &&
+                typeof run.runIndex === "number" &&
+                typeof run.status === "string" &&
+                typeof run.discardedLast === "boolean" &&
+                typeof run.emittedCompartments === "number" &&
+                typeof run.persistedCompartments === "number" &&
+                typeof run.factsEmitted === "number" &&
+                (run.failureReason === null || typeof run.failureReason === "string") &&
+                (run.lookaheadMargin === null || typeof run.lookaheadMargin === "number") &&
+                (run.chunkStartOrdinal === null || typeof run.chunkStartOrdinal === "number") &&
+                (run.chunkEndOrdinal === null || typeof run.chunkEndOrdinal === "number"),
+        )
+    ) {
+        problems.push("historianRuns[]");
+    }
+    if (!Array.isArray(record.probes)) {
+        problems.push("probes");
+    } else if (
+        !record.probes.every(
+            (exchange) =>
+                exchange !== null &&
+                typeof exchange === "object" &&
+                typeof exchange.probeId === "string" &&
+                (exchange.answerRaw === null || typeof exchange.answerRaw === "string") &&
+                (exchange.payloadText === null || typeof exchange.payloadText === "string") &&
+                (exchange.responseText === null || typeof exchange.responseText === "string") &&
+                Array.isArray(exchange.injectedRevisionLocators) &&
+                exchange.injectedRevisionLocators.every((locator) => typeof locator === "string"),
+        )
+    ) {
+        problems.push("probes[]");
+    }
+    if (!Array.isArray(record.injectedClaims)) {
+        problems.push("injectedClaims");
+    } else if (
+        !record.injectedClaims.every(
+            (claim) =>
+                claim !== null &&
+                typeof claim === "object" &&
+                typeof claim.publicClaimId === "string" &&
+                typeof claim.revisionLocator === "string" &&
+                typeof claim.content === "string" &&
+                typeof claim.category === "string" &&
+                typeof claim.revision === "number",
+        )
+    ) {
+        problems.push("injectedClaims[]");
+    }
     if (!Array.isArray(record.authoredTurnOrdinals) || !record.authoredTurnOrdinals.every(isPair)) {
         problems.push("authoredTurnOrdinals");
     }
@@ -868,8 +933,21 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
         // rows at all, which is the case this separates out.
         let absent: string[];
         try {
+            // Existence AND ownership. A globally-present row is not evidence the
+            // claim was ever on this scenario's injection surface: a real claim
+            // from another project can be appended with its true public id,
+            // locator, content, and category, and it is never compared because the
+            // reverse and divergence checks iterate `visible`. Its locator in a
+            // probe set would then let `compareProbeAnswer` accept a claim that was
+            // never injected. Ownership is the discriminator that still admits a
+            // claim of THIS project hidden at the read clock by expiry or
+            // supersession.
+            const ownProjectIds = new Set(resolveProjectIdsForIdentities(db, [record.projectIdentity]));
             absent = record.injectedClaims
-                .filter((claim) => getProjectMemoryClaimByPublicId(db, claim.publicClaimId) === null)
+                .filter((claim) => {
+                    const ref = getProjectMemoryClaimByPublicId(db, claim.publicClaimId);
+                    return ref === null || !ownProjectIds.has(ref.projectId);
+                })
                 .map((claim) => claim.publicClaimId);
         } catch (error) {
             return errorScore(
@@ -883,7 +961,7 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
             return errorScore(
                 record.scenarioId,
                 "record-snapshot-mismatch",
-                `run record names ${absent.length} injected claim(s) with no row in its snapshot: [${absent.slice(0, 5).join(", ")}]`,
+                `run record names ${absent.length} injected claim(s) absent from its snapshot or owned by another project: [${absent.slice(0, 5).join(", ")}]`,
                 record.system,
             );
         }
@@ -1118,11 +1196,16 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
         // to the gold value turns a probe FAIL into a PASS.
         for (const exchange of record.probes) {
             if (exchange.responseText === null) {
-                if (!scriptedProbes) continue;
+                // Required in BOTH modes, unlike the captured payload. `askProbe`
+                // records this for every route and extracts `answerRaw` from it,
+                // and two unextractable replies abort the run — so a completed
+                // exchange cannot legitimately lack it, and exempting live records
+                // would leave `answerRaw` unfalsifiable exactly where the payload
+                // gate is already absent.
                 return errorScore(
                     record.scenarioId,
                     "harness-failure",
-                    `probe ${exchange.probeId}: scripted record carries no response text, so its answer cannot be checked`,
+                    `probe ${exchange.probeId}: record carries no response text, so its answer cannot be checked`,
                     record.system,
                 );
             }

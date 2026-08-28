@@ -153,6 +153,9 @@ function goldenRun(overrides: Partial<HistorianRunArtifact> = {}): HistorianRunA
         factsEmitted: 2,
         chunkStartOrdinal: 1,
         chunkEndOrdinal: 20,
+        // A promoting run changed the claim state; the runner records the delta
+        // per run so a later run's lost promotion is not masked by an earlier one.
+        claimsAdded: 2,
         ...overrides,
     };
     // A discarding run emitted one more compartment than it persisted, which is
@@ -970,6 +973,42 @@ describe("scoreRunRecord", () => {
             );
             expect(score.verdict).toBe("ERROR");
             expect(score.errorReason).toBe("unreadable-snapshot");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("a malformed nested entry is one ERROR, not a thrown lane abort", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario);
+            // A container check alone leaves this to throw on the first field
+            // dereference inside the inventory check.
+            const nested = { ...record, historianRuns: [null] } as unknown as HistorianEvalRunRecord;
+            const score = scoreRunRecord(nested, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("record-malformed");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("a record missing its probe response text is a harness failure in either mode", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = validScenario();
+            const record = makeRecord(fixture, scenario);
+            const liveRecord = {
+                ...record,
+                system: { ...record.system, probeModelId: "anthropic/claude-sonnet-4-5" },
+                probes: record.probes.map((exchange, index) =>
+                    index === 0 ? { ...exchange, responseText: null } : exchange,
+                ),
+            };
+            const score = scoreRunRecord(liveRecord, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("harness-failure");
         } finally {
             fixture.cleanup();
         }
