@@ -453,6 +453,41 @@ export function stripInjectedBlocks(text: string): string {
 }
 
 /**
+ * The compartment-derived injected surfaces: historian-authored summary text a
+ * probe can read, as distinct from `<project-memory>`, which carries the claims.
+ *
+ * The split matters for trimming attribution. A probe is told it may answer from
+ * project memory AND session history, so a gold claim missing from the claim
+ * surface does not make the probe unanswerable — the same fact can still be stated
+ * in a compartment summary. Keeping those tags in one list keeps that judgement
+ * from being made against an ad-hoc subset.
+ */
+export const COMPARTMENT_BLOCK_TAGS = [
+    "session-history",
+    "session-history-since",
+    "new-compartments",
+    "memory-mural",
+] as const satisfies readonly (typeof INJECTED_BLOCK_TAGS)[number][];
+
+/**
+ * Concatenated contents of the given injected blocks, or "" when none appear.
+ *
+ * The inverse of `stripInjectedBlocks` and subject to the same limitation: a block
+ * whose closing tag budget trimming removed does not match, so its contents are
+ * absent here. For a trimming judgement that is the safe direction — an
+ * unreadable surface is not counted as evidence the probe was answerable.
+ */
+export function injectedBlockContents(text: string, tags: readonly string[]): string {
+    const chunks: string[] = [];
+    for (const tag of tags) {
+        for (const match of text.matchAll(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, "g"))) {
+            chunks.push(match[1]);
+        }
+    }
+    return chunks.join("\n");
+}
+
+/**
  * Whether text opens or closes an injected-block tag itself.
  *
  * `stripInjectedBlocks` treats every matching tag span as injected, which an

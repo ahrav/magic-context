@@ -43,11 +43,13 @@ import {
 import { promotionEvidenceCount, readInjectedClaims } from "./claim-read";
 import { verifyAllActiveClaims } from "./verification-bridge";
 import {
+    COMPARTMENT_BLOCK_TAGS,
     RUN_RECORD_SCHEMA,
     authoredTurnOrdinalsFor,
     buildProbePrompt,
     extractAnswerEnvelope,
     goldRangeLeak,
+    injectedBlockContents,
     probeResponseLeak,
     rangeCoveredByCompartments,
 } from "./runner";
@@ -293,7 +295,31 @@ export function compareProbeAnswer(args: {
     if (goldClaim !== null) {
         const promoted = claimsMatchingGold(goldClaim, injectedClaims);
         if (promoted.length > 0 && promoted.every((item) => !injectedLocators.has(item.revisionLocator))) {
-            return { probeId: probe.id, outcome: "error-trimmed", expected, actual: exchange.answerRaw };
+            // The claim surface is not the only surface the probe may use. The prompt
+            // says "project memory AND session history", and the injection splices
+            // compartment-derived blocks alongside `<project-memory>` — so a gold fact
+            // the claim budget dropped can still be stated in a compartment summary the
+            // probe read. Calling that `error-trimmed` takes an ANSWERABLE model miss
+            // out of scored metrics.
+            //
+            // Searched in the compartment blocks only, not the whole payload. A
+            // predicate like "4096" can appear incidentally in prompt text, ordinals,
+            // or filler, and a false "answerable" here converts an infrastructure
+            // ERROR into a model FAIL — the R6 violation in reverse. Historian-authored
+            // summary text is the surface whose match actually means the fact was
+            // available.
+            //
+            // A payload-less exchange keeps `error-trimmed`: live routes cannot capture
+            // the request, so there is no evidence the fact was reachable, and assuming
+            // it was would charge the model on an absence of proof. That is the same
+            // live-mode capture gap the replayed leak gate already carries.
+            const compartmentSurface =
+                exchange.payloadText === null
+                    ? ""
+                    : injectedBlockContents(exchange.payloadText, COMPARTMENT_BLOCK_TAGS);
+            if (!predicateMatches(goldClaim.predicate, compartmentSurface)) {
+                return { probeId: probe.id, outcome: "error-trimmed", expected, actual: exchange.answerRaw };
+            }
         }
     }
     return { probeId: probe.id, outcome: "fail", expected, actual: exchange.answerRaw };

@@ -1772,6 +1772,57 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
         ).toBe("fail");
     });
 
+    test("a trimmed claim whose fact a compartment still states is a model FAIL, not trimmed", () => {
+        const probe = scenario.probes[0];
+        // The claim budget dropped the capacity claim, but the injected compartment
+        // summary states the fact — and the prompt tells the probe it may answer from
+        // session history. The probe was answerable, so a wrong answer is the model's
+        // miss; `error-trimmed` would take it out of scored metrics.
+        const verdict = compareProbeAnswer({
+            probe,
+            exchange: {
+                ...exchange(probe.id, "wrong", ["loc-lru01"]),
+                payloadText:
+                    "<new-compartments>\nCache decision: capacity set to 4096 entries.\n</new-compartments>",
+            },
+            scenario,
+            injectedClaims: injected,
+        });
+        expect(verdict.outcome).toBe("fail");
+    });
+
+    test("a trimmed claim absent from every compartment stays error-trimmed", () => {
+        const probe = scenario.probes[0];
+        // Same trim, but no injected surface carries the fact — the probe genuinely
+        // could not answer, which is an injection-budget loss and not model quality.
+        const verdict = compareProbeAnswer({
+            probe,
+            exchange: {
+                ...exchange(probe.id, "wrong", ["loc-lru01"]),
+                payloadText: "<new-compartments>\nCache decision: Redis was rejected.\n</new-compartments>",
+            },
+            scenario,
+            injectedClaims: injected,
+        });
+        expect(verdict.outcome).toBe("error-trimmed");
+    });
+
+    test("the fact stated only in the claim surface does not make a trimmed probe answerable", () => {
+        const probe = scenario.probes[0];
+        // `<project-memory>` is the surface the trim removed the claim FROM. Searching
+        // it would read the block's own contents as proof the trim did not happen.
+        const verdict = compareProbeAnswer({
+            probe,
+            exchange: {
+                ...exchange(probe.id, "wrong", ["loc-lru01"]),
+                payloadText: "<project-memory>\nmem-cap01: Session cache capacity is 4096 entries.\n</project-memory>",
+            },
+            scenario,
+            injectedClaims: injected,
+        });
+        expect(verdict.outcome).toBe("error-trimmed");
+    });
+
     test("miss whose gold claim was promoted but not injected is error-trimmed, excluded from rates", () => {
         const probe = scenario.probes[0];
         const verdict = compareProbeAnswer({
