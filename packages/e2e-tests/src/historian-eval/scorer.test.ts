@@ -158,12 +158,14 @@ function makeRecord(
     overrides: Partial<HistorianEvalRunRecord> = {},
 ): HistorianEvalRunRecord {
     const locators = fixture.injectedClaims.map((claim) => claim.revisionLocator);
-    const maxPersistedEnd =
-        (
-            fixture.db
-                .prepare("SELECT MAX(end_message) AS m FROM compartments WHERE session_id = ?")
-                .get(SESSION_ID) as { m: number | null } | null
-        )?.m ?? null;
+    // Ordered ends, so a run's chunk bound can be normalized against the prefix
+    // that existed after IT — the way the runner records the margin — rather than
+    // against the session's final maximum.
+    const compartmentEnds = (
+        fixture.db
+            .prepare("SELECT end_message AS endMessage FROM compartments WHERE session_id = ? ORDER BY sequence ASC")
+            .all(SESSION_ID) as Array<{ endMessage: number }>
+    ).map((row) => row.endMessage);
     const probes: ProbeExchange[] = scenario.probes.map((probe) => {
         let answerRaw = "4096";
         if (probe.answerType === "multiple-choice") answerRaw = probe.goldAnswer;
@@ -242,13 +244,15 @@ function makeRecord(
         error: null,
         ...overrides,
       } satisfies HistorianEvalRunRecord;
+      let persistedSoFar = 0;
       return {
           ...draft,
-          historianRuns: draft.historianRuns.map((run) =>
-              run.lookaheadMargin === null || maxPersistedEnd === null
-                  ? run
-                  : { ...run, chunkEndOrdinal: maxPersistedEnd + run.lookaheadMargin },
-          ),
+          historianRuns: draft.historianRuns.map((run) => {
+              persistedSoFar += run.persistedCompartments;
+              const prefix = compartmentEnds.slice(0, persistedSoFar);
+              if (run.lookaheadMargin === null || prefix.length === 0) return run;
+              return { ...run, chunkEndOrdinal: Math.max(...prefix) + run.lookaheadMargin };
+          }),
       };
     }
 }
@@ -917,6 +921,36 @@ describe("scoreRunRecord", () => {
                 ],
             });
             expect(scoreRunRecord(invalid, scenario).verdict).not.toBe("ERROR");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("a two-run artifact whose later run persists a further compartment is not a mismatch", () => {
+        // Run 1's margin was recorded against the compartments that existed then
+        // (prefix max 12); run 2's against the full set (max 20). Reconstructing
+        // both from the snapshot's FINAL maximum makes run 1's expected margin
+        // -8 and rejects a valid artifact.
+        const fixture = makeSnapshot({
+            facts: goldFacts(),
+            compartments: [
+                { start: 1, end: 12 },
+                { start: 13, end: 20 },
+            ],
+        });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario, {
+                historianRuns: [
+                    goldenRun({ persistedCompartments: 1, lookaheadMargin: 0 }),
+                    goldenRun({ runIndex: 2, persistedCompartments: 1, lookaheadMargin: 0 }),
+                ],
+            });
+            expect(record.historianRuns[0].chunkEndOrdinal).toBe(12);
+            expect(record.historianRuns[1].chunkEndOrdinal).toBe(20);
+            const score = scoreRunRecord(record, scenario);
+            expect(score.errorReason).toBeNull();
+            expect(score.verdict).toBe("PASS");
         } finally {
             fixture.cleanup();
         }

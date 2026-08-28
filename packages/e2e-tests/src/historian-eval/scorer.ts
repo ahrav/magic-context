@@ -673,6 +673,14 @@ function probeCoverageError(
  * Row COUNT is part of the agreement: an undeclared historian pass — one that
  * fired during the probe phase, after the run inventory was assembled — leaves an
  * extra row whose compartments and claims still reach scoring.
+ *
+ * `lookaheadMargin` is reconstructed against the compartment prefix that existed
+ * after each run, not the snapshot's final maximum. The runner records the margin
+ * immediately after its own run, so in a multi-run scenario whose later run
+ * persists a further compartment the final maximum yields a smaller or negative
+ * value for the earlier run — rejecting a valid artifact. Compartments are only
+ * ever appended, so the prefix after run i is the first `sum(persisted[0..i])`
+ * rows in sequence order.
  */
 function telemetryMismatch(
     record: HistorianEvalRunRecord,
@@ -685,15 +693,19 @@ function telemetryMismatch(
         factsEmitted: number | null;
         discardedLast: number;
     }>,
-    maxPersistedEnd: number | null,
+    compartmentEndsInSequence: readonly number[],
 ): string | null {
     if (rows.length !== record.historianRuns.length) {
         return `snapshot holds ${rows.length} historian run row(s), record carries ${record.historianRuns.length}`;
     }
+    let persistedSoFar = 0;
     for (const [index, run] of record.historianRuns.entries()) {
         const row = rows[index];
         const discardedLast = row.discardedLast === 1;
         const persisted = row.compartmentsProduced ?? 0;
+        persistedSoFar += persisted;
+        const prefix = compartmentEndsInSequence.slice(0, persistedSoFar);
+        const maxPersistedEnd = prefix.length === 0 ? null : Math.max(...prefix);
         const expected = {
             status: row.status,
             failureReason: row.failureReason,
@@ -908,7 +920,7 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
             factsEmitted: number | null;
             discardedLast: number;
         }>;
-        let maxPersistedEnd: number | null;
+        let compartmentEndsInSequence: number[];
         try {
             runRows = db
                 .prepare(
@@ -918,10 +930,13 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
                        FROM historian_runs WHERE session_id = ? ORDER BY id ASC`,
                 )
                 .all(record.sessionId) as typeof runRows;
-            const maxRow = db
-                .prepare("SELECT MAX(end_message) AS m FROM compartments WHERE session_id = ?")
-                .get(record.sessionId) as { m: number | null } | null;
-            maxPersistedEnd = maxRow?.m ?? null;
+            compartmentEndsInSequence = (
+                db
+                    .prepare(
+                        "SELECT end_message AS endMessage FROM compartments WHERE session_id = ? ORDER BY sequence ASC",
+                    )
+                    .all(record.sessionId) as Array<{ endMessage: number }>
+            ).map((row) => row.endMessage);
         } catch (error) {
             return errorScore(
                 record.scenarioId,
@@ -930,7 +945,7 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
                 record.system,
             );
         }
-        const mismatch = telemetryMismatch(record, runRows, maxPersistedEnd);
+        const mismatch = telemetryMismatch(record, runRows, compartmentEndsInSequence);
         if (mismatch !== null) {
             return errorScore(record.scenarioId, "record-snapshot-mismatch", mismatch, record.system);
         }
