@@ -14,7 +14,7 @@ import type { HistorianEvalScenario } from "./contract";
 import { scenarioFingerprint } from "./contract";
 import { buildMockHistorianOutput, type MockHistorianFact } from "../mock-historian";
 import type { HistorianEvalRunRecord, HistorianRunArtifact, InjectedClaimRecord, ProbeExchange } from "./runner";
-import { RUN_RECORD_SCHEMA } from "./runner";
+import { RUN_RECORD_SCHEMA, authoredTurnOrdinalsFor } from "./runner";
 import {
     buildLaneReport,
     compareProbeAnswer,
@@ -53,7 +53,13 @@ function makeSnapshot(args: {
     const dbPath = join(dir, "context-db-snapshot.sqlite");
     const { db } = createDirectTestDatabase({ path: dbPath });
     const nowMs = args.nowMs ?? Date.now();
-    const compartments = args.compartments ?? [{ start: 1, end: 8 }];
+    // Rendered-space default: validScenario is shorter than the runner's
+    // MIN_BUILD_TURNS, so six harness-owned filler turns precede its four
+    // authored ones and the authored span is ordinals 13-20. A real run's
+    // compartments cover the chunk from ordinal 1, so one compartment spanning
+    // the whole rendered transcript is what the contiguity invariant expects;
+    // the authored-span scoping is what decides the gold minimum.
+    const compartments = args.compartments ?? [{ start: 1, end: 20 }];
     appendCompartments(
         db,
         SESSION_ID,
@@ -183,12 +189,10 @@ function makeRecord(
         historianRuns: Array.from({ length: scenario.trigger.expectedHistorianRuns }, (_, index) =>
             goldenRun({ runIndex: index + 1 }),
         ),
-        authoredTurnOrdinals: [
-            [1, 2],
-            [3, 4],
-            [5, 6],
-            [7, 8],
-        ],
+        // Derived, not hand-written: the scorer validates this against the exact
+        // rendered layout, and a literal here was claiming ordinals the runner
+        // cannot produce for a scenario this short.
+        authoredTurnOrdinals: authoredTurnOrdinalsFor(scenario),
         perGoldPredicate: [],
         injectedClaims: fixture.injectedClaims,
         probes,
@@ -868,6 +872,29 @@ describe("scoreRunRecord", () => {
         }
     });
 
+    test("an earlier run's kept provisional boundary is not repaired by a later success", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            // Run 1 took the forbidden forced-keep path and PERSISTED that
+            // boundary, so unlike a discard there is nothing for run 2 to
+            // re-derive; a final-run-only check would report nothing.
+            const record = makeRecord(fixture, scenario, {
+                historianRuns: [
+                    goldenRun({ emittedCompartments: 2, persistedCompartments: 2, lookaheadMargin: 1 }),
+                    goldenRun({ runIndex: 2, status: "success" }),
+                ],
+            });
+            const score = scoreRunRecord(record, scenario);
+            expect(score.failReasons).toContain("structural");
+            expect(
+                score.structuralFindings.some((finding) => finding.includes("run 1 kept a provisional boundary")),
+            ).toBe(true);
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
     test("record-controlled authored ordinals are validated against the scenario", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {
@@ -928,9 +955,11 @@ describe("scoreRunRecord", () => {
         // filler/padding one exists outside the authored ordinal span.
         const fixture = makeSnapshot({
             facts: goldFacts(),
+            // Ordinals 1-12 are the harness-owned filler turns; 13-20 are the
+            // authored transcript. Only the second compartment is authored.
             compartments: [
-                { start: 1, end: 8 },
-                { start: 9, end: 20 },
+                { start: 1, end: 12 },
+                { start: 13, end: 20 },
             ],
         });
         try {
@@ -939,15 +968,7 @@ describe("scoreRunRecord", () => {
                 ...base,
                 gold: { ...base.gold, compartments: { minCount: 2 } },
             };
-            const record = makeRecord(fixture, scenario, {
-                // Authored turns occupy 1..8; ordinals 9-20 are harness-owned.
-                authoredTurnOrdinals: [
-                    [1, 2],
-                    [3, 4],
-                    [5, 6],
-                    [7, 8],
-                ],
-            });
+            const record = makeRecord(fixture, scenario);
             const score = scoreRunRecord(record, scenario);
             expect(score.failReasons).toContain("structural");
             expect(

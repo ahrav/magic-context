@@ -212,6 +212,23 @@ export const MAX_TURN_TEXT_CHARS = 20_000;
  */
 export const MAX_EXPECTATION_ENTRIES = 100;
 /**
+ * Reject a gold answer the answer envelope cannot carry.
+ *
+ * Probe answers travel inside `<answer>...</answer>` and the runner extracts
+ * them non-greedily, so a value containing the closing delimiter is read back
+ * truncated at that point. The truncated prefix is non-empty, so the runner does
+ * not re-ask either — it records a probe FAILURE against an answer no correct
+ * reply could ever have produced. Freezing such a value would bake a
+ * permanently-wrong probe into the corpus.
+ */
+function envelopeSafeAnswer(value: string, label: string): string {
+    if (value.includes("</answer>") || value.includes("<answer>")) {
+        fail(`${label}: answer-envelope-delimiter`);
+    }
+    return value;
+}
+
+/**
  * Operational maximum for one probe's option list. Bounded before the array is
  * mapped for the same reason as the expectation arrays, and separately from them
  * because it is nested: a scenario can stay under the probe cap while each probe
@@ -279,7 +296,7 @@ function parseProbe(raw: unknown, label: string): Probe {
             id,
             question,
             answerType,
-            goldAnswer: string(value.goldAnswer, `${label}.goldAnswer`),
+            goldAnswer: envelopeSafeAnswer(string(value.goldAnswer, `${label}.goldAnswer`), `${label}.goldAnswer`),
             sourceClaimRef: staticId(value.sourceClaimRef, `${label}.sourceClaimRef`, EXPECTED_CLAIM_ID_RE),
         };
     }
@@ -294,6 +311,12 @@ function parseProbe(raw: unknown, label: string): Probe {
         // two indistinguishable options in one question, and a model picking the
         // non-gold spelling of the same option would be scored wrong.
         unique(choices.map(normalizeContent), `${label}.choices`);
+        // Every choice, not only the gold one: the model may legitimately reply
+        // with any of them, and a delimiter-bearing choice would be read back
+        // truncated and scored wrong.
+        for (const [index, choice] of choices.entries()) {
+            envelopeSafeAnswer(choice, `${label}.choices[${index}]`);
+        }
         const goldAnswer = string(value.goldAnswer, `${label}.goldAnswer`);
         if (!choices.includes(goldAnswer)) fail(`${label}.goldAnswer: not-a-choice`);
         return {
@@ -397,6 +420,24 @@ export function parseScenario(raw: unknown, label = "scenario"): HistorianEvalSc
         expectedClaims.map((claim) => JSON.stringify([claim.category, normalizeContent(claim.predicate.value)])),
         `${label}.gold.expectedClaims.identity`,
     );
+    // Identical pairs are the special case; SUBSUMPTION has the same consequence
+    // for the same reason. Predicates are normalized substrings, so if two
+    // same-category predicates stand in a containment relation, any claim
+    // matching the longer necessarily matches the shorter — one injected fact
+    // credits both expectations, giving full recall for half the formation. The
+    // check above cannot see it because the strings differ.
+    for (const [leftIndex, left] of expectedClaims.entries()) {
+        for (const right of expectedClaims.slice(leftIndex + 1)) {
+            if (left.category !== right.category) continue;
+            const leftValue = normalizeContent(left.predicate.value);
+            const rightValue = normalizeContent(right.predicate.value);
+            if (leftValue.includes(rightValue) || rightValue.includes(leftValue)) {
+                fail(
+                    `${label}.gold.expectedClaims: subsumed-predicate (${left.id} and ${right.id} share category ${left.category} and one predicate contains the other)`,
+                );
+            }
+        }
+    }
     const expectedAbsent = bounded(goldValue.expectedAbsent, `${label}.gold.expectedAbsent`).map((entry, index) =>
         parseExpectedAbsent(entry, `${label}.gold.expectedAbsent[${index}]`),
     );

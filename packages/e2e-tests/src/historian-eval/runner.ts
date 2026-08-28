@@ -79,6 +79,24 @@ const TITLE_SYSTEM_MARKER = requireSignature(INTERNAL_OPENCODE_AGENT_SIGNATURES,
 /** Build turns before the spike; the v3 protected-tail boundary needs mass. */
 const MIN_BUILD_TURNS = 10;
 
+/**
+ * Ordinals the scenario's authored turns occupy in the rendered transcript.
+ *
+ * Harness-owned filler turns precede the authored ones whenever the scenario is
+ * shorter than `MIN_BUILD_TURNS`, so the layout is fully determined by the
+ * scenario and nothing else. Exported because the scorer validates a stored
+ * record's `authoredTurnOrdinals` against it: that field decides which
+ * compartments count toward gold's minimum, and a second derivation of the same
+ * layout is how the two could disagree about which rows are authored.
+ */
+export function authoredTurnOrdinalsFor(scenario: HistorianEvalScenario): Array<[number, number]> {
+    const fillerCount = Math.max(0, MIN_BUILD_TURNS - scenario.transcript.turns.length);
+    return scenario.transcript.turns.map((_, index) => {
+        const userOrdinal = (fillerCount + index) * 2 + 1;
+        return [userOrdinal, userOrdinal + 1];
+    });
+}
+
 const POISON_TEXT = "HISTORIAN-EVAL-POISON: unscripted main-agent turn reached the default response";
 
 /** Infra causes (R6). None of these may be attributed to historian quality. */
@@ -518,7 +536,7 @@ class ScenarioRunner {
             system: this.systemTuple(),
             expectedHistorianRuns: this.scenario.trigger.expectedHistorianRuns,
             historianRuns: this.collectedRuns,
-            authoredTurnOrdinals: this.authoredTurnOrdinals(this.fillerCount()),
+            authoredTurnOrdinals: this.authoredTurnOrdinals(),
         };
     }
 
@@ -868,11 +886,8 @@ class ScenarioRunner {
         }
     }
 
-    private authoredTurnOrdinals(fillerCount: number): Array<[number, number]> {
-        return this.scenario.transcript.turns.map((_, index) => {
-            const userOrdinal = (fillerCount + index) * 2 + 1;
-            return [userOrdinal, userOrdinal + 1];
-        });
+    private authoredTurnOrdinals(): Array<[number, number]> {
+        return authoredTurnOrdinalsFor(this.scenario);
     }
 
     /**
@@ -1287,7 +1302,7 @@ class ScenarioRunner {
             .contextDb()
             .prepare("SELECT start_message AS start, end_message AS end FROM compartments WHERE session_id = ?")
             .all(sessionId) as Array<{ start: number; end: number }>;
-        const ordinals = this.authoredTurnOrdinals(this.fillerCount());
+        const ordinals = this.authoredTurnOrdinals();
         const covered = (range: [number, number]): boolean => {
             // Union coverage: adjacent compartments legitimately tile a
             // multi-turn gold range, so requiring one containing compartment

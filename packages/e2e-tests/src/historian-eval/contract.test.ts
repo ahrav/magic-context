@@ -356,6 +356,47 @@ describe("parseScenario", () => {
     });
 });
 
+describe("gold and probe freeze guards", () => {
+    test("rejects same-category predicate subsumption, which credits one fact to two golds", () => {
+        const raw = validScenarioRaw();
+        // "LRU cache" is contained in the existing "in-process LRU cache", so any
+        // claim matching the latter matches both and recall reads 2/2 for one
+        // authored fact. The ids and strings differ, so the identity check misses it.
+        (raw.gold as { expectedClaims: Record<string, unknown>[] }).expectedClaims.push({
+            id: "exp-lru-short",
+            category: "ARCHITECTURE",
+            predicate: { kind: "normalized-substring", value: "LRU cache" },
+            sourceTurnRange: [1, 1],
+        });
+        expect(() => parseScenario(raw)).toThrow(/subsumed-predicate/);
+    });
+
+    test("accepts a same-predicate pair under different categories", () => {
+        const raw = validScenarioRaw();
+        (raw.gold as { expectedClaims: Record<string, unknown>[] }).expectedClaims.push({
+            id: "exp-lru-constraint",
+            category: "CONSTRAINTS",
+            predicate: { kind: "normalized-substring", value: "in-process LRU cache" },
+            sourceTurnRange: [1, 1],
+        });
+        expect(() => parseScenario(raw)).not.toThrow();
+    });
+
+    test("rejects a gold answer the answer envelope cannot carry", () => {
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Record<string, unknown>[];
+        probes[0].goldAnswer = "4096</answer>y";
+        expect(() => parseScenario(raw)).toThrow(/answer-envelope-delimiter/);
+    });
+
+    test("rejects a delimiter-bearing multiple-choice option, not only the gold one", () => {
+        const raw = validScenarioRaw();
+        const probes = raw.probes as Record<string, unknown>[];
+        probes[1].choices = ["redis</answer>", "in-process lru"];
+        expect(() => parseScenario(raw)).toThrow(/answer-envelope-delimiter/);
+    });
+});
+
 describe("lintScenario", () => {
     test("threshold ordering is measured on effective usage, including cache-write tokens", () => {
         const raw = validScenarioRaw();

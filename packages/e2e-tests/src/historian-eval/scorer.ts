@@ -40,7 +40,7 @@ import {
 } from "./contract";
 import { readInjectedClaims } from "./claim-read";
 import { verifyAllActiveClaims } from "./verification-bridge";
-import { RUN_RECORD_SCHEMA } from "./runner";
+import { RUN_RECORD_SCHEMA, authoredTurnOrdinalsFor } from "./runner";
 import type {
     HistorianEvalRunRecord,
     InjectedClaimRecord,
@@ -184,8 +184,7 @@ function structuralFindingsFromRows(
  */
 function healingFindings(record: HistorianEvalRunRecord): string[] {
     const runs = record.historianRuns;
-    const finalRun = runs[runs.length - 1];
-    if (!finalRun) return [];
+    if (runs.length === 0) return [];
     const findings: string[] = [];
     for (const [index, run] of runs.entries()) {
         if (!run.discardedLast) continue;
@@ -194,15 +193,21 @@ function healingFindings(record: HistorianEvalRunRecord): string[] {
             `healing: run ${run.runIndex} discarded its provisional last compartment and no later successful run healed it`,
         );
     }
-    if (
-        !finalRun.discardedLast &&
-        finalRun.emittedCompartments >= 2 &&
-        finalRun.lookaheadMargin !== null &&
-        finalRun.lookaheadMargin <= HISTORIAN_BOUNDARY_HEALING_SLACK
-    ) {
-        findings.push(
-            `healing: final run kept a provisional boundary (lookahead margin ${finalRun.lookaheadMargin} <= slack ${HISTORIAN_BOUNDARY_HEALING_SLACK})`,
-        );
+    // Every run, not just the last. A kept provisional boundary was PERSISTED,
+    // so unlike a discard there is nothing for a later run to re-derive — the
+    // forbidden forced-keep path is already in the stored structure, and a
+    // subsequent success does not repair it.
+    for (const run of runs) {
+        if (
+            !run.discardedLast &&
+            run.emittedCompartments >= 2 &&
+            run.lookaheadMargin !== null &&
+            run.lookaheadMargin <= HISTORIAN_BOUNDARY_HEALING_SLACK
+        ) {
+            findings.push(
+                `healing: run ${run.runIndex} kept a provisional boundary (lookahead margin ${run.lookaheadMargin} <= slack ${HISTORIAN_BOUNDARY_HEALING_SLACK})`,
+            );
+        }
     }
     return findings;
 }
@@ -570,23 +575,17 @@ function recordIdentityError(
     }
     // `authoredTurnOrdinals` decides which compartments count toward gold's
     // minimum, and nothing else binds it: the fingerprint covers the scenario,
-    // not the record's copy of the rendered layout. An empty array falls back to
-    // counting every filler and padding compartment, and a widened pair does the
-    // same, so the field is checked against the shape the runner can produce —
-    // one pair per authored turn, each `[u, u + 1]`, successive pairs two apart,
-    // the first offset by a whole number of harness-owned filler turns.
-    const ordinals = record.authoredTurnOrdinals;
-    const turnCount = scenario.transcript.turns.length;
-    const wellFormed =
-        ordinals.length === turnCount &&
-        ordinals.every(([user, assistant]) => Number.isInteger(user) && assistant === user + 1) &&
-        ordinals.every(([user], index) => index === 0 || user === ordinals[index - 1][0] + 2) &&
-        (turnCount === 0 || (ordinals[0][0] >= 1 && (ordinals[0][0] - 1) % 2 === 0));
-    if (!wellFormed) {
+    // not the record's copy of the rendered layout. The layout is fully
+    // determined by the scenario, so it is compared against the EXACT ordinals
+    // the runner derives rather than a shape test — a shape test admits any
+    // whole-turn offset, and shifting the span onto harness-owned filler rows is
+    // precisely how a record makes filler compartments count toward gold.
+    const expectedOrdinals = authoredTurnOrdinalsFor(scenario);
+    if (canonicalJson(record.authoredTurnOrdinals) !== canonicalJson(expectedOrdinals)) {
         return errorScore(
             record.scenarioId,
             "record-scenario-mismatch",
-            `run record's authoredTurnOrdinals do not describe ${turnCount} authored turn(s) of the rendered transcript: ${JSON.stringify(ordinals)}`,
+            `run record's authoredTurnOrdinals ${JSON.stringify(record.authoredTurnOrdinals)} do not match the rendered layout ${JSON.stringify(expectedOrdinals)}`,
             record.system,
         );
     }
