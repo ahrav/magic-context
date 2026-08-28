@@ -50,6 +50,10 @@ export function closeRpc(): void {
     rpcClient = null;
 }
 
+function isRpcError(value: unknown): boolean {
+    return value !== null && typeof value === "object" && "error" in value;
+}
+
 const EMPTY_SNAPSHOT: SidebarSnapshot = {
     sessionId: "",
     usagePercentage: 0,
@@ -58,6 +62,8 @@ const EMPTY_SNAPSHOT: SidebarSnapshot = {
     systemPromptTokens: 0,
     compartmentCount: 0,
     memoryCount: 0,
+    memoryClaims: [],
+    memorySnapshotVector: null,
     memoryBlockCount: 0,
     pendingOpsCount: 0,
     historianRunning: false,
@@ -148,7 +154,7 @@ export async function loadSidebarSnapshot(
             sessionId,
             directory,
         });
-        if ((result as unknown as Record<string, unknown>).error) {
+        if (isRpcError(result)) {
             // Snapshot-build errors are explicit failure envelopes, equivalent to
             // a transport failure: retain the last known-good client snapshot.
             return recallSidebarSnapshot(sessionId, empty);
@@ -222,7 +228,7 @@ export async function loadStatusDetail(
             directory,
             modelKey,
         });
-        if ((result as unknown as Record<string, unknown>).error) {
+        if (isRpcError(result)) {
             return emptyDetail;
         }
         return result;
@@ -236,7 +242,6 @@ const EMPTY_EMBED_DETAIL: EmbedDetail = {
     model: "off",
     provider: "off",
     session: { embedded: 0, total: 0 },
-    memories: { embedded: 0, total: 0 },
     commits: { embedded: 0, total: 0, gitEnabled: false },
     statusText: "Embedding is off (no provider configured).",
 };
@@ -249,7 +254,7 @@ export async function loadEmbedDetail(sessionId: string, directory: string): Pro
             sessionId,
             directory,
         });
-        if ((result as unknown as Record<string, unknown>).error) {
+        if (isRpcError(result)) {
             return EMPTY_EMBED_DETAIL;
         }
         return result;

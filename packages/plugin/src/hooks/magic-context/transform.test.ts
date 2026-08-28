@@ -8,7 +8,6 @@ import {
     replaceAllCompartmentState,
     replaceAllCompartments,
 } from "../../features/magic-context/compartment-storage";
-import { insertMemory as insertMemoryRaw } from "../../features/magic-context/memory";
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
 import {
     __resetMessageIndexAsyncForTests,
@@ -42,6 +41,7 @@ import {
     setEmergencyDropSample,
 } from "../../features/magic-context/storage-meta-persisted";
 import { createTagger } from "../../features/magic-context/tagger";
+import { seedProjectMemoryClaim } from "../../features/magic-context/test-claim-database";
 import { recordToolDefinition } from "../../features/magic-context/tool-definition-tokens";
 import {
     scheduleOpenCodeTransformDecisionWrite,
@@ -56,10 +56,24 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import { getSlot, resetLkgSlotsForTest } from "./lkg-slot";
 import { createTransform } from "./transform";
 
-// Policy reclassification: automatic injection requires effective-VERIFIED
-// rows, so these fixtures use explicit-user origin memories.
-const insertMemory: typeof insertMemoryRaw = (db, input) =>
-    insertMemoryRaw(db, { sourceType: "user", ...input });
+function insertMemory(
+    db: Database,
+    input: { projectPath: string; category: string; content: string },
+): void {
+    seedProjectMemoryClaim(db, {
+        projectIdentity: input.projectPath,
+        category: [
+            "PROJECT_RULES",
+            "ARCHITECTURE",
+            "CONSTRAINTS",
+            "CONFIG_VALUES",
+            "NAMING",
+        ].includes(input.category)
+            ? input.category
+            : "PROJECT_RULES",
+        content: input.content,
+    });
+}
 
 type TextPart = { type: "text"; text: string };
 type ToolPart = {
@@ -298,7 +312,7 @@ describe("createTransform", () => {
         expect(bySession.get(toolSession)?.tool_call_tokens).toBeGreaterThan(0);
 
         const moduleStatus = {
-            usage: { current_total_input_tokens: 10_000, context_limit_tokens: 100_000 },
+            usage: { current_total_input_tokens: 100_000, context_limit_tokens: 200_000 },
         };
         const shortSnapshot = buildSidebarSnapshot(
             db,

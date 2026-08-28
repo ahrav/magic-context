@@ -1,7 +1,7 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
-import { Database } from "../../shared/sqlite";
+import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { acquireCompartmentLease } from "./compartment-lease";
 import {
@@ -16,11 +16,10 @@ import {
     getAverageCompressionDepth,
     getIncrementDepthStatement,
 } from "./compression-depth-storage";
-import { initializeDatabase } from "./storage-db";
+import { createDirectTestDatabase } from "./test-database";
 
 function makeDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
+    const db = createDirectTestDatabase().db;
     return db;
 }
 

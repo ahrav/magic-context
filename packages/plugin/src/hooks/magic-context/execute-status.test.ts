@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
-import { Database } from "../../shared/sqlite";
+import { createDirectTestDatabase } from "../../features/magic-context/test-database";
 import { executeStatus } from "./execute-status";
 import { estimateTokens } from "./read-session-formatting";
 
@@ -9,8 +8,7 @@ const SESSION_ID = "ses_execute_status";
 
 describe("executeStatus", () => {
     test("attributes history tokens using rendered compartment headings", () => {
-        const db = new Database(":memory:");
-        initializeDatabase(db);
+        const db = createDirectTestDatabase().db;
         getOrCreateSessionMeta(db, SESSION_ID);
         db.prepare(
             "INSERT INTO compartments (session_id, sequence, start_message, end_message, start_message_id, end_message_id, title, content, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -24,8 +22,7 @@ describe("executeStatus", () => {
     });
 
     test("annotates the execute threshold when a tokens config is clamped (#241)", () => {
-        const db = new Database(":memory:");
-        initializeDatabase(db);
+        const db = createDirectTestDatabase().db;
         getOrCreateSessionMeta(db, SESSION_ID);
 
         // 190K requested on a 128K model → clamped to 90% × 128K. The status must
@@ -49,8 +46,7 @@ describe("executeStatus", () => {
     });
 
     test("omits the clamp annotation when the threshold is not clamped (#241)", () => {
-        const db = new Database(":memory:");
-        initializeDatabase(db);
+        const db = createDirectTestDatabase().db;
         getOrCreateSessionMeta(db, SESSION_ID);
 
         const status = executeStatus(
@@ -71,8 +67,7 @@ describe("executeStatus", () => {
     });
 
     test("shows the exact nudge hygiene ratio and keeps zero values", () => {
-        const db = new Database(":memory:");
-        initializeDatabase(db);
+        const db = createDirectTestDatabase().db;
         getOrCreateSessionMeta(db, SESSION_ID);
 
         const status = executeStatus(
@@ -105,8 +100,7 @@ describe("executeStatus", () => {
     });
 
     test("renders 'never expires' for cacheTtl 'never'", () => {
-        const db = new Database(":memory:");
-        initializeDatabase(db);
+        const db = createDirectTestDatabase().db;
         getOrCreateSessionMeta(db, SESSION_ID);
         db.prepare("UPDATE session_meta SET cache_ttl = 'never' WHERE session_id = ?").run(
             SESSION_ID,

@@ -14,9 +14,6 @@ export function formatEmbedStatusText(
     lines.push(
         `This session:  ${coverage.session.embedded} / ${coverage.session.total} compartments embedded`,
     );
-    lines.push(
-        `Project memories:  ${coverage.memories.embedded} / ${coverage.memories.total} embedded`,
-    );
     if (coverage.commits.gitEnabled) {
         lines.push(`Git commits:  ${coverage.commits.embedded} / ${coverage.commits.total}`);
     } else {

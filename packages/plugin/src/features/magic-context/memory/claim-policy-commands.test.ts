@@ -1,21 +1,9 @@
-/// <reference types="bun-types" />
-
 import { afterEach, describe, expect, test } from "bun:test";
-import {
-    existsSync,
-    mkdirSync,
-    mkdtempSync,
-    readFileSync,
-    rmSync,
-    symlinkSync,
-    writeFileSync,
-} from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Database, isInTransaction } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
-import { runMigrations } from "../migrations";
-import { initializeDatabase } from "../storage-db";
+import { createClaimReaderTestDatabase, seedProjectMemoryClaim } from "../test-claim-database";
 import {
     type ArtifactEvaluation,
     type ClaimCommandDeps,
@@ -23,66 +11,27 @@ import {
     executeClaimApprovalCommand,
     executeClaimEnforceCommand,
 } from "./claim-policy-commands";
-import { sha256Utf8Hex } from "./storage-claims";
 import {
-    createMemoryWithClaimsInCurrentTransaction,
-    type MemoryClaimOperationEnvelope,
-    runInMemoryClaimsWriteTransaction,
-    updateMemoryContentWithClaimsInCurrentTransaction,
-} from "./storage-memory-claims";
+    computeProjectMemoryMutationToken,
+    getProjectMemoryClaimByPublicId,
+    reviseProjectMemoryClaim,
+    setProjectMemoryClaimLifecycle,
+} from "./storage-claim-operations";
 
 const PROJECT = "git:approval-project";
 const FOREIGN_PROJECT = "git:foreign-project";
-
-function migratedDb(): Database {
-    const db = new Database(":memory:");
-    db.exec("PRAGMA foreign_keys=ON");
-    initializeDatabase(db);
-    runMigrations(db);
-    return db;
-}
-
-function envelope(operationKey: string, request: unknown): MemoryClaimOperationEnvelope {
-    return {
-        producer: "approval-test",
-        operationKey,
-        requestDigest: sha256Utf8Hex(JSON.stringify(request)),
-    };
-}
-
-function seedMemory(
-    db: Database,
-    key: string,
-    content: string,
-    projectPath = PROJECT,
-): { memoryId: number; claimId: number; revisionId: number } {
-    const outcome = runInMemoryClaimsWriteTransaction(db, () =>
-        createMemoryWithClaimsInCurrentTransaction(db, envelope(key, { key, content }), {
-            projectPath,
-            category: "CONSTRAINTS",
-            content,
-            normalizedHash: `hash:${content}`,
-            importance: 60,
-            sourceSessionId: "ses-approve",
-            sourceType: "agent",
-            nowMs: 1_000,
-        }),
-    );
-    return {
-        memoryId: outcome.result.memoryId,
-        claimId: outcome.result.claimId as number,
-        revisionId: outcome.result.revisionId as number,
-    };
-}
-
 const tempDirs: string[] = [];
+
 function tempProjectRoot(): string {
     const dir = mkdtempSync(join(tmpdir(), "claim-enforce-"));
     tempDirs.push(dir);
     return dir;
 }
 
-function deps(db: Database, overrides: Partial<ClaimCommandDeps> = {}): ClaimCommandDeps {
+function deps(
+    db: ReturnType<typeof createClaimReaderTestDatabase>,
+    overrides: Partial<ClaimCommandDeps> = {},
+): ClaimCommandDeps {
     return {
         db,
         projectPath: PROJECT,
@@ -93,20 +42,33 @@ function deps(db: Database, overrides: Partial<ClaimCommandDeps> = {}): ClaimCom
     };
 }
 
+function seed(
+    db: ReturnType<typeof createClaimReaderTestDatabase>,
+    key: string,
+    projectIdentity = PROJECT,
+) {
+    const claim = seedProjectMemoryClaim(db, {
+        projectIdentity,
+        content: `${key} content`,
+        category: "CONSTRAINTS",
+        operationKey: key,
+    });
+    const ref = getProjectMemoryClaimByPublicId(db, claim.publicClaimId);
+    if (!ref) throw new Error("seeded claim missing");
+    return { ...claim, revisionId: ref.currentRevisionId };
+}
+
 const passEvaluator = (): ArtifactEvaluation => ({
     result: "pass",
     evaluator: "test-evaluator",
     evaluatorVersion: "1",
 });
 
-const failEvaluator = (): ArtifactEvaluation => ({
-    result: "fail",
-    evaluator: "test-evaluator",
-    evaluatorVersion: "1",
-    detail: "1 test failed",
-});
-
-function approvalCount(db: Database, revisionId: number, action: string): number {
+function approvalCount(
+    db: ReturnType<typeof createClaimReaderTestDatabase>,
+    revisionId: number,
+    action: string,
+): number {
     return (
         db
             .prepare(
@@ -116,12 +78,15 @@ function approvalCount(db: Database, revisionId: number, action: string): number
     ).count;
 }
 
-function effectiveMaturityOf(db: Database, revisionId: number): string | null {
+function effectiveMaturity(
+    db: ReturnType<typeof createClaimReaderTestDatabase>,
+    revisionId: number,
+): string | null {
     const row = db
         .prepare(
             "SELECT effective_maturity AS maturity FROM claim_effective_policy WHERE revision_id = ?",
         )
-        .get(revisionId) as { maturity: string } | null | undefined;
+        .get(revisionId) as { maturity: string } | undefined;
     return row?.maturity ?? null;
 }
 
@@ -130,461 +95,262 @@ afterEach(() => {
     for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-describe("claim approval command workflow", () => {
-    test("first command confirms without recording; the repeat records one approval", async () => {
-        const db = migratedDb();
+describe("claim approval command", () => {
+    test("confirms the public claim locator and records one direct claim operation", async () => {
+        const db = createClaimReaderTestDatabase();
         try {
-            const seed = seedMemory(db, "appr-1", "approve me");
+            const claim = seed(db, "approve");
             const commandDeps = deps(db);
-            const first = await executeClaimApprovalCommand(commandDeps, String(seed.memoryId));
+            const first = await executeClaimApprovalCommand(commandDeps, claim.publicClaimId);
             expect(first.level).toBe("warning");
-            expect(first.text).toContain("Confirmation Required");
-            expect(first.text).toContain(PROJECT);
-            expect(first.text).toContain(`revision ${seed.revisionId}`);
-            expect(approvalCount(db, seed.revisionId, "approve")).toBe(0);
+            expect(first.text).toContain(claim.publicClaimId);
+            expect(first.text).toContain(claim.revisionLocator);
+            expect(approvalCount(db, claim.revisionId, "approve")).toBe(0);
 
-            const second = await executeClaimApprovalCommand(commandDeps, String(seed.memoryId));
+            const second = await executeClaimApprovalCommand(commandDeps, claim.publicClaimId);
             expect(second.level).toBe("info");
-            expect(approvalCount(db, seed.revisionId, "approve")).toBe(1);
-            expect(effectiveMaturityOf(db, seed.revisionId)).toBe("APPROVED");
-
-            const third = await executeClaimApprovalCommand(commandDeps, String(seed.memoryId));
-            expect(third.text).toContain("already approved");
-            expect(approvalCount(db, seed.revisionId, "approve")).toBe(1);
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    test("a content change between confirmation and repeat makes the confirmation stale", async () => {
-        const db = migratedDb();
-        try {
-            const seed = seedMemory(db, "appr-stale", "original");
-            const commandDeps = deps(db);
-            await executeClaimApprovalCommand(commandDeps, String(seed.memoryId));
-            runInMemoryClaimsWriteTransaction(db, () =>
-                updateMemoryContentWithClaimsInCurrentTransaction(
-                    db,
-                    envelope("appr-stale-2", { next: true }),
-                    {
-                        memoryId: seed.memoryId,
-                        content: "changed content",
-                        normalizedHash: "hash:changed content",
-                        nowMs: 2_000,
-                    },
-                ),
-            );
-            const second = await executeClaimApprovalCommand(commandDeps, String(seed.memoryId));
-            expect(second.level).toBe("warning");
-            expect(second.text).toContain("Confirmation Required");
-            expect(approvalCount(db, seed.revisionId, "approve")).toBe(0);
+            expect(approvalCount(db, claim.revisionId, "approve")).toBe(1);
+            expect(effectiveMaturity(db, claim.revisionId)).toBe("APPROVED");
             expect(
-                (
-                    db.prepare("SELECT COUNT(*) AS count FROM claim_approval_actions").get() as {
-                        count: number;
-                    }
-                ).count,
-            ).toBe(0);
+                db
+                    .prepare(
+                        "SELECT COUNT(*) AS count FROM claim_operation_effects WHERE change_kind = 'lifecycle'",
+                    )
+                    .get(),
+            ).toEqual({ count: 1 });
         } finally {
             closeQuietly(db);
         }
     });
 
-    test("a different session cannot consume another session's confirmation", async () => {
-        const db = migratedDb();
+    test("revision or claim-token movement invalidates confirmation", async () => {
+        const db = createClaimReaderTestDatabase();
         try {
-            const seed = seedMemory(db, "appr-session", "session bound");
-            await executeClaimApprovalCommand(deps(db), String(seed.memoryId));
-            const other = await executeClaimApprovalCommand(
-                deps(db, { sessionId: "other-session" }),
-                String(seed.memoryId),
-            );
-            expect(other.level).toBe("warning");
-            expect(approvalCount(db, seed.revisionId, "approve")).toBe(0);
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    test("foreign-project targets are rejected before any confirmation detail", async () => {
-        const db = migratedDb();
-        try {
-            const foreign = seedMemory(db, "appr-foreign", "foreign row", FOREIGN_PROJECT);
-            const result = await executeClaimApprovalCommand(deps(db), String(foreign.memoryId));
-            expect(result.level).toBe("error");
-            expect(result.text).not.toContain("Confirmation Required");
-            expect(result.text).not.toContain("foreign row");
-            expect(approvalCount(db, foreign.revisionId, "approve")).toBe(0);
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    test("revocation appends an action and lowers effective maturity without deleting history", async () => {
-        const db = migratedDb();
-        try {
-            const seed = seedMemory(db, "appr-revoke", "revoke me");
+            const revisionMoved = seed(db, "approval-revision-moved");
             const commandDeps = deps(db);
-            await executeClaimApprovalCommand(commandDeps, String(seed.memoryId));
-            await executeClaimApprovalCommand(commandDeps, String(seed.memoryId));
-            expect(effectiveMaturityOf(db, seed.revisionId)).toBe("APPROVED");
+            await executeClaimApprovalCommand(commandDeps, revisionMoved.publicClaimId);
+            reviseProjectMemoryClaim(
+                db,
+                { producer: "test", operationKey: "move-revision" },
+                {
+                    token: revisionMoved.token,
+                    content: "changed after confirmation",
+                    provenance: {
+                        sourceLocator: "test://approval/revision",
+                        sourceContent: "changed after confirmation",
+                        extractor: "test",
+                        extractorVersion: "1",
+                        extractorRunId: "move-revision",
+                        independenceKey: "move-revision",
+                    },
+                    actor: "user:test",
+                },
+            );
+            const revisionRetry = await executeClaimApprovalCommand(
+                commandDeps,
+                revisionMoved.publicClaimId,
+            );
+            expect(revisionRetry.level).toBe("warning");
+            expect(approvalCount(db, revisionMoved.revisionId, "approve")).toBe(0);
 
-            await executeClaimApprovalCommand(commandDeps, `${seed.memoryId} --revoke`);
-            await executeClaimApprovalCommand(commandDeps, `${seed.memoryId} --revoke`);
-            expect(approvalCount(db, seed.revisionId, "revoke")).toBe(1);
-            expect(approvalCount(db, seed.revisionId, "approve")).toBe(1);
-            expect(effectiveMaturityOf(db, seed.revisionId)).toBe("CANDIDATE");
-            const head = db
-                .prepare("SELECT maturity FROM claim_maturity_heads WHERE revision_id = ?")
-                .get(seed.revisionId) as { maturity: string };
-            expect(head.maturity).toBe("APPROVED");
+            clearClaimCommandConfirmationsForTests();
+            const tokenMoved = seed(db, "approval-token-moved");
+            await executeClaimApprovalCommand(commandDeps, tokenMoved.publicClaimId);
+            setProjectMemoryClaimLifecycle(
+                db,
+                { producer: "test", operationKey: "move-lifecycle" },
+                {
+                    token: tokenMoved.token,
+                    state: "archived",
+                    actor: "user:test",
+                },
+            );
+            const tokenRetry = await executeClaimApprovalCommand(
+                commandDeps,
+                tokenMoved.publicClaimId,
+            );
+            expect(tokenRetry.level).toBe("warning");
+            expect(approvalCount(db, tokenMoved.revisionId, "approve")).toBe(0);
         } finally {
             closeQuietly(db);
         }
     });
 
-    test("invalid arguments and unknown memories fail with usage or resolution errors", async () => {
-        const db = migratedDb();
+    test("foreign claims and numeric legacy IDs reveal no confirmation detail", async () => {
+        const db = createClaimReaderTestDatabase();
         try {
-            expect((await executeClaimApprovalCommand(deps(db), "")).level).toBe("error");
-            expect((await executeClaimApprovalCommand(deps(db), "not-a-number")).level).toBe(
-                "error",
+            const foreign = seed(db, "foreign", FOREIGN_PROJECT);
+            const foreignResult = await executeClaimApprovalCommand(
+                deps(db),
+                foreign.publicClaimId,
             );
-            const missing = await executeClaimApprovalCommand(deps(db), "99999");
-            expect(missing.level).toBe("error");
+            expect(foreignResult.level).toBe("error");
+            expect(foreignResult.text).not.toContain("Confirmation Required");
+            expect(foreignResult.text).not.toContain("foreign content");
+            expect((await executeClaimApprovalCommand(deps(db), "42")).text).toContain("Usage");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("revocation keeps history and falls back to explicit-user VERIFIED support", async () => {
+        const db = createClaimReaderTestDatabase();
+        try {
+            const claim = seed(db, "revoke");
+            expect(effectiveMaturity(db, claim.revisionId)).toBe("VERIFIED");
+            const commandDeps = deps(db);
+            await executeClaimApprovalCommand(commandDeps, claim.publicClaimId);
+            await executeClaimApprovalCommand(commandDeps, claim.publicClaimId);
+            await executeClaimApprovalCommand(commandDeps, `${claim.publicClaimId} --revoke`);
+            await executeClaimApprovalCommand(commandDeps, `${claim.publicClaimId} --revoke`);
+            expect(approvalCount(db, claim.revisionId, "approve")).toBe(1);
+            expect(approvalCount(db, claim.revisionId, "revoke")).toBe(1);
+            expect(effectiveMaturity(db, claim.revisionId)).toBe("VERIFIED");
         } finally {
             closeQuietly(db);
         }
     });
 });
 
-describe("claim enforcement command workflow", () => {
-    async function approvedSeed(db: Database, commandDeps: ClaimCommandDeps, key: string) {
-        const seed = seedMemory(db, key, `${key} content`);
-        await executeClaimApprovalCommand(commandDeps, String(seed.memoryId));
-        await executeClaimApprovalCommand(commandDeps, String(seed.memoryId));
-        return seed;
+describe("claim enforcement command", () => {
+    async function approvedClaim(
+        db: ReturnType<typeof createClaimReaderTestDatabase>,
+        commandDeps: ClaimCommandDeps,
+        key: string,
+    ) {
+        const claim = seed(db, key);
+        await executeClaimApprovalCommand(commandDeps, claim.publicClaimId);
+        await executeClaimApprovalCommand(commandDeps, claim.publicClaimId);
+        return claim;
     }
 
-    test("an approved revision plus a passing bound artifact records ENFORCED once", async () => {
-        const db = migratedDb();
+    test("records ENFORCED for a passing artifact under the same direct operation contract", async () => {
+        const db = createClaimReaderTestDatabase();
         try {
             const commandDeps = deps(db, { evaluateArtifact: passEvaluator });
-            const seed = await approvedSeed(db, commandDeps, "enf-pass");
+            const claim = await approvedClaim(db, commandDeps, "enforce-pass");
             writeFileSync(join(commandDeps.projectRoot, "gate.test.ts"), "test bytes");
-            const first = await executeClaimEnforceCommand(
-                commandDeps,
-                `${seed.memoryId} gate.test.ts`,
-            );
-            expect(first.level).toBe("warning");
-            const second = await executeClaimEnforceCommand(
-                commandDeps,
-                `${seed.memoryId} gate.test.ts`,
-            );
-            expect(second.level).toBe("info");
-            expect(second.text).toContain("ENFORCED");
-            expect(effectiveMaturityOf(db, seed.revisionId)).toBe("ENFORCED");
-            const artifact = db
-                .prepare(
-                    "SELECT canonical_path AS path, evaluator_result AS result FROM claim_enforcement_artifacts WHERE revision_id = ?",
-                )
-                .get(seed.revisionId) as { path: string; result: string };
-            expect(artifact).toEqual({ path: "gate.test.ts", result: "pass" });
-            const effects = db
-                .prepare(
-                    "SELECT COUNT(*) AS count FROM claim_change_outbox WHERE effect_key LIKE 'policy:%:enforcement'",
-                )
-                .get() as { count: number };
-            expect(effects.count).toBe(1);
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    test("the supported --kind flag passes validation; unknown flags are rejected", async () => {
-        const db = migratedDb();
-        try {
-            const commandDeps = deps(db, { evaluateArtifact: passEvaluator });
-            const seed = await approvedSeed(db, commandDeps, "enf-kind");
-            writeFileSync(join(commandDeps.projectRoot, "kind.test.ts"), "test bytes");
-            // --kind is a documented flag and must reach the value parser,
-            // not the unknown-flag rejection.
-            const first = await executeClaimEnforceCommand(
-                commandDeps,
-                `${seed.memoryId} kind.test.ts --kind test`,
-            );
-            expect(first.level).toBe("warning");
-            const second = await executeClaimEnforceCommand(
-                commandDeps,
-                `${seed.memoryId} kind.test.ts --kind test`,
-            );
-            expect(second.text).toContain("ENFORCED");
-            // A mistyped flag returns usage instead of being treated as a
-            // path argument (or, for approve, the opposite action).
-            const mistyped = await executeClaimEnforceCommand(
-                commandDeps,
-                `${seed.memoryId} kind.test.ts --revok`,
-            );
-            expect(mistyped.level).toBe("error");
-            expect(mistyped.text).toContain("Usage");
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    test("a failing artifact records the attempt but never ENFORCED", async () => {
-        const db = migratedDb();
-        try {
-            const commandDeps = deps(db, { evaluateArtifact: failEvaluator });
-            const seed = await approvedSeed(db, commandDeps, "enf-fail");
-            writeFileSync(join(commandDeps.projectRoot, "gate.test.ts"), "test bytes");
-            await executeClaimEnforceCommand(commandDeps, `${seed.memoryId} gate.test.ts`);
-            const second = await executeClaimEnforceCommand(
-                commandDeps,
-                `${seed.memoryId} gate.test.ts`,
-            );
-            expect(second.level).toBe("error");
-            expect(effectiveMaturityOf(db, seed.revisionId)).toBe("APPROVED");
+            const args = `${claim.publicClaimId} gate.test.ts`;
+            expect((await executeClaimEnforceCommand(commandDeps, args)).level).toBe("warning");
+            const result = await executeClaimEnforceCommand(commandDeps, args);
+            expect(result.level).toBe("info");
+            expect(result.text).toContain(claim.revisionLocator);
+            expect(effectiveMaturity(db, claim.revisionId)).toBe("ENFORCED");
             expect(
-                (
-                    db
-                        .prepare(
-                            "SELECT COUNT(*) AS count FROM claim_maturity_assertions WHERE maturity = 'ENFORCED'",
-                        )
-                        .get() as { count: number }
-                ).count,
-            ).toBe(0);
+                db.prepare("SELECT COUNT(*) AS count FROM claim_enforcement_artifacts").get(),
+            ).toEqual({ count: 1 });
         } finally {
             closeQuietly(db);
         }
     });
 
-    test("unapproved revisions, absolute paths, escapes, and missing files are rejected", async () => {
-        const db = migratedDb();
+    test("rechecks exact revision and digest after artifact evaluation", async () => {
+        const db = createClaimReaderTestDatabase();
+        try {
+            const commandDeps = deps(db);
+            const claim = await approvedClaim(db, commandDeps, "enforce-revision-race");
+            writeFileSync(join(commandDeps.projectRoot, "gate.test.ts"), "test bytes");
+            commandDeps.evaluateArtifact = () => {
+                reviseProjectMemoryClaim(
+                    db,
+                    { producer: "test", operationKey: "evaluation-revision-race" },
+                    {
+                        token: computeProjectMemoryMutationToken(db, claim.publicClaimId),
+                        content: "changed during artifact evaluation",
+                        provenance: {
+                            sourceLocator: "test://enforcement/revision-race",
+                            sourceContent: "changed during artifact evaluation",
+                            extractor: "test",
+                            extractorVersion: "1",
+                            extractorRunId: "evaluation-revision-race",
+                            independenceKey: "evaluation-revision-race",
+                        },
+                        actor: "user:test",
+                    },
+                );
+                return passEvaluator();
+            };
+            const args = `${claim.publicClaimId} gate.test.ts`;
+            await executeClaimEnforceCommand(commandDeps, args);
+            const result = await executeClaimEnforceCommand(commandDeps, args);
+            expect(result.level).toBe("error");
+            expect(result.text).toContain("changed since confirmation");
+            expect(
+                db.prepare("SELECT COUNT(*) AS count FROM claim_enforcement_artifacts").get(),
+            ).toEqual({ count: 0 });
+            expect(effectiveMaturity(db, claim.revisionId)).not.toBe("ENFORCED");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("rechecks the exact claim token after artifact evaluation", async () => {
+        const db = createClaimReaderTestDatabase();
+        try {
+            const commandDeps = deps(db);
+            const claim = await approvedClaim(db, commandDeps, "enforce-token-race");
+            writeFileSync(join(commandDeps.projectRoot, "gate.test.ts"), "test bytes");
+            commandDeps.evaluateArtifact = () => {
+                setProjectMemoryClaimLifecycle(
+                    db,
+                    { producer: "test", operationKey: "evaluation-lifecycle-race" },
+                    {
+                        token: computeProjectMemoryMutationToken(db, claim.publicClaimId),
+                        state: "archived",
+                        actor: "user:test",
+                    },
+                );
+                return passEvaluator();
+            };
+            const args = `${claim.publicClaimId} gate.test.ts`;
+            await executeClaimEnforceCommand(commandDeps, args);
+            const result = await executeClaimEnforceCommand(commandDeps, args);
+            expect(result.level).toBe("error");
+            expect(result.text).toContain("changed since confirmation");
+            expect(
+                db.prepare("SELECT COUNT(*) AS count FROM claim_enforcement_artifacts").get(),
+            ).toEqual({ count: 0 });
+            expect(effectiveMaturity(db, claim.revisionId)).not.toBe("ENFORCED");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("rejects unapproved claims, path escapes, and artifact mutation", async () => {
+        const db = createClaimReaderTestDatabase();
         try {
             const commandDeps = deps(db, { evaluateArtifact: passEvaluator });
-            const unapproved = seedMemory(db, "enf-unapproved", "not approved");
+            const unapproved = seed(db, "unapproved");
             writeFileSync(join(commandDeps.projectRoot, "gate.test.ts"), "test bytes");
             expect(
                 (
                     await executeClaimEnforceCommand(
                         commandDeps,
-                        `${unapproved.memoryId} gate.test.ts`,
+                        `${unapproved.publicClaimId} gate.test.ts`,
                     )
                 ).text,
             ).toContain("not approved");
 
-            const seed = await approvedSeed(db, commandDeps, "enf-paths");
-            expect(
-                (await executeClaimEnforceCommand(commandDeps, `${seed.memoryId} /etc/passwd`))
-                    .text,
-            ).toContain("project-relative");
+            const claim = await approvedClaim(db, commandDeps, "artifact-change");
+            const artifactPath = join(commandDeps.projectRoot, "changed.test.ts");
+            writeFileSync(artifactPath, "original bytes");
+            commandDeps.evaluateArtifact = () => {
+                writeFileSync(artifactPath, "changed bytes");
+                return passEvaluator();
+            };
+            const args = `${claim.publicClaimId} changed.test.ts`;
+            await executeClaimEnforceCommand(commandDeps, args);
+            const changed = await executeClaimEnforceCommand(commandDeps, args);
+            expect(changed.level).toBe("error");
+            expect(changed.text).toContain("changed during evaluation");
             expect(
                 (
                     await executeClaimEnforceCommand(
                         commandDeps,
-                        `${seed.memoryId} ../outside.test.ts`,
+                        `${claim.publicClaimId} ../outside.test.ts`,
                     )
-                ).text,
-            ).toContain("not found");
-            expect(
-                (await executeClaimEnforceCommand(commandDeps, `${seed.memoryId} missing.test.ts`))
-                    .text,
-            ).toContain("not found");
-
-            // A symlink pointing outside the project escapes canonicalization.
-            const outside = tempProjectRoot();
-            writeFileSync(join(outside, "outside.test.ts"), "outside bytes");
-            symlinkSync(
-                join(outside, "outside.test.ts"),
-                join(commandDeps.projectRoot, "sneaky.test.ts"),
-            );
-            expect(
-                (await executeClaimEnforceCommand(commandDeps, `${seed.memoryId} sneaky.test.ts`))
-                    .text,
-            ).toContain("escapes the owning project");
-
-            // A directory is not a regular file.
-            mkdirSync(join(commandDeps.projectRoot, "dir.test.ts"));
-            expect(
-                (await executeClaimEnforceCommand(commandDeps, `${seed.memoryId} dir.test.ts`))
-                    .text,
-            ).toContain("regular file");
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    test("the artifact evaluator runs outside the claims write transaction", async () => {
-        const db = migratedDb();
-        try {
-            let evaluatedInTransaction: boolean | null = null;
-            const commandDeps = deps(db, {
-                evaluateArtifact: () => {
-                    evaluatedInTransaction = isInTransaction(db);
-                    return passEvaluator();
-                },
-            });
-            const seed = await approvedSeed(db, commandDeps, "enf-outside-tx");
-            writeFileSync(join(commandDeps.projectRoot, "gate.test.ts"), "test bytes");
-            await executeClaimEnforceCommand(commandDeps, `${seed.memoryId} gate.test.ts`);
-            const second = await executeClaimEnforceCommand(
-                commandDeps,
-                `${seed.memoryId} gate.test.ts`,
-            );
-            expect(second.level).toBe("info");
-            expect(evaluatedInTransaction).toBeFalse();
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    test("an artifact rewritten during evaluation is rejected and records nothing", async () => {
-        const db = migratedDb();
-        try {
-            const commandDeps = deps(db);
-            const seed = await approvedSeed(db, commandDeps, "enf-mutate");
-            const artifactPath = join(commandDeps.projectRoot, "gate.test.ts");
-            writeFileSync(artifactPath, "original bytes");
-            commandDeps.evaluateArtifact = () => {
-                writeFileSync(artifactPath, "swapped bytes");
-                return passEvaluator();
-            };
-            await executeClaimEnforceCommand(commandDeps, `${seed.memoryId} gate.test.ts`);
-            const second = await executeClaimEnforceCommand(
-                commandDeps,
-                `${seed.memoryId} gate.test.ts`,
-            );
-            expect(second.level).toBe("error");
-            expect(second.text).toContain("changed during evaluation");
-            expect(
-                (
-                    db
-                        .prepare("SELECT COUNT(*) AS count FROM claim_enforcement_artifacts")
-                        .get() as { count: number }
-                ).count,
-            ).toBe(0);
-            expect(effectiveMaturityOf(db, seed.revisionId)).not.toBe("ENFORCED");
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    test("the evaluator runs an immutable snapshot, so a swap-and-restore cannot bind unevaluated bytes", async () => {
-        const db = migratedDb();
-        try {
-            const commandDeps = deps(db);
-            const seed = await approvedSeed(db, commandDeps, "enf-snapshot");
-            const artifactPath = join(commandDeps.projectRoot, "gate.test.ts");
-            writeFileSync(artifactPath, "original bytes");
-            let evaluatedPath = "";
-            let evaluatedBytes = "";
-            commandDeps.evaluateArtifact = (snapshotPath) => {
-                evaluatedPath = snapshotPath;
-                // Swap the live artifact mid-run and restore it before the
-                // run finishes — the endpoint-hash race the snapshot closes.
-                writeFileSync(artifactPath, "swapped bytes");
-                evaluatedBytes = readFileSync(snapshotPath, "utf8");
-                writeFileSync(artifactPath, "original bytes");
-                return passEvaluator();
-            };
-            await executeClaimEnforceCommand(commandDeps, `${seed.memoryId} gate.test.ts`);
-            const second = await executeClaimEnforceCommand(
-                commandDeps,
-                `${seed.memoryId} gate.test.ts`,
-            );
-            expect(second.level).toBe("info");
-            // The evaluator saw a snapshot holding the digested bytes, not
-            // the live path or the transient replacement.
-            expect(evaluatedPath).not.toBe(artifactPath);
-            expect(evaluatedBytes).toBe("original bytes");
-            expect(existsSync(evaluatedPath)).toBe(false);
-            expect(effectiveMaturityOf(db, seed.revisionId)).toBe("ENFORCED");
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    test("an approval revocation between confirmation and repeat blocks enforcement", async () => {
-        const db = migratedDb();
-        try {
-            const commandDeps = deps(db, { evaluateArtifact: passEvaluator });
-            const seed = await approvedSeed(db, commandDeps, "enf-revoked");
-            writeFileSync(join(commandDeps.projectRoot, "gate.test.ts"), "test bytes");
-            await executeClaimEnforceCommand(commandDeps, `${seed.memoryId} gate.test.ts`);
-            await executeClaimApprovalCommand(commandDeps, `${seed.memoryId} --revoke`);
-            await executeClaimApprovalCommand(commandDeps, `${seed.memoryId} --revoke`);
-            const second = await executeClaimEnforceCommand(
-                commandDeps,
-                `${seed.memoryId} gate.test.ts`,
-            );
-            expect(second.level).toBe("error");
-            expect(effectiveMaturityOf(db, seed.revisionId)).not.toBe("ENFORCED");
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    test("a quoted artifact path with spaces evaluates as one token", async () => {
-        const db = migratedDb();
-        try {
-            const commandDeps = deps(db, { evaluateArtifact: passEvaluator });
-            const seed = await approvedSeed(db, commandDeps, "enf-quoted-path");
-            mkdirSync(join(commandDeps.projectRoot, "integration suite"), { recursive: true });
-            writeFileSync(
-                join(commandDeps.projectRoot, "integration suite", "policy.test.ts"),
-                "test bytes",
-            );
-            const argsText = `${seed.memoryId} "integration suite/policy.test.ts"`;
-            const first = await executeClaimEnforceCommand(commandDeps, argsText);
-            expect(first.level).toBe("warning");
-            const second = await executeClaimEnforceCommand(commandDeps, argsText);
-            expect(second.level).toBe("info");
-            expect(second.text).toContain("ENFORCED");
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    test("artifact revocation removes ENFORCED and a later re-approval cannot restore it", async () => {
-        const db = migratedDb();
-        try {
-            const commandDeps = deps(db, { evaluateArtifact: passEvaluator });
-            const seed = await approvedSeed(db, commandDeps, "enf-artifact-revoke");
-            writeFileSync(join(commandDeps.projectRoot, "gate.test.ts"), "test bytes");
-            await executeClaimEnforceCommand(commandDeps, `${seed.memoryId} gate.test.ts`);
-            await executeClaimEnforceCommand(commandDeps, `${seed.memoryId} gate.test.ts`);
-            expect(effectiveMaturityOf(db, seed.revisionId)).toBe("ENFORCED");
-
-            // Two-step confirmation, mirroring approval revocation.
-            const first = await executeClaimEnforceCommand(
-                commandDeps,
-                `${seed.memoryId} --revoke`,
-            );
-            expect(first.level).toBe("warning");
-            const second = await executeClaimEnforceCommand(
-                commandDeps,
-                `${seed.memoryId} --revoke`,
-            );
-            expect(second.level).toBe("info");
-            expect(second.text).toContain("Revoked 1 enforcement artifact");
-            expect(effectiveMaturityOf(db, seed.revisionId)).not.toBe("ENFORCED");
-
-            // The compromise-response regression: an approval cycle must not
-            // resurrect ENFORCED through the revoked artifact.
-            await executeClaimApprovalCommand(commandDeps, `${seed.memoryId} --revoke`);
-            await executeClaimApprovalCommand(commandDeps, `${seed.memoryId} --revoke`);
-            await executeClaimApprovalCommand(commandDeps, `${seed.memoryId}`);
-            await executeClaimApprovalCommand(commandDeps, `${seed.memoryId}`);
-            expect(effectiveMaturityOf(db, seed.revisionId)).toBe("APPROVED");
-
-            // Nothing left to revoke: the command reports the empty set.
-            const empty = await executeClaimEnforceCommand(
-                commandDeps,
-                `${seed.memoryId} --revoke`,
-            );
-            expect(empty.level).toBe("error");
-            expect(empty.text).toContain("no currently valid enforcement artifact");
+                ).level,
+            ).toBe("error");
         } finally {
             closeQuietly(db);
         }

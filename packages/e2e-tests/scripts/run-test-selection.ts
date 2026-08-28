@@ -51,14 +51,65 @@ export function prospectiveUnitFiles(root: string = E2E_ROOT): string[] {
     return assertPresent(files, root);
 }
 
+/**
+ * Pure-data historian-eval lane tests (contract, scorer, mutation battery,
+ * promote). Harness-booting lane tests live in the OpenCode standalone list
+ * instead, so they never run under rust or pi modes.
+ */
+export function historianEvalUnitFiles(root: string = E2E_ROOT): string[] {
+    const files = [
+        ...new Glob("src/historian-eval/**/*.test.ts").scanSync({
+            cwd: root,
+            onlyFiles: true,
+        }),
+    ]
+        .filter((file) => !HISTORIAN_EVAL_HARNESS_TESTS.includes(file))
+        .sort();
+    if (files.length === 0) throw new Error("historian eval unit selection is empty");
+    return files;
+}
+
+/**
+ * Historian-eval tests that boot the TestHarness (`opencode serve` + mock
+ * provider). TS-mode only: `mc-module`'s Rust historian producer does not
+ * promote claims, so these must never join a rust or pi selection.
+ *
+ * Forward declaration: entries are excluded from `historianEvalUnitFiles()` and
+ * claimed by `tsOpenCodeStandaloneFiles()` the moment they land, so adding one
+ * never trips `assertSrcTestsClassified` — which every CLI path runs, and which
+ * would otherwise break `--mode ts` and `--incident-unit` alike. Listing a name
+ * before the file exists is therefore deliberate, and the presence filter in
+ * `tsOpenCodeStandaloneFiles` is what makes it harmless.
+ */
+export const HISTORIAN_EVAL_HARNESS_TESTS = ["src/historian-eval/runner.test.ts"];
+
 export function standaloneUnitFiles(root: string = E2E_ROOT): string[] {
     const files = [
         "src/cache-analysis.test.ts",
+        "src/oracle-arms/seed-gold-memories.test.ts",
         "src/opencode-runner/spawn.test.ts",
         "src/pi-runner/rpc-client.test.ts",
         "src/pi-runner/spawn.test.ts",
     ];
     return assertPresent(files, root);
+}
+
+/** OpenCode-only oracle tests that require the TypeScript TestHarness. */
+export function tsOpenCodeStandaloneFiles(root: string = E2E_ROOT): string[] {
+    return [
+        ...assertPresent(
+            [
+                "src/oracle-arms/presets.test.ts",
+                "src/oracle-arms/scripted-ctx-search.test.ts",
+            ],
+            root,
+        ),
+        // Presence-filtered, not asserted: the harness list is a forward
+        // declaration (see HISTORIAN_EVAL_HARNESS_TESTS), so a name may legally
+        // precede its file. Claiming the ones that do exist is what keeps the
+        // historian-eval exclusion wired to a destination.
+        ...HISTORIAN_EVAL_HARNESS_TESTS.filter((file) => existsSync(resolve(root, file))),
+    ];
 }
 
 /**
@@ -90,14 +141,19 @@ export function assertSrcTestsClassified(root: string = E2E_ROOT): void {
     const claimed = new Set([
         ...incidentUnitFiles(root).filter((file) => file.startsWith("src/")),
         ...prospectiveUnitFiles(root).filter((file) => file.startsWith("src/")),
+        ...historianEvalUnitFiles(root),
         ...standaloneUnitFiles(root),
+        ...tsOpenCodeStandaloneFiles(root),
         ...rustStandaloneFiles(root),
     ]);
     const unclassified = onDisk.filter((file) => !claimed.has(file)).sort();
     if (unclassified.length > 0) {
         throw new Error(
             `src test files missing from every selection: ${unclassified.join(", ")}; ` +
-                "add them to standaloneUnitFiles, rustStandaloneFiles, or the incident-unit glob",
+                "add them to standaloneUnitFiles, rustStandaloneFiles, the historian-eval glob, or the incident-unit glob. " +
+                "Harness-booting TS-only tests (e.g. historian-eval runner tests excluded via " +
+                "HISTORIAN_EVAL_HARNESS_TESTS) belong in tsOpenCodeStandaloneFiles — never in " +
+                "standaloneUnitFiles, which joins rust and pi selections",
         );
     }
 }
@@ -125,9 +181,24 @@ export function greenTestFiles(
     return files;
 }
 
+export function standaloneFilesForSelection(
+    mode: Mode,
+    harness: GreenHarness,
+    root: string = E2E_ROOT,
+): string[] {
+    return [
+        ...standaloneUnitFiles(root),
+        ...(mode === "ts" && harness !== "pi"
+            ? tsOpenCodeStandaloneFiles(root)
+            : []),
+        ...(mode === "rust" ? rustStandaloneFiles(root) : []),
+    ];
+}
+
 interface CliArgs {
     incidentUnit: boolean;
     prospectiveUnit: boolean;
+    historianEvalUnit: boolean;
     mode: Mode | null;
     harness: GreenHarness;
     timeoutMs: number;
@@ -137,6 +208,7 @@ interface CliArgs {
 function parseArgs(args: string[]): CliArgs {
     let incidentUnit = false;
     let prospectiveUnit = false;
+    let historianEvalUnit = false;
     let mode: Mode | null = null;
     let harness: GreenHarness = "all";
     let timeoutMs = 120_000;
@@ -147,6 +219,8 @@ function parseArgs(args: string[]): CliArgs {
             incidentUnit = true;
         } else if (arg === "--prospective-unit") {
             prospectiveUnit = true;
+        } else if (arg === "--historian-eval-unit") {
+            historianEvalUnit = true;
         } else if (arg === "--mode") {
             const value = args[++index];
             if (value !== "ts" && value !== "rust") {
@@ -175,21 +249,24 @@ function parseArgs(args: string[]): CliArgs {
             maxConcurrency = value;
         } else if (arg === "--help" || arg === "-h") {
             console.log(
-                "Usage: run-test-selection.ts (--incident-unit | --prospective-unit | --mode ts|rust [--harness all|opencode|pi]) [--timeout <ms>] [--max-concurrency <n>]",
+                "Usage: run-test-selection.ts (--incident-unit | --prospective-unit | --historian-eval-unit | --mode ts|rust [--harness all|opencode|pi]) [--timeout <ms>] [--max-concurrency <n>]",
             );
             process.exit(0);
         } else {
             throw new Error(`unknown argument: ${arg}`);
         }
     }
-    const selectionCount = Number(incidentUnit) + Number(prospectiveUnit) + Number(mode !== null);
+    const selectionCount =
+        Number(incidentUnit) + Number(prospectiveUnit) + Number(historianEvalUnit) + Number(mode !== null);
     if (selectionCount !== 1) {
-        throw new Error("select exactly one of --incident-unit, --prospective-unit, or --mode");
+        throw new Error(
+            "select exactly one of --incident-unit, --prospective-unit, --historian-eval-unit, or --mode",
+        );
     }
-    if ((incidentUnit || prospectiveUnit) && harness !== "all") {
+    if ((incidentUnit || prospectiveUnit || historianEvalUnit) && harness !== "all") {
         throw new Error("--harness does not apply to unit test selections");
     }
-    return { incidentUnit, prospectiveUnit, mode, harness, timeoutMs, maxConcurrency };
+    return { incidentUnit, prospectiveUnit, historianEvalUnit, mode, harness, timeoutMs, maxConcurrency };
 }
 
 async function main(): Promise<number> {
@@ -199,7 +276,9 @@ async function main(): Promise<number> {
         ? incidentUnitFiles()
         : args.prospectiveUnit
           ? prospectiveUnitFiles()
-          : greenTestFiles(args.mode!, args.harness);
+          : args.historianEvalUnit
+            ? historianEvalUnitFiles()
+            : greenTestFiles(args.mode!, args.harness);
     if (args.mode === "rust") {
         const prerequisite = detectRustPrerequisites();
         if (!prerequisite.ok) {
@@ -212,12 +291,10 @@ async function main(): Promise<number> {
     // The wrapper drives the whole pool in-process, so it runs alone in a
     // second phase. Hermetic standalone units ride the first phase; the
     // Cargo-fixture ones join only when Rust prerequisites were proven above.
-    const standalone = args.incidentUnit || args.prospectiveUnit
-        ? []
-        : [
-              ...standaloneUnitFiles(),
-              ...(args.mode === "rust" ? rustStandaloneFiles() : []),
-          ];
+    const standalone =
+        args.incidentUnit || args.prospectiveUnit || args.historianEvalUnit
+            ? []
+            : standaloneFilesForSelection(args.mode!, args.harness);
     const selected = [...files, ...standalone];
     const groups = selected.includes(wrapper)
         ? [selected.filter((file) => file !== wrapper), [wrapper]]

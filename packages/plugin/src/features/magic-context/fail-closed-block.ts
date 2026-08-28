@@ -30,12 +30,9 @@ export interface FailClosedBlockingProcess {
 
 export type FailClosedReason =
     | {
-          kind: "migration_guard";
-          persistedVersion: number;
-          supportedVersion: number;
-          blockingProcesses: readonly FailClosedBlockingProcess[];
-          unreadableFile?: string;
-          unreadableArm?: "parse" | "io";
+          kind: "format_refusal";
+          family: string;
+          reasons: readonly string[];
       }
     | {
           kind: "schema_fence";
@@ -125,23 +122,11 @@ export function formatFailClosedBlockingProcesses(
 }
 
 export function formatFailClosedBlockingMessage(reason: FailClosedReason): string {
-    if (reason.kind === "migration_guard") {
-        if (reason.unreadableFile) {
-            const arm = reason.unreadableArm ?? "io";
-            const recovery =
-                arm === "io"
-                    ? `If none of these processes are running, it is safe to delete ${reason.unreadableFile} and retry.`
-                    : `The file may be a recent incomplete write; retry after the file is older than the ten-minute grace window, or stop the relevant process before deleting it.`;
-            return [
-                `Magic Context cannot migrate the shared database because RPC discovery file ${reason.unreadableFile} is uncertain (${arm} arm), so the absence of a live process cannot be proven.`,
-                recovery,
-                `Recovery: ${FAIL_CLOSED_DOCTOR_COMMAND}`,
-            ].join(" ");
-        }
+    if (reason.kind === "format_refusal") {
+        const detail = reason.reasons.length > 0 ? ` (${reason.reasons.join("; ")})` : "";
         return [
-            `Magic Context cannot migrate the shared database because ${formatFailClosedBlockingProcesses(reason.blockingProcesses)} may be running an older Magic Context build that would fail against the migrated database.`,
-            "Restart the blocking process (it will pick up the new build and migrate on start), or shut it down and retry.",
-            `Recovery: ${FAIL_CLOSED_DOCTOR_COMMAND}`,
+            `Magic Context cannot operate: the shared database is not the supported direct claims format (${reason.family})${detail}. No data was changed.`,
+            `To abandon this database family and start fresh, run '${FAIL_CLOSED_DOCTOR_COMMAND} reset-db'.`,
         ].join(" ");
     }
     if (reason.kind === "schema_fence") {

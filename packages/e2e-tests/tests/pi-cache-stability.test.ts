@@ -1,12 +1,10 @@
 /// <reference types="bun-types" />
 
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
-import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import { Database as CoreDatabase } from "@magic-context/core/shared/sqlite";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { PiTestHarness } from "../src/pi-harness";
@@ -40,8 +38,6 @@ function createCurrentSchemaDataDir(): { dataDir: string; rootDir: string } {
     mkdirSync(dbDir, { recursive: true });
     const db = new CoreDatabase(join(dbDir, "context.db"));
     try {
-        initializeDatabase(db);
-        runMigrations(db);
     } finally {
         closeQuietly(db);
     }
@@ -74,7 +70,8 @@ function mainRequests(h: PiTestHarness) {
     return h.mock.requests().filter((request) => {
         const system = request.body.system;
         if (system === undefined || system === null) return false;
-        const asString = typeof system === "string" ? system : JSON.stringify(system);
+        const asString =
+            typeof system === "string" ? system : JSON.stringify(system);
         return asString.includes("## Magic Context");
     });
 }
@@ -112,7 +109,9 @@ function requestMessages(request: { body: { messages?: unknown } }): unknown[] {
  * messages by prependM0M1Messages). Content-presence assertions must scan
  * the whole wire, not just body.system.
  */
-function wireText(request: { body: { system?: unknown; messages?: unknown } }): string {
+function wireText(request: {
+    body: { system?: unknown; messages?: unknown };
+}): string {
     const parts: string[] = [];
     const sys = request.body.system;
     if (typeof sys === "string") parts.push(sys);
@@ -146,7 +145,9 @@ function firstUserMessage(request: { body: { messages?: unknown } }): unknown {
 function maxTagNumber(h: PiTestHarness, sessionId: string): number {
     return readDb(h, (db) => {
         const row = db
-            .prepare("SELECT COALESCE(MAX(tag_number), 0) AS n FROM tags WHERE session_id = ?")
+            .prepare(
+                "SELECT COALESCE(MAX(tag_number), 0) AS n FROM tags WHERE session_id = ?",
+            )
             .get(sessionId) as { n: number } | null;
         return row?.n ?? 0;
     });
@@ -155,13 +156,19 @@ function maxTagNumber(h: PiTestHarness, sessionId: string): number {
 function minTagNumber(h: PiTestHarness, sessionId: string): number {
     return readDb(h, (db) => {
         const row = db
-            .prepare("SELECT COALESCE(MIN(tag_number), 0) AS n FROM tags WHERE session_id = ?")
+            .prepare(
+                "SELECT COALESCE(MIN(tag_number), 0) AS n FROM tags WHERE session_id = ?",
+            )
             .get(sessionId) as { n: number } | null;
         return row?.n ?? 0;
     });
 }
 
-function queueDrop(h: PiTestHarness, sessionId: string, tagNumber: number): void {
+function queueDrop(
+    h: PiTestHarness,
+    sessionId: string,
+    tagNumber: number,
+): void {
     writeDb(h, (db) => {
         db.prepare(
             "INSERT INTO pending_ops (session_id, tag_id, operation, queued_at, harness) VALUES (?, ?, 'drop', ?, 'pi')",
@@ -211,10 +218,13 @@ describe("pi cache stability", () => {
                         timeoutMs: 60_000,
                     });
                     expect(warm.sessionId).toBeTruthy();
-                    await h.sendPrompt("establish the stable mural-enabled baseline", {
-                        timeoutMs: 60_000,
-                        continueSession: true,
-                    });
+                    await h.sendPrompt(
+                        "establish the stable mural-enabled baseline",
+                        {
+                            timeoutMs: 60_000,
+                            continueSession: true,
+                        },
+                    );
                     await h.waitFor(() => h.countTags(warm.sessionId!) > 0, {
                         label: "quiet-pass baseline tag",
                     });
@@ -223,7 +233,9 @@ describe("pi cache stability", () => {
                             .prepare(
                                 "SELECT cached_m0_upgrade_state AS value FROM session_meta WHERE session_id = ?",
                             )
-                            .get(warm.sessionId!) as { value: string | null } | null;
+                            .get(warm.sessionId!) as {
+                            value: string | null;
+                        } | null;
                         return row?.value ?? "";
                     });
                     expect(cachedUpgradeState).toContain("mural-enabled:1");
@@ -241,19 +253,29 @@ describe("pi cache stability", () => {
                     }
 
                     expect(h.countPendingOps(warm.sessionId!)).toBe(1);
-                    expect(piBustCount(h, warm.sessionId!, quietStartedAt)).toBe(0);
+                    expect(
+                        piBustCount(h, warm.sessionId!, quietStartedAt),
+                    ).toBe(0);
                     const requests = h.requests().slice(requestStart);
                     expect(requests).toHaveLength(quietPasses + 1);
-                    for (let index = 0; index < requests.length - 1; index += 1) {
+                    for (
+                        let index = 0;
+                        index < requests.length - 1;
+                        index += 1
+                    ) {
                         const earlier = requestMessages(requests[index]!);
                         const later = requestMessages(requests[index + 1]!);
-                        expect(earlier.length).toBeLessThanOrEqual(later.length);
+                        expect(earlier.length).toBeLessThanOrEqual(
+                            later.length,
+                        );
                         for (
                             let messageIndex = 0;
                             messageIndex < earlier.length;
                             messageIndex += 1
                         ) {
-                            expect(serializeDurablePrefix(later[messageIndex])).toBe(
+                            expect(
+                                serializeDurablePrefix(later[messageIndex]),
+                            ).toBe(
                                 serializeDurablePrefix(earlier[messageIndex]),
                             );
                         }
@@ -267,10 +289,15 @@ describe("pi cache stability", () => {
 
     it("persists tag source_contents once with harness='pi' and keeps original unprefixed text", async () => {
         await withPiHarness({}, async (h) => {
-            const original = "pi source persistence: keep this exact unprefixed user text";
+            const original =
+                "pi source persistence: keep this exact unprefixed user text";
             h.mock.setDefault({
                 text: "first response",
-                usage: { input_tokens: 120, output_tokens: 10, cache_creation_input_tokens: 120 },
+                usage: {
+                    input_tokens: 120,
+                    output_tokens: 10,
+                    cache_creation_input_tokens: 120,
+                },
             });
 
             const first = await h.sendPrompt(original, { timeoutMs: 60_000 });
@@ -291,15 +318,13 @@ describe("pi cache stability", () => {
                          ORDER BY t.tag_number ASC
                          LIMIT 1`,
                     )
-                    .get(first.sessionId!) as
-                    | {
-                          tag_number: number;
-                          tag_harness: string;
-                          source_harness: string;
-                          content: string;
-                          created_at: number;
-                      }
-                    | null;
+                    .get(first.sessionId!) as {
+                    tag_number: number;
+                    tag_harness: string;
+                    source_harness: string;
+                    content: string;
+                    created_at: number;
+                } | null;
             });
             expect(initial).not.toBeNull();
             expect(initial!.tag_harness).toBe("pi");
@@ -309,12 +334,19 @@ describe("pi cache stability", () => {
 
             h.mock.setDefault({
                 text: "second response",
-                usage: { input_tokens: 125, output_tokens: 10, cache_creation_input_tokens: 125 },
+                usage: {
+                    input_tokens: 125,
+                    output_tokens: 10,
+                    cache_creation_input_tokens: 125,
+                },
             });
-            const second = await h.sendPrompt("second pass retags prior content", {
-                timeoutMs: 60_000,
-                continueSession: true,
-            });
+            const second = await h.sendPrompt(
+                "second pass retags prior content",
+                {
+                    timeoutMs: 60_000,
+                    continueSession: true,
+                },
+            );
             expect(second.exitCode).toBeNull();
 
             const after = readDb(h, (db) => {
@@ -322,14 +354,18 @@ describe("pi cache stability", () => {
                     .prepare(
                         "SELECT COUNT(*) AS n FROM source_contents WHERE session_id = ? AND tag_id = ?",
                     )
-                    .get(first.sessionId!, initial!.tag_number) as { n: number } | null;
+                    .get(first.sessionId!, initial!.tag_number) as {
+                    n: number;
+                } | null;
                 const row = db
                     .prepare(
                         "SELECT content, harness, created_at FROM source_contents WHERE session_id = ? AND tag_id = ?",
                     )
-                    .get(first.sessionId!, initial!.tag_number) as
-                    | { content: string; harness: string; created_at: number }
-                    | null;
+                    .get(first.sessionId!, initial!.tag_number) as {
+                    content: string;
+                    harness: string;
+                    created_at: number;
+                } | null;
                 return { count: count?.n ?? 0, row };
             });
             expect(after.count).toBe(1);
@@ -359,12 +395,20 @@ describe("pi cache stability", () => {
                     );
                 h.mock.setDefault({
                     text: "ok",
-                    usage: { input_tokens: 80, output_tokens: 10, cache_creation_input_tokens: 80 },
+                    usage: {
+                        input_tokens: 80,
+                        output_tokens: 10,
+                        cache_creation_input_tokens: 80,
+                    },
                 });
 
-                const first = await h.sendPrompt(largeOriginal, { timeoutMs: 60_000 });
+                const first = await h.sendPrompt(largeOriginal, {
+                    timeoutMs: 60_000,
+                });
                 expect(first.sessionId).toBeTruthy();
-                await h.waitFor(() => h.countTags(first.sessionId!) > 0, { label: "tag ready" });
+                await h.waitFor(() => h.countTags(first.sessionId!) > 0, {
+                    label: "tag ready",
+                });
 
                 const tagNumber = readDb(h, (db) => {
                     const row = db
@@ -404,7 +448,9 @@ describe("pi cache stability", () => {
                         .prepare(
                             "SELECT content FROM source_contents WHERE session_id = ? AND tag_id = ?",
                         )
-                        .get(first.sessionId!, tagNumber) as { content: string } | null;
+                        .get(first.sessionId!, tagNumber) as {
+                        content: string;
+                    } | null;
                     return row?.content ?? "";
                 });
                 expect(source).toBe(largeOriginal);
@@ -416,7 +462,10 @@ describe("pi cache stability", () => {
         await withPiHarness(
             {
                 modelContextLimit: 200,
-                magicContextConfig: { protected_tags: 1, execute_threshold_percentage: 20 },
+                magicContextConfig: {
+                    protected_tags: 1,
+                    execute_threshold_percentage: 20,
+                },
             },
             async (h) => {
                 h.mock.script([
@@ -428,34 +477,55 @@ describe("pi cache stability", () => {
                     // by the cutover instead of by a real execute decision.
                     {
                         text: "warm-up: absorb the one-time stable-id cutover",
-                        usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 10 },
+                        usage: {
+                            input_tokens: 10,
+                            output_tokens: 5,
+                            cache_creation_input_tokens: 10,
+                        },
                     },
                     {
                         text: "low pressure one",
-                        usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 10 },
+                        usage: {
+                            input_tokens: 10,
+                            output_tokens: 5,
+                            cache_creation_input_tokens: 10,
+                        },
                     },
                     {
                         text: "high pressure marker for next transform",
-                        usage: { input_tokens: 150, output_tokens: 5, cache_creation_input_tokens: 150 },
+                        usage: {
+                            input_tokens: 150,
+                            output_tokens: 5,
+                            cache_creation_input_tokens: 150,
+                        },
                     },
                     {
                         text: "after materialization",
-                        usage: { input_tokens: 20, output_tokens: 5, cache_creation_input_tokens: 20 },
+                        usage: {
+                            input_tokens: 20,
+                            output_tokens: 5,
+                            cache_creation_input_tokens: 20,
+                        },
                     },
                 ]);
 
                 // Warm-up turn: lets the stable-id cutover complete (scheme → 1)
                 // before we queue a drop, so the next turn is a genuine defer.
-                const warm = await h.sendPrompt("warm-up turn", { timeoutMs: 60_000 });
+                const warm = await h.sendPrompt("warm-up turn", {
+                    timeoutMs: 60_000,
+                });
                 expect(warm.sessionId).toBeTruthy();
 
-                const firstText = "pi queued drop target should survive one defer pass";
+                const firstText =
+                    "pi queued drop target should survive one defer pass";
                 const first = await h.sendPrompt(firstText, {
                     timeoutMs: 60_000,
                     continueSession: true,
                 });
                 expect(first.sessionId).toBeTruthy();
-                await h.waitFor(() => h.countTags(first.sessionId!) > 0, { label: "tag ready" });
+                await h.waitFor(() => h.countTags(first.sessionId!) > 0, {
+                    label: "tag ready",
+                });
                 // Drop the firstText message's tag. Resolve its tag number from
                 // the DB rather than hardcoding — with the warm-up turn ahead of
                 // it, firstText is no longer guaranteed to be tag 1.
@@ -475,23 +545,35 @@ describe("pi cache stability", () => {
                 expect(dropTag).toBeGreaterThan(0);
                 queueDrop(h, first.sessionId!, dropTag!);
 
-                await h.sendPrompt("second turn stays defer and must not drain pending_ops", {
-                    timeoutMs: 60_000,
-                    continueSession: true,
-                });
+                await h.sendPrompt(
+                    "second turn stays defer and must not drain pending_ops",
+                    {
+                        timeoutMs: 60_000,
+                        continueSession: true,
+                    },
+                );
                 expect(h.countPendingOps(first.sessionId!)).toBe(1);
-                expect(JSON.stringify(h.mock.lastRequest()!.body)).toContain(firstText);
-                expect(JSON.stringify(h.mock.lastRequest()!.body)).not.toContain(
+                expect(JSON.stringify(h.mock.lastRequest()!.body)).toContain(
+                    firstText,
+                );
+                expect(
+                    JSON.stringify(h.mock.lastRequest()!.body),
+                ).not.toContain(`dropped §${dropTag}§`);
+
+                await h.sendPrompt(
+                    "third turn sees prior high usage and executes drops",
+                    {
+                        timeoutMs: 60_000,
+                        continueSession: true,
+                    },
+                );
+                expect(h.countPendingOps(first.sessionId!)).toBe(0);
+                expect(
+                    h.countDroppedTags(first.sessionId!),
+                ).toBeGreaterThanOrEqual(1);
+                expect(JSON.stringify(h.mock.lastRequest()!.body)).toContain(
                     `dropped §${dropTag}§`,
                 );
-
-                await h.sendPrompt("third turn sees prior high usage and executes drops", {
-                    timeoutMs: 60_000,
-                    continueSession: true,
-                });
-                expect(h.countPendingOps(first.sessionId!)).toBe(0);
-                expect(h.countDroppedTags(first.sessionId!)).toBeGreaterThanOrEqual(1);
-                expect(JSON.stringify(h.mock.lastRequest()!.body)).toContain(`dropped §${dropTag}§`);
             },
         );
     }, 180_000);
@@ -500,7 +582,10 @@ describe("pi cache stability", () => {
         await withPiHarness(
             {
                 modelContextLimit: 200,
-                magicContextConfig: { protected_tags: 1, execute_threshold_percentage: 20 },
+                magicContextConfig: {
+                    protected_tags: 1,
+                    execute_threshold_percentage: 20,
+                },
             },
             async (h) => {
                 const callId = "toolu_pi_pairing_cache_stability";
@@ -511,29 +596,51 @@ describe("pi cache stability", () => {
                                 type: "tool_use",
                                 id: callId,
                                 name: "ctx_search",
-                                input: { query: "pi no result expected", limit: 1 },
+                                input: {
+                                    query: "pi no result expected",
+                                    limit: 1,
+                                },
                             },
                         ],
                         stop_reason: "tool_use",
-                        usage: { input_tokens: 20, output_tokens: 5, cache_creation_input_tokens: 20 },
+                        usage: {
+                            input_tokens: 20,
+                            output_tokens: 5,
+                            cache_creation_input_tokens: 20,
+                        },
                     },
                     {
                         text: "tool loop complete",
-                        usage: { input_tokens: 30, output_tokens: 5, cache_creation_input_tokens: 30 },
+                        usage: {
+                            input_tokens: 30,
+                            output_tokens: 5,
+                            cache_creation_input_tokens: 30,
+                        },
                     },
                     {
                         text: "high usage before materialization",
-                        usage: { input_tokens: 150, output_tokens: 5, cache_creation_input_tokens: 150 },
+                        usage: {
+                            input_tokens: 150,
+                            output_tokens: 5,
+                            cache_creation_input_tokens: 150,
+                        },
                     },
                     {
                         text: "after tool drop",
-                        usage: { input_tokens: 20, output_tokens: 5, cache_creation_input_tokens: 20 },
+                        usage: {
+                            input_tokens: 20,
+                            output_tokens: 5,
+                            cache_creation_input_tokens: 20,
+                        },
                     },
                 ]);
 
-                const first = await h.sendPrompt("call ctx_search once so Pi stores a tool pair", {
-                    timeoutMs: 60_000,
-                });
+                const first = await h.sendPrompt(
+                    "call ctx_search once so Pi stores a tool pair",
+                    {
+                        timeoutMs: 60_000,
+                    },
+                );
                 expect(first.sessionId).toBeTruthy();
 
                 const toolTag = await h.waitFor(
@@ -543,17 +650,22 @@ describe("pi cache stability", () => {
                                 .prepare(
                                     "SELECT tag_number FROM tags WHERE session_id = ? AND type = 'tool' ORDER BY tag_number ASC LIMIT 1",
                                 )
-                                .get(first.sessionId!) as { tag_number: number } | null;
+                                .get(first.sessionId!) as {
+                                tag_number: number;
+                            } | null;
                             return row?.tag_number ?? 0;
                         }),
                     { label: "tool tag persisted" },
                 );
                 queueDrop(h, first.sessionId!, toolTag);
 
-                await h.sendPrompt("record high usage for the next execute pass", {
-                    timeoutMs: 60_000,
-                    continueSession: true,
-                });
+                await h.sendPrompt(
+                    "record high usage for the next execute pass",
+                    {
+                        timeoutMs: 60_000,
+                        continueSession: true,
+                    },
+                );
                 await h.sendPrompt("materialize the queued tool drop", {
                     timeoutMs: 60_000,
                     continueSession: true,
@@ -580,7 +692,10 @@ describe("pi cache stability", () => {
     it("keeps Pi system prompt bytes stable across unchanged defer turns", async () => {
         await withPiHarness(
             {
-                magicContextConfig: { execute_threshold_percentage: 90, dreamer: {} },
+                magicContextConfig: {
+                    execute_threshold_percentage: 90,
+                    dreamer: {},
+                },
             },
             async (h) => {
                 writeFileSync(
@@ -589,10 +704,17 @@ describe("pi cache stability", () => {
                 );
                 h.mock.setDefault({
                     text: "ok",
-                    usage: { input_tokens: 100, output_tokens: 10, cache_creation_input_tokens: 100 },
+                    usage: {
+                        input_tokens: 100,
+                        output_tokens: 10,
+                        cache_creation_input_tokens: 100,
+                    },
                 });
 
-                const first = await h.sendPrompt("system prompt stable turn 1", { timeoutMs: 60_000 });
+                const first = await h.sendPrompt(
+                    "system prompt stable turn 1",
+                    { timeoutMs: 60_000 },
+                );
                 expect(first.sessionId).toBeTruthy();
                 for (let i = 2; i <= 4; i++) {
                     await h.sendPrompt(`system prompt stable turn ${i}`, {
@@ -602,7 +724,9 @@ describe("pi cache stability", () => {
                 }
 
                 const requests = mainRequests(h);
-                const systems = requests.map((request) => serialize(request.body.system));
+                const systems = requests.map((request) =>
+                    serialize(request.body.system),
+                );
                 expect(systems.length).toBeGreaterThanOrEqual(4);
                 // System field stays byte-identical across defer turns 2..N.
                 expect(new Set(systems.slice(1)).size).toBe(1);
@@ -611,7 +735,9 @@ describe("pi cache stability", () => {
                 // messages), not the legacy system-only location.
                 const lastWire = wireText(requests.at(-1)!);
                 expect(lastWire).toContain("<project-docs>");
-                expect(lastWire).toContain("Pi cache-stability architecture note");
+                expect(lastWire).toContain(
+                    "Pi cache-stability architecture note",
+                );
             },
         );
     }, 180_000);
@@ -624,9 +750,15 @@ describe("pi cache stability", () => {
             async (h) => {
                 h.mock.setDefault({
                     text: "ok",
-                    usage: { input_tokens: 100, output_tokens: 10, cache_creation_input_tokens: 100 },
+                    usage: {
+                        input_tokens: 100,
+                        output_tokens: 10,
+                        cache_creation_input_tokens: 100,
+                    },
                 });
-                const first = await h.sendPrompt("prefix stable turn 1", { timeoutMs: 60_000 });
+                const first = await h.sendPrompt("prefix stable turn 1", {
+                    timeoutMs: 60_000,
+                });
                 expect(first.sessionId).toBeTruthy();
                 for (let i = 2; i <= 5; i++) {
                     await h.sendPrompt(`prefix stable turn ${i}`, {
@@ -661,34 +793,55 @@ describe("pi cache stability", () => {
                         type: "text",
                         text: `assistant block ${index + 1} for tag counter restart coverage`,
                     })),
-                    usage: { input_tokens: 120, output_tokens: 60, cache_creation_input_tokens: 120 },
+                    usage: {
+                        input_tokens: 120,
+                        output_tokens: 60,
+                        cache_creation_input_tokens: 120,
+                    },
                 },
                 {
                     text: "second response after many assistant blocks",
-                    usage: { input_tokens: 120, output_tokens: 10, cache_creation_input_tokens: 120 },
+                    usage: {
+                        input_tokens: 120,
+                        output_tokens: 10,
+                        cache_creation_input_tokens: 120,
+                    },
                 },
                 {
                     text: "third response after restart",
-                    usage: { input_tokens: 120, output_tokens: 10, cache_creation_input_tokens: 120 },
+                    usage: {
+                        input_tokens: 120,
+                        output_tokens: 10,
+                        cache_creation_input_tokens: 120,
+                    },
                 },
             ]);
 
-            const first = await h.sendPrompt("bootstrap tag counter restart coverage", {
-                timeoutMs: 60_000,
-            });
+            const first = await h.sendPrompt(
+                "bootstrap tag counter restart coverage",
+                {
+                    timeoutMs: 60_000,
+                },
+            );
             expect(first.sessionId).toBeTruthy();
 
-            await h.sendPrompt("second turn tags all prior assistant text blocks", {
-                timeoutMs: 60_000,
-                continueSession: true,
-            });
+            await h.sendPrompt(
+                "second turn tags all prior assistant text blocks",
+                {
+                    timeoutMs: 60_000,
+                    continueSession: true,
+                },
+            );
             const beforeRestart = maxTagNumber(h, first.sessionId!);
             expect(beforeRestart).toBeGreaterThanOrEqual(50);
 
-            await h.sendPrompt("third turn must allocate after the persisted max", {
-                timeoutMs: 60_000,
-                continueSession: true,
-            });
+            await h.sendPrompt(
+                "third turn must allocate after the persisted max",
+                {
+                    timeoutMs: 60_000,
+                    continueSession: true,
+                },
+            );
             const afterRestart = maxTagNumber(h, first.sessionId!);
             expect(afterRestart).toBeGreaterThan(beforeRestart);
             expect(afterRestart).not.toBe(1);

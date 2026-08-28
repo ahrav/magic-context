@@ -11,8 +11,8 @@
 
 import { log } from "../../../shared/logger";
 import type { Database, Statement as PreparedStatement } from "../../../shared/sqlite";
+import { sanitizeFtsQuery } from "../fts-query";
 import { cosineSimilarity } from "../memory/cosine-similarity";
-import { sanitizeFtsQuery } from "../memory/storage-memory-fts";
 import { MAX_LANE_CANDIDATES } from "../search-bounds";
 import type { HybridLaneStageMarks, VectorLoadObserver } from "../search-trace";
 import { loadProjectCommitEmbeddings } from "./storage-git-commit-embeddings";

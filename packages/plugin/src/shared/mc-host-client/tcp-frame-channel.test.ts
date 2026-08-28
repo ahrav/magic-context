@@ -78,7 +78,7 @@ describe("TCP adapter specifics", () => {
         const channel = new TcpFrameChannel({
             host: "127.0.0.1",
             port: peer.port,
-            credentials: { key: peer.key, daemonId: peer.daemonId },
+            credentials: { key: peer.key, daemonId: peer.daemonId, daemonVer: peer.daemonVer },
             budget,
             frameDeadlineMs: options.frameDeadlineMs,
             maxBodyLen: options.maxBodyLen,

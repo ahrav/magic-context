@@ -443,6 +443,57 @@ async fn managed_client_negotiation_failures_retire_socket_without_application_f
     }
 }
 
+/// Wire protocol §5.2 requires the client to reject a `ServerProof` whose
+/// `daemon_ver` disagrees with the connection file, before it emits `ClientAuth`.
+/// `daemon_ver` is not an input to either proof, so a peer holding the right key
+/// and daemon ID can still report any version it likes; only this comparison
+/// binds the reported version to the snapshot that was authenticated.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_rewritten_daemon_ver_fails_the_handshake() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let publication = root.path().join("connection.json");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let key = vec![0x5a; 32];
+    let daemon_id = [0x3c; 16];
+    let info = ConnectionInfo {
+        schema: 1,
+        wire_version: 2,
+        endpoints: vec![Endpoint {
+            host: "127.0.0.1".to_owned(),
+            port: listener.local_addr().unwrap().port(),
+        }],
+        key: key.clone(),
+        daemon_id,
+        pid: std::process::id(),
+        daemon_ver: "fake-peer".to_owned(),
+    };
+    std::fs::write(&publication, serde_json::to_vec(&info).unwrap()).unwrap();
+    std::fs::set_permissions(&publication, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let peer = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        // Correct key and daemon ID, but a version the connection file never
+        // published. The server-side handshake therefore fails on the client's
+        // refusal to send `ClientAuth`, which is the behavior under test.
+        let _ = authenticate_server(
+            &mut socket,
+            &key,
+            &daemon_id,
+            "mc-host/999.0.0",
+            Duration::from_secs(1),
+        )
+        .await;
+    });
+
+    let error = Client::connect(&publication)
+        .await
+        .expect_err("a rewritten daemon_ver must not authenticate");
+    assert_eq!(error.code(), "authentication_failed");
+    peer.await.unwrap();
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn zero_length_stream_item_is_delivered_and_does_not_retire_the_connection() {

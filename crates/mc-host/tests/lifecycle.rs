@@ -1812,8 +1812,12 @@ async fn a_replaced_cortexkit_subtree_cannot_admit_an_overlapping_incarnation() 
     })
     .await;
     assert!(
-        matches!(blocked, Err(HostError::Instance(_))),
-        "the lifetime fence must refuse a successor while the first host lives"
+        matches!(
+            blocked,
+            Err(HostError::Instance(mc_host::InstanceError::AlreadyRunning))
+        ),
+        "the lifetime fence must refuse a successor while the first host lives, \
+         and must do so because the fence is held"
     );
 
     host.shutdown().await.expect("graceful shutdown");

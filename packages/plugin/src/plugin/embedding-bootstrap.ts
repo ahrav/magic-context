@@ -4,7 +4,6 @@ import {
     registerProjectEmbedding,
     registerProjectShadowEmbedding,
 } from "../features/magic-context/memory/embedding";
-import { invalidateProject } from "../features/magic-context/memory/embedding-cache";
 import { resolveProjectIdentityForSession } from "../features/magic-context/memory/project-identity";
 import { log } from "../shared/logger";
 import type { Database } from "../shared/sqlite";
@@ -21,7 +20,6 @@ export async function ensureProjectRegisteredFromOpenCodeDirectory(
         detailed.config.allow_home_project,
     );
     if (!projectIdentity) return;
-    invalidateProject(projectIdentity);
     if (isConfigLoadUntrusted(detailed)) {
         handleUntrustedLoad(db, projectIdentity, directory, detailed);
         return;

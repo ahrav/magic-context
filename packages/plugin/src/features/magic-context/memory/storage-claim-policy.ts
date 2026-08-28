@@ -4,7 +4,7 @@
  *
  * Every writer here assumes the caller already holds the outer write
  * transaction (`runInMemoryClaimsWriteTransaction` / the operation envelope),
- * matching the `storage-memory-claims.ts` kernel pattern. Policy decisions,
+ * matching the claim-operation kernel pattern. Policy decisions,
  * projection rows, outbox effects, and generations therefore commit together
  * (R27); the append-only v86 triggers enforce the ledger invariants at the
  * database boundary.
@@ -491,74 +491,45 @@ export function countIndependentEvidenceGroups(db: Database, revisionId: number)
     return row.hasAny ? 1 : 0;
 }
 
-/** Exact explicit-user evidence for this revision: a supports observation
- * with the explicit-user trust class, or — for revisions at or below the
- * recorded seed boundary only — retained raw `user` source provenance on the
- * revision's memory metadata. Post-boundary revisions must carry the trust
- * class on the observation itself, so retained legacy metadata cannot
- * qualify later rewrites.
- *
- * Both branches are restricted to the claim's FIRST revision — with one
- * carve-out. The pre-v86 rewrite path passed the retained `user` source
- * type into the new observation and left the revision metadata untouched,
- * so a later revision's explicit-user stamp can be model-authored
- * replacement bytes; a held-open pre-v86 writer keeps producing such
- * observations AFTER the seed boundary too, so the boundary alone cannot
- * clear them. First revisions come from the original user write or legacy
- * adoption and keep their stated provenance. The carve-out: a post-boundary
- * later revision whose bytes still equal the first revision's bytes (the
- * v86 classification path re-observes unchanged content) keeps its
- * evidence, because no writer can smuggle new content through it. A missing
- * boundary key reads as 0 (never seeded): every revision on such a database
- * was written by a build that classifies rewrites as model inference. */
+/**
+ * The only producer whose explicit-user observation may grant explicit-user
+ * credit to a revision that changes content. The Tauri dashboard records the
+ * new content as the observation's own `extracted_text`. Mirrored by
+ * `EXPLICIT_USER_REVISION_PRODUCER` in
+ * `packages/dashboard/src-tauri/src/claim_adapter.rs`; the adapter conformance
+ * suite compares both policies' verdicts, so a drift shows up as a maturity
+ * disagreement rather than passing silently.
+ */
+export const EXPLICIT_USER_REVISION_PRODUCER = "dashboard:tauri";
+
+/** Exact explicit-user evidence for this revision. First revisions retain
+ * their stated provenance. Later revisions qualify only when their bytes still
+ * equal the first revision or when the dashboard's explicit-user channel
+ * observed the revision's exact bytes. */
 export function hasExplicitUserEvidence(db: Database, revisionId: number): boolean {
-    const byObservation = db
-        .prepare(
-            // Post-boundary observations are NOT unconditionally trusted:
-            // a held-open pre-v86 writer's rewrite path copies the retained
-            // `user` trust class onto the model-authored successor's
-            // observation. A post-boundary later revision qualifies only
-            // while its bytes ARE still the claim's first-revision bytes
-            // (the v86 classification path re-observes unchanged content;
-            // no v86 path authors NEW user-content revisions), so a
-            // content-changing compatibility rewrite can never ride the
-            // copied stamp to VERIFIED.
-            `SELECT 1 FROM claim_evidence e
+    return (
+        db
+            .prepare(
+                `SELECT 1 FROM claim_evidence e
              JOIN observations o ON o.id = e.observation_id
              JOIN claim_revisions cr ON cr.id = e.revision_id
              WHERE e.revision_id = ? AND e.relation = 'supports'
                AND o.source_trust_class = 'explicit_user'
                AND (
                    cr.revision = 1
+                   OR cr.content_sha256 = (
+                       SELECT first.content_sha256 FROM claim_revisions first
+                       WHERE first.claim_id = cr.claim_id AND first.revision = 1
+                   )
                    OR (
-                       e.revision_id > COALESCE((
-                           SELECT CAST(value AS INTEGER) FROM schema_migrations_meta
-                           WHERE key = 'claim_policy_seed_boundary_revision_id'
-                       ), 0)
-                       AND cr.content_sha256 = (
-                           SELECT first.content_sha256 FROM claim_revisions first
-                           WHERE first.claim_id = cr.claim_id AND first.revision = 1
-                       )
+                       o.extractor = ?
+                       AND o.content_sha256 = cr.content_sha256
                    )
                )
              LIMIT 1`,
-        )
-        .get(revisionId);
-    if (byObservation) return true;
-    const byMetadata = db
-        .prepare(
-            `SELECT 1 FROM claim_revision_memory_metadata m
-             JOIN claim_revisions cr ON cr.id = m.revision_id
-             WHERE m.revision_id = ? AND m.source_type = 'user'
-               AND cr.revision = 1
-               AND m.revision_id <= (
-                   SELECT CAST(value AS INTEGER) FROM schema_migrations_meta
-                   WHERE key = 'claim_policy_seed_boundary_revision_id'
-               )
-             LIMIT 1`,
-        )
-        .get(revisionId);
-    return byMetadata != null;
+            )
+            .get(revisionId, EXPLICIT_USER_REVISION_PRODUCER) != null
+    );
 }
 
 export function readActiveDispositions(db: Database, revisionId: number): ActiveDispositions {

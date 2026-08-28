@@ -60,8 +60,15 @@ impl Settlement {
 
 /// The terminal frames a request can settle with.
 pub enum Terminal {
-    Response { body: OutputBuffer, binary: bool },
-    Error { code: String, message: String },
+    Response {
+        body: OutputBuffer,
+        binary: bool,
+    },
+    Error {
+        code: String,
+        message: String,
+        retry_after_ms: Option<u64>,
+    },
     StreamEnd,
 }
 
@@ -72,14 +79,19 @@ pub enum Terminal {
 const MAX_TERMINAL_CODE_LEN: usize = 128;
 const MAX_TERMINAL_MESSAGE_LEN: usize = 4096;
 
-fn bounded_terminal_error(code: String, message: String) -> Terminal {
+fn bounded_terminal_error(code: String, message: String, retry_after_ms: Option<u64>) -> Terminal {
     if code.len() > MAX_TERMINAL_CODE_LEN || message.len() > MAX_TERMINAL_MESSAGE_LEN {
         return Terminal::Error {
             code: CODE_INTERNAL_ERROR.to_owned(),
             message: "handler error exceeds diagnostic limit".to_owned(),
+            retry_after_ms: None,
         };
     }
-    Terminal::Error { code, message }
+    Terminal::Error {
+        code,
+        message,
+        retry_after_ms,
+    }
 }
 
 /// Serialized length of `s` inside a JSON string, without materializing it:
@@ -94,6 +106,21 @@ fn escaped_json_len(s: &str) -> usize {
             _ => 1,
         })
         .sum()
+}
+
+fn decimal_u64_len(value: u64) -> usize {
+    value.checked_ilog10().map_or(1, |log| log as usize + 1)
+}
+
+fn error_body_len(code: &str, message: &str, retry_after_ms: Option<u64>) -> usize {
+    const ERROR_ENVELOPE_OVERHEAD: usize = r#"{"code":"","message":""}"#.len();
+    const RETRY_AFTER_FIELD_OVERHEAD: usize = b",\"retry_after_ms\":".len();
+    escaped_json_len(code)
+        .saturating_add(escaped_json_len(message))
+        .saturating_add(ERROR_ENVELOPE_OVERHEAD)
+        .saturating_add(retry_after_ms.map_or(0, |value| {
+            RETRY_AFTER_FIELD_OVERHEAD.saturating_add(decimal_u64_len(value))
+        }))
 }
 
 /// Builds an error terminal body under a pre-acquired egress reservation.
@@ -152,19 +179,19 @@ async fn charged_error_body(
     gen: &GenerationCore,
     code: &str,
     message: &str,
+    retry_after_ms: Option<u64>,
 ) -> Result<(OutputBuffer, Instant), ()> {
-    const ERROR_ENVELOPE_OVERHEAD: usize = r#"{"code":"","message":""}"#.len();
-    let encoded_len = |code: &str, message: &str| {
-        escaped_json_len(code)
-            .saturating_add(escaped_json_len(message))
-            .saturating_add(ERROR_ENVELOPE_OVERHEAD)
-    };
-    let (code, message) = if encoded_len(code, message) > crate::wire::MAX_BODY_LEN as usize {
-        (CODE_INTERNAL_ERROR, "handler error exceeds frame limit")
-    } else {
-        (code, message)
-    };
-    let body_len = encoded_len(code, message);
+    let (code, message, retry_after_ms) =
+        if error_body_len(code, message, retry_after_ms) > crate::wire::MAX_BODY_LEN as usize {
+            (
+                CODE_INTERNAL_ERROR,
+                "handler error exceeds frame limit",
+                None,
+            )
+        } else {
+            (code, message, retry_after_ms)
+        };
+    let body_len = error_body_len(code, message, retry_after_ms);
     if gen.writer.is_retired() || gen.token.is_cancelled() {
         return Err(());
     }
@@ -180,6 +207,7 @@ async fn charged_error_body(
         Vec::with_capacity(body_len + HEADER_LEN),
         code,
         message,
+        retry_after_ms,
     );
     debug_assert_eq!(body.len(), body_len, "escaped length model diverged");
     Ok((
@@ -197,11 +225,21 @@ async fn charged_error_body(
 /// `serde_json::Value` — so the only allocation is the charged output buffer.
 /// Field order and escaping match `serde_json`, which `escaped_json_len`
 /// models exactly.
-fn error_body_json_into(mut buf: Vec<u8>, code: &str, message: &str) -> Vec<u8> {
+fn error_body_json_into(
+    mut buf: Vec<u8>,
+    code: &str,
+    message: &str,
+    retry_after_ms: Option<u64>,
+) -> Vec<u8> {
     buf.extend_from_slice(b"{\"code\":");
     serde_json::to_writer(&mut buf, code).expect("string serialization cannot fail");
     buf.extend_from_slice(b",\"message\":");
     serde_json::to_writer(&mut buf, message).expect("string serialization cannot fail");
+    if let Some(retry_after_ms) = retry_after_ms {
+        buf.extend_from_slice(b",\"retry_after_ms\":");
+        serde_json::to_writer(&mut buf, &retry_after_ms)
+            .expect("integer serialization cannot fail");
+    }
     buf.push(b'}');
     buf
 }
@@ -324,7 +362,7 @@ pub async fn emit_error_terminal(
     code: &str,
     message: &str,
 ) {
-    let Ok((body, deadline)) = charged_error_body(budget, gen, code, message).await else {
+    let Ok((body, deadline)) = charged_error_body(budget, gen, code, message, None).await else {
         gen.token.cancel();
         return;
     };
@@ -372,6 +410,7 @@ pub async fn settle(
                     gen,
                     CODE_INTERNAL_ERROR,
                     "handler returned a unary response after streaming",
+                    None,
                 )
                 .await
                 else {
@@ -408,8 +447,13 @@ pub async fn settle(
             }
             return true;
         }
-        Terminal::Error { code, message } => {
-            let Ok((body, deadline)) = charged_error_body(budget, gen, &code, &message).await
+        Terminal::Error {
+            code,
+            message,
+            retry_after_ms,
+        } => {
+            let Ok((body, deadline)) =
+                charged_error_body(budget, gen, &code, &message, retry_after_ms).await
             else {
                 gen.token.cancel();
                 return true;
@@ -724,7 +768,8 @@ pub(crate) async fn emit_authoritative_rejection<H: McHostHandler>(
     message: &'static str,
     written_tx: oneshot::Sender<()>,
 ) {
-    let Ok((body, deadline)) = charged_error_body(&shared.egress_budget, gen, code, message).await
+    let Ok((body, deadline)) =
+        charged_error_body(&shared.egress_budget, gen, code, message, None).await
     else {
         return;
     };
@@ -883,6 +928,7 @@ pub async fn dispatch_request<H: McHostHandler>(
                 Terminal::Error {
                     code: CODE_CANCELLED.to_owned(),
                     message: "request cancelled".to_owned(),
+                    retry_after_ms: None,
                 },
             )
             .await;
@@ -941,6 +987,7 @@ pub async fn dispatch_request<H: McHostHandler>(
                     Terminal::Error {
                         code: CODE_CANCELLED.to_owned(),
                         message: "request cancelled".to_owned(),
+                        retry_after_ms: None,
                     },
                 )
                 .await;
@@ -955,6 +1002,7 @@ pub async fn dispatch_request<H: McHostHandler>(
                             code: CODE_INTERNAL_ERROR.to_owned(),
                             message: "handler returned a unary response after streaming"
                                 .to_owned(),
+                            retry_after_ms: None,
                         }
                     }
                     Ok(RequestOutcome::Response { body, binary })
@@ -964,19 +1012,25 @@ pub async fn dispatch_request<H: McHostHandler>(
                     Ok(RequestOutcome::Response { .. }) => Terminal::Error {
                         code: CODE_INTERNAL_ERROR.to_owned(),
                         message: "handler response exceeds frame limit".to_owned(),
+                        retry_after_ms: None,
                     },
-                    Ok(RequestOutcome::Error { code, message }) => {
+                    Ok(RequestOutcome::Error {
+                        code,
+                        message,
+                        retry_after_ms,
+                    }) => {
                         // Normalized before the terminal is held across the
                         // egress wait: the handler task permit is already
                         // released, so oversized owned strings would otherwise
                         // accumulate uncharged across up to
                         // max_pending_requests settlements.
-                        bounded_terminal_error(code, message)
+                        bounded_terminal_error(code, message, retry_after_ms)
                     }
                     Ok(RequestOutcome::Streamed) => Terminal::StreamEnd,
                     Err(join_err) if join_err.is_panic() => Terminal::Error {
                         code: CODE_INTERNAL_ERROR.to_owned(),
                         message: "handler request task failed".to_owned(),
+                        retry_after_ms: None,
                     },
                     Err(_) => {
                         remove_pending(&gen_task, key);
@@ -1405,5 +1459,48 @@ pub fn handle_cancel(gen: &GenerationCore, key: PendingKey) {
         if !entry.settlement.is_settled() {
             entry.cancel.cancel();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bounded_terminal_error, error_body_json_into, error_body_len, Terminal};
+
+    #[test]
+    fn error_body_length_model_is_exact_with_and_without_retry_hint() {
+        for retry_after_ms in [None, Some(0), Some(9), Some(10), Some(50), Some(u64::MAX)] {
+            let code = "quoted\"code";
+            let message = "line one\nline two\\tail";
+            let expected = error_body_len(code, message, retry_after_ms);
+            let body =
+                error_body_json_into(Vec::with_capacity(expected), code, message, retry_after_ms);
+            assert_eq!(body.len(), expected);
+            assert_eq!(body.capacity(), expected);
+
+            let parsed: serde_json::Value =
+                serde_json::from_slice(&body).expect("valid error JSON");
+            assert_eq!(parsed["code"], code);
+            assert_eq!(parsed["message"], message);
+            match retry_after_ms {
+                Some(value) => assert_eq!(parsed["retry_after_ms"], value),
+                None => assert!(parsed.get("retry_after_ms").is_none()),
+            }
+        }
+    }
+
+    #[test]
+    fn diagnostic_limit_substitution_drops_retry_hint() {
+        let terminal = bounded_terminal_error("x".repeat(129), "message".to_owned(), Some(50));
+        let Terminal::Error {
+            code,
+            message,
+            retry_after_ms,
+        } = terminal
+        else {
+            panic!("expected error terminal");
+        };
+        assert_eq!(code, "internal_error");
+        assert_eq!(message, "handler error exceeds diagnostic limit");
+        assert_eq!(retry_after_ms, None);
     }
 }

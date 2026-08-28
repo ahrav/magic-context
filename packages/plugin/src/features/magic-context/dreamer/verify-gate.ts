@@ -2,61 +2,30 @@ import path from "node:path";
 
 import type { Database } from "../../../shared/sqlite";
 import {
-    getMemoriesByProject,
-    getMemoryVerifications,
     readGitChangedFilesSince,
     readGitFileChangeTimesSince,
     readGitHead,
     resolveGitTopLevel,
     verificationFileExists,
 } from "../memory";
-import { filterMemoriesForMaintenance } from "../memory/storage-claim-visibility";
+import { APPLICABILITY_BASELINE_STREAM_KEY } from "../storage-claim-applicability-schema";
+import { readDreamerProjectClaims } from "./claim-manifest";
 import { runLeaseGuardedWrite } from "./lease";
 import { getTaskScheduleState, writeTaskScheduleState } from "./storage-task-schedule";
 import type { VerifyPromptMemory } from "./verify-prompt";
-
-/**
- * Per-memory verify scope (DreamerV2 rework).
- *
- * Replaces the old GLOBAL commit-watermark + all-or-nothing coverage gate. Now
- * each memory carries its own `verified_at` (set by the verify apply), so:
- *  - partial progress STICKS: a timed-out verify banks the memories it checked;
- *    the next run skips them and continues (the cold-start trap is gone).
- *  - there is no watermark to advance and no coverage check.
- *
- * Scope = active memories that have a REAL backing-file mapping (recorded by the
- * map-memories backfill). Excluded:
- *  - file-independent memories (no-file sentinel) — they describe external
- *    behavior and cannot be checked against local code; curate + age decay own
- *    them.
- *  - unmapped memories — map-memories maps them first; once mapped they enter
- *    verify scope as never-verified (verified_at = 0).
- *
- * Modes:
- *  - `verify` (incremental, default): a candidate is in scope if it was never
- *    content-verified (verified_at = 0) OR any mapped file changed since THAT
- *    memory's verified_at (committed change-time newer, an uncommitted edit, or
- *    the file was deleted).
- *  - `verify-broad` (`forceBroad`): candidates whose `verified_at` predates the
- *    currently open broad cycle. The cycle start is persisted in the existing
- *    `last_broad_run_at` schedule-state column, so a large pool drains oldest-first
- *    across scheduled runs instead of being selected afresh every week.
- */
 
 export interface VerifyGateResult {
     runStartedAt: number;
     mode: "non-git" | "full" | "broad" | "incremental";
     inScope: VerifyPromptMemory[];
-    inScopeIds: number[];
-    skippedIds: number[];
+    inScopeIds: string[];
+    skippedIds: string[];
     reason: string;
-    /** The persisted broad-cycle watermark used for this run, when broad. */
     broadCycleStartAt?: number;
 }
 
-/** Min of a numeric list without spread (avoids RangeError on large pools). */
 function minOf(values: readonly number[]): number {
-    return values.reduce((acc, v) => (v < acc ? v : acc), Number.POSITIVE_INFINITY);
+    return values.reduce((minimum, value) => Math.min(minimum, value), Number.POSITIVE_INFINITY);
 }
 
 function ensureBroadCycleStart(args: {
@@ -70,27 +39,47 @@ function ensureBroadCycleStart(args: {
     if (current?.lastBroadRunAt != null && current.lastBroadRunAt > 0) {
         return current.lastBroadRunAt;
     }
-    // Direct gate callers without a scheduler row have no schedule state to
-    // persist. Production runs are seeded by the scheduler and take the guarded
-    // path below; retaining this fallback keeps the gate useful in isolated tests
-    // and for old callers that do not use Dreamer v2 scheduling.
     if (!current) return args.runStartedAt;
     if (!args.holderId || !args.leaseKey) {
         throw new Error("verify-broad cycle opening requires the task lease");
     }
-
     return runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
         const latest = getTaskScheduleState(args.db, args.projectIdentity, "verify-broad");
         if (!latest) return args.runStartedAt;
         if (latest.lastBroadRunAt != null && latest.lastBroadRunAt > 0) {
             return latest.lastBroadRunAt;
         }
-        writeTaskScheduleState(args.db, {
-            ...latest,
-            lastBroadRunAt: args.runStartedAt,
-        });
+        writeTaskScheduleState(args.db, { ...latest, lastBroadRunAt: args.runStartedAt });
         return args.runStartedAt;
     });
+}
+
+function mappedFiles(claim: ReturnType<typeof readDreamerProjectClaims>[number]): string[] {
+    const baseline = claim.applicability.find(
+        (assertion) => assertion.streamKey === APPLICABILITY_BASELINE_STREAM_KEY,
+    );
+    if (baseline?.pathsState !== "known") return [];
+    return baseline.paths
+        .flatMap((entry) => (entry.kind === "exact" ? [entry.value] : []))
+        .sort((left, right) => left.localeCompare(right));
+}
+
+function verifiedAt(claim: ReturnType<typeof readDreamerProjectClaims>[number]): number {
+    return claim.verification.latestOutcome === "verified" ? claim.verification.verifiedAt : 0;
+}
+
+function toPromptMemory(
+    claim: ReturnType<typeof readDreamerProjectClaims>[number],
+): VerifyPromptMemory {
+    return {
+        publicClaimId: claim.publicClaimId,
+        revisionLocator: claim.revisionLocator,
+        contentDigest: claim.contentDigest,
+        mutationToken: claim.mutationToken,
+        category: claim.category,
+        content: claim.content,
+        mappedFiles: mappedFiles(claim),
+    };
 }
 
 export async function partitionVerifyScope(args: {
@@ -103,54 +92,27 @@ export async function partitionVerifyScope(args: {
     leaseKey?: string;
 }): Promise<VerifyGateResult> {
     const runStartedAt = args.now ?? Date.now();
-    // Verification is the lane that OWNS stale/disputed outcomes and heals
-    // them, so its pool keeps those rows and candidates; the uniform-absence
-    // class and superseded rows never reach the child-model prompt.
-    const active = filterMemoriesForMaintenance(
-        args.db,
-        getMemoriesByProject(args.db, args.projectIdentity),
-        "verification",
-    );
-    const verById = getMemoryVerifications(
-        args.db,
-        active.map((m) => m.id),
-    );
-
-    // Candidates: active memories WITH a real backing-file mapping. A memory with
-    // only the no-file sentinel (file-independent) or no mapping row at all is
-    // excluded — see the doc comment.
-    const candidates = active.filter((m) => (verById.get(m.id)?.files.length ?? 0) > 0);
-
-    const toPrompt = (m: (typeof active)[number]): VerifyPromptMemory => ({
-        id: m.id,
-        category: m.category,
-        content: m.content,
-        mappedFiles: verById.get(m.id)?.files ?? [],
-    });
+    const active = readDreamerProjectClaims(args.db, args.projectIdentity, "verification");
+    const candidates = active.filter((claim) => mappedFiles(claim).length > 0);
 
     if (args.forceBroad) {
-        const broadCycleStartAt = ensureBroadCycleStart({
-            db: args.db,
-            projectIdentity: args.projectIdentity,
-            holderId: args.holderId,
-            leaseKey: args.leaseKey,
-            runStartedAt,
-        });
+        const broadCycleStartAt = ensureBroadCycleStart({ ...args, runStartedAt });
         const broadCandidates = candidates
-            .filter((m) => (verById.get(m.id)?.verifiedAt ?? 0) < broadCycleStartAt)
-            .sort((a, b) => {
-                const verifiedAtA = verById.get(a.id)?.verifiedAt ?? 0;
-                const verifiedAtB = verById.get(b.id)?.verifiedAt ?? 0;
-                return verifiedAtA - verifiedAtB || a.id - b.id;
-            });
+            .filter((claim) => verifiedAt(claim) < broadCycleStartAt)
+            .sort(
+                (left, right) =>
+                    verifiedAt(left) - verifiedAt(right) ||
+                    left.publicClaimId.localeCompare(right.publicClaimId),
+            );
+        const inScopeIds = new Set(broadCandidates.map((claim) => claim.publicClaimId));
         return {
             runStartedAt,
             mode: "broad",
-            inScope: broadCandidates.map(toPrompt),
-            inScopeIds: broadCandidates.map((m) => m.id),
-            skippedIds: candidates
-                .filter((m) => !broadCandidates.some((candidate) => candidate.id === m.id))
-                .map((m) => m.id),
+            inScope: broadCandidates.map(toPromptMemory),
+            inScopeIds: [...inScopeIds],
+            skippedIds: candidates.flatMap((claim) =>
+                inScopeIds.has(claim.publicClaimId) ? [] : [claim.publicClaimId],
+            ),
             broadCycleStartAt,
             reason: `broad cycle (${broadCandidates.length} remain; started ${broadCycleStartAt})`,
         };
@@ -163,66 +125,53 @@ export async function partitionVerifyScope(args: {
             inScope: [],
             inScopeIds: [],
             skippedIds: [],
-            reason: "no file-mapped memories in scope",
+            reason: "no file-mapped claims in scope",
         };
     }
 
     const allInScope = (mode: VerifyGateResult["mode"], reason: string): VerifyGateResult => ({
         runStartedAt,
         mode,
-        inScope: candidates.map(toPrompt),
-        inScopeIds: candidates.map((m) => m.id),
+        inScope: candidates.map(toPromptMemory),
+        inScopeIds: candidates.map((claim) => claim.publicClaimId),
         skippedIds: [],
         reason,
     });
-
     const gitRoot =
         (await resolveGitTopLevel(args.projectDirectory)) ?? path.resolve(args.projectDirectory);
-
-    // Oldest verified time among already-verified candidates bounds the git-log
-    // window. Never-verified candidates (verified_at = 0) are always in scope.
-    const verifiedTimes = candidates
-        .map((m) => verById.get(m.id)?.verifiedAt ?? 0)
-        .filter((t) => t > 0);
+    const verifiedTimes = candidates.map(verifiedAt).filter((time) => time > 0);
     const sinceMs = verifiedTimes.length > 0 ? minOf(verifiedTimes) : runStartedAt;
-
     const changeTimes = await readGitFileChangeTimesSince(args.projectDirectory, sinceMs);
     if (changeTimes === null) {
-        // git unavailable → verify everything (safe direction: re-check vs skip).
         return allInScope("full", "git change-times unavailable; full verification");
     }
-    // Also catch uncommitted working-tree edits (committed change-times miss them):
-    // a mapped file with a pending edit is "changed now" → re-verify.
     const head = await readGitHead(args.projectDirectory);
     const uncommitted = head
         ? ((await readGitChangedFilesSince(args.projectDirectory, head)) ?? new Set<string>())
         : new Set<string>();
 
     const inScope: VerifyPromptMemory[] = [];
-    const skippedIds: number[] = [];
-    for (const m of candidates) {
-        const v = verById.get(m.id);
-        const verifiedAt = v?.verifiedAt ?? 0;
-        if (verifiedAt === 0) {
-            inScope.push(toPrompt(m)); // never content-verified
+    const skippedIds: string[] = [];
+    for (const claim of candidates) {
+        const lastVerifiedAt = verifiedAt(claim);
+        if (lastVerifiedAt === 0) {
+            inScope.push(toPromptMemory(claim));
             continue;
         }
-        const files = v?.files ?? [];
-        const needs = files.some(
+        const needsVerification = mappedFiles(claim).some(
             (file) =>
-                !verificationFileExists(gitRoot, file) || // deleted → re-check
-                uncommitted.has(file) || // pending working-tree edit
-                (changeTimes.get(file) ?? 0) >= verifiedAt - 1_000, // git commit times are second-granular
+                !verificationFileExists(gitRoot, file) ||
+                uncommitted.has(file) ||
+                (changeTimes.get(file) ?? 0) >= lastVerifiedAt - 1_000,
         );
-        if (needs) inScope.push(toPrompt(m));
-        else skippedIds.push(m.id);
+        if (needsVerification) inScope.push(toPromptMemory(claim));
+        else skippedIds.push(claim.publicClaimId);
     }
-
     return {
         runStartedAt,
         mode: "incremental",
         inScope,
-        inScopeIds: inScope.map((m) => m.id),
+        inScopeIds: inScope.map((claim) => claim.publicClaimId),
         skippedIds,
         reason: `incremental verification (${inScope.length} changed of ${candidates.length} mapped)`,
     };

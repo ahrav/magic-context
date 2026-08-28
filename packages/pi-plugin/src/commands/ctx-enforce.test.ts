@@ -3,14 +3,8 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { clearClaimCommandConfirmationsForTests } from "@magic-context/core/features/magic-context/memory/claim-policy-commands";
-import { sha256Utf8Hex } from "@magic-context/core/features/magic-context/memory/storage-claims";
-import {
-	createMemoryWithClaimsInCurrentTransaction,
-	runInMemoryClaimsWriteTransaction,
-} from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
-import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
-import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
-import { Database } from "@magic-context/core/shared/sqlite";
+import { seedProjectMemoryClaim } from "@magic-context/core/features/magic-context/test-claim-database";
+import { createDirectTestDatabase } from "@magic-context/core/features/magic-context/test-database";
 import { registerCtxApproveCommand } from "./ctx-approve";
 import { registerCtxEnforceCommand } from "./ctx-enforce";
 
@@ -57,33 +51,16 @@ afterEach(() => {
 
 describe("/ctx-enforce (pi)", () => {
 	it("requires approval first and refuses unapproved revisions", async () => {
-		const db = new Database(":memory:");
+		const db = createDirectTestDatabase().db;
 		db.exec("PRAGMA foreign_keys=ON");
-		initializeDatabase(db);
-		runMigrations(db);
 		const projectDir = mkdtempSync(join(tmpdir(), "pi-enforce-"));
 		try {
-			const outcome = runInMemoryClaimsWriteTransaction(db, () =>
-				createMemoryWithClaimsInCurrentTransaction(
-					db,
-					{
-						producer: "pi-enforce-test",
-						operationKey: "seed-1",
-						requestDigest: sha256Utf8Hex("seed-1"),
-					},
-					{
-						projectPath: PROJECT,
-						category: "CONSTRAINTS",
-						content: "pi enforcement target",
-						normalizedHash: "hash:pi enforcement target",
-						importance: 60,
-						sourceSessionId: "ses-pi-enf",
-						sourceType: "agent",
-						nowMs: 1_000,
-					},
-				),
-			);
-			const memoryId = outcome.result.memoryId;
+			const publicClaimId = seedProjectMemoryClaim(db, {
+				projectIdentity: PROJECT,
+				category: "CONSTRAINTS",
+				content: "pi enforcement target",
+				importance: 60,
+			}).publicClaimId;
 			writeFileSync(join(projectDir, "gate.test.ts"), "bytes");
 			const mock = createMockPi();
 			registerCtxApproveCommand(mock.pi as never, {
@@ -97,13 +74,13 @@ describe("/ctx-enforce (pi)", () => {
 				projectIdentity: PROJECT,
 			});
 			const enforce = mock.handlers.get("ctx-enforce");
-			await enforce?.(`${memoryId} gate.test.ts`, ctx);
+			await enforce?.(`${publicClaimId} gate.test.ts`, ctx);
 			expect(mock.sent.at(-1)?.data.text).toContain("not approved");
 
 			const approve = mock.handlers.get("ctx-approve");
-			await approve?.(String(memoryId), ctx);
-			await approve?.(String(memoryId), ctx);
-			await enforce?.(`${memoryId} gate.test.ts`, ctx);
+			await approve?.(publicClaimId, ctx);
+			await approve?.(publicClaimId, ctx);
+			await enforce?.(`${publicClaimId} gate.test.ts`, ctx);
 			expect(mock.sent.at(-1)?.data.text).toContain("Confirmation Required");
 			expect(
 				(

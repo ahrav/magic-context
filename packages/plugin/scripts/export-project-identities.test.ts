@@ -23,7 +23,8 @@ test("export-project-identities excludes an opted-in home identity from registry
         const contextDb = new Database(contextDbPath);
         contextDb.exec(`
             CREATE TABLE session_projects (session_id TEXT, project_path TEXT);
-            CREATE TABLE memories (project_path TEXT);
+            CREATE TABLE projects (id INTEGER PRIMARY KEY AUTOINCREMENT, canonical_identity TEXT NOT NULL UNIQUE);
+            CREATE TABLE claims (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL REFERENCES projects(id));
         `);
         contextDb
             .prepare("INSERT INTO session_projects (session_id, project_path) VALUES (?, ?)")
@@ -31,8 +32,14 @@ test("export-project-identities excludes an opted-in home identity from registry
         contextDb
             .prepare("INSERT INTO session_projects (session_id, project_path) VALUES (?, ?)")
             .run("other-session", otherIdentity);
-        contextDb.prepare("INSERT INTO memories (project_path) VALUES (?)").run(homeIdentity);
-        contextDb.prepare("INSERT INTO memories (project_path) VALUES (?)").run(otherIdentity);
+        const insertProject = contextDb.prepare(
+            "INSERT INTO projects (canonical_identity) VALUES (?) RETURNING id",
+        );
+        const insertClaim = contextDb.prepare("INSERT INTO claims (project_id) VALUES (?)");
+        for (const identity of [homeIdentity, otherIdentity]) {
+            const { id } = insertProject.get(identity) as { id: number };
+            insertClaim.run(id);
+        }
         contextDb.close();
 
         const openCodeDb = new Database(openCodeDbPath);
