@@ -851,6 +851,51 @@ describe("bootstrap staging (U3 scenarios 3 and 6)", () => {
         }
     });
 
+    test("a byte-invalid trust index is rejected, not silently repaired", () => {
+        // toString("utf8") substitutes U+FFFD for an invalid byte, and the
+        // resulting document still passes every shape check below it — so
+        // byte-corrupt package metadata would cross the trust boundary as a
+        // valid index.
+        const dir = tempDir("mc-trust-utf8-");
+        try {
+            const valid = JSON.stringify({
+                schema: "magic-context.payload-index/v1",
+                package: "@cortexkit/mc-host-linux-x64-gnu",
+                version: "0.38.0",
+                launcher_rel_path: "bin/ck-mc-host",
+                launcher_sha256: "a".repeat(64),
+                payload_manifest_digest: "b".repeat(64),
+            });
+            const marker = '"package":"@cortexkit/mc-host-linux-x64-gnu"';
+            expect(valid).toContain(marker);
+            const [head, tail] = valid.split(marker) as [string, string];
+            const corrupt = Buffer.concat([
+                Buffer.from(head, "utf8"),
+                Buffer.from('"package":"@cortexkit/mc-host', "utf8"),
+                Buffer.from([0xff]),
+                Buffer.from('-linux-x64-gnu"', "utf8"),
+                Buffer.from(tail, "utf8"),
+            ]);
+            // Sanity: lossy decoding really would have produced parseable JSON.
+            expect(() => JSON.parse(corrupt.toString("utf8"))).not.toThrow();
+
+            const indexPath = path.join(dir, "mc-host-payload-index.json");
+            writeFileSync(indexPath, corrupt, { mode: 0o600 });
+            let reason: string | null = null;
+            let message = "";
+            try {
+                loadTrustIndex(indexPath);
+            } catch (error) {
+                reason = (error as BootstrapError).reason;
+                message = (error as Error).message;
+            }
+            expect(reason).toBe("native_payload_invalid");
+            expect(message).toContain("not valid UTF-8");
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
     test("a present but unopenable retained bootstrap is invalid, not missing", () => {
         // Same line the launcher source and the trust index draw. A retained
         // object rejected by O_NOFOLLOW is a tampered artifact, and calling it

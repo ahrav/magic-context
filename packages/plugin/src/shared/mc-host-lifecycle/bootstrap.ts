@@ -281,7 +281,15 @@ function readTrustIndexText(fd: number): string {
     if (total > MAX_TRUST_INDEX_BYTES) {
         throw new BootstrapError("native_payload_invalid", "trust index exceeds the byte cap");
     }
-    return buffer.subarray(0, total).toString("utf8");
+    // Strict, for the same reason the native-output path is: `toString("utf8")`
+    // substitutes U+FFFD for an invalid byte, and the resulting document can
+    // still pass every shape check below — letting byte-corrupt package metadata
+    // cross the trust boundary as a valid index.
+    try {
+        return new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, total));
+    } catch {
+        throw new BootstrapError("native_payload_invalid", "trust index is not valid UTF-8");
+    }
 }
 
 /**

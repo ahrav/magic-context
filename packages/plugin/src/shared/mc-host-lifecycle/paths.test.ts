@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { getTestBackstopDataRoot } from "../data-path";
 import {
     admitLifecycleFilesystem,
     CONNECTION_FILE_NAME,
@@ -48,6 +49,42 @@ describe("data-root resolution (U3 scenario 1, Rust parity)", () => {
         expect(resolveLifecycleDataRoot({ XDG_DATA_HOME: "relative", HOME: "" })).toEqual({
             ok: false,
             reason: "no_data_dir",
+        });
+    });
+
+    test("NODE_ENV=test backstops the root instead of reaching the real HOME", () => {
+        // The test preload only runs when bun test's CWD has a bunfig wiring it.
+        // A run from a directory without that wiring has no
+        // MAGIC_CONTEXT_TEST_DATA_DIR, and falling through to the real HOME
+        // would let a lifecycle policy probe, start, stop, or stage inside the
+        // user's live ~/.local/share tree.
+        const backstopped = resolveLifecycleDataRoot({ NODE_ENV: "test", HOME: "/home-root" });
+        expect(backstopped.ok).toBe(true);
+        if (backstopped.ok) {
+            expect(backstopped.root).not.toBe(path.join("/home-root", ".local", "share"));
+            expect(backstopped.root).toContain("mc-test-db-backstop-");
+            // Memoized: the same process must resolve to the same root, or a
+            // test's daemon state and its database would land in different trees.
+            expect(resolveLifecycleDataRoot({ NODE_ENV: "test" })).toEqual(backstopped);
+            // It is the storage resolver's own backstop root, so when neither
+            // resolver is isolated they agree the way one XDG_DATA_HOME makes
+            // them agree in production. Asserted through the shared accessor
+            // rather than getMagicContextStorageDir(), which honors this
+            // process's own ambient isolation.
+            expect(backstopped.root).toBe(getTestBackstopDataRoot());
+        }
+        // Explicit isolation still wins over the backstop, in both forms.
+        expect(resolveLifecycleDataRoot({ NODE_ENV: "test", XDG_DATA_HOME: "/xdg-root" })).toEqual({
+            ok: true,
+            root: "/xdg-root",
+        });
+        expect(
+            resolveLifecycleDataRoot({ NODE_ENV: "test", MAGIC_CONTEXT_TEST_DATA_DIR: "/iso" }),
+        ).toEqual({ ok: true, root: "/iso" });
+        // Production, which never sets NODE_ENV=test, is unchanged.
+        expect(resolveLifecycleDataRoot({ HOME: "/home-root" })).toEqual({
+            ok: true,
+            root: path.join("/home-root", ".local", "share"),
         });
     });
 

@@ -281,6 +281,24 @@ describe("native invocation mapping", () => {
             }
             expect(deadlineKind).toBe("deadline");
 
+            // Non-finite budgets are inactive too, not generous: NaN stays NaN
+            // through the residual subtraction, and setTimeout coerces both NaN
+            // and Infinity to a 1ms delay, so the waiter would detach at once
+            // and leave the start unowned.
+            for (const deadlineMs of [Number.NaN, Number.POSITIVE_INFINITY]) {
+                let kind: string | null = null;
+                try {
+                    await policy.demandStart({
+                        origin: "managed-default",
+                        capability: "magic-context",
+                        deadlineMs,
+                    });
+                } catch (error) {
+                    kind = (error as WaiterDetachedError).cause_kind;
+                }
+                expect(kind).toBe("deadline");
+            }
+
             // The load-bearing assertion: no native invocation happened at all.
             expect(invocations(invocationLog)).toEqual([]);
             expect(policy.inflightStartCount).toBe(0);

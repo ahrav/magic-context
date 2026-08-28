@@ -12,11 +12,14 @@
  * test backstops that must keep their current behavior), while lifecycle
  * paths must agree byte-for-byte with the Rust daemon or two processes would
  * coordinate on different roots. The test-isolation guard is preserved by
- * honoring `MAGIC_CONTEXT_TEST_DATA_DIR` the same way `data-path.ts` does.
+ * honoring `MAGIC_CONTEXT_TEST_DATA_DIR` the same way `data-path.ts` does, and
+ * by sharing its `NODE_ENV=test` backstop root so an unisolated test cannot
+ * reach the user's live tree through either resolver.
  */
 
 import { readFileSync, realpathSync } from "node:fs";
 import * as path from "node:path";
+import { getTestBackstopDataRoot } from "../data-path";
 import { releaseContract } from "./generated-contract";
 
 /** Canonical publication filename (version-2 `subc` literal, R45). */
@@ -34,6 +37,15 @@ function absoluteOrNull(value: string | undefined): string | null {
  * `MAGIC_CONTEXT_TEST_DATA_DIR` guard (set only by test preloads) wins over
  * the HOME fallback but not over an explicit absolute `XDG_DATA_HOME`,
  * matching `data-path.ts`'s isolation contract.
+ *
+ * That contract includes a third layer, and this resolver honors it too: the
+ * preload only runs when `bun test`'s CWD has a bunfig wiring `[test] preload`,
+ * so a run from a directory without it executes every test with no preload and
+ * no `MAGIC_CONTEXT_TEST_DATA_DIR`. Falling through to the real `HOME` there
+ * would let a lifecycle policy probe, start, stop, or stage inside the user's
+ * live `~/.local/share` tree. Bun sets `NODE_ENV=test` for every `bun test`
+ * regardless of CWD and production never sets it, so that window redirects to
+ * the same throwaway root the storage resolver uses.
  */
 export function resolveLifecycleDataRoot(
     env: Record<string, string | undefined> = process.env,
@@ -42,6 +54,7 @@ export function resolveLifecycleDataRoot(
     if (xdg) return { ok: true, root: xdg };
     const testDataDir = absoluteOrNull(env.MAGIC_CONTEXT_TEST_DATA_DIR);
     if (testDataDir) return { ok: true, root: testDataDir };
+    if (env.NODE_ENV === "test") return { ok: true, root: getTestBackstopDataRoot() };
     const home = absoluteOrNull(env.HOME);
     if (home) return { ok: true, root: path.join(home, ".local", "share") };
     return { ok: false, reason: "no_data_dir" };

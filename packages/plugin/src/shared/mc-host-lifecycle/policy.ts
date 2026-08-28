@@ -251,7 +251,16 @@ export class McHostLifecyclePolicy {
             // keeps the detach-only behavior, because that work is already in
             // flight and owned by whoever started it.
             if (request.signal?.aborted) throw new WaiterDetachedError("aborted");
-            if (request.deadlineMs !== undefined && request.deadlineMs <= 0) {
+            if (
+                request.deadlineMs !== undefined &&
+                (!Number.isFinite(request.deadlineMs) || request.deadlineMs <= 0)
+            ) {
+                // Non-finite budgets are inactive too, not generous: `NaN`
+                // subtracted from anything stays `NaN`, and `setTimeout` coerces
+                // both `NaN` and `Infinity` to a 1ms delay, so the waiter would
+                // detach almost immediately and leave the start unowned — the
+                // same outcome as an expired deadline. `runNativeLifecycle`
+                // rejects the same shape for the same reason.
                 throw new WaiterDetachedError("deadline");
             }
             shared = this.start();
