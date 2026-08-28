@@ -34,8 +34,12 @@ use mc_module::release_contract;
 
 /// Fresh Linux request-to-authenticated-transport outer aggregate (hard).
 const OUTER_AGGREGATE: Duration = Duration::from_secs(60);
-/// Spawn/publication/auth phase (hard).
-const SPAWN_PUBLICATION_AUTH: Duration = Duration::from_secs(3);
+/// Spawn/publication/auth phase (hard). Before publishing, serve fully
+/// revalidates the staged generation and re-hashes every retained harness
+/// closure node (hundreds of megabytes when both harnesses are qualified),
+/// so this budget covers cold-page-cache reads of that working set, not
+/// just process spawn and socket publication.
+const SPAWN_PUBLICATION_AUTH: Duration = Duration::from_secs(10);
 /// Stop teardown: committed shutdown until publication removal plus both
 /// fences acquirable, bounded above the runtime's own shutdown deadline.
 const STOP_TEARDOWN: Duration = Duration::from_secs(10);
@@ -893,9 +897,9 @@ struct ResolvedGeneration {
 /// `.ok()` on the verification result conflated two different states: a dev
 /// fixture that legitimately ships no launcher, and a production payload whose
 /// launcher was deleted, truncated, or rewritten since staging. Both reached
-/// `spawn_detached` as `None`, which reads that as permission to re-exec the
-/// *running* binary — so a tampered launcher produced a successful start from
-/// bytes outside the selected generation instead of failing closed.
+/// `spawn_detached` as `None`, which then re-execs the *running* binary — so a
+/// tampered launcher produced a successful start from bytes outside the selected
+/// generation instead of failing closed.
 ///
 /// The manifest separates the two: a launcher it names must verify, and one it
 /// does not name does not exist.
@@ -1935,15 +1939,16 @@ mod tests {
         let startup = envelope.materialize_into_startup(root.path().to_path_buf(), "cd".repeat(32));
         assert!(matches!(
             startup.opencode,
-            Some(serve::HarnessSnapshot::Unavailable { ref reason })
-                if reason == "descriptor_invalid"
+            Some(serve::HarnessSnapshot::Unavailable {
+                reason: serve::HarnessUnavailableReason::DescriptorInvalid
+            })
         ));
         let serialized = serde_json::to_string(&startup).expect("serialize startup");
         assert!(!serialized.contains(secret_source));
         assert!(!serialized.contains("source_roots"));
 
         let ready = serve::StartupEnvelope {
-            schema: 1,
+            schema: serve::STARTUP_ENVELOPE_SCHEMA,
             data_dir: root.path().to_path_buf(),
             payload_manifest_digest: "cd".repeat(32),
             opencode: Some(serve::HarnessSnapshot::Ready {

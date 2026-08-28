@@ -758,7 +758,6 @@ impl Supervisor {
             model: request.model,
             max_output_tokens: request.max_output_tokens,
             temperature: request.temperature,
-            project_root: run.key.project_root.clone(),
             harness: run.key.harness,
             session: run.key.session.clone(),
             run_id: run.run_id.clone(),

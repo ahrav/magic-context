@@ -7,7 +7,6 @@
 //! supervisor behavior never depends on which one runs.
 
 use std::future::Future;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -50,7 +49,6 @@ pub struct BackendRequest {
     pub model: String,
     pub max_output_tokens: u64,
     pub temperature: f64,
-    pub project_root: PathBuf,
     pub harness: Harness,
     pub session: String,
     pub run_id: String,

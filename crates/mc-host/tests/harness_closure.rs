@@ -487,3 +487,84 @@ fn retained_closure_rejects_extra_missing_and_wrong_mode_nodes() {
         "closure file is not owner-only single-link"
     );
 }
+
+#[test]
+fn prune_reclaims_unprotected_digests_and_stale_temps_only() {
+    let (temp, _source, candidate) = setup();
+    let store_root = temp.path().join("closures");
+    let store = HarnessClosureStore::open(&store_root).expect("store");
+    let closure = store.materialize(&candidate).expect("materialize");
+    let digest = closure.digest().to_owned();
+
+    // A staging directory orphaned by an interrupted copy, and an entry the
+    // store did not create (neither digest-named nor `.tmp-`-prefixed).
+    std::fs::create_dir(store_root.join(".tmp-deadbeefdeadbeef")).expect("stale temp");
+    std::fs::set_permissions(
+        store_root.join(".tmp-deadbeefdeadbeef"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("temp mode");
+    std::fs::create_dir(store_root.join("foreign-entry")).expect("foreign entry");
+
+    let protected = std::collections::BTreeSet::from([digest.clone()]);
+    store.prune(&protected).expect("prune with protection");
+    assert!(
+        store_root.join(&digest).is_dir(),
+        "protected digest survives"
+    );
+    assert!(
+        !store_root.join(".tmp-deadbeefdeadbeef").exists(),
+        "stale staging directory is reclaimed"
+    );
+    assert!(
+        store_root.join("foreign-entry").is_dir(),
+        "entries the store did not create are left untouched"
+    );
+    store
+        .validate(&digest)
+        .expect("protected closure still validates");
+
+    store
+        .prune(&std::collections::BTreeSet::new())
+        .expect("prune without protection");
+    assert!(
+        !store_root.join(&digest).is_dir(),
+        "unprotected digest is reclaimed"
+    );
+}
+
+#[test]
+fn native_edges_and_native_addons_must_correspond_exactly() {
+    let (_temp, _source, candidate) = setup();
+
+    // A non-native edge onto a native addon is rejected, matching the
+    // qualification-side biconditional.
+    let mut static_edge = candidate.clone();
+    static_edge.manifest.nodes[2].dependencies = vec![
+        dependency("node_modules/pi/dist/addon.node", DependencyKind::Static),
+        dependency("node_modules/pi/dist/helper.js", DependencyKind::Static),
+    ];
+    assert_eq!(
+        validate_manifest(&static_edge.manifest)
+            .expect_err("static edge onto native addon")
+            .detail(),
+        "native dependency kind must correspond exactly to a native addon target"
+    );
+
+    // A native addon with no inbound native edge is rejected even when the
+    // graph is otherwise reachable.
+    let mut unclaimed = candidate.clone();
+    unclaimed.manifest.nodes[2].dependencies = vec![
+        dependency(
+            "node_modules/pi/dist/addon.node",
+            DependencyKind::FiniteDynamic,
+        ),
+        dependency("node_modules/pi/dist/helper.js", DependencyKind::Static),
+    ];
+    assert_eq!(
+        validate_manifest(&unclaimed.manifest)
+            .expect_err("finite_dynamic edge onto native addon")
+            .detail(),
+        "native dependency kind must correspond exactly to a native addon target"
+    );
+}

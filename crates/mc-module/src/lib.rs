@@ -3025,16 +3025,8 @@ pub trait HistorianProducerFactory: Send + Sync {
         &self,
         project_root: &Path,
         harness: &str,
+        credential_fingerprints: &std::collections::BTreeMap<String, String>,
     ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError>;
-
-    async fn connect_with_credentials(
-        &self,
-        project_root: &Path,
-        harness: &str,
-        _credential_fingerprints: &std::collections::BTreeMap<String, String>,
-    ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
-        self.connect(project_root, harness).await
-    }
 }
 
 struct RealHistorianProducerFactory {
@@ -3045,15 +3037,6 @@ struct RealHistorianProducerFactory {
 #[async_trait]
 impl HistorianProducerFactory for RealHistorianProducerFactory {
     async fn connect(
-        &self,
-        project_root: &Path,
-        harness: &str,
-    ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
-        self.connect_with_credentials(project_root, harness, &std::collections::BTreeMap::new())
-            .await
-    }
-
-    async fn connect_with_credentials(
         &self,
         project_root: &Path,
         harness: &str,
@@ -3401,6 +3384,7 @@ impl HistorianProducerFactory for MissingProducerFactory {
         &self,
         _project_root: &Path,
         _harness: &str,
+        _credential_fingerprints: &std::collections::BTreeMap<String, String>,
     ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
         Err(HistorianProducerError::Client(
             historian_producer::HistorianClientFailure {
@@ -4759,11 +4743,7 @@ impl McHandler {
                             historian::RestartAction::ReattachProducer { .. } => {}
                         }
                         let mut producer = factory
-                            .connect_with_credentials(
-                                &project_root,
-                                &harness,
-                                &credential_fingerprints,
-                            )
+                            .connect(&project_root, &harness, &credential_fingerprints)
                             .await?;
                         reattach_historian_producer(
                             &mut *producer,
@@ -5376,7 +5356,7 @@ impl McHandler {
         let failure_started_at_ms = firing.now_ms;
         let configured_failure_backoff_at_ms = firing.failure_backoff_at_ms;
         match factory
-            .connect_with_credentials(&project_root, &harness, &credential_fingerprints)
+            .connect(&project_root, &harness, &credential_fingerprints)
             .await
         {
             Ok(mut producer) => {
@@ -9867,7 +9847,7 @@ impl McHandler {
             let _dreamer_run_guard = self.register_dreamer_run(&child_session);
             let mut producer = match self
                 .producer_factory
-                .connect_with_credentials(
+                .connect(
                     &binding.project_root,
                     &binding.harness,
                     &binding.credential_fingerprints,
@@ -12029,10 +12009,15 @@ impl CompositeComponent for McHandler {
                 detail: Some("storage is opening".to_owned()),
                 metrics: None,
             },
+            // `waiting_report` re-reads the phase and returns `None` when the
+            // store finished opening between the two loads. Falling back to
+            // the dispatch report keeps that benign race non-fatal: a panic
+            // here propagates through the health probe's lifecycle join and
+            // trips daemon shutdown.
             STORE_OPEN_WAITING => self
                 .store_open
                 .waiting_report(now)
-                .expect("waiting phase has a waiting report"),
+                .unwrap_or_else(|| DISPATCH_HEALTH.report(now)),
             STORE_OPENED => DISPATCH_HEALTH.report(now),
             _ if self.store().is_some() => DISPATCH_HEALTH.report(now),
             _ => HealthReport {
@@ -17823,6 +17808,7 @@ mod tests {
             &self,
             _project_root: &Path,
             _harness: &str,
+            _credential_fingerprints: &std::collections::BTreeMap<String, String>,
         ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
             Ok(Box::new(BlockingLifecycleProducer {
                 state: Arc::clone(&self.state),
@@ -17913,6 +17899,7 @@ mod tests {
             &self,
             _project_root: &Path,
             harness: &str,
+            _credential_fingerprints: &std::collections::BTreeMap<String, String>,
         ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
             self.state.connects.fetch_add(1, Ordering::SeqCst);
             self.state

@@ -50,15 +50,25 @@ pub struct EnvSnapshot {
     vars: Arc<[(OsString, OsString)]>,
 }
 
-const CREDENTIAL_VALUE_CAP_BYTES: usize = 16 * 1024;
-const CREDENTIAL_ROW_CAP_BYTES: usize = 64 * 1024;
+/// Per-value byte cap for one admitted credential. Shared with the launcher's
+/// envelope admission so both boundaries reject the same inputs; matches the
+/// release contract's `harness_unavailable.value_cap_bytes`.
+pub const CREDENTIAL_VALUE_CAP_BYTES: usize = 16 * 1024;
+/// Aggregate byte cap on an admitted credential set; matches the release
+/// contract's `harness_unavailable.row_cap_bytes`.
+pub const CREDENTIAL_ROW_CAP_BYTES: usize = 64 * 1024;
+/// Key-derivation domain committed into every credential fingerprint;
+/// matches the release contract's `credential_fingerprint.domain`.
+pub const CREDENTIAL_FINGERPRINT_DOMAIN: &str = "subc-broca-credential-v1";
+/// Fingerprint pre-image layout identifier; matches the release contract's
+/// `credential_fingerprint.canonicalization`.
+pub const CREDENTIAL_FINGERPRINT_CANONICALIZATION: &str = "harness-provider-name-length-value/1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialRowError {
     ProviderUnsupported,
     CredentialMissing,
     CredentialValueTooLarge,
-    CredentialRowTooLarge,
 }
 
 impl CredentialRowError {
@@ -67,29 +77,39 @@ impl CredentialRowError {
             Self::ProviderUnsupported => "provider_unsupported",
             Self::CredentialMissing => "credential_missing",
             Self::CredentialValueTooLarge => "credential_value_too_large",
-            Self::CredentialRowTooLarge => "credential_row_too_large",
         }
     }
 }
 
-impl EnvSnapshot {
-    /// Captures the current process environment once — call at daemon
-    /// startup, not per run, so request handling can never observe
-    /// request-derived environment mutations.
-    ///
-    /// Fails when the environment's charge exceeds
-    /// [`MAX_ENV_SNAPSHOT_BYTES`], which is what makes the component's
-    /// declared retained reservation a real ceiling; see that constant for
-    /// why this rejects rather than truncates.
-    pub fn capture() -> io::Result<Self> {
-        Self::capture_from(std::env::vars_os())
+/// The single alias-to-canonical provider map. Every canonicalization site —
+/// row selection, fingerprint derivation, and send-time verification — must
+/// resolve through this function so an alias admitted by one site can never
+/// be rejected or renamed by another.
+pub fn canonical_provider(
+    harness: &str,
+    provider: &str,
+) -> Result<&'static str, CredentialRowError> {
+    match (harness, provider) {
+        ("pi", "google-antigravity") => Ok("google"),
+        ("pi", "openai-codex") => Ok("openai"),
+        ("opencode" | "pi", "anthropic") => Ok("anthropic"),
+        ("opencode" | "pi", "google") => Ok("google"),
+        ("opencode" | "pi", "openai") => Ok("openai"),
+        _ => Err(CredentialRowError::ProviderUnsupported),
     }
+}
 
-    /// The admission behind [`EnvSnapshot::capture`], on explicit variables.
-    /// Each variable is charged its string bytes plus
+impl EnvSnapshot {
+    /// Builds a bounded snapshot from explicit startup variables — the
+    /// launcher envelope's admitted credential rows in production. Each
+    /// variable is charged its string bytes plus
     /// [`ENV_ENTRY_OVERHEAD_BYTES`], so an environment of many short
     /// variables cannot pass the ceiling while its per-entry container
     /// costs push each spawn representation past the declared headroom.
+    ///
+    /// Fails when the charge exceeds [`MAX_ENV_SNAPSHOT_BYTES`], which is
+    /// what makes the component's declared retained reservation a real
+    /// ceiling; the admission rejects rather than truncates.
     ///
     /// [`ENV_ENTRY_OVERHEAD_BYTES`]: super::config::ENV_ENTRY_OVERHEAD_BYTES
     /// [`MAX_ENV_SNAPSHOT_BYTES`]: super::config::MAX_ENV_SNAPSHOT_BYTES
@@ -144,13 +164,7 @@ impl EnvSnapshot {
         harness: &str,
         provider: &str,
     ) -> Result<Vec<(OsString, OsString)>, CredentialRowError> {
-        let canonical = match (harness, provider) {
-            ("pi", "google-antigravity") => "google",
-            ("pi", "openai-codex") => "openai",
-            ("opencode" | "pi", "anthropic" | "google" | "openai") => provider,
-            _ => return Err(CredentialRowError::ProviderUnsupported),
-        };
-        let variable = match canonical {
+        let variable = match canonical_provider(harness, provider)? {
             "anthropic" => "ANTHROPIC_API_KEY",
             "google" => "GEMINI_API_KEY",
             "openai" => "OPENAI_API_KEY",
@@ -169,13 +183,6 @@ impl EnvSnapshot {
         if value.len() > CREDENTIAL_VALUE_CAP_BYTES {
             return Err(CredentialRowError::CredentialValueTooLarge);
         }
-        let row_bytes = name
-            .len()
-            .checked_add(value.len())
-            .ok_or(CredentialRowError::CredentialRowTooLarge)?;
-        if row_bytes > CREDENTIAL_ROW_CAP_BYTES {
-            return Err(CredentialRowError::CredentialRowTooLarge);
-        }
         Ok(vec![(name.clone(), value.clone())])
     }
 
@@ -185,18 +192,12 @@ impl EnvSnapshot {
         harness: &str,
         provider: &str,
     ) -> Result<String, CredentialRowError> {
-        const DOMAIN: &str = "subc-broca-credential-v1";
-        const CANONICALIZATION: &str = "harness-provider-name-length-value/1";
-        let canonical_provider = match (harness, provider) {
-            ("pi", "google-antigravity") => "google",
-            ("pi", "openai-codex") => "openai",
-            ("opencode" | "pi", "anthropic" | "google" | "openai") => provider,
-            _ => return Err(CredentialRowError::ProviderUnsupported),
-        };
-        let row = self.provider_row(harness, canonical_provider)?;
+        let canonical = canonical_provider(harness, provider)?;
+        let row = self.provider_row(harness, canonical)?;
         let encoded = |field: &str| format!("{}:{field}", field.len());
-        let mut message =
-            encoded(CANONICALIZATION) + &encoded(harness) + &encoded(canonical_provider);
+        let mut message = encoded(CREDENTIAL_FINGERPRINT_CANONICALIZATION)
+            + &encoded(harness)
+            + &encoded(canonical);
         for (name, value) in row {
             let name = name.to_string_lossy();
             let value = value.to_string_lossy();
@@ -206,7 +207,7 @@ impl EnvSnapshot {
         }
         let mut derive =
             Hmac::<Sha256>::new_from_slice(connection_key).expect("HMAC accepts any key length");
-        derive.update(DOMAIN.as_bytes());
+        derive.update(CREDENTIAL_FINGERPRINT_DOMAIN.as_bytes());
         let derived = derive.finalize().into_bytes();
         let mut mac =
             Hmac::<Sha256>::new_from_slice(&derived).expect("HMAC accepts any key length");

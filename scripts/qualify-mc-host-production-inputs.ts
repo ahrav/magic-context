@@ -291,6 +291,55 @@ export const ROW_CAP_BYTES = 65536;
 
 const VARIABLE_NAME_RE = /^[A-Z][A-Z0-9_]*$/;
 
+export const HARNESS_CLOSURE_SCHEMA =
+    "magic-context.mc-host-harness-closure/v1";
+
+// The closure manifest's closed sets, published into the credentials doc's
+// `closure_manifest_schema` and enforced verbatim by
+// `validateClosureManifest`. Field lists are alphabetical because the
+// published document is canonically sorted.
+export const HARNESS_CLOSURE_MANIFEST_FIELDS = [
+    "argument_variant",
+    "entrypoint",
+    "executable",
+    "extensions",
+    "harness",
+    "interpreter",
+    "nodes",
+    "package",
+    "schema",
+    "source_roots",
+    "version",
+] as const;
+
+export const HARNESS_CLOSURE_NODE_FIELDS = [
+    "dependencies",
+    "kind",
+    "mode",
+    "path",
+    "sha256",
+    "size_bytes",
+    "source_path",
+    "source_root",
+] as const;
+
+export const HARNESS_CLOSURE_DEPENDENCY_FIELDS = ["kind", "path"] as const;
+
+export const HARNESS_CLOSURE_NODE_KINDS = [
+    "data",
+    "executable",
+    "extension",
+    "interpreter",
+    "module",
+    "native_addon",
+] as const;
+
+export const HARNESS_CLOSURE_DEPENDENCY_KINDS = [
+    "finite_dynamic",
+    "native",
+    "static",
+] as const;
+
 const CREDENTIALS_DOC = {
     schema: "magic-context.mc-host-provider-credentials/v1",
     caps: {
@@ -524,48 +573,22 @@ const CREDENTIALS_DOC = {
     },
     // Closed harness runtime-closure manifest schema (KTD21). U2 materializes a
     // daemon-owned content-addressed closure matching this shape; runtime code
-    // never discovers new dependencies.
+    // never discovers new dependencies. Every closed set below is the same
+    // constant `validateClosureManifest` enforces, so the published schema
+    // and the enforced schema cannot drift apart.
     closure_manifest_schema: {
-        id: "magic-context.mc-host-harness-closure/v1",
+        id: HARNESS_CLOSURE_SCHEMA,
         closed: true,
-        fields: [
-            "argument_variant",
-            "entrypoint",
-            "executable",
-            "extensions",
-            "harness",
-            "interpreter",
-            "nodes",
-            "package",
-            "schema",
-            "source_roots",
-            "version",
-        ],
+        fields: HARNESS_CLOSURE_MANIFEST_FIELDS,
         node: {
-            fields: [
-                "dependencies",
-                "kind",
-                "mode",
-                "path",
-                "sha256",
-                "size_bytes",
-                "source_path",
-                "source_root",
-            ],
+            fields: HARNESS_CLOSURE_NODE_FIELDS,
             path_rules: ["relative", "no_parent_segments", "no_symlink_escape"],
         },
         dependency: {
-            fields: ["kind", "path"],
-            kinds: ["finite_dynamic", "native", "static"],
+            fields: HARNESS_CLOSURE_DEPENDENCY_FIELDS,
+            kinds: HARNESS_CLOSURE_DEPENDENCY_KINDS,
         },
-        node_kinds: [
-            "data",
-            "executable",
-            "extension",
-            "interpreter",
-            "module",
-            "native_addon",
-        ],
+        node_kinds: HARNESS_CLOSURE_NODE_KINDS,
         extensions_ordered: true,
         rules: {
             finite_dynamic_imports_only: true,
@@ -1203,9 +1226,6 @@ function resolveVerifyPath(
     return resolved;
 }
 
-export const HARNESS_CLOSURE_SCHEMA =
-    "magic-context.mc-host-harness-closure/v1";
-
 const QUALIFIED_NONLITERAL_DYNAMIC_IMPORT_SITES: ReadonlyMap<
     string,
     {
@@ -1286,21 +1306,6 @@ const QUALIFIED_NONLITERAL_DYNAMIC_IMPORT_SITES: ReadonlyMap<
         },
     ],
 ]);
-
-export const HARNESS_CLOSURE_NODE_KINDS = [
-    "data",
-    "executable",
-    "extension",
-    "interpreter",
-    "module",
-    "native_addon",
-] as const;
-
-export const HARNESS_CLOSURE_DEPENDENCY_KINDS = [
-    "finite_dynamic",
-    "native",
-    "static",
-] as const;
 
 export type HarnessClosureName = "opencode" | "pi";
 export type HarnessClosureNodeKind =
@@ -1509,23 +1514,7 @@ export function validateClosureManifest(
         version: string;
     },
 ): asserts manifest is HarnessClosureManifest {
-    assertExactKeys(
-        manifest,
-        [
-            "schema",
-            "harness",
-            "package",
-            "version",
-            "argument_variant",
-            "source_roots",
-            "executable",
-            "interpreter",
-            "entrypoint",
-            "extensions",
-            "nodes",
-        ],
-        "closure",
-    );
+    assertExactKeys(manifest, [...HARNESS_CLOSURE_MANIFEST_FIELDS], "closure");
     const closure = manifest as HarnessClosureManifest;
     if (closure.schema !== HARNESS_CLOSURE_SCHEMA) {
         fail("closure: unknown schema");
@@ -1597,20 +1586,7 @@ export function validateClosureManifest(
     const nodes = new Map<string, HarnessClosureNode>();
     for (const [index, node] of closure.nodes.entries()) {
         const where = `closure.nodes[${index}]`;
-        assertExactKeys(
-            node,
-            [
-                "path",
-                "source_root",
-                "source_path",
-                "kind",
-                "mode",
-                "size_bytes",
-                "sha256",
-                "dependencies",
-            ],
-            where,
-        );
+        assertExactKeys(node, [...HARNESS_CLOSURE_NODE_FIELDS], where);
         assertSafeRelativePath(node.path, `${where}.path`);
         assertSafeRelativePath(node.source_path, `${where}.source_path`);
         if (!closure.source_roots.includes(node.source_root)) {
@@ -1650,7 +1626,11 @@ export function validateClosureManifest(
         const dependencyPaths = new Set<string>();
         for (const [dependencyIndex, dependency] of node.dependencies.entries()) {
             const dependencyWhere = `${where}.dependencies[${dependencyIndex}]`;
-            assertExactKeys(dependency, ["path", "kind"], dependencyWhere);
+            assertExactKeys(
+                dependency,
+                [...HARNESS_CLOSURE_DEPENDENCY_FIELDS],
+                dependencyWhere,
+            );
             assertSafeRelativePath(dependency.path, `${dependencyWhere}.path`);
             if (
                 !(

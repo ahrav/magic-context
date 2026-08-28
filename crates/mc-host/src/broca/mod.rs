@@ -61,17 +61,17 @@ impl CredentialVerifier {
             Harness::OpenCode => "opencode",
             Harness::Pi => "pi",
         };
+        // The same alias map used for row selection and fingerprint
+        // derivation; a divergent local copy here would look presented
+        // fingerprints up under a name the client never binds.
+        let canonical = subprocess::canonical_provider(harness_name, provider)
+            .map_err(|error| error.subreason())?;
         let expected = self
             .env
             .credential_fingerprint(key, harness_name, provider)
             .map_err(|error| error.subreason())?;
-        let canonical_provider = match (harness, provider) {
-            (Harness::Pi, "google-antigravity") => "google",
-            (Harness::Pi, "openai-codex") => "openai",
-            _ => provider,
-        };
         let actual = presented
-            .get(canonical_provider)
+            .get(canonical)
             .ok_or("credential_snapshot_mismatch")?;
         if expected.as_bytes().ct_eq(actual.as_bytes()).into() {
             Ok(())

@@ -130,8 +130,15 @@ impl ValidatedHarnessClosure {
         &self.path
     }
 
-    /// Resolves a listed node to a closure-owned path after revalidating it
-    /// through the retained `files/` descriptor.
+    /// Resolves a listed node to a closure-owned path after re-proving its
+    /// identity through the retained `files/` descriptor.
+    ///
+    /// This runs on the per-request launch path, so it re-checks the cheap
+    /// invariants only — regular file, owner-only, single-link, manifest
+    /// mode, manifest size. Content hashes were proven for every node when
+    /// this closure was validated; the owner-only tree plus the no-follow
+    /// re-open makes an in-place content swap require the owner's own
+    /// authority, which the hash could not defend against either.
     pub fn resolve_node(&self, node_path: &str) -> Result<PathBuf, HarnessClosureError> {
         let node = self
             .manifest
@@ -141,7 +148,11 @@ impl ValidatedHarnessClosure {
             .ok_or_else(|| invalid("resolved node is not listed by the manifest"))?;
         let fd = open_relative_file(&self.files_fd, node_path)
             .map_err(|_| invalid("resolved node is missing or insecure"))?;
-        verify_node_file(&fd, node)?;
+        verify_secure_file(&fd, node.mode)?;
+        let stat = rustix::fs::fstat(&fd).map_err(|_| invalid("closure node stat failed"))?;
+        if stat.st_size as u64 != node.size_bytes {
+            return Err(invalid("closure node size diverges from manifest"));
+        }
         Ok(self.path.join(FILES_NAME).join(node_path))
     }
 }
@@ -335,12 +346,30 @@ pub fn validate_manifest(manifest: &ClosureManifest) -> Result<(), HarnessClosur
         roots.push(path);
     }
 
+    // Mirrors the qualification-side rule set exactly: a `native` edge and a
+    // `native_addon` target imply each other, and every native addon must be
+    // named by at least one explicit `native` edge. A weaker rule on either
+    // side lets one lane bless a manifest the other refuses.
+    let mut native_targets = BTreeSet::new();
     for node in &manifest.nodes {
         for dependency in &node.dependencies {
             let target = require_existing_node(&by_path, &dependency.path)?;
-            if dependency.kind == DependencyKind::Native && target.kind != NodeKind::NativeAddon {
-                return Err(invalid("native dependency does not target a native addon"));
+            if (dependency.kind == DependencyKind::Native) != (target.kind == NodeKind::NativeAddon)
+            {
+                return Err(invalid(
+                    "native dependency kind must correspond exactly to a native addon target",
+                ));
             }
+            if dependency.kind == DependencyKind::Native {
+                native_targets.insert(dependency.path.as_str());
+            }
+        }
+    }
+    for node in &manifest.nodes {
+        if node.kind == NodeKind::NativeAddon && !native_targets.contains(node.path.as_str()) {
+            return Err(invalid(
+                "native addon lacks an explicit native dependency edge",
+            ));
         }
     }
 
@@ -494,6 +523,28 @@ impl HarnessClosureStore {
             }
         }
         self.validate(&digest)
+    }
+
+    /// Removes every retained closure whose digest is not protected, plus
+    /// any staging directory left by an interrupted materialization. Each
+    /// closure holds an entire harness runtime (hundreds of megabytes), so
+    /// unreferenced digests otherwise accumulate without bound in the user
+    /// data root. Callers serialize pruning against materialization through
+    /// the launcher's start transaction.
+    pub fn prune(&self, protected: &BTreeSet<String>) -> Result<(), HarnessClosureError> {
+        for name in list_names(&self.root_fd)? {
+            if protected.contains(&name) {
+                continue;
+            }
+            // Only entries this store creates are eligible: digest-named
+            // closures and `.tmp-` staging directories. Anything else is
+            // foreign and left untouched.
+            if !name.starts_with(TEMP_PREFIX) && validate_hash(&name).is_err() {
+                continue;
+            }
+            remove_tree(&self.root_fd, &name)?;
+        }
+        fsync(&self.root_fd).map_err(|_| invalid("closure store fsync failed"))
     }
 
     /// Fully revalidates one retained closure before returning it.
