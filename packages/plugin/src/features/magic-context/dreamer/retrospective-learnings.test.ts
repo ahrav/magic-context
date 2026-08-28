@@ -120,6 +120,42 @@ describe("parseRetrospectiveLearnings", () => {
         });
         expect(learnings[1]?.route).toBe("memory");
     });
+
+    test("tolerates attributes and stray whitespace on anti-memory child tags", () => {
+        // A required field that fails to extract discards the whole learning, so
+        // ordinary model formatting variance must not cost a memory.
+        const learnings = parseRetrospectiveLearnings(`<learnings>
+            <learning route="anti_memory">
+                <trigger >Choosing a session cache backend</trigger>
+                <rejected_strategy>Use Redis for session cache storage</rejected_strategy>
+                <rejection_reason>The deployment must remain single-process and offline-capable</rejection_reason>
+                <safer_alternative note="from the pivot">Use the existing SQLite store</safer_alternative >
+            </learning>
+        </learnings>`);
+
+        expect(learnings).toHaveLength(1);
+        expect(learnings[0]).toMatchObject({
+            route: "anti_memory",
+            payload: {
+                trigger: "Choosing a session cache backend",
+                saferAlternative: "Use the existing SQLite store",
+            },
+        });
+    });
+
+    test("does not let a tolerated tag match a longer tag with the same prefix", () => {
+        const learnings = parseRetrospectiveLearnings(`<learnings>
+            <learning route="anti_memory">
+                <trigger>Choosing a session cache backend</trigger>
+                <rejected_strategy>Use Redis for session cache storage</rejected_strategy>
+                <rejection_reason>The deployment must remain single-process and offline-capable</rejection_reason>
+                <recovery_plan>Not the recovery field</recovery_plan>
+            </learning>
+        </learnings>`);
+
+        expect(learnings).toHaveLength(1);
+        expect(learnings[0]).toMatchObject({ payload: { recovery: null } });
+    });
 });
 
 describe("retrospective privacy validation", () => {

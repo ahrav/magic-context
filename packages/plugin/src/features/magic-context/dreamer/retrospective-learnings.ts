@@ -108,8 +108,17 @@ export function parseRetrospectiveLearnings(text: string): ParsedRetrospectiveLe
     return learnings;
 }
 
+/**
+ * Extract one child element's text.
+ *
+ * The open tag tolerates attributes and trailing whitespace (`<trigger >`,
+ * `<safer_alternative note="...">`) because a missed match on a REQUIRED field
+ * silently discards the whole learning at the caller, turning ordinary model
+ * formatting variance into lost memory. `\b` keeps the tolerance from matching a
+ * longer tag that merely starts with this name (`recovery` vs `recovery_plan`).
+ */
 function childText(inner: string, tag: string): string | null {
-    const match = inner.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, "i"));
+    const match = inner.match(new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}\\s*>`, "i"));
     if (!match) return null;
     const value = unescapeXml(match[1] ?? "")
         .replace(/\s+/g, " ")

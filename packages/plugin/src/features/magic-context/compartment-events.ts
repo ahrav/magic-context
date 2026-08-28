@@ -116,6 +116,14 @@ export function getCompartmentEvents(db: Database, sessionId: string): StoredCom
  * and per-call cost stays proportional to the unconsumed backlog rather than
  * project lifetime. `limit` bounds one call so a large backlog drains across
  * runs instead of inside one long write transaction.
+ *
+ * The `session_projects` join must match on harness as well as session id.
+ * That table is keyed `(session_id, harness)`, so one session id can carry a
+ * different project binding per harness; joining on session id alone attributes
+ * an event to BOTH bindings. Since the receipt key is `event:<id>` and is not
+ * project-scoped, the first project to harvest such an event writes it into its
+ * own durable memory and receipts it globally, so the owning project never sees
+ * it. Cross-harness leakage is a correctness bug, not a feature.
  */
 export function getProjectCompartmentEvents(
     db: Database,
@@ -143,10 +151,13 @@ export function getProjectCompartmentEvents(
                     events.at_compartment, events.fields_json, events.created_at,
                     compartments.start_message, compartments.end_message
                FROM compartment_events events
-               JOIN session_projects projects ON projects.session_id = events.session_id
+               JOIN session_projects projects
+                 ON projects.session_id = events.session_id
+                AND projects.harness = events.harness
                LEFT JOIN compartments
                  ON compartments.id = events.compartment_id
                 AND compartments.session_id = events.session_id
+                AND compartments.harness = events.harness
               WHERE projects.project_path = ? AND events.kind = ?
                 ${receiptFilter}
               ORDER BY events.id ASC

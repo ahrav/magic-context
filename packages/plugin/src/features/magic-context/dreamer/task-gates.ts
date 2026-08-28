@@ -346,11 +346,17 @@ export function getDreamTaskBacklog(
             return { pending: countUnclassifiedActiveMemories(db, projectPath), total };
         }
         case "retrospective": {
-            const pendingSessions = countProjectSessionsSince(
-                db,
-                projectPath,
-                options.retrospectiveWatermarkMs ?? null,
-            );
+            // Fall back to the persisted content watermark when the caller did
+            // not supply one, the same way verify-broad reads its cycle state
+            // above. `countProjectSessionsSince` with a null watermark counts
+            // every session for the project's lifetime, so a status query that
+            // passes no options would otherwise report a backlog that only ever
+            // grows instead of the sessions since the last retrospective.
+            const watermarkMs =
+                options.retrospectiveWatermarkMs ??
+                getTaskScheduleState(db, projectPath, "retrospective")?.retrospectiveWatermarkMs ??
+                null;
+            const pendingSessions = countProjectSessionsSince(db, projectPath, watermarkMs);
             const pending = pendingSessions + countPendingCorrectionEvents(db, projectPath);
             return { pending, total: pending };
         }

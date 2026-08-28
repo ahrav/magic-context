@@ -43,9 +43,17 @@ export interface CorrectionHarvestResult {
 export function countPendingCorrectionEvents(db: Database, projectIdentity: string): number {
     const row = db
         .prepare(
+            // Joined on harness as well as session id, matching
+            // getProjectCompartmentEvents: `session_projects` is keyed
+            // `(session_id, harness)`, so session id alone counts another
+            // harness's project events as pending for this project. The gate and
+            // the reader must agree, or the scheduler reopens work the harvest
+            // cannot drain.
             `SELECT COUNT(DISTINCT events.id) AS count
                FROM compartment_events events
-               JOIN session_projects projects ON projects.session_id = events.session_id
+               JOIN session_projects projects
+                 ON projects.session_id = events.session_id
+                AND projects.harness = events.harness
               WHERE projects.project_path = ?
                 AND events.kind = 'trajectory_correction'
                 AND NOT EXISTS (
@@ -61,10 +69,21 @@ export function countPendingCorrectionEvents(db: Database, projectIdentity: stri
 function mappedPayload(event: ProjectCompartmentEvent): AntiMemoryPayload | null {
     const trigger = event.fields.summary?.trim();
     const rejectedStrategy = event.fields.before_strategy?.trim();
-    // The historian's `reason_for_change` is the field that carries WHY the
-    // approach was rejected; `evidence` is a quote/paraphrase proving the event
-    // and is only a fallback when no explicit reason was extracted.
-    const rejectionReason = event.fields.reason_for_change?.trim() || event.fields.evidence?.trim();
+    // Only `reason_for_change` carries WHY the approach was rejected, so it is
+    // the sole source for the durable rejection reason.
+    //
+    // The two obvious alternatives are both wrong. `evidence` is contractually a
+    // quote or paraphrase proving the pivot happened, so falling back to it
+    // records statements like "the final implementation now uses X" as the
+    // reason a strategy was unsafe — proof of the pivot, not its cause.
+    // `correction_signal` is contractually a quote of the trigger, which is
+    // frequently the user's own words; persisting those is forbidden outright,
+    // and the privacy gate is not a safe filter for telling a quote from a
+    // paraphrase.
+    //
+    // An event carrying no causal reason therefore yields no anti-memory: it is
+    // skipped as `missing_warning_core` and receipted, so it is not retried.
+    const rejectionReason = event.fields.reason_for_change?.trim();
     if (!trigger || !rejectedStrategy || !rejectionReason) return null;
     const saferAlternative = event.fields.after_strategy?.trim() || null;
     return { trigger, rejectedStrategy, rejectionReason, saferAlternative };

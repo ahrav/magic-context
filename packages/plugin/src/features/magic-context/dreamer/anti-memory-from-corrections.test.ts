@@ -134,16 +134,54 @@ describe("historian trajectory-correction anti-memory harvest", () => {
                 {
                     kind: "trajectory_correction",
                     atCompartment: 1,
-                    // No distilled reason: the fallback is the evidence quote,
-                    // which is a verbatim run of the user's message and must be
-                    // rejected by the source-overlap privacy gate.
-                    fields: correctionFields({ reason_for_change: "" }),
+                    // A causal reason IS present, so the payload maps; it is a
+                    // verbatim run of the user's message, so the source-overlap
+                    // privacy gate is what must reject it.
+                    fields: correctionFields({
+                        reason_for_change: "The cache must remain offline capable",
+                    }),
                 },
             ],
             [compartmentId],
         );
         expect(runHarvest()).toEqual({ consumed: 0, skipped: 1, effects: [] });
         expect(db.prepare("SELECT COUNT(*) AS count FROM claims").get()).toEqual({ count: 0 });
+    });
+
+    test("skips a correction carrying proof of the pivot but no causal reason", () => {
+        db = createClaimReaderTestDatabase();
+        const compartmentId = seedSession(
+            db,
+            "ses-no-reason",
+            "Some unrelated user message that overlaps nothing.",
+        );
+        insertCompartmentEvents(
+            db,
+            "ses-no-reason",
+            [
+                {
+                    kind: "trajectory_correction",
+                    atCompartment: 1,
+                    // `evidence` is contractually proof that the pivot happened,
+                    // never why the old strategy was wrong. With no
+                    // `reason_for_change` there is no causal reason to persist, so
+                    // this must skip rather than record the proof as the reason.
+                    fields: correctionFields({
+                        reason_for_change: "",
+                        evidence: "The final implementation now uses the existing SQLite store",
+                    }),
+                },
+            ],
+            [compartmentId],
+        );
+        expect(runHarvest()).toEqual({ consumed: 0, skipped: 1, effects: [] });
+        expect(db.prepare("SELECT COUNT(*) AS count FROM claims").get()).toEqual({ count: 0 });
+        // The proof text must not have reached storage by any route.
+        expect(
+            db
+                .prepare("SELECT COUNT(*) AS count FROM observations WHERE extracted_text LIKE ?")
+                .get("%final implementation now uses%"),
+        ).toEqual({ count: 0 });
     });
 
     test("does not let a forged ord_span widen corroboration beyond the compartment", () => {
@@ -218,5 +256,32 @@ describe("historian trajectory-correction anti-memory harvest", () => {
         expect(
             db.prepare("SELECT source_trust_class AS trust FROM observations LIMIT 1").get(),
         ).toEqual({ trust: "model_inference" });
+    });
+
+    test("never harvests an event whose harness binds the session to another project", () => {
+        db = createClaimReaderTestDatabase();
+        // `session_projects` is keyed (session_id, harness), so one session id can
+        // bind to a different project per harness. This session is this project
+        // under opencode and a DIFFERENT project under pi.
+        const compartmentId = seedSession(db, "ses-shared", "Unrelated user message.");
+        db.prepare(
+            "INSERT INTO session_projects (session_id, project_path, updated_at, harness) VALUES (?, ?, ?, 'pi')",
+        ).run("ses-shared", "git:someone-elses-project", 1);
+        // The event belongs to the pi binding, so it is the other project's event.
+        db.prepare(
+            `INSERT INTO compartment_events
+                (session_id, compartment_id, kind, at_compartment, fields_json, created_at, harness)
+             VALUES (?, ?, 'trajectory_correction', 1, ?, 1, 'pi')`,
+        ).run("ses-shared", compartmentId, JSON.stringify(correctionFields()));
+
+        expect(countPendingCorrectionEvents(db, PROJECT)).toBe(0);
+        expect(runHarvest()).toEqual({ consumed: 0, skipped: 0, effects: [] });
+        expect(db.prepare("SELECT COUNT(*) AS count FROM claims").get()).toEqual({ count: 0 });
+        // The other project's event must still be unconsumed: a global
+        // `event:<id>` receipt here would starve its real owner.
+        expect(db.prepare("SELECT COUNT(*) AS count FROM claim_operation_receipts").get()).toEqual({
+            count: 0,
+        });
+        expect(countPendingCorrectionEvents(db, "git:someone-elses-project")).toBe(1);
     });
 });
