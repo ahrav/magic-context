@@ -623,6 +623,28 @@ export function parseScenario(raw: unknown, label = "scenario"): HistorianEvalSc
                     `${label}.probes: shared-answer-surface (${left.id} and ${right.id} both resolve ${leftRef} to the same runtime claim id)`,
                 );
             }
+            // Distinct references are not enough. `matchesGold` accepts a claim on
+            // category plus a substring predicate, so ONE promoted claim whose content
+            // happens to state both predicates satisfies both expectations and resolves
+            // to one public id for both probes — handing the later probe the earlier
+            // one's answer verbatim. The subsumption check does not reach it: it refuses
+            // predicates in a containment relation, not two unrelated predicates that
+            // can co-occur in a single sentence.
+            //
+            // Same CATEGORY is the precondition, and the only part decidable at freeze
+            // time: what a historian will write is not. Refusing the pair is the right
+            // place for it too — co-resolution is a scenario-design flaw, and detecting
+            // it at runtime would report a designed-in ambiguity as an infrastructure
+            // ERROR. Two claim-id probes on different categories stay legal.
+            if (left.answerType === "claim-id" && right.answerType === "claim-id") {
+                const leftCategory = expectedClaims.find((claim) => claim.id === leftRef)?.category;
+                const rightCategory = expectedClaims.find((claim) => claim.id === rightRef)?.category;
+                if (leftCategory !== undefined && leftCategory === rightCategory) {
+                    fail(
+                        `${label}.probes: claim-id-co-resolvable (${left.id} and ${right.id} reference same-category claims, so one promoted claim can satisfy both and resolve to one runtime id)`,
+                    );
+                }
+            }
             // Answer values are compared across ALL pairs, not only probes sharing
             // a gold claim. What makes the copy work is that the earlier exchange
             // put the later probe's answer in recent history; which claim each

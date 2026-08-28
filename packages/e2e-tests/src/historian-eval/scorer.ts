@@ -697,6 +697,11 @@ function recordShapeError(record: HistorianEvalRunRecord): ScenarioScore | null 
                 (exchange.answerRaw === null || typeof exchange.answerRaw === "string") &&
                 (exchange.payloadText === null || typeof exchange.payloadText === "string") &&
                 (exchange.responseText === null || typeof exchange.responseText === "string") &&
+                // Validated for the same reason `promotionEvidenceAdded` is: the deferred
+                // claim-id leak scan reads this array, and an omitted field would make it
+                // scan nothing while every other check still passed.
+                Array.isArray(exchange.discardedResponseTexts) &&
+                exchange.discardedResponseTexts.every((text) => typeof text === "string") &&
                 Array.isArray(exchange.injectedRevisionLocators) &&
                 exchange.injectedRevisionLocators.every((locator) => typeof locator === "string"),
         )

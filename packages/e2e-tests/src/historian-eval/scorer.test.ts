@@ -235,6 +235,8 @@ function makeRecord(
             // The response the answer was extracted from; the scorer reproduces
             // the extraction and requires the two to agree.
             responseText: `<answer>${answerRaw}</answer>`,
+            // No re-ask in the golden fixture, so nothing was discarded.
+            discardedResponseTexts: [],
         };
     });
     const record = buildRecord();
@@ -1827,6 +1829,7 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
         injectedRevisionLocators: locators,
         payloadText: null,
         responseText: answerRaw === null ? null : `<answer>${answerRaw}</answer>`,
+        discardedResponseTexts: [],
     });
 
     test("exact-value probe compares by normalized string equality", () => {

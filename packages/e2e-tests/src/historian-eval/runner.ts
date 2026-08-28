@@ -253,8 +253,15 @@ export function probeResponseClaimIdLeak(args: {
     const exchangeById = new Map(exchanges.map((exchange) => [exchange.probeId, exchange]));
     for (const [index, earlier] of scenario.probes.entries()) {
         const earlierExchange = exchangeById.get(earlier.id);
-        if (earlierExchange?.responseText == null) continue;
-        const outside = outsideAcceptedEnvelope(earlierExchange.responseText);
+        if (earlierExchange === undefined) continue;
+        // Every reply this probe sent, not only the one its answer came from. A
+        // discarded malformed reply is still in the session for the next probe to read.
+        const replies = [
+            ...earlierExchange.discardedResponseTexts,
+            ...(earlierExchange.responseText === null ? [] : [earlierExchange.responseText]),
+        ];
+        if (replies.length === 0) continue;
+        const outside = replies.map((reply) => outsideAcceptedEnvelope(reply)).join("\n");
         for (const later of scenario.probes.slice(index + 1)) {
             if (later.answerType !== "claim-id") continue;
             const laterExchange = exchangeById.get(later.id);
@@ -292,6 +299,17 @@ export interface ProbeExchange {
      * makes the extraction reproducible, so the two must agree.
      */
     responseText: string | null;
+    /**
+     * Replies from attempts whose answer was REJECTED, in the order they were sent.
+     *
+     * `responseText` holds only the reply the answer came from, and a re-asked probe
+     * discards the first one — but that reply was already sent, so it stays raw in the
+     * shared session and a later probe still reads it. The authored-value scan runs per
+     * attempt and covers it live; the claim-id scan is deferred until every probe's
+     * injection evidence exists, by which point only the recorded exchange remains. So
+     * the discarded replies are recorded, and the deferred scan reads them too.
+     */
+    discardedResponseTexts: string[];
 }
 
 export interface SystemVersionTuple {
@@ -1248,9 +1266,24 @@ class ScenarioRunner {
     ): Promise<HistorianRunArtifact> {
         const trigger = this.scenario.trigger;
         const invocationsBefore = this.countHistorianInvocations(harness, sessionId);
+        const completedInvocationsBefore = this.countHistorianInvocations(harness, sessionId, "completed");
         const markerHitsBefore = this.historianMarkerMockHits;
         const promotionEvidenceBefore = this.scopedPromotionEvidenceCount(harness);
 
+        // Exactly the rows the earlier declared runs produced, checked BEFORE the spike.
+        // A filler, authored, or padding turn that unexpectedly crossed the live
+        // execution threshold leaves a row here, and the wait below only requires
+        // `>= runIndex` — so that early pass would be adopted as this declared run,
+        // having evaluated a different trigger point and a different chunk. It also
+        // consumed the scripted output, which empties the queue and leaves
+        // `assertNoScriptDrift` with nothing to report.
+        const rowsBeforeSpike = this.historianRunRows(harness, sessionId).length;
+        if (rowsBeforeSpike !== runIndex - 1) {
+            throw new RunAbort(
+                "harness-failure",
+                `historian run ${runIndex} found ${rowsBeforeSpike} run row(s) before its spike turn; ${runIndex - 1} expected, so a pass fired against an undeclared trigger point`,
+            );
+        }
         await this.scriptedTurn(
             harness,
             sessionId,
@@ -1296,8 +1329,26 @@ class ScenarioRunner {
         // whole scenario, so an earlier run's fallback would otherwise abort a
         // later, healthy one.
         const markerHitsDuringRun = this.historianMarkerMockHits - markerHitsBefore;
+        // The `validation: ` prefix is NOT proof the historian produced output.
+        // `runValidatedHistorianPass` returns `{ok: false}` for a provider error, an
+        // auth failure, a timeout, a child session it could not create, and "returned
+        // no assistant output" as readily as for unusable compartments — and
+        // `compartment-runner-incremental` prefixes every one of them the same way. So
+        // the prefix alone cannot separate "the model emitted garbage" (KTD4 model
+        // behavior) from "the model never ran" (infrastructure).
+        //
+        // `subagent_invocations.status` can: production records `completed` for an
+        // attempt that returned text and `failed` for one that did not. Requiring a
+        // completed attempt in THIS run's window is what makes the prefix mean what the
+        // branches below read it as — without it, a live outage suppressed the
+        // fallback abort and was scored FAIL:invalid-output, charging an infrastructure
+        // failure to model quality, which is precisely the attribution R6 forbids.
+        const completedDuringRun =
+            this.countHistorianInvocations(harness, sessionId, "completed") - completedInvocationsBefore;
         const failedValidation =
-            row.status === "failed" && (row.failure_reason ?? "").startsWith("validation: ");
+            row.status === "failed" &&
+            (row.failure_reason ?? "").startsWith("validation: ") &&
+            completedDuringRun > 0;
         if (this.options.mode.kind === "live" && markerHitsDuringRun > 0 && !failedValidation) {
             throw new RunAbort(
                 "fallback-engaged",
@@ -1420,15 +1471,26 @@ class ScenarioRunner {
         }
     }
 
-    private countHistorianInvocations(harness: TestHarness, sessionId: string): number {
+    /**
+     * Historian subagent invocations for the session, optionally narrowed to one
+     * recorded status.
+     *
+     * `completed` versus `failed` is the only evidence that separates an attempt which
+     * returned text from one that never executed — production records the former when
+     * it has messages to validate and the latter on a model error — and the run's
+     * failure reason cannot, because every unsuccessful pass is prefixed `validation: `.
+     */
+    private countHistorianInvocations(harness: TestHarness, sessionId: string, status?: string): number {
         if (!harness.hasContextDb()) return 0;
         try {
+            const clause = status === undefined ? "" : " AND status = ?";
+            const params = status === undefined ? [sessionId] : [sessionId, status];
             const row = harness
                 .contextDb()
                 .prepare(
-                    "SELECT COUNT(*) AS n FROM subagent_invocations WHERE session_id = ? AND subagent = 'historian'",
+                    `SELECT COUNT(*) AS n FROM subagent_invocations WHERE session_id = ? AND subagent = 'historian'${clause}`,
                 )
-                .get(sessionId) as { n: number } | null;
+                .get(...params) as { n: number } | null;
             return row?.n ?? 0;
         } catch {
             return 0;
@@ -1647,6 +1709,7 @@ class ScenarioRunner {
         let responseText = first.responseText;
         const toolNames = new Set(first.toolNames);
         let reAsked = false;
+        const discardedResponseTexts: string[] = [];
         // Every attempt's reply, not only the recorded one: a malformed first
         // attempt is discarded as an answer but its text still lands in the session
         // and reaches the next probe. The record keeps only the final reply, so
@@ -1655,6 +1718,7 @@ class ScenarioRunner {
         this.assertNoProbeResponseLeak(probe, probeIndex, first.responseText);
         if (answerRaw === null) {
             reAsked = true;
+            if (first.responseText !== null) discardedResponseTexts.push(first.responseText);
             const retry = await this.askProbe(
                 harness,
                 sessionId,
@@ -1691,6 +1755,7 @@ class ScenarioRunner {
             injectedRevisionLocators: this.visibleRevisionLocators(harness, sessionId),
             payloadText,
             responseText,
+            discardedResponseTexts,
         };
     }
 

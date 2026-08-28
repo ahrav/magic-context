@@ -396,6 +396,40 @@ describe("gold and probe freeze guards", () => {
         expect(() => parseScenario(raw)).toThrow(/shared-answer-surface/);
     });
 
+    test("rejects two claim-id probes whose same-category claims one promotion can satisfy", () => {
+        const raw = validScenarioRaw();
+        // Distinct references, unrelated predicates, same category — so one promoted
+        // claim stating both satisfies both expectations and resolves to one public id
+        // for both probes. The subsumption check does not see it: neither predicate
+        // contains the other.
+        (raw.gold as { expectedClaims: Record<string, unknown>[] }).expectedClaims.push({
+            id: "exp-eviction",
+            category: "ARCHITECTURE",
+            predicate: { kind: "normalized-substring", value: "TTL eviction" },
+            sourceTurnRange: [0, 0],
+        });
+        (raw.probes as Record<string, unknown>[]).push({
+            id: "probe-claim-eviction",
+            question: "Which claim records the eviction policy?",
+            answerType: "claim-id",
+            expectedClaimRef: "exp-eviction",
+        });
+        expect(() => parseScenario(raw)).toThrow(/claim-id-co-resolvable/);
+    });
+
+    test("accepts two claim-id probes on different categories", () => {
+        const raw = validScenarioRaw();
+        // Different categories cannot be satisfied by one claim, so neither probe can
+        // resolve to the other's id.
+        (raw.probes as Record<string, unknown>[]).push({
+            id: "probe-claim-capacity",
+            question: "Which claim records the capacity?",
+            answerType: "claim-id",
+            expectedClaimRef: "exp-cache-capacity",
+        });
+        expect(() => parseScenario(raw)).not.toThrow();
+    });
+
     test("rejects two claim-id probes on one claim, whose runtime answer is identical", () => {
         const raw = validScenarioRaw();
         const probes = raw.probes as Record<string, unknown>[];
