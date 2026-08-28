@@ -18,6 +18,8 @@ pub mod jobs;
 pub mod protocol;
 
 use std::path::PathBuf;
+#[cfg(feature = "bench-topology")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
@@ -218,6 +220,163 @@ struct SynapseInner {
     tracker: TaskTracker,
     /// Cancels queued (not yet started) work and closes admission.
     closing: CancellationToken,
+    #[cfg(feature = "bench-topology")]
+    observer: Option<Arc<SynapseObserver>>,
+}
+
+#[cfg(feature = "bench-topology")]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct SynapseObserverSnapshot {
+    pub query_queued: u64,
+    pub query_queued_peak: u64,
+    pub query_holding: u64,
+    pub query_holding_peak: u64,
+    pub batch_queued: u64,
+    pub batch_queued_peak: u64,
+    pub batch_holding: u64,
+    pub batch_holding_peak: u64,
+    pub drain_started_ns: Option<u64>,
+    pub drain_completed_ns: Option<u64>,
+}
+
+#[cfg(feature = "bench-topology")]
+pub struct SynapseObserver {
+    origin: std::time::Instant,
+    query_queued: AtomicU64,
+    query_queued_peak: AtomicU64,
+    query_holding: AtomicU64,
+    query_holding_peak: AtomicU64,
+    batch_queued: AtomicU64,
+    batch_queued_peak: AtomicU64,
+    batch_holding: AtomicU64,
+    batch_holding_peak: AtomicU64,
+    drain_started_ns: AtomicU64,
+    drain_completed_ns: AtomicU64,
+}
+
+#[cfg(feature = "bench-topology")]
+impl SynapseObserver {
+    pub fn new() -> Self {
+        Self {
+            origin: std::time::Instant::now(),
+            query_queued: AtomicU64::new(0),
+            query_queued_peak: AtomicU64::new(0),
+            query_holding: AtomicU64::new(0),
+            query_holding_peak: AtomicU64::new(0),
+            batch_queued: AtomicU64::new(0),
+            batch_queued_peak: AtomicU64::new(0),
+            batch_holding: AtomicU64::new(0),
+            batch_holding_peak: AtomicU64::new(0),
+            drain_started_ns: AtomicU64::new(0),
+            drain_completed_ns: AtomicU64::new(0),
+        }
+    }
+
+    pub fn snapshot(&self) -> SynapseObserverSnapshot {
+        let optional = |value: &AtomicU64| match value.load(Ordering::Relaxed) {
+            0 => None,
+            value => Some(value - 1),
+        };
+        SynapseObserverSnapshot {
+            query_queued: self.query_queued.load(Ordering::Relaxed),
+            query_queued_peak: self.query_queued_peak.load(Ordering::Relaxed),
+            query_holding: self.query_holding.load(Ordering::Relaxed),
+            query_holding_peak: self.query_holding_peak.load(Ordering::Relaxed),
+            batch_queued: self.batch_queued.load(Ordering::Relaxed),
+            batch_queued_peak: self.batch_queued_peak.load(Ordering::Relaxed),
+            batch_holding: self.batch_holding.load(Ordering::Relaxed),
+            batch_holding_peak: self.batch_holding_peak.load(Ordering::Relaxed),
+            drain_started_ns: optional(&self.drain_started_ns),
+            drain_completed_ns: optional(&self.drain_completed_ns),
+        }
+    }
+
+    fn timestamp(&self, target: &AtomicU64) {
+        let elapsed = u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        target.store(elapsed.saturating_add(1), Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "bench-topology")]
+impl Default for SynapseObserver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "bench-topology")]
+#[derive(Clone, Copy)]
+enum ObservedClass {
+    Query,
+    Batch,
+}
+
+#[cfg(feature = "bench-topology")]
+struct ObservationGuard {
+    observer: Option<Arc<SynapseObserver>>,
+    class: ObservedClass,
+    holding: bool,
+}
+
+#[cfg(feature = "bench-topology")]
+impl ObservationGuard {
+    fn queued(inner: &SynapseInner, class: ObservedClass) -> Self {
+        let observer = inner.observer.clone();
+        if let Some(observer) = &observer {
+            let (current, peak) = match class {
+                ObservedClass::Query => (&observer.query_queued, &observer.query_queued_peak),
+                ObservedClass::Batch => (&observer.batch_queued, &observer.batch_queued_peak),
+            };
+            update_peak(peak, current.fetch_add(1, Ordering::Relaxed) + 1);
+        }
+        Self {
+            observer,
+            class,
+            holding: false,
+        }
+    }
+
+    fn hold(&mut self) {
+        let Some(observer) = &self.observer else {
+            return;
+        };
+        let (queued, holding, peak) = match self.class {
+            ObservedClass::Query => (
+                &observer.query_queued,
+                &observer.query_holding,
+                &observer.query_holding_peak,
+            ),
+            ObservedClass::Batch => (
+                &observer.batch_queued,
+                &observer.batch_holding,
+                &observer.batch_holding_peak,
+            ),
+        };
+        queued.fetch_sub(1, Ordering::Relaxed);
+        update_peak(peak, holding.fetch_add(1, Ordering::Relaxed) + 1);
+        self.holding = true;
+    }
+}
+
+#[cfg(feature = "bench-topology")]
+impl Drop for ObservationGuard {
+    fn drop(&mut self) {
+        let Some(observer) = &self.observer else {
+            return;
+        };
+        let counter = match (self.class, self.holding) {
+            (ObservedClass::Query, false) => &observer.query_queued,
+            (ObservedClass::Query, true) => &observer.query_holding,
+            (ObservedClass::Batch, false) => &observer.batch_queued,
+            (ObservedClass::Batch, true) => &observer.batch_holding,
+        };
+        counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "bench-topology")]
+fn update_peak(peak: &AtomicU64, value: u64) {
+    peak.fetch_max(value, Ordering::Relaxed);
 }
 
 pub struct SynapseComponent {
@@ -246,6 +405,8 @@ impl SynapseComponent {
                 query_admission: Arc::new(tokio::sync::Semaphore::new(query_admission_permits)),
                 tracker: TaskTracker::new(),
                 closing: CancellationToken::new(),
+                #[cfg(feature = "bench-topology")]
+                observer: None,
             }),
         }
     }
@@ -282,8 +443,24 @@ impl SynapseComponent {
                 query_admission: Arc::new(tokio::sync::Semaphore::new(query_admission_permits)),
                 tracker: TaskTracker::new(),
                 closing: CancellationToken::new(),
+                #[cfg(feature = "bench-topology")]
+                observer: None,
             }),
         })
+    }
+
+    #[cfg(feature = "bench-topology")]
+    pub fn ready_with_engine_observed(
+        lane: LaneInfo,
+        engine: Arc<dyn EmbeddingEngine>,
+        limits: SynapseLimits,
+        observer: Arc<SynapseObserver>,
+    ) -> Result<Self, bundle::BundleError> {
+        let mut component = Self::ready_with_engine(lane, engine, limits)?;
+        Arc::get_mut(&mut component.inner)
+            .expect("newly constructed component has one owner")
+            .observer = Some(observer);
+        Ok(component)
     }
 
     pub fn status(&self) -> SynapseStatus {
@@ -572,6 +749,8 @@ impl SynapseComponent {
         // the response waiter, so route loss or a deadline cancels waiting
         // without orphaning inference.
         self.inner.tracker.spawn(async move {
+            #[cfg(feature = "bench-topology")]
+            let mut observation = ObservationGuard::queued(&inner, ObservedClass::Query);
             let _query_permit = worker_query_permit;
             let _text_charge = text_charge;
             let mut tx = tx;
@@ -598,6 +777,8 @@ impl SynapseComponent {
                 ))));
                 return;
             };
+            #[cfg(feature = "bench-topology")]
+            observation.hold();
             // Serialized queries queue behind one another, so a predecessor's
             // invariant failure can condemn the lane while this call waits.
             // The lane is already marked, so this reports the existing fault
@@ -742,6 +923,8 @@ impl SynapseComponent {
     fn spawn_batch_worker(&self, lane: Arc<ReadyLane>, seq: u64) {
         let inner = Arc::clone(&self.inner);
         self.inner.tracker.spawn(async move {
+            #[cfg(feature = "bench-topology")]
+            let mut observation = ObservationGuard::queued(&inner, ObservedClass::Batch);
             let permit = tokio::select! {
                 biased;
                 // A queued wrapper is cancellable; a started native call is
@@ -750,6 +933,8 @@ impl SynapseComponent {
                 permit = Arc::clone(&inner.cpu).acquire_owned() => permit,
             };
             let Ok(_permit) = permit else { return };
+            #[cfg(feature = "bench-topology")]
+            observation.hold();
             // A queued batch inherits the same hazard as a queued query: the
             // lane can be condemned while this worker waits for the permit,
             // and the job fails against the existing reason instead of
@@ -1056,11 +1241,19 @@ impl CompositeComponent for SynapseComponent {
     /// tracker, and only then is retained state released. Never aborts a
     /// native call.
     async fn shutdown(&self) -> Result<(), crate::composite::ShutdownError> {
+        #[cfg(feature = "bench-topology")]
+        if let Some(observer) = &self.inner.observer {
+            observer.timestamp(&observer.drain_started_ns);
+        }
         self.inner.closing.cancel();
         self.inner.jobs.close_admission();
         self.inner.tracker.close();
         self.inner.tracker.wait().await;
         self.inner.jobs.clear();
+        #[cfg(feature = "bench-topology")]
+        if let Some(observer) = &self.inner.observer {
+            observer.timestamp(&observer.drain_completed_ns);
+        }
         Ok(())
     }
 }

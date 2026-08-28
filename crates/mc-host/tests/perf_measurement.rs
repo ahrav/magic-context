@@ -276,6 +276,80 @@ fn retry_and_poll_schedule_matches_plugin_policy() {
 }
 
 #[test]
+fn current_plugin_policy_pins_split_caps_and_escalating_fallback() {
+    use perf_measurement::CurrentPluginPolicy;
+
+    assert_eq!(CurrentPluginPolicy::attempt_limit("queue_full"), 64);
+    assert_eq!(CurrentPluginPolicy::attempt_limit("timeout"), 4);
+    assert_eq!(CurrentPluginPolicy::fallback_base_ms(0), 100);
+    assert_eq!(CurrentPluginPolicy::fallback_base_ms(1), 200);
+    assert_eq!(CurrentPluginPolicy::fallback_base_ms(4), 1_600);
+    assert_eq!(CurrentPluginPolicy::fallback_base_ms(5), 1_600);
+}
+
+#[test]
+fn method_rng_derivation_is_stable_and_stream_independent() {
+    use perf_measurement::{rng_for_logical, SynapseMethod};
+
+    let query = rng_for_logical(7, SynapseMethod::Query, 11).unit();
+    let batch = rng_for_logical(7, SynapseMethod::Batch, 11).unit();
+    assert_ne!(query, batch);
+    assert_eq!(query, rng_for_logical(7, SynapseMethod::Query, 11).unit());
+    assert_ne!(query, rng_for_logical(7, SynapseMethod::Query, 12).unit());
+}
+
+#[test]
+fn batch_deadline_goodput_excludes_late_pages_but_retains_them() {
+    use perf_measurement::{summarize_batch_pages, BatchPageRecord};
+
+    let pages = [
+        BatchPageRecord {
+            logical_id: 1,
+            generation: 0,
+            item_count: 8,
+            receipt_ns: 90,
+            deadline_ns: 100,
+            published: true,
+        },
+        BatchPageRecord {
+            logical_id: 1,
+            generation: 0,
+            item_count: 4,
+            receipt_ns: 110,
+            deadline_ns: 100,
+            published: true,
+        },
+        BatchPageRecord {
+            logical_id: 1,
+            generation: 1,
+            item_count: 4,
+            receipt_ns: 95,
+            deadline_ns: 100,
+            published: false,
+        },
+    ];
+    let summary = summarize_batch_pages(&pages, 20).expect("nonzero elapsed");
+    assert_eq!(summary.received_items, 16);
+    assert_eq!(summary.deadline_items, 8);
+    assert_eq!(summary.page_count, 3);
+    assert_eq!(summary.deadline_goodput_items_per_sec, 400_000_000.0);
+}
+
+#[test]
+fn cancellation_cause_splits_invalid_measurement_from_adverse_outcome() {
+    use perf_measurement::{classify_repetition, CancellationCause, RepetitionClass};
+
+    assert_eq!(
+        classify_repetition(&[], &[CancellationCause::Candidate]),
+        RepetitionClass::AdverseTreatment
+    );
+    assert_eq!(
+        classify_repetition(&[], &[CancellationCause::HarnessTeardown]),
+        RepetitionClass::MeasurementInvalid
+    );
+}
+
+#[test]
 fn adjacent_seeds_disperse_their_first_draw() {
     // The benchmark seeds per-request generators as `seed ^ logical_id`,
     // so adjacent small seeds must not produce synchronized first draws:

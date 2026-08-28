@@ -1,14 +1,13 @@
-//! Cross-platform test-only process resource observer (plan U5, KTD9,
-//! R13).
+//! Cross-platform test-only process resource observer.
 //!
 //! Counts open file descriptors, mapped memory regions, and threads for
 //! one pid through one interface. Linux reads `/proc/<pid>/fd`,
 //! `/proc/<pid>/maps`, and `/proc/<pid>/task`; macOS uses the public
 //! `libproc` selectors `PROC_PIDLISTFDS`, `PROC_PIDREGIONINFO`, and
 //! `PROC_PIDLISTTHREADS`. Short, unsupported, or permission-denied
-//! observations FAIL with a bounded error naming only the counter kind —
-//! a counter is never silently dropped (R13). Errors carry no paths,
-//! addresses, or provider data (R17).
+//! observations fail with a bounded error naming only the counter kind. A
+//! counter is never silently dropped, and errors carry no paths, addresses, or
+//! provider data.
 //!
 //! Observing a process's own fd table on Linux includes the enumeration
 //! descriptor itself; the bias is constant across samples, so deltas and
@@ -36,7 +35,7 @@ impl ResourceCounts {
     }
 }
 
-/// Failed observation. Carries only the counter kind (R13, R17).
+/// Failed observation. Carries only the counter kind.
 #[derive(Clone, Copy)]
 pub struct ObserveError {
     counter: &'static str,
@@ -96,6 +95,55 @@ pub struct TaskDelta {
     pub stime_ticks: u64,
     pub voluntary_context_switches: u64,
     pub nonvoluntary_context_switches: u64,
+}
+
+/// Process-wide Linux evidence from `/proc/self/status` and `/proc/self/stat`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ProcessCounters {
+    pub vm_rss_kib: u64,
+    pub vm_hwm_kib: u64,
+    pub threads: u64,
+    pub user_cpu_ticks: u64,
+    pub system_cpu_ticks: u64,
+}
+
+#[cfg(target_os = "linux")]
+pub fn observe_process() -> Result<ProcessCounters, ObserveError> {
+    let counter = "process_status_stat";
+    let status = std::fs::read_to_string("/proc/self/status").map_err(|_| fail(counter))?;
+    let stat = std::fs::read_to_string("/proc/self/stat").map_err(|_| fail(counter))?;
+    parse_process_counters(&status, &stat).ok_or_else(|| fail(counter))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn observe_process() -> Result<ProcessCounters, ObserveError> {
+    Err(fail("process_status_stat"))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_process_counters(status: &str, stat: &str) -> Option<ProcessCounters> {
+    let close = stat.rfind(')')?;
+    let fields: Vec<&str> = stat.get(close + 1..)?.split_whitespace().collect();
+    Some(ProcessCounters {
+        vm_rss_kib: status_kib(status, "VmRSS")?,
+        vm_hwm_kib: status_kib(status, "VmHWM")?,
+        threads: status_counter(status, "Threads")?,
+        user_cpu_ticks: fields.get(11)?.parse().ok()?,
+        system_cpu_ticks: fields.get(12)?.parse().ok()?,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn status_kib(status: &str, key: &str) -> Option<u64> {
+    status.lines().find_map(|line| {
+        let (actual, value) = line.split_once(':')?;
+        if actual != key {
+            return None;
+        }
+        let mut fields = value.split_whitespace();
+        let value = fields.next()?.parse().ok()?;
+        (fields.next()? == "kB").then_some(value)
+    })
 }
 
 /// Enumerates every Linux task through the same `/proc/<pid>/task` authority
@@ -196,7 +244,7 @@ pub fn task_deltas(
 }
 
 // ---------------------------------------------------------------------------
-// Linux backend: /proc (R13).
+// Linux backend: /proc.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
@@ -223,15 +271,41 @@ fn count_mapped_regions(pid: u32) -> Result<u64, ObserveError> {
     u64::try_from(count).map_err(|_| fail("mapped_regions"))
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_process_status_and_stat_with_spaces_in_comm() {
+        let status = "Name:\ttest\nVmHWM:\t2048 kB\nVmRSS:\t1024 kB\nThreads:\t7\n";
+        let mut fields = vec!["S"; 18];
+        fields[11] = "31";
+        fields[12] = "12";
+        let stat = format!("99 (generator worker) {}", fields.join(" "));
+        let counters = parse_process_counters(status, &stat).expect("valid proc fixture");
+        assert_eq!(counters.vm_rss_kib, 1024);
+        assert_eq!(counters.vm_hwm_kib, 2048);
+        assert_eq!(counters.threads, 7);
+        assert_eq!(counters.user_cpu_ticks, 31);
+        assert_eq!(counters.system_cpu_ticks, 12);
+    }
+
+    #[test]
+    fn self_process_observation_has_consistent_rss() {
+        let counters = observe_process().expect("Linux exposes self proc counters");
+        assert!(counters.vm_hwm_kib >= counters.vm_rss_kib);
+        assert!(counters.threads > 0);
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn count_threads(pid: u32) -> Result<u64, ObserveError> {
     count_dir_entries(&format!("/proc/{pid}/task"), "threads")
 }
 
 // ---------------------------------------------------------------------------
-// macOS backend: public libproc (R13). Compiled and self-testable on macOS
-// CI; this crate's provisional soak tuple itself is Linux-only until the
-// frozen `.12` manifest retains a macOS provider. commentlint: allow(JUDGE)
+// macOS backend: public libproc. This code compiles and runs its own checks on
+// macOS even though the shared-memory soak target is Linux-only.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "macos")]
@@ -299,7 +373,7 @@ const LIST_ENTRY_HINT: usize = 64;
 
 /// Counts fixed-size list entries returned by one `proc_pidinfo` list
 /// selector, growing the buffer until the result provably fits. Short or
-/// non-multiple results FAIL instead of dropping entries (R13).
+/// non-multiple results fail instead of dropping entries.
 #[cfg(target_os = "macos")]
 fn count_list_entries(
     pid: u32,
@@ -331,7 +405,7 @@ fn count_list_entries(
         }
         let returned = returned as usize;
         if returned % entry_size != 0 {
-            // A short observation must fail, never round down (R13).
+            // A short observation must fail, never round down.
             return Err(fail(counter));
         }
         if returned < capacity {
@@ -390,7 +464,7 @@ fn count_mapped_regions(pid: u32) -> Result<u64, ObserveError> {
         if returned <= 0 {
             // End of the address space is only distinguishable after at
             // least one region; an empty walk is unsupported or
-            // permission-denied and must FAIL (R13).
+            // permission-denied and must fail.
             return if count > 0 {
                 Ok(count)
             } else {

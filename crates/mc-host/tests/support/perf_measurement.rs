@@ -246,6 +246,86 @@ impl SynapseMethod {
     }
 }
 
+/// Derives one independent random stream for a logical method request.
+pub fn rng_for_logical(seed: u64, method: SynapseMethod, logical_id: u64) -> DeterministicRng {
+    let method_salt = match method {
+        SynapseMethod::Query => 0x5175_6572_795f_726e,
+        SynapseMethod::Batch => 0x4261_7463_685f_726e,
+        SynapseMethod::Result => 0x5265_7375_6c74_726e,
+    };
+    DeterministicRng::new(seed ^ method_salt ^ logical_id.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
+/// Why a logical cancellation reached the harness ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancellationCause {
+    Candidate,
+    HarnessTeardown,
+}
+
+/// Top-level KTD7 classification retained with every repetition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepetitionClass {
+    Valid,
+    AdverseTreatment,
+    MeasurementInvalid,
+}
+
+pub fn classify_repetition(
+    invalid_causes: &[String],
+    cancellations: &[CancellationCause],
+) -> RepetitionClass {
+    if !invalid_causes.is_empty() || cancellations.contains(&CancellationCause::HarnessTeardown) {
+        RepetitionClass::MeasurementInvalid
+    } else if cancellations.contains(&CancellationCause::Candidate) {
+        RepetitionClass::AdverseTreatment
+    } else {
+        RepetitionClass::Valid
+    }
+}
+
+/// One received result page, retained even when it misses its session deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BatchPageRecord {
+    pub logical_id: u64,
+    pub generation: u32,
+    pub item_count: u64,
+    pub receipt_ns: u64,
+    pub deadline_ns: u64,
+    pub published: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BatchGoodputSummary {
+    pub page_count: u64,
+    pub received_items: u64,
+    pub deadline_items: u64,
+    pub deadline_goodput_items_per_sec: f64,
+}
+
+pub fn summarize_batch_pages(
+    pages: &[BatchPageRecord],
+    elapsed_ns: u64,
+) -> Option<BatchGoodputSummary> {
+    if elapsed_ns == 0 {
+        return None;
+    }
+    let received_items = pages.iter().map(|page| page.item_count).sum();
+    let deadline_items = pages
+        .iter()
+        .filter(|page| page.published && page.receipt_ns <= page.deadline_ns)
+        .map(|page| page.item_count)
+        .sum();
+    Some(BatchGoodputSummary {
+        page_count: pages.len() as u64,
+        received_items,
+        deadline_items,
+        deadline_goodput_items_per_sec: deadline_items as f64 * 1_000_000_000.0 / elapsed_ns as f64,
+    })
+}
+
 /// Code the harness records when its own deadline fired before any terminal
 /// arrived. It marks an attempt whose admission outcome the wire never
 /// revealed, which is why [`validate_synapse_ledgers`] keeps it out of both
@@ -310,6 +390,7 @@ pub enum LogicalDisposition {
     Completed,
     Rejected,
     TimedOut,
+    Cancelled,
     InFlight,
 }
 
@@ -525,6 +606,7 @@ pub struct SynapseLedgerSummary {
     pub timed_out: u64,
     pub timed_out_by_method_code: BTreeMap<String, u64>,
     pub in_flight: u64,
+    pub cancelled: u64,
     pub attempts: u64,
     pub successes: u64,
     pub retryable_rejections: u64,
@@ -557,6 +639,10 @@ pub fn validate_synapse_ledgers(
     let in_flight = logical
         .iter()
         .filter(|record| record.disposition == LogicalDisposition::InFlight)
+        .count() as u64;
+    let cancelled = logical
+        .iter()
+        .filter(|record| record.disposition == LogicalDisposition::Cancelled)
         .count() as u64;
 
     let successes = attempts
@@ -688,9 +774,9 @@ pub fn validate_synapse_ledgers(
             ));
         }
     }
-    if offered != completed + terminal_rejected + timed_out + in_flight {
+    if offered != completed + terminal_rejected + timed_out + cancelled + in_flight {
         errors.push(format!(
-            "logical ledger: {offered} != {completed} + {terminal_rejected} + {timed_out} + {in_flight}"
+            "logical ledger: {offered} != {completed} + {terminal_rejected} + {timed_out} + {cancelled} + {in_flight}"
         ));
     }
     let attempt_total = attempts.len() as u64;
@@ -702,9 +788,16 @@ pub fn validate_synapse_ledgers(
     // The frozen attempt vocabulary has four categories. A recorded failure
     // is a wire error the client policy cannot act on, so the repetition
     // carries an instrumentation or host fault and is inadmissible.
-    if failures != 0 {
+    let non_candidate_failures = attempts
+        .iter()
+        .filter(|attempt| {
+            attempt.disposition == AttemptDisposition::Failure
+                && attempt.code.as_deref() != Some("cancelled")
+        })
+        .count();
+    if non_candidate_failures != 0 {
         errors.push(format!(
-            "attempt ledger: {failures} non-poll attempts ended in an error outside the frozen vocabulary"
+            "attempt ledger: {non_candidate_failures} non-poll attempts ended in an error outside the frozen vocabulary"
         ));
     }
     for request in logical {
@@ -747,6 +840,7 @@ pub fn validate_synapse_ledgers(
         timed_out,
         timed_out_by_method_code,
         in_flight,
+        cancelled,
         attempts: attempt_total,
         successes,
         retryable_rejections,
@@ -815,6 +909,27 @@ pub const POLL_MIN_DELAY_MS: u64 = 10;
 /// amplification when a served hint is pathologically small.
 pub const QUEUE_FULL_MAX_ATTEMPTS: u32 = 64;
 
+/// Current TypeScript plugin retry and polling policy used by deciding cells.
+pub struct CurrentPluginPolicy;
+
+impl CurrentPluginPolicy {
+    pub const OTHER_MAX_ATTEMPTS: u32 = 4;
+
+    pub fn attempt_limit(code: &str) -> u32 {
+        if code == "queue_full" {
+            QUEUE_FULL_MAX_ATTEMPTS
+        } else {
+            Self::OTHER_MAX_ATTEMPTS
+        }
+    }
+
+    pub fn fallback_base_ms(attempt: u32) -> u64 {
+        100u64
+            .saturating_mul(1u64 << attempt.min(4))
+            .clamp(1, 2_000)
+    }
+}
+
 /// Consumes the current pending-poll delay and escalates the stored next
 /// one, mirroring the plugin's `pendingPollDelay`: the first pending reply
 /// waits the jittered fast-first seed, later pendings wait the escalated
@@ -831,6 +946,8 @@ pub fn pending_poll_delay_ms(next_delay_ms: &mut f64, served_cap_ms: u64) -> f64
 /// in one place so a host hint cannot accidentally leak into control arms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SynapseVariant {
+    #[serde(rename = "current-plugin")]
+    CurrentPlugin,
     #[serde(rename = "baseline")]
     Baseline,
     #[serde(rename = "hygiene-only")]
@@ -848,19 +965,24 @@ pub enum SynapseVariant {
 impl SynapseVariant {
     pub fn parse(value: &str) -> Result<Self, String> {
         match value {
+            "current-plugin" => Ok(Self::CurrentPlugin),
             "baseline" => Ok(Self::Baseline),
             "hygiene-only" => Ok(Self::HygieneOnly),
             "a" => Ok(Self::A),
             "b" => Ok(Self::B),
             "c" => Ok(Self::C),
             "a+c" => Ok(Self::APlusC),
-            _ => Err("variant must be baseline, hygiene-only, a, b, c, or a+c".to_owned()),
+            _ => Err(
+                "variant must be current-plugin, baseline, hygiene-only, a, b, c, or a+c"
+                    .to_owned(),
+            ),
         }
     }
 
     /// CLI spelling of the variant; the inverse of `parse`.
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::CurrentPlugin => "current-plugin",
             Self::Baseline => "baseline",
             Self::HygieneOnly => "hygiene-only",
             Self::A => "a",
@@ -874,6 +996,10 @@ impl SynapseVariant {
         matches!(self, Self::A | Self::APlusC)
     }
 
+    pub fn permits_waiting_queries(self) -> bool {
+        matches!(self, Self::CurrentPlugin | Self::A | Self::APlusC)
+    }
+
     /// `None` is the historical query-only admission loop: retry until the
     /// single absolute deadline with no attempt cap. Treatment/hygiene arms
     /// mirror the plugin's `queue_full` budget: deadline-bounded with the
@@ -882,16 +1008,24 @@ impl SynapseVariant {
         (!matches!(self, Self::Baseline)).then_some(QUEUE_FULL_MAX_ATTEMPTS)
     }
 
+    pub fn attempt_limit(self, code: &str) -> Option<u32> {
+        if matches!(self, Self::CurrentPlugin) {
+            Some(CurrentPluginPolicy::attempt_limit(code))
+        } else {
+            self.query_attempt_limit()
+        }
+    }
+
     /// Only candidate B reads the host's served `query_retry_after_ms`. The
     /// frozen matrix declares `a+c` as A's bounded server waiting plus C's
     /// fast polling, so letting it read the hint too would make its query
     /// results unattributable between A+C and an unlabelled B.
     pub fn uses_served_query_hint(self) -> bool {
-        matches!(self, Self::B)
+        matches!(self, Self::CurrentPlugin | Self::B)
     }
 
     pub fn fast_polls(self) -> bool {
-        matches!(self, Self::C | Self::APlusC)
+        matches!(self, Self::CurrentPlugin | Self::C | Self::APlusC)
     }
 
     /// Seed of the pending-poll ladder for fast-poll arms: the jittered
@@ -929,6 +1063,21 @@ impl SynapseVariant {
                 100
             };
             rng.retry_delay_ms(base)
+        }
+    }
+
+    pub fn retry_delay_ms(
+        self,
+        served_hint_ms: Option<u64>,
+        attempt: u32,
+        rng: &mut DeterministicRng,
+    ) -> f64 {
+        if matches!(self, Self::CurrentPlugin) {
+            rng.retry_delay_ms(
+                served_hint_ms.unwrap_or_else(|| CurrentPluginPolicy::fallback_base_ms(attempt)),
+            )
+        } else {
+            self.query_retry_delay_ms(served_hint_ms, rng)
         }
     }
 }

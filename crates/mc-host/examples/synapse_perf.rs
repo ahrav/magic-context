@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 use mc_host::synapse::inference::InferenceError;
 use mc_host::synapse::jobs::BatchItem;
 use mc_host::synapse::{
-    EmbeddingEngine, LaneInfo, SynapseComponent, SynapseLimits, SYNAPSE_MODULE_ID,
+    EmbeddingEngine, LaneInfo, SynapseComponent, SynapseLimits, SynapseObserver,
+    SynapseObserverSnapshot, SYNAPSE_MODULE_ID,
 };
 use mc_host::{
     BindOutcome, CancellationToken, CompositeComponent, HealthReport, HostConfig, HostInit,
@@ -28,7 +29,7 @@ use mc_host::{
     RouteIdentity, SecondaryComponent, ShutdownError, StaticComposite,
 };
 use perf_measurement::{
-    AttemptDisposition, AttemptRecord, DeterministicRng, LatencySummary, LogicalDisposition,
+    AttemptDisposition, AttemptRecord, BatchPageRecord, LatencySummary, LogicalDisposition,
     LogicalRecord, ServiceSample, SynapseMethod, SynapseVariant, WindowClass,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
@@ -96,18 +97,60 @@ impl BatchShape {
 enum Arm {
     Query,
     Batch(BatchShape),
+    Mixed(BatchShape),
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TopologyId {
+    B0,
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+enum RateRatio {
+    #[serde(rename = "1:1")]
+    OneToOne,
+    #[serde(rename = "4:1")]
+    FourToOne,
+}
+
+impl RateRatio {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "1:1" => Ok(Self::OneToOne),
+            "4:1" => Ok(Self::FourToOne),
+            _ => Err("ratio must be 1:1 or 4:1".to_owned()),
+        }
+    }
+
+    fn matches(self, query_rate: u64, batch_rate: u64) -> bool {
+        match self {
+            Self::OneToOne => batch_rate == query_rate,
+            Self::FourToOne => batch_rate == query_rate.saturating_mul(4),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Load {
-    Open { rate: u64 },
-    Closed { concurrency: usize },
+    Open {
+        rate: u64,
+    },
+    Closed {
+        concurrency: usize,
+    },
+    Mixed {
+        query_rate: u64,
+        batch_rate: u64,
+        ratio: RateRatio,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
 struct Opts {
     variant: SynapseVariant,
+    topology: TopologyId,
     arm: Arm,
     load: Load,
     seconds: u64,
@@ -116,6 +159,7 @@ struct Opts {
     query_retry_after_ms: u64,
     seed: u64,
     transport_floor_ns: u64,
+    observer: bool,
 }
 
 fn parse_opts() -> Result<Opts, String> {
@@ -128,12 +172,17 @@ fn parse_opts_from(args: impl IntoIterator<Item = String>) -> Result<Opts, Strin
     let mut batch_shape = None;
     let mut rate = None;
     let mut concurrency = None;
+    let mut query_rate = None;
+    let mut batch_rate = None;
+    let mut ratio = None;
     let mut seconds = 1;
     let mut engine_delay_ms = 0;
     let mut max_waiting_queries = 0;
     let mut query_retry_after_ms = 50;
     let mut seed = 1;
     let mut transport_floor_ns = 0;
+    let mut topology = TopologyId::B0;
+    let mut observer = true;
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         let value = args
@@ -145,12 +194,28 @@ fn parse_opts_from(args: impl IntoIterator<Item = String>) -> Result<Opts, Strin
             "--batch-shape" => batch_shape = Some(BatchShape::parse(&value)?),
             "--rate" => rate = Some(parse(&value, "rate")?),
             "--concurrency" => concurrency = Some(parse(&value, "concurrency")?),
+            "--query-rate" => query_rate = Some(parse(&value, "query rate")?),
+            "--batch-rate" => batch_rate = Some(parse(&value, "batch rate")?),
+            "--ratio" => ratio = Some(RateRatio::parse(&value)?),
             "--seconds" => seconds = parse(&value, "seconds")?,
             "--engine-delay-ms" => engine_delay_ms = parse(&value, "engine delay")?,
             "--max-waiting-queries" => max_waiting_queries = parse(&value, "max waiting queries")?,
             "--query-retry-after-ms" => query_retry_after_ms = parse(&value, "query retry after")?,
             "--seed" => seed = parse(&value, "seed")?,
             "--transport-floor-ns" => transport_floor_ns = parse(&value, "transport floor")?,
+            "--topology" => {
+                topology = match value.as_str() {
+                    "b0" => TopologyId::B0,
+                    _ => return Err("topology must be b0".to_owned()),
+                }
+            }
+            "--observer" => {
+                observer = match value.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err("observer must be on or off".to_owned()),
+                }
+            }
             _ => return Err(format!("unknown option {flag}")),
         }
     }
@@ -159,19 +224,52 @@ fn parse_opts_from(args: impl IntoIterator<Item = String>) -> Result<Opts, Strin
         (Some("query"), Some(_)) => return Err("query arm rejects --batch-shape".to_owned()),
         (Some("batch"), Some(shape)) => Arm::Batch(shape),
         (Some("batch"), None) => return Err("batch arm requires --batch-shape".to_owned()),
-        (Some(other), _) => return Err(format!("arm must be query or batch, got {other}")),
-        (None, _) => return Err("--arm query|batch is required".to_owned()),
+        (Some("mixed"), Some(shape)) => Arm::Mixed(shape),
+        (Some("mixed"), None) => return Err("mixed arm requires --batch-shape".to_owned()),
+        (Some(other), _) => return Err(format!("arm must be query, batch, or mixed, got {other}")),
+        (None, _) => return Err("--arm query|batch|mixed is required".to_owned()),
     };
     let variant = variant.ok_or_else(|| "--variant is required".to_owned())?;
-    let load = match (rate, concurrency) {
-        (Some(rate), None) => {
+    if matches!(arm, Arm::Mixed(_)) && !matches!(variant, SynapseVariant::CurrentPlugin) {
+        return Err("mixed arm requires --variant current-plugin".to_owned());
+    }
+    let load = match (arm, rate, concurrency, query_rate, batch_rate, ratio) {
+        (Arm::Mixed(_), None, None, Some(query_rate), Some(batch_rate), Some(ratio)) => {
+            perf_measurement::validate_open_loop_rate(query_rate)?;
+            perf_measurement::validate_open_loop_rate(batch_rate)?;
+            if !ratio.matches(query_rate, batch_rate) {
+                return Err("query and batch rates do not match the declared ratio".to_owned());
+            }
+            Load::Mixed {
+                query_rate,
+                batch_rate,
+                ratio,
+            }
+        }
+        (Arm::Mixed(_), _, _, _, _, _) => {
+            return Err(
+                "mixed arm requires --query-rate, --batch-rate, and --ratio only".to_owned(),
+            )
+        }
+        (_, _, _, Some(_), _, _) | (_, _, _, _, Some(_), _) | (_, _, _, _, _, Some(_)) => {
+            return Err("query/batch rates and ratio are only valid for the mixed arm".to_owned())
+        }
+        (_, Some(rate), None, None, None, None) => {
             perf_measurement::validate_open_loop_rate(rate)?;
             Load::Open { rate }
         }
-        (None, Some(concurrency)) if concurrency > 0 => Load::Closed { concurrency },
-        (None, Some(_)) => return Err("concurrency must be nonzero".to_owned()),
-        (Some(_), Some(_)) => return Err("--rate and --concurrency are contradictory".to_owned()),
-        (None, None) => return Err("exactly one of --rate or --concurrency is required".to_owned()),
+        (_, None, Some(concurrency), None, None, None) if concurrency > 0 => {
+            Load::Closed { concurrency }
+        }
+        (_, None, Some(_), None, None, None) => {
+            return Err("concurrency must be nonzero".to_owned())
+        }
+        (_, Some(_), Some(_), None, None, None) => {
+            return Err("--rate and --concurrency are contradictory".to_owned())
+        }
+        (_, None, None, None, None, None) => {
+            return Err("exactly one load shape is required".to_owned())
+        }
     };
     if seconds == 0 {
         return Err("seconds must be nonzero".to_owned());
@@ -185,7 +283,7 @@ fn parse_opts_from(args: impl IntoIterator<Item = String>) -> Result<Opts, Strin
             variant.as_str()
         ));
     }
-    if !variant.needs_waiting_queries() && max_waiting_queries != 0 {
+    if !variant.permits_waiting_queries() && max_waiting_queries != 0 {
         return Err(format!(
             "variant {} requires --max-waiting-queries 0",
             variant.as_str()
@@ -200,13 +298,25 @@ fn parse_opts_from(args: impl IntoIterator<Item = String>) -> Result<Opts, Strin
             variant.as_str()
         ));
     }
-    if let Load::Open { rate, .. } = load {
+    for rate in match load {
+        Load::Open { rate } => [Some(rate), None],
+        Load::Mixed {
+            query_rate,
+            batch_rate,
+            ..
+        } => [Some(query_rate), Some(batch_rate)],
+        Load::Closed { .. } => [None, None],
+    }
+    .into_iter()
+    .flatten()
+    {
         rate.checked_mul(seconds)
             .filter(|count| *count > 0)
             .ok_or_else(|| "offered request count is zero or overflows".to_owned())?;
     }
     Ok(Opts {
         variant,
+        topology,
         arm,
         load,
         seconds,
@@ -215,6 +325,7 @@ fn parse_opts_from(args: impl IntoIterator<Item = String>) -> Result<Opts, Strin
         query_retry_after_ms,
         seed,
         transport_floor_ns,
+        observer,
     })
 }
 
@@ -723,6 +834,7 @@ struct RunContext {
     next_attempt: Arc<AtomicU64>,
     fatal_errors: Arc<Mutex<Vec<String>>>,
     connection_loss: Arc<AtomicU64>,
+    batch_pages: Arc<Mutex<Vec<BatchPageRecord>>>,
     opts: Opts,
 }
 
@@ -901,7 +1013,8 @@ async fn execute_query(
     scheduled_start_ns: Option<u64>,
 ) -> Result<LogicalRecord, String> {
     let deadline = Instant::now() + QUERY_DEADLINE;
-    let mut rng = DeterministicRng::new(ctx.opts.seed ^ logical_id);
+    let mut rng =
+        perf_measurement::rng_for_logical(ctx.opts.seed, SynapseMethod::Query, logical_id);
     let mut first_send = None;
     let mut attempts = 0u32;
     loop {
@@ -949,11 +1062,14 @@ async fn execute_query(
                 let may_retry = ctx
                     .opts
                     .variant
-                    .query_attempt_limit()
+                    .attempt_limit(perf_measurement::ATTEMPT_TIMEOUT_CODE)
                     .is_none_or(|limit| attempts < limit);
                 if may_retry {
                     let delay = Duration::from_secs_f64(
-                        ctx.opts.variant.query_retry_delay_ms(None, &mut rng) / 1_000.0,
+                        ctx.opts
+                            .variant
+                            .retry_delay_ms(None, attempts.saturating_sub(1), &mut rng)
+                            / 1_000.0,
                     );
                     if Instant::now() + delay < deadline {
                         tokio::time::sleep(delay).await;
@@ -1016,13 +1132,25 @@ async fn execute_query(
                 0,
             ));
         }
+        if code == "cancelled" {
+            return Ok(terminal_record(
+                logical_id,
+                scheduled_start_ns,
+                first_send.expect("set above"),
+                reply.received_ns,
+                LogicalDisposition::Cancelled,
+                Some(code.to_owned()),
+                u64::from(attempts),
+                0,
+            ));
+        }
         if code != "queue_full" {
             return Err(format!("unexpected embed.query error: {json}"));
         }
         if ctx
             .opts
             .variant
-            .query_attempt_limit()
+            .attempt_limit(code)
             .is_some_and(|limit| attempts >= limit)
         {
             return Ok(terminal_record(
@@ -1037,10 +1165,11 @@ async fn execute_query(
             ));
         }
         let delay = Duration::from_secs_f64(
-            ctx.opts
-                .variant
-                .query_retry_delay_ms(json["retry_after_ms"].as_u64(), &mut rng)
-                / 1_000.0,
+            ctx.opts.variant.retry_delay_ms(
+                json["retry_after_ms"].as_u64(),
+                attempts.saturating_sub(1),
+                &mut rng,
+            ) / 1_000.0,
         );
         if Instant::now() + delay >= deadline {
             return Ok(terminal_record(
@@ -1100,10 +1229,12 @@ async fn execute_batch(
         .iter()
         .map(|item| (item.id.as_str(), item.content_sha256.as_str()))
         .collect();
-    let mut rng = DeterministicRng::new(ctx.opts.seed ^ logical_id.rotate_left(17));
+    let mut rng =
+        perf_measurement::rng_for_logical(ctx.opts.seed, SynapseMethod::Batch, logical_id);
     let mut first_send = None;
     let mut batch_attempts = 0u64;
     let mut polls = 0u64;
+    let mut generation = 0u32;
     // One-resubmission budget for `module_restarted`, mirroring the plugin
     // policy (embedding-synapse.ts): a host restart evicts every in-flight
     // job, the first `module_restarted` on a logical request resubmits the
@@ -1150,7 +1281,14 @@ async fn execute_batch(
                     // request's latency even when a resubmission follows.
                     first_send.get_or_insert(sent_ns);
                     if submit_attempts < MAX_TOTAL_ATTEMPTS {
-                        let delay = Duration::from_secs_f64(rng.retry_delay_ms(100) / 1_000.0);
+                        let base = if matches!(ctx.opts.variant, SynapseVariant::CurrentPlugin) {
+                            perf_measurement::CurrentPluginPolicy::fallback_base_ms(
+                                submit_attempts.saturating_sub(1),
+                            )
+                        } else {
+                            100
+                        };
+                        let delay = Duration::from_secs_f64(rng.retry_delay_ms(base) / 1_000.0);
                         if Instant::now() + delay < deadline {
                             tokio::time::sleep(delay).await;
                             continue;
@@ -1195,6 +1333,7 @@ async fn execute_batch(
             let code = json["code"].as_str().unwrap_or("unparsable");
             if code == "module_restarted" {
                 if !std::mem::replace(&mut restart_used, true) {
+                    generation = generation.saturating_add(1);
                     // A resubmission is a new submission: restart the outer
                     // loop so the per-submission retry budget resets.
                     continue 'logical;
@@ -1205,6 +1344,18 @@ async fn execute_batch(
                     first_send.expect("set above"),
                     reply.received_ns,
                     LogicalDisposition::Rejected,
+                    Some(code.to_owned()),
+                    batch_attempts + polls,
+                    polls,
+                ));
+            }
+            if code == "cancelled" {
+                return Ok(terminal_record(
+                    logical_id,
+                    scheduled_start_ns,
+                    first_send.expect("set above"),
+                    reply.received_ns,
+                    LogicalDisposition::Cancelled,
                     Some(code.to_owned()),
                     batch_attempts + polls,
                     polls,
@@ -1228,7 +1379,15 @@ async fn execute_batch(
                     polls,
                 ));
             }
-            let base = json["retry_after_ms"].as_u64().unwrap_or(100);
+            let base = json["retry_after_ms"].as_u64().unwrap_or_else(|| {
+                if matches!(ctx.opts.variant, SynapseVariant::CurrentPlugin) {
+                    perf_measurement::CurrentPluginPolicy::fallback_base_ms(
+                        submit_attempts.saturating_sub(1),
+                    )
+                } else {
+                    100
+                }
+            });
             let delay = Duration::from_secs_f64(rng.retry_delay_ms(base) / 1_000.0);
             if Instant::now() + delay >= deadline {
                 return Ok(terminal_record(
@@ -1296,15 +1455,28 @@ async fn execute_batch(
                         // Mirrors the plugin's split budgets: `queue_full`
                         // waits for a slot under the shared deadline-bounded
                         // cap; other transients keep four attempts.
-                        let attempt_cap = if code == Some("queue_full") {
-                            perf_measurement::QUEUE_FULL_MAX_ATTEMPTS
-                        } else {
-                            MAX_TOTAL_ATTEMPTS
-                        };
+                        let attempt_cap =
+                            if matches!(ctx.opts.variant, SynapseVariant::CurrentPlugin) {
+                                perf_measurement::CurrentPluginPolicy::attempt_limit(
+                                    code.unwrap_or("timeout"),
+                                )
+                            } else if code == Some("queue_full") {
+                                perf_measurement::QUEUE_FULL_MAX_ATTEMPTS
+                            } else {
+                                MAX_TOTAL_ATTEMPTS
+                            };
                         if !retryable || poll_attempt >= attempt_cap {
                             break (reply, json);
                         }
-                        let base = json["retry_after_ms"].as_u64().unwrap_or(100);
+                        let base = json["retry_after_ms"].as_u64().unwrap_or_else(|| {
+                            if matches!(ctx.opts.variant, SynapseVariant::CurrentPlugin) {
+                                perf_measurement::CurrentPluginPolicy::fallback_base_ms(
+                                    poll_attempt.saturating_sub(1),
+                                )
+                            } else {
+                                100
+                            }
+                        });
                         let delay = Duration::from_secs_f64(rng.retry_delay_ms(base) / 1_000.0);
                         if Instant::now() + delay >= deadline {
                             break (reply, json);
@@ -1316,7 +1488,15 @@ async fn execute_batch(
                         // that produced this job, so the poll's own send adds
                         // nothing to the logical latency window.
                         if poll_attempt < MAX_TOTAL_ATTEMPTS {
-                            let delay = Duration::from_secs_f64(rng.retry_delay_ms(100) / 1_000.0);
+                            let base = if matches!(ctx.opts.variant, SynapseVariant::CurrentPlugin)
+                            {
+                                perf_measurement::CurrentPluginPolicy::fallback_base_ms(
+                                    poll_attempt.saturating_sub(1),
+                                )
+                            } else {
+                                100
+                            };
+                            let delay = Duration::from_secs_f64(rng.retry_delay_ms(base) / 1_000.0);
                             if Instant::now() + delay < deadline {
                                 tokio::time::sleep(delay).await;
                                 continue;
@@ -1355,6 +1535,7 @@ async fn execute_batch(
                 let code = json["code"].as_str().unwrap_or("unparsable");
                 if code == "module_restarted" {
                     if !std::mem::replace(&mut restart_used, true) {
+                        generation = generation.saturating_add(1);
                         continue 'logical;
                     }
                     return Ok(terminal_record(
@@ -1363,6 +1544,18 @@ async fn execute_batch(
                         first_send.expect("batch sent"),
                         reply.received_ns,
                         LogicalDisposition::Rejected,
+                        Some(code.to_owned()),
+                        batch_attempts + polls,
+                        polls,
+                    ));
+                }
+                if code == "cancelled" {
+                    return Ok(terminal_record(
+                        logical_id,
+                        scheduled_start_ns,
+                        first_send.expect("batch sent"),
+                        reply.received_ns,
+                        LogicalDisposition::Cancelled,
                         Some(code.to_owned()),
                         batch_attempts + polls,
                         polls,
@@ -1389,6 +1582,14 @@ async fn execute_batch(
             let result = &json["result"];
             if let Some(vectors) = result["vectors"].as_array() {
                 validate_batch_page(&json, &expected_items)?;
+                ctx.batch_pages.lock().await.push(BatchPageRecord {
+                    logical_id,
+                    generation,
+                    item_count: vectors.len() as u64,
+                    receipt_ns: reply.received_ns,
+                    deadline_ns: ctx.wire.ns_at(deadline),
+                    published: false,
+                });
                 for vector in vectors {
                     collected.push(
                         vector["id"]
@@ -1403,6 +1604,11 @@ async fn execute_batch(
                         return Err(
                             "batch result did not preserve every item exactly once".to_owned()
                         );
+                    }
+                    for page in ctx.batch_pages.lock().await.iter_mut().filter(|page| {
+                        page.logical_id == logical_id && page.generation == generation
+                    }) {
+                        page.published = true;
                     }
                     return Ok(terminal_record(
                         logical_id,
@@ -1568,6 +1774,7 @@ async fn execute(
     let result = match ctx.opts.arm {
         Arm::Query => execute_query(ctx, logical_id, scheduled_start_ns).await,
         Arm::Batch(shape) => execute_batch(ctx, logical_id, scheduled_start_ns, shape).await,
+        Arm::Mixed(_) => unreachable!("mixed requests select their method explicitly"),
     };
     match result {
         Ok(record) => record,
@@ -1601,8 +1808,48 @@ async fn execute(
     }
 }
 
+async fn execute_method(
+    ctx: &RunContext,
+    logical_id: u64,
+    scheduled_start_ns: u64,
+    method: SynapseMethod,
+    shape: BatchShape,
+) -> LogicalRecord {
+    let result = match method {
+        SynapseMethod::Query => execute_query(ctx, logical_id, Some(scheduled_start_ns)).await,
+        SynapseMethod::Batch => {
+            execute_batch(ctx, logical_id, Some(scheduled_start_ns), shape).await
+        }
+        SynapseMethod::Result => unreachable!("result polls belong to a batch session"),
+    };
+    match result {
+        Ok(record) => record,
+        Err(error) => {
+            ctx.fatal_errors
+                .lock()
+                .await
+                .push(format!("logical {logical_id}: {error}"));
+            let now = ctx.wire.elapsed_ns();
+            terminal_record(
+                logical_id,
+                Some(scheduled_start_ns),
+                now,
+                now,
+                LogicalDisposition::InFlight,
+                Some("harness_error".to_owned()),
+                0,
+                0,
+            )
+        }
+    }
+}
+
 async fn warm(ctx: &RunContext) -> Result<(), String> {
-    let record = execute(ctx, 0, None).await;
+    let record = if matches!(ctx.opts.arm, Arm::Mixed(_)) {
+        execute_query(ctx, 0, None).await?
+    } else {
+        execute(ctx, 0, None).await
+    };
     if record.disposition != LogicalDisposition::Completed {
         return Err(format!("warmup did not complete: {record:?}"));
     }
@@ -1621,10 +1868,62 @@ struct LoadOutcome {
     records: Vec<LogicalRecord>,
     send_lag_max_ns: u64,
     missed_slots: u64,
+    query_missed_slots: u64,
+    batch_missed_slots: u64,
     window: perf_measurement::HoldWindow,
     /// `None` when a boundary observation failed; the reason is recorded in the
     /// run's fatal errors, which already invalidate the repetition.
     task_window: Option<TaskWindow>,
+    process_samples: Vec<ProcessSample>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct ProcessSample {
+    observed_ns: u64,
+    counters: process_resources::ProcessCounters,
+}
+
+async fn observe_process_series(
+    origin: Instant,
+    start: Instant,
+    end: Instant,
+) -> Result<Vec<ProcessSample>, String> {
+    let mut interval = tokio::time::interval_at(start.into(), Duration::from_millis(100));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut samples = Vec::new();
+    loop {
+        interval.tick().await;
+        let observed = Instant::now();
+        samples.push(ProcessSample {
+            observed_ns: u64::try_from(observed.saturating_duration_since(origin).as_nanos())
+                .unwrap_or(u64::MAX),
+            counters: process_resources::observe_process()
+                .map_err(|error| format!("process counters: {error}"))?,
+        });
+        if observed >= end {
+            return Ok(samples);
+        }
+    }
+}
+
+async fn join_process_samples(
+    ctx: &RunContext,
+    observed: tokio::task::JoinHandle<Result<Vec<ProcessSample>, String>>,
+) -> Vec<ProcessSample> {
+    match observed.await {
+        Ok(Ok(samples)) => samples,
+        Ok(Err(error)) => {
+            ctx.fatal_errors.lock().await.push(error);
+            Vec::new()
+        }
+        Err(error) => {
+            ctx.fatal_errors
+                .lock()
+                .await
+                .push(format!("process counter observer: {error}"));
+            Vec::new()
+        }
+    }
 }
 
 /// Task counter evidence for one repetition's measured window.
@@ -1706,6 +2005,31 @@ fn open_loop_send_lag(records: &[LogicalRecord], rate: u64) -> (u64, u64) {
     (send_lag_max_ns, missed_slots)
 }
 
+fn mixed_stream_send_lag(
+    records: &[LogicalRecord],
+    rate: u64,
+    method: SynapseMethod,
+) -> (u64, u64) {
+    let stream: Vec<LogicalRecord> = records
+        .iter()
+        .filter(|record| match method {
+            SynapseMethod::Query => record.logical_id % 2 == 1,
+            SynapseMethod::Batch => record.logical_id % 2 == 0,
+            SynapseMethod::Result => false,
+        })
+        .cloned()
+        .map(|mut record| {
+            record.logical_id = match method {
+                SynapseMethod::Query => record.logical_id.div_ceil(2),
+                SynapseMethod::Batch => record.logical_id / 2,
+                SynapseMethod::Result => unreachable!(),
+            };
+            record
+        })
+        .collect();
+    open_loop_send_lag(&stream, rate)
+}
+
 /// The two boundary instants of `window` on the caller's clock.
 ///
 /// Derived from the window rather than recomputed from `seconds` so the
@@ -1747,6 +2071,8 @@ async fn run_load(ctx: RunContext) -> LoadOutcome {
             let (warmup_end, end) = window_boundaries(&window, start);
             let tasks_observed =
                 tokio::spawn(observe_task_window(ctx.wire.origin(), warmup_end, end));
+            let process_observed =
+                tokio::spawn(observe_process_series(ctx.wire.origin(), start, end));
             let mut tasks = tokio::task::JoinSet::new();
             for slot in 0..offered {
                 let offset_ns = perf_measurement::open_loop_offset_ns(slot, rate);
@@ -1787,12 +2113,20 @@ async fn run_load(ctx: RunContext) -> LoadOutcome {
             records.sort_by_key(|record| record.logical_id);
             let (send_lag_max_ns, missed_slots) = open_loop_send_lag(&records, rate);
             let task_window = join_task_window(&ctx, tasks_observed).await;
+            let process_samples = join_process_samples(&ctx, process_observed).await;
             LoadOutcome {
                 records,
                 send_lag_max_ns,
                 missed_slots,
+                query_missed_slots: matches!(ctx.opts.arm, Arm::Query)
+                    .then_some(missed_slots)
+                    .unwrap_or(0),
+                batch_missed_slots: matches!(ctx.opts.arm, Arm::Batch(_))
+                    .then_some(missed_slots)
+                    .unwrap_or(0),
                 window,
                 task_window,
+                process_samples,
             }
         }
         Load::Closed { concurrency } => {
@@ -1802,6 +2136,8 @@ async fn run_load(ctx: RunContext) -> LoadOutcome {
             let (warmup_end, end) = window_boundaries(&window, start);
             let tasks_observed =
                 tokio::spawn(observe_task_window(ctx.wire.origin(), warmup_end, end));
+            let process_observed =
+                tokio::spawn(observe_process_series(ctx.wire.origin(), start, end));
             let next_id = Arc::new(AtomicU64::new(1));
             let mut workers = tokio::task::JoinSet::new();
             for _ in 0..concurrency {
@@ -1829,15 +2165,153 @@ async fn run_load(ctx: RunContext) -> LoadOutcome {
             }
             records.sort_by_key(|record| record.logical_id);
             let task_window = join_task_window(&ctx, tasks_observed).await;
+            let process_samples = join_process_samples(&ctx, process_observed).await;
             LoadOutcome {
                 records,
                 // Closed-loop work has no schedule to fall behind.
                 send_lag_max_ns: 0,
                 missed_slots: 0,
+                query_missed_slots: 0,
+                batch_missed_slots: 0,
                 window,
                 task_window,
+                process_samples,
             }
         }
+        Load::Mixed {
+            query_rate,
+            batch_rate,
+            ..
+        } => {
+            let Arm::Mixed(shape) = ctx.opts.arm else {
+                unreachable!("mixed load has mixed arm")
+            };
+            let start = Instant::now() + Duration::from_millis(25);
+            let start_ns = ctx.wire.ns_at(start);
+            let window = perf_measurement::HoldWindow::new(start_ns, ctx.opts.seconds);
+            let (warmup_end, end) = window_boundaries(&window, start);
+            let tasks_observed =
+                tokio::spawn(observe_task_window(ctx.wire.origin(), warmup_end, end));
+            let process_observed =
+                tokio::spawn(observe_process_series(ctx.wire.origin(), start, end));
+            let mut schedule = Vec::new();
+            for slot in 0..query_rate * ctx.opts.seconds {
+                schedule.push((
+                    perf_measurement::open_loop_offset_ns(slot, query_rate),
+                    SynapseMethod::Query,
+                    slot.saturating_mul(2).saturating_add(1),
+                ));
+            }
+            for slot in 0..batch_rate * ctx.opts.seconds {
+                schedule.push((
+                    perf_measurement::open_loop_offset_ns(slot, batch_rate),
+                    SynapseMethod::Batch,
+                    slot.saturating_mul(2).saturating_add(2),
+                ));
+            }
+            schedule.sort_by_key(|(offset, method, id)| (*offset, *method, *id));
+            let mut tasks = tokio::task::JoinSet::new();
+            for (index, (offset_ns, method, logical_id)) in schedule.iter().copied().enumerate() {
+                let scheduled = start + Duration::from_nanos(offset_ns);
+                let next_offset = schedule
+                    .get(index + 1)
+                    .map_or(window.end_ns.saturating_sub(start_ns), |next| next.0);
+                let slack = PACING_SLACK.min(Duration::from_nanos(
+                    next_offset.saturating_sub(offset_ns) / 2,
+                ));
+                tokio::time::sleep_until((scheduled - slack).into()).await;
+                while Instant::now() < scheduled {
+                    std::hint::spin_loop();
+                }
+                let task_ctx = ctx.clone();
+                tasks.spawn(async move {
+                    execute_method(
+                        &task_ctx,
+                        logical_id,
+                        start_ns.saturating_add(offset_ns),
+                        method,
+                        shape,
+                    )
+                    .await
+                });
+            }
+            let mut records = Vec::with_capacity(schedule.len());
+            while let Some(result) = tasks.join_next().await {
+                match result {
+                    Ok(record) => records.push(record),
+                    Err(error) => ctx
+                        .fatal_errors
+                        .lock()
+                        .await
+                        .push(format!("mixed load task: {error}")),
+                }
+            }
+            records.sort_by_key(|record| record.logical_id);
+            let (query_lag, query_missed_slots) =
+                mixed_stream_send_lag(&records, query_rate, SynapseMethod::Query);
+            let (batch_lag, batch_missed_slots) =
+                mixed_stream_send_lag(&records, batch_rate, SynapseMethod::Batch);
+            let task_window = join_task_window(&ctx, tasks_observed).await;
+            let process_samples = join_process_samples(&ctx, process_observed).await;
+            LoadOutcome {
+                records,
+                send_lag_max_ns: query_lag.max(batch_lag),
+                missed_slots: query_missed_slots.saturating_add(batch_missed_slots),
+                query_missed_slots,
+                batch_missed_slots,
+                window,
+                task_window,
+                process_samples,
+            }
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct MethodSummary {
+    ledger: perf_measurement::SynapseLedgerSummary,
+    logical_latency: Option<LatencySummary>,
+}
+
+#[derive(serde::Serialize)]
+struct ProcessResourceSummary {
+    sample_cadence_ms: u64,
+    steady_vm_rss_kib: Option<u64>,
+    peak_vm_rss_kib: Option<u64>,
+    peak_vm_hwm_kib: Option<u64>,
+    post_idle: Option<process_resources::ProcessCounters>,
+    process_user_cpu_ticks: Option<u64>,
+    process_system_cpu_ticks: Option<u64>,
+    peak_threads: Option<u64>,
+    samples: Vec<ProcessSample>,
+}
+
+fn process_resource_summary(
+    samples: Vec<ProcessSample>,
+    warmup_end_ns: u64,
+    end_ns: u64,
+    post_idle: Option<process_resources::ProcessCounters>,
+) -> ProcessResourceSummary {
+    let steady: Vec<&ProcessSample> = samples
+        .iter()
+        .filter(|sample| sample.observed_ns >= warmup_end_ns && sample.observed_ns <= end_ns)
+        .collect();
+    let first = steady.first().map(|sample| sample.counters);
+    let last = steady.last().map(|sample| sample.counters);
+    ProcessResourceSummary {
+        sample_cadence_ms: 100,
+        steady_vm_rss_kib: last.map(|sample| sample.vm_rss_kib),
+        peak_vm_rss_kib: steady.iter().map(|sample| sample.counters.vm_rss_kib).max(),
+        peak_vm_hwm_kib: steady.iter().map(|sample| sample.counters.vm_hwm_kib).max(),
+        post_idle,
+        process_user_cpu_ticks: first
+            .zip(last)
+            .map(|(first, last)| last.user_cpu_ticks.saturating_sub(first.user_cpu_ticks)),
+        process_system_cpu_ticks: first
+            .zip(last)
+            .map(|(first, last)| last.system_cpu_ticks.saturating_sub(first.system_cpu_ticks)),
+        peak_threads: steady.iter().map(|sample| sample.counters.threads).max(),
+        samples,
     }
 }
 
@@ -1845,6 +2319,7 @@ async fn run_load(ctx: RunContext) -> LoadOutcome {
 struct Summary {
     kind: &'static str,
     variant: SynapseVariant,
+    topology: TopologyId,
     arm: Arm,
     load: Load,
     seconds: u64,
@@ -1861,6 +2336,8 @@ struct Summary {
     /// contract admits only for variants that vary client policy alone.
     host_build_id: Option<&'static str>,
     ledger: perf_measurement::SynapseLedgerSummary,
+    method_summaries: std::collections::BTreeMap<String, MethodSummary>,
+    batch_goodput: Option<perf_measurement::BatchGoodputSummary>,
     attempt_latency: Option<LatencySummary>,
     logical_latency: Option<LatencySummary>,
     permit_wait: Option<SignedSummary>,
@@ -1875,6 +2352,8 @@ struct Summary {
     service_excluded_samples: u64,
     send_lag_max_ns: u64,
     missed_slots: u64,
+    query_missed_slots: u64,
+    batch_missed_slots: u64,
     /// Frozen hold window on the wire clock. Emitted so both discards and the
     /// in-flight censoring below are re-derivable from raw evidence.
     hold_window_start_ns: u64,
@@ -1898,6 +2377,14 @@ struct Summary {
     task_deltas: Option<Vec<process_resources::TaskDelta>>,
     task_window_start_ns: Option<u64>,
     task_window_end_ns: Option<u64>,
+    cpu_authority: &'static str,
+    process_resources: ProcessResourceSummary,
+    observer_enabled: bool,
+    observer: Option<SynapseObserverSnapshot>,
+    observer_overhead_control: bool,
+    repetition_class: perf_measurement::RepetitionClass,
+    invalid_causes: Vec<String>,
+    adverse_outcomes: Vec<String>,
     /// Transport-loss failures on the single shared wire. A subset of
     /// `fatal_errors` (still part of the fatal gate), counted separately
     /// so analysis can distinguish connection loss from harness defects.
@@ -1965,6 +2452,57 @@ impl SignedSummary {
     }
 }
 
+fn logical_method(arm: Arm, logical_id: u64) -> SynapseMethod {
+    match arm {
+        Arm::Query => SynapseMethod::Query,
+        Arm::Batch(_) => SynapseMethod::Batch,
+        Arm::Mixed(_) if logical_id % 2 == 1 => SynapseMethod::Query,
+        Arm::Mixed(_) => SynapseMethod::Batch,
+    }
+}
+
+fn method_summaries(
+    arm: Arm,
+    logical: &[LogicalRecord],
+    attempts: &[AttemptRecord],
+) -> std::collections::BTreeMap<String, MethodSummary> {
+    [SynapseMethod::Query, SynapseMethod::Batch]
+        .into_iter()
+        .filter_map(|method| {
+            let logical: Vec<LogicalRecord> = logical
+                .iter()
+                .filter(|record| logical_method(arm, record.logical_id) == method)
+                .cloned()
+                .collect();
+            if logical.is_empty() {
+                return None;
+            }
+            let ids: std::collections::BTreeSet<u64> =
+                logical.iter().map(|record| record.logical_id).collect();
+            let attempts: Vec<AttemptRecord> = attempts
+                .iter()
+                .filter(|attempt| ids.contains(&attempt.logical_id))
+                .cloned()
+                .collect();
+            let ledger = perf_measurement::validate_synapse_ledgers(&logical, &attempts);
+            let logical_latency = LatencySummary::from_unsorted(
+                logical
+                    .iter()
+                    .filter(|record| !is_censored(record.disposition))
+                    .map(|record| record.latency_ns)
+                    .collect(),
+            );
+            Some((
+                method.wire_name().to_owned(),
+                MethodSummary {
+                    ledger,
+                    logical_latency,
+                },
+            ))
+        })
+        .collect()
+}
+
 async fn run(
     opts: Opts,
 ) -> Result<
@@ -1972,6 +2510,7 @@ async fn run(
         Vec<LogicalRecord>,
         Vec<AttemptRecord>,
         Vec<ServiceSample>,
+        Vec<BatchPageRecord>,
         Summary,
     ),
     String,
@@ -2002,11 +2541,20 @@ async fn run(
         max_queued_request_bytes: HARNESS_QUEUED_REQUEST_BYTES,
         ..Default::default()
     };
-    if let Arm::Batch(shape) = opts.arm {
+    if let Arm::Batch(shape) | Arm::Mixed(shape) = opts.arm {
         limits.max_page_vectors = shape.page_vectors();
     }
-    let component = SynapseComponent::ready_with_engine(lane(), engine, limits)
-        .map_err(|error| format!("validate Synapse limits: {error}"))?;
+    let observer = opts.observer.then(|| Arc::new(SynapseObserver::new()));
+    let component = match &observer {
+        Some(observer) => SynapseComponent::ready_with_engine_observed(
+            lane(),
+            engine,
+            limits,
+            Arc::clone(observer),
+        ),
+        None => SynapseComponent::ready_with_engine(lane(), engine, limits),
+    }
+    .map_err(|error| format!("validate Synapse limits: {error}"))?;
     let host = HostThread::start(component, data_root.path().to_path_buf())?;
     let publication = data_root
         .path()
@@ -2029,6 +2577,7 @@ async fn run(
         next_attempt: Arc::new(AtomicU64::new(1)),
         fatal_errors: Arc::new(Mutex::new(Vec::new())),
         connection_loss: Arc::new(AtomicU64::new(0)),
+        batch_pages: Arc::new(Mutex::new(Vec::new())),
         opts,
     };
     warm(&ctx).await?;
@@ -2038,8 +2587,11 @@ async fn run(
         mut records,
         send_lag_max_ns,
         missed_slots,
+        query_missed_slots,
+        batch_missed_slots,
         window,
         task_window,
+        process_samples,
     } = load;
     let mut attempts = ctx.attempts.lock().await.clone();
     // Apply the frozen window before anything is estimated: classify every row
@@ -2052,23 +2604,33 @@ async fn run(
         perf_measurement::partition_measured(&logical, |record| record.window);
     let (attempt_estimates, attempt_excluded) =
         perf_measurement::partition_measured(&attempts, |attempt| attempt.window);
-    let fatal_errors = ctx.fatal_errors.lock().await.clone();
     let connection_loss_errors = ctx.connection_loss.load(Ordering::Relaxed);
     let ledger = perf_measurement::validate_synapse_ledgers(&logical_estimates, &attempt_estimates);
+    let method_summaries = method_summaries(opts.arm, &logical_estimates, &attempt_estimates);
+    let measured_batch_ids: std::collections::BTreeSet<u64> = logical_estimates
+        .iter()
+        .filter(|record| logical_method(opts.arm, record.logical_id) == SynapseMethod::Batch)
+        .map(|record| record.logical_id)
+        .collect();
+    let all_batch_pages = ctx.batch_pages.lock().await.clone();
+    let batch_pages: Vec<BatchPageRecord> = all_batch_pages
+        .iter()
+        .filter(|page| measured_batch_ids.contains(&page.logical_id))
+        .copied()
+        .collect();
+    let batch_goodput = perf_measurement::summarize_batch_pages(
+        &batch_pages,
+        window.end_ns.saturating_sub(window.warmup_end_ns),
+    );
     let attempt_latency = LatencySummary::from_unsorted(
         attempt_estimates
             .iter()
             .map(|attempt| attempt.latency_ns)
             .collect(),
     );
-    // Percentiles describe requests that reached a terminal outcome inside the
-    // window. A censored row's `latency_ns` runs to whenever it actually
-    // settled — seconds or minutes past the boundary for an overloaded cell —
-    // so admitting it would let the tail be dominated by durations the ledger
-    // simultaneously declares right-censored, and the contamination would grow
-    // with the treatment. The censoring rate reports what this excludes, so the
-    // pair stays interpretable: percentiles over answered requests, plus the
-    // fraction that went unanswered.
+    // Timeouts are terminal outcomes at the application deadline and remain in
+    // the latency distribution. Only work still in flight when the hold window
+    // closes is right-censored.
     let logical_latency = LatencySummary::from_unsorted(
         logical_estimates
             .iter()
@@ -2127,9 +2689,84 @@ async fn run(
     } else {
         censored as f64 * 1_000.0 / ledger.offered as f64
     };
+    tokio::time::sleep(Duration::from_secs(opts.seconds)).await;
+    let post_idle = match process_resources::observe_process() {
+        Ok(sample) => Some(sample),
+        Err(error) => {
+            ctx.fatal_errors
+                .lock()
+                .await
+                .push(format!("post-idle process counters: {error}"));
+            None
+        }
+    };
+    let process_resources = process_resource_summary(
+        process_samples,
+        window.warmup_end_ns,
+        window.end_ns,
+        post_idle,
+    );
+    let overdeadline_writes = ctx.wire.overdeadline_writes();
+    let fatal_errors = ctx.fatal_errors.lock().await.clone();
+    let mut invalid_causes = ledger.errors.clone();
+    if missed_slots != 0 {
+        invalid_causes.push(format!(
+            "missed scheduled slots: query={query_missed_slots}, batch={batch_missed_slots}"
+        ));
+    }
+    if !fatal_errors.is_empty() {
+        invalid_causes.push("fatal harness errors".to_owned());
+    }
+    if overdeadline_writes != 0 {
+        invalid_causes.push("writes completed after deadline".to_owned());
+    }
+    if u128::from(censored) * 1_000 > u128::from(ledger.offered) * MAX_CENSORED_PER_MILLE {
+        invalid_causes.push("censoring overrun".to_owned());
+    }
+    if poll_distribution
+        .as_ref()
+        .is_some_and(|polls| polls.max > MAX_POLLS_PER_LOGICAL)
+    {
+        invalid_causes.push("poll ceiling exceeded".to_owned());
+    }
+    if ledger.offered == 0 || logical_latency.is_none() {
+        invalid_causes.push("empty measured window".to_owned());
+    }
+    let cancellation_causes = (ledger.cancelled != 0)
+        .then_some(perf_measurement::CancellationCause::Candidate)
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut repetition_class =
+        perf_measurement::classify_repetition(&invalid_causes, &cancellation_causes);
+    let mut adverse_outcomes = Vec::new();
+    if ledger.cancelled != 0 {
+        adverse_outcomes.push(format!("candidate_cancelled={}", ledger.cancelled));
+    }
+    let queue_full = ledger
+        .rejected_by_method_code
+        .iter()
+        .filter(|(key, _)| key.ends_with(":queue_full"))
+        .map(|(_, count)| *count)
+        .sum::<u64>();
+    if queue_full != 0 {
+        adverse_outcomes.push(format!("queue_full={queue_full}"));
+        if matches!(repetition_class, perf_measurement::RepetitionClass::Valid) {
+            repetition_class = perf_measurement::RepetitionClass::AdverseTreatment;
+        }
+    }
+    drop(ctx);
+    let shutdown_error = host.shutdown().err();
+    if let Some(error) = shutdown_error {
+        adverse_outcomes.push(format!("drain_budget_miss={error}"));
+        if matches!(repetition_class, perf_measurement::RepetitionClass::Valid) {
+            repetition_class = perf_measurement::RepetitionClass::AdverseTreatment;
+        }
+    }
+    let observer_snapshot = observer.as_ref().map(|observer| observer.snapshot());
     let summary = Summary {
         kind: "synapse_perf_summary",
         variant: opts.variant,
+        topology: opts.topology,
         arm: opts.arm,
         load: opts.load,
         seconds: opts.seconds,
@@ -2140,6 +2777,8 @@ async fn run(
         transport_floor_ns: opts.transport_floor_ns,
         host_build_id: HOST_BUILD_ID,
         ledger,
+        method_summaries,
+        batch_goodput,
         attempt_latency,
         logical_latency,
         permit_wait,
@@ -2151,6 +2790,8 @@ async fn run(
         service_excluded_samples: (service_samples.len() - service_measured.len()) as u64,
         send_lag_max_ns,
         missed_slots,
+        query_missed_slots,
+        batch_missed_slots,
         hold_window_start_ns: window.start_ns,
         warmup_end_ns: window.warmup_end_ns,
         hold_window_end_ns: window.end_ns,
@@ -2178,13 +2819,20 @@ async fn run(
         task_deltas: task_window.as_ref().map(|window| window.deltas.clone()),
         task_window_start_ns: task_window.as_ref().map(|window| window.observed_start_ns),
         task_window_end_ns: task_window.as_ref().map(|window| window.observed_end_ns),
+        cpu_authority: "process /proc/self/stat ticks (generator + SUT)",
+        process_resources,
+        observer_enabled: opts.observer,
+        observer: observer_snapshot,
+        observer_overhead_control: matches!(opts.topology, TopologyId::B0)
+            && opts.engine_delay_ms == 0,
+        repetition_class,
+        invalid_causes,
+        adverse_outcomes,
         connection_loss_errors,
-        overdeadline_writes: ctx.wire.overdeadline_writes(),
+        overdeadline_writes,
         fatal_errors,
     };
-    drop(ctx);
-    host.shutdown()?;
-    Ok((logical, attempts, service_samples, summary))
+    Ok((logical, attempts, service_samples, all_batch_pages, summary))
 }
 
 fn mean(samples: &[u64]) -> Option<f64> {
@@ -2208,26 +2856,19 @@ fn coefficient_of_variation(samples: &[u64]) -> Option<f64> {
 }
 
 fn censored_count(ledger: &perf_measurement::SynapseLedgerSummary) -> u64 {
-    ledger.timed_out.saturating_add(ledger.in_flight)
+    ledger.in_flight
 }
 
-/// The two dispositions the censoring rate counts, and therefore the two the
-/// latency percentiles exclude. A timeout's duration is truncated at the
-/// deadline and an in-flight row's runs past the window, so both are
-/// right-censored observations rather than measured request latencies; keeping
-/// one definition means the reported rate always describes exactly the rows the
-/// percentiles omit.
+/// Work still in flight when the hold window closes has no terminal latency.
 fn is_censored(disposition: LogicalDisposition) -> bool {
-    matches!(
-        disposition,
-        LogicalDisposition::TimedOut | LogicalDisposition::InFlight
-    )
+    matches!(disposition, LogicalDisposition::InFlight)
 }
 
 fn emit(
     logical: &[LogicalRecord],
     attempts: &[AttemptRecord],
     service_samples: &[ServiceSample],
+    batch_pages: &[BatchPageRecord],
     summary: &Summary,
 ) -> Result<(), String> {
     for record in logical {
@@ -2273,6 +2914,21 @@ fn emit(
             .map_err(|error| error.to_string())?
         );
     }
+    for page in batch_pages {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "kind": "synapse_perf_batch_page",
+                "variant": summary.variant,
+                "topology": summary.topology,
+                "arm": summary.arm,
+                "load": summary.load,
+                "seed": summary.seed,
+                "record": page
+            }))
+            .map_err(|error| error.to_string())?
+        );
+    }
     println!(
         "{}",
         serde_json::to_string(summary).map_err(|error| error.to_string())?
@@ -2301,8 +2957,14 @@ fn main() {
     };
     let result = runtime.block_on(run(opts));
     match result {
-        Ok((logical, attempts, service_samples, summary)) => {
-            if let Err(error) = emit(&logical, &attempts, &service_samples, &summary) {
+        Ok((logical, attempts, service_samples, batch_pages, summary)) => {
+            if let Err(error) = emit(
+                &logical,
+                &attempts,
+                &service_samples,
+                &batch_pages,
+                &summary,
+            ) {
                 eprintln!("synapse_perf failed: emit: {error}");
                 std::process::exit(1);
             }
@@ -2320,9 +2982,7 @@ fn main() {
             // consumable as admissible evidence. A closed-loop repetition
             // reaches this state whenever every request it opened fell in the
             // warmup prefix or spanned the whole hold.
-            let empty_window = summary.ledger.offered == 0
-                || summary.logical_latency.is_none()
-                || summary.service_time.is_none();
+            let empty_window = summary.ledger.offered == 0 || summary.logical_latency.is_none();
             if !summary.ledger.valid
                 || !summary.fatal_errors.is_empty()
                 || summary.missed_slots != 0
@@ -2379,7 +3039,7 @@ mod tests {
     }
 
     #[test]
-    fn timeout_and_in_flight_are_censoring() {
+    fn timeout_is_terminal_and_only_in_flight_is_censored() {
         let ledger = perf_measurement::validate_synapse_ledgers(
             &[
                 logical(1, LogicalDisposition::TimedOut),
@@ -2389,13 +3049,44 @@ mod tests {
         );
 
         assert!(ledger.valid);
-        assert_eq!(censored_count(&ledger), 2);
+        assert_eq!(censored_count(&ledger), 1);
+        assert!(!is_censored(LogicalDisposition::TimedOut));
+        assert!(is_censored(LogicalDisposition::InFlight));
     }
 
     #[test]
     fn service_time_mean_retains_raw_sample_mean() {
         assert_eq!(mean(&[10, 20, 30]), Some(20.0));
         assert_eq!(mean(&[]), None);
+    }
+
+    #[test]
+    fn process_summary_keeps_peak_hwm_and_post_idle_sample() {
+        let counters = |rss, hwm, user, system| process_resources::ProcessCounters {
+            vm_rss_kib: rss,
+            vm_hwm_kib: hwm,
+            threads: 3,
+            user_cpu_ticks: user,
+            system_cpu_ticks: system,
+        };
+        let samples = vec![
+            ProcessSample {
+                observed_ns: 100,
+                counters: counters(80, 120, 10, 5),
+            },
+            ProcessSample {
+                observed_ns: 200,
+                counters: counters(90, 150, 17, 8),
+            },
+        ];
+        let post_idle = counters(70, 150, 18, 8);
+        let summary = process_resource_summary(samples, 100, 200, Some(post_idle));
+
+        assert_eq!(summary.peak_vm_rss_kib, Some(90));
+        assert_eq!(summary.peak_vm_hwm_kib, Some(150));
+        assert_eq!(summary.process_user_cpu_ticks, Some(7));
+        assert_eq!(summary.process_system_cpu_ticks, Some(3));
+        assert_eq!(summary.post_idle, Some(post_idle));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2619,5 +3310,52 @@ mod tests {
         .expect("A+C with finite K");
         assert_eq!(a.variant, SynapseVariant::APlusC);
         assert_eq!(a.max_waiting_queries, 2);
+    }
+
+    #[test]
+    fn mixed_arm_requires_independent_rates_and_matching_ratio() {
+        let mixed = parse_opts_from(args(&[
+            "--variant",
+            "current-plugin",
+            "--arm",
+            "mixed",
+            "--batch-shape",
+            "1x16",
+            "--query-rate",
+            "2",
+            "--batch-rate",
+            "8",
+            "--ratio",
+            "4:1",
+            "--max-waiting-queries",
+            "1",
+        ]))
+        .expect("valid mixed arm");
+        assert!(matches!(mixed.arm, Arm::Mixed(BatchShape::OneBy16)));
+        assert!(matches!(
+            mixed.load,
+            Load::Mixed {
+                query_rate: 2,
+                batch_rate: 8,
+                ratio: RateRatio::FourToOne
+            }
+        ));
+
+        assert!(parse_opts_from(args(&[
+            "--variant",
+            "current-plugin",
+            "--arm",
+            "mixed",
+            "--batch-shape",
+            "1x16",
+            "--query-rate",
+            "2",
+            "--batch-rate",
+            "2",
+            "--ratio",
+            "4:1",
+        ]))
+        .expect_err("mismatched ratio")
+        .contains("do not match"));
     }
 }

@@ -51,9 +51,9 @@ resource movement selects a candidate automatically.
   with one host-process invocation per treatment.
 
 Query latency uses scheduled send to terminal-frame receipt. Timeouts and
-terminal rejections remain in the logical-request ledger and are never silently
-dropped from the latency evidence. Reports show p50, p95, and p99 for each
-logical-query terminal class and show censoring separately.
+terminal rejections remain in both the logical-request ledger and latency
+distribution. Reports show p50, p95, and p99 for each logical-query terminal
+class. Only requests still in flight when the hold window closes are censored.
 
 Each cell discards the first 10% of its fixed hold window as warmup. The harness
 records intended, scheduled, sent, admitted, completed, `queue_full`, timeout,
