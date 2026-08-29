@@ -10,6 +10,7 @@ import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-pro
 import {
     _resetProjectEmbeddingRegistryForTests,
     _setTestProviderFactoryForProject,
+    getShadowEmbeddingMeasurementCohort,
     registerProjectShadowEmbedding,
 } from "./project-embedding-registry";
 import type { UnifiedSearchOptions, UnifiedSearchResult } from "./search";
@@ -174,7 +175,7 @@ describe("recordShadowMeasurement", () => {
         registerProjectShadowEmbedding(db, "git:shadow-measure", synapseConfig, "/tmp/shadow");
 
         const primaryResults = [
-            { source: "memory", memoryId: 42 },
+            { source: "memory", publicClaimId: "mcm_42" },
             { source: "compartment", compartmentId: 7 },
             { source: "git_commit", sha: "abc123" },
         ] as unknown as UnifiedSearchResult[];
@@ -192,7 +193,7 @@ describe("recordShadowMeasurement", () => {
 
         const rows = listEmbeddingMeasurements(db, "ses-shadow");
         expect(rows).toHaveLength(1);
-        const primaryIds = ["memory:42", "chunk:7", "commit:abc123"];
+        const primaryIds = ["memory:mcm_42", "chunk:7", "commit:abc123"];
         const shadowIds = ["message:msg_1", "primer:3", "note:11"];
         expect(rows[0].primary_result_ids_json).toBe(JSON.stringify(primaryIds));
         expect(rows[0].shadow_result_ids_json).toBe(JSON.stringify(shadowIds));
@@ -201,5 +202,69 @@ describe("recordShadowMeasurement", () => {
                 .update(JSON.stringify({ query: "queue backpressure", primaryIds, shadowIds }))
                 .digest("hex"),
         );
+    });
+
+    it("records the resolved lane when the shadow query itself resolves a deferred one", async () => {
+        const db = useTempDb();
+        // A deferred lane has no fingerprint yet, so the registration publishes
+        // the placeholder identity until the first embed resolves it.
+        const deferredConfig = {
+            provider: "synapse",
+            model: "gte-modernbert-base-f16",
+            synapse_connection_origin: "managed-default",
+            synapse_fallback: { provider: "off" },
+        } as unknown as EmbeddingConfig;
+
+        let announceLane: (() => void) | undefined;
+        class DeferredLaneProvider extends FakeShadowProvider {
+            override async embed(
+                _text: string,
+                _signal?: AbortSignal,
+                _purpose?: EmbeddingPurpose,
+            ): Promise<Float32Array> {
+                // The real Synapse provider announces its lane from inside the
+                // first embed; the registry then commits the resolved identity.
+                announceLane?.();
+                return new Float32Array([1, 2]);
+            }
+        }
+        _setTestProviderFactoryForProject((_config, context) => {
+            announceLane = () =>
+                context?.onSynapseLaneReady?.({
+                    laneIdentity: "lane-resolved",
+                    model: "gte-modernbert-base-f16",
+                    fingerprint: "fp-resolved",
+                    table_epoch: 7,
+                    dims: 8,
+                });
+            return new DeferredLaneProvider();
+        });
+        registerProjectShadowEmbedding(db, "git:shadow-measure", deferredConfig, "/tmp/shadow");
+
+        const placeholder = getShadowEmbeddingMeasurementCohort("git:shadow-measure");
+        expect(placeholder?.fingerprint).toBe("");
+
+        const overrides: (string | undefined)[] = [];
+        await recordShadowMeasurement({
+            ...makeMeasurementArgs(db),
+            search: async (_db, _sessionId, _projectPath, _query, options) => {
+                overrides.push(options?.embeddingModelIdOverride);
+                return [];
+            },
+        });
+
+        const resolved = getShadowEmbeddingMeasurementCohort("git:shadow-measure");
+        expect(resolved?.fingerprint).toBe("fp-resolved");
+        expect(resolved?.modelId).not.toBe(placeholder?.modelId);
+        // The replayed search must query the lane that answered, not the
+        // placeholder model_id nothing is stored under.
+        expect(overrides).toEqual([resolved?.modelId]);
+
+        const rows = listEmbeddingMeasurements(db, "ses-shadow");
+        expect(rows).toHaveLength(1);
+        expect(rows[0].shadow_model_id).toBe(resolved?.modelId as string);
+        expect(rows[0].shadow_fingerprint).toBe("fp-resolved");
+        expect(rows[0].shadow_epoch).toBe(7);
+        expect(rows[0].shadow_failed).toBe(0);
     });
 });

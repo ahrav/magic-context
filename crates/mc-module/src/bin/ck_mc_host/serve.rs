@@ -7,20 +7,22 @@
 //! then runtime lock), the `starting` record, publication, and the
 //! post-publication activation split all live inside `mc_host::run`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mc_host::broca::backend::{
-    BackendError, BackendFuture, BackendRequest, BackendTerminal, ErrorClass, EventSink,
+    BackendError, BackendFuture, BackendRequest, BackendTerminal, ErrorClass, EventSink, Harness,
     HarnessDispatchBackend, LlmExecutionBackend,
 };
 use mc_host::broca::opencode::{OpenCodeBackend, OpenCodeRuntime};
 use mc_host::broca::pi::{PiBackend, PiRuntimeDescriptor};
-use mc_host::broca::subprocess::EnvSnapshot;
+use mc_host::broca::subprocess::{
+    EnvSnapshot, CREDENTIAL_ROW_CAP_BYTES, CREDENTIAL_VALUE_CAP_BYTES,
+};
 use mc_host::broca::BrocaComponent;
 use mc_host::generation::{GenerationStore, ValidatedGeneration};
 use mc_host::harness_closure::{
@@ -35,8 +37,6 @@ use crate::spawn::MAX_ENVELOPE_BYTES;
 const STORE_FILE: &str = "mc-store.db";
 const MAX_DESCRIPTOR_ITEMS: usize = 32;
 const MAX_DESCRIPTOR_ITEM_BYTES: usize = 4096;
-const CREDENTIAL_VALUE_CAP_BYTES: usize = 16 * 1024;
-const CREDENTIAL_ROW_CAP_BYTES: usize = 64 * 1024;
 const CREDENTIAL_NAMES: [&str; 3] = ["ANTHROPIC_API_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY"];
 
 /// The bounded launcher-to-serve startup envelope (KTD18). Strict: unknown
@@ -86,12 +86,41 @@ pub struct HarnessCandidate {
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HarnessSnapshot {
     Ready { manifest_sha256: String },
-    Unavailable { reason: String },
+    Unavailable { reason: HarnessUnavailableReason },
 }
+
+/// The closed set of per-harness unavailability reasons the launcher may
+/// hand to serve. A typed enum (not a string) so serde rejects unknown
+/// reasons at decode and every consumer match is exhaustiveness-checked —
+/// a reason added to the producer without a consumer arm fails the build
+/// instead of silently degrading to `descriptor_invalid`. Variants must
+/// stay in the release contract's `harness_unavailable.reasons_by_precedence`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessUnavailableReason {
+    DescriptorInvalid,
+    ClosureIncomplete,
+    ArgumentVariantInvalid,
+}
+
+impl HarnessUnavailableReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DescriptorInvalid => "descriptor_invalid",
+            Self::ClosureIncomplete => "closure_incomplete",
+            Self::ArgumentVariantInvalid => "argument_variant_invalid",
+        }
+    }
+}
+
+/// Current startup envelope schema. Bumped whenever the envelope's decoded
+/// shape changes so a cross-version launcher/serve pairing fails as a typed
+/// schema mismatch instead of an opaque decode error.
+pub const STARTUP_ENVELOPE_SCHEMA: u32 = 2;
 
 impl StartupEnvelope {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.schema != 1 {
+        if self.schema != STARTUP_ENVELOPE_SCHEMA {
             return Err("unsupported startup envelope schema");
         }
         if !self.data_dir.is_absolute() {
@@ -131,10 +160,24 @@ impl LauncherEnvelope {
     ) -> StartupEnvelope {
         let closure_root = data_dir.join("cortexkit").join("mc-host-harness-closures");
         let store = HarnessClosureStore::open(&closure_root).ok();
+        // Closures are content-addressed and never referenced across starts
+        // except through this envelope, so every digest the candidates do
+        // not name — superseded harness versions and staging directories
+        // orphaned by an interrupted copy — is reclaimed here, under the
+        // launcher's start transaction. Without this each qualified harness
+        // version retains its full runtime copy forever.
+        if let Some(store) = store.as_ref() {
+            let protected: BTreeSet<String> = [self.opencode.as_ref(), self.pi.as_ref()]
+                .into_iter()
+                .flatten()
+                .map(|candidate| candidate.manifest_sha256.clone())
+                .collect();
+            let _ = store.prune(&protected);
+        }
         let opencode = materialize_snapshot("opencode", self.opencode, store.as_ref());
         let pi = materialize_snapshot("pi", self.pi, store.as_ref());
         StartupEnvelope {
-            schema: 1,
+            schema: STARTUP_ENVELOPE_SCHEMA,
             data_dir,
             payload_manifest_digest,
             opencode,
@@ -206,32 +249,37 @@ fn validate_snapshot(snapshot: Option<&HarnessSnapshot>) -> Result<(), &'static 
                 Err("harness snapshot digest is noncanonical")
             }
         }
-        Some(HarnessSnapshot::Unavailable { reason })
-            if matches!(
-                reason.as_str(),
-                "descriptor_invalid" | "closure_incomplete" | "argument_variant_invalid"
-            ) =>
-        {
-            Ok(())
-        }
-        Some(HarnessSnapshot::Unavailable { .. }) => {
-            Err("harness snapshot unavailable reason is invalid")
-        }
+        // The reason set is closed by the `HarnessUnavailableReason` enum:
+        // serde already rejected anything outside it during decode.
+        Some(HarnessSnapshot::Unavailable { .. }) => Ok(()),
     }
 }
 
-fn qualified_manifest(harness: &str, expected_digest: &str) -> Option<ClosureManifest> {
+fn qualified_manifest(
+    harness: &str,
+    expected_digest: &str,
+) -> Result<ClosureManifest, HarnessUnavailableReason> {
     let (_, _, bytes) = mc_module::production_inputs::QUALIFIED_HARNESS_CLOSURES
         .iter()
-        .find(|(name, digest, _)| *name == harness && *digest == expected_digest)?;
-    let manifest: ClosureManifest = serde_json::from_str(bytes).ok()?;
+        .find(|(name, digest, _)| *name == harness && *digest == expected_digest)
+        .ok_or(HarnessUnavailableReason::DescriptorInvalid)?;
+    let manifest: ClosureManifest =
+        serde_json::from_str(bytes).map_err(|_| HarnessUnavailableReason::DescriptorInvalid)?;
     if manifest.harness != harness
-        || manifest.argument_variant != "run_prompt"
-        || manifest_digest(&manifest).ok()?.as_str() != expected_digest
+        || manifest_digest(&manifest)
+            .map_err(|_| HarnessUnavailableReason::DescriptorInvalid)?
+            .as_str()
+            != expected_digest
     {
-        return None;
+        return Err(HarnessUnavailableReason::DescriptorInvalid);
     }
-    Some(manifest)
+    // The variant mismatch has its own reason so operators see "this build
+    // does not speak the qualified argument shape" rather than a generic
+    // invalid descriptor.
+    if manifest.argument_variant != "run_prompt" {
+        return Err(HarnessUnavailableReason::ArgumentVariantInvalid);
+    }
+    Ok(manifest)
 }
 
 fn materialize_snapshot(
@@ -240,14 +288,13 @@ fn materialize_snapshot(
     store: Option<&HarnessClosureStore>,
 ) -> Option<HarnessSnapshot> {
     let candidate = candidate?;
-    let Some(manifest) = qualified_manifest(harness, &candidate.manifest_sha256) else {
-        return Some(HarnessSnapshot::Unavailable {
-            reason: "descriptor_invalid".to_owned(),
-        });
+    let manifest = match qualified_manifest(harness, &candidate.manifest_sha256) {
+        Ok(manifest) => manifest,
+        Err(reason) => return Some(HarnessSnapshot::Unavailable { reason }),
     };
     let Some(store) = store else {
         return Some(HarnessSnapshot::Unavailable {
-            reason: "closure_incomplete".to_owned(),
+            reason: HarnessUnavailableReason::ClosureIncomplete,
         });
     };
     let closure = ClosureCandidate {
@@ -259,7 +306,7 @@ fn materialize_snapshot(
             manifest_sha256: validated.digest().to_owned(),
         }),
         Err(_) => Some(HarnessSnapshot::Unavailable {
-            reason: "closure_incomplete".to_owned(),
+            reason: HarnessUnavailableReason::ClosureIncomplete,
         }),
     }
 }
@@ -287,6 +334,10 @@ impl LlmExecutionBackend for UnavailableBackend {
                 provider_code: None,
             })
         })
+    }
+
+    fn unavailable_reason(&self, _harness: Harness) -> Option<&'static str> {
+        Some(self.subreason)
     }
 }
 
@@ -349,21 +400,17 @@ fn open_snapshot(
         return Err("descriptor_absent");
     };
     match snapshot {
-        HarnessSnapshot::Unavailable { reason } => match reason.as_str() {
-            "descriptor_invalid" => Err("descriptor_invalid"),
-            "closure_incomplete" => Err("closure_incomplete"),
-            "argument_variant_invalid" => Err("argument_variant_invalid"),
-            _ => Err("descriptor_invalid"),
-        },
+        HarnessSnapshot::Unavailable { reason } => Err(reason.as_str()),
         HarnessSnapshot::Ready { manifest_sha256 } => {
             let store = store.ok_or("closure_incomplete")?;
             let closure = store
                 .validate(manifest_sha256)
                 .map_err(|_| "closure_incomplete")?;
-            if closure.manifest().harness != harness
-                || closure.manifest().argument_variant != "run_prompt"
-            {
+            if closure.manifest().harness != harness {
                 return Err("descriptor_invalid");
+            }
+            if closure.manifest().argument_variant != "run_prompt" {
+                return Err("argument_variant_invalid");
             }
             Ok(Arc::new(closure))
         }
@@ -387,6 +434,13 @@ fn read_envelope() -> Result<StartupEnvelope, &'static str> {
 }
 
 pub fn read_launcher_envelope() -> Result<LauncherEnvelope, &'static str> {
+    // A terminal never sends EOF on its own, so reading to end would hang an
+    // interactive `ck-mc-host start` forever. A TTY carries no envelope by
+    // definition — the launcher always redirects or closes stdin — so treat it as
+    // the absent envelope it is instead of blocking on a human.
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Ok(LauncherEnvelope::empty());
+    }
     let mut bytes = Vec::new();
     std::io::stdin()
         .lock()
@@ -406,10 +460,21 @@ pub fn read_launcher_envelope() -> Result<LauncherEnvelope, &'static str> {
 }
 
 fn storage_init(root: &Path) -> Result<HostInit, &'static str> {
-    let managed = root.join("cortexkit");
-    std::fs::create_dir_all(&managed).map_err(|_| "managed directory creation failed")?;
-    std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o700))
-        .map_err(|_| "managed directory permissions failed")?;
+    // The managed segment is the library's definition, not a second copy: a
+    // rename here would otherwise leave the store outside the tree that
+    // `mc_host::run` creates and validates.
+    let managed =
+        mc_host::managed_dir_path(Some(root)).map_err(|_| "managed directory path failed")?;
+    // Mode is applied by mkdir(2) at creation rather than by a follow-up
+    // chmod: `set_permissions` follows symlinks, so on a pre-existing
+    // symlinked path it would change the mode of the target instead. The
+    // authoritative owner-only creation and ancestor validation of this tree
+    // stay with `mc_host::run`.
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&managed)
+        .map_err(|_| "managed directory creation failed")?;
     let descriptor = cortexkit_store_types::StorageDescriptor {
         module_id: "magic-context".to_owned(),
         storage_namespace: "mc_cache".to_owned(),
@@ -443,16 +508,24 @@ fn synapse_component(generation: &ValidatedGeneration) -> SynapseComponent {
             return SynapseComponent::new(None);
         };
         let bundle_dir = generation.path().join(BUNDLE_DIR);
-        if !generation
+        // The generation manifest is the trust root: its digest already covers
+        // these bytes, so carrying the bundle manifest's own hash forward binds
+        // every artifact `load_bundle` verifies to the generation that was
+        // selected. Presence alone was not enough — the loader would then prove
+        // only that whatever sits at this pathname is self-consistent, so a
+        // directory replaced after validation could serve different embedding
+        // bytes under a generation the daemon still reported as valid.
+        let Some(bundle_manifest) = generation
             .manifest
             .files
             .iter()
-            .any(|entry| entry.path == format!("{BUNDLE_DIR}/manifest.json"))
-        {
+            .find(|entry| entry.path == format!("{BUNDLE_DIR}/manifest.json"))
+        else {
             return SynapseComponent::new(None);
-        }
+        };
         SynapseComponent::new(Some(SynapseConfig {
             bundle_dir,
+            bundle_manifest_sha256: Some(bundle_manifest.sha256.clone()),
             ort_library: generation.path().join(ORT_LIBRARY),
             ort_library_sha256: ort.sha256.clone(),
             limits: SynapseLimits::default(),
@@ -488,13 +561,21 @@ pub fn run() -> Result<(), &'static str> {
     )
     .map_err(|_| "credential snapshot exceeds bounds")?;
     let synapse = synapse_component(&generation);
+    // The credential verifier fails closed on every Broca send, so it is
+    // installed only when the launcher actually admitted credential rows —
+    // an envelope with none (older parents, credential-less deployments)
+    // keeps the harness lane on its pre-credential behavior instead of
+    // hard-failing every send with `credential_snapshot_mismatch`.
+    let backend: Arc<dyn LlmExecutionBackend> = Arc::new(harness_backend(&envelope, &env));
+    let broca = if envelope.credentials.is_empty() {
+        BrocaComponent::new(backend)
+    } else {
+        BrocaComponent::new_with_credentials(backend, env.clone())
+    };
     let composite = StaticComposite::new(
         mc_module::McHandler::new_with_connection_file(Some(publication)),
         synapse,
-        BrocaComponent::new_with_credentials(
-            Arc::new(harness_backend(&envelope, &env)),
-            env.clone(),
-        ),
+        broca,
     )
     .map_err(|_| "composite construction failed")?;
 
@@ -520,19 +601,31 @@ pub fn run() -> Result<(), &'static str> {
     let shutdown = CancellationToken::new();
     runtime.block_on(async {
         let signal_shutdown = shutdown.clone();
+        // Installed before the host future starts. Creating a stream inside the
+        // spawned task races `mc_host::run`: a signal arriving before
+        // registration takes the default disposition and kills the daemon
+        // outright, so the runtime never observes the cancellation and the
+        // fenced teardown in `mc_host::run` never runs. An installation failure
+        // is also fatal to the shutdown path, so it fails startup here rather
+        // than panicking a detached task and leaving `run` serving with no
+        // signal handling and nothing reporting it.
+        //
+        // SIGINT is handled alongside SIGTERM: the spawn path resets every
+        // inherited disposition to its default, so an interrupt from an operator
+        // or a process supervisor would otherwise terminate the daemon without
+        // draining routes and components.
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|_| "SIGTERM handler installation failed")?;
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .map_err(|_| "SIGINT handler installation failed")?;
         let signal_task = tokio::spawn(async move {
-            let mut terminate =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("SIGTERM handler installs");
-            let mut interrupt =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                    .expect("SIGINT handler installs");
-            if tokio::select! {
-                received = terminate.recv() => received,
-                received = interrupt.recv() => received,
-            }
-            .is_some()
-            {
+            let received = tokio::select! {
+                signal = terminate.recv() => signal,
+                signal = interrupt.recv() => signal,
+            };
+            if received.is_some() {
                 signal_shutdown.cancel();
             }
         });

@@ -11,9 +11,11 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { initializeIsolatedContextDb } from "../initialize-context-db";
+import { createDirectTestDatabase } from "../../../plugin/src/features/magic-context/test-database";
+import { initializeIsolatedContextDb as initializeContextDbFromRelease } from "../initialize-context-db";
 import { waitForChildExit } from "../process-exit";
 import { releaseRootPath, type VerifiedReleaseRoot } from "../prospective-holdout/release-root";
+import { isSensitiveEnvKey } from "../secret-env-keys";
 import {
     buildDirectHostFixture,
     detectRustModePrereqs,
@@ -29,9 +31,38 @@ const REPO_ROOT = resolve(import.meta.dir, "../../../..");
 // src/, so the source path also tests a slowness users never see.
 const PLUGIN_DIST_ENTRY = join(REPO_ROOT, "packages/plugin/dist/index.js");
 const PLUGIN_SRC_ENTRY = join(REPO_ROOT, "packages/plugin/src/index.ts");
-const PLUGIN_ENTRY = existsSync(PLUGIN_DIST_ENTRY)
-    ? PLUGIN_DIST_ENTRY
-    : PLUGIN_SRC_ENTRY;
+/**
+ * Resolved per spawn, not once at module load.
+ *
+ * A module-level constant snapshots mutable filesystem state at import time, and
+ * the import happens before any caller code runs — a caller that builds the
+ * bundle and then spawns in the same process got the pre-build answer. That is
+ * not merely stale bytes: with no bundle present the entry latched to `src/`
+ * permanently, so the same process could load a different plugin entrypoint than
+ * a caller that prebuilt, while reporting the same identity. Since the two paths
+ * have materially different startup behaviour, and production never loads from
+ * `src/`, the choice has to be made when it is used.
+ *
+ * Semantics are unchanged for every caller that does not create or remove the
+ * bundle between import and spawn: the answer is the same, just computed later.
+ */
+function pluginEntryPath(): string {
+    return existsSync(PLUGIN_DIST_ENTRY) ? PLUGIN_DIST_ENTRY : PLUGIN_SRC_ENTRY;
+}
+
+function initializeIsolatedContextDb(
+    dataDir: string,
+    releaseRoot?: VerifiedReleaseRoot,
+): void {
+    if (releaseRoot) {
+        initializeContextDbFromRelease(dataDir, releaseRoot);
+        return;
+    }
+    const path = join(dataDir, "cortexkit", "magic-context", "context.db");
+    if (existsSync(path)) return;
+    mkdirSync(dirname(path), { recursive: true });
+    createDirectTestDatabase({ path }).db.close();
+}
 
 export interface IsolatedEnv {
     configDir: string;
@@ -39,6 +70,18 @@ export interface IsolatedEnv {
     cacheDir: string;
     workdir: string;
 }
+
+/**
+ * Listen addresses the fixed loopback client URL can reach.
+ *
+ * The set is closed on purpose. Readiness polling and the returned handle both
+ * target `http://127.0.0.1:${port}`, so an address that URL cannot reach — an
+ * IPv6-only `::1`, or a single non-loopback interface — would bind a socket no
+ * client ever connects to and burn the whole readiness timeout instead of
+ * failing with the reason. Admitting another value means deriving the client
+ * URL from it in the same change, including IPv6 bracket form.
+ */
+export type ServeHostname = "0.0.0.0" | "127.0.0.1";
 
 export interface SpawnedOpencode {
     url: string;
@@ -74,6 +117,21 @@ export interface SpawnOptions {
      * per-suite file). Merged last, overriding inherited values.
      */
     extraEnv?: Record<string, string>;
+    /**
+     * Listen address for `opencode serve`. Defaults to "0.0.0.0" because
+     * GitHub-hosted runners sometimes time out Bun's `fetch()` against a
+     * 127.0.0.1-bound server. The serve HTTP API is unauthenticated, so any
+     * spawn that places a real credential in the child env must pass
+     * "127.0.0.1" to keep the API off non-loopback interfaces.
+     */
+    hostname?: ServeHostname;
+    /**
+     * Waive the loopback requirement for a secret-shaped `extraEnv` key. Set it
+     * only when the value is a fake fixture credential, and say why at the call
+     * site: it re-permits publishing an unauthenticated serve API on all
+     * interfaces alongside something named like a secret.
+     */
+    allowSecretEnvOffLoopback?: boolean;
     /** Verified immutable release root. Omitted keeps active-checkout behavior. */
     releaseRoot?: VerifiedReleaseRoot;
 }
@@ -126,7 +184,7 @@ function writeConfigs(
 ): void {
     const pluginEntry = opts.releaseRoot
         ? releaseRootPath(opts.releaseRoot, "opencodePlugin")
-        : PLUGIN_ENTRY;
+        : pluginEntryPath();
     const pluginSpec = `file://${pluginEntry}`;
 
     const opencodeConfig: Record<string, unknown> = {
@@ -367,10 +425,116 @@ async function provisionRustMode(releaseRoot?: VerifiedReleaseRoot): Promise<Rus
     }
 }
 
+/**
+ * Whether a parent-environment variable is handed to the serve child.
+ *
+ * The child otherwise inherits the runner's environment wholesale, and it is an
+ * unauthenticated server that binds all interfaces by default, so this list is
+ * what stands between the runner's environment and anything that can reach the
+ * port.
+ */
+function isInheritableEnvKey(key: string): boolean {
+    // Our tests run unsecured on a random localhost port, and inherited auth
+    // would force every SDK request to carry Basic auth headers we don't set.
+    if (key === "OPENCODE_SERVER_PASSWORD" || key === "OPENCODE_SERVER_USERNAME") return false;
+    // Bun's test runner sets NODE_ENV=test automatically and the plugin's logger
+    // (src/shared/logger.ts) silences all output when it is set. The subprocess
+    // should behave like a real install so the log file populates for diagnostics.
+    if (key === "NODE_ENV") return false;
+    // Strip any inherited supervised-launch identity. These are still the live
+    // variable names (`mc_host::wire::SUBC_MODULE_ID_ENV` /
+    // `SUBC_LAUNCH_NONCE_ENV`), and `historian_producer` reads them into
+    // `consumer_module_id`/`consumer_launch_nonce` on every route identity. When
+    // the test process is itself launched under a supervisor that sets them, the
+    // plugin would present THAT identity to our hermetic host, which rejects it
+    // as not matching a supervised launch nonce. A real install is never launched
+    // under a supervised identity, so clearing them matches production. Harmless
+    // for TS-mode suites, which never reach the Rust client.
+    if (key === "SUBC_MODULE_ID" || key === "SUBC_LAUNCH_NONCE") return false;
+    // Ambient secrets are never forwarded. A CI job's GITHUB_TOKEN or NPM_TOKEN,
+    // or an exported cloud or provider credential, would otherwise be served by
+    // the unauthenticated API to anything that can reach the port. None of it is
+    // needed: the child talks to the mock provider, and a spawn that genuinely
+    // needs a credential passes it through `extraEnv`, where
+    // `assertSecretsBoundToLoopback` governs it. Dropping them here is what
+    // makes that guard total, by leaving `extraEnv` as the only channel a caller
+    // secret can arrive on. The predicate covers vendor-prefixed names as well as
+    // secret-shaped suffixes, so `OPENAI_KEY` and `GCP_SA_KEY` are dropped too;
+    // `assertSafeExtraEnv` shares that one definition.
+    if (isSensitiveEnvKey(key)) return false;
+    return true;
+}
+
+/**
+ * Refuse to publish an unauthenticated serve API on a non-loopback interface
+ * while a caller-supplied secret reaches the child.
+ *
+ * Scope is exactly `extraEnv`, and that is the whole effective *environment*
+ * surface rather than a narrower slice of it: the inherited `process.env` copy
+ * below drops secret-shaped names outright, so ambient runner credentials never
+ * reach the child on any interface, and the fake `ANTHROPIC_API_KEY` default it
+ * sets is a fixture value. `extraEnv` is therefore the only channel a real
+ * credential can arrive on as a variable. Checking the assembled child env
+ * instead would refuse every default spawn, since that fake default is always
+ * present and is shaped like a secret.
+ *
+ * It does not cover a credential written directly into `openCodeConfigExtra`,
+ * which lands in the generated `opencode.json` rather than the environment.
+ * `liveModelSpawnOptions()` deliberately keeps the value in `extraEnv` and has
+ * the provider block reference it by name, so the sanctioned path stays covered;
+ * a caller that inlines an `apiKey` into the provider map instead is outside this
+ * guard. Extending to it needs a separate predicate, since config keys are
+ * camelCase and match none of the environment-name shapes.
+ *
+ * The pairing this enforces was previously a convention: `liveModelSpawnOptions()`
+ * returns the credential and `hostname: "127.0.0.1"` together, and a comment
+ * asked callers to keep them together. Nothing held it. The recipe is a
+ * `Pick<SpawnOptions>`, so any partial merge that forwards `extraEnv` without
+ * `hostname` falls back to the all-interfaces default — and neither
+ * `TestHarnessOptions` nor `RustTestHarnessOptions` carries `hostname`, so
+ * routing a real key through a harness instead of raw `spawnOpencode` drops the
+ * pin silently. The serve API has no authentication, so the failure publishes a
+ * live credential to anything that can reach the port for the process lifetime.
+ *
+ * Fail closed on the name, and at the top of the spawn path: Rust mode builds a
+ * Cargo fixture and starts a hermetic host subprocess before the ordinary spawn
+ * work begins, so a later check would pay for both before refusing.
+ * Names are matched rather than values because a fake test credential is shaped
+ * like a real one, so a value check would guess per vendor and would pull the
+ * secret into the diagnostic. A spawn that genuinely wants a secret-shaped
+ * variable off loopback — the fake-key config assertions, which need the
+ * all-interfaces default to dodge a Bun `fetch()` flake on GitHub-hosted
+ * runners — says so with `allowSecretEnvOffLoopback`. Requiring the waiver to be
+ * written down keeps the unsafe combination reviewable instead of reachable by
+ * omission. `assertSafeExtraEnv` applies the same predicate to refuse secrets
+ * from incident cases outright.
+ */
+function assertSecretsBoundToLoopback(
+    resolvedOpts: SpawnOptions,
+    hostname: ServeHostname,
+): void {
+    if (hostname === "127.0.0.1" || resolvedOpts.allowSecretEnvOffLoopback) return;
+    const secretKeys = Object.keys(resolvedOpts.extraEnv ?? {}).filter(isSensitiveEnvKey);
+    if (secretKeys.length === 0) return;
+    throw new Error(
+        `refusing to bind the unauthenticated serve API to ${hostname} while extraEnv carries ` +
+            `${secretKeys.join(", ")}. Pass hostname: "127.0.0.1" to keep the API on loopback, ` +
+            `or allowSecretEnvOffLoopback: true if the value is a fake fixture credential.`,
+    );
+}
+
 async function spawnOpencodeWithProvision(
     opts: SpawnOptions,
     provision: () => Promise<RustSpawnResources>,
 ): Promise<SpawnedOpencode> {
+    // Ahead of provisioning: Rust mode builds a Cargo fixture and starts a real
+    // hermetic host subprocess, so checking later would do that work before
+    // refusing. `resolvedOpts` below only overrides the env, connection file, and
+    // project config, leaving `hostname`, `extraEnv`, and the waiver identical to
+    // `opts`, so the earlier check decides the same way.
+    const hostname = opts.hostname ?? "0.0.0.0";
+    assertSecretsBoundToLoopback(opts, hostname);
+
     // MC_E2E_MODE is intentionally read only at this shared spawn seam. Rust
     // suites that already supplied a host connection keep their existing
     // stack; ordinary suites get one provisioned here for the rust invocation.
@@ -425,31 +589,10 @@ async function spawnOpencodeWithProvision(
         if (compaction?.auto !== true) initializeIsolatedContextDb(env.dataDir, resolvedOpts.releaseRoot);
         writeConfigs(env, resolvedOpts.mockProviderURL, resolvedOpts);
 
-        // Explicitly strip any inherited OPENCODE_SERVER_PASSWORD from the parent shell —
-        // our tests run unsecured on a random localhost port, and inherited auth would
-        // force every SDK request to carry Basic auth headers we don't set.
-        // Also strip NODE_ENV=test: Bun's test runner sets it automatically and the
-        // plugin's logger (src/shared/logger.ts) silences all output when NODE_ENV=test.
-        // We want the subprocess to behave like a real install, so the log file gets
-        // populated normally for diagnostics.
         const childEnv: Record<string, string> = {};
         for (const [key, value] of Object.entries(process.env)) {
             if (value === undefined) continue;
-            if (key === "OPENCODE_SERVER_PASSWORD") continue;
-            if (key === "OPENCODE_SERVER_USERNAME") continue;
-            if (key === "NODE_ENV") continue;
-            // Strip any inherited supervised-launch identity. These are still the
-            // live variable names (`mc_host::wire::SUBC_MODULE_ID_ENV` /
-            // `SUBC_LAUNCH_NONCE_ENV`), and `historian_producer` reads them into
-            // `consumer_module_id`/`consumer_launch_nonce` on every route identity.
-            // When the test process is itself launched under a supervisor that sets
-            // them, the plugin would present THAT identity to our hermetic host,
-            // which rejects it as not matching a supervised launch nonce. A real
-            // install is never launched under a supervised identity, so clearing
-            // them matches production. Harmless for TS-mode suites, which never
-            // reach the Rust client.
-            if (key === "SUBC_MODULE_ID") continue;
-            if (key === "SUBC_LAUNCH_NONCE") continue;
+            if (!isInheritableEnvKey(key)) continue;
             childEnv[key] = value;
         }
         childEnv.OPENCODE_CONFIG_DIR = env.configDir;
@@ -465,16 +608,26 @@ async function spawnOpencodeWithProvision(
             childEnv[key] = value;
         }
 
-        // Bind to 0.0.0.0 (all interfaces) instead of 127.0.0.1 — empirically on
-        // GitHub-hosted runners, opencode binding to 127.0.0.1 sometimes results
-        // in Bun's `fetch()` timing out even though `curl` succeeds. Binding all
-        // interfaces removes any loopback-specific stack-resolution edge case
-        // (IPv4-only AF_INET vs IPv4-mapped IPv6, AF_UNSPEC name resolution, etc.).
-        // Clients still connect to `127.0.0.1:${port}` — only the listen socket
-        // changes. Safe locally too: process is short-lived, port is random.
+        // Bind to 0.0.0.0 (all interfaces) by default instead of 127.0.0.1 —
+        // empirically on GitHub-hosted runners, opencode binding to 127.0.0.1
+        // sometimes results in Bun's `fetch()` timing out even though `curl`
+        // succeeds. Binding all interfaces removes any loopback-specific
+        // stack-resolution edge case (IPv4-only AF_INET vs IPv4-mapped IPv6,
+        // AF_UNSPEC name resolution, etc.). Clients still connect to
+        // `127.0.0.1:${port}` — only the listen socket changes. Safe for the
+        // default fake-credential spawns: process is short-lived, port is
+        // random. Spawns carrying a real credential pass `hostname` to pin the
+        // unauthenticated API to loopback, which
+        // `assertSecretsBoundToLoopback` enforces above rather than trusting.
         child = spawn(
             "opencode",
-            ["serve", "--port", String(port), "--hostname", "0.0.0.0"],
+            [
+                "serve",
+                "--port",
+                String(port),
+                "--hostname",
+                hostname,
+            ],
             {
                 cwd: env.workdir,
                 env: childEnv,
@@ -528,6 +681,8 @@ export function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode> {
 }
 
 export const __spawnOpencodeTest = {
+    assertSecretsBoundToLoopback,
+    isInheritableEnvKey,
     initializeIsolatedContextDb,
     rejectOnSpawnError,
     stopChild,

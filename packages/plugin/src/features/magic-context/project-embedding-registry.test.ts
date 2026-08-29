@@ -23,26 +23,15 @@ import {
     type SynapseClientLike,
     SynapseEmbeddingError,
 } from "./memory/embedding-synapse";
-import { insertMemory } from "./memory/storage-memory";
-import {
-    runInMemoryClaimsWriteTransaction,
-    withClaimsWriteCapabilityInCurrentTransaction,
-} from "./memory/storage-memory-claims";
-import {
-    getStoredModelId,
-    loadAllEmbeddings,
-    saveEmbedding,
-} from "./memory/storage-memory-embeddings";
 import {
     _resetProjectEmbeddingRegistryForTests,
     _setTestProviderFactoryForProject,
     drainCommitBacklogForProject,
     embedCompartmentWindowsDetailedForProject,
-    embedMemoriesDetailedForProject,
     embedSessionCompartmentChunks,
+    embedShadowTextForProject,
     embedTextForProject,
     embedUnembeddedCompartmentChunksForProject,
-    embedUnembeddedMemoriesForProject,
     enqueueShadowEmbeddingItems,
     flushShadowEmbeddingBacklog,
     getProjectEmbeddingMaxInputTokens,
@@ -57,9 +46,8 @@ import {
 } from "./project-embedding-registry";
 import { recordSessionProjectIdentity } from "./session-project-storage";
 import { closeDatabase, openDatabase } from "./storage";
-import { createSynapseLedgerPage, getSynapseLedgerPage } from "./storage-embedding-measurements";
+import { createSynapseLedgerPage } from "./storage-embedding-measurements";
 import {
-    crashingDatabase,
     DetailedSynapseTestHost,
     detailedSynapseTestProvider,
     SYNAPSE_TEST_LANE_IDENTITY,
@@ -258,7 +246,9 @@ describe("project embedding registry", () => {
         const dir = mkdtempSync(join(tmpdir(), "project-embedding-registry-"));
         tempDirs.push(dir);
         process.env.XDG_DATA_HOME = dir;
-        return openDatabase();
+        const db = openDatabase();
+        if (!db) throw new Error("failed to open test database");
+        return db;
     }
 
     afterEach(() => {
@@ -298,6 +288,34 @@ describe("project embedding registry", () => {
                 )
                 .get("deferred-synapse"),
         ).toBeNull();
+    });
+
+    it("keeps a deferred Synapse lane enabled so first use can resolve it", () => {
+        const db = useTempDb();
+        const snapshot = registerProjectEmbedding(
+            db,
+            "deferred-enabled-synapse",
+            {
+                provider: "synapse",
+                model: "gte-modernbert-base-f16",
+                synapse_connection_origin: "managed-default",
+                synapse_fallback: { provider: "off" },
+            } as EmbeddingConfig,
+            { memoryEnabled: true, gitCommitEnabled: true },
+            "/repo",
+        );
+
+        // The embed entry points (memory queue, commit batches, chunk drains,
+        // search) gate on the snapshot; a deferred lane reported as disabled
+        // could never reach the first embed that resolves it or activates the
+        // configured fallback.
+        expect(snapshot.enabled).toBe(true);
+        expect(snapshot.gitCommitEnabled).toBe(true);
+        expect(snapshot.provider).toBe("synapse");
+        // The unresolved lane still exposes no usable identity: stale-identity
+        // GC and chunk search stay gated until the first vector commits it.
+        expect(snapshot.modelId).toBe("off");
+        expect(snapshot.chunkModelId).toBe("off");
     });
 
     it("resolved primary and shadow descriptors are removed when Synapse becomes deferred", () => {
@@ -354,6 +372,140 @@ describe("project embedding registry", () => {
                 .prepare("SELECT 1 FROM shadow_embedding_registrations WHERE project_path = ?")
                 .get(projectIdentity),
         ).toBeNull();
+    });
+
+    it("preserves a shadow lane whose first discovery is still in flight", async () => {
+        // Two operations re-registering the same deferred lane before
+        // `models.list` returns is the ordinary case. Replacing the pending
+        // registration disposes the provider whose discovery is in flight, and its
+        // `onSynapseLaneReady` is then dropped by the identity guard in
+        // `commitShadowSynapseLane`, so the lane never commits and the cohort
+        // stays `off`. Only a lane that already failed may be replaced.
+        const db = useTempDb();
+        const projectIdentity = "shadow-pending-lane";
+        let releaseCatalog: (() => void) | undefined;
+        let catalogCalls = 0;
+        const client: SynapseClientLike = {
+            async call<Response>(_module, method): Promise<Response> {
+                if (method === "models.list") {
+                    catalogCalls += 1;
+                    // Hold discovery open so the second registration observes a
+                    // pending lane rather than a resolved or failed one.
+                    await new Promise<void>((resolve) => {
+                        releaseCatalog = resolve;
+                    });
+                    return [
+                        {
+                            model: "gte-modernbert-base-f16",
+                            fingerprint: "fp-pending",
+                            table_epoch: 2,
+                            dims: 3,
+                            certified: true,
+                        },
+                    ] as Response;
+                }
+                if (method === "embed.query") {
+                    return {
+                        vector: [1, 2, 3],
+                        model: "gte-modernbert-base-f16",
+                        fingerprint: "fp-pending",
+                        table_epoch: 2,
+                        dims: 3,
+                    } as Response;
+                }
+                throw new Error(`unexpected method ${method}`);
+            },
+            close() {},
+        };
+        const deferred = {
+            provider: "synapse",
+            model: "gte-modernbert-base-f16",
+            synapse_connection_origin: "injected",
+            synapse_client_factory: async () => client,
+        } as unknown as EmbeddingConfig;
+
+        registerProjectShadowEmbedding(db, projectIdentity, deferred, "/repo");
+        const inFlight = embedShadowTextForProject(projectIdentity, "first");
+        // Let the provider reach models.list and park there.
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(catalogCalls).toBe(1);
+
+        // The re-registration must not replace the pending lane.
+        registerProjectShadowEmbedding(db, projectIdentity, deferred, "/repo");
+        releaseCatalog?.();
+
+        expect(await inFlight).not.toBeNull();
+        // Discovery ran once and committed, so the lane resolved rather than
+        // being torn down and re-demanded.
+        expect(catalogCalls).toBe(1);
+        expect(
+            db
+                .prepare(
+                    "SELECT fingerprint FROM shadow_embedding_registrations WHERE project_path = ?",
+                )
+                .get(projectIdentity),
+        ).toEqual({ fingerprint: "fp-pending" });
+    });
+
+    it("retries a shadow lane whose first discovery failed permanently", async () => {
+        // A lane-wide permanent error (`not_certified`, `artifact_invalid`) ends
+        // discovery with the registration still holding its deferred intent and
+        // no resolved metadata. Matching on that intent alone would resume the
+        // prior lane, dispose the fresh provider, and hand back the latched one
+        // whose `permanentFailure` flag makes `initialize()` refuse to retry — so
+        // the shadow experiment would stay dead for the process lifetime even
+        // after the model is certified.
+        const db = useTempDb();
+        const projectIdentity = "shadow-permanent-failure";
+        let certified = false;
+        let catalogCalls = 0;
+        const client: SynapseClientLike = {
+            async call<Response>(_module, method): Promise<Response> {
+                if (method === "models.list") {
+                    catalogCalls += 1;
+                    return [
+                        {
+                            model: "gte-modernbert-base-f16",
+                            fingerprint: "fp-repaired",
+                            table_epoch: 1,
+                            dims: 3,
+                            certified,
+                            ...(certified ? {} : { status: "not_certified" }),
+                        },
+                    ] as Response;
+                }
+                if (method === "embed.query") {
+                    return {
+                        vector: [1, 2, 3],
+                        model: "gte-modernbert-base-f16",
+                        fingerprint: "fp-repaired",
+                        table_epoch: 1,
+                        dims: 3,
+                    } as Response;
+                }
+                throw new Error(`unexpected method ${method}`);
+            },
+            close() {},
+        };
+        const deferred = {
+            provider: "synapse",
+            model: "gte-modernbert-base-f16",
+            synapse_connection_origin: "injected",
+            synapse_client_factory: async () => client,
+        } as unknown as EmbeddingConfig;
+
+        registerProjectShadowEmbedding(db, projectIdentity, deferred, "/repo");
+        expect(await embedShadowTextForProject(projectIdentity, "first")).toBeNull();
+        expect(catalogCalls).toBe(1);
+
+        // The model is certified now. Re-registering must build a lane that can
+        // discover again rather than resuming the latched one.
+        certified = true;
+        registerProjectShadowEmbedding(db, projectIdentity, deferred, "/repo");
+        const vector = await embedShadowTextForProject(projectIdentity, "second");
+
+        expect(vector).not.toBeNull();
+        expect(catalogCalls).toBe(2);
     });
 
     it("commits the discovered Synapse lane before returning its first vector", async () => {
@@ -413,6 +565,193 @@ describe("project embedding registry", () => {
             table_epoch: 7,
             dims: 3,
         });
+    });
+
+    it("re-registering the same deferred config keeps the resolved lane and its provider", async () => {
+        const db = useTempDb();
+        let catalogCalls = 0;
+        const client: SynapseClientLike = {
+            async call<Response>(_module, method): Promise<Response> {
+                if (method === "models.list") {
+                    catalogCalls += 1;
+                    return [
+                        {
+                            model: "gte-modernbert-base-f16",
+                            fingerprint: "fp-stable",
+                            table_epoch: 4,
+                            dims: 3,
+                            certified: true,
+                        },
+                    ] as Response;
+                }
+                if (method === "embed.query") {
+                    return {
+                        vector: [1, 2, 3],
+                        model: "gte-modernbert-base-f16",
+                        fingerprint: "fp-stable",
+                        table_epoch: 4,
+                        dims: 3,
+                    } as Response;
+                }
+                throw new Error(`unexpected method ${method}`);
+            },
+            close() {},
+        };
+        const features = { memoryEnabled: true, gitCommitEnabled: true };
+        const deferred = {
+            provider: "synapse",
+            model: "gte-modernbert-base-f16",
+            synapse_connection_origin: "injected",
+            synapse_client_factory: async () => client,
+            synapse_fallback: { provider: "off" },
+        } as EmbeddingConfig;
+
+        registerProjectEmbedding(db, "stable-deferred", deferred, features, "/repo");
+        const resolvedIdentity = getSynapseLaneIdentity("gte-modernbert-base-f16", "fp-stable");
+        expect((await embedTextForProject("stable-deferred", "first"))?.modelId).toBe(
+            resolvedIdentity,
+        );
+        expect(catalogCalls).toBe(1);
+
+        // Every tool call re-registers from the user's configuration, which is
+        // still the deferred one. That must not discard the resolved lane: doing
+        // so tears down a healthy provider and deletes its descriptor per call,
+        // and a transient rediscovery failure would switch to the fallback.
+        const snapshot = registerProjectEmbedding(
+            db,
+            "stable-deferred",
+            deferred,
+            features,
+            "/repo",
+        );
+        expect(snapshot.modelId).toBe(resolvedIdentity);
+        expect(snapshot.providerIdentity).toBe(resolvedIdentity);
+        expect(
+            db
+                .prepare("SELECT fingerprint FROM embedding_registrations WHERE project_path = ?")
+                .get("stable-deferred"),
+        ).toEqual({ fingerprint: "fp-stable" });
+
+        expect((await embedTextForProject("stable-deferred", "second"))?.modelId).toBe(
+            resolvedIdentity,
+        );
+        // A preserved provider is already initialized, so no second discovery.
+        expect(catalogCalls).toBe(1);
+    });
+
+    it("retries the deferred intent after a fallback activation instead of latching it", async () => {
+        const db = useTempDb();
+        let laneAvailable = false;
+        let catalogCalls = 0;
+        const client: SynapseClientLike = {
+            async call<Response>(_module, method): Promise<Response> {
+                if (method === "models.list") {
+                    catalogCalls += 1;
+                    if (!laneAvailable) throw new Error("catalog unavailable");
+                    return [
+                        {
+                            model: "gte-modernbert-base-f16",
+                            fingerprint: "fp-late",
+                            table_epoch: 2,
+                            dims: 3,
+                            certified: true,
+                        },
+                    ] as Response;
+                }
+                if (method === "embed.query") {
+                    return {
+                        vector: [1, 2, 3],
+                        model: "gte-modernbert-base-f16",
+                        fingerprint: "fp-late",
+                        table_epoch: 2,
+                        dims: 3,
+                    } as Response;
+                }
+                throw new Error(`unexpected method ${method}`);
+            },
+            close() {},
+        };
+        const features = { memoryEnabled: true, gitCommitEnabled: true };
+        const deferred = {
+            provider: "synapse",
+            model: "gte-modernbert-base-f16",
+            synapse_connection_origin: "injected",
+            synapse_client_factory: async () => client,
+            synapse_fallback: { provider: "off" },
+        } as EmbeddingConfig;
+
+        registerProjectEmbedding(db, "transient-deferred", deferred, features, "/repo");
+        // A transient discovery failure activates the configured fallback.
+        expect(await embedTextForProject("transient-deferred", "first")).toBeNull();
+        expect(catalogCalls).toBeGreaterThan(0);
+        expect(getProjectEmbeddingSnapshot("transient-deferred")?.modelId).toBe("off");
+
+        // A fallback activation is a demotion, not a resolved lane: a registration
+        // carrying the same deferred intent must rebuild the Synapse provider
+        // instead of copying the demoted config forward.
+        laneAvailable = true;
+        registerProjectEmbedding(db, "transient-deferred", deferred, features, "/repo");
+        const expectedIdentity = getSynapseLaneIdentity("gte-modernbert-base-f16", "fp-late");
+        expect((await embedTextForProject("transient-deferred", "second"))?.modelId).toBe(
+            expectedIdentity,
+        );
+        expect(getProjectEmbeddingSnapshot("transient-deferred")?.modelId).toBe(expectedIdentity);
+    });
+
+    it("keeps lane resolution attached when a re-registration overlaps initialization", async () => {
+        const db = useTempDb();
+        let releaseCatalog!: () => void;
+        const catalogGate = new Promise<void>((resolve) => {
+            releaseCatalog = resolve;
+        });
+        const client: SynapseClientLike = {
+            async call<Response>(_module, method): Promise<Response> {
+                if (method === "models.list") {
+                    await catalogGate;
+                    return [
+                        {
+                            model: "gte-modernbert-base-f16",
+                            fingerprint: "fp-overlap",
+                            table_epoch: 5,
+                            dims: 3,
+                            certified: true,
+                        },
+                    ] as Response;
+                }
+                if (method === "embed.query") {
+                    return {
+                        vector: [1, 2, 3],
+                        model: "gte-modernbert-base-f16",
+                        fingerprint: "fp-overlap",
+                        table_epoch: 5,
+                        dims: 3,
+                    } as Response;
+                }
+                throw new Error(`unexpected method ${method}`);
+            },
+            close() {},
+        };
+        const features = { memoryEnabled: true, gitCommitEnabled: true };
+        const deferred = {
+            provider: "synapse",
+            model: "gte-modernbert-base-f16",
+            synapse_connection_origin: "injected",
+            synapse_client_factory: async () => client,
+            synapse_fallback: { provider: "off" },
+        } as EmbeddingConfig;
+
+        registerProjectEmbedding(db, "overlapped-deferred", deferred, features, "/repo");
+        // One operation is mid-initialization when a second re-registers from the
+        // same configuration. The provider carried forward announces its lane to
+        // the registration object it was constructed with, so that object has to
+        // stay the one the registry holds.
+        const inFlight = embedTextForProject("overlapped-deferred", "first");
+        registerProjectEmbedding(db, "overlapped-deferred", deferred, features, "/repo");
+        releaseCatalog();
+
+        const expectedIdentity = getSynapseLaneIdentity("gte-modernbert-base-f16", "fp-overlap");
+        expect((await inFlight)?.modelId).toBe(expectedIdentity);
+        expect(getProjectEmbeddingSnapshot("overlapped-deferred")?.modelId).toBe(expectedIdentity);
     });
 
     it("preserves existing provider and runtime identity goldens", () => {
@@ -646,15 +985,16 @@ describe("project embedding registry", () => {
                 new FakeEmbeddingProvider(config.provider === "local" ? config.model : "off"),
         );
 
+        const db = useTempDb();
         registerProjectEmbedding(
-            useTempDb(),
+            db,
             "git:project-a",
             localConfig("model-a"),
             { memoryEnabled: true, gitCommitEnabled: false },
             "/tmp/a",
         );
         registerProjectEmbedding(
-            openDatabase(),
+            db,
             "git:project-b",
             localConfig("model-b-long"),
             { memoryEnabled: true, gitCommitEnabled: true },
@@ -710,8 +1050,9 @@ describe("project embedding registry", () => {
                 })(config.provider === "local" ? config.model : "off"),
         );
 
+        const db = useTempDb();
         registerProjectEmbedding(
-            useTempDb(),
+            db,
             "git:project",
             localConfig("model-a"),
             { memoryEnabled: true, gitCommitEnabled: false },
@@ -719,7 +1060,7 @@ describe("project embedding registry", () => {
         );
         const inFlight = embedTextForProject("git:project", "hello");
         registerProjectEmbedding(
-            openDatabase(),
+            db,
             "git:project",
             localConfig("model-b"),
             { memoryEnabled: true, gitCommitEnabled: false },
@@ -729,82 +1070,6 @@ describe("project embedding registry", () => {
         release?.();
 
         expect(await inFlight).toBeNull();
-    });
-
-    it("stores unembedded memory vectors when the memory content stays unchanged", async () => {
-        _setTestProviderFactoryForProject(
-            (config) =>
-                new FakeEmbeddingProvider(config.provider === "local" ? config.model : "off"),
-        );
-        const db = useTempDb();
-        const projectIdentity = "git:memory-backfill";
-        const memory = insertMemory(db, {
-            projectPath: projectIdentity,
-            category: "CONSTRAINTS",
-            content: "Backfill this exact memory.",
-        });
-        registerProjectEmbedding(
-            db,
-            projectIdentity,
-            localConfig("model-a"),
-            { memoryEnabled: true, gitCommitEnabled: false },
-            "/tmp/memory-backfill",
-        );
-
-        const embedded = await embedUnembeddedMemoriesForProject(db, projectIdentity, 10);
-
-        expect(embedded).toBe(1);
-        expect(
-            loadAllEmbeddings(db, projectIdentity, currentModelId(projectIdentity)).has(memory.id),
-        ).toBe(true);
-    });
-
-    it("skips stale sweep results when a memory changes before the batch save", async () => {
-        let release: (() => void) | undefined;
-        let batchStarted: (() => void) | undefined;
-        _setTestProviderFactoryForProject(
-            (config) =>
-                new (class extends FakeEmbeddingProvider {
-                    override async embedBatch(texts: string[]): Promise<Float32Array[]> {
-                        batchStarted?.();
-                        await new Promise<void>((resolve) => {
-                            release = resolve;
-                        });
-                        return super.embedBatch(texts);
-                    }
-                })(config.provider === "local" ? config.model : "off"),
-        );
-        const db = useTempDb();
-        const projectIdentity = "git:memory-stale";
-        const memory = insertMemory(db, {
-            projectPath: projectIdentity,
-            category: "CONSTRAINTS",
-            content: "Old memory body",
-        });
-        registerProjectEmbedding(
-            db,
-            projectIdentity,
-            localConfig("model-a"),
-            { memoryEnabled: true, gitCommitEnabled: false },
-            "/tmp/memory-stale",
-        );
-
-        const started = new Promise<void>((resolve) => {
-            batchStarted = resolve;
-        });
-        const inFlight = embedUnembeddedMemoriesForProject(db, projectIdentity, 10);
-        await started;
-        runInMemoryClaimsWriteTransaction(db, () => {
-            db.prepare(
-                "UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
-            ).run("New memory body", "new-memory-hash", Date.now(), memory.id);
-        });
-        release?.();
-
-        expect(await inFlight).toBe(0);
-        expect(loadAllEmbeddings(db, projectIdentity, currentModelId(projectIdentity)).size).toBe(
-            0,
-        );
     });
 
     it("prunes expired synthetic-session ledger rows on project registration", () => {
@@ -862,297 +1127,30 @@ describe("project embedding registry", () => {
         ).toBe(2);
     });
 
-    it("keeps memory, commit, and chunk embeddings coexisting per model", () => {
-        const db = useTempDb();
-        const projectIdentity = "git:coexist";
-        const memory = insertMemory(db, {
-            projectPath: projectIdentity,
-            category: "CONSTRAINTS",
-            content: "Keep per-model vectors independent.",
-        });
-        upsertCommits(db, projectIdentity, [makeGitCommit("coexist-a", 1000)]);
-        const commitSha = makeGitCommit("coexist-a", 1000).sha;
-        const compartmentId = seedCompartmentWithFts(db, "ses-coexist");
-        const windows = chunkCanonicalText("[1] U: hello", 1, 1, 10_000);
-
-        const first = registerProjectEmbedding(
-            db,
-            projectIdentity,
-            localConfig("model-a"),
-            { memoryEnabled: true, gitCommitEnabled: true },
-            "/tmp/coexist",
-        );
-        saveEmbedding(db, memory.id, new Float32Array([1, 0]), first.modelId);
-        saveCommitEmbedding(db, commitSha, new Float32Array([1, 0]), first.modelId);
-        replaceCompartmentChunkEmbeddings(
-            db,
-            windows.map((window) => ({
-                compartmentId,
-                sessionId: "ses-coexist",
-                projectPath: projectIdentity,
-                window,
-                modelId: first.chunkModelId,
-                vector: new Float32Array([1, 0]),
-            })),
-        );
-
-        const second = registerProjectEmbedding(
-            db,
-            projectIdentity,
-            localConfig("model-b"),
-            { memoryEnabled: true, gitCommitEnabled: true },
-            "/tmp/coexist",
-        );
-        saveEmbedding(db, memory.id, new Float32Array([0, 1]), second.modelId);
-        saveCommitEmbedding(db, commitSha, new Float32Array([0, 1]), second.modelId);
-        replaceCompartmentChunkEmbeddings(
-            db,
-            windows.map((window) => ({
-                compartmentId,
-                sessionId: "ses-coexist",
-                projectPath: projectIdentity,
-                window,
-                modelId: second.chunkModelId,
-                vector: new Float32Array([0, 1]),
-            })),
-        );
-
-        saveEmbedding(db, memory.id, new Float32Array([0, 2]), second.modelId);
-
-        expect(
-            Array.from(
-                loadAllEmbeddings(db, projectIdentity, first.modelId).get(memory.id)!.embedding,
-            ),
-        ).toEqual([1, 0]);
-        expect(
-            Array.from(
-                loadAllEmbeddings(db, projectIdentity, second.modelId).get(memory.id)!.embedding,
-            ),
-        ).toEqual([0, 2]);
-        expect(
-            countRows(
-                db,
-                `SELECT COUNT(*) AS count FROM git_commit_embeddings e
-                 JOIN git_commits c ON c.sha = e.sha WHERE c.project_path = ?`,
-                projectIdentity,
-            ),
-        ).toBe(2);
-        expect(
-            loadCompartmentChunkEmbeddingsForSearch(
-                db,
-                "ses-coexist",
-                projectIdentity,
-                first.chunkModelId,
-            ),
-        ).toHaveLength(1);
-        expect(
-            loadCompartmentChunkEmbeddingsForSearch(
-                db,
-                "ses-coexist",
-                projectIdentity,
-                second.chunkModelId,
-            ),
-        ).toHaveLength(1);
-
-        const restored = registerProjectEmbedding(
-            db,
-            projectIdentity,
-            localConfig("model-a"),
-            { memoryEnabled: true, gitCommitEnabled: true },
-            "/tmp/coexist",
-        );
-        expect(restored.modelId).toBe(first.modelId);
-        expect(loadAllEmbeddings(db, projectIdentity, restored.modelId).has(memory.id)).toBe(true);
-    });
-
-    it("garbage-collects only stale inactive embedding identities after the grace window", () => {
-        const db = useTempDb();
-        const projectIdentity = "git:gc";
-        const memory = insertMemory(db, {
-            projectPath: projectIdentity,
-            category: "CONSTRAINTS",
-            content: "Delete only stale inactive embedding vectors.",
-        });
-        upsertCommits(db, projectIdentity, [makeGitCommit("gc-a", 1000)]);
-        const commitSha = makeGitCommit("gc-a", 1000).sha;
-        const compartmentId = seedCompartmentWithFts(db, "ses-gc");
-        const windows = chunkCanonicalText("[1] U: hello", 1, 1, 10_000);
-        const now = Date.now();
-
-        const first = registerProjectEmbedding(
-            db,
-            projectIdentity,
-            localConfig("model-a"),
-            { memoryEnabled: true, gitCommitEnabled: true },
-            "/tmp/gc",
-        );
-        saveEmbedding(db, memory.id, new Float32Array([1, 0]), first.modelId);
-        saveCommitEmbedding(db, commitSha, new Float32Array([1, 0]), first.modelId);
-        replaceCompartmentChunkEmbeddings(
-            db,
-            windows.map((window) => ({
-                compartmentId,
-                sessionId: "ses-gc",
-                projectPath: projectIdentity,
-                window,
-                modelId: first.chunkModelId,
-                vector: new Float32Array([1, 0]),
-            })),
-        );
-
-        const second = registerProjectEmbedding(
-            db,
-            projectIdentity,
-            localConfig("model-b"),
-            { memoryEnabled: true, gitCommitEnabled: true },
-            "/tmp/gc",
-        );
-        saveEmbedding(db, memory.id, new Float32Array([0, 1]), second.modelId);
-        saveCommitEmbedding(db, commitSha, new Float32Array([0, 1]), second.modelId);
-        replaceCompartmentChunkEmbeddings(
-            db,
-            windows.map((window) => ({
-                compartmentId,
-                sessionId: "ses-gc",
-                projectPath: projectIdentity,
-                window,
-                modelId: second.chunkModelId,
-                vector: new Float32Array([0, 1]),
-            })),
-        );
-
-        db.prepare(
-            "UPDATE embedding_identity_active SET last_active_at = ? WHERE project_path = ? AND model_id IN (?, ?)",
-        ).run(now - 15 * 24 * 60 * 60 * 1000, projectIdentity, first.modelId, first.chunkModelId);
-        db.prepare(
-            "UPDATE embedding_identity_active SET last_active_at = ? WHERE project_path = ? AND model_id IN (?, ?)",
-        ).run(now - 15 * 24 * 60 * 60 * 1000, projectIdentity, second.modelId, second.chunkModelId);
-
-        const swept = sweepStaleEmbeddingIdentitiesForProject(db, projectIdentity, now);
-
-        expect(swept.memoryRowsDeleted).toBe(1);
-        expect(swept.commitRowsDeleted).toBe(1);
-        expect(swept.chunkRowsDeleted).toBe(1);
-        expect(loadAllEmbeddings(db, projectIdentity, first.modelId).size).toBe(0);
-        expect(loadAllEmbeddings(db, projectIdentity, second.modelId).size).toBe(1);
-        expect(countEmbeddedCommits(db, projectIdentity, second.modelId)).toBe(1);
-        expect(
-            loadCompartmentChunkEmbeddingsForSearch(
-                db,
-                "ses-gc",
-                projectIdentity,
-                second.chunkModelId,
-            ),
-        ).toHaveLength(1);
-
-        saveEmbedding(db, memory.id, new Float32Array([1, 0]), first.modelId);
-        db.prepare(
-            `INSERT INTO embedding_identity_active (project_path, scope, model_id, last_active_at)
-             VALUES (?, 'memory', ?, ?)`,
-        ).run(projectIdentity, first.modelId, now - 13 * 24 * 60 * 60 * 1000);
-        const withinGrace = sweepStaleEmbeddingIdentitiesForProject(db, projectIdentity, now);
-        expect(withinGrace.memoryRowsDeleted).toBe(0);
-        expect(loadAllEmbeddings(db, projectIdentity, first.modelId).size).toBe(1);
-    });
-
-    it("deletes stale embedding rows in bounded batches and resumes on the next sweep", () => {
-        const db = useTempDb();
-        const projectIdentity = "git:gc-batched";
-        const compartmentId = seedCompartmentWithFts(db, "ses-gc-batched");
-        const windows = chunkCanonicalText("[1] U: hello", 1, 1, 10_000);
-        const now = Date.now();
-        const first = registerProjectEmbedding(
-            db,
-            projectIdentity,
-            localConfig("model-a"),
-            { memoryEnabled: true, gitCommitEnabled: false },
-            "/tmp/gc-batched",
-        );
-        replaceCompartmentChunkEmbeddings(
-            db,
-            windows.map((window) => ({
-                compartmentId,
-                sessionId: "ses-gc-batched",
-                projectPath: projectIdentity,
-                window,
-                modelId: first.chunkModelId,
-                vector: new Float32Array([1, 0]),
-            })),
-        );
-        db.prepare(
-            `WITH RECURSIVE seq(n) AS (
-                 SELECT 1
-                 UNION ALL
-                 SELECT n + 1 FROM seq WHERE n < 299
-             )
-             INSERT INTO compartment_chunk_embeddings(
-                 compartment_id, session_id, project_path, harness, window_index,
-                 start_ordinal, end_ordinal, chunk_hash, model_id, dims, vector, created_at
-             )
-             SELECT base.compartment_id, base.session_id, base.project_path, base.harness, seq.n,
-                    base.start_ordinal, base.end_ordinal, base.chunk_hash || '-' || seq.n,
-                    base.model_id, base.dims, base.vector, base.created_at
-             FROM compartment_chunk_embeddings base
-             CROSS JOIN seq
-             WHERE base.compartment_id = ? AND base.model_id = ? AND base.window_index = 0`,
-        ).run(compartmentId, first.chunkModelId);
-
-        registerProjectEmbedding(
-            db,
-            projectIdentity,
-            localConfig("model-b"),
-            { memoryEnabled: true, gitCommitEnabled: false },
-            "/tmp/gc-batched",
-        );
-        db.prepare(
-            `UPDATE embedding_identity_active
-             SET last_active_at = ?
-             WHERE project_path = ? AND scope = 'chunk' AND model_id = ?`,
-        ).run(now - 15 * 24 * 60 * 60 * 1000, projectIdentity, first.chunkModelId);
-
-        const firstSweep = sweepStaleEmbeddingIdentitiesForProject(db, projectIdentity, now);
-        expect(firstSweep.chunkRowsDeleted).toBe(250);
-        expect(firstSweep.trackingRowsDeleted).toBe(0);
-        expect(
-            db
-                .prepare(
-                    "SELECT COUNT(*) AS count FROM compartment_chunk_embeddings WHERE project_path = ? AND model_id = ?",
-                )
-                .get(projectIdentity, first.chunkModelId),
-        ).toEqual({ count: 50 });
-
-        const secondSweep = sweepStaleEmbeddingIdentitiesForProject(db, projectIdentity, now);
-        expect(secondSweep.chunkRowsDeleted).toBe(50);
-        expect(secondSweep.trackingRowsDeleted).toBe(1);
-    });
-
     it("suppresses GC while a project's last config load was untrusted", () => {
         const db = useTempDb();
         const projectIdentity = "git:untrusted-gc";
-        const memory = insertMemory(db, {
-            projectPath: projectIdentity,
-            category: "CONSTRAINTS",
-            content: "Do not GC off a degraded config load.",
-        });
+        upsertCommits(db, projectIdentity, [makeGitCommit("gc-a", 1000)]);
+        const sha = makeGitCommit("gc-a", 1000).sha;
         const now = Date.now();
 
         const first = registerProjectEmbedding(
             db,
             projectIdentity,
             localConfig("model-a"),
-            { memoryEnabled: true, gitCommitEnabled: false },
+            { memoryEnabled: true, gitCommitEnabled: true },
             "/tmp/untrusted-gc",
         );
-        saveEmbedding(db, memory.id, new Float32Array([1, 0]), first.modelId);
+        saveCommitEmbedding(db, sha, new Float32Array([1, 0]), first.modelId);
 
         const second = registerProjectEmbedding(
             db,
             projectIdentity,
             localConfig("model-b"),
-            { memoryEnabled: true, gitCommitEnabled: false },
+            { memoryEnabled: true, gitCommitEnabled: true },
             "/tmp/untrusted-gc",
         );
-        saveEmbedding(db, memory.id, new Float32Array([0, 1]), second.modelId);
+        saveCommitEmbedding(db, sha, new Float32Array([0, 1]), second.modelId);
         // Age model-a past the grace window so it is a genuine GC candidate.
         db.prepare(
             "UPDATE embedding_identity_active SET last_active_at = ? WHERE project_path = ? AND model_id = ?",
@@ -1163,15 +1161,15 @@ describe("project embedding registry", () => {
         // would delete against is last-known-good rather than a trusted config.
         markProjectLoadUntrusted(projectIdentity);
         const suppressed = sweepStaleEmbeddingIdentitiesForProject(db, projectIdentity, now);
-        expect(suppressed.memoryRowsDeleted).toBe(0);
-        expect(loadAllEmbeddings(db, projectIdentity, first.modelId).size).toBe(1);
+        expect(suppressed.commitRowsDeleted).toBe(0);
+        expect(countEmbeddedCommits(db, projectIdentity, first.modelId)).toBe(1);
 
         // A trusted re-register clears the latch; GC resumes and reaps model-a.
         const third = registerProjectEmbedding(
             db,
             projectIdentity,
             localConfig("model-b"),
-            { memoryEnabled: true, gitCommitEnabled: false },
+            { memoryEnabled: true, gitCommitEnabled: true },
             "/tmp/untrusted-gc",
         );
         expect(third.modelId).toBe(second.modelId);
@@ -1179,9 +1177,9 @@ describe("project embedding registry", () => {
             "UPDATE embedding_identity_active SET last_active_at = ? WHERE project_path = ? AND model_id = ?",
         ).run(now - 15 * 24 * 60 * 60 * 1000, projectIdentity, first.modelId);
         const resumed = sweepStaleEmbeddingIdentitiesForProject(db, projectIdentity, now);
-        expect(resumed.memoryRowsDeleted).toBe(1);
-        expect(loadAllEmbeddings(db, projectIdentity, first.modelId).size).toBe(0);
-        expect(loadAllEmbeddings(db, projectIdentity, second.modelId).size).toBe(1);
+        expect(resumed.commitRowsDeleted).toBe(1);
+        expect(countEmbeddedCommits(db, projectIdentity, first.modelId)).toBe(0);
+        expect(countEmbeddedCommits(db, projectIdentity, second.modelId)).toBe(1);
     });
 
     it("keeps old-model compartment chunk embeddings inert on provider change", async () => {
@@ -1243,7 +1241,7 @@ describe("project embedding registry", () => {
             "/tmp/backfill",
         );
 
-        const first = await sweepAllRegisteredProjects(db, 5);
+        const first = await sweepAllRegisteredProjects(db);
         expect(first.chunksEmbedded).toBe(1);
         expect(
             loadCompartmentChunkEmbeddingsForSearch(
@@ -1254,7 +1252,7 @@ describe("project embedding registry", () => {
             ),
         ).toHaveLength(1);
 
-        const second = await sweepAllRegisteredProjects(db, 5);
+        const second = await sweepAllRegisteredProjects(db);
         expect(second.chunksEmbedded).toBe(0);
         expect(batchCalls).toBe(1);
     });
@@ -1483,14 +1481,14 @@ describe("project embedding registry", () => {
             "/tmp/off",
         );
 
-        const result = await sweepAllRegisteredProjects(db, 5);
+        const result = await sweepAllRegisteredProjects(db);
         expect(result.chunksEmbedded).toBe(0);
         expect(
             loadCompartmentChunkEmbeddingsForSearch(db, "ses-memory-off", "git:off", "chunk:model"),
         ).toHaveLength(0);
     });
 
-    it("re-embeds chunks but preserves memory vectors when max_input_tokens changes", async () => {
+    it("re-embeds chunks when max_input_tokens changes", async () => {
         _setTestProviderFactoryForProject(
             (config) =>
                 new FakeEmbeddingProvider(config.provider === "local" ? config.model : "off"),
@@ -1504,13 +1502,6 @@ describe("project embedding registry", () => {
             { memoryEnabled: true, gitCommitEnabled: false },
             "/tmp/window",
         );
-        const memory = insertMemory(db, {
-            projectPath: "git:window",
-            category: "CONSTRAINTS",
-            content: "Preserve provider-scoped memory vectors across chunk window changes.",
-        });
-        saveEmbedding(db, memory.id, new Float32Array([1, 2]), firstSnapshot.modelId);
-
         const first = await embedSessionCompartmentChunks(db, "git:window", "ses-window");
         expect(first.status).toBe("done");
         expect(
@@ -1530,7 +1521,6 @@ describe("project embedding registry", () => {
             "/tmp/window",
         );
 
-        expect(getStoredModelId(db, "git:window")).toBe(firstSnapshot.modelId);
         expect(
             loadCompartmentChunkEmbeddingsForSearch(
                 db,
@@ -1739,17 +1729,19 @@ describe("project embedding registry", () => {
             db,
             projectIdentity,
             localConfig("model-primary"),
-            { memoryEnabled: true, gitCommitEnabled: false },
+            { memoryEnabled: true, gitCommitEnabled: true },
             "/tmp/stop-drained",
         );
-        // Seed a few primary memories so the shadow backfill has work to do.
-        for (let i = 0; i < 3; i++) {
-            const memory = insertMemory(db, {
-                projectPath: projectIdentity,
-                category: "CONSTRAINTS",
-                content: `drained memory ${i}`,
-            });
-            saveEmbedding(db, memory.id, new Float32Array([i, 1]), currentModelId(projectIdentity));
+        // Seed a few primary commits so the shadow backfill has work to do.
+        const drainedCommits = [0, 1, 2].map((i) => makeGitCommit(`dr${i}x`, 1000 + i));
+        upsertCommits(db, projectIdentity, drainedCommits);
+        for (const commit of drainedCommits) {
+            saveCommitEmbedding(
+                db,
+                commit.sha,
+                new Float32Array([1, 1]),
+                currentModelId(projectIdentity),
+            );
         }
 
         registerProjectShadowEmbedding(
@@ -1764,7 +1756,7 @@ describe("project embedding registry", () => {
         );
         await flushShadowEmbeddingBacklog(projectIdentity);
 
-        expect(getShadowBackfillStopReason(projectIdentity, "memory")).toBe("drained");
+        expect(getShadowBackfillStopReason(projectIdentity, "commit")).toBe("drained");
     });
 
     it("getShadowBackfillStopReason returns stalled_no_progress when the provider cannot embed", async () => {
@@ -1784,16 +1776,18 @@ describe("project embedding registry", () => {
             db,
             projectIdentity,
             localConfig("model-primary"),
-            { memoryEnabled: true, gitCommitEnabled: false },
+            { memoryEnabled: true, gitCommitEnabled: true },
             "/tmp/stop-stalled",
         );
-        for (let i = 0; i < 3; i++) {
-            const memory = insertMemory(db, {
-                projectPath: projectIdentity,
-                category: "CONSTRAINTS",
-                content: `stalled memory ${i}`,
-            });
-            saveEmbedding(db, memory.id, new Float32Array([i, 1]), currentModelId(projectIdentity));
+        const stalledCommits = [0, 1, 2].map((i) => makeGitCommit(`st${i}x`, 1000 + i));
+        upsertCommits(db, projectIdentity, stalledCommits);
+        for (const commit of stalledCommits) {
+            saveCommitEmbedding(
+                db,
+                commit.sha,
+                new Float32Array([1, 1]),
+                currentModelId(projectIdentity),
+            );
         }
 
         registerProjectShadowEmbedding(
@@ -1808,7 +1802,7 @@ describe("project embedding registry", () => {
         );
         await flushShadowEmbeddingBacklog(projectIdentity);
 
-        expect(getShadowBackfillStopReason(projectIdentity, "memory")).toBe("stalled_no_progress");
+        expect(getShadowBackfillStopReason(projectIdentity, "commit")).toBe("stalled_no_progress");
     });
 
     it("re-arms a stalled shadow backfill when the same identity registers after recovery", async () => {
@@ -1829,16 +1823,18 @@ describe("project embedding registry", () => {
             db,
             projectIdentity,
             localConfig("model-primary"),
-            { memoryEnabled: true, gitCommitEnabled: false },
+            { memoryEnabled: true, gitCommitEnabled: true },
             "/tmp/shadow-rearm",
         );
-        for (let i = 0; i < 3; i++) {
-            const memory = insertMemory(db, {
-                projectPath: projectIdentity,
-                category: "CONSTRAINTS",
-                content: `recoverable shadow memory ${i}`,
-            });
-            saveEmbedding(db, memory.id, new Float32Array([i, 1]), currentModelId(projectIdentity));
+        const rearmCommits = [0, 1, 2].map((i) => makeGitCommit(`re${i}x`, 1000 + i));
+        upsertCommits(db, projectIdentity, rearmCommits);
+        for (const commit of rearmCommits) {
+            saveCommitEmbedding(
+                db,
+                commit.sha,
+                new Float32Array([1, 1]),
+                currentModelId(projectIdentity),
+            );
         }
         const shadowConfig = {
             provider: "synapse",
@@ -1852,7 +1848,7 @@ describe("project embedding registry", () => {
             "/tmp/shadow-rearm",
         );
         await flushShadowEmbeddingBacklog(projectIdentity);
-        expect(getShadowBackfillStopReason(projectIdentity, "memory")).toBe("stalled_no_progress");
+        expect(getShadowBackfillStopReason(projectIdentity, "commit")).toBe("stalled_no_progress");
 
         providerRecovered = true;
         const repeated = registerProjectShadowEmbedding(
@@ -1864,8 +1860,8 @@ describe("project embedding registry", () => {
         expect(repeated?.generation).toBe(first?.generation);
         await flushShadowEmbeddingBacklog(projectIdentity);
 
-        expect(getShadowBackfillStopReason(projectIdentity, "memory")).toBe("drained");
-        expect(loadAllEmbeddings(db, projectIdentity, repeated!.modelId).size).toBe(3);
+        expect(getShadowBackfillStopReason(projectIdentity, "commit")).toBe("drained");
+        expect(countEmbeddedCommits(db, projectIdentity, repeated!.modelId)).toBe(3);
     });
 
     it("drains every ID from a shadow queue item larger than one worker pass", async () => {
@@ -1892,26 +1888,21 @@ describe("project embedding registry", () => {
             "/tmp/shadow-large-queue-item",
         );
         if (!shadow) throw new Error("failed to register shadow provider");
-        const ids = Array.from({ length: 70 }, (_, index) =>
-            String(
-                insertMemory(db, {
-                    projectPath: projectIdentity,
-                    category: "CONSTRAINTS",
-                    content: `queued shadow memory ${index}`,
-                }).id,
-            ),
+        const queuedCommits = Array.from({ length: 70 }, (_, index) =>
+            makeGitCommit(`q${index}x`, 1000 + index),
         );
+        upsertCommits(db, projectIdentity, queuedCommits);
+        const ids = queuedCommits.map((commit) => commit.sha);
 
         let passes = 0;
-        enqueueShadowEmbeddingItems(projectIdentity, "memory", ids);
+        enqueueShadowEmbeddingItems(projectIdentity, "commit", ids);
         await flushShadowEmbeddingBacklog(projectIdentity, () => {
             passes += 1;
         });
 
         expect(batchSizes).toEqual([64, 6]);
         expect(passes).toBeGreaterThanOrEqual(2);
-        const embeddings = loadAllEmbeddings(db, projectIdentity, shadow.modelId);
-        expect([...embeddings.keys()].sort((a, b) => a - b)).toEqual(ids.map(Number));
+        expect(countEmbeddedCommits(db, projectIdentity, shadow.modelId)).toBe(70);
     });
 
     it("windows shadow chunks against the shadow provider's advertised token window", async () => {
@@ -2031,278 +2022,6 @@ describe("detailed synapse writers apply complete receipt groups atomically", ()
             "/tmp/registry-detailed",
         );
     }
-
-    it("memory drain writes every item in the group and completes all receipts together", async () => {
-        const db = useTempDb();
-        const projectIdentity = "git:detailed-memory";
-        const host = new DetailedSynapseTestHost();
-        insertMemory(db, { projectPath: projectIdentity, category: "CONSTRAINTS", content: "m1" });
-        insertMemory(db, { projectPath: projectIdentity, category: "CONSTRAINTS", content: "m2" });
-        registerDetailed(db, projectIdentity, host);
-
-        const embedded = await embedUnembeddedMemoriesForProject(db, projectIdentity, 10);
-
-        expect(embedded).toBe(2);
-        expect(loadAllEmbeddings(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY).size).toBe(2);
-        const rows = ledgerRows(db);
-        expect(rows.length).toBeGreaterThan(0);
-        expect(rows.every((row) => row.state === "complete")).toBe(true);
-        expect(new Set(rows.map((row) => row.application_group)).size).toBe(1);
-    });
-
-    it("an eligible row behind a page-sized policy-hidden prefix still embeds", async () => {
-        const db = useTempDb();
-        const projectIdentity = "git:detailed-hidden-prefix";
-        const host = new DetailedSynapseTestHost();
-        const { getCurrentMemoryClaimByLegacyMemoryId, runInMemoryClaimsWriteTransaction } =
-            await import("./memory/storage-memory-claims");
-        const {
-            recordDispositionEventInCurrentTransaction,
-            refreshEffectivePolicyInCurrentTransaction,
-        } = await import("./memory/storage-claim-policy");
-        // One full id-ordered page (max(4 * batchSize, 64) = 64) of
-        // quarantined rows precedes the only eligible one: the backlog walk
-        // must page past the hidden prefix instead of reading the empty
-        // first page as completion, whatever the prefix length.
-        for (let index = 0; index < 64; index += 1) {
-            const hidden = insertMemory(db, {
-                projectPath: projectIdentity,
-                category: "CONSTRAINTS",
-                content: `hidden prefix row ${index}`,
-            });
-            const claim = getCurrentMemoryClaimByLegacyMemoryId(db, hidden.id);
-            if (!claim) throw new Error("expected claim link");
-            runInMemoryClaimsWriteTransaction(db, () => {
-                recordDispositionEventInCurrentTransaction(db, {
-                    revisionId: claim.revisionId,
-                    projectId: claim.projectId,
-                    disposition: "quarantined",
-                    action: "assert",
-                    actor: "host",
-                });
-                refreshEffectivePolicyInCurrentTransaction(db, claim.revisionId);
-                return undefined;
-            });
-        }
-        insertMemory(db, {
-            projectPath: projectIdentity,
-            category: "CONSTRAINTS",
-            content: "eligible row behind the prefix",
-        });
-        registerDetailed(db, projectIdentity, host);
-
-        const embedded = await embedUnembeddedMemoriesForProject(db, projectIdentity, 1);
-
-        expect(embedded).toBe(1);
-        expect(loadAllEmbeddings(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY).size).toBe(1);
-    });
-
-    it("a rolled-back receipt group returns no vectors to the read path", async () => {
-        const db = useTempDb();
-        const projectIdentity = "git:detailed-memory-rollback";
-        const host = new DetailedSynapseTestHost();
-        insertMemory(db, {
-            projectPath: projectIdentity,
-            category: "CONSTRAINTS",
-            content: "rolled back memory",
-        });
-        registerDetailed(db, projectIdentity, host);
-        // Throw at the receipt-complete CAS: the destination write already ran
-        // inside the same transaction, so SQLite rolls it back with the ledger.
-        const crashed = crashingDatabase(db, {
-            matcher:
-                /UPDATE synapse_batch_ledger\s+SET state = \?, failure_disposition = \?, state_version = state_version \+ 1, updated_at = \?\s+WHERE id = \? AND state_version = \? AND state IN \(\?\)\s*$/,
-            times: 1,
-        });
-
-        const written = await embedMemoriesDetailedForProject(crashed, projectIdentity, [
-            { id: 1, content: "rolled back memory" },
-        ]);
-
-        expect(written?.size).toBe(0);
-        expect(loadAllEmbeddings(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY).size).toBe(0);
-        const rows = ledgerRows(db);
-        expect(rows.length).toBeGreaterThan(0);
-        expect(rows.every((row) => row.state !== "complete")).toBe(true);
-    });
-
-    it("one drifted memory in the group writes nothing and retires the receipt", async () => {
-        const db = useTempDb();
-        const projectIdentity = "git:detailed-memory-drift";
-        const host = new DetailedSynapseTestHost();
-        const first = insertMemory(db, {
-            projectPath: projectIdentity,
-            category: "CONSTRAINTS",
-            content: "stable memory",
-        });
-        insertMemory(db, {
-            projectPath: projectIdentity,
-            category: "CONSTRAINTS",
-            content: "another memory",
-        });
-        registerDetailed(db, projectIdentity, host);
-        host.resultPages = (_jobId, items) => {
-            withClaimsWriteCapabilityInCurrentTransaction(db, () =>
-                db
-                    .prepare("UPDATE memories SET content = ? WHERE id = ?")
-                    .run("edited mid-flight", first.id),
-            );
-            return {
-                result: {
-                    ...host.envelope(),
-                    done: true,
-                    vectors: items.map((item) => ({
-                        id: item.id,
-                        content_sha256: item.content_sha256,
-                        vector: [1, 2, 3],
-                    })),
-                },
-            };
-        };
-
-        const embedded = await embedUnembeddedMemoriesForProject(db, projectIdentity, 10);
-
-        expect(embedded).toBe(0);
-        expect(loadAllEmbeddings(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY).size).toBe(0);
-        const rows = ledgerRows(db);
-        expect(rows.some((row) => row.state === "obsolete")).toBe(true);
-        expect(rows.every((row) => row.state !== "complete")).toBe(true);
-    });
-
-    it("a registration change between inference and apply writes no vectors and leaves receipts recoverable", async () => {
-        const db = useTempDb();
-        const projectIdentity = "git:detailed-memory-generation";
-        const host = new DetailedSynapseTestHost();
-        insertMemory(db, {
-            projectPath: projectIdentity,
-            category: "CONSTRAINTS",
-            content: "generation guard memory",
-        });
-        registerDetailed(db, projectIdentity, host);
-        host.resultPages = (_jobId, items) => {
-            registerProjectEmbedding(
-                db,
-                projectIdentity,
-                localConfig("model-b"),
-                { memoryEnabled: true, gitCommitEnabled: false },
-                "/tmp/registry-detailed",
-            );
-            return {
-                result: {
-                    ...host.envelope(),
-                    done: true,
-                    vectors: items.map((item) => ({
-                        id: item.id,
-                        content_sha256: item.content_sha256,
-                        vector: [1, 2, 3],
-                    })),
-                },
-            };
-        };
-
-        const embedded = await embedUnembeddedMemoriesForProject(db, projectIdentity, 10);
-
-        expect(embedded).toBe(0);
-        expect(loadAllEmbeddings(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY).size).toBe(0);
-        const rows = ledgerRows(db);
-        expect(rows.length).toBeGreaterThan(0);
-        expect(rows.every((row) => row.state === "ready")).toBe(true);
-    });
-
-    it("retries a whole conflicted group when only one of its pages lost its destination", async () => {
-        const db = useTempDb();
-        const projectIdentity = "git:detailed-memory-group-reopen";
-        const host = new DetailedSynapseTestHost();
-        // The test provider pages two items at a time, so four memories in one
-        // application group span two pages.
-        const memories = ["g1", "g2", "g3", "g4"].map((content) => {
-            const memory = insertMemory(db, {
-                projectPath: projectIdentity,
-                category: "CONSTRAINTS",
-                content,
-            });
-            return { id: memory.id, content: memory.content };
-        });
-        registerDetailed(db, projectIdentity, host);
-
-        const first = await embedMemoriesDetailedForProject(db, projectIdentity, memories);
-        expect(first?.size).toBe(4);
-        const pageRowIds = (
-            db.prepare("SELECT id FROM synapse_batch_ledger ORDER BY id").all() as Array<{
-                id: number;
-            }>
-        ).map((row) => row.id);
-        expect(pageRowIds.length).toBe(2);
-        expect(ledgerRows(db).every((row) => row.state === "complete")).toBe(true);
-
-        // Drop the destination rows of the FIRST page only: that page is
-        // provably unapplied while its sibling stays complete and current.
-        const lostPage = getSynapseLedgerPage(db, pageRowIds[0]);
-        if (!lostPage) throw new Error("expected the first page's ledger row");
-        const lostIds = lostPage.manifest.map((item) => Number(item.id.slice("memory:".length)));
-        expect(lostIds.length).toBe(2);
-        for (const memoryId of lostIds) {
-            db.prepare("DELETE FROM memory_embeddings WHERE memory_id = ? AND model_id = ?").run(
-                memoryId,
-                SYNAPSE_TEST_LANE_IDENTITY,
-            );
-        }
-        expect(loadAllEmbeddings(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY).size).toBe(2);
-
-        const second = await embedMemoriesDetailedForProject(db, projectIdentity, memories);
-
-        // Both pages reopened against the one proof, so the retry covers the
-        // whole group and the group applies.
-        expect([...(second?.keys() ?? [])].sort((a, b) => a - b)).toEqual(
-            memories.map((memory) => memory.id),
-        );
-        expect(loadAllEmbeddings(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY).size).toBe(4);
-        const rows = ledgerRows(db);
-        expect(rows.length).toBe(2);
-        expect(rows.every((row) => row.state === "complete")).toBe(true);
-        expect(new Set(rows.map((row) => row.application_group)).size).toBe(1);
-    });
-
-    it("reopens a conflicted page on the provider's configured batch timeout", async () => {
-        const db = useTempDb();
-        const projectIdentity = "git:detailed-memory-reopen-deadline";
-        const host = new DetailedSynapseTestHost();
-        // detailedSynapseTestProvider configures batchTimeoutMs, so the lane's
-        // page deadlines sit far below the provider's own default.
-        const configuredTimeoutMs = 5_000;
-        const memories = ["d1", "d2"].map((content) => {
-            const memory = insertMemory(db, {
-                projectPath: projectIdentity,
-                category: "CONSTRAINTS",
-                content,
-            });
-            return { id: memory.id, content: memory.content };
-        });
-        registerDetailed(db, projectIdentity, host);
-
-        const first = await embedMemoriesDetailedForProject(db, projectIdentity, memories);
-        expect(first?.size).toBe(2);
-        db.prepare("DELETE FROM memory_embeddings WHERE model_id = ?").run(
-            SYNAPSE_TEST_LANE_IDENTITY,
-        );
-
-        const before = Date.now();
-        const second = await embedMemoriesDetailedForProject(db, projectIdentity, memories);
-        const after = Date.now();
-
-        expect(second?.size).toBe(2);
-        const deadlines = (
-            db.prepare("SELECT deadline_at FROM synapse_batch_ledger ORDER BY id").all() as Array<{
-                deadline_at: number | null;
-            }>
-        ).map((row) => row.deadline_at);
-        expect(deadlines.length).toBe(1);
-        for (const deadline of deadlines) {
-            expect(deadline).not.toBeNull();
-            expect(deadline as number).toBeGreaterThanOrEqual(before + configuredTimeoutMs);
-            expect(deadline as number).toBeLessThanOrEqual(after + configuredTimeoutMs);
-        }
-    });
 
     it("does not publish chunk receipts after the compartment source changes", async () => {
         const db = useTempDb();

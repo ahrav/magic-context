@@ -1,12 +1,14 @@
 /// <reference types="bun-types" />
 
 import { beforeEach, describe, expect, it, mock } from "bun:test";
-import { Database } from "../../shared/sqlite";
+import { seedProjectMemoryClaim } from "../../features/magic-context/test-claim-database";
+import { createDirectTestDatabase } from "../../features/magic-context/test-database";
+import type { Database } from "../../shared/sqlite";
 import { createMagicContextCommandHandler } from "./command-handler";
 import { MAX_WRAPUP_REQUEST_BUDGET_MS } from "./module-transport";
 
 function createTestDb(): Database {
-    const db = new Database(":memory:");
+    const db = createDirectTestDatabase().db;
     db.exec(`
     CREATE TABLE IF NOT EXISTS tags (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -89,7 +91,6 @@ function createTestDb(): Database {
       cached_m0_project_memory_epoch INTEGER,
       cached_m0_project_user_profile_version INTEGER,
       cached_m0_max_compartment_seq INTEGER,
-      cached_m0_max_memory_id INTEGER,
       cached_m0_max_mutation_id INTEGER,
       cached_m0_project_docs_hash TEXT,
       cached_m0_materialized_at INTEGER,
@@ -167,7 +168,6 @@ function seedCachedM0(db: Database, sessionId: string): void {
             cached_m0_project_memory_epoch = 7,
             cached_m0_project_user_profile_version = 3,
             cached_m0_max_compartment_seq = 42,
-            cached_m0_max_memory_id = 99,
             cached_m0_max_mutation_id = 12,
             cached_m0_project_docs_hash = 'docs-hash',
             cached_m0_materialized_at = 123456,
@@ -185,7 +185,6 @@ function getCachedM0Row(db: Database, sessionId: string) {
                 cached_m0_project_memory_epoch AS projectMemoryEpoch,
                 cached_m0_project_user_profile_version AS userProfileVersion,
                 cached_m0_max_compartment_seq AS maxCompartmentSeq,
-                cached_m0_max_memory_id AS maxMemoryId,
                 cached_m0_max_mutation_id AS maxMutationId,
                 cached_m0_project_docs_hash AS projectDocsHash,
                 cached_m0_materialized_at AS materializedAt,
@@ -199,7 +198,6 @@ function getCachedM0Row(db: Database, sessionId: string) {
               projectMemoryEpoch: number | null;
               userProfileVersion: number | null;
               maxCompartmentSeq: number | null;
-              maxMemoryId: number | null;
               maxMutationId: number | null;
               projectDocsHash: string | null;
               materializedAt: number | null;
@@ -1515,44 +1513,19 @@ describe("ctx-approve and ctx-enforce", () => {
         );
     });
 
-    it("runs the shared two-step approval workflow against a migrated database", async () => {
-        const { initializeDatabase } = await import("../../features/magic-context/storage-db");
-        const { runMigrations } = await import("../../features/magic-context/migrations");
-        const { runInMemoryClaimsWriteTransaction, createMemoryWithClaimsInCurrentTransaction } =
-            await import("../../features/magic-context/memory/storage-memory-claims");
-        const { sha256Utf8Hex } = await import(
-            "../../features/magic-context/memory/storage-claims"
-        );
+    it("runs the shared two-step approval workflow against a direct database", async () => {
         const { clearClaimCommandConfirmationsForTests } = await import(
             "../../features/magic-context/memory/claim-policy-commands"
         );
         clearClaimCommandConfirmationsForTests();
-        const db = new Database(":memory:");
-        db.exec("PRAGMA foreign_keys=ON");
-        initializeDatabase(db);
-        runMigrations(db);
+        const db = createDirectTestDatabase().db;
         const projectPath = "git:approve-handler";
-        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
-            createMemoryWithClaimsInCurrentTransaction(
-                db,
-                {
-                    producer: "handler-test",
-                    operationKey: "seed-1",
-                    requestDigest: sha256Utf8Hex("seed-1"),
-                },
-                {
-                    projectPath,
-                    category: "CONSTRAINTS",
-                    content: "handler approval target",
-                    normalizedHash: "hash:handler approval target",
-                    importance: 60,
-                    sourceSessionId: "ses-handler",
-                    sourceType: "agent",
-                    nowMs: 1_000,
-                },
-            ),
-        );
-        const memoryId = outcome.result.memoryId;
+        const publicClaimId = seedProjectMemoryClaim(db, {
+            projectIdentity: projectPath,
+            category: "CONSTRAINTS",
+            content: "handler approval target",
+            importance: 60,
+        }).publicClaimId;
         const sendNotification = mock(async () => {});
         const handler = createMagicContextCommandHandler({
             db,
@@ -1567,7 +1540,7 @@ describe("ctx-approve and ctx-enforce", () => {
                     {
                         command: "ctx-approve",
                         sessionID: "ses-handler",
-                        arguments: String(memoryId),
+                        arguments: publicClaimId,
                     },
                     makeOutput(""),
                     {},

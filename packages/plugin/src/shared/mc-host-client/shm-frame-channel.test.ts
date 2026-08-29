@@ -63,7 +63,7 @@ async function generationHarness(): Promise<{
     const generation = new ConnectionGeneration({
         host: "127.0.0.1",
         port: 1,
-        credentials: { key: new Uint8Array(32), daemonId: new Uint8Array(16) },
+        credentials: { key: new Uint8Array(32), daemonId: new Uint8Array(16), daemonVer: "test" },
         channelFactory: ({ budget, handlers }) => {
             channel = new ShmFrameChannel({
                 nativeChannel: pair.first,

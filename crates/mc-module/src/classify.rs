@@ -24,6 +24,21 @@ pub const CLASSIFY_TEMPERATURE: f64 = 0.1;
 pub const CLASSIFY_MAX_OUTPUT_TOKENS: u32 = 32_000;
 pub const CLASSIFY_AWAIT_TIMEOUT: Duration = Duration::from_secs(600);
 pub const CLASSIFY_RECOVERY_TIMEOUT: Duration = Duration::from_secs(60);
+/// Work `handle_dreamer_run_task` still has to do AFTER the payload deadline
+/// expires, and therefore the margin a caller must leave between its own
+/// transport budget and the `timeout_ms` it sends.
+///
+/// The deadline bounds the start, await, and re-drain windows, so the last of
+/// them returns at the deadline. What follows is bounded but not free:
+/// `HistorianProducer::purge_session` wraps its whole `session.delete` plus
+/// `close` in `request_timeout` (30s), the host then reaps the Broca
+/// subprocess group under `SubprocessLimits::termination_grace` (5s between
+/// SIGTERM and SIGKILL), and the ledger write plus response dispatch need
+/// slack on top. A caller whose transport budget equals `timeout_ms` cancels
+/// inside that window: the handler task is dropped between the producer run
+/// and the purge, so nothing is recorded, no fallback can complete, and the
+/// attempt's billable run stays alive holding the memory-pool prompt.
+pub const CLASSIFY_CLEANUP_RESERVE: Duration = Duration::from_secs(40);
 
 /// This is deliberately a zero-tool system role. The host supplies the pool and
 /// retains the parser because accepting a caller-selected role would reopen the
@@ -53,8 +68,8 @@ Keep `shareable="false"` only for what is tied to the USER or their machine rath
 
 Output ONE XML manifest at the very end and NOTHING else — no narration, no per-memory commentary, no reasoning:
 <classify>
-<memory id="N" importance="75" scope="project" shareable="true"/>
-<memory id="M" importance="20" scope="universe" shareable="false"/>
+<memory claim="mcm_..." importance="75" scope="project" shareable="true"/>
+<memory claim="mcm_..." importance="20" scope="universe" shareable="false"/>
 </classify>
 
 Rules:
@@ -70,9 +85,14 @@ fn memory_entry_pattern() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"<memory\b([^>]*)/?>").expect("memory entry pattern"))
 }
 
-fn id_attr_pattern() -> &'static Regex {
+/// Deliberately as permissive as `parseClassifyManifest`'s own
+/// `\bclaim\s*=\s*"([^"]+)"`: the well-formedness check below, not this
+/// pattern, is what separates a claim identity from arbitrary text. A
+/// narrower pattern would silently reclassify a malformed identity as "no
+/// claim attribute" and lose that diagnostic.
+fn claim_attr_pattern() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r#"\bid\s*=\s*"(\d+)""#).expect("id attribute pattern"))
+    RE.get_or_init(|| Regex::new(r#"\bclaim\s*=\s*"([^"]+)""#).expect("claim attribute pattern"))
 }
 
 fn importance_attr_pattern() -> &'static Regex {
@@ -121,7 +141,7 @@ fn classify_body(text: &str) -> Option<&str> {
 }
 
 /// Whether one attempt's output is an acceptable classify manifest for
-/// `expected` — the memory IDs this attempt actually asked about.
+/// `expected` — the public claim IDs this attempt actually asked about.
 ///
 /// This is the accept predicate for a chain attempt, so it has to live here
 /// rather than only in the TypeScript caller: the module decides whether to
@@ -133,19 +153,29 @@ fn classify_body(text: &str) -> Option<&str> {
 ///
 /// The rules mirror `parseClassifyManifest`/`validateClassifyManifest` in
 /// `classify-prompt.ts`, which stays the authority for INTERPRETING and
-/// applying values; both sides are pinned by tests. Diagnostics name IDs and
-/// counts the caller already supplied — never manifest text.
-pub fn validate_classify_manifest(text: &str, expected: &BTreeSet<i64>) -> Result<(), String> {
+/// applying values; both sides are pinned by tests. Identity is the claim's
+/// opaque public ID — the same `claim="mcm_..."` attribute
+/// `CLASSIFY_SYSTEM_PROMPT` demands.
+///
+/// Diagnostics name counts the caller supplied, and claim IDs only after
+/// `is_valid_public_claim_id` proves them to be `mcm_` plus 32 lowercase hex
+/// — a fixed-shape opaque token that cannot carry pool text. That check runs
+/// before any other per-entry rule so no diagnostic can echo a
+/// model-controlled string.
+pub fn validate_classify_manifest(text: &str, expected: &BTreeSet<String>) -> Result<(), String> {
     let body = classify_body(text).ok_or("no complete classify envelope")?;
-    let mut seen: BTreeSet<i64> = BTreeSet::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut entries = 0usize;
     for captures in memory_entry_pattern().captures_iter(body) {
         entries += 1;
         let attrs = captures.get(1).map_or("", |group| group.as_str());
-        let id: i64 = id_attr_pattern()
+        let claim = claim_attr_pattern()
             .captures(attrs)
-            .and_then(|caps| caps[1].parse().ok())
-            .ok_or("manifest entry is missing a numeric id")?;
+            .map(|caps| caps[1].to_owned())
+            .ok_or("manifest entry is missing a claim id")?;
+        if !mc_core::claim_operation::is_valid_public_claim_id(&claim) {
+            return Err("manifest entry carries a malformed claim id".to_owned());
+        }
         let importance = importance_attr_pattern()
             .captures(attrs)
             .and_then(|caps| caps[1].parse::<u32>().ok());
@@ -155,16 +185,16 @@ pub fn validate_classify_manifest(text: &str, expected: &BTreeSet<i64>) -> Resul
         let shareable = shareable_attr_pattern().is_match(attrs);
         if let Some(scope) = &scope {
             if !CLASSIFY_SCOPES.contains(&scope.as_str()) {
-                return Err(format!("manifest entry {id} carries an unknown scope"));
+                return Err(format!("manifest entry {claim} carries an unknown scope"));
             }
         }
         if importance.is_none() && scope.is_none() && !shareable {
             return Err(format!(
-                "manifest entry {id} carries no classification fields"
+                "manifest entry {claim} carries no classification fields"
             ));
         }
-        if !seen.insert(id) {
-            return Err(format!("manifest repeats entry {id}"));
+        if !seen.insert(claim.clone()) {
+            return Err(format!("manifest repeats entry {claim}"));
         }
     }
     // Content that parsed to nothing is an unrecognized shape, not an empty
@@ -174,12 +204,32 @@ pub fn validate_classify_manifest(text: &str, expected: &BTreeSet<i64>) -> Resul
     }
     if &seen != expected {
         return Err(format!(
-            "manifest covers {} of the {} requested memories",
+            "manifest covers {} of the {} requested claims",
             seen.intersection(expected).count(),
             expected.len()
         ));
     }
     Ok(())
+}
+
+/// Cheap producer-chain guard for completions that succeeded at the transport
+/// layer but did not return even a classify manifest envelope. The TypeScript
+/// host remains responsible for XML parsing, membership checks, and field validation.
+pub fn has_manifest_envelope(text: &str) -> bool {
+    let text = text.trim();
+    text.contains("<classify>") && text.contains("</classify>")
+}
+
+/// Mint an opaque child id without exposing the command id or project path in
+/// provider/session diagnostics. The registry, rather than this prefix, is the
+/// transform exemption authority.
+pub fn child_session_id(project: &str, command_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(project.as_bytes());
+    hasher.update([0]);
+    hasher.update(command_id.as_bytes());
+    let digest = hasher.finalize();
+    format!("mc-dreamer:classify:{}", hex_prefix(&digest, 16))
 }
 
 /// Derives the deterministic Broca child session for one classify attempt.
@@ -225,22 +275,50 @@ fn hex_prefix(bytes: &[u8], count: usize) -> String {
 mod tests {
     use super::*;
 
+    /// A well-formed public claim ID, distinct per `seed`.
+    fn claim(seed: u8) -> String {
+        format!("mcm_{}", format!("{seed:02x}").repeat(16))
+    }
+
+    #[test]
+    fn manifest_envelope_rejects_provider_outage_text() {
+        assert!(!has_manifest_envelope("All Antigravity endpoints failed"));
+        assert!(has_manifest_envelope(
+            "<classify><memory claim=\"mcm_test\"/></classify>"
+        ));
+    }
+
+    #[test]
+    fn child_ids_are_stable_but_lineage_scoped() {
+        assert_eq!(
+            child_session_id("project", "command"),
+            child_session_id("project", "command")
+        );
+        assert_ne!(
+            child_session_id("project", "command"),
+            child_session_id("other", "command")
+        );
+        assert!(child_session_id("project", "command").starts_with("mc-dreamer:classify:"));
+    }
+
     /// The envelope syntax must match what the caller's parser accepts, or
     /// this gate would advance the chain over output the authority parses.
     #[test]
     fn manifest_root_matching_mirrors_the_caller_parser() {
-        let expected: BTreeSet<i64> = [1].into_iter().collect();
+        let one = claim(1);
+        let expected: BTreeSet<String> = [one.clone()].into_iter().collect();
+        let entry = format!("<memory claim=\"{one}\" scope=\"project\"/>");
         for text in [
-            "<classify><memory id=\"1\" scope=\"project\"/></classify>",
+            format!("<classify>{entry}</classify>"),
             // Case-insensitive root, as `extractCompleteManifestBody` is.
-            "<Classify><memory id=\"1\" scope=\"project\"/></Classify>",
+            format!("<Classify>{entry}</Classify>"),
             // Attributes on the root are tolerated there too.
-            "<classify version=\"1\"><memory id=\"1\" scope=\"project\"/></classify>",
+            format!("<classify version=\"1\">{entry}</classify>"),
             // Surrounding prose is ignored: the root is located, not anchored.
-            "here you go:\n<classify><memory id=\"1\" scope=\"project\"/></classify>\ndone",
+            format!("here you go:\n<classify>{entry}</classify>\ndone"),
         ] {
             assert_eq!(
-                validate_classify_manifest(text, &expected),
+                validate_classify_manifest(&text, &expected),
                 Ok(()),
                 "must accept {text:?}"
             );
@@ -251,10 +329,13 @@ mod tests {
 
     #[test]
     fn manifest_validation_accepts_exact_coverage_and_rejects_every_invalid_shape() {
-        let expected: BTreeSet<i64> = [1, 2].into_iter().collect();
-        let ok = "<classify><memory id=\"1\" importance=\"80\" scope=\"project\"/>\
-                  <memory id=\"2\" shareable=\"false\"/></classify>";
-        assert_eq!(validate_classify_manifest(ok, &expected), Ok(()));
+        let (one, two, three) = (claim(1), claim(2), claim(3));
+        let expected: BTreeSet<String> = [one.clone(), two.clone()].into_iter().collect();
+        let ok = format!(
+            "<classify><memory claim=\"{one}\" importance=\"80\" scope=\"project\"/>\
+             <memory claim=\"{two}\" shareable=\"false\"/></classify>"
+        );
+        assert_eq!(validate_classify_manifest(&ok, &expected), Ok(()));
 
         // An empty request is satisfied only by an empty manifest.
         assert_eq!(
@@ -266,44 +347,82 @@ mod tests {
         // command's durable response, so the caller's later validation threw
         // with no fallback model left to try.
         for (label, text) in [
-            ("no envelope", "All Antigravity endpoints failed"),
+            ("no envelope", "All Antigravity endpoints failed".to_owned()),
             (
                 "unterminated envelope",
-                "<classify><memory id=\"1\" scope=\"project\"/>",
+                format!("<classify><memory claim=\"{one}\" scope=\"project\"/>"),
             ),
             (
                 "missing memory",
-                "<classify><memory id=\"1\" scope=\"project\"/></classify>",
+                format!("<classify><memory claim=\"{one}\" scope=\"project\"/></classify>"),
             ),
             (
                 "extra memory",
-                "<classify><memory id=\"1\" scope=\"project\"/><memory id=\"2\" scope=\"project\"/>\
-                 <memory id=\"3\" scope=\"project\"/></classify>",
+                format!(
+                    "<classify><memory claim=\"{one}\" scope=\"project\"/>\
+                     <memory claim=\"{two}\" scope=\"project\"/>\
+                     <memory claim=\"{three}\" scope=\"project\"/></classify>"
+                ),
             ),
             (
-                "duplicate id",
-                "<classify><memory id=\"1\" scope=\"project\"/><memory id=\"1\" scope=\"project\"/>\
-                 <memory id=\"2\" scope=\"project\"/></classify>",
+                "duplicate claim",
+                format!(
+                    "<classify><memory claim=\"{one}\" scope=\"project\"/>\
+                     <memory claim=\"{one}\" scope=\"project\"/>\
+                     <memory claim=\"{two}\" scope=\"project\"/></classify>"
+                ),
             ),
             (
-                "non-numeric id",
-                "<classify><memory id=\"one\" scope=\"project\"/><memory id=\"2\" scope=\"project\"/></classify>",
+                "missing claim attribute",
+                format!(
+                    "<classify><memory scope=\"project\"/>\
+                     <memory claim=\"{two}\" scope=\"project\"/></classify>"
+                ),
+            ),
+            (
+                // The retired integer identity is no longer an identity at all.
+                "numeric id instead of a claim",
+                format!(
+                    "<classify><memory id=\"1\" scope=\"project\"/>\
+                     <memory claim=\"{two}\" scope=\"project\"/></classify>"
+                ),
+            ),
+            (
+                "malformed claim id",
+                format!(
+                    "<classify><memory claim=\"mcm_short\" scope=\"project\"/>\
+                     <memory claim=\"{two}\" scope=\"project\"/></classify>"
+                ),
+            ),
+            (
+                "unprefixed claim id",
+                format!(
+                    "<classify><memory claim=\"{}\" scope=\"project\"/>\
+                     <memory claim=\"{two}\" scope=\"project\"/></classify>",
+                    &one[4..]
+                ),
             ),
             (
                 "unknown scope",
-                "<classify><memory id=\"1\" scope=\"galaxy\"/><memory id=\"2\" scope=\"project\"/></classify>",
+                format!(
+                    "<classify><memory claim=\"{one}\" scope=\"galaxy\"/>\
+                     <memory claim=\"{two}\" scope=\"project\"/></classify>"
+                ),
             ),
             (
                 "no classification fields",
-                "<classify><memory id=\"1\"/><memory id=\"2\" scope=\"project\"/></classify>",
+                format!(
+                    "<classify><memory claim=\"{one}\"/>\
+                     <memory claim=\"{two}\" scope=\"project\"/></classify>"
+                ),
             ),
             (
                 "unrecognized body",
-                "<classify>I classified them all, trust me.</classify>",
+                "<classify>I classified them all, trust me.</classify>".to_owned(),
             ),
         ] {
             assert!(
-                validate_classify_manifest(text, &expected).is_err(),
+                validate_classify_manifest(&text, &expected).is_err(),
                 "{label} must not be accepted as a successful attempt"
             );
         }
@@ -311,11 +430,22 @@ mod tests {
 
     #[test]
     fn manifest_validation_diagnostics_never_quote_the_manifest() {
-        let expected: BTreeSet<i64> = [7].into_iter().collect();
+        let expected: BTreeSet<String> = [claim(7)].into_iter().collect();
         let secret = "POOL-SECRET-SENTINEL";
-        let text = format!("<classify>{secret}</classify>");
-        let detail = validate_classify_manifest(&text, &expected).expect_err("rejected");
-        assert!(!detail.contains(secret), "manifest text leaked: {detail}");
+        for text in [
+            format!("<classify>{secret}</classify>"),
+            // A claim attribute is model-controlled text until
+            // `is_valid_public_claim_id` bounds its shape, so the
+            // well-formedness rejection must not echo it either.
+            format!("<classify><memory claim=\"{secret}\" importance=\"80\"/></classify>"),
+            format!(
+                "<classify><memory claim=\"{secret}\" scope=\"galaxy\"/>\
+                 <memory claim=\"{secret}\"/></classify>"
+            ),
+        ] {
+            let detail = validate_classify_manifest(&text, &expected).expect_err("rejected");
+            assert!(!detail.contains(secret), "manifest text leaked: {detail}");
+        }
     }
 
     #[test]

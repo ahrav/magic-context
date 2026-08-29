@@ -641,11 +641,11 @@ Required fields:
 - `correction_source` — enum: `user | test_result | tool_result | self_review`
 - `correction_signal` — quote or tight paraphrase of the trigger
 - `after_strategy` — new direction
+- `reason_for_change` — WHY the old strategy was wrong, in your own words. Not a quote, and not proof that the pivot happened: state the property that made the prior approach unsafe or unworkable ("Redis would add a network dependency this deployment cannot assume"), not the change itself ("the implementation now uses SQLite").
 - `evidence` — short quote or paraphrase from the raw chunk
 - `at_compartment` — index of the compartment
 
 Optional:
-- `reason_for_change` — when the correction language is implicit
 - `ord_span` — start-end ordinal range if narrower than the compartment
 
 ### Extraction gates summary
@@ -704,6 +704,8 @@ If no candidates, omit the `<primer_candidates>` section entirely.
 
 Output valid XML only in this shape:
 
+Closing tags must match their opening tier tag (e.g. `<p1>...</p1>`, never `<p1>...</p2>`).
+
 ```xml
 <output>
 <compartments>
@@ -753,6 +755,7 @@ Output valid XML only in this shape:
 <correction_source>...</correction_source>
 <correction_signal>...</correction_signal>
 <after_strategy>...</after_strategy>
+<reason_for_change>...</reason_for_change>
 <evidence>...</evidence>
 </trajectory_correction>
 </events>

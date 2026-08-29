@@ -1,18 +1,15 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
-import { insertMemory } from "@magic-context/core/features/magic-context/memory";
-import { sha256Utf8Hex } from "@magic-context/core/features/magic-context/memory/storage-claims";
 import {
-	runInMemoryClaimsWriteTransaction,
-	updateMemoryContentWithClaimsInCurrentTransaction,
-	updateMemoryVerificationWithClaimsInCurrentTransaction,
-} from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
+	createAntiMemory,
+	readAntiMemory,
+} from "@magic-context/core/features/magic-context/memory/storage-anti-memory";
+import { ensureProject } from "@magic-context/core/features/magic-context/memory/storage-claims";
 import type { UnifiedSearchResult } from "@magic-context/core/features/magic-context/search";
 import * as searchModule from "@magic-context/core/features/magic-context/search";
 import {
 	appendAutoSearchHintDecision,
 	getAutoSearchHintDecisions,
 } from "@magic-context/core/features/magic-context/storage";
-import type { Database as DatabaseType } from "@magic-context/core/shared/sqlite";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import {
 	clearAutoSearchForPiSession,
@@ -40,43 +37,11 @@ function memoryResult(
 		source: "memory",
 		content,
 		score,
-		memoryId,
+		publicClaimId: `mcm_${memoryId}`,
+		revisionLocator: `mcm_${memoryId}/r1/${"0".repeat(64)}`,
 		category: "WORKFLOW_RULES",
-		matchType: "fts",
+		matchType: "exact",
 		...(contentDigest === undefined ? {} : { contentDigest }),
-	};
-}
-
-/** A real claim-backed memory plus the search result the lane would emit for
- * it: fresh hints pass the same eligibility gate as replays, so mocked
- * results need a policy-eligible id and the digest of the loaded bytes. */
-function seedEligibleMemory(
-	db: DatabaseType,
-	content = "historian cache wiring details",
-): { id: number; digest: string; result: UnifiedSearchResult } {
-	const seeded = insertMemory(db, {
-		projectPath: "git:test",
-		category: "WORKFLOW_RULES",
-		content,
-	});
-	// A fresh insert is a CANDIDATE (auto-ineligible); the auto-search lane
-	// only surfaces verified rows, so promote the seed the same way.
-	runInMemoryClaimsWriteTransaction(db, () =>
-		updateMemoryVerificationWithClaimsInCurrentTransaction(
-			db,
-			{
-				producer: "auto-search-pi-test",
-				operationKey: `verify:${seeded.id}`,
-				requestDigest: sha256Utf8Hex(`verify:${seeded.id}`),
-			},
-			{ memoryId: seeded.id, verificationStatus: "verified", nowMs: 2_000 },
-		),
-	);
-	const digest = sha256Utf8Hex(content);
-	return {
-		id: seeded.id,
-		digest,
-		result: memoryResult(0.9, content, seeded.id, digest),
 	};
 }
 
@@ -132,59 +97,6 @@ describe("runAutoSearchHintForPi", () => {
 		}
 	});
 
-	it("suppresses a persisted hint whose contributing memory is no longer eligible", async () => {
-		const db = createTestDb();
-		const seeded = seedEligibleMemory(db);
-		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
-			async () => [seeded.result],
-		);
-		try {
-			const firstMessages = [
-				userMessage("explain the historian cache wiring", 1),
-			];
-			await runAutoSearchHintForPi({
-				sessionId: "ses-auto",
-				db,
-				messages: firstMessages,
-				options: baseOptions,
-			});
-			expect(textOf(firstMessages[0])).toContain("<ctx-search-hint>");
-
-			// An in-place rewrite changes the exact content digest, so the
-			// replay pass must suppress the persisted hint instead of
-			// re-serving a fragment bound to bytes that no longer exist.
-			runInMemoryClaimsWriteTransaction(db, () =>
-				updateMemoryContentWithClaimsInCurrentTransaction(
-					db,
-					{
-						producer: "auto-search-pi-test",
-						operationKey: `rewrite:${seeded.id}`,
-						requestDigest: sha256Utf8Hex(`rewrite:${seeded.id}`),
-					},
-					{
-						memoryId: seeded.id,
-						content: "rewritten after the hint was persisted",
-						normalizedHash: "hash:rewritten",
-					},
-				),
-			);
-			const replayMessages = [
-				userMessage("explain the historian cache wiring", 1),
-			];
-			await runAutoSearchHintForPi({
-				sessionId: "ses-auto",
-				db,
-				messages: replayMessages,
-				options: baseOptions,
-			});
-			expect(spy).toHaveBeenCalledTimes(1);
-			expect(textOf(replayMessages[0])).not.toContain("<ctx-search-hint>");
-		} finally {
-			spy.mockRestore();
-			closeQuietly(db);
-		}
-	});
-
 	it("excludes Primers from transform-time auto-search hints", async () => {
 		const db = createTestDb();
 		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
@@ -202,6 +114,126 @@ describe("runAutoSearchHintForPi", () => {
 
 			const options = spy.mock.calls[0]?.[4];
 			expect(options?.sources).toEqual(["memory", "message", "git_commit"]);
+			expect(options?.memoryPolicySurface).toBe("auto_search");
+		} finally {
+			spy.mockRestore();
+			closeQuietly(db);
+		}
+	});
+
+	it("delivers anti-memory warnings and increments retrieval usage once", async () => {
+		const db = createTestDb();
+		const created = createAntiMemory(
+			db,
+			{ producer: "pi-runner-test", operationKey: "anti-warning" },
+			{
+				projectId: ensureProject(db, baseOptions.projectPath),
+				payload: {
+					trigger: "session caching",
+					rejectedStrategy: "Redis",
+					rejectionReason: "split ownership",
+					saferAlternative: "use SQLite",
+				},
+				provenance: {
+					sourceLocator: "test://pi/anti",
+					sourceContent: "Redis rejected",
+					extractor: "test",
+					extractorVersion: "1",
+					extractorRunId: "seed",
+					independenceKey: "pi-anti",
+					sourceTrustClass: "explicit_user",
+				},
+				actor: "user:test",
+			},
+		);
+		const publicClaimId = (
+			created.result.payload as { claim: { publicClaimId: string } }
+		).claim.publicClaimId;
+		const anti = readAntiMemory(db, publicClaimId);
+		if (anti === null) throw new Error("missing anti-memory");
+		const warning: UnifiedSearchResult = {
+			source: "anti_memory",
+			score: 0.95,
+			publicClaimId,
+			revisionLocator: anti.revisionLocator,
+			contentDigest: anti.contentDigest,
+			claimId: anti.claimId,
+			normalizedHash: anti.normalizedHash,
+			trigger: anti.payload.trigger,
+			rejectedStrategy: anti.payload.rejectedStrategy,
+			rejectionReason: anti.payload.rejectionReason,
+			saferAlternative: anti.payload.saferAlternative,
+			matchType: "lexical",
+		};
+		const spy = spyOn(searchModule, "unifiedSearch").mockResolvedValue([
+			warning,
+		]);
+		try {
+			const messages = [
+				userMessage("please add Redis backed session caching", 1),
+			];
+			await runAutoSearchHintForPi({
+				sessionId: "ses-auto",
+				db,
+				messages,
+				options: baseOptions,
+			});
+			expect(textOf(messages[0])).toContain("⚠ Previously rejected: Redis");
+			expect(
+				db
+					.prepare(
+						`SELECT usage.retrieval_count AS count FROM claim_usage_stats usage
+						  JOIN claim_public_ids public ON public.claim_id = usage.claim_id
+						 WHERE public.public_id = ?`,
+					)
+					.get(publicClaimId),
+			).toEqual({ count: 1 });
+			expect(getAutoSearchHintDecisions(db, "ses-auto")[0]).toMatchObject({
+				decision: "hint",
+				memoryFragments: [{ id: anti.claimId, hash: anti.normalizedHash }],
+			});
+		} finally {
+			spy.mockRestore();
+			closeQuietly(db);
+		}
+	});
+
+	it("does not deliver a sub-threshold warning riding another lane's strong hit", async () => {
+		const db = createTestDb();
+		const warning: UnifiedSearchResult = {
+			source: "anti_memory",
+			score: 0.5,
+			publicClaimId: "mcm_weak_warning",
+			revisionLocator: "mcm_weak_warning/r1/digest",
+			contentDigest: "digest",
+			claimId: 99,
+			normalizedHash: "hash",
+			trigger: "session caching",
+			rejectedStrategy: "Redis",
+			rejectionReason: "it creates split ownership",
+			saferAlternative: "use SQLite",
+			matchType: "lexical",
+		};
+		const spy = spyOn(searchModule, "unifiedSearch").mockResolvedValue([
+			memoryResult(0.9),
+			warning,
+		]);
+		try {
+			const messages = [
+				userMessage("please add Redis backed session caching", 1),
+			];
+			await runAutoSearchHintForPi({
+				sessionId: "ses-auto",
+				db,
+				messages,
+				options: baseOptions,
+			});
+			expect(textOf(messages[0])).not.toContain("Previously rejected");
+			expect(textOf(messages[0])).toContain("<ctx-search-hint>");
+			expect(getAutoSearchHintDecisions(db, "ses-auto")[0]).toMatchObject({
+				decision: "hint",
+				memoryFragments: [],
+			});
 		} finally {
 			spy.mockRestore();
 			closeQuietly(db);
@@ -260,9 +292,8 @@ describe("runAutoSearchHintForPi", () => {
 		// now-removed message's id ("entry-OLD-WRONG"). The reference-keyed map
 		// must win and anchor the hint to the real id ("entry-REAL").
 		const db = createTestDb();
-		const seeded = seedEligibleMemory(db);
 		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
-			async () => [seeded.result],
+			async () => [memoryResult()],
 		);
 		try {
 			const latest = userMessage("explain the historian cache wiring", 1);
@@ -545,9 +576,8 @@ describe("runAutoSearchHintForPi", () => {
 
 	it("does not double-append an already present cached hint", async () => {
 		const db = createTestDb();
-		const seeded = seedEligibleMemory(db);
 		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
-			async () => [seeded.result],
+			async () => [memoryResult()],
 		);
 		try {
 			const messages = [userMessage("explain the historian cache wiring", 1)];

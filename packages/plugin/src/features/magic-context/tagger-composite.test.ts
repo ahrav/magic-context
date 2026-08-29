@@ -19,17 +19,13 @@
  */
 
 import { beforeEach, describe, expect, it } from "bun:test";
-import type { Database as DatabaseType } from "../../shared/sqlite";
-import { Database } from "../../shared/sqlite";
-import { runMigrations } from "./migrations";
-import { initializeDatabase } from "./storage-db";
+import type { Database, Database as DatabaseType } from "../../shared/sqlite";
 import { getNullOwnerToolTag, getTagsBySession } from "./storage-tags";
 import { createTagger } from "./tagger";
+import { createDirectTestDatabase } from "./test-database";
 
 function openTestDb(): DatabaseType {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase().db;
     return db;
 }
 

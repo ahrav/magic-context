@@ -2,8 +2,10 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setProjectMemoryClaimLifecycle } from "@magic-context/core/features/magic-context/memory/storage-claim-operations";
 import { resolveMuralWire } from "@magic-context/core/features/magic-context/mural/render-trigger";
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage";
+import { seedProjectMemoryClaim } from "@magic-context/core/features/magic-context/test-claim-database";
 import {
 	clearModelsDevCache,
 	refreshModelLimitsFromApi,
@@ -121,6 +123,80 @@ describe("Pi m[0] mural image fold (on-demand render → wire)", () => {
 			expect(deferImage?.data).toBe(FAKE_MURAL_BASE64);
 			expect(deferImage?.data).not.toBe(currentManifestBase64);
 			expect(textOf(deferMessages[0])).toBe(textOf(hardMessages[0]));
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("publishes no mural image and no marker when the claim snapshot went stale", () => {
+		const db = createTestDb();
+		try {
+			getOrCreateSessionMeta(db, SESSION_ID);
+			const state = baseState({
+				mural: muralOption(),
+				injectionBudgetTokens: 8_000,
+				historyBudgetTokens: 60_000,
+			});
+			const claim = seedProjectMemoryClaim(db, {
+				projectIdentity: "git:pi-mural",
+				content: "Claim whose cue the mural draws.",
+				category: "ARCHITECTURE",
+			});
+
+			// Fold with a mural so both the marker and the image payload are cached
+			// against this claim snapshot.
+			const foldMessages = [userMessage("hello")];
+			injectM0M1Pi(state, db, foldMessages as never, undefined, true);
+			expect(textOf(foldMessages[0])).toContain("<memory-mural>");
+			expect(textOf(foldMessages[0])).toContain("<project-memory>");
+			expect(findM0Image(foldMessages)?.data).toBe(FAKE_MURAL_BASE64);
+
+			// Withdraw the claim after the mural was cached, so the next pass must fold.
+			setProjectMemoryClaimLifecycle(
+				db,
+				{ producer: "test", operationKey: "pi-mural-stale-archive" },
+				{ token: claim.token, state: "archived", actor: "user:test" },
+			);
+
+			// A sibling process holds the materialize lock, so every attempt loses
+			// BEGIN IMMEDIATE and the pass falls back to replaying the cached m[0]
+			// — which still carries the mural marker and the cached image payload.
+			const locked = new Proxy(db, {
+				get(target, property, receiver) {
+					if (property === "exec") {
+						return (sql: string, ...rest: unknown[]) => {
+							if (/BEGIN IMMEDIATE/i.test(sql)) {
+								throw Object.assign(new Error("database is locked"), {
+									code: "SQLITE_BUSY",
+								});
+							}
+							return (
+								target.exec as (sql: string, ...rest: unknown[]) => unknown
+							)(sql, ...rest);
+						};
+					}
+					const value = Reflect.get(target, property, receiver);
+					return typeof value === "function" ? value.bind(target) : value;
+				},
+			});
+
+			const staleMessages = [userMessage("stale")];
+			const stale = injectM0M1Pi(
+				state,
+				locked as never,
+				staleMessages as never,
+				undefined,
+				true,
+			);
+			expect(stale.contentionExhausted).toBe(true);
+
+			// The publication fence withholds the claim text, so every other
+			// claim-derived representation must obey it too: no image part, no
+			// marker promising one, and no cached payload left to replay.
+			const staleText = textOf(staleMessages[0]);
+			expect(staleText).not.toContain("<project-memory>");
+			expect(staleText).not.toContain("<memory-mural>");
+			expect(findM0Image(staleMessages)).toBeNull();
 		} finally {
 			closeQuietly(db);
 		}

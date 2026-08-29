@@ -34,8 +34,6 @@ import type {
 	MagicContextConfig,
 	SidekickConfig,
 } from "@magic-context/core/config/schema/magic-context";
-import { runClaimPolicySeedStartup } from "@magic-context/core/features/magic-context/claim-policy-backfill-startup";
-import { runClaimsBackfillStartup } from "@magic-context/core/features/magic-context/claims-backfill-startup";
 import {
 	summarizeDreamSchedule,
 	userMemoryCollectionEnabled,
@@ -51,7 +49,6 @@ import {
 } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { scheduleIncrementalIndex } from "@magic-context/core/features/magic-context/message-index-async";
 import { detectOverflow } from "@magic-context/core/features/magic-context/overflow-detection";
-import { runSessionProjectBackfill } from "@magic-context/core/features/magic-context/session-project-backfill";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import {
 	getOrCreateSessionMeta,
@@ -61,7 +58,7 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import {
 	applySqliteTuningPragmas,
-	getMigrationOnOpenRefusal,
+	getFormatRefusal,
 	getSchemaFenceRejection,
 	openDatabaseAsync,
 	setSqlitePragmaConfig,
@@ -84,10 +81,7 @@ import {
 import { preloadTokenizer } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { normalizeTodoStateJson } from "@magic-context/core/hooks/magic-context/todo-view";
 import { maybeSendUpgradeReminder } from "@magic-context/core/hooks/magic-context/upgrade-reminder";
-import {
-	beginBootQuietPeriod,
-	scheduleAfterBootQuiet,
-} from "@magic-context/core/plugin/boot-quiet";
+import { beginBootQuietPeriod } from "@magic-context/core/plugin/boot-quiet";
 import {
 	ANNOUNCEMENT_FEATURES,
 	ANNOUNCEMENT_FOOTER,
@@ -158,7 +152,6 @@ import {
 	registerPiDreamerProject,
 	unregisterPiDreamerProject,
 } from "./dreamer";
-import { loadDefaultPiSessionApi } from "./dreamer/pi-session-api";
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import { registerPiFailClosedSurface } from "./fail-closed-pi";
 import { resolvePiUsableContextLimit } from "./pi-context-limit";
@@ -479,28 +472,10 @@ export const __test = {
 	isPiMagicContextActiveInProcess,
 	markPiMagicContextActive,
 	clearPiMagicContextActive,
-	scheduleStartupBackfills,
 };
 
 function formatTokens(value: number): string {
 	return value.toLocaleString();
-}
-
-function scheduleStartupBackfills(
-	db: ContextDatabase,
-	run = runClaimsBackfillStartup,
-): Promise<unknown> {
-	// The two runners are independent: an unseeded revision reads as
-	// automatic-hidden, so chaining the policy seed behind the claims backfill
-	// would hide every pre-existing memory whenever that backfill fails.
-	return Promise.all([
-		run(db, { log: warn }).catch((err) => {
-			warn(`[claims-backfill] background runner failed: ${err}`);
-		}),
-		runClaimPolicySeedStartup(db, { log: warn }).catch((err) => {
-			warn(`[claim-policy-seed] background runner failed: ${err}`);
-		}),
-	]);
 }
 
 function getPiMessageModel(message: unknown): {
@@ -815,33 +790,26 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			);
 			return;
 		}
-		const migration = getMigrationOnOpenRefusal();
-		const blockingProcesses =
-			migration?.blockingProcesses ??
-			migration?.serverPids.map((pid) => ({ kind: "process" as const, pid })) ??
-			[];
+		const formatRefusal = getFormatRefusal();
 		const fence = getSchemaFenceRejection();
-		const reason: FailClosedReason =
-			migration && blockingProcesses.length > 0
+		const reason: FailClosedReason = formatRefusal
+			? {
+					kind: "format_refusal",
+					family: formatRefusal.family,
+					reasons: formatRefusal.reasons,
+				}
+			: fence
 				? {
-						kind: "migration_guard",
-						persistedVersion: migration.persistedVersion,
-						supportedVersion: migration.supportedVersion,
-						blockingProcesses,
+						kind: "schema_fence",
+						persistedVersion: fence.persistedVersion,
+						supportedVersion: fence.supportedVersion,
 					}
-				: fence
-					? {
-							kind: "schema_fence",
-							persistedVersion: fence.persistedVersion,
-							supportedVersion: fence.supportedVersion,
-						}
-					: {
-							kind: "storage_failure",
-							cause: migration?.unreadableFile
-								? `migration guard could not read RPC discovery file ${migration.unreadableFile}`
-								: (openFailureCause ??
-									`storage unavailable at ${dbPath} (cache schema newer than this binary, or open failed)`),
-						};
+				: {
+						kind: "storage_failure",
+						cause:
+							openFailureCause ??
+							`storage unavailable at ${dbPath} (unsupported database format, or open failed)`,
+					};
 		if (
 			early.config.fail_closed_blocking === false ||
 			!isCompactionEnabled(early.config)
@@ -888,27 +856,6 @@ async function startPiMagicContextRuntime(
 	dbPath: string,
 ): Promise<void> {
 	const db = database;
-
-	scheduleAfterBootQuiet(() => {
-		void (async () => {
-			try {
-				const api = await loadDefaultPiSessionApi();
-				const sessions = (await api.listSessions()) as Array<{
-					id?: unknown;
-					cwd?: unknown;
-				}>;
-				await runSessionProjectBackfill(
-					database,
-					sessions.map((session) => ({
-						sessionId: typeof session?.id === "string" ? session.id : "",
-						directory: typeof session?.cwd === "string" ? session.cwd : "",
-					})),
-				);
-			} catch (err) {
-				warn(`[session-projects] background runner failed: ${err}`);
-			}
-		})();
-	}, 0);
 
 	// Capture boot project for initial config load and logging only. Runtime
 	// identity/path resolution uses ctx.cwd per hook/command so session cwd
@@ -998,13 +945,6 @@ async function startPiMagicContextRuntime(
 		info("plugin DISABLED via config (enabled: false) — skipping registration");
 		return;
 	}
-
-	// Behind the enabled gate: the claims backfill mutates the shared DB, so a
-	// disabled plugin must not schedule it (same gating the OpenCode plugin
-	// applies before runClaimsBackfillStartup).
-	scheduleAfterBootQuiet(() => {
-		scheduleStartupBackfills(db);
-	});
 
 	await ensureProjectRegisteredFromPiDirectory(projectDir, db);
 	info(
@@ -2132,6 +2072,7 @@ async function startPiMagicContextRuntime(
 				| undefined;
 			const sessionId = sm?.getSessionId?.();
 			if (typeof sessionId !== "string" || sessionId.length === 0) return;
+			// SAFETY: id and role are re-checked below before use.
 			const endedMsg = event.message as unknown as {
 				id?: string;
 				role?: string;
@@ -2354,6 +2295,7 @@ async function startPiMagicContextRuntime(
 		// resolved we just skip — Pi resets module state on /reload
 		// anyway.
 		try {
+			// SAFETY: sessionManager and getSessionId are checked before use.
 			const sm = (
 				ctx as unknown as {
 					sessionManager?: { getSessionId?: () => string | undefined };
@@ -2393,6 +2335,7 @@ async function startPiMagicContextRuntime(
 	// OpenCode's `session.deleted` handler in `event-handler.ts`.
 	pi.on("session_before_switch", (_event, ctx) => {
 		try {
+			// SAFETY: sessionManager and getSessionId are checked before use.
 			const sm = (
 				ctx as unknown as {
 					sessionManager?: { getSessionId?: () => string | undefined };

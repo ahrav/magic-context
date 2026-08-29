@@ -1,8 +1,16 @@
 import type { DreamingTask } from "../../../config/schema/magic-context";
+import {
+    assertManifestCoversExactly,
+    assertNoDuplicateManifestIds,
+    assertParsedManifestNonEmpty,
+    describeUnrecognizedManifestShape,
+    extractCompleteManifestBody,
+} from "./manifest-parser";
 
-/** Memory shape the curate prompt renders (verify now has its own runner/prompt). */
 export interface CuratePromptMemory {
-    id: number;
+    publicClaimId: string;
+    revisionLocator: string;
+    contentDigest: string;
     category: string;
     content: string;
     mappedFiles: string[];
@@ -17,8 +25,6 @@ export interface CuratePromptMemory {
 // task's instructions.
 export const DREAMER_SYSTEM_PROMPT = `You are a background maintenance agent for the magic-context system, running during a scheduled dream window. Your task and its full instructions arrive in the message below. Never read or quote secrets from .env, credentials, or key files, and never commit — the user handles git.`;
 
-// The 5-category project-memory taxonomy, shared by the tasks that actually touch
-// project memories (curate). Kept as one constant so the wording can't drift.
 const PROJECT_MEMORY_TAXONOMY = `## Memory taxonomy (5 categories)
 
 Project memory uses exactly 5 categories. Every memory belongs to one:
@@ -26,29 +32,26 @@ Project memory uses exactly 5 categories. Every memory belongs to one:
 - **ARCHITECTURE** — load-bearing design decisions and WHY they hold (not WHAT a file does).
 - **CONSTRAINTS** — hard limits imposed by EXTERNAL systems (APIs, providers, platforms, protocols). Not our own code's behavior.
 - **CONFIG_VALUES** — stable configuration keys/values and conventions. Not transient measurements (test counts, sizes, versions).
-- **NAMING** — naming conventions and canonical names. Not inventories.
+- **NAMING** — naming conventions and canonical names. Not inventories.`;
 
-**Legacy categories during transition:** older memories may still carry pre-v2 category names. When you touch one, map it to its 5-category home with \`action="update"\` (or \`merge\`): WORKFLOW_RULES→PROJECT_RULES, ARCHITECTURE_DECISIONS→ARCHITECTURE, CONFIG_DEFAULTS→CONFIG_VALUES, ENVIRONMENT→CONFIG_VALUES (paths) or CONSTRAINTS, KNOWN_ISSUES→CONSTRAINTS only if it's an external-system limit (otherwise archive — our own fixed bugs are not world facts). USER_DIRECTIVES / USER_PREFERENCES are NOT project categories — they live in the global user profile; archive project copies only when they add zero project-specific detail.`;
-
-// curate: memory-pool hygiene only. It edits the memory store via ctx_memory and
-// never reads code (a separate verify task owns memory-vs-code correctness), so
-// the codebase-tool framing is deliberately absent.
-export const CURATE_SYSTEM_PROMPT = `You are a memory-pool curator for the magic-context system. You run during a scheduled dream window to keep a project's cross-session memory store lean and well-formed.
-
-## Memory operations (ctx_memory)
-- \`action="list"\` — browse active memories, optionally filter by category
-- \`action="merge", ids=[N,M,...], content="...", category="..."\` — consolidate duplicates into one canonical memory
-- \`action="update", ids=[N], content="..."\` — rewrite a memory's content
-- \`action="write", category="...", content="..."\` — create a memory (SPLITS ONLY — never mint new facts)
-- \`action="archive", ids=[N], reason="..."\` — soft-archive a stale or low-value memory
+export const CURATE_SYSTEM_PROMPT = `You are a memory-pool curator for the magic-context system. You keep one project's cross-session memory store lean and well-formed. You call no tools. The host applies your final manifest.
 
 ## Rules
-1. **Assume the pool is accurate.** A separate verify task checks memories against code. You handle QUALITY only — duplicates, wording, low-value entries — never correctness, and you do NOT read the codebase.
-2. **Work methodically.** Choose your own batch size.
-3. **Be conservative with archives.** Use the task's archive criteria.
-4. **Present-tense operational language.** "X uses Y" not "X was changed to use Y."
-5. **One rule/fact per memory.**
-6. **Never mint new facts** — that is the historian's job. \`write\` is for splitting a compound memory only.
+1. Assume the pool is accurate. Handle quality only: duplicates, wording, compound entries, and low-value entries.
+2. Cover every public claim id exactly once.
+3. Be conservative with archives.
+4. Use present-tense operational language.
+5. Keep one rule or fact per memory.
+6. Never mint new facts. A split may only separate facts already present in its source.
+
+Output one XML manifest and nothing else:
+<curate>
+<keep claim="mcm_..."/>
+<update claim="mcm_...">replacement content</update>
+<archive claim="mcm_..." reason="specific quality reason"/>
+<merge target="mcm_..." sources="mcm_...,mcm_...">canonical merged content</merge>
+<split claim="mcm_..."><keep>first existing fact</keep><new category="CONSTRAINTS">second existing fact</new></split>
+</curate>
 
 ${PROJECT_MEMORY_TAXONOMY}`;
 
@@ -70,9 +73,9 @@ export const MAINTAIN_DOCS_SYSTEM_PROMPT = `You are a documentation maintainer f
 // review-user-memories: a pure JSON reviewer of behavioral observations about the
 // human user (the GLOBAL user profile, NOT project memories). It calls no tools
 // and the host applies the verdict, so it needs no memory ops or taxonomy.
-export const REVIEW_USER_MEMORIES_SYSTEM_PROMPT = `You are a user-profile reviewer for the magic-context system. You run during a scheduled dream window to decide which recurring behavioral observations about the human user are real, persistent patterns worth keeping in their global user profile.
+export const REVIEW_USER_MEMORIES_SYSTEM_PROMPT = `You are a memory reviewer for the magic-context system. You run during a scheduled dream window to decide which recurring observations are real, persistent patterns worth keeping. Observations about the human user belong in their global user profile; observations that describe how THIS project works belong in the project's memory.
 
-You do NOT call any tools and you do NOT touch project memories — you read the candidate observations the host gives you and return a JSON verdict. Distill durable patterns; never transcribe a single moment. Output only the JSON the task asks for, with no surrounding prose.`;
+You do NOT call any tools — you read the candidate observations the host gives you and return a JSON verdict. Promote a project-scoped pattern only through the \`promote_project\` action the task defines, and only when several candidates corroborate it; the host rejects a project promotion that rests on a single observation. Distill durable patterns; never transcribe a single moment. Output only the JSON the task asks for, with no surrounding prose.`;
 
 // refresh-primers: a read-only code investigator that answers ONE standing
 // question about the current codebase. It runs on the locked
@@ -95,7 +98,7 @@ function renderMemoryList(memories: CuratePromptMemory[]): string {
             const files = memory.mappedFiles.length
                 ? memory.mappedFiles.join(", ")
                 : "(none mapped yet)";
-            return `[${memory.id}] ${memory.category}\nContent: ${memory.content}\nMapped files: ${files}${memory.hasNoFileSentinel ? " (file-independent)" : ""}`;
+            return `[${memory.publicClaimId}] ${memory.category}\nRevision: ${memory.revisionLocator}\nContent digest: ${memory.contentDigest}\nContent: ${memory.content}\nMapped files: ${files}${memory.hasNoFileSentinel ? " (file-independent)" : ""}`;
         })
         .join("\n\n");
 }
@@ -104,7 +107,7 @@ function formatUserProfileList(
     userMemories?: Array<{ id: number; content: string }>,
 ): string | undefined {
     if (!userMemories || userMemories.length === 0) return undefined;
-    return userMemories.map((um) => `- [U${um.id}] ${um.content}`).join("\n");
+    return userMemories.map((um) => `- ${um.content}`).join("\n");
 }
 
 export function buildCuratePrompt(args: {
@@ -122,10 +125,10 @@ The memories below are assumed ACCURATE (a separate verify task keeps them true)
 Work ALL THREE phases below in order (A → B → C) over the whole pool. Do NOT stop after consolidating — a run that only merges and never improves or archives is incomplete.
 
 ### Phase A — Consolidate duplicates
-Group by category, then merge near-identical / superset-subset / same-fact-different-angle clusters into one canonical memory with \`ctx_memory(action="merge", ids=[...], content="...", category="...")\`. Preserve every unique detail; terse present tense; paths/keys verbatim. Every id in a merge MUST share the same category — the system rejects cross-category merges. If two similar memories sit in different categories they are NOT duplicates (one is miscategorized — archive the redundant one in Phase C instead). One fact per memory.
+Group by category, then merge near-identical, superset-subset, or same-fact-different-angle clusters. Preserve every unique detail; use terse present tense and keep paths or keys verbatim. Every claim in a merge must share one category. One fact per memory.
 
 ### Phase B — Improve wording
-Rewrite narrative/historical → operational present tense ("X uses Y because Z", not "we switched to Y"); drop session-local context and commit hashes (unless the hash is the point); add specifics where vague. \`write\` is for SPLITS ONLY (update the original down to its first fact, write the second) — a healthy run is net-neutral or net-shrinking, never net-adds facts.
+Rewrite narrative or historical text into operational present tense; drop session-local context and incidental commit hashes. Use a split only for a compound memory whose separate facts already exist in its text. A healthy run is net-neutral or net-shrinking and never adds facts.
 
 ### Phase C — Archive stale / low-value
 Archive (with a specific reason) memories that: restate code without rationale · are redundant with a better memory · are stale implementation detail (line numbers/internals) · low signal (seen_count=1, retrieval_count=0, no constraint language) · bare config value · transient measurement · a solved bug in OUR OWN code · redundant with the global user profile (zero added project detail).
@@ -133,6 +136,135 @@ KEEP (overrides archive): constraint/rule language (must/never/always) · explai
 ${args.userProfile ? `\n### Global user profile (for the redundancy check)\n${args.userProfile}\n` : ""}
 ### Memory pool
 ${renderMemoryList(args.memories)}`;
+}
+
+export type CurateManifestAction =
+    | { kind: "keep"; publicClaimId: string }
+    | { kind: "update"; publicClaimId: string; content: string }
+    | { kind: "archive"; publicClaimId: string; reason: string }
+    | {
+          kind: "merge";
+          targetPublicClaimId: string;
+          sourcePublicClaimIds: string[];
+          content: string;
+      }
+    | {
+          kind: "split";
+          publicClaimId: string;
+          content: string;
+          created: Array<{ category: string; content: string }>;
+      };
+
+const CURATE_CATEGORIES = new Set([
+    "PROJECT_RULES",
+    "ARCHITECTURE",
+    "CONSTRAINTS",
+    "CONFIG_VALUES",
+    "NAMING",
+]);
+
+function curateAttribute(raw: string, name: string): string | null {
+    return raw.match(new RegExp(`\\b${name}\\s*=\\s*"([^"]*)"`))?.[1] ?? null;
+}
+
+function curateText(raw: string): string {
+    return raw
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&apos;/g, "'")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function curateActionIds(action: CurateManifestAction): string[] {
+    return action.kind === "merge"
+        ? [action.targetPublicClaimId, ...action.sourcePublicClaimIds]
+        : [action.publicClaimId];
+}
+
+export function parseCurateManifest(text: string): CurateManifestAction[] {
+    let body: string;
+    try {
+        body = extractCompleteManifestBody(text, "curate");
+    } catch (error) {
+        const described = describeUnrecognizedManifestShape(text, "curate", "keep");
+        if (!described.startsWith("parsed zero entries")) throw new Error(described);
+        throw error;
+    }
+    const actions: CurateManifestAction[] = [];
+    for (const match of body.matchAll(
+        /<(keep|update|archive|merge|split)\b([^>]*?)(?:\/>|>([\s\S]*?)<\/\1>)/g,
+    )) {
+        const kind = match[1];
+        const attrs = match[2] ?? "";
+        const inner = match[3] ?? "";
+        if (kind === "merge") {
+            const targetPublicClaimId = curateAttribute(attrs, "target");
+            const sourcePublicClaimIds = (curateAttribute(attrs, "sources") ?? "")
+                .split(",")
+                .map((id) => id.trim())
+                .filter(Boolean);
+            const content = curateText(inner);
+            if (!targetPublicClaimId || sourcePublicClaimIds.length === 0 || !content) {
+                throw new Error("curate merge requires target, sources, and content");
+            }
+            if (sourcePublicClaimIds.includes(targetPublicClaimId)) {
+                throw new Error("curate merge target cannot also be a source");
+            }
+            actions.push({ kind, targetPublicClaimId, sourcePublicClaimIds, content });
+            continue;
+        }
+        const publicClaimId = curateAttribute(attrs, "claim");
+        if (!publicClaimId) throw new Error(`curate ${kind} entry missing public claim id`);
+        if (kind === "keep") {
+            actions.push({ kind, publicClaimId });
+        } else if (kind === "update") {
+            const content = curateText(inner);
+            if (!content) throw new Error(`curate update ${publicClaimId} has empty content`);
+            actions.push({ kind, publicClaimId, content });
+        } else if (kind === "archive") {
+            const reason = curateText(curateAttribute(attrs, "reason") ?? "");
+            if (!reason) throw new Error(`curate archive ${publicClaimId} has no reason`);
+            actions.push({ kind, publicClaimId, reason });
+        } else {
+            const keep = inner.match(/<keep>([\s\S]*?)<\/keep>/)?.[1] ?? "";
+            const content = curateText(keep);
+            const created = [...inner.matchAll(/<new\b([^>]*)>([\s\S]*?)<\/new>/g)].map(
+                (newMatch) => ({
+                    category: curateAttribute(newMatch[1] ?? "", "category") ?? "",
+                    content: curateText(newMatch[2] ?? ""),
+                }),
+            );
+            if (
+                !content ||
+                created.length === 0 ||
+                created.some(
+                    (item) => !CURATE_CATEGORIES.has(item.category) || item.content.length === 0,
+                )
+            ) {
+                throw new Error(`curate split ${publicClaimId} is incomplete`);
+            }
+            actions.push({ kind: "split", publicClaimId, content, created });
+        }
+    }
+    if (actions.length === 0 && body.trim().length > 0) {
+        throw new Error(describeUnrecognizedManifestShape(text, "curate", "keep"));
+    }
+    assertNoDuplicateManifestIds(actions.flatMap(curateActionIds), "curate");
+    return actions;
+}
+
+export function validateCurateManifest(
+    text: string,
+    expectedIds: ReadonlySet<string>,
+): CurateManifestAction[] {
+    const actions = parseCurateManifest(text);
+    const ids = actions.flatMap(curateActionIds);
+    assertParsedManifestNonEmpty(ids.length, expectedIds.size, text, "curate", "keep");
+    assertManifestCoversExactly(ids, expectedIds, "curate");
+    return actions;
 }
 
 // ── Retrospective ───────────────────────────────────────────────────────────
@@ -205,12 +337,14 @@ ${renderRetrospectiveEvents(args.events)}
 - Do NOT quote the user, include dates, or preserve anger/frustration wording.
 - Write in plain prose with NO quotation marks at all — not around the user's words, and not around illustrative trigger words. Describe trigger conditions directly (write: when the user asks you to investigate or diagnose without requesting a fix — not: when the user says "investigate"). A learning containing any quotation marks is rejected.
 - Use route="memory" for project-specific agent behavior/rules, with category one of PROJECT_RULES, ARCHITECTURE, CONSTRAINTS, CONFIG_VALUES, NAMING.
+- Use route="anti_memory" when the durable lesson is that a concrete strategy was rejected. Supply trigger, rejected_strategy, rejection_reason, and safer_alternative when one exists. Never flatten a rejection into a positive memory.
 - Use route="observation" only for recurring user workflow/preferences that belong in the global user profile.
 - Zero learnings is acceptable and should be represented by an empty learnings block.
 
 Return only XML in this exact shape:
 <learnings>
   <learning route="memory" category="PROJECT_RULES">one durable actionable correction</learning>
+  <learning route="anti_memory"><trigger>semantic work scope</trigger><rejected_strategy>discarded strategy</rejected_strategy><rejection_reason>why it was rejected</rejection_reason><safer_alternative>preferred alternative</safer_alternative></learning>
   <learning route="observation">one recurring user preference</learning>
 </learnings>`;
 }

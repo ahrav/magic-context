@@ -20,7 +20,8 @@ use tokio::net::TcpStream;
 
 use super::evidence::HistogramConfig;
 use super::perf_measurement::{
-    open_loop_interval_ns, Outcome, OutcomeCounts, FIXTURE_BODY, MAX_BODY_LEN,
+    open_loop_offset_ns, validate_open_loop_rate, Outcome, OutcomeCounts, FIXTURE_BODY,
+    MAX_BODY_LEN,
 };
 use super::raw_client::{self, RawClient, FLAGS_INTERACTIVE, TY_ERROR, TY_RESPONSE};
 
@@ -408,18 +409,17 @@ pub fn run_open_loop(publication: &Path, cfg: &OpenLoopConfig) -> Result<OpenLoo
     if cfg.measure.is_zero() {
         return Err("open-loop arm requires a nonzero measurement window".to_owned());
     }
-    let interval_ns = open_loop_interval_ns(cfg.rate_per_sec)?;
+    validate_open_loop_rate(cfg.rate_per_sec)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|err| err.to_string())?;
-    runtime.block_on(run_open_loop_inner(publication, cfg, interval_ns))
+    runtime.block_on(run_open_loop_inner(publication, cfg))
 }
 
 async fn run_open_loop_inner(
     publication: &Path,
     cfg: &OpenLoopConfig,
-    interval_ns: u64,
 ) -> Result<OpenLoopResult, String> {
     let (stream, channel, epoch) = open_route(publication, "budget-open").await?;
     let (mut read_half, mut write_half) = stream.into_split();
@@ -443,7 +443,7 @@ async fn run_open_loop_inner(
     let mut slot = 0u64;
 
     'sender: loop {
-        let scheduled_ns = slot * interval_ns;
+        let scheduled_ns = open_loop_offset_ns(slot, cfg.rate_per_sec);
         slot += 1;
         if scheduled_ns >= deadline_ns {
             break;

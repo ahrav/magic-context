@@ -1,25 +1,22 @@
 import { createHmac, randomUUID } from "node:crypto";
-import {
-    reconcileCompatibilityVerifications,
-    seedLateCompatibilityRevisions,
-} from "../../features/magic-context/claim-policy-backfill";
 import type { Compartment } from "../../features/magic-context/compartment-storage";
+import { readAuthorizedClaimMemorySnapshot } from "../../features/magic-context/memory/claim-memory-render";
 import {
-    autoSearchHintFragmentsStillEligible,
-    bindMemoriesToCurrentRevision,
-    exactMemoryContentDigests,
-    filterMemoriesByPolicy,
-    filterMemoryIdsByPolicy,
-} from "../../features/magic-context/memory/storage-claim-visibility";
-import { sha256Utf8Hex } from "../../features/magic-context/memory/storage-claims";
+    type ClaimOperationResult,
+    canonicalSnapshotVector,
+    decodeClaimOperationResult,
+    parseRevisionLocator,
+    type SnapshotVector,
+} from "../../features/magic-context/memory/claim-operation-contract";
 import {
-    buildWorkspaceMemorySqlFilter,
-    getMaxMemoryIdForProjects,
-    getMemoriesByIds,
-    getMemoriesByProject,
-    getMemoriesByProjects,
-    readNewMemoriesForM1Union,
-} from "../../features/magic-context/memory/storage-memory";
+    type ProjectMemoryClaimSnapshot,
+    readProjectMemorySnapshotVector,
+} from "../../features/magic-context/memory/storage-claim-current-state";
+import {
+    advanceOutboxConsumerCheckpointInCurrentTransaction,
+    readOutboxConsumerCheckpoint,
+} from "../../features/magic-context/memory/storage-claim-operations";
+import { autoSearchHintFragmentsStillEligible } from "../../features/magic-context/memory/storage-claim-visibility";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import {
     getCompartments,
@@ -28,10 +25,6 @@ import {
     getStaleReduceStrippedIds,
     getStrippedPlaceholderIds,
 } from "../../features/magic-context/storage";
-import {
-    getMaxMemoryMutationIdForProjects,
-    getMemoryMutationsForRenderByProjects,
-} from "../../features/magic-context/storage-memory-mutation-log";
 import {
     getAutoSearchHintDecisions,
     getChannel2NudgeState,
@@ -64,7 +57,23 @@ import { sessionLog } from "../../shared/logger";
 import { isRecord } from "../../shared/record-type-guard";
 import { resolveTodowriteAvailability } from "./ctx-reduce-availability";
 import { isModuleTransportGenerationChangedResult } from "./module-transport";
-import { MODULE_PAGE_MAX_BYTES, moduleRawBlockMappings, moduleWireBodyBytes } from "./module-wire";
+import {
+    CLAIM_MIRROR_PROTOCOL_VERSION,
+    CLAIM_MIRROR_VERSION,
+    type ClaimEffectDeliveryReceipt,
+    type ClaimMirrorChangeKind,
+    type ClaimMirrorReceiptRequest,
+    type ClaimMirrorReceiptResponse,
+    type ClaimMirrorSnapshot,
+    type ClaimMirrorSnapshotRequest,
+    type ClaimMirrorSnapshotResponse,
+    type CommittedClaimMirrorRow,
+    decodeClaimMirrorReceiptResponse,
+    decodeClaimMirrorSnapshotResponse,
+    MODULE_PAGE_MAX_BYTES,
+    moduleRawBlockMappings,
+    moduleWireBodyBytes,
+} from "./module-wire";
 
 /** Ceiling for a single live (non-seed) state_sync body. Well under the
  * transport frame limit; an epoch-driven replacement snapshot that exceeds
@@ -81,9 +90,7 @@ import { formatDate } from "./temporal-awareness";
 
 export interface ModuleWatermarks {
     compartment_sequence: number;
-    memory_id: number;
     m0_mutation_id: number;
-    memory_mutation_id: number;
     last_todo_state_hash: string;
     project_memory_epoch: number;
     project_user_profile_version: number;
@@ -174,17 +181,6 @@ export interface ModuleStateSyncPayload {
         seed_complete?: boolean;
         seed_boundary_id?: string | null;
         compartments: unknown[];
-        memories?: unknown[];
-        /** Projects whose `memories` entries form a FULL policy snapshot: the
-         * receiver prunes mirrored rows absent from the payload within this
-         * scope. Absent means incremental upsert-only semantics. */
-        memories_replace_projects?: string[];
-        /** Explicit prune: mirrored rows with these ids are deleted. Covers
-         * policy-hidden rows the replace scope cannot name — a foreign
-         * workspace member's rows — without granting a project-wide prune
-         * over that member's non-shared rows. */
-        memories_delete_ids?: number[];
-        memory_mutations?: unknown[];
         user_profile?: string[];
         workspace?: ModuleWorkspacePayload | null;
         last_todo_state?: string;
@@ -214,14 +210,6 @@ export interface ModuleStateSyncPayload {
     };
     watermarks: ModuleWatermarks;
     wireBatches?: ModuleStateSyncPayload[];
-    /** Exact digests of the content-carrying snapshot rows this payload
-     * installs, retained for the post-send recheck. Top-level (not in
-     * `params`), so it never crosses the wire. */
-    memorySnapshotDigests?: ReadonlyMap<number, string>;
-    /** Digest per content-carrying mutation row (by mutation id), retained
-     * for the same post-send recheck — mutations install content the
-     * snapshot digests do not cover. Top-level, never crosses the wire. */
-    memoryMutationDigests?: ReadonlyMap<number, { targetMemoryId: number; digest: string }>;
 }
 
 /** The subset of sender state needed to serialize a state-sync payload. */
@@ -232,7 +220,10 @@ export interface ModuleStateSyncState {
     idOrdinalMemoGeneration: number;
     idOrdinalMemo: Map<string, number>;
     seedPassPending?: boolean;
-    authorityMemorySyncSkipLogged?: boolean;
+    /** Host-side proof that the claim mirror has been seeded. */
+    claimMirrorSeeded?: boolean;
+    claimMirrorSuppressed?: boolean;
+    claimMirrorVector?: SnapshotVector | null;
 }
 
 export interface ModuleStateSyncPass {
@@ -638,25 +629,12 @@ export function loadModuleWatermarks(args: {
             "SELECT COALESCE(MAX(sequence), -1) AS max_sequence FROM compartments WHERE session_id = ?",
         )
         .get(args.sessionId) as { max_sequence?: number } | undefined;
-    const memoryId = args.projectPath
-        ? getMaxMemoryIdForProjects(
-              args.db,
-              workspace.expandedIdentities,
-              workspace.ownIdentities,
-              workspace.shareCategories,
-          )
-        : 0;
     const m0Row = args.db
         .prepare("SELECT COALESCE(MAX(id), 0) AS max_id FROM m0_mutation_log WHERE session_id = ?")
         .get(args.sessionId) as { max_id?: number } | undefined;
-    const memoryMutationId = args.projectPath
-        ? (getMaxMemoryMutationIdForProjects(args.db, workspace.expandedIdentities) ?? 0)
-        : 0;
     return {
         compartment_sequence: compartmentRow?.max_sequence ?? -1,
-        memory_id: memoryId,
         m0_mutation_id: m0Row?.max_id ?? 0,
-        memory_mutation_id: memoryMutationId,
         last_todo_state_hash: stableHash(effectiveLastTodoState(args.sessionId, sessionMeta)),
         project_memory_epoch: args.projectPath
             ? (getProjectState(args.db, args.projectPath)?.projectMemoryEpoch ?? 0)
@@ -676,9 +654,7 @@ export function moduleWatermarksEqual(
     return (
         left !== null &&
         left.compartment_sequence === right.compartment_sequence &&
-        left.memory_id === right.memory_id &&
         left.m0_mutation_id === right.m0_mutation_id &&
-        left.memory_mutation_id === right.memory_mutation_id &&
         left.last_todo_state_hash === right.last_todo_state_hash &&
         left.project_memory_epoch === right.project_memory_epoch &&
         left.project_user_profile_version === right.project_user_profile_version &&
@@ -980,10 +956,8 @@ function buildAutoSearchHintSeeds(args: {
         if (mapping && value.nativeBlockId !== blockId) {
             recordAutoSearchHintNativeBlockId(args.db, args.sessionId, value.messageId, blockId);
         }
-        // The same replay gate as the TypeScript and Pi paths: a hint whose
-        // contributing memory was hidden or rewritten seeds the empty
-        // no-result shape, so the native overlay revokes the fragment
-        // instead of replaying it verbatim.
+        // Anti-memory warnings seed the empty no-result shape because stored
+        // warning text never replays; fresh search is required.
         const hintText =
             value.decision === "hint" &&
             autoSearchHintFragmentsStillEligible(args.db, value.memoryFragments)
@@ -1027,9 +1001,6 @@ function buildStripSeeds(args: { db: ContextDatabase; sessionId: string }): Modu
 
 type SeedItem =
     | { kind: "compartment"; value: unknown }
-    | { kind: "memory"; value: unknown }
-    | { kind: "memory_mutation"; value: unknown }
-    | { kind: "memory_delete_id"; value: number }
     | { kind: "drop_seed"; value: ModuleDropSeed }
     | { kind: "pending_agent_drop"; value: ModulePendingDropSeed }
     | { kind: "note_nudge_anchor"; value: ModuleNoteNudgeAnchorSeed }
@@ -1097,88 +1068,6 @@ function readCompartmentsAfterSequence(
  * cover them either. Id-only so a large legacy history never hydrates
  * content just to compute deletions.
  */
-function readForeignCoverageMemoryIds(args: {
-    db: ContextDatabase;
-    workspace: ModuleWorkspaceContext;
-}): Array<{ id: number; shareVisible: boolean }> {
-    const identities = args.workspace.expandedIdentities;
-    if (identities.length === 0) return [];
-    const filter = buildWorkspaceMemorySqlFilter({
-        identities,
-        ownIdentities: args.workspace.ownIdentities,
-        shareCategories: args.workspace.shareCategories,
-        tableName: "m",
-        // Coverage must name FORMERLY visible rows, not only rows matching
-        // the current share filter: a foreign row reclassified shareable=0
-        // or private-scope leaves the kept snapshot, and without coverage
-        // its stale shareable copy would keep serving foreign readers. The
-        // classification predicate rides along as a SELECT flag instead of
-        // a WHERE clause: classification departures are CLASSIFICATION
-        // PROPAGATION (the owner keeps the row; the native reader's own
-        // share filter hides it), while only policy-hidden rows are
-        // DELETED. The category restriction stays, so this session still
-        // cannot touch a member's non-shared categories.
-        includeClassificationFields: false,
-    });
-    const ownIdentities = args.workspace.ownIdentities;
-    const ownClause =
-        ownIdentities.length > 0
-            ? ` AND m.project_path NOT IN (${ownIdentities.map(() => "?").join(", ")})`
-            : "";
-    const placeholders = identities.map(() => "?").join(", ");
-    const rows = args.db
-        .prepare(
-            // Interpolation is a compile-time placeholder list, not caller input.
-            // pi-lens-ignore: sql-injection
-            `SELECT m.id,
-                    (m.shareable = 1 AND m.scope IN ('project','ecosystem','universe')) AS shareVisible
-               FROM memories AS m
-              WHERE m.project_path IN (${placeholders})
-                ${ownClause}
-                ${filter.clause}
-              ORDER BY m.id ASC`,
-        )
-        .all(...identities, ...ownIdentities, ...filter.params) as Array<{
-        id?: unknown;
-        shareVisible?: unknown;
-    }>;
-    return rows.flatMap((row) =>
-        typeof row.id === "number" ? [{ id: row.id, shareVisible: row.shareVisible === 1 }] : [],
-    );
-}
-
-function readRenderedMemoryIds(args: {
-    db: ContextDatabase;
-    projectPath?: string;
-    workspace: ModuleWorkspaceContext;
-    nowMs: number;
-}): number[] {
-    if (!args.projectPath) return [];
-    const identities =
-        args.workspace.expandedIdentities.length > 0
-            ? args.workspace.expandedIdentities
-            : [args.projectPath];
-    const filter = buildWorkspaceMemorySqlFilter({
-        identities,
-        ownIdentities: args.workspace.ownIdentities,
-        shareCategories: args.workspace.shareCategories,
-        tableName: "m",
-    });
-    const placeholders = identities.map(() => "?").join(", ");
-    const rows = args.db
-        .prepare(
-            `SELECT m.id
-               FROM memories AS m
-              WHERE m.project_path IN (${placeholders})
-                AND m.status IN ('active', 'permanent')
-                AND (m.expires_at IS NULL OR m.expires_at > ?)
-                ${filter.clause}
-              ORDER BY m.id ASC`,
-        )
-        .all(...identities, args.nowMs, ...filter.params) as Array<{ id?: unknown }>;
-    return rows.flatMap((row) => (typeof row.id === "number" ? [row.id] : []));
-}
-
 function encodedSeedItemBytes(item: SeedItem): number {
     const encoded = JSON.stringify(item.value);
     return Buffer.byteLength(encoded === undefined ? "null" : encoded);
@@ -1190,8 +1079,6 @@ export function buildPagedModuleStateSyncPayloads(args: {
     seedId: string;
     seedBoundaryId: string | null;
     compartments: unknown[];
-    memories: unknown[];
-    memoryMutations: unknown[];
     dropSeeds?: ModuleDropSeed[];
     dropSeedSkipped?: number;
     pendingDropSeeds?: ModulePendingDropSeed[];
@@ -1211,31 +1098,9 @@ export function buildPagedModuleStateSyncPayloads(args: {
     workspace: ModuleWorkspacePayload | null;
     lastTodoState: string;
     watermarks: ModuleWatermarks;
-    omitAuthorityMemorySections?: boolean;
-    /** Full-snapshot replace scope; rides the completing batch so the module
-     * prunes after assembling every page's memories. */
-    memoriesReplaceProjects?: string[];
-    /** Explicit prune ids for rows the replace scope cannot name (foreign
-     * workspace members) or that left the base query (archived, expired).
-     * Paged with the seed items and concatenated by the reassembler, so a
-     * large legacy prune cannot overflow the completing page. */
-    memoriesDeleteIds?: number[];
 }): ModuleStateSyncPayload[] {
     const items: SeedItem[] = [
         ...args.compartments.map((value) => ({ kind: "compartment", value }) as const),
-        ...(args.omitAuthorityMemorySections
-            ? []
-            : args.memories.map((value) => ({ kind: "memory", value }) as const)),
-        ...(args.omitAuthorityMemorySections
-            ? []
-            : args.memoryMutations.map((value) => ({ kind: "memory_mutation", value }) as const)),
-        // Delete ids page with the other seed items: a large legacy project's
-        // hidden-row prune can exceed a single page's budget on its own.
-        ...(args.omitAuthorityMemorySections
-            ? []
-            : (args.memoriesDeleteIds ?? []).map(
-                  (value) => ({ kind: "memory_delete_id", value }) as const,
-              )),
         ...(args.dropSeeds ?? []).map((value) => ({ kind: "drop_seed", value }) as const),
         ...(args.pendingDropSeeds ?? []).map(
             (value) => ({ kind: "pending_agent_drop", value }) as const,
@@ -1252,9 +1117,6 @@ export function buildPagedModuleStateSyncPayloads(args: {
 
     type SeedBatch = {
         compartments: unknown[];
-        memories: unknown[];
-        memoryMutations: unknown[];
-        memoriesDeleteIds: number[];
         dropSeeds: ModuleDropSeed[];
         pendingAgentDrops: ModulePendingDropSeed[];
         noteNudgeAnchors: ModuleNoteNudgeAnchorSeed[];
@@ -1265,9 +1127,6 @@ export function buildPagedModuleStateSyncPayloads(args: {
 
     const emptyBatch = (): SeedBatch => ({
         compartments: [],
-        memories: [],
-        memoryMutations: [],
-        memoriesDeleteIds: [],
         dropSeeds: [],
         pendingAgentDrops: [],
         noteNudgeAnchors: [],
@@ -1278,9 +1137,6 @@ export function buildPagedModuleStateSyncPayloads(args: {
 
     const appendItem = (batch: SeedBatch, item: SeedItem): void => {
         if (item.kind === "compartment") batch.compartments.push(item.value);
-        else if (item.kind === "memory") batch.memories.push(item.value);
-        else if (item.kind === "memory_mutation") batch.memoryMutations.push(item.value);
-        else if (item.kind === "memory_delete_id") batch.memoriesDeleteIds.push(item.value);
         else if (item.kind === "drop_seed") batch.dropSeeds.push(item.value);
         else if (item.kind === "pending_agent_drop") batch.pendingAgentDrops.push(item.value);
         else if (item.kind === "note_nudge_anchor") batch.noteNudgeAnchors.push(item.value);
@@ -1294,9 +1150,6 @@ export function buildPagedModuleStateSyncPayloads(args: {
         total: number;
         complete: boolean;
         compartments: unknown[];
-        memories: unknown[];
-        memoryMutations: unknown[];
-        memoriesDeleteIds: number[];
         dropSeeds?: ModuleDropSeed[];
         pendingAgentDrops: ModulePendingDropSeed[];
         noteNudgeAnchors: ModuleNoteNudgeAnchorSeed[];
@@ -1321,15 +1174,6 @@ export function buildPagedModuleStateSyncPayloads(args: {
             seed_batch_total: input.total,
             seed_complete: input.complete,
             compartments: input.compartments,
-            ...(args.omitAuthorityMemorySections
-                ? {}
-                : {
-                      memories: input.memories,
-                      memory_mutations: input.memoryMutations,
-                  }),
-            ...(args.omitAuthorityMemorySections || input.memoriesDeleteIds.length === 0
-                ? {}
-                : { memories_delete_ids: input.memoriesDeleteIds }),
             user_profile: input.userProfile,
             ...(args.dropSeeds !== undefined ? { drop_seeds: input.dropSeeds } : {}),
             ...(args.pendingDropSeeds !== undefined
@@ -1350,10 +1194,6 @@ export function buildPagedModuleStateSyncPayloads(args: {
                       project_memory_epoch: args.watermarks.project_memory_epoch,
                       user_profile_version: args.watermarks.project_user_profile_version,
                       acked_watermarks: args.watermarks,
-                      ...(args.memoriesReplaceProjects !== undefined &&
-                      !args.omitAuthorityMemorySections
-                          ? { memories_replace_projects: args.memoriesReplaceProjects }
-                          : {}),
                       ...(args.dropSeedSkipped !== undefined
                           ? { drop_seed_skipped: args.dropSeedSkipped }
                           : {}),
@@ -1484,34 +1324,6 @@ export async function buildModuleStateSyncPayload(args: {
     | "frame_budget"
 > {
     const workspace = resolveModuleWorkspaceContext(args.pass.db, args.pass.projectPath);
-    // One authority pool has one writer. While MODULE owns memories, this sender only mirrors
-    // module changes back to TypeScript and must not send the TypeScript view in the other direction.
-    const omitAuthorityMemorySections = args.options?.authorityState === "MODULE";
-    // A held-open v85 writer can append compatibility verification events at
-    // any time, not just before startup; reconcile them before reading
-    // watermarks so a resulting epoch bump is visible to THIS pass. The
-    // reconciler is watermark-guarded (one MAX probe when idle) and its
-    // failure must not fail the sync — an unmoved watermark retries next pass.
-    try {
-        reconcileCompatibilityVerifications(args.pass.db);
-    } catch (error) {
-        sessionLog(
-            args.pass.sessionId,
-            `compatibility verification reconcile failed (retrying next pass): ${error instanceof Error ? error.message : String(error)}`,
-        );
-    }
-    // Sibling straggler probe: a held-open v85 writer can also append a NEW
-    // revision after the startup seeder completed; unseeded revisions read
-    // as automatic-hidden until seeded. One single-row anti-join when idle;
-    // the seed itself runs async and must not fail the sync.
-    try {
-        seedLateCompatibilityRevisions(args.pass.db);
-    } catch (error) {
-        sessionLog(
-            args.pass.sessionId,
-            `late compatibility seed probe failed (retrying next pass): ${error instanceof Error ? error.message : String(error)}`,
-        );
-    }
     const currentWatermarks = loadModuleWatermarks({
         db: args.pass.db,
         sessionId: args.pass.sessionId,
@@ -1531,9 +1343,7 @@ export async function buildModuleStateSyncPayload(args: {
     const acked = args.force
         ? {
               compartment_sequence: -1,
-              memory_id: 0,
               m0_mutation_id: 0,
-              memory_mutation_id: 0,
               last_todo_state_hash: "",
               project_memory_epoch: 0,
               project_user_profile_version: 0,
@@ -1542,9 +1352,7 @@ export async function buildModuleStateSyncPayload(args: {
           }
         : (args.state.lastAckedWatermarks ?? {
               compartment_sequence: -1,
-              memory_id: 0,
               m0_mutation_id: 0,
-              memory_mutation_id: 0,
               last_todo_state_hash: "",
               project_memory_epoch: 0,
               project_user_profile_version: 0,
@@ -1566,15 +1374,6 @@ export async function buildModuleStateSyncPayload(args: {
     const workspacePolicyDrift =
         workspace.workspace != null &&
         (currentWatermarks.workspace_fingerprint ?? null) !== (acked.workspace_fingerprint ?? null);
-    const memoryChanged =
-        !omitAuthorityMemorySections &&
-        (args.force ||
-            currentWatermarks.memory_id > acked.memory_id ||
-            currentWatermarks.project_memory_epoch !== acked.project_memory_epoch ||
-            workspacePolicyDrift);
-    const memoryMutationsChanged =
-        !omitAuthorityMemorySections &&
-        (args.force || currentWatermarks.memory_mutation_id > acked.memory_mutation_id);
     const profileChanged =
         args.force ||
         currentWatermarks.project_user_profile_version !== acked.project_user_profile_version;
@@ -1618,259 +1417,16 @@ export async function buildModuleStateSyncPayload(args: {
     }
 
     // A policy transition (approval, verification, revocation) changes rows
-    // the memory-id watermark cannot see: pre-existing memories flip in or
-    // out of automatic eligibility with no new row id. The root project's
-    // epoch carries that signal directly; workspace fingerprint drift covers
-    // foreign members' transitions.
+    // no compartment watermark can see. The root project's epoch carries
+    // that signal directly; workspace fingerprint drift covers foreign
+    // members' transitions. Hint seeds below replay on the same signal.
     const epochChanged =
-        memoryChanged &&
         !args.force &&
         (currentWatermarks.project_memory_epoch !== acked.project_memory_epoch ||
             workspacePolicyDrift);
-    const allMemories =
-        (args.force || epochChanged) && !omitAuthorityMemorySections && args.pass.projectPath
-            ? workspace.workspace
-                ? getMemoriesByProjects(
-                      args.pass.db,
-                      workspace.expandedIdentities,
-                      ["active", "permanent"],
-                      args.pass.nowMs,
-                      workspace.ownIdentities,
-                      workspace.shareCategories,
-                  )
-                : getMemoriesByProject(
-                      args.pass.db,
-                      args.pass.projectPath,
-                      ["active", "permanent"],
-                      args.pass.nowMs,
-                  )
-            : [];
-    const incrementalMemories =
-        memoryChanged && !args.force && !epochChanged && args.pass.projectPath
-            ? readNewMemoriesForM1Union(
-                  args.pass.db,
-                  workspace.expandedIdentities,
-                  acked.memory_id,
-                  args.pass.nowMs,
-                  workspace.ownIdentities,
-                  workspace.shareCategories,
-              )
-            : [];
-    // Both full-snapshot shapes need replace semantics: the receiver only
-    // upserts, so without a prune scope a policy-hidden row already mirrored
-    // in the durable module store would survive a forced resync (which also
-    // acknowledges the current epoch, blocking any later epoch-driven
-    // replacement until the next policy change). The scope names ONLY the
-    // session's OWN identities: the workspace snapshot carries a foreign
-    // member's rows filtered by share category, so naming that member would
-    // let this session prune the member's non-shared rows from the global
-    // native store. Foreign members prune their own rows from their own
-    // sessions' syncs.
-    const memoriesReplaceProjects =
-        (args.force || epochChanged) && !omitAuthorityMemorySections && args.pass.projectPath
-            ? workspace.workspace
-                ? workspace.ownIdentities
-                : [args.pass.projectPath]
-            : undefined;
-    // The module mirror is a host-computed snapshot: only policy-eligible
-    // automatic rows cross the boundary, so the native memory lane can never
-    // serve content the policy hides. Rust stays free of policy derivation.
-    // Exact-bind each loaded row to the revision the policy evaluated: a
-    // rewrite committed between the snapshot load and the policy read
-    // resolves the id through the NEW revision, and the superseded bytes
-    // must not be persisted into the native store under its eligibility.
-    const policyFiltered = filterMemoriesByPolicy(
-        args.pass.db,
-        args.force || epochChanged ? allMemories : incrementalMemories,
-        "auto_inject",
-    ).memories;
-    const snapshotDigests = exactMemoryContentDigests(
-        args.pass.db,
-        policyFiltered.map((memory) => memory.id),
-    );
-    const memoryRows = policyFiltered.filter(
-        (memory) => snapshotDigests.get(memory.id) === sha256Utf8Hex(memory.content),
-    );
-    // The replace scope above cannot cover foreign workspace members, so a
-    // previously mirrored foreign row that the policy now hides — or that was
-    // archived or expired since it was mirrored — would survive in the native
-    // store until one of the member's own sessions syncs. Explicit id
-    // deletions close that gap for exactly those rows: an id-only foreign
-    // coverage query (all statuses, no expiry cutoff) minus the kept
-    // snapshot. Own-project rows are never named — the replace scope prunes
-    // them wholesale, and re-listing a large archived history here would
-    // bloat every force or epoch-driven sync for nothing. Non-shared foreign
-    // categories are outside the coverage scope entirely, so the session
-    // still cannot prune a member's non-shared rows.
-    const foreignCoverage = (() => {
-        if (!(args.force || epochChanged) || omitAuthorityMemorySections) return null;
-        if (!args.pass.projectPath) return null;
-        if (!workspace.workspace) return null;
-        const keptIds = new Set(memoryRows.map((memory) => memory.id));
-        const covered = readForeignCoverageMemoryIds({ db: args.pass.db, workspace });
-        const departed = covered.filter((row) => !keptIds.has(row.id));
-        // A CLASSIFICATION departure (shareable=0 / private scope) is the
-        // owner's row leaving the shared view, not leaving existence: the
-        // native store applies shareable/scope itself when selecting
-        // foreign rows, so upserting the current classification hides it
-        // from foreign readers while the owner's own native injection keeps
-        // it. Deleting it globally would erase the owner's private memory
-        // from native injection until an unrelated force sync. Only rows
-        // the POLICY hides (still share-classified but not kept) are
-        // deleted — uniform absence applies to everyone including the
-        // owner.
-        const reclassifyIds = departed.filter((row) => !row.shareVisible).map((row) => row.id);
-        const reclassifyEligible = new Set(
-            filterMemoryIdsByPolicy(args.pass.db, reclassifyIds, "auto_inject"),
-        );
-        const deleteIds = departed
-            .filter((row) => row.shareVisible || !reclassifyEligible.has(row.id))
-            .map((row) => row.id);
-        const reclassifyRows = bindMemoriesToCurrentRevision(
-            args.pass.db,
-            getMemoriesByIds(
-                args.pass.db,
-                reclassifyIds.filter((id) => reclassifyEligible.has(id)),
-            ),
-        );
-        return { deleteIds, reclassifyRows };
-    })();
-    const memoriesDeleteIds =
-        foreignCoverage !== null && foreignCoverage.deleteIds.length > 0
-            ? foreignCoverage.deleteIds
-            : undefined;
-    const snapshotRows =
-        foreignCoverage !== null && foreignCoverage.reclassifyRows.length > 0
-            ? [...memoryRows, ...foreignCoverage.reclassifyRows]
-            : memoryRows;
-    // Retained for the post-send recheck: a held-open pre-v86 writer can
-    // rewrite a member while the paged sends are in flight without bumping
-    // the epoch, and the completing-batch epoch/fingerprint comparison
-    // cannot see it. The digests describe exactly the bytes this payload
-    // installs (each row passed the oracle equality above).
-    const memorySnapshotDigests: ReadonlyMap<number, string> = new Map(
-        snapshotRows.map((memory) => [memory.id, sha256Utf8Hex(memory.content)]),
-    );
-    const memories = snapshotRows.map((memory) => ({
-        id: memory.id,
-        project_path: memory.projectPath,
-        category: memory.category,
-        content: memory.content,
-        normalized_hash: memory.normalizedHash,
-        importance: memory.importance,
-        scope: memory.scope,
-        shareable: memory.shareable,
-        source_session_id: memory.sourceSessionId,
-        source_type: memory.sourceType,
-        seen_count: memory.seenCount,
-        retrieval_count: memory.retrievalCount,
-        first_seen_at: memory.firstSeenAt,
-        created_at: memory.createdAt,
-        updated_at: memory.updatedAt,
-        last_seen_at: memory.lastSeenAt,
-        last_retrieved_at: memory.lastRetrievedAt,
-        status: memory.status,
-        expires_at: memory.expiresAt,
-        verification_status: memory.verificationStatus,
-        verified_at: memory.verifiedAt,
-        superseded_by_memory_id: memory.supersededByMemoryId,
-        merged_from: memory.mergedFrom,
-        metadata_json: memory.metadataJson,
-    }));
-    // Mutation targets cross the boundary with `new_content`, so they get the
-    // same automatic policy as the snapshot rows: a hidden target's update
-    // must not ship its bytes through the mutation lane (a held-open compat
-    // writer can advance the mutation watermark without an epoch bump). The
-    // reader still force-includes visibility-mutation targets, so removal
-    // signals for previously mirrored rows are unaffected.
-    const unfilteredRenderedIds = memoryMutationsChanged
-        ? args.force
-            ? allMemories.map((memory) => memory.id)
-            : readRenderedMemoryIds({
-                  db: args.pass.db,
-                  projectPath: args.pass.projectPath,
-                  workspace,
-                  nowMs: args.pass.nowMs,
-              })
-        : [];
-    const renderedMemoryIds = memoryMutationsChanged
-        ? args.force
-            ? memoryRows.map((memory) => memory.id)
-            : filterMemoryIdsByPolicy(args.pass.db, unfilteredRenderedIds, "auto_inject")
-        : [];
-    // A denied mutation target must not merely be dropped: the mutation
-    // watermark still advances, so with no full snapshot in this payload the
-    // module would keep serving the previously mirrored (old, eligible) row
-    // until an unrelated resync. Name denied targets as explicit deletions so
-    // the incremental sync removes the stale native row in the same
-    // acknowledgement. The full-snapshot shapes already cover them through
-    // the coverage subtraction above.
-    const incrementalDeniedIds = (() => {
-        if (memoriesDeleteIds !== undefined) return undefined;
-        if (!memoryMutationsChanged || args.force || epochChanged) return undefined;
-        const shipped = new Set(renderedMemoryIds);
-        const denied = unfilteredRenderedIds.filter((id) => !shipped.has(id));
-        return denied.length > 0 ? denied : undefined;
-    })();
-    const effectiveMemoriesDeleteIds = memoriesDeleteIds ?? incrementalDeniedIds;
     const userProfile = includeUserProfile
         ? getActiveUserMemories(args.pass.db).map((memory) => memory.content)
         : [];
-    // Retained for the post-send recheck: a held-open compatibility writer
-    // can rewrite a mutation target while the sends are in flight without
-    // bumping the epoch, and the snapshot digests do not cover mutation
-    // content.
-    const boundMutationDigests = new Map<number, { targetMemoryId: number; digest: string }>();
-    const memoryMutations = (() => {
-        if (!memoryMutationsChanged || !args.pass.projectPath) return [];
-        const rows = getMemoryMutationsForRenderByProjects(
-            args.pass.db,
-            workspace.expandedIdentities,
-            acked.memory_mutation_id,
-            renderedMemoryIds,
-        );
-        // Bind each content-carrying mutation to the revision the policy
-        // check evaluated: a held-open pre-v86 writer can rewrite the target
-        // AFTER filterMemoryIdsByPolicy approved the id but BEFORE this read
-        // — without bumping the policy epoch, so the completion guard cannot
-        // catch it. A mutation whose bytes no longer match the claim's
-        // current revision is dropped; the unprojected successor reaches the
-        // native store only after the late-seed probe seeds it and the epoch
-        // bump triggers a policy-checked full sync.
-        const contentTargets = rows
-            .filter((row) => typeof row.newContent === "string")
-            .map((row) => row.targetMemoryId);
-        const oracleDigests = exactMemoryContentDigests(args.pass.db, contentTargets);
-        const bound = rows.filter(
-            (row) =>
-                typeof row.newContent !== "string" ||
-                oracleDigests.get(row.targetMemoryId) === sha256Utf8Hex(row.newContent),
-        );
-        if (bound.length < rows.length) {
-            sessionLog(
-                args.pass.sessionId,
-                `module sync dropped ${rows.length - bound.length} mutation(s) whose bytes no longer match the policy-evaluated revision`,
-            );
-        }
-        for (const row of bound) {
-            if (typeof row.newContent === "string") {
-                boundMutationDigests.set(row.id, {
-                    targetMemoryId: row.targetMemoryId,
-                    digest: sha256Utf8Hex(row.newContent),
-                });
-            }
-        }
-        return bound.map((row) => ({
-            id: row.id,
-            project_path: row.projectPath,
-            mutation_type: row.mutationType,
-            target_memory_id: row.targetMemoryId,
-            superseded_by_id: row.supersededById,
-            category: row.category,
-            new_content: row.newContent,
-            queued_at: row.queuedAt,
-        }));
-    })();
     const sessionMeta = getOrCreateSessionMeta(args.pass.db, args.pass.sessionId);
     const pendingDropSeedState = args.force
         ? buildPendingDropSeeds({ db: args.pass.db, sessionId: args.pass.sessionId, readRawById })
@@ -1960,8 +1516,6 @@ export async function buildModuleStateSyncPayload(args: {
                 ? seedBoundaryFromSerializedCompartments(compartments)
                 : null,
         compartments,
-        memories,
-        memoryMutations,
         dropSeeds:
             dropSeedState && dropSeedState.seeds.length > 0 ? dropSeedState.seeds : undefined,
         dropSeedSkipped:
@@ -1999,34 +1553,20 @@ export async function buildModuleStateSyncPayload(args: {
         workspace: workspace.workspace,
         lastTodoState: effectiveLastTodoState(args.pass.sessionId, sessionMeta),
         watermarks: currentWatermarks,
-        omitAuthorityMemorySections,
-        memoriesReplaceProjects,
-        memoriesDeleteIds: effectiveMemoriesDeleteIds,
     };
     if (args.force) {
         const wireBatches = buildPagedModuleStateSyncPayloads(payloadArgs);
         return {
             ...wireBatches[0],
             wireBatches,
-            memorySnapshotDigests,
-            memoryMutationDigests: boundMutationDigests,
         };
     }
     const livePayload: ModuleStateSyncPayload = {
-        memorySnapshotDigests,
-        memoryMutationDigests: boundMutationDigests,
         method: "state_sync",
         params: {
             shadow_generation: args.state.moduleGeneration,
             expected_shadow_seq: args.state.lastAckedSeq,
             compartments,
-            ...(omitAuthorityMemorySections ? {} : { memories, memory_mutations: memoryMutations }),
-            ...(memoriesReplaceProjects !== undefined
-                ? { memories_replace_projects: memoriesReplaceProjects }
-                : {}),
-            ...(effectiveMemoriesDeleteIds !== undefined && !omitAuthorityMemorySections
-                ? { memories_delete_ids: effectiveMemoriesDeleteIds }
-                : {}),
             ...(includeUserProfile ? { user_profile: userProfile } : {}),
             ...(includeWorkspace ? { workspace: workspace.workspace } : {}),
             last_todo_state: effectiveLastTodoState(args.pass.sessionId, sessionMeta),
@@ -2074,6 +1614,751 @@ export async function buildModuleStateSyncPayload(args: {
     return livePayload;
 }
 
+export const MODULE_CLAIM_MIRROR_CONSUMER = "rust-module-claim-mirror-v1";
+// Outbox consumer identity for the claim-effect lane. Checkpoint bookkeeping and
+// the delivered request body must name the same consumer, or checkpoints advance
+// under one identity while the module is told about another.
+export const MODULE_CLAIM_EFFECTS_CONSUMER = "rust-module-claims-v1";
+const CLAIM_MIRROR_MAX_GROUPS_PER_SYNC = 1_000;
+const CLAIM_MIRROR_CHANGE_KINDS: readonly ClaimMirrorChangeKind[] = [
+    "upsert",
+    "evidence",
+    "lifecycle",
+    "applicability",
+    "verification",
+    "derivation",
+];
+
+export type ModuleClaimMirrorSyncResult =
+    | { status: "active"; seeded: boolean; appliedReceipts: number }
+    | { status: "unavailable" }
+    | { status: "suppressed"; reason: string };
+
+function claimMirrorRow(
+    item: ProjectMemoryClaimSnapshot,
+    vector: SnapshotVector,
+): CommittedClaimMirrorRow {
+    const projectKey = String(item.projectId);
+    return {
+        publicClaimId: item.publicClaimId,
+        projectId: item.projectId,
+        revisionLocator: item.revisionLocator,
+        content: item.content,
+        contentDigest: item.contentDigest,
+        attributes: {
+            category: item.category,
+            normalizedHash: item.normalizedHash,
+            importance: item.importance,
+            memoryScope: item.memoryScope,
+            sharing: item.sharing,
+            expiresAt: item.expiresAt,
+        },
+        lifecycle: item.lifecycleState,
+        applicability: { assertions: item.applicability },
+        policy: { ...item.policy, dispositions: item.dispositions },
+        provenanceLabel: item.explicitLabel,
+        projectGeneration: vector.projectGenerations[projectKey] ?? -1,
+        policyGeneration: vector.policyGenerations[projectKey] ?? -1,
+    };
+}
+
+function maxClaimEffectId(db: ContextDatabase, projectId: number): number {
+    return (
+        db
+            .prepare(
+                "SELECT COALESCE(MAX(id), 0) AS effectId FROM claim_operation_effects WHERE project_id = ?",
+            )
+            .get(projectId) as { effectId: number }
+    ).effectId;
+}
+
+/** Return a snapshot only when its vector stays fixed while reading effect checkpoints. */
+export function buildAuthorizedClaimMirrorSnapshot(args: {
+    db: ContextDatabase;
+    projectPath: string;
+    nowMs?: number;
+}): ClaimMirrorSnapshot | null {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+        // Resolved per attempt: a membership or sharing change invalidates the
+        // authorization set as well as the epoch, and only a fresh resolve can
+        // rebuild it. Reusing a captured context would make the retry fail the
+        // same way.
+        const workspace = resolveModuleWorkspaceContext(args.db, args.projectPath);
+        const workspaceEpoch = computeWorkspaceEpochFingerprint(
+            args.db,
+            workspace.expandedIdentities,
+        );
+        const provider = readAuthorizedClaimMemorySnapshot(args.db, {
+            authorizedIdentities: workspace.expandedIdentities,
+            ownIdentities: workspace.ownIdentities,
+            sharedCategories: workspace.shareCategories ?? [],
+            workspaceEpoch,
+            // Names the identities `workspaceEpoch` was derived from so the
+            // provider recomputes the fingerprint at publication time instead of
+            // echoing it back. Without this, a revocation landing between the
+            // resolve above and this read is undetectable, and a claim from a
+            // no-longer-authorized project reaches the module mirror.
+            ...(workspace.expandedIdentities.length === 0
+                ? {}
+                : { workspaceIdentities: workspace.expandedIdentities }),
+            ...(args.nowMs === undefined ? {} : { nowMs: args.nowMs }),
+        });
+        if (!provider) continue;
+        const projectIds = [...provider.projectIds].sort((left, right) => left - right);
+        const projectCheckpoints: Record<string, number> = {};
+        for (const projectId of projectIds) {
+            projectCheckpoints[String(projectId)] = maxClaimEffectId(args.db, projectId);
+        }
+        const after = readProjectMemorySnapshotVector(args.db, projectIds, workspaceEpoch);
+        if (canonicalSnapshotVector(provider.snapshotVector) !== canonicalSnapshotVector(after)) {
+            continue;
+        }
+        return {
+            mirrorVersion: CLAIM_MIRROR_VERSION,
+            vector: provider.snapshotVector,
+            projectCheckpoints,
+            claims: provider.items
+                .map((item) => claimMirrorRow(item, provider.snapshotVector))
+                .sort((left, right) => left.publicClaimId.localeCompare(right.publicClaimId)),
+        };
+    }
+    return null;
+}
+
+function advanceClaimMirrorCheckpoints(
+    db: ContextDatabase,
+    checkpoints: Readonly<Record<string, number>>,
+): void {
+    db.transaction(() => {
+        for (const [projectId, ackedEffectId] of Object.entries(checkpoints)) {
+            advanceOutboxConsumerCheckpointInCurrentTransaction(db, {
+                consumer: MODULE_CLAIM_MIRROR_CONSUMER,
+                projectId: Number(projectId),
+                ackedEffectId,
+            });
+        }
+    }).immediate();
+}
+
+async function publishClaimMirrorSnapshot(args: {
+    client: Required<Pick<ModuleStateSyncClient, "claimMirrorReplace">>;
+    state: ModuleStateSyncState;
+    pass: ModuleStateSyncPass & { projectPath: string };
+    projectRoot: string;
+    snapshot: ClaimMirrorSnapshot;
+}): Promise<void> {
+    const request: ClaimMirrorSnapshotRequest = {
+        protocolVersion: CLAIM_MIRROR_PROTOCOL_VERSION,
+        snapshot: args.snapshot,
+    };
+    const response = await args.client.claimMirrorReplace({
+        sessionId: args.pass.sessionId,
+        projectRoot: args.projectRoot,
+        request,
+    });
+    decodeClaimMirrorSnapshotResponse(response, request);
+    advanceClaimMirrorCheckpoints(args.pass.db, args.snapshot.projectCheckpoints);
+    args.state.claimMirrorSeeded = true;
+    args.state.claimMirrorSuppressed = false;
+    args.state.claimMirrorVector = args.snapshot.vector;
+}
+
+function pendingClaimMirrorReceipt(
+    db: ContextDatabase,
+    projectIds: readonly number[],
+): number | null {
+    if (projectIds.length === 0) return null;
+    const placeholders = projectIds.map(() => "?").join(", ");
+    const row = db
+        .prepare(
+            `SELECT effects.receipt_id AS receiptId
+               FROM claim_operation_effects AS effects
+               LEFT JOIN claim_outbox_consumer_checkpoints AS checkpoint
+                 ON checkpoint.consumer = ? AND checkpoint.project_id = effects.project_id
+              WHERE effects.project_id IN (${placeholders})
+                AND effects.id > COALESCE(checkpoint.acked_effect_id, 0)
+              ORDER BY effects.id LIMIT 1`,
+        )
+        .get(MODULE_CLAIM_MIRROR_CONSUMER, ...projectIds) as { receiptId: number } | undefined;
+    return row?.receiptId ?? null;
+}
+
+function vectorsAdvanceOneReceipt(
+    previous: SnapshotVector,
+    current: SnapshotVector,
+    touchedProjects: ReadonlySet<number>,
+): boolean {
+    if (
+        previous.vectorVersion !== current.vectorVersion ||
+        previous.databaseIncarnationId !== current.databaseIncarnationId ||
+        previous.workspaceEpoch !== current.workspaceEpoch ||
+        Object.keys(previous.projectGenerations).join("\0") !==
+            Object.keys(current.projectGenerations).join("\0")
+    ) {
+        return false;
+    }
+    return Object.keys(current.projectGenerations).every((projectId) => {
+        const increment = touchedProjects.has(Number(projectId)) ? 1 : 0;
+        return (
+            current.projectGenerations[projectId] ===
+                previous.projectGenerations[projectId] + increment &&
+            current.policyGenerations[projectId] ===
+                previous.policyGenerations[projectId] + increment
+        );
+    });
+}
+
+function claimMirrorGroup(args: {
+    db: ContextDatabase;
+    snapshot: ClaimMirrorSnapshot;
+    receiptId: number;
+    previousVector: SnapshotVector;
+}): ClaimMirrorReceiptRequest {
+    const receipt = args.db
+        .prepare(
+            `SELECT producer, operation_key AS operationKey,
+                    request_digest AS requestDigest, result_json AS resultJson,
+                    expected_effect_count AS expectedEffectCount
+               FROM claim_operation_receipts WHERE id = ?`,
+        )
+        .get(args.receiptId) as
+        | {
+              producer: string;
+              operationKey: string;
+              requestDigest: string;
+              resultJson: string;
+              expectedEffectCount: number;
+          }
+        | undefined;
+    if (!receipt) throw new Error(`claim mirror receipt ${args.receiptId} is missing`);
+    const proof = proveClaimOperationDurable({
+        db: args.db,
+        producer: receipt.producer,
+        operationKey: receipt.operationKey,
+        resultJson: receipt.resultJson,
+    });
+    if (
+        proof.receiptId !== args.receiptId ||
+        proof.effects.length === 0 ||
+        proof.effects.length !== receipt.expectedEffectCount
+    ) {
+        throw new Error(`claim mirror receipt ${args.receiptId} is incomplete`);
+    }
+    const firstEffectId = proof.effects[0]?.id ?? 0;
+    if (proof.effects.some((effect, index) => effect.id !== firstEffectId + index)) {
+        throw new Error(`claim mirror receipt ${args.receiptId} is reordered`);
+    }
+    const projectIds = new Set(Object.keys(args.snapshot.vector.projectGenerations).map(Number));
+    const touchedProjects = new Set(proof.effects.map((effect) => effect.projectId));
+    if (
+        [...touchedProjects].some((projectId) => !projectIds.has(projectId)) ||
+        !vectorsAdvanceOneReceipt(args.previousVector, args.snapshot.vector, touchedProjects)
+    ) {
+        throw new Error(`claim mirror receipt ${args.receiptId} generation mismatch`);
+    }
+    const claimByPublicId = new Map(
+        args.snapshot.claims.map((claim) => [claim.publicClaimId, claim] as const),
+    );
+    const previousByProject = new Map<number, number>();
+    for (const projectId of projectIds) {
+        previousByProject.set(
+            projectId,
+            readOutboxConsumerCheckpoint(args.db, MODULE_CLAIM_MIRROR_CONSUMER, projectId),
+        );
+    }
+    const effects = proof.effects.map((effect) => {
+        const changeKind = CLAIM_MIRROR_CHANGE_KINDS.find(
+            (candidate) => candidate === effect.changeKind,
+        );
+        const revisionLocator = effect.revisionLocator;
+        const locator = revisionLocator === null ? null : parseRevisionLocator(revisionLocator);
+        const previousProjectEffectId = previousByProject.get(effect.projectId);
+        if (
+            !changeKind ||
+            revisionLocator === null ||
+            !locator ||
+            previousProjectEffectId === undefined ||
+            effect.id <= previousProjectEffectId ||
+            effect.generation !== args.snapshot.vector.projectGenerations[String(effect.projectId)]
+        ) {
+            throw new Error(`claim mirror effect ${effect.id} is invalid`);
+        }
+        const claim = claimByPublicId.get(locator.publicClaimId) ?? null;
+        if (claim !== null && claim.revisionLocator !== revisionLocator) {
+            throw new Error(`claim mirror effect ${effect.id} revision is no longer current`);
+        }
+        previousByProject.set(effect.projectId, effect.id);
+        return {
+            effectId: effect.id,
+            previousProjectEffectId,
+            effectKey: effect.effectKey,
+            projectId: effect.projectId,
+            generation: effect.generation,
+            changeKind,
+            publicClaimId: locator.publicClaimId,
+            revisionLocator,
+            claim,
+        };
+    });
+    return {
+        protocolVersion: CLAIM_MIRROR_PROTOCOL_VERSION,
+        receipt: {
+            mirrorVersion: CLAIM_MIRROR_VERSION,
+            receiptId: args.receiptId,
+            expectedEffectCount: receipt.expectedEffectCount,
+            vector: args.snapshot.vector,
+            effects,
+        },
+    };
+}
+
+function claimMirrorNotSeeded(error: unknown): boolean {
+    let current = error;
+    const seen = new Set<unknown>();
+    while (isRecord(current) && !seen.has(current)) {
+        seen.add(current);
+        const code = typeof current.code === "string" ? current.code.toLowerCase() : "";
+        const message = typeof current.message === "string" ? current.message.toLowerCase() : "";
+        if (
+            code === "claim_mirror_not_seeded" ||
+            message.includes("claim mirror has not been seeded")
+        ) {
+            return true;
+        }
+        current = current.cause;
+    }
+    return false;
+}
+
+function suppressClaimMirror(
+    state: ModuleStateSyncState,
+    sessionId: string,
+    error: unknown,
+): ModuleClaimMirrorSyncResult {
+    const reason = error instanceof Error ? error.message : String(error);
+    // Suppression persists until the lane recovers and the caller discards this
+    // result, so without this a suppressed mirror is invisible: Rust transforms
+    // render no project memories and report nothing. Logged on entry into
+    // suppression rather than on every pass, so a lane that cannot recover
+    // reports its reason once instead of per transform.
+    if (state.claimMirrorSuppressed !== true) {
+        sessionLog(
+            sessionId,
+            `claim mirror suppressed; Rust transforms omit project memories until it recovers: ${reason}`,
+        );
+    }
+    state.claimMirrorSuppressed = true;
+    return { status: "suppressed", reason };
+}
+
+export async function syncModuleClaimMirror(args: {
+    client: ModuleStateSyncClient;
+    state: ModuleStateSyncState;
+    pass: ModuleStateSyncPass;
+    projectRoot: string;
+}): Promise<ModuleClaimMirrorSyncResult> {
+    if (
+        !args.pass.projectPath ||
+        !args.client.claimMirrorReplace ||
+        !args.client.claimMirrorApply
+    ) {
+        return { status: "unavailable" };
+    }
+    const projectPath = args.pass.projectPath;
+    const snapshot = buildAuthorizedClaimMirrorSnapshot({
+        db: args.pass.db,
+        projectPath,
+        nowMs: args.pass.nowMs,
+    });
+    if (!snapshot)
+        return suppressClaimMirror(
+            args.state,
+            args.pass.sessionId,
+            new Error("claim provider snapshot moved"),
+        );
+    const claimMirrorReplace = args.client.claimMirrorReplace;
+    const claimMirrorApply = args.client.claimMirrorApply;
+    const client: Required<Pick<ModuleStateSyncClient, "claimMirrorReplace" | "claimMirrorApply">> =
+        {
+            claimMirrorReplace: (mirrorArgs) => claimMirrorReplace.call(args.client, mirrorArgs),
+            claimMirrorApply: (mirrorArgs) => claimMirrorApply.call(args.client, mirrorArgs),
+        };
+    if (args.state.claimMirrorSeeded !== true) {
+        try {
+            await publishClaimMirrorSnapshot({
+                client,
+                state: args.state,
+                pass: { ...args.pass, projectPath },
+                projectRoot: args.projectRoot,
+                snapshot,
+            });
+            return { status: "active", seeded: true, appliedReceipts: 0 };
+        } catch (error) {
+            return suppressClaimMirror(args.state, args.pass.sessionId, error);
+        }
+    }
+    if (!args.state.claimMirrorVector) {
+        return suppressClaimMirror(
+            args.state,
+            args.pass.sessionId,
+            new Error("claim mirror host vector is missing"),
+        );
+    }
+
+    let appliedReceipts = 0;
+    let currentSnapshot = snapshot;
+    try {
+        while (appliedReceipts < CLAIM_MIRROR_MAX_GROUPS_PER_SYNC) {
+            const receiptId = pendingClaimMirrorReceipt(
+                args.pass.db,
+                Object.keys(currentSnapshot.vector.projectGenerations).map(Number),
+            );
+            if (receiptId === null) {
+                if (
+                    canonicalSnapshotVector(args.state.claimMirrorVector) !==
+                    canonicalSnapshotVector(currentSnapshot.vector)
+                ) {
+                    throw new Error("claim mirror generation moved without a contiguous receipt");
+                }
+                args.state.claimMirrorSuppressed = false;
+                return { status: "active", seeded: false, appliedReceipts };
+            }
+            const request = claimMirrorGroup({
+                db: args.pass.db,
+                snapshot: currentSnapshot,
+                receiptId,
+                previousVector: args.state.claimMirrorVector,
+            });
+            const response: ClaimMirrorReceiptResponse = await client.claimMirrorApply({
+                sessionId: args.pass.sessionId,
+                projectRoot: args.projectRoot,
+                request,
+            });
+            decodeClaimMirrorReceiptResponse(response, request);
+            const maxByProject: Record<string, number> = {};
+            for (const effect of request.receipt.effects) {
+                maxByProject[String(effect.projectId)] = Math.max(
+                    maxByProject[String(effect.projectId)] ?? 0,
+                    effect.effectId,
+                );
+            }
+            advanceClaimMirrorCheckpoints(args.pass.db, maxByProject);
+            args.state.claimMirrorVector = request.receipt.vector;
+            args.state.claimMirrorSuppressed = false;
+            appliedReceipts += 1;
+            currentSnapshot =
+                buildAuthorizedClaimMirrorSnapshot({
+                    db: args.pass.db,
+                    projectPath,
+                    nowMs: args.pass.nowMs,
+                }) ??
+                (() => {
+                    throw new Error("claim provider snapshot moved");
+                })();
+        }
+        throw new Error("claim mirror outbox drain exceeded 1000 receipt groups");
+    } catch (error) {
+        if (claimMirrorNotSeeded(error)) {
+            args.state.claimMirrorSeeded = false;
+            const reseed = buildAuthorizedClaimMirrorSnapshot({
+                db: args.pass.db,
+                projectPath,
+                nowMs: args.pass.nowMs,
+            });
+            if (!reseed)
+                return suppressClaimMirror(
+                    args.state,
+                    args.pass.sessionId,
+                    new Error("claim provider snapshot moved"),
+                );
+            try {
+                await publishClaimMirrorSnapshot({
+                    client,
+                    state: args.state,
+                    pass: { ...args.pass, projectPath },
+                    projectRoot: args.projectRoot,
+                    snapshot: reseed,
+                });
+                return { status: "active", seeded: true, appliedReceipts };
+            } catch (reseedError) {
+                return suppressClaimMirror(args.state, args.pass.sessionId, reseedError);
+            }
+        }
+        return suppressClaimMirror(args.state, args.pass.sessionId, error);
+    }
+}
+
+export interface ClaimOperationDurabilityProof {
+    receiptId: number;
+    requestDigest: string;
+    resultJson: string;
+    result: ClaimOperationResult;
+    effects: ClaimEffectDeliveryReceipt["effects"];
+}
+
+interface ClaimReceiptRow {
+    id: number;
+    requestDigest: string;
+    expectedEffectCount: number;
+    resultJson: string;
+}
+
+interface ClaimEffectRow {
+    id: number;
+    receiptId: number;
+    effectKey: string;
+    projectId: number;
+    generation: number;
+    changeKind: string;
+}
+
+function claimReceiptRow(
+    db: ContextDatabase,
+    producer: string,
+    operationKey: string,
+): ClaimReceiptRow | null {
+    return (
+        (db
+            .prepare(
+                `SELECT id, request_digest AS requestDigest,
+                        expected_effect_count AS expectedEffectCount, result_json AS resultJson
+                   FROM claim_operation_receipts
+                  WHERE producer = ? AND operation_key = ?`,
+            )
+            .get(producer, operationKey) as ClaimReceiptRow | undefined) ?? null
+    );
+}
+
+function claimEffectRows(db: ContextDatabase, receiptId: number): ClaimEffectRow[] {
+    return db
+        .prepare(
+            `SELECT id, receipt_id AS receiptId, effect_key AS effectKey,
+                    project_id AS projectId, generation, change_kind AS changeKind
+               FROM claim_operation_effects
+              WHERE receipt_id = ? ORDER BY id`,
+        )
+        .all(receiptId) as ClaimEffectRow[];
+}
+
+export function proveClaimOperationDurable(args: {
+    db: ContextDatabase;
+    producer: string;
+    operationKey: string;
+    resultJson?: string;
+}): ClaimOperationDurabilityProof {
+    const receipt = claimReceiptRow(args.db, args.producer, args.operationKey);
+    if (!receipt) throw new Error("claim operation context receipt is not durable");
+    if (args.resultJson !== undefined && receipt.resultJson !== args.resultJson) {
+        throw new Error("claim operation context receipt result changed");
+    }
+    const result = decodeClaimOperationResult(receipt.resultJson);
+    const rows = claimEffectRows(args.db, receipt.id);
+    if (rows.length !== receipt.expectedEffectCount || rows.length !== result.effects.length) {
+        throw new Error("claim operation receipt group is incomplete");
+    }
+    const resultByKey = new Map(result.effects.map((effect) => [effect.effectKey, effect]));
+    if (resultByKey.size !== result.effects.length) {
+        throw new Error("claim operation result repeats an effect key");
+    }
+    const effects = rows.map((row) => {
+        const effect = resultByKey.get(row.effectKey);
+        if (
+            !effect ||
+            effect.projectId !== row.projectId ||
+            effect.generation !== row.generation ||
+            effect.changeKind !== row.changeKind
+        ) {
+            throw new Error(`claim operation effect ${row.id} disagrees with its receipt`);
+        }
+        return {
+            id: row.id,
+            effectKey: row.effectKey,
+            projectId: row.projectId,
+            generation: row.generation,
+            changeKind: row.changeKind,
+            revisionLocator: effect.revisionLocator,
+        };
+    });
+    for (const [projectIdText, generation] of Object.entries(result.generations)) {
+        const projectId = Number(projectIdText);
+        if (!Number.isSafeInteger(projectId) || projectId <= 0) {
+            throw new Error(`claim operation generation project ${projectIdText} is invalid`);
+        }
+        const row = args.db
+            .prepare("SELECT generation FROM claim_project_generations WHERE project_id = ?")
+            .get(projectId) as { generation: number } | undefined;
+        if (!row || row.generation < generation) {
+            throw new Error(
+                `claim operation generation ${projectIdText}:${generation} is not durable`,
+            );
+        }
+    }
+    return {
+        receiptId: receipt.id,
+        requestDigest: receipt.requestDigest,
+        resultJson: receipt.resultJson,
+        result,
+        effects,
+    };
+}
+
+export interface ClaimEffectPrefixDrainResult {
+    deliveredReceipts: number;
+    deliveredEffects: number;
+    lastEffectId: number;
+    reachedReceipt: boolean;
+}
+
+export async function drainClaimEffectPrefix(args: {
+    db: ContextDatabase;
+    consumer: string;
+    deliver: (receipt: ClaimEffectDeliveryReceipt) => Promise<{ ackedEffectId: number }>;
+    throughReceiptId?: number;
+    maxReceipts?: number;
+}): Promise<ClaimEffectPrefixDrainResult> {
+    const maxReceipts = Math.max(1, Math.min(args.maxReceipts ?? 1_000, 1_000));
+    let deliveredReceipts = 0;
+    let deliveredEffects = 0;
+    let lastEffectId = 0;
+    let reachedReceipt = false;
+    // Projects the target mutation touches. Delivery order is per project, so a
+    // target only needs its own projects' unacknowledged prefix. Draining every
+    // project would make one mutation wait on unrelated history and, past
+    // `maxReceipts`, fail after the write already committed.
+    let scopedProjectIds: number[] | null = null;
+
+    if (args.throughReceiptId !== undefined) {
+        const targetEffects = claimEffectRows(args.db, args.throughReceiptId);
+        const targetReceiptExists = args.db
+            .prepare("SELECT 1 AS present FROM claim_operation_receipts WHERE id = ?")
+            .get(args.throughReceiptId) as { present: number } | undefined;
+        if (!targetReceiptExists) {
+            throw new Error(`claim effect target receipt ${args.throughReceiptId} is missing`);
+        }
+        reachedReceipt = targetEffects.every(
+            (effect) =>
+                effect.id <= readOutboxConsumerCheckpoint(args.db, args.consumer, effect.projectId),
+        );
+        if (reachedReceipt) {
+            lastEffectId = targetEffects.at(-1)?.id ?? 0;
+            return { deliveredReceipts, deliveredEffects, lastEffectId, reachedReceipt };
+        }
+        const targetProjectIds = [...new Set(targetEffects.map((effect) => effect.projectId))];
+        if (targetProjectIds.length > 0) scopedProjectIds = targetProjectIds;
+    }
+
+    const scopeClause =
+        scopedProjectIds === null
+            ? ""
+            : ` AND effects.project_id IN (${scopedProjectIds.map(() => "?").join(", ")})`;
+    const scopeParams = scopedProjectIds ?? [];
+
+    while (deliveredReceipts < maxReceipts) {
+        const first = args.db
+            .prepare(
+                `SELECT effects.id, effects.receipt_id AS receiptId
+                   FROM claim_operation_effects AS effects
+                   LEFT JOIN claim_outbox_consumer_checkpoints AS checkpoint
+                     ON checkpoint.consumer = ? AND checkpoint.project_id = effects.project_id
+                  WHERE effects.id > COALESCE(checkpoint.acked_effect_id, 0)${scopeClause}
+                  ORDER BY effects.id LIMIT 1`,
+            )
+            .get(args.consumer, ...scopeParams) as { id: number; receiptId: number } | undefined;
+        if (!first) break;
+
+        const receipt = args.db
+            .prepare(
+                `SELECT producer, operation_key AS operationKey,
+                        request_digest AS requestDigest, result_json AS resultJson,
+                        expected_effect_count AS expectedEffectCount
+                   FROM claim_operation_receipts WHERE id = ?`,
+            )
+            .get(first.receiptId) as
+            | {
+                  producer: string;
+                  operationKey: string;
+                  requestDigest: string;
+                  resultJson: string;
+                  expectedEffectCount: number;
+              }
+            | undefined;
+        if (!receipt) throw new Error(`claim effect receipt ${first.receiptId} is missing`);
+        const proof = proveClaimOperationDurable({
+            db: args.db,
+            producer: receipt.producer,
+            operationKey: receipt.operationKey,
+            resultJson: receipt.resultJson,
+        });
+        if (
+            proof.receiptId !== first.receiptId ||
+            proof.effects.length !== receipt.expectedEffectCount
+        ) {
+            throw new Error(`claim effect receipt ${first.receiptId} is incomplete`);
+        }
+        for (const effect of proof.effects) {
+            const checkpoint = readOutboxConsumerCheckpoint(
+                args.db,
+                args.consumer,
+                effect.projectId,
+            );
+            if (effect.id <= checkpoint) {
+                throw new Error(
+                    `claim effect receipt ${first.receiptId} was checkpointed partially`,
+                );
+            }
+        }
+        const delivery: ClaimEffectDeliveryReceipt = {
+            receiptId: proof.receiptId,
+            producer: receipt.producer,
+            operationKey: receipt.operationKey,
+            requestDigest: receipt.requestDigest,
+            resultJson: receipt.resultJson,
+            effects: proof.effects,
+        };
+        const expectedEffectId = proof.effects.at(-1)?.id;
+        if (expectedEffectId === undefined) {
+            throw new Error(`claim effect receipt ${first.receiptId} has no effects`);
+        }
+        const acknowledged = await args.deliver(delivery);
+        if (acknowledged.ackedEffectId !== expectedEffectId) {
+            throw new Error(
+                `claim effect delivery skipped checkpoint ${expectedEffectId} -> ${acknowledged.ackedEffectId}`,
+            );
+        }
+        args.db
+            .transaction(() => {
+                const maxByProject = new Map<number, number>();
+                for (const effect of proof.effects) {
+                    maxByProject.set(
+                        effect.projectId,
+                        Math.max(maxByProject.get(effect.projectId) ?? 0, effect.id),
+                    );
+                }
+                for (const [projectId, ackedEffectId] of maxByProject) {
+                    advanceOutboxConsumerCheckpointInCurrentTransaction(args.db, {
+                        consumer: args.consumer,
+                        projectId,
+                        ackedEffectId,
+                    });
+                }
+            })
+            .immediate();
+
+        deliveredReceipts += 1;
+        deliveredEffects += proof.effects.length;
+        lastEffectId = expectedEffectId;
+        reachedReceipt ||= proof.receiptId === args.throughReceiptId;
+        if (reachedReceipt) break;
+    }
+
+    if (args.throughReceiptId !== undefined && !reachedReceipt) {
+        throw new Error(
+            `claim effect prefix did not reach receipt ${args.throughReceiptId} within ${maxReceipts} groups`,
+        );
+    }
+    return { deliveredReceipts, deliveredEffects, lastEffectId, reachedReceipt };
+}
+
 export interface ModuleStateSyncClient {
     /** Synchronously exposes capabilities cached for the transport's live connection generation. */
     getCachedStateSyncCapabilities?(): { state_sync_deltas?: boolean } | undefined;
@@ -2084,6 +2369,16 @@ export interface ModuleStateSyncClient {
         sessionId: string;
         projectRoot: string;
     }): Promise<{ state_sync_deltas?: boolean }>;
+    claimMirrorReplace?(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimMirrorSnapshotRequest;
+    }): Promise<ClaimMirrorSnapshotResponse>;
+    claimMirrorApply?(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimMirrorReceiptRequest;
+    }): Promise<ClaimMirrorReceiptResponse>;
     call(args: {
         sessionId: string;
         projectRoot: string;
@@ -2106,11 +2401,6 @@ export interface ModuleStateSyncClient {
         signal?: AbortSignal;
         generationSensitive?: boolean;
     }): Promise<unknown>;
-}
-
-function responseMemoriesSkipped(response: unknown): boolean {
-    const value = isRecord(response) && isRecord(response.result) ? response.result : response;
-    return isRecord(value) && value.memories_skipped === true;
 }
 
 function isHistorianCompartmentSyncBusy(error: unknown): boolean {
@@ -2176,6 +2466,12 @@ export async function syncModuleState(args: {
     options?: ModuleStateSyncOptions;
 }): Promise<ModuleStateSyncResult> {
     let force = args.force;
+    await syncModuleClaimMirror({
+        client: args.client,
+        state: args.state,
+        pass: args.pass,
+        projectRoot: args.projectRoot,
+    });
     // Captured from the completing batch of the most recent send, for the
     // post-send policy revalidation below (the batch list itself is scoped
     // to the try block).
@@ -2281,17 +2577,6 @@ export async function syncModuleState(args: {
                     stateSyncDeltas = await resolveStateSyncDeltas(true);
                     continue syncLoop;
                 }
-                if (
-                    args.options?.authority === true &&
-                    responseMemoriesSkipped(response) &&
-                    !args.state.authorityMemorySyncSkipLogged
-                ) {
-                    args.state.authorityMemorySyncSkipLogged = true;
-                    sessionLog(
-                        args.pass.sessionId,
-                        "authority state sync skipped module-owned memory sections",
-                    );
-                }
             }
         } catch (error) {
             if (isHistorianCompartmentSyncBusy(error)) {
@@ -2310,16 +2595,8 @@ export async function syncModuleState(args: {
             force = true;
             continue;
         }
-        // Post-send revalidation: a held-open pre-v86 compatibility writer
-        // appends stale/flagged verification events WITHOUT bumping the
-        // project epoch — including while the awaited sends above were in
-        // flight, a window the pre-send completing-batch check cannot see.
-        // Reconcile first (it projects those events into policy state and
-        // bumps the epoch when any exist), then compare against the built
-        // snapshot; accepting the old watermarks here would leave the module
-        // serving a row the current policy already soft-hides.
+        // Revalidate after sends because state can change while they await; the module must not serve a row the current policy soft-hides.
         if (args.pass.projectPath && completingBatchParams !== null) {
-            reconcileCompatibilityVerifications(args.pass.db);
             const params = completingBatchParams as {
                 project_memory_epoch?: number;
                 acked_watermarks?: { workspace_fingerprint?: string | null };
@@ -2340,77 +2617,6 @@ export async function syncModuleState(args: {
                 );
                 force = true;
                 continue;
-            }
-            // Exact snapshot recheck: the epoch/fingerprint comparison above
-            // cannot see a held-open pre-v86 writer's rewrite (it never
-            // bumps the epoch), so re-prove every content-carrying snapshot
-            // row this payload installed against the claim-revision oracle
-            // and rebuild before acking on any mismatch.
-            const sentDigests = payload.memorySnapshotDigests;
-            if (sentDigests !== undefined && sentDigests.size > 0) {
-                const sentIds = [...sentDigests.keys()];
-                const digestsNow = exactMemoryContentDigests(args.pass.db, sentIds);
-                const rewritten = sentIds.filter(
-                    (id) => digestsNow.get(id) !== sentDigests.get(id),
-                );
-                if (rewritten.length > 0) {
-                    sessionLog(
-                        args.pass.sessionId,
-                        `module state sync rebuilding after send: ${rewritten.length} snapshot row(s) rewritten while the sync was in flight`,
-                    );
-                    force = true;
-                    continue;
-                }
-            }
-            // Mutations carry content the snapshot digests do not cover:
-            // re-prove each sent mutation's bytes against the claim-revision
-            // oracle the same way, or the sender would ack the mutation
-            // watermark for content a compatibility writer superseded while
-            // the call was in flight.
-            const sentMutationDigests = payload.memoryMutationDigests;
-            if (sentMutationDigests !== undefined && sentMutationDigests.size > 0) {
-                const targets = [...sentMutationDigests.values()].map(
-                    (entry) => entry.targetMemoryId,
-                );
-                const digestsNow = exactMemoryContentDigests(args.pass.db, targets);
-                const rewrittenMutations = [...sentMutationDigests.values()].filter(
-                    (entry) => digestsNow.get(entry.targetMemoryId) !== entry.digest,
-                );
-                if (rewrittenMutations.length > 0) {
-                    sessionLog(
-                        args.pass.sessionId,
-                        `module state sync rebuilding after send: ${rewrittenMutations.length} mutation target(s) rewritten while the sync was in flight`,
-                    );
-                    force = true;
-                    continue;
-                }
-            }
-            // Reapply the automatic policy itself to every id this payload
-            // installed: a held-open v85 writer can record a claim_conflicts
-            // supersession (or another authoritative fact) mid-flight that
-            // bumps no epoch and changes no digest — the reconcile above
-            // only projects verification events. readMemoryPolicyRows reads
-            // the authoritative conflict/disposition subqueries, so a
-            // now-hidden id here forces the rebuild that removes it.
-            const installedIds = new Set<number>([
-                ...(payload.memorySnapshotDigests?.keys() ?? []),
-                ...[...(payload.memoryMutationDigests?.values() ?? [])].map(
-                    (entry) => entry.targetMemoryId,
-                ),
-            ]);
-            if (installedIds.size > 0) {
-                const eligibleNow = new Set(
-                    filterMemoryIdsByPolicy(args.pass.db, [...installedIds], "auto_inject"),
-                );
-                const hiddenNow = [...installedIds].filter((id) => !eligibleNow.has(id));
-                if (hiddenNow.length > 0) {
-                    sessionLog(
-                        args.pass.sessionId,
-                        `module state sync rebuilding after send: ${hiddenNow.length} installed row(s) no longer auto-eligible`,
-                    );
-                    force = true;
-                    continue;
-                }
             }
         }
         args.state.lastAckedWatermarks = payload.watermarks;

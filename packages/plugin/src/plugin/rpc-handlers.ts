@@ -37,6 +37,7 @@ import {
 } from "../hooks/magic-context/event-resolvers";
 import { formatEmbedStatusText } from "../hooks/magic-context/format-embed-status";
 import { getLiveNotificationParams } from "../hooks/magic-context/hook-handlers";
+import { readProjectClaimLaneSnapshot } from "../hooks/magic-context/inject-compartments";
 import type { LiveSessionState } from "../hooks/magic-context/live-session-state";
 import { computeM0BlockTokens } from "../hooks/magic-context/m0-token-breakdown";
 import {
@@ -269,15 +270,15 @@ export function buildSidebarSnapshot(
                 ? moduleStatus.compartment_count
                 : archivedCompartmentCount;
 
-        let memoryCount = 0;
-        if (projectIdentity) {
-            const memRow = db
-                .prepare<[string], { count: number }>(
-                    "SELECT COUNT(*) as count FROM memories WHERE project_path = ? AND status = 'active'",
-                )
-                .get(projectIdentity);
-            memoryCount = memRow?.count ?? 0;
-        }
+        const claimLane = projectIdentity
+            ? readProjectClaimLaneSnapshot(db, projectIdentity)
+            : null;
+        const memoryClaims = (claimLane?.items ?? []).map((item) => ({
+            publicClaimId: item.publicClaimId,
+            revisionLocator: item.revisionLocator,
+        }));
+        const memoryCount = memoryClaims.length;
+        const memorySnapshotVector = claimLane?.snapshotVector ?? null;
 
         let pendingOpsCount = 0;
         try {
@@ -511,6 +512,8 @@ export function buildSidebarSnapshot(
             compartmentCount,
             archivedCompartmentCount,
             memoryCount,
+            memoryClaims,
+            memorySnapshotVector,
             memoryBlockCount,
             pendingOpsCount,
             historianRunning: moduleStatus?.wrapup_active === true || compartmentInProgress,
@@ -579,6 +582,7 @@ export function buildSidebarSnapshotRpcResponse(
     compactionEnabled = true,
 ): Record<string, unknown> {
     try {
+        // SAFETY: RPC results serialize to JSON; the handler map's value type is the JSON-object envelope.
         return buildSidebarSnapshot(
             db,
             sessionId,
@@ -851,7 +855,6 @@ function buildEmbedDetail(
         model: coverage.model,
         provider: coverage.provider,
         session: coverage.session,
-        memories: coverage.memories,
         commits: coverage.commits,
         statusText,
     };
@@ -876,6 +879,7 @@ export function registerRpcHandlers(
     const compactionEnabled = isCompactionEnabled(config);
 
     // Read config as raw object for per-model resolution
+    // SAFETY: RPC results serialize to JSON; the handler map's value type is the JSON-object envelope.
     const rawConfig = config as unknown as Record<string, unknown>;
     const getNotificationParams = (sessionId: string) =>
         getLiveNotificationParams(
@@ -919,6 +923,7 @@ export function registerRpcHandlers(
             config.transform_mode === "rust"
                 ? await loadRustSessionStatus(rustModeModuleClient, sessionId, dir)
                 : undefined;
+        // SAFETY: RPC results serialize to JSON; the handler map's value type is the JSON-object envelope.
         return buildStatusDetail(
             db,
             sessionId,
@@ -938,6 +943,7 @@ export function registerRpcHandlers(
         const db = getDb();
         if (!db || !sessionId) return { error: "unavailable" };
         try {
+            // SAFETY: RPC results serialize to JSON; the handler map's value type is the JSON-object envelope.
             return buildEmbedDetail(db, sessionId, dir, liveSessionState) as unknown as Record<
                 string,
                 unknown
@@ -996,7 +1002,6 @@ export function registerRpcHandlers(
             memoryEnabled: config.memory?.enabled ?? true,
             autoPromote: config.memory?.auto_promote ?? true,
             fallbackModels: resolveFallbackChain(config.historian?.fallback_models),
-            runMigration: config.memory?.enabled !== false && !!config.historian?.model,
             userMemoriesEnabled: userMemoryCollectionEnabled(config.dreamer),
             historianTwoPass: config.historian?.two_pass === true,
             getNotificationParams,
@@ -1104,8 +1109,10 @@ export function registerRpcHandlers(
         // shouldShowAnnouncement already covers the empty-version / empty-features
         // case as "nothing to show", so this is the single gate.
         if (!shouldShowAnnouncement()) {
+            // SAFETY: RPC results serialize to JSON; the handler map's value type is the JSON-object envelope.
             return { show: false } as unknown as Record<string, unknown>;
         }
+        // SAFETY: RPC results serialize to JSON; the handler map's value type is the JSON-object envelope.
         return {
             show: true,
             version: ANNOUNCEMENT_VERSION,
@@ -1118,6 +1125,7 @@ export function registerRpcHandlers(
         if (ANNOUNCEMENT_VERSION) {
             markAnnouncementSeen(ANNOUNCEMENT_VERSION);
         }
+        // SAFETY: RPC results serialize to JSON; the handler map's value type is the JSON-object envelope.
         return { ok: true } as unknown as Record<string, unknown>;
     });
 }

@@ -1,14 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { clearClaimCommandConfirmationsForTests } from "@magic-context/core/features/magic-context/memory/claim-policy-commands";
-import { sha256Utf8Hex } from "@magic-context/core/features/magic-context/memory/storage-claims";
-import {
-	createMemoryWithClaimsInCurrentTransaction,
-	runInMemoryClaimsWriteTransaction,
-} from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
-import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage";
-import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
-import { Database } from "@magic-context/core/shared/sqlite";
+import { seedProjectMemoryClaim } from "@magic-context/core/features/magic-context/test-claim-database";
+import { createDirectTestDatabase } from "@magic-context/core/features/magic-context/test-database";
+import type { Database } from "@magic-context/core/shared/sqlite";
 import { registerCtxApproveCommand } from "./ctx-approve";
 
 type Handler = (args: string, ctx: MockCommandContext) => Promise<void>;
@@ -44,35 +39,18 @@ function createMockPi() {
 }
 
 function createDb() {
-	const db = new Database(":memory:");
+	const db = createDirectTestDatabase().db;
 	db.exec("PRAGMA foreign_keys=ON");
-	initializeDatabase(db);
-	runMigrations(db);
 	return db;
 }
 
-function seedMemory(db: Database): number {
-	const outcome = runInMemoryClaimsWriteTransaction(db, () =>
-		createMemoryWithClaimsInCurrentTransaction(
-			db,
-			{
-				producer: "pi-approve-test",
-				operationKey: "seed-1",
-				requestDigest: sha256Utf8Hex("seed-1"),
-			},
-			{
-				projectPath: PROJECT,
-				category: "CONSTRAINTS",
-				content: "pi approval target",
-				normalizedHash: "hash:pi approval target",
-				importance: 60,
-				sourceSessionId: "ses-pi",
-				sourceType: "agent",
-				nowMs: 1_000,
-			},
-		),
-	);
-	return outcome.result.memoryId;
+function seedClaim(db: Database): string {
+	return seedProjectMemoryClaim(db, {
+		projectIdentity: PROJECT,
+		category: "CONSTRAINTS",
+		content: "pi approval target",
+		importance: 60,
+	}).publicClaimId;
 }
 
 const ctx: MockCommandContext = {
@@ -87,7 +65,7 @@ afterEach(() => {
 describe("/ctx-approve (pi)", () => {
 	it("confirms first, records one approval on repeat, and matches OpenCode rows", async () => {
 		const db = createDb();
-		const memoryId = seedMemory(db);
+		const publicClaimId = seedClaim(db);
 		const mock = createMockPi();
 		registerCtxApproveCommand(mock.pi as never, {
 			db,
@@ -96,8 +74,8 @@ describe("/ctx-approve (pi)", () => {
 		});
 		const handler = mock.handlers.get("ctx-approve");
 		expect(handler).toBeDefined();
-		await handler?.(String(memoryId), ctx);
-		await handler?.(String(memoryId), ctx);
+		await handler?.(publicClaimId, ctx);
+		await handler?.(publicClaimId, ctx);
 		expect(mock.sent[0]?.data.text).toContain("Confirmation Required");
 		expect(mock.sent[1]?.data.text).toContain("Recorded");
 		const row = db
@@ -111,7 +89,7 @@ describe("/ctx-approve (pi)", () => {
 
 	it("refuses subagent sessions before any confirmation detail", async () => {
 		const db = createDb();
-		const memoryId = seedMemory(db);
+		const publicClaimId = seedClaim(db);
 		getOrCreateSessionMeta(db, "ses-pi-sub");
 		db.prepare(
 			"UPDATE session_meta SET is_subagent = 1 WHERE session_id = 'ses-pi-sub'",
@@ -123,7 +101,7 @@ describe("/ctx-approve (pi)", () => {
 			projectIdentity: PROJECT,
 		});
 		const handler = mock.handlers.get("ctx-approve");
-		await handler?.(String(memoryId), {
+		await handler?.(publicClaimId, {
 			cwd: "/tmp",
 			sessionManager: { getSessionId: () => "ses-pi-sub" },
 		});
@@ -142,7 +120,7 @@ describe("/ctx-approve (pi)", () => {
 
 	it("rejects targets outside the active project", async () => {
 		const db = createDb();
-		const memoryId = seedMemory(db);
+		const publicClaimId = seedClaim(db);
 		const mock = createMockPi();
 		registerCtxApproveCommand(mock.pi as never, {
 			db,
@@ -150,7 +128,7 @@ describe("/ctx-approve (pi)", () => {
 			projectIdentity: "git:some-other-project",
 		});
 		const handler = mock.handlers.get("ctx-approve");
-		await handler?.(String(memoryId), ctx);
+		await handler?.(publicClaimId, ctx);
 		expect(mock.sent[0]?.data.level).toBe("error");
 		expect(
 			(

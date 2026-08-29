@@ -1,95 +1,108 @@
 import { describe, expect, it } from "bun:test";
 
-import { buildVerifyPrompt, parseVerifyManifest, validateVerifyManifest } from "./verify-prompt";
+import type { ClaimMutationToken } from "../memory/claim-operation-contract";
+import {
+    buildVerifyPrompt,
+    parseVerifyManifest,
+    VERIFY_SYSTEM_PROMPT,
+    validateVerifyManifest,
+} from "./verify-prompt";
 
-describe("parseVerifyManifest", () => {
-    it("parses verified / update / archive with attribute-order tolerance", () => {
-        const text = `narration
-<verify>
-<verified id="1" files="a/b.ts,c/d.ts"/>
-<update id="2" files="x.ts">X uses Y now</update>
-<archive id="3" reason="the symbol no longer exists"/>
-<verified files="z.ts" id="4"/>
-</verify>`;
-        const out = parseVerifyManifest(text);
-        expect(out.verified).toEqual([
-            { id: 1, files: ["a/b.ts", "c/d.ts"] },
-            { id: 4, files: ["z.ts"] },
-        ]);
-        expect(out.updated).toEqual([{ id: 2, files: ["x.ts"], content: "X uses Y now" }]);
-        expect(out.archived).toEqual([{ id: 3, reason: "the symbol no longer exists" }]);
-    });
+const A = `mcm_${"a".repeat(32)}`;
+const B = `mcm_${"b".repeat(32)}`;
+const C = `mcm_${"c".repeat(32)}`;
 
-    it("handles a self-closing update (no content)", () => {
-        const out = parseVerifyManifest(`<verify><update id="7" files="a.ts"/></verify>`);
-        expect(out.updated).toEqual([{ id: 7, files: ["a.ts"], content: "" }]);
-    });
+function token(): ClaimMutationToken {
+    return {
+        tokenVersion: 1,
+        publicClaimId: A,
+        revision: 1,
+        contentDigest: "1".repeat(64),
+        lifecycleSeq: 1,
+        applicabilityHeadsDigest: "2".repeat(64),
+        policyHeadsDigest: "3".repeat(64),
+    };
+}
 
-    it("rejects a truncated manifest with no closing root", () => {
-        expect(() => parseVerifyManifest(`<verify><archive id="9" reason="r"/>`)).toThrow(
-            /closing root/,
+describe("verify manifest", () => {
+    it("parses claim-bound verified, update, and archive entries", () => {
+        const parsed = parseVerifyManifest(
+            `<verify><verified claim="${A}" files="a.ts,b.ts"/><update claim="${B}" files="b.ts">New fact</update><archive claim="${C}" reason="removed"/></verify>`,
         );
-    });
-
-    it("still accepts an empty verify body (no unrecognized children)", () => {
-        expect(parseVerifyManifest(`<verify></verify>`)).toEqual({
-            verified: [],
-            updated: [],
-            archived: [],
+        expect(parsed).toEqual({
+            verified: [{ publicClaimId: A, files: ["a.ts", "b.ts"] }],
+            updated: [{ publicClaimId: B, files: ["b.ts"], content: "New fact" }],
+            archived: [{ publicClaimId: C, reason: "removed" }],
         });
     });
 
-    it("rejects a well-formed root with no recognized entries", () => {
-        expect(() => parseVerifyManifest(`<verify><item id="1"/></verify>`)).toThrow(
-            /root <item> unrecognized; expected <verify> with <verified> entries/,
+    it("rejects missing files, duplicates, truncation, and coverage mismatch", () => {
+        expect(() => parseVerifyManifest(`<verify><verified claim="${A}"/></verify>`)).toThrow(
+            /missing backing files/,
         );
-        expect(() =>
-            parseVerifyManifest(`<verify>[{ "id": 1, "status": "verified" }]</verify>`),
-        ).toThrow(/JSON array unrecognized; expected <verify> with <verified> entries/);
-    });
-
-    it("rejects duplicate ids and invalid entries", () => {
         expect(() =>
             parseVerifyManifest(
-                `<verify><verified id="9" files="a.ts"/><archive id="9" reason="r"/></verify>`,
+                `<verify><verified claim="${A}" files="a.ts"/><archive claim="${A}" reason="r"/></verify>`,
             ),
         ).toThrow(/duplicate id/);
-        expect(() =>
-            parseVerifyManifest(`<verify><verified id="x" files="a.ts"/></verify>`),
-        ).toThrow(/numeric id/);
-    });
-});
-
-describe("validateVerifyManifest", () => {
-    it("rejects an empty parse against a non-empty batch", () => {
-        expect(() => validateVerifyManifest(`<verify></verify>`, new Set([1]))).toThrow(
-            /parsed zero entries; expected <verify> with <verified> entries/,
+        expect(() => parseVerifyManifest(`<verify><archive claim="${A}" reason="r"/>`)).toThrow(
+            /closing root/,
         );
+        expect(() =>
+            validateVerifyManifest(
+                `<verify><verified claim="${A}" files="a.ts"/></verify>`,
+                new Set([A, B]),
+            ),
+        ).toThrow(/missing id/);
     });
 
-    it("rejects missing and extra ids at retry time", () => {
-        expect(() =>
-            validateVerifyManifest(
-                `<verify><verified id="1" files="a.ts"/></verify>`,
-                new Set([1, 2]),
-            ),
-        ).toThrow(/missing id 2/);
-        expect(() =>
-            validateVerifyManifest(
-                `<verify><verified id="1" files="a.ts"/><verified id="9" files="b.ts"/></verify>`,
-                new Set([1]),
-            ),
-        ).toThrow(/unknown id 9/);
+    it("allows file-independent anti-memory outcomes only when selected as such", () => {
+        const text = `<verify><verified claim="${A}" files=""/></verify>`;
+        expect(() => validateVerifyManifest(text, new Set([A]))).toThrow(/missing backing files/);
+        expect(validateVerifyManifest(text, new Set([A]), new Set([A])).verified).toEqual([
+            { publicClaimId: A, files: [] },
+        ]);
     });
 });
 
-describe("buildVerifyPrompt", () => {
-    it("lists each memory with its backing files and instructs default-verified", () => {
+describe("verify prompt", () => {
+    it("renders exact public locator, digest, and backing files", () => {
+        const contentDigest = "1".repeat(64);
         const prompt = buildVerifyPrompt("git:abc", [
-            { id: 1, category: "ARCHITECTURE", content: "foo", mappedFiles: ["a.ts", "b.ts"] },
+            {
+                publicClaimId: A,
+                revisionLocator: `${A}/r1/${contentDigest}`,
+                contentDigest,
+                mutationToken: token(),
+                category: "ARCHITECTURE",
+                content: "Fact",
+                mappedFiles: ["a.ts", "b.ts"],
+            },
         ]);
-        expect(prompt).toContain("[1] ARCHITECTURE");
+        expect(prompt).toContain(`[${A}] ARCHITECTURE`);
+        expect(prompt).toContain(`Revision: ${A}/r1/${contentDigest}`);
+        expect(prompt).toContain(`Content digest: ${contentDigest}`);
         expect(prompt).toContain("Backing files: a.ts, b.ts");
-        expect(prompt).toContain("default verified");
+    });
+
+    it("labels file-independent anti-memories and explains archive-to-stale semantics", () => {
+        const prompt = buildVerifyPrompt("git:abc", [
+            {
+                publicClaimId: A,
+                revisionLocator: `${A}/r1/${"1".repeat(64)}`,
+                contentDigest: "1".repeat(64),
+                mutationToken: token(),
+                category: "REJECTED_APPROACH",
+                content: "Rejected strategy: Redis",
+                mappedFiles: [],
+            },
+        ]);
+        expect(prompt).toContain("Backing files: (none; inspect current project evidence)");
+        expect(VERIFY_SYSTEM_PROMPT).toContain("anti-memory");
+        expect(VERIFY_SYSTEM_PROMPT).toContain("ARCHIVE");
+        expect(VERIFY_SYSTEM_PROMPT).toContain("stale");
+        expect(VERIFY_SYSTEM_PROMPT).toContain(
+            "Use ARCHIVE when the rejection no longer clearly holds; the host preserves it as labeled stale history rather than deleting it.",
+        );
     });
 });

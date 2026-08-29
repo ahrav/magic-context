@@ -9,11 +9,9 @@ import {
     type AuthorityStatus,
     getAuthorityManagedMarker,
 } from "../../features/magic-context/context-authority";
-import { insertMemory } from "../../features/magic-context/memory";
-import { runMigrations } from "../../features/magic-context/migrations";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import { getChannel2NudgeState, setChannel2NudgeState } from "../../features/magic-context/storage";
-import { initializeDatabase, openDatabase } from "../../features/magic-context/storage-db";
+import { openDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
 import {
     getEmergencyRecoveryArmedAt,
@@ -22,6 +20,8 @@ import {
     recordOverflowDetected,
     resetEmergencyRecoveryRegistryForTest,
 } from "../../features/magic-context/storage-meta-persisted";
+import { seedProjectMemoryClaim } from "../../features/magic-context/test-claim-database";
+import { createDirectTestDatabase } from "../../features/magic-context/test-database";
 import {
     scheduleOpenCodeTransformDecisionWrite,
     __test as transformDecisionTest,
@@ -36,7 +36,7 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import { deriveWindowGeometry } from "../../shared/window-geometry";
 import { createCtxSearchTools } from "../../tools/ctx-search/tools";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
-import { getVisibleMemoryIds } from "./inject-compartments";
+import { getVisibleRevisionLocators, readProjectClaimLaneSnapshot } from "./inject-compartments";
 import { getSlot } from "./lkg-slot";
 import { MODULE_PAGE_MAX_BYTES } from "./module-wire";
 import { RawFallbackContextLimitError } from "./raw-fallback-context-limit";
@@ -142,9 +142,7 @@ afterEach(() => {
 });
 
 function makeDb(): ContextDatabase {
-    const db = new Database(":memory:") as ContextDatabase;
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase().db as ContextDatabase;
     databases.push(db);
     return db;
 }
@@ -271,11 +269,6 @@ describe("Rust mode authority adapter", () => {
         const sessionId = "ses-directory-root";
         installRawProvider(sessionId);
         const db = makeDb();
-        withPrivilegedWriter(db, () => {
-            db.prepare(
-                "INSERT INTO memories (project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, 'CONSTRAINTS', 'seed me', 'seed-hash', 0, 0, 0, 0)",
-            ).run("git:identity");
-        });
         const authorityRoots: string[] = [];
         const statuses = new Map<string, AuthorityStatus>();
         const module: RustModeModuleClient = {
@@ -1247,16 +1240,18 @@ describe("Rust mode authority adapter", () => {
         );
     });
 
-    it("mirrors rendered memory ids for ctx_search without rewriting a stable manifest", async () => {
-        const sessionId = `rust-memory-visibility-${Date.now()}`;
+    it("mirrors canonical revision locators and snapshot vectors for ctx_search", async () => {
+        const sessionId = `rust-claim-visibility-${Date.now()}`;
         sessions.push(sessionId);
         const db = makeDb();
         installRawProvider(sessionId);
-        const memory = insertMemory(db, {
-            projectPath: "/tmp/project",
-            category: "ARCHITECTURE_DECISIONS",
-            content: "The rust-rendered memory must not be returned twice.",
+        const firstClaim = seedProjectMemoryClaim(db, {
+            projectIdentity: "dir:/tmp/project",
+            category: "ARCHITECTURE",
+            content: "The rust-rendered claim must not be returned twice.",
         });
+        const firstLane = readProjectClaimLaneSnapshot(db, "dir:/tmp/project");
+        if (!firstLane) throw new Error("missing first claim lane");
         const meta = makeMeta(db, sessionId);
         db.exec(`
             CREATE TABLE memory_manifest_updates (count INTEGER NOT NULL);
@@ -1267,15 +1262,33 @@ describe("Rust mode authority adapter", () => {
                 UPDATE memory_manifest_updates SET count = count + 1;
             END;
         `);
-        let renderedMemoryIds = [memory.id];
+        let renderedRevisionLocators = [firstClaim.revisionLocator];
+        let memorySnapshotVector = firstLane.snapshotVector;
+        const transformClaimLanes: unknown[] = [];
         const moduleClient: RustModeModuleClient = {
-            call: async ({ method }) =>
-                method === "transform"
-                    ? {
-                          native_messages: makeMessages(sessionId),
-                          rendered_memory_ids: renderedMemoryIds,
-                      }
-                    : { ok: true },
+            call: async ({ method, body }) => {
+                if (method !== "transform") return { ok: true };
+                transformClaimLanes.push((body as Record<string, unknown>).claim_lane);
+                return {
+                    native_messages: makeMessages(sessionId),
+                    rendered_revision_locators: renderedRevisionLocators,
+                    memory_snapshot_vector: memorySnapshotVector,
+                };
+            },
+            claimMirrorReplace: async ({ request }) => ({
+                protocolVersion: 1,
+                mirrorVersion: 1,
+                databaseIncarnationId: request.snapshot.vector.databaseIncarnationId,
+                projectCheckpoints: request.snapshot.projectCheckpoints,
+            }),
+            claimMirrorApply: async ({ request }) => ({
+                protocolVersion: 1,
+                mirrorVersion: 1,
+                receiptId: request.receipt.receiptId,
+                replayed: false,
+                appliedEffectCount: request.receipt.effects.length,
+                ackedEffectId: request.receipt.effects.at(-1)?.effectId ?? 0,
+            }),
         };
         const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
         const run = async () => {
@@ -1284,16 +1297,25 @@ describe("Rust mode authority adapter", () => {
         };
 
         await run();
-        expect(getVisibleMemoryIds(db, sessionId)).toEqual(new Set([memory.id]));
+        expect(transformClaimLanes.at(-1)).toMatchObject({
+            enabled: true,
+            snapshot_vector: {
+                vectorVersion: 1,
+                databaseIncarnationId: firstLane.snapshotVector.databaseIncarnationId,
+            },
+        });
+        expect(getVisibleRevisionLocators(db, sessionId)).toEqual(
+            new Set([firstClaim.revisionLocator]),
+        );
         const tools = createCtxSearchTools({
             db,
-            resolveProjectPath: () => "/tmp/project",
+            resolveProjectPath: () => "dir:/tmp/project",
             memoryEnabled: true,
             embeddingEnabled: false,
             readMessages: () => [],
         });
         const search = await tools.ctx_search.execute(
-            { query: `#${memory.id}`, sources: ["memory"] },
+            { query: firstClaim.publicClaimId, sources: ["memory"] },
             { sessionID: sessionId, directory: "/tmp/project" } as never,
         );
         expect(search).toContain("No results found");
@@ -1303,12 +1325,28 @@ describe("Rust mode authority adapter", () => {
             db.prepare("SELECT count FROM memory_manifest_updates").get() as { count: number },
         ).toEqual({ count: 1 });
 
-        renderedMemoryIds = [memory.id + 1];
+        const secondClaim = seedProjectMemoryClaim(db, {
+            projectIdentity: "dir:/tmp/project",
+            category: "ARCHITECTURE",
+            content: "A new rust-rendered claim replaces the host manifest.",
+        });
+        const secondLane = readProjectClaimLaneSnapshot(db, "dir:/tmp/project");
+        if (!secondLane) throw new Error("missing second claim lane");
+        renderedRevisionLocators = [secondClaim.revisionLocator];
+        memorySnapshotVector = secondLane.snapshotVector;
         await run();
-        expect(getVisibleMemoryIds(db, sessionId)).toEqual(new Set([memory.id + 1]));
+        expect(getVisibleRevisionLocators(db, sessionId)).toEqual(
+            new Set([secondClaim.revisionLocator]),
+        );
         expect(
             db.prepare("SELECT count FROM memory_manifest_updates").get() as { count: number },
         ).toEqual({ count: 2 });
+        const mirrored = db
+            .prepare(
+                "SELECT cached_m0_claim_snapshot_vector AS vector FROM session_meta WHERE session_id = ?",
+            )
+            .get(sessionId) as { vector: string };
+        expect(JSON.parse(mirrored.vector)).toEqual(secondLane.snapshotVector);
     });
 
     it("preserves the receiver for a class-backed compartment mirror client", async () => {
@@ -2928,36 +2966,16 @@ describe("Rust mode authority adapter", () => {
 });
 
 describe("prepareRustMemoryAuthority mixed restore", () => {
-    it("resumes a schema-57 DRAINING restart through the real prepare path", async () => {
+    it("fails closed when a legacy memories DRAINING restart has unreplayed feed rows", async () => {
         const db = makeDb();
         const projectPath = "git:schema-57-restart";
         const projectRoot = "/worktrees/schema-57-restart";
-        db.exec(`
-            DROP TABLE mirror_live_staging;
-            DROP TABLE mirror_resnapshot_state;
-            DROP TABLE mirror_live_memory_rows;
-            DELETE FROM schema_migrations WHERE version >= 58;
-        `);
         withPrivilegedWriter(db, () => {
-            db.prepare(
-                "INSERT INTO memories (id, project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (9395, ?, 'CONFIG_VALUES', 'drive model', 'same-hash', 0, 0, 0, 0)",
-            ).run(projectPath);
-            db.prepare(
-                "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', '/legacy', 100, 9395)",
-            ).run();
             db.prepare(
                 "INSERT INTO mirror_cursors(domain, cursor, updated_at) VALUES ('memories', 20, 0)",
             ).run();
         });
-        runMigrations(db);
-        db.prepare(
-            "UPDATE mirror_resnapshot_state SET status = 'resnapshotting' WHERE domain = 'memories'",
-        ).run();
-        db.prepare(
-            "INSERT INTO mirror_live_staging VALUES ('abandoned', '/stale', 1, 'CONSTRAINTS', 'stale', NULL)",
-        ).run();
 
-        const calls: Array<{ liveOnly?: boolean; cursor: number }> = [];
         const statuses = new Map<string, AuthorityStatus | null>([
             [
                 "memories",
@@ -2982,14 +3000,6 @@ describe("prepareRustMemoryAuthority mixed restore", () => {
                 },
             ],
         ]);
-        const memoryRow = (id: number, sourceProject: string) => ({
-            id,
-            project_path: sourceProject,
-            category: "CONFIG_VALUES",
-            content: "drive model",
-            normalized_hash: "same-hash",
-            status: "active",
-        });
         const module: RustModeModuleClient = {
             call: async () => ({ ok: true }),
             authorityStatus: async (args) => ({ authority: statuses.get(args.domain) ?? null }),
@@ -2997,68 +3007,26 @@ describe("prepareRustMemoryAuthority mixed restore", () => {
                 throw new Error("prepare should not run during DRAINING recovery");
             },
             authoritySeed: async () => ({ seeded: 0 }),
-            authorityDrain: async (args) => {
-                if (args.action === "finish") {
-                    statuses.set("memories", {
-                        context_store_uuid: "store",
-                        project: projectPath,
-                        domain: "memories",
-                        state: "TS",
-                        generation: 4,
-                    });
-                }
-                return {
-                    authority: {
-                        context_store_uuid: "store",
-                        project: projectPath,
-                        domain: "memories",
-                        state: args.action === "finish" ? "TS" : "DRAINING",
-                        generation: args.action === "finish" ? 4 : 3,
-                        captured_upper_bound: 21,
-                        coordinator_token: "restart-token",
-                    },
-                };
-            },
-            mirrorPull: async (args) => {
-                calls.push({ liveOnly: args.live_only, cursor: args.cursor });
-                return args.live_only
-                    ? {
-                          page: {
-                              domain: "memories",
-                              cursor: 0,
-                              next_cursor: 200,
-                              has_more: false,
-                              rows: [
-                                  {
-                                      feed_seq: 0,
-                                      domain: "memories",
-                                      op: "insert",
-                                      module_row_id: 200,
-                                      full_row_snapshot: memoryRow(200, projectPath),
-                                      content_hash: "same-hash",
-                                  },
-                              ],
-                          },
-                      }
-                    : {
-                          page: {
-                              domain: "memories",
-                              cursor: args.cursor,
-                              next_cursor: 21,
-                              has_more: false,
-                              rows: [
-                                  {
-                                      feed_seq: 21,
-                                      domain: "memories",
-                                      op: "tombstone",
-                                      module_row_id: 100,
-                                      full_row_snapshot: memoryRow(100, "/legacy"),
-                                      content_hash: "same-hash",
-                                  },
-                              ],
-                          },
-                      };
-            },
+            authorityDrain: async () => ({
+                authority: {
+                    context_store_uuid: "store",
+                    project: projectPath,
+                    domain: "memories",
+                    state: "DRAINING",
+                    generation: 3,
+                    captured_upper_bound: 21,
+                    coordinator_token: "restart-token",
+                },
+            }),
+            mirrorPull: async (args) => ({
+                page: {
+                    domain: args.domain as "memories" | "notes",
+                    cursor: args.cursor,
+                    next_cursor: args.cursor,
+                    has_more: false,
+                    rows: [],
+                },
+            }),
         };
         const state = {
             initialized: false,
@@ -3091,28 +3059,21 @@ describe("prepareRustMemoryAuthority mixed restore", () => {
             memoryAuthorityReady: false,
         };
 
-        await __rustModeTransformTest.prepareRustMemoryAuthority({
-            db,
-            module,
-            projectPath,
-            projectRoot,
-            state,
-        });
-
-        expect(calls.map((call) => call.liveOnly)).toEqual([true, undefined]);
+        await expect(
+            __rustModeTransformTest.prepareRustMemoryAuthority({
+                db,
+                module,
+                projectPath,
+                projectRoot,
+                state,
+            }),
+        ).rejects.toThrow("legacy module feed rows");
         expect(
             db.prepare("SELECT cursor FROM mirror_cursors WHERE domain = 'memories'").get(),
         ).toEqual({
-            cursor: 21,
+            cursor: 20,
         });
-        expect(db.prepare("SELECT id FROM memories WHERE id = 9395").get()).toEqual({ id: 9395 });
-        expect(db.prepare("SELECT status FROM mirror_resnapshot_state").get()).toEqual({
-            status: "complete",
-        });
-        expect(db.prepare("SELECT COUNT(*) AS count FROM mirror_live_staging").get()).toEqual({
-            count: 0,
-        });
-        expect(state.memoryAuthorityReady).toBe(true);
+        expect(state.memoryAuthorityReady).toBe(false);
     });
 
     it("reconciles remaining MODULE domains after a DRAINING resume before tools open", async () => {

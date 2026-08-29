@@ -9,9 +9,12 @@ description = "Magic Context cache-stability core: pass classifier + frozen-unit
 name = "mc_core"
 path = "src/lib.rs"
 
-[dependencies]
-cortexkit-cache-core = { workspace = true }
+[features]
+default = ["cache-core"]
+cache-core = ["dep:cortexkit-cache-core"]
 
-[dev-dependencies]
+[dependencies]
+cortexkit-cache-core = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }

@@ -1,11 +1,9 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { Database } from "../../../shared/sqlite";
+import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
-import { insertMemory } from "../memory/storage-memory";
-import { runMigrations } from "../migrations";
-import { initializeDatabase } from "../storage-db";
+import { createClaimReaderTestDatabase, seedProjectMemoryClaim } from "../test-claim-database";
 import { acquireLease, releaseLease } from "./lease";
 import { setDreamState } from "./storage-dream-state";
 import {
@@ -29,10 +27,7 @@ afterEach(() => {
 });
 
 function freshDb(): Database {
-    const d = new Database(":memory:");
-    initializeDatabase(d);
-    runMigrations(d);
-    return d;
+    return createClaimReaderTestDatabase();
 }
 
 const PROJECT = "git:abc";
@@ -45,12 +40,12 @@ function cfg(
     return { task, schedule, timeoutMinutes: 20, ...extra };
 }
 
-/** Give a project active memories so memory-domain gates pass. */
+/** Give a project active claims so memory-domain gates pass. */
 let memorySeq = 0;
 function seedActiveMemory(d: Database, project = PROJECT): void {
     memorySeq += 1;
-    insertMemory(d, {
-        projectPath: project,
+    seedProjectMemoryClaim(d, {
+        projectIdentity: project,
         category: "PROJECT_RULES",
         content: `mem-${memorySeq}`,
     });

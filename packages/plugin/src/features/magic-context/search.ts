@@ -4,35 +4,32 @@ import {
     loadCompartmentChunkEmbeddingsForSearch,
     type StoredCompartmentChunkEmbedding,
 } from "./compartment-chunk-embedding";
+import { sanitizeFtsQuery } from "./fts-query";
 import { type GitCommitSearchHit, searchGitCommitsSync } from "./git-commits";
 import { containsProbeVerbatim, extractLiteralProbes } from "./literal-probes";
-import {
-    ensureMemoryEmbeddings,
-    getMemoriesByProject,
-    getMemoriesByProjects,
-    getMemoriesByRequestedIds,
-    getProjectEmbeddings,
-    type Memory,
-    ModuleMemoryAuthorityError,
-    peekProjectEmbeddings,
-    searchMemoriesFTSWithinIds,
-    updateMemoryRetrievalCount,
-} from "./memory";
+import { readProjectIdentityMap } from "./memory/claim-memory-render";
+import { isValidPublicClaimId, parseRevisionLocator } from "./memory/claim-operation-contract";
+import { CLAIM_POLICY_VERSION } from "./memory/claim-visibility-policy";
+import { ANTI_MEMORY_CATEGORY } from "./memory/constants";
 import { cosineSimilarity } from "./memory/cosine-similarity";
-import { embedText, getProjectEmbeddingSnapshot, isEmbeddingEnabled } from "./memory/embedding";
+import {
+    embedBatchForProject,
+    embedText,
+    getProjectEmbeddingSnapshot,
+    isEmbeddingEnabled,
+} from "./memory/embedding";
 import type { EmbeddingPurpose } from "./memory/embedding-provider";
 import {
-    bindMemoriesToCurrentRevision,
-    decideMemoryPolicy,
-    exactMemoryContentDigests,
-    filterMemoriesByPolicy,
-    hasClaimEffectivePolicy,
-    type MemoryPolicyRow,
-    type MemoryPolicySurface,
-    readMemoryPolicyRows,
-} from "./memory/storage-claim-visibility";
-import { sha256Utf8Hex } from "./memory/storage-claims";
-import { sanitizeFtsQuery } from "./memory/storage-memory-fts";
+    listActiveAntiMemoryPublicIds,
+    readAntiMemories,
+    readAntiMemory,
+} from "./memory/storage-anti-memory";
+import {
+    type ProjectMemoryClaimSnapshot,
+    readProjectMemoryCurrentState,
+    resolveProjectIdsForIdentities,
+} from "./memory/storage-claim-current-state";
+import { recordClaimUsage } from "./memory/storage-claim-operations";
 import { getIndexedMessageCorpusSize } from "./message-index";
 import {
     DEFAULT_SEARCH_RESULT_LIMIT,
@@ -41,6 +38,7 @@ import {
     normalizeSearchResultLimit,
     prepareExplicitQuery,
     QueryBoundsError,
+    truncateUtf8Bytes,
 } from "./search-bounds";
 import { recordShadowMeasurement } from "./search-measurement";
 import {
@@ -64,8 +62,8 @@ import {
 } from "./storage-notes";
 import { getActivePrimers, type Primer } from "./storage-primers";
 import {
+    computeWorkspaceEpochFingerprint,
     expandWorkspaceIdentitySetWithAliases,
-    resolveStoredPathWorkspaceIdentity,
     resolveWorkspaceIdentitySet,
     resolveWorkspaceShareCategories,
     sourceNameForMemory,
@@ -88,6 +86,19 @@ const MEMORY_SOURCE_BOOST = 1.3;
 const MESSAGE_SOURCE_BOOST = 1.15;
 const GIT_COMMIT_SOURCE_BOOST = 1.2;
 const PRIMER_SOURCE_BOOST = 1.25;
+const ANTI_MEMORY_SEMANTIC_THRESHOLD = 0.7;
+/** Ceiling on candidate texts sent to the embedding provider per search.
+ *  Anti-memory passage vectors are computed live (nothing persists them),
+ *  and this lane runs on the per-user-prompt auto-search path, so the batch
+ *  must not scale with the record population. Lexically matched candidates
+ *  keep priority; the remainder of the budget goes to the newest records. */
+const ANTI_MEMORY_MAX_SEMANTIC_CANDIDATES = 32;
+/** Ceiling on the bytes of one anti-memory passage handed to the embedding
+ *  provider and scanned for lexical overlap. Payload fields are normalized but
+ *  not length-limited at write time, so without this a single oversized record
+ *  could exceed the provider's input budget or spend the whole per-prompt
+ *  deadline. Paired with the candidate ceiling above, it bounds a batch. */
+const ANTI_MEMORY_MAX_PASSAGE_BYTES = 2048;
 
 interface MessageSearchRow {
     messageOrdinal?: number | string;
@@ -155,6 +166,11 @@ export interface UnifiedSearchOptions {
         signal?: AbortSignal,
         purpose?: EmbeddingPurpose,
     ) => Promise<CapturedQueryEmbedding | Float32Array | null>;
+    embedPassages?: (
+        texts: string[],
+        signal?: AbortSignal,
+        purpose?: EmbeddingPurpose,
+    ) => Promise<(Float32Array | null)[]>;
     isEmbeddingRuntimeEnabled?: () => boolean;
     /** Only return message-history hits with ordinal ≤ this value (e.g. last compartment end). -1 or omit to search all. */
     maxMessageOrdinal?: number;
@@ -166,12 +182,6 @@ export interface UnifiedSearchOptions {
      *  Facts are NOT a source — they're already always rendered in the
      *  <session-history> block injected into message[0]. */
     sources?: SearchSource[];
-    /** Hard-filter memories already rendered in <session-history>. The agent
-     *  can see them in message[0] — surfacing them via ctx_search wastes
-     *  tokens and crowds out high-signal raw-history hits. Pass null or omit
-     *  to disable filtering (for callers outside the transform context that
-     *  can't resolve the visible set). */
-    visibleMemoryIds?: Set<number> | null;
     /** Abort signal — if provided, cancels in-flight embedding requests
      *  (and any downstream HTTP calls) when the caller gives up. Used by
      *  transform-hot-path callers like auto-search whose own 3s timeout
@@ -210,16 +220,32 @@ export interface MemorySearchResult {
     source: "memory";
     content: string;
     score: number;
-    memoryId: number;
+    /** Opaque public claim identity (`mcm_<32hex>`). */
+    publicClaimId: string;
+    /** Canonical current revision locator the content was read from. */
+    revisionLocator: string;
     category: string;
-    matchType: "semantic" | "fts" | "hybrid";
+    matchType: "exact";
     sourceName?: string;
     policyLabel?: string;
-    /** Exact SHA-256 digest of the LOADED memory bytes this result was ranked
-     * from. Consumers that persist replay state (auto-search hints) bind to
-     * this digest so a rewrite committed after the lane's recheck cannot pair
-     * the old packed text with the new revision's identity. */
+    /** Exact SHA-256 digest of the served revision's content bytes. */
     contentDigest?: string;
+}
+
+export interface AntiMemorySearchResult {
+    source: "anti_memory";
+    score: number;
+    publicClaimId: string;
+    revisionLocator: string;
+    contentDigest: string;
+    claimId: number;
+    normalizedHash: string;
+    trigger: string;
+    rejectedStrategy: string;
+    rejectionReason: string;
+    saferAlternative: string | null;
+    matchType: "exact" | "lexical" | "semantic";
+    policyLabel?: string;
 }
 
 export interface MessageSearchResult {
@@ -279,13 +305,12 @@ export interface NoteSearchResult {
 
 export type UnifiedSearchResult =
     | MemorySearchResult
+    | AntiMemorySearchResult
     | MessageSearchResult
     | CompartmentSearchResult
     | GitCommitSearchResult
     | PrimerSearchResult
     | NoteSearchResult;
-
-const FTS_SEMANTIC_CANDIDATE_LIMIT = 50;
 
 export { ID_SHAPED_QUERY_MAX_TOKENS, parseIdShapedQuery } from "./search-bounds";
 
@@ -339,34 +364,6 @@ function resolveSearchWorkspaceContext(
         canonicalIdentityByStoredPath,
         isWorkspaced,
     };
-}
-
-function memoryWorkspaceIdentity(memory: Memory, workspace: SearchWorkspaceContext): string | null {
-    return resolveStoredPathWorkspaceIdentity(
-        memory.projectPath,
-        workspace.identities,
-        workspace.canonicalIdentityByStoredPath,
-    );
-}
-
-function sourceNamesForSearchMemories(args: {
-    memories: readonly Memory[];
-    projectPath: string;
-    workspace: SearchWorkspaceContext;
-}): Map<number, string> | undefined {
-    if (!args.workspace.isWorkspaced) return undefined;
-    const sourceNames = new Map<number, string>();
-    for (const memory of args.memories) {
-        const source = sourceNameForMemory(
-            memory.projectPath,
-            args.projectPath,
-            args.workspace.identities,
-            args.workspace.namesByIdentity,
-            args.workspace.canonicalIdentityByStoredPath,
-        );
-        if (source) sourceNames.set(memory.id, source);
-    }
-    return sourceNames.size > 0 ? sourceNames : undefined;
 }
 
 function getMessageSearchStatement(db: Database): PreparedStatement {
@@ -473,505 +470,6 @@ function getMessageOrdinal(value: number | string | undefined): number | null {
     }
 
     return null;
-}
-
-/** R37: post-score lane ceiling. Brute-force semantic scoring must visit
- *  every cached vector, but only the strongest MAX_LANE_CANDIDATES scores may
- *  enter fusion so downstream merge and sort work is bounded by the lane cap
- *  rather than the corpus. Ties break toward the lower memory id, matching
- *  the deterministic tie-break in `mergeMemoryResults`. */
-function pruneToLaneCeiling(scores: Map<number, number>): Map<number, number> {
-    if (scores.size <= MAX_LANE_CANDIDATES) return scores;
-    const top = [...scores.entries()]
-        .sort((left, right) => right[1] - left[1] || left[0] - right[0])
-        .slice(0, MAX_LANE_CANDIDATES);
-    return new Map(top);
-}
-
-/** Total vector-buffer bytes held by a loaded embedding map — what a cache
- *  miss actually decoded, as opposed to the candidate subset compared. */
-function totalEmbeddingBytes(embeddings: ReadonlyMap<number, { embedding: Float32Array }>): number {
-    let bytes = 0;
-    for (const entry of embeddings.values()) bytes += entry.embedding.byteLength;
-    return bytes;
-}
-
-async function getSemanticScores(args: {
-    db: Database;
-    projectPath: string;
-    memories: Memory[];
-    /** Pre-computed query embedding. Pass `null` to skip semantic scoring
-     *  (e.g. embedding disabled, query embed failed, runtime not ready).
-     *  unifiedSearch is responsible for computing this once and passing the
-     *  same vector to memory + git-commit searches so we never embed the
-     *  same query twice in parallel. */
-    queryEmbedding: Float32Array | null;
-    queryModelId?: string | null;
-    workspace?: SearchWorkspaceContext;
-    /** Memories already rendered in <session-history>. They are excluded
-     *  BEFORE scoring and the lane ceiling: merge drops them anyway, so
-     *  letting them occupy pruned lane slots would evict eligible
-     *  lower-scored matches from the bounded lane entirely. */
-    visibleMemoryIds?: Set<number> | null;
-    /** Reports the exact vector-buffer bytes compared by the scan. */
-    onVectorLoad?: VectorLoadObserver;
-}): Promise<Map<number, number>> {
-    const semanticScores = new Map<number, number>();
-
-    if (
-        !args.queryEmbedding ||
-        args.memories.length === 0 ||
-        !args.queryModelId ||
-        args.queryModelId === "off"
-    ) {
-        return semanticScores;
-    }
-
-    if (!args.workspace?.isWorkspaced) {
-        const wasCached = args.onVectorLoad
-            ? peekProjectEmbeddings(args.projectPath, args.queryModelId) !== null
-            : false;
-        const cachedEmbeddings = getProjectEmbeddings(args.db, args.projectPath, args.queryModelId);
-        const embeddings = await ensureMemoryEmbeddings({
-            db: args.db,
-            projectIdentity: args.projectPath,
-            memories: args.memories,
-            existingEmbeddings: cachedEmbeddings,
-        });
-
-        let touchedBytes = 0;
-        let touchedVectors = 0;
-        for (const memory of args.memories) {
-            if (args.visibleMemoryIds?.has(memory.id)) continue;
-            const memoryEmbedding = embeddings.get(memory.id);
-            if (!memoryEmbedding) {
-                continue;
-            }
-            touchedBytes += memoryEmbedding.embedding.byteLength;
-            touchedVectors += 1;
-
-            const score = normalizeCosineScore(
-                cosineSimilarity(args.queryEmbedding, memoryEmbedding.embedding),
-            );
-            // A nonpositive score is "no semantic signal", not a semantic
-            // match: keeping it would label an FTS hit hybrid (and downweight
-            // it) or not based on which zero entries survive the lane
-            // ceiling. Mirrors the git-commit lane's admission rule.
-            if (score > 0) semanticScores.set(memory.id, score);
-        }
-
-        args.onVectorLoad?.({
-            // A cache miss decodes the WHOLE project's embedding table, not
-            // just the candidates compared afterwards; the counters must
-            // attribute the bytes the load actually decoded.
-            decodedBytes: wasCached ? 0 : totalEmbeddingBytes(embeddings),
-            cachedBytes: wasCached ? touchedBytes : 0,
-            vectorCount: wasCached ? touchedVectors : embeddings.size,
-            cacheHit: wasCached,
-        });
-        return pruneToLaneCeiling(semanticScores);
-    }
-
-    const workspace = args.workspace;
-    const memoriesByIdentity = new Map<string, Memory[]>();
-    for (const memory of args.memories) {
-        const identity = memoryWorkspaceIdentity(memory, workspace);
-        if (!identity) continue;
-        const list = memoriesByIdentity.get(identity) ?? [];
-        list.push(memory);
-        memoriesByIdentity.set(identity, list);
-    }
-
-    const ownMemories = memoriesByIdentity.get(args.projectPath) ?? [];
-    // getProjectEmbeddings below primes the process cache for the own
-    // project, so its cached-before state must be captured first or the
-    // loop would report every cold own-project load as a cache hit.
-    let ownWasCachedBeforePrime: boolean | null = null;
-    if (ownMemories.length > 0) {
-        ownWasCachedBeforePrime =
-            peekProjectEmbeddings(args.projectPath, args.queryModelId) !== null;
-        const ownEmbeddings = getProjectEmbeddings(args.db, args.projectPath, args.queryModelId);
-        await ensureMemoryEmbeddings({
-            db: args.db,
-            projectIdentity: args.projectPath,
-            memories: ownMemories,
-            existingEmbeddings: ownEmbeddings,
-        });
-    }
-
-    for (const identity of workspace.identities) {
-        const memberMemories = memoriesByIdentity.get(identity) ?? [];
-        if (memberMemories.length === 0) continue;
-        const identityWasCached = args.onVectorLoad
-            ? identity === args.projectPath && ownWasCachedBeforePrime !== null
-                ? ownWasCachedBeforePrime
-                : peekProjectEmbeddings(identity, args.queryModelId) !== null
-            : false;
-        const cachedEmbeddings = getProjectEmbeddings(args.db, identity, args.queryModelId);
-        // A cold identity decodes its whole embedding table on load; warm
-        // identities are billed at touched-byte granularity. The whole-map
-        // scan only feeds the observer, so skip it on untraced searches.
-        const identityIsCold = args.onVectorLoad !== undefined && !identityWasCached;
-        let identityTouchedBytes = 0;
-        let identityTouchedVectors = 0;
-        for (const memory of memberMemories) {
-            if (args.visibleMemoryIds?.has(memory.id)) continue;
-            const memoryEmbedding = cachedEmbeddings.get(memory.id);
-            if (!memoryEmbedding || memoryEmbedding.modelId !== args.queryModelId) continue;
-            if (!identityIsCold) {
-                identityTouchedBytes += memoryEmbedding.embedding.byteLength;
-                identityTouchedVectors += 1;
-            }
-            const score = normalizeCosineScore(
-                cosineSimilarity(args.queryEmbedding, memoryEmbedding.embedding),
-            );
-            if (score > 0) semanticScores.set(memory.id, score);
-        }
-        // One all-or-nothing event per identity load (the v1 VectorLoadEvent
-        // contract): a mixed warm/cold workspace emits one event per side
-        // instead of a single event with both byte fields nonzero.
-        args.onVectorLoad?.(
-            identityIsCold
-                ? {
-                      decodedBytes: totalEmbeddingBytes(cachedEmbeddings),
-                      cachedBytes: 0,
-                      vectorCount: cachedEmbeddings.size,
-                      cacheHit: false,
-                  }
-                : {
-                      decodedBytes: 0,
-                      cachedBytes: identityTouchedBytes,
-                      vectorCount: identityTouchedVectors,
-                      cacheHit: true,
-                  },
-        );
-    }
-
-    return pruneToLaneCeiling(semanticScores);
-}
-
-function getFtsEligibleMatches(args: {
-    db: Database;
-    memoryIds: readonly number[];
-    query: string;
-    limit: number;
-}): Memory[] {
-    try {
-        return searchMemoriesFTSWithinIds(args.db, args.memoryIds, args.query, args.limit);
-    } catch (error) {
-        log(
-            `[search] FTS query failed for "${args.query}": ${error instanceof Error ? error.message : String(error)}`,
-        );
-        return [];
-    }
-}
-
-function getFtsScores(matches: Memory[]): Map<number, number> {
-    return new Map(matches.map((memory, rank) => [memory.id, 1 / (rank + 1)]));
-}
-
-function selectSemanticCandidates(args: {
-    memories: Memory[];
-    projectPath: string;
-    ftsMatches: Memory[];
-    queryModelId?: string | null;
-    workspace?: SearchWorkspaceContext;
-}): Memory[] {
-    if (args.ftsMatches.length === 0) {
-        return args.memories;
-    }
-
-    const candidateIds = new Set(args.ftsMatches.map((memory) => memory.id));
-    if (args.queryModelId && args.queryModelId !== "off") {
-        const embeddingProjects = args.workspace?.isWorkspaced
-            ? args.workspace.identities
-            : [args.projectPath];
-        for (const projectPath of embeddingProjects) {
-            const cachedEmbeddings = peekProjectEmbeddings(projectPath, args.queryModelId);
-            if (!cachedEmbeddings) continue;
-            for (const memoryId of cachedEmbeddings.keys()) {
-                candidateIds.add(memoryId);
-            }
-        }
-    }
-
-    return args.memories.filter((memory) => candidateIds.has(memory.id));
-}
-
-function mergeMemoryResults(args: {
-    memories: Memory[];
-    semanticScores: Map<number, number>;
-    ftsScores: Map<number, number>;
-    limit: number;
-    visibleMemoryIds?: Set<number> | null;
-    sourceNameByMemoryId?: ReadonlyMap<number, string>;
-}): MemorySearchResult[] {
-    const memoryById = new Map(args.memories.map((memory) => [memory.id, memory]));
-    const candidateIds = new Set<number>([...args.semanticScores.keys(), ...args.ftsScores.keys()]);
-    const results: MemorySearchResult[] = [];
-
-    for (const id of candidateIds) {
-        // Hard-filter: memory is already rendered in <session-history>, so the
-        // agent sees it in message[0]. Returning it from ctx_search wastes
-        // output tokens and displaces high-signal raw-history hits.
-        if (args.visibleMemoryIds?.has(id)) {
-            continue;
-        }
-
-        const memory = memoryById.get(id);
-        if (!memory) {
-            continue;
-        }
-
-        const semanticScore = args.semanticScores.get(id);
-        const ftsScore = args.ftsScores.get(id);
-        let score = 0;
-        let matchType: MemorySearchResult["matchType"] = "fts";
-
-        if (semanticScore !== undefined && ftsScore !== undefined) {
-            score = SEMANTIC_WEIGHT * semanticScore + FTS_WEIGHT * ftsScore;
-            matchType = "hybrid";
-        } else if (semanticScore !== undefined) {
-            score = semanticScore * SINGLE_SOURCE_PENALTY;
-            matchType = "semantic";
-        } else if (ftsScore !== undefined) {
-            score = ftsScore * SINGLE_SOURCE_PENALTY;
-            matchType = "fts";
-        }
-
-        if (score <= 0) {
-            continue;
-        }
-
-        results.push({
-            source: "memory",
-            content: previewText(memory.content),
-            score,
-            memoryId: memory.id,
-            category: memory.category,
-            matchType,
-            sourceName: args.sourceNameByMemoryId?.get(memory.id),
-        });
-    }
-
-    return results
-        .sort((left, right) => {
-            if (right.score !== left.score) {
-                return right.score - left.score;
-            }
-            return left.memoryId - right.memoryId;
-        })
-        .slice(0, args.limit);
-}
-
-async function searchMemories(args: {
-    db: Database;
-    projectPath: string;
-    query: string;
-    limit: number;
-    /** Explicit per-lane candidate bound (from `options.candidateDepth`).
-     *  When absent the lane keeps its fixed lexical candidate ceiling, so
-     *  production behavior is unchanged; an explicit depth is executed as
-     *  the lexical fetch bound so K sweeps measure a real workload change. */
-    candidateLimit?: number | null;
-    memoryEnabled: boolean;
-    /** Pre-computed query embedding (or null if embedding is disabled / failed).
-     *  unifiedSearch embeds once and passes the same vector here and to
-     *  searchGitCommitsAsync — never embed twice for one query. */
-    queryEmbedding: Float32Array | null;
-    queryModelId?: string | null;
-    workspace?: SearchWorkspaceContext;
-    visibleMemoryIds?: Set<number> | null;
-    trace?: SearchTraceRecorder | null;
-    rootSpanId?: number | null;
-    /** The span gating the query vector this lane consumes — the generation
-     *  lookup when tracing records one, else the query-inference span — so
-     *  the vector scan's causal chain includes the generation check. */
-    semanticGateSpanId?: number | null;
-    /** The unified filter span; the lane's first span depends on it so the
-     *  causal chain includes filter and workspace-resolution cost. */
-    filterSpanId?: number | null;
-    policySurface: MemoryPolicySurface;
-}): Promise<{ results: MemorySearchResult[]; laneSpanId: number | null }> {
-    if (!args.memoryEnabled) {
-        return { results: [], laneSpanId: null };
-    }
-
-    const trace = args.trace ?? null;
-    const rootSpanId = args.rootSpanId ?? null;
-    const hydrationSpan =
-        trace?.begin("metadata_hydration", "memory", {
-            parent: rootSpanId,
-            dependsOn: args.filterSpanId != null ? [args.filterSpanId] : [],
-        }) ?? null;
-    const loaded = args.workspace?.isWorkspaced
-        ? getMemoriesByProjects(
-              args.db,
-              args.workspace.expandedIdentities,
-              ["active", "permanent"],
-              Date.now(),
-              args.workspace.ownIdentities,
-              args.workspace.shareCategories,
-          )
-        : getMemoriesByProject(args.db, args.projectPath);
-    // Policy eligibility applies before candidate limits and scoring, so an
-    // ineligible row never consumes a result slot.
-    const policyFilter = filterMemoriesByPolicy(args.db, loaded, args.policySurface);
-    const memories = policyFilter.memories;
-    hydrationSpan?.end("ok", { rows: memories.length });
-    if (memories.length === 0) {
-        return { results: [], laneSpanId: hydrationSpan?.id ?? null };
-    }
-
-    // Hydration completes synchronously before the lexical and vector work
-    // starts, so both downstream spans depend on it; otherwise the critical
-    // path treats a costly hydration as an isolated branch.
-    const hydrationDeps = hydrationSpan ? [hydrationSpan.id] : [];
-    const lexicalSpan =
-        trace?.begin("lexical_scan", "memory", {
-            parent: rootSpanId,
-            dependsOn: hydrationDeps,
-        }) ?? null;
-    const candidateLimit = args.candidateLimit ?? FTS_SEMANTIC_CANDIDATE_LIMIT;
-    // The FTS query ranks WITHIN the eligible id set, so hidden matches can
-    // neither consume candidate slots nor force a widening scan: one bounded
-    // fetch returns the top-ranked eligible matches exactly, however many
-    // hidden rows outrank them, and pins the semantic lane to rows that
-    // survive the policy filter.
-    const ftsMatches = getFtsEligibleMatches({
-        db: args.db,
-        memoryIds: memories.map((memory) => memory.id),
-        query: args.query,
-        limit: candidateLimit,
-    });
-    lexicalSpan?.end("ok", { candidatesOut: ftsMatches.length });
-    const ftsScores = getFtsScores(ftsMatches);
-    const semanticCandidates = selectSemanticCandidates({
-        memories,
-        projectPath: args.projectPath,
-        ftsMatches,
-        queryModelId: args.queryModelId,
-        workspace: args.workspace,
-    });
-    let memoryLoad: VectorLoadEvent | null = null;
-    const scanSpan =
-        trace?.begin("vector_scan", "memory", {
-            parent: rootSpanId,
-            dependsOn: [
-                ...hydrationDeps,
-                ...(args.semanticGateSpanId != null ? [args.semanticGateSpanId] : []),
-            ],
-        }) ?? null;
-    const semanticScores = await getSemanticScores({
-        db: args.db,
-        projectPath: args.projectPath,
-        memories: semanticCandidates,
-        queryEmbedding: args.queryEmbedding,
-        queryModelId: args.queryModelId,
-        workspace: args.workspace,
-        visibleMemoryIds: args.visibleMemoryIds,
-        onVectorLoad: scanSpan
-            ? (event) => {
-                  memoryLoad = accumulateVectorLoad(memoryLoad, event);
-              }
-            : undefined,
-    });
-    scanSpan?.end("ok", {
-        ...vectorLoadCounters(memoryLoad),
-        candidatesIn: semanticCandidates.length,
-        candidatesOut: semanticScores.size,
-        // Same plumbing-identity convention as the top_k span below, so the
-        // candidate-depth assertion covers this lane's scan instead of
-        // skipping a span with no depth evidence.
-        requestedK: args.limit,
-        effectiveK: args.candidateLimit ?? args.limit,
-    });
-
-    const topKSpan =
-        trace?.begin("top_k", "memory", {
-            parent: rootSpanId,
-            dependsOn: [
-                ...(lexicalSpan ? [lexicalSpan.id] : []),
-                ...(scanSpan ? [scanSpan.id] : []),
-            ],
-        }) ?? null;
-    const merged = mergeMemoryResults({
-        memories,
-        semanticScores,
-        ftsScores,
-        limit: args.limit,
-        visibleMemoryIds: args.visibleMemoryIds,
-        sourceNameByMemoryId: sourceNamesForSearchMemories({
-            memories,
-            projectPath: args.projectPath,
-            workspace: args.workspace ?? {
-                identities: [args.projectPath],
-                expandedIdentities: [args.projectPath],
-                namesByIdentity: new Map(),
-                canonicalIdentityByStoredPath: new Map([[args.projectPath, args.projectPath]]),
-                ownIdentities: [args.projectPath],
-                shareCategories: null,
-                isWorkspaced: false,
-            },
-        }),
-    });
-    topKSpan?.end("ok", {
-        candidatesIn: new Set([...semanticScores.keys(), ...ftsScores.keys()]).size,
-        candidatesOut: merged.length,
-        requestedK: args.limit,
-        // With an explicit candidate bound the lexical fetch executed it;
-        // otherwise both counters carry the caller's limit (plumbing
-        // identity only, not an executed lane bound).
-        effectiveK: args.candidateLimit ?? args.limit,
-    });
-    // Policy recheck before results leave the lane: a transition committed
-    // during scoring must not publish newly hidden content.
-    const hasPolicy = hasClaimEffectivePolicy(args.db);
-    const recheckRows = hasPolicy
-        ? readMemoryPolicyRows(
-              args.db,
-              merged.map((result) => result.memoryId),
-          )
-        : new Map<number, MemoryPolicyRow>();
-    // The recheck must bind to the LOADED bytes, not just the id: a rewrite
-    // committed during the scoring yields makes the unchanged memory id
-    // resolve through the new revision, whose eligibility would otherwise
-    // admit the superseded content this lane loaded. Exact SHA-256 digests —
-    // the normalized hash lowercases and collapses whitespace, so it cannot
-    // tell a rewritten revision from its predecessor. Only the merged
-    // results' rows are hashed (bounded by the lane limit).
-    const loadedMemoriesById = new Map(memories.map((memory) => [memory.id, memory]));
-    const currentHashById = hasPolicy
-        ? exactMemoryContentDigests(
-              args.db,
-              merged.map((result) => result.memoryId),
-          )
-        : new Map<number, string>();
-    const rechecked: MemorySearchResult[] = [];
-    for (const result of merged) {
-        if (!hasPolicy) {
-            rechecked.push(result);
-            continue;
-        }
-        const loaded = loadedMemoriesById.get(result.memoryId);
-        if (loaded === undefined) continue;
-        const loadedDigest = sha256Utf8Hex(loaded.content);
-        if (currentHashById.get(result.memoryId) !== loadedDigest) {
-            continue;
-        }
-        const decision = decideMemoryPolicy(recheckRows.get(result.memoryId), args.policySurface);
-        if (!decision.eligible) continue;
-        // The digest of the LOADED bytes rides the result so hint persistence
-        // binds to exactly what was ranked and packed, not a later reload.
-        rechecked.push({
-            ...result,
-            contentDigest: loadedDigest,
-            ...(decision.label ? { policyLabel: decision.label } : {}),
-        });
-    }
-    // The lane's terminal span: the unified fusion span depends on it so
-    // critical-path analysis can follow the memory lane.
-    return { results: rechecked, laneSpanId: topKSpan?.id ?? null };
 }
 
 /** Linear decay message scoring.
@@ -1316,6 +814,267 @@ function tokenizeKeywordNeedle(text: string): string[] {
         tokens.push(match);
     }
     return tokens;
+}
+
+async function searchAntiMemories(args: {
+    db: Database;
+    projectPath: string;
+    query: string;
+    limit: number;
+    surface: "auto_search" | "explicit_search";
+    queryEmbedding: Float32Array | null;
+    embedPassages: (
+        texts: string[],
+        signal?: AbortSignal,
+        purpose?: EmbeddingPurpose,
+    ) => Promise<(Float32Array | null)[]>;
+    signal?: AbortSignal;
+}): Promise<AntiMemorySearchResult[]> {
+    const workspace = resolveSearchWorkspaceContext(args.db, args.projectPath);
+    const projectIds = resolveProjectIdsForIdentities(
+        args.db,
+        workspace.isWorkspaced ? workspace.expandedIdentities : [args.projectPath],
+    );
+    if (projectIds.length === 0) return [];
+    const ownProjectIds = resolveProjectIdsForIdentities(
+        args.db,
+        workspace.isWorkspaced ? workspace.ownIdentities : [args.projectPath],
+    );
+    // Bounded candidate listing first: hydrating current state for the whole
+    // project claim set just to keep the anti-memory category would make this
+    // per-prompt lane O(all active claims). The id list is capped like every
+    // sibling lane and scopes the provider read below to anti-memory claims.
+    //
+    // Listed from the caller's own projects, not the expanded workspace set.
+    // Anti-memory records are written `sharing: "private"`, so a co-member's
+    // warning can never clear the authorization step below — including it here
+    // would let newer foreign rows consume the ceiling and then be dropped,
+    // hiding the caller's own warnings behind claims they can never see.
+    const candidateIds = listActiveAntiMemoryPublicIds(
+        args.db,
+        ownProjectIds,
+        MAX_LANE_CANDIDATES,
+        Date.now(),
+    );
+    if (candidateIds.length === 0) return [];
+    // One closure = one authorization/surface/lifecycle setting, shared by the
+    // hydration read and the post-embedding recheck below, so the two reads
+    // cannot drift: the provider stays the single authority on visibility.
+    //
+    // `stale` is a routine outcome, not a failure: the provider reports it when
+    // a project, policy, or workspace generation moves during hydration, which
+    // any concurrent claim write can cause. Giving up on the first one would
+    // drop the whole warning lane for an unrelated write, so it is retried once
+    // against the new snapshot — the same two-attempt shape the locator lane
+    // uses. Persisting past that returns null and the caller fails closed.
+    const readAntiMemoryState = (publicClaimIds: readonly string[]) => {
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            const result = readProjectMemoryCurrentState(args.db, {
+                publicClaimIds: [...publicClaimIds],
+                projectIds,
+                workspaceAuthorization: {
+                    ownProjectIds,
+                    sharedCategories: workspace.shareCategories ?? [],
+                },
+                workspaceEpoch: computeWorkspaceEpochFingerprint(args.db, workspace.identities),
+                workspaceIdentities: workspace.identities,
+                surface: "explicit_search",
+                lifecycleStates: ["active"],
+            });
+            if (result.status === "ok") {
+                return result.items.filter((item) => item.category === ANTI_MEMORY_CATEGORY);
+            }
+        }
+        return null;
+    };
+    // The state read uses the explicit-search surface (the only surface whose
+    // candidate query includes anti-memory), so the automatic-surface policy
+    // gates are applied here. A projection written under a newer policy version
+    // fails closed — its stored bits are not trustworthy — and anything below
+    // the automatic eligibility bar (effective VERIFIED+ with a present,
+    // supported policy subject) must not be auto-injected into user prompts.
+    // Dispositions are re-checked from the authoritative facts because the
+    // projection can lag a policy-unaware writer.
+    const eligibleForSurface = (item: ProjectMemoryClaimSnapshot): boolean => {
+        if (args.surface !== "auto_search") return true;
+        if (item.policy.policyVersion > CLAIM_POLICY_VERSION) return false;
+        if (!item.policy.autoEligible) return false;
+        return !(
+            item.dispositions.stale ||
+            item.dispositions.disputed ||
+            item.dispositions.superseded
+        );
+    };
+    const antiMemoryItems = readAntiMemoryState(candidateIds);
+    if (antiMemoryItems === null) return [];
+    const records = readAntiMemories(
+        args.db,
+        antiMemoryItems.map((item) => item.publicClaimId),
+    );
+    const normalizedQuery = args.query.trim().toLowerCase();
+    const queryTokens = tokenizeKeywordNeedle(normalizedQuery);
+    const candidates: Array<{
+        result: Omit<AntiMemorySearchResult, "score" | "matchType">;
+        text: string;
+        lexicalScore: number | null;
+    }> = [];
+    for (const item of antiMemoryItems) {
+        if (!eligibleForSurface(item)) continue;
+        const record = records.get(item.publicClaimId);
+        if (record === undefined) continue;
+        // Match against payload values only. The rendered `record.content`
+        // carries constant field labels ("Rejected strategy", "Root cause",
+        // …) whose tokens would let unrelated prompts match every record.
+        //
+        // `nonApplicableWhen` is deliberately absent: it records the exception
+        // where the rejection does NOT hold, and it is not rendered in the
+        // warning. Matching on it would retrieve the warning for exactly the
+        // prompt it disclaims and then show text asserting the opposite. It
+        // belongs in an exclusion test, which does not exist yet.
+        //
+        // Payload fields carry no write-side length limit, so the assembled
+        // text is capped: it feeds both the token scan below and a live
+        // provider batch, and one oversized record must not be able to blow the
+        // embedding request or the per-prompt time budget. Field order puts the
+        // load-bearing values first, so truncation drops context, not identity.
+        const text = truncateUtf8Bytes(
+            [
+                record.payload.trigger,
+                record.payload.rejectedStrategy,
+                record.payload.rejectionReason,
+                record.payload.saferAlternative,
+                record.payload.preconditions,
+                record.payload.attemptedApproach,
+                record.payload.observedFailure,
+                record.payload.rootCause,
+                record.payload.recovery,
+            ]
+                .filter((value): value is string => value !== null)
+                .join("\n")
+                .toLowerCase(),
+            ANTI_MEMORY_MAX_PASSAGE_BYTES,
+        );
+        const exact = text.includes(normalizedQuery);
+        const textTokens = new Set(tokenizeKeywordNeedle(text));
+        const matched = queryTokens.filter((token) => textTokens.has(token)).length;
+        const coverage = queryTokens.length === 0 ? 0 : matched / queryTokens.length;
+        const lexicalScore =
+            exact || (matched > 0 && (queryTokens.length <= 1 || matched >= 2))
+                ? exact
+                    ? 1
+                    : 0.5 + coverage / 2
+                : null;
+        const result: Omit<AntiMemorySearchResult, "score" | "matchType"> = {
+            source: "anti_memory",
+            publicClaimId: record.publicClaimId,
+            revisionLocator: record.revisionLocator,
+            contentDigest: record.contentDigest,
+            claimId: record.claimId,
+            normalizedHash: record.normalizedHash,
+            trigger: record.payload.trigger,
+            rejectedStrategy: record.payload.rejectedStrategy,
+            rejectionReason: record.payload.rejectionReason,
+            saferAlternative: record.payload.saferAlternative,
+            ...(item.explicitLabel === null ? {} : { policyLabel: item.explicitLabel }),
+        };
+        candidates.push({ result, text, lexicalScore });
+    }
+
+    // The embedding batch is a live provider call on the per-prompt path, so
+    // it is capped independently of the candidate ceiling: lexically matched
+    // candidates first (strongest score first), then the newest remaining
+    // records. State items arrive ordered by ascending claim id, so a higher
+    // candidate index means a newer record.
+    const semanticQueryEmbedding = args.surface === "auto_search" ? args.queryEmbedding : null;
+    const embedIndices =
+        semanticQueryEmbedding && candidates.length > 0
+            ? candidates
+                  .map((_, index) => index)
+                  .sort((left, right) => {
+                      const leftScore = candidates[left].lexicalScore;
+                      const rightScore = candidates[right].lexicalScore;
+                      if ((leftScore !== null) !== (rightScore !== null)) {
+                          return leftScore !== null ? -1 : 1;
+                      }
+                      if (leftScore !== null && rightScore !== null && leftScore !== rightScore) {
+                          return rightScore - leftScore;
+                      }
+                      return right - left;
+                  })
+                  .slice(0, ANTI_MEMORY_MAX_SEMANTIC_CANDIDATES)
+            : [];
+    const vectorByCandidate = new Map<number, Float32Array | null>();
+    if (semanticQueryEmbedding && embedIndices.length > 0) {
+        const vectors = await args
+            .embedPassages(
+                embedIndices.map((index) => candidates[index].text),
+                args.signal,
+                "passage",
+            )
+            .catch((error) => {
+                log(
+                    `[search] anti-memory embedding failed: ${error instanceof Error ? error.message : String(error)}`,
+                );
+                return [];
+            });
+        embedIndices.forEach((candidateIndex, vectorIndex) => {
+            vectorByCandidate.set(candidateIndex, vectors[vectorIndex] ?? null);
+        });
+    }
+    const ranked: AntiMemorySearchResult[] = [];
+    for (const [index, candidate] of candidates.entries()) {
+        const vector = vectorByCandidate.get(index) ?? null;
+        const semanticScore =
+            semanticQueryEmbedding && vector
+                ? normalizeCosineScore(cosineSimilarity(semanticQueryEmbedding, vector))
+                : 0;
+        const semanticMatch = semanticScore >= ANTI_MEMORY_SEMANTIC_THRESHOLD;
+        if (candidate.lexicalScore === null && !semanticMatch) continue;
+        const semanticWins = semanticMatch && semanticScore > (candidate.lexicalScore ?? 0);
+        ranked.push({
+            ...candidate.result,
+            // A cosine score below the threshold is noise, not evidence. Folding
+            // it into the score through `Math.max` would let an unrelated
+            // passage outrank a genuine lexical hit while still reporting
+            // `matchType: "lexical"`, so only a threshold-clearing score ranks.
+            score: semanticMatch
+                ? Math.max(candidate.lexicalScore ?? 0, semanticScore)
+                : (candidate.lexicalScore ?? 0),
+            matchType: semanticWins ? "semantic" : "lexical",
+        });
+    }
+    const published = ranked
+        .sort(
+            (left, right) =>
+                right.score - left.score || left.publicClaimId.localeCompare(right.publicClaimId),
+        )
+        .slice(0, args.limit);
+    // Revalidate before publishing, on every path. The awaited passage
+    // embedding opens the widest window — a live provider call that can take
+    // seconds, during which another process can retire, revise, expire, or
+    // quarantine a warning — but it is not the only one: the state read and the
+    // record read are separate autocommit statements, so even the lexical path
+    // publishes bytes assembled across two snapshots. The provider proves
+    // visibility at publication time, the same rule the locator lane applies.
+    if (published.length === 0) return published;
+    const current = readAntiMemoryState(published.map((result) => result.publicClaimId));
+    if (current === null) return [];
+    const currentById = new Map(current.map((item) => [item.publicClaimId, item]));
+    return published.filter((result) => {
+        const item = currentById.get(result.publicClaimId);
+        // Absent means archived, expired, or no longer visible; a moved locator
+        // or digest means the payload copied above is pre-transition content.
+        if (item === undefined) return false;
+        if (item.revisionLocator !== result.revisionLocator) return false;
+        if (item.contentDigest !== result.contentDigest) return false;
+        // A disposition landing between the two reads changes the label without
+        // touching the revision, so the label is the only signal that a warning
+        // went stale, disputed, or superseded under an explicit search — where
+        // the surface policy below deliberately does not gate on dispositions.
+        // Publishing the pre-transition copy would render it as unqualified.
+        if ((item.explicitLabel ?? undefined) !== result.policyLabel) return false;
+        return eligibleForSurface(item);
+    });
 }
 
 interface RankedNoteMatch {
@@ -1787,6 +1546,7 @@ export function mergeMessageAndCompartmentResults(args: {
 function getSourceBoost(result: UnifiedSearchResult): number {
     switch (result.source) {
         case "memory":
+        case "anti_memory":
             return MEMORY_SOURCE_BOOST;
         case "message":
         case "compartment":
@@ -1808,8 +1568,11 @@ function compareUnifiedResults(left: UnifiedSearchResult, right: UnifiedSearchRe
         return rightEffective - leftEffective;
     }
 
-    if (left.source === "memory" && right.source === "memory") {
-        return left.memoryId - right.memoryId;
+    if (
+        (left.source === "memory" || left.source === "anti_memory") &&
+        (right.source === "memory" || right.source === "anti_memory")
+    ) {
+        return left.publicClaimId.localeCompare(right.publicClaimId);
     }
 
     if (left.source === "message" && right.source === "message") {
@@ -1985,91 +1748,211 @@ function resolveSources(sources: SearchSource[] | undefined): Set<SearchSource> 
     return set;
 }
 
-/** Turn memories already filtered through the visibility predicate into
- *  MemorySearchResult rows. Used by the ctx_search ID short-circuit so the
- *  direct-by-id path can return the same shape the normal search lanes emit
- *  (and reuse formatResult without a second code path). */
-function memoriesToIdLookupResults(args: {
-    memories: readonly Memory[];
-    limit: number;
-    sourceNameByMemoryId?: ReadonlyMap<number, string>;
-}): MemorySearchResult[] {
-    // Preserve the caller's order so a `parseIdShapedQuery` result like
-    // `["#12", "34"]` renders hits in the same order the user typed them.
-    const ordered = args.memories.slice(0, args.limit);
-    return ordered.map((memory, rank) => ({
-        source: "memory",
-        content: previewText(memory.content),
-        score: 1 - rank * 0.01,
-        memoryId: memory.id,
-        category: memory.category,
-        matchType: "fts" as const,
-        sourceName: args.sourceNameByMemoryId?.get(memory.id),
-    }));
+/**
+ * Parse a whole-query exact-locator list: every whitespace-separated token
+ * must be a public claim ID (`mcm_<32hex>`) or a full revision locator
+ * (`mcm_<32hex>/r<n>/<sha256>`). Returns null for anything else so ordinary
+ * text queries fall through to the normal lanes.
+ */
+export function parseLocatorShapedQuery(query: string): string[] | null {
+    const tokens = query
+        .trim()
+        .split(/[\s,]+/)
+        .filter(Boolean);
+    if (tokens.length === 0) return null;
+    const publicClaimIds: string[] = [];
+    for (const token of tokens) {
+        if (isValidPublicClaimId(token)) {
+            publicClaimIds.push(token);
+            continue;
+        }
+        const locator = parseRevisionLocator(token);
+        if (locator === null) return null;
+        publicClaimIds.push(locator.publicClaimId);
+    }
+    return publicClaimIds;
 }
 
-/** Resolve a parsed id list through the session's visibility scope. Returns
- *  MemorySearchResult rows in the caller's id order, or `null` when nothing
- *  resolved (signals the caller to fall through to the normal search lanes). */
-export function resolveMemoriesByIdsForSearch(args: {
+/**
+ * Exact claim/revision-locator lookup through the current-state provider —
+ * the only search path that serves project-memory claims while the retrieval
+ * projection is inactive. A revision locator resolves to the claim's CURRENT
+ * visible revision. Workspace authorization applies before the limit: a
+ * foreign member's claim is visible only when shareable in a shared
+ * category, and a nonmember cannot distinguish hidden from missing. Results
+ * are revalidated through the same provider after telemetry and immediately
+ * before publication, so a claim hidden or revised once the provider's
+ * snapshot closed is dropped rather than served. Returns null when nothing
+ * resolved so callers fall through to the normal lanes.
+ */
+export function resolveClaimsByLocatorsForSearch(args: {
     db: Database;
     projectPath: string;
-    ids: readonly number[];
+    locators: readonly string[];
     limit: number;
-    /** Optional filter mirroring the m[0] hard-filter — already-rendered
-     *  memories are skipped so the agent doesn't see the same content twice. */
-    visibleMemoryIds?: Set<number> | null;
-}): MemorySearchResult[] | null {
-    if (args.ids.length === 0) {
-        return null;
+    /** Revision locators already rendered in the injected baseline. */
+    visibleRevisionLocators?: ReadonlySet<string> | null;
+    /** Bump claim retrieval telemetry (explicit agent lookups). */
+    countRetrievals?: boolean;
+}): Array<MemorySearchResult | AntiMemorySearchResult> | null {
+    if (args.locators.length === 0) return null;
+    const publicClaimIds: string[] = [];
+    for (const raw of args.locators) {
+        if (isValidPublicClaimId(raw)) {
+            publicClaimIds.push(raw);
+            continue;
+        }
+        const parsed = parseRevisionLocator(raw);
+        if (parsed !== null) publicClaimIds.push(parsed.publicClaimId);
     }
+    if (publicClaimIds.length === 0) return null;
     const workspace = resolveSearchWorkspaceContext(args.db, args.projectPath);
-    const fetched = getMemoriesByRequestedIds(args.db, {
-        ids: args.ids,
-        identities: workspace.isWorkspaced ? workspace.expandedIdentities : [args.projectPath],
-        statuses: ["active", "permanent", "archived"],
-        expiryCutoff: Date.now(),
-        ownIdentities: workspace.isWorkspaced ? workspace.ownIdentities : undefined,
-        shareCategories: workspace.isWorkspaced ? workspace.shareCategories : null,
-    });
-    // Direct-ID lookup routes through the same explicit-surface decision as
-    // text search: hard-hidden rows return uniform absence. The binder then
-    // drops rows rewritten between load and policy read, so revision B's
-    // eligibility (and label) can never lend itself to superseded revision A
-    // bytes — including revealing A after a hidden target was rewritten.
-    const policyFilter = filterMemoriesByPolicy(args.db, fetched, "explicit_search");
-    // Reapply the policy on the BOUND rows: a quarantine or label transition
-    // committed between the first policy read and the binding must not
-    // publish the hidden row or a stale label — this lane short-circuits
-    // before executeUnifiedSearch's final recheck.
-    const recheck = filterMemoriesByPolicy(
-        args.db,
-        bindMemoriesToCurrentRevision(args.db, policyFilter.memories),
-        "explicit_search",
+    const authorizedIdentities = workspace.isWorkspaced
+        ? workspace.expandedIdentities
+        : [args.projectPath];
+    const authorizedProjectIds = new Set(
+        resolveProjectIdsForIdentities(args.db, authorizedIdentities),
     );
-    const bound = recheck.memories;
-    const ordered: Memory[] = [];
-    for (const memory of bound) {
-        if (args.visibleMemoryIds?.has(memory.id)) continue;
-        ordered.push(memory);
+    const ownProjectIds = new Set(
+        resolveProjectIdsForIdentities(
+            args.db,
+            workspace.isWorkspaced ? workspace.ownIdentities : [args.projectPath],
+        ),
+    );
+    // One closure = one authorization/surface/lifecycle setting, used by both
+    // the hydration read and the pre-publication recheck below. The two reads
+    // must not be able to drift: the provider is the single authority that
+    // decides visibility, so the recheck asks it the same question rather than
+    // reimplementing the policy filter.
+    const readVisibleClaims = (): ProjectMemoryClaimSnapshot[] | null => {
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            const result = readProjectMemoryCurrentState(args.db, {
+                publicClaimIds: [...new Set(publicClaimIds)],
+                projectIds: [...authorizedProjectIds],
+                workspaceAuthorization: {
+                    ownProjectIds: [...ownProjectIds],
+                    sharedCategories: workspace.shareCategories ?? [],
+                },
+                workspaceEpoch: computeWorkspaceEpochFingerprint(args.db, workspace.identities),
+                // Named so the provider recomputes the fingerprint at
+                // publication time; without them it echoes the value above into
+                // both snapshot vectors and a revocation in flight goes
+                // undetected.
+                workspaceIdentities: workspace.identities,
+                surface: "explicit_search",
+                lifecycleStates: ["active", "archived"],
+            });
+            if (result.status === "ok") return result.items;
+        }
+        return null;
+    };
+    const items = readVisibleClaims();
+    if (items === null) return null;
+    const visible = items;
+    const identityByProjectId = readProjectIdentityMap(
+        args.db,
+        visible.map((item) => item.projectId),
+    );
+    const ordered: Array<MemorySearchResult | AntiMemorySearchResult> = [];
+    for (const item of visible) {
+        if (args.visibleRevisionLocators?.has(item.revisionLocator)) continue;
+        const identity = identityByProjectId.get(item.projectId);
+        const sourceName =
+            workspace.isWorkspaced && identity
+                ? (sourceNameForMemory(
+                      identity,
+                      args.projectPath,
+                      workspace.identities,
+                      workspace.namesByIdentity,
+                      workspace.canonicalIdentityByStoredPath,
+                  ) ?? undefined)
+                : undefined;
+        if (item.category === ANTI_MEMORY_CATEGORY) {
+            if (item.lifecycleState !== "active") continue;
+            const record = readAntiMemory(args.db, item.publicClaimId);
+            if (record === null) continue;
+            ordered.push({
+                source: "anti_memory",
+                score: 1,
+                publicClaimId: record.publicClaimId,
+                revisionLocator: record.revisionLocator,
+                contentDigest: record.contentDigest,
+                claimId: record.claimId,
+                normalizedHash: record.normalizedHash,
+                trigger: record.payload.trigger,
+                rejectedStrategy: record.payload.rejectedStrategy,
+                rejectionReason: record.payload.rejectionReason,
+                saferAlternative: record.payload.saferAlternative,
+                matchType: "exact",
+                ...(item.explicitLabel === null ? {} : { policyLabel: item.explicitLabel }),
+            });
+        } else
+            ordered.push({
+                source: "memory",
+                content: item.content,
+                score: 1,
+                publicClaimId: item.publicClaimId,
+                revisionLocator: item.revisionLocator,
+                category: item.category,
+                matchType: "exact",
+                ...(sourceName === undefined ? {} : { sourceName }),
+                ...(item.explicitLabel === null ? {} : { policyLabel: item.explicitLabel }),
+                contentDigest: item.contentDigest,
+            });
         if (ordered.length >= args.limit) break;
     }
-    if (ordered.length === 0) {
-        return null;
+    if (ordered.length === 0) return null;
+    if (args.countRetrievals !== false) {
+        recordClaimUsage(args.db, {
+            publicClaimIds: ordered
+                .filter((result): result is MemorySearchResult => result.source === "memory")
+                .map((result) => result.publicClaimId),
+            kind: "retrieved",
+        });
     }
-    const results = memoriesToIdLookupResults({
-        memories: ordered,
-        limit: args.limit,
-        sourceNameByMemoryId: sourceNamesForSearchMemories({
-            memories: ordered,
-            projectPath: args.projectPath,
-            workspace,
-        }),
+    // Revalidate through the provider before publishing. The provider proves
+    // visibility inside its own snapshot and then CLOSES it, so every byte
+    // above was read from state that is already historical here: one
+    // connection is cached per path per process, and under WAL another process
+    // can take the writer lock, let this process read old committed state, and
+    // commit a quarantine, rejection, or revision before this call returns.
+    // The telemetry write widens that window — `BEGIN IMMEDIATE` blocks for up
+    // to `busy_timeout` behind that writer — but it does not create it, so the
+    // recheck runs even when `countRetrievals === false`: publication safety
+    // must not depend on whether a counter is enabled.
+    const current = readVisibleClaims();
+    if (current === null) return null;
+    const currentByClaimId = new Map(current.map((item) => [item.publicClaimId, item]));
+    // Publish a result only when every field copied out of the snapshot still
+    // matches. Absent means hidden or gone; a moved locator, digest, content,
+    // category, or evidence label means the claim transitioned under us and
+    // the copy above is pre-transition content.
+    const confirmed = ordered.filter((result) => {
+        const item = currentByClaimId.get(result.publicClaimId);
+        if (item === undefined) return false;
+        if (
+            item.revisionLocator !== result.revisionLocator ||
+            item.contentDigest !== result.contentDigest ||
+            (item.explicitLabel ?? undefined) !== result.policyLabel
+        ) {
+            return false;
+        }
+        // An anti-memory result carries payload fields, not `content`/`category`,
+        // so the equality checks above cannot cover it. The read spans
+        // `["active", "archived"]` and archiving moves neither the locator nor
+        // the digest, so the lifecycle and category gates hydration applied are
+        // re-applied here instead; otherwise a warning archived under us is
+        // still published.
+        if (result.source === "anti_memory") {
+            return item.category === ANTI_MEMORY_CATEGORY && item.lifecycleState === "active";
+        }
+        return item.content === result.content && item.category === result.category;
     });
-    return results.map((result) => {
-        const label = recheck.labels.get(result.memoryId);
-        return label ? { ...result, policyLabel: label } : result;
-    });
+    // Dropping is the same observable outcome as never resolving: `null` is
+    // exactly what a missing or foreign-hidden locator returns, so a caller
+    // cannot distinguish "this claim went hidden" from "no such claim".
+    if (confirmed.length === 0) return null;
+    return confirmed;
 }
 
 export async function unifiedSearch(
@@ -2155,11 +2038,11 @@ async function executeUnifiedSearch(args: {
     const activeSources = resolveSources(options.sources);
 
     const memoryFeatureEnabled = options.memoryEnabled ?? true;
-    const runMemory = activeSources.has("memory") && memoryFeatureEnabled;
     const runMessages = activeSources.has("message");
     const runGitCommits = activeSources.has("git_commit") && gitCommitsEnabled;
     const runPrimers = activeSources.has("primer") && memoryFeatureEnabled;
     const runNotes = activeSources.has("note");
+    const runAntiMemories = activeSources.has("memory") && memoryFeatureEnabled;
     const runCompartmentChunks = runMessages && memoryFeatureEnabled && embeddingEnabled;
     filterSpan?.end("ok");
     // Downstream chain roots depend on the filter span so criticalPathMs
@@ -2184,8 +2067,10 @@ async function executeUnifiedSearch(args: {
     // (`ensureMessagesIndexed` walks raw OpenCode session history); doing
     // that BEFORE the embed call meant the embed fetch couldn't start
     // until indexing finished.
+    const antiMemorySemanticEnabled =
+        runAntiMemories && (options.memoryPolicySurface ?? "explicit_search") === "auto_search";
     const needsEmbedding =
-        (runMemory || runGitCommits || runCompartmentChunks || runPrimers) &&
+        (runGitCommits || runCompartmentChunks || runPrimers || antiMemorySemanticEnabled) &&
         embeddingEnabled &&
         isEmbeddingRuntimeEnabled();
 
@@ -2221,20 +2106,6 @@ async function executeUnifiedSearch(args: {
     // doesn't actually leave the process until we await later.
     await Promise.resolve();
 
-    // Workspace resolution is filter work — the identity/alias/sharing
-    // lookups deciding what the memory lane may read — but placing its
-    // synchronous SQLite reads before the embed dispatch above would delay
-    // the outbound fetch, the exact latency regression the searchMessages
-    // placement below exists to avoid. It runs post-dispatch under its own
-    // filter span; the memory lane's causal chain gates on it.
-    const workspaceSpan =
-        trace?.begin("filter_construction", "unified", {
-            parent: rootId,
-            dependsOn: filterDeps,
-        }) ?? null;
-    const workspace = resolveSearchWorkspaceContext(db, projectPath);
-    workspaceSpan?.end("ok");
-
     // Run the synchronous message-FTS SELECT now that the embed fetch is
     // in flight. Message indexing is event-driven and never runs here;
     // unreconciled sessions simply return no message hits until the async
@@ -2269,6 +2140,18 @@ async function executeUnifiedSearch(args: {
     const embeddingSnapshot = getProjectEmbeddingSnapshot(projectPath);
     const queryContract =
         capturedQuery instanceof Float32Array || capturedQuery === null ? null : capturedQuery;
+    const embedPassages =
+        options.embedPassages ??
+        (async (texts, signal, purpose) => {
+            const batch = await embedBatchForProject(projectPath, texts, signal, purpose);
+            const expectedGeneration = queryContract?.generation ?? embeddingSnapshot?.generation;
+            const expectedModelId = queryContract?.modelId ?? embeddingSnapshot?.modelId;
+            return batch &&
+                batch.generation === expectedGeneration &&
+                batch.modelId === expectedModelId
+                ? batch.vectors
+                : texts.map(() => null);
+        });
     const generationIsCurrent =
         queryContract === null ||
         (embeddingSnapshot !== null && embeddingSnapshot.generation === queryContract.generation);
@@ -2287,6 +2170,42 @@ async function executeUnifiedSearch(args: {
         queryContract?.chunkModelId ??
         options.chunkModelIdOverride ??
         embeddingSnapshot?.chunkModelId;
+    const laneSpanIds: number[] = [];
+    const antiMemorySpan =
+        trace && runAntiMemories
+            ? trace.begin("fusion", "memory", {
+                  parent: rootId,
+                  dependsOn: [...filterDeps, ...semanticDeps],
+              })
+            : null;
+    if (trace && !runAntiMemories) trace.notApplicable("fusion", "memory", rootId);
+    const antiMemoryPromise: Promise<AntiMemorySearchResult[]> = runAntiMemories
+        ? searchAntiMemories({
+              db,
+              projectPath,
+              query: trimmedQuery,
+              limit: tierLimit,
+              surface: options.memoryPolicySurface ?? "explicit_search",
+              queryEmbedding,
+              embedPassages,
+              signal: options.signal,
+          }).then(
+              (results) => {
+                  if (antiMemorySpan) {
+                      laneSpanIds.push(antiMemorySpan.id);
+                      antiMemorySpan.end("ok", {
+                          candidatesOut: results.length,
+                          ...laneDepth,
+                      });
+                  }
+                  return results;
+              },
+              (error) => {
+                  antiMemorySpan?.end(options.signal?.aborted ? "cancelled" : "failed");
+                  throw error;
+              },
+          )
+        : Promise.resolve([]);
     let compartmentLoad: VectorLoadEvent | null = null;
     const compartmentSpan =
         trace && runCompartmentChunks
@@ -2341,7 +2260,7 @@ async function executeUnifiedSearch(args: {
         candidatesOut: messageLikeResults.length,
     });
 
-    const laneSpanIds: number[] = messageFusionSpan ? [messageFusionSpan.id] : [];
+    if (messageFusionSpan) laneSpanIds.push(messageFusionSpan.id);
 
     // Hybrid lanes (git-commit, primer) decompose into lexical_scan,
     // vector_scan, and fusion spans through stage marks the lane functions
@@ -2458,46 +2377,19 @@ async function executeUnifiedSearch(args: {
         return lane;
     };
 
-    const [memoryLane, gitCommitResults, primerResults, noteResults] = await Promise.all([
-        runMemory
-            ? searchMemories({
-                  db,
-                  projectPath,
-                  query: trimmedQuery,
-                  limit: tierLimit,
-                  candidateLimit: args.candidateDepth,
-                  memoryEnabled: true,
-                  queryEmbedding,
-                  queryModelId:
-                      embeddingModelId && embeddingModelId !== "off" ? embeddingModelId : null,
-                  workspace,
-                  visibleMemoryIds: options.visibleMemoryIds,
-                  trace,
-                  rootSpanId: rootId,
-                  semanticGateSpanId: semanticDeps.length > 0 ? semanticDeps[0] : null,
-                  filterSpanId: workspaceSpan?.id ?? filterSpan?.id ?? null,
-                  policySurface: options.memoryPolicySurface ?? "explicit_search",
-              })
-            : Promise.resolve({
-                  results: [] as MemorySearchResult[],
-                  laneSpanId: null as number | null,
-              }),
+    const [antiMemoryResults, gitCommitResults, primerResults, noteResults] = await Promise.all([
+        antiMemoryPromise,
         runGitCommits
             ? Promise.resolve(runGitCommitLane())
             : Promise.resolve([] as GitCommitSearchResult[]),
         runPrimers ? Promise.resolve(runPrimerLane()) : Promise.resolve([] as PrimerSearchResult[]),
         runNotes ? Promise.resolve(runNoteLane()) : Promise.resolve([] as NoteSearchResult[]),
     ]);
-    const memoryResults = memoryLane.results;
-    // The memory lane runs inside searchMemories, so its terminal span joins
-    // the fusion dependency set here; without it criticalPathMs understates
-    // queries whose longest path is the memory lane.
-    if (memoryLane.laneSpanId !== null) laneSpanIds.push(memoryLane.laneSpanId);
 
     const fusionSpan =
         trace?.begin("fusion", "unified", { parent: rootId, dependsOn: laneSpanIds }) ?? null;
     const fused = [
-        ...memoryResults,
+        ...antiMemoryResults,
         ...primerResults,
         ...messageLikeResults,
         ...gitCommitResults,
@@ -2505,8 +2397,8 @@ async function executeUnifiedSearch(args: {
     ].sort(compareUnifiedResults);
     fusionSpan?.end("ok", {
         candidatesIn:
-            memoryResults.length +
             primerResults.length +
+            antiMemoryResults.length +
             messageLikeResults.length +
             gitCommitResults.length +
             noteResults.length,
@@ -2517,7 +2409,16 @@ async function executeUnifiedSearch(args: {
             parent: rootId,
             dependsOn: fusionSpan ? [fusionSpan.id] : [],
         }) ?? null;
-    const results = fused.slice(0, limit);
+    const reservedAntiMemory =
+        (options.memoryPolicySurface ?? "explicit_search") === "auto_search"
+            ? antiMemoryResults[0]
+            : undefined;
+    const results = reservedAntiMemory
+        ? [
+              ...fused.filter((result) => result !== reservedAntiMemory).slice(0, limit - 1),
+              reservedAntiMemory,
+          ].sort(compareUnifiedResults)
+        : fused.slice(0, limit);
     topKSpan?.end("ok", { candidatesIn: fused.length, candidatesOut: results.length });
     if (trace) {
         trace.notApplicable("reranking", "unified", rootId);
@@ -2536,77 +2437,6 @@ async function executeUnifiedSearch(args: {
             primaryLatencyMs: Date.now() - args.measurementStartedAt,
             search: unifiedSearch,
         });
-    }
-
-    // Only count retrievals for explicit agent-driven searches. Plugin-internal
-    // automatic surfacing (auto-search hints) should not inflate retrieval_count
-    // because the agent may never actually consume the hint.
-    // retrieval_count is telemetry, not correctness: under MODULE authority the
-    // TS write path is fenced, so skip the bump rather than failing the search.
-    const countRetrievals = options.countRetrievals ?? true;
-    {
-        const memoryIds = results
-            .filter((result): result is MemorySearchResult => result.source === "memory")
-            .map((result) => result.memoryId);
-
-        if (memoryIds.length > 0) {
-            if (countRetrievals) {
-                db.transaction(() => {
-                    for (const memoryId of memoryIds) {
-                        try {
-                            updateMemoryRetrievalCount(db, memoryId);
-                        } catch (error) {
-                            // Telemetry only — module-managed rows must not fail the search.
-                            if (error instanceof ModuleMemoryAuthorityError) continue;
-                            throw error;
-                        }
-                    }
-                })();
-            }
-            // This is the LAST database boundary before publication — and it
-            // runs for EVERY caller, telemetry or not: the auto-search lane
-            // passes countRetrievals: false, and the lane-level recheck can
-            // still read the old policy when a concurrent writer's commit
-            // (which the telemetry transaction may have waited on) hides one
-            // of these rows. Reapply the policy and exact-digest gate so the
-            // returned set reflects every transition that committed before
-            // publication.
-            if (hasClaimEffectivePolicy(db)) {
-                const surface = options.memoryPolicySurface ?? "explicit_search";
-                // ONE snapshot for both facts: as separate autocommit
-                // statements, a transition committing between them pairs a
-                // stale eligible decision with an unchanged digest (hide
-                // after digest) or a fresh decision with superseded bytes
-                // (rewrite after digest). A deferred read transaction pins
-                // one WAL snapshot, so the decision and the digest describe
-                // the same revision — and the loaded bytes must match it.
-                const { policyRows, digestsNow } = db.transaction(() => ({
-                    policyRows: readMemoryPolicyRows(db, memoryIds),
-                    digestsNow: exactMemoryContentDigests(db, memoryIds),
-                }))();
-                // Drop rows the final policy read hides AND refresh every
-                // survivor's trust label from that same read: a memory
-                // marked stale/flagged while the telemetry write waited
-                // stays eligible for explicit search but must carry the new
-                // label (and a row that became clean must shed its old one).
-                return results.flatMap<(typeof results)[number]>((result) => {
-                    if (result.source !== "memory") return [result];
-                    const decision = decideMemoryPolicy(policyRows.get(result.memoryId), surface);
-                    if (
-                        !decision.eligible ||
-                        (result.contentDigest !== undefined &&
-                            digestsNow.get(result.memoryId) !== result.contentDigest)
-                    ) {
-                        return [];
-                    }
-                    const { policyLabel: _stale, ...rest } = result;
-                    const refreshed: MemorySearchResult = decision.label
-                        ? { ...rest, policyLabel: decision.label }
-                        : rest;
-                    return [refreshed];
-                });
-            }
-        }
     }
 
     return results;

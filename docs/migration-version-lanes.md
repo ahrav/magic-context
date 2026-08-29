@@ -1,74 +1,83 @@
-# Context database migration version lanes
+# Context database format
 
-The shared `context.db` migration bookkeeping uses two reserved ranges:
+`context.db` uses an exact direct format. Production openers do not run the
+historical migration chain and do not import, backfill, salvage, or reinterpret
+older project-memory schemas.
 
-- Upstream Magic Context migrations use versions below `10000`.
-- Downstream forks and sibling plugins sharing `context.db` use versions `10000` and above.
+## Format identity
 
-The boundary isolates migration **bookkeeping** only. A fork's DDL must remain compatible with the upstream tables; version ranges cannot make incompatible DDL safe. Multiple sibling forks must coordinate their own subranges. Magic Context provides one downstream lane, not an allocator.
+The current family is identified by:
 
-A fork that does not use the downstream range continues to be treated like stock, so it gets today's status quo, not worse. Rows inserted by hand at versions `>= 10000` are fence-invisible by design, so upstream schema fences and probes report only the upstream lane. Migration pendingness checks each candidate in the pending upstream range directly, preserving downstream rows while shared-core migrations run.
+- `PRAGMA application_id = 0x4d435458` (`MCTX`)
+- `PRAGMA user_version = 1`
+- one immutable `mc_format_marker` row
+- a random 32-hex database-incarnation ID
+- the SHA-256 digest of the build's registered schema-component manifest
+- an exact `main.sqlite_schema` inventory
 
-The `crates/mc-store` migration chain is out of scope: it uses a separate database with namespace-keyed primary keys and already has its own owner design.
+The schema composer owns component dependencies and object ownership. Duplicate
+ownership, dependency cycles, undeclared objects, and a manifest mismatch fail
+closed.
 
-## v82 claims-and-evidence rollout order
+## Open behavior
 
-Migration v82 creates the authoritative claims domain (`projects`, `project_aliases`, `episodes`, `source_spans`, `observations`, `claims`, `claim_revisions`, `claim_evidence`, `claim_conflicts`, `verification_events`) and seeds the numeric project registry from existing identities. It writes nothing to `memories` or any other legacy table.
+A database family is accepted only when it is:
 
-- **Binary order:** ship the OpenCode plugin, Pi plugin, CLI, and `ck-mc` from the same source revision **before** any process opens a database at v82. The first v82-capable process migrates on open; the schema fence then refuses older binaries.
-- **Runtime SQLite gate:** `node packages/plugin/scripts/smoke-node-sqlite.ts` records `sqlite_version()` per shipped engine and exercises the v82 create/append CAS path. An engine older than SQLite 3.51.3 without an approved vendor backport falls under the WAL-reset advisory and blocks rollout through a separate runtime-upgrade decision.
-- **Session cleanup vs erasure:** `clearSession()` removes runtime session state only. Durable evidence rows keep `source_session_id` as provenance and deliberately survive session deletion; the claims tables are append-only at the database boundary, so ordinary deletion is rejected. A privacy-erasure requirement for that durable evidence needs the deferred privileged-purge design before deployment.
+1. the exact current format; or
+2. truly pristine, with no main-schema row, application marker, WAL, SHM,
+   rollback journal, or reset artifact.
 
-## v84 memories-to-claims compatibility rollout order
+A pristine family is bootstrapped under `BEGIN IMMEDIATE`. The opener
+reclassifies after taking the lock, creates every registered component, validates
+the exact inventory, stamps the incarnation marker, and commits before enabling
+WAL. Concurrent openers either observe that complete result or refuse the changed
+shape.
 
-Migration v84 creates the memories-to-claims compatibility contract: the `legacy_memory_claims` crosswalk, `claim_revision_memory_metadata`, the audit-only `claim_merge_lineage`, the `claim_operations` idempotency envelope, `claim_change_outbox`, `claim_project_generations`, `claim_backfill_failures`, and the transaction-scoped `claim_compatibility_write_state` capability. It also installs semantic write guards over `memories` and `memory_verifications` and records the backfill boundary, expected row count, mode, phase, and v22-takeover state in `schema_migrations_meta` (`claims_backfill_*` keys). An empty corpus completes synchronously inside the migration; a nonempty corpus records pending lazy state for the backfill runner.
+Every other family is unsupported and remains unchanged. This includes historical
+versioned databases, partial direct schemas, malformed markers, orphan sidecars,
+and interrupted reset state.
 
-- **Object ownership:** every v84 object is migration-owned (`packages/plugin/src/features/magic-context/storage-memory-claims-schema.ts`); `initializeDatabase()` stays at the legacy baseline. The transaction-local write kernel lives in `memory/storage-memory-claims.ts` over the `memory/storage-memory-projection.ts` leaf; `storage-memory.ts` and OpenCode/Pi/dreamer/identity/module adapters depend on the kernel, never the reverse. Kernel commits crosswalk, revision/evidence, projection, operation envelope, outbox, generation, and caller cursor/checkpoint in one outer transaction.
-- **Binary order:** ship the OpenCode plugin, Pi plugin, CLI, and `ck-mc` from the same source revision **before** any process opens a database at v84. The first v84-capable process migrates on open; the schema fence (`LATEST_SUPPORTED_VERSION = 84`) then refuses older binaries.
-- **Held-open-writer guard:** the schema fence protects new opens, not old handles. The v84 triggers reject INSERT, DELETE, semantic-column UPDATE on `memories`, and every `memory_verifications` write from any connection that does not hold the claims-write capability, so a held-open v82 binary fails before changing semantic fields. Telemetry (`memory_stats`), mural-cue columns, `classified_at` stamps, and embeddings stay outside the guard. Rows at or below the recorded boundary additionally require a crosswalk link before deletion or identity movement, even with the capability held.
-- **Capability scope:** `claim_compatibility_write_state` is enabled only inside the owning write transaction and cleared before commit; it is deliberately separate from the module-authority `context_privilege_state`, and privileged module mirror transactions hold both.
-- **Backfill mode:** production eager cutoff is zero until full 1K/10K/100K/1M Bun and Node reference-host evidence is run and reviewed. Current bounded evidence is `docs/evidence/claims-backfill/v84-threshold.json`; omitted scales and runtimes are explicit and never extrapolated into policy.
-- **v22 takeover and recovery:** v84 owns pending v22 identity work. OpenCode and Pi schedule the shared startup helper once; it resolves v22 takeover before treating a claims `complete` phase as a no-op. Inspect with `magic-context doctor --check-claims-backfill`; repair with `magic-context doctor --retry-claims-backfill`, then restart every running harness.
-- **Completion:** cursors only accelerate bounded row and relationship batches. Completion publishes reconciliation version and final outbox watermark only after expected-count, crosswalk, evidence, metadata, lineage-disposition, outbox, generation, failure, and v22 anti-join checks pass in one immediate transaction.
-- **Lock policy:** lazy batches use bounded backoff only for SQLite base code 5 (`SQLITE_BUSY`, including extended busy codes). Base code 6 (`SQLITE_LOCKED`) is not external writer contention and surfaces as a connection/shared-cache defect; adapter message text is never classified.
-- **Reader ownership:** search, mural, dreamer task gates, injection, and module serialization continue reading `memories` until U9. Claims reads stay independent for reconciliation and downstream integration; no production union/fan-out reader exists.
-- **Lifecycle:** archive and ordinary delete retire claim/projection state but retain immutable revisions, evidence, and non-cascading crosswalk history. They are not erasure. Physical removal requires future privileged purge design; no current command promises it.
-- **Backup:** use SQLite backup API, or stop every writer, checkpoint, and preserve `context.db`, `context.db-wal`, and `context.db-shm` as one consistent set. Copying only main file can omit committed WAL state.
-- **Downgrade:** refused by the fence. A pre-commit v84 migration failure rolls back to a complete v82 database and reruns; after commit the database rolls forward only.
+## Runtime contract
 
-## v85 claim applicability, git anchors, and source trust rollout order
+Before opening `context.db`, Bun and Node writers probe an
+approved WAL-reset-safe SQLite source on an off-path database. The root Rust
+module applies the same rule to `store.db`. Application connections verify:
 
-Migration v85 adds the passive bitemporal applicability contract: the `observations.source_trust_class` column (six-value CHECK, `NOT NULL DEFAULT 'model_inference'`), project-scoped `git_anchors` with append-only typed `git_anchor_representations`, first-class `claim_revision_applicability_streams`, gapless append-only `claim_revision_applicability_assertions`, `claim_revision_applicability_paths`/`_symbols` selectors, and the derived `claim_revision_applicability_intervals` view. Retrieval, search, rendering, and authority behavior are unchanged; the contract is populated but not yet consumed.
+- foreign keys enabled
+- WAL activation
+- configured busy timeout
+- declared synchronous mode
 
-- **Version-lane note:** the U6c plan predates the U7 merge and assumed U6c at v84 with U7 renumbered to v85. U7 (memories-to-claims) landed on main as v84, so U6c owns v85 instead and U7 keeps v84. No executable artifact treats v84 as the applicability migration.
-- **Object ownership:** every v85 object is migration-owned (`packages/plugin/src/features/magic-context/storage-claim-applicability-schema.ts`); `initializeDatabase()` stays at the legacy baseline. Transaction-local writers live in `memory/storage-claim-applicability.ts`; the conservative legacy trust map lives in `memory/source-trust.ts`; Git capture and anchor storage live under `git-anchors/`.
-- **Binary order:** ship the OpenCode plugin, Pi plugin, CLI, and `ck-mc` from the same source revision **before** any process opens a database at v85. The first v85-capable process migrates on open; the schema fence (`LATEST_SUPPORTED_VERSION = 85`) then refuses older binaries.
-- **Baseline seeding:** v85 appends one `unknown` baseline stream/assertion per claim revision that predates it, using the revision's `created_at` as retained knowledge time when it is a plausible positive integer. Revision, evidence, and observation rows keep their exact bytes; a missing assertion still reads as `unknown` by contract.
-- **Trust for already-converted rows:** observations written before v85 (including rows converted by a v84 eager backfill or an already-completed lazy backfill) keep the conservative `model_inference` default — observations are append-only, so no retroactive promotion happens. Raw `source_type` provenance is retained in `claim_revision_memory_metadata`, so a later policy can re-derive channel confidence. Rows converted by a lazy backfill that runs after v85 map `user` → `explicit_user` and everything else → `model_inference`.
-- **Applicability population:** post-v85 claim writers append a source-stream assertion per new revision (memory writers derive path knowledge from `memory_verifications`: no rows = unknown, sentinel-only = known-empty, real rows = exact selectors). Mapping, verification, and clear operations append successor assertions only when path state changes and emit one `upsert` outbox effect for the change.
-- **Held-open writers:** a pre-v85 connection inserting observations omits the trust column and receives the conservative default; a revision written without an assertion reads as `unknown`. Neither corrupts the contract.
-- **Downgrade:** refused by the fence. A pre-commit v85 migration failure rolls back to a complete v84 database and reruns; after commit the database rolls forward only.
+OpenCode, Pi, CLI, and `ck-mc` must ship and restart from the same
+release. The format fence does not claim to stop a pre-cutover process that
+already passed its open checks.
 
-## v86 claim trust policy rollout order
+## Explicit reset
 
-Migration v86 adds the claim trust policy authority: `claim_revision_policy_subjects` (frozen claim kind, origin observation, fine origin taint, bound content digest, policy version), `claim_maturity_streams` with gapless append-only `claim_maturity_assertions` (`CANDIDATE -> CORROBORATED -> VERIFIED -> APPROVED -> ENFORCED`, strictly increasing per stream), `claim_disposition_events` (stale/disputed/rejected/quarantined assert-clear ledger), `claim_approval_actions` (host-confirmed approve/revoke with idempotent command identity), `claim_enforcement_artifacts` plus append-only `claim_enforcement_artifact_events`, the rebuildable non-authoritative `claim_effective_policy` projection, `claim_policy_projector_watermarks`, and the derived `claim_maturity_heads` view.
+Reset is a separate Doctor operation, never a startup branch. Dry-run reports the
+main file, WAL, SHM, rollback journal, reset marker, file identities, database
+incarnation, and same-directory quarantine destination.
 
-- **Object ownership:** every v86 object is migration-owned (`packages/plugin/src/features/magic-context/storage-claim-policy-schema.ts`); `initializeDatabase()` stays at the legacy baseline. The pure evaluator lives in `memory/claim-visibility-policy.ts`, the taint classifier and transition predicates in `memory/claim-policy.ts`, the transaction-local write kernel in `memory/storage-claim-policy.ts`, the surface readers in `memory/storage-claim-visibility.ts`, and the host command workflows in `memory/claim-policy-commands.ts`.
-- **Binary order:** ship the OpenCode plugin, Pi plugin, CLI, and `ck-mc` from the same source revision **before** any process opens a database at v86 or later. The first capable process migrates on open; the schema fence (`LATEST_SUPPORTED_VERSION = 89`) then refuses older binaries.
-- **Fail-closed seed boundary:** the migration records the deterministic revision boundary, expected count, cursor, and pending phase in `schema_migrations_meta` (`claim_policy_seed_*` keys) before any reconciliation. A revision without policy rows reads as `CANDIDATE`, unknown taint, and automatic-hidden by contract; an empty corpus completes synchronously inside the migration.
-- **Bounded reconciliation:** the startup seeder (`claim-policy-backfill.ts`) reconciles bounded batches in immediate transactions. Exact-revision positive verification or exact explicit-user evidence seeds `VERIFIED`; independently rooted evidence groups (writer key capped by distinct extractor runs and distinct observed content) seed `CORROBORATED`; everything else seeds `CANDIDATE`. Completion publishes only after boundary-count and whole-table anti-join checks pass; a revision added by a held-open v85 writer during reconciliation is seeded before the completion watermark. No legacy row is grandfathered into automatic visibility.
-- **Cache invalidation:** the migration bumps every `project_state.project_memory_epoch`, clears cached m0/m1 bytes, and resets sticky auto-search decisions so pre-policy automatic context cannot replay. Live approval/enforcement commands and automatic-eligibility flips bump the owning project's epoch again.
-- **Visibility cutover:** automatic injection, auto-search hints, and the native module memory mirror require effective `VERIFIED+` with no disposition; explicit search and `ctx_memory` reads label candidate/corroborated/unknown rows; contradicted and quarantined revisions are hard-hidden from every agent surface; rejected revisions are host-review-only.
-- **Human authority:** `/ctx-approve` and `/ctx-enforce` are host slash commands in both harnesses (two-step stale-safe confirmation bound to project, revision, and content digest); no agent tool schema gains approve or enforce capability. Approval revocation and artifact revocation lower effective maturity without mutating ledger history.
-- **Held-open writers:** a pre-v86 connection appending revisions cannot create policy rows; those revisions stay automatic-hidden until the reconciler or a live writer appends the companion state.
-- **Downgrade:** refused by the fence. A pre-commit v86 migration failure rolls back to a complete v85 database and reruns; a half-created v86 shape refuses replay instead of skipping or overwriting objects.
+After explicit confirmation, reset:
 
-### v87-v89 follow-up migrations
+1. publishes a private identity-bound marker;
+2. rechecks holders and every family-file identity;
+3. moves journal and sidecar files before the main file;
+4. resumes or rolls back an interrupted quarantine idempotently; and
+5. leaves the next supported open to create a new database incarnation.
 
-Three small migrations harden the v86 authority and ship in the same release. Each runs in its own transaction, so a failure after v86 leaves the database at the last completed version; the fence is the highest version (`LATEST_SUPPORTED_VERSION = 89`), and a binary capped at an earlier version refuses a database that has already reached a later one.
+Reset is logical abandonment. It is not migration, recovery, import, or secure
+erasure. Quarantined files retain immutable history until the operator applies
+their retention policy.
 
-- **v87** recreates the policy-subject origin guard so a named origin must be `supports` evidence for the same revision; `merged_from` lineage no longer selects the origin. Same trigger name, so the v86 replay guard's object inventory is unchanged. A replay of v87 drops and recreates the trigger to the identical body.
-- **v88** adds the nullable `claim_enforcement_artifacts.enforced_from_root` column. Artifact revalidation only rehashes from the checkout that ran the enforcement; a NULL root (a row recorded before v88) reads as "owning checkout unknown" and is skipped. The column add is idempotent on replay.
-- **v89** recreates the origin guard again with a second branch: a live write with no named origin only carries an inference taint (`ASSISTANT_INFERENCE` or `DREAMER_INFERENCE`). Legacy-seed subjects (classification method suffix `:seed`) are exempt because the pre-v86 corpus legitimately elevates boundary-gated metadata provenance whose observations were never linked as evidence. Same trigger name and replay behavior as v87.
+## Claim durability
 
-Recovery follows the per-version transaction boundary: a failure inside v87, v88, or v89 rolls that migration back and reruns it on the next open, and the v86 seed state machine above is unaffected because none of the three touch the seed metadata or ledger contents.
+Project memory is stored only as claims, immutable revisions, evidence,
+applicability, policy, operation receipts, semantic effects, and project
+generations. Session cleanup removes session-owned runtime state but preserves
+claim history and unresolved staged module intents. Operation receipts remain for
+the lifetime of the database incarnation and are removed only with whole-family
+reset.
+
+The old migration version ranges remain relevant only to historical source
+definitions and refusal fixtures. They are not supported production inputs.

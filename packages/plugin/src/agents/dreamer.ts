@@ -59,10 +59,4 @@ export const DREAMER_DOCS_ALLOWED_TOOLS = [
 // calls NO tools (zero), so it gets the empty allow-list, locked.
 export const DREAMER_REVIEWER_AGENT = "dreamer-reviewer";
 
-/** Tool profile for the base `dreamer` agent, now CURATE-ONLY (memory-pool
- *  hygiene). Curate edits the memory store through ctx_memory and never reads
- *  code (a separate verify task owns memory-vs-code correctness), so it needs
- *  only ctx_memory — not the former bash/write/edit/read/aft/ctx_search/ctx_note
- *  kitchen sink. Kept on the `dreamer` id so the ctx_memory dreamer-action gate
- *  (toolContext.agent === DREAMER_AGENT) still recognizes it. */
-export const DREAMER_CURATE_ALLOWED_TOOLS = ["ctx_memory"] as const;
+export const DREAMER_CURATE_ALLOWED_TOOLS = [] as const;

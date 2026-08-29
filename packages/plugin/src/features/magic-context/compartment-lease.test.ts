@@ -13,11 +13,10 @@ import {
     releaseCompartmentLease,
     renewCompartmentLease,
 } from "./compartment-lease";
-import { initializeDatabase } from "./storage-db";
+import { createDirectTestDatabase } from "./test-database";
 
 function makeDb(path = ":memory:"): Database {
-    const db = new Database(path);
-    initializeDatabase(db);
+    const db = createDirectTestDatabase({ path: path }).db;
     return db;
 }
 
@@ -102,7 +101,10 @@ describe("compartment state lease", () => {
         const dir = mkdtempSync(join(tmpdir(), "mc-lease-handles-"));
         const path = join(dir, "context.db");
         const dbA = makeDb(path);
-        const dbB = makeDb(path);
+        const dbB = new Database(path);
+        dbB.exec("PRAGMA busy_timeout=5000");
+        dbB.exec("PRAGMA foreign_keys=ON");
+        dbB.exec("PRAGMA journal_mode=WAL");
         try {
             const results = [
                 acquireCompartmentLease(dbA, "ses", "holder-a"),
@@ -134,10 +136,9 @@ describe("compartment state lease", () => {
 
             const script = `
                 const sqlite = await import(${JSON.stringify(`file://${pluginRoot}/src/shared/sqlite.ts`)});
-                const storageDb = await import(${JSON.stringify(`file://${pluginRoot}/src/features/magic-context/storage-db.ts`)});
                 const lease = await import(${JSON.stringify(`file://${pluginRoot}/src/features/magic-context/compartment-lease.ts`)});
                 const db = new sqlite.Database(${JSON.stringify(path)});
-                storageDb.initializeDatabase(db);
+                db.exec("PRAGMA busy_timeout=5000");
                 const ok = lease.acquireCompartmentLease(db, "ses", process.argv.at(-1) ?? "missing-holder") !== null;
                 db.close();
                 console.log(JSON.stringify({ ok }));

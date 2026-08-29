@@ -24,8 +24,7 @@
   <a href="#-consolidate">Consolidate</a> ·
   <a href="#-recall">Recall</a> ·
   <a href="https://docs.cortexkit.io/magic-context">Docs</a> ·
-  <a href="./CONFIGURATION.md">Configuration</a> ·
-  <a href="https://github.com/cortexkit/magic-context/releases?q=dashboard&expanded=true">Dashboard</a>
+  <a href="./CONFIGURATION.md">Configuration</a>
 </p>
 
 ---
@@ -53,16 +52,19 @@ Run one session per project and keep it going for weeks, months, or years. It re
 Run the interactive setup wizard. It detects your models, configures everything, and handles compatibility.
 
 **macOS / Linux:**
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ahrav/magic-context/main/scripts/install.sh | bash
 ```
 
 **Windows (PowerShell):**
+
 ```powershell
 irm https://raw.githubusercontent.com/ahrav/magic-context/main/scripts/install.ps1 | iex
 ```
 
 **Or run directly (any OS):**
+
 ```bash
 npx @cortexkit/magic-context@latest setup
 ```
@@ -97,7 +99,7 @@ Then create `magic-context.jsonc` with the one setting the historian needs:
 - **Optional:** `dreamer` and `sidekick` model/disable blocks. Omit them to leave periodic memory consolidation and `/ctx-aug` off.
 - **Optional:** `embedding`. Omit it to use the local `Xenova/bge-small-en-v1.5`; turning embeddings off removes semantic/embedding-backed search, but keyword search and context management continue.
 
-User-level config is `~/.config/cortexkit/magic-context.jsonc` on macOS/Linux and `%USERPROFILE%\.config\cortexkit\magic-context.jsonc` on Windows (or `$XDG_CONFIG_HOME/cortexkit/magic-context.jsonc` when set). OpenCode Desktop users can use the dashboard's config editor or hand-edit that file; Desktop does not include the CLI setup wizard.
+User-level config is `~/.config/cortexkit/magic-context.jsonc` on macOS/Linux and `%USERPROFILE%\.config\cortexkit\magic-context.jsonc` on Windows (or `$XDG_CONFIG_HOME/cortexkit/magic-context.jsonc` when set). OpenCode Desktop users hand-edit that file; Desktop does not include the CLI setup wizard.
 
 **Pi:** `npx @cortexkit/magic-context@latest setup --harness pi` (requires Pi `>= 0.74.0`). The Pi extension shares the same database as OpenCode; project memories and embeddings pool across both.
 
@@ -150,7 +152,7 @@ The result: one session runs for months, with no compaction pauses and low cost 
 
 The agent can also record memories explicitly, though most are captured automatically for it:
 
-- **`ctx_memory`**: write or delete cross-session knowledge directly, in a small category taxonomy (`PROJECT_RULES`, `ARCHITECTURE`, `CONSTRAINTS`, `CONFIG_VALUES`, `NAMING`).
+- **`ctx_memory`**: create, revise, archive, restore, or merge cross-session knowledge as immutable claim revisions in a small category taxonomy (`PROJECT_RULES`, `ARCHITECTURE`, `CONSTRAINTS`, `CONFIG_VALUES`, `NAMING`).
 
 ```
 ctx_memory(action="write", category="ARCHITECTURE", content="Event sourcing for orders.")
@@ -200,9 +202,9 @@ Recall works **across sessions** (a new session inherits everything) and **acros
 ### Agent tools at a glance
 
 | Tool | Section | What it does |
-|------|-------|-------------|
+| ------ | ------- | ------------- |
 | `ctx_reduce` | Context | Queue stale tagged content for removal, cache-aware |
-| `ctx_memory` | Capture | Write or delete durable cross-session memories |
+| `ctx_memory` | Capture | Create and revise durable project-memory claims |
 | `ctx_search` | Recall | Search memories, conversation history, git commits, notes, and primers |
 | `ctx_expand` | Recall | Decompress a history range back to the transcript |
 | `ctx_note` | Recall | Deferred intentions and dreamer-evaluated smart notes |
@@ -212,34 +214,15 @@ Recall works **across sessions** (a new session inherits everything) and **acros
 ## Commands
 
 | Command | Description |
-|---------|-------------|
+| --------- | ------------- |
 | `/ctx-status` | Debug view: tags, pending drops, cache TTL, nudge state, historian progress, compartment coverage, history budget |
 | `/ctx-flush` | Force all queued operations immediately, bypassing cache TTL |
 | `/ctx-recomp` | Rebuild compartments from raw history (accepts a `start-end` range). Use when stored state seems wrong |
 | `/ctx-wrapup [messages_to_keep]` | Compact older live history while keeping the newest N messages raw; queued compaction materializes on the next model message |
-| `/ctx-session-upgrade` | Upgrade this session to the latest history format: rebuild compartments and migrate project memories |
+| `/ctx-session-upgrade` | Upgrade this session's history format and rebuild compartments |
 | `/ctx-aug` | Run sidekick augmentation on a prompt: retrieve relevant memories via a separate model |
 | `/ctx-dream` | Run dreamer maintenance on demand: maintain memory, docs, smart notes, and user-profile review |
 | `/ctx-embed` | Embedding status, or start/pause history compartment embedding (`start` \| `pause`) |
-
----
-
-## Desktop app
-
-A companion desktop app for browsing and managing Magic Context state outside the terminal.
-
-<p align="center">
-  <a href="https://github.com/cortexkit/magic-context/releases?q=dashboard&expanded=true"><strong>⬇️ Download for macOS · Windows · Linux</strong></a>
-</p>
-
-- **Memory browser**: search, filter, and edit project memories by category and project.
-- **Session history**: browse compartments and notes for any session with timeline navigation.
-- **Cache diagnostics**: real-time cache hit/miss timeline and bust-cause detection.
-- **Dreamer management**: view dream-run history, trigger runs, inspect task results.
-- **Configuration editor**: form-based editing for every setting, including model fallback chains.
-- **Log viewer**: live-tailing logs with search.
-
-It reads directly from Magic Context's SQLite database. No extra server, no API. Auto-updates built in.
 
 ---
 
@@ -250,6 +233,7 @@ Settings live in `magic-context.jsonc`. Most settings have sensible defaults, bu
 > **Note on per-model settings (OpenCode/Pi):** settings that route per model — like `prompt_surface.models` — apply to the injected guidance block. Tool descriptions are registered once per process by the current (v1) plugin API and follow the default preset; per-model tool descriptions arrive with the OpenCode v2 plugin API once the SDK stabilizes ([#260](https://github.com/cortexkit/magic-context/issues/260)).
 
 **Config locations** (one shared CortexKit location, project overrides user):
+
 1. `<project-root>/.cortexkit/magic-context.jsonc`
 2. `~/.config/cortexkit/magic-context.jsonc`
 
@@ -259,12 +243,12 @@ Upgrading from an earlier version? Your existing config is moved here automatica
 
 ## Storage
 
-All durable state lives in a local SQLite database under the shared CortexKit store (`~/.local/share/cortexkit/magic-context/context.db`, XDG-equivalent on Windows; legacy OpenCode-folder databases are migrated forward on first boot). If the database can't be opened, Magic Context disables itself and notifies you. Memories are keyed to a **stable project identity** derived from the repo, so they follow a project across worktrees, clones, and forks rather than being tied to a directory path.
+All durable state lives in a local SQLite database under the shared CortexKit store (`~/.local/share/cortexkit/magic-context/context.db`, XDG-equivalent on Windows). The current release accepts only its exact direct format; an older or malformed database is refused unchanged and can be abandoned only through the explicit Doctor reset workflow. Project-memory claims use stable public identities, so they follow a project across worktrees, clones, and forks rather than being tied to a directory path.
 
 Magic Context also writes to a few other locations:
 
 | Path | What | Persistence |
-|---|---|---|
+| --- | --- | --- |
 | `~/.local/share/cortexkit/magic-context/context.db` | SQLite database — tags, compartments, memories, all durable state (XDG-equivalent on Windows) | **Must persist.** Losing it loses your memory/history. |
 | `~/.local/share/cortexkit/magic-context/models/` | Local embedding model cache (~130 MB `Xenova/bge-small-en-v1.5` ONNX), downloaded on first use when local embeddings are enabled | Should persist, else re-downloaded each run. Not used when `memory.enabled: false` or an `openai_compatible`/`ollama` embedding backend is configured. |
 | `$MAGIC_CONTEXT_LOG_PATH` (default: `${TMPDIR}/opencode/magic-context/magic-context.log`, `pi/` for Pi) | Diagnostic log. Set `MAGIC_CONTEXT_LOG_PATH` to redirect it (e.g. to a persistent path in a container). | Disposable. |
@@ -275,7 +259,11 @@ Magic Context also writes to a few other locations:
 
 ## Development
 
-**Requirements:** [Bun](https://bun.sh) ≥ 1.0
+**Requirements:** [Bun](https://bun.sh) ≥ 1.3.14
+
+Storage refuses to open below that floor: the runtime gate needs a SQLite build
+that resets the WAL safely, and Bun exposes one from 1.3.14 onward. The floor
+lives in `MIN_SUPPORTED_BUN_VERSION` (`packages/plugin/src/shared/sqlite.ts`).
 
 ```sh
 bun install         # Install dependencies

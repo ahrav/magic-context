@@ -11,7 +11,6 @@ import {
     replaceAllCompartmentStateAndBumpDepth,
     saveRecompStagingPass,
 } from "./compartment-storage";
-import { runMigrations } from "./migrations";
 import {
     addNote,
     appendAutoSearchHintDecision,
@@ -45,7 +44,8 @@ import {
     updateSessionMeta,
     updateTagStatus,
 } from "./storage";
-import { ensureColumn, initializeDatabase } from "./storage-db";
+import { ensureColumn } from "./storage-db";
+import { createDirectTestDatabase } from "./test-database";
 
 const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
@@ -82,9 +82,7 @@ function resolveDbPath(dataHome: string): string {
 }
 
 function makeMemoryDatabase(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase().db;
     return db;
 }
 

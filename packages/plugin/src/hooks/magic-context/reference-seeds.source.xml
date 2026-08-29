@@ -83,6 +83,7 @@ Acorn Suite made JWT tenant_id the single tenant authority across REST, GraphQL,
   <correction_source>user</correction_source>
   <correction_signal>U: "if the header lies, don't heal it with orgSlug"</correction_signal>
   <after_strategy>Require JWT tenant_id everywhere and return 403 when it is absent or inconsistent.</after_strategy>
+  <reason_for_change>A stale bookmarked dashboard URL could present an orgSlug that disagreed with the JWT, and healing the missing tenant_id from it turned a presentation hint into tenant authority, which is a cross-tenant read.</reason_for_change>
   <evidence>The final implementation made requireTenantContext(req) the only REST/GraphQL tenant entry point.</evidence>
 </trajectory_correction>
 </events>
@@ -141,6 +142,7 @@ OpLog; SnapshotCache; vector_clock; max_ops_before_compact=10000; crates/chorus-
   <correction_source>self_review</correction_source>
   <correction_signal>"every time we have a 3-way merge we end up replaying the log to fix it anyway, maybe the log should just BE the truth"</correction_signal>
   <after_strategy>Op log is authoritative and defines the document; materialized snapshots derived on-read from log, cached in SnapshotCache with synchronous invalidation</after_strategy>
+  <reason_for_change>Materialized state discards the causal information conflict resolution needs, so every three-way merge had to replay the log anyway and divergent states could not be reconciled from the snapshot alone.</reason_for_change>
   <evidence>Under concurrent editing from 3+ clients, three-way merge conflicts produced divergent materialized states that couldn't be reconciled without replaying the log anyway.</evidence>
 </trajectory_correction>
 </events>
@@ -246,6 +248,7 @@ RLS on tenant_id; SET LOCAL app.current_tenant; BYPASSRLS = analytics_admin only
   <correction_source>self_review</correction_source>
   <correction_signal>Realized `SET search_path` is session-scoped and doesn't survive pgbouncer transaction-mode pooling.</correction_signal>
   <after_strategy>Adopt RLS with `SET LOCAL app.current_tenant` per transaction.</after_strategy>
+  <reason_for_change>`SET search_path` is session-scoped, and pgbouncer transaction pooling hands a different session to each transaction, so per-tenant schema selection silently does not survive the connection layer we already depend on.</reason_for_change>
   <evidence>"I keep getting pulled toward schema-per-tenant... I want to be talked out of it if RLS holds up"</evidence>
 </trajectory_correction>
 </events>
@@ -347,6 +350,7 @@ internal/leaderelection/release.go shim removed; PreStop hook; lease 30s / retry
   <correction_source>user</correction_source>
   <correction_signal>"write down somewhere that we never touch the leader-election internals again, that's the second time this exact thing has bitten us"</correction_signal>
   <after_strategy>Delete the wrapper, use library's native release path, configure timings via standard options, lock the package under CODEOWNERS.</after_strategy>
+  <reason_for_change>Suppressing errors during SIGTERM drew the boundary around the network call rather than the logging, so a slow apiserver made the lease release silently not happen and terminated pods kept holding the lease.</reason_for_change>
   <evidence>holderIdentity in `kubectl get lease` pointed at pods whose Nodes were already gone, for 90+ seconds during every rolling deploy.</evidence>
 </trajectory_correction>
 </events>
@@ -436,6 +440,7 @@ Harborlight sharding is namespace-scoped: one operator binary can run cluster-wi
   <correction_source>user</correction_source>
   <correction_signal>U: "don't make one leader own the world; namespace failover is the point"</correction_signal>
   <after_strategy>Use per-namespace Lease objects and record observed lease UID in QueueShard status.</after_strategy>
+  <reason_for_change>A single global leader makes failover move every namespace at once, which removes the tenant isolation the sharding exists to provide.</reason_for_change>
   <evidence>The implementation now names one harborlight-queueshard Lease per namespace and avoids global failover.</evidence>
 </trajectory_correction>
 </events>
@@ -841,6 +846,7 @@ CollabPad CRDT ordering now follows document clocks rather than server receive t
   <correction_source>test_result</correction_source>
   <correction_signal>The offline-client replay test showed receivedAt inverted edits buffered over WebRTC.</correction_signal>
   <after_strategy>Order operations by lamport and site_id, keeping receivedAt only for telemetry.</after_strategy>
+  <reason_for_change>Server receive time is not causal: a client reconnecting over WebRTC can deliver buffered edits after a later websocket ack, so ordering by receivedAt inverts edits that happened earlier.</reason_for_change>
   <evidence>The final patch refactored oplog.ts and replay.ts around (lamport, site_id).</evidence>
 </trajectory_correction>
 </events>
@@ -956,6 +962,7 @@ onPreInstall; onPostInstall; onRemove; schema_version; dependency-declaration or
   <correction_source>test_result</correction_source>
   <correction_signal>Load test with 4 plugins all subscribing to install:pre showed non-deterministic execution order dependent on plugin registration sequence</correction_signal>
   <after_strategy>Explicit lifecycle hook functions declared in plugin manifest; executed in dependency-declaration order (deterministic)</after_strategy>
+  <reason_for_change>Registration order is load-order dependent and not something plugin authors can control, so an ordering contract built on it is non-deterministic from the author's point of view.</reason_for_change>
   <evidence>Load testing with 4 plugins all subscribing to install:pre showed non-deterministic execution order depending on which plugin was registered first.</evidence>
 </trajectory_correction>
 </events>
@@ -1344,6 +1351,7 @@ The SKU importer now defaults to a safe preview workflow instead of assuming liv
   <correction_source>user</correction_source>
   <correction_signal>U: no, make it dry-run first or I won't let ops touch it.</correction_signal>
   <after_strategy>Require an explicit apply flag and treat preview output as the standard operator workflow.</after_strategy>
+  <reason_for_change>Applying changes on the normal execution path gives an irreversible warehouse mutation no confirmation step, so a routine invocation can commit an unreviewed import.</reason_for_change>
   <evidence>The final command behavior in tools/sku-import/main.go makes preview the default and docs/runbooks/sku-import.md leads with the diff-review step.</evidence>
 </trajectory_correction>
 </events>
@@ -1425,6 +1433,7 @@ Low-confidence scan rotation is now handled through a manual override path, with
   <correction_source>user</correction_source>
   <correction_signal>U: if confidence is fuzzy, give support a knob instead of guessing.</correction_signal>
   <after_strategy>Persist per-page rotation overrides and reserve automatic rotation for only high-confidence predictions.</after_strategy>
+  <reason_for_change>OCR angle confidence below the threshold is not reliable enough to distinguish a correct rotation from a wrong one, so broad auto-rotation silently corrupts pages that were already right.</reason_for_change>
   <evidence>The final implementation added PageRotationOverride in triage UI and left ingest auto-rotation behind a strict confidence gate.</evidence>
 </trajectory_correction>
 </events>
@@ -1496,6 +1505,7 @@ This was a scoped replay, not a lasting data-model change: the useful outcome wa
   <correction_source>user</correction_source>
   <correction_signal>U: don't touch closed months if the hole is just that May gap.</correction_signal>
   <after_strategy>Trace the mismatch to its ingestion window and replay only the affected landed_at partitions.</after_strategy>
+  <reason_for_change>The drift was isolated to four ingestion days, so rebuilding the full year would rewrite closed months that were already correct and reconciled.</reason_for_change>
   <evidence>The investigation isolated the issue to raw.orders_ingest for 2025-05-11 through 2025-05-14, and the final repair command targeted only that range.</evidence>
 </trajectory_correction>
 </events>
@@ -1654,6 +1664,7 @@ False start: attempted-and-reverted controller-runtime cache bypass.
   <correction_source>self_review</correction_source>
   <correction_signal>Microbenchmark showed no latency change; realized controller-runtime cache is informer-backed.</correction_signal>
   <after_strategy>Delete the scratch branch; keep the existing setup.</after_strategy>
+  <reason_for_change>controller-runtime's cache is itself informer-backed, so bypassing it removes no indirection and the premise the refactor rested on was false.</reason_for_change>
   <evidence>"yeah let's not, this was a bad idea"</evidence>
 </trajectory_correction>
 </events>

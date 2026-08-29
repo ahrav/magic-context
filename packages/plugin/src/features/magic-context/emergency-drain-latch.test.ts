@@ -1,8 +1,7 @@
 /// <reference types="bun-types" />
 
 import { beforeEach, describe, expect, it } from "bun:test";
-import { Database } from "../../shared/sqlite";
-import { initializeDatabase } from "./storage-db";
+import type { Database } from "../../shared/sqlite";
 import {
     clearEmergencyDrainLatch,
     EMERGENCY_DRAIN_FAILURE_BACKOFF_MS,
@@ -13,6 +12,7 @@ import {
     recordHistorianDrainFailure,
     reserveProtectedTailDrainTokens,
 } from "./storage-meta-persisted";
+import { createDirectTestDatabase } from "./test-database";
 
 // Reserve args that exhaust the per-window budget in one call, so the SECOND
 // reserve in a window only succeeds if the emergency latch bypass kicks in.
@@ -54,8 +54,7 @@ describe("emergency drain catch-up latch", () => {
     const SID = "sess-latch";
 
     beforeEach(() => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
     });
 
     describe("emergencyDrainExitThreshold", () => {

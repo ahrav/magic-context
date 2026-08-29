@@ -10,7 +10,7 @@ import {
     MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS,
     sweepOrphanedOpenCodeMessageIndexes,
 } from "./message-index";
-import { initializeDatabase } from "./storage-db";
+import { createDirectTestDatabase } from "./test-database";
 
 const tempDirectories: string[] = [];
 
@@ -55,8 +55,7 @@ afterEach(() => {
 
 describe("message history orphan maintenance", () => {
     test("sweeps old orphans while retaining live and young sessions", () => {
-        const db = new Database(":memory:");
-        initializeDatabase(db);
+        const db = createDirectTestDatabase().db;
         const now = 2_000_000_000_000;
         const old = now - MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS - 1;
         seedIndexedSession(db, "ses-live", old);
@@ -84,8 +83,7 @@ describe("message history orphan maintenance", () => {
     });
 
     test("persists a keyset cursor and resumes within the configured batch bound", () => {
-        const db = new Database(":memory:");
-        initializeDatabase(db);
+        const db = createDirectTestDatabase().db;
         const now = 2_000_000_000_000;
         const old = now - MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS - 1;
         for (const sessionId of ["ses-a", "ses-b", "ses-c"]) {
@@ -126,8 +124,7 @@ describe("message history orphan maintenance", () => {
     });
 
     test("parks cleanly when a Pi-only install has no OpenCode database", () => {
-        const db = new Database(":memory:");
-        initializeDatabase(db);
+        const db = createDirectTestDatabase().db;
         const now = 2_000_000_000_000;
         seedIndexedSession(db, "pi-do-not-delete", now - MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS - 1);
         let openAttempts = 0;

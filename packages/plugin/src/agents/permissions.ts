@@ -50,19 +50,16 @@ import { log } from "../shared/logger";
  *     navigation is allowed so historian can find or verify a symbol or
  *     file structure when writing accurate compartment summaries.
  *
- *   - **dreamer**: `read`, `grep`, `glob`, `bash`, `write`, `edit`, the
- *     read-only AFT navigation/search tools `aft_outline`, `aft_zoom`,
- *     `aft_search`, plus the Magic Context MCP tools `ctx_memory`,
- *     `ctx_search`, `ctx_note`.
- *     Dreamer task prompts in
- *     `features/magic-context/dreamer/task-prompts.ts` explicitly tell
- *     the model to grep schema files for defaults, read source to
- *     confirm claims, run `git log` / `gh` / `curl` for verify and
- *     smart-note evaluation, and use glob/find for directory
- *     inventory. Live DB shows >100 bash invocations across all
- *     dreamer task variants. `task` / `edit` / `write` / `webfetch` /
- *     `websearch` remain denied — dreamer must not spawn subagents
- *     or commit changes.
+ *   - **dreamer**: no single allow-list. Each dreamer task runs on its
+ *     own scoped agent whose allow-list lives beside it in `dreamer.ts`,
+ *     so every unsupervised scheduled loop carries only the surface that
+ *     one task needs. The base `dreamer` agent is curate and holds ZERO
+ *     tools: it emits one XML manifest and the host validates it and
+ *     applies every claim write inside a single guarded transaction. No
+ *     dreamer agent holds `ctx_memory` — the host applies memory writes
+ *     from the agent's manifest, so none of them needs a mutation tool.
+ *     `task` stays denied across all of them: a dreamer task must never
+ *     spawn subagents.
  *
  *   - **sidekick**: `ctx_search`, plus the read-only AFT
  *     navigation tools `aft_outline` and `aft_zoom`. Sidekick's job
@@ -226,11 +223,15 @@ export function applyDisallowedTools(
     return defaults.filter((t) => !disallowed.includes(t));
 }
 
-// The old kitchen-sink DREAMER_ALLOWED_TOOLS is retired: each dreamer task now
-// runs on its own scoped agent. Curate uses DREAMER_CURATE_ALLOWED_TOOLS
-// (ctx_memory only) and maintain-docs uses DREAMER_DOCS_ALLOWED_TOOLS (file
-// read/write/bash, no memory) — both in `dreamer.ts` alongside the other
-// per-task allow-lists (mapper/classifier/etc).
+// There is no combined dreamer allow-list: each dreamer task runs on its own
+// scoped agent, holding the narrowest surface that task needs. Curate uses
+// DREAMER_CURATE_ALLOWED_TOOLS, which is empty — it emits one XML manifest and
+// the host validates it and applies every claim write inside a single guarded
+// transaction, so granting ctx_memory would expose
+// list/create/revise/archive/restore/merge to the model and let a run mutate
+// claims outside that transaction. maintain-docs uses
+// DREAMER_DOCS_ALLOWED_TOOLS (file read/write/bash, no memory). Both live in
+// `dreamer.ts` alongside the other per-task allow-lists (mapper/classifier/etc).
 
 /**
  * Tools the sidekick agent needs. Sidekick is a read-only memory
