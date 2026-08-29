@@ -15,8 +15,8 @@ import {
     insertTag,
     saveSourceContent,
 } from "../../features/magic-context/storage";
-import { initializeDatabase, type openDatabase } from "../../features/magic-context/storage-db";
-import { Database } from "../../shared/sqlite";
+import type { openDatabase } from "../../features/magic-context/storage-db";
+import { createDirectTestDatabase } from "../../features/magic-context/test-database";
 import { cavemanCompress } from "./caveman";
 import {
     applyCavemanCleanup,
@@ -28,8 +28,7 @@ import type { TagTarget } from "./tag-messages";
 const SESSION = "ses-caveman-test";
 
 function createInMemoryDb(): ReturnType<typeof openDatabase> {
-    const db = new Database(":memory:") as ReturnType<typeof openDatabase>;
-    initializeDatabase(db);
+    const db = createDirectTestDatabase().db as ReturnType<typeof openDatabase>;
     return db;
 }
 

@@ -5,10 +5,8 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { Database } from "../../shared/sqlite";
+import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { runMigrations } from "./migrations";
-import { initializeDatabase } from "./storage-db";
 import {
     addNote,
     dismissNote,
@@ -18,14 +16,13 @@ import {
     type Note,
     updateNote,
 } from "./storage-notes";
+import { createDirectTestDatabase } from "./test-database";
 
 const PROJECT = "/revision/project";
 const SCOPE = { sessionId: "session", projectPath: PROJECT };
 
 function freshDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase().db;
     return db;
 }
 

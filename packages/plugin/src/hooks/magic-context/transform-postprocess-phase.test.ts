@@ -22,7 +22,6 @@ import {
     setPendingCompactionMarkerState,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
-import { initializeDatabase } from "../../features/magic-context/storage-db";
 import {
     getMergedReasoningStrippedIds,
     getPersistedCompactionMarkerState,
@@ -34,6 +33,7 @@ import {
     setPersistedTodoSyntheticAnchor,
 } from "../../features/magic-context/storage-meta-persisted";
 import { createTagger } from "../../features/magic-context/tagger";
+import { createDirectTestDatabase } from "../../features/magic-context/test-database";
 import * as loggerModule from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
@@ -96,8 +96,7 @@ afterEach(() => {
 
 describe("m[0] mutation drift watcher", () => {
     it("schedules next-pass materialization when m0_mutation_log gets a newer id", () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const pendingMaterializationSessions = new Set<string>();
         const historyRefreshSessions = new Set<string>();
 
@@ -121,8 +120,7 @@ describe("m[0] mutation drift watcher", () => {
     });
 
     it("does not schedule when the cached monotonic mutation id is current", () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const mutation = queueM0Mutation(db, {
             sessionId: SESSION_ID,
             mutationType: "compartment_merge",
@@ -238,8 +236,7 @@ function cloneMessages(messages: MessageLike[]): MessageLike[] {
 
 describe("tail hygiene last-writer guard", () => {
     it("logs a production structural mismatch after a post-walk mutation without throwing", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-tail-hygiene-last-writer";
         const messages = [
             {
@@ -286,8 +283,7 @@ describe("tail hygiene last-writer guard", () => {
 
 describe("Channel-2 measured-collapse cycle reset", () => {
     it("CAS-rearms delivered at the baseline-refresh site when measured U falls below 25k", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-channel2-u-collapse";
         setChannel2NudgeState(db, sessionId, "delivered");
         const channel1StateBySession = new Map<string, Channel1State>([
@@ -427,8 +423,7 @@ function serializeAnthropicWireWithAdjacentAssistantMerge(messages: MessageLike[
 
 describe("deferred compaction marker representation", () => {
     it("ignores a persisted message that carries a forged syntheticHead flag", () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-marker-forged-head";
         const state = {
             boundaryMessageId: "boundary",
@@ -473,8 +468,7 @@ describe("deferred compaction marker representation", () => {
     });
 
     it("uses only marked m[0]/m[1] slots as the synthetic head", () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-marker-synthetic-tail";
         const state = {
             boundaryMessageId: "boundary",
@@ -527,8 +521,7 @@ describe("deferred compaction marker representation", () => {
     });
 
     it("rebuilds byte-identical summary rows in TypeScript and Rust lanes", () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-marker-rust-parity";
         const state = {
             boundaryMessageId: "boundary",
@@ -581,8 +574,7 @@ describe("deferred compaction marker representation", () => {
     });
 
     it("keeps a provisional marker untagged and freezes the callable tag choice", () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-marker-provisional-availability";
         const state = {
             boundaryMessageId: "boundary",
@@ -629,8 +621,7 @@ describe("deferred compaction marker representation", () => {
     });
 
     it("keeps todo synthesis at the head when the only assistant is a summary", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-marker-todo-head";
         const state = {
             boundaryMessageId: "boundary",
@@ -711,8 +702,7 @@ describe("deferred compaction marker representation", () => {
     });
 
     it("keeps the marker-consuming fold byte-identical with the rebuilt defer wire", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-marker-wire-stability";
         const dataHome = mkdtempSync(join(tmpdir(), "postprocess-marker-wire-"));
         tempDirs.push(dataHome);
@@ -912,8 +902,7 @@ describe("deferred compaction marker representation", () => {
     });
 
     it("reconciles duplicate summaries at the synthetic-prefix boundary and is idempotent", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-marker-reconcile-idempotent";
         setPersistedCompactionMarkerState(db, sessionId, {
             boundaryMessageId: "boundary",
@@ -993,8 +982,7 @@ describe("deferred compaction marker representation", () => {
     });
 
     it("leaves a marker-free session byte-identical across repeated passes", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-without-marker";
         const messages = [
             {
@@ -1013,8 +1001,7 @@ describe("deferred compaction marker representation", () => {
 
 describe("deferred compaction marker advance representation", () => {
     it("keeps the advance drain byte-identical with the next pass after removing the old marker", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-marker-advance-wire-stability";
         const dataHome = mkdtempSync(join(tmpdir(), "postprocess-marker-advance-wire-"));
         tempDirs.push(dataHome);
@@ -1255,8 +1242,7 @@ describe("deferred compaction marker advance representation", () => {
 
 describe("deferred compaction marker CAS drain", () => {
     it("preserves the deferred-history signal when a newer pending blob exists", () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-marker-cas-newer";
         const expected = { ordinal: 10, endMessageId: "msg-old", publishedAt: 1 };
         const newer = { ordinal: 11, endMessageId: "msg-new", publishedAt: 2 };
@@ -1275,8 +1261,7 @@ describe("deferred compaction marker CAS drain", () => {
     });
 
     it("does not re-add the signal when the pending blob was already cleared", () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-marker-cas-cleared";
         const expected = { ordinal: 10, endMessageId: "msg-old", publishedAt: 1 };
         const deferredHistoryRefreshSessions = new Set<string>();
@@ -1293,8 +1278,7 @@ describe("deferred compaction marker CAS drain", () => {
     });
 
     it("preserves a pending marker newer than the consumed compartment boundary", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-marker-newer-than-consumed";
         const newer = { ordinal: 12, endMessageId: "msg-12", publishedAt: 2 };
         setPendingCompactionMarkerState(db, sessionId, newer);
@@ -1324,8 +1308,7 @@ describe("deferred compaction marker CAS drain", () => {
     });
 
     it("drains a pending marker covered by the consumed compartment boundary", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-marker-covered-by-consumed";
         createOpenCodeDbWithoutMessages("postprocess-covered-marker-");
         const covered = { ordinal: 10, endMessageId: "msg-10", publishedAt: 1 };
@@ -1474,8 +1457,7 @@ describe("confirmed emergency abort", () => {
 
 describe("postprocess emergency drop accounting", () => {
     it("plans emergency floor from tags that remain active after pending ops", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-postprocess-floor";
         const messages = [1, 2, 3, 4].map((tag) => makeToolMessage(`tool-${tag}`));
         const targets = new Map<number, TagTarget>();
@@ -1546,8 +1528,7 @@ describe("postprocess emergency drop accounting", () => {
     });
 
     it("reports estimated tokens reclaimed by successful emergency tool drops", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-postprocess-reclaim";
         const messages = [1, 2, 3, 4].map((tag) => makeToolMessage(`tool-${tag}`));
         const targets = new Map<number, TagTarget>();
@@ -1577,8 +1558,7 @@ describe("two-pass tool reclaim", () => {
     }
 
     it("does not auto-drop on an execute pass with no confirmed wire mutation", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-reclaim-noop";
         const message = makeToolMessage("tool-1");
         insertTag(db, sessionId, "tool-1", "tool", 4000, 1, 0, "bash");
@@ -1600,8 +1580,7 @@ describe("two-pass tool reclaim", () => {
     });
 
     it("auto-drops eligible old visible tools only when another confirmed mutation already happened", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-reclaim-mutating";
         const first = makeToolMessage("tool-1");
         const second = makeToolMessage("tool-2");
@@ -1631,8 +1610,7 @@ describe("two-pass tool reclaim", () => {
     });
 
     it("keeps sub-floor arcs while reclaiming a larger sibling", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-reclaim-size-floor";
         const trigger = makeToolMessage("tool-1");
         const small = makeToolMessage("tool-2");
@@ -1671,8 +1649,7 @@ describe("two-pass tool reclaim", () => {
     });
 
     it("keeps the newest todowrite arc while reclaiming an older one", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-reclaim-newest-todowrite";
         const trigger = makeToolMessage("tool-1");
         const older = makeToolMessage("tool-2");
@@ -1712,8 +1689,7 @@ describe("two-pass tool reclaim", () => {
     });
 
     it("does not persist a synthetic drop for an absent old DB tag", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-reclaim-absent";
         const visible = makeToolMessage("tool-2");
         insertTag(db, sessionId, "tool-1", "tool", 4000, 1, 0, "bash");
@@ -1736,8 +1712,7 @@ describe("two-pass tool reclaim", () => {
     });
 
     it("suppresses two-pass reclaim in the emergency band but still advances the watermark on execute", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-reclaim-emergency";
         const first = makeToolMessage("tool-1");
         const second = makeToolMessage("tool-2");
@@ -1766,8 +1741,7 @@ describe("two-pass tool reclaim", () => {
     });
 
     it("advances the watermark on execute even when the auto-drop gate is closed", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-reclaim-advance";
         const message = makeToolMessage("tool-1");
         insertTag(db, sessionId, "tool-1", "tool", 4000, 1, 0, "bash");
@@ -1786,8 +1760,7 @@ describe("two-pass tool reclaim", () => {
     });
 
     it("does not advance the watermark on a non-execute force-materialization pass", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-reclaim-force-defer";
         const message = makeToolMessage("tool-1");
         insertTag(db, sessionId, "tool-1", "tool", 4000, 1, 0, "bash");
@@ -1832,8 +1805,7 @@ describe("smart-drops supersession reclaim (flag-gated)", () => {
     }
 
     it("OFF (default): superseded todowrite is NOT dropped even on a mutating execute pass", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-smart-off";
         const { trigger, older, newer } = seedTodowriteSession(sessionId);
 
@@ -1858,8 +1830,7 @@ describe("smart-drops supersession reclaim (flag-gated)", () => {
     });
 
     it("ON: superseded todowrite is dropped, newest kept, on a mutating execute pass", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-smart-on";
         const { trigger, older, newer } = seedTodowriteSession(sessionId);
 
@@ -1884,8 +1855,7 @@ describe("smart-drops supersession reclaim (flag-gated)", () => {
     });
 
     it("ON but plain DEFER pass: nothing is dropped (reclaim block requires a known bust)", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-smart-defer";
         const { trigger, older, newer } = seedTodowriteSession(sessionId);
 
@@ -1934,8 +1904,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
     }
 
     it("keeps OpenCode final bytes identical to a one-shot executed fold", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const directSession = "ses-hardfold-byte-direct";
         const postprocessSession = "ses-hardfold-byte-postprocess";
         materializeBaseline(directSession);
@@ -1976,8 +1945,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
     });
 
     it("re-arms Channel 2 when a HARD fold advances m0 compartment coverage", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-hardfold-channel2-cycle";
         materializeBaseline(sessionId);
         appendCompartments(db, sessionId, [
@@ -2008,8 +1976,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
     });
 
     it("drains queued pending ops on a DEFER scheduler pass when m[0] HARD-folds", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-hardfold-drain";
         materializeBaseline(sessionId);
 
@@ -2052,8 +2019,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         // into a second bust ~a turn later. The fold-fold bypass must drain into
         // the one unavoidable bust instead. canRunCompartments=true + a registered
         // active run makes compartmentRunning=true.
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-hardfold-drain-while-historian";
         materializeBaseline(sessionId);
 
@@ -2092,8 +2058,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
     });
 
     it("drains pending ops but not two-pass reclaim or its watermark on a low-usage TTL fold", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-hardfold-reclaim-drain";
         materializeBaseline(sessionId);
 
@@ -2162,8 +2127,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         // Counterpart: same historian-running condition, but NO hard fold and NOT
         // an execute pass → the compartmentRunning veto still holds (don't mutate
         // the bytes the historian is reading on a pass that isn't busting anyway).
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-nofold-historian-novdrain";
         materializeBaseline(sessionId);
 
@@ -2196,8 +2160,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
     });
 
     it("does NOT drain on a plain DEFER pass with no hard fold (baseline behavior)", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-nofold-nodrain";
         materializeBaseline(sessionId);
 
@@ -2230,8 +2193,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
 
 describe("postprocess empty-sentinel provider gate", () => {
     it("does not sentinelize cleared reasoning on github-copilot execute passes", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-copilot-cleared-reasoning";
         const messages: MessageLike[] = [
             {
@@ -2253,8 +2215,7 @@ describe("postprocess empty-sentinel provider gate", () => {
     });
 
     it("does not WRITE [cleared] into old reasoning on github-copilot (clearOldReasoning gated)", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-copilot-clear-write";
         const oldThinking = { type: "thinking", thinking: "real reasoning content" };
         const oldMsg = {
@@ -2288,8 +2249,7 @@ describe("postprocess empty-sentinel provider gate", () => {
     });
 
     it("still clears + sentinelizes old reasoning on anthropic execute passes", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-anthropic-clear-write";
         const oldThinking = { type: "thinking", thinking: "real reasoning content" };
         const oldMsg = {
@@ -2323,8 +2283,7 @@ describe("postprocess empty-sentinel provider gate", () => {
     });
 
     it("leaves processed image file parts native for github-copilot", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-copilot-processed-image";
         const userMessage = {
             info: { id: "m-image", role: "user" },
@@ -2357,8 +2316,7 @@ describe("postprocess empty-sentinel provider gate", () => {
     });
 
     it("still sentinelizes processed image file parts for anthropic", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-anthropic-processed-image";
         const userMessage = {
             info: { id: "m-image", role: "user" },
@@ -2396,8 +2354,7 @@ describe("postprocess empty-sentinel provider gate", () => {
     });
 
     it("replays frozen processed image strips on defer passes even when the watermark is zero", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-anthropic-processed-image-zero-watermark";
         addProcessedImageStrippedIds(db, sessionId, ["m-image-frozen"]);
         const userMessage = {
@@ -2432,8 +2389,7 @@ describe("postprocess empty-sentinel provider gate", () => {
     });
 
     it("does not replay stale ctx_reduce frozen ids as empty sentinels for github-copilot", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-copilot-stale-reduce";
         addStaleReduceStrippedIds(db, sessionId, ["reduce-1"]);
         const messages: MessageLike[] = [
@@ -2463,8 +2419,7 @@ describe("postprocess empty-sentinel provider gate", () => {
 
 describe("final message representation", () => {
     it("serializes a late auto-reclaim clear identically on execute and defer", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-final-representation-late-clear";
         const template = [
             {
@@ -2607,8 +2562,7 @@ describe("final message representation", () => {
     });
 
     it("preserves leading signed reasoning after a predecessor is reclaimed and pruned", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-final-representation-preserve-reasoning";
         const preservedReasoning = {
             type: "reasoning",
@@ -2716,8 +2670,7 @@ describe("final message representation", () => {
     });
 
     it("strips reasoning created by final adjacency, stays idempotent, and gates non-Anthropic providers", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-final-representation-adjacency";
         const template = [
             {
@@ -2847,8 +2800,7 @@ describe("final message representation", () => {
     });
 
     it("freezes first merged-strip application onto a bust and replays it across fresh rebuilds", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-merged-reasoning-transition";
         const buildMessages = (includeNewest: boolean): MessageLike[] => {
             const messages = [
@@ -2940,8 +2892,7 @@ describe("final message representation", () => {
     });
 
     it("skips merged-assistant reasoning persistence and stripping in compaction-off mode", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-merged-reasoning-compaction-off";
         const messages = [
             {
@@ -3074,8 +3025,7 @@ describe("final message representation", () => {
     });
 
     it("freezes both trailing-blank race outcomes and replays them on defer", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
 
         const buildTarget = (includeTrailing: boolean) =>
             ({
@@ -3126,8 +3076,7 @@ describe("final message representation", () => {
     });
 
     it("freezes defer-served trailing shapes before late provider blanks arrive", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
 
         const fixtures = [
             {
@@ -3225,8 +3174,7 @@ describe("final message representation", () => {
     });
 
     it("uses the last blank shape served while an assistant is still newest", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-trailing-live-newest";
         const buildTarget = (includeTrailing: boolean) =>
             ({
@@ -3286,8 +3234,7 @@ describe("final message representation", () => {
     });
 
     it("prevents a three-turn late-blank storm without opening the defer gate", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-three-turn-late-blank-storm";
         const firstServedBytes = new Map<string, string>();
         const buildAssistant = (turn: number, includeTrailing: boolean): MessageLike =>
@@ -3355,8 +3302,7 @@ describe("final message representation", () => {
     });
 
     it("preserves the newest assistant reasoning through final representation", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-final-representation-newest-reasoning";
         const latest = {
             info: { id: "assistant-latest", role: "assistant" },
@@ -3522,8 +3468,7 @@ describe("todo synthesis — disabled todowrite tool gate", () => {
     const AVAILABLE = { callable: true, frozen: true };
 
     it("(a) busting pass with todowrite filtered out injects nothing and clears the persisted anchor", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-todo-gate-bust";
         // Stale state + anchor persisted from before the tool was disabled.
         updateSessionMeta(db, sessionId, { lastTodoState: TODO_ACTIVE_STATE });
@@ -3550,8 +3495,7 @@ describe("todo synthesis — disabled todowrite tool gate", () => {
     });
 
     it("(b) unavailable defer keeps replaying the persisted pair byte-identically, then the next bust removes it", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-todo-gate-defer";
         updateSessionMeta(db, sessionId, { lastTodoState: TODO_ACTIVE_STATE });
         const callId = computeSyntheticCallId(TODO_ACTIVE_STATE);
@@ -3598,8 +3542,7 @@ describe("todo synthesis — disabled todowrite tool gate", () => {
     });
 
     it("(c) busting pass with todowrite available keeps the existing injection behavior", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-todo-gate-available";
         updateSessionMeta(db, sessionId, { lastTodoState: TODO_ACTIVE_STATE });
 
@@ -3623,8 +3566,7 @@ describe("todo synthesis — disabled todowrite tool gate", () => {
     });
 
     it("retains a persisted denial after restart when the SDK permission read fails", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-todo-gate-cold-cache";
         updateSessionMeta(db, sessionId, { lastTodoState: TODO_ACTIVE_STATE });
         setPersistedTodoPermissionDenied(db, sessionId, true);
@@ -3657,8 +3599,7 @@ describe("todo synthesis — disabled todowrite tool gate", () => {
     });
 
     it("(d) a provisional (not yet frozen) verdict fails open and still injects", async () => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-todo-gate-provisional";
         updateSessionMeta(db, sessionId, { lastTodoState: TODO_ACTIVE_STATE });
 
@@ -3685,8 +3626,7 @@ describe("reconcileMarkerRepresentation on rust-mode output heads", () => {
         // compaction summary in at index 0 — an assistant ahead of m0 —
         // which fails the rust-mode m0 wire invariant on every pass for
         // sessions carrying persisted marker state.
-        db = new Database(":memory:");
-        initializeDatabase(db);
+        db = createDirectTestDatabase().db;
         const sessionId = "ses-marker-rust-head";
         const state = {
             boundaryMessageId: "boundary",

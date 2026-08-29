@@ -202,7 +202,7 @@ fn list_workspace_members(
         .collect::<Result<Vec<_>, _>>()?;
     let mut members = Vec::with_capacity(raw.len());
     for (project_path, display_name, display_path, added_at) in raw {
-        let count = db::count_memories_matching_identity(conn, &project_path)?;
+        let count = db::count_claims_matching_identity(conn, &project_path)?;
         members.push(WorkspaceMemberView {
             project_path,
             display_name,
@@ -253,51 +253,6 @@ pub fn workspace_member_identities_for_project(
     workspace_member_identities(conn, ws_id)
 }
 
-pub fn display_name_for_memory_in_workspace(
-    conn: &Connection,
-    workspace_id: i64,
-    memory_project_path: &str,
-) -> Result<Option<String>, rusqlite::Error> {
-    if !workspace_schema_ready(conn)? {
-        return Ok(None);
-    }
-    let memory_identity = normalize_stored_project_path(memory_project_path);
-    let mut stmt = conn.prepare(
-        "SELECT display_name, project_path FROM workspace_members WHERE workspace_id = ?1",
-    )?;
-    let rows: Vec<(String, String)> = stmt
-        .query_map(params![workspace_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<Result<Vec<_>, _>>()?;
-    for (display_name, member_path) in rows {
-        if normalize_stored_project_path(&member_path) == memory_identity
-            || member_path == memory_project_path
-        {
-            return Ok(Some(display_name));
-        }
-    }
-    Ok(None)
-}
-
-pub fn resolve_workspace_filter_paths(
-    conn: &Connection,
-    workspace_id: i64,
-) -> Result<Vec<String>, rusqlite::Error> {
-    if !workspace_schema_ready(conn)? {
-        return Ok(Vec::new());
-    }
-    let identities = workspace_member_identities(conn, workspace_id)?;
-    let mut paths = HashSet::new();
-    for identity in identities {
-        let resolved = db::resolve_paths_for_memory_filter(conn, &identity)?;
-        for p in resolved {
-            paths.insert(p);
-        }
-    }
-    let mut v: Vec<String> = paths.into_iter().collect();
-    v.sort();
-    Ok(v)
-}
-
 pub fn workspace_member_identities_union(
     old_members: &HashSet<String>,
     new_members: &HashSet<String>,
@@ -310,7 +265,7 @@ pub fn bump_epochs_for_identities(
     identities: &HashSet<String>,
 ) -> Result<(), rusqlite::Error> {
     for identity in identities {
-        db::bump_project_memory_epoch_for_identity_pub(tx, identity)?;
+        db::bump_project_claim_epoch_for_identity(tx, identity)?;
     }
     Ok(())
 }
@@ -322,15 +277,6 @@ pub fn bump_epochs_for_workspace_mutation(
 ) -> Result<(), rusqlite::Error> {
     let union = workspace_member_identities_union(old_members, new_members);
     bump_epochs_for_identities(tx, &union)
-}
-
-pub fn bump_epochs_for_memory_identity(
-    tx: &Transaction<'_>,
-    conn: &Connection,
-    identity: &str,
-) -> Result<(), rusqlite::Error> {
-    let set = workspace_member_identities_for_project(conn, identity)?;
-    bump_epochs_for_identities(tx, &set)
 }
 
 pub fn workspace_member_picker_rows(conn: &Connection) -> Result<Vec<ProjectRow>, rusqlite::Error> {

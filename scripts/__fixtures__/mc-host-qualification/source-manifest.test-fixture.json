@@ -6,7 +6,7 @@
   "inputs": {
     "bundle_manifest": {
       "qualified": true,
-      "source": "https://artifacts.example.invalid/mc-host/0.38.0/bundle-manifest.json",
+      "source": "https://artifacts.example.invalid/mc-host/0.38.0/de6e83b74343b47ec7de02f58c01e76fd58c28afee636271976dc46ff3cbb3e6/bundle-manifest.json",
       "size_bytes": 60,
       "sha256": "de6e83b74343b47ec7de02f58c01e76fd58c28afee636271976dc46ff3cbb3e6",
       "provenance": "immutable test-only qualification artifact",
@@ -117,14 +117,28 @@
       "target": "linux-x64-gnu",
       "kernel": "4.18",
       "glibc": "2.28",
-      "exact_floor": true
+      "exact_floor": true,
+      "procfs_self_fd_exec": true
     },
     "expected_vectors": 8,
     "tolerance": 0.01,
     "network_access": "none",
+    "result": "pass",
+    "vectors_compared": 8,
+    "observed_max_error": 0.004,
+    "bound_inputs": {
+      "bundle_manifest": "de6e83b74343b47ec7de02f58c01e76fd58c28afee636271976dc46ff3cbb3e6",
+      "config": "4fd2d898799ffd2fb86d6876bbc61fee51f15f9084371b6855a7c33baa3f7afe",
+      "corpus": "9e0acccc7df8aa48992d86aa72b07014b86e74e2dd563ca8873788e92fc9d4cc",
+      "model_onnx": "7b76162eb214679b69ada2511b7bcbc4a3a10e5a4f6975b63151d9e70228fbb9",
+      "ort_runtime": "7163d84f017b03efe91688c775f817bc86598f094361cab70066a5f601f3f262",
+      "special_tokens_map": "edb50ff6967f699266556dd0ad34fcc8223862dbfc2c1fc89605886694b47be8",
+      "tokenizer": "ce626902caf146eae1f94b18c3ac4e6afdb3de53543c964a70ec47931567f485",
+      "tokenizer_config": "ab5bb3f9cf48aaa106425b71ae7669ac7e11fbdf7171a603d8ff6a002c7b15c9"
+    },
     "smoke_report": {
       "path": "scripts/__fixtures__/mc-host-qualification/artifacts/synapse-smoke-report.json",
-      "sha256": "21d5718fb63be39a4cbf474e7bf5e23f35c512e96bd1b5355839b4f17e5cc967"
+      "sha256": "d1a9679e52f9b9408f7556451f47b5b967aa9f861ed50d65f7e7a474aca4e519"
     }
   },
   "harnesses": {

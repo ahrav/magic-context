@@ -110,6 +110,10 @@ Per-session state (compartments, tags, session facts) is scoped to the originati
 
 ## What is the database format?
 
-SQLite. The schema is managed by Magic Context's migration system and is upgraded automatically when you update the plugin. You can open and inspect it with any SQLite tool, but do not write to it directly — the schema may change between versions.
+SQLite, in one exact format. A release opens a database only when it matches that format exactly, or when the location is empty and can be created from scratch. Anything else — a database written by an older release, a partial schema, a damaged marker — is refused and left untouched, with the reason logged. There is no in-place upgrade and no import.
+
+Recovering from a refusal is an explicit operator step, never a startup branch: `npx @cortexkit/magic-context@latest doctor reset-db` abandons the old database family, moving it aside so the next open creates a fresh one. It reports what it will move before it moves anything. Keep every Magic Context surface — OpenCode, Pi, the CLI, the dashboard — on the same release, since a database one of them owns is refused by an older one.
+
+You can open and inspect the file with any SQLite tool, but do not write to it directly.
 
 The [desktop dashboard](https://github.com/cortexkit/magic-context/releases) provides a UI for viewing and editing the data that is safe to use.

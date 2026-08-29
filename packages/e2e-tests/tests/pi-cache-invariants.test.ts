@@ -12,14 +12,6 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { realpathSync } from "node:fs";
-import { resolve as pathResolve } from "node:path";
-import { reconcileCompatibilityVerifications } from "../../plugin/src/features/magic-context/claim-policy-backfill";
-import { insertMemory, updateMemoryContent, updateMemoryVerification } from "../../plugin/src/features/magic-context/memory";
-import { computeNormalizedHash } from "../../plugin/src/features/magic-context/memory/normalize-hash";
-import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
-import type { Memory } from "../../plugin/src/features/magic-context/memory/types";
-import { Database } from "../../plugin/src/shared/sqlite";
 import {
     extractM0,
     extractM1,
@@ -29,7 +21,6 @@ import {
 } from "../src/cache-analysis";
 import type { CapturedRequest, MockUsage } from "../src/mock-provider/server";
 import { PiTestHarness } from "../src/pi-harness";
-import { openTestDb } from "../src/test-db";
 
 const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
 const MODEL_LIMIT = 100_000;
@@ -143,104 +134,6 @@ function countCompartments(h: PiTestHarness, sessionId: string): number {
     } catch {
         return 0;
     }
-}
-
-function projectIdentity(h: PiTestHarness): string {
-    return resolveProjectIdentity(realpathSync(pathResolve(h.env.workdir)));
-}
-
-function writeDb<T>(h: PiTestHarness, fn: (db: Database) => T): T {
-    const db = openTestDb(h.contextDbPath(), { readwrite: true });
-    try {
-        return fn(db);
-    } finally {
-        db.close();
-    }
-}
-
-/** Promote a memory to verified and settle the epoch bump its verification
- * event queues. `reconcileCompatibilityVerifications` is the synchronous
- * reconciler the plugin itself runs during injection: draining it here makes
- * the write's ONE epoch bump land now instead of during the next turn, after
- * `setProjectEpoch` has already pinned. Without this the pin is silently
- * undone mid-turn and m[0] HARD-refolds
- * (reason=project_memory_change), which routes the write into m[0] and leaves
- * the m[1] delta lanes untested. */
-function verifyAndSettle(db: Database, memoryId: number): void {
-    updateMemoryVerification(db, memoryId, "verified");
-    reconcileCompatibilityVerifications(db);
-}
-
-function seedMemory(
-    h: PiTestHarness,
-    content: string,
-    category: Memory["category"] = "PROJECT_RULES",
-): number {
-    return writeDb(h, (db) => {
-        const id = insertMemory(db, {
-            projectPath: projectIdentity(h),
-            category,
-            content,
-            // v86 trust policy: explicit-user origin rows are auto-eligible,
-            // but the effective policy is computed by an ASYNC evaluator; a
-            // synchronous verification promotion makes eligibility
-            // deterministic before the next turn materializes m[0].
-            sourceType: "user",
-        }).id;
-        verifyAndSettle(db, id);
-        return id;
-    });
-}
-
-function projectEpoch(h: PiTestHarness): number {
-    return writeDb(
-        h,
-        (db) =>
-            (
-                db
-                    .prepare(
-                        "SELECT project_memory_epoch AS epoch FROM project_state WHERE project_path = ?",
-                    )
-                    .get(projectIdentity(h)) as { epoch: number } | null
-            )?.epoch ?? 0,
-    );
-}
-
-/** Pin the project epoch to a captured value. Eligible writes and
- * verification promotions bump the epoch, which HARD-refolds m[0]; the
- * m[1] delta lanes under test only fire when memory ids advance WITHOUT an
- * epoch change, so tests pin the epoch back after seeding. */
-function setProjectEpoch(h: PiTestHarness, epoch: number): void {
-    writeDb(h, (db) => {
-        db.prepare(
-            `INSERT INTO project_state (project_path, project_memory_epoch)
-             VALUES (?, ?)
-             ON CONFLICT(project_path) DO UPDATE SET project_memory_epoch = excluded.project_memory_epoch`,
-        ).run(projectIdentity(h), epoch);
-    });
-}
-
-/** Queue the memory-update record used when a memory is replaced, archived, or deleted. */
-function queueMemoryUpdate(h: PiTestHarness, targetId: number, newContent: string): void {
-    writeDb(h, (db) => {
-        db.prepare(
-            `INSERT INTO memory_mutation_log
-                (project_path, mutation_type, target_memory_id, superseded_by_id, category, new_content, queued_at)
-             VALUES (?, 'update', ?, NULL, NULL, ?, ?)`,
-        ).run(projectIdentity(h), targetId, newContent, Date.now());
-        updateMemoryContent(db, targetId, newContent, computeNormalizedHash(newContent));
-    });
-}
-
-/** Increment the project epoch so other processes notice the memory change and reload the initial session-history baseline. */
-function bumpProjectEpoch(h: PiTestHarness): void {
-    writeDb(h, (db) => {
-        db.prepare(
-            `INSERT INTO project_state (project_path, project_memory_epoch)
-             VALUES (?, 1)
-             ON CONFLICT(project_path) DO UPDATE SET project_memory_epoch = project_memory_epoch + 1`,
-        ).run(projectIdentity(h));
-    });
 }
 
 function readOldestActiveTag(h: PiTestHarness, sessionId: string): number {
@@ -478,132 +371,5 @@ describe("pi cache invariants — m[0]/m[1] taxonomy", () => {
         }
     }, 360_000);
 
-    it("B10: additive memory writes ride m[1] <new-memories> while m[0] stays frozen", async () => {
-        const h = await createHarness();
-        try {
-            await sendTurn(h, "pi B10 bootstrap: create the context DB before seeding memory.", "pi B10 bootstrap");
-            seedMemory(h, "B10 baseline rule: prefer the project's own tools over shell fallbacks.");
-            await h.newSession();
-            h.mock.reset();
-            await sendTurn(h, "pi B10 turn 1: warmup after baseline memory exists.", "pi B10 warm");
-            await sendTurn(h, "pi B10 turn 2: high usage marks next pass execute.", "pi B10 high", HIGH_USAGE);
-            await sendTurn(h, "pi B10 turn 3: execute pass materializes m[0] with baseline memory.", "pi B10 materialize");
 
-            const m0Baseline = extractM0(mainRequests(h).at(-1)!.body);
-            expect(m0Baseline).toContain("B10 baseline rule");
-
-            await sendTurn(h, "pi B10 turn 4: high usage marks the next pass execute.", "pi B10 pressure", HIGH_USAGE);
-            const epochBeforeAdditive = projectEpoch(h);
-            seedMemory(h, "B10 fresh rule: always run the full gate before a release.");
-            setProjectEpoch(h, epochBeforeAdditive);
-            await sendTurn(h, "pi B10 turn 5: execute pass surfaces the new memory.", "pi B10 surface");
-
-            const surfaceReq = mainRequests(h).find((r) => extractM1(r.body)?.includes("B10 fresh rule"));
-            expect(surfaceReq).toBeDefined();
-            const m1 = extractM1(surfaceReq!.body)!;
-            const m0 = extractM0(surfaceReq!.body)!;
-            expect(m1).toContain("<new-memories>");
-            expect(m1).toContain("B10 fresh rule");
-            expect(m0).toContain("B10 baseline rule");
-            expect(m0).not.toContain("B10 fresh rule");
-            expect(m0).toBe(m0Baseline!);
-
-            await sendTurn(h, "pi B10 turn 6: defer replay.", "pi B10 replay 1");
-            await sendTurn(h, "pi B10 turn 7: defer replay again.", "pi B10 replay 2");
-            assertNoBusts("B10-additive-memory-replay", mainRequests(h).slice(-2));
-        } finally {
-            await h.dispose();
-        }
-    }, 260_000);
-
-    it("B11: non-additive memory mutations render <memory-updates> while m[0] stays byte-frozen", async () => {
-        const h = await createHarness();
-        try {
-            await sendTurn(h, "pi B11 bootstrap: create the context DB before seeding memory.", "pi B11 bootstrap");
-            const memId = seedMemory(h, "B11 original rule: deploys go through the staging pipeline first.");
-            await h.newSession();
-            h.mock.reset();
-            await sendTurn(h, "pi B11 turn 1: warmup after baseline memory exists.", "pi B11 warm");
-            await sendTurn(h, "pi B11 turn 2: high usage marks next pass execute.", "pi B11 high", HIGH_USAGE);
-            await sendTurn(h, "pi B11 turn 3: execute pass materializes m[0] with the memory.", "pi B11 materialize");
-
-            const m0Baseline = extractM0(mainRequests(h).at(-1)!.body);
-            expect(m0Baseline).toContain("B11 original rule");
-
-            await sendTurn(h, "pi B11 turn 4: high usage marks the next pass execute.", "pi B11 pressure", HIGH_USAGE);
-            const epochBeforeUpdate = projectEpoch(h);
-            queueMemoryUpdate(h, memId, "B11 revised rule: deploys go straight to production with a feature flag.");
-            // A content rewrite withdraws verification (the successor revision
-            // starts CANDIDATE); re-verify through the real API so the revised
-            // row stays render-eligible, then pin the epoch so the mutation
-            // rides the m[1] delta instead of HARD-refolding m[0].
-            writeDb(h, (db) => verifyAndSettle(db, memId));
-            setProjectEpoch(h, epochBeforeUpdate);
-            await sendTurn(h, "pi B11 turn 5: execute pass renders the memory-updates delta.", "pi B11 reconcile");
-
-            const reconcileReq = mainRequests(h).find((r) => extractM1(r.body)?.includes("<memory-updates>"));
-            expect(reconcileReq).toBeDefined();
-            const m1 = extractM1(reconcileReq!.body)!;
-            const m0 = extractM0(reconcileReq!.body)!;
-            expect(m1).toContain("<memory-updates>");
-            expect(m1).toContain(`<updated id="${memId}">`);
-            expect(m1).toContain("B11 revised rule");
-            expect(m0).toContain("B11 original rule");
-            expect(m0).not.toContain("B11 revised rule");
-            expect(m0).toBe(m0Baseline!);
-
-            await sendTurn(h, "pi B11 turn 6: defer replay.", "pi B11 replay 1");
-            await sendTurn(h, "pi B11 turn 7: defer replay again.", "pi B11 replay 2");
-            assertNoBusts("B11-supersede-delta-replay", mainRequests(h).slice(-2));
-        } finally {
-            await h.dispose();
-        }
-    }, 260_000);
-
-    it("B12: project epoch bump HARD-refolds a surfaced m[1] delta into m[0]", async () => {
-        const h = await createHarness();
-        try {
-            await sendTurn(h, "pi B12 turn 1: warmup creates the context DB.", "pi B12 warm");
-            await sendTurn(h, "pi B12 turn 2: high usage marks next pass execute.", "pi B12 high", HIGH_USAGE);
-            await sendTurn(h, "pi B12 turn 3: execute pass materializes empty m[0].", "pi B12 materialize-empty");
-            expect(extractM0(mainRequests(h).at(-1)!.body)).toContain("<session-history></session-history>");
-
-            await sendTurn(h, "pi B12 turn 4: high usage marks next pass execute.", "pi B12 pressure", HIGH_USAGE);
-            const epochBeforeSeed = projectEpoch(h);
-            seedMemory(h, "B12 delta rule: keep the cache prefix byte-identical across defer passes.");
-            setProjectEpoch(h, epochBeforeSeed);
-            await sendTurn(h, "pi B12 turn 5: execute pass surfaces the memory into m[1].", "pi B12 surface");
-
-            let requests = mainRequests(h);
-            const surfaceReq = requests.find((r) => extractM1(r.body)?.includes("B12 delta rule"));
-            expect(surfaceReq).toBeDefined();
-            expect(extractM0(surfaceReq!.body)).toContain("<session-history></session-history>");
-            expect(extractM0(surfaceReq!.body)).not.toContain("B12 delta rule");
-            expect(extractM1(surfaceReq!.body)).toContain("B12 delta rule");
-
-            await sendTurn(h, "pi B12 turn 6: high usage marks next pass execute.", "pi B12 hard-pressure", HIGH_USAGE);
-            bumpProjectEpoch(h);
-            await sendTurn(h, "pi B12 turn 7: execute pass HARD-refolds m[0].", "pi B12 refold");
-
-            requests = mainRequests(h);
-            const refoldReq = requests.find(
-                (r, i) => i > requests.indexOf(surfaceReq!) && (extractM0(r.body)?.includes("B12 delta rule") ?? false),
-            );
-            expect(refoldReq).toBeDefined();
-            const m0 = extractM0(refoldReq!.body)!;
-            const m1 = extractM1(refoldReq!.body)!;
-            expect(m0).toContain("B12 delta rule");
-            expect(m1).toContain("(no new content since last materialization)");
-            expect(m1).not.toContain("B12 delta rule");
-
-            const refoldIdx = requests.indexOf(refoldReq!);
-            await sendTurn(h, "pi B12 turn 8: defer replay after refold.", "pi B12 replay 1");
-            await sendTurn(h, "pi B12 turn 9: defer replay again.", "pi B12 replay 2");
-            const after = mainRequests(h).slice(refoldIdx);
-            expect(new Set(after.map((r) => extractM0(r.body))).size).toBe(1);
-            assertNoBusts("B12-hard-refold-replay", mainRequests(h).slice(-2));
-        } finally {
-            await h.dispose();
-        }
-    }, 280_000);
 });

@@ -6,8 +6,8 @@ import {
     getPrimaryEmbeddingMeasurementCohort,
     getShadowEmbeddingMeasurementCohort,
 } from "./memory/embedding";
+import { encodePhysicalResultLocator } from "./physical-result-locator";
 import type { CapturedQueryEmbedding, UnifiedSearchOptions, UnifiedSearchResult } from "./search";
-import { encodePhysicalResultLocator } from "./search-result-locator";
 import { recordEmbeddingMeasurement } from "./storage-embedding-measurements";
 
 export async function recordShadowMeasurement(args: {

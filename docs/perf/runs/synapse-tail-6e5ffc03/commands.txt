@@ -1,0 +1,23 @@
+Build and preflight:
+  cargo run --release -p mc-host --example synapse_perf -- --help
+
+Service pilot template, repeated for blocks 1 and 2, delays 0/5/25 ms, and
+query plus batch shapes 1x16/4x16-paged/1x64:
+  target/release/examples/synapse_perf --variant hygiene-only --arm query --concurrency 1 --seconds 1 --engine-delay-ms DELAY --max-waiting-queries 0 --query-retry-after-ms 50 --seed BLOCK
+  target/release/examples/synapse_perf --variant hygiene-only --arm batch --batch-shape SHAPE --concurrency 1 --seconds 1 --engine-delay-ms DELAY --max-waiting-queries 0 --query-retry-after-ms 50 --seed BLOCK
+
+Queue pilot template, repeated for blocks 1 and 2 at (delay=5 ms, rate=200)
+and (delay=25 ms, rate=40), variants baseline and hygiene-only, then candidate
+A at K=1/2/3/4/8/16:
+  target/release/examples/synapse_perf --variant VARIANT --arm query --rate RATE --seconds 1 --engine-delay-ms DELAY --max-waiting-queries K --query-retry-after-ms 50 --seed BLOCK
+
+Analysis and integrity:
+  python3 docs/perf/runs/synapse-tail-6e5ffc03/analyze.py
+  (cd docs/perf/runs/synapse-tail-6e5ffc03 && sha256sum -c SHA256SUMS)
+
+Verification gates:
+  cargo test -p mc-host
+  (cd packages/plugin && bun test)
+  bun run --cwd packages/plugin typecheck
+  bun run --cwd packages/plugin lint
+  cargo clippy -p mc-host

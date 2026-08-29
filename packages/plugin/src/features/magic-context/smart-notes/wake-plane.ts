@@ -1,9 +1,7 @@
 import { statSync } from "node:fs";
-import { join } from "node:path";
-
 import { getDataDir } from "../../../shared/data-path";
 import { McHostClient } from "../../../shared/mc-host-client";
-import { connectionFilePath, resolveLifecycleDataRoot } from "../../../shared/mc-host-lifecycle";
+import { defaultConnectionFilePath } from "../../../shared/mc-host-lifecycle/paths";
 
 /** The sole wire-level coupling between standalone smart notes and scheduled wakes. */
 export const WAKE_PLANE_CAPABILITY = "wake.create";
@@ -39,9 +37,7 @@ function connectionFile(): string {
     // managed start publishes somewhere this never reads. The application
     // storage resolver only backstops environments where no lifecycle root
     // resolves at all.
-    const root = resolveLifecycleDataRoot(process.env);
-    if (root.ok) return connectionFilePath(root.root);
-    return join(getDataDir(), "cortexkit", "run", "subc-connection.json");
+    return defaultConnectionFilePath(getDataDir());
 }
 
 /**

@@ -7,14 +7,16 @@ import {
 } from "../../features/magic-context/compartment-lease";
 import { getCompartments } from "../../features/magic-context/compartment-storage";
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
-import { getMemoriesByProject } from "../../features/magic-context/memory/storage-memory";
-import { runMigrations } from "../../features/magic-context/migrations";
-import { initializeDatabase } from "../../features/magic-context/storage-db";
+import {
+    readProjectMemoryCurrentState,
+    resolveProjectIdsForIdentities,
+} from "../../features/magic-context/memory/storage-claim-current-state";
 import { reserveProtectedTailDrainTokens } from "../../features/magic-context/storage-meta-persisted";
 import { getPrimerCandidatesForProject } from "../../features/magic-context/storage-primers";
+import { createDirectTestDatabase } from "../../features/magic-context/test-database";
 import { getUserMemoryCandidates } from "../../features/magic-context/user-memory/storage-user-memory";
 import type { PluginContext } from "../../plugin/types";
-import { Database } from "../../shared/sqlite";
+import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { runCompartmentAgent } from "./compartment-runner";
 import {
@@ -25,10 +27,18 @@ import { readSessionChunk, setRawMessageProvider } from "./read-session-chunk";
 import type { RawMessage } from "./read-session-raw";
 
 function createDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
-    return db;
+    return createDirectTestDatabase().db;
+}
+
+function projectClaims(db: Database, projectIdentity: string) {
+    const result = readProjectMemoryCurrentState(db, {
+        projectIds: resolveProjectIdsForIdentities(db, [projectIdentity]),
+        lifecycleStates: ["active"],
+        surface: "maintenance_hygiene",
+        workspaceEpoch: "wrapup-test",
+    });
+    if (result.status !== "ok") throw new Error(result.reasons.join(", "));
+    return result.items;
 }
 
 function rawMessages(count: number): RawMessage[] {
@@ -245,11 +255,11 @@ describe("runCompartmentAgent wrapup controls", () => {
 
                 expect(getCompartments(db, sessionId)).toHaveLength(1);
                 if (forceKeepLastCompartment) {
-                    expect(getMemoriesByProject(db, project)).toHaveLength(0);
+                    expect(projectClaims(db, project)).toHaveLength(0);
                     expect(getUserMemoryCandidates(db)).toHaveLength(0);
                     expect(getPrimerCandidatesForProject(db, project)).toHaveLength(0);
                 } else {
-                    expect(getMemoriesByProject(db, project).length).toBeGreaterThan(0);
+                    expect(projectClaims(db, project).length).toBeGreaterThan(0);
                 }
             } finally {
                 closeQuietly(db);
@@ -297,7 +307,7 @@ describe("runCompartmentAgent wrapup controls", () => {
             // the re-read), so no memories may appear here.
             expect(getCompartments(db, sessionId)).toHaveLength(1);
             expect(getCompartments(db, sessionId)[0]?.endMessage).toBe(2);
-            expect(getMemoriesByProject(db, project)).toHaveLength(0);
+            expect(projectClaims(db, project)).toHaveLength(0);
         } finally {
             closeQuietly(db);
         }

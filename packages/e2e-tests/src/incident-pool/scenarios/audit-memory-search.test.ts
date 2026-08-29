@@ -526,10 +526,10 @@ describe("catalog binding surface", () => {
         );
     });
 
-    it("binds A32 to storage-memory-claims without overbinding sibling cases", () => {
+    it("binds A32 to storage-claim-operations without overbinding sibling cases", () => {
         const registry = builtinIncidentCaseRegistry();
         const dependency =
-            "packages/plugin/src/features/magic-context/memory/storage-memory-claims.ts";
+            "packages/plugin/src/features/magic-context/memory/storage-claim-operations.ts";
         expect(
             registry.get("var-a32-stale-embedding-recall")!.implementationFiles,
         ).toContain(dependency);

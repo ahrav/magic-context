@@ -6,9 +6,9 @@
  * Ownership rules (KTD13/KTD17): only `managed-default` connection origin may
  * reach {@link McHostLifecyclePolicy.demandStart}; explicit connection files
  * and injected clients never construct a policy call. Concurrent managed
- * demands coalesce on one shared native start keyed by data root plus
- * capability; each caller races the shared promise against its own
- * signal/deadline, and a detaching caller never cancels the native work.
+ * demands coalesce on one shared native start keyed by data root; each caller
+ * races the shared promise against its own signal/deadline, and a detaching
+ * caller never cancels the native work.
  *
  * Every operation returns one KTD12 v1 result object. Pre-native failures are
  * synthesized locally with the bounded no-follow root classifier; no raw
@@ -19,6 +19,7 @@ import { checkPlatform, type LifecycleFailureReason, type PlatformReaders } from
 import {
     classifyPreNativeRoots,
     type DaemonCheck,
+    type DaemonCommand,
     type DaemonReadiness,
     type DaemonReason,
     type DaemonResultV1,
@@ -43,6 +44,25 @@ import { type AdmissionIo, admitLifecycleFilesystem, resolveLifecycleDataRoot } 
 export const STORAGE_HARD_BUDGET_MS = 5_000;
 /** Fresh Linux request-to-authenticated-transport outer aggregate (hard). */
 export const OUTER_AGGREGATE_MS = 60_000;
+/**
+ * Fresh macOS request-to-authenticated-transport outer aggregate (hard).
+ *
+ * Darwin is qualified against a far tighter bound than Linux, so applying the
+ * Linux aggregate universally lets a hung macOS startup run four times past the
+ * budget it was qualified for. Both values mirror
+ * `release/mc-host-production-inputs.lock.json`
+ * (`fresh_linux_transport_aggregate.hard`, `fresh_macos_transport_aggregate.hard`);
+ * the generated contract does not carry them yet, so changing one there means
+ * changing it here.
+ */
+export const OUTER_AGGREGATE_MS_DARWIN = 15_000;
+
+/** The qualified outer aggregate for a platform-gate target. */
+export function aggregateForTarget(
+    target: "linux-x64-gnu" | "darwin-arm64" | "darwin-x64",
+): number {
+    return target === "linux-x64-gnu" ? OUTER_AGGREGATE_MS : OUTER_AGGREGATE_MS_DARWIN;
+}
 
 export type LifecycleCommand = "start" | "stop" | "restart" | "status" | "doctor";
 
@@ -51,6 +71,25 @@ export type StorageReadiness = "ready" | "starting" | "unavailable";
 export interface ObservationalHealth {
     readiness: DaemonReadiness;
     authenticatedDaemonVersion: string;
+}
+
+/**
+ * Elapsed-time source for every lifecycle budget.
+ *
+ * `Date.now()` is a wall clock and can step in either direction: a backward
+ * correction makes elapsed time negative and hands the native child more than
+ * its platform's qualified aggregate, while a forward correction expires a live
+ * request that has barely started. Budgets are durations, so they are measured
+ * on a monotonic timeline — the same basis, and the same reason, as the client's
+ * `Deadline`.
+ *
+ * `performance.now()` does not advance across system suspend. That is the right
+ * trade here: it can never over-grant, and expiring on resume would need an
+ * explicit second signal rather than a clock that also jumps for timezone and
+ * NTP corrections.
+ */
+function monotonicNow(): number {
+    return performance.now();
 }
 
 export class WaiterDetachedError extends Error {
@@ -77,7 +116,11 @@ export interface LifecyclePolicyOptions {
     admissionIo?: AdmissionIo;
     /**
      * Post-transport storage probe used by managed Magic Context demand.
-     * The default reports `ready` for explicit and test-only policy instances.
+     * U4 wires the real Magic Context status call. There is deliberately no
+     * permissive default: an unset probe reports `unavailable`, because a
+     * default of `ready` would authorize application bodies against a daemon
+     * whose storage state was never examined. Explicit CLI flows are
+     * unaffected — they never reach `demandStart`.
      */
     storageProbe?: (budgetMs: number) => Promise<StorageReadiness>;
     /** Authenticated route-free component health for status and doctor. */
@@ -91,11 +134,22 @@ export interface LifecyclePolicyOptions {
     outerAggregateMs?: number;
 }
 
+/**
+ * Synthesize a pre-native v1 result.
+ *
+ * `effectsKnown` distinguishes a failure that provably committed nothing —
+ * the native binary was never invoked — from one whose native transaction was
+ * killed mid-flight and whose outcome is therefore unknown. Only the former
+ * may state `stop_committed`/`start_committed`; the latter reports `null`,
+ * because asserting `false` for a SIGKILLed restart would tell an operator the
+ * old incarnation is still serving when the stop may already have committed.
+ */
 function localResult(
     command: LifecycleCommand,
     ok: boolean,
     state: DaemonState,
     reason: DaemonReason,
+    effectsKnown = true,
 ): DaemonResultV1 {
     return {
         schema: "magic-context.daemon/v1",
@@ -104,7 +158,10 @@ function localResult(
         state,
         reason,
         remediation: remediationForReason(reason),
-        effects: command === "restart" ? { stop_committed: false, start_committed: false } : null,
+        effects:
+            command === "restart" && effectsKnown
+                ? { stop_committed: false, start_committed: false }
+                : null,
         readiness: null,
         checks: [],
         versions: {
@@ -117,6 +174,20 @@ function localResult(
         },
     };
 }
+
+/**
+ * Reason for a native command whose child was killed at the deadline, keyed by
+ * the caller-facing command. `status` and `doctor` run no startup or shutdown:
+ * the killed child was the read-only probe, so the daemon was left unobserved
+ * rather than left mid-transaction.
+ */
+const TIMEOUT_REASON: Record<LifecycleCommand, DaemonReason> = {
+    start: "startup_timeout",
+    restart: "startup_timeout",
+    stop: "shutdown_timeout",
+    status: "native_probe_unavailable",
+    doctor: "native_probe_unavailable",
+};
 
 export interface DemandStartRequest {
     origin: ConnectionOrigin;
@@ -148,7 +219,7 @@ export class McHostLifecyclePolicy {
     private readonly payloadDir: string | undefined;
     private readonly payloadManifestDigest: string | undefined;
     private readonly payloadDirFallback: (() => string | null) | undefined;
-    private readonly outerAggregateMs: number;
+    private readonly outerAggregateMs: number | undefined;
     private readonly inflightStarts = new Map<string, Promise<DaemonResultV1>>();
 
     constructor(options: LifecyclePolicyOptions = {}) {
@@ -157,12 +228,17 @@ export class McHostLifecyclePolicy {
         this.bootstrapFailure = options.bootstrapFailure;
         this.platformReaders = options.platformReaders;
         this.admissionIo = options.admissionIo;
-        this.storageProbe = options.storageProbe ?? (async () => "ready");
+        // Fail closed: an unwired probe must not assert readiness.
+        this.storageProbe = options.storageProbe ?? (async () => "unavailable");
         this.readinessProbe = options.readinessProbe;
         this.payloadDir = options.payloadDir;
         this.payloadManifestDigest = options.payloadManifestDigest;
         this.payloadDirFallback = options.payloadDirFallback;
-        this.outerAggregateMs = options.outerAggregateMs ?? OUTER_AGGREGATE_MS;
+        // Left undefined when the caller does not pin it: the qualified default
+        // depends on the platform-gate target, which `preflight` resolves per
+        // command rather than in the constructor — `checkPlatform`'s darwin arm
+        // can shell out to `sw_vers`, which does not belong in a constructor.
+        this.outerAggregateMs = options.outerAggregateMs;
     }
 
     /** Count of live coalesced startups; test observability only. */
@@ -193,19 +269,45 @@ export class McHostLifecyclePolicy {
 
     /**
      * Managed demand-start with KTD17 coalescing. Only `managed-default`
-     * origin is accepted; the shared native start is keyed by data root plus
-     * capability, callers race it against their own signal/deadline, and a
-     * settled promise is evicted so no rejection becomes a permanent latch.
-     * For the `magic-context` capability, the outcome additionally reports
-     * storage readiness after waiting at most the 5-second hard budget.
+     * origin is accepted; the shared native start is keyed by data root,
+     * callers race it against their own signal/deadline, and a settled promise
+     * is evicted so no rejection becomes a permanent latch. For the
+     * `magic-context` capability, the outcome additionally reports storage
+     * readiness after waiting at most the 5-second hard budget.
      */
     async demandStart(request: DemandStartRequest): Promise<DemandStartOutcome> {
         if (!mayDemandStart(request.origin)) {
             throw new Error(`connection origin ${request.origin} is lifecycle-neutral`);
         }
-        const waiterStartedAt = Date.now();
+        const startedAt = monotonicNow();
+        // Validated at entry, for every caller, before the shared start is even
+        // looked up. A caller with no live interest must not create a start —
+        // `start()`'s synchronous prefix reaches `spawn()` before any await, so
+        // it would launch a mutating child nobody is waiting for. And a caller
+        // *joining* an existing start must not be admitted either: `raceWaiter`
+        // subtracts elapsed time and `NaN` stays `NaN`, while `setTimeout`
+        // coerces both `NaN` and `Infinity` to a 1ms delay, so a non-finite
+        // budget yields either a ~1ms detach or — if the shared start settles
+        // within one microtask drain — a result adopted on an invalid budget.
+        // Identical input would then resolve or reject depending only on whether
+        // another demand happened to be in flight.
+        //
+        // Rejecting a caller is not cancelling: the shared promise stays in the
+        // map untouched, so every other waiter is unaffected, which is the
+        // detach-only guarantee this design actually requires.
+        if (request.signal?.aborted) throw new WaiterDetachedError("aborted");
+        if (
+            request.deadlineMs !== undefined &&
+            (!Number.isFinite(request.deadlineMs) || request.deadlineMs <= 0)
+        ) {
+            throw new WaiterDetachedError("deadline");
+        }
         const rootResolution = resolveLifecycleDataRoot(this.env);
-        const key = `${rootResolution.ok ? rootResolution.root : "\u0000no-root"}\u0000${request.capability}`;
+        // The data root alone identifies the host: `start()` takes no
+        // capability and one daemon serves them all, so keying on capability
+        // would launch a second native start that only collides with the
+        // first on the transaction lock.
+        const key = rootResolution.ok ? rootResolution.root : "\u0000no-root";
         let shared = this.inflightStarts.get(key);
         if (!shared) {
             shared = this.start(request.startupEnvelope);
@@ -216,42 +318,96 @@ export class McHostLifecyclePolicy {
                     if (this.inflightStarts.get(key) === shared) this.inflightStarts.delete(key);
                 });
         }
-        const result = await this.raceWaiter(shared, request);
+        const result = await this.raceWaiter(shared, request, startedAt);
         if (request.capability !== "magic-context" || !result.ok) {
             return { result, storage: null };
         }
-        const remainingMs =
-            request.deadlineMs === undefined
-                ? undefined
-                : Math.max(0, request.deadlineMs - (Date.now() - waiterStartedAt));
-        if (remainingMs === 0) throw new WaiterDetachedError("deadline");
-        const storageBudget =
-            remainingMs === undefined
-                ? STORAGE_HARD_BUDGET_MS
-                : Math.min(STORAGE_HARD_BUDGET_MS, remainingMs);
-        const storage = await this.raceDetached(
-            this.storageProbe(storageBudget),
-            request.signal,
-            remainingMs,
-        );
+        const storage = await this.boundedStorageProbe(request, startedAt);
         return { result, storage };
+    }
+
+    /**
+     * Run the storage probe under the policy's own bound rather than trusting
+     * it to honor the budget it is handed.
+     *
+     * `raceWaiter` has already cleared its timer and detached the abort
+     * listener by the time the start resolves, so without this the probe would
+     * be both unbounded and uncancellable: a hanging probe would keep
+     * `demandStart` pending forever with the caller's signal and deadline no
+     * longer watching. Expiry, abort, and probe failure — rejected or thrown
+     * synchronously — all degrade to `unavailable`, never to `ready`, and the
+     * already-successful start result is still returned.
+     */
+    private async boundedStorageProbe(
+        request: DemandStartRequest,
+        startedAt: number,
+    ): Promise<StorageReadiness> {
+        const remaining =
+            request.deadlineMs === undefined
+                ? STORAGE_HARD_BUDGET_MS
+                : Math.min(
+                      STORAGE_HARD_BUDGET_MS,
+                      request.deadlineMs - (monotonicNow() - startedAt),
+                  );
+        if (remaining <= 0) return "unavailable";
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        let onAbort: (() => void) | null = null;
+        try {
+            return await new Promise<StorageReadiness>((resolve) => {
+                let settled = false;
+                const finish = (value: StorageReadiness): void => {
+                    if (settled) return;
+                    settled = true;
+                    resolve(value);
+                };
+                timer = setTimeout(() => finish("unavailable"), remaining);
+                if (request.signal) {
+                    if (request.signal.aborted) {
+                        finish("unavailable");
+                        return;
+                    }
+                    onAbort = () => finish("unavailable");
+                    request.signal.addEventListener("abort", onAbort, { once: true });
+                }
+                // A probe that throws before returning its promise fails the
+                // same way a rejection does; letting it escape the executor
+                // would reject `demandStart` instead of reporting readiness.
+                try {
+                    this.storageProbe(remaining).then(
+                        (value) => finish(value),
+                        () => finish("unavailable"),
+                    );
+                } catch {
+                    finish("unavailable");
+                }
+            });
+        } finally {
+            if (timer !== null) clearTimeout(timer);
+            if (onAbort !== null) request.signal?.removeEventListener("abort", onAbort);
+        }
     }
 
     private raceWaiter(
         shared: Promise<DaemonResultV1>,
         request: DemandStartRequest,
+        startedAt: number,
     ): Promise<DaemonResultV1> {
-        const { signal, deadlineMs } = request;
-        return this.raceDetached(shared, signal, deadlineMs);
-    }
-
-    private raceDetached<T>(
-        shared: Promise<T>,
-        signal: AbortSignal | undefined,
-        deadlineMs: number | undefined,
-    ): Promise<T> {
+        const { signal } = request;
+        // The caller's budget is spent from `startedAt`, not from here.
+        // `start()` is async, but its synchronous prefix — data-root
+        // resolution, filesystem admission, and the platform gate, whose darwin
+        // arm can fall back to a `sw_vers` call bounded at 2s — runs inside the
+        // `this.start()` call *before* the promise reaches this method. Arming
+        // the full `deadlineMs` here would grant the waiter its whole budget
+        // after that work had already consumed the caller's, so a 100ms caller
+        // could block for seconds and then accept a result it had no time left
+        // to wait for.
+        const deadlineMs =
+            request.deadlineMs === undefined
+                ? undefined
+                : request.deadlineMs - (monotonicNow() - startedAt);
         if (!signal && deadlineMs === undefined) return shared;
-        return new Promise<T>((resolve, reject) => {
+        return new Promise<DaemonResultV1>((resolve, reject) => {
             let settled = false;
             let timer: ReturnType<typeof setTimeout> | null = null;
             const detach = (kind: "aborted" | "deadline"): void => {
@@ -272,6 +428,14 @@ export class McHostLifecyclePolicy {
                 signal.addEventListener("abort", onAbort, { once: true });
             }
             if (deadlineMs !== undefined) {
+                // An already-expired budget detaches here: a timer of 0 fires
+                // in a later macrotask, so an already-settled shared start
+                // would resolve this waiter through the microtask queue first
+                // and hand it a result it had no time left to wait for.
+                if (deadlineMs <= 0) {
+                    detach("deadline");
+                    return;
+                }
                 timer = setTimeout(() => detach("deadline"), deadlineMs);
             }
             shared.then(
@@ -297,9 +461,24 @@ export class McHostLifecyclePolicy {
     // Shared preflight and native invocation.
     // ------------------------------------------------------------------
 
+    /**
+     * Root resolution, filesystem admission, and the platform gate: the
+     * pre-native checks every command shares.
+     *
+     * Observational commands gate on the platform too. A host outside the
+     * supported target table has no retained-descriptor exec path, so probing
+     * it or answering with the no-probe classifier would report a daemon state
+     * for a host the release cannot run on at all.
+     */
     private preflight(
         command: LifecycleCommand,
-    ): { ok: true; root: string } | { ok: false; result: DaemonResultV1 } {
+    ): { ok: true; root: string; deadlineMs: number } | { ok: false; result: DaemonResultV1 } {
+        // The aggregate is a request-to-transport bound, so preflight's own cost
+        // counts against it. `checkPlatform`'s darwin arm can spend up to two
+        // seconds in `sw_vers`, and handing the child a fresh full aggregate
+        // afterwards let the operation overrun the budget its platform was
+        // qualified against — the same mistake the demand waiter had.
+        const startedAt = monotonicNow();
         const rootResolution = resolveLifecycleDataRoot(this.env);
         if (!rootResolution.ok) {
             return { ok: false, result: localResult(command, false, "unavailable", "no_data_dir") };
@@ -310,10 +489,33 @@ export class McHostLifecyclePolicy {
             const state = preNativeState(classifyPreNativeRoots(root));
             return {
                 ok: false,
-                result: localResult(command, false, state, "unsupported_filesystem"),
+                result: localResult(command, false, state, admission.reason),
             };
         }
-        return { ok: true, root };
+        const platform = checkPlatform(this.platformReaders);
+        if (!platform.ok) {
+            const state = preNativeState(classifyPreNativeRoots(root));
+            return {
+                ok: false,
+                result: localResult(command, false, state, platform.reason),
+            };
+        }
+        // The gate already resolved which qualified target this host is, so the
+        // aggregate comes from that rather than from a Linux-shaped default.
+        const aggregate = this.outerAggregateMs ?? aggregateForTarget(platform.target);
+        const deadlineMs = aggregate - (monotonicNow() - startedAt);
+        if (deadlineMs <= 0) {
+            // Preflight consumed the whole budget, so the operation is out of
+            // time before the child exists. That is this command's timeout, not
+            // an internal error: nothing was spawned, so a restart reports no
+            // committed effects rather than unknown ones.
+            const state = preNativeState(classifyPreNativeRoots(root));
+            return {
+                ok: false,
+                result: localResult(command, false, state, TIMEOUT_REASON[command]),
+            };
+        }
+        return { ok: true, root, deadlineMs };
     }
 
     private async mutatingCommand(
@@ -322,11 +524,6 @@ export class McHostLifecyclePolicy {
     ): Promise<DaemonResultV1> {
         const preflight = this.preflight(command);
         if (!preflight.ok) return preflight.result;
-        const platform = checkPlatform(this.platformReaders);
-        if (!platform.ok) {
-            const state = preNativeState(classifyPreNativeRoots(preflight.root));
-            return localResult(command, false, state, "unsupported_platform");
-        }
         if (this.bootstrapFailure !== undefined) {
             const state = preNativeState(classifyPreNativeRoots(preflight.root));
             return localResult(command, false, state, this.bootstrapFailure);
@@ -335,11 +532,12 @@ export class McHostLifecyclePolicy {
             const state = preNativeState(classifyPreNativeRoots(preflight.root));
             return localResult(command, false, state, "native_payload_missing");
         }
+        const launchTarget = this.launchTarget;
         try {
             const invoke = (payloadDir: string | undefined) =>
-                runNativeLifecycle(this.launchTarget as NativeLaunchTarget, {
+                runNativeLifecycle(launchTarget, {
                     command: command as NativeLifecycleCommand,
-                    deadlineMs: this.outerAggregateMs,
+                    deadlineMs: preflight.deadlineMs,
                     env: this.nativeEnv(preflight.root),
                     ...(payloadDir !== undefined && command !== "stop" ? { payloadDir } : {}),
                     ...(command !== "stop" && this.payloadManifestDigest !== undefined
@@ -367,7 +565,7 @@ export class McHostLifecyclePolicy {
                 const fallback = this.payloadDirFallback();
                 if (fallback !== null) native = await invoke(fallback);
             }
-            return { ...native, command };
+            return this.relabel(native, command, command);
         } catch (error) {
             return this.launchFailure(command, preflight.root, error);
         }
@@ -384,17 +582,25 @@ export class McHostLifecyclePolicy {
             return localResult(command, ok, verdict.state, verdict.reason);
         }
         try {
-            const deadline = Date.now() + this.outerAggregateMs;
+            const startedAt = monotonicNow();
             const native = await runNativeLifecycle(this.launchTarget, {
                 command: "probe",
-                deadlineMs: this.outerAggregateMs,
+                deadlineMs: preflight.deadlineMs,
                 env: this.nativeEnv(preflight.root),
             });
-            if (!native.ok || native.state !== "running" || this.readinessProbe === undefined) {
-                return { ...native, command };
+            const relabeled = this.relabel(native, "status", command);
+            if (
+                !relabeled.ok ||
+                relabeled.state !== "running" ||
+                this.readinessProbe === undefined
+            ) {
+                return relabeled;
             }
-            const observed = await this.readinessProbe(Math.max(1, deadline - Date.now()));
-            const checks: DaemonCheck[] = [...native.checks];
+            // The readiness probe shares the command's aggregate with the probe
+            // child that just ran, so it gets only what that child left behind.
+            const remaining = preflight.deadlineMs - (monotonicNow() - startedAt);
+            const observed = await this.readinessProbe(Math.max(1, remaining));
+            const checks: DaemonCheck[] = [...relabeled.checks];
             const addCheck = (
                 id: "readiness.transport" | "readiness.storage" | "readiness.synapse",
                 record: NonNullable<DaemonReadiness[keyof DaemonReadiness]>,
@@ -437,15 +643,14 @@ export class McHostLifecyclePolicy {
                     return candidate < winning ? check : winner;
                 }, undefined);
             return {
-                ...native,
-                command,
+                ...relabeled,
                 ok: failed === undefined,
                 reason: failed?.reason ?? "healthy",
                 remediation: failed?.remediation ?? null,
                 readiness: observed.readiness,
                 checks,
                 versions: {
-                    ...native.versions,
+                    ...relabeled.versions,
                     proof: "current",
                     daemon: observed.authenticatedDaemonVersion,
                 },
@@ -453,6 +658,34 @@ export class McHostLifecyclePolicy {
         } catch (error) {
             return this.launchFailure(command, preflight.root, error);
         }
+    }
+
+    /**
+     * Restamp a native result with the caller-facing command, first proving the
+     * child answered the command this call is willing to accept.
+     *
+     * `parseDaemonResult` validates the restart-only `effects` invariant
+     * against the child's own `command`, so blindly overwriting that field can
+     * publish a `restart` result carrying `effects` under a `stop` or `start`
+     * label. A disagreement means the child answered a different command than
+     * requested — a real version-skew signal — so it becomes `internal_error`
+     * rather than being silently relabeled.
+     *
+     * `expected` is the command the child must *report*, which is not always the
+     * argv it was *sent*. Observational commands send the `probe` argv, but the
+     * contract's command union is exactly start/stop/restart/status/doctor, so
+     * the binary answers the read-only observation as `status` and a `probe`
+     * response would be rejected by every contract-validating consumer.
+     */
+    private relabel(
+        native: DaemonResultV1,
+        expected: DaemonCommand,
+        command: LifecycleCommand,
+    ): DaemonResultV1 {
+        if (native.command !== expected) {
+            return localResult(command, false, "wedged", "internal_error", false);
+        }
+        return { ...native, command };
     }
 
     private nativeEnv(root: string): Record<string, string> {
@@ -464,6 +697,9 @@ export class McHostLifecyclePolicy {
 
     private launchFailure(command: LifecycleCommand, root: string, error: unknown): DaemonResultV1 {
         const state = preNativeState(classifyPreNativeRoots(root));
+        // A launcher that already reduced the failure to a closed lifecycle
+        // reason speaks for itself; re-deriving one from the error code would
+        // discard the more specific classification it made.
         if (
             error !== null &&
             typeof error === "object" &&
@@ -487,17 +723,24 @@ export class McHostLifecyclePolicy {
         if (error instanceof NativeLaunchError) {
             switch (error.code) {
                 case "timeout":
-                    return localResult(
-                        command,
-                        false,
-                        state === "stopped" ? "stopped" : "wedged",
-                        command === "stop" ? "shutdown_timeout" : "startup_timeout",
-                    );
-                case "spawn_failed":
+                    // The child was SIGKILLed mid-flight, so whatever it had
+                    // committed is unknown, not `false`.
+                    return localResult(command, false, state, TIMEOUT_REASON[command], false);
+                case "unsupported_platform":
+                    // The platform has no retained-descriptor exec path; the
+                    // binary was never invoked, so nothing committed.
+                    return localResult(command, false, state, "unsupported_platform");
                 case "signal_exit":
-                case "malformed_output":
+                case "output_cap_exceeded":
                 case "exit_disagreement":
+                case "malformed_output":
+                    // The child ran and was cut short or disagreed with itself;
+                    // its effects are equally unknown.
+                    return localResult(command, false, state, "internal_error", false);
+                case "spawn_failed":
                 case "usage_error":
+                    // The binary never ran, or rejected its invocation before
+                    // touching anything, so nothing committed.
                     return localResult(command, false, state, "internal_error");
             }
         }

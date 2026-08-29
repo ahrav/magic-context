@@ -43,10 +43,7 @@ impl CompositeComponent for EchoPrimary {
 
     async fn handle(&self, ctx: RequestCtx) -> RequestOutcome {
         let Ok(mut body) = ctx.reserve_output(ctx.body.len()).await else {
-            return RequestOutcome::Error {
-                code: "internal_error".to_owned(),
-                message: "output reservation unavailable".to_owned(),
-            };
+            return RequestOutcome::error("internal_error", "output reservation unavailable");
         };
         body.extend_from_slice(&ctx.body)
             .expect("reservation matches request length");
@@ -93,10 +90,7 @@ impl CompositeComponent for PlaceholderBroca {
     }
 
     async fn handle(&self, _ctx: RequestCtx) -> RequestOutcome {
-        RequestOutcome::Error {
-            code: "internal_error".to_owned(),
-            message: "unreachable: broca binds are rejected".to_owned(),
-        }
+        RequestOutcome::error("internal_error", "unreachable: broca binds are rejected")
     }
 
     async fn route_gone(&self, _route: RouteHandle) {}
@@ -127,6 +121,7 @@ async fn main() {
 
     let synapse_config = (bundle_dir != "-").then(|| SynapseConfig {
         bundle_dir: std::path::PathBuf::from(bundle_dir),
+        bundle_manifest_sha256: None,
         ort_library,
         ort_library_sha256,
         limits: SynapseLimits::default(),

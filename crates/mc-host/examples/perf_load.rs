@@ -30,7 +30,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use perf_measurement::{
-    open_loop_interval_ns, LatencySummary, Outcome, OutcomeCounts, FIXTURE_BODY,
+    open_loop_offset_ns, validate_open_loop_rate, LatencySummary, Outcome, OutcomeCounts,
+    FIXTURE_BODY,
 };
 use raw_client::{RawClient, FLAGS_INTERACTIVE, TY_ERROR, TY_REQUEST, TY_RESPONSE};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -194,11 +195,10 @@ async fn run_conn(
     let sender_done = Arc::new(tokio::sync::Notify::new());
 
     let send_deadline = start + Duration::from_secs(opts.secs);
-    let interval_ns = if opts.rate > 0 {
-        open_loop_interval_ns(opts.rate).expect("offered rate") * opts.conns as u64
-    } else {
-        0
-    };
+    let rate = opts.rate;
+    if rate > 0 {
+        validate_open_loop_rate(rate).expect("offered rate");
+    }
     let warmup_ns = warmup.as_nanos() as u64;
 
     let sender = {
@@ -212,17 +212,17 @@ async fn run_conn(
             let mut corr: u64 = 1_000_000;
             let mut k: u64 = 0;
             let mut inflight_full = 0u64;
-            let offset_ns = if interval_ns > 0 {
-                interval_ns * idx as u64 / conns
-            } else {
-                0
-            };
+            // Connection `idx` owns every `conns`-th slot of the exact
+            // global arrival schedule, so the aggregate offered rate is
+            // exact for any rate, not only divisors of 1e9.
+            let idx = idx as u64;
             loop {
                 // Open loop: the arrival schedule is absolute; a late wake
                 // issues immediately (lag recorded), never a catch-up
                 // burst of extra slots.
-                let scheduled = if interval_ns > 0 {
-                    let at = start + Duration::from_nanos(offset_ns + k * interval_ns);
+                let scheduled = if rate > 0 {
+                    let at =
+                        start + Duration::from_nanos(open_loop_offset_ns(k * conns + idx, rate));
                     if at >= send_deadline {
                         break;
                     }
@@ -243,7 +243,7 @@ async fn run_conn(
                     Err(TryAcquireError::Closed) => break,
                     Err(TryAcquireError::NoPermits) => {
                         inflight_full += 1;
-                        if interval_ns > 0 {
+                        if rate > 0 {
                             // Open loop: a saturated window drops the slot
                             // (the reader records MissedSlot) and holds the
                             // absolute schedule. Waiting for a permit here
@@ -289,11 +289,7 @@ async fn run_conn(
                 // follows the issue time. Classifying an open-loop request
                 // by a late issue would move pre-warmup arrivals into the
                 // measured distribution under scheduler lag.
-                let window_ns = if interval_ns > 0 {
-                    scheduled_ns
-                } else {
-                    issue_ns
-                };
+                let window_ns = if rate > 0 { scheduled_ns } else { issue_ns };
                 if meta_tx.send((corr, scheduled_ns, issue_ns)).is_err() {
                     break;
                 }
@@ -694,7 +690,7 @@ async fn main() {
     let opts = parse_opts();
     if opts.rate > 0 {
         // Fail malformed offered rates before any traffic is generated.
-        open_loop_interval_ns(opts.rate).expect("offered rate");
+        validate_open_loop_rate(opts.rate).expect("offered rate");
     }
     let info = raw_client::discover(&opts.publication).expect("publication");
 

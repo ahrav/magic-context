@@ -208,33 +208,39 @@ export function getMagicContextStorageDir(): string {
     return path.join(getDataDir(), "cortexkit", "magic-context");
 }
 
-let testBackstopStorageDir: string | null = null;
+let testBackstopDataRoot: string | null = null;
 let testBackstopWarned = false;
 
 /**
- * Memoized per process so repeated calls in the same unisolated test resolve to
- * the SAME path — `openDatabase()` caches by path, and a fresh temp dir per call
- * would defeat that cache and hand back different DB handles.
+ * The throwaway data ROOT used when `NODE_ENV=test` and no isolation variable is
+ * set. Memoized per process so repeated calls in the same unisolated test
+ * resolve to the SAME path — `openDatabase()` caches by path, and a fresh temp
+ * dir per call would defeat that cache and hand back different DB handles.
+ *
+ * Exported so the mc-host lifecycle resolver can share this exact root. In
+ * production both it and the storage dir derive from one `XDG_DATA_HOME`, so a
+ * backstop that split them would put a test's daemon state and its database
+ * under different trees.
  */
-function getTestBackstopStorageDir(): string {
-    if (!testBackstopStorageDir) {
-        testBackstopStorageDir = path.join(
-            mkdtempSync(path.join(os.tmpdir(), "mc-test-db-backstop-")),
-            "cortexkit",
-            "magic-context",
-        );
+export function getTestBackstopDataRoot(): string {
+    if (!testBackstopDataRoot) {
+        testBackstopDataRoot = mkdtempSync(path.join(os.tmpdir(), "mc-test-db-backstop-"));
     }
     if (!testBackstopWarned) {
         testBackstopWarned = true;
         // Deliberately console, not the logger: logger.ts imports this module.
         console.warn(
             "[magic-context] TEST BACKSTOP: NODE_ENV=test with no MAGIC_CONTEXT_TEST_DATA_DIR " +
-                `— redirecting storage to a throwaway temp dir (${testBackstopStorageDir}) so no ` +
-                "test can touch the user's real shared database. Wire `[test] preload` in this " +
-                "package's bunfig.toml.",
+                `— redirecting storage to a throwaway temp dir (${testBackstopDataRoot}) so no ` +
+                "test can touch the user's real shared database or daemon state. Wire " +
+                "`[test] preload` in this package's bunfig.toml.",
         );
     }
-    return testBackstopStorageDir;
+    return testBackstopDataRoot;
+}
+
+function getTestBackstopStorageDir(): string {
+    return path.join(getTestBackstopDataRoot(), "cortexkit", "magic-context");
 }
 
 /**

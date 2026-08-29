@@ -5,15 +5,14 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connectionFilePath, resolveLifecycleDataRoot } from "../../../shared/mc-host-lifecycle";
-import { Database } from "../../../shared/sqlite";
+import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { evaluateSmartNotes } from "../dreamer/evaluate-smart-notes";
 import { acquireLease } from "../dreamer/lease";
 import { createDreamTaskExecutor } from "../dreamer/task-executor";
 import { leaseKeyFor } from "../dreamer/task-registry";
-import { runMigrations } from "../migrations";
-import { initializeDatabase } from "../storage-db";
 import { addNote, getPendingSmartNotes } from "../storage-notes";
+import { createDirectTestDatabase } from "../test-database";
 import { runDueCompiledSmartNoteChecks } from "./runner";
 import { SMART_NOTE_CHECK_POLICY_VERSION } from "./types";
 import { __wakePlaneTest, WAKE_PLANE_CAPABILITY, wakePlaneStatus } from "./wake-plane";
@@ -21,9 +20,7 @@ import { __wakePlaneTest, WAKE_PLANE_CAPABILITY, wakePlaneStatus } from "./wake-
 const PROJECT = "git:wake-plane-test";
 
 function freshDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase().db;
     return db;
 }
 
@@ -201,31 +198,29 @@ describe("wakePlaneStatus", () => {
     });
 
     test("dials and binds to the connection file the lifecycle owner publishes", () => {
-        // An empty XDG_DATA_HOME is ignored by the lifecycle resolver, which
-        // starts mc-host under HOME/.local/share. Reading getDataDir() here
-        // instead would stat a different path, so a managed start would neither
-        // answer the catalog probe nor retire the negative answer cached before it.
-        const home = mkdtempSync(join(tmpdir(), "wake-plane-root-"));
+        // The lifecycle resolver honors MAGIC_CONTEXT_TEST_DATA_DIR; getDataDir()
+        // ignores it. That makes it the discriminator: reading getDataDir() here
+        // would stat a different path, so a managed start would neither answer
+        // the catalog probe nor retire the negative answer cached before it.
+        //
+        // HOME is deliberately not the lever here. Under NODE_ENV=test the
+        // lifecycle resolver backstops to a throwaway root before it ever
+        // consults HOME, so a HOME-derived expectation proves nothing.
+        const root = mkdtempSync(join(tmpdir(), "wake-plane-root-"));
         const previousXdg = process.env.XDG_DATA_HOME;
         const previousTestRoot = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
-        const previousHome = process.env.HOME;
-        process.env.XDG_DATA_HOME = "";
-        delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
-        process.env.HOME = home;
+        delete process.env.XDG_DATA_HOME;
+        process.env.MAGIC_CONTEXT_TEST_DATA_DIR = root;
         try {
-            expect(__wakePlaneTest.connectionFile()).toBe(
-                connectionFilePath(join(home, ".local", "share")),
-            );
-            const root = resolveLifecycleDataRoot(process.env);
-            expect(root.ok && root.root).toBe(join(home, ".local", "share"));
+            expect(__wakePlaneTest.connectionFile()).toBe(connectionFilePath(root));
+            const resolved = resolveLifecycleDataRoot(process.env);
+            expect(resolved.ok && resolved.root).toBe(root);
         } finally {
             if (previousXdg === undefined) delete process.env.XDG_DATA_HOME;
             else process.env.XDG_DATA_HOME = previousXdg;
             if (previousTestRoot === undefined) delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
             else process.env.MAGIC_CONTEXT_TEST_DATA_DIR = previousTestRoot;
-            if (previousHome === undefined) delete process.env.HOME;
-            else process.env.HOME = previousHome;
-            rmSync(home, { recursive: true, force: true });
+            rmSync(root, { recursive: true, force: true });
         }
     });
 

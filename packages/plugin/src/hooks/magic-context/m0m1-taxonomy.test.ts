@@ -22,8 +22,8 @@ import {
     type CompartmentInput,
 } from "../../features/magic-context/compartment-storage";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage";
-import { initializeDatabase } from "../../features/magic-context/storage-db";
-import { Database } from "../../shared/sqlite";
+import { createDirectTestDatabase } from "../../features/magic-context/test-database";
+import type { Database } from "../../shared/sqlite";
 import { clearInjectionCache, injectM0M1, type M0HardSignals } from "./inject-compartments";
 
 const SESSION_ID = "ses_taxonomy";
@@ -35,8 +35,7 @@ let db: Database;
 const tempDirs: string[] = [];
 
 function makeDb(): Database {
-    const d = new Database(":memory:");
-    initializeDatabase(d);
+    const d = createDirectTestDatabase().db;
     getOrCreateSessionMeta(d, SESSION_ID);
     return d;
 }

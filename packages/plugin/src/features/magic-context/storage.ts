@@ -32,7 +32,6 @@ export {
     listAuthorityManagedMarkers,
     type PrepareAuthorityArgs,
     prepareAuthority,
-    pullAndApplyMirrorPage,
     reconcileAuthorityMarker,
     removeAuthorityManagedMarker,
 } from "./context-authority";
@@ -40,7 +39,6 @@ export {
     clearIndexedMessages,
     deleteIndexedMessage,
 } from "./message-index";
-export { runMigrations } from "./migrations";
 export {
     computeProjectDocsHash,
     readProjectDocsCanonical,
@@ -64,12 +62,11 @@ export {
     applySqliteTuningPragmas,
     type ContextDatabase,
     closeDatabase,
-    enforceSchemaFence,
     FORK_MIGRATION_VERSION_FLOOR,
     getDatabasePath,
     getDatabasePersistenceError,
+    getFormatRefusal,
     getPersistedSchemaVersion,
-    initializeDatabase,
     isDatabasePersisted,
     LATEST_SUPPORTED_VERSION,
     type OpenDatabaseOptions,
@@ -104,16 +101,6 @@ export {
     queueM0Mutation,
     queueM0Mutation as appendM0Mutation,
 } from "./storage-m0-mutation-log";
-export {
-    getMaxMemoryMutationId,
-    getMaxMemoryMutationIdForProjects,
-    getMemoryMutation,
-    getMemoryMutationsForRender,
-    getMemoryMutationsForRenderByProjects,
-    type MemoryMutationLogRow,
-    type MemoryMutationType,
-    queueMemoryMutation,
-} from "./storage-memory-mutation-log";
 export {
     type AcquireWrapupResult,
     type AppendAutoSearchHintOutcome,

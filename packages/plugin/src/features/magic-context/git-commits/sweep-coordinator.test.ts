@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it } from "bun:test";
-import { Database } from "../../../shared/sqlite";
-import { runMigrations } from "../migrations";
-import { initializeDatabase } from "../storage-db";
+import type { Database } from "../../../shared/sqlite";
+import { createDirectTestDatabase } from "../test-database";
 import type { GitCommit } from "./git-log-reader";
 import { enforceProjectCap, getCommitCount, upsertCommits } from "./storage-git-commits";
 import {
@@ -14,9 +13,7 @@ import {
 } from "./sweep-coordinator";
 
 function openTestDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase().db;
     return db;
 }
 

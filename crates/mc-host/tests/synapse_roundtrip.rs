@@ -68,6 +68,7 @@ async fn corrupt_bundle_degrades_synapse_and_keeps_magic_context_routable() {
 
     let component = SynapseComponent::new(Some(SynapseConfig {
         bundle_dir: dir.path().to_path_buf(),
+        bundle_manifest_sha256: None,
         ort_library: PathBuf::from("/nonexistent/libonnxruntime.so"),
         ort_library_sha256: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
             .to_owned(),
@@ -124,6 +125,7 @@ async fn all_four_operations_serve_certified_vectors_over_the_wire() {
     };
     let component = SynapseComponent::new(Some(SynapseConfig {
         bundle_dir: fixture_dir(),
+        bundle_manifest_sha256: None,
         ort_library,
         ort_library_sha256: ort_hash,
         limits: SynapseLimits {

@@ -2,7 +2,9 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::{commands, config, db, embedding_probe, log_parser, workspaces, AppState};
+use crate::{
+    claim_adapter, commands, config, db, embedding_probe, log_parser, workspaces, AppState,
+};
 
 #[derive(Debug)]
 pub enum DispatchError {
@@ -20,19 +22,11 @@ struct NoArgs {}
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct GetMemoriesArgs {
     project: Option<String>,
-    workspace_id: Option<i64>,
-    status: Option<String>,
+    lifecycle: Option<String>,
     category: Option<String>,
     search: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ProjectWorkspaceArgs {
-    project: Option<String>,
-    workspace_id: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -73,42 +67,33 @@ struct ApplyWorkspaceChangesArgs {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct MemoryStatusArgs {
-    memory_id: i64,
-    status: String,
+struct SetMemoryLifecycleArgs {
+    target: claim_adapter::ClaimMutationTarget,
+    operation_key: String,
+    lifecycle_state: String,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct MemoryContentArgs {
-    memory_id: i64,
+struct ReviseMemoryContentArgs {
+    target: claim_adapter::ClaimMutationTarget,
+    operation_key: String,
     content: String,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct MemoryCategoryArgs {
-    memory_id: i64,
+struct ReviseMemoryCategoryArgs {
+    target: claim_adapter::ClaimMutationTarget,
+    operation_key: String,
     category: String,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct MemoryIdArgs {
-    memory_id: i64,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct BulkMemoryStatusArgs {
-    memory_ids: Vec<i64>,
-    status: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct BulkMemoryIdsArgs {
-    memory_ids: Vec<i64>,
+struct BulkArchiveMemoriesArgs {
+    targets: Vec<claim_adapter::ClaimMutationTarget>,
+    operation_key: String,
 }
 
 #[derive(Deserialize)]
@@ -184,12 +169,6 @@ struct NoteIdArgs {
 struct DreamRunsArgs {
     project_path: Option<String>,
     limit: Option<usize>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RunIdArgs {
-    run_id: i64,
 }
 
 #[derive(Deserialize)]
@@ -289,11 +268,10 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
             let a: GetMemoriesArgs = parse_args(args)?;
             let conn = open_readonly(state)?;
             json(
-                db::get_memories(
+                claim_adapter::read_claim_memories(
                     &conn,
                     a.project.as_deref(),
-                    a.workspace_id,
-                    a.status.as_deref(),
+                    a.lifecycle.as_deref(),
                     a.category.as_deref(),
                     a.search.as_deref(),
                     a.limit.unwrap_or(100),
@@ -303,10 +281,10 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
             )
         }
         "get_memory_stats" => {
-            let a: ProjectWorkspaceArgs = parse_args(args)?;
+            let a: ProjectArgs = parse_args(args)?;
             let conn = open_readonly(state)?;
             json(
-                db::get_memory_stats(&conn, a.project.as_deref(), a.workspace_id)
+                claim_adapter::read_claim_memory_stats(&conn, a.project.as_deref())
                     .map_err(to_command)?,
             )
         }
@@ -374,44 +352,70 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
                 .map_err(to_command)?,
             )
         }
-        "update_memory_status" => {
-            let a: MemoryStatusArgs = parse_args(args)?;
-            let mut conn = open_readwrite(state)?;
-            json(db::update_memory_status(&mut conn, a.memory_id, &a.status).map_err(to_command)?)
-        }
-        "update_memory_content" => {
-            let a: MemoryContentArgs = parse_args(args)?;
+        "set_memory_lifecycle" => {
+            let a: SetMemoryLifecycleArgs = parse_args(args)?;
             let mut conn = open_readwrite(state)?;
             json(
-                db::update_memory_content(&mut conn, a.memory_id, &a.content)
-                    .map_err(to_command)?,
+                claim_adapter::set_claim_lifecycle(
+                    &mut conn,
+                    claim_adapter::MutationChannel::BearerHttp,
+                    claim_adapter::SetLifecycleInput {
+                        target: a.target,
+                        operation_key: a.operation_key,
+                        lifecycle_state: a.lifecycle_state,
+                    },
+                )
+                .map_err(to_command)?,
             )
         }
-        "update_memory_category" => {
-            let a: MemoryCategoryArgs = parse_args(args)?;
+        "revise_memory_content" => {
+            let a: ReviseMemoryContentArgs = parse_args(args)?;
             let mut conn = open_readwrite(state)?;
             json(
-                db::update_memory_category(&mut conn, a.memory_id, &a.category)
-                    .map_err(to_command)?,
+                claim_adapter::revise_claim(
+                    &mut conn,
+                    claim_adapter::MutationChannel::BearerHttp,
+                    claim_adapter::ReviseClaimInput {
+                        target: a.target,
+                        operation_key: a.operation_key,
+                        content: Some(a.content),
+                        category: None,
+                    },
+                )
+                .map_err(to_command)?,
             )
         }
-        "delete_memory" => {
-            let a: MemoryIdArgs = parse_args(args)?;
-            let mut conn = open_readwrite(state)?;
-            json(db::delete_memory(&mut conn, a.memory_id).map_err(to_command)?)
-        }
-        "bulk_update_memory_status" => {
-            let a: BulkMemoryStatusArgs = parse_args(args)?;
+        "revise_memory_category" => {
+            let a: ReviseMemoryCategoryArgs = parse_args(args)?;
             let mut conn = open_readwrite(state)?;
             json(
-                db::bulk_update_memory_status(&mut conn, &a.memory_ids, &a.status)
-                    .map_err(to_command)?,
+                claim_adapter::revise_claim(
+                    &mut conn,
+                    claim_adapter::MutationChannel::BearerHttp,
+                    claim_adapter::ReviseClaimInput {
+                        target: a.target,
+                        operation_key: a.operation_key,
+                        content: None,
+                        category: Some(a.category),
+                    },
+                )
+                .map_err(to_command)?,
             )
         }
-        "bulk_delete_memory" => {
-            let a: BulkMemoryIdsArgs = parse_args(args)?;
+        "bulk_archive_memories" => {
+            let a: BulkArchiveMemoriesArgs = parse_args(args)?;
             let mut conn = open_readwrite(state)?;
-            json(db::bulk_delete_memory(&mut conn, &a.memory_ids).map_err(to_command)?)
+            json(
+                claim_adapter::bulk_archive_claims(
+                    &mut conn,
+                    claim_adapter::MutationChannel::BearerHttp,
+                    claim_adapter::BulkArchiveInput {
+                        targets: a.targets,
+                        operation_key: a.operation_key,
+                    },
+                )
+                .map_err(to_command)?,
+            )
         }
         "get_sessions" => {
             parse_args::<NoArgs>(args)?;
@@ -484,7 +488,7 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
         "enumerate_memory_projects" => {
             parse_args::<NoArgs>(args)?;
             let conn = open_readonly(state)?;
-            json(db::enumerate_memory_projects(&conn).map_err(to_command)?)
+            json(claim_adapter::enumerate_claim_projects(&conn).map_err(to_command)?)
         }
         "get_project_cards" => {
             parse_args::<NoArgs>(args)?;
@@ -571,14 +575,6 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
             let conn = open_readonly(state)?;
             json(
                 db::get_dream_runs(&conn, a.project_path.as_deref(), a.limit.unwrap_or(20))
-                    .map_err(DispatchError::Command)?,
-            )
-        }
-        "get_dream_run_memory_changes" => {
-            let a: RunIdArgs = parse_args(args)?;
-            let conn = open_readonly(state)?;
-            json(
-                db::get_dream_run_memory_changes(&conn, a.run_id)
                     .map_err(DispatchError::Command)?,
             )
         }

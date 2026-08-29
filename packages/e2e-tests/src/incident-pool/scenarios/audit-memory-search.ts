@@ -24,8 +24,8 @@ import {
     deterministicEmbedding,
     MockProvider,
 } from "../../mock-provider/server";
-import { updateMemoryVerification } from "../../../../plugin/src/features/magic-context/memory";
-import { withClaimsWriteCapabilityInCurrentTransaction } from "../../../../plugin/src/features/magic-context/memory/storage-memory-claims";
+import { runScriptedToolCall } from "../../scripted-tool-call";
+import { promoteMemoryToVerified } from "../../test-db";
 import type {
     CaseDriverContext,
     JsonValue,
@@ -41,7 +41,6 @@ import {
     DEFER_USAGE,
     EXECUTE_USAGE,
     readContextDb,
-    runScriptedToolCall,
     writeContextDb,
 } from "../support/tool-loop";
 
@@ -161,17 +160,14 @@ function memoryIdIn(m0: string, content: string): number {
     return Number(match[1]);
 }
 
-function verifyMemoryByContent(h: TestHarness, content: string): number {
-    return writeContextDb(h, (db) => {
-        const row = db
-            .prepare(
-                "SELECT id FROM memories WHERE content = ? ORDER BY id DESC LIMIT 1",
-            )
-            .get(content) as { id: number } | null;
-        if (!row) throw new Error("written memory row not found");
-        updateMemoryVerification(db, row.id, "verified");
-        return row.id;
-    });
+/**
+ * Promote the claim carrying `content` to VERIFIED through the real
+ * verification API. An agent `ctx_memory` write lands CANDIDATE and is hidden
+ * from every automatic surface, so a case that asserts on injected bytes has to
+ * clear the maturity gate first. Returns the promoted claim's public ID.
+ */
+function verifyMemoryByContent(h: TestHarness, content: string): string {
+    return promoteMemoryToVerified(h.contextDbPath(), content);
 }
 
 function memoryProjectEpoch(h: TestHarness, memoryId: number): number {
@@ -314,7 +310,10 @@ const IMPLEMENTATION_FILES = [
 
 const A32_IMPLEMENTATION_FILES = [
     ...IMPLEMENTATION_FILES,
-    "packages/plugin/src/features/magic-context/memory/storage-memory-claims.ts",
+    // Project-memory claim writes, revisions, and verification events all run
+    // through this module's operation envelope, so it owns the write-side
+    // behavior A32 measures.
+    "packages/plugin/src/features/magic-context/memory/storage-claim-operations.ts",
     "packages/plugin/src/features/magic-context/memory/storage-memory-embeddings.ts",
     // `search.ts` delegates the behavior A32 measures — missing/stale selection,
     // re-embedding, and guarded persistence — to the backfill path, which in turn
@@ -1098,16 +1097,17 @@ export async function driveEmbeddingFreshness(
             const before = db
                 .prepare("SELECT COUNT(*) AS n FROM memories")
                 .get() as { n: number };
-            withClaimsWriteCapabilityInCurrentTransaction(db, () => {
-                db.prepare(
-                    "UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
-                ).run(
-                    fixture.newContent,
-                    normalizedMemoryHash(fixture.newContent),
-                    Date.now(),
-                    memoryId,
-                );
-            });
+            // The edit rewrites content and dedup identity in place without
+            // touching the stored vector, which is what leaves the embedding
+            // stale for the searches below.
+            db.prepare(
+                "UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
+            ).run(
+                fixture.newContent,
+                normalizedMemoryHash(fixture.newContent),
+                Date.now(),
+                memoryId,
+            );
             const after = db
                 .prepare("SELECT COUNT(*) AS n FROM memories")
                 .get() as { n: number };

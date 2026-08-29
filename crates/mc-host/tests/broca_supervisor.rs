@@ -116,7 +116,8 @@ fn default_limits_and_resource_declaration_match_the_fixed_caps() {
     assert_eq!(resources.reserved_handler_tasks, 96);
     // The supervisor's 64 MiB budget plus the retention classes outside
     // it: the route-identity map (1024 routes x (4096-byte root + 256-byte
-    // session + three bounded provider fingerprints + map/key overhead)), live backend capture
+    // session + three bounded provider fingerprints + the fingerprint
+    // BTreeMap's leaf-node and map/key overhead)), live backend capture
     // (8 backends x ((4 MiB stdout + 64 KiB stderr) x 5 parse-time copies
     // + one 512 KiB request body retained across the Pi provider
     // fallback's aliased attempt)), the uncharged deletion-tombstone
@@ -128,7 +129,7 @@ fn default_limits_and_resource_declaration_match_the_fixed_caps() {
     assert_eq!(
         resources.retained_resident_bytes,
         64 * 1024 * 1024
-            + 1024 * (4096 + 256 + 3 * (16 + 64) + 256)
+            + 1024 * (4096 + 256 + 3 * (16 + 64) + 1024)
             + 8 * ((4 * 1024 * 1024 + 64 * 1024) * 5 + 512 * 1024)
             + 256 * ((4096 + 256) * 3 + 128)
             + (1 + 3 * 8) * 1536 * 1024

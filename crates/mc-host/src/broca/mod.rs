@@ -61,17 +61,17 @@ impl CredentialVerifier {
             Harness::OpenCode => "opencode",
             Harness::Pi => "pi",
         };
+        // The same alias map used for row selection and fingerprint
+        // derivation; a divergent local copy here would look presented
+        // fingerprints up under a name the client never binds.
+        let canonical = subprocess::canonical_provider(harness_name, provider)
+            .map_err(|error| error.subreason())?;
         let expected = self
             .env
             .credential_fingerprint(key, harness_name, provider)
             .map_err(|error| error.subreason())?;
-        let canonical_provider = match (harness, provider) {
-            (Harness::Pi, "google-antigravity") => "google",
-            (Harness::Pi, "openai-codex") => "openai",
-            _ => provider,
-        };
         let actual = presented
-            .get(canonical_provider)
+            .get(canonical)
             .ok_or("credential_snapshot_mismatch")?;
         if expected.as_bytes().ct_eq(actual.as_bytes()).into() {
             Ok(())
@@ -125,17 +125,11 @@ impl BrocaComponent {
 }
 
 fn request_error(error: RequestError) -> RequestOutcome {
-    RequestOutcome::Error {
-        code: error.code.to_owned(),
-        message: error.message,
-    }
+    RequestOutcome::error(error.code, error.message)
 }
 
 fn app_error(code: &str, message: &str) -> RequestOutcome {
-    RequestOutcome::Error {
-        code: code.to_owned(),
-        message: message.to_owned(),
-    }
+    RequestOutcome::error(code, message)
 }
 
 async fn respond(ctx: &RequestCtx, body: Vec<u8>) -> RequestOutcome {
@@ -178,6 +172,7 @@ impl CompositeComponent for BrocaComponent {
             reserved_handler_tasks: config::RESERVED_HANDLER_TASKS,
             reserved_pending_requests: config::RESERVED_PENDING_REQUESTS,
             retained_resident_bytes: config::DECLARED_RETAINED_RESIDENT_BYTES,
+            general_task_hold_bound: 0,
             route_class: RouteClass::Reserved,
         }
     }
@@ -255,6 +250,17 @@ impl CompositeComponent for BrocaComponent {
         };
         match request {
             Request::Send(send) => {
+                // Contract precedence (`harness_unavailable.reasons_by_precedence`):
+                // descriptor_absent, descriptor_invalid, closure_incomplete, and
+                // argument_variant_invalid all rank ahead of every credential
+                // reason. The backend owns that verdict, so it is asked before the
+                // credential snapshot is verified — otherwise a startup with no
+                // usable descriptor and no provider row answered
+                // `credential_missing`, which names a remedy that cannot fix the
+                // descriptor the run actually lacks.
+                if let Some(reason) = self.supervisor.harness_unavailable_reason(key.harness) {
+                    return app_error("harness_unavailable", reason);
+                }
                 if let Some(verifier) = &self.credential_verifier {
                     let fingerprints = self
                         .route_fingerprints

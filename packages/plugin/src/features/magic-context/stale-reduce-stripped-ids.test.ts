@@ -1,15 +1,12 @@
 /// <reference types="bun-types" />
 
 import { beforeEach, describe, expect, it } from "bun:test";
-import { Database } from "../../shared/sqlite";
-import { runMigrations } from "./migrations";
-import { initializeDatabase } from "./storage-db";
+import type { Database } from "../../shared/sqlite";
 import { addStaleReduceStrippedIds, getStaleReduceStrippedIds } from "./storage-meta-persisted";
+import { createDirectTestDatabase } from "./test-database";
 
 function createTestDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase().db;
     return db;
 }
 

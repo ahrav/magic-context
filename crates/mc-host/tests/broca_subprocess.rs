@@ -891,7 +891,7 @@ fn collecting_sink() -> (EventSink, Arc<Mutex<Vec<BackendEvent>>>) {
 }
 
 fn request(
-    project_root: &Path,
+    _project_root: &Path,
     harness: Harness,
     model: &str,
     system: Option<&str>,
@@ -904,7 +904,6 @@ fn request(
         model: model.to_owned(),
         max_output_tokens: 32_000,
         temperature: 0.25,
-        project_root: project_root.to_path_buf(),
         harness,
         session: "session-1".to_owned(),
         run_id: "run-1".to_owned(),

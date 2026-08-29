@@ -71,7 +71,6 @@ import { foldExecutesThisPass } from "./fold-execution-gate";
 import { applyHeuristicCleanup } from "./heuristic-cleanup";
 import {
     clearInjectionCache,
-    getVisibleMemoryIds,
     injectM0M1,
     type M0HardSignals,
     type M0M1State,
@@ -393,11 +392,8 @@ export function runRustModePostprocess(args: {
         appendReminderToUserMessageById(args.messages, anchor.messageId, anchor.text);
     }
     for (const decision of getAutoSearchHintDecisions(args.db, args.sessionId)) {
-        // Same replay gate as runAutoSearchHint: a persisted hint replays
-        // only while every contributing memory is still auto_search-eligible
-        // and byte-identical — a quarantine, contradiction, rejection, or
-        // rewrite after the hint was computed must not keep re-injecting the
-        // stored fragment through this sticky loop.
+        // Anti-memory warnings never replay from stored hint text; they require
+        // a fresh search. Decisions without warning fragments can replay.
         if (
             decision.decision === "hint" &&
             autoSearchHintFragmentsStillEligible(args.db, decision.memoryFragments)
@@ -1726,9 +1722,8 @@ export async function runPostTransformPhase(
             appendReminderToUserMessageById(args.messages, anchor.messageId, anchor.text);
         }
         for (const decision of getAutoSearchHintDecisions(args.db, args.sessionId)) {
-            // Same replay gate as runAutoSearchHint (see the Rust-mode loop
-            // above): the stored fragment must never outlive its
-            // contributing memories' eligibility.
+            // Anti-memory warnings require a fresh search; stored decisions
+            // replay only when they contain no warning fragments.
             if (
                 decision.decision === "hint" &&
                 autoSearchHintFragmentsStillEligible(args.db, decision.memoryFragments)
@@ -1964,13 +1959,7 @@ export async function runPostTransformPhase(
     }
 
     if (args.fullFeatureMode && args.autoSearch?.enabled && args.projectPath) {
-        // Resolve memory ids currently rendered in the <session-history>
-        // block. The auto-search runner drops hint fragments for memories the
-        // agent already sees in message[0] so the hint stays "vague recall"
-        // for content not already in context.
         const tAutoSearch = performance.now();
-        const visibleMemoryIds = getVisibleMemoryIds(args.db, args.sessionId) ?? undefined;
-
         try {
             const autoSearchOutcome = await runAutoSearchHint({
                 sessionId: args.sessionId,
@@ -1983,7 +1972,6 @@ export async function runPostTransformPhase(
                     directory: args.autoSearch.directory ?? args.sessionDirectory,
                     projectPath: args.projectPath,
                     ensureProjectRegistered: args.autoSearch.ensureProjectRegistered,
-                    visibleMemoryIds,
                 },
             });
             if (!autoSearchOutcome.ok) {

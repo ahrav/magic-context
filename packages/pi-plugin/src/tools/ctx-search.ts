@@ -21,9 +21,10 @@ import {
 	getProjectEmbeddingSnapshot,
 } from "@magic-context/core/features/magic-context/memory/embedding";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
+import { recordDeliveredAntiMemoryUsage } from "@magic-context/core/features/magic-context/memory/storage-claim-operations";
 import {
-	parseIdShapedQuery,
-	resolveMemoriesByIdsForSearch,
+	parseLocatorShapedQuery,
+	resolveClaimsByLocatorsForSearch,
 	unifiedSearch,
 } from "@magic-context/core/features/magic-context/search";
 import {
@@ -32,9 +33,9 @@ import {
 	prepareExplicitQuery,
 } from "@magic-context/core/features/magic-context/search-bounds";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
-import { getVisibleMemoryIds } from "@magic-context/core/hooks/magic-context/inject-compartments";
+import { getVisibleRevisionLocators } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import { CTX_SEARCH_DESCRIPTION } from "@magic-context/core/tools/ctx-search/constants";
-import { formatSearchResults } from "@magic-context/core/tools/ctx-search/render";
+import { packSearchResults } from "@magic-context/core/tools/ctx-search/render";
 import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import { type Static, Type } from "typebox";
 
@@ -43,7 +44,7 @@ const ParamsSchema = Type.Object(
 		query: Type.Optional(
 			Type.String({
 				description:
-					"Search query. Matches against memory content, Primers, git commit messages, and raw user/assistant message text.",
+					"Search query. Matches rejected-approach warnings, Primers, git commit messages, notes, and raw user/assistant message text. Positive project-memory claims require an opaque public claim id (mcm_<32hex>) or full revision locator.",
 			}),
 		),
 		limit: Type.Optional(
@@ -62,7 +63,7 @@ const ParamsSchema = Type.Object(
 				]),
 				{
 					description:
-						'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["memory"] for naming conventions, ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. Omit for a broad search across all enabled sources.',
+						'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. ["memory"] searches rejected-approach warnings and resolves exact positive-memory locators; broad positive-memory text retrieval remains disabled. Omit for all enabled sources.',
 				},
 			),
 		),
@@ -173,32 +174,51 @@ export function createCtxSearchTool(
 			const messageOrdinalCutoff =
 				lastCompartmentEnd >= 0 ? lastCompartmentEnd : 0;
 
-			// Hard-filter memories already rendered in <session-history>.
-			const visibleMemoryIds = getVisibleMemoryIds(deps.db, sessionId);
+			// Hard-filter claims already rendered in the injected baseline.
+			const visibleRevisionLocators = getVisibleRevisionLocators(
+				deps.db,
+				sessionId,
+			);
+			const renderDelivered = (
+				results: Awaited<ReturnType<typeof unifiedSearch>>,
+			) => {
+				const packed = packSearchResults(query, results, sessionId);
+				recordDeliveredAntiMemoryUsage(deps.db, packed.delivered);
+				return packed.text;
+			};
 
-			// ID-shaped short-circuit (parity with OpenCode ctx_search): when the
-			// whole query is one or more memory ids, bypass the lexical+semantic
-			// lanes and look the ids up directly. If nothing resolves we fall
-			// through to the normal lanes so a numeric query with no matching
-			// memory still searches text.
-			const idShape = parseIdShapedQuery(query);
-			if (idShape && memoryEnabled) {
-				const idResults = resolveMemoriesByIdsForSearch({
+			// Exact-locator short-circuit (parity with OpenCode ctx_search):
+			// when the whole query is one or more claim/revision locators,
+			// bypass the lexical+semantic lanes and resolve them through the
+			// current-state provider. If nothing resolves we fall through to
+			// the normal lanes so ordinary text still searches the corpus.
+			//
+			// Source restriction binds here too: this path runs before
+			// `params.sources` reaches `unifiedSearch`, so without the check a
+			// locator-shaped query would return claim content under a
+			// restriction that names only non-memory sources, or under an
+			// explicit empty list.
+			const memorySourceAllowed =
+				params.sources === undefined || params.sources.includes("memory");
+			const locatorShape = parseLocatorShapedQuery(query);
+			if (locatorShape && memoryEnabled && memorySourceAllowed) {
+				const locatorResults = resolveClaimsByLocatorsForSearch({
 					db: deps.db,
 					projectPath: projectIdentity,
-					ids: idShape,
-					limit: Math.max(
-						normalizeSearchResultLimit(params.limit),
-						idShape.length,
-					),
-					visibleMemoryIds,
+					locators: locatorShape,
+					// The requested limit applies here exactly as it does to
+					// every other search path. Raising the cap to the locator
+					// count let `limit: 1` with two ids return both, and a long
+					// enough locator list slip past the shared hard ceiling.
+					limit: normalizeSearchResultLimit(params.limit),
+					visibleRevisionLocators,
 				});
-				if (idResults !== null) {
+				if (locatorResults !== null) {
 					return {
 						content: [
 							{
 								type: "text",
-								text: formatSearchResults(query, idResults, sessionId),
+								text: renderDelivered(locatorResults),
 							},
 						],
 						details: undefined,
@@ -228,7 +248,6 @@ export function createCtxSearchTool(
 					maxMessageOrdinal: messageOrdinalCutoff,
 					gitCommitsEnabled,
 					sources: params.sources,
-					visibleMemoryIds,
 					// Explicit agent search → literal-probe multi-query recall
 					// (parity with OpenCode's ctx_search). Pi auto-search leaves
 					// this off to protect its latency budget.
@@ -240,7 +259,7 @@ export function createCtxSearchTool(
 				content: [
 					{
 						type: "text",
-						text: formatSearchResults(query, results, sessionId),
+						text: renderDelivered(results),
 					},
 				],
 				details: undefined,

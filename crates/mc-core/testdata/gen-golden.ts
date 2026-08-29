@@ -27,7 +27,7 @@ import { mkdtempSync, rmSync, writeFileSync as writeDocFile } from "node:fs";
 import { tmpdir } from "node:os";
 import { readProjectDocsCanonical } from "../../../packages/plugin/src/features/magic-context/project-docs-hash.ts";
 import { renderMemoryBlockV2 } from "../../../packages/plugin/src/hooks/magic-context/inject-compartments.ts";
-import type { Memory } from "../../../packages/plugin/src/features/magic-context/memory/storage-memory.ts";
+import type { Memory } from "../../../packages/plugin/src/features/magic-context/memory/types.ts";
 
 const indices = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 200, 400, 1000];
 const importances = [1, 10, 25, 40, 50, 60, 75, 90, 100];

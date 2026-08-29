@@ -6,8 +6,10 @@ import {
 	getSessionFacts,
 } from "@magic-context/core/features/magic-context/compartment-storage";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
-import { getMemoriesByProject } from "@magic-context/core/features/magic-context/memory/storage-memory";
-import { getCurrentMemoryClaimByLegacyMemoryId } from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
+import {
+	readProjectMemoryCurrentState,
+	resolveProjectIdsForIdentities,
+} from "@magic-context/core/features/magic-context/memory/storage-claim-current-state";
 import {
 	getHistorianFailureState,
 	getOverflowState,
@@ -62,6 +64,20 @@ describe("buildPiCompactionSummary", () => {
 		expect(summary).toBe("Magic Context compacted messages 3-9.");
 	});
 });
+
+function projectClaims(
+	db: ReturnType<typeof createTestDb>,
+	projectIdentity: string,
+) {
+	const result = readProjectMemoryCurrentState(db, {
+		projectIds: resolveProjectIdsForIdentities(db, [projectIdentity]),
+		lifecycleStates: ["active"],
+		surface: "maintenance_hygiene",
+		workspaceEpoch: "pi-historian-test",
+	});
+	if (result.status !== "ok") throw new Error(result.reasons.join(", "));
+	return result.items;
+}
 
 function rawMessages(count = 12): RawMessage[] {
 	return Array.from({ length: count }, (_, index) => {
@@ -507,17 +523,13 @@ describe("runPiHistorian", () => {
 			// (no REPLACE). They flow to project memory via promotion.
 			expect(getSessionFacts(db, "ses-historian")).toEqual([]);
 			const projectPath = resolveProjectIdentity(process.cwd());
-			expect(
-				getMemoriesByProject(db, projectPath).map((m) => m.content),
-			).toContain("Pi historian facts can promote to memory.");
-			const promoted = getMemoriesByProject(db, projectPath).find(
-				(m) => m.content === "Pi historian facts can promote to memory.",
+			const promoted = projectClaims(db, projectPath).find(
+				(claim) =>
+					claim.content === "Pi historian facts can promote to memory.",
 			);
-			if (!promoted) throw new Error("expected promoted memory");
-			const claim = getCurrentMemoryClaimByLegacyMemoryId(db, promoted.id);
-			expect(claim?.revision).toBe(1);
-			expect(claim?.state).toBe("active");
-			expect(claim?.content).toBe("Pi historian facts can promote to memory.");
+			expect(promoted?.revision).toBe(1);
+			expect(promoted?.lifecycleState).toBe("active");
+			expect(promoted?.publicClaimId).toMatch(/^mcm_/);
 		} finally {
 			closeQuietly(db);
 		}
@@ -720,7 +732,7 @@ describe("runPiHistorian", () => {
 			).toBe(3);
 			const projectPath = resolveProjectIdentity(process.cwd());
 			expect(
-				getMemoriesByProject(db, projectPath).map((memory) => memory.content),
+				projectClaims(db, projectPath).map((claim) => claim.content),
 			).toContain("Pi durable fact survives registration outage.");
 			expect(
 				db
@@ -819,7 +831,7 @@ describe("runPiHistorian", () => {
 			expect(getCompartments(midLoop.db, "ses-historian")[0]?.endMessage).toBe(
 				2,
 			);
-			expect(getMemoriesByProject(midLoop.db, projectPath)).toEqual([]);
+			expect(projectClaims(midLoop.db, projectPath)).toEqual([]);
 		} finally {
 			closeQuietly(midLoop.db);
 		}
@@ -830,7 +842,7 @@ describe("runPiHistorian", () => {
 		});
 		try {
 			expect(getCompartments(finalChunk.db, "ses-historian")).toHaveLength(1);
-			expect(getMemoriesByProject(finalChunk.db, projectPath)).toEqual([]);
+			expect(projectClaims(finalChunk.db, projectPath)).toEqual([]);
 		} finally {
 			closeQuietly(finalChunk.db);
 		}
@@ -845,9 +857,7 @@ describe("runPiHistorian", () => {
 		});
 		try {
 			expect(
-				getMemoriesByProject(allowed.db, projectPath).map(
-					(memory) => memory.content,
-				),
+				projectClaims(allowed.db, projectPath).map((claim) => claim.content),
 			).toContain("Promote this Pi fact.");
 		} finally {
 			closeQuietly(allowed.db);
@@ -859,7 +869,7 @@ describe("runPiHistorian", () => {
 			autoPromote: true,
 		});
 		try {
-			expect(getMemoriesByProject(blocked.db, projectPath)).toEqual([]);
+			expect(projectClaims(blocked.db, projectPath)).toEqual([]);
 		} finally {
 			closeQuietly(blocked.db);
 		}
@@ -896,7 +906,7 @@ describe("runPiHistorian", () => {
 				// Editor output won — the promoted fact is from the editor.
 				const projectPath = resolveProjectIdentity(process.cwd());
 				expect(
-					getMemoriesByProject(db, projectPath).map((m) => m.content),
+					projectClaims(db, projectPath).map((claim) => claim.content),
 				).toContain("Edited fact replaced the draft.");
 			} finally {
 				closeQuietly(db);
@@ -915,7 +925,7 @@ describe("runPiHistorian", () => {
 				// Draft fact is promoted despite editor failure (no data loss).
 				const projectPath = resolveProjectIdentity(process.cwd());
 				expect(
-					getMemoriesByProject(db, projectPath).map((m) => m.content),
+					projectClaims(db, projectPath).map((claim) => claim.content),
 				).toContain("Original draft fact.");
 				// Compartments still persisted.
 				expect(getCompartments(db, "ses-historian")).toEqual([

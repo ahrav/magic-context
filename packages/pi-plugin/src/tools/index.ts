@@ -121,7 +121,6 @@ export function registerMagicContextTools(
 					db: opts.db,
 					ensureProjectRegistered: opts.ensureProjectRegistered,
 					memoryEnabled: opts.memoryEnabled,
-					embeddingEnabled: opts.embeddingEnabled,
 					allowDreamerActions: opts.allowDreamerActions ?? false,
 					resolveProjectIdentity,
 				}),

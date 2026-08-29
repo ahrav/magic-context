@@ -16,13 +16,13 @@
  */
 
 import { detectRustPrerequisites } from "../../../scripts/check-rust-prerequisites";
+import { DEFAULT_SCRIPTED_TOOL_USAGE } from "../../scripted-tool-call";
 import {
     findBusts,
     formatBustReport,
     mainAgentRequests,
 } from "../../cache-analysis";
 import type { TestHarness, TestHarnessOptions } from "../../harness";
-import type { MockUsage } from "../../mock-provider/server";
 import type {
     CaseDriverContext,
     JsonValue,
@@ -64,12 +64,7 @@ export function failedCheckIds(result: RegressionResult): string[] {
 // threshold, so this usage keeps every pass a pure defer pass.
 // ---------------------------------------------------------------------------
 
-const DEFER_USAGE: MockUsage = {
-    input_tokens: 2_000,
-    output_tokens: 20,
-    cache_creation_input_tokens: 0,
-    cache_read_input_tokens: 2_000,
-};
+const DEFER_USAGE = DEFAULT_SCRIPTED_TOOL_USAGE;
 
 export const FIRST_RENDER_HARNESS_OPTIONS = {
     modelContextLimit: 100_000,

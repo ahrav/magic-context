@@ -1,0 +1,27 @@
+captured_utc=2026-08-26T22:15:21Z
+commit=881be45b552625935a6b725a7ef830165a4c2f00
+short_commit=881be45b
+branch=feat/synapse-tail-amplification
+hostname=<redacted: collection host>
+kernel=Linux 6.12.100-125.179.amzn2023.aarch64 #1 SMP Mon Aug 10 22:44:02 UTC 2026 aarch64
+machine=aarch64
+rustc=rustc 1.94.1 (e408947bf 2026-03-25); LLVM 21.1.8
+cargo=cargo 1.94.1 (29ea6fb6a 2026-03-24)
+bun=1.4.0
+node=v24.14.0
+cpu_online=0-31
+artifact=target/release/examples/synapse_perf
+artifact_sha256=304571f903697540689d755497f098b1db25cd6f7511868c5801abb76665aa66
+harness_sha256=c1fdd1f8ac6be277675398bbe42d8d28f979763043171c5b52f48f62354028c7
+measurement_sha256=e8868599193f9698bbd8bf5df91728cb4235845864a02cd0203aa3adbe6289ee
+plugin_policy_sha256=42e02b603592d4f0bd5f42a01b53ee249bf93f4bdc954c70ace245a0342032a6
+process_arrangement=in-process generator and SUT; separate host thread; generator threads excluded by task labels
+block_load_capture=sampled from /proc/loadavg before every phase block; entries appended below and mirrored in block_loadavg.ndjson
+pre_collection_loadavg=1.72 1.95 2.03
+block_loadavg phase=calibration block=1 sequence_start=1 utc=2026-08-26T22:15:21.554208Z loadavg=1.72 1.95 2.03 4/3976 425121
+block_loadavg phase=calibration block=2 sequence_start=3 utc=2026-08-26T22:15:23.794118Z loadavg=2.06 2.02 2.06 5/3977 425286
+block_loadavg phase=aa block=1 sequence_start=1 utc=2026-08-26T22:15:39.727771Z loadavg=2.11 2.03 2.06 3/3979 425646
+block_loadavg phase=aa block=2 sequence_start=289 utc=2026-08-26T22:22:13.095056Z loadavg=3.24 2.62 2.28 3/3973 457958
+block_loadavg phase=treatment block=1 sequence_start=1 utc=2026-08-26T22:29:16.832566Z loadavg=1.64 2.47 2.42 2/3973 490027
+block_loadavg phase=treatment block=2 sequence_start=1153 utc=2026-08-26T22:55:29.910166Z loadavg=2.47 2.84 2.71 4/3994 629811
+post_collection_loadavg=1.51 2.85 3.09

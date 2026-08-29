@@ -19,7 +19,6 @@ import {
     probeEmbeddingEndpoint,
 } from "@magic-context/core/features/magic-context/memory/embedding-probe";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
-import { getLiveMigrationBlockingProcesses } from "@magic-context/core/features/magic-context/storage-db";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import {
     isPrototypePollutionKey,
@@ -30,18 +29,10 @@ import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
 
 import { writeFileAtomic } from "../lib/atomic-write";
 import {
-    type ClaimsBackfillCommandArgs,
-    runClaimsBackfillCommands,
-} from "../lib/claims-backfill-commands";
-import {
     hasUserConfigLocationMigrationRefusal,
     migrateConfigLocationsForCli,
 } from "../lib/config-location-migration";
-import {
-    openExistingContextDatabase,
-    openExistingContextDatabaseForMutation,
-    UnsupportedSchemaVersionError,
-} from "../lib/database-access";
+import { openExistingContextDatabase, UnsupportedSchemaVersionError } from "../lib/database-access";
 import { formatDatabaseRepairGuidance } from "../lib/database-repair-guidance";
 import { collectDiagnostics } from "../lib/diagnostics-pi";
 import {
@@ -76,7 +67,6 @@ import {
     formatStorageVersions,
     readStorageVersions,
 } from "../lib/storage-versions";
-import { runV22BackfillCommands, type V22BackfillCommandArgs } from "../lib/v22-backfill-commands";
 import { writePiSettingsPackage } from "./setup-pi";
 
 const PACKAGE_NAME = "@cortexkit/pi-magic-context";
@@ -84,7 +74,7 @@ const PACKAGE_NAME = "@cortexkit/pi-magic-context";
 // to `@earendil-works/pi-coding-agent`. Magic Context's peerDependency targets
 // the new scope, so older Pi installs cannot load this extension.
 const MIN_PI_VERSION = "0.74.0";
-const ROW_COUNT_TABLES = ["tags", "compartments", "memories", "notes", "dream_runs"];
+const ROW_COUNT_TABLES = ["tags", "compartments", "claims", "notes", "dream_runs"];
 
 type CheckStatus = "pass" | "warn" | "fail" | "info";
 
@@ -121,7 +111,7 @@ interface DoctorDeps {
     spawnSync: typeof spawnSync;
 }
 
-export interface RunDoctorOptions extends V22BackfillCommandArgs, ClaimsBackfillCommandArgs {
+export interface RunDoctorOptions {
     force?: boolean;
     issue?: boolean;
     help?: boolean;
@@ -161,24 +151,6 @@ function printDoctorHelp(): void {
     console.log("    magic-context-pi doctor          Run health checks");
     console.log("    magic-context-pi doctor --force  Repair safe issues, then re-check");
     console.log("    magic-context-pi doctor --issue  Create a sanitized bug report");
-    console.log(
-        "    magic-context-pi doctor --check-v22-backfill  Show v22 memory backfill status",
-    );
-    console.log(
-        "    magic-context-pi doctor --retry-v22-backfill  Retry failed v22 memory backfill rows",
-    );
-    console.log(
-        "    magic-context-pi doctor --rekey-v22-dir-identity <path>  Re-key legacy dir identity rows",
-    );
-    console.log(
-        "    magic-context-pi doctor --check-claims-backfill  Show v84 claims backfill status",
-    );
-    console.log(
-        "    magic-context-pi doctor --retry-claims-backfill  Repair and resume the v84 claims backfill",
-    );
-    console.log(
-        '    magic-context-pi doctor --waive-claims-backfill-failure <id> --rationale "<why>"  Waive a reviewed lineage failure',
-    );
     console.log("    magic-context-pi doctor --help   Show this help");
     console.log("");
 }
@@ -625,9 +597,7 @@ async function runHealthChecks(options: {
                 // Stable storage-version probe: live DB schema vs this binary's fence.
                 const storageVersions = readStorageVersions(db);
                 add(results, "info", formatStorageVersions(storageVersions));
-                const fenceCheck = checkStorageVersionFence(storageVersions, {
-                    blockingProcesses: getLiveMigrationBlockingProcesses(storageDir),
-                });
+                const fenceCheck = checkStorageVersionFence(storageVersions);
                 add(results, fenceCheck.alarm ? "fail" : "info", fenceCheck.message);
 
                 const integrity = db.prepare("PRAGMA integrity_check").get() as {
@@ -1077,55 +1047,6 @@ export async function runDoctor(options: RunDoctorOptions = {}): Promise<number>
         return runIssueFlow({ cwd, prompts, deps });
     }
 
-    let sharedCommandExitCode: number | null = null;
-
-    let v22Db: ReturnType<typeof openExistingContextDatabase> = null;
-    const v22Result = await runV22BackfillCommands(
-        {
-            name: "Pi",
-            openDatabase: (readonly = true) => {
-                const dbPath = join(getMagicContextStorageDir(), "context.db");
-                v22Db = readonly
-                    ? openExistingContextDatabase(dbPath, { readonly: true })
-                    : openExistingContextDatabaseForMutation(dbPath);
-                return v22Db;
-            },
-            closeDatabase: () => {
-                v22Db?.close();
-                v22Db = null;
-            },
-            log: prompts.log,
-        },
-        options,
-    );
-    if (v22Result.handled) {
-        sharedCommandExitCode = Math.max(sharedCommandExitCode ?? 0, v22Result.exitCode);
-    }
-
-    let claimsDb: ReturnType<typeof openExistingContextDatabase> = null;
-    const claimsResult = await runClaimsBackfillCommands(
-        {
-            name: "Pi",
-            openDatabase: (readonly = true) => {
-                const dbPath = join(getMagicContextStorageDir(), "context.db");
-                claimsDb = readonly
-                    ? openExistingContextDatabase(dbPath, { readonly: true })
-                    : openExistingContextDatabaseForMutation(dbPath);
-                return claimsDb;
-            },
-            closeDatabase: () => {
-                claimsDb?.close();
-                claimsDb = null;
-            },
-            log: prompts.log,
-        },
-        options,
-    );
-    if (claimsResult.handled) {
-        sharedCommandExitCode = Math.max(sharedCommandExitCode ?? 0, claimsResult.exitCode);
-    }
-    if (sharedCommandExitCode !== null) return sharedCommandExitCode;
-
     prompts.intro("Magic Context for Pi Doctor");
     const first = await runHealthChecks({
         cwd,
@@ -1164,33 +1085,11 @@ export async function runDoctor(options: RunDoctorOptions = {}): Promise<number>
     return first.fail > 0 ? 1 : 0;
 }
 
-function valueAfter(args: string[], flag: string): string | null {
-    const index = args.indexOf(flag);
-    if (index === -1) return null;
-    // Reject a flag-shaped value: `--rekey-v22-dir-identity --force` must NOT
-    // consume `--force` as the project path. Returning null drops the option
-    // (parseDoctorArgs gates on `!== null`) so the doctor proceeds normally
-    // instead of rekeying against a bogus `dir:<hash of cwd/--force>` identity.
-    const next = args[index + 1];
-    if (next === undefined || next.startsWith("--")) return null;
-    return next;
-}
-
 export function parseDoctorArgs(args: string[]): RunDoctorOptions {
-    const rekeyV22DirIdentity = valueAfter(args, "--rekey-v22-dir-identity");
-    const waiveClaimsBackfillFailure = valueAfter(args, "--waive-claims-backfill-failure");
-    const waiveRationale = valueAfter(args, "--rationale");
     return {
         force: args.includes("--force"),
         issue: args.includes("--issue"),
         help: args.includes("--help") || args.includes("-h"),
-        checkV22Backfill: args.includes("--check-v22-backfill"),
-        retryV22Backfill: args.includes("--retry-v22-backfill"),
-        ...(rekeyV22DirIdentity !== null ? { rekeyV22DirIdentity } : {}),
-        checkClaimsBackfill: args.includes("--check-claims-backfill"),
-        retryClaimsBackfill: args.includes("--retry-claims-backfill"),
-        ...(args.includes("--waive-claims-backfill-failure") ? { waiveClaimsBackfillFailure } : {}),
-        ...(waiveRationale !== null ? { waiveRationale } : {}),
     };
 }
 

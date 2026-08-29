@@ -13,7 +13,7 @@
 
 import { basename, dirname, resolve } from "node:path";
 
-import { SOURCE_LOCATOR_KIND } from "../src/features/magic-context/search-result-locator";
+import { SOURCE_LOCATOR_KIND } from "./retrieval-benchmark/physical-locator";
 import { AUTO_SEARCH_SOURCES } from "../src/hooks/magic-context/auto-search-prompt";
 import {
     type CorpusArtifact,

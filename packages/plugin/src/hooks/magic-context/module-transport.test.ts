@@ -28,6 +28,7 @@ import {
 import {
     __moduleTransportTest,
     buildManagedStartupEnvelope,
+    configureManagedDemandStart,
     McHostModuleTransport,
 } from "./module-transport";
 
@@ -56,6 +57,12 @@ beforeEach(() => {
     peers = [];
     transports = [];
     _resetHarnessForTesting();
+    // The configured demand-start is process-global: the plugin entry point sets
+    // it at boot, so any earlier test file that booted the plugin would leave a
+    // managed owner installed here. Every test in this file that wants a demand
+    // passes one through options, so clearing it keeps this file hermetic
+    // instead of dependent on suite ordering.
+    configureManagedDemandStart(undefined);
     delete process.env.SUBC_MODULE_ID;
     delete process.env.SUBC_LAUNCH_NONCE;
 });

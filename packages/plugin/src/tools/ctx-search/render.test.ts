@@ -11,18 +11,29 @@ import {
     MAX_RENDERED_RESULT_TOKENS,
 } from "../../features/magic-context/search-bounds";
 import { estimateTokens } from "../../shared/token-estimator";
-import { formatSearchResults, packSearchResults } from "./render";
+import { packSearchResults } from "./render";
 
 const SESSION = "session-1";
+
+/** Text-only view of the packer, kept as a local helper so the rendering
+ *  contract tests below stay focused on the emitted text. */
+function formatSearchResults(
+    query: string,
+    results: UnifiedSearchResult[],
+    currentSessionId: string,
+): string {
+    return packSearchResults(query, results, currentSessionId).text;
+}
 
 function memoryResult(id: number, content: string): MemorySearchResult {
     return {
         source: "memory",
         content,
         score: 0.9,
-        memoryId: id,
+        publicClaimId: `mcm_${id}`,
+        revisionLocator: `mcm_${id}/r1/${"0".repeat(64)}`,
         category: "decision",
-        matchType: "fts",
+        matchType: "exact",
     };
 }
 
@@ -62,7 +73,7 @@ describe("boundDynamicField", () => {
     });
 });
 
-describe("formatSearchResults", () => {
+describe("packed search text rendering", () => {
     it("freezes the historical under-budget shape", () => {
         const results: UnifiedSearchResult[] = [
             memoryResult(7, "always use bd for tracking"),
@@ -73,7 +84,7 @@ describe("formatSearchResults", () => {
             [
                 'Found 2 results for "queue":',
                 "",
-                "[1] [memory] score=0.90 id=7 category=decision match=fts",
+                "[1] [memory] score=0.90 id=mcm_7 category=decision match=exact",
                 "always use bd for tracking",
                 "",
                 "[2] [message] score=0.80 ordinal=42 range=39-45 role=user",
@@ -176,22 +187,20 @@ describe("formatSearchResults", () => {
 });
 
 describe("packSearchResults", () => {
-    it("returns text byte-identical to formatSearchResults for under-budget results", () => {
+    it("packs under-budget results with full delivery accounting", () => {
         const results: UnifiedSearchResult[] = [
             memoryResult(7, "always use bd for tracking"),
             messageResult(42, "we discussed queue saturation"),
         ];
         const packed = packSearchResults("queue", results, SESSION);
-        expect(packed.text).toBe(formatSearchResults("queue", results, SESSION));
         expect(packed.delivered).toEqual(results);
         expect(packed.omittedCount).toBe(0);
         expect(packed.reason).toBe("delivered");
         expect(packed.tokenCount).toBe(estimateTokens(packed.text));
     });
 
-    it("returns text byte-identical to formatSearchResults for empty results", () => {
+    it("reports empty results with the empty reason", () => {
         const packed = packSearchResults("nothing", [], SESSION);
-        expect(packed.text).toBe(formatSearchResults("nothing", [], SESSION));
         expect(packed.delivered).toEqual([]);
         expect(packed.omittedCount).toBe(0);
         expect(packed.reason).toBe("empty-results");
@@ -205,7 +214,6 @@ describe("packSearchResults", () => {
             memoryResult(index + 1, `${filler} tail-${index}`),
         );
         const packed = packSearchResults("big", results, SESSION);
-        expect(packed.text).toBe(formatSearchResults("big", results, SESSION));
         expect(packed.reason).toBe("delivered");
         expect(packed.tokenCount).toBe(estimateTokens(packed.text));
         expect(packed.tokenCount).toBeLessThanOrEqual(MAX_RENDERED_RESULT_TOKENS);
@@ -216,10 +224,11 @@ describe("packSearchResults", () => {
         expect(packed.omittedCount).toBe(50 - shownBlocks);
         // Delivered blocks are fully rendered; omitted blocks are fully absent.
         for (const delivered of results.slice(0, shownBlocks)) {
-            expect(packed.text).toContain(`id=${delivered.memoryId}`);
+            expect(packed.text).toContain(`id=${delivered.publicClaimId}`);
         }
-        for (const omitted of results.slice(shownBlocks)) {
-            expect(packed.text).not.toContain(`tail-${omitted.memoryId - 1}`);
+        for (const [index, omitted] of results.slice(shownBlocks).entries()) {
+            void omitted;
+            expect(packed.text).not.toContain(`tail-${shownBlocks + index}`);
         }
     });
 });
