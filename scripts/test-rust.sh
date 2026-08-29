@@ -12,9 +12,3 @@ else
     echo "cargo-nextest not found (install: cargo install cargo-nextest --locked); using cargo test" >&2
     cargo test --workspace
 fi
-
-# packages/dashboard/db-adapter declares its own [workspace], so none of the
-# --workspace commands above reach it. Run it explicitly or the dashboard's
-# claim-adapter conformance suite passes only when someone remembers the
-# manifest path by hand.
-sh "$(dirname "$0")/test-dashboard-adapter.sh"

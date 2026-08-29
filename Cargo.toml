@@ -5,7 +5,7 @@ members = ["crates/mc-core", "crates/mc-store", "crates/mc-host", "crates/mc-mod
 # sibling sources, so it must never join this workspace's dependency graph.
 # The cargo-fuzz workspace under crates/mc-shm-transport/fuzz declares its own
 # [workspace] and stays excluded here.
-exclude = ["packages/dashboard/src-tauri", "docs/evidence/subc-surface-probe", "crates/mc-shm-transport/fuzz"]
+exclude = ["docs/evidence/subc-surface-probe", "crates/mc-shm-transport/fuzz"]
 
 [workspace.dependencies]
 # CortexKit cache-stability core + storage substrate. Sibling path-deps for local
