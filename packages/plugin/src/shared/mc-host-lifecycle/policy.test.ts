@@ -343,6 +343,75 @@ describe("native invocation mapping", () => {
         }
     });
 
+    test("a failing readiness probe keeps the observation it already proved", async () => {
+        // The native probe child already answered and was validated, so a
+        // readiness failure on top of it must not be reported as an internal
+        // error for a daemon this call verifiably observed. Same rule the
+        // storage probe follows: degrade, never erase a successful observation.
+        const root = tempDir("mc-policy-readiness-failure-");
+        const { binary } = fakeBinary(root);
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                readinessProbe: async () => {
+                    throw new Error("route collapsed mid-probe");
+                },
+            });
+            for (const result of [await policy.status(), await policy.doctor()]) {
+                expect(result.ok).toBe(true);
+                expect(result.state).toBe("running");
+                expect(result.reason).not.toBe("internal_error");
+                // The native result's own readiness survives untouched, and no
+                // probe-derived component is invented on top of it.
+                expect(result.readiness?.storage).toBeUndefined();
+                expect(result.readiness?.synapse).toBeUndefined();
+                expect(result.checks.some((check) => check.id.startsWith("readiness."))).toBe(
+                    false,
+                );
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("the readiness probe is bounded by what the probe child left of the aggregate", async () => {
+        // The aggregate is a request-to-transport bound shared with the child, so
+        // the probe gets the residual rather than a fresh full budget. The floor
+        // is also load-bearing: it must never hand out a token 1ms budget, which
+        // would start a probe that can only fail.
+        const root = tempDir("mc-policy-readiness-residual-");
+        const CHILD_MS = 1_000;
+        const AGGREGATE_MS = 20_000;
+        const { binary } = fakeBinary(root, { sleepSeconds: CHILD_MS / 1_000 });
+        const budgets: number[] = [];
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                outerAggregateMs: AGGREGATE_MS,
+                readinessProbe: async (budgetMs) => {
+                    budgets.push(budgetMs);
+                    return {
+                        authenticatedDaemonVersion: "mc-host/0.1.0",
+                        readiness: {
+                            transport: { state: "ready", reason: "healthy" },
+                        },
+                    };
+                },
+            });
+            const result = await policy.status();
+            expect(result.ok).toBe(true);
+            expect(budgets).toHaveLength(1);
+            // The child's second of runtime came out of the aggregate.
+            expect(budgets[0]).toBeLessThan(AGGREGATE_MS - CHILD_MS + 1);
+            // And a real budget was handed over, not the old 1ms floor.
+            expect(budgets[0]).toBeGreaterThan(1);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 20_000);
+
     test("the reported readiness reason follows contract precedence, not check-id order", async () => {
         const root = tempDir("mc-policy-readiness-precedence-");
         const { binary } = fakeBinary(root);

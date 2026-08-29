@@ -95,7 +95,22 @@ async function probeManagedReadiness(root: string, budgetMs: number): Promise<Ob
                     }
                   : synapseState === "starting"
                     ? { state: "starting" as const, reason: "synapse_starting" as const }
-                    : { state: "degraded" as const, reason: "synapse_degraded" as const };
+                    : synapseState === undefined
+                      ? // The status payload omits a component whose state it
+                        // cannot report: the daemon skips any module missing from
+                        // `components`, missing a usable `status`, or missing its
+                        // state key. Absence means the lane is not offered, so it
+                        // reports `unsupported` — the one non-failing readiness
+                        // state, which `addCheck` maps to a skipped check. Calling
+                        // it `degraded` would make `status` and `doctor` answer
+                        // `ok: false` for a daemon that is serving correctly and
+                        // simply has no Synapse lane, which is the normal shape on
+                        // every platform the model lane does not cover.
+                        {
+                            state: "unsupported" as const,
+                            reason: "synapse_unsupported" as const,
+                        }
+                      : { state: "degraded" as const, reason: "synapse_degraded" as const };
         return {
             authenticatedDaemonVersion: authenticated.daemonVer,
             readiness: {

@@ -598,8 +598,21 @@ export class McHostLifecyclePolicy {
             }
             // The readiness probe shares the command's aggregate with the probe
             // child that just ran, so it gets only what that child left behind.
+            // An exhausted budget means there is nothing left to observe with:
+            // granting a 1ms floor would start a probe that can only fail.
             const remaining = preflight.deadlineMs - (monotonicNow() - startedAt);
-            const observed = await this.readinessProbe(Math.max(1, remaining));
+            if (remaining <= 0) return relabeled;
+            // A readiness failure must not erase an observation that already
+            // succeeded. Letting it reach the outer `catch` would answer
+            // `internal_error` for a daemon this call verifiably observed, so it
+            // degrades to the native result — the same rule `boundedStorageProbe`
+            // applies to a storage probe that expires or throws.
+            let observed: ObservationalHealth;
+            try {
+                observed = await this.readinessProbe(remaining);
+            } catch {
+                return relabeled;
+            }
             const checks: DaemonCheck[] = [...relabeled.checks];
             const addCheck = (
                 id: "readiness.transport" | "readiness.storage" | "readiness.synapse",

@@ -744,11 +744,30 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 "managed Synapse demand recently failed; backing off",
             );
         }
-        const outcome = await this.demandStart({
-            origin: this.connectionOrigin,
-            capability: "synapse",
-            deadlineMs: SYNAPSE_DEMAND_STARTUP_BUDGET_MS,
-        });
+        // A rejection arms the same backoff as a negative outcome. The shared
+        // owner signals failure both ways: it resolves `ok: false`, and it
+        // rejects when the start blows the budget or fails outright. Only the
+        // resolved path used to arm the backoff, so a rejection left the window
+        // stale and every later embed call demanded another native lifecycle
+        // invocation — exactly what the backoff exists to prevent. No abort
+        // signal is passed and the deadline is a fixed positive budget, so a
+        // detach here means the start really did exhaust it.
+        let outcome: Awaited<ReturnType<SynapseDemandStart>>;
+        try {
+            outcome = await this.demandStart({
+                origin: this.connectionOrigin,
+                capability: "synapse",
+                deadlineMs: SYNAPSE_DEMAND_STARTUP_BUDGET_MS,
+            });
+        } catch (error) {
+            this.demandFailedUntilMs = Date.now() + SYNAPSE_DEMAND_RETRY_BACKOFF_MS;
+            if (error instanceof SynapseEmbeddingError) throw error;
+            throw new SynapseEmbeddingError(
+                "transport",
+                `managed Synapse demand failed: ${error instanceof Error ? error.message : String(error)}`,
+                { cause: error },
+            );
+        }
         if (!outcome.ok) {
             this.demandFailedUntilMs = Date.now() + SYNAPSE_DEMAND_RETRY_BACKOFF_MS;
             throw new SynapseEmbeddingError(

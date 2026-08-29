@@ -310,20 +310,36 @@ export interface AdmissionIo {
 
 // Reading the darwin mount table spawns /sbin/mount synchronously, and
 // admission runs on every lifecycle command reached from request-driven
-// demand-start. The verdict-relevant mounts (the data root's filesystem) are
-// process-lifetime stable for admission purposes, so one read serves the
-// process instead of blocking the event loop per demand.
+// demand-start, and spawning `/sbin/mount` per demand would block the event
+// loop each time. The read is therefore cached, but only briefly: the mount
+// table is not process-lifetime stable, because a volume can be mounted after
+// the first read. A data root on a volume mounted later would otherwise never
+// match its own mount, `longestMountFor` would fall back to `/` — apfs and
+// local, so admissible — and an unsupported filesystem would be admitted. The
+// window bounds that staleness while still collapsing a burst of demands onto
+// one spawn. Measured on a monotonic timeline so a wall-clock step cannot
+// stretch it.
+const DARWIN_MOUNTS_CACHE_TTL_MS = 1_000;
+
 let cachedDarwinMounts: string | undefined;
+let cachedDarwinMountsAt = 0;
 
 const defaultAdmissionIo: AdmissionIo = {
     platform: process.platform,
     readMounts: () => {
         if (process.platform !== "darwin") return readFileSync("/proc/self/mounts", "utf8");
-        cachedDarwinMounts ??= execFileSync("/sbin/mount", [], {
-            encoding: "utf8",
-            timeout: 2_000,
-            maxBuffer: 1024 * 1024,
-        });
+        const now = performance.now();
+        if (
+            cachedDarwinMounts === undefined ||
+            now - cachedDarwinMountsAt >= DARWIN_MOUNTS_CACHE_TTL_MS
+        ) {
+            cachedDarwinMounts = execFileSync("/sbin/mount", [], {
+                encoding: "utf8",
+                timeout: 2_000,
+                maxBuffer: 1024 * 1024,
+            });
+            cachedDarwinMountsAt = now;
+        }
         return cachedDarwinMounts;
     },
     realpath: nativeRealpath,
