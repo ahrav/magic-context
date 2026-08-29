@@ -185,6 +185,10 @@ impl LauncherEnvelope {
     ) -> Result<PreparedLauncherEnvelope, &'static str> {
         let closure_root = data_dir.join("cortexkit").join("mc-host-harness-closures");
         let store = HarnessClosureStore::open(&closure_root).ok();
+        // One memo for the whole call: the recorded selection, the supplied
+        // candidates, and the merged selection routinely name the same digests,
+        // and each `validate` re-hashes the entire closure tree.
+        let mut validator = ClosureValidator::new(store.as_ref());
         let running = matches!(mode, SelectionMode::Running { .. });
         let (previous, mut credential_identities, require_previous_credentials) = match mode {
             SelectionMode::Fresh => {
@@ -192,7 +196,7 @@ impl LauncherEnvelope {
                 // (its cited closure no longer qualified or validatable) is
                 // tolerated here: the commit that follows a successful start
                 // replaces the file. Hostile or unsupported shapes still fail.
-                read_selection(&closure_root, store.as_ref())?;
+                read_selection(&closure_root, &mut validator)?;
                 (
                     HarnessSelection {
                         schema: 1,
@@ -206,7 +210,7 @@ impl LauncherEnvelope {
                 credential_identity_key,
                 require_previous_credentials,
             } => (
-                match read_selection(&closure_root, store.as_ref())? {
+                match read_selection(&closure_root, &mut validator)? {
                     SelectionState::Active(previous) => previous,
                     SelectionState::Absent => HarnessSelection {
                         schema: 1,
@@ -227,8 +231,8 @@ impl LauncherEnvelope {
         }
         let supplied_opencode = self.opencode.is_some();
         let supplied_pi = self.pi.is_some();
-        let opencode_candidate = materialize_snapshot("opencode", self.opencode, store.as_ref());
-        let pi_candidate = materialize_snapshot("pi", self.pi, store.as_ref());
+        let opencode_candidate = materialize_snapshot("opencode", self.opencode, &mut validator);
+        let pi_candidate = materialize_snapshot("pi", self.pi, &mut validator);
         if running
             && ((supplied_opencode
                 && matches!(
@@ -259,9 +263,9 @@ impl LauncherEnvelope {
             "opencode",
             selection.opencode.as_deref(),
             opencode_candidate,
-            store.as_ref(),
+            &mut validator,
         );
-        let pi = selected_snapshot("pi", selection.pi.as_deref(), pi_candidate, store.as_ref());
+        let pi = selected_snapshot("pi", selection.pi.as_deref(), pi_candidate, &mut validator);
         Ok(PreparedLauncherEnvelope {
             data_dir,
             closure_root,
@@ -436,10 +440,63 @@ fn qualified_manifest(harness: &str, expected_digest: &str) -> Option<ClosureMan
     Some(manifest)
 }
 
+/// One `prepare()`-scoped memo over `HarnessClosureStore::validate`.
+///
+/// `validate` re-opens and re-hashes the whole closure tree on every call, and
+/// a single `prepare()` asks the same question up to three times about the same
+/// digest: once in `read_selection` to classify the recorded selection, once
+/// inside `HarnessClosureStore::materialize`, and once in `selected_snapshot`
+/// for the merged selection. With the committed closures totalling hundreds of
+/// megabytes across thousands of files, and `start`/`stop` holding the
+/// exclusive lifecycle lock across the call, that repetition is the dominant
+/// cost of a demand-start against an already-running daemon.
+///
+/// Memoizing is sound only because the store is immutable for the lifetime of
+/// one `prepare()`: it is keyed by content digest, the process holds the
+/// lifecycle transaction lock, and a digest that validated once cannot become
+/// invalid without a concurrent writer the lock excludes.
+struct ClosureValidator<'a> {
+    store: Option<&'a HarnessClosureStore>,
+    validated: BTreeMap<String, bool>,
+}
+
+impl<'a> ClosureValidator<'a> {
+    fn new(store: Option<&'a HarnessClosureStore>) -> Self {
+        Self {
+            store,
+            validated: BTreeMap::new(),
+        }
+    }
+
+    fn store(&self) -> Option<&'a HarnessClosureStore> {
+        self.store
+    }
+
+    /// Whether `digest` names a closure this binary can validate, hashing the
+    /// tree at most once per digest.
+    fn is_valid(&mut self, digest: &str) -> bool {
+        if let Some(known) = self.validated.get(digest) {
+            return *known;
+        }
+        let valid = self
+            .store
+            .and_then(|store| store.validate(digest).ok())
+            .is_some();
+        self.validated.insert(digest.to_owned(), valid);
+        valid
+    }
+
+    /// Records a digest proven valid by a successful `materialize`, so the
+    /// `selected_snapshot` pass over the same digest does not re-hash it.
+    fn note_valid(&mut self, digest: &str) {
+        self.validated.insert(digest.to_owned(), true);
+    }
+}
+
 fn materialize_snapshot(
     harness: &str,
     candidate: Option<HarnessCandidate>,
-    store: Option<&HarnessClosureStore>,
+    validator: &mut ClosureValidator<'_>,
 ) -> Option<HarnessSnapshot> {
     let candidate = candidate?;
     let Some(manifest) = qualified_manifest(harness, &candidate.manifest_sha256) else {
@@ -447,19 +504,30 @@ fn materialize_snapshot(
             reason: "descriptor_invalid".to_owned(),
         });
     };
-    let Some(store) = store else {
+    let Some(store) = validator.store() else {
         return Some(HarnessSnapshot::Unavailable {
             reason: "closure_incomplete".to_owned(),
         });
     };
+    // A digest already proven valid in this `prepare()` needs no second pass:
+    // `materialize` itself short-circuits on `validate`, so reusing the memo is
+    // the same decision without re-hashing the tree.
+    if validator.is_valid(&candidate.manifest_sha256) {
+        return Some(HarnessSnapshot::Ready {
+            manifest_sha256: candidate.manifest_sha256,
+        });
+    }
     let closure = ClosureCandidate {
         manifest,
         source_roots: candidate.source_roots,
     };
     match store.materialize(&closure) {
-        Ok(validated) => Some(HarnessSnapshot::Ready {
-            manifest_sha256: validated.digest().to_owned(),
-        }),
+        Ok(validated) => {
+            validator.note_valid(validated.digest());
+            Some(HarnessSnapshot::Ready {
+                manifest_sha256: validated.digest().to_owned(),
+            })
+        }
         Err(_) => Some(HarnessSnapshot::Unavailable {
             reason: "closure_incomplete".to_owned(),
         }),
@@ -470,17 +538,13 @@ fn selected_snapshot(
     harness: &str,
     digest: Option<&str>,
     candidate: Option<HarnessSnapshot>,
-    store: Option<&HarnessClosureStore>,
+    validator: &mut ClosureValidator<'_>,
 ) -> Option<HarnessSnapshot> {
     if matches!(candidate, Some(HarnessSnapshot::Unavailable { .. })) {
         return candidate;
     }
     let digest = digest?;
-    if qualified_manifest(harness, digest).is_none()
-        || store
-            .and_then(|store| store.validate(digest).ok())
-            .is_none()
-    {
+    if qualified_manifest(harness, digest).is_none() || !validator.is_valid(digest) {
         return Some(HarnessSnapshot::Unavailable {
             reason: "closure_incomplete".to_owned(),
         });
@@ -512,7 +576,7 @@ enum SelectionState {
 
 fn read_selection(
     closure_root: &Path,
-    store: Option<&HarnessClosureStore>,
+    validator: &mut ClosureValidator<'_>,
 ) -> Result<SelectionState, &'static str> {
     let path = closure_root.join(ACTIVE_HARNESS_SELECTION);
     let mut file = match std::fs::OpenOptions::new()
@@ -566,11 +630,7 @@ fn read_selection(
         ("pi", selection.pi.as_deref()),
     ] {
         if let Some(digest) = digest {
-            if qualified_manifest(harness, digest).is_none()
-                || store
-                    .and_then(|store| store.validate(digest).ok())
-                    .is_none()
-            {
+            if qualified_manifest(harness, digest).is_none() || !validator.is_valid(digest) {
                 return Ok(SelectionState::Stale);
             }
         }
@@ -644,7 +704,11 @@ pub fn clear_active_selection() -> Result<(), &'static str> {
     // state once the owner decided to clear it. Only hostile shapes and
     // schemas owned by a newer binary keep failing, preserving the file as
     // evidence for the binary that understands it.
-    read_selection(&closure_root, Some(&store))?;
+    read_selection(&closure_root, &mut ClosureValidator::new(Some(&store)))?;
+    #[cfg(debug_assertions)]
+    if std::env::var_os("CK_MC_HOST_TEST_FAIL_SELECTION_REMOVAL").is_some() {
+        return Err("injected active selection removal failure");
+    }
     match std::fs::remove_file(path) {
         Ok(()) => std::fs::File::open(closure_root)
             .and_then(|dir| dir.sync_all())
@@ -1046,7 +1110,9 @@ mod tests {
             credential_identities: credential_identities(&credentials, &[11; 32]),
         };
         write_selection(root.path(), &selection).expect("write selection");
-        let loaded = match read_selection(root.path(), Some(&store)).expect("read selection") {
+        let loaded = match read_selection(root.path(), &mut ClosureValidator::new(Some(&store)))
+            .expect("read selection")
+        {
             SelectionState::Active(loaded) => loaded,
             _ => panic!("a committed selection must read back as active"),
         };
@@ -1089,7 +1155,8 @@ mod tests {
         plant_stale_selection(&closure_root);
         let store = HarnessClosureStore::open(&closure_root).expect("closure store");
         assert!(matches!(
-            read_selection(&closure_root, Some(&store)).expect("stale selection reads"),
+            read_selection(&closure_root, &mut ClosureValidator::new(Some(&store)))
+                .expect("stale selection reads"),
             SelectionState::Stale
         ));
     }
@@ -1125,5 +1192,39 @@ mod tests {
             Err(reason) => assert_eq!(reason, "active harness selection is stale"),
             Ok(_) => panic!("running merge must refuse a stale selection"),
         }
+    }
+
+    /// `HarnessClosureStore::validate` re-hashes the whole closure tree, and one
+    /// `prepare()` asks about the same digest up to three times. The memo must
+    /// answer identically while consulting the store only once per digest,
+    /// including for the negative answer: an unqualified digest that re-hashed
+    /// on every ask is what made a demand-start against an already-running
+    /// daemon pay for the closure set two to three times over.
+    #[test]
+    fn the_closure_validator_answers_each_digest_once() {
+        let root = tempfile::tempdir().expect("closure root");
+        let closure_root = root.path().join("closures");
+        std::fs::create_dir_all(&closure_root).expect("closure root");
+        std::fs::set_permissions(&closure_root, std::fs::Permissions::from_mode(0o700))
+            .expect("closure root mode");
+        let store = HarnessClosureStore::open(&closure_root).expect("closure store");
+        let absent = "f".repeat(64);
+
+        let mut validator = ClosureValidator::new(Some(&store));
+        assert!(!validator.is_valid(&absent));
+        assert!(!validator.is_valid(&absent));
+        assert_eq!(validator.validated.len(), 1);
+        assert_eq!(validator.validated.get(&absent), Some(&false));
+
+        // A digest proven valid by `materialize` is recorded, so the later
+        // `selected_snapshot` pass over the merged selection reuses it.
+        validator.note_valid(&absent);
+        assert!(validator.is_valid(&absent));
+        assert_eq!(validator.validated.len(), 1);
+
+        // Absent stores answer negatively without consulting anything.
+        let mut storeless = ClosureValidator::new(None);
+        assert!(!storeless.is_valid(&absent));
+        assert!(storeless.store().is_none());
     }
 }

@@ -781,6 +781,29 @@ fn credentialed_restart_is_explicit_exact_and_clears_stale_selection() {
         !selection.exists(),
         "stop must clear a stale selection citing an unqualified closure"
     );
+
+    // Selector cleanup is best-effort stale-state removal, so its failure must
+    // not restate the lifecycle state. The host is stopped; reporting `wedged`
+    // sent callers into wedged recovery against a daemon that is not running
+    // and contradicted the next probe. Only `ok`/`reason` carry the fault.
+    std::fs::write(&selection, b"{\"schema\":1}").expect("cleanup-failure fixture");
+    std::fs::set_permissions(&selection, std::fs::Permissions::from_mode(0o600))
+        .expect("cleanup-failure mode");
+    let cleanup_failed = run_with_envelope_and_env(
+        &data,
+        &["stop"],
+        None,
+        &[("CK_MC_HOST_TEST_FAIL_SELECTION_REMOVAL", "1")],
+    );
+    assert_eq!(cleanup_failed.code, 1);
+    assert_result(
+        &cleanup_failed.json(),
+        "stop",
+        false,
+        "stopped",
+        "internal_error",
+    );
+    std::fs::remove_file(&selection).expect("cleanup-failure fixture removal");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
