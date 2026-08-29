@@ -417,6 +417,29 @@ jobs:
       - name: Run the invalid-state mutation battery
         run: bun packages/e2e-tests/scripts/run-historian-eval.ts --mutations
 
+  # Keep this credential-free lane independent from unrelated jobs. Without a
+  # standalone job, an upstream failure could skip every dreamer eval contract.
+  dreamer-eval-contracts:
+    name: Dreamer eval lane contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Dreamer eval unit contracts
+        run: bun run test:dreamer-eval-unit
+
   mc-host-client-interop:
     name: mc-host client interop (Bun + Node 24)
     runs-on: ubuntu-latest

@@ -1,0 +1,75 @@
+# Dreamer manifest eval lane: live scenario runs.
+#
+# Deterministic contract, scorer, seeder, mutation, variance, and runner tests
+# run per PR in ci.yml without credentials. Live model calls run only here.
+name: dreamer-eval
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, offset from the historian eval schedule.
+    - cron: "17 5 * * 3"
+
+permissions:
+  contents: read
+
+jobs:
+  live-lane:
+    # A branch dispatch could rewrite a package lifecycle script and exfiltrate
+    # secrets, so manual runs are restricted to the default branch.
+    if: >-
+      github.event_name == 'schedule' ||
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    concurrency:
+      group: dreamer-eval-live
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0"
+
+      - name: Install workspace deps
+        run: bun install --frozen-lockfile
+
+      # Fail before installing the live harness or exposing provider secrets.
+      - name: Gate the deterministic lane
+        run: |
+          bun run test:dreamer-eval-unit
+          bun run --cwd packages/e2e-tests typecheck
+
+      - name: Install opencode
+        run: |
+          curl -fsSL https://opencode.ai/install | bash
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      - name: Record the resolved opencode version
+        run: opencode --version
+
+      - name: Build the plugin the harness loads
+        run: bun run --cwd packages/plugin build
+
+      - name: Run the live lane
+        timeout-minutes: 300
+        env:
+          NODE_ENV: ""
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          DREAMER_EVAL_MODEL: ${{ secrets.DREAMER_EVAL_MODEL }}
+        run: |
+          bun packages/e2e-tests/scripts/run-dreamer-eval.ts \
+            --repeat 3 \
+            --output-dir packages/e2e-tests/artifacts/dreamer-eval
+
+      - name: Archive run reports and variance artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dreamer-eval-report
+          path: packages/e2e-tests/artifacts/dreamer-eval/
+          if-no-files-found: warn
