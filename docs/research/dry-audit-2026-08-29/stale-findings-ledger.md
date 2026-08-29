@@ -33,6 +33,25 @@ tree; later gate runs are interpreted modulo this exact set.
 
 | Finding | Reason |
 |---|---|
+| features T0-1/CC-4 (storage-meta.ts half) | Gate-narrowed: replacing `storage-meta.ts` with three `export *` lines widens its surface by 45 unintended names (declaration-surface diff). Applied the `storage.ts` half only (+1 blessed name, `PendingSessionCleanupRetryResult`). |
+| mc-module T0-2 (test-only `stats` fields) | Stale: four test readers exist at HEAD, not two; `lib.rs` tests also assert `delta_fallback_reason` from the stored stats, and the apply-once path exposes no `cache_stats` alternative. Fields kept. |
+| mc-host F3a / F3b / F3d | Premise fails: `harness_closure.rs` is compiled standalone by `tests/harness_closure.rs` via `#[path]`, so it cannot import `crate::instance`. Only F3c (generation.rs `owner_uid` fold) applied. |
+| hooks O1 (3 of 21 symbols) | Drifted: `hasLoggedCtxReducePermissionDeny`, `markCtxReducePermissionDenyLogged` (consumed by `transform-postprocess-phase.ts`) and `resetNoteNudgeCooldownOnly` (consumed by `hook-handlers.ts`) now have external consumers; kept exported. |
+| docs D2 (`autoresearch-results.tsv`) | Already absent at HEAD; nothing to remove. |
+
+## Wave review dispositions
+
+- Wave 1: independent fresh-context review (claude CLI, print mode) over
+  `b4f75a88..2114cd06`; 20 findings. Fixed in `995e732c`: unused imports,
+  dangling doc comments, three comment rewrites that inverted or weakened
+  meaning, stale mirror references, benchmark header, docs index link, RSS
+  guidance reconciliation, `S_ISVTX` visibility revert, additional stale
+  dashboard-consumer comments. Declined: `export *` barrel revert (covered by
+  the declaration-surface gate), `issue-135-wire-fixtures.ts` rename (not
+  scheduled in Wave 1), `paths.ts` alias collapse (Wave 2c / F-8),
+  `mural-selection.ts` file move (beyond minimal edit), auto-search no-op
+  deletion (F-22 T2 slice, deferred), `MAX_EMERGENCY_REQUEST_BUDGET` doc
+  wording (minor, pre-existing).
 
 ## Guarded skips (report scheduled work the guard forbids)
 
