@@ -1580,8 +1580,18 @@ describe("embedItemsDetailed", () => {
         const db = ledgerDb();
         try {
             const host = new DetailedHost();
+            const daemonIds = [new Uint8Array([1]), new Uint8Array([2])];
+            // One rotation, observed when the retained job's reply reports the
+            // restart. Identity is a function of that generation, not of the
+            // demand count: the lifecycle owner coalesces demands and reports
+            // whichever daemon is live, so every demand raised while recovering
+            // from the same restart must observe the same replacement.
+            let rotated = false;
             host.resultPages = (jobId, items) => {
-                if (jobId === "job-1") return moduleRestartedError();
+                if (jobId === "job-1") {
+                    rotated = true;
+                    return moduleRestartedError();
+                }
                 return {
                     result: {
                         ...ENVELOPE,
@@ -1595,7 +1605,6 @@ describe("embedItemsDetailed", () => {
                 };
             };
             const provider = detailedProvider(host);
-            const daemonIds = [new Uint8Array([1]), new Uint8Array([2])];
             let demands = 0;
             const mutable = provider as unknown as {
                 connectionOrigin: "managed-default";
@@ -1607,12 +1616,15 @@ describe("embedItemsDetailed", () => {
                 }>;
             };
             mutable.connectionOrigin = "managed-default";
-            mutable.demandStart = async () => ({
-                ok: true,
-                reason: "started",
-                storage: null,
-                authenticatedDaemonId: daemonIds[demands++] as Uint8Array,
-            });
+            mutable.demandStart = async () => {
+                demands += 1;
+                return {
+                    ok: true,
+                    reason: "started",
+                    storage: null,
+                    authenticatedDaemonId: (rotated ? daemonIds[1] : daemonIds[0]) as Uint8Array,
+                };
+            };
 
             const result = await provider.embedItemsDetailed(
                 detailedItems([{ id: "memory:1", group: "g1" }]),
@@ -1621,7 +1633,10 @@ describe("embedItemsDetailed", () => {
 
             expect(result.failures).toEqual([]);
             expect(result.receipts).toHaveLength(1);
-            expect(demands).toBe(2);
+            // At least one re-derivation past the initial demand. The exact
+            // count is not pinned: recovery re-certifies at both the page and
+            // the lane, and that split is not this test's contract.
+            expect(demands).toBeGreaterThanOrEqual(2);
             const batches = host.batchCalls();
             expect(batches).toHaveLength(2);
             expect(batches[0].expectedDaemonId).toEqual(daemonIds[0]);
@@ -1764,8 +1779,10 @@ describe("embedItemsDetailed", () => {
         const db = ledgerDb();
         try {
             const host = new DetailedHost();
-            // The submit itself restarts, so the durable restart CAS never
-            // runs and the page's single restart stays unspent.
+            // Every submit restarts: the first restart consumes the one
+            // submission-time rebind and resubmits the same request key; the
+            // second propagates. The durable restart CAS never runs, so the
+            // page's single durable restart stays unspent.
             host.batchError = () => moduleRestartedError();
             const provider = detailedProvider(host);
             const result = await provider.embedItemsDetailed(
@@ -1777,7 +1794,9 @@ describe("embedItemsDetailed", () => {
             expect(result.failures).toHaveLength(1);
             expect(result.failures[0].code).toBe("module_restarted");
             expect(result.failures[0].disposition).toBe("retryable");
-            expect(host.batchCalls()).toHaveLength(1);
+            const batchCalls = host.batchCalls();
+            expect(batchCalls).toHaveLength(2);
+            expect(batchCalls[1].params.request_key).toBe(batchCalls[0].params.request_key);
             const row = ledgerRows(db)[0];
             expect(row.state).toBe("failed");
             expect(row.failure_disposition).toBe("retryable");

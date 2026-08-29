@@ -33,6 +33,7 @@ import {
 import { credentialFingerprints } from "./credential-fingerprint";
 import { armExpiryTimer, Deadline, type MonotonicClock } from "./deadline";
 import {
+    DAEMON_GENERATION_CHANGED_CODE,
     isMcHostCallError,
     McHostCallError,
     McHostClientError,
@@ -562,7 +563,6 @@ export class McHostClient {
         options: RequestOptions = {},
     ): Promise<unknown> {
         const active = this.requireLiveHandle(handle);
-        this.assertExpectedDaemon(active, options.expectedDaemonId);
         const deadline = Deadline.start(options.timeoutMs ?? this.requestTimeoutMs, this.clock);
         const terminal = await this.awaitRequest(active.generation, {
             channel: handle.channel,
@@ -581,7 +581,6 @@ export class McHostClient {
         options: RequestOptions = {},
     ): Promise<ReceiveLease> {
         const active = this.requireLiveHandle(handle);
-        this.assertExpectedDaemon(active, options.expectedDaemonId);
         const deadline = Deadline.start(options.timeoutMs ?? this.requestTimeoutMs, this.clock);
         const terminal = await this.awaitRequest(active.generation, {
             channel: handle.channel,
@@ -614,7 +613,6 @@ export class McHostClient {
         options: RequestOptions & { maxStreamItems?: number } = {},
     ): Promise<Item[]> {
         const active = this.requireLiveHandle(handle);
-        this.assertExpectedDaemon(active, options.expectedDaemonId);
         const deadline = Deadline.start(options.timeoutMs ?? this.requestTimeoutMs, this.clock);
         const terminal = await this.awaitRequest(active.generation, {
             channel: handle.channel,
@@ -668,7 +666,6 @@ export class McHostClient {
             const handle = await this.managedRouteHandle(moduleId, options, deadline);
             try {
                 const active = this.requireLiveHandle(handle);
-                this.assertExpectedDaemon(active, options.expectedDaemonId);
                 const terminal = await this.awaitRequest(active.generation, {
                     channel: handle.channel,
                     epoch: handle.epoch,
@@ -796,7 +793,7 @@ export class McHostClient {
             if (this.closeStarted) throw new McHostClientError("client closed", "client_closed");
             const active = this.active;
             if (active && !active.generation.isRetired()) {
-                this.assertExpectedDaemon(active, expectedDaemonId);
+                this.assertExpectedDaemon(active.generation, expectedDaemonId);
                 return active;
             }
             let flight = this.connecting;
@@ -831,7 +828,7 @@ export class McHostClient {
             // KTD4: adopt only a still-current, non-retired generation; a
             // stale success re-enters recovery under the unchanged stage.
             if (this.active === conn && !conn.generation.isRetired()) {
-                this.assertExpectedDaemon(conn, expectedDaemonId);
+                this.assertExpectedDaemon(conn.generation, expectedDaemonId);
                 return conn;
             }
             if (stage.isExpired()) throw connectionStageError();
@@ -1241,15 +1238,15 @@ export class McHostClient {
     }
 
     private assertExpectedDaemon(
-        connection: ActiveConnection,
+        generation: ConnectionGeneration,
         expectedDaemonId?: Uint8Array,
     ): void {
         if (expectedDaemonId === undefined) return;
-        if (!sameDaemonId(connection.generation.authenticatedDaemonId, expectedDaemonId)) {
+        if (!sameDaemonId(generation.authenticatedDaemonId, expectedDaemonId)) {
             throw new McHostCallError(
                 "not_sent",
                 "authenticated daemon changed after lifecycle compatibility validation",
-                "daemon_generation_changed",
+                DAEMON_GENERATION_CHANGED_CODE,
             );
         }
     }
@@ -1534,6 +1531,10 @@ export class McHostClient {
         generation: ConnectionGeneration,
         params: RequestParams,
     ): Promise<RequestTerminal> {
+        // The one publication choke point every request-shaped method passes
+        // through: the daemon-binding gate runs here, before any byte is
+        // enqueued, so no publisher can forget it.
+        this.assertExpectedDaemon(generation, params.options.expectedDaemonId);
         const signal = params.options.signal;
         const pending: PendingRequest = generation.request({
             channel: params.channel,

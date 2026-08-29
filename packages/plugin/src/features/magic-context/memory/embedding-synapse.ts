@@ -3,7 +3,11 @@ import { join } from "node:path";
 import { getDataDir } from "../../../shared/data-path";
 import { getHarness } from "../../../shared/harness";
 import { log } from "../../../shared/logger";
-import { isMcHostCallError, McHostClient } from "../../../shared/mc-host-client";
+import {
+    DAEMON_GENERATION_CHANGED_CODE,
+    isMcHostCallError,
+    McHostClient,
+} from "../../../shared/mc-host-client";
 import {
     type ConnectionOrigin,
     resolveConnectionOrigin,
@@ -1237,7 +1241,12 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         const deadlineAt = row.deadlineAt ?? Date.now() + timeoutMs;
         try {
             if (row.state === "pending") {
-                const jobId = await this.submitBatchPage(page, requestKey, deadlineAt, signal);
+                const jobId = await this.submitBatchPageWithRebind(
+                    page,
+                    requestKey,
+                    deadlineAt,
+                    signal,
+                );
                 row = markSynapseLedgerPolling(db, {
                     rowId: row.rowId,
                     expectedStateVersion: row.stateVersion,
@@ -1249,7 +1258,12 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 if (!row.jobId) {
                     // A crash between the restart CAS and resubmission leaves a
                     // polling row without a job; resubmit the same page key.
-                    const jobId = await this.submitBatchPage(page, requestKey, deadlineAt, signal);
+                    const jobId = await this.submitBatchPageWithRebind(
+                        page,
+                        requestKey,
+                        deadlineAt,
+                        signal,
+                    );
                     row = recordSynapseLedgerJob(db, {
                         rowId: row.rowId,
                         expectedStateVersion: row.stateVersion,
@@ -1393,6 +1407,31 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
             );
         }
         return jobId;
+    }
+
+    /**
+     * Submit one page, absorbing at most one daemon restart observed at
+     * submission time. A restart during submission is the normal first
+     * symptom after a rotation (`initialize` short-circuits on a live
+     * provider, leaving a stale binding), and the replacement daemon dedupes
+     * by `request_key`, so one rebind-and-resubmit under the page's original
+     * absolute deadline is safe. A second restart propagates to the caller's
+     * disposition handling.
+     */
+    private async submitBatchPageWithRebind(
+        page: readonly { id: string; text: string; contentSha256: string }[],
+        requestKey: string,
+        deadlineAt: number,
+        signal?: AbortSignal,
+    ): Promise<string> {
+        try {
+            return await this.submitBatchPage(page, requestKey, deadlineAt, signal);
+        } catch (error) {
+            const classified = classifyError(error);
+            if (classified.code !== "module_restarted") throw classified;
+            await this.rebindAfterModuleRestart(deadlineAt, signal);
+            return this.submitBatchPage(page, requestKey, deadlineAt, signal);
+        }
     }
 
     private async collectJobPages(

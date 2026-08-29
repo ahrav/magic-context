@@ -15,6 +15,7 @@ import {
     BROCA_CREDENTIAL_NAMES,
     BROCA_CREDENTIAL_ROW_CAP_BYTES,
     BROCA_CREDENTIAL_VALUE_CAP_BYTES,
+    DAEMON_GENERATION_CHANGED_CODE,
     Deadline,
     isConsumerReconnectTransient,
     isMcHostCallError,
@@ -295,7 +296,7 @@ function isConnectionFailure(error: unknown): boolean {
                 "request_deadline",
                 "deadline_exceeded_no_drop_observed",
                 "connection_dropped",
-                "daemon_generation_changed",
+                DAEMON_GENERATION_CHANGED_CODE,
                 "MC_HOST_CONNECTION_BACKOFF",
             ].includes(code) ||
             /\bclient closed\b|\bconnection closed\b|\bclosed the connection\b/i.test(message)
