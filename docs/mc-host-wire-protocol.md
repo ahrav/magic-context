@@ -406,7 +406,7 @@ The Synapse and Broca entries are immutable identity, not readiness: each stays 
 
 ### 7.4 Operation classification
 
-`route.open`, `catalog.list`, `host.shutdown` (Section 7.6), `host.status`, and `transport.negotiate` (Section 7.7) are the only required channel-0 operations. Every other operation receives terminal `unsupported_operation`; host stays connected if framing remains valid. `transport.activate` and `transport.commit` are candidate-channel-only (Section 7.7): on a bootstrap connection they are unrecognized operations and receive terminal `unsupported_operation` like any other. `host.status` reads the last completed host-owned health snapshot; it never invokes a handler callback on the requesting connection and exposes only closed component states and sanitized metrics, never handler detail text.
+`route.open`, `catalog.list`, `host.shutdown` (Section 7.6), `host.status` (Section 7.6), and `transport.negotiate` (Section 7.7) are the only required channel-0 operations. Every other operation receives terminal `unsupported_operation`; host stays connected if framing remains valid. `transport.activate` and `transport.commit` are candidate-channel-only (Section 7.7): on a bootstrap connection they are unrecognized operations and receive terminal `unsupported_operation` like any other. `host.status` reads the last completed host-owned health snapshot; it never invokes a handler callback on the requesting connection and exposes only closed component states and sanitized metrics, never handler detail text.
 
 Canonical error body:
 
@@ -531,7 +531,7 @@ Both languages MUST produce identical bytes: UTF-8 pass-through for non-ASCII, t
 | request-key golden vectors | `crates/mc-host/src/synapse/protocol.rs` (unit tests), `packages/plugin/src/features/magic-context/memory/embedding-synapse.test.ts` (matching TypeScript golden test) |
 | durable ledger recovery, receipts, atomic application | `packages/plugin/src/features/magic-context/migrations-v83.test.ts`, `storage-embedding-measurements.test.ts`, domain writer suites |
 
-### 7.6 `host.shutdown`
+### 7.6 `host.status` and `host.shutdown`
 
 `host.status` is a bearer-authenticated, route-free readiness observation:
 
@@ -548,6 +548,27 @@ snapshot and sends no routed application body. During post-publication
 activation, starting components refresh on a bounded 50 ms cadence; after
 activation settles, polling returns to the configured health interval.
 Handler detail strings are tainted and omitted.
+
+The `magic-context` component additionally carries a sanitized
+`metrics.epochs` object holding exactly these five compatibility epochs, in
+this order:
+
+| epoch | meaning |
+| --- | --- |
+| `memory_render_epoch` | memory render format |
+| `compartment_render_epoch` | compartment render format |
+| `profile_epoch` | serializer profile |
+| `tagger_epoch` | tagger feature |
+| `state_sync_epoch` | state-sync format |
+
+Sanitization is all-or-nothing and admits only the exact set: the object MUST
+carry all five names, no others, and each value MUST be an unsigned integer no
+greater than `u32::MAX`. Any unknown key, missing key, extra key, or
+out-of-range or non-integer value drops the whole `epochs` object from the
+response rather than reporting a partial set. Managed clients treat a missing
+or unequal epoch as a hard compatibility failure, so a host that omits
+`epochs` fails every managed lifecycle gate; adding a sixth epoch is a
+breaking change on both sides, never an additive one.
 
 `host.shutdown` is the authenticated host-global stop. Request and success response are both compact tagged objects; unknown request fields are ignored under the Section 7.1 bounds:
 
@@ -628,10 +649,12 @@ The fallback vocabulary is closed. Fallback always selects the exact offered `tc
 
 | `reason` | Meaning |
 | --- | --- |
-| `unavailable` | no installed provider serves an offered non-TCP transport |
+| `unavailable` | an installed, statically eligible non-TCP offer is dynamically unavailable: provider readiness (`Recovering`/`Quarantined`) or admission pressure. Permanent absence of a provider and statically ineligible offer parameters are NOT `unavailable`; they select TCP with no `reason` |
 | `capability_version_mismatch` | an offered transport is installed but no offered `capability_version` intersects the host's |
 
 A direct TCP selection or a valid TCP selection carrying one of these reasons commits TCP. This preserves explicit negotiated fallback when an optional candidate is unavailable. Negotiation-version mismatch, `unsupported_operation`, `connection_in_use`, timeout, malformed content, an unoffered selection, token mismatch, provider attachment failure, activation or commit failure, channel failure, and base-wire or authentication failure are not fallback evidence and MUST fail closed without same-generation TCP continuation.
+
+Exact `unavailable` is the only selection that authorizes an automatic client re-upgrade probe: the client keeps the committed TCP generation primary and MAY retry a fresh shadow setup (discovery, authentication, negotiation, activation, commit) under one immutable bounded episode deadline, moving only new managed work after a successful commit. A reasonless TCP selection, every other fallback reason, the legacy terminal, and any post-grant failure MUST NOT start or extend that probe window.
 
 #### 7.7.4 Candidate activation and commit
 
