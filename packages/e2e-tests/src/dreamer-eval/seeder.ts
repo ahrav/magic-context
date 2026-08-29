@@ -228,7 +228,10 @@ function prepareFixtureRepository(
     const commitTimeMs = Number.isFinite(firstVerification) ? firstVerification - 2_000 : nowMs - 2_000;
     if (commitTimeMs <= 0) fixtureError("verification timestamps leave no positive fixture commit time");
     const commitDate = new Date(commitTimeMs).toISOString();
-    git(workdir, ["add", "--", FIXTURE_MARKER, ...files.keys()]);
+    // Every path here was explicitly authored and has to be committed for the
+    // evaluation to run, so a fixture-local .gitignore must not suppress one:
+    // without --force `git add` exits nonzero on an ignored path.
+    git(workdir, ["add", "--force", "--", FIXTURE_MARKER, ...files.keys()]);
     git(
         workdir,
         [

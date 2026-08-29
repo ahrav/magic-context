@@ -88,18 +88,35 @@ const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const MIN_VERIFIED_AT_MS = 2_001;
 
 /**
- * Highest verification timestamp the seeder can turn into a commit date.
- * `prepareFixtureRepository` calls `new Date(commitTimeMs).toISOString()`, which
- * throws `RangeError` past the maximum representable Date, so a larger value
- * crashes before any typed seeder check runs.
+ * Latest commit second git will accept: 2099-12-31T23:59:59Z. Git 2.50.1 rejects
+ * 2100-01-01T00:00:00Z with `fatal: invalid date format` in both ISO and raw
+ * `<seconds> <tz>` form, so the ceiling belongs to git's own date handling rather
+ * than to one input spelling — reformatting cannot lift it.
  */
-const MAX_VERIFIED_AT_MS = 8_640_000_000_000_000;
+const MAX_GIT_COMMIT_SECONDS = 4_102_444_799;
+
+/**
+ * Highest verification timestamp a scenario may author. The seeder derives the
+ * fixture commit as the earliest verification minus 2_000 ms and formats it with
+ * second precision, so the last acceptable verification is the final millisecond
+ * of git's last acceptable second, plus that offset. Bounding it here keeps a
+ * `RangeError` from `toISOString` and git's own date rejection out of the run:
+ * both would land before any typed seeder check.
+ */
+const MAX_VERIFIED_AT_MS = (MAX_GIT_COMMIT_SECONDS + 1) * 1_000 + 2_000 - 1;
 
 /**
  * `parseVerifyManifest` ends an update entry at the first literal occurrence of
  * this tag, matched case-sensitively.
  */
 const UPDATE_CLOSE_TAG = "</update>";
+
+/**
+ * `extractCompleteManifestBody` ends the verify body at the first occurrence of
+ * this tag and matches the root case-insensitively, so any case variant cuts the
+ * body short.
+ */
+const VERIFY_ROOT_CLOSE_TAG = "</verify>";
 
 export class DreamerEvalContractError extends Error {
     readonly diagnostics: readonly string[];
@@ -423,6 +440,12 @@ function parseVerifyGold(raw: unknown, label: string, pool: ReadonlyMap<string, 
             if (anchor.includes(UPDATE_CLOSE_TAG)) {
                 fail(`${itemLabel}.requiredUpdateAnchors[${anchorIndex}]: anchor-holds-close-tag`);
             }
+            // The root extraction runs first and is case-insensitive, so any
+            // spelling of the closing root tag truncates the body before the
+            // entry parser sees it.
+            if (anchor.toLowerCase().includes(VERIFY_ROOT_CLOSE_TAG)) {
+                fail(`${itemLabel}.requiredUpdateAnchors[${anchorIndex}]: anchor-holds-root-close-tag`);
+            }
         }
         // Anchors are scored only for an update verdict, so an anchor on any
         // other verdict states a requirement nothing enforces.
@@ -549,6 +572,17 @@ function parseTask(raw: unknown, label: string, pool: ReadonlyMap<string, Scenar
     if (task === "classify-memories" && expectedSkippedClaimIds.length > 0) {
         fail(`${label}.expectedSkippedClaimIds: classify-skips-nothing`);
     }
+    if (task === "classify-memories") {
+        // Recording `stale` or `flagged` sets the claim's stale or disputed
+        // disposition, and the maintenance_hygiene surface admits a claim only
+        // when both are clear. Such a claim leaves the hygiene pool the classify
+        // gate reads, so the whole-pool expectation above can no longer hold.
+        for (const [index, entry] of preconditions.verifications.entries()) {
+            if (entry.outcome === "stale" || entry.outcome === "flagged") {
+                fail(`${label}.preconditions.verifications[${index}].outcome: classify-hidden-disposition`);
+            }
+        }
+    }
     if (task === "verify-broad") {
         if (expectedResultMode !== "broad") fail(`${label}.expectedResultMode: broad-required`);
         // `seedDreamerEvalTask` cannot construct the broad-cycle watermark
@@ -570,18 +604,41 @@ function parseTask(raw: unknown, label: string, pool: ReadonlyMap<string, Scenar
         fail(`${label}.expectedResultMode: verify-mode-unproducible`);
     }
     if (task === "verify" || task === "verify-broad") {
-        // Declaring fixtureFiles does not seed a mapping — only an explicit
-        // mapping precondition does — and the gate keeps a normal claim only
-        // when it has mapped files. An in-scope claim without one is filtered
-        // out, so the task terminates with gate-mismatch before scoring. The
-        // anti-memory category, the one kind the gate admits without a mapping,
-        // is already refused at the claim level.
+        // The gate keeps a normal claim only when it has mapped files, and only
+        // an explicit mapping precondition seeds one — declaring fixtureFiles
+        // does not. The anti-memory category, the one kind admitted without a
+        // mapping, is already refused at the claim level.
         const mappedClaimIds = new Set(
             preconditions.mappings.flatMap((entry) => (entry.files.length > 0 ? [entry.claimId] : [])),
         );
-        for (const [index, claimId] of expectedInScopeClaimIds.entries()) {
-            if (!mappedClaimIds.has(claimId)) {
-                fail(`${label}.expectedInScopeClaimIds[${index}]: verify-scope-unmapped`);
+        // `verifiedAt` reports a timestamp only for a latest outcome of
+        // "verified" and 0 for every other one, and the seeder pins the fixture
+        // commit before every seeded verification with no later file change, so
+        // incremental skips exactly the claims carrying a verified outcome.
+        // Broad re-sweeps all of them, because the seeded watermark sits above
+        // every verification.
+        const verifiedClaimIds = new Set(
+            preconditions.verifications.flatMap((entry) => (entry.outcome === "verified" ? [entry.claimId] : [])),
+        );
+        const derived = [...poolIds].filter(
+            (claimId) =>
+                mappedClaimIds.has(claimId) &&
+                (task === "verify-broad" || !verifiedClaimIds.has(claimId)),
+        );
+        if (!sameSet(expectedInScopeClaimIds, derived)) {
+            fail(`${label}.expectedInScopeClaimIds: verify-scope-mismatch`);
+        }
+    }
+    if (task === "map-memories") {
+        // `selectMapMemoryInputs` always selects a claim with no baseline, and a
+        // mapping precondition is the only thing that creates one — including a
+        // mapping with an empty file set. The converse is not derivable here: a
+        // claim that has a baseline may still be requeued by an independence
+        // heuristic that reads its content and the repository.
+        const seededClaimIds = new Set(preconditions.mappings.map((entry) => entry.claimId));
+        for (const [index, claimId] of expectedSkippedClaimIds.entries()) {
+            if (!seededClaimIds.has(claimId)) {
+                fail(`${label}.expectedSkippedClaimIds[${index}]: map-scope-unmapped`);
             }
         }
     }
@@ -839,9 +896,11 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
     const rawManifest = nullableRawText(root.rawManifest, `${label}.rawManifest`);
     const parsedManifest = parseManifestEvidence(root.parsedManifest, `${label}.parsedManifest`);
     // A scorer reaches PASS only after a nonblank manifest survives validation
-    // and yields parsed evidence, so a PASS carrying neither claims a scored
-    // experiment that left nothing behind to show a model was scored at all.
-    if (status === "PASS" && (rawManifest === null || parsedManifest === null)) {
+    // and yields parsed evidence, so a PASS carrying blank bytes or no evidence
+    // claims a scored experiment with nothing showing a model was scored. Blank
+    // bytes stay retainable on an ERROR report, which is exactly what
+    // ERROR:provider-failure records.
+    if (status === "PASS" && (rawManifest === null || rawManifest.trim().length === 0 || parsedManifest === null)) {
         fail(`${label}.parsedManifest: pass-requires-evidence`);
     }
     return {

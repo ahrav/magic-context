@@ -1,4 +1,5 @@
 import { VERIFY_UPDATE_CONTENT_MAX_LENGTH } from "../../../plugin/src/features/magic-context/dreamer/verify";
+import { hasShareabilitySensitiveText } from "../../../plugin/src/shared/redaction";
 import { isRunFatal } from "./contract";
 import type {
     FailReason,
@@ -165,7 +166,7 @@ function buildUpdateContent(gold: VerifyGoldClaim): string {
         ).repeat(3);
     }
     const joined = gold.requiredUpdateAnchors.join("; ");
-    if (!containsAny(joined, gold.forbiddenUpdateAnchors)) return joined;
+    if (!containsAny(joined, gold.forbiddenUpdateAnchors)) return padEdgeWhitespace(joined, gold);
     const filler = fillerAbsentFrom(
         gold.forbiddenUpdateAnchors,
         "a separator absent from every forbidden update anchor",
@@ -174,7 +175,24 @@ function buildUpdateContent(gold: VerifyGoldClaim): string {
     if (containsAny(spaced, gold.forbiddenUpdateAnchors)) {
         throw new Error("mutation fixture needs update anchors joinable without a forbidden phrase");
     }
-    return spaced;
+    return padEdgeWhitespace(spaced, gold);
+}
+
+/**
+ * Keeps an anchor's own edge whitespace inside the body. `parseVerifyManifest`
+ * trims the body before the scorer runs, so an anchor like `" alpha "` sitting at
+ * the outer edge loses its spaces and the supposedly correct baseline fails —
+ * even though such gold is satisfiable by placing the anchor inside other
+ * content. The pad is a character absent from every forbidden anchor, so it
+ * cannot introduce one, and untouched gold keeps its exact former bytes.
+ */
+function padEdgeWhitespace(content: string, gold: VerifyGoldClaim): string {
+    if (!gold.requiredUpdateAnchors.some((anchor) => anchor !== anchor.trim())) return content;
+    const pad = fillerAbsentFrom(
+        gold.forbiddenUpdateAnchors,
+        "a pad character absent from every forbidden update anchor",
+    );
+    return `${pad}${content}${pad}`;
 }
 
 /**
@@ -338,8 +356,19 @@ function mutationManifest(
             return { task: "classify", manifest: classify.replace(new RegExp(`(claim="${escapeRegExp(claim.publicClaimId)}"[^>]*scope=")${target.scope}`), `$1${wrong}`) };
         }
         case "wrong-shareable": {
-            const target = fixture.classifyGold.claims[0];
-            if (target === undefined) throw new Error("mutation fixture needs classify gold");
+            // Flipping a `false` gold to `true` is a no-op when the claim's
+            // content is sensitive: production forces the reported `true` back to
+            // false, the applied value still matches gold, and the mutation
+            // scores PASS. Either a `true` gold — which the contract only admits
+            // for non-sensitive content — or non-sensitive content keeps the flip
+            // observable.
+            const target = requiredGold(
+                fixture.classifyGold.claims,
+                (entry) =>
+                    entry.shareable ||
+                    !hasShareabilitySensitiveText(claimById(fixture.pool, entry.claimId).content),
+                "a classify gold whose flipped shareability survives the production override",
+            );
             const claim = claimById(fixture.pool, target.claimId);
             return { task: "classify", manifest: classify.replace(new RegExp(`(claim="${escapeRegExp(claim.publicClaimId)}"[^>]*shareable=")${target.shareable}`), `$1${!target.shareable}`) };
         }

@@ -193,6 +193,52 @@ describe("dreamer manifest mutation battery", () => {
         expect(evidence.green).toBe(true);
     });
 
+    test("the shareability mutation avoids a claim the override would rescue", () => {
+        // Sensitive content forces a reported `true` back to false, so flipping a
+        // `false` gold there is invisible and the mutation would score PASS.
+        const fixture = {
+            ...dreamerScorerFixture,
+            pool: {
+                ...dreamerScorerFixture.pool,
+                claims: dreamerScorerFixture.pool.claims.map((claim) =>
+                    claim.claimId === "claim-true"
+                        ? { ...claim, content: "The box answers on 127.0.0.1:8080 for local runs." }
+                        : claim,
+                ),
+            },
+            classifyGold: {
+                kind: "classify" as const,
+                claims: dreamerScorerFixture.classifyGold.claims.map((claim) =>
+                    claim.claimId === "claim-true" ? { ...claim, shareable: false } : claim,
+                ),
+            },
+        };
+        const evidence = runMutationBattery(fixture);
+        expect(evidence.results.find((entry) => entry.mutationClass === "wrong-shareable")).toMatchObject({
+            green: true,
+            actualStage: "scored",
+            actualReason: "wrong-classification",
+        });
+        expect(evidence.green).toBe(true);
+    });
+
+    test("an anchor's edge whitespace survives the parser's trim", () => {
+        // The parser trims the body, so an anchor with meaningful edge spaces at
+        // the outer edge of the baseline would be destroyed before scoring.
+        const fixture = {
+            ...dreamerScorerFixture,
+            verifyGold: {
+                kind: "verify" as const,
+                claims: dreamerScorerFixture.verifyGold.claims.map((claim) =>
+                    claim.verdict === "update"
+                        ? { ...claim, requiredUpdateAnchors: [" alpha "], forbiddenUpdateAnchors: ["2048 entries"] }
+                        : claim,
+                ),
+            },
+        };
+        expect(runMutationBattery(fixture).green).toBe(true);
+    });
+
     test("a single-file map gold still yields a changed manifest", () => {
         const fixture = {
             ...dreamerScorerFixture,

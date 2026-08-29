@@ -412,6 +412,47 @@ describe("dreamer eval seeder", () => {
         ).rejects.toThrow("differ only by case");
     });
 
+    test("an authored gitignore cannot suppress another fixture file", async () => {
+        const selectedScenario = scenario("verify");
+        // Without --force, `git add` exits nonzero on the ignored path and the
+        // scenario cannot be seeded at all.
+        selectedScenario.pool.claims[0]!.fixtureFiles = [
+            { path: ".gitignore", content: "src/current.ts\n" },
+        ];
+        selectedScenario.tasks[0]!.preconditions.mappings = selectedScenario.tasks[0]!.preconditions.mappings.map(
+            (mapping) => (mapping.claimId === "claim-0" ? { ...mapping, files: [".gitignore"] } : mapping),
+        );
+
+        const result = await seedDreamerEvalTask({
+            db: database(),
+            scenario: selectedScenario,
+            task: selectedScenario.tasks[0]!,
+            workdir: workdir(),
+        });
+
+        expect(result.pool.claims).toHaveLength(10);
+        assertFixtureFilesCommitted(result.workdir, [".gitignore", "src/current.ts"]);
+    });
+
+    test("the contract's latest verification timestamp still seeds", async () => {
+        const selectedScenario = scenario("verify");
+        // The exact ceiling the contract admits: one millisecond more derives a
+        // commit second git rejects outright.
+        const latestAuthorable = 4_102_444_801_999;
+        selectedScenario.tasks[0]!.preconditions.verifications = [
+            { claimId: "claim-8", outcome: "verified", verifiedAt: latestAuthorable },
+        ];
+
+        const result = await seedDreamerEvalTask({
+            db: database(),
+            scenario: selectedScenario,
+            task: selectedScenario.tasks[0]!,
+            workdir: workdir(),
+        });
+
+        expect(result.fixtureCommitTimeMs).toBe(4_102_444_799_000);
+    });
+
     test("reports a result mode the production gate did not return", async () => {
         const selectedScenario = scenario("verify");
         const selectedTask = selectedScenario.tasks[0]!;

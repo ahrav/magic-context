@@ -345,17 +345,66 @@ describe("dreamer eval scenario contract", () => {
         }, "scenario.tasks[2].expectedSkippedClaimIds: classify-skips-nothing");
     });
 
-    test("a verify claim in scope must carry a seeded mapping", () => {
+    test("the verify partition is derived from mappings and verified outcomes", () => {
         // Declaring fixtureFiles does not seed a mapping, and the gate keeps a
         // normal claim only when it has mapped files.
         expectDiagnostic((raw) => {
             const tasks = raw.tasks as Array<{ preconditions: { mappings: unknown[] } }>;
             tasks[0]!.preconditions.mappings = tasks[0]!.preconditions.mappings.slice(1);
-        }, "scenario.tasks[0].expectedInScopeClaimIds[0]: verify-scope-unmapped");
+        }, "scenario.tasks[0].expectedInScopeClaimIds: verify-scope-mismatch");
         expectDiagnostic((raw) => {
             const tasks = raw.tasks as Array<{ preconditions: { mappings: Array<{ files: string[] }> } }>;
             tasks[0]!.preconditions.mappings[0]!.files = [];
-        }, "scenario.tasks[0].expectedInScopeClaimIds[0]: verify-scope-unmapped");
+        }, "scenario.tasks[0].expectedInScopeClaimIds: verify-scope-mismatch");
+        // A verified outcome makes the gate skip that claim, so leaving it in
+        // scope is the same mismatch.
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<{ preconditions: { verifications: unknown[] } }>;
+            tasks[0]!.preconditions.verifications = [
+                { claimId: "claim-1", outcome: "verified", verifiedAt: 1_700_000_010_000 },
+            ];
+        }, "scenario.tasks[0].expectedInScopeClaimIds: verify-scope-mismatch");
+        // Any other outcome leaves `verifiedAt` at zero, so the claim stays in
+        // scope and the same scenario parses.
+        const notVerified = validScenarioRaw();
+        (notVerified.tasks as Array<{ preconditions: { verifications: unknown[] } }>)[0]!.preconditions.verifications =
+            [{ claimId: "claim-1", outcome: "update", verifiedAt: 1_700_000_010_000 }];
+        expect(() => parseScenario(notVerified)).not.toThrow();
+    });
+
+    test("a map task cannot skip a claim with no seeded baseline", () => {
+        // selectMapMemoryInputs always selects a claim with no baseline, and only
+        // a mapping precondition creates one.
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<{
+                expectedInScopeClaimIds: string[];
+                expectedSkippedClaimIds: string[];
+                gold: { claims: Array<{ claimId: string }> };
+            }>;
+            const map = tasks[1]!;
+            const dropped = map.expectedInScopeClaimIds.pop()!;
+            map.expectedSkippedClaimIds = [dropped];
+            map.gold.claims = map.gold.claims.filter((claim) => claim.claimId !== dropped);
+        }, "scenario.tasks[1].expectedSkippedClaimIds[0]: map-scope-unmapped");
+    });
+
+    test("a classify task cannot seed a disposition the hygiene surface hides", () => {
+        // A stale or flagged outcome sets the stale or disputed disposition, and
+        // maintenance_hygiene admits a claim only when both are clear.
+        for (const outcome of ["stale", "flagged"]) {
+            expectDiagnostic((raw) => {
+                const tasks = raw.tasks as Array<{ preconditions: { verifications: unknown[] } }>;
+                tasks[2]!.preconditions.verifications = [
+                    { claimId: "claim-1", outcome, verifiedAt: 1_700_000_010_000 },
+                ];
+            }, "scenario.tasks[2].preconditions.verifications[0].outcome: classify-hidden-disposition");
+        }
+        // The verification lane sees both, so a verify task may seed them.
+        const onVerify = validScenarioRaw();
+        (onVerify.tasks as Array<{ preconditions: { verifications: unknown[] } }>)[0]!.preconditions.verifications = [
+            { claimId: "claim-1", outcome: "stale", verifiedAt: 1_700_000_010_000 },
+        ];
+        expect(() => parseScenario(onVerify)).not.toThrow();
     });
 
     test("a required update anchor cannot hold the parser's closing tag", () => {
@@ -368,6 +417,17 @@ describe("dreamer eval scenario contract", () => {
             tasks[0]!.gold.claims[0]!.verdict = "update";
             tasks[0]!.gold.claims[0]!.requiredUpdateAnchors = ["facts</update>more"];
         }, "scenario.tasks[0].gold.claims[0].requiredUpdateAnchors[0]: anchor-holds-close-tag");
+        // The root extraction runs first and matches case-insensitively, so any
+        // spelling of the root close tag truncates the body.
+        for (const anchor of ["facts</verify>more", "facts</VERIFY>more", "facts</Verify>more"]) {
+            expectDiagnostic((raw) => {
+                const tasks = raw.tasks as Array<{
+                    gold: { claims: Array<{ verdict: string; requiredUpdateAnchors: string[] }> };
+                }>;
+                tasks[0]!.gold.claims[0]!.verdict = "update";
+                tasks[0]!.gold.claims[0]!.requiredUpdateAnchors = [anchor];
+            }, "scenario.tasks[0].gold.claims[0].requiredUpdateAnchors[0]: anchor-holds-root-close-tag");
+        }
     });
 
     test("a fixture path cannot carry a NUL byte", () => {
@@ -379,18 +439,25 @@ describe("dreamer eval scenario contract", () => {
         }, "scenario.pool.claims[0].fixtureFiles[0].path: path-unrepresentable");
     });
 
-    test("a verification timestamp must stay inside the Date range", () => {
-        // `new Date(commitTimeMs).toISOString()` throws RangeError past the
-        // maximum representable Date, before any typed seeder check runs.
+    test("a verification timestamp must stay inside git's accepted date range", () => {
+        // git rejects a commit date past 2099-12-31T23:59:59Z in every input
+        // form, and `toISOString` throws past the maximum Date; both land before
+        // any typed seeder check.
         expectDiagnostic((raw) => {
             const tasks = raw.tasks as Array<{ preconditions: { verifications: unknown[] } }>;
             tasks[0]!.preconditions.verifications = [
                 { claimId: "claim-1", outcome: "verified", verifiedAt: Number.MAX_SAFE_INTEGER },
             ];
         }, "scenario.tasks[0].preconditions.verifications[0].verifiedAt: integer-invalid");
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<{ preconditions: { verifications: unknown[] } }>;
+            tasks[0]!.preconditions.verifications = [
+                { claimId: "claim-1", outcome: "update", verifiedAt: 4_102_444_802_000 },
+            ];
+        }, "scenario.tasks[0].preconditions.verifications[0].verifiedAt: integer-invalid");
         const atLimit = validScenarioRaw();
         (atLimit.tasks as Array<{ preconditions: { verifications: unknown[] } }>)[0]!.preconditions.verifications = [
-            { claimId: "claim-1", outcome: "verified", verifiedAt: 8_640_000_000_000_000 },
+            { claimId: "claim-1", outcome: "update", verifiedAt: 4_102_444_801_999 },
         ];
         expect(() => parseScenario(atLimit)).not.toThrow();
     });
@@ -426,7 +493,7 @@ describe("dreamer eval scenario contract", () => {
         }, "scenario.tasks[0].preconditions.verifications[0].verifiedAt: integer-invalid");
         const seedable = validScenarioRaw();
         (seedable.tasks as Array<{ preconditions: { verifications: unknown[] } }>)[0]!.preconditions.verifications = [
-            { claimId: "claim-1", outcome: "verified", verifiedAt: 2_001 },
+            { claimId: "claim-1", outcome: "update", verifiedAt: 2_001 },
         ];
         expect(() => parseScenario(seedable)).not.toThrow();
     });
@@ -663,6 +730,15 @@ describe("dreamer eval report contract", () => {
         expect(() => parseRunReport({ ...baseReport, parsedManifest: null })).toThrow(
             /parsedManifest: pass-requires-evidence/,
         );
+        // Blank bytes are non-null but are exactly what every scorer rejects as
+        // ERROR:provider-failure, so they cannot back a PASS either.
+        expect(() => parseRunReport({ ...baseReport, rawManifest: "   " })).toThrow(
+            /parsedManifest: pass-requires-evidence/,
+        );
+        expect(
+            parseRunReport({ ...baseReport, status: "ERROR", reason: "provider-failure", rawManifest: "   " })
+                .rawManifest,
+        ).toBe("   ");
         // An ERROR run may hold neither.
         expect(
             parseRunReport({
