@@ -32,7 +32,7 @@ export function getDataDir(): string {
  * which plugin is loaded). Production runtime callers should omit it so
  * the helper picks up the boot-time harness automatically.
  */
-export function getMagicContextTempDir(harness: HarnessId = getHarness()): string {
+function getMagicContextTempDir(harness: HarnessId = getHarness()): string {
     return path.join(os.tmpdir(), harness, "magic-context");
 }
 

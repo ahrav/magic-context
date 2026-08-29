@@ -33,44 +33,6 @@ export function buildMagicContextHookConfig(pluginConfig: MagicContextPluginConf
     };
 }
 
-export function createSessionHooks(args: {
-    ctx: PluginContext;
-    pluginConfig: MagicContextPluginConfig;
-    liveSessionState: LiveSessionState;
-    rustModeModuleClient?: RustModeModuleClient;
-    promptSurfaceRuntime?: PromptSurfaceRuntime;
-}) {
-    const { ctx, pluginConfig, liveSessionState } = args;
-
-    if (pluginConfig.enabled !== true) {
-        return { magicContext: null, rustToolBackends: undefined };
-    }
-
-    const tagger = createTagger();
-    const scheduler = createScheduler({
-        executeThresholdPercentage:
-            pluginConfig.execute_threshold_percentage ?? DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
-        executeThresholdTokens: pluginConfig.execute_threshold_tokens,
-    });
-    const compactionHandler = createCompactionHandler();
-    const hookResult = createMagicContextHook({
-        client: ctx.client,
-        directory: ctx.directory,
-        tagger,
-        scheduler,
-        compactionHandler,
-        liveSessionState,
-        rustModeModuleClient: args.rustModeModuleClient,
-        promptSurfaceRuntime: args.promptSurfaceRuntime,
-        config: buildMagicContextHookConfig(pluginConfig),
-    });
-
-    return {
-        magicContext: hookResult,
-        rustToolBackends: hookResult?.rustToolBackends,
-    };
-}
-
 export async function createSessionHooksAsync(args: {
     ctx: PluginContext;
     pluginConfig: MagicContextPluginConfig;

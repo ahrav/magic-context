@@ -146,10 +146,3 @@ export async function resolveEmbeddingRouting(args: {
         warnings,
     };
 }
-
-export function getResolvedSynapseProviderIdentity(config: ResolvedSynapseEmbeddingConfig): string {
-    if (!config.synapse_fingerprint) {
-        throw new Error("deferred Synapse intent has no resolved provider identity");
-    }
-    return getSynapseLaneIdentity(config.model, config.synapse_fingerprint);
-}

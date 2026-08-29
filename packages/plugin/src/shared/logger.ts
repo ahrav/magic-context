@@ -102,9 +102,6 @@ export function flushLogger(): void {
  * who format diagnostic output with this value always see the path the next
  * flush will actually use.
  */
-export function getLogFilePath(): string {
-    return getMagicContextLogPath();
-}
 
 // Flush remaining buffer on process exit
 if (!isTestEnv) {
