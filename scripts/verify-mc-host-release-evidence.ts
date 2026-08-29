@@ -15,9 +15,14 @@ import {
     type ReleaseContract,
     sha256Hex,
 } from "./generate-mc-host-release-manifest";
+import { OUTPUT_PATHS as U9_OUTPUT_PATHS } from "./qualify-mc-host-production-inputs";
 
 const EVIDENCE_PATH = "tmp/mc-host-installed-release-evidence.json";
-const QUALIFICATION_PATH = "tmp/mc-host-release-qualification.json";
+// The qualifier owns this path and exports it; `build-mc-host-payload.ts`
+// already consumes it the same way. Restating the literal here let the writer
+// relocate the artifact while the GA verifier kept hashing a path nothing
+// writes, which fails the evidence gate for the wrong reason.
+const QUALIFICATION_PATH = U9_OUTPUT_PATHS.evidence;
 const INPUT_LOCK_PATH = "release/mc-host-production-inputs.lock.json";
 const PAYLOAD_INDEX_PATH = "release/mc-host-payload-index.json";
 const STOP_PROVENANCE_PATH = "release/mc-host-n-minus-one-stop.json";

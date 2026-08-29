@@ -2605,6 +2605,12 @@ export function generate(
         const path = join(rootDir, relative);
         const expected = outputs[key];
         if (options.check) {
+            // The qualification evidence is an environment-derived byproduct
+            // under gitignored `tmp/`, not a committed artifact, so neither its
+            // absence nor its bytes are drift in this committed-artifact check.
+            // Staleness is caught where it matters: `requireQualificationEvidence`
+            // fails closed on absent, malformed, or contract-mismatched evidence
+            // when a production build tries to consume it.
             if (key === "evidence") {
                 continue;
             }
