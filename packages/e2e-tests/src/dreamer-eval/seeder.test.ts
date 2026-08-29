@@ -356,6 +356,27 @@ describe("dreamer eval seeder", () => {
         ).rejects.toThrow("ERROR:fixture-drift: fixture path is reserved: .dreamer-eval-fixture");
     });
 
+    test("a fixture file cannot nest under another declared fixture file", async () => {
+        const selectedScenario = scenario("verify");
+        // Writing these in either order fails with EEXIST from mkdir or EISDIR
+        // from the write, and that raw filesystem error would escape untyped.
+        selectedScenario.pool.claims[0]!.fixtureFiles = [{ path: "src/config", content: "a\n" }];
+        selectedScenario.pool.claims[1]!.fixtureFiles = [
+            { path: "src/config/settings.ts", content: "b\n" },
+        ];
+
+        await expect(
+            seedDreamerEvalTask({
+                db: database(),
+                scenario: selectedScenario,
+                task: selectedScenario.tasks[0]!,
+                workdir: workdir(),
+            }),
+        ).rejects.toThrow(
+            "ERROR:fixture-drift: fixture path src/config/settings.ts nests under declared file src/config",
+        );
+    });
+
     test("reports a result mode the production gate did not return", async () => {
         const selectedScenario = scenario("verify");
         const selectedTask = selectedScenario.tasks[0]!;

@@ -162,6 +162,21 @@ function fixtureFiles(workdir: string, scenario: DreamerEvalScenario): Map<strin
             files.set(file.path, file.content);
         }
     }
+    // A declared file and a declared descendant of it cannot both exist. The
+    // write loop would fail with EEXIST from mkdir or EISDIR from the write
+    // depending on declaration order, and that raw filesystem error escapes
+    // untyped — bypassing the fixture-drift path a caller matches on. Paths are
+    // canonical and POSIX-normalized by fixturePath, so segment prefixes of one
+    // path are exactly its ancestors.
+    for (const path of files.keys()) {
+        const segments = path.split("/");
+        for (let index = 1; index < segments.length; index += 1) {
+            const ancestor = segments.slice(0, index).join("/");
+            if (files.has(ancestor)) {
+                fixtureError(`fixture path ${path} nests under declared file ${ancestor}`);
+            }
+        }
+    }
     return files;
 }
 

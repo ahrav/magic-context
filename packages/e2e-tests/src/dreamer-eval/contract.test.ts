@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { VERIFY_UPDATE_CONTENT_MAX_LENGTH } from "../../../plugin/src/features/magic-context/dreamer/verify";
 import {
     DREAMER_EVAL_REPORT_SCHEMA,
     DREAMER_EVAL_SCENARIO_SCHEMA,
@@ -273,6 +274,31 @@ describe("dreamer eval scenario contract", () => {
             { claimId: "claim-1", files: ["src/file-1.ts"] },
         ];
         expect(() => parseScenario(declared)).not.toThrow();
+    });
+
+    test("a required update anchor cannot exceed the production content cap", () => {
+        // Passing content must contain the anchor as a substring, so it is at
+        // least as long as the anchor, and both the scorer and production reject
+        // an update body over the cap. No manifest can satisfy such gold.
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<{
+                gold: { claims: Array<{ verdict: string; requiredUpdateAnchors: string[] }> };
+            }>;
+            tasks[0]!.gold.claims[0]!.verdict = "update";
+            tasks[0]!.gold.claims[0]!.requiredUpdateAnchors = ["a".repeat(VERIFY_UPDATE_CONTENT_MAX_LENGTH + 1)];
+        }, "scenario.tasks[0].gold.claims[0].requiredUpdateAnchors[0]: anchor-exceeds-content-cap");
+        // The combined length is deliberately not capped: anchors may overlap
+        // inside one body, so a sum over the cap does not prove impossibility.
+        const atCap = validScenarioRaw();
+        const tasks = atCap.tasks as Array<{
+            gold: { claims: Array<{ verdict: string; requiredUpdateAnchors: string[] }> };
+        }>;
+        tasks[0]!.gold.claims[0]!.verdict = "update";
+        tasks[0]!.gold.claims[0]!.requiredUpdateAnchors = [
+            "a".repeat(VERIFY_UPDATE_CONTENT_MAX_LENGTH),
+            "b".repeat(VERIFY_UPDATE_CONTENT_MAX_LENGTH),
+        ];
+        expect(() => parseScenario(atCap)).not.toThrow();
     });
 
     test("a verify task must declare the one result mode the seeder can produce", () => {

@@ -1,3 +1,4 @@
+import { VERIFY_UPDATE_CONTENT_MAX_LENGTH } from "../../../plugin/src/features/magic-context/dreamer/verify";
 import { isRunFatal } from "./contract";
 import type {
     FailReason,
@@ -130,7 +131,8 @@ function fillerAbsentFrom(phrases: readonly string[], description: string): stri
 }
 
 /**
- * Update content that carries every required anchor and no forbidden one.
+ * Update content that carries every required anchor, no forbidden one, and fits
+ * the production content cap.
  *
  * The contract rejects a forbidden anchor contained in a single required anchor
  * but not one spanning their join: required `alpha` and `beta` with forbidden
@@ -138,8 +140,22 @@ function fillerAbsentFrom(phrases: readonly string[], description: string): stri
  * forbidden phrase and fail scoring, making `runMutationBattery` throw on its
  * own supposedly-correct baseline. A separator holding a character absent from
  * every forbidden anchor makes a spanning match impossible.
+ *
+ * The contract also caps each individual anchor, which is the length it can
+ * prove unsatisfiable, but anchors may overlap inside one body so it cannot
+ * reject a combined length. This construction does not exploit that overlap, so
+ * a fixture whose anchors only fit when interleaved gets a named error here
+ * rather than the opaque "baseline must pass all scorers".
  */
 function passingUpdateContent(gold: VerifyGoldClaim): string {
+    const content = buildUpdateContent(gold);
+    if (content.length > VERIFY_UPDATE_CONTENT_MAX_LENGTH) {
+        throw new Error("mutation fixture needs required update anchors that join within the content cap");
+    }
+    return content;
+}
+
+function buildUpdateContent(gold: VerifyGoldClaim): string {
     if (gold.requiredUpdateAnchors.length === 0) {
         // Production refuses an empty replacement body, so the baseline still
         // needs content when the gold requires no anchor.

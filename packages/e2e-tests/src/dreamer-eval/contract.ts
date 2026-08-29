@@ -1,5 +1,6 @@
 import { makeContractPrimitives } from "../contract-primitives";
 import { ANTI_MEMORY_CATEGORY } from "../../../plugin/src/features/magic-context/memory/constants";
+import { VERIFY_UPDATE_CONTENT_MAX_LENGTH } from "../../../plugin/src/features/magic-context/dreamer/verify";
 import { hasShareabilitySensitiveText } from "../../../plugin/src/shared/redaction";
 
 export const DREAMER_EVAL_SCENARIO_SCHEMA = "dreamer-eval-scenario/v1";
@@ -380,6 +381,17 @@ function parseVerifyGold(raw: unknown, label: string, pool: ReadonlyMap<string, 
         }
         const requiredUpdateAnchors = parseStringArray(item.requiredUpdateAnchors, `${itemLabel}.requiredUpdateAnchors`);
         const forbiddenUpdateAnchors = parseStringArray(item.forbiddenUpdateAnchors, `${itemLabel}.forbiddenUpdateAnchors`);
+        // Passing content must contain every required anchor as a substring, so
+        // it is at least as long as the longest one. Production and the scorer
+        // both reject an update body over VERIFY_UPDATE_CONTENT_MAX_LENGTH, which
+        // makes an anchor past that length unsatisfiable by any manifest. The
+        // combined length is deliberately not checked: anchors may overlap
+        // inside one body, so a sum over the cap does not prove impossibility.
+        for (const [anchorIndex, anchor] of requiredUpdateAnchors.entries()) {
+            if (anchor.length > VERIFY_UPDATE_CONTENT_MAX_LENGTH) {
+                fail(`${itemLabel}.requiredUpdateAnchors[${anchorIndex}]: anchor-exceeds-content-cap`);
+            }
+        }
         // Anchors are scored only for an update verdict, so an anchor on any
         // other verdict states a requirement nothing enforces.
         if (verdict !== "update" && (requiredUpdateAnchors.length > 0 || forbiddenUpdateAnchors.length > 0)) {
