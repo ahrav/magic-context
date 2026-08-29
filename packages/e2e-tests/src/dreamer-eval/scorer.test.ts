@@ -268,12 +268,52 @@ describe("dreamer manifest scorers", () => {
         ).toMatchObject({ status: "FAIL", reason: "wrong-mapping" });
     });
 
-    test("classification requires every gold field and scores parsed clamped importance", () => {
+    test("classification scores the applied value and clamps parsed importance", () => {
         expect(scoreClassifyManifest(correctClassify.replace('importance="70"', 'importance="64"'), pool, classifyGold)).toMatchObject({ status: "FAIL", reason: "wrong-classification" });
         expect(scoreClassifyManifest(correctClassify.replace('scope="project"', 'scope="ecosystem"'), pool, classifyGold)).toMatchObject({ status: "FAIL", reason: "wrong-classification" });
         expect(scoreClassifyManifest(correctClassify.replace('shareable="true"', 'shareable="false"'), pool, classifyGold)).toMatchObject({ status: "FAIL", reason: "wrong-classification" });
-        expect(scoreClassifyManifest(correctClassify.replace(' importance="70"', ""), pool, classifyGold)).toMatchObject({ stage: "scored", status: "FAIL", reason: "wrong-classification" });
+        // Production preserves a field the entry omits, so the applied
+        // importance stays the claim's current 70 — inside the 65-75 band, which
+        // is a pass rather than a wrong classification.
+        expect(scoreClassifyManifest(correctClassify.replace(' importance="70"', ""), pool, classifyGold)).toMatchObject({
+            stage: "scored",
+            status: "PASS",
+            reason: null,
+        });
+        // The omission only passes because the preserved value satisfies gold. A
+        // band that excludes it still fails, on the preserved value.
+        const narrowGold = {
+            kind: "classify" as const,
+            claims: classifyGold.claims.map((claim) =>
+                claim.claimId === "claim-true" ? { ...claim, importance: { min: 10, max: 20 } } : claim,
+            ),
+        };
+        expect(scoreClassifyManifest(correctClassify.replace(' importance="70"', ""), pool, narrowGold)).toMatchObject({
+            stage: "scored",
+            status: "FAIL",
+            reason: "wrong-classification",
+        });
         expect(scoreClassifyManifest(correctClassify.replace('importance="70"', 'importance="101"'), pool, classifyGold)).toMatchObject({ status: "FAIL", reason: "wrong-classification" });
+    });
+
+    test("a canonicalizable alias of a gold path scores as that path", () => {
+        // Production resolves the path before matching it against a tracked file,
+        // so a manifest naming a gold file through an alias applies exactly the
+        // gold path and must not read as a wrong mapping.
+        expect(
+            scoreVerifyManifest(correctVerify.replace("src/cache.ts,src/config.ts", "src/./cache.ts,src/sub/../config.ts"), pool, verifyGold),
+        ).toMatchObject({ status: "PASS", reason: null });
+        expect(
+            scoreMapManifest(correctMap.replace("src/cache.ts,src/config.ts", "src/./cache.ts,src/sub/../config.ts"), pool, mapGold),
+        ).toMatchObject({ status: "PASS", reason: null });
+        // A path that leaves the project is dropped by production rather than
+        // resolved inward, so it must not collapse onto a tracked path here.
+        expect(
+            scoreMapManifest(correctMap.replace("src/cache.ts", "../src/cache.ts"), pool, mapGold),
+        ).toMatchObject({ status: "FAIL", reason: "wrong-mapping" });
+        expect(
+            scoreMapManifest(correctMap.replace("src/cache.ts", "/src/cache.ts"), pool, mapGold),
+        ).toMatchObject({ status: "FAIL", reason: "wrong-mapping" });
     });
 
     test("production validation rejects malformed coverage as invalid model output", () => {

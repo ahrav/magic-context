@@ -301,6 +301,40 @@ describe("dreamer eval scenario contract", () => {
         expect(() => parseScenario(atCap)).not.toThrow();
     });
 
+    test("two claims cannot normalize to one stored claim", () => {
+        // Claim creation dedupes on (project, category, normalized content hash),
+        // so these collapse into one row and the seeder aborts on its public-id
+        // cardinality check.
+        expectDiagnostic((raw) => {
+            const claims = (raw.pool as { claims: Array<{ content: string; category: string }> }).claims;
+            claims[1]!.content = `  ${claims[0]!.content.toUpperCase()}  `;
+        }, "scenario.pool.claims.content: duplicate");
+        // The identity includes the category, so the same content under a
+        // different category is two distinct claims.
+        const distinctCategory = validScenarioRaw();
+        const claims = (distinctCategory.pool as { claims: Array<{ content: string; category: string }> }).claims;
+        claims[1]!.content = claims[0]!.content.toUpperCase();
+        claims[1]!.category = "PROJECT_FACT";
+        expect(() => parseScenario(distinctCategory)).not.toThrow();
+    });
+
+    test("a classify task cannot skip any claim", () => {
+        // Classify reads the hygiene surface, which returns every active row, and
+        // parsing already forces every claim hygiene-visible with a pool of at
+        // least ten, so the production gate always selects the whole pool.
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<{
+                expectedInScopeClaimIds: string[];
+                expectedSkippedClaimIds: string[];
+                gold: { claims: Array<{ claimId: string }> };
+            }>;
+            const classify = tasks[2]!;
+            const dropped = classify.expectedInScopeClaimIds.pop()!;
+            classify.expectedSkippedClaimIds = [dropped];
+            classify.gold.claims = classify.gold.claims.filter((claim) => claim.claimId !== dropped);
+        }, "scenario.tasks[2].expectedSkippedClaimIds: classify-skips-nothing");
+    });
+
     test("a verify task must declare the one result mode the seeder can produce", () => {
         // The seeder always git-inits and commits, and calls the gate with
         // forceBroad false: "broad" needs forceBroad, "non-git" is never

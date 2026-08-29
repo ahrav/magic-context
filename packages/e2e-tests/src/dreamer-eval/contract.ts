@@ -1,5 +1,6 @@
 import { makeContractPrimitives } from "../contract-primitives";
 import { ANTI_MEMORY_CATEGORY } from "../../../plugin/src/features/magic-context/memory/constants";
+import { normalizeMemoryContent } from "../../../plugin/src/features/magic-context/memory/normalize-hash";
 import { VERIFY_UPDATE_CONTENT_MAX_LENGTH } from "../../../plugin/src/features/magic-context/dreamer/verify";
 import { hasShareabilitySensitiveText } from "../../../plugin/src/shared/redaction";
 
@@ -509,6 +510,14 @@ function parseTask(raw: unknown, label: string, pool: ReadonlyMap<string, Scenar
     if ((task === "map-memories" || task === "classify-memories") && expectedResultMode !== null) {
         fail(`${label}.expectedResultMode: task-mode-mismatch`);
     }
+    // Classify reads the hygiene surface, which returns every active row, and
+    // runs only once the pool reaches CLASSIFY_MIN_POOL. Parsing rejects
+    // `hygieneVisible: false` and requires at least ten claims, so the
+    // production gate always selects the whole pool and a scenario skipping any
+    // claim terminates with gate-mismatch at preflight.
+    if (task === "classify-memories" && expectedSkippedClaimIds.length > 0) {
+        fail(`${label}.expectedSkippedClaimIds: classify-skips-nothing`);
+    }
     if (task === "verify-broad") {
         if (expectedResultMode !== "broad") fail(`${label}.expectedResultMode: broad-required`);
         // `seedDreamerEvalTask` cannot construct the broad-cycle watermark
@@ -558,6 +567,15 @@ export function parseScenario(raw: unknown, label = "scenario"): DreamerEvalScen
     if (claims.length > 50) fail(`${label}.pool.claims: count-invalid`);
     if (claims.filter((claim) => claim.hygieneVisible).length < 10) fail(`${label}.pool.claims: hygiene-visible-count-invalid`);
     unique(claims.map((claim) => claim.id), `${label}.pool.claims`);
+    // Claim creation dedupes on (project, category, normalized content hash)
+    // among active claims, so two rows whose contents normalize alike collapse
+    // into one and the seeder aborts on its public-id cardinality check. The
+    // production normalizer decides the identity here rather than a local copy
+    // of its rules.
+    unique(
+        claims.map((claim) => `${claim.category}\u0000${normalizeMemoryContent(claim.content)}`),
+        `${label}.pool.claims.content`,
+    );
     const pool = new Map(claims.map((claim) => [claim.id, claim]));
     const tasks = array(root.tasks, `${label}.tasks`).map((entry, index) => parseTask(entry, `${label}.tasks[${index}]`, pool));
     if (tasks.length === 0) fail(`${label}.tasks: empty`);

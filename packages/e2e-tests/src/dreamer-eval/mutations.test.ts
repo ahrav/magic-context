@@ -172,6 +172,27 @@ describe("dreamer manifest mutation battery", () => {
         expect(runMutationBattery(fixture).green).toBe(true);
     });
 
+    test("an anchor holding a replacement token stays literal in the mutation", () => {
+        // `$&` in a string replacement expands to the matched entry, which would
+        // drop the forbidden phrase from the mutation and let it score PASS.
+        const fixture = {
+            ...dreamerScorerFixture,
+            verifyGold: {
+                kind: "verify" as const,
+                claims: dreamerScorerFixture.verifyGold.claims.map((claim) =>
+                    claim.verdict === "update" ? { ...claim, forbiddenUpdateAnchors: ["$&"] } : claim,
+                ),
+            },
+        };
+        const evidence = runMutationBattery(fixture);
+        expect(evidence.results.find((entry) => entry.mutationClass === "update-forbidden-anchor")).toMatchObject({
+            green: true,
+            actualStage: "scored",
+            actualReason: "wrong-update-content",
+        });
+        expect(evidence.green).toBe(true);
+    });
+
     test("a single-file map gold still yields a changed manifest", () => {
         const fixture = {
             ...dreamerScorerFixture,

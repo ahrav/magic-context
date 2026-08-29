@@ -232,7 +232,12 @@ function escapeRegExp(value: string): string {
 function replaceEntry(manifest: string, publicClaimId: string, replacement: string): string {
     const escaped = escapeRegExp(publicClaimId);
     const pattern = new RegExp(`<(?:verified|archive)\\b[^>]*claim="${escaped}"[^>]*/>|<update\\b[^>]*claim="${escaped}"[^>]*>[\\s\\S]*?</update>`);
-    const changed = manifest.replace(pattern, replacement);
+    // A callback keeps the replacement bytes literal. Passing the string form
+    // lets `$&`, `$1`, or a backtick token inside an authored anchor expand into
+    // the matched entry, so the mutation would carry content nobody wrote — and
+    // for the forbidden-anchor case the forbidden phrase would vanish from it
+    // and the mutation could score PASS.
+    const changed = manifest.replace(pattern, () => replacement);
     if (changed === manifest) throw new Error(`mutation fixture could not replace verify entry ${publicClaimId}`);
     return changed;
 }
@@ -307,7 +312,7 @@ function mutationManifest(
         case "wrong-independence": {
             const target = requiredGold(fixture.mapGold.claims, (entry) => !entry.independent, "file-bound map gold");
             const claim = claimById(fixture.pool, target.claimId);
-            return { task: "map", manifest: map.replace(new RegExp(`<memory\\b[^>]*claim="${escapeRegExp(claim.publicClaimId)}"[^>]*/>`), `<memory claim="${claim.publicClaimId}" independent="true"/>`) };
+            return { task: "map", manifest: map.replace(new RegExp(`<memory\\b[^>]*claim="${escapeRegExp(claim.publicClaimId)}"[^>]*/>`), () => `<memory claim="${claim.publicClaimId}" independent="true"/>`) };
         }
         case "missing-gold-file": {
             const target = requiredGold(fixture.mapGold.claims, (entry) => !entry.independent && entry.files.length > 0, "mapped gold file");
@@ -345,7 +350,7 @@ function mutationManifest(
         case "unknown-id":
             return { task: "verify", manifest: verify.replace(verifiedClaim.publicClaimId, "mcm_unknown") };
         case "duplicate-id":
-            return { task: "verify", manifest: verify.replace("</verify>", `<verified claim="${verifiedClaim.publicClaimId}" files="${verifiedClaim.files.join(",")}"/>\n</verify>`) };
+            return { task: "verify", manifest: verify.replace("</verify>", () => `<verified claim="${verifiedClaim.publicClaimId}" files="${verifiedClaim.files.join(",")}"/>\n</verify>`) };
     }
 }
 

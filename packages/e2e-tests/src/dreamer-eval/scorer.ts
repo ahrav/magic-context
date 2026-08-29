@@ -91,6 +91,36 @@ function invalidOutput(manifestText: string, evidence?: ManifestInfraEvidence): 
     return score("FAIL", "invalid-output", "validation-rejected");
 }
 
+/**
+ * Collapses `.` and `..` in a path the provider emitted, the way production's
+ * `path.resolve` does before `normalizeVerificationFiles` matches it against a
+ * tracked path. Gold is already canonical — the scenario contract admits only
+ * declared fixture paths — so without this a manifest naming a tracked file
+ * through an alias such as `src/./file.ts` scores `wrong-mapping` even though
+ * production canonicalizes it and applies exactly the gold path.
+ *
+ * An escaping prefix and a leading slash survive on purpose: production drops a
+ * path that leaves the project rather than resolving it inward, so neither may
+ * quietly turn into a tracked path here.
+ */
+function canonicalObservedPath(value: string): string {
+    const resolved: string[] = [];
+    for (const segment of value.split("/")) {
+        if (segment === "" || segment === ".") continue;
+        if (segment === ".." && resolved.length > 0 && resolved[resolved.length - 1] !== "..") {
+            resolved.pop();
+            continue;
+        }
+        resolved.push(segment);
+    }
+    const joined = resolved.join("/");
+    return value.startsWith("/") ? `/${joined}` : joined;
+}
+
+function canonicalObservedPaths(values: readonly string[]): string[] {
+    return values.map(canonicalObservedPath);
+}
+
 export function scoreVerifyManifest(
     manifestText: string,
     pool: PoolDescriptor,
@@ -149,7 +179,7 @@ export function scoreVerifyManifest(
         }
         // Verification applies this attribute as the claim's new exact mapping,
         // so a narrowed set silently shrinks future incremental verify scope.
-        if (expected.verdict !== "archive" && !sameSet(observed.files, expected.expectedFiles)) {
+        if (expected.verdict !== "archive" && !sameSet(canonicalObservedPaths(observed.files), expected.expectedFiles)) {
             return score("FAIL", "wrong-mapping", "scored", parsed);
         }
         if (expected.verdict === "update") {
@@ -203,7 +233,7 @@ export function scoreMapManifest(
     for (const expected of gold.claims) {
         const publicClaimId = context.byClaimId.get(expected.claimId)?.publicClaimId;
         const observed = publicClaimId === undefined ? undefined : actual.get(publicClaimId);
-        if (observed === undefined || !sameSet(observed.files, expected.files)) {
+        if (observed === undefined || !sameSet(canonicalObservedPaths(observed.files), expected.files)) {
             return score("FAIL", "wrong-mapping", "scored", parsed);
         }
     }
@@ -228,15 +258,28 @@ export function scoreClassifyManifest(
         return invalidOutput(manifestText, evidence);
     }
     const actual = new Map(parsed.map((entry) => [entry.publicClaimId, entry]));
+    const poolByClaimId = new Map(pool.claims.map((claim) => [claim.claimId, claim]));
     for (const expected of gold.claims) {
         const publicClaimId = context.byClaimId.get(expected.claimId)?.publicClaimId;
         const observed = publicClaimId === undefined ? undefined : actual.get(publicClaimId);
+        const current = poolByClaimId.get(expected.claimId);
+        if (observed === undefined || current === undefined) {
+            return score("FAIL", "wrong-classification", "scored", parsed);
+        }
+        // A manifest entry may report any subset of the three fields — the parser
+        // requires at least one and coverage is enforced per claim — and
+        // production preserves whatever the entry omits. The applied value is
+        // therefore the reported one where present and the claim's current value
+        // otherwise, so scoring the reported field alone fails a run whose
+        // resulting pool matches gold.
+        const importance = observed.importance ?? current.importance;
+        const scope = observed.scope ?? current.memoryScope;
+        const shareable = observed.shareable ?? current.sharing === "shareable";
         if (
-            observed?.importance === undefined ||
-            observed.importance < expected.importance.min ||
-            observed.importance > expected.importance.max ||
-            observed.scope !== expected.scope ||
-            observed.shareable !== expected.shareable
+            importance < expected.importance.min ||
+            importance > expected.importance.max ||
+            scope !== expected.scope ||
+            shareable !== expected.shareable
         ) {
             return score("FAIL", "wrong-classification", "scored", parsed);
         }
