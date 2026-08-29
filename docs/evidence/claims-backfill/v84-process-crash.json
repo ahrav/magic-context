@@ -1,8 +1,8 @@
 {
   "schemaVersion": "claims-process-crash-evidence/v1",
-  "commitUnderTest": "c81d2209806f97e1b3b42e1db2cb2146dfe34626",
+  "commitUnderTest": "f160a91ba756315fb4208e734fcefa0d8e0eaa61",
   "dirtyDiffDigestPolicy": "sha256(sorted U6 implementation path + NUL + full file bytes + NUL); evidence file excluded",
-  "dirtyDiffDigest": "129a8eb319e4a5d1ca2fb94aed5193d61c6883379aba6fbb6bb372162856d99b",
+  "dirtyDiffDigest": "dc475b441f379326d6cb2fc65653239e7c45efc5047043f3d18a1c26e2ff37f2",
   "implementationFiles": [
     "ARCHITECTURE.md",
     "STRUCTURE.md",
@@ -38,18 +38,18 @@
   ],
   "runtimes": {
     "bun": {
-      "version": "1.4.0",
-      "sqliteVersion": "3.53.2"
+      "version": "1.3.14",
+      "sqliteVersion": "3.53.0"
     },
     "node": {
-      "version": "v24.15.0",
-      "sqliteVersion": "3.51.3"
+      "version": "v24.18.0",
+      "sqliteVersion": "3.53.1"
     }
   },
   "environment": {
     "os": "linux",
-    "release": "6.12.100-125.179.amzn2023.aarch64",
-    "arch": "arm64",
+    "release": "6.12.95-124.187.amzn2023.x86_64",
+    "arch": "x64",
     "filesystem": {
       "type": "1021994",
       "blockSize": 4096,
