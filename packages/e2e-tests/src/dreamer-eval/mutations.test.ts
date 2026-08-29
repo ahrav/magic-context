@@ -45,4 +45,48 @@ describe("dreamer manifest mutation battery", () => {
         expect(result).toMatchObject({ green: false, actualStage: "validation-rejected" });
         expect(evidence.green).toBe(false);
     });
+
+    test("missed archival stays scoreable when the archived claim carries no mapping", () => {
+        // Retaining a claim requires a backing set, so the mutation needs a
+        // stand-in file here; emitting an empty attribute would be rejected as
+        // invalid output before the scorer could observe the missed archival.
+        const fixture = {
+            ...dreamerScorerFixture,
+            pool: {
+                ...dreamerScorerFixture.pool,
+                claims: dreamerScorerFixture.pool.claims.map((claim) =>
+                    claim.claimId === "claim-false" ? { ...claim, files: [] } : claim,
+                ),
+            },
+        };
+        const evidence = runMutationBattery(fixture);
+        expect(evidence.results.find((entry) => entry.mutationClass === "missed-archival")).toMatchObject({
+            green: true,
+            actualStage: "scored",
+            actualReason: "missed-archival",
+        });
+        expect(evidence.green).toBe(true);
+    });
+
+    test("missing gold file targets its own claim when two claims share a file set", () => {
+        const shared = ["src/cache.ts", "src/config.ts"];
+        const fixture = {
+            ...dreamerScorerFixture,
+            mapGold: {
+                kind: "map" as const,
+                claims: [
+                    { claimId: "claim-true", files: shared, independent: false },
+                    { claimId: "claim-update", files: shared, independent: false },
+                    { claimId: "claim-independent", files: [], independent: true },
+                ],
+            },
+        };
+        const evidence = runMutationBattery(fixture);
+        expect(evidence.results.find((entry) => entry.mutationClass === "missing-gold-file")).toMatchObject({
+            green: true,
+            actualStage: "scored",
+            actualReason: "wrong-mapping",
+        });
+        expect(evidence.green).toBe(true);
+    });
 });

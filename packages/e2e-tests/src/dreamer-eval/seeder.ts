@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import {
+    existsSync,
     mkdirSync,
     realpathSync,
     writeFileSync,
@@ -121,6 +122,11 @@ function fixturePath(workdir: string, path: string): string {
     if (fromRoot === "" || fromRoot === ".." || fromRoot.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`)) {
         fixtureError(`fixture path escapes workdir: ${path}`);
     }
+    // Aliases of one target (`src/./a.ts`, `src/sub/../a.ts`) must not reach the
+    // repository. Mapping preconditions, gold file sets, and `git ls-files`
+    // compare the authored string, so two aliases would satisfy every check
+    // while writing one file — the second content silently replacing the first.
+    if (fromRoot !== path) fixtureError(`fixture path is not canonical: ${path}`);
     // The control directory lives inside the workdir but is not fixture
     // content: a write there steers the seeder's own git invocations, and
     // `.git/hooks` would execute during the fixture commit.
@@ -130,10 +136,13 @@ function fixturePath(workdir: string, path: string): string {
     return target;
 }
 
-function fixtureFiles(scenario: DreamerEvalScenario): Map<string, string> {
+function fixtureFiles(workdir: string, scenario: DreamerEvalScenario): Map<string, string> {
     const files = new Map<string, string>();
     for (const claim of scenario.pool.claims) {
         for (const file of claim.fixtureFiles) {
+            // Validate before keying: conflict detection must run on the path
+            // that reaches disk, not on the authored spelling.
+            fixturePath(workdir, file.path);
             const existing = files.get(file.path);
             if (existing !== undefined && existing !== file.content) {
                 fixtureError(`fixture content conflicts for ${file.path}`);
@@ -150,15 +159,20 @@ function prepareFixtureRepository(
     task: DreamerTaskScenario,
     nowMs: number,
 ): number {
-    const existingHead = spawnSync("git", ["rev-parse", "--verify", "HEAD"], {
-        cwd: workdir,
-        stdio: "ignore",
-        env: fixtureGitEnv(),
-    });
-    if (existingHead.status === 0) fixtureError("workdir already contains a commit");
+    // Only probe a repository the workdir itself owns. `git rev-parse` walks
+    // parent directories, so an unprobed nested workdir resolves the
+    // surrounding repository's HEAD and reports drift that does not exist.
+    if (existsSync(join(workdir, ".git"))) {
+        const existingHead = spawnSync("git", ["rev-parse", "--verify", "HEAD"], {
+            cwd: workdir,
+            stdio: "ignore",
+            env: fixtureGitEnv(),
+        });
+        if (existingHead.status === 0) fixtureError("workdir already contains a commit");
+    }
 
     git(workdir, ["init", "--quiet"]);
-    const files = fixtureFiles(scenario);
+    const files = fixtureFiles(workdir, scenario);
     for (const [path, content] of files) {
         const target = fixturePath(workdir, path);
         mkdirSync(dirname(target), { recursive: true });
@@ -282,6 +296,17 @@ export async function preflightDreamerEvalTask(args: {
     const skipped = Object.keys(args.publicClaimIds).filter((claimId) => !inScopeSet.has(claimId));
     assertExpectedSet("in-scope claims", inScope, args.task.expectedInScopeClaimIds);
     assertExpectedSet("skipped claims", skipped, args.task.expectedSkippedClaimIds);
+    // The scenario contract pins a mode for every task: a verify mode for
+    // verify, "broad" for verify-broad, and null for map and classify. A gate
+    // that returns the expected candidates under the wrong mode still
+    // invalidates the experiment, because mode decides what a later cycle
+    // re-sweeps.
+    if (mode !== args.task.expectedResultMode) {
+        throw new DreamerEvalSeederError(
+            "gate-mismatch",
+            `result mode: expected ${args.task.expectedResultMode ?? "none"}, got ${mode ?? "none"}`,
+        );
+    }
     return {
         task: args.task.task,
         mode,

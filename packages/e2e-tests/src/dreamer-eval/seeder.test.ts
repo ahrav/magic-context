@@ -1,7 +1,8 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeQuietly } from "../../../plugin/src/shared/sqlite-helpers";
@@ -268,5 +269,88 @@ describe("dreamer eval seeder", () => {
                 workdir: workdir(),
             }),
         ).rejects.toThrow("ERROR:fixture-drift: fixture path targets the git control directory");
+    });
+
+    test("refuses an alias of a fixture path already declared by another claim", async () => {
+        // `src/current.ts` and `src/./current.ts` resolve to one file, so an
+        // alias would let two claims declare different evidence for the same
+        // path while every per-path check still passed.
+        const selectedScenario = scenario("map-memories");
+        selectedScenario.pool.claims[1]!.fixtureFiles = [
+            { path: "src/./current.ts", content: "export const current = 99;\n" },
+        ];
+
+        await expect(
+            seedDreamerEvalTask({
+                db: database(),
+                scenario: selectedScenario,
+                task: selectedScenario.tasks[0]!,
+                workdir: workdir(),
+            }),
+        ).rejects.toThrow("ERROR:fixture-drift: fixture path is not canonical: src/./current.ts");
+    });
+
+    test("names the claim whose fixture content contradicts an existing path", async () => {
+        const selectedScenario = scenario("map-memories");
+        selectedScenario.pool.claims[1]!.fixtureFiles = [
+            { path: "src/current.ts", content: "export const current = 99;\n" },
+        ];
+
+        await expect(
+            seedDreamerEvalTask({
+                db: database(),
+                scenario: selectedScenario,
+                task: selectedScenario.tasks[0]!,
+                workdir: workdir(),
+            }),
+        ).rejects.toThrow("ERROR:fixture-drift: fixture content conflicts for src/current.ts");
+    });
+
+    test("seeds a workdir nested inside another repository", async () => {
+        // `git rev-parse` walks parents, so probing HEAD before `git init`
+        // resolved the surrounding repository and reported drift that the
+        // run-owned workdir did not have.
+        const outer = workdir();
+        const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+        expect(spawnSync("git", ["init", "--quiet"], { cwd: outer, env }).status).toBe(0);
+        expect(
+            spawnSync(
+                "git",
+                ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "--allow-empty", "--no-gpg-sign", "-m", "outer"],
+                { cwd: outer, env },
+            ).status,
+        ).toBe(0);
+        const nested = join(outer, "nested", "work");
+        mkdirSync(nested, { recursive: true });
+
+        const selectedScenario = scenario("map-memories");
+        const result = await seedDreamerEvalTask({
+            db: database(),
+            scenario: selectedScenario,
+            task: selectedScenario.tasks[0]!,
+            workdir: nested,
+        });
+
+        expect(result.pool.claims).toHaveLength(10);
+        expect(result.preflight.inScopeClaimIds).toEqual(
+            selectedScenario.tasks[0]!.expectedInScopeClaimIds,
+        );
+    });
+
+    test("reports a result mode the production gate did not return", async () => {
+        const selectedScenario = scenario("verify");
+        const selectedTask = selectedScenario.tasks[0]!;
+        // Same candidate set, different mode: what a later cycle re-sweeps
+        // changes, so the scenario is no longer the experiment it declares.
+        selectedTask.expectedResultMode = "full";
+
+        await expect(
+            seedDreamerEvalTask({
+                db: database(),
+                scenario: selectedScenario,
+                task: selectedTask,
+                workdir: workdir(),
+            }),
+        ).rejects.toThrow("ERROR:gate-mismatch: result mode: expected full, got incremental");
     });
 });

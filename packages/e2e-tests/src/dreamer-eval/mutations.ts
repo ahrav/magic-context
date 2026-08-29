@@ -116,11 +116,28 @@ function requiredGold<T>(items: readonly T[], predicate: (item: T) => boolean, d
     return item;
 }
 
+function escapeRegExp(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function replaceEntry(manifest: string, publicClaimId: string, replacement: string): string {
-    const escaped = publicClaimId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const escaped = escapeRegExp(publicClaimId);
     const pattern = new RegExp(`<(?:verified|archive)\\b[^>]*claim="${escaped}"[^>]*/>|<update\\b[^>]*claim="${escaped}"[^>]*>[\\s\\S]*?</update>`);
     const changed = manifest.replace(pattern, replacement);
     if (changed === manifest) throw new Error(`mutation fixture could not replace verify entry ${publicClaimId}`);
+    return changed;
+}
+
+/**
+ * Rewrites one claim's `files` attribute in a mappings manifest. Scoping to the
+ * claim id matters because claims may declare identical file sets, and an
+ * unscoped match rewrites whichever entry appears first rather than the one the
+ * mutation class selected.
+ */
+function replaceMapFiles(manifest: string, publicClaimId: string, files: readonly string[]): string {
+    const pattern = new RegExp(`(<memory\\b[^>]*claim="${escapeRegExp(publicClaimId)}"[^>]*files=")[^"]*(")`);
+    const changed = manifest.replace(pattern, (_match, prefix: string, suffix: string) => `${prefix}${files.join(",")}${suffix}`);
+    if (changed === manifest) throw new Error(`mutation fixture could not replace map files for ${publicClaimId}`);
     return changed;
 }
 
@@ -141,8 +158,14 @@ function mutationManifest(
     switch (mutationClass) {
         case "wrong-archival":
             return { task: "verify", manifest: replaceEntry(verify, verifiedClaim.publicClaimId, `<archive claim="${verifiedClaim.publicClaimId}" reason="wrong"/>`) };
-        case "missed-archival":
-            return { task: "verify", manifest: replaceEntry(verify, archivedClaim.publicClaimId, `<verified claim="${archivedClaim.publicClaimId}" files="${archivedClaim.files.join(",")}"/>`) };
+        case "missed-archival": {
+            // A backing set is required whenever the manifest retains a claim,
+            // so an archived claim carrying no mapping needs a stand-in here:
+            // an empty attribute would be rejected as invalid output before the
+            // scorer could observe the missed archival this class exercises.
+            const files = archivedClaim.files.length > 0 ? archivedClaim.files : ["mutation/retained.ts"];
+            return { task: "verify", manifest: replaceEntry(verify, archivedClaim.publicClaimId, `<verified claim="${archivedClaim.publicClaimId}" files="${files.join(",")}"/>`) };
+        }
         case "update-for-verified":
             return { task: "verify", manifest: replaceEntry(verify, verifiedClaim.publicClaimId, `<update claim="${verifiedClaim.publicClaimId}" files="${verifiedClaim.files.join(",")}">still true</update>`) };
         case "verified-for-update":
@@ -150,38 +173,40 @@ function mutationManifest(
         case "update-missing-anchor":
             return { task: "verify", manifest: replaceEntry(verify, updatedClaim.publicClaimId, `<update claim="${updatedClaim.publicClaimId}" files="${updated.expectedFiles.join(",")}">replacement omits required facts</update>`) };
         case "update-forbidden-anchor": {
-            const content = [...updated.requiredUpdateAnchors, updated.forbiddenUpdateAnchors[0]].filter(Boolean).join("; ");
-            if (updated.forbiddenUpdateAnchors.length === 0) throw new Error("mutation fixture needs forbidden update anchor");
+            const forbidden = updated.forbiddenUpdateAnchors[0];
+            if (forbidden === undefined) throw new Error("mutation fixture needs forbidden update anchor");
+            const content = [...updated.requiredUpdateAnchors, forbidden].join("; ");
             return { task: "verify", manifest: replaceEntry(verify, updatedClaim.publicClaimId, `<update claim="${updatedClaim.publicClaimId}" files="${updated.expectedFiles.join(",")}">${content}</update>`) };
         }
         case "wrong-independence": {
             const target = requiredGold(fixture.mapGold.claims, (entry) => !entry.independent, "file-bound map gold");
             const claim = claimById(fixture.pool, target.claimId);
-            return { task: "map", manifest: map.replace(new RegExp(`<memory\\b[^>]*claim="${claim.publicClaimId}"[^>]*/>`), `<memory claim="${claim.publicClaimId}" independent="true"/>`) };
+            return { task: "map", manifest: map.replace(new RegExp(`<memory\\b[^>]*claim="${escapeRegExp(claim.publicClaimId)}"[^>]*/>`), `<memory claim="${claim.publicClaimId}" independent="true"/>`) };
         }
         case "missing-gold-file": {
             const target = requiredGold(fixture.mapGold.claims, (entry) => !entry.independent && entry.files.length > 0, "mapped gold file");
+            const claim = claimById(fixture.pool, target.claimId);
             const remaining = target.files.length > 1 ? target.files.slice(1) : ["mutation/other.ts"];
-            return { task: "map", manifest: map.replace(`files="${target.files.join(",")}"`, `files="${remaining.join(",")}"`) };
+            return { task: "map", manifest: replaceMapFiles(map, claim.publicClaimId, remaining) };
         }
         case "importance-outside-band": {
             const target = requiredGold(fixture.classifyGold.claims, (entry) => entry.importance.min > 1 || entry.importance.max < 100, "non-total importance band");
             const claim = claimById(fixture.pool, target.claimId);
             const outside = target.importance.min > 1 ? target.importance.min - 1 : target.importance.max + 1;
-            return { task: "classify", manifest: classify.replace(new RegExp(`(claim="${claim.publicClaimId}"[^>]*importance=")\\d+`), `$1${outside}`) };
+            return { task: "classify", manifest: classify.replace(new RegExp(`(claim="${escapeRegExp(claim.publicClaimId)}"[^>]*importance=")\\d+`), `$1${outside}`) };
         }
         case "wrong-scope": {
             const target = fixture.classifyGold.claims[0];
             if (target === undefined) throw new Error("mutation fixture needs classify gold");
             const claim = claimById(fixture.pool, target.claimId);
             const wrong = target.scope === "project" ? "ecosystem" : "project";
-            return { task: "classify", manifest: classify.replace(new RegExp(`(claim="${claim.publicClaimId}"[^>]*scope=")${target.scope}`), `$1${wrong}`) };
+            return { task: "classify", manifest: classify.replace(new RegExp(`(claim="${escapeRegExp(claim.publicClaimId)}"[^>]*scope=")${target.scope}`), `$1${wrong}`) };
         }
         case "wrong-shareable": {
             const target = fixture.classifyGold.claims[0];
             if (target === undefined) throw new Error("mutation fixture needs classify gold");
             const claim = claimById(fixture.pool, target.claimId);
-            return { task: "classify", manifest: classify.replace(new RegExp(`(claim="${claim.publicClaimId}"[^>]*shareable=")${target.shareable}`), `$1${!target.shareable}`) };
+            return { task: "classify", manifest: classify.replace(new RegExp(`(claim="${escapeRegExp(claim.publicClaimId)}"[^>]*shareable=")${target.shareable}`), `$1${!target.shareable}`) };
         }
         case "truncated-root":
             return { task: "verify", manifest: verify.replace("</verify>", "") };

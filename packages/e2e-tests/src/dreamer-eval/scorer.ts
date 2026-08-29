@@ -10,6 +10,7 @@ import type {
     ErrorReason,
     FailReason,
     ParsedLayerGold,
+    ParsedManifestEvidence,
     PoolDescriptor,
 } from "./contract";
 
@@ -20,7 +21,11 @@ export interface ManifestScore {
     status: "PASS" | "FAIL" | "ERROR";
     reason: ErrorReason | FailReason | null;
     runFatal: boolean;
-    parsedManifest: unknown | null;
+    /**
+     * Evidence in the shape the report contract accepts, so a score can be
+     * carried into a run report without a wrapper transformation.
+     */
+    parsedManifest: ParsedManifestEvidence | null;
 }
 
 export interface ManifestInfraEvidence {
@@ -36,7 +41,7 @@ type VerifyGold = Extract<ParsedLayerGold, { kind: "verify" }>;
 type MapGold = Extract<ParsedLayerGold, { kind: "map" }>;
 type ClassifyGold = Extract<ParsedLayerGold, { kind: "classify" }>;
 
-function score(status: ManifestScore["status"], reason: ManifestScore["reason"], stage: ManifestScoreStage, parsedManifest: unknown | null = null): ManifestScore {
+function score(status: ManifestScore["status"], reason: ManifestScore["reason"], stage: ManifestScoreStage, parsedManifest: ParsedManifestEvidence | null = null): ManifestScore {
     return {
         stage,
         status,

@@ -450,6 +450,16 @@ export interface DreamerSystemTuple {
 
 export type DreamerRunStatus = "PASS" | "FAIL" | "ERROR";
 
+/**
+ * Parsed-manifest evidence exactly as the task's scorer produced it: verify
+ * parses to one record of verdict lists, while map and classify parse to one
+ * entry per claim. `object` is the widest compile-time bound that accepts every
+ * scorer's interface-typed result without a cast, because an interface carries
+ * no implicit index signature; `parseRunReport` is the gate that admits only a
+ * non-array record or an array of records.
+ */
+export type ParsedManifestEvidence = object;
+
 export interface ClaimOperationReceiptOutcome {
     claimId: string;
     operation: string;
@@ -469,7 +479,7 @@ export interface DreamerEvalRunReport {
     poolBefore: ClaimSnapshotProjection[];
     poolAfter: ClaimSnapshotProjection[];
     rawManifest: string | null;
-    parsedManifest: Record<string, unknown> | null;
+    parsedManifest: ParsedManifestEvidence | null;
     receiptOutcomes: ClaimOperationReceiptOutcome[];
 }
 
@@ -494,17 +504,27 @@ function parseSnapshot(raw: unknown, label: string): ClaimSnapshotProjection {
     };
 }
 
+/**
+ * Sole snapshot-array parser. Pool descriptors and run reports carry the same
+ * projection, so identity uniqueness is enforced here rather than per caller: a
+ * repeated claim inflates any consumer that counts rows while a consumer that
+ * keys by id silently retains one copy.
+ */
+function parseSnapshotArray(raw: unknown, label: string): ClaimSnapshotProjection[] {
+    const claims = array(raw, label).map((entry, index) => parseSnapshot(entry, `${label}[${index}]`));
+    unique(claims.map((claim) => claim.claimId), label);
+    unique(claims.map((claim) => claim.publicClaimId), `${label}.publicClaimId`);
+    return claims;
+}
+
 export function parsePoolDescriptor(raw: unknown, label = "pool"): PoolDescriptor {
     const value = record(raw, label);
     exact(value, ["schema", "scenarioId", "claims"], label);
     if (value.schema !== DREAMER_EVAL_POOL_SCHEMA) fail(`${label}.schema: version-invalid`);
-    const claims = array(value.claims, `${label}.claims`).map((entry, index) => parseSnapshot(entry, `${label}.claims[${index}]`));
-    unique(claims.map((claim) => claim.claimId), `${label}.claims`);
-    unique(claims.map((claim) => claim.publicClaimId), `${label}.claims.publicClaimId`);
     return {
         schema: DREAMER_EVAL_POOL_SCHEMA,
         scenarioId: staticId(value.scenarioId, `${label}.scenarioId`, SCENARIO_ID_RE),
-        claims,
+        claims: parseSnapshotArray(value.claims, `${label}.claims`),
     };
 }
 
@@ -518,6 +538,12 @@ function parseSystem(raw: unknown, label: string): DreamerSystemTuple {
         modelId: string(value.modelId, `${label}.modelId`),
         parserImpl: enumeration(value.parserImpl, ["ts"], `${label}.parserImpl`),
     };
+}
+
+function parseManifestEvidence(value: unknown, label: string): ParsedManifestEvidence | null {
+    if (value === null) return null;
+    if (Array.isArray(value)) return array(value, label).map((entry, index) => record(entry, `${label}[${index}]`));
+    return record(value, label);
 }
 
 export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunReport {
@@ -535,8 +561,8 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
     }
     const runFatal = boolean(root.runFatal, `${label}.runFatal`);
     if (runFatal !== isRunFatal(status, reason)) fail(`${label}.runFatal: mapping-invalid`);
-    const poolBefore = array(root.poolBefore, `${label}.poolBefore`).map((entry, index) => parseSnapshot(entry, `${label}.poolBefore[${index}]`));
-    const poolAfter = array(root.poolAfter, `${label}.poolAfter`).map((entry, index) => parseSnapshot(entry, `${label}.poolAfter[${index}]`));
+    const poolBefore = parseSnapshotArray(root.poolBefore, `${label}.poolBefore`);
+    const poolAfter = parseSnapshotArray(root.poolAfter, `${label}.poolAfter`);
     const receiptOutcomes = array(root.receiptOutcomes, `${label}.receiptOutcomes`).map((entry, index) => {
         const itemLabel = `${label}.receiptOutcomes[${index}]`;
         const item = record(entry, itemLabel);
@@ -560,7 +586,7 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
         poolBefore,
         poolAfter,
         rawManifest: nullableString(root.rawManifest, `${label}.rawManifest`),
-        parsedManifest: root.parsedManifest === null ? null : record(root.parsedManifest, `${label}.parsedManifest`),
+        parsedManifest: parseManifestEvidence(root.parsedManifest, `${label}.parsedManifest`),
         receiptOutcomes,
     };
 }

@@ -236,4 +236,51 @@ describe("dreamer eval report contract", () => {
             parseRunReport({ ...baseReport, status: "ERROR", reason: "harness-failure", runFatal: true }),
         ).toThrow(/runFatal: mapping-invalid/);
     });
+
+    test("parsed manifest evidence round-trips every scorer's shape", () => {
+        // Verify parses to one record of verdict lists; map and classify parse
+        // to one entry per claim, so a report that only accepted a record could
+        // not carry the evidence two of the three scorers produce.
+        const mapShape = [{ publicClaimId: "mcm_one", files: ["src/a.ts"], independent: false }];
+        expect(parseRunReport({ ...baseReport, task: "map-memories", parsedManifest: mapShape }).parsedManifest).toEqual(
+            mapShape,
+        );
+        const verifyShape = { verified: [{ publicClaimId: "mcm_one", files: ["src/a.ts"] }], updated: [], archived: [] };
+        expect(parseRunReport({ ...baseReport, parsedManifest: verifyShape }).parsedManifest).toEqual(verifyShape);
+        expect(parseRunReport({ ...baseReport, parsedManifest: null }).parsedManifest).toBeNull();
+        expect(() => parseRunReport({ ...baseReport, parsedManifest: ["not-a-record"] })).toThrow(
+            /parsedManifest\[0\]: object-required/,
+        );
+        expect(() => parseRunReport({ ...baseReport, parsedManifest: "not-a-manifest" })).toThrow(
+            /parsedManifest: object-required/,
+        );
+    });
+
+    test("a report snapshot array cannot repeat a claim", () => {
+        const snapshot = {
+            claimId: "claim-1",
+            publicClaimId: "mcm_one",
+            revisionLocator: "mcm_one@1",
+            content: "Distinct memory content",
+            category: "CONSTRAINTS",
+            importance: 50,
+            memoryScope: "project",
+            sharing: "private",
+            lifecycleState: "active",
+            files: ["src/a.ts"],
+            verificationOutcome: null,
+        };
+        for (const field of ["poolBefore", "poolAfter"] as const) {
+            expect(() => parseRunReport({ ...baseReport, [field]: [snapshot, { ...snapshot }] })).toThrow(
+                new RegExp(`${field}: duplicate`),
+            );
+            expect(() =>
+                parseRunReport({
+                    ...baseReport,
+                    [field]: [snapshot, { ...snapshot, claimId: "claim-2" }],
+                }),
+            ).toThrow(new RegExp(`${field}.publicClaimId: duplicate`));
+        }
+        expect(parseRunReport({ ...baseReport, poolBefore: [snapshot] }).poolBefore).toHaveLength(1);
+    });
 });
