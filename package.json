@@ -39,5 +39,8 @@
     "test:release": "bun test scripts/generate-mc-host-release-manifest.test.ts scripts/qualify-mc-host-production-inputs.test.ts scripts/build-mc-host-payload.test.ts",
     "check:all": "bun run test && bun run test:release && bun run test:rust && bun run release:contract:check && bun run release:qualify:check && bun run release:payload:check && cargo clippy --workspace --all-targets -- -D warnings",
     "build:dists": "bun run --cwd packages/plugin build && bun run --cwd packages/pi-plugin build"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0"
   }
 }

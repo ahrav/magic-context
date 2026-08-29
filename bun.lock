@@ -2,7 +2,11 @@
   "lockfileVersion": 1,
   "configVersion": 1,
   "workspaces": {
-    "": {},
+    "": {
+      "devDependencies": {
+        "typescript": "^5.8.0",
+      },
+    },
     "packages/cli": {
       "name": "@cortexkit/magic-context",
       "version": "0.37.0",
@@ -74,7 +78,7 @@
     },
     "packages/pi-plugin": {
       "name": "@cortexkit/pi-magic-context",
-      "version": "0.37.0",
+      "version": "0.38.0",
       "dependencies": {
         "@huggingface/transformers": "^4.1.0",
         "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",
@@ -110,7 +114,7 @@
     },
     "packages/plugin": {
       "name": "@cortexkit/opencode-magic-context",
-      "version": "0.37.0",
+      "version": "0.38.0",
       "dependencies": {
         "@huggingface/transformers": "^4.1.0",
         "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",

@@ -681,6 +681,12 @@ jobs:
         # specifier pointing at packages/plugin/, so dist must exist.
         run: bun run --cwd packages/plugin build
 
+      - name: Build Pi plugin
+        # The OpenCode selection carries cross-harness parity tests that spawn a
+        # Pi runner alongside opencode, and that spawn asserts
+        # packages/pi-plugin/dist/index.js exists before booting.
+        run: bun run --cwd packages/pi-plugin build
+
       # Strip inherited NODE_ENV=test so the spawned opencode subprocess
       # gets the same logging + runtime behavior as a normal local run
       # (documented in CONTRIBUTING / project memory).
