@@ -24,8 +24,17 @@ export type CompatibilityVerdict =
 
 type SemverTriple = [number, number, number];
 
+/**
+ * Each part is a semver numeric identifier: a single `0`, or a non-zero digit
+ * followed by any digits. `\d+` would also admit leading zeroes, which
+ * `Number.parseInt` then silently normalizes — `00.01.000` would parse to
+ * `[0, 1, 0]` and pass the range gate, so a non-canonical peer version would
+ * satisfy a check whose verdict promises a canonical `X.Y.Z` value.
+ */
+const CANONICAL_SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+
 export function parseSemverTriple(value: string): SemverTriple | null {
-    const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(value);
+    const match = CANONICAL_SEMVER.exec(value);
     if (!match) return null;
     const triple: SemverTriple = [
         Number.parseInt(match[1] as string, 10),

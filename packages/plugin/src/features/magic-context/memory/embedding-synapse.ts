@@ -1033,12 +1033,27 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 // the compatible daemon identity; re-validate before this page
                 // so it never rides an unverified incarnation.
                 if (!this.initialized && !(await this.initialize(signal))) {
+                    // `initialize` reports an abort raised during its own await
+                    // as a plain `false`, so the signal is re-read here. Without
+                    // it a caller-cancelled request records this one page as a
+                    // retryable `transport` failure — inviting a retry of work
+                    // the caller withdrew — while every later page correctly
+                    // reports `cancelled` from the check above.
+                    const aborted = signal?.aborted === true;
                     result.failures.push({
                         applicationGroup,
                         items: manifest,
                         rowId: null,
-                        code: this.permanentFailure ? "artifact_invalid" : "transport",
-                        message: "Synapse lane is unavailable",
+                        code: this.permanentFailure
+                            ? "artifact_invalid"
+                            : aborted
+                              ? "cancelled"
+                              : "transport",
+                        message: this.permanentFailure
+                            ? "Synapse lane disabled after a permanent failure"
+                            : aborted
+                              ? "Synapse request aborted"
+                              : "Synapse lane is unavailable",
                         disposition: this.permanentFailure ? "permanent" : "retryable",
                     });
                     continue;
