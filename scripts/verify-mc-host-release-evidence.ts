@@ -23,6 +23,8 @@ const PAYLOAD_INDEX_PATH = "release/mc-host-payload-index.json";
 const STOP_PROVENANCE_PATH = "release/mc-host-n-minus-one-stop.json";
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const QUALIFICATION_WORKFLOW_PATH = ".github/workflows/mc-host-release-qualification.yml";
+const TEST_REPORT_DIR = "tmp/mc-host-test-reports/";
+const TEST_REPORT_SCHEMA = "magic-context.mc-host-test-report/v1";
 
 interface RegistryPackageEvidence {
     name: string;
@@ -67,32 +69,44 @@ export interface WorkflowSource {
     workflow: string;
 }
 
+function claimedRunId(source: WorkflowSource): string | undefined {
+    return source.runUrl.match(/\/actions\/runs\/(\d+)$/)?.[1];
+}
+
 export function workflowRunApiPath(source: WorkflowSource): string | null {
-    const runId = source.runUrl.match(/\/actions\/runs\/(\d+)$/)?.[1];
+    const runId = claimedRunId(source);
     return runId === undefined ? null : `repos/${source.repository}/actions/runs/${runId}`;
 }
 
-function attestationCertificateMatches(
+/**
+ * Returns the run attempt the certificate was signed in, or null when the
+ * attestation does not bind this artifact to the claimed workflow source.
+ *
+ * The attempt is required: a run-level conclusion reflects only the latest
+ * attempt, so re-running a failed run would otherwise bless artifacts that
+ * were signed by the attempt that failed.
+ */
+function matchedAttestationAttempt(
     value: unknown,
     source: WorkflowSource,
     artifactSha256: string,
-): boolean {
-    if (!Array.isArray(value) || value.length === 0) return false;
-    const claimedRunId = source.runUrl.match(/\/actions\/runs\/(\d+)$/)?.[1];
-    if (claimedRunId === undefined) return false;
-    return value.some((entry) => {
-        if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return false;
+): string | null {
+    if (!Array.isArray(value) || value.length === 0) return null;
+    const runId = claimedRunId(source);
+    if (runId === undefined) return null;
+    for (const entry of value) {
+        if (entry === null || typeof entry !== "object" || Array.isArray(entry)) continue;
         const verificationResult = (entry as Record<string, unknown>).verificationResult;
         if (
             verificationResult === null ||
             typeof verificationResult !== "object" ||
             Array.isArray(verificationResult)
         ) {
-            return false;
+            continue;
         }
         const signature = (verificationResult as Record<string, unknown>).signature;
         if (signature === null || typeof signature !== "object" || Array.isArray(signature)) {
-            return false;
+            continue;
         }
         const certificate = (signature as Record<string, unknown>).certificate;
         if (
@@ -100,12 +114,12 @@ function attestationCertificateMatches(
             typeof certificate !== "object" ||
             Array.isArray(certificate)
         ) {
-            return false;
+            continue;
         }
         const fields = certificate as Record<string, unknown>;
         const statement = (verificationResult as Record<string, unknown>).statement;
         if (statement === null || typeof statement !== "object" || Array.isArray(statement)) {
-            return false;
+            continue;
         }
         const subjects = (statement as Record<string, unknown>).subject;
         const artifactMatches =
@@ -123,20 +137,125 @@ function attestationCertificateMatches(
                 );
             });
         const runInvocationUri = fields.runInvocationURI;
-        const attestedRunId =
+        const invocation =
             typeof runInvocationUri === "string"
-                ? runInvocationUri.match(/\/actions\/runs\/(\d+)(?:\/attempts\/\d+)?$/)?.[1]
-                : undefined;
-        return (
+                ? runInvocationUri.match(/\/actions\/runs\/(\d+)\/attempts\/(\d+)$/)
+                : null;
+        if (invocation === null || invocation[1] !== runId) continue;
+        if (
             fields.sourceRepositoryURI === `https://github.com/${source.repository}` &&
             fields.sourceRepositoryDigest === source.headSha &&
             typeof fields.buildConfigURI === "string" &&
             fields.buildConfigURI.split("@", 1)[0] ===
                 `https://github.com/${source.repository}/${source.workflow}` &&
-            artifactMatches &&
-            attestedRunId === claimedRunId
-        );
+            artifactMatches
+        ) {
+            return invocation[2];
+        }
+    }
+    return null;
+}
+
+/**
+ * Runs `gh attestation verify` and returns the parsed bundle, or null when the
+ * subprocess or its output is unusable. Callers treat null as "unattested".
+ */
+function ghAttestationJson(
+    rootDir: string,
+    artifactPath: string,
+    source: WorkflowSource,
+): unknown {
+    const result = spawnSync(
+        "gh",
+        [
+            "attestation",
+            "verify",
+            artifactPath,
+            "--repo",
+            source.repository,
+            "--source-digest",
+            source.headSha,
+            "--signer-workflow",
+            `${source.repository}/${source.workflow}`,
+            "--format",
+            "json",
+        ],
+        { cwd: rootDir, encoding: "utf8" },
+    );
+    if (result.status !== 0) return null;
+    try {
+        return JSON.parse(result.stdout) as unknown;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Confirms the attempt that signed the artifacts is the attempt that succeeded.
+ *
+ * `detail` separates a transport or permission failure (missing `gh`, no auth,
+ * or a token without `actions: read`) from a genuine negative verdict, so a
+ * blocked release is not misread as tampered evidence.
+ */
+function verifyWorkflowRunAttempt(
+    rootDir: string,
+    source: WorkflowSource,
+    attempt: string,
+): { ok: boolean; detail: string } {
+    const apiPath = workflowRunApiPath(source);
+    if (apiPath === null) return { ok: false, detail: "unparsable run url" };
+    const result = spawnSync("gh", ["api", `${apiPath}/attempts/${attempt}`], {
+        cwd: rootDir,
+        encoding: "utf8",
     });
+    if (result.status !== 0) {
+        const stderr = (result.stderr ?? "").trim().split("\n").at(-1) ?? "";
+        return {
+            ok: false,
+            detail: `gh api exit ${String(result.status)}${stderr === "" ? "" : `: ${stderr}`}`,
+        };
+    }
+    let observed: Record<string, unknown>;
+    try {
+        observed = record(JSON.parse(result.stdout), "workflow run verification");
+    } catch {
+        return { ok: false, detail: "unparsable gh api response" };
+    }
+    if (observed.conclusion !== "success") {
+        return { ok: false, detail: `attempt ${attempt} concluded ${String(observed.conclusion)}` };
+    }
+    if (
+        observed.head_sha !== source.headSha ||
+        observed.path !== source.workflow ||
+        String(observed.run_attempt) !== attempt
+    ) {
+        return { ok: false, detail: `attempt ${attempt} does not match the claimed source` };
+    }
+    return { ok: true, detail: "" };
+}
+
+/**
+ * Verifies each distinct run attempt once.
+ *
+ * Every qualified proof is forced to share one workflow source and attempt, so
+ * without this the gate would re-issue one identical `gh api` call per proof.
+ */
+function cachedWorkflowRunCheck(
+    rootDir: string,
+    source: WorkflowSource,
+    attempt: string,
+    cache: Map<string, { ok: boolean; detail: string }>,
+    override?: (source: WorkflowSource, attempt: string) => boolean,
+): { ok: boolean; detail: string } {
+    const key = `${workflowRunApiPath(source) ?? source.runUrl}/attempts/${attempt}`;
+    const cached = cache.get(key);
+    if (cached !== undefined) return cached;
+    const check =
+        override !== undefined
+            ? { ok: override(source, attempt), detail: "injected verifier declined" }
+            : verifyWorkflowRunAttempt(rootDir, source, attempt);
+    cache.set(key, check);
+    return check;
 }
 
 export function attestationMatchesWorkflowSource(
@@ -144,7 +263,7 @@ export function attestationMatchesWorkflowSource(
     source: WorkflowSource,
     artifactSha256: string,
 ): boolean {
-    return attestationCertificateMatches(value, source, artifactSha256);
+    return matchedAttestationAttempt(value, source, artifactSha256) !== null;
 }
 
 export interface InstalledReleaseEvidence {
@@ -247,12 +366,80 @@ function sha256File(rootDir: string, relative: string): string {
         .digest("hex");
 }
 
+/** Digest of a cited file, or null when it is absent or unreadable. */
+function sha256FileOrNull(rootDir: string, relative: string): string | null {
+    try {
+        return sha256File(rootDir, relative);
+    } catch {
+        return null;
+    }
+}
+
 function isSafeRelativePath(path: string): boolean {
     return (
         !path.startsWith("/") &&
         !path.includes("\\") &&
         !path.split("/").some((part) => part.length === 0 || part === "." || part === "..")
     );
+}
+
+/**
+ * Proves a target proof is backed by real test report bytes that attest this
+ * target.
+ *
+ * The report is mandatory: deriving the expected observations from the
+ * observations themselves would let a proof mirror a null citation and clear
+ * the gate while proving nothing. `seen` rejects one report satisfying more
+ * than one target.
+ */
+function verifyTargetTestReport(
+    rootDir: string,
+    proof: ProofArtifactRef,
+    observations: Record<string, unknown>,
+    seen: Map<string, string>,
+): { path: string; sha256: string } {
+    const identity = `proof artifact ${proof.kind}:${proof.subject}`;
+    const reportPath = observations.test_report_path;
+    if (
+        typeof reportPath !== "string" ||
+        !isSafeRelativePath(reportPath) ||
+        !reportPath.startsWith(TEST_REPORT_DIR)
+    ) {
+        fail(`${identity} must cite a test report under ${TEST_REPORT_DIR}`);
+    }
+    const claimed = observations.test_report_sha256;
+    if (typeof claimed !== "string" || !SHA256_RE.test(claimed)) {
+        fail(`${identity} must cite a sha256 for ${reportPath}`);
+    }
+    const reusedBy = seen.get(reportPath);
+    if (reusedBy !== undefined) {
+        fail(`${identity} reuses the test report already cited by ${reusedBy}`);
+    }
+    const actual = sha256FileOrNull(rootDir, reportPath);
+    if (actual === null) {
+        fail(`${identity} cites an unreadable test report at ${reportPath}`);
+    }
+    if (actual !== claimed) {
+        fail(`${identity} test report digest does not match ${reportPath}`);
+    }
+    let report: Record<string, unknown>;
+    try {
+        report = record(
+            JSON.parse(readFileSync(join(rootDir, reportPath), "utf8")),
+            `${identity} test report`,
+        );
+    } catch {
+        fail(`${identity} cites a malformed test report at ${reportPath}`);
+    }
+    if (
+        report.schema !== TEST_REPORT_SCHEMA ||
+        report.target !== proof.subject ||
+        report.passed !== true
+    ) {
+        fail(`${identity} test report does not attest a passing ${proof.subject}`);
+    }
+    seen.set(reportPath, proof.subject);
+    return { path: reportPath, sha256: claimed };
 }
 
 function exactIdentitySet(
@@ -561,7 +748,7 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
         ) => unknown;
         verifyWorkflowRun?: (
             source: WorkflowSource,
-            proof: ProofArtifactRef,
+            attempt: string,
         ) => boolean;
         verifyInstalledEvidenceAttestation?: (
             path: string,
@@ -597,6 +784,9 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
         }
     }
     let qualifiedSource: WorkflowSource | null = null;
+    let qualifiedAttempt: string | null = null;
+    const citedTestReports = new Map<string, string>();
+    const workflowRunChecks = new Map<string, { ok: boolean; detail: string }>();
     for (const proof of evidence.proof_artifacts) {
         const bytes = readFileSync(join(rootDir, proof.path));
         const digest = createHash("sha256").update(bytes).digest("hex");
@@ -670,6 +860,10 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
         const flow = evidence.product_flows.find(
             (entry) => entry.package === proof.subject,
         );
+        const verifiedTestReport =
+            proof.kind === "target" && target
+                ? verifyTargetTestReport(rootDir, proof, observations, citedTestReports)
+                : null;
         const expectedObservations =
             proof.kind === "registry_package" && registry
                 ? {
@@ -698,20 +892,8 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
                             : "linux",
                         self_fd_verified: target.self_fd_verified,
                         target: target.target,
-                        test_report_path:
-                            typeof observations.test_report_path === "string" &&
-                            isSafeRelativePath(observations.test_report_path)
-                                ? observations.test_report_path
-                                : null,
-                        test_report_sha256:
-                            typeof observations.test_report_path === "string" &&
-                            isSafeRelativePath(observations.test_report_path) &&
-                            typeof observations.test_report_sha256 === "string" &&
-                            SHA256_RE.test(observations.test_report_sha256) &&
-                            sha256File(rootDir, observations.test_report_path) ===
-                                observations.test_report_sha256
-                                ? observations.test_report_sha256
-                                : null,
+                        test_report_path: verifiedTestReport?.path ?? null,
+                        test_report_sha256: verifiedTestReport?.sha256 ?? null,
                     }
                   : proof.kind === "product_flow" && flow
                     ? {
@@ -755,69 +937,35 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
                 fail("qualified proof artifacts must share one workflow source");
             }
             qualifiedSource = workflowSource;
-            const workflowVerified =
-                options.verifyWorkflowRun?.(workflowSource, proof) ??
-                (() => {
-                    const apiPath = workflowRunApiPath(workflowSource);
-                    if (apiPath === null) return false;
-                    const result = spawnSync(
-                        "gh",
-                        ["api", apiPath],
-                        { cwd: rootDir, encoding: "utf8" },
-                    );
-                    if (result.status !== 0) return false;
-                    try {
-                        const observed = record(
-                            JSON.parse(result.stdout),
-                            "workflow run verification",
-                        );
-                        return (
-                            observed.conclusion === "success" &&
-                            observed.head_sha === headSha &&
-                            observed.html_url === runUrl &&
-                            observed.path === workflow
-                        );
-                    } catch {
-                        return false;
-                    }
-                })();
-            if (!workflowVerified) {
-                fail(`proof artifact ${proof.kind}:${proof.subject} workflow run is unverified`);
-            }
+            // The attestation is checked first because it names the run attempt
+            // the artifact was signed in, which the run check then confirms.
             const attestationResult =
-                options.verifyAttestation?.(proofPath, proof, workflowSource) ??
-                (() => {
-                    const result = spawnSync(
-                        "gh",
-                        [
-                            "attestation",
-                            "verify",
-                            proofPath,
-                            "--repo",
-                            repository,
-                            "--source-digest",
-                            headSha,
-                            "--signer-workflow",
-                            `${repository}/${workflow}`,
-                            "--format",
-                            "json",
-                        ],
-                        { cwd: rootDir, encoding: "utf8" },
-                    );
-                    if (result.status !== 0) return null;
-                    try {
-                        return JSON.parse(result.stdout) as unknown;
-                    } catch {
-                        return null;
-                    }
-                })();
-            const verified = attestationCertificateMatches(
+                options.verifyAttestation !== undefined
+                    ? options.verifyAttestation(proofPath, proof, workflowSource)
+                    : ghAttestationJson(rootDir, proofPath, workflowSource);
+            const attempt = matchedAttestationAttempt(
                 attestationResult,
                 workflowSource,
                 proof.sha256,
             );
-            if (!verified) {
+            if (attempt === null) {
                 fail(`proof artifact ${proof.kind}:${proof.subject} lacks a valid attestation`);
+            }
+            if (qualifiedAttempt !== null && qualifiedAttempt !== attempt) {
+                fail("qualified proof artifacts must share one workflow run attempt");
+            }
+            qualifiedAttempt = attempt;
+            const runCheck = cachedWorkflowRunCheck(
+                rootDir,
+                workflowSource,
+                attempt,
+                workflowRunChecks,
+                options.verifyWorkflowRun,
+            );
+            if (!runCheck.ok) {
+                fail(
+                    `proof artifact ${proof.kind}:${proof.subject} workflow run is unverified (${runCheck.detail})`,
+                );
             }
         }
     }
@@ -837,44 +985,23 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
             .update(installedEvidenceBytes)
             .digest("hex");
         const attestationResult =
-            options.verifyInstalledEvidenceAttestation?.(
-                installedEvidencePath,
-                qualifiedSource,
-                installedEvidenceSha256,
-            ) ??
-            (() => {
-                const result = spawnSync(
-                    "gh",
-                    [
-                        "attestation",
-                        "verify",
-                        installedEvidencePath,
-                        "--repo",
-                        qualifiedSource.repository,
-                        "--source-digest",
-                        qualifiedSource.headSha,
-                        "--signer-workflow",
-                        `${qualifiedSource.repository}/${qualifiedSource.workflow}`,
-                        "--format",
-                        "json",
-                    ],
-                    { cwd: rootDir, encoding: "utf8" },
-                );
-                if (result.status !== 0) return null;
-                try {
-                    return JSON.parse(result.stdout) as unknown;
-                } catch {
-                    return null;
-                }
-            })();
-        if (
-            !attestationCertificateMatches(
-                attestationResult,
-                qualifiedSource,
-                installedEvidenceSha256,
-            )
-        ) {
+            options.verifyInstalledEvidenceAttestation !== undefined
+                ? options.verifyInstalledEvidenceAttestation(
+                      installedEvidencePath,
+                      qualifiedSource,
+                      installedEvidenceSha256,
+                  )
+                : ghAttestationJson(rootDir, installedEvidencePath, qualifiedSource);
+        const installedAttempt = matchedAttestationAttempt(
+            attestationResult,
+            qualifiedSource,
+            installedEvidenceSha256,
+        );
+        if (installedAttempt === null) {
             fail("installed release evidence lacks a valid attestation");
+        }
+        if (installedAttempt !== qualifiedAttempt) {
+            fail("installed release evidence was attested by a different workflow run attempt");
         }
     }
     if (requireQualified && !evidence.qualified) {
