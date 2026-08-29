@@ -149,6 +149,18 @@ describe("dreamer eval variance", () => {
         ]);
     });
 
+    test("expected repeats expose wholly missing claims and interrupted runs", () => {
+        const sparse = transformReport(1, "classify-memories", []);
+        const artifact = aggregateDreamerEvalVariance([sparse], 3);
+        expect(artifact.repeatCount).toBe(3);
+        expect(artifact.runs).toHaveLength(1);
+        expect(artifact.red).toBe(true);
+        expect(artifact.claimHistograms).toEqual([
+            { claimId: "claim-a", counts: {}, disagreement: false, observedRuns: 0, missingRuns: 3 },
+            { claimId: "claim-b", counts: {}, disagreement: false, observedRuns: 0, missingRuns: 3 },
+        ]);
+    });
+
     test("mixed system tuples are rejected", () => {
         const changed = report(2);
         changed.system = { ...changed.system, modelId: "anthropic/other" };

@@ -183,8 +183,7 @@
             "outcome": "verified",
             "verifiedAt": 1700000010000
           }
-        ],
-        "classifiedClaimIds": []
+        ]
       },
       "expectedInScopeClaimIds": [
         "claim-history-1",

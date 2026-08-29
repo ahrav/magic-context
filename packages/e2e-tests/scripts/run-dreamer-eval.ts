@@ -21,6 +21,7 @@ interface CliArgs {
     tasks: DreamerTask[];
     repeat: number;
     outputDir: string;
+    deadlineMinutes: number;
 }
 
 function parseArgs(args: string[]): CliArgs {
@@ -28,6 +29,7 @@ function parseArgs(args: string[]): CliArgs {
     const tasks: DreamerTask[] = [];
     let repeat = 1;
     let outputDir = join(E2E_ROOT, "artifacts", "dreamer-eval");
+    let deadlineMinutes = 280;
     const value = (flag: string, candidate: string | undefined): string => {
         if (candidate === undefined || candidate.startsWith("-")) throw new Error(`${flag} requires a value`);
         return candidate;
@@ -50,9 +52,15 @@ function parseArgs(args: string[]): CliArgs {
             }
         } else if (arg === "--output-dir") {
             outputDir = value(arg, args[++index]);
+        } else if (arg === "--deadline-minutes") {
+            const raw = value(arg, args[++index]);
+            deadlineMinutes = Number(raw);
+            if (!Number.isSafeInteger(deadlineMinutes) || deadlineMinutes < 1) {
+                throw new Error(`--deadline-minutes expects a positive integer (got ${raw})`);
+            }
         } else if (arg === "--help" || arg === "-h") {
             console.log(
-                "Usage: run-dreamer-eval.ts [--scenario <id>] [--task <task>] [--repeat <n>] [--output-dir <dir>]",
+                "Usage: run-dreamer-eval.ts [--scenario <id>] [--task <task>] [--repeat <n>] [--output-dir <dir>] [--deadline-minutes <n>]",
             );
             process.exit(0);
         } else {
@@ -64,7 +72,17 @@ function parseArgs(args: string[]): CliArgs {
         tasks: [...new Set(tasks)],
         repeat,
         outputDir: resolve(outputDir),
+        deadlineMinutes,
     };
+}
+
+export function canStartDreamerEvalRun(
+    startedAtMs: number,
+    deadlineMinutes: number,
+    nowMs: number,
+    completedRuns: number,
+): boolean {
+    return completedRuns === 0 || nowMs < startedAtMs + deadlineMinutes * 60_000;
 }
 
 function loadScenarios(): DreamerEvalScenario[] {
@@ -93,6 +111,7 @@ function opencodeVersion(): string {
 }
 
 async function main(): Promise<0 | 1 | 2> {
+    const startedAtMs = Date.now();
     const args = parseArgs(Bun.argv.slice(2));
     const apiKey = process.env.ANTHROPIC_API_KEY;
     const model = process.env.DREAMER_EVAL_MODEL;
@@ -116,6 +135,10 @@ async function main(): Promise<0 | 1 | 2> {
         const groupDir = join(args.outputDir, scenario.id, task.task);
         const groupReports: DreamerEvalRunReport[] = [];
         for (let repeat = 1; repeat <= args.repeat; repeat += 1) {
+            if (!canStartDreamerEvalRun(startedAtMs, args.deadlineMinutes, Date.now(), reports.length)) {
+                console.log(`dreamer-eval deadline reached before ${scenario.id}/${task.task} run ${repeat}`);
+                break;
+            }
             console.log(`${scenario.id}/${task.task}: run ${repeat}/${args.repeat}`);
             const report = await runDreamerEvalTask(scenario, task, {
                 apiKey,
@@ -127,10 +150,15 @@ async function main(): Promise<0 | 1 | 2> {
             reports.push(report);
             console.log(`${report.runId}: ${report.status}${report.reason === null ? "" : `:${report.reason}`}`);
         }
-        const variance = aggregateDreamerEvalVariance(groupReports);
-        writeFileSync(join(groupDir, "variance.json"), `${JSON.stringify(variance, null, 2)}\n`);
+        if (groupReports.length > 0) {
+            const variance = aggregateDreamerEvalVariance(groupReports, args.repeat);
+            writeFileSync(join(groupDir, "variance.json"), `${JSON.stringify(variance, null, 2)}\n`);
+        }
+        if (!canStartDreamerEvalRun(startedAtMs, args.deadlineMinutes, Date.now(), reports.length)) break;
     }
-    return dreamerEvalExitCode(reports);
+    const expectedRunCount = groups.length * args.repeat;
+    const reportExitCode = dreamerEvalExitCode(reports);
+    return reportExitCode === 2 ? 2 : reports.length === expectedRunCount ? reportExitCode : 1;
 }
 
 if (import.meta.main) {

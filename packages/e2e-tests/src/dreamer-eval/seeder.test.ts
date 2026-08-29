@@ -58,7 +58,6 @@ function task(taskName: DreamerTask): DreamerTaskScenario {
                 taskName === "verify" || taskName === "verify-broad"
                     ? [{ claimId: "claim-8", outcome: "verified", verifiedAt: VERIFIED_AT }]
                     : [],
-            classifiedClaimIds: [],
         },
         expectedInScopeClaimIds,
         expectedSkippedClaimIds: all.filter((claimId) => !expectedInScopeClaimIds.includes(claimId)),
@@ -229,6 +228,21 @@ describe("dreamer eval seeder", () => {
         ).rejects.toThrow("ERROR:gate-mismatch");
     });
 
+    test.each([
+        ["verify", "full"],
+        ["verify-broad", "incremental"],
+    ] as const)("rejects %s production mode mismatch before invocation", async (taskName, expectedResultMode) => {
+        const selectedScenario = scenario(taskName);
+        const selectedTask = selectedScenario.tasks[0]!;
+        selectedTask.expectedResultMode = expectedResultMode;
+        await expect(seedDreamerEvalTask({
+            db: database(),
+            scenario: selectedScenario,
+            task: selectedTask,
+            workdir: workdir(),
+        })).rejects.toThrow("ERROR:gate-mismatch: result mode");
+    });
+
     test("names a fixture file changed after its commit", async () => {
         const selectedScenario = scenario("map-memories");
         const result = await seedDreamerEvalTask({
@@ -242,5 +256,17 @@ describe("dreamer eval seeder", () => {
         expect(() => assertFixtureFilesCommitted(result.workdir, ["src/current.ts"])).toThrow(
             "ERROR:fixture-drift: fixture file is not committed: src/current.ts",
         );
+    });
+
+    test("ignores unrelated untracked harness files", async () => {
+        const selectedScenario = scenario("map-memories");
+        const result = await seedDreamerEvalTask({
+            db: database(),
+            scenario: selectedScenario,
+            task: selectedScenario.tasks[0]!,
+            workdir: workdir(),
+        });
+        writeFileSync(join(result.workdir, "harness-output.log"), "unrelated\n");
+        expect(() => assertFixtureFilesCommitted(result.workdir, ["src/current.ts"])).not.toThrow();
     });
 });

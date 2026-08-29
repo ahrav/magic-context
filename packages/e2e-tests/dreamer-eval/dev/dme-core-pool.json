@@ -203,8 +203,7 @@
           { "claimId": "claim-rejected-redis", "files": ["docs/storage.md"] },
           { "claimId": "claim-release-branch", "files": ["config/release.ts"] }
         ],
-        "verifications": [],
-        "classifiedClaimIds": []
+        "verifications": []
       },
       "expectedInScopeClaimIds": [
         "claim-cache-primary",
@@ -290,8 +289,7 @@
       "task": "map-memories",
       "preconditions": {
         "mappings": [],
-        "verifications": [],
-        "classifiedClaimIds": []
+        "verifications": []
       },
       "expectedInScopeClaimIds": [
         "claim-cache-primary",
@@ -373,8 +371,7 @@
       "task": "classify-memories",
       "preconditions": {
         "mappings": [],
-        "verifications": [],
-        "classifiedClaimIds": []
+        "verifications": []
       },
       "expectedInScopeClaimIds": [
         "claim-cache-primary",

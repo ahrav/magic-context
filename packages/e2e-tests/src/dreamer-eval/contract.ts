@@ -130,7 +130,6 @@ export interface VerificationPrecondition {
 export interface TaskPreconditions {
     mappings: MappingPrecondition[];
     verifications: VerificationPrecondition[];
-    classifiedClaimIds: string[];
 }
 
 export interface VerifyGoldClaim {
@@ -245,7 +244,7 @@ function assertKnownClaim(claimId: string, poolIds: ReadonlySet<string>, label: 
 
 function parsePreconditions(raw: unknown, label: string, poolIds: ReadonlySet<string>): TaskPreconditions {
     const value = record(raw, label);
-    exact(value, ["mappings", "verifications", "classifiedClaimIds"], label);
+    exact(value, ["mappings", "verifications"], label);
     const mappings = array(value.mappings, `${label}.mappings`).map((entry, index) => {
         const itemLabel = `${label}.mappings[${index}]`;
         const item = record(entry, itemLabel);
@@ -268,11 +267,7 @@ function parsePreconditions(raw: unknown, label: string, poolIds: ReadonlySet<st
         };
     });
     unique(verifications.map((entry) => entry.claimId), `${label}.verifications`);
-    const classifiedClaimIds = parseClaimIdArray(value.classifiedClaimIds, `${label}.classifiedClaimIds`);
-    for (const [index, claimId] of classifiedClaimIds.entries()) {
-        assertKnownClaim(claimId, poolIds, `${label}.classifiedClaimIds[${index}]`);
-    }
-    return { mappings, verifications, classifiedClaimIds };
+    return { mappings, verifications };
 }
 
 function parseVerifyGold(raw: unknown, label: string, pool: ReadonlyMap<string, ScenarioClaim>): ParsedLayerGold {

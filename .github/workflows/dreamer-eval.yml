@@ -64,6 +64,7 @@ jobs:
         run: |
           bun packages/e2e-tests/scripts/run-dreamer-eval.ts \
             --repeat 3 \
+            --deadline-minutes 280 \
             --output-dir packages/e2e-tests/artifacts/dreamer-eval
 
       - name: Archive run reports and variance artifacts

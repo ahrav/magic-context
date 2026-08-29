@@ -11,14 +11,21 @@ import {
 import {
     classifyDreamerRun,
     readDreamerReceipts,
+    resolveDreamerSystemTuple,
     reconstructPoolEndState,
     type DreamerRunClassificationInput,
 } from "./runner";
 
-const validManifest = `<classifications>
-<memory id="mem-1" importance="85" scope="project" shareable="true" />
-<memory id="mem-2" importance="25" scope="ecosystem" shareable="false" />
-</classifications>`;
+const validManifest = `<classify>
+<memory claim="mcm_true" importance="70" scope="project" shareable="true"/>
+<memory claim="mcm_independent" importance="85" scope="universe" shareable="true"/>
+</classify>`;
+
+const validVerifyManifest = `<verify>
+<verified claim="mcm_true" files="src/cache.ts"/>
+<update claim="mcm_update" files="src/cache.ts">Uses a bounded cache with 4096 entries.</update>
+<archive claim="mcm_false" reason="queue removed"/>
+</verify>`;
 
 function assistantMessages(text: string, info: Record<string, unknown> = {}): unknown[] {
     return [
@@ -61,6 +68,39 @@ function input(overrides: Partial<DreamerRunClassificationInput> = {}): DreamerR
 }
 
 describe("dreamer runner classification", () => {
+    test("valid production classify output reaches PASS", () => {
+        expect(classifyDreamerRun(input())).toMatchObject({ status: "PASS", reason: null });
+    });
+
+    test("valid production output reaches model-quality FAIL", () => {
+        const wrong = validManifest.replace('importance="70"', 'importance="10"');
+        expect(
+            classifyDreamerRun(input({ rawManifest: wrong, childMessages: assistantMessages(wrong) })),
+        ).toMatchObject({ status: "FAIL", reason: "wrong-classification", runFatal: false });
+    });
+
+    test("valid production output reaches run-fatal wrong archival", () => {
+        const wrong = validVerifyManifest.replace(
+            '<verified claim="mcm_true" files="src/cache.ts"/>',
+            '<archive claim="mcm_true" reason="wrong"/>',
+        );
+        expect(
+            classifyDreamerRun(input({
+                task: "verify",
+                gold: dreamerScorerFixture.verifyGold,
+                rawManifest: wrong,
+                childMessages: assistantMessages(wrong),
+            })),
+        ).toMatchObject({ status: "FAIL", reason: "wrong-archival", runFatal: true });
+    });
+
+    test("scored output with incomplete invocation is harness failure", () => {
+        expect(classifyDreamerRun(input({ invocation: null }))).toMatchObject({
+            status: "ERROR",
+            reason: "harness-failure",
+        });
+    });
+
     test("completed validator rejection is FAIL:invalid-output", () => {
         const result = classifyDreamerRun(
             input({
@@ -90,6 +130,12 @@ describe("dreamer runner classification", () => {
             classifyDreamerRun(
                 input({
                     childMessages: assistantMessages(validManifest, { finish_reason: "length" }),
+                    receipts: [{
+                        affectedClaimIds: [],
+                        operationKey: "reject:one",
+                        outcome: "stale",
+                        requestDigest: "b".repeat(64),
+                    }],
                 }),
             ),
         ).toMatchObject({ status: "ERROR", reason: "output-length-capped" });
@@ -159,6 +205,32 @@ describe("dreamer runner classification", () => {
         ).toMatchObject({ status: "FAIL", reason: "invalid-output" });
     });
 
+    test("matching rejection receipt is invalid output regardless of scorer verdict", () => {
+        const rejection = {
+            affectedClaimIds: [],
+            operationKey: "reject:one",
+            outcome: "stale",
+            requestDigest: "b".repeat(64),
+        };
+        expect(classifyDreamerRun(input({ receipts: [rejection] }))).toMatchObject({
+            status: "FAIL",
+            reason: "invalid-output",
+        });
+        const wrongVerdict = validVerifyManifest.replace(
+            '<verified claim="mcm_true" files="src/cache.ts"/>',
+            '<update claim="mcm_true" files="src/cache.ts">still true</update>',
+        );
+        expect(
+            classifyDreamerRun(input({
+                task: "verify",
+                gold: dreamerScorerFixture.verifyGold,
+                rawManifest: wrongVerdict,
+                childMessages: assistantMessages(wrongVerdict),
+                receipts: [rejection],
+            })),
+        ).toMatchObject({ status: "FAIL", reason: "invalid-output" });
+    });
+
     test("fixture drift, child mismatch, and lease loss remain ERROR", () => {
         expect(classifyDreamerRun(input({ fixtureUnchanged: false }))).toMatchObject({
             status: "ERROR",
@@ -176,6 +248,17 @@ describe("dreamer runner classification", () => {
 
     test("runner import does not mutate keep-subagents", () => {
         expect(shouldKeepSubagents()).toBe(false);
+    });
+
+    test("system tuple rejects an unresolved repository identity", () => {
+        expect(() =>
+            resolveDreamerSystemTuple({
+                apiKey: "unused",
+                model: "anthropic/claude-test",
+                artifactDir: "/tmp/unused",
+                repoCommitSha: "",
+            }),
+        ).toThrow("could not resolve a concrete repository commit");
     });
 
     test("pool end state reconstructs from report snapshots without a database", () => {

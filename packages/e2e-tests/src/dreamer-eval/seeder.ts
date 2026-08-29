@@ -224,6 +224,12 @@ export async function preflightDreamerEvalTask(args: {
         });
         actualPublicIds = gate.inScopeIds;
         mode = gate.mode;
+        if (mode !== args.task.expectedResultMode) {
+            throw new DreamerEvalSeederError(
+                "gate-mismatch",
+                `result mode: expected ${args.task.expectedResultMode}, got ${mode}`,
+            );
+        }
     } else if (args.task.task === "map-memories") {
         actualPublicIds = selectMapMemoryInputs(
             args.db,

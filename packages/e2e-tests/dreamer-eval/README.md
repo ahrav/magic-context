@@ -41,6 +41,7 @@ bun scripts/run-dreamer-eval.ts \
   --scenario dme-core-pool \
   --task verify \
   --repeat 3 \
+  --deadline-minutes 280 \
   --output-dir artifacts/dreamer-eval
 ```
 
@@ -48,7 +49,11 @@ Each task repeat gets a fresh harness database and fixture repository. The
 command runs in its own Bun process so the runner's temporary keep-subagents
 setting cannot leak into a shared test process. Output is grouped under
 `<output-dir>/<scenario>/<task>/`: one versioned run report per repeat and one
-`variance.json` artifact for the set.
+`variance.json` artifact for the set. `observedRuns` counts manifests that
+included a claim, while `missingRuns` includes sparse outputs and repeats skipped
+after the script-level deadline. `repeatCount` remains the requested repeat count.
+The deadline is checked between paid runs, leaving time for variance writes and
+artifact upload before the enclosing workflow timeout.
 
 Exit codes are `0` when every run passes, `1` for any ordinary FAIL or ERROR,
 and `2` when any run archives a gold-true claim. Missing credentials, invalid

@@ -164,7 +164,7 @@ export function getSubagentInvocations(
               .prepare(
                   `SELECT * FROM subagent_invocations
                    WHERE session_id = ? AND subagent = ?
-                   ORDER BY started_at DESC
+                    ORDER BY started_at DESC, id DESC
                    LIMIT ?`,
               )
               .all(sessionId, opts.subagent, limit) as SubagentInvocationDbRow[])
@@ -172,7 +172,7 @@ export function getSubagentInvocations(
               .prepare(
                   `SELECT * FROM subagent_invocations
                    WHERE session_id = ?
-                   ORDER BY started_at DESC
+                    ORDER BY started_at DESC, id DESC
                    LIMIT ?`,
               )
               .all(sessionId, limit) as SubagentInvocationDbRow[]);

@@ -74,9 +74,15 @@ function observedVerdicts(report: DreamerEvalRunReport): Map<string, string> {
     return observed;
 }
 
-export function aggregateDreamerEvalVariance(reports: readonly DreamerEvalRunReport[]): DreamerVarianceArtifact {
+export function aggregateDreamerEvalVariance(
+    reports: readonly DreamerEvalRunReport[],
+    expectedRuns: number = reports.length,
+): DreamerVarianceArtifact {
     const first = reports[0];
     if (first === undefined) throw new Error("variance requires at least one report");
+    if (!Number.isSafeInteger(expectedRuns) || expectedRuns < reports.length) {
+        throw new Error("variance expected runs must cover observed reports");
+    }
     const systemIdentity = JSON.stringify(first.system);
     if (reports.some((report) => JSON.stringify(report.system) !== systemIdentity)) {
         throw new Error("variance reports must share one system tuple");
@@ -85,7 +91,7 @@ export function aggregateDreamerEvalVariance(reports: readonly DreamerEvalRunRep
         throw new Error("variance reports must share one scenario and task");
     }
 
-    const counts = new Map<string, Map<string, number>>();
+    const counts = new Map(first.poolBefore.map((claim) => [claim.claimId, new Map<string, number>()]));
     for (const report of reports) {
         const logicalByPublic = new Map(report.poolBefore.map((claim) => [claim.publicClaimId, claim.claimId]));
         for (const [publicId, verdict] of observedVerdicts(report)) {
@@ -107,13 +113,13 @@ export function aggregateDreamerEvalVariance(reports: readonly DreamerEvalRunRep
                 counts: Object.fromEntries(entries),
                 disagreement: entries.length > 1,
                 observedRuns,
-                missingRuns: reports.length - observedRuns,
+                missingRuns: expectedRuns - observedRuns,
             };
         });
     return {
         scenarioId: first.scenarioId,
         task: first.task,
-        repeatCount: reports.length,
+        repeatCount: expectedRuns,
         system: first.system,
         runs: reports.map((report) => ({
             runId: report.runId,
@@ -122,7 +128,7 @@ export function aggregateDreamerEvalVariance(reports: readonly DreamerEvalRunRep
             runFatal: report.runFatal,
         })),
         claimHistograms,
-        red: reports.some((report) => report.status !== "PASS"),
+        red: reports.length !== expectedRuns || reports.some((report) => report.status !== "PASS"),
         runFatal: reports.some((report) => report.runFatal),
     };
 }

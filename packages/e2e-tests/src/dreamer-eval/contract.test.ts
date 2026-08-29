@@ -37,7 +37,7 @@ function validScenarioRaw(): Record<string, unknown> {
         tasks: [
             {
                 task: "verify",
-                preconditions: { mappings: [], verifications: [], classifiedClaimIds: [] },
+                preconditions: { mappings: [], verifications: [] },
                 expectedInScopeClaimIds: claims.slice(0, 9).map((entry) => entry.id),
                 expectedSkippedClaimIds: ["claim-10"],
                 expectedResultMode: "incremental",
@@ -53,7 +53,7 @@ function validScenarioRaw(): Record<string, unknown> {
             },
             {
                 task: "map-memories",
-                preconditions: { mappings: [], verifications: [], classifiedClaimIds: [] },
+                preconditions: { mappings: [], verifications: [] },
                 expectedInScopeClaimIds: claims.map((entry) => entry.id),
                 expectedSkippedClaimIds: [],
                 expectedResultMode: null,
@@ -68,7 +68,7 @@ function validScenarioRaw(): Record<string, unknown> {
             },
             {
                 task: "classify-memories",
-                preconditions: { mappings: [], verifications: [], classifiedClaimIds: [] },
+                preconditions: { mappings: [], verifications: [] },
                 expectedInScopeClaimIds: claims.map((entry) => entry.id),
                 expectedSkippedClaimIds: [],
                 expectedResultMode: null,

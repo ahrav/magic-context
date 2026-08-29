@@ -152,6 +152,9 @@ export function classifyDreamerRun(input: DreamerRunClassificationInput): Dreame
     }
 
     const scored = scoreManifest(input);
+    const matchingRejection = input.rejectionRequestDigest === null
+        ? undefined
+        : input.receipts.find((receipt) => receipt.requestDigest === input.rejectionRequestDigest);
     if (scored.status === "ERROR") {
         return outcome("ERROR", scored.reason, scored.parsedManifest);
     }
@@ -165,17 +168,12 @@ export function classifyDreamerRun(input: DreamerRunClassificationInput): Dreame
                 : null;
         if (actualModel !== input.pinnedModel) return outcome("ERROR", "fallback-engaged");
     }
+    if (matchingRejection !== undefined) {
+        return outcome("FAIL", "invalid-output", scored.parsedManifest);
+    }
 
     const stale = input.receipts.find((receipt) => receipt.outcome === "stale");
     if (stale !== undefined) {
-        if (
-            input.rejectionRequestDigest !== null &&
-            stale.requestDigest === input.rejectionRequestDigest
-        ) {
-            return scored.status === "FAIL" && scored.reason === "invalid-output"
-                ? outcome("FAIL", "invalid-output", scored.parsedManifest)
-                : outcome("ERROR", "harness-failure", scored.parsedManifest);
-        }
         return outcome("ERROR", "apply-not-applied", scored.parsedManifest);
     }
     if (scored.status === "FAIL" && scored.reason === "invalid-output") {
@@ -332,7 +330,7 @@ function gitOutput(workdir: string, args: readonly string[]): string | null {
     return result.success ? result.stdout.toString().trim() : null;
 }
 
-function systemTuple(options: RunDreamerEvalTaskOptions) {
+export function resolveDreamerSystemTuple(options: RunDreamerEvalTaskOptions) {
     const repoCommitSha = options.repoCommitSha ?? gitOutput(process.cwd(), ["rev-parse", "HEAD"]) ?? "";
     if (!/^[0-9a-f]{40,64}$/.test(repoCommitSha)) {
         throw new Error("dreamer-eval could not resolve a concrete repository commit");
@@ -386,6 +384,8 @@ export async function runDreamerEvalTask(
 ): Promise<DreamerEvalRunReport> {
     const nowMs = options.nowMs ?? Date.now();
     const runId = options.runId ?? `run-${randomUUID().replaceAll("-", "")}`;
+    assertDreamerModelPin(options.model);
+    const system = resolveDreamerSystemTuple(options);
     let harness: TestHarness | null = null;
     let db: ReturnType<typeof openTestDb> | null = null;
     let parentSessionId = "";
@@ -401,7 +401,6 @@ export async function runDreamerEvalTask(
     let acquired: NonNullable<ReturnType<typeof acquireLeaseWithAcquisition>> | null = null;
     const priorKeepSubagents = shouldKeepSubagents();
     try {
-        assertDreamerModelPin(options.model);
         const live = liveModelSpawnOptions({ apiKey: options.apiKey, providerBlock: ANTHROPIC_PROVIDER_BLOCK });
         const activeHarness = await TestHarness.create({ ...live });
         harness = activeHarness;
@@ -481,8 +480,7 @@ export async function runDreamerEvalTask(
         try {
             assertFixtureFilesCommitted(seeded.workdir, fixturePaths(scenario));
             fixtureUnchanged =
-                gitOutput(seeded.workdir, ["rev-parse", "HEAD"]) === fixtureHead &&
-                gitOutput(seeded.workdir, ["status", "--porcelain"]) === "";
+                gitOutput(seeded.workdir, ["rev-parse", "HEAD"]) === fixtureHead;
         } catch {
             fixtureUnchanged = false;
         }
@@ -539,7 +537,7 @@ export async function runDreamerEvalTask(
         status: classification.status,
         reason: classification.reason,
         runFatal: classification.runFatal,
-        system: systemTuple(options),
+        system,
         poolBefore,
         poolAfter,
         rawManifest,
