@@ -221,12 +221,51 @@ function liveAdmissionGate(scenarios: readonly HistorianEvalScenario[]): number 
     return 0;
 }
 
+/**
+ * Rebuild the plugin bundle the harness will load, so the recorded commit
+ * identifies the code that actually ran.
+ *
+ * `opencode-runner/spawn.ts` prefers `packages/plugin/dist/index.js` over
+ * `src/index.ts` whenever the bundle exists, and `dist/` is gitignored — so
+ * `git status --porcelain` never sees it and the runner's dirty-worktree digest
+ * excludes it entirely. A stale bundle therefore makes OpenCode load old plugin
+ * code while the report names the current source commit, with no system-tuple
+ * mismatch to reveal it. That silently invalidates exactly the longitudinal
+ * comparison the tuple exists to protect, and a live run is far too expensive to
+ * discover it afterwards. The scheduled workflow already builds before running;
+ * this is the same command, so the documented direct command behaves the same
+ * way.
+ *
+ * Rebuilding rather than staleness-checking, because it is correct in both
+ * branches of that `existsSync`. `spawn.ts` binds its entry at import time: if
+ * the bundle exists it is already the chosen path and this refreshes the bytes
+ * before the spawn reads them; if it does not, the entry is already bound to the
+ * current source and building only affects later processes. An mtime comparison
+ * would have to be right about which one applies.
+ */
+function buildPluginBundle(): number {
+    const repoRoot = resolve(E2E_ROOT, "..", "..");
+    console.log("building the plugin bundle the harness loads...");
+    try {
+        execSync("bun run --cwd packages/plugin build", { cwd: repoRoot, stdio: "inherit" });
+        return 0;
+    } catch (error) {
+        console.error(
+            `live admission: plugin build failed, so the harness would load a stale or missing bundle: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        return 1;
+    }
+}
+
 async function runLive(args: CliArgs): Promise<number> {
     const { scenarios, releaseVersion } = loadCorpus(args);
     // Routing first: it is instantaneous, and an operator who forgot a variable
-    // should not wait out the battery to be told so. Both still precede the first
-    // request, which is what "before any token is spent" requires.
+    // should not wait out the build and battery to be told so. All three still
+    // precede the first request, which is what "before any token is spent"
+    // requires.
     const mode = liveModeFromEnv();
+    const built = buildPluginBundle();
+    if (built !== 0) return built;
     const admission = liveAdmissionGate(scenarios);
     if (admission !== 0) return admission;
     const opencode = opencodeVersion();

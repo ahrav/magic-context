@@ -1099,6 +1099,56 @@ describe("scoreRunRecord", () => {
         }
     });
 
+    test("an aborted record's forbidden promotion is scored from the snapshot, not its serialized claims", () => {
+        const fixture = makeSnapshot({
+            facts: [...goldFacts(), { category: "ARCHITECTURE", content: "Use Redis for the session cache." }],
+        });
+        try {
+            const scenario = validScenario();
+            const aborted = makeRecord(fixture, scenario, {
+                error: { reason: "probe-response-leak", detail: "probe-capacity leaked a claim id" },
+            });
+            // Masking direction: dropping the forbidden entry from the serialized
+            // array must not hide it, because an ERROR record never reaches the
+            // snapshot-binding checks that would otherwise catch the omission.
+            const truncated = scoreRunRecord({ ...aborted, injectedClaims: [] }, scenario);
+            expect(truncated.verdict).toBe("FAIL");
+            expect(truncated.falseAuthoritativeMatches).toEqual(["abs-redis-active"]);
+            expect(laneExitCode(buildLaneReport([truncated]))).toBe(2);
+
+            // Manufacturing direction: with a readable snapshot the snapshot is the
+            // authority, so an array naming a promotion the database does not hold
+            // cannot invent a run-fatal verdict.
+            const clean = makeSnapshot({ facts: goldFacts() });
+            try {
+                const cleanRecord = makeRecord(clean, scenario, {
+                    error: { reason: "probe-response-leak", detail: "probe-capacity leaked a claim id" },
+                });
+                const forged = scoreRunRecord(
+                    {
+                        ...cleanRecord,
+                        injectedClaims: [
+                            {
+                                publicClaimId: "clm-forged",
+                                revisionLocator: "rev-forged",
+                                content: "Use Redis for the session cache.",
+                                category: "ARCHITECTURE",
+                                revision: 1,
+                            },
+                        ],
+                    },
+                    scenario,
+                );
+                expect(forged.verdict).toBe("ERROR");
+                expect(forged.errorReason).toBe("probe-response-leak");
+            } finally {
+                clean.cleanup();
+            }
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
     test("an aborted run with no forbidden promotion stays an ordinary ERROR", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {

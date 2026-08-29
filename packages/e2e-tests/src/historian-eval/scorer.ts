@@ -1246,6 +1246,49 @@ function renderedClaimIdsInLastMemoryBlock(payloadText: string): Set<string> | n
 }
 
 /**
+ * False-authoritative matches for a record that aborted.
+ *
+ * Snapshot-derived whenever a snapshot is available, because an ERROR record's
+ * serialized `injectedClaims` never reaches the snapshot-binding checks — those
+ * run only on the completion path — so an edited or mispaired array could
+ * manufacture a run-fatal verdict, and worse, HIDE a real promotion by dropping
+ * the entry. Masking is the direction this whole path exists to close, so the
+ * array cannot be the authority when a better one is on disk: the snapshot is
+ * what the completion path scores facts from, and `emptyRecord` captures it
+ * after the claim read, so it supersedes the array in both directions.
+ *
+ * Falls back to the recorded array only when there is no readable snapshot.
+ * `contextDbSnapshotPath` is best effort on an abort and is frequently `""`,
+ * and there the array is the only evidence there is; trusting it is the
+ * fail-loud direction, and refusing to score it would restore the masking hole.
+ * A snapshot that cannot be opened, queried, or that reads stale degrades to
+ * that same fallback rather than becoming an `unreadable-snapshot` ERROR: the
+ * abort's own reason is the more informative fact about the run, and replacing
+ * it would lose that.
+ */
+function abortedRecordFalseAuthoritative(
+    record: HistorianEvalRunRecord,
+    scenario: HistorianEvalScenario,
+): string[] {
+    const recorded = (): string[] => falseAuthoritativeMatchesIn(scenario, record.injectedClaims);
+    if (record.contextDbSnapshotPath.length === 0) return recorded();
+    let db: ReturnType<typeof openTestDb>;
+    try {
+        db = openTestDb(record.contextDbSnapshotPath, { readonly: true });
+    } catch {
+        return recorded();
+    }
+    try {
+        const visible = readInjectedClaims(db, record.projectIdentity, record.scenarioId, record.nowMs);
+        return visible === null ? recorded() : falseAuthoritativeMatchesIn(scenario, visible);
+    } catch {
+        return recorded();
+    } finally {
+        db.close();
+    }
+}
+
+/**
  * Score a run record produced by the replay runner. ERROR-flagged records
  * propagate their reason with no rates computed (R6). A live historian
  * whose every attempt failed validation is model behavior, not
@@ -1273,18 +1316,18 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
     // `runFatal: false` ERROR — exit 1 instead of 2 — so aborting after a
     // forbidden promotion was a way to mask it.
     //
-    // Scored from the record's captured claims rather than the snapshot: an
-    // error record's DB snapshot is best effort and often absent
-    // (`contextDbSnapshotPath: ""`), while the recorded set is what the runner
-    // read from the injection-visible surface at the pinned clock. The abort's
-    // reason and detail stay on the score, so the infrastructure failure is
+    // Scored from the snapshot when the abort left a readable one, and from the
+    // record's captured claims only when it did not — see
+    // `abortedRecordFalseAuthoritative` for why the serialized array cannot be
+    // the authority while a snapshot is on disk. The abort's reason and detail
+    // stay on the score, so the infrastructure failure is
     // still reported rather than replaced; only the verdict changes, which is
     // what puts the scenario where the always-run-fatal rule can see it. Rates
     // stay null and the claim counts zero — nothing here measures recall or
     // precision — so the aggregate is unaffected beyond the false-authoritative
     // rate this outcome belongs in.
     if (record.error !== null) {
-        const falseAuthoritativeMatches = falseAuthoritativeMatchesIn(scenario, record.injectedClaims);
+        const falseAuthoritativeMatches = abortedRecordFalseAuthoritative(record, scenario);
         const errored = errorScore(record.scenarioId, record.error.reason, record.error.detail, record.system);
         if (falseAuthoritativeMatches.length === 0) return errored;
         return { ...errored, verdict: "FAIL", failReasons: ["false-authoritative"], falseAuthoritativeMatches };
