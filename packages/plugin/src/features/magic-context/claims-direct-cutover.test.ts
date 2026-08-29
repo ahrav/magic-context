@@ -63,9 +63,6 @@ const SOURCE_ROOTS = [
     "packages/plugin/scripts",
     "packages/pi-plugin/src",
     "packages/cli/src",
-    "packages/dashboard/src",
-    "packages/dashboard/src-tauri/src",
-    "packages/dashboard/db-adapter/src",
     "crates",
 ] as const;
 const SOURCE_EXTENSION = /\.(?:ts|tsx|js|mjs|rs)$/;

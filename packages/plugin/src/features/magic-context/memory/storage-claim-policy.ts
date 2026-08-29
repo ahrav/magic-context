@@ -493,12 +493,11 @@ export function countIndependentEvidenceGroups(db: Database, revisionId: number)
 
 /**
  * The only producer whose explicit-user observation may grant explicit-user
- * credit to a revision that changes content. The Tauri dashboard records the
- * new content as the observation's own `extracted_text`. Mirrored by
- * `EXPLICIT_USER_REVISION_PRODUCER` in
- * `packages/dashboard/src-tauri/src/claim_adapter.rs`; the adapter conformance
- * suite compares both policies' verdicts, so a drift shows up as a maturity
- * disagreement rather than passing silently.
+ * credit to a revision that changes content. The retired Tauri dashboard
+ * recorded the new content as the observation's own `extracted_text`, and
+ * existing databases still hold revisions it authored, so this producer tag
+ * and its qualification rule are load-bearing for their trust classification
+ * even though no current surface writes new observations under it.
  */
 export const EXPLICIT_USER_REVISION_PRODUCER = "dashboard:tauri";
 
