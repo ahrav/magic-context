@@ -443,11 +443,26 @@ fn publication_daemon_ver(observed: &LifecycleProbe) -> Option<String> {
 /// Parses `mc-host/X.Y.Z` against the embedded half-open supported daemon
 /// range from the release contract.
 fn daemon_version_compatible(daemon_ver: &str) -> bool {
+    /// One canonical numeric component: digits only, and no leading zero
+    /// unless the component is exactly `0`. This is the same grammar the
+    /// plugin's `CANONICAL_SEMVER` enforces in
+    /// `mc-host-lifecycle/compatibility.ts`. Deferring to `str::parse` alone
+    /// would accept `00`, `01`, and `+1`, so the CLI would call a daemon
+    /// healthy that the client refuses as `incompatible_daemon`.
+    fn component(part: &str) -> Option<u64> {
+        if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        if part.len() > 1 && part.starts_with('0') {
+            return None;
+        }
+        part.parse().ok()
+    }
     fn triple(version: &str) -> Option<[u64; 3]> {
         let mut parts = version.split('.');
-        let major = parts.next()?.parse().ok()?;
-        let minor = parts.next()?.parse().ok()?;
-        let patch = parts.next()?.parse().ok()?;
+        let major = component(parts.next()?)?;
+        let minor = component(parts.next()?)?;
+        let patch = component(parts.next()?)?;
         if parts.next().is_some() {
             return None;
         }
@@ -1188,13 +1203,18 @@ fn cmd_stop() -> DaemonResult {
     };
     match observed.state {
         // No lock-held incarnation exists. Selector cleanup is best-effort
-        // stale-state removal under the transaction ownership boundary.
+        // stale-state removal under the transaction ownership boundary, so a
+        // cleanup failure is reported (`ok:false`) without restating the
+        // lifecycle state: the host really is stopped, and `wedged` would
+        // route remediation at a daemon process that is not there. Only an
+        // unsupported schema stays `wedged`, because that state is owned by a
+        // newer binary and needs `align_versions`.
         LifecycleState::Stopped => match serve::clear_active_selection() {
             Ok(()) => DaemonResult::new(command, true, "stopped", "already_stopped"),
             Err("unsupported active harness selection schema") => {
                 DaemonResult::new(command, false, "wedged", "unsupported_state_schema")
             }
-            Err(_) => DaemonResult::new(command, false, "wedged", "internal_error"),
+            Err(_) => DaemonResult::new(command, false, "stopped", "internal_error"),
         },
         LifecycleState::Wedged => {
             let reason = if observed.reason == "unsupported_state_schema" {
@@ -1211,12 +1231,19 @@ fn cmd_stop() -> DaemonResult {
             "lifecycle_busy",
         ),
         LifecycleState::Running => match stop_phase(&runtime, outer) {
+            // The stop transaction committed: the incarnation was signalled,
+            // acknowledged, and observed stopped. A best-effort selector
+            // cleanup failure after that point cannot un-commit it, so the
+            // reported state stays `stopped` and only `ok`/`reason` carry the
+            // cleanup fault. Reporting `wedged` here contradicted the
+            // committed stop and sent callers into wedged recovery against an
+            // already-stopped host.
             (_, Ok(())) => match serve::clear_active_selection() {
                 Ok(()) => DaemonResult::new(command, true, "stopped", "stopped"),
                 Err("unsupported active harness selection schema") => {
                     DaemonResult::new(command, false, "wedged", "unsupported_state_schema")
                 }
-                Err(_) => DaemonResult::new(command, false, "wedged", "internal_error"),
+                Err(_) => DaemonResult::new(command, false, "stopped", "internal_error"),
             },
             (_, Err((state, reason))) => DaemonResult::new(command, false, state, reason),
         },
@@ -1729,5 +1756,21 @@ mod tests {
         assert!(!daemon_version_compatible("mc-host/0.0.9"));
         assert!(!daemon_version_compatible("other/0.1.0"));
         assert!(!daemon_version_compatible("mc-host/1"));
+    }
+
+    /// The CLI gate and the plugin's `evaluateDaemonCompatibility` decide the
+    /// same question about the same authenticated `daemon_ver`, so a version
+    /// the client quarantines as `incompatible_daemon` must never pass here.
+    /// `mc-host/00.01.000` numerically resolves inside the supported range,
+    /// so only the canonical-component rule rejects it.
+    #[test]
+    fn daemon_version_rejects_noncanonical_components() {
+        assert!(!daemon_version_compatible("mc-host/00.01.000"));
+        assert!(!daemon_version_compatible("mc-host/0.01.0"));
+        assert!(!daemon_version_compatible("mc-host/0.1.00"));
+        assert!(!daemon_version_compatible("mc-host/+0.1.0"));
+        assert!(!daemon_version_compatible("mc-host/0.+1.0"));
+        assert!(!daemon_version_compatible("mc-host/0. 1.0"));
+        assert!(!daemon_version_compatible("mc-host/0..0"));
     }
 }
