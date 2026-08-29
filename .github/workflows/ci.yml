@@ -279,6 +279,9 @@ jobs:
       - name: Provision metadata-only sibling stubs
         run: sh scripts/provision-rust-ci-stubs.sh
 
+      - name: Warm mc-host dependency graph
+        run: cargo tree -p mc-host -e normal >/dev/null
+
       - name: Test
         run: bun run test
 
