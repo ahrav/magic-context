@@ -1040,6 +1040,28 @@ describe("scoreRunRecord", () => {
         }
     });
 
+    test("an empty system-version field is malformed, not a usable identity", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario);
+            // `typeof x === "string"` accepts "": the record would take an ordinary
+            // verdict and then be grouped as comparable with runs it shares no
+            // runtime with, which is the opposite of why these fields exist.
+            for (const field of ["bunVersion", "opencodeVersion", "repoCommitSha", "historianModelId", "probeModelId"] as const) {
+                for (const empty of ["", "   "]) {
+                    const score = scoreRunRecord(
+                        { ...record, system: { ...record.system, [field]: empty } },
+                        scenario,
+                    );
+                    expect(score.errorReason, `${field}=${JSON.stringify(empty)}`).toBe("record-malformed");
+                }
+            }
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
     test("an older schema is classified as unsupported, not as a malformed record", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {

@@ -873,6 +873,11 @@ function errorMessage(error: unknown): string {
  * counted as one damaged artifact. Checked explicitly rather than behind a
  * blanket catch, so a genuine scorer bug still surfaces as a bug.
  */
+/** A system-tuple field that actually names something: a string with non-whitespace text. */
+function isIdentityValue(value: unknown): boolean {
+    return typeof value === "string" && value.trim().length > 0;
+}
+
 function recordShapeError(record: HistorianEvalRunRecord): ScenarioScore | null {
     // The root itself: deserialized JSON can be null, an array, or a primitive,
     // and every field access below would throw before reporting anything.
@@ -905,11 +910,17 @@ function recordShapeError(record: HistorianEvalRunRecord): ScenarioScore | null 
     if (
         record.system === null ||
         typeof record.system !== "object" ||
-        typeof record.system.repoCommitSha !== "string" ||
-        typeof record.system.bunVersion !== "string" ||
-        typeof record.system.opencodeVersion !== "string" ||
-        typeof record.system.historianModelId !== "string" ||
-        typeof record.system.probeModelId !== "string" ||
+        // Non-empty, not merely `string`. Every one of these exists to DISTINGUISH
+        // one run from another, and `""` distinguishes nothing — a record with an
+        // empty version or sha would take an ordinary PASS/FAIL and then be grouped
+        // by `resolveReportSystem` as comparable with runs it shares nothing with.
+        // Applied to the whole tuple rather than the two version fields alone,
+        // because the argument is identical for the sha and the model routes.
+        !isIdentityValue(record.system.repoCommitSha) ||
+        !isIdentityValue(record.system.bunVersion) ||
+        !isIdentityValue(record.system.opencodeVersion) ||
+        !isIdentityValue(record.system.historianModelId) ||
+        !isIdentityValue(record.system.probeModelId) ||
         record.system.parserImpl !== "ts" ||
         !(record.system.chunkTokenBudget === null || typeof record.system.chunkTokenBudget === "number")
     ) {
