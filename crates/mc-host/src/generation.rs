@@ -26,8 +26,8 @@ use sha2::Digest;
 
 use crate::instance::{
     hex, io_err, is_safe_ancestor, is_secure_regular, mode_bits, open_secure_dir_existing,
-    read_all_fd, secure_runtime_dir, write_all_fd, InstanceError, S_IFDIR, S_IFLNK, S_IFMT,
-    S_IFREG,
+    owner_uid, read_all_fd, secure_runtime_dir, write_all_fd, InstanceError, S_IFDIR, S_IFLNK,
+    S_IFMT, S_IFREG,
 };
 use crate::lifecycle::{is_canonical_payload_digest, lifecycle_dir_path};
 
@@ -402,10 +402,6 @@ fn open_rel_dir_nofollow(dir: &OwnedFd, rel: &str) -> Option<OwnedFd> {
         }
     }
     current
-}
-
-fn owner_uid() -> u32 {
-    rustix::process::geteuid().as_raw()
 }
 
 /// Permission bits as rustix's platform-width `RawMode`.

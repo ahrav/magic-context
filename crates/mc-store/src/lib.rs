@@ -8046,44 +8046,6 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// Read the next chronological compartment page and the highest sequence currently
-    /// published for the session. The caller supplies the protocol page cap.
-    pub fn load_compartments_after(
-        &self,
-        session_id: &str,
-        after_sequence: i64,
-        limit: usize,
-    ) -> Result<CompartmentPage, McStoreError> {
-        let page = self.inner.with_conn(|conn| {
-            let max_sequence = conn
-                .query_row(
-                    "SELECT MAX(sequence) FROM mc_compartments WHERE session_id = ?1",
-                    params![session_id],
-                    |row| row.get::<_, Option<i64>>(0),
-                )?
-                .map_or(after_sequence, |max| max.max(after_sequence));
-            let mut stmt = conn.prepare_cached(
-                "SELECT sequence, start_message, end_message, start_message_id, end_message_id,
-                        start_date, end_date, title, content, p1, p2, p3, p4, importance,
-                        episode_type, legacy, created_at
-                 FROM mc_compartments
-                 WHERE session_id = ?1 AND sequence > ?2
-                 ORDER BY sequence ASC LIMIT ?3",
-            )?;
-            let compartments = stmt
-                .query_map(
-                    params![session_id, after_sequence, limit as i64],
-                    Self::stored_compartment_from_row,
-                )?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(CompartmentPage {
-                compartments,
-                max_sequence,
-            })
-        })?;
-        Ok(page)
-    }
-
     /// Read the compartment rows and session revert epoch in one store snapshot for
     /// historian assembly. The epoch is the fence carried by the firing until publish.
     pub fn load_historian_assembly_snapshot(

@@ -707,10 +707,14 @@ pub(crate) fn flock_exclusive_bounded(
 }
 
 pub(crate) const S_IFMT: u32 = 0o170000;
-const S_ISVTX: u32 = 0o1000;
+pub(crate) const S_ISVTX: u32 = 0o1000;
 pub(crate) const S_IFDIR: u32 = 0o040000;
 pub(crate) const S_IFREG: u32 = 0o100000;
 pub(crate) const S_IFLNK: u32 = 0o120000;
+
+pub(crate) fn owner_uid() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
 
 #[cfg(target_os = "macos")]
 pub(crate) fn mode_bits(stat: &rustix::fs::Stat) -> u32 {
