@@ -76,14 +76,27 @@ const pool: PoolDescriptor = {
 };
 
 const verifyGold = { kind: "verify" as const, claims: [
-    { claimId: "claim-true", verdict: "verified", requiredUpdateAnchors: [], forbiddenUpdateAnchors: [] },
+    {
+        claimId: "claim-true",
+        verdict: "verified",
+        expectedFiles: ["src/cache.ts", "src/config.ts"],
+        requiredUpdateAnchors: [],
+        forbiddenUpdateAnchors: [],
+    },
     {
         claimId: "claim-update",
         verdict: "update",
+        expectedFiles: ["src/cache.ts"],
         requiredUpdateAnchors: ["4096 entries", "bounded cache"],
         forbiddenUpdateAnchors: ["2048 entries"],
     },
-    { claimId: "claim-false", verdict: "archive", requiredUpdateAnchors: [], forbiddenUpdateAnchors: [] },
+    {
+        claimId: "claim-false",
+        verdict: "archive",
+        expectedFiles: [],
+        requiredUpdateAnchors: [],
+        forbiddenUpdateAnchors: [],
+    },
 ] satisfies VerifyGoldClaim[] };
 
 const mapGold = { kind: "map" as const, claims: [
@@ -97,7 +110,7 @@ const classifyGold = { kind: "classify" as const, claims: [
 ] satisfies ClassifyGoldClaim[] };
 
 const correctVerify = `<verify>
-<verified claim="mcm_true" files="src/cache.ts"/>
+<verified claim="mcm_true" files="src/cache.ts,src/config.ts"/>
 <update claim="mcm_update" files="src/cache.ts">Uses a BOUNDED CACHE with 4096 ENTRIES.</update>
 <archive claim="mcm_false" reason="queue removed"/>
 </verify>`;
@@ -146,7 +159,7 @@ describe("dreamer manifest scorers", () => {
 
     test("wrong archival of a gold-true claim is run-fatal", () => {
         const result = scoreVerifyManifest(
-            correctVerify.replace('<verified claim="mcm_true" files="src/cache.ts"/>', '<archive claim="mcm_true" reason="wrong"/>'),
+            correctVerify.replace('<verified claim="mcm_true" files="src/cache.ts,src/config.ts"/>', '<archive claim="mcm_true" reason="wrong"/>'),
             pool,
             verifyGold,
         );
@@ -164,11 +177,40 @@ describe("dreamer manifest scorers", () => {
         ).toMatchObject({ status: "FAIL", reason: "missed-archival", runFatal: false });
         expect(
             scoreVerifyManifest(
-                correctVerify.replace('<verified claim="mcm_true" files="src/cache.ts"/>', '<update claim="mcm_true" files="src/cache.ts">still true</update>'),
+                correctVerify.replace('<verified claim="mcm_true" files="src/cache.ts,src/config.ts"/>', '<update claim="mcm_true" files="src/cache.ts,src/config.ts">still true</update>'),
                 pool,
                 verifyGold,
             ),
         ).toMatchObject({ status: "FAIL", reason: "wrong-verdict", runFatal: false });
+    });
+
+    test("missed archival outranks a wrong verdict regardless of gold order", () => {
+        const manifest = correctVerify
+            .replace('<archive claim="mcm_false" reason="queue removed"/>', '<verified claim="mcm_false" files="src/queue.ts"/>')
+            .replace('<update claim="mcm_update" files="src/cache.ts">Uses a BOUNDED CACHE with 4096 ENTRIES.</update>', '<verified claim="mcm_update" files="src/cache.ts"/>');
+        const reordered = {
+            kind: "verify" as const,
+            claims: [...verifyGold.claims].reverse() satisfies VerifyGoldClaim[],
+        };
+        expect(scoreVerifyManifest(manifest, pool, verifyGold)).toMatchObject({ reason: "missed-archival" });
+        expect(scoreVerifyManifest(manifest, pool, reordered)).toMatchObject({ reason: "missed-archival" });
+    });
+
+    test("a narrowed backing set on a retained claim is a wrong mapping", () => {
+        expect(
+            scoreVerifyManifest(
+                correctVerify.replace('<verified claim="mcm_true" files="src/cache.ts,src/config.ts"/>', '<verified claim="mcm_true" files="src/cache.ts"/>'),
+                pool,
+                verifyGold,
+            ),
+        ).toMatchObject({ stage: "scored", status: "FAIL", reason: "wrong-mapping", runFatal: false });
+        expect(
+            scoreVerifyManifest(
+                correctVerify.replace('<update claim="mcm_update" files="src/cache.ts">', '<update claim="mcm_update" files="src/other.ts">'),
+                pool,
+                verifyGold,
+            ),
+        ).toMatchObject({ status: "FAIL", reason: "wrong-mapping" });
     });
 
     test("update anchors are case-insensitive and reject missing or stale content", () => {
@@ -202,7 +244,7 @@ describe("dreamer manifest scorers", () => {
             correctVerify.replace("</verify>", ""),
             correctVerify.replace(' claim="mcm_true"', ""),
             correctVerify.replace("mcm_true", "mcm_unknown"),
-            correctVerify.replace("</verify>", '<verified claim="mcm_true" files="src/cache.ts"/></verify>'),
+            correctVerify.replace("</verify>", '<verified claim="mcm_true" files="src/cache.ts,src/config.ts"/></verify>'),
         ]) {
             expect(scoreVerifyManifest(manifest, pool, verifyGold)).toMatchObject({
                 stage: "validation-rejected",

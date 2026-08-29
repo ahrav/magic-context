@@ -35,6 +35,8 @@ import {
 
 const CLASSIFY_MIN_POOL = 10;
 const FIXTURE_MARKER = ".dreamer-eval-fixture";
+const NULL_DEVICE = process.platform === "win32" ? "NUL" : "/dev/null";
+const PATH_SEGMENT_RE = /[\\/]/;
 
 type SeederFailureReason = "fixture-drift" | "gate-mismatch";
 
@@ -76,11 +78,34 @@ function fixtureError(detail: string): never {
     throw new DreamerEvalSeederError("fixture-drift", detail);
 }
 
-function git(workdir: string, args: readonly string[], env?: NodeJS.ProcessEnv): string {
+/**
+ * Environment for every fixture git invocation. GIT_DIR, GIT_INDEX_FILE,
+ * GIT_WORK_TREE, and GIT_OBJECT_DIRECTORY override repository discovery, so an
+ * ambient value (a git hook, `git rebase --exec`, or an outer harness) would
+ * redirect these writes at the surrounding repository instead of the run-owned
+ * workdir. Neutralizing global and system config additionally keeps
+ * `core.hooksPath` from running host scripts during the fixture commit.
+ */
+function fixtureGitEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+    const inherited: NodeJS.ProcessEnv = {};
+    for (const [key, value] of Object.entries(process.env)) {
+        if (!key.startsWith("GIT_")) inherited[key] = value;
+    }
+    return {
+        ...inherited,
+        GIT_CONFIG_GLOBAL: NULL_DEVICE,
+        GIT_CONFIG_SYSTEM: NULL_DEVICE,
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_TERMINAL_PROMPT: "0",
+        ...overrides,
+    };
+}
+
+function git(workdir: string, args: readonly string[], overrides?: NodeJS.ProcessEnv): string {
     const result = spawnSync("git", args, {
         cwd: workdir,
         encoding: "utf8",
-        env: env ?? process.env,
+        env: fixtureGitEnv(overrides),
     });
     if (result.status !== 0) {
         const detail = (result.stderr || result.stdout || `exit ${result.status}`).trim();
@@ -95,6 +120,12 @@ function fixturePath(workdir: string, path: string): string {
     const fromRoot = relative(workdir, target);
     if (fromRoot === "" || fromRoot === ".." || fromRoot.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`)) {
         fixtureError(`fixture path escapes workdir: ${path}`);
+    }
+    // The control directory lives inside the workdir but is not fixture
+    // content: a write there steers the seeder's own git invocations, and
+    // `.git/hooks` would execute during the fixture commit.
+    if (fromRoot.split(PATH_SEGMENT_RE).some((segment) => segment.toLowerCase() === ".git")) {
+        fixtureError(`fixture path targets the git control directory: ${path}`);
     }
     return target;
 }
@@ -122,6 +153,7 @@ function prepareFixtureRepository(
     const existingHead = spawnSync("git", ["rev-parse", "--verify", "HEAD"], {
         cwd: workdir,
         stdio: "ignore",
+        env: fixtureGitEnv(),
     });
     if (existingHead.status === 0) fixtureError("workdir already contains a commit");
 
@@ -154,7 +186,6 @@ function prepareFixtureRepository(
             `fixture: ${scenario.id}`,
         ],
         {
-            ...process.env,
             GIT_AUTHOR_DATE: commitDate,
             GIT_COMMITTER_DATE: commitDate,
         },
@@ -177,6 +208,7 @@ export function assertFixtureFilesCommitted(workdir: string, paths: readonly str
         const tracked = spawnSync("git", ["ls-files", "--error-unmatch", "--", path], {
             cwd: workdir,
             stdio: "ignore",
+            env: fixtureGitEnv(),
         });
         const status = git(workdir, ["status", "--porcelain", "--", path]);
         if (tracked.status !== 0 || status !== "") {
@@ -368,7 +400,13 @@ export async function seedDreamerEvalTask(
             (entry) => entry.verifiedAt,
         );
         if (verificationTimes.length === 0) fixtureError("verify-broad requires seeded verification history");
-        const lastBroadRunAt = Math.min(...verificationTimes) - 1;
+        // partitionVerifyScope keeps a claim whose verifiedAt precedes the broad
+        // cycle start, so the watermark must sit after every seeded
+        // verification. A watermark below them filters the verified claims out
+        // and collapses broad scope onto the never-verified set that
+        // incremental already selects, which is the one behavior broad exists
+        // to differ on.
+        const lastBroadRunAt = Math.max(...verificationTimes) + 1;
         if (lastBroadRunAt <= 0) fixtureError("verify-broad watermark must be positive");
         seedTaskScheduleState(
             options.db,

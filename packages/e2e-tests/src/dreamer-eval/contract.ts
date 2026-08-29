@@ -37,11 +37,27 @@ export type FailReason = (typeof FAIL_REASONS)[number];
 
 export const RUN_FATAL_FAIL_REASONS = ["wrong-archival"] as const satisfies readonly FailReason[];
 
+/**
+ * Sole decision point for the run-fatal (exit 2) class. Report validation, the
+ * scorer, and the mutation battery all route through this, so extending
+ * RUN_FATAL_FAIL_REASONS changes every consumer at once.
+ */
+export function isRunFatal(status: DreamerRunStatus, reason: ErrorReason | FailReason | null): boolean {
+    return (
+        status === "FAIL" &&
+        reason !== null &&
+        (RUN_FATAL_FAIL_REASONS as readonly string[]).includes(reason)
+    );
+}
+
 export const CLAIM_SCOPES = ["project", "ecosystem", "universe"] as const;
 export type ClaimScope = (typeof CLAIM_SCOPES)[number];
 
 export const VERIFY_VERDICTS = ["verified", "update", "archive"] as const;
 export type VerifyVerdict = (typeof VERIFY_VERDICTS)[number];
+
+export const VERIFICATION_OUTCOMES = ["verified", "update", "archive", "stale", "flagged"] as const;
+export type VerificationOutcome = (typeof VERIFICATION_OUTCOMES)[number];
 
 const SCENARIO_ID_RE = /^dme-[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const CLAIM_ID_RE = /^claim-[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -99,7 +115,7 @@ export interface MappingPrecondition {
 
 export interface VerificationPrecondition {
     claimId: string;
-    outcome: "verified" | "update" | "archive" | "stale" | "flagged";
+    outcome: VerificationOutcome;
     verifiedAt: number;
 }
 
@@ -112,6 +128,13 @@ export interface TaskPreconditions {
 export interface VerifyGoldClaim {
     claimId: string;
     verdict: VerifyVerdict;
+    /**
+     * Backing set the manifest must report. Verification applies this attribute
+     * as the claim's new exact mapping, so it is scored rather than ignored; it
+     * may differ from the pool's current mapping when a fixture models a file
+     * that moved. An archive verdict carries no mapping.
+     */
+    expectedFiles: string[];
     requiredUpdateAnchors: string[];
     forbiddenUpdateAnchors: string[];
 }
@@ -220,7 +243,7 @@ function parsePreconditions(raw: unknown, label: string, poolIds: ReadonlySet<st
         assertKnownClaim(claimId, poolIds, `${itemLabel}.claimId`);
         return {
             claimId,
-            outcome: enumeration(item.outcome, ["verified", "update", "archive", "stale", "flagged"], `${itemLabel}.outcome`),
+            outcome: enumeration(item.outcome, VERIFICATION_OUTCOMES, `${itemLabel}.outcome`),
             verifiedAt: integer(item.verifiedAt, `${itemLabel}.verifiedAt`),
         };
     });
@@ -229,6 +252,9 @@ function parsePreconditions(raw: unknown, label: string, poolIds: ReadonlySet<st
     for (const [index, claimId] of classifiedClaimIds.entries()) {
         assertKnownClaim(claimId, poolIds, `${label}.classifiedClaimIds[${index}]`);
     }
+    // The seeder applies mappings and verifications only, so a populated value
+    // here would assert database state that no seeding step creates.
+    if (classifiedClaimIds.length > 0) fail(`${label}.classifiedClaimIds: unsupported`);
     return { mappings, verifications, classifiedClaimIds };
 }
 
@@ -239,14 +265,23 @@ function parseVerifyGold(raw: unknown, label: string, pool: ReadonlyMap<string, 
     const claims = array(value.claims, `${label}.claims`).map((entry, index) => {
         const itemLabel = `${label}.claims[${index}]`;
         const item = record(entry, itemLabel);
-        exact(item, ["claimId", "verdict", "requiredUpdateAnchors", "forbiddenUpdateAnchors"], itemLabel);
+        exact(item, ["claimId", "verdict", "expectedFiles", "requiredUpdateAnchors", "forbiddenUpdateAnchors"], itemLabel);
         const claimId = staticId(item.claimId, `${itemLabel}.claimId`, CLAIM_ID_RE);
         const poolClaim = pool.get(claimId);
         if (poolClaim === undefined) return fail(`${itemLabel}.claimId: unknown-claim`);
         if (poolClaim.fileIndependent) fail(`${itemLabel}.claimId: file-independent-verify`);
+        const verdict = enumeration(item.verdict, VERIFY_VERDICTS, `${itemLabel}.verdict`);
+        const expectedFiles = parseStringArray(item.expectedFiles, `${itemLabel}.expectedFiles`);
+        if (verdict === "archive" && expectedFiles.length > 0) {
+            fail(`${itemLabel}.expectedFiles: archive-has-files`);
+        }
+        if (verdict !== "archive" && expectedFiles.length === 0) {
+            fail(`${itemLabel}.expectedFiles: retained-claim-has-no-file`);
+        }
         return {
             claimId,
-            verdict: enumeration(item.verdict, VERIFY_VERDICTS, `${itemLabel}.verdict`),
+            verdict,
+            expectedFiles,
             requiredUpdateAnchors: parseStringArray(item.requiredUpdateAnchors, `${itemLabel}.requiredUpdateAnchors`),
             forbiddenUpdateAnchors: parseStringArray(item.forbiddenUpdateAnchors, `${itemLabel}.forbiddenUpdateAnchors`),
         };
@@ -268,7 +303,13 @@ function parseMapGold(raw: unknown, label: string, pool: ReadonlyMap<string, Sce
         if (poolClaim === undefined) return fail(`${itemLabel}.claimId: unknown-claim`);
         const independent = boolean(item.independent, `${itemLabel}.independent`);
         if (independent !== poolClaim.fileIndependent) fail(`${itemLabel}.independent: pool-mismatch`);
-        return { claimId, files: parseStringArray(item.files, `${itemLabel}.files`), independent };
+        const files = parseStringArray(item.files, `${itemLabel}.files`);
+        // A manifest reports either an independent claim or a file set, never
+        // both, so the opposite pairing describes an outcome no correct model
+        // response can produce.
+        if (independent && files.length > 0) fail(`${itemLabel}.files: independent-has-files`);
+        if (!independent && files.length === 0) fail(`${itemLabel}.files: mapped-claim-has-no-file`);
+        return { claimId, files, independent };
     });
     unique(claims.map((entry) => entry.claimId), `${label}.claims`);
     return { kind: "map", claims };
@@ -301,8 +342,15 @@ function parseClassifyGold(raw: unknown, label: string, pool: ReadonlyMap<string
     return { kind: "classify", claims };
 }
 
-function sameSet(left: readonly string[], right: readonly string[]): boolean {
-    return left.length === right.length && left.every((entry) => right.includes(entry));
+/**
+ * Order- and duplicate-insensitive set equality. Duplicates collapse, so this
+ * compares membership rather than sequence; callers that need positional
+ * agreement must compare arrays directly.
+ */
+export function sameSet(left: readonly string[], right: readonly string[]): boolean {
+    const leftSet = new Set(left);
+    const rightSet = new Set(right);
+    return leftSet.size === rightSet.size && [...leftSet].every((value) => rightSet.has(value));
 }
 
 function parseTask(raw: unknown, label: string, pool: ReadonlyMap<string, ScenarioClaim>): DreamerTaskScenario {
@@ -383,7 +431,7 @@ export interface ClaimSnapshotProjection {
     sharing: "private" | "shareable";
     lifecycleState: "active" | "archived" | "retired";
     files: string[];
-    verificationOutcome: "verified" | "update" | "archive" | "stale" | "flagged" | null;
+    verificationOutcome: VerificationOutcome | null;
 }
 
 export interface PoolDescriptor {
@@ -430,7 +478,7 @@ function parseSnapshot(raw: unknown, label: string): ClaimSnapshotProjection {
     exact(value, ["claimId", "publicClaimId", "revisionLocator", "content", "category", "importance", "memoryScope", "sharing", "lifecycleState", "files", "verificationOutcome"], label);
     const verificationOutcome = value.verificationOutcome === null
         ? null
-        : enumeration(value.verificationOutcome, ["verified", "update", "archive", "stale", "flagged"], `${label}.verificationOutcome`);
+        : enumeration(value.verificationOutcome, VERIFICATION_OUTCOMES, `${label}.verificationOutcome`);
     return {
         claimId: staticId(value.claimId, `${label}.claimId`, CLAIM_ID_RE),
         publicClaimId: string(value.publicClaimId, `${label}.publicClaimId`),
@@ -486,7 +534,7 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
         reason = enumeration(root.reason, FAIL_REASONS, `${label}.reason`);
     }
     const runFatal = boolean(root.runFatal, `${label}.runFatal`);
-    if (runFatal !== (status === "FAIL" && reason === "wrong-archival")) fail(`${label}.runFatal: mapping-invalid`);
+    if (runFatal !== isRunFatal(status, reason)) fail(`${label}.runFatal: mapping-invalid`);
     const poolBefore = array(root.poolBefore, `${label}.poolBefore`).map((entry, index) => parseSnapshot(entry, `${label}.poolBefore[${index}]`));
     const poolAfter = array(root.poolAfter, `${label}.poolAfter`).map((entry, index) => parseSnapshot(entry, `${label}.poolAfter[${index}]`));
     const receiptOutcomes = array(root.receiptOutcomes, `${label}.receiptOutcomes`).map((entry, index) => {

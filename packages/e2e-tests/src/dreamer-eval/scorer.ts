@@ -5,6 +5,7 @@ import {
 import { validateClassifyManifest } from "../../../plugin/src/features/magic-context/dreamer/classify-prompt";
 import { validateMapMemoriesManifest } from "../../../plugin/src/features/magic-context/dreamer/map-memories-prompt";
 import { validateVerifyManifest } from "../../../plugin/src/features/magic-context/dreamer/verify-prompt";
+import { isRunFatal, sameSet } from "./contract";
 import type {
     ErrorReason,
     FailReason,
@@ -26,7 +27,7 @@ export interface ManifestInfraEvidence {
     messages: unknown;
 }
 
-interface ScoringContext<Gold> {
+interface ScoringContext {
     expectedIds: Set<string>;
     byClaimId: Map<string, { publicClaimId: string; files: string[] }>;
 }
@@ -40,7 +41,7 @@ function score(status: ManifestScore["status"], reason: ManifestScore["reason"],
         stage,
         status,
         reason,
-        runFatal: status === "FAIL" && reason === "wrong-archival",
+        runFatal: isRunFatal(status, reason),
         parsedManifest,
     };
 }
@@ -48,7 +49,7 @@ function score(status: ManifestScore["status"], reason: ManifestScore["reason"],
 function scoringContext<Gold extends { claimId: string }>(
     pool: PoolDescriptor,
     gold: readonly Gold[],
-): ScoringContext<Gold> | ManifestScore {
+): ScoringContext | ManifestScore {
     const poolByClaimId = new Map(pool.claims.map((claim) => [claim.claimId, claim]));
     const byClaimId = new Map<string, { publicClaimId: string; files: string[] }>();
     for (const entry of gold) {
@@ -62,7 +63,7 @@ function scoringContext<Gold extends { claimId: string }>(
     };
 }
 
-function isScore<Gold>(value: ScoringContext<Gold> | ManifestScore): value is ManifestScore {
+function isScore(value: ScoringContext | ManifestScore): value is ManifestScore {
     return "stage" in value;
 }
 
@@ -84,12 +85,6 @@ function invalidOutput(manifestText: string, evidence?: ManifestInfraEvidence): 
     return score("FAIL", "invalid-output", "validation-rejected");
 }
 
-function sameSet(left: readonly string[], right: readonly string[]): boolean {
-    const leftSet = new Set(left);
-    const rightSet = new Set(right);
-    return leftSet.size === rightSet.size && [...leftSet].every((value) => rightSet.has(value));
-}
-
 export function scoreVerifyManifest(
     manifestText: string,
     pool: PoolDescriptor,
@@ -108,26 +103,48 @@ export function scoreVerifyManifest(
         return invalidOutput(manifestText, evidence);
     }
 
-    const actual = new Map<string, { verdict: "verified" | "update" | "archive"; content: string | null }>();
-    for (const entry of parsed.verified) actual.set(entry.publicClaimId, { verdict: "verified", content: null });
-    for (const entry of parsed.updated) actual.set(entry.publicClaimId, { verdict: "update", content: entry.content });
-    for (const entry of parsed.archived) actual.set(entry.publicClaimId, { verdict: "archive", content: null });
+    const actual = new Map<
+        string,
+        { verdict: "verified" | "update" | "archive"; files: string[]; content: string | null }
+    >();
+    for (const entry of parsed.verified) {
+        actual.set(entry.publicClaimId, { verdict: "verified", files: entry.files, content: null });
+    }
+    for (const entry of parsed.updated) {
+        actual.set(entry.publicClaimId, { verdict: "update", files: entry.files, content: entry.content });
+    }
+    for (const entry of parsed.archived) {
+        actual.set(entry.publicClaimId, { verdict: "archive", files: [], content: null });
+    }
+    const observedFor = (claimId: string) => {
+        const publicClaimId = context.byClaimId.get(claimId)?.publicClaimId;
+        return publicClaimId === undefined ? undefined : actual.get(publicClaimId);
+    };
 
+    // Each archival class gets its own full pass so the reported reason does not
+    // depend on the order of gold.claims: an irreversible wrong archival
+    // outranks a retained false memory, which outranks any other verdict error.
     for (const expected of gold.claims) {
-        const publicClaimId = context.byClaimId.get(expected.claimId)?.publicClaimId;
-        const observed = publicClaimId === undefined ? undefined : actual.get(publicClaimId);
+        const observed = observedFor(expected.claimId);
         if (observed?.verdict === "archive" && expected.verdict !== "archive") {
             return score("FAIL", "wrong-archival", "scored", parsed);
         }
     }
     for (const expected of gold.claims) {
-        const publicClaimId = context.byClaimId.get(expected.claimId)?.publicClaimId;
-        const observed = publicClaimId === undefined ? undefined : actual.get(publicClaimId);
+        const observed = observedFor(expected.claimId);
         if (expected.verdict === "archive" && observed?.verdict !== "archive") {
             return score("FAIL", "missed-archival", "scored", parsed);
         }
+    }
+    for (const expected of gold.claims) {
+        const observed = observedFor(expected.claimId);
         if (observed?.verdict !== expected.verdict) {
             return score("FAIL", "wrong-verdict", "scored", parsed);
+        }
+        // Verification applies this attribute as the claim's new exact mapping,
+        // so a narrowed set silently shrinks future incremental verify scope.
+        if (expected.verdict !== "archive" && !sameSet(observed.files, expected.expectedFiles)) {
+            return score("FAIL", "wrong-mapping", "scored", parsed);
         }
         if (expected.verdict === "update") {
             const content = observed.content?.toLowerCase() ?? "";

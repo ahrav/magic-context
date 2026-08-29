@@ -3,6 +3,7 @@ import {
     DREAMER_EVAL_REPORT_SCHEMA,
     DREAMER_EVAL_SCENARIO_SCHEMA,
     DreamerEvalContractError,
+    RUN_FATAL_FAIL_REASONS,
     dreamerEvalExitCode,
     parseRunReport,
     parseScenario,
@@ -42,9 +43,10 @@ function validScenarioRaw(): Record<string, unknown> {
                 expectedResultMode: "incremental",
                 gold: {
                     kind: "verify",
-                    claims: claims.slice(0, 9).map((entry) => ({
+                    claims: claims.slice(0, 9).map((entry, index) => ({
                         claimId: entry.id,
                         verdict: "verified",
+                        expectedFiles: [`src/file-${index + 1}.ts`],
                         requiredUpdateAnchors: [],
                         forbiddenUpdateAnchors: [],
                     })),
@@ -129,6 +131,7 @@ describe("dreamer eval scenario contract", () => {
             tasks[0]!.gold.claims.push({
                 claimId: "claim-10",
                 verdict: "verified",
+                expectedFiles: [],
                 requiredUpdateAnchors: [],
                 forbiddenUpdateAnchors: [],
             });
@@ -143,6 +146,37 @@ describe("dreamer eval scenario contract", () => {
             const claims = (raw.pool as { claims: unknown[] }).claims;
             for (let index = 11; index <= 51; index += 1) claims.push(claim(index));
         }, "scenario.pool.claims: count-invalid");
+    });
+
+    test("verify gold ties the reported backing set to the verdict", () => {
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<{ gold: { claims: Array<{ expectedFiles: string[] }> } }>;
+            tasks[0]!.gold.claims[0]!.expectedFiles = [];
+        }, "scenario.tasks[0].gold.claims[0].expectedFiles: retained-claim-has-no-file");
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<{
+                gold: { claims: Array<{ verdict: string; expectedFiles: string[] }> };
+            }>;
+            tasks[0]!.gold.claims[0]!.verdict = "archive";
+        }, "scenario.tasks[0].gold.claims[0].expectedFiles: archive-has-files");
+    });
+
+    test("map gold cannot pair independence with a file set", () => {
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<{ gold: { claims: Array<{ files: string[] }> } }>;
+            tasks[1]!.gold.claims[9]!.files = ["src/ghost.ts"];
+        }, "scenario.tasks[1].gold.claims[9].files: independent-has-files");
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<{ gold: { claims: Array<{ files: string[] }> } }>;
+            tasks[1]!.gold.claims[0]!.files = [];
+        }, "scenario.tasks[1].gold.claims[0].files: mapped-claim-has-no-file");
+    });
+
+    test("a precondition with no seeding implementation is rejected", () => {
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<{ preconditions: { classifiedClaimIds: string[] } }>;
+            tasks[0]!.preconditions.classifiedClaimIds = ["claim-1"];
+        }, "scenario.tasks[0].preconditions.classifiedClaimIds: unsupported");
     });
 });
 
@@ -187,5 +221,19 @@ describe("dreamer eval report contract", () => {
                 parseRunReport({ ...baseReport, status: "FAIL", reason: "wrong-archival", runFatal: true }),
             ),
         ).toBe(2);
+    });
+
+    test("runFatal must agree with the declared run-fatal reason set", () => {
+        for (const reason of RUN_FATAL_FAIL_REASONS) {
+            expect(() => parseRunReport({ ...baseReport, status: "FAIL", reason, runFatal: false })).toThrow(
+                /runFatal: mapping-invalid/,
+            );
+        }
+        expect(() =>
+            parseRunReport({ ...baseReport, status: "FAIL", reason: "wrong-verdict", runFatal: true }),
+        ).toThrow(/runFatal: mapping-invalid/);
+        expect(() =>
+            parseRunReport({ ...baseReport, status: "ERROR", reason: "harness-failure", runFatal: true }),
+        ).toThrow(/runFatal: mapping-invalid/);
     });
 });

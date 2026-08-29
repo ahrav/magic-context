@@ -1,3 +1,4 @@
+import { isRunFatal } from "./contract";
 import type {
     FailReason,
     ParsedLayerGold,
@@ -40,11 +41,10 @@ export interface DreamerMutationFixture {
 interface ExpectedMutationOutcome {
     stage: Extract<ManifestScoreStage, "validation-rejected" | "scored">;
     reason: FailReason;
-    runFatal?: boolean;
 }
 
 export const EXPECTED_MUTATION_OUTCOMES: Record<DreamerMutationClass, ExpectedMutationOutcome> = {
-    "wrong-archival": { stage: "scored", reason: "wrong-archival", runFatal: true },
+    "wrong-archival": { stage: "scored", reason: "wrong-archival" },
     "missed-archival": { stage: "scored", reason: "missed-archival" },
     "update-for-verified": { stage: "scored", reason: "wrong-verdict" },
     "verified-for-update": { stage: "scored", reason: "wrong-verdict" },
@@ -84,10 +84,10 @@ function correctVerifyManifest(fixture: DreamerMutationFixture): string {
     const entries = fixture.verifyGold.claims.map((gold) => {
         const claim = claimById(fixture.pool, gold.claimId);
         if (gold.verdict === "verified") {
-            return `<verified claim="${claim.publicClaimId}" files="${claim.files.join(",")}"/>`;
+            return `<verified claim="${claim.publicClaimId}" files="${gold.expectedFiles.join(",")}"/>`;
         }
         if (gold.verdict === "archive") return `<archive claim="${claim.publicClaimId}" reason="contradicted"/>`;
-        return `<update claim="${claim.publicClaimId}" files="${claim.files.join(",")}">${gold.requiredUpdateAnchors.join("; ")}</update>`;
+        return `<update claim="${claim.publicClaimId}" files="${gold.expectedFiles.join(",")}">${gold.requiredUpdateAnchors.join("; ")}</update>`;
     });
     return `<verify>\n${entries.join("\n")}\n</verify>`;
 }
@@ -148,11 +148,11 @@ function mutationManifest(
         case "verified-for-update":
             return { task: "verify", manifest: replaceEntry(verify, updatedClaim.publicClaimId, `<verified claim="${updatedClaim.publicClaimId}" files="${updatedClaim.files.join(",")}"/>`) };
         case "update-missing-anchor":
-            return { task: "verify", manifest: replaceEntry(verify, updatedClaim.publicClaimId, `<update claim="${updatedClaim.publicClaimId}" files="${updatedClaim.files.join(",")}">replacement omits required facts</update>`) };
+            return { task: "verify", manifest: replaceEntry(verify, updatedClaim.publicClaimId, `<update claim="${updatedClaim.publicClaimId}" files="${updated.expectedFiles.join(",")}">replacement omits required facts</update>`) };
         case "update-forbidden-anchor": {
             const content = [...updated.requiredUpdateAnchors, updated.forbiddenUpdateAnchors[0]].filter(Boolean).join("; ");
             if (updated.forbiddenUpdateAnchors.length === 0) throw new Error("mutation fixture needs forbidden update anchor");
-            return { task: "verify", manifest: replaceEntry(verify, updatedClaim.publicClaimId, `<update claim="${updatedClaim.publicClaimId}" files="${updatedClaim.files.join(",")}">${content}</update>`) };
+            return { task: "verify", manifest: replaceEntry(verify, updatedClaim.publicClaimId, `<update claim="${updatedClaim.publicClaimId}" files="${updated.expectedFiles.join(",")}">${content}</update>`) };
         }
         case "wrong-independence": {
             const target = requiredGold(fixture.mapGold.claims, (entry) => !entry.independent, "file-bound map gold");
@@ -228,7 +228,7 @@ export function runMutationBattery(
             result.stage === expected.stage &&
             result.status === "FAIL" &&
             result.reason === expected.reason &&
-            result.runFatal === (expected.runFatal ?? false);
+            result.runFatal === isRunFatal("FAIL", expected.reason);
         return {
             mutationClass,
             green,
