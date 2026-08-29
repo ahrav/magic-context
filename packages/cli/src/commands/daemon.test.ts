@@ -220,7 +220,7 @@ describe("daemon command contract", () => {
                     release: "0.38.0",
                     proof: "Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
                     daemon: `${root}/daemon`,
-                    magic_context: null,
+                    magic_context: `mc-host/0.1.0 (payload ${root}/cortexkit/bin)`,
                     synapse: null,
                     broca: null,
                 },
@@ -235,6 +235,79 @@ describe("daemon command contract", () => {
         expect(output).not.toContain("abcdefghijklmnopqrstuvwxyz");
         expect(output).toContain("<data-root>");
         expect(output).toContain("<REDACTED:bearer>");
+        expect(output).toContain("payload <data-root>/cortexkit/bin");
+    });
+
+    test("neutralizes control characters and bounds peer version text", async () => {
+        const h = harness((command) =>
+            result(command, {
+                versions: {
+                    release: "0.38.0",
+                    proof: "2",
+                    daemon: `mc-host/0.1.0\u001b[2K\u001b[1;31m\nforged: line${"x".repeat(4096)}`,
+                    magic_context: null,
+                    synapse: null,
+                    broca: null,
+                },
+            }),
+        );
+
+        const exit = await runDaemonCommand(["status"], h.dependencies);
+
+        expect(exit).toBe(0);
+        const output = h.stdout.join("\n");
+        expect(output).not.toContain("\u001b");
+        // The embedded newline must not mint a standalone forged output line.
+        expect(output.split("\n").some((line) => line.startsWith("forged:"))).toBe(false);
+        const versionsLine = output.split("\n").find((line) => line.startsWith("Versions:"));
+        expect(versionsLine).toBeDefined();
+        const daemonValue = /daemon=(.*)$/.exec(versionsLine ?? "")?.[1] ?? "";
+        expect(daemonValue.length).toBeLessThanOrEqual(128);
+    });
+
+    test("redaction failures fall back per value instead of rejecting", async () => {
+        const h = harness((command) =>
+            result(command, {
+                versions: {
+                    release: "0.38.0",
+                    // A non-string value makes the redaction chain throw for
+                    // this entry; the command must substitute a placeholder
+                    // and still emit one complete v1 object.
+                    proof: 10n as unknown as string,
+                    daemon: "mc-host/0.1.0",
+                    magic_context: null,
+                    synapse: null,
+                    broca: null,
+                },
+            }),
+        );
+
+        const exit = await runDaemonCommand(["status", "--json"], h.dependencies);
+
+        expect(exit).toBe(0);
+        expect(h.stdout).toHaveLength(1);
+        expect(h.stderr).toEqual([]);
+        const output = JSON.parse(h.stdout[0] ?? "") as DaemonResultV1;
+        expect(output.versions.proof).toBe("<REDACTED>");
+        expect(output.versions.daemon).toBe("mc-host/0.1.0");
+    });
+
+    test("rendering failures produce bounded stderr without a partial v1 object", async () => {
+        const h = harness((command) =>
+            result(command, {
+                // A BigInt outside the redacted versions block makes
+                // JSON.stringify throw, exercising the guarded render region.
+                checks: [10n] as unknown as DaemonResultV1["checks"],
+            }),
+        );
+
+        const exit = await runDaemonCommand(["status", "--json"], h.dependencies);
+
+        expect(exit).toBe(1);
+        expect(h.stdout).toEqual([]);
+        expect(h.stderr).toEqual([
+            "Daemon status produced a result that could not be rendered safely.",
+        ]);
     });
 
     test("policy exceptions produce bounded stderr without a partial v1 object", async () => {
