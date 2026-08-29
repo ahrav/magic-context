@@ -3780,10 +3780,6 @@ const AUTHORITY_SELECT_SQL: &str = "SELECT context_store_uuid, project, domain, 
     checksum_expected, checksum_actual, checksum_ok
     FROM mc_authority WHERE context_store_uuid = ?1 AND project = ?2 AND domain = ?3";
 
-/// Column list every `stored_compartment_from_row` reader selects, in the
-/// positional order that mapper reads. All compartment SELECTs interpolate
-/// this one constant: the mapper indexes by position, so a reordered or
-/// partial per-site list would silently mis-map fields.
 /// The two `mc_cache_state` row reads, shared so every reader stays on the
 /// same projection.
 const CACHE_STATE_META_SELECT: &str =
@@ -3791,6 +3787,10 @@ const CACHE_STATE_META_SELECT: &str =
 const CACHE_STATE_FULL_SELECT: &str =
     "SELECT row_version, core_state, meta FROM mc_cache_state WHERE session_id = ?1";
 
+/// Column list every `stored_compartment_from_row` reader selects, in the
+/// positional order that mapper reads. All compartment SELECTs interpolate
+/// this one constant: the mapper indexes by position, so a reordered or
+/// partial per-site list would silently mis-map fields.
 const COMPARTMENT_SELECT_COLUMNS: &str = "sequence, start_message, end_message, start_message_id, end_message_id, start_date, end_date, title, content, p1, p2, p3, p4, importance, episode_type, legacy, created_at";
 
 const CLAIM_INTENT_COLUMNS: &str = "producer, operation_key, database_incarnation_id,
@@ -6707,11 +6707,12 @@ impl McStore {
     }
 
     /// Canonical test descriptor: an `mc_cache`-namespace module store on
-    /// `<dir>/store.db`. Sibling-crate tests reach it through the
-    /// `test-support` feature; in-crate tests through `cfg(test)`.
+    /// `<dir>/store.db`. Unit tests reach it through `cfg(test)`; this
+    /// crate's integration tests and sibling crates through the
+    /// `test-support` feature.
     #[cfg(any(test, feature = "test-support"))]
     pub fn test_descriptor(dir: &std::path::Path, module_id: &str) -> StorageDescriptor {
-        use cortexkit_store::{Isolation, StorageBackend};
+        use cortexkit_store_types::{Isolation, StorageBackend};
         StorageDescriptor {
             module_id: module_id.to_string(),
             storage_namespace: "mc_cache".to_string(),

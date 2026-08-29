@@ -15,6 +15,7 @@ pub(crate) const MAX_COMMITS_PER_BLOCK: usize = 5;
 pub(crate) const SYSTEM_DIRECTIVE_PREFIX: &str = "[SYSTEM DIRECTIVE: MAGIC-CONTEXT";
 pub(crate) const OMO_INTERNAL_INITIATOR_MARKER: &str = "<!-- OMO_INTERNAL_INITIATOR -->";
 
+#[derive(Debug, Clone)]
 pub(crate) struct CompactedText {
     pub(crate) text: String,
     pub(crate) commit_hashes: Vec<String>,
@@ -66,7 +67,7 @@ pub(crate) fn merge_commit_hashes(existing: &[String], next: &[String]) -> Vec<S
     merged
 }
 
-pub(crate) fn extract_commit_hashes(text: &str) -> Vec<String> {
+fn extract_commit_hashes(text: &str) -> Vec<String> {
     let mut hashes = Vec::new();
     for capture in commit_hash_extract_regex().captures_iter(text) {
         let Some(hash) = capture.get(1).map(|value| value.as_str().to_lowercase()) else {
@@ -119,7 +120,7 @@ pub(crate) fn extract_key_arg(input: &Value) -> Option<String> {
     None
 }
 
-pub(crate) fn truncate_arg(value: &str) -> String {
+fn truncate_arg(value: &str) -> String {
     let max_len = 60;
     if value.chars().count() <= max_len {
         return value.to_string();
@@ -158,17 +159,17 @@ pub(crate) fn compact_role(role: &str) -> String {
     }
 }
 
-pub(crate) fn system_reminder_regex() -> &'static Regex {
+fn system_reminder_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?is)<system-reminder>[\s\S]*?</system-reminder>").unwrap())
 }
 
-pub(crate) fn commit_hash_extract_regex() -> &'static Regex {
+fn commit_hash_extract_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?i)`?\b([0-9a-f]{7,12})\b`?").unwrap())
 }
 
-pub(crate) fn commit_verb_regex() -> &'static Regex {
+fn commit_verb_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
@@ -178,27 +179,27 @@ pub(crate) fn commit_verb_regex() -> &'static Regex {
     })
 }
 
-pub(crate) fn empty_parens_regex() -> &'static Regex {
+fn empty_parens_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"\(\s*\)").unwrap())
 }
 
-pub(crate) fn space_before_comma_regex() -> &'static Regex {
+fn space_before_comma_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"\s+,").unwrap())
 }
 
-pub(crate) fn repeated_comma_regex() -> &'static Regex {
+fn repeated_comma_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r",\s*,+").unwrap())
 }
 
-pub(crate) fn repeated_space_regex() -> &'static Regex {
+fn repeated_space_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"\s{2,}").unwrap())
 }
 
-pub(crate) fn space_before_punct_regex() -> &'static Regex {
+fn space_before_punct_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"\s+([,.;:])").unwrap())
 }

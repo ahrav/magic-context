@@ -1930,6 +1930,9 @@ async fn read_active_frame<R: AsyncRead + Unpin>(
         return Ok(None);
     }
     let deadline = Instant::now() + CLIENT_FRAME_TIMEOUT;
+    // Every read stop below is fatal to this generation: the client
+    // resynchronizes by reconnecting, never by guessing where the next header
+    // begins, so the mapped error deliberately carries no detail.
     // Frozen-prefix discipline (§5): `len` and `ver` live in bytes 0..5, and an
     // incompatible version is provable from them alone. Waiting for all 21 bytes
     // first lets a peer that sends only the prefix hold this connection — and one

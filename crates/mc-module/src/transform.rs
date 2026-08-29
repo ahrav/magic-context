@@ -19,7 +19,8 @@ use crate::compartment_coverage::{fold_m0_content_epoch, resolve_coverage, M0Con
 use crate::config::{
     CacheTtlProvenance, DEFAULT_AUTO_SEARCH_MIN_PROMPT_CHARS, DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD,
 };
-use crate::divergence::{self, FirstDivergence};
+use crate::divergence;
+pub use crate::divergence::FirstDivergence;
 use crate::healing::{self, quirk_residual, SerializerProfile};
 use crate::injection::{
     advance_injection_from_meta, capture_todo_state_on_bust, injection_pending_after_capture,
@@ -36,7 +37,8 @@ use crate::memory_render::{
     render_claim_memory_block, render_m0, M0Inputs, MirroredClaimMemory, M1_PLACEHOLDER,
 };
 use crate::project_docs::read_project_docs_canonical;
-use crate::prompt_surface::{PromptSurfacePreset, PromptSurfaceSelection};
+pub use crate::prompt_surface::PromptSurfacePreset;
+use crate::prompt_surface::PromptSurfaceSelection;
 use crate::scheduler::{
     self, BoundaryBypass, ContextUsage, DeferredExecute, ExecuteThresholdConfig, LatchState,
     SchedulerConfig, SchedulerInputs, SessionMeta, TailState,
@@ -11585,6 +11587,8 @@ fn build_output(
     })
 }
 
+// Provider and durable-watermark arguments stay explicit: they affect cache
+// identity and differ across replay paths.
 #[allow(clippy::too_many_arguments)]
 fn build_output_with_tags(
     core: &CoreState,
