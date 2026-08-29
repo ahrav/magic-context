@@ -23,7 +23,7 @@ import {
     writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { canonicalFingerprint, readCanonicalJsonFile } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { hasGitAncestor } from "../../../plugin/scripts/retrieval-benchmark/fs-boundary";
 import { scanForSensitiveContent } from "../../../plugin/scripts/retrieval-benchmark/privacy";
@@ -197,8 +197,8 @@ export function releaseArtifactFingerprint(
 }
 
 /**
- * Corpus-wide hard-negative coverage: the union of declared families must be the
- * whole set.
+ * Corpus-wide hard-negative coverage (R2): the union of declared families must be
+ * the whole set.
  *
  * Per-scenario lint only proves each scenario exercises the families IT declares,
  * so a corpus of unique, lint-clean scenarios inside the size budget can cover a
@@ -209,8 +209,12 @@ export function releaseArtifactFingerprint(
  * because the battery only ever asserts what each scenario claims. Family names
  * come from `HARD_NEGATIVE_FAMILIES`, not the corpus, so naming the missing ones
  * echoes no artifact content.
+ *
+ * Exported so the per-PR `--lint` gate applies the same rule as freeze promotion:
+ * a corpus that promotion would reject must not pass the cheap gate, or a release
+ * could freeze in a state the per-PR gate then rejects forever.
  */
-function checkFamilyCoverage(scenarios: readonly HistorianEvalScenario[]): string[] {
+export function checkFamilyCoverage(scenarios: readonly HistorianEvalScenario[]): string[] {
     const declared = new Set(scenarios.flatMap((scenario) => scenario.families));
     const missing = HARD_NEGATIVE_FAMILIES.filter((family) => !declared.has(family));
     return missing.length > 0 ? [`release.families: missing-${missing.join(",")}`] : [];
@@ -352,6 +356,28 @@ export function loadRelease(
     // externally assembled release could declare `v01` and be certified here
     // while `promoteRelease` refuses to publish it.
     assertCanonicalVersion(manifest.releaseVersion, "release.manifest.releaseVersion");
+    // The declared version must also be the version this tree is INSTALLED as.
+    // Nothing above compares them: a copied or hand-edited `releases/v2` holding
+    // a valid v1 manifest passes every check, and the lane then runs the v2
+    // corpus while labelling its report v1 — and prior-release traversal reads
+    // the same mislabelled tree as v2. `installedReleases` already enforces this
+    // for predecessors; the consumer path did not.
+    //
+    // Guarded on the directory being version-named, because the promoter loads
+    // its own review and staging trees through here under `historian-eval-promote-*`
+    // and `.staging-*` names that legitimately do not encode a version. Both
+    // names are `RELEASE_VERSION_RE`-bounded when the guard fires, so reporting
+    // them echoes no artifact content.
+    //
+    // Resolved before the basename is taken: `basename` is purely lexical, so
+    // `releases/v2/.` yields `.` and a trailing separator or a `..` component
+    // shifts it likewise — each one skipping the guard on the very tree it names.
+    // `resolve` collapses those components first, so the check binds to the
+    // directory that is actually read.
+    const installedAs = basename(resolve(releaseDir));
+    if (RELEASE_VERSION_RE.test(installedAs) && manifest.releaseVersion !== installedAs) {
+        fail([`release.manifest.releaseVersion: declares ${manifest.releaseVersion} in directory ${installedAs}`]);
+    }
     const mutationEvidence = parseMutationEvidence(rawEvidence);
     const scenarios = rawScenarios.map((raw, index) => parseScenario(raw, `release.scenarios[${index}]`));
     // Authenticity before any content is trusted, over all three artifact groups:

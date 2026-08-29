@@ -663,6 +663,42 @@ describe("promoteRelease", () => {
         });
     });
 
+    test("strict loading rejects a manifest whose version is not the directory it is installed as", () => {
+        withRoot((root) => {
+            const scenarios = corpusRaw();
+            const { releaseDir } = promoteRelease({
+                scenarios,
+                approvals: approvalsFor(scenarios),
+                releasesRoot: root,
+                releaseVersion: "v1",
+            });
+            // A copied release tree: internally valid and internally consistent —
+            // canonical bytes, matching tuple, green evidence, approvals bound to
+            // the version the manifest declares — and nothing above compares that
+            // version with the directory it now sits in. Left unchecked the lane
+            // runs this corpus as v2 while labelling its report v1, and prior-release
+            // traversal reads the same tree as v2.
+            const copy = join(root, "v2");
+            cpSync(releaseDir, copy, { recursive: true });
+            expect(() => loadRelease(copy)).toThrow(
+                /release\.manifest\.releaseVersion: declares v1 in directory v2/,
+            );
+            // `basename` is lexical, so a terminal `.`, a trailing separator, or a
+            // `..` component names the same tree while yielding a basename the
+            // version guard skips. The path is resolved before the basename is
+            // taken, so every spelling of the directory binds to v2.
+            for (const spelling of [join(copy, "."), `${copy}/`, join(copy, "..", "v2")]) {
+                expect(() => loadRelease(spelling)).toThrow(
+                    /release\.manifest\.releaseVersion: declares v1 in directory v2/,
+                );
+            }
+            // The genuine install still loads: the check is about the pairing, not
+            // the tree, and the promoter's own review and staging directories are
+            // not version-named so they stay unaffected.
+            expect(loadRelease(releaseDir).manifest.releaseVersion).toBe("v1");
+        });
+    });
+
     test("a noncanonical prior release directory is rejected before its lineage is inherited", () => {
         withRoot((root) => {
             const scenarios = corpusRaw();

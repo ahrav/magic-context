@@ -21,6 +21,7 @@ import {
     renderedFillerBlocks,
     renderedTranscriptBlocks,
     scenarioFingerprint,
+    parseModelRoute,
 } from "./contract";
 import { ballastProse } from "../ballast";
 import { estimateTokens } from "../../../plugin/src/shared/token-estimator";
@@ -1576,5 +1577,49 @@ describe("release tuple and manifest", () => {
             };
             expect(() => parseManifest(forged)).toThrow(new RegExp(`${key}: version-invalid`));
         }
+    });
+});
+
+describe("parseModelRoute", () => {
+    test("accepts provider/model and keeps a slash-bearing model id intact", () => {
+        expect(parseModelRoute("HISTORIAN_EVAL_MODEL", "anthropic/claude-sonnet-4-5")).toEqual({
+            providerID: "anthropic",
+            modelID: "claude-sonnet-4-5",
+        });
+        expect(parseModelRoute("HISTORIAN_EVAL_MODEL", "openrouter/vendor/model-1")).toEqual({
+            providerID: "openrouter",
+            modelID: "vendor/model-1",
+        });
+    });
+
+    test("trims surrounding whitespace off both components", () => {
+        // These strings go straight to OpenCode as model identifiers, so a
+        // provider of "anthropic " would fail to resolve.
+        expect(parseModelRoute("HISTORIAN_EVAL_MODEL", "anthropic / claude-sonnet-4-5")).toEqual({
+            providerID: "anthropic",
+            modelID: "claude-sonnet-4-5",
+        });
+        // Per SEGMENT, not just the outer edges: trimming the joined model id
+        // leaves interior padding around a legitimate slash in place, and the
+        // route then fails at provider dispatch instead of here.
+        expect(parseModelRoute("HISTORIAN_EVAL_MODEL", "openrouter / vendor / model-1")).toEqual({
+            providerID: "openrouter",
+            modelID: "vendor/model-1",
+        });
+    });
+
+    test.each([
+        ["empty model component", "anthropic/"],
+        ["whitespace model component", "anthropic/   "],
+        ["empty provider component", "/claude-sonnet-4-5"],
+        ["no separator", "claude-sonnet-4-5"],
+        ["empty value", ""],
+        // `modelParts.join("/")` is non-empty for all three, so checking the
+        // joined value alone accepted a model id of "/" or "a//b".
+        ["trailing separator", "anthropic//"],
+        ["whitespace-only interior segment", "anthropic/ / "],
+        ["empty interior segment", "anthropic/a//b"],
+    ])("rejects %s before the lane spends a token", (_label, value) => {
+        expect(() => parseModelRoute("HISTORIAN_EVAL_PROBE_MODEL", value)).toThrow(HistorianEvalContractError);
     });
 });

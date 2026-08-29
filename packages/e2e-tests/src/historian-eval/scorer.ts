@@ -67,7 +67,15 @@ import type {
     SystemVersionTuple,
 } from "./runner";
 
-const LANE_REPORT_SCHEMA = "historian-eval-report/v1";
+/**
+ * Lane-report schema identity. Bumped with the run record for the same change:
+ * the report embeds a `SystemVersionTuple` both at the top level and on every
+ * scenario score, so requiring `opencodeVersion` (v2) and then `bunVersion` (v3)
+ * changed the report's shape too. Left unchanged, one identifier would name two
+ * incompatible report shapes and a consumer could not tell an archived report from
+ * a current one.
+ */
+const LANE_REPORT_SCHEMA = "historian-eval-report/v3";
 
 /** KTD8 FAIL reason codes. */
 export const FAIL_REASONS = ["false-authoritative", "recall", "structural", "probe", "invalid-output"] as const;
@@ -189,6 +197,25 @@ function augmentGoldMatch(
 }
 
 /**
+ * Expected-absent predicate ids matched by a claim set (R8).
+ *
+ * Extracted from `scoreFacts` because the stored-error passthrough in
+ * `scoreRunRecord` has to ask the same question of a record's CAPTURED claims,
+ * where no snapshot-derived visible set exists. `ExpectedAbsent` carries no
+ * category, so the check is predicate-only by construction and needs nothing
+ * from a claim but its content.
+ */
+function falseAuthoritativeMatchesIn(
+    scenario: HistorianEvalScenario,
+    claims: ReadonlyArray<{ content: string }>,
+): string[] {
+    return scenario.gold.expectedAbsent
+        .filter((absent) => claims.some((item) => predicateMatches(absent.predicate, item.content)))
+        .map((absent) => absent.id)
+        .sort();
+}
+
+/**
  * Facts precision/recall against gold, keyed by the shared `matchesGold`
  * rule (category + content predicate, R7), plus the separately-reported
  * false-authoritative check (R8; `ExpectedAbsent` carries no category, so
@@ -221,10 +248,7 @@ function scoreFacts(
     // claim. Pairing it would penalise a historian for stating two wanted facts in one
     // well-formed claim, which is not an error.
     const matchedVisible = visible.filter((item) => expected.some((claim) => matchesGold(claim, item)));
-    const falseAuthoritativeMatches = scenario.gold.expectedAbsent
-        .filter((absent) => visible.some((item) => predicateMatches(absent.predicate, item.content)))
-        .map((absent) => absent.id)
-        .sort();
+    const falseAuthoritativeMatches = falseAuthoritativeMatchesIn(scenario, visible);
     return {
         precision: visible.length === 0 ? null : matchedVisible.length / visible.length,
         recall: expected.length === 0 ? null : matchedExpectedCount / expected.length,
@@ -849,11 +873,30 @@ function errorMessage(error: unknown): string {
  * counted as one damaged artifact. Checked explicitly rather than behind a
  * blanket catch, so a genuine scorer bug still surfaces as a bug.
  */
+/** A system-tuple field that actually names something: a string with non-whitespace text. */
+function isIdentityValue(value: unknown): boolean {
+    return typeof value === "string" && value.trim().length > 0;
+}
+
 function recordShapeError(record: HistorianEvalRunRecord): ScenarioScore | null {
     // The root itself: deserialized JSON can be null, an array, or a primitive,
     // and every field access below would throw before reporting anything.
     if (record === null || typeof record !== "object" || Array.isArray(record)) {
         return errorScore("<unknown>", "record-malformed", `run record is not an object: ${typeof record}`, null);
+    }
+    // Schema BEFORE the field requirements below, which are version-specific: a real
+    // v1 or v2 record legitimately lacks `system.opencodeVersion` or
+    // `system.bunVersion`, and reporting that as `record-malformed` calls a valid
+    // historical artifact damaged — defeating the point of bumping the schema for
+    // those very fields. Only the root-object check above precedes this, because
+    // reading `.schema` needs it.
+    if (record.schema !== RUN_RECORD_SCHEMA) {
+        return errorScore(
+            typeof record.scenarioId === "string" && record.scenarioId.length > 0 ? record.scenarioId : "<unknown>",
+            "record-schema-unsupported",
+            `run record schema ${JSON.stringify(record.schema)} is not ${RUN_RECORD_SCHEMA}`,
+            null,
+        );
     }
     const isPair = (value: unknown): boolean =>
         Array.isArray(value) && value.length === 2 && value.every((entry) => typeof entry === "number");
@@ -867,9 +910,17 @@ function recordShapeError(record: HistorianEvalRunRecord): ScenarioScore | null 
     if (
         record.system === null ||
         typeof record.system !== "object" ||
-        typeof record.system.repoCommitSha !== "string" ||
-        typeof record.system.historianModelId !== "string" ||
-        typeof record.system.probeModelId !== "string" ||
+        // Non-empty, not merely `string`. Every one of these exists to DISTINGUISH
+        // one run from another, and `""` distinguishes nothing — a record with an
+        // empty version or sha would take an ordinary PASS/FAIL and then be grouped
+        // by `resolveReportSystem` as comparable with runs it shares nothing with.
+        // Applied to the whole tuple rather than the two version fields alone,
+        // because the argument is identical for the sha and the model routes.
+        !isIdentityValue(record.system.repoCommitSha) ||
+        !isIdentityValue(record.system.bunVersion) ||
+        !isIdentityValue(record.system.opencodeVersion) ||
+        !isIdentityValue(record.system.historianModelId) ||
+        !isIdentityValue(record.system.probeModelId) ||
         record.system.parserImpl !== "ts" ||
         !(record.system.chunkTokenBudget === null || typeof record.system.chunkTokenBudget === "number")
     ) {
@@ -964,19 +1015,9 @@ function recordIdentityError(
     record: HistorianEvalRunRecord,
     scenario: HistorianEvalScenario,
 ): ScenarioScore | null {
-    // Version first: every check below reads fields by v1 meaning, so an
-    // artifact written under a different schema must be refused rather than
-    // reinterpreted. Otherwise a persisted record whose fields merely still
-    // parse receives an ordinary PASS or FAIL under semantics it never had,
-    // which defeats the point of versioning the record at all.
-    if (record.schema !== RUN_RECORD_SCHEMA) {
-        return errorScore(
-            record.scenarioId,
-            "record-schema-unsupported",
-            `run record schema ${JSON.stringify(record.schema)} is not ${RUN_RECORD_SCHEMA}`,
-            record.system,
-        );
-    }
+    // The schema is already proven supported by `recordShapeError`, which has to
+    // classify it before applying version-specific field requirements — so every
+    // check here may read fields by their current meaning.
     if (record.scenarioId !== scenario.id) {
         return errorScore(
             record.scenarioId,
@@ -1229,6 +1270,125 @@ function renderedClaimIdsInLastMemoryBlock(payloadText: string): Set<string> | n
 }
 
 /**
+ * What an aborted record's claim evidence supports.
+ *
+ * Three outcomes, not two, because there are three genuinely different states and
+ * collapsing any pair of them is what made the previous two attempts at this
+ * wrong.
+ */
+type AbortedClaimEvidence =
+    | { kind: "scored"; falseAuthoritativeMatches: string[] }
+    | { kind: "snapshot-mismatch"; detail: string };
+
+/**
+ * Claim evidence for a record that aborted, and how far it can be trusted.
+ *
+ * An ERROR record never reaches the snapshot-binding checks below — those run
+ * only on the completion path — so on this path neither side is verified, and
+ * each one alone can be edited to lie in a different direction:
+ *
+ * - Trusting the ARRAY lets a truncated `injectedClaims` HIDE a captured
+ *   promotion.
+ * - Trusting the SNAPSHOT lets the record's own unverified selectors hide it
+ *   instead (`readInjectedClaims` is keyed by `projectIdentity` and `nowMs`), or
+ *   lets a mispaired snapshot from another attempt of the same project INVENT a
+ *   promotion this run never made.
+ *
+ * No additional selector guard fixes that, because the question is not whether
+ * the selectors look plausible — it is whether this snapshot belongs to this run,
+ * and nothing on the record answers it directly. What does answer it is the same
+ * mutual agreement the completion path relies on: the runner writes
+ * `injectedClaims` and the snapshot from one read at one pinned clock, so for a
+ * genuine record the two claim sets are IDENTICAL — locators, contents,
+ * categories, revisions, cardinality. A different attempt's snapshot, an edited
+ * selector that changes the visible set, and an edited array each break that
+ * equality.
+ *
+ * So agreement decides authority. When the sets agree the snapshot answers, and
+ * the array cannot invent anything. When they disagree, this artifact is
+ * self-inconsistent: it is not a report about the run at all, and guessing which
+ * side was edited is how both earlier versions ended up maskable. It becomes a
+ * `record-snapshot-mismatch` ERROR — exactly what the completion path returns for
+ * the identical forgery — carrying the abort's own reason in the detail so
+ * nothing is lost.
+ *
+ * A missing, unopenable, unqueryable, or stale snapshot leaves the array as the
+ * only evidence there is. Scoring it is the fail-loud direction; refusing would
+ * restore the masking hole this path exists to close.
+ */
+function abortedRecordClaimEvidence(
+    record: HistorianEvalRunRecord,
+    scenario: HistorianEvalScenario,
+): AbortedClaimEvidence {
+    const recordedOnly = (): AbortedClaimEvidence => ({
+        kind: "scored",
+        falseAuthoritativeMatches: falseAuthoritativeMatchesIn(scenario, record.injectedClaims),
+    });
+    if (record.contextDbSnapshotPath.length === 0) return recordedOnly();
+    let db: ReturnType<typeof openTestDb>;
+    try {
+        db = openTestDb(record.contextDbSnapshotPath, { readonly: true });
+    } catch {
+        return recordedOnly();
+    }
+    try {
+        const visible = readInjectedClaims(db, record.projectIdentity, record.scenarioId, record.nowMs);
+        if (visible === null) return recordedOnly();
+        // The selector has to name something in THIS snapshot before its answer can
+        // bind anything. `readInjectedClaims` is keyed by `record.projectIdentity`,
+        // so an identity that resolves to no project returns an empty visible set —
+        // and two empty sets compare equal, making a vacuous query look like
+        // agreement while a forbidden claim sits in the snapshot under the real
+        // project. The runner reaches exactly that shape when abort-path claim
+        // capture fails and the best-effort snapshot succeeds: `emptyRecord` writes
+        // `projectIdentity: ""` with `injectedClaims: []`.
+        //
+        // Set equality proves the snapshot belongs to this run; identity resolution
+        // proves the question was asked of it at all. Neither substitutes for the
+        // other, and an unresolvable identity is the same unbindable artifact as a
+        // disagreement, so it reports the same way.
+        if (resolveProjectIdsForIdentities(db, [record.projectIdentity]).length === 0) {
+            return {
+                kind: "snapshot-mismatch",
+                detail:
+                    "run record's project identity resolves to no project in its snapshot, " +
+                    "so its claim set cannot be bound to this run",
+            };
+        }
+        // Whole claims, locator-ordered: one comparison covers the locator set,
+        // every field behind each locator, and cardinality — so a truncation, an
+        // appended entry, a content or category edit, a duplicate, and a foreign
+        // snapshot all surface as the same disagreement.
+        const claimSetIdentity = (claims: ReadonlyArray<InjectedClaimRecord>): string =>
+            canonicalJson(
+                [...claims].sort((left, right) =>
+                    left.revisionLocator < right.revisionLocator
+                        ? -1
+                        : left.revisionLocator > right.revisionLocator
+                          ? 1
+                          : 0,
+                ),
+            );
+        if (claimSetIdentity(record.injectedClaims) !== claimSetIdentity(visible)) {
+            // Counts only: the ids on either side may be unreviewed text from an
+            // externally assembled artifact, which is why the surrounding checks
+            // report shapes rather than values.
+            return {
+                kind: "snapshot-mismatch",
+                detail:
+                    `run record names ${record.injectedClaims.length} injected claim(s) while its snapshot exposes ` +
+                    `${visible.length}, and the two sets are not identical, so the snapshot cannot be bound to this run`,
+            };
+        }
+        return { kind: "scored", falseAuthoritativeMatches: falseAuthoritativeMatchesIn(scenario, visible) };
+    } catch {
+        return recordedOnly();
+    } finally {
+        db.close();
+    }
+}
+
+/**
  * Score a run record produced by the replay runner. ERROR-flagged records
  * propagate their reason with no rates computed (R6). A live historian
  * whose every attempt failed validation is model behavior, not
@@ -1247,8 +1407,42 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
     const identityError = recordIdentityError(record, scenario);
     if (identityError !== null) return identityError;
 
+    // The stored-error passthrough is ordinary infrastructure precedence, and it
+    // must not outrank an authoritative state that was already OBSERVED. The
+    // runner captures claim state BEFORE the probe tier precisely so a probe
+    // abort (`probe-envelope-malformed`, `probe-gold-uncovered`,
+    // `probe-response-leak`, `probe-tool-use`) keeps that evidence on the
+    // record; discarding it here reported the one always-run-fatal outcome as a
+    // `runFatal: false` ERROR — exit 1 instead of 2 — so aborting after a
+    // forbidden promotion was a way to mask it.
+    //
+    // Scored from the snapshot when it can be bound to this run, from the
+    // record's captured claims when there is no readable snapshot at all, and
+    // refused as an integrity ERROR when the two disagree — see
+    // `abortedRecordClaimEvidence`. On the scored paths the abort's reason and
+    // detail stay put, so the infrastructure failure is still reported rather
+    // than replaced; only the verdict changes, which is what puts the scenario
+    // where the always-run-fatal rule can see it. Rates stay null and the claim
+    // counts zero — nothing here measures recall or precision — so the aggregate
+    // is unaffected beyond the false-authoritative rate this outcome belongs in.
     if (record.error !== null) {
-        return errorScore(record.scenarioId, record.error.reason, record.error.detail, record.system);
+        const evidence = abortedRecordClaimEvidence(record, scenario);
+        if (evidence.kind === "snapshot-mismatch") {
+            return errorScore(
+                record.scenarioId,
+                "record-snapshot-mismatch",
+                `${evidence.detail}; the run also aborted with ${record.error.reason}: ${record.error.detail}`,
+                record.system,
+            );
+        }
+        const errored = errorScore(record.scenarioId, record.error.reason, record.error.detail, record.system);
+        if (evidence.falseAuthoritativeMatches.length === 0) return errored;
+        return {
+            ...errored,
+            verdict: "FAIL",
+            failReasons: ["false-authoritative"],
+            falseAuthoritativeMatches: evidence.falseAuthoritativeMatches,
+        };
     }
 
     // Only a record claiming completion is held to the full inventory.
@@ -1549,7 +1743,7 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
 
         // The runner's authored-chunk-coverage proof, reapplied to a stored artifact. The
         // live gate rejects a token-capped run before it writes a completed record, but a
-        // record scored independently never passes through it — and a v1 artifact whose
+        // record scored independently never passes through it — and a stored record whose
         // successful chunks stop before a hard-negative suffix passes facts and the early
         // probes while the absence check passes vacuously. The ranges are snapshot-bound by
         // the telemetry cross-check above, and the ordinals by `recordIdentityError`, so
@@ -2060,6 +2254,49 @@ export function buildLaneReport(
         red: sorted.some((score) => score.verdict !== "PASS"),
         runFatal: scored.some((score) => score.failReasons.includes("false-authoritative")),
     };
+}
+
+/**
+ * Placeholder for a scenario the lane has not finished yet.
+ *
+ * Seeded for every scenario before the first one is attempted, and replaced in
+ * place as each completes, so an incremental report always describes the WHOLE
+ * corpus rather than the prefix that happened to finish. Two things follow from
+ * that. A report killed mid-run cannot be mistaken for a complete result over a
+ * smaller corpus — the aggregate is micro-averaged, so a prefix-only report would
+ * publish rates for scenarios nobody selected. And a run terminated during its
+ * very first scenario still leaves evidence, which "write after each scenario"
+ * alone does not provide: nothing had completed, so nothing had been written,
+ * while the tokens were already spent.
+ *
+ * An ERROR verdict, so an unfinished run is never green.
+ */
+export function scenarioNotCompletedScore(scenarioId: string, system: SystemVersionTuple | null): ScenarioScore {
+    return errorScore(
+        scenarioId,
+        "scenario-not-completed",
+        "the lane had not finished this scenario when the report was written",
+        system,
+    );
+}
+
+/**
+ * Score for a scenario the lane never got to because its wall-clock budget ran
+ * out.
+ *
+ * An ERROR, not a silent omission: `buildLaneReport` micro-averages over the
+ * scenarios it is given, so dropping the unreached ones would publish rates for a
+ * corpus subset while claiming the release, and `red` would be false if the ones
+ * that did run all passed. Constructed here rather than in the caller so the
+ * score shape stays owned by the scorer.
+ */
+export function laneBudgetExhaustedScore(scenarioId: string, system: SystemVersionTuple | null): ScenarioScore {
+    return errorScore(
+        scenarioId,
+        "lane-budget-exhausted",
+        "the lane's wall-clock budget could not cover this scenario's worst-case historian waits, so it was not run",
+        system,
+    );
 }
 
 /**

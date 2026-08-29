@@ -31,9 +31,24 @@ const REPO_ROOT = resolve(import.meta.dir, "../../../..");
 // src/, so the source path also tests a slowness users never see.
 const PLUGIN_DIST_ENTRY = join(REPO_ROOT, "packages/plugin/dist/index.js");
 const PLUGIN_SRC_ENTRY = join(REPO_ROOT, "packages/plugin/src/index.ts");
-const PLUGIN_ENTRY = existsSync(PLUGIN_DIST_ENTRY)
-    ? PLUGIN_DIST_ENTRY
-    : PLUGIN_SRC_ENTRY;
+/**
+ * Resolved per spawn, not once at module load.
+ *
+ * A module-level constant snapshots mutable filesystem state at import time, and
+ * the import happens before any caller code runs — a caller that builds the
+ * bundle and then spawns in the same process got the pre-build answer. That is
+ * not merely stale bytes: with no bundle present the entry latched to `src/`
+ * permanently, so the same process could load a different plugin entrypoint than
+ * a caller that prebuilt, while reporting the same identity. Since the two paths
+ * have materially different startup behaviour, and production never loads from
+ * `src/`, the choice has to be made when it is used.
+ *
+ * Semantics are unchanged for every caller that does not create or remove the
+ * bundle between import and spawn: the answer is the same, just computed later.
+ */
+function pluginEntryPath(): string {
+    return existsSync(PLUGIN_DIST_ENTRY) ? PLUGIN_DIST_ENTRY : PLUGIN_SRC_ENTRY;
+}
 
 function initializeIsolatedContextDb(
     dataDir: string,
@@ -169,7 +184,7 @@ function writeConfigs(
 ): void {
     const pluginEntry = opts.releaseRoot
         ? releaseRootPath(opts.releaseRoot, "opencodePlugin")
-        : PLUGIN_ENTRY;
+        : pluginEntryPath();
     const pluginSpec = `file://${pluginEntry}`;
 
     const opencodeConfig: Record<string, unknown> = {

@@ -3,9 +3,9 @@
 import { describe, expect, it } from "bun:test";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { verifyReleaseRoot } from "../prospective-holdout/release-root";
 import { releaseRootFixture } from "../prospective-holdout/test-fixtures";
 import type { HermeticMcHostStack } from "../rust-runner/hermetic-mc-host";
@@ -34,6 +34,51 @@ function childProcess(fake: FakeChild): ChildProcess {
 }
 
 describe("opencode child lifecycle", () => {
+    it("resolves the plugin entry when spawning, not when this module was imported", () => {
+        // A module-level `existsSync` snapshot is taken before any caller code
+        // runs, so a caller that builds the bundle and then spawns in the same
+        // process got the pre-build answer — and with no bundle present the entry
+        // latched to `src/` permanently, making that process load a different
+        // plugin entrypoint than a caller that prebuilt while reporting the same
+        // identity. This module has already been imported by the time this test
+        // body runs, which is exactly the window that has to stay live.
+        const repoRoot = resolve(import.meta.dir, "../../../..");
+        const dist = join(repoRoot, "packages/plugin/dist/index.js");
+        const distExisted = existsSync(dist);
+        const stash = `${dist}.spawn-entry-test`;
+        const root = mkdtempSync(join(tmpdir(), "opencode-plugin-entry-"));
+        const env: IsolatedEnv = {
+            configDir: join(root, "config"),
+            dataDir: join(root, "data"),
+            cacheDir: join(root, "cache"),
+            workdir: join(root, "work"),
+        };
+        const pluginOf = (): string => {
+            __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:1", { mockProviderURL: "http://127.0.0.1:1" });
+            return (
+                JSON.parse(readFileSync(join(env.configDir, "opencode.json"), "utf8")) as { plugin: string[] }
+            ).plugin[0] as string;
+        };
+        try {
+            for (const dir of Object.values(env)) mkdirSync(dir, { recursive: true });
+            if (distExisted) renameSync(dist, stash);
+            expect(pluginOf()).toBe(`file://${join(repoRoot, "packages/plugin/src/index.ts")}`);
+
+            // Same process, same already-imported module: creating the bundle now
+            // must move the resolved entry.
+            mkdirSync(dirname(dist), { recursive: true });
+            writeFileSync(dist, distExisted ? readFileSync(stash) : "// built after import\n");
+            expect(pluginOf()).toBe(`file://${dist}`);
+        } finally {
+            if (distExisted) {
+                renameSync(stash, dist);
+            } else {
+                rmSync(dist, { force: true });
+            }
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     it("uses selected plugin and database bytes only when release root is supplied", () => {
         const release = mkdtempSync(join(tmpdir(), "opencode-release-root-"));
         const active = mkdtempSync(join(tmpdir(), "opencode-active-root-"));

@@ -312,6 +312,8 @@ function makeRecord(
         nowMs: fixture.nowMs,
         system: {
             repoCommitSha: "test",
+            bunVersion: "test-bun",
+            opencodeVersion: "test",
             historianModelId: "scripted-mock",
             probeModelId: "scripted-mock",
             parserImpl: "ts",
@@ -1038,6 +1040,51 @@ describe("scoreRunRecord", () => {
         }
     });
 
+    test("an empty system-version field is malformed, not a usable identity", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario);
+            // `typeof x === "string"` accepts "": the record would take an ordinary
+            // verdict and then be grouped as comparable with runs it shares no
+            // runtime with, which is the opposite of why these fields exist.
+            for (const field of ["bunVersion", "opencodeVersion", "repoCommitSha", "historianModelId", "probeModelId"] as const) {
+                for (const empty of ["", "   "]) {
+                    const score = scoreRunRecord(
+                        { ...record, system: { ...record.system, [field]: empty } },
+                        scenario,
+                    );
+                    expect(score.errorReason, `${field}=${JSON.stringify(empty)}`).toBe("record-malformed");
+                }
+            }
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("an older schema is classified as unsupported, not as a malformed record", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario);
+            // A real v1/v2 record lacks the system fields v3 requires. Reporting that
+            // as `record-malformed` would call a valid historical artifact damaged and
+            // defeat the schema bump that added those fields.
+            const { bunVersion: _bun, opencodeVersion: _oc, ...olderSystem } = record.system;
+            const older = {
+                ...record,
+                schema: "historian-eval-run-record/v1" as typeof RUN_RECORD_SCHEMA,
+                system: olderSystem as typeof record.system,
+            };
+            const score = scoreRunRecord(older, scenario);
+            expect(score.errorReason).toBe("record-schema-unsupported");
+            expect(score.errorDetail).toContain("historian-eval-run-record/v1");
+            expect(score.scenarioId).toBe(scenario.id);
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
     test("an ERROR artifact under an unsupported schema is an integrity error, not its own stale reason", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {
@@ -1060,6 +1107,113 @@ describe("scoreRunRecord", () => {
             // the inventory check must stay behind the passthrough.
             const aborted = scoreRunRecord({ ...record, historianRuns: [] }, scenario);
             expect(aborted.errorReason).toBe("script-drift");
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("an observed false-authoritative promotion survives an aborted run: FAIL run-fatal, not ERROR (R8/KTD8)", () => {
+        const fixture = makeSnapshot({
+            facts: [...goldFacts(), { category: "ARCHITECTURE", content: "Use Redis for the session cache." }],
+        });
+        try {
+            const scenario = validScenario();
+            // The runner captures claim state before the probe tier precisely so a
+            // probe abort keeps this evidence. Left to the ordinary stored-error
+            // passthrough, the always-run-fatal outcome came back as a
+            // `runFatal: false` ERROR and the lane exited 1, so aborting after a
+            // forbidden promotion masked it.
+            const aborted = makeRecord(fixture, scenario, {
+                error: { reason: "probe-response-leak", detail: "probe-capacity leaked a claim id" },
+            });
+            const score = scoreRunRecord(aborted, scenario);
+            expect(score.verdict).toBe("FAIL");
+            expect(score.failReasons).toEqual(["false-authoritative"]);
+            expect(score.falseAuthoritativeMatches).toEqual(["abs-redis-active"]);
+            // The abort is still reported, not replaced: only the verdict changes.
+            expect(score.errorReason).toBe("probe-response-leak");
+            expect(score.errorDetail).toBe("probe-capacity leaked a claim id");
+            // Nothing here measured recall or precision, so the aggregate rates
+            // must not move.
+            expect(score.recall).toBeNull();
+            expect(score.precision).toBeNull();
+            const report = buildLaneReport([score]);
+            expect(report.runFatal).toBe(true);
+            expect(laneExitCode(report)).toBe(2);
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("an aborted record whose claim set disagrees with its snapshot is an integrity ERROR, not a verdict", () => {
+        const fixture = makeSnapshot({
+            facts: [...goldFacts(), { category: "ARCHITECTURE", content: "Use Redis for the session cache." }],
+        });
+        try {
+            const scenario = validScenario();
+            const aborted = makeRecord(fixture, scenario, {
+                error: { reason: "probe-response-leak", detail: "probe-capacity leaked a claim id" },
+            });
+            // Each of these breaks the record-to-snapshot equality in a different
+            // place, and each one used to be scored: the truncated array hid the
+            // promotion, the forged entry invented one, and the two edited
+            // selectors returned an empty visible set indistinguishable from "no
+            // promotion". None of them is a report about the run, so none of them
+            // produces a verdict — the completion path returns the same
+            // `record-snapshot-mismatch` for the identical forgeries.
+            const forged = {
+                publicClaimId: "clm-forged",
+                revisionLocator: "rev-forged",
+                content: "Use Redis for the session cache.",
+                category: "ARCHITECTURE",
+                revision: 1,
+            };
+            for (const [label, edited] of [
+                ["truncated claim array", { ...aborted, injectedClaims: [] }],
+                // The shape the runner writes when abort-path claim capture fails but
+                // the best-effort snapshot succeeds: an empty identity resolves to no
+                // project, so the read is vacuous and two empty sets would otherwise
+                // compare equal while the snapshot holds the forbidden claim.
+                ["unresolvable identity with no recorded claims", { ...aborted, projectIdentity: "", injectedClaims: [] }],
+                ["appended forged claim", { ...aborted, injectedClaims: [...aborted.injectedClaims, forged] }],
+                ["edited project identity", { ...aborted, projectIdentity: "no-such-project" }],
+            ] satisfies Array<[string, HistorianEvalRunRecord]>) {
+                const score = scoreRunRecord(edited, scenario);
+                expect(score.verdict, label).toBe("ERROR");
+                expect(score.errorReason, label).toBe("record-snapshot-mismatch");
+                // The abort is still named, so the integrity failure does not erase
+                // what the run was doing when it stopped.
+                expect(score.errorDetail, label).toContain("probe-response-leak");
+                expect(score.failReasons, label).toEqual([]);
+            }
+
+            // An edited clock is only a forgery when it MOVES the visible set.
+            // These fixtures carry no validity windows, so the read returns the
+            // same three claims and the record still agrees with its snapshot —
+            // the promotion is genuinely bound to this run and stays run-fatal.
+            // Asserted so the mismatch rule is not mistaken for "any edit is an
+            // ERROR": it rejects disagreement, not tampering it cannot see.
+            const shiftedClock = scoreRunRecord({ ...aborted, nowMs: 1 }, scenario);
+            expect(shiftedClock.verdict).toBe("FAIL");
+            expect(shiftedClock.falseAuthoritativeMatches).toEqual(["abs-redis-active"]);
+            expect(laneExitCode(buildLaneReport([shiftedClock]))).toBe(2);
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("an aborted run with no forbidden promotion stays an ordinary ERROR", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = validScenario();
+            const aborted = makeRecord(fixture, scenario, {
+                error: { reason: "probe-response-leak", detail: "probe-capacity leaked a claim id" },
+            });
+            const score = scoreRunRecord(aborted, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("probe-response-leak");
+            expect(score.failReasons).toEqual([]);
+            expect(laneExitCode(buildLaneReport([score]))).toBe(1);
         } finally {
             fixture.cleanup();
         }
@@ -2341,6 +2495,8 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
 describe("buildLaneReport", () => {
     const LANE_SYSTEM = {
         repoCommitSha: "c".repeat(40),
+        bunVersion: "test-bun",
+        opencodeVersion: "test",
         historianModelId: "scripted-mock",
         probeModelId: "scripted-mock",
         parserImpl: "ts" as const,
@@ -2415,6 +2571,8 @@ describe("buildLaneReport", () => {
     test("a report cannot span two systems, and cannot be labelled with a system the scores contradict", () => {
         const system = {
             repoCommitSha: "a".repeat(40),
+            bunVersion: "test-bun",
+            opencodeVersion: "test",
             historianModelId: "anthropic/claude-sonnet-4-5",
             probeModelId: "anthropic/claude-sonnet-4-5",
             parserImpl: "ts" as const,
@@ -2453,6 +2611,8 @@ describe("buildLaneReport", () => {
             parserImpl: system.parserImpl,
             historianModelId: system.historianModelId,
             repoCommitSha: system.repoCommitSha,
+            bunVersion: "test-bun",
+            opencodeVersion: "test",
         };
         expect(JSON.stringify(permuted)).not.toBe(JSON.stringify(system));
         expect(() => buildLaneReport([{ ...passScore("hse-a"), system: permuted }], { system })).not.toThrow();

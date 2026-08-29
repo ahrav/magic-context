@@ -15,7 +15,7 @@
  * idempotency receipts and score first-attempt state.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
     extractLatestAssistantText,
@@ -59,12 +59,36 @@ import {
     deriveHistorianChunkTokens,
     resolveHistorianContextLimit,
 } from "../../../plugin/src/hooks/magic-context/derive-budgets";
+import { DEFAULT_HISTORIAN_TIMEOUT_MS } from "../../../plugin/src/config/schema/magic-context";
 import { promotionEvidenceCount, readInjectedClaims, type InjectedClaimRecord } from "./claim-read";
 import { verifyAllActiveClaims } from "./verification-bridge";
 
 export type { InjectedClaimRecord } from "./claim-read";
 
-export const RUN_RECORD_SCHEMA = "historian-eval-run-record/v1";
+/**
+ * Run-record schema identity. The scorer keys record MEANING off this string —
+ * it rejects any other value outright — so a change to the required record
+ * shape has to move it. `v2` added `system.opencodeVersion` and `v3` adds
+ * `system.bunVersion`, both of which the scorer requires: left unchanged, one
+ * identifier would name two incompatible shapes and a record written by an earlier
+ * producer would be rejected as `record-malformed` rather than as the older schema
+ * it is.
+ */
+/**
+ * Non-request work inside one live historian pass, bounded generously.
+ *
+ * Child-session setup, output validation, repair-prompt construction, compartment
+ * and claim persistence, and the quiescence poll all sit between and after the two
+ * provider requests, and none is individually bounded. Two minutes is far above what
+ * local SQLite writes and a poll loop take, and it is the difference between the
+ * lane's wait exceeding the plugin's own bound and expiring exactly on it.
+ */
+const LIVE_HISTORIAN_OVERHEAD_MS = 120_000;
+
+/** Claim-capture-time database image; see `ScenarioRunner.capturedClaims`. */
+const PRE_PROBE_SNAPSHOT_FILE = "context-db-snapshot-pre-probe.sqlite";
+
+export const RUN_RECORD_SCHEMA = "historian-eval-run-record/v3";
 
 /**
  * The canonical internal-agent signature containing `needle`. Request routing
@@ -411,6 +435,26 @@ export interface ProbeExchange {
 
 export interface SystemVersionTuple {
     repoCommitSha: string;
+    /**
+     * `Bun.version` of the process that ran the lane.
+     *
+     * Bun both builds the plugin bundle and executes the runner, so two runs on
+     * different Bun releases execute different bytes. The scheduled workflow pins
+     * it, which makes it a function of the recorded commit THERE — but a direct
+     * operator run uses whatever `bun` is on the path, and the documented
+     * multi-run stability audit is exactly the case where that variance would be
+     * invisible. Recording it makes the difference visible wherever the pin does
+     * not reach.
+     */
+    bunVersion: string;
+    /**
+     * Resolved OpenCode release the harness ran against. The installer serves
+     * whatever is current, so two otherwise identical scheduled runs can sit on
+     * different harness runtimes; without this field they record the same system
+     * identity and look longitudinally comparable when they are not. "unknown"
+     * when the version cannot be resolved.
+     */
+    opencodeVersion: string;
     historianModelId: string;
     probeModelId: string;
     parserImpl: "ts";
@@ -487,8 +531,77 @@ export interface RunScenarioOptions {
     /** Directory the run record and DB snapshot are written into. */
     artifactDir: string;
     repoCommitSha?: string;
-    /** Per-run historian completion wait. */
+    /** Resolved `opencode --version`; recorded in the system tuple. */
+    opencodeVersion?: string;
+    /**
+     * Per-run historian completion wait. Defaults per mode — see
+     * `historianWaitBudgetMs`.
+     */
     historianWaitMs?: number;
+}
+
+/**
+ * How long to wait for one declared historian run to complete, by mode.
+ *
+ * A scripted historian answers from a local mock, so the old flat 90s was
+ * generous. For a LIVE historian it was below the plugin's ceiling for a SINGLE
+ * prompt attempt (`DEFAULT_HISTORIAN_TIMEOUT_MS`), let alone a pass that also
+ * runs a validation-repair prompt — so this runner, not the historian's own
+ * timeout, decided the run "never fired", and it did so after the API tokens were
+ * already spent. That converts a slow provider into an invalidated experiment.
+ *
+ * The live budget covers the healthy path: the initial prompt plus one repair
+ * prompt, each bounded by the plugin's own per-attempt timeout, PLUS the work that
+ * is not a provider request. Summing only the two request timeouts made the outer
+ * wait expire at exactly their total, so two responses landing near their limits
+ * left no room for child-session setup, output validation, repair-prompt
+ * construction, persistence, or the quiescence poll — and the lane recorded
+ * `run-never-fired` while the plugin was still legitimately finishing a valid
+ * repaired pass it had already paid for. Deliberately NOT
+ * the pathological path — `runHistorianPrompt` retries transient failures
+ * `MAX_HISTORIAN_RETRIES` times, and budgeting for every retry of both ladders
+ * would put one stuck scenario above 30 minutes, enough for a single scenario to
+ * consume the whole 240-minute job budget for the corpus's 26 declared runs.
+ * Sitting above every non-retrying live pass keeps the plugin's timeout as the
+ * authority on "the historian took too long", while a genuine retry storm still
+ * surfaces as `run-never-fired` for that one scenario — a recoverable ERROR
+ * rather than a silently truncated job. Callers with a different budget override
+ * it through `historianWaitMs`.
+ */
+function historianWaitBudgetMs(mode: RunScenarioOptions["mode"]): number {
+    return mode.kind === "live" ? 2 * DEFAULT_HISTORIAN_TIMEOUT_MS + LIVE_HISTORIAN_OVERHEAD_MS : 90_000;
+}
+
+/**
+ * System identity for a run, derived entirely from its OPTIONS — nothing about a
+ * scenario enters it.
+ *
+ * Exported because of that independence: a caller can build the same tuple before
+ * the first scenario starts, which is what lets an interrupted first run publish a
+ * partial report that still names the commit, the OpenCode version, and the model
+ * routes that consumed the tokens. Without it that artifact carries `system: null`
+ * and is useless for the longitudinal comparison the report schema exists for.
+ *
+ * One definition, two call sites, so the pre-run tuple and the recorded one cannot
+ * drift — and `resolveRepoCommitSha` caches per process, so both resolve the same
+ * sha even though the digest is computed lazily.
+ */
+export function runSystemTuple(
+    options: Pick<RunScenarioOptions, "mode"> & { repoCommitSha?: string; opencodeVersion?: string },
+): SystemVersionTuple {
+    const mode = options.mode;
+    return {
+        repoCommitSha: options.repoCommitSha ?? resolveRepoCommitSha(),
+        bunVersion: Bun.version,
+        opencodeVersion: options.opencodeVersion ?? "unknown",
+        historianModelId: mode.kind === "live" ? mode.historianModel : "scripted-mock",
+        probeModelId:
+            mode.kind === "live" ? `${mode.probeModel.providerID}/${mode.probeModel.modelID}` : "scripted-mock",
+        parserImpl: "ts",
+        chunkTokenBudget: deriveHistorianChunkTokens(
+            resolveHistorianContextLimit(mode.kind === "live" ? mode.historianModel : undefined),
+        ),
+    };
 }
 
 class RunAbort extends Error {
@@ -943,6 +1056,31 @@ class ScenarioRunner {
     // record still carries whatever the run produced before the abort (R6).
     private collectedRuns: HistorianRunArtifact[] = [];
     private collectedProbes: ProbeExchange[] = [];
+    // Authoritative claim read, taken before the probe tier can abort. A
+    // false-authoritative promotion is run-fatal (R8/KTD8), so its evidence
+    // must survive a probe-stage ERROR rather than being cleared with the rest
+    // of the record.
+    private capturedClaims: {
+        nowMs: number;
+        injectedClaims: InjectedClaimRecord[];
+        perGoldPredicate: PerGoldPredicateCount[];
+        /**
+         * Database image taken WITH the claim read above, not after the abort.
+         *
+         * The scorer binds an aborted record's claim array to its snapshot by
+         * requiring the two claim sets to be identical, which holds only if they
+         * describe the same instant. A snapshot taken when the abort unwinds does
+         * not: `driveProbes` waits for an undeclared historian pass to FINISH
+         * before reporting it, and a finished pass can promote claims — so the
+         * post-abort store may legitimately differ from this array, and the
+         * scorer would read that as an unbindable artifact and drop an already
+         * observed run-fatal promotion to an integrity ERROR.
+         *
+         * Superseded and deleted on the completion path, where the end-of-run
+         * snapshot is the one facts are scored from.
+         */
+        snapshotPath: string;
+    } | null = null;
     private sessionId = "";
 
     constructor(
@@ -1011,22 +1149,30 @@ class ScenarioRunner {
     }
 
     private emptyRecord(error: RunRecordError): HistorianEvalRunRecord {
-        // Best-effort DB snapshot: an ERROR record with the database beside
-        // it is diagnosable without re-running the scenario.
-        let snapshotPath = "";
-        try {
-            if (this.harness !== null && this.harness.hasContextDb()) {
-                snapshotPath = this.snapshotContextDb(this.harness);
+        // The snapshot taken WITH the claim capture, when there is one: the scorer
+        // requires an aborted record's claim array and snapshot to describe the same
+        // instant, and a snapshot taken here does not (see `capturedClaims`). Only
+        // when nothing was captured does a fresh best-effort image apply — an ERROR
+        // record with the database beside it is diagnosable without re-running.
+        let snapshotPath = this.capturedClaims?.snapshotPath ?? "";
+        if (snapshotPath === "") {
+            try {
+                if (this.harness !== null && this.harness.hasContextDb()) {
+                    snapshotPath = this.snapshotContextDb(this.harness);
+                }
+            } catch {
+                snapshotPath = "";
             }
-        } catch {
-            snapshotPath = "";
         }
         return {
             ...this.baseRecord(),
-            projectIdentity: "",
-            nowMs: Date.now(),
-            perGoldPredicate: [],
-            injectedClaims: [],
+            projectIdentity:
+                this.capturedClaims === null || this.harness === null
+                    ? ""
+                    : resolveProjectIdentity(this.harness.opencode.env.workdir),
+            nowMs: this.capturedClaims?.nowMs ?? Date.now(),
+            perGoldPredicate: this.capturedClaims?.perGoldPredicate ?? [],
+            injectedClaims: this.capturedClaims?.injectedClaims ?? [],
             probes: this.collectedProbes,
             verifiedClaimCount: 0,
             contextDbSnapshotPath: snapshotPath,
@@ -1087,17 +1233,7 @@ class ScenarioRunner {
     }
 
     private systemTuple(): SystemVersionTuple {
-        const mode = this.options.mode;
-        return {
-            repoCommitSha: this.options.repoCommitSha ?? resolveRepoCommitSha(),
-            historianModelId: mode.kind === "live" ? mode.historianModel : "scripted-mock",
-            probeModelId:
-                mode.kind === "live" ? `${mode.probeModel.providerID}/${mode.probeModel.modelID}` : "scripted-mock",
-            parserImpl: "ts",
-            chunkTokenBudget: deriveHistorianChunkTokens(
-                resolveHistorianContextLimit(mode.kind === "live" ? mode.historianModel : undefined),
-            ),
-        };
+        return runSystemTuple(this.options);
     }
 
     private async execute(): Promise<HistorianEvalRunRecord> {
@@ -1141,7 +1277,42 @@ class ScenarioRunner {
         // formation, not the orthogonal maturity gate, so it verifies every
         // active claim through the production verification operation before
         // the injection-dependent probe tier runs. See verification-bridge.ts.
-        const verifiedClaimCount = this.runVerificationBridge(harness);
+        //
+        // The bridge applies one claim at a time and fails closed on a
+        // non-applied outcome, and it runs BEFORE the authoritative capture
+        // below — so an abort here unwound with `capturedClaims` still null.
+        // `emptyRecord` then wrote an empty identity and claim array while the
+        // snapshot already held whatever had been verified, including a
+        // forbidden promotion, and the always-run-fatal outcome came back as an
+        // ordinary `harness-failure`. Capturing before the rethrow keeps that
+        // evidence exactly as a probe-stage abort keeps it. The capture runs
+        // after the partial application, so it sees the claims verification had
+        // actually made visible rather than a pre-bridge guess.
+        let verifiedClaimCount: number;
+        try {
+            verifiedClaimCount = this.runVerificationBridge(harness);
+        } catch (error) {
+            this.captureClaimStateForAbort(harness);
+            throw error;
+        }
+
+        // Read the authoritative claim state BEFORE the probe tier. A probe
+        // stage can abort (`probe-envelope-malformed`, `probe-gold-uncovered`,
+        // `probe-response-leak`, `probe-tool-use`), and reading afterwards
+        // means such an abort discards an already-observed false-authoritative
+        // promotion — the one outcome that is always run-fatal, downgraded to
+        // an ordinary ERROR because `emptyRecord` carries no claims. Probes ask
+        // questions and do not mutate claims, so the read is equivalent here,
+        // and pinning the clock with it keeps re-scoring time-independent
+        // (KTD1).
+        const nowMs = Date.now();
+        const { injectedClaims, perGoldPredicate } = this.captureClaimState(harness, nowMs);
+        this.capturedClaims = {
+            nowMs,
+            injectedClaims,
+            perGoldPredicate,
+            snapshotPath: this.snapshotContextDb(harness, PRE_PROBE_SNAPSHOT_FILE),
+        };
 
         const probes = await this.driveProbes(harness, sessionId);
         // Again, because the probe phase is provider traffic too. The call before the
@@ -1153,16 +1324,16 @@ class ScenarioRunner {
         // than a prefix of it.
         this.assertNoScriptDrift(harness);
 
-        // Pin the clock before the authoritative snapshot read so re-scoring
-        // is time-independent (KTD1).
-        const nowMs = Date.now();
-        const { injectedClaims, perGoldPredicate } = this.captureClaimState(harness, nowMs);
         // The claim-id half of the response-leak gate, deferred to here because
         // acceptance is per-probe: it needs every probe's injected locator set and the
         // captured claims, which is exactly the pair the scorer replays from.
         const claimIdLeak = probeResponseClaimIdLeak({ scenario: this.scenario, exchanges: probes, injectedClaims });
         if (claimIdLeak !== null) throw new RunAbort("probe-response-leak", claimIdLeak);
         const snapshotPath = this.snapshotContextDb(harness);
+        // The completion path scores facts from THIS image, and `driveProbes` has
+        // already proven no undeclared pass moved the store, so the pre-probe copy is
+        // redundant here rather than a second answer to archive.
+        rmSync(join(this.options.artifactDir, PRE_PROBE_SNAPSHOT_FILE), { force: true });
 
         return {
             ...this.baseRecord(),
@@ -1452,7 +1623,7 @@ class ScenarioRunner {
         try {
             await harness.waitFor(
                 () => this.historianRunRows(harness, sessionId).length >= runIndex && this.historianQuiesced(harness, sessionId),
-                { timeoutMs: this.options.historianWaitMs ?? 90_000, label: `historian run ${runIndex}` },
+                { timeoutMs: this.options.historianWaitMs ?? historianWaitBudgetMs(this.options.mode), label: `historian run ${runIndex}` },
             );
         } catch {
             throw new RunAbort(
@@ -1865,7 +2036,7 @@ class ScenarioRunner {
         // taken with its compartments present but its row absent.
         try {
             await harness.waitFor(() => this.historianQuiesced(harness, sessionId), {
-                timeoutMs: this.options.historianWaitMs ?? 90_000,
+                timeoutMs: this.options.historianWaitMs ?? historianWaitBudgetMs(this.options.mode),
                 label: "historian quiescent after the probe phase",
             });
         } catch {
@@ -2204,6 +2375,33 @@ class ScenarioRunner {
      * (`auto_inject`, active lifecycle, stale retry) with the pinned clock
      * (KTD1). A snapshot still stale after the built-in retry is ERROR.
      */
+    /**
+     * Claim capture on an abort path, best effort.
+     *
+     * Never overwrites an existing capture — the authoritative read wins — and
+     * never throws: a capture that fails must not replace the abort that is
+     * actually being reported. Leaving `capturedClaims` null on failure returns
+     * the previous behaviour for that case, which is the correct floor.
+     */
+    private captureClaimStateForAbort(harness: TestHarness): void {
+        if (this.capturedClaims !== null) return;
+        try {
+            const nowMs = Date.now();
+            const { injectedClaims, perGoldPredicate } = this.captureClaimState(harness, nowMs);
+            // Paired with the read, for the same reason the pre-probe capture is:
+            // the scorer requires an aborted record's claims and snapshot to
+            // describe one instant.
+            this.capturedClaims = {
+                nowMs,
+                injectedClaims,
+                perGoldPredicate,
+                snapshotPath: this.snapshotContextDb(harness, PRE_PROBE_SNAPSHOT_FILE),
+            };
+        } catch {
+            // Intentionally swallowed; see above.
+        }
+    }
+
     private captureClaimState(
         harness: TestHarness,
         nowMs: number,
@@ -2229,8 +2427,8 @@ class ScenarioRunner {
         }
     }
 
-    private snapshotContextDb(harness: TestHarness): string {
-        const snapshotPath = join(this.options.artifactDir, "context-db-snapshot.sqlite");
+    private snapshotContextDb(harness: TestHarness, fileName = "context-db-snapshot.sqlite"): string {
+        const snapshotPath = join(this.options.artifactDir, fileName);
         // VACUUM INTO produces a complete single-file image regardless of the
         // live database's WAL state; a plain file copy would silently drop
         // committed pages still sitting in `-wal`.
