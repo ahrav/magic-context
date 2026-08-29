@@ -545,7 +545,7 @@ export function injectCompactionMarker(
     }
 }
 
-// ── Foreign-marker scan (fork-orphan hygiene, #263) ─────────────
+// ── Foreign-marker scan (fork-orphan hygiene) ─────────────
 
 /**
  * One compaction marker row-set found in opencode.db for a session.
@@ -568,7 +568,7 @@ export interface SessionCompactionMarkerRows {
 /**
  * List every compaction marker present in opencode.db for a session.
  *
- * Used by the fork-orphan hygiene pass (#263): OpenCode's `/fork` copies the
+ * Used by the fork-orphan hygiene pass: OpenCode's `/fork` copies the
  * parent session's message rows — including this plugin's compaction marker
  * rows — into the fork, while magic-context's durable marker state (context.db)
  * is NOT inherited (PARITY.md gap #25). The fork then owns marker rows its
@@ -666,7 +666,7 @@ export function removeForeignCompactionMarker(
 
 /**
  * Result of the compaction-off flip cleanup over one session's opencode.db
- * rows (issue #266). Counts are row-level so the transition can both gate
+ * rows. Counts are row-level so the transition can both gate
  * the flip notice ("cleared something") and prove idempotence (a second run
  * reports zero removed rows).
  */
@@ -723,8 +723,8 @@ function isMcCanonicalCompactionPartData(data: unknown): boolean {
 
 /**
  * Delete every Magic Context-owned compaction-marker lineage for a session
- * from opencode.db. This is the flip-off transition's primary mechanism
- * (issue #266 decision #7): with MC no longer injecting `<session-history>`,
+ * from opencode.db. This is the flip-off transition's primary mechanism:
+ * with MC no longer injecting `<session-history>`,
  * a surviving MC marker would keep `filterCompacted` hiding pre-boundary
  * history with nothing to replace it — orphaned context. Deleting the MC
  * pairs lets OpenCode recompute filtering live from the surviving rows, as if

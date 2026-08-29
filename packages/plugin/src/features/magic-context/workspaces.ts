@@ -235,22 +235,6 @@ export function resolveStoredPathWorkspaceIdentity(
     return null;
 }
 
-export function storedPathBelongsToWorkspace(
-    storedProjectPath: string,
-    memberIdentities: readonly string[],
-    expandedIdentities: readonly string[],
-    canonicalIdentityByStoredPath: ReadonlyMap<string, string>,
-): boolean {
-    if (expandedIdentities.includes(storedProjectPath)) return true;
-    return (
-        resolveStoredPathWorkspaceIdentity(
-            storedProjectPath,
-            memberIdentities,
-            canonicalIdentityByStoredPath,
-        ) !== null
-    );
-}
-
 export function sourceNameForMemory(
     storedProjectPath: string,
     ownIdentity: string,
@@ -350,30 +334,6 @@ export function bumpEpochsForWorkspaceMembers(
     now = Date.now(),
 ): void {
     const run = () => bumpEpochRows(db, workspaceMembersForIdentity(db, identity), now);
-    if (isInTransaction(db)) {
-        run();
-        return;
-    }
-    db.exec("BEGIN IMMEDIATE");
-    try {
-        run();
-        db.exec("COMMIT");
-    } catch (error) {
-        try {
-            db.exec("ROLLBACK");
-        } catch {
-            // ignore rollback failures from an already-closed transaction
-        }
-        throw error;
-    }
-}
-
-export function bumpEpochsForWorkspaceMemberSet(
-    db: Database,
-    identities: readonly string[],
-    now = Date.now(),
-): void {
-    const run = () => bumpEpochRows(db, identities, now);
     if (isInTransaction(db)) {
         run();
         return;

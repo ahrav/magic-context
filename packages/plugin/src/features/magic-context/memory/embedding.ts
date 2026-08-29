@@ -38,7 +38,6 @@ export {
     registerProjectShadowEmbedding,
     type ShadowEmbeddingMeasurementCohort,
     sweepAllRegisteredProjects,
-    unregisterProjectEmbedding,
 } from "../project-embedding-registry";
 
 const DEFAULT_EMBEDDING_CONFIG: EmbeddingConfig = {
@@ -62,7 +61,7 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
                   }
                 : {}),
             // local_dtype is spread CONDITIONALLY to preserve the byte-identical
-            // default identity when unset (mirrors the schema transform). See #259.
+            // default identity when unset (mirrors the schema transform).
             ...(config?.local_dtype ? { local_dtype: config.local_dtype } : {}),
         };
     }

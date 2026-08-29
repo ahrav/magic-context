@@ -21,7 +21,6 @@ import {
     type ClaimOperationStageOutcome,
     computeProjectMemoryMutationToken,
     getProjectMemoryClaimByPublicId,
-    runClaimOperation,
     runClaimOperationInCurrentTransaction,
 } from "./storage-claim-operations";
 import { sha256Utf8Hex } from "./storage-claims";
@@ -344,24 +343,6 @@ export function recordAutonomousManifestRejectionInCurrentTransaction(args: {
     assertIdentity(args.identity);
     const nowMs = args.nowMs ?? Date.now();
     return runClaimOperationInCurrentTransaction(
-        args.db,
-        rejectionEnvelope(args),
-        () => ({ kind: "stale", reason: args.reason }),
-        nowMs,
-    );
-}
-
-/** Persist a malformed/incomplete provider manifest as one replayable zero-effect result. */
-export function recordAutonomousManifestRejection(args: {
-    db: Database;
-    identity: AutonomousManifestIdentity;
-    rawManifest: string;
-    reason: string;
-    nowMs?: number;
-}): ClaimOperationRunResult {
-    assertIdentity(args.identity);
-    const nowMs = args.nowMs ?? Date.now();
-    return runClaimOperation(
         args.db,
         rejectionEnvelope(args),
         () => ({ kind: "stale", reason: args.reason }),

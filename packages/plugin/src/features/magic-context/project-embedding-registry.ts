@@ -587,7 +587,7 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
             // local_dtype is spread CONDITIONALLY to preserve the byte-identical
             // default identity when unset (mirrors the schema transform). Only
             // a user-configured dtype survives normalization and reaches the
-            // provider + identity hash. See issue #259.
+            // provider + identity hash.
             ...(config?.local_dtype ? { local_dtype: config.local_dtype } : {}),
         };
     }
@@ -2501,18 +2501,6 @@ export function registerProjectInObservationMode(
     return snapshotFor(registration);
 }
 
-export function unregisterProjectEmbedding(projectIdentity: string): void {
-    const prior = projectRegistrations.get(projectIdentity);
-    const shadow = shadowRegistrations.get(projectIdentity);
-    if (!prior && !shadow) return;
-    projectRegistrations.delete(projectIdentity);
-    shadowRegistrations.delete(projectIdentity);
-    dbForShadowQueue.delete(projectIdentity);
-    globalRegistrationGeneration += 1;
-    disposeProvider(prior?.provider ?? null);
-    disposeProvider(shadow?.provider ?? null);
-}
-
 export function getProjectEmbeddingSnapshot(
     projectIdentity: string,
 ): ProjectEmbeddingRegistrationSnapshot | null {
@@ -3052,7 +3040,7 @@ async function embedCandidateChunkBatch(
                 // this, the slice builder's "always include at least one
                 // compartment" rule could hand the provider one enormous text array
                 // in a single HTTP call, defeating the payload bound and risking
-                // provider timeouts/rejections (PR #207 review).
+                // provider timeouts/rejections.
                 result = await embedItemsWindowBounded(projectIdentity, items, signal);
             } catch (error) {
                 log("[magic-context] failed to proactively embed compartment chunks:", error);

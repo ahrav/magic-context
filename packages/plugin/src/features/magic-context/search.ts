@@ -2027,7 +2027,7 @@ async function executeUnifiedSearch(args: {
     // requestedK and effectiveK are emitted from this one variable, so the
     // candidate-depth assertion over these counters checks plumbing
     // identity only; it cannot see a lane that internally clamped its
-    // executed bound. Surfacing per-lane executed bounds is future work.
+    // executed bound.
     const laneDepth = { requestedK: tierLimit, effectiveK: tierLimit };
 
     const filterSpan = trace?.begin("filter_construction", "unified", { parent: rootId }) ?? null;

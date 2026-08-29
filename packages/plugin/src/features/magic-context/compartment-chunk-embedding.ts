@@ -619,7 +619,7 @@ export function chunkCanonicalText(
         // budget — e.g. a span containing a large file dump or paste rendered into
         // one line. Packing only flushes BETWEEN lines, so such a line would be
         // emitted as one oversized window and blow past the provider's hard context
-        // window (#206: jina returned 400 exceed_context_size for a 51774-token
+        // window (jina returned 400 exceed_context_size for a 51774-token
         // window against an 8192 ceiling). Split the line down to budget first, and
         // emit each sub-slice as its own window carrying this line's ordinal range.
         if (lineTokens > effectiveMax) {

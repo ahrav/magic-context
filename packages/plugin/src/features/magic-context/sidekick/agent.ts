@@ -90,7 +90,7 @@ export async function runSidekick(deps: {
                     agent: SIDEKICK_AGENT,
                     system: systemPrompt,
                     // synthetic: true hides the sidekick prompt from the TUI subagent
-                    // pane while still delivering it to the model. See issue #50.
+                    // pane while still delivering it to the model.
                     parts: [{ type: "text", text: deps.userMessage, synthetic: true }],
                 },
             },

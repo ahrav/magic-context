@@ -524,7 +524,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             before: ReturnType<typeof censusProjectMemoryClaims>,
         ): DreamRunMemoryChanges | null {
             const after = censusProjectMemoryClaims(db, projectIdentity);
-            // Capture the exact changed ids (#221) — count === array length.
+            // Capture the exact changed ids — count === array length.
             // Claims are append-only, so deletedIds stays empty outside a reset;
             // "merged" reports newly retired claims (merge retires its sources).
             const writtenIds = newIds(before.ids, after.ids);

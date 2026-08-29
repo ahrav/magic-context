@@ -2047,29 +2047,6 @@ export function pickNearestPriorOwner(
     return best?.id ?? null;
 }
 
-/**
- * Legacy alias kept for the rare runtime call site that hasn't been
- * migrated to the split lookup-then-pick form. Always returns null
- * (no message-time data available without a DB handle the function
- * itself can't reach). New call sites should use `getCandidateToolOwners`
- * + `getMessageTimesFromOpenCodeDb` + `pickNearestPriorOwner` directly.
- *
- * Why we keep this name: the v3.3.1 plan documents this as the public
- * entry point for the result-only-window fallback. Removing it would
- * require touching `.alfonso/plans/tag-owner-fix-plan.md` and migrating
- * the test fixtures that exercise it. Leaving the symbol present with
- * a noop body keeps existing test scaffolds working while the actual
- * pick happens in the hooks-tree caller.
- */
-export function getPersistedToolOwnerNearestPrior(
-    _db: Database,
-    _sessionId: string,
-    _callId: string,
-    _currentMessageId: string,
-): string | null {
-    return null;
-}
-
 function getDeleteToolTagsByOwnerStatement(db: Database): PreparedStatement {
     let stmt = deleteToolTagsByOwnerStatements.get(db);
     if (!stmt) {

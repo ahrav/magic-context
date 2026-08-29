@@ -325,24 +325,6 @@ export function appendCompartments(
     })();
 }
 
-/**
- * Replace session facts without touching compartments.
- * Facts are fully re-normalized by the historian on each pass,
- * so they always need a full replacement.
- */
-export function replaceSessionFacts(
-    db: Database,
-    sessionId: string,
-    facts: Array<{ category: string; content: string }>,
-): void {
-    const now = Date.now();
-    db.transaction(() => {
-        db.prepare("DELETE FROM session_facts WHERE session_id = ?").run(sessionId);
-        insertFactRows(db, sessionId, facts, now);
-        clearCachedM0M1(db, sessionId);
-    })();
-}
-
 export function getSessionFacts(db: Database, sessionId: string): SessionFact[] {
     const rows = db
         .prepare("SELECT * FROM session_facts WHERE session_id = ? ORDER BY category ASC, id ASC")
