@@ -127,12 +127,11 @@ jobs:
         run: sh scripts/provision-rust-ci-stubs.sh
 
       # mc-module is absent here on purpose. It depends on mc-core and
-      # mc-store, which import real types from the private ../commons
-      # cortexkit crates; the stubs above are metadata-only, so anything
-      # that COMPILES mc-module fails to resolve those imports. The
-      # ck-mc-host binary build and the lifecycle_cli contract run in the
-      # local release gate (scripts/test-rust.sh, whole workspace), which
-      # has the sibling sources checked out.
+      # mc-store, which import real types from the ../commons cortexkit
+      # crates; the stubs above are metadata-only, so anything that COMPILES
+      # mc-module fails to resolve those imports. The ck-mc-host binary build
+      # and the lifecycle_cli contract run in the mc-host-lifecycle job, which
+      # checks out the sibling sources instead of stubbing them.
       - name: Source-build transport, host, addon, and iceoryx
         run: |
           cargo build -p mc-shm-transport -p mc-host -p mc-shm-native
@@ -638,9 +637,9 @@ jobs:
         # manifest, carries the standalone oracles that live outside the
         # manifest's tests/**/*.test.ts inventory (see standaloneUnitFiles),
         # and runs the incident-pool green wrapper alone in a second phase
-        # with --max-concurrency 1. Rust is intentionally absent from public
-        # CI because its private ../commons and ../subconscious path-deps are
-        # not provisioned here; the local release gate runs that host group.
+        # with --max-concurrency 1. Rust is intentionally absent from this job
+        # because its ../commons and ../subconscious path-deps are not checked
+        # out here; the local release gate runs that host group.
         run: bun run --cwd packages/e2e-tests test:opencode-e2e
 
   e2e-host-pi:
