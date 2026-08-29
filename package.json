@@ -3,10 +3,14 @@
   "workspaces": [
     "packages/*"
   ],
+  "devDependencies": {
+    "typescript": "5.9.3"
+  },
   "scripts": {
     "build": "bun run --cwd packages/plugin build && bun run --cwd packages/pi-plugin build && bun run --cwd packages/cli build",
     "typecheck": "bun run --cwd packages/plugin typecheck && bun run --cwd packages/pi-plugin typecheck && bun run --cwd packages/cli typecheck && bun run --cwd packages/retina-local-fs typecheck",
     "test": "sh scripts/test-shard.sh packages/plugin && bun run --cwd packages/pi-plugin test && bun run --cwd packages/cli test && bun run --cwd packages/retina-local-fs test",
+    "test:release": "bun test scripts/generate-mc-host-release-manifest.test.ts scripts/qualify-mc-host-production-inputs.test.ts scripts/build-mc-host-payload.test.ts scripts/verify-mc-host-release-evidence.test.ts",
     "test:changed": "bun run --cwd packages/plugin test --changed && bun run --cwd packages/pi-plugin test --changed && bun run --cwd packages/cli test --changed && bun run --cwd packages/retina-local-fs test --changed",
     "test:e2e": "bun run --cwd packages/e2e-tests test",
     "test:e2e-opencode": "bun run --cwd packages/e2e-tests test:opencode-e2e",
@@ -30,12 +34,16 @@
     "fmt:rust": "cargo fmt",
     "release:contract": "bun scripts/generate-mc-host-release-manifest.ts",
     "release:contract:check": "bun scripts/generate-mc-host-release-manifest.ts --check",
-    "release:qualify": "bun scripts/qualify-mc-host-production-inputs.ts",
+    "release:qualify": "bun scripts/run-mc-host-closure-qualification.ts && bun scripts/qualify-mc-host-production-inputs.ts",
     "release:qualify:check": "bun scripts/qualify-mc-host-production-inputs.ts --check",
     "release:qualify:require": "bun scripts/qualify-mc-host-production-inputs.ts --require-qualified --verify-bytes",
+    "release:closures:check": "bun scripts/run-mc-host-closure-qualification.ts",
+    "release:retained-fd:smoke": "bun scripts/smoke-mc-host-retained-fd.ts",
     "release:payload": "bun scripts/build-mc-host-payload.ts",
     "release:payload:check": "bun scripts/build-mc-host-payload.ts --check",
-    "test:release": "bun test scripts/generate-mc-host-release-manifest.test.ts scripts/qualify-mc-host-production-inputs.test.ts scripts/build-mc-host-payload.test.ts",
+    "release:evidence:template": "bun scripts/verify-mc-host-release-evidence.ts --write-template",
+    "release:evidence:schema": "bun scripts/verify-mc-host-release-evidence.ts --check-schema",
+    "release:evidence:check": "bun scripts/verify-mc-host-release-evidence.ts --check",
     "check:all": "bun run test && bun run test:release && bun run test:rust && bun run release:contract:check && bun run release:qualify:check && bun run release:payload:check && cargo clippy --workspace --all-targets -- -D warnings",
     "build:dists": "bun run --cwd packages/plugin build && bun run --cwd packages/pi-plugin build"
   }

@@ -16,6 +16,8 @@ use rustix::fs::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::file_mode::raw_mode;
+
 const MANIFEST_NAME: &str = "manifest.json";
 const FILES_NAME: &str = "files";
 const CLOSURE_SCHEMA: &str = "magic-context.mc-host-harness-closure/v1";
@@ -699,10 +701,10 @@ fn copy_node(
         &parent,
         basename.as_str(),
         OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_raw_mode(node.mode),
+        Mode::from_raw_mode(raw_mode(node.mode)),
     )
     .map_err(|_| invalid("closure node creation failed"))?;
-    rustix::fs::fchmod(&destination, Mode::from_raw_mode(node.mode))
+    rustix::fs::fchmod(&destination, Mode::from_raw_mode(raw_mode(node.mode)))
         .map_err(|_| invalid("closure node chmod failed"))?;
 
     let mut reader = std::fs::File::from(
@@ -974,10 +976,10 @@ fn write_new_file(
         parent,
         name,
         OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_raw_mode(mode),
+        Mode::from_raw_mode(raw_mode(mode)),
     )
     .map_err(|_| invalid("closure metadata file creation failed"))?;
-    rustix::fs::fchmod(&fd, Mode::from_raw_mode(mode))
+    rustix::fs::fchmod(&fd, Mode::from_raw_mode(raw_mode(mode)))
         .map_err(|_| invalid("closure metadata file chmod failed"))?;
     let mut writer = std::fs::File::from(
         rustix::io::dup(&fd).map_err(|_| invalid("closure metadata descriptor dup failed"))?,
