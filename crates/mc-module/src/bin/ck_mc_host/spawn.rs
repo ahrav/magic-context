@@ -246,7 +246,13 @@ pub fn spawn_detached(
     }
     // Highest signal number to reset, resolved before fork so the child makes
     // no library call that could consult allocator or lock state.
+    #[cfg(target_os = "linux")]
     let max_signal = libc::SIGRTMAX();
+    // Darwin defines no realtime signals and `libc` exposes no `NSIG` for it, so
+    // the highest signal the platform names is the ceiling. Resetting past it
+    // would only collect `EINVAL`.
+    #[cfg(not(target_os = "linux"))]
+    let max_signal = libc::SIGUSR2;
 
     // SAFETY: fork with a multithreaded parent; the child performs only
     // async-signal-safe operations (setsid/umask/chdir/signal/sigprocmask/
