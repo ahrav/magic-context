@@ -20,21 +20,26 @@ describe("dreamer manifest mutation battery", () => {
         }
     });
 
-    test("wrong archival mutation carries exit 2 evidence", () => {
-        const result = runMutationBattery(dreamerScorerFixture).results.find(
-            (entry) => entry.mutationClass === "wrong-archival",
-        );
-        expect(result).toMatchObject({ green: true, runFatal: true });
-        const score = scoreVerifyManifest(
-            `<verify>
-<archive claim="mcm_true" reason="wrong"/>
-<update claim="mcm_update" files="src/cache.ts">4096 entries; bounded cache</update>
+    test("wrong archival mutations for verified and update gold carry exit 2 evidence", () => {
+        const evidence = runMutationBattery(dreamerScorerFixture);
+        for (const mutationClass of ["wrong-archival", "wrong-archival-update"] as const) {
+            expect(evidence.results.find((entry) => entry.mutationClass === mutationClass)).toMatchObject({
+                green: true,
+                runFatal: true,
+            });
+        }
+        for (const claim of ["mcm_true", "mcm_update"]) {
+            const score = scoreVerifyManifest(
+                `<verify>
+<archive claim="${claim}" reason="wrong"/>
+${claim === "mcm_true" ? '<update claim="mcm_update" files="src/cache.ts">4096 entries; bounded cache</update>' : '<verified claim="mcm_true" files="src/cache.ts,src/config.ts"/>'}
 <archive claim="mcm_false" reason="removed"/>
 </verify>`,
-            dreamerScorerFixture.pool,
-            dreamerScorerFixture.verifyGold,
-        );
-        expect(exitCodeForScore(score)).toBe(2);
+                dreamerScorerFixture.pool,
+                dreamerScorerFixture.verifyGold,
+            );
+            expect(exitCodeForScore(score)).toBe(2);
+        }
     });
 
     test("stage migration makes battery evidence red", () => {

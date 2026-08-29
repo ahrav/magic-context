@@ -154,6 +154,19 @@ describe("dreamer manifest scorers", () => {
         expect(exitCodeForScore(result)).toBe(2);
     });
 
+    test("wrong archival of a gold-update claim is run-fatal", () => {
+        const result = scoreVerifyManifest(
+            correctVerify.replace(
+                '<update claim="mcm_update" files="src/cache.ts">Uses a BOUNDED CACHE with 4096 ENTRIES.</update>',
+                '<archive claim="mcm_update" reason="wrong"/>',
+            ),
+            pool,
+            verifyGold,
+        );
+        expect(result).toMatchObject({ status: "FAIL", reason: "wrong-archival", runFatal: true });
+        expect(exitCodeForScore(result)).toBe(2);
+    });
+
     test("missed archival and wrong verify verdict remain ordinary failures", () => {
         expect(
             scoreVerifyManifest(
@@ -187,6 +200,13 @@ describe("dreamer manifest scorers", () => {
         expect(
             scoreMapManifest(correctMap.replace('files="src/cache.ts,src/config.ts"', 'files="src/cache.ts"'), pool, mapGold),
         ).toMatchObject({ status: "FAIL", reason: "wrong-mapping" });
+        expect(
+            scoreMapManifest(
+                correctMap.replace('files="src/cache.ts,src/config.ts"', 'files="src/cache.ts,src/queue.ts"'),
+                pool,
+                mapGold,
+            ),
+        ).toMatchObject({ status: "FAIL", reason: "wrong-mapping" });
     });
 
     test("classification requires every gold field and scores parsed clamped importance", () => {
@@ -194,7 +214,36 @@ describe("dreamer manifest scorers", () => {
         expect(scoreClassifyManifest(correctClassify.replace('scope="project"', 'scope="ecosystem"'), pool, classifyGold)).toMatchObject({ status: "FAIL", reason: "wrong-classification" });
         expect(scoreClassifyManifest(correctClassify.replace('shareable="true"', 'shareable="false"'), pool, classifyGold)).toMatchObject({ status: "FAIL", reason: "wrong-classification" });
         expect(scoreClassifyManifest(correctClassify.replace(' importance="70"', ""), pool, classifyGold)).toMatchObject({ stage: "scored", status: "FAIL", reason: "wrong-classification" });
+        expect(scoreClassifyManifest(correctClassify.replace(' scope="project"', ""), pool, classifyGold)).toMatchObject({ stage: "scored", status: "FAIL", reason: "wrong-classification" });
+        expect(scoreClassifyManifest(correctClassify.replace(' shareable="true"', ""), pool, classifyGold)).toMatchObject({ stage: "scored", status: "FAIL", reason: "wrong-classification" });
         expect(scoreClassifyManifest(correctClassify.replace('importance="70"', 'importance="101"'), pool, classifyGold)).toMatchObject({ status: "FAIL", reason: "wrong-classification" });
+    });
+
+    test("classification accepts inclusive band boundaries and a clamped 100 inside an upper band", () => {
+        expect(
+            scoreClassifyManifest(
+                correctClassify.replace('importance="70"', 'importance="50"'),
+                pool,
+                { ...classifyGold, claims: [{ ...classifyGold.claims[0]!, importance: { min: 50, max: 50 } }, classifyGold.claims[1]!] },
+            ),
+        ).toMatchObject({ status: "PASS" });
+        expect(
+            scoreClassifyManifest(
+                correctClassify.replace('importance="70"', 'importance="101"'),
+                pool,
+                { ...classifyGold, claims: [{ ...classifyGold.claims[0]!, importance: { min: 95, max: 100 } }, classifyGold.claims[1]!] },
+            ),
+        ).toMatchObject({ status: "PASS" });
+    });
+
+    test("forbidden update anchors are case-insensitive", () => {
+        expect(
+            scoreVerifyManifest(
+                correctVerify.replace("4096 ENTRIES.", "4096 ENTRIES; formerly 2048 EnTrIeS."),
+                pool,
+                verifyGold,
+            ),
+        ).toMatchObject({ status: "FAIL", reason: "wrong-update-content" });
     });
 
     test("production validation rejects malformed coverage as invalid model output", () => {

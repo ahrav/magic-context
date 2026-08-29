@@ -4,6 +4,8 @@ export interface DreamerClaimVerdictHistogram {
     claimId: string;
     counts: Record<string, number>;
     disagreement: boolean;
+    observedRuns: number;
+    missingRuns: number;
 }
 
 export interface DreamerVarianceArtifact {
@@ -59,7 +61,7 @@ function observedVerdicts(report: DreamerEvalRunReport): Map<string, string> {
         if (entry === null || id === null) continue;
         if (report.task === "map-memories") {
             const files = Array.isArray(entry.files)
-                ? entry.files.filter((file): file is string => typeof file === "string").sort()
+                ? entry.files.filter((file): file is string => typeof file === "string").slice().sort()
                 : [];
             observed.set(id, entry.independent === true ? "independent" : `files:${files.join(",")}`);
         } else {
@@ -99,10 +101,13 @@ export function aggregateDreamerEvalVariance(reports: readonly DreamerEvalRunRep
         .sort(([left], [right]) => left.localeCompare(right))
         .map(([claimId, histogram]) => {
             const entries = [...histogram].sort(([left], [right]) => left.localeCompare(right));
+            const observedRuns = entries.reduce((total, [, count]) => total + count, 0);
             return {
                 claimId,
                 counts: Object.fromEntries(entries),
                 disagreement: entries.length > 1,
+                observedRuns,
+                missingRuns: reports.length - observedRuns,
             };
         });
     return {

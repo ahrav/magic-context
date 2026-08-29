@@ -184,6 +184,20 @@ describe("dreamer eval report contract", () => {
             .toEqual([{ publicClaimId: "mem-1" }]);
     });
 
+    test("runFatal must agree with status and reason in both directions", () => {
+        expect(() => parseRunReport({ ...baseReport, runFatal: true })).toThrow(
+            "report.runFatal: mapping-invalid",
+        );
+        expect(() =>
+            parseRunReport({
+                ...baseReport,
+                status: "FAIL",
+                reason: "wrong-archival",
+                runFatal: false,
+            }),
+        ).toThrow("report.runFatal: mapping-invalid");
+    });
+
     test("receipt records retain digest, operation identity, and actual affected claims", () => {
         const receipt = {
             requestDigest: "b".repeat(64),
@@ -208,6 +222,18 @@ describe("dreamer eval report contract", () => {
             dreamerEvalExitCode(
                 parseRunReport({ ...baseReport, status: "FAIL", reason: "wrong-archival", runFatal: true }),
             ),
+        ).toBe(2);
+        expect(
+            dreamerEvalExitCode([
+                parseRunReport(baseReport),
+                parseRunReport({
+                    ...baseReport,
+                    runId: "run-2",
+                    status: "FAIL",
+                    reason: "wrong-archival",
+                    runFatal: true,
+                }),
+            ]),
         ).toBe(2);
     });
 });

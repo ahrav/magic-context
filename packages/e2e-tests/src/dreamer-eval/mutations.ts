@@ -13,6 +13,7 @@ import {
 
 export const DREAMER_MUTATION_CLASSES = [
     "wrong-archival",
+    "wrong-archival-update",
     "missed-archival",
     "update-for-verified",
     "verified-for-update",
@@ -20,6 +21,7 @@ export const DREAMER_MUTATION_CLASSES = [
     "update-forbidden-anchor",
     "wrong-independence",
     "missing-gold-file",
+    "substituted-gold-file",
     "importance-outside-band",
     "wrong-scope",
     "wrong-shareable",
@@ -45,6 +47,7 @@ interface ExpectedMutationOutcome {
 
 export const EXPECTED_MUTATION_OUTCOMES: Record<DreamerMutationClass, ExpectedMutationOutcome> = {
     "wrong-archival": { stage: "scored", reason: "wrong-archival", runFatal: true },
+    "wrong-archival-update": { stage: "scored", reason: "wrong-archival", runFatal: true },
     "missed-archival": { stage: "scored", reason: "missed-archival" },
     "update-for-verified": { stage: "scored", reason: "wrong-verdict" },
     "verified-for-update": { stage: "scored", reason: "wrong-verdict" },
@@ -52,6 +55,7 @@ export const EXPECTED_MUTATION_OUTCOMES: Record<DreamerMutationClass, ExpectedMu
     "update-forbidden-anchor": { stage: "scored", reason: "wrong-update-content" },
     "wrong-independence": { stage: "scored", reason: "wrong-independence" },
     "missing-gold-file": { stage: "scored", reason: "wrong-mapping" },
+    "substituted-gold-file": { stage: "scored", reason: "wrong-mapping" },
     "importance-outside-band": { stage: "scored", reason: "wrong-classification" },
     "wrong-scope": { stage: "scored", reason: "wrong-classification" },
     "wrong-shareable": { stage: "scored", reason: "wrong-classification" },
@@ -141,6 +145,8 @@ function mutationManifest(
     switch (mutationClass) {
         case "wrong-archival":
             return { task: "verify", manifest: replaceEntry(verify, verifiedClaim.publicClaimId, `<archive claim="${verifiedClaim.publicClaimId}" reason="wrong"/>`) };
+        case "wrong-archival-update":
+            return { task: "verify", manifest: replaceEntry(verify, updatedClaim.publicClaimId, `<archive claim="${updatedClaim.publicClaimId}" reason="wrong"/>`) };
         case "missed-archival":
             return { task: "verify", manifest: replaceEntry(verify, archivedClaim.publicClaimId, `<verified claim="${archivedClaim.publicClaimId}" files="${archivedClaim.files.join(",")}"/>`) };
         case "update-for-verified":
@@ -163,6 +169,11 @@ function mutationManifest(
             const target = requiredGold(fixture.mapGold.claims, (entry) => !entry.independent && entry.files.length > 0, "mapped gold file");
             const remaining = target.files.length > 1 ? target.files.slice(1) : ["mutation/other.ts"];
             return { task: "map", manifest: map.replace(`files="${target.files.join(",")}"`, `files="${remaining.join(",")}"`) };
+        }
+        case "substituted-gold-file": {
+            const target = requiredGold(fixture.mapGold.claims, (entry) => !entry.independent && entry.files.length > 0, "mapped gold file");
+            const replacement = target.files.map((file, index) => index === 0 ? "mutation/substitute.ts" : file);
+            return { task: "map", manifest: map.replace(`files="${target.files.join(",")}"`, `files="${replacement.join(",")}"`) };
         }
         case "importance-outside-band": {
             const target = requiredGold(fixture.classifyGold.claims, (entry) => entry.importance.min > 1 || entry.importance.max < 100, "non-total importance band");
