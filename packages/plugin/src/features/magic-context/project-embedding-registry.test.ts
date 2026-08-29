@@ -29,6 +29,7 @@ import {
     drainCommitBacklogForProject,
     embedCompartmentWindowsDetailedForProject,
     embedSessionCompartmentChunks,
+    embedShadowTextForProject,
     embedTextForProject,
     embedUnembeddedCompartmentChunksForProject,
     enqueueShadowEmbeddingItems,
@@ -371,6 +372,67 @@ describe("project embedding registry", () => {
                 .prepare("SELECT 1 FROM shadow_embedding_registrations WHERE project_path = ?")
                 .get(projectIdentity),
         ).toBeNull();
+    });
+
+    it("retries a shadow lane whose first discovery failed permanently", async () => {
+        // A lane-wide permanent error (`not_certified`, `artifact_invalid`) ends
+        // discovery with the registration still holding its deferred intent and
+        // no resolved metadata. Matching on that intent alone would resume the
+        // prior lane, dispose the fresh provider, and hand back the latched one
+        // whose `permanentFailure` flag makes `initialize()` refuse to retry — so
+        // the shadow experiment would stay dead for the process lifetime even
+        // after the model is certified.
+        const db = useTempDb();
+        const projectIdentity = "shadow-permanent-failure";
+        let certified = false;
+        let catalogCalls = 0;
+        const client: SynapseClientLike = {
+            async call<Response>(_module, method): Promise<Response> {
+                if (method === "models.list") {
+                    catalogCalls += 1;
+                    return [
+                        {
+                            model: "gte-modernbert-base-f16",
+                            fingerprint: "fp-repaired",
+                            table_epoch: 1,
+                            dims: 3,
+                            certified,
+                            ...(certified ? {} : { status: "not_certified" }),
+                        },
+                    ] as Response;
+                }
+                if (method === "embed.query") {
+                    return {
+                        vector: [1, 2, 3],
+                        model: "gte-modernbert-base-f16",
+                        fingerprint: "fp-repaired",
+                        table_epoch: 1,
+                        dims: 3,
+                    } as Response;
+                }
+                throw new Error(`unexpected method ${method}`);
+            },
+            close() {},
+        };
+        const deferred = {
+            provider: "synapse",
+            model: "gte-modernbert-base-f16",
+            synapse_connection_origin: "injected",
+            synapse_client_factory: async () => client,
+        } as unknown as EmbeddingConfig;
+
+        registerProjectShadowEmbedding(db, projectIdentity, deferred, "/repo");
+        expect(await embedShadowTextForProject(projectIdentity, "first")).toBeNull();
+        expect(catalogCalls).toBe(1);
+
+        // The model is certified now. Re-registering must build a lane that can
+        // discover again rather than resuming the latched one.
+        certified = true;
+        registerProjectShadowEmbedding(db, projectIdentity, deferred, "/repo");
+        const vector = await embedShadowTextForProject(projectIdentity, "second");
+
+        expect(vector).not.toBeNull();
+        expect(catalogCalls).toBe(2);
     });
 
     it("commits the discovered Synapse lane before returning its first vector", async () => {

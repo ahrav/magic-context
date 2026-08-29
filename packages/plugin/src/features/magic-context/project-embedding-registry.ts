@@ -1298,7 +1298,18 @@ export function registerProjectShadowEmbedding(
     // is re-registered from the same deferred config on every tool call, and its
     // descriptor now describes the discovered lane.
     const resumesResolvedLane =
-        deferredIntent !== undefined && priorRegistration?.deferredIntent === deferredIntent;
+        deferredIntent !== undefined &&
+        priorRegistration?.deferredIntent === deferredIntent &&
+        // Same rule the primary lane applies: only a lane that actually RESOLVED
+        // may be carried forward. A prior whose config is still the deferred one
+        // never received its metadata — lane-wide permanent errors such as
+        // `not_certified` and `artifact_invalid` end discovery that way — and its
+        // provider latches `permanentFailure`, so `initialize()` refuses to
+        // rediscover. Resuming it would keep the shadow experiment disabled for
+        // the process lifetime even after the daemon or model is repaired.
+        // An unresolved prior falls through to the ordinary reuse predicate.
+        priorRegistration.config.provider === "synapse" &&
+        !isDeferredSynapseConfig(priorRegistration.config);
     if (deferredSynapse && !resumesResolvedLane) {
         clearDeferredDescriptor(db, "shadow_embedding_registrations", projectIdentity);
     }
