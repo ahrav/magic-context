@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { shouldKeepSubagents } from "../../../plugin/src/shared/keep-subagents";
 import { seedProjectMemoryClaim } from "../../../plugin/src/features/magic-context/test-claim-database";
 import { createDirectTestDatabase } from "../../../plugin/src/features/magic-context/test-database";
@@ -13,6 +13,7 @@ import {
     readDreamerReceipts,
     resolveDreamerSystemTuple,
     reconstructPoolEndState,
+    runDreamerEvalCleanup,
     type DreamerRunClassificationInput,
 } from "./runner";
 
@@ -68,6 +69,46 @@ function input(overrides: Partial<DreamerRunClassificationInput> = {}): DreamerR
 }
 
 describe("dreamer runner classification", () => {
+    test("cleanup failure does not prevent later cleanup", async () => {
+        const completed: string[] = [];
+        const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+        try {
+            const classification = classifyDreamerRun(input());
+            const result = await runDreamerEvalCleanup(
+                classification,
+                [
+                    () => {
+                        completed.push("first");
+                        throw new Error("close failed");
+                    },
+                    () => {
+                        throw Object.create(null);
+                    },
+                    () => {
+                        completed.push("second");
+                    },
+                ],
+            );
+            expect(result).toMatchObject({ status: "ERROR", reason: "harness-failure" });
+            expect(result.parsedManifest).toEqual(classification.parsedManifest);
+            expect(completed).toEqual(["first", "second"]);
+
+            const wrong = validManifest.replace('importance="70"', 'importance="10"');
+            const modelFailure = classifyDreamerRun(
+                input({ rawManifest: wrong, childMessages: assistantMessages(wrong) }),
+            );
+            expect(
+                await runDreamerEvalCleanup(modelFailure, [
+                    () => {
+                        throw new Error("cleanup failed");
+                    },
+                ]),
+            ).toBe(modelFailure);
+        } finally {
+            errorSpy.mockRestore();
+        }
+    });
+
     test("valid production classify output reaches PASS", () => {
         expect(classifyDreamerRun(input())).toMatchObject({ status: "PASS", reason: null });
     });

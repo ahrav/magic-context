@@ -103,6 +103,26 @@ export interface DreamerRunClassification {
     parsedManifest: ManifestScore["parsedManifest"];
 }
 
+export async function runDreamerEvalCleanup(
+    classification: DreamerRunClassification,
+    cleanups: readonly (() => void | Promise<void>)[],
+): Promise<DreamerRunClassification> {
+    let succeeded = true;
+    for (const cleanup of cleanups) {
+        try {
+            await cleanup();
+        } catch (error) {
+            succeeded = false;
+            try {
+                console.error("dreamer-eval cleanup failed:", error);
+            } catch {}
+        }
+    }
+    return !succeeded && classification.status === "PASS"
+        ? outcome("ERROR", "harness-failure", classification.parsedManifest)
+        : classification;
+}
+
 function outcome(
     status: DreamerRunStatus,
     reason: ErrorReason | FailReason | null,
@@ -522,10 +542,17 @@ export async function runDreamerEvalTask(
             classification = outcome("ERROR", "harness-failure");
         }
     } finally {
-        if (acquired !== null && db !== null) releaseLease(db, holderId, leaseKey);
-        setKeepSubagents(priorKeepSubagents);
-        db?.close();
-        if (harness !== null) await harness.dispose();
+        classification = await runDreamerEvalCleanup(
+            classification,
+            [
+                () => {
+                    if (acquired !== null && db !== null) releaseLease(db, holderId, leaseKey);
+                },
+                () => setKeepSubagents(priorKeepSubagents),
+                () => db?.close(),
+                () => harness?.dispose(),
+            ],
+        );
     }
 
     const report: DreamerEvalRunReport = {
