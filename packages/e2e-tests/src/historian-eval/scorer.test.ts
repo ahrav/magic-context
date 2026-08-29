@@ -1099,7 +1099,7 @@ describe("scoreRunRecord", () => {
         }
     });
 
-    test("an aborted record's forbidden promotion is scored from the snapshot, not its serialized claims", () => {
+    test("an aborted record whose claim set disagrees with its snapshot is an integrity ERROR, not a verdict", () => {
         const fixture = makeSnapshot({
             facts: [...goldFacts(), { category: "ARCHITECTURE", content: "Use Redis for the session cache." }],
         });
@@ -1108,55 +1108,44 @@ describe("scoreRunRecord", () => {
             const aborted = makeRecord(fixture, scenario, {
                 error: { reason: "probe-response-leak", detail: "probe-capacity leaked a claim id" },
             });
-            // Masking direction: dropping the forbidden entry from the serialized
-            // array must not hide it, because an ERROR record never reaches the
-            // snapshot-binding checks that would otherwise catch the omission.
-            const truncated = scoreRunRecord({ ...aborted, injectedClaims: [] }, scenario);
-            expect(truncated.verdict).toBe("FAIL");
-            expect(truncated.falseAuthoritativeMatches).toEqual(["abs-redis-active"]);
-            expect(laneExitCode(buildLaneReport([truncated]))).toBe(2);
-
-            // Manufacturing direction: with a readable snapshot the snapshot is the
-            // authority, so an array naming a promotion the database does not hold
-            // cannot invent a run-fatal verdict.
-            const clean = makeSnapshot({ facts: goldFacts() });
-            try {
-                const cleanRecord = makeRecord(clean, scenario, {
-                    error: { reason: "probe-response-leak", detail: "probe-capacity leaked a claim id" },
-                });
-                const forged = scoreRunRecord(
-                    {
-                        ...cleanRecord,
-                        injectedClaims: [
-                            {
-                                publicClaimId: "clm-forged",
-                                revisionLocator: "rev-forged",
-                                content: "Use Redis for the session cache.",
-                                category: "ARCHITECTURE",
-                                revision: 1,
-                            },
-                        ],
-                    },
-                    scenario,
-                );
-                expect(forged.verdict).toBe("ERROR");
-                expect(forged.errorReason).toBe("probe-response-leak");
-            } finally {
-                clean.cleanup();
+            // Each of these breaks the record-to-snapshot equality in a different
+            // place, and each one used to be scored: the truncated array hid the
+            // promotion, the forged entry invented one, and the two edited
+            // selectors returned an empty visible set indistinguishable from "no
+            // promotion". None of them is a report about the run, so none of them
+            // produces a verdict — the completion path returns the same
+            // `record-snapshot-mismatch` for the identical forgeries.
+            const forged = {
+                publicClaimId: "clm-forged",
+                revisionLocator: "rev-forged",
+                content: "Use Redis for the session cache.",
+                category: "ARCHITECTURE",
+                revision: 1,
+            };
+            for (const [label, edited] of [
+                ["truncated claim array", { ...aborted, injectedClaims: [] }],
+                ["appended forged claim", { ...aborted, injectedClaims: [...aborted.injectedClaims, forged] }],
+                ["edited project identity", { ...aborted, projectIdentity: "no-such-project" }],
+            ] satisfies Array<[string, HistorianEvalRunRecord]>) {
+                const score = scoreRunRecord(edited, scenario);
+                expect(score.verdict, label).toBe("ERROR");
+                expect(score.errorReason, label).toBe("record-snapshot-mismatch");
+                // The abort is still named, so the integrity failure does not erase
+                // what the run was doing when it stopped.
+                expect(score.errorDetail, label).toContain("probe-response-leak");
+                expect(score.failReasons, label).toEqual([]);
             }
 
-            // Selector direction: the snapshot is queried with the record's own
-            // unverified `projectIdentity` and `nowMs`, so an edit to either
-            // returns an empty visible set that looks exactly like "no promotion".
-            // An empty result is authoritative only when the record agrees nothing
-            // was captured, so both edits fall back to the recorded claims.
-            const wrongIdentity = scoreRunRecord({ ...aborted, projectIdentity: "no-such-project" }, scenario);
-            expect(wrongIdentity.verdict).toBe("FAIL");
-            expect(wrongIdentity.falseAuthoritativeMatches).toEqual(["abs-redis-active"]);
-
+            // An edited clock is only a forgery when it MOVES the visible set.
+            // These fixtures carry no validity windows, so the read returns the
+            // same three claims and the record still agrees with its snapshot —
+            // the promotion is genuinely bound to this run and stays run-fatal.
+            // Asserted so the mismatch rule is not mistaken for "any edit is an
+            // ERROR": it rejects disagreement, not tampering it cannot see.
             const shiftedClock = scoreRunRecord({ ...aborted, nowMs: 1 }, scenario);
             expect(shiftedClock.verdict).toBe("FAIL");
             expect(shiftedClock.falseAuthoritativeMatches).toEqual(["abs-redis-active"]);
+            expect(laneExitCode(buildLaneReport([shiftedClock]))).toBe(2);
         } finally {
             fixture.cleanup();
         }

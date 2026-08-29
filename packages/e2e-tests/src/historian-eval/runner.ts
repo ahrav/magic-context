@@ -59,6 +59,7 @@ import {
     deriveHistorianChunkTokens,
     resolveHistorianContextLimit,
 } from "../../../plugin/src/hooks/magic-context/derive-budgets";
+import { DEFAULT_HISTORIAN_TIMEOUT_MS } from "../../../plugin/src/config/schema/magic-context";
 import { promotionEvidenceCount, readInjectedClaims, type InjectedClaimRecord } from "./claim-read";
 import { verifyAllActiveClaims } from "./verification-bridge";
 
@@ -505,8 +506,37 @@ export interface RunScenarioOptions {
     repoCommitSha?: string;
     /** Resolved `opencode --version`; recorded in the system tuple. */
     opencodeVersion?: string;
-    /** Per-run historian completion wait. */
+    /**
+     * Per-run historian completion wait. Defaults per mode — see
+     * `historianWaitBudgetMs`.
+     */
     historianWaitMs?: number;
+}
+
+/**
+ * How long to wait for one declared historian run to complete, by mode.
+ *
+ * A scripted historian answers from a local mock, so the old flat 90s was
+ * generous. For a LIVE historian it was below the plugin's ceiling for a SINGLE
+ * prompt attempt (`DEFAULT_HISTORIAN_TIMEOUT_MS`), let alone a pass that also
+ * runs a validation-repair prompt — so this runner, not the historian's own
+ * timeout, decided the run "never fired", and it did so after the API tokens were
+ * already spent. That converts a slow provider into an invalidated experiment.
+ *
+ * The live budget covers the healthy path: the initial prompt plus one repair
+ * prompt, each bounded by the plugin's own per-attempt timeout. Deliberately NOT
+ * the pathological path — `runHistorianPrompt` retries transient failures
+ * `MAX_HISTORIAN_RETRIES` times, and budgeting for every retry of both ladders
+ * would put one stuck scenario above 30 minutes, enough for a single scenario to
+ * consume the whole 240-minute job budget for the corpus's 26 declared runs.
+ * Sitting above every non-retrying live pass keeps the plugin's timeout as the
+ * authority on "the historian took too long", while a genuine retry storm still
+ * surfaces as `run-never-fired` for that one scenario — a recoverable ERROR
+ * rather than a silently truncated job. Callers with a different budget override
+ * it through `historianWaitMs`.
+ */
+function historianWaitBudgetMs(mode: RunScenarioOptions["mode"]): number {
+    return mode.kind === "live" ? 2 * DEFAULT_HISTORIAN_TIMEOUT_MS : 90_000;
 }
 
 class RunAbort extends Error {
@@ -1492,7 +1522,7 @@ class ScenarioRunner {
         try {
             await harness.waitFor(
                 () => this.historianRunRows(harness, sessionId).length >= runIndex && this.historianQuiesced(harness, sessionId),
-                { timeoutMs: this.options.historianWaitMs ?? 90_000, label: `historian run ${runIndex}` },
+                { timeoutMs: this.options.historianWaitMs ?? historianWaitBudgetMs(this.options.mode), label: `historian run ${runIndex}` },
             );
         } catch {
             throw new RunAbort(
@@ -1905,7 +1935,7 @@ class ScenarioRunner {
         // taken with its compartments present but its row absent.
         try {
             await harness.waitFor(() => this.historianQuiesced(harness, sessionId), {
-                timeoutMs: this.options.historianWaitMs ?? 90_000,
+                timeoutMs: this.options.historianWaitMs ?? historianWaitBudgetMs(this.options.mode),
                 label: "historian quiescent after the probe phase",
             });
         } catch {

@@ -1246,61 +1246,98 @@ function renderedClaimIdsInLastMemoryBlock(payloadText: string): Set<string> | n
 }
 
 /**
- * False-authoritative matches for a record that aborted.
+ * What an aborted record's claim evidence supports.
  *
- * Snapshot-derived when the snapshot is readable AND the record's own query
- * selectors bind to it; otherwise from the serialized `injectedClaims`. Both
- * halves of that condition are load-bearing, and in opposite directions.
+ * Three outcomes, not two, because there are three genuinely different states and
+ * collapsing any pair of them is what made the previous two attempts at this
+ * wrong.
+ */
+type AbortedClaimEvidence =
+    | { kind: "scored"; falseAuthoritativeMatches: string[] }
+    | { kind: "snapshot-mismatch"; detail: string };
+
+/**
+ * Claim evidence for a record that aborted, and how far it can be trusted.
  *
  * An ERROR record never reaches the snapshot-binding checks below — those run
- * only on the completion path — so neither side can be trusted unconditionally:
+ * only on the completion path — so on this path neither side is verified, and
+ * each one alone can be edited to lie in a different direction:
  *
  * - Trusting the ARRAY lets a truncated `injectedClaims` HIDE a captured
- *   promotion, which is the masking this path exists to close.
- * - Trusting the SNAPSHOT unconditionally lets the record's own unverified
- *   selectors hide it instead. `readInjectedClaims` is keyed by
- *   `record.projectIdentity` and `record.nowMs`; an identity absent from the
- *   snapshot, or a shifted clock, returns an empty visible set that looks
- *   exactly like "no promotion" while the array still names one.
+ *   promotion.
+ * - Trusting the SNAPSHOT lets the record's own unverified selectors hide it
+ *   instead (`readInjectedClaims` is keyed by `projectIdentity` and `nowMs`), or
+ *   lets a mispaired snapshot from another attempt of the same project INVENT a
+ *   promotion this run never made.
  *
- * So the snapshot's answer is authoritative only when its selectors are
- * corroborated by the snapshot itself: the identity must resolve to a project in
- * this database, and an empty visible set is accepted only if the record agrees
- * that nothing was captured. Otherwise the record and its snapshot disagree,
- * nothing here can say which side was edited, and the fallback is the array —
- * the direction that fails loud rather than reporting quality on a run that may
- * have promoted a forbidden claim.
+ * No additional selector guard fixes that, because the question is not whether
+ * the selectors look plausible — it is whether this snapshot belongs to this run,
+ * and nothing on the record answers it directly. What does answer it is the same
+ * mutual agreement the completion path relies on: the runner writes
+ * `injectedClaims` and the snapshot from one read at one pinned clock, so for a
+ * genuine record the two claim sets are IDENTICAL — locators, contents,
+ * categories, revisions, cardinality. A different attempt's snapshot, an edited
+ * selector that changes the visible set, and an edited array each break that
+ * equality.
  *
- * Corroborated selectors also keep the opposite direction closed: with a
- * trustworthy visible set the array is not consulted at all, so a forged
- * gold-matching entry cannot manufacture an always-run-fatal verdict.
+ * So agreement decides authority. When the sets agree the snapshot answers, and
+ * the array cannot invent anything. When they disagree, this artifact is
+ * self-inconsistent: it is not a report about the run at all, and guessing which
+ * side was edited is how both earlier versions ended up maskable. It becomes a
+ * `record-snapshot-mismatch` ERROR — exactly what the completion path returns for
+ * the identical forgery — carrying the abort's own reason in the detail so
+ * nothing is lost.
  *
- * A missing, unopenable, unqueryable, or stale snapshot degrades to the array
- * rather than becoming an `unreadable-snapshot` ERROR: the abort's own reason is
- * the more informative fact about the run, and replacing it would lose it.
+ * A missing, unopenable, unqueryable, or stale snapshot leaves the array as the
+ * only evidence there is. Scoring it is the fail-loud direction; refusing would
+ * restore the masking hole this path exists to close.
  */
-function abortedRecordFalseAuthoritative(
+function abortedRecordClaimEvidence(
     record: HistorianEvalRunRecord,
     scenario: HistorianEvalScenario,
-): string[] {
-    const recorded = (): string[] => falseAuthoritativeMatchesIn(scenario, record.injectedClaims);
-    if (record.contextDbSnapshotPath.length === 0) return recorded();
+): AbortedClaimEvidence {
+    const recordedOnly = (): AbortedClaimEvidence => ({
+        kind: "scored",
+        falseAuthoritativeMatches: falseAuthoritativeMatchesIn(scenario, record.injectedClaims),
+    });
+    if (record.contextDbSnapshotPath.length === 0) return recordedOnly();
     let db: ReturnType<typeof openTestDb>;
     try {
         db = openTestDb(record.contextDbSnapshotPath, { readonly: true });
     } catch {
-        return recorded();
+        return recordedOnly();
     }
     try {
         const visible = readInjectedClaims(db, record.projectIdentity, record.scenarioId, record.nowMs);
-        if (visible === null) return recorded();
-        const identityResolves = resolveProjectIdsForIdentities(db, [record.projectIdentity]).length > 0;
-        if (!identityResolves || (visible.length === 0 && record.injectedClaims.length > 0)) {
-            return recorded();
+        if (visible === null) return recordedOnly();
+        // Whole claims, locator-ordered: one comparison covers the locator set,
+        // every field behind each locator, and cardinality — so a truncation, an
+        // appended entry, a content or category edit, a duplicate, and a foreign
+        // snapshot all surface as the same disagreement.
+        const claimSetIdentity = (claims: ReadonlyArray<InjectedClaimRecord>): string =>
+            canonicalJson(
+                [...claims].sort((left, right) =>
+                    left.revisionLocator < right.revisionLocator
+                        ? -1
+                        : left.revisionLocator > right.revisionLocator
+                          ? 1
+                          : 0,
+                ),
+            );
+        if (claimSetIdentity(record.injectedClaims) !== claimSetIdentity(visible)) {
+            // Counts only: the ids on either side may be unreviewed text from an
+            // externally assembled artifact, which is why the surrounding checks
+            // report shapes rather than values.
+            return {
+                kind: "snapshot-mismatch",
+                detail:
+                    `run record names ${record.injectedClaims.length} injected claim(s) while its snapshot exposes ` +
+                    `${visible.length}, and the two sets are not identical, so the snapshot cannot be bound to this run`,
+            };
         }
-        return falseAuthoritativeMatchesIn(scenario, visible);
+        return { kind: "scored", falseAuthoritativeMatches: falseAuthoritativeMatchesIn(scenario, visible) };
     } catch {
-        return recorded();
+        return recordedOnly();
     } finally {
         db.close();
     }
@@ -1334,21 +1371,33 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
     // `runFatal: false` ERROR — exit 1 instead of 2 — so aborting after a
     // forbidden promotion was a way to mask it.
     //
-    // Scored from the snapshot when the abort left a readable one, and from the
-    // record's captured claims only when it did not — see
-    // `abortedRecordFalseAuthoritative` for why the serialized array cannot be
-    // the authority while a snapshot is on disk. The abort's reason and detail
-    // stay on the score, so the infrastructure failure is
-    // still reported rather than replaced; only the verdict changes, which is
-    // what puts the scenario where the always-run-fatal rule can see it. Rates
-    // stay null and the claim counts zero — nothing here measures recall or
-    // precision — so the aggregate is unaffected beyond the false-authoritative
-    // rate this outcome belongs in.
+    // Scored from the snapshot when it can be bound to this run, from the
+    // record's captured claims when there is no readable snapshot at all, and
+    // refused as an integrity ERROR when the two disagree — see
+    // `abortedRecordClaimEvidence`. On the scored paths the abort's reason and
+    // detail stay put, so the infrastructure failure is still reported rather
+    // than replaced; only the verdict changes, which is what puts the scenario
+    // where the always-run-fatal rule can see it. Rates stay null and the claim
+    // counts zero — nothing here measures recall or precision — so the aggregate
+    // is unaffected beyond the false-authoritative rate this outcome belongs in.
     if (record.error !== null) {
-        const falseAuthoritativeMatches = abortedRecordFalseAuthoritative(record, scenario);
+        const evidence = abortedRecordClaimEvidence(record, scenario);
+        if (evidence.kind === "snapshot-mismatch") {
+            return errorScore(
+                record.scenarioId,
+                "record-snapshot-mismatch",
+                `${evidence.detail}; the run also aborted with ${record.error.reason}: ${record.error.detail}`,
+                record.system,
+            );
+        }
         const errored = errorScore(record.scenarioId, record.error.reason, record.error.detail, record.system);
-        if (falseAuthoritativeMatches.length === 0) return errored;
-        return { ...errored, verdict: "FAIL", failReasons: ["false-authoritative"], falseAuthoritativeMatches };
+        if (evidence.falseAuthoritativeMatches.length === 0) return errored;
+        return {
+            ...errored,
+            verdict: "FAIL",
+            failReasons: ["false-authoritative"],
+            falseAuthoritativeMatches: evidence.falseAuthoritativeMatches,
+        };
     }
 
     // Only a record claiming completion is held to the full inventory.
