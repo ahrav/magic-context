@@ -20,7 +20,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use mc_host::generation::{GenerationError, GenerationStore, SourceSpec, StageMeta};
+use mc_host::generation::{
+    GenerationError, GenerationStore, SourceSpec, StageMeta, ValidatedGeneration,
+};
 use mc_host::{
     Client, InstanceError, LifecycleProbe, LifecycleState, LifecycleTransactionLock,
     NamespaceAnchor, ProbeFreshness,
@@ -399,16 +401,17 @@ impl Runtime {
     }
 
     /// One bounded authenticated connect (bearer handshake) then close.
-    /// `Ok(true)` is the transport-authenticated success signal.
-    fn authenticate(&self, publication: &Path) -> bool {
+    /// Returns the proof-authenticated daemon version, never publication metadata.
+    fn authenticate(&self, publication: &Path) -> Option<String> {
         let path = publication.to_path_buf();
         self.inner.block_on(async move {
             match Client::connect(&path).await {
                 Ok(client) => {
+                    let daemon_ver = client.daemon_ver().to_owned();
                     let _ = client.close().await;
-                    true
+                    Some(daemon_ver)
                 }
-                Err(_) => false,
+                Err(_) => None,
             }
         })
     }
@@ -565,20 +568,20 @@ fn start_phase(
         Err(_) => return fail("stopped", "internal_error"),
     };
     loop {
-        if publication.exists() && runtime.authenticate(&publication) {
-            let observed = probe().ok();
-            let daemon_ver = observed.as_ref().and_then(publication_daemon_ver);
-            if let Some(daemon_ver) = &daemon_ver {
-                if !daemon_version_compatible(daemon_ver) {
-                    return StartOutcome {
-                        ok: false,
-                        start_committed: true,
-                        state: "running",
-                        reason: "incompatible_daemon",
-                        daemon_ver: Some(daemon_ver.clone()),
-                        generation_check: Some(("pass", "healthy")),
-                    };
-                }
+        if let Some(daemon_ver) = publication
+            .exists()
+            .then(|| runtime.authenticate(&publication))
+            .flatten()
+        {
+            if !daemon_version_compatible(&daemon_ver) {
+                return StartOutcome {
+                    ok: false,
+                    start_committed: true,
+                    state: "running",
+                    reason: "incompatible_daemon",
+                    daemon_ver: Some(daemon_ver),
+                    generation_check: Some(("pass", "healthy")),
+                };
             }
             if launcher_envelope.commit_selection(&publication).is_err() {
                 return match stop_phase(runtime, outer) {
@@ -587,7 +590,7 @@ fn start_phase(
                         start_committed: true,
                         state: "stopped",
                         reason: "internal_error",
-                        daemon_ver,
+                        daemon_ver: Some(daemon_ver),
                         generation_check: Some(("fail", "internal_error")),
                     },
                     (_, Err((state, reason))) => StartOutcome {
@@ -595,7 +598,7 @@ fn start_phase(
                         start_committed: true,
                         state,
                         reason,
-                        daemon_ver,
+                        daemon_ver: Some(daemon_ver),
                         generation_check: Some(("fail", "internal_error")),
                     },
                 };
@@ -605,7 +608,7 @@ fn start_phase(
                 start_committed: true,
                 state: "running",
                 reason: "started",
-                daemon_ver,
+                daemon_ver: Some(daemon_ver),
                 generation_check: Some(("pass", "healthy")),
             };
         }
@@ -633,7 +636,6 @@ fn resolve_generation(
     payload_dir: Option<&Path>,
     payload_manifest_digest: Option<&str>,
 ) -> Result<(String, Option<std::os::fd::OwnedFd>), (&'static str, &'static str)> {
-    const PRODUCTION_LAUNCHER: &str = "payload/bin/ck-mc-host";
     match payload_dir {
         Some(dir) => {
             let store = GenerationStore::open(None).map_err(|e| generation_failure(&e))?;
@@ -666,7 +668,7 @@ fn resolve_generation(
             let validated = store
                 .validate(&digest)
                 .map_err(|e| generation_failure(&e))?;
-            let launcher = validated.open_verified_file(PRODUCTION_LAUNCHER).ok();
+            let launcher = resolve_generation_launcher(&validated)?;
             Ok((digest, launcher))
         }
         None => {
@@ -683,7 +685,7 @@ fn resolve_generation(
                     }) {
                         return Err(("stopped", "native_payload_invalid"));
                     }
-                    let launcher = validated.open_verified_file(PRODUCTION_LAUNCHER).ok();
+                    let launcher = resolve_generation_launcher(&validated)?;
                     Ok((digest, launcher))
                 }
                 mc_host::generation::CurrentProfile::Absent => {
@@ -694,6 +696,22 @@ fn resolve_generation(
                 }
             }
         }
+    }
+}
+
+fn resolve_generation_launcher(
+    validated: &ValidatedGeneration,
+) -> Result<Option<std::os::fd::OwnedFd>, (&'static str, &'static str)> {
+    const PRODUCTION_LAUNCHER: &str = "payload/bin/ck-mc-host";
+    match validated.open_verified_file(PRODUCTION_LAUNCHER) {
+        Ok(launcher) => Ok(Some(launcher)),
+        Err(_)
+            if validated.manifest.source_payload_manifest_sha256 == "unqualified-dev-manifest"
+                && spawn::test_self_exec_allowed() =>
+        {
+            Ok(None)
+        }
+        Err(_) => Err(("stopped", "native_payload_invalid")),
     }
 }
 
@@ -991,17 +1009,14 @@ fn cmd_start(
                 Ok(path) => path,
                 Err(_) => return DaemonResult::new(command, false, "running", "internal_error"),
             };
-            if !runtime.authenticate(&publication) {
+            let Some(daemon_ver) = runtime.authenticate(&publication) else {
                 return DaemonResult::new(command, false, "running", "authentication_failed");
-            }
-            let daemon_ver = publication_daemon_ver(&observed);
-            if let Some(daemon_ver) = &daemon_ver {
-                if !daemon_version_compatible(daemon_ver) {
-                    let mut result =
-                        DaemonResult::new(command, false, "running", "incompatible_daemon");
-                    result.versions.daemon = Some(daemon_ver.clone());
-                    return result;
-                }
+            };
+            if !daemon_version_compatible(&daemon_ver) {
+                let mut result =
+                    DaemonResult::new(command, false, "running", "incompatible_daemon");
+                result.versions.daemon = Some(daemon_ver);
+                return result;
             }
             let credential_identity_key = match serve::credential_identity_key(&publication) {
                 Ok(key) => key,
@@ -1028,7 +1043,7 @@ fn cmd_start(
                 return DaemonResult::new(command, false, "running", "harness_unavailable");
             }
             let mut result = DaemonResult::new(command, true, "running", "already_running");
-            result.versions.daemon = daemon_ver;
+            result.versions.daemon = Some(daemon_ver);
             result.versions.proof = Some("current");
             result.readiness = Some(Readiness {
                 transport: ReadinessRecord {
@@ -1264,7 +1279,7 @@ fn cmd_restart(
                     .with_effects(effects(false, false))
             }
         };
-        if !runtime.authenticate(&publication) {
+        if runtime.authenticate(&publication).is_none() {
             return DaemonResult::new(command, false, "running", "authentication_failed")
                 .with_effects(effects(false, false));
         }

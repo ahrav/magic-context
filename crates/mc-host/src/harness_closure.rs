@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CStr;
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
@@ -130,9 +131,13 @@ impl ValidatedHarnessClosure {
         &self.path
     }
 
-    /// Resolves a listed node to a closure-owned path after revalidating it
-    /// through the retained `files/` descriptor.
-    pub fn resolve_node(&self, node_path: &str) -> Result<PathBuf, HarnessClosureError> {
+    /// Opens and revalidates one node, returning both the descriptor-rooted
+    /// path that names the verified inode and the closure pathname, so each
+    /// call site can hand the child the form its role actually supports.
+    pub fn resolve_node_descriptor(
+        &self,
+        node_path: &str,
+    ) -> Result<ResolvedHarnessNode, HarnessClosureError> {
         let node = self
             .manifest
             .nodes
@@ -142,7 +147,83 @@ impl ValidatedHarnessClosure {
         let fd = open_relative_file(&self.files_fd, node_path)
             .map_err(|_| invalid("resolved node is missing or insecure"))?;
         verify_node_file(&fd, node)?;
-        Ok(self.path.join(FILES_NAME).join(node_path))
+        // Verification hashes to EOF through an offset-sharing dup, leaving
+        // this descriptor at EOF. A macOS child opening `/dev/fd/N` receives a
+        // dup of it, offset included, and would read zero bytes.
+        rustix::fs::seek(&fd, rustix::fs::SeekFrom::Start(0))
+            .map_err(|_| invalid("resolved node rewind failed"))?;
+        Ok(ResolvedHarnessNode {
+            descriptor_path: descriptor_path(fd.as_raw_fd()),
+            closure_path: self.path.join(FILES_NAME).join(node_path),
+            fd,
+        })
+    }
+}
+
+/// Builds the descriptor-rooted pathname naming an open descriptor's object.
+///
+/// Linux `/proc/self/fd/N` is a magic symlink: opening it performs a fresh
+/// open of the underlying inode at offset 0, and a loader that resolves
+/// symlinks recovers the object's real pathname. macOS `/dev/fd/N` provides
+/// neither property. `open("/dev/fd/N", ...)` is equivalent to
+/// `fcntl(N, F_DUPFD, 0)`, so it shares the descriptor's file offset, and the
+/// entry is not a symlink, so a loader cannot walk back to the containing
+/// directory. Both platforms support exec through this path, which the release
+/// contract declares as `procfs_self_fd_exec` and `dev_fd_exec`.
+#[allow(dead_code)] // Path-included closure tests compile without Broca adapters.
+pub fn descriptor_path(fd: RawFd) -> PathBuf {
+    let root = if cfg!(target_os = "macos") {
+        "/dev/fd"
+    } else {
+        "/proc/self/fd"
+    };
+    PathBuf::from(root).join(fd.to_string())
+}
+
+/// Whether a descriptor-rooted path behaves like the file it names for data
+/// reads and module resolution, not only for exec. See [`descriptor_path`].
+#[allow(dead_code)] // Path-included closure tests compile without Broca adapters.
+pub const DESCRIPTOR_PATHS_ARE_FILE_LIKE: bool = !cfg!(target_os = "macos");
+
+#[allow(dead_code)] // Path-included closure tests compile without Broca adapters.
+pub struct ResolvedHarnessNode {
+    descriptor_path: PathBuf,
+    closure_path: PathBuf,
+    fd: OwnedFd,
+}
+
+#[allow(dead_code)] // Path-included closure tests compile without Broca adapters.
+impl ResolvedHarnessNode {
+    /// Path for an exec target: always descriptor-rooted, so the pathname
+    /// cannot be replaced between validation and exec.
+    pub fn path(&self) -> &Path {
+        &self.descriptor_path
+    }
+
+    /// Path for a file the child reads as data or resolves sibling modules
+    /// against. Descriptor-rooted only where that resolves like the file
+    /// itself; otherwise the closure pathname, which every platform can walk.
+    pub fn module_path(&self) -> &Path {
+        if DESCRIPTOR_PATHS_ARE_FILE_LIKE {
+            &self.descriptor_path
+        } else {
+            &self.closure_path
+        }
+    }
+
+    /// The closure-owned pathname of the verified node.
+    pub fn closure_path(&self) -> &Path {
+        &self.closure_path
+    }
+
+    pub fn inherited_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+
+    /// The descriptor a child must inherit to use [`Self::module_path`], which
+    /// is `None` when that path is an ordinary pathname needing no descriptor.
+    pub fn module_inherited_fd(&self) -> Option<RawFd> {
+        DESCRIPTOR_PATHS_ARE_FILE_LIKE.then(|| self.fd.as_raw_fd())
     }
 }
 
@@ -630,10 +711,10 @@ fn copy_node(
         &parent,
         basename.as_str(),
         OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_raw_mode(node.mode),
+        mode_from_u32(node.mode),
     )
     .map_err(|_| invalid("closure node creation failed"))?;
-    rustix::fs::fchmod(&destination, Mode::from_raw_mode(node.mode))
+    rustix::fs::fchmod(&destination, mode_from_u32(node.mode))
         .map_err(|_| invalid("closure node chmod failed"))?;
 
     let mut reader = std::fs::File::from(
@@ -905,10 +986,10 @@ fn write_new_file(
         parent,
         name,
         OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_raw_mode(mode),
+        mode_from_u32(mode),
     )
     .map_err(|_| invalid("closure metadata file creation failed"))?;
-    rustix::fs::fchmod(&fd, Mode::from_raw_mode(mode))
+    rustix::fs::fchmod(&fd, mode_from_u32(mode))
         .map_err(|_| invalid("closure metadata file chmod failed"))?;
     let mut writer = std::fs::File::from(
         rustix::io::dup(&fd).map_err(|_| invalid("closure metadata descriptor dup failed"))?,
@@ -1028,6 +1109,16 @@ fn verify_safe_ancestor(fd: &OwnedFd) -> Result<(), HarnessClosureError> {
 
 fn owner_uid() -> u32 {
     rustix::process::geteuid().as_raw()
+}
+
+#[cfg(target_os = "macos")]
+fn mode_from_u32(mode: u32) -> Mode {
+    Mode::from_raw_mode(u16::try_from(mode).expect("validated mode fits macOS mode_t"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mode_from_u32(mode: u32) -> Mode {
+    Mode::from_raw_mode(mode)
 }
 
 #[cfg(target_os = "macos")]

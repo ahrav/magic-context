@@ -136,10 +136,6 @@ impl PreparedLauncherEnvelope {
     }
 
     pub fn commit_selection(&self, publication: &Path) -> Result<(), &'static str> {
-        #[cfg(debug_assertions)]
-        if std::env::var_os("CK_MC_HOST_TEST_FAIL_SELECTION_COMMIT").is_some() {
-            return Err("injected active selection commit failure");
-        }
         let key = credential_identity_key(publication)?;
         let mut selection = self.selection.clone();
         selection.credential_identities = credential_identities(&self.credentials, &key);
@@ -280,7 +276,13 @@ fn merge_selection(
     let changed = selection.opencode != previous.opencode
         || selection.pi != previous.pi
         || credential_identities != previous.credential_identities;
-    if (changed || require_previous_credentials)
+    if require_previous_credentials && changed {
+        return Err("restart cannot change the active harness selection");
+    }
+    // Only reachable with `changed`, so no `require_previous_credentials`
+    // disjunct: a restart that reaches here matched the previous selection
+    // exactly, which already implies identical credential identities.
+    if changed
         && previous
             .credential_identities
             .iter()
@@ -561,20 +563,28 @@ fn write_selection(closure_root: &Path, selection: &HarnessSelection) -> Result<
         .custom_flags(libc::O_NOFOLLOW)
         .open(&temp)
         .map_err(|_| "active harness selection temp creation failed")?;
+    let final_path = closure_root.join(ACTIVE_HARNESS_SELECTION);
     let mut promoted = false;
     let result = (|| {
         file.write_all(&bytes)
             .and_then(|()| file.sync_all())
             .map_err(|_| "active harness selection write failed")?;
-        std::fs::rename(&temp, closure_root.join(ACTIVE_HARNESS_SELECTION))
+        std::fs::rename(&temp, &final_path)
             .map_err(|_| "active harness selection promotion failed")?;
         promoted = true;
+        #[cfg(debug_assertions)]
+        if std::env::var_os("CK_MC_HOST_TEST_FAIL_SELECTION_FSYNC").is_some() {
+            return Err("injected active selection fsync failure");
+        }
         std::fs::File::open(closure_root)
             .and_then(|dir| dir.sync_all())
             .map_err(|_| "active harness selection fsync failed")
     })();
     if !promoted {
         let _ = std::fs::remove_file(temp);
+    } else if result.is_err() {
+        let _ = std::fs::remove_file(&final_path);
+        let _ = std::fs::File::open(closure_root).and_then(|dir| dir.sync_all());
     }
     result
 }
@@ -786,7 +796,8 @@ fn synapse_component(generation: &ValidatedGeneration) -> SynapseComponent {
         else {
             return SynapseComponent::new(None);
         };
-        let bundle_dir = generation.path().join(BUNDLE_DIR);
+        let descriptor_root = generation.descriptor_root_path();
+        let bundle_dir = descriptor_root.join(BUNDLE_DIR);
         if !generation
             .manifest
             .files
@@ -797,7 +808,7 @@ fn synapse_component(generation: &ValidatedGeneration) -> SynapseComponent {
         }
         SynapseComponent::new(Some(SynapseConfig {
             bundle_dir,
-            ort_library: generation.path().join(ORT_LIBRARY),
+            ort_library: descriptor_root.join(ORT_LIBRARY),
             ort_library_sha256: ort.sha256.clone(),
             limits: SynapseLimits::default(),
         }))
@@ -956,6 +967,27 @@ mod tests {
                 )]),
                 &key,
             ),
+            true,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn harness_restart_refuses_a_new_descriptor_even_with_exact_credentials() {
+        let key = [10; 32];
+        let credentials =
+            BTreeMap::from([("ANTHROPIC_API_KEY".to_owned(), "shared-secret".to_owned())]);
+        let previous = HarnessSelection {
+            schema: 1,
+            opencode: Some("a".repeat(64)),
+            pi: None,
+            credential_identities: credential_identities(&credentials, &key),
+        };
+        assert!(merge_selection(
+            &previous,
+            None,
+            Some("b".repeat(64)),
+            credential_identities(&credentials, &key),
             true,
         )
         .is_err());

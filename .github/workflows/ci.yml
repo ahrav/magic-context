@@ -126,14 +126,17 @@ jobs:
       - name: Provision metadata-only sibling stubs
         run: sh scripts/provision-rust-ci-stubs.sh
 
+      # mc-module is absent here on purpose. It depends on mc-core and
+      # mc-store, which import real types from the private ../commons
+      # cortexkit crates; the stubs above are metadata-only, so anything
+      # that COMPILES mc-module fails to resolve those imports. The
+      # ck-mc-host binary build and the lifecycle_cli contract run in the
+      # local release gate (scripts/test-rust.sh, whole workspace), which
+      # has the sibling sources checked out.
       - name: Source-build transport, host, addon, and iceoryx
         run: |
           cargo build -p mc-shm-transport -p mc-host -p mc-shm-native
-          cargo build -p mc-module --bin ck-mc-host
           cargo check -p mc-shm-transport --features iceoryx
-
-      - name: Native lifecycle binary contract
-        run: cargo test -p mc-module --test lifecycle_cli
 
       - name: Rust contracts and lifecycle (Linux)
         if: runner.os == 'Linux'
@@ -216,6 +219,14 @@ jobs:
 
       - name: Check compiled TUI freshness
         run: bun run --cwd packages/plugin check:tui-compiled
+
+      # `bun run test` ends in test:release, whose dependency-boundary check
+      # shells out to `cargo tree -p mc-host`. cargo refuses to load the
+      # workspace until every path-dep manifest exists, including the private
+      # ../commons cortexkit crates. Metadata-only stubs satisfy the manifest
+      # graph; nothing in this job compiles them.
+      - name: Provision metadata-only sibling stubs
+        run: sh scripts/provision-rust-ci-stubs.sh
 
       - name: Test
         run: bun run test

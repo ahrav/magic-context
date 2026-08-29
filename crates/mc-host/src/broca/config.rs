@@ -28,9 +28,10 @@ pub const MAX_OPENCODE_CONFIG_BYTES: usize = 96 * 1024;
 pub const MAX_RUN_REPLAY_BYTES: usize = 1024 * 1024;
 
 /// Slice of [`MAX_RUN_REPLAY_BYTES`] reserved at admission for the
-/// `run_started` unit and one terminal unit. Charged with the run's base
-/// reservation so a terminal append can never fail on budget pressure —
-/// otherwise an overflowing run could not record the failure that stopped it.
+/// `run_started` unit, the `harness_dispatch` unit, and one terminal unit.
+/// Charged with the run's base reservation so those appends can never fail on
+/// budget pressure — otherwise an overflowing run could not record the failure
+/// that stopped it, and an admitted run could die before it spawned.
 pub const TERMINAL_HEADROOM_BYTES: usize = 4096;
 
 /// Aggregate retained-data budget (R12): immutable request bytes, replay

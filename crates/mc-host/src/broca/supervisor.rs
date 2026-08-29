@@ -953,14 +953,40 @@ fn begin_running(run: &Run) -> bool {
     true
 }
 
+/// Appends one small control unit from the terminal headroom reserved with the
+/// run's base charge, so it neither fails an admitted run under aggregate
+/// pressure nor consumes the per-run assistant-text budget.
+fn append_reserved(run: &Arc<Run>, unit: Vec<u8>) -> SinkStatus {
+    let unit = ReplayFrame::uncharged(unit);
+    {
+        let mut state = lock_run(run);
+        if state.terminal_appended || state.purged {
+            return SinkStatus::Closed;
+        }
+        state.replay.push(unit);
+    }
+    run.notify.notify_waiters();
+    SinkStatus::Accepted
+}
+
 /// Retains one backend event (KTD4, R12). Nonblocking by contract: charge
 /// first, then a short run-lock append. `Closed` tells the backend the run
 /// accepts nothing further.
 fn append_event(inner: &Arc<Inner>, run: &Arc<Run>, event: BackendEvent) -> SinkStatus {
-    let BackendEvent::AssistantText {
-        text,
-        finish_reason,
-    } = event;
+    let (text, finish_reason) = match event {
+        // Uncharged like `run_started`: the dispatch unit rides the terminal
+        // headroom reserved with the run's base charge. Charging it would let
+        // aggregate pressure fail a run the supervisor already admitted,
+        // before any subprocess is spawned, and would silently shrink the
+        // per-run assistant-text budget by the unit's size on every run.
+        BackendEvent::HarnessDispatch { harness } => {
+            return append_reserved(run, protocol::harness_dispatch_unit(&run.run_id, harness));
+        }
+        BackendEvent::AssistantText {
+            text,
+            finish_reason,
+        } => (text, finish_reason),
+    };
     let bytes: Box<[u8]> =
         protocol::assistant_message_unit(&run.run_id, &text, finish_reason).into();
     let len = bytes.len();

@@ -13,6 +13,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use mc_module::{
+    COMPARTMENT_RENDER_FORMAT_EPOCH, MEMORY_RENDER_FORMAT_EPOCH,
+    PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC, STATE_SYNC_EPOCH, TAGGER_FEATURE_EPOCH,
+};
 use serde_json::Value;
 
 const BIN: &str = env!("CARGO_BIN_EXE_ck-mc-host");
@@ -61,6 +65,7 @@ fn run_with_envelope_and_env(
         .env_clear()
         .env("XDG_DATA_HOME", root)
         .env("CK_MC_HOST_TEST_PHASE_CAP_MS", PHASE_CAP_MS)
+        .env("CK_MC_HOST_TEST_ALLOW_SELF_EXEC", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -336,6 +341,30 @@ fn stop_reports_wedged_when_lifetime_fence_is_held_without_a_runtime_dir() {
     assert!(lock_path.exists());
 }
 
+#[test]
+fn dev_payload_without_explicit_test_self_exec_fails_closed() {
+    let root = tempfile::tempdir().expect("root");
+    let data = root.path().join("data");
+    let payload = root.path().join("payload");
+    write_payload(&payload);
+    let payload_arg = payload.to_str().expect("payload path");
+
+    let out = run_with_envelope_and_env(
+        &data,
+        &["start", "--payload-dir", payload_arg],
+        None,
+        &[("CK_MC_HOST_TEST_ALLOW_SELF_EXEC", "0")],
+    );
+    assert_eq!(out.code, 1);
+    assert_result(
+        &out.json(),
+        "start",
+        false,
+        "stopped",
+        "native_payload_invalid",
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn full_dev_mode_lifecycle_roundtrip() {
     let root = tempfile::tempdir().expect("root");
@@ -374,6 +403,15 @@ async fn full_dev_mode_lifecycle_roundtrip() {
         let storage =
             status.metrics["components"]["magic-context"]["metrics"]["storage_state"].as_str();
         if storage == Some("ready") {
+            let epochs = &status.metrics["components"]["magic-context"]["metrics"]["epochs"];
+            assert_eq!(epochs["memory_render_epoch"], MEMORY_RENDER_FORMAT_EPOCH);
+            assert_eq!(
+                epochs["compartment_render_epoch"],
+                COMPARTMENT_RENDER_FORMAT_EPOCH
+            );
+            assert_eq!(epochs["profile_epoch"], PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC);
+            assert_eq!(epochs["tagger_epoch"], TAGGER_FEATURE_EPOCH);
+            assert_eq!(epochs["state_sync_epoch"], STATE_SYNC_EPOCH);
             break;
         }
         assert!(
@@ -383,6 +421,25 @@ async fn full_dev_mode_lifecycle_roundtrip() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     client.close().await.expect("client closes");
+
+    // Publication daemon_ver is diagnostic only. Compatibility uses the
+    // version authenticated in the proof transcript.
+    let mut publication_json: Value =
+        serde_json::from_slice(&std::fs::read(&publication).expect("read publication"))
+            .expect("publication JSON");
+    publication_json["daemon_ver"] = Value::String("mc-host/9.9.9".to_owned());
+    std::fs::write(
+        &publication,
+        serde_json::to_vec(&publication_json).expect("publication serializes"),
+    )
+    .expect("rewrite publication diagnostic");
+    std::fs::set_permissions(&publication, std::fs::Permissions::from_mode(0o600))
+        .expect("publication mode");
+    let out = run(&data, &["start"]);
+    assert_eq!(out.code, 0);
+    let value = out.json();
+    assert_result(&value, "start", true, "running", "already_running");
+    assert_eq!(value["versions"]["daemon"], "mc-host/0.1.0");
 
     // probe: running and healthy.
     let out = run(&data, &["probe"]);
@@ -492,6 +549,10 @@ fn credentialed_restart_is_explicit_exact_and_clears_stale_selection() {
         started.stdout, started.stderr
     );
     let first_id = daemon_id(&data);
+    let selection = data
+        .join("cortexkit")
+        .join("mc-host-harness-closures")
+        .join("active-selection.json");
 
     let plain_start = run(&data, &["start"]);
     assert_eq!(plain_start.code, 0);
@@ -575,25 +636,53 @@ fn credentialed_restart_is_explicit_exact_and_clears_stale_selection() {
         "start must not restart to merge an additional credential row"
     );
 
-    let restarted = run_with_envelope(&data, &["restart"], Some(&merged_envelope));
-    assert_eq!(
-        restarted.code, 0,
-        "credentialed restart failed: {} {}",
-        restarted.stdout, restarted.stderr
+    let selection_before_changed_restart =
+        std::fs::read(&selection).expect("active selection before rejected restart");
+    let changed_restart = run_with_envelope(&data, &["restart"], Some(&merged_envelope));
+    assert_eq!(changed_restart.code, 1);
+    assert_result(
+        &changed_restart.json(),
+        "restart",
+        false,
+        "running",
+        "harness_unavailable",
     );
-    assert_result(&restarted.json(), "restart", true, "running", "started");
-    assert_eq!(effects(&restarted.json()), (true, true));
+    assert_eq!(effects(&changed_restart.json()), (false, false));
+    assert_eq!(
+        daemon_id(&data),
+        first_id,
+        "restart must not adopt changed credential or descriptor snapshots"
+    );
+    assert_eq!(
+        std::fs::read(&selection).expect("active selection after rejected restart"),
+        selection_before_changed_restart,
+        "rejected restart must preserve active selection bytes"
+    );
+
+    let refresh_stop = run(&data, &["stop"]);
+    assert_eq!(refresh_stop.code, 0);
+    assert_result(&refresh_stop.json(), "stop", true, "stopped", "stopped");
+    janitor.active = false;
+
+    let demand_started = run_with_envelope(&data, &["start"], Some(&merged_envelope));
+    assert_eq!(
+        demand_started.code, 0,
+        "demand start failed: {} {}",
+        demand_started.stdout, demand_started.stderr
+    );
+    assert_result(&demand_started.json(), "start", true, "running", "started");
+    janitor.active = true;
     assert_ne!(
         daemon_id(&data),
         first_id,
-        "explicit restart must rotate daemon identity"
+        "stop plus later demand-start must rotate daemon identity"
     );
 
     let failed_commit = run_with_envelope_and_env(
         &data,
         &["restart"],
         Some(&merged_envelope),
-        &[("CK_MC_HOST_TEST_FAIL_SELECTION_COMMIT", "1")],
+        &[("CK_MC_HOST_TEST_FAIL_SELECTION_FSYNC", "1")],
     );
     assert_eq!(failed_commit.code, 1);
     assert_result(
@@ -604,16 +693,16 @@ fn credentialed_restart_is_explicit_exact_and_clears_stale_selection() {
         "internal_error",
     );
     assert_eq!(effects(&failed_commit.json()), (true, true));
+    assert!(
+        !selection.exists(),
+        "failed post-rename selector commit must remove the stale selector"
+    );
     janitor.active = false;
 
     let stopped = run(&data, &["stop"]);
     assert_eq!(stopped.code, 0);
     janitor.active = false;
 
-    let selection = data
-        .join("cortexkit")
-        .join("mc-host-harness-closures")
-        .join("active-selection.json");
     let unknown = b"{\"schema\":2,\"future\":\"preserve-me\"}";
     std::fs::write(&selection, unknown).expect("unknown selection fixture");
     std::fs::set_permissions(&selection, std::fs::Permissions::from_mode(0o600))

@@ -81,6 +81,10 @@ fn main() {
             "opencode_hostile_project_untouched",
             opencode_hostile_project_untouched,
         ),
+        (
+            "closed_dispatch_sink_prevents_spawn",
+            closed_dispatch_sink_prevents_spawn,
+        ),
         ("pi_argv_privacy_contract", pi_argv_privacy_contract),
         ("pi_provider_alias_mapping", pi_provider_alias_mapping),
         (
@@ -1206,10 +1210,15 @@ fn opencode_argv_env_stdin_contract() {
     );
     assert_eq!(
         events,
-        vec![BackendEvent::AssistantText {
-            text: "Hello from fixture".to_owned(),
-            finish_reason: None,
-        }]
+        vec![
+            BackendEvent::HarnessDispatch {
+                harness: Harness::OpenCode,
+            },
+            BackendEvent::AssistantText {
+                text: "Hello from fixture".to_owned(),
+                finish_reason: None,
+            },
+        ]
     );
 
     // Exact argv: the host owns the complete fixed argument surface.
@@ -1278,6 +1287,28 @@ fn opencode_argv_env_stdin_contract() {
     assert_eq!(
         env.get("HOME").map(PathBuf::from).as_deref(),
         Some(private_dir)
+    );
+}
+
+fn closed_dispatch_sink_prevents_spawn() {
+    let setup = RunSetup::new();
+    let backend = opencode_backend(&setup, &[]);
+    let sink = EventSink::new(Arc::new(|_| SinkStatus::Closed));
+    let terminal = rt().block_on(backend.execute(
+        request(
+            setup.project.path(),
+            Harness::OpenCode,
+            "anthropic/claude-test",
+            None,
+        ),
+        sink,
+        CancellationToken::new(),
+    ));
+    let error = failed(&terminal);
+    assert!(error.message.contains("closed before subprocess dispatch"));
+    assert!(
+        !setup.out.path().join("argv.json").exists(),
+        "closed dispatch must not spawn a harness child"
     );
 }
 
@@ -1375,7 +1406,13 @@ fn pi_argv_privacy_contract() {
     );
     let (terminal, events) = execute(&backend, request);
     assert!(matches!(terminal, BackendTerminal::Completed { .. }));
-    assert_eq!(events.len(), 1);
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        events[0],
+        BackendEvent::HarnessDispatch {
+            harness: Harness::Pi,
+        }
+    );
 
     let args = setup.argv();
     assert_eq!(
@@ -1392,7 +1429,12 @@ fn pi_argv_privacy_contract() {
             "--no-approve",
         ]
     );
-    assert!(args[0].ends_with("node_modules/pi/entry.mjs"));
+    let descriptor_root = if cfg!(target_os = "macos") {
+        "/dev/fd/"
+    } else {
+        "/proc/self/fd/"
+    };
+    assert!(args[0].starts_with(descriptor_root));
     assert_eq!(args[10], "--no-extensions");
     // Descriptor extensions in order, bundled hook LAST (R16, KTD8).
     let extensions: Vec<&String> = args
@@ -1402,8 +1444,9 @@ fn pi_argv_privacy_contract() {
         .filter_map(|(index, _)| args.get(index + 1))
         .collect();
     assert_eq!(extensions.len(), 3);
-    assert!(extensions[0].ends_with("node_modules/provider/0.mjs"));
-    assert!(extensions[1].ends_with("node_modules/provider/1.mjs"));
+    assert!(extensions[0].starts_with(descriptor_root));
+    assert!(extensions[1].starts_with(descriptor_root));
+    assert_ne!(extensions[0], extensions[1]);
     assert!(extensions[2].ends_with(PI_BROCA_EXTENSION_FILE));
     // Known provider alias translation happens at the argv edge (openai ->
     // openai-codex), never in the canonical request.
@@ -1706,10 +1749,22 @@ fn success_transcripts_align_across_harnesses() {
     // Identical canonical text and completion metadata from both harness
     // wire families.
     assert_eq!(oc_terminal, pi_terminal);
-    assert_eq!(oc_events, pi_events);
+    assert_eq!(&oc_events[1..], &pi_events[1..]);
     assert_eq!(
-        oc_events,
-        vec![BackendEvent::AssistantText {
+        oc_events[0],
+        BackendEvent::HarnessDispatch {
+            harness: Harness::OpenCode,
+        }
+    );
+    assert_eq!(
+        pi_events[0],
+        BackendEvent::HarnessDispatch {
+            harness: Harness::Pi,
+        }
+    );
+    assert_eq!(
+        &oc_events[1..],
+        &[BackendEvent::AssistantText {
             text: ANSWER.to_owned(),
             finish_reason: None,
         }]
@@ -1803,7 +1858,7 @@ fn provider_error_metadata_preserved() {
             finish_reason: FinishReason::Length
         }
     );
-    assert_eq!(events.len(), 1);
+    assert_eq!(events.len(), 2);
 
     // Pi length cap: the unit carries the length-class step reason the
     // producer's `length_capped` detection reads.
@@ -1816,10 +1871,15 @@ fn provider_error_metadata_preserved() {
     );
     assert_eq!(
         events,
-        vec![BackendEvent::AssistantText {
-            text: "truncated".to_owned(),
-            finish_reason: Some(FinishReason::Length),
-        }]
+        vec![
+            BackendEvent::HarnessDispatch {
+                harness: Harness::Pi,
+            },
+            BackendEvent::AssistantText {
+                text: "truncated".to_owned(),
+                finish_reason: Some(FinishReason::Length),
+            },
+        ]
     );
 
     // Pi context overflow classified from the provider message.
@@ -1929,7 +1989,12 @@ fn opencode_oversized_inline_config_rejected_before_spawn() {
         !error.message.contains("ssss"),
         "the oversized system prompt must not leak into the diagnostic"
     );
-    assert!(events.is_empty());
+    assert_eq!(
+        events,
+        vec![BackendEvent::HarnessDispatch {
+            harness: Harness::OpenCode,
+        }]
+    );
     assert!(
         !setup.out.path().join("argv.json").exists(),
         "the rejection must land before any child was spawned"
@@ -2981,8 +3046,9 @@ fn pi_auto_retry_supersedes_the_failed_attempts_terminal() {
     );
     let texts: Vec<&str> = events
         .iter()
-        .map(|event| match event {
-            BackendEvent::AssistantText { text, .. } => text.as_str(),
+        .filter_map(|event| match event {
+            BackendEvent::AssistantText { text, .. } => Some(text.as_str()),
+            BackendEvent::HarnessDispatch { .. } => None,
         })
         .collect();
     assert_eq!(
@@ -3021,7 +3087,9 @@ fn pi_retry_announcement_without_a_new_terminal_fails_as_missing() {
             error.message
         );
         assert!(
-            events.is_empty(),
+            !events
+                .iter()
+                .any(|event| matches!(event, BackendEvent::AssistantText { .. })),
             "{continuation}: a superseded attempt publishes no text"
         );
     }
