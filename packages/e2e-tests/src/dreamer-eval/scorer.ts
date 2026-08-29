@@ -224,25 +224,24 @@ export function scoreVerifyManifest(
 }
 
 /** A claim's dedup identity: its category plus its normalized content. */
-function claimIdentity(category: string, content: string): string {
+export function claimIdentity(category: string, content: string): string {
     return `${category}\u0000${normalizeMemoryContent(content)}`;
 }
 
 /**
- * Whether `content` would land on another active claim's identity as the pool
- * stands. Callers staging a batch must use `firstUnappliableUpdate` instead,
- * which tracks identities the batch itself moves.
+ * Identities the active pool already owns, keyed to their holder. Shared with the
+ * mutation battery so the rule for "this content is already taken" has one
+ * definition: the battery plans a manifest against it while the scorer judges
+ * one.
  */
-export function updateTakesLiveIdentity(pool: PoolDescriptor, claimId: string, content: string): boolean {
-    const revised = pool.claims.find((claim) => claim.claimId === claimId);
-    if (revised === undefined) return false;
-    const next = claimIdentity(revised.category, content);
-    return pool.claims.some(
-        (claim) =>
-            claim.claimId !== claimId &&
-            claim.lifecycleState === "active" &&
-            claimIdentity(claim.category, claim.content) === next,
-    );
+export function liveIdentities(pool: PoolDescriptor): Map<string, string> {
+    const owner = new Map<string, string>();
+    for (const claim of pool.claims) {
+        if (claim.lifecycleState === "active") {
+            owner.set(claimIdentity(claim.category, claim.content), claim.publicClaimId);
+        }
+    }
+    return owner;
 }
 
 /**
@@ -263,12 +262,7 @@ function firstUnappliableUpdate(
     updates: readonly { publicClaimId: string; content: string | null }[],
 ): boolean {
     const byPublicId = new Map(pool.claims.map((claim) => [claim.publicClaimId, claim]));
-    const owner = new Map<string, string>();
-    for (const claim of pool.claims) {
-        if (claim.lifecycleState === "active") {
-            owner.set(claimIdentity(claim.category, claim.content), claim.publicClaimId);
-        }
-    }
+    const owner = liveIdentities(pool);
     for (const entry of updates) {
         const claim = byPublicId.get(entry.publicClaimId);
         if (claim === undefined) continue;

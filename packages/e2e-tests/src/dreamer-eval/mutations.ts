@@ -11,7 +11,8 @@ import {
     scoreClassifyManifest,
     scoreMapManifest,
     scoreVerifyManifest,
-    updateTakesLiveIdentity,
+    claimIdentity,
+    liveIdentities,
     type ManifestScore,
     type ManifestScoreStage,
 } from "./scorer";
@@ -149,27 +150,58 @@ function fillerAbsentFrom(phrases: readonly string[], description: string): stri
  * a fixture whose anchors only fit when interleaved gets a named error here
  * rather than the opaque "baseline must pass all scorers".
  */
-function passingUpdateContent(fixture: DreamerMutationFixture, gold: VerifyGoldClaim): string {
+/**
+ * Update content that carries every required anchor, no forbidden one, fits the
+ * production content cap, and takes an identity no other live claim holds —
+ * including one an earlier update in this same batch just took.
+ *
+ * The contract rejects a forbidden anchor contained in a single required anchor
+ * but not one spanning their join: required `alpha` and `beta` with forbidden
+ * `alpha; beta` validates, yet the delimiter-joined baseline would contain the
+ * forbidden phrase and fail scoring, making `runMutationBattery` throw on its
+ * own supposedly-correct baseline. A separator holding a character absent from
+ * every forbidden anchor makes a spanning match impossible.
+ *
+ * The contract also caps each individual anchor, which is the length it can
+ * prove unsatisfiable, but anchors may overlap inside one body so it cannot
+ * reject a combined length. This construction does not exploit that overlap, so
+ * a fixture whose anchors only fit when interleaved gets a named error here
+ * rather than the opaque "baseline must pass all scorers".
+ *
+ * `ledger` carries the identities already spoken for and is updated in place, so
+ * two updates whose anchors generate the same body do not silently converge on
+ * one identity — which the scorer would reject as unappliable on the second.
+ */
+function passingUpdateContent(
+    fixture: DreamerMutationFixture,
+    gold: VerifyGoldClaim,
+    ledger: Map<string, string>,
+): string {
+    const claim = claimById(fixture.pool, gold.claimId);
+    // The revision vacates whatever this claim held, matching the exemption
+    // production grants a claim against its own identity.
+    ledger.delete(claimIdentity(claim.category, claim.content));
     let content = buildUpdateContent(gold);
-    // The scorer refuses content landing on another active claim's identity, so a
-    // baseline whose anchors happen to spell a sibling's content needs padding
-    // that shifts the normalized identity while keeping every anchor present.
-    // Padding is the reason this is still satisfiable rather than a bad fixture.
-    if (updateTakesLiveIdentity(fixture.pool, gold.claimId, content)) {
-        const pad = fillerAbsentFrom(
-            gold.forbiddenUpdateAnchors,
-            "a pad character absent from every forbidden update anchor",
-        );
-        content = `${content} ${pad}`;
-        if (updateTakesLiveIdentity(fixture.pool, gold.claimId, content)) {
+    // Padding shifts the normalized identity while keeping every anchor present,
+    // which is what makes such a fixture satisfiable rather than broken.
+    for (let attempt = 0; ledger.has(claimIdentity(claim.category, content)); attempt += 1) {
+        if (attempt >= MAX_IDENTITY_PAD_ATTEMPTS) {
             throw new Error("mutation fixture needs update anchors that avoid every live claim identity");
         }
+        content = `${content} ${fillerAbsentFrom(
+            gold.forbiddenUpdateAnchors,
+            "a pad character absent from every forbidden update anchor",
+        )}`;
     }
     if (content.length > VERIFY_UPDATE_CONTENT_MAX_LENGTH) {
         throw new Error("mutation fixture needs required update anchors that join within the content cap");
     }
+    ledger.set(claimIdentity(claim.category, content), claim.publicClaimId);
     return content;
 }
+
+/** Each pad appends a distinct suffix, so a free identity arrives immediately or the fixture is pathological. */
+const MAX_IDENTITY_PAD_ATTEMPTS = 8;
 
 function buildUpdateContent(gold: VerifyGoldClaim): string {
     if (gold.requiredUpdateAnchors.length === 0) {
@@ -223,13 +255,16 @@ function pathAbsentFrom(files: readonly string[]): string {
 }
 
 function correctVerifyManifest(fixture: DreamerMutationFixture): string {
+    // One ledger for the whole manifest: production stages these updates in this
+    // order, and each takes its identity for the rest of the batch.
+    const ledger = liveIdentities(fixture.pool);
     const entries = fixture.verifyGold.claims.map((gold) => {
         const claim = claimById(fixture.pool, gold.claimId);
         if (gold.verdict === "verified") {
             return `<verified claim="${claim.publicClaimId}" files="${gold.expectedFiles.join(",")}"/>`;
         }
         if (gold.verdict === "archive") return `<archive claim="${claim.publicClaimId}" reason="contradicted"/>`;
-        return `<update claim="${claim.publicClaimId}" files="${gold.expectedFiles.join(",")}">${passingUpdateContent(fixture, gold)}</update>`;
+        return `<update claim="${claim.publicClaimId}" files="${gold.expectedFiles.join(",")}">${passingUpdateContent(fixture, gold, ledger)}</update>`;
     });
     return `<verify>\n${entries.join("\n")}\n</verify>`;
 }

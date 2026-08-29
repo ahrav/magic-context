@@ -348,3 +348,41 @@ describe("dreamer mutation battery fixture tolerance", () => {
         });
     });
 });
+
+describe("dreamer mutation battery baseline planning", () => {
+    test("two updates generating the same body do not converge on one identity", () => {
+        // Both updates carry the same anchors, so their generated bodies come out
+        // identical. Checking each against the pool in isolation leaves both
+        // unpadded, and the scorer then rejects the second as unappliable —
+        // aborting the battery on a fixture that is satisfiable by padding.
+        const anchors = {
+            requiredUpdateAnchors: ["shared body"],
+            forbiddenUpdateAnchors: ["2048 entries"],
+        };
+        const fixture = {
+            ...dreamerScorerFixture,
+            pool: {
+                ...dreamerScorerFixture.pool,
+                claims: dreamerScorerFixture.pool.claims.map((claim) =>
+                    // Same category as claim-update, so the two identities can collide.
+                    claim.claimId === "claim-independent" ? { ...claim, category: "PROJECT_FACT" } : claim,
+                ),
+            },
+            verifyGold: {
+                kind: "verify" as const,
+                claims: [
+                    dreamerScorerFixture.verifyGold.claims[0]!,
+                    { ...dreamerScorerFixture.verifyGold.claims[1]!, ...anchors },
+                    {
+                        claimId: "claim-independent",
+                        verdict: "update" as const,
+                        expectedFiles: ["src/cache.ts"],
+                        ...anchors,
+                    },
+                    dreamerScorerFixture.verifyGold.claims[2]!,
+                ],
+            },
+        };
+        expect(runMutationBattery(fixture).green).toBe(true);
+    });
+});
