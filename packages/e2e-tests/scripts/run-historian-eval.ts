@@ -26,8 +26,19 @@ import {
 } from "../src/historian-eval/contract";
 import { runMutationBattery } from "../src/historian-eval/mutations";
 import { checkFamilyCoverage, loadRelease } from "../src/historian-eval/promote";
-import { runScenario, type LiveHistorianMode, type SystemVersionTuple } from "../src/historian-eval/runner";
-import { buildLaneReport, laneExitCode, scoreRunRecord, type ScenarioScore } from "../src/historian-eval/scorer";
+import {
+    historianWaitBudgetMs,
+    runScenario,
+    type LiveHistorianMode,
+    type SystemVersionTuple,
+} from "../src/historian-eval/runner";
+import {
+    buildLaneReport,
+    laneBudgetExhaustedScore,
+    laneExitCode,
+    scoreRunRecord,
+    type ScenarioScore,
+} from "../src/historian-eval/scorer";
 import { E2E_ROOT } from "./validate-mode-manifest";
 
 interface CliArgs {
@@ -35,6 +46,18 @@ interface CliArgs {
     scenariosDir: string | null;
     releaseDir: string | null;
     reportPath: string;
+    /**
+     * Wall-clock budget for the whole live loop, in minutes, or null for none.
+     *
+     * A scheduled run needs this because the per-run historian waits are bounded
+     * individually, not in aggregate: the release size budget allows 30 scenarios
+     * and two runs each, so the worst-case waits exceed any job timeout GitHub
+     * permits. Without a budget the runner is killed mid-scenario and publishes no
+     * report at all, having already spent the tokens. With one it stops between
+     * scenarios and publishes what it has. An operator running directly has no such
+     * external killer, so the default is no deadline.
+     */
+    deadlineMinutes: number | null;
 }
 
 function parseArgs(args: string[]): CliArgs {
@@ -42,6 +65,7 @@ function parseArgs(args: string[]): CliArgs {
     let scenariosDir: string | null = null;
     let releaseDir: string | null = null;
     let reportPath = join(E2E_ROOT, "artifacts", "historian-eval-report.json");
+    let deadlineMinutes: number | null = null;
     /**
      * Value for an option that requires one, or a diagnostic naming the option.
      *
@@ -70,9 +94,14 @@ function parseArgs(args: string[]): CliArgs {
             releaseDir = requireValue(arg, args[++index]);
         } else if (arg === "--report") {
             reportPath = requireValue(arg, args[++index]);
+        } else if (arg === "--deadline-minutes") {
+            const raw = requireValue(arg, args[++index]);
+            const parsed = Number(raw);
+            if (!Number.isFinite(parsed) || parsed <= 0) throw new Error(`${arg} expects a positive number (got "${raw}")`);
+            deadlineMinutes = parsed;
         } else if (arg === "--help" || arg === "-h") {
             console.log(
-                "Usage: run-historian-eval.ts (--lint | --mutations | --live) [--scenarios <dir> | --release <dir>] [--report <path>]",
+                "Usage: run-historian-eval.ts (--lint | --mutations | --live) [--scenarios <dir> | --release <dir>] [--report <path>] [--deadline-minutes <n>]",
             );
             process.exit(0);
         } else {
@@ -86,7 +115,7 @@ function parseArgs(args: string[]): CliArgs {
     if (scenariosDir === null && releaseDir === null) {
         scenariosDir = join(E2E_ROOT, "historian-eval", "dev");
     }
-    return { mode, scenariosDir, releaseDir, reportPath };
+    return { mode, scenariosDir, releaseDir, reportPath, deadlineMinutes };
 }
 
 function loadCorpus(args: CliArgs): { scenarios: HistorianEvalScenario[]; releaseVersion: string | null } {
@@ -247,8 +276,21 @@ function liveAdmissionGate(scenarios: readonly HistorianEvalScenario[]): number 
 function buildPluginBundle(): number {
     const repoRoot = resolve(E2E_ROOT, "..", "..");
     console.log("building the plugin bundle the harness loads...");
+    // The live credential is already in this process's environment by the time
+    // this runs, and the workflow deliberately builds the plugin in a
+    // credential-free step. Inheriting the ambient environment would hand the
+    // production key to `tsc`, Bun's bundler, and the TUI build script — a build
+    // toolchain with no need for it — before any provider call. Stripped rather
+    // than passing a minimal allowlist, because the build legitimately needs PATH,
+    // HOME, and the Bun install cache, and enumerating those is how a build breaks
+    // on the next toolchain change.
+    const { ANTHROPIC_API_KEY: _live, ...credentialFreeEnv } = process.env;
     try {
-        execSync("bun run --cwd packages/plugin build", { cwd: repoRoot, stdio: "inherit" });
+        execSync("bun run --cwd packages/plugin build", {
+            cwd: repoRoot,
+            stdio: "inherit",
+            env: credentialFreeEnv,
+        });
         return 0;
     } catch (error) {
         console.error(
@@ -256,6 +298,21 @@ function buildPluginBundle(): number {
         );
         return 1;
     }
+}
+
+/**
+ * Worst case wall clock one scenario can spend inside the runner.
+ *
+ * Derived from the runner's own per-wait budget rather than a second constant, so
+ * the two cannot drift: the runner waits once per declared historian run, plus
+ * once more for quiescence after the probe phase. Everything else in a scenario —
+ * harness boot, transcript replay, probe calls — is bounded well below one of
+ * those waits, and this figure only decides whether to START a scenario, so
+ * overshooting it costs a skipped scenario and undershooting it costs a killed
+ * job.
+ */
+function scenarioWorstCaseMs(scenario: HistorianEvalScenario, mode: LiveHistorianMode): number {
+    return (scenario.trigger.expectedHistorianRuns + 1) * historianWaitBudgetMs(mode);
 }
 
 async function runLive(args: CliArgs): Promise<number> {
@@ -273,7 +330,23 @@ async function runLive(args: CliArgs): Promise<number> {
     const artifactsRoot = join(dirname(resolve(args.reportPath)), "historian-eval-runs");
     const scores: ScenarioScore[] = [];
     let system: SystemVersionTuple | undefined;
-    for (const scenario of scenarios) {
+    // Measured after the build and battery, so the budget covers the part that
+    // spends tokens rather than the deterministic preamble.
+    const deadlineAt = args.deadlineMinutes === null ? null : Date.now() + args.deadlineMinutes * 60_000;
+    for (const [index, scenario] of scenarios.entries()) {
+        // Checked BEFORE starting, never mid-scenario: a scenario abandoned
+        // half-way has spent its tokens and produced no record, so the only useful
+        // decision point is whether there is room for the whole thing.
+        if (deadlineAt !== null && Date.now() + scenarioWorstCaseMs(scenario, mode) > deadlineAt) {
+            const unreached = scenarios.slice(index);
+            console.error(
+                `lane budget: ${unreached.length} scenario(s) not run; remaining wall clock cannot cover a worst-case run`,
+            );
+            for (const skipped of unreached) {
+                scores.push(laneBudgetExhaustedScore(skipped.id, system ?? null));
+            }
+            break;
+        }
         const artifactDir = join(artifactsRoot, scenario.id);
         rmSync(artifactDir, { recursive: true, force: true });
         console.log(`running ${scenario.id}...`);

@@ -67,7 +67,14 @@ import type {
     SystemVersionTuple,
 } from "./runner";
 
-const LANE_REPORT_SCHEMA = "historian-eval-report/v1";
+/**
+ * Lane-report schema identity. Bumped with the run record for the same change:
+ * the report embeds a `SystemVersionTuple` both at the top level and on every
+ * scenario score, so requiring `opencodeVersion` changed the report's shape too.
+ * Left at `v1`, one identifier would name two incompatible report shapes and a
+ * consumer could not tell an archived report from a current one.
+ */
+const LANE_REPORT_SCHEMA = "historian-eval-report/v2";
 
 /** KTD8 FAIL reason codes. */
 export const FAIL_REASONS = ["false-authoritative", "recall", "structural", "probe", "invalid-output"] as const;
@@ -2209,6 +2216,25 @@ export function buildLaneReport(
         red: sorted.some((score) => score.verdict !== "PASS"),
         runFatal: scored.some((score) => score.failReasons.includes("false-authoritative")),
     };
+}
+
+/**
+ * Score for a scenario the lane never got to because its wall-clock budget ran
+ * out.
+ *
+ * An ERROR, not a silent omission: `buildLaneReport` micro-averages over the
+ * scenarios it is given, so dropping the unreached ones would publish rates for a
+ * corpus subset while claiming the release, and `red` would be false if the ones
+ * that did run all passed. Constructed here rather than in the caller so the
+ * score shape stays owned by the scorer.
+ */
+export function laneBudgetExhaustedScore(scenarioId: string, system: SystemVersionTuple | null): ScenarioScore {
+    return errorScore(
+        scenarioId,
+        "lane-budget-exhausted",
+        "the lane's wall-clock budget could not cover this scenario's worst-case historian waits, so it was not run",
+        system,
+    );
 }
 
 /**

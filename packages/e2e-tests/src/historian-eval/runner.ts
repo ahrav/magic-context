@@ -535,7 +535,7 @@ export interface RunScenarioOptions {
  * rather than a silently truncated job. Callers with a different budget override
  * it through `historianWaitMs`.
  */
-function historianWaitBudgetMs(mode: RunScenarioOptions["mode"]): number {
+export function historianWaitBudgetMs(mode: RunScenarioOptions["mode"]): number {
     return mode.kind === "live" ? 2 * DEFAULT_HISTORIAN_TIMEOUT_MS : 90_000;
 }
 
@@ -1202,7 +1202,24 @@ class ScenarioRunner {
         // formation, not the orthogonal maturity gate, so it verifies every
         // active claim through the production verification operation before
         // the injection-dependent probe tier runs. See verification-bridge.ts.
-        const verifiedClaimCount = this.runVerificationBridge(harness);
+        //
+        // The bridge applies one claim at a time and fails closed on a
+        // non-applied outcome, and it runs BEFORE the authoritative capture
+        // below — so an abort here unwound with `capturedClaims` still null.
+        // `emptyRecord` then wrote an empty identity and claim array while the
+        // snapshot already held whatever had been verified, including a
+        // forbidden promotion, and the always-run-fatal outcome came back as an
+        // ordinary `harness-failure`. Capturing before the rethrow keeps that
+        // evidence exactly as a probe-stage abort keeps it. The capture runs
+        // after the partial application, so it sees the claims verification had
+        // actually made visible rather than a pre-bridge guess.
+        let verifiedClaimCount: number;
+        try {
+            verifiedClaimCount = this.runVerificationBridge(harness);
+        } catch (error) {
+            this.captureClaimStateForAbort(harness);
+            throw error;
+        }
 
         // Read the authoritative claim state BEFORE the probe tier. A probe
         // stage can abort (`probe-envelope-malformed`, `probe-gold-uncovered`,
@@ -2274,6 +2291,25 @@ class ScenarioRunner {
      * (`auto_inject`, active lifecycle, stale retry) with the pinned clock
      * (KTD1). A snapshot still stale after the built-in retry is ERROR.
      */
+    /**
+     * Claim capture on an abort path, best effort.
+     *
+     * Never overwrites an existing capture — the authoritative read wins — and
+     * never throws: a capture that fails must not replace the abort that is
+     * actually being reported. Leaving `capturedClaims` null on failure returns
+     * the previous behaviour for that case, which is the correct floor.
+     */
+    private captureClaimStateForAbort(harness: TestHarness): void {
+        if (this.capturedClaims !== null) return;
+        try {
+            const nowMs = Date.now();
+            const { injectedClaims, perGoldPredicate } = this.captureClaimState(harness, nowMs);
+            this.capturedClaims = { nowMs, injectedClaims, perGoldPredicate };
+        } catch {
+            // Intentionally swallowed; see above.
+        }
+    }
+
     private captureClaimState(
         harness: TestHarness,
         nowMs: number,

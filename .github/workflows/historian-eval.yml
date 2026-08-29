@@ -38,9 +38,14 @@ jobs:
       github.event_name == 'schedule' ||
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
-    # Worst case: ~30 scenarios x (two historian runs + repair + probes) on a
-    # live model.
-    timeout-minutes: 240
+    # GitHub's ceiling for a hosted job, and the lane needs the room: the release
+    # size budget allows 30 scenarios declaring two historian runs each, and the
+    # runner's live per-wait budget is 10 minutes, so the worst-case waits alone
+    # exceed any timeout GitHub permits. The job timeout is therefore not the
+    # bound that protects the report — `--deadline-minutes` below is. This is the
+    # outer backstop, set above that deadline so the script always wins the race
+    # and publishes.
+    timeout-minutes: 360
     concurrency:
       group: historian-eval-live
       cancel-in-progress: false
@@ -108,7 +113,12 @@ jobs:
           HISTORIAN_EVAL_MODEL: anthropic/claude-sonnet-4-5
           HISTORIAN_EVAL_PROBE_MODEL: anthropic/claude-haiku-4-5
         run: |
+          # Stops between scenarios and publishes what it has rather than being
+          # killed mid-scenario with no artifact after spending the tokens. Sized
+          # below `timeout-minutes` with room for setup, the plugin build, scoring,
+          # and the artifact upload that follows.
           bun packages/e2e-tests/scripts/run-historian-eval.ts --live "$SELECT_FLAG" "$SELECT_PATH" \
+            --deadline-minutes 320 \
             --report packages/e2e-tests/artifacts/historian-eval-report.json
 
       - name: Archive the lane report and run records
