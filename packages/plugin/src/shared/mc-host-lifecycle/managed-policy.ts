@@ -391,13 +391,31 @@ export function createManagedLifecyclePolicy(
         // re-issuing `host.status`. The observation is single-use and only a
         // terminal state short-circuits; a `starting` observation still runs
         // the polling probe so it can wait out startup within its own budget.
-        let observedStorage: "ready" | "starting" | "unavailable" | null = null;
+        //
+        // The observation is tagged with the daemon incarnation whose
+        // `host.status` produced it and is only consumed by a demand that
+        // certified that same incarnation. Concurrent probes share this slot:
+        // `sharedCompatibility` dedupes per data root, so a real-root and a
+        // no-root key can be in flight together, and a non-`magic-context`
+        // demand writes an observation it never consumes. Untagged reuse would
+        // let a waiter read a state observed on a different request or daemon
+        // generation and publish module traffic against it.
+        let observedStorage: {
+            daemonId: Uint8Array;
+            state: "ready" | "starting" | "unavailable";
+        } | null = null;
         const defaultCompatibilityProbe = async (
             budgetMs: number,
             signal?: AbortSignal,
         ): Promise<CompatibilitySnapshot> => {
             const probe = await probeManagedCompatibility(root.root, budgetMs, signal);
-            observedStorage = probe.status === null ? null : storageState(probe.status.metrics);
+            observedStorage =
+                probe.status === null
+                    ? null
+                    : {
+                          daemonId: Uint8Array.from(probe.snapshot.authenticatedDaemonId),
+                          state: storageState(probe.status.metrics),
+                      };
             return probe.snapshot;
         };
         const defaultStorageProbe = (
@@ -406,8 +424,13 @@ export function createManagedLifecyclePolicy(
         ): Promise<"ready" | "starting" | "unavailable"> => {
             const observed = observedStorage;
             observedStorage = null;
-            if (observed === "ready" || observed === "unavailable") {
-                return Promise.resolve(observed);
+            if (
+                expectedDaemonId !== undefined &&
+                observed !== null &&
+                sameDaemonId(observed.daemonId, expectedDaemonId) &&
+                (observed.state === "ready" || observed.state === "unavailable")
+            ) {
+                return Promise.resolve(observed.state);
             }
             return probeManagedStorage(root.root, budgetMs, expectedDaemonId);
         };
