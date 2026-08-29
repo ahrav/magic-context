@@ -6,7 +6,7 @@
  * 1. Normalize the two committed mutation-artifact shapes (`mutations[].name`
  *    and `mutation_records[].id`) into one evidence view without rewriting the
  *    raw artifacts, link every record to the verifier it challenged, and
- *    derive the accepted 13-artifact/21-record snapshot from a live file scan.
+ *    derive the accepted 20-artifact/27-record snapshot from a live file scan.
  * 2. Scan the named incident sources (audit A/G headings and embedded claims,
  *    parity H2 claims, the thinking-block adjudication, the Pi declared-red
  *    synthesis suite, and the bead-recorded provenance mismatches) into stable
@@ -39,6 +39,7 @@ import type {
 } from "./contract";
 import { EXECUTABLE_LANES } from "./contract";
 import { rowDigest } from "./history";
+import { validateCommittedMatrix } from "../../scripts/validate-shm-hardening-matrix";
 
 export const E2E_ROOT = resolve(import.meta.dir, "..", "..");
 export const REPO_ROOT = resolve(E2E_ROOT, "..", "..");
@@ -111,6 +112,30 @@ export interface EvidenceView {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** A deferred record is an UNPROVEN hardening claim, so tolerating it is only
+ *  defensible while the failure-hardening matrix is still unresolved — the exact
+ *  condition every deferral cites, and the condition under which tuple-specific
+ *  execution is blocked anyway. Freezing the matrix unblocks that execution, at
+ *  which point a deferral is an untested claim riding through the very gate that
+ *  exists to stop it. `invalid` is not a licence either: a matrix that fails its
+ *  own validation says nothing about whether the drill is inapplicable. */
+export function deferralPermittedFor(
+    outcome: ReturnType<typeof validateCommittedMatrix>["outcome"],
+): boolean {
+    return outcome === "unresolved";
+}
+
+/** Fail closed on a deferral the matrix state no longer justifies. Re-read per
+ *  call rather than cached: the manifest is small, only a deferred record
+ *  triggers it, and a cached verdict would go stale the moment the matrix
+ *  freezes. */
+function assertDeferralStillPermitted(label: string): void {
+    if (deferralPermittedFor(validateCommittedMatrix().outcome)) return;
+    throw new Error(
+        `${label} is deferred, but the failure_hardening matrix is no longer unresolved: freezing it unblocks tuple execution, so this claim needs a real mutation record instead of a deferral`,
+    );
 }
 
 function requireString(value: unknown, label: string): string {
@@ -239,10 +264,10 @@ export function loadMutationEvidence(
             declaredRecords = raw.mutations.length;
             // A deferred record states that no mutation was applied and names
             // the reason, so it binds no verifier and carries no replay. It is
-            // not evidence and must not become an evidence record; the
-            // hardening-matrix gate is what keeps the unproven claim blocked.
-            // An artifact whose every record is deferred therefore has no run
-            // command to require.
+            // not evidence and must not become an evidence record. Tolerating it
+            // is gated on the matrix still being unresolved, checked per record
+            // below. An artifact whose every record is deferred therefore has no
+            // run command to require.
             const proven = raw.mutations.filter(
                 (rawRecord) =>
                     !isRecord(rawRecord) || rawRecord.status !== "deferred",
@@ -257,6 +282,7 @@ export function loadMutationEvidence(
                     throw new Error(`${label} must be an object`);
                 if (rawRecord.status === "deferred") {
                     requireString(rawRecord.reason, `${label}.reason`);
+                    assertDeferralStillPermitted(label);
                     continue;
                 }
                 const name = requireString(rawRecord.name, `${label}.name`);
