@@ -34,6 +34,7 @@ import {
     type NativeStartupEnvelope,
     resolveConnectionOrigin,
     type StorageReadiness,
+    WaiterDetachedError,
 } from "../../shared/mc-host-lifecycle";
 import { qualifiedHarnessClosures } from "../../shared/mc-host-lifecycle/generated-production-inputs";
 import { isRecord } from "../../shared/record-type-guard";
@@ -1241,8 +1242,17 @@ export class McHostModuleTransport {
             // A failed demand (probe failure, incompatibility, storage not ready)
             // must not be re-issued at request rate: arm the same dial backoff a
             // failed connect arms, so the next caller is gated above.
-            this.nextProbeMs = Date.now() + this.backoffMs;
-            this.backoffMs = Math.min(this.backoffMs * 2, CONNECT_BACKOFF_MAX_MS);
+            //
+            // Detachment is not one of those failures. It is evidence about one
+            // caller's own signal or deadline, and the backoff is transport-wide:
+            // arming it here would make a single cancelled request fail every
+            // other session with MC_HOST_CONNECTION_BACKOFF, and a burst of
+            // cancellations would walk that gate toward its cap while the daemon
+            // is healthy.
+            if (!(error instanceof WaiterDetachedError)) {
+                this.nextProbeMs = Date.now() + this.backoffMs;
+                this.backoffMs = Math.min(this.backoffMs * 2, CONNECT_BACKOFF_MAX_MS);
+            }
             throw error;
         }
         this.compatibleDaemonId =
