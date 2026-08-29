@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
+import { connectionFilePath, resolveLifecycleDataRoot } from "../../../shared/mc-host-lifecycle";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { evaluateSmartNotes } from "../dreamer/evaluate-smart-notes";
@@ -198,6 +198,35 @@ describe("wakePlaneStatus", () => {
         hasWakePlane = false;
         expect(await wakePlaneStatus()).toBe("absent");
         expect(probes).toBe(2);
+    });
+
+    test("dials and binds to the connection file the lifecycle owner publishes", () => {
+        // An empty XDG_DATA_HOME is ignored by the lifecycle resolver, which
+        // starts mc-host under HOME/.local/share. Reading getDataDir() here
+        // instead would stat a different path, so a managed start would neither
+        // answer the catalog probe nor retire the negative answer cached before it.
+        const home = mkdtempSync(join(tmpdir(), "wake-plane-root-"));
+        const previousXdg = process.env.XDG_DATA_HOME;
+        const previousTestRoot = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+        const previousHome = process.env.HOME;
+        process.env.XDG_DATA_HOME = "";
+        delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+        process.env.HOME = home;
+        try {
+            expect(__wakePlaneTest.connectionFile()).toBe(
+                connectionFilePath(join(home, ".local", "share")),
+            );
+            const root = resolveLifecycleDataRoot(process.env);
+            expect(root.ok && root.root).toBe(join(home, ".local", "share"));
+        } finally {
+            if (previousXdg === undefined) delete process.env.XDG_DATA_HOME;
+            else process.env.XDG_DATA_HOME = previousXdg;
+            if (previousTestRoot === undefined) delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+            else process.env.MAGIC_CONTEXT_TEST_DATA_DIR = previousTestRoot;
+            if (previousHome === undefined) delete process.env.HOME;
+            else process.env.HOME = previousHome;
+            rmSync(home, { recursive: true, force: true });
+        }
     });
 
     test("re-probes a negative answer once a daemon publishes", async () => {

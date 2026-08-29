@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 import { getDataDir } from "../../../shared/data-path";
 import { McHostClient } from "../../../shared/mc-host-client";
+import { connectionFilePath, resolveLifecycleDataRoot } from "../../../shared/mc-host-lifecycle";
 
 /** The sole wire-level coupling between standalone smart notes and scheduled wakes. */
 export const WAKE_PLANE_CAPABILITY = "wake.create";
@@ -32,6 +33,14 @@ let readPublication: PublicationReader = readDaemonPublication;
 let now = () => Date.now();
 
 function connectionFile(): string {
+    // The managed lifecycle owner publishes the daemon under the lifecycle data
+    // root, and this file is both what the catalog probe dials and what binds a
+    // retained answer to its daemon. Both must agree with that resolver, or a
+    // managed start publishes somewhere this never reads. The application
+    // storage resolver only backstops environments where no lifecycle root
+    // resolves at all.
+    const root = resolveLifecycleDataRoot(process.env);
+    if (root.ok) return connectionFilePath(root.root);
     return join(getDataDir(), "cortexkit", "run", "subc-connection.json");
 }
 
@@ -145,5 +154,6 @@ export const __wakePlaneTest = {
     setNow(clock: () => number): void {
         now = clock;
     },
+    connectionFile,
     ttlMs: WAKE_PLANE_STATUS_TTL_MS,
 };
