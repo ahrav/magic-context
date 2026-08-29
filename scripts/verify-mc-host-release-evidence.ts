@@ -222,6 +222,31 @@ function ghAttestationJson(
 }
 
 /**
+ * Compares an observed workflow-run-attempt payload against the claimed source.
+ *
+ * The workflow path is compared without its ref suffix. GitHub's documented
+ * example response for a run attempt reports `path` with a ref appended
+ * (`.github/workflows/build.yml@main`) while observed responses for a directly
+ * triggered workflow return the bare path, and a fail-closed gate that accepts
+ * only one of those two forms could never pass against the other. Dropping the
+ * ref costs nothing here: the ref is a mutable label, and the immutable binding
+ * is `head_sha`, which is compared separately and exactly. `buildConfigURI` is
+ * already normalized the same way when the certificate is checked.
+ */
+export function workflowRunAttemptMatchesSource(
+    observed: Record<string, unknown>,
+    source: WorkflowSource,
+    attempt: string,
+): boolean {
+    return (
+        observed.head_sha === source.headSha &&
+        typeof observed.path === "string" &&
+        observed.path.split("@", 1)[0] === source.workflow &&
+        String(observed.run_attempt) === attempt
+    );
+}
+
+/**
  * Confirms the attempt that signed the artifacts is the attempt that succeeded.
  *
  * `detail` separates a transport or permission failure (missing `gh`, no auth,
@@ -255,11 +280,7 @@ function verifyWorkflowRunAttempt(
     if (observed.conclusion !== "success") {
         return { ok: false, detail: `attempt ${attempt} concluded ${String(observed.conclusion)}` };
     }
-    if (
-        observed.head_sha !== source.headSha ||
-        observed.path !== source.workflow ||
-        String(observed.run_attempt) !== attempt
-    ) {
+    if (!workflowRunAttemptMatchesSource(observed, source, attempt)) {
         return { ok: false, detail: `attempt ${attempt} does not match the claimed source` };
     }
     return { ok: true, detail: "" };

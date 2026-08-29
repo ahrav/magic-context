@@ -9,6 +9,7 @@ import {
     validateInstalledReleaseEvidence,
     validateInstalledReleaseEvidenceAgainstArtifacts,
     workflowRunApiPath,
+    workflowRunAttemptMatchesSource,
 } from "./verify-mc-host-release-evidence";
 
 function matchingAttestation(
@@ -652,6 +653,54 @@ describe("installed release evidence", () => {
             // rejected and attempt 2 carries the release.
             expect(runChecks).toEqual(["1", "2"]);
         }
+    });
+
+    test("a run attempt matches whether or not its path carries a ref suffix", () => {
+        const source = {
+            runUrl: "https://github.com/ahrav/magic-context/actions/runs/123456",
+            repository: "ahrav/magic-context",
+            headSha: "a".repeat(40),
+            workflow: ".github/workflows/mc-host-release-qualification.yml",
+        };
+        const observed = (path: string, overrides: Record<string, unknown> = {}) => ({
+            head_sha: "a".repeat(40),
+            path,
+            run_attempt: 2,
+            ...overrides,
+        });
+        // Observed responses return the bare path; GitHub's documented example
+        // for a run attempt appends the ref. Both denote the same workflow.
+        expect(
+            workflowRunAttemptMatchesSource(observed(source.workflow), source, "2"),
+        ).toBe(true);
+        expect(
+            workflowRunAttemptMatchesSource(
+                observed(`${source.workflow}@refs/heads/main`),
+                source,
+                "2",
+            ),
+        ).toBe(true);
+        expect(
+            workflowRunAttemptMatchesSource(observed(`${source.workflow}@main`), source, "2"),
+        ).toBe(true);
+        // The ref is dropped, never the rest of the claim.
+        expect(
+            workflowRunAttemptMatchesSource(
+                observed(".github/workflows/untrusted.yml@main"),
+                source,
+                "2",
+            ),
+        ).toBe(false);
+        expect(
+            workflowRunAttemptMatchesSource(
+                observed(source.workflow, { head_sha: "b".repeat(40) }),
+                source,
+                "2",
+            ),
+        ).toBe(false);
+        expect(
+            workflowRunAttemptMatchesSource(observed(source.workflow), source, "1"),
+        ).toBe(false);
     });
 
     test("an attestation without a run attempt is not a binding", () => {
