@@ -131,24 +131,35 @@ The host additionally maintains `${dataDir}/cortexkit/run/mc-host-lifecycle.json
 
 `phase` is `starting` (after lock acquisition, before publication), `running` (after publication), or `stopping` (from graceful-shutdown step 1). `pid` is display metadata only: no reader may signal it, infer liveness from it, or authorize anything with it. Record cleanup is fenced by matching launch and daemon identity and runs under the instance lock before lock release, mirroring publication cleanup.
 
-Lifecycle state is derived from lock ownership plus this evidence, never from PID existence:
+`payload_manifest_digest` is required payload identity: exactly 64 lowercase hex characters, validated as host input before any lock is taken, and byte-identical across every `starting`, `running`, and `stopping` record one incarnation writes. An empty, oversized, or otherwise noncanonical digest never decodes as a valid record, so it can never support a `running` classification. A record whose JSON carries an unknown `schema` is quarantined: its bytes are preserved byte-for-byte, probes classify it `unsupported_state_schema`, and a host start against it fails closed rather than interpreting, migrating, or overwriting it.
 
-| Instance lock | Evidence | State |
-| --- | --- | --- |
-| free | anything, including stale record or publication | `stopped`; nothing is unlinked |
-| held | fresh `starting` record, with or without a predecessor's leftover publication | `starting` |
-| held | `running` record and publication with the same daemon ID | `running` |
-| held | `running` record with a missing or daemon-ID-mismatched publication | `wedged` |
-| held | fresh `stopping` record, with or without a predecessor's leftover publication | `stopping` |
-| held | missing, corrupt, insecure, or expired *record*, or a corrupt or insecure *publication* (any phase) | `wedged` |
+Lifecycle state is derived from lock ownership plus this evidence, never from PID existence. Two locks participate: the stable lifetime fence (`lifetime.lock`, below) and the runtime-directory instance lock.
 
-A missing publication is `wedged` only under a `running` record (the row above); `starting` and `stopping` require no publication at all.
+| Lifetime fence | Instance lock | Evidence | State |
+| --- | --- | --- | --- |
+| free | free | anything, including stale record or publication | `stopped`; nothing is unlinked |
+| free | free | record with an unknown schema | `stopped` with `unsupported_state_schema`; bytes preserved |
+| held | free (or the runtime directory is missing) | anything | `wedged` after a bounded reread: a live incarnation's namespace was replaced, or a start/teardown window persisted |
+| free | held | anything | `wedged` after a bounded reread: a holder without the stable fence is never coherent |
+| held | held | fresh `starting` record, with or without a predecessor's leftover publication | `starting` |
+| held | held | `running` record and publication with the same daemon ID | `running` |
+| held | held | `running` record with a missing or daemon-ID-mismatched publication | `wedged` |
+| held | held | fresh `stopping` record, with or without a predecessor's leftover publication | `stopping` |
+| held | held | record with an unknown schema | `wedged` with `unsupported_state_schema`; bytes preserved |
+| held | held | missing, corrupt, insecure, or expired *record* (including a noncanonical digest), or a corrupt or insecure *publication* (any phase) | `wedged` |
+
+A missing publication is `wedged` only under a `running` record (the row above); `starting` and `stopping` require no publication at all. A free replacement runtime-directory lock is never proof that the first daemon ended; only the stable lifetime fence proves that.
 
 A publication whose daemon ID differs from the record's is crash residue during `starting` and `stopping`: a killed incarnation leaves its publication behind, and its successor writes a `starting` record before its own publication overwrites the file (symmetrically, an incarnation that fails before publishing demotes to `stopping` without ever owning the leftover). Only the `running` claim requires the publication to match the record; the freshness windows still age a hung start or stop to `wedged`.
 
 `wedged` is observational: probes and clients MUST NOT kill processes, break locks, or repair files. Probes use a validation-only opener (no create, no chmod, no link following, and no blocking on a non-regular file), test the instance lock nonblockingly and in shared mode so concurrent probes cannot alias each other into a false holder reading, and reread evidence boundedly when identities change mid-sample. Because a daemon must hold the instance lock before it can write its `starting` record, a held lock with no record is rechecked over a bounded grace window before it classifies `wedged`. An evidence name that is present but not a secure regular file — a symlink, FIFO, directory, or wrong owner or mode — is `insecure`, never `missing`.
 
-A separate owner-only directory, `${dataDir}/cortexkit/lifecycle`, carries the cross-process lifecycle transaction lock on its directory inode: mutating lifecycle transactions (launcher start/stop, owned by downstream packaging work) take it exclusively, and probes take it shared when it exists. It is distinct from the runtime-directory instance lock, which only the daemon holds for its whole incarnation.
+Cross-process lifecycle serialization lives in a fixed, version-neutral, owner-only directory directly under the data root: `${dataDir}/.mc-host-coordination/`, containing the never-renamed regular files `transaction.lock` and `lifetime.lock`. Supported code never renames, replaces, or unlinks the directory or either file; same-UID replacement of that root or an ancestor is trusted-policy replacement outside this boundary.
+
+- `transaction.lock` carries the exclusive flock serializing mutating lifecycle transactions (launcher start/stop, owned by downstream packaging work); probes take it shared, without creating anything, when it exists. Shared acquisition is bounded, not awaited: four attempts 25 ms apart, after which a probe that still finds a mutator holding the lock samples on evidence alone. A probe therefore does not always exclude an in-flight mutation, and may observe an intermediate lifecycle state; the bounded reread loop, not the lock, is what makes such a sample coherent. Lock absence degrades the same way, since a probe never creates the coordination root.
+- `lifetime.lock` carries the daemon's whole-incarnation exclusive flock, acquired before the runtime-directory instance lock and held through publication cleanup, component shutdown, and callback reaping.
+
+Neither the runtime-directory inode nor a lock on the managed `${dataDir}/cortexkit/lifecycle` directory prevents replacement-induced overlap on its own: both live inside the replaceable managed subtree, so renaming `run`, `lifecycle`, or the whole `cortexkit` tree would let a successor anchor fresh inodes under the same names. Because the coordination files sit outside that subtree and are never renamed, replacing the managed subtree cannot split either lock: a mutator still contends on the same `transaction.lock` inode, and a successor daemon still blocks on the same `lifetime.lock` inode until the displaced incarnation fully tears down. The runtime-directory instance lock remains as the descriptor-relative publication/cleanup fence. A mutator holding `transaction.lock` must additionally anchor named-namespace mutations to retained `cortexkit`/child descriptors and abort its named-namespace result when parent or child identity drifts.
 
 ## 5. Pre-envelope authentication
 
@@ -206,7 +217,7 @@ Those proofs use key bytes `00..1f`, client nonce `20..3f`, server nonce `40..5f
 
 ```text
 HMAC-SHA256(key, ASCII(D) || client_nonce || server_nonce ||
-            u32be(len(daemon_ver)) || UTF8(daemon_ver) || daemon_id)
+            u32be(len(UTF8(daemon_ver))) || UTF8(daemon_ver) || daemon_id)
 ```
 
 `u32be(len(daemon_ver))` is the byte length of the UTF-8 `daemon_ver` encoded as a **big-endian** `u32`. It is the only big-endian integer in this otherwise little-endian protocol; the length prefix keeps the transcript injective because `daemon_ver` is the only variable-length field between the fixed-length nonces and the trailing `daemon_id`. Binding `daemon_ver` into both proofs means a peer without the key cannot tamper with the reported daemon version: a substituted version fails the server-proof check on the client and the client-auth check on the host.
@@ -333,6 +344,7 @@ Before filesystem work or handler bind, host MUST enforce these UTF-8 byte limit
 | `consumer_identity.launch_nonce` | 256 bytes; no NUL |
 | each consumer capability | 64 bytes; at most 32 entries |
 | `admission_facts` | at most 8,192 encoded bytes and 32 nesting levels |
+| `identity.credential_fingerprints` | optional object; keys only `anthropic`, `google`, `openai`; at most 3 entries; each value exactly 64 lowercase hex |
 
 Malformed JSON, duplicate recognized fields, invalid UTF-8, invalid field type, excessive nesting, out-of-range field, or relative project root receives terminal `invalid_control_request` for that correlation. Unknown fields are ignored for published serde forward compatibility but still count toward body and nesting limits. `admission_facts` size is its compact UTF-8 JSON serialization; collection depth is 1 at the subtree root and increases for each nested object/array. No handler callback or filesystem work runs on rejection. `BindIdentity` still grants no authority. Host MAY verify an absolute project root against its real filesystem when handler semantics require it; caller and handler MUST NOT derive privilege from existence or path spelling. Error `code` is stable; `message` is diagnostic unless this document states exact text.
 
@@ -344,7 +356,7 @@ Required compact canonical request:
 {"op":"route.open","target":{"kind":"tool_provider","module_id":"magic-context"},"identity":{"project_root":"/workspace/project","harness":"opencode","session":"session-1"}}
 ```
 
-Optional `consumer_identity` is `{module_id, launch_nonce}`. Optional `consumer_capabilities` is an array of strings. Optional `admission_facts` is any bounded JSON value. Absence means no claim/capability/facts; it is not a denied claim. The bearer key remains authority.
+Optional `consumer_identity` is `{module_id, launch_nonce}`. Optional `consumer_capabilities` is an array of strings. Optional `admission_facts` is any bounded JSON value. Managed callers may include `identity.credential_fingerprints`, a provider-to-HMAC map derived from the authenticated connection bearer and the current qualified credential row. The derived key is `HMAC-SHA256(connection_key, "subc-broca-credential-v1")`; each value is `HMAC-SHA256(derived_key, canonical_row_encoding)` rendered as 64 lowercase hex, where canonical row encoding is the U9 length-prefixed `harness-provider-name-length-value/1` contract. Values are protocol-internal and never credentials. Absence means no claim/capability/facts; it is not a denied claim. The bearer key remains authority.
 
 Successful response MUST retain the tag:
 
@@ -364,7 +376,7 @@ The direct profile routes exactly three static target pairs. Classification runs
 | any recognized kind above | any other module | terminal `unknown_module`; zero bind calls |
 | any other kind (`internal_service`, model-runner kinds, unknown strings) | any module | terminal `target_unavailable`; zero bind calls |
 
-A successful classification carries the validated typed target into the handler bind, so the composite dispatches on host-validated data and never re-parses the client body. The Synapse target stays in this matrix even when its model bundle is missing or invalid: classification still succeeds, the bind is invoked, and the component rejects it with terminal `artifact_invalid` (Section 7.5.1). The Broca component serves the five-operation LLM-run management protocol consumed by `HistorianProducer` (`session.send`, `session.subscribe`, `run.status`, `run.cancel`, `session.delete`); its application protocol is specified by the Broca revision that implements it, not this section. That protocol's load-bearing properties for this profile are: run lifetime is detached from transport lifetime (waiter loss never stops a run; only `run.cancel`, `session.delete`, or host shutdown does, and each terminates and reaps the complete harness subprocess group before settling), run state is process-local and bounded (a restarted host reports old run IDs as strict `missing`), and subprocess execution is confined to the hardened OpenCode/Pi adapter trust boundary (no shell, private prompt delivery, daemon-owned environment snapshot, bounded redacted output). A Broca bind additionally requires harness `opencode` or `pi`; any other harness is rejected at bind with `invalid_identity` and no run state. Dynamic routing, provider discovery, and `internal_service` routing remain outside this document.
+A successful classification carries the validated typed target into the handler bind, so the composite dispatches on host-validated data and never re-parses the client body. The Synapse target stays in this matrix even when its model bundle is missing or invalid: classification still succeeds, the bind is invoked, and the component rejects it with terminal `artifact_invalid` (Section 7.5.1). The Broca component serves the five-operation LLM-run management protocol consumed by `HistorianProducer` (`session.send`, `session.subscribe`, `run.status`, `run.cancel`, `session.delete`); its application protocol is specified by the Broca revision that implements it, not this section. That protocol's load-bearing properties for this profile are: run lifetime is detached from transport lifetime (waiter loss never stops a run; only `run.cancel`, `session.delete`, or host shutdown does, and each terminates and reaps the complete harness subprocess group before settling), run state is process-local and bounded (a restarted host reports old run IDs as strict `missing`), and subprocess execution is confined to the hardened OpenCode/Pi adapter trust boundary (no shell, private prompt delivery, provider-scoped child environment, bounded redacted output). Before `session.send` creates a run, Broca derives the requested provider row fingerprint from its frozen startup snapshot and incarnation bearer and constant-time compares it with the route-frozen managed caller value; missing, oversize, unsupported, or changed rows return `harness_unavailable` with the closed credential subreason and spawn no child. A Broca bind additionally requires harness `opencode` or `pi`; any other harness is rejected at bind with `invalid_identity` and no run state. Dynamic routing, provider discovery, and `internal_service` routing remain outside this document.
 
 The direct component exposes no `thalamus` resolver route. A facade request without an explicit or route-bound session returns the existing typed `session_unresolved` result locally and opens no resolver transport route. Bound OpenCode sessions retain their proven direct path.
 
@@ -377,7 +389,7 @@ Requests MAY omit `module_id` to list all entries or supply a filter. Unknown fi
 ```
 
 ```json
-{"op":"catalog.list","generation":1,"modules":[],"subc_ops":["route.open","catalog.list","host.shutdown","transport.negotiate"]}
+{"op":"catalog.list","generation":1,"modules":[],"subc_ops":["route.open","catalog.list","host.shutdown","host.status","transport.negotiate"]}
 ```
 
 An unfiltered request MUST return exactly three entries — `magic-context`, then `synapse`, then `broca`, in that deterministic order — and an exact-module filter MUST return that one entry, each derived without lossy rewriting from its startup manifest:
@@ -390,7 +402,7 @@ An unfiltered request MUST return exactly three entries — `magic-context`, the
 | `modules[i].module_version` | that manifest's exact build version |
 | `modules[i].roles` | that manifest's complete `provides` array, including tool schemas |
 | `modules[i].control_ops` | implemented module control operations only; the direct profile never includes `wake.create` |
-| `subc_ops` | `route.open`, `catalog.list`, `host.shutdown`, `transport.negotiate` |
+| `subc_ops` | `route.open`, `catalog.list`, `host.shutdown`, `host.status`, `transport.negotiate` |
 
 `transport.activate` and `transport.commit` (Section 7.7) are candidate-channel-only operations and MUST NOT appear in `subc_ops`: the catalog advertises bootstrap channel-0 capabilities, and those two operations are never valid on a bootstrap connection.
 
@@ -398,7 +410,7 @@ The Synapse and Broca entries are immutable identity, not readiness: each stays 
 
 ### 7.4 Operation classification
 
-`route.open`, `catalog.list`, `host.shutdown` (Section 7.6), and `transport.negotiate` (Section 7.7) are the only required channel-0 operations. Every other operation receives terminal `unsupported_operation`; host stays connected if framing remains valid. `transport.activate` and `transport.commit` are candidate-channel-only (Section 7.7): on a bootstrap connection they are unrecognized operations and receive terminal `unsupported_operation` like any other. A client health operation MUST NOT proxy handler health, which remains host-internal.
+`route.open`, `catalog.list`, `host.shutdown` (Section 7.6), `host.status` (Section 7.6), and `transport.negotiate` (Section 7.7) are the only required channel-0 operations. Every other operation receives terminal `unsupported_operation`; host stays connected if framing remains valid. `transport.activate` and `transport.commit` are candidate-channel-only (Section 7.7): on a bootstrap connection they are unrecognized operations and receive terminal `unsupported_operation` like any other. `host.status` reads the last completed host-owned health snapshot; it never invokes a handler callback on the requesting connection and exposes only closed component states and sanitized metrics, never handler detail text.
 
 Canonical error body:
 
@@ -535,9 +547,46 @@ Both languages MUST produce identical bytes: UTF-8 pass-through for non-ASCII, t
 | request-key golden vectors | `crates/mc-host/src/synapse/protocol.rs` (unit tests), `packages/plugin/src/features/magic-context/memory/embedding-synapse.test.ts` (matching TypeScript golden test) |
 | durable ledger recovery, receipts, atomic application | `packages/plugin/src/features/magic-context/migrations-v83.test.ts`, `storage-embedding-measurements.test.ts`, domain writer suites |
 
-### 7.6 `host.shutdown`
+### 7.6 `host.status` and `host.shutdown`
 
-Authenticated host-global stop. Request and success response are both compact tagged objects; unknown request fields are ignored under the Section 7.1 bounds:
+`host.status` is a bearer-authenticated, route-free readiness observation:
+
+```json
+{"op":"host.status"}
+```
+
+The response has `op:"host.status"`, `health:"ok|degraded|failing"`, and a
+sanitized `metrics.components` object. The fixed profile reports Magic
+Context `storage_state` as `ready | starting | unavailable`, Synapse
+`synapse_state` as `ready | starting | degraded | unsupported`, and Broca
+`broca_state` as `ready | unavailable`. It reads the latest host-owned health
+snapshot and sends no routed application body. During post-publication
+activation, starting components refresh on a bounded 50 ms cadence; after
+activation settles, polling returns to the configured health interval.
+Handler detail strings are tainted and omitted.
+
+The `magic-context` component additionally carries a sanitized
+`metrics.epochs` object holding exactly these five compatibility epochs, in
+this order:
+
+| epoch | meaning |
+| --- | --- |
+| `memory_render_epoch` | memory render format |
+| `compartment_render_epoch` | compartment render format |
+| `profile_epoch` | serializer profile |
+| `tagger_epoch` | tagger feature |
+| `state_sync_epoch` | state-sync format |
+
+Sanitization is all-or-nothing and admits only the exact set: the object MUST
+carry all five names, no others, and each value MUST be an unsigned integer no
+greater than `u32::MAX`. Any unknown key, missing key, extra key, or
+out-of-range or non-integer value drops the whole `epochs` object from the
+response rather than reporting a partial set. Managed clients treat a missing
+or unequal epoch as a hard compatibility failure, so a host that omits
+`epochs` fails every managed lifecycle gate; adding a sixth epoch is a
+breaking change on both sides, never an additive one.
+
+`host.shutdown` is the authenticated host-global stop. Request and success response are both compact tagged objects; unknown request fields are ignored under the Section 7.1 bounds:
 
 ```json
 {"op":"host.shutdown"}
@@ -988,10 +1037,11 @@ Every scenario has one required outcome. These are review vectors; executable fi
 | V52 | First post-auth request is application traffic or another control operation | Host retires setup generation; zero application dispatch and no TCP continuation |
 | V53 | Negotiation receives `unsupported_operation`, `connection_in_use`, malformed response, version mismatch, or unoffered selection | Client retires generation; no application request continues on TCP |
 | V54 | Optional candidate unavailable or capability version mismatched | Valid negotiation explicitly selects offered TCP with the matching fallback reason; generation may continue |
+| V55 | Authenticated `host.status` during post-publication activation | One route-free response reports separate closed component states; no routed application body is sent, handler detail is omitted, and starting storage refreshes until ready or unavailable |
 
 ### 14.1 Fixture oracle
 
-Fixtures MUST use committed literal bytes and an independent decoder/oracle; importing production proof, header, or frame helpers to generate expected values proves only self-consistency. V1-V54 define deterministic cases. A green suite establishes only that checked implementations, vectors, schedules, platforms, and bounds passed. Broad Rust E2E, mutation, performance, and release qualification remain owned by `magic-context-c50.9`.
+Fixtures MUST use committed literal bytes and an independent decoder/oracle; importing production proof, header, or frame helpers to generate expected values proves only self-consistency. V1-V55 define deterministic cases. A green suite establishes only that checked implementations, vectors, schedules, platforms, and bounds passed. Broad Rust E2E, mutation, performance, and release qualification remain owned by `magic-context-c50.9`.
 
 ## 15. Consumer traceability
 
