@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildContract, canonicalJson, sha256Hex } from "./generate-mc-host-release-manifest";
@@ -218,6 +218,9 @@ function installProofArtifacts(
                     ? {
                           cli_commands_passed: flowEvidence?.cli_commands_passed,
                           managed_demand_passed: flowEvidence?.managed_demand_passed,
+                          package_integrity: registry.find(
+                              (entry) => entry.name === proof.subject,
+                          )?.integrity,
                           offline_verified: flowEvidence?.offline_verified,
                       }
                     : proof.kind === "publication"
@@ -682,12 +685,64 @@ describe("installed release evidence", () => {
         expect(() =>
             validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true),
         ).toThrow(/qualification workflow at .*mc-host-release-qualification\.yml/);
-        // A stub still bypasses it: the precondition is about the `gh` path only.
+        // With the workflow present the next unmet precondition must surface, not
+        // a permissive verification: an unpinned source ref lets the approved
+        // workflow authorize GA from any branch.
+        const workflow = ".github/workflows/mc-host-release-qualification.yml";
+        mkdirSync(dirname(join(root, workflow)), { recursive: true });
+        writeFileSync(join(root, workflow), "name: placeholder\n");
+        expect(() =>
+            validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true),
+        ).toThrow(/requires an attestation source ref/);
+        // A stub still bypasses both: the preconditions are about the `gh` path.
         expect(() =>
             validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, {
                 verifyAttestation: () => true,
             }),
         ).not.toThrow();
+    });
+
+    test("a parent flow proof cannot pass without naming the published artifact", () => {
+        const root = mkdtempSync(join(tmpdir(), "mc-host-installed-evidence-"));
+        const evidence = qualifiedEvidence();
+        installProofArtifacts(root, evidence);
+        installRegistryGate(root);
+        for (const [field, relative] of Object.entries({
+            production_inputs_sha256:
+                "release/mc-host-production-inputs.lock.json",
+            qualification_sha256:
+                "docs/evidence/mc-host-release-qualification.json",
+            payload_index_sha256: "release/mc-host-payload-index.json",
+            stop_provenance_sha256: "release/mc-host-n-minus-one-stop.json",
+        })) {
+            const bytes = citedArtifactBytes(field);
+            mkdirSync(dirname(join(root, relative)), { recursive: true });
+            writeFileSync(join(root, relative), bytes);
+            evidence[field] = sha256Hex(bytes);
+        }
+        // Rewrite one flow proof so it reports the same three passing booleans
+        // against a different artifact — the source-checkout / stale-install case.
+        // The proof stays byte-consistent with its recorded digest, so only the
+        // integrity binding can reject it.
+        const proofs = evidence.proof_artifacts as {
+            kind: string;
+            path: string;
+            sha256: string;
+        }[];
+        const flowProof = proofs.find((entry) => entry.kind === "product_flow");
+        if (flowProof === undefined) throw new Error("no product_flow proof");
+        const report = JSON.parse(
+            readFileSync(join(root, flowProof.path), "utf8"),
+        ) as { observations: Record<string, unknown> };
+        report.observations.package_integrity = "sha512-someotherartifact";
+        const rewritten = `${canonicalJson(report)}\n`;
+        writeFileSync(join(root, flowProof.path), rewritten);
+        flowProof.sha256 = sha256Hex(rewritten);
+        expect(() =>
+            validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, {
+                verifyAttestation: () => true,
+            }),
+        ).toThrow(/product_flow:.* observations drift/);
     });
 
     test("canonical evidence has a stable digest", () => {

@@ -53,6 +53,25 @@ const ATTESTATION_SIGNER_WORKFLOW_PATH =
     ".github/workflows/mc-host-release-qualification.yml";
 const ATTESTATION_SIGNER_WORKFLOW = `${ATTESTATION_REPO}/${ATTESTATION_SIGNER_WORKFLOW_PATH}`;
 
+/**
+ * The source ref an attestation must have been produced from, or `null` if the
+ * release-qualification policy has not chosen one yet.
+ *
+ * `--repo` plus `--signer-workflow` still admits any revision of the approved
+ * workflow, so the same workflow run from a feature branch authorizes GA. `gh`
+ * constrains this with `--source-ref` (and `--source-digest` for an exact
+ * revision), but the correct value is a policy decision this repository has not
+ * made: there is no release-tag convention to derive it from — the only tag is
+ * `premerge-pr32` — and inventing one here would bake in a rule nobody agreed
+ * to.
+ *
+ * So the slot is declared and left empty rather than defaulted to permissive:
+ * GA verification refuses while it is `null`, which forces the decision instead
+ * of silently trusting every revision. Set it to the ref GA releases are cut
+ * from (`refs/tags/...` or `refs/heads/main`) when that is settled.
+ */
+const ATTESTATION_SOURCE_REF: string | null = null;
+
 const RUN_URL_RE = new RegExp(
     `^https://github\\.com/${ATTESTATION_REPO}/actions/runs/\\d+`,
 );
@@ -707,6 +726,14 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
                     "no attestation can match the pinned signer identity until that lane is built",
             );
         }
+        // Refusing beats defaulting to permissive: without a source-ref
+        // constraint the approved workflow authorizes GA from any branch.
+        if (ATTESTATION_SOURCE_REF === null) {
+            fail(
+                "GA verification requires an attestation source ref, which release policy has not chosen; " +
+                    "set ATTESTATION_SOURCE_REF to the ref GA releases are cut from",
+            );
+        }
     }
     for (const proof of evidence.proof_artifacts) {
         const bytes = readFileSync(join(rootDir, proof.path));
@@ -804,6 +831,18 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
                     ? {
                           cli_commands_passed: flow.cli_commands_passed,
                           managed_demand_passed: flow.managed_demand_passed,
+                          // Without this the flow proof is three booleans that
+                          // say nothing about *what* was exercised, so a run
+                          // against a source checkout, a staged tarball, or a
+                          // stale install passes identically to one against the
+                          // published artifact. The registry proof establishes
+                          // that a package with this integrity exists; naming it
+                          // here is what ties those bytes to the behavior. Target
+                          // proofs already carry `package_integrity` for the same
+                          // reason.
+                          package_integrity: evidence.registry_packages.find(
+                              (entry) => entry.name === flow.package,
+                          )?.integrity,
                           offline_verified: flow.offline_verified,
                       }
                     : proof.kind === "publication"
@@ -841,6 +880,9 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
                         ATTESTATION_REPO,
                         "--signer-workflow",
                         ATTESTATION_SIGNER_WORKFLOW,
+                        ...(ATTESTATION_SOURCE_REF === null
+                            ? []
+                            : ["--source-ref", ATTESTATION_SOURCE_REF]),
                     ],
                     { cwd: rootDir, stdio: "ignore" },
                 ).status === 0;
