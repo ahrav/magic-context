@@ -27,7 +27,7 @@ Memories come from two sources:
 ctx_memory(action="write", category="ARCHITECTURE", content="Event sourcing for orders.")
 ```
 
-The agent can write and delete memories. Other actions (update, merge, archive) are available to the dreamer and the dashboard.
+The agent can write and delete memories. Other actions (update, merge, archive) are available to the dreamer.
 
 **Historian promotion.** When the [historian](/concepts/historian/) compresses a chunk of conversation, it extracts durable facts in the same 5-category taxonomy. Promotable facts are deduplicated against existing memories and inserted automatically. Most memories in a mature project come from historian promotion — the memory builds itself from work you're already doing.
 
@@ -39,7 +39,7 @@ Each memory has one of three statuses:
 - **permanent** — pinned. Permanent memories are protected from archival by the dreamer.
 - **archived** — soft-deleted. Archived memories don't inject but remain in the database with provenance.
 
-You can set a memory to permanent through the dashboard or the desktop app. The dreamer uses archive to retire stale memories.
+Memories can be marked permanent to pin them. The dreamer uses archive to retire stale memories.
 
 ## How memories inject
 
@@ -59,11 +59,11 @@ The dreamer's **classify-memories** task scores each memory on importance, scope
 
 ## Workspaces
 
-A **workspace** groups multiple project repos so their project memories pool across member sessions — useful for multi-repo microservice setups where the same constraints and architecture decisions apply across services. Create a workspace in the [dashboard](/reference/dashboard/), add member projects, and choose which memory categories are shared (CONSTRAINTS only, by default). Shared visibility is read-only: member projects can read shared categories from neighbors, but only the owning project can update, archive, or merge its own memories. A malformed `share_categories` list fails closed to sharing nothing rather than accidentally sharing everything.
+A **workspace** groups multiple project repos so their project memories pool across member sessions — useful for multi-repo microservice setups where the same constraints and architecture decisions apply across services. Workspace membership lives in the shared database; choose which memory categories are shared (CONSTRAINTS only, by default). Shared visibility is read-only: member projects can read shared categories from neighbors, but only the owning project can update, archive, or merge its own memories. A malformed `share_categories` list fails closed to sharing nothing rather than accidentally sharing everything.
 
 ## Editing memories
 
-The desktop app and dashboard provide a memory browser where you can search, filter, and edit project memories by category and project. Changes made outside the session signal running sessions to refresh their memory injection on the next cache-safe pass.
+The agent edits memories with `ctx_memory`, and the dreamer maintains them in the background. Changes made outside the session (for example, by the CLI doctor) signal running sessions to refresh their memory injection on the next cache-safe pass.
 
 ## Project-scoped and shared
 

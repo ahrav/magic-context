@@ -108,7 +108,7 @@ Agent: ctx_memory({ "action": "write", "category": "CONSTRAINTS",
 Tool: Memory #42 written (CONSTRAINTS).
 ```
 
-Edit memories in the [dashboard](/reference/dashboard/) Mem tab; running sessions pick up changes automatically.
+Edit memories with `ctx_memory` or the CLI doctor; running sessions pick up changes automatically.
 
 ## ctx_search
 

@@ -24,8 +24,7 @@
   <a href="#-consolidate">Consolidate</a> ·
   <a href="#-recall">Recall</a> ·
   <a href="https://docs.cortexkit.io/magic-context">Docs</a> ·
-  <a href="./CONFIGURATION.md">Configuration</a> ·
-  <a href="https://github.com/cortexkit/magic-context/releases?q=dashboard&expanded=true">Dashboard</a>
+  <a href="./CONFIGURATION.md">Configuration</a>
 </p>
 
 ---
@@ -100,7 +99,7 @@ Then create `magic-context.jsonc` with the one setting the historian needs:
 - **Optional:** `dreamer` and `sidekick` model/disable blocks. Omit them to leave periodic memory consolidation and `/ctx-aug` off.
 - **Optional:** `embedding`. Omit it to use the local `Xenova/bge-small-en-v1.5`; turning embeddings off removes semantic/embedding-backed search, but keyword search and context management continue.
 
-User-level config is `~/.config/cortexkit/magic-context.jsonc` on macOS/Linux and `%USERPROFILE%\.config\cortexkit\magic-context.jsonc` on Windows (or `$XDG_CONFIG_HOME/cortexkit/magic-context.jsonc` when set). OpenCode Desktop users can use the dashboard's config editor or hand-edit that file; Desktop does not include the CLI setup wizard.
+User-level config is `~/.config/cortexkit/magic-context.jsonc` on macOS/Linux and `%USERPROFILE%\.config\cortexkit\magic-context.jsonc` on Windows (or `$XDG_CONFIG_HOME/cortexkit/magic-context.jsonc` when set). OpenCode Desktop users hand-edit that file; Desktop does not include the CLI setup wizard.
 
 **Pi:** `npx @cortexkit/magic-context@latest setup --harness pi` (requires Pi `>= 0.74.0`). The Pi extension shares the same database as OpenCode; project memories and embeddings pool across both.
 
@@ -224,25 +223,6 @@ Recall works **across sessions** (a new session inherits everything) and **acros
 | `/ctx-aug` | Run sidekick augmentation on a prompt: retrieve relevant memories via a separate model |
 | `/ctx-dream` | Run dreamer maintenance on demand: maintain memory, docs, smart notes, and user-profile review |
 | `/ctx-embed` | Embedding status, or start/pause history compartment embedding (`start` \| `pause`) |
-
----
-
-## Desktop app
-
-A companion desktop app for browsing and managing Magic Context state outside the terminal.
-
-<p align="center">
-  <a href="https://github.com/cortexkit/magic-context/releases?q=dashboard&expanded=true"><strong>⬇️ Download for macOS · Windows · Linux</strong></a>
-</p>
-
-- **Memory browser**: search, filter, and edit project memories by category and project.
-- **Session history**: browse compartments and notes for any session with timeline navigation.
-- **Cache diagnostics**: real-time cache hit/miss timeline and bust-cause detection.
-- **Dreamer management**: view dream-run history, trigger runs, inspect task results.
-- **Configuration editor**: form-based editing for every setting, including model fallback chains.
-- **Log viewer**: live-tailing logs with search.
-
-It reads directly from Magic Context's SQLite database. No extra server, no API. Auto-updates built in.
 
 ---
 

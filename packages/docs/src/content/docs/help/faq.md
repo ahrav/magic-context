@@ -56,7 +56,6 @@ This is about 130 MB and is downloaded on first use. It can be safely deleted �
 Yes.
 
 - **Via the agent:** Ask the agent to call `ctx_memory` with `action="write"` (add) or `action="archive"` (retire). This works in any session.
-- **Via the dashboard:** The [desktop app](https://github.com/cortexkit/magic-context/releases) has a memory browser that lets you search, filter, edit, and bulk-delete memories.
 
 Memories are scoped to a project (identified by git root commit hash). Deleting a memory removes it from all future sessions on that project.
 
@@ -98,10 +97,6 @@ npx @cortexkit/magic-context@latest doctor migrate \
 
 Use `--to omp` for OMP. Add `--dry-run` to preview without writing, or `--max-messages N` to migrate only the most recent N messages. See [Migrating between harnesses](/getting-started/migrating-between-harnesses/) for the full walkthrough. Reverse migration is not yet supported.
 
-## The dashboard shows no models / I'm on OpenCode Desktop only
-
-The dashboard's model pickers merge cached provider model lists refreshed in the background. Discovery is never exhaustive — you can always type a model id directly even when a discovered list is present. On OpenCode Desktop-only installs (no CLI alongside), the model list may be empty until you run a session once; type the model id (e.g. `claude-sonnet-4-6`) directly into the picker.
-
 ## Do memories from OpenCode appear in Pi?
 
 Yes. Project memories are stored in the shared database scoped by project identity (git root commit hash), not by harness. A memory written in an OpenCode session appears in the next Pi session for the same project, and vice versa.
@@ -112,8 +107,6 @@ Per-session state (compartments, tags, session facts) is scoped to the originati
 
 SQLite, in one exact format. A release opens a database only when it matches that format exactly, or when the location is empty and can be created from scratch. Anything else — a database written by an older release, a partial schema, a damaged marker — is refused and left untouched, with the reason logged. There is no in-place upgrade and no import.
 
-Recovering from a refusal is an explicit operator step, never a startup branch: `npx @cortexkit/magic-context@latest doctor reset-db` abandons the old database family, moving it aside so the next open creates a fresh one. It reports what it will move before it moves anything. Keep every Magic Context surface — OpenCode, Pi, the CLI, the dashboard — on the same release, since a database one of them owns is refused by an older one.
+Recovering from a refusal is an explicit operator step, never a startup branch: `npx @cortexkit/magic-context@latest doctor reset-db` abandons the old database family, moving it aside so the next open creates a fresh one. It reports what it will move before it moves anything. Keep every Magic Context surface — OpenCode, Pi, the CLI — on the same release, since a database one of them owns is refused by an older one.
 
 You can open and inspect the file with any SQLite tool, but do not write to it directly.
-
-The [desktop dashboard](https://github.com/cortexkit/magic-context/releases) provides a UI for viewing and editing the data that is safe to use.

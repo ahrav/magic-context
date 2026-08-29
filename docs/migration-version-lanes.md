@@ -39,7 +39,7 @@ and interrupted reset state.
 
 ## Runtime contract
 
-Before opening `context.db`, Bun, Node, and dashboard Rust writers probe an
+Before opening `context.db`, Bun and Node writers probe an
 approved WAL-reset-safe SQLite source on an off-path database. The root Rust
 module applies the same rule to `store.db`. Application connections verify:
 
@@ -48,7 +48,7 @@ module applies the same rule to `store.db`. Application connections verify:
 - configured busy timeout
 - declared synchronous mode
 
-OpenCode, Pi, CLI, dashboard, and `ck-mc` must ship and restart from the same
+OpenCode, Pi, CLI, and `ck-mc` must ship and restart from the same
 release. The format fence does not claim to stop a pre-cutover process that
 already passed its open checks.
 
