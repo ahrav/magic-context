@@ -15,7 +15,7 @@
  */
 
 import { execSync } from "node:child_process";
-import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import {
     HARD_NEGATIVE_FAMILIES,
@@ -371,16 +371,50 @@ function writePartialReport(
             system,
             ...(releaseVersion === null ? {} : { releaseVersion }),
         });
-        writeFileSync(partialReportPath(reportPath), `${JSON.stringify(report, null, 2)}\n`);
+        // Temp sibling then rename, because `writeFileSync` TRUNCATES before it
+        // writes: a failure partway — a full filesystem is the obvious one — would
+        // otherwise replace the accumulated evidence with truncated JSON, which is
+        // strictly worse than not writing at all and would falsify the guarantee
+        // below. `renameSync` within one directory is atomic, so the partial is
+        // either the previous complete report or the new one.
+        const destination = partialReportPath(reportPath);
+        const staging = `${destination}.tmp`;
+        try {
+            writeFileSync(staging, `${JSON.stringify(report, null, 2)}\n`);
+            renameSync(staging, destination);
+        } catch (error) {
+            rmSync(staging, { force: true });
+            throw error;
+        }
         return true;
     } catch (error) {
         // Never let progress bookkeeping fail a run that already has evidence on
-        // disk — a later write failing leaves the previous partial, which is stale
-        // but real. The caller decides; only the SEED write is fatal, because until
-        // the first scenario finishes it is the only report there is.
+        // disk — a failed write now leaves the previous partial intact, which is
+        // stale but real, because the write above is atomic. The caller decides;
+        // only the SEED write is fatal, because until the first scenario finishes it
+        // is the only report there is.
         console.error(`partial report not written: ${error instanceof Error ? error.message : String(error)}`);
         return false;
     }
+}
+
+/**
+ * Whether the three paths this run owns already exist in a shape it cannot use.
+ *
+ * Returns a diagnostic instead of throwing, so the caller can refuse as an
+ * admission failure before any provider traffic rather than surfacing a raw
+ * filesystem error from inside a scenario.
+ */
+function liveArtifactPathShapeError(reportPath: string, artifactsRoot: string): string | null {
+    for (const file of [resolve(reportPath), partialReportPath(reportPath)]) {
+        if (existsSync(file) && !lstatSync(file).isFile()) {
+            return `${file} exists and is not a regular file, so this run cannot write its report there`;
+        }
+    }
+    if (existsSync(artifactsRoot) && !lstatSync(artifactsRoot).isDirectory()) {
+        return `${artifactsRoot} exists and is not a directory, so this report's run records have nowhere to go`;
+    }
+    return null;
 }
 
 async function runLive(args: CliArgs): Promise<number> {
@@ -412,6 +446,17 @@ async function runLive(args: CliArgs): Promise<number> {
     // `clearPreviousLiveArtifacts`, ahead of everything that can reject.
     mkdirSync(reportDir, { recursive: true });
     const artifactsRoot = liveRunArtifactsDir(args.reportPath);
+    // Refused here rather than discovered inside the first scenario. All three paths
+    // are derived from a user-supplied report name, so each can already exist in the
+    // wrong shape — a previous audit written to `--report <this>-runs`, or a
+    // directory where a report file belongs. `clearPreviousLiveArtifacts` will not
+    // remove any of them, so left unchecked the collision surfaces as a raw ENOTDIR
+    // or EISDIR from deep inside the first scenario, after its tokens are spent.
+    const shapeError = liveArtifactPathShapeError(args.reportPath, artifactsRoot);
+    if (shapeError !== null) {
+        console.error(`live admission: ${shapeError}`);
+        return 1;
+    }
     // One entry per scenario from the start, replaced in place as each finishes.
     // Seeding the whole corpus is what makes every partial describe the whole
     // corpus, and what leaves evidence when the process dies inside the FIRST
@@ -498,11 +543,28 @@ async function runLive(args: CliArgs): Promise<number> {
  * a directory whose completed report had just been deleted — evidence that reads
  * as this invocation's.
  */
+/** Removes a path only when it is a regular file; see `clearPreviousLiveArtifacts`. */
+function removeIfFile(path: string): void {
+    if (existsSync(path) && lstatSync(path).isFile()) rmSync(path, { force: true });
+}
+
 function clearPreviousLiveArtifacts(reportPath: string): void {
     const reportDir = dirname(resolve(reportPath));
-    rmSync(resolve(reportPath), { force: true });
-    rmSync(partialReportPath(reportPath), { force: true });
-    rmSync(liveRunArtifactsDir(reportPath), { recursive: true, force: true });
+    // Both of these are derived from a user-supplied name, so neither is guaranteed
+    // to be the file shape this expects. `rmSync` without `recursive` throws on a
+    // directory, which would abort the run with a raw filesystem error instead of a
+    // diagnostic — so removal is limited to real files here and the shape is
+    // reported as an admission failure by `assertLiveArtifactPathsUsable`.
+    removeIfFile(resolve(reportPath));
+    removeIfFile(partialReportPath(reportPath));
+    // Only ever recursive-removes a real DIRECTORY. The suffix is user-spellable, so
+    // a completed audit written to `--report foo-runs` sits exactly where a later
+    // `--report foo` derives its records — and an unguarded recursive remove would
+    // delete that finished report to make room for a directory.
+    const records = liveRunArtifactsDir(reportPath);
+    if (existsSync(records) && lstatSync(records).isDirectory()) {
+        rmSync(records, { recursive: true, force: true });
+    }
 }
 
 async function main(): Promise<number> {
