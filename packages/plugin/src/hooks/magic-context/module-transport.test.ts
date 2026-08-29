@@ -25,6 +25,7 @@ import {
     waitUntil,
     writeConnectionFile,
 } from "../../shared/mc-host-client/test-support/test-util";
+import { WaiterDetachedError } from "../../shared/mc-host-lifecycle";
 import {
     __moduleTransportTest,
     buildManagedStartupEnvelope,
@@ -334,6 +335,37 @@ describe("McHostModuleTransport", () => {
         expect(events).toEqual(["demand"]);
     });
 
+    it("a detached caller does not arm the transport-wide connection backoff", async () => {
+        const events: string[] = [];
+        const transport = trackTransport(
+            new McHostModuleTransport({
+                requestTimeoutMs: 100,
+                demandStart: async () => {
+                    events.push("demand");
+                    throw new WaiterDetachedError("aborted");
+                },
+            }),
+        );
+
+        const detached = {
+            sessionId: "detached-caller",
+            projectRoot: "/workspace/project",
+            method: "transform",
+            body: { method: "transform", v: 1 },
+        } as const;
+        await expect(transport.call(detached)).rejects.toMatchObject({
+            name: "WaiterDetachedError",
+        });
+
+        // The backoff is transport-wide. One caller's own abort or deadline is no
+        // evidence about the daemon, so the next session still reaches the demand
+        // instead of failing on MC_HOST_CONNECTION_BACKOFF.
+        await expect(
+            transport.call({ ...detached, sessionId: "unrelated-caller" }),
+        ).rejects.toMatchObject({ name: "WaiterDetachedError" });
+        expect(events).toEqual(["demand", "demand"]);
+    });
+
     it("credential source changes rebind the managed route before another body", async () => {
         const peer = await startPeer();
         const dataHome = join(tempDir, `managed-home-${++fileCounter}`);
@@ -351,6 +383,7 @@ describe("McHostModuleTransport", () => {
                     ok: true,
                     reason: "already_running",
                     storage: "ready",
+                    authenticatedDaemonId: Uint8Array.from(peer.daemonId),
                 }),
             }),
         );
@@ -410,6 +443,39 @@ describe("McHostModuleTransport", () => {
             if (oldCredential === undefined) delete process.env.ANTHROPIC_API_KEY;
             else process.env.ANTHROPIC_API_KEY = oldCredential;
         }
+    });
+
+    it("rejects a rotated daemon before route open or application body", async () => {
+        const peer = await startPeer();
+        const connectionFile = await writeConnFile(peer);
+        const wrongDaemonId = Uint8Array.from(peer.daemonId);
+        wrongDaemonId[0] = (wrongDaemonId[0] ?? 0) ^ 1;
+        const transport = trackTransport(
+            new McHostModuleTransport({
+                connectionFile,
+                connectionOrigin: "managed-default",
+                requestTimeoutMs: 100,
+                demandStart: async () => ({
+                    ok: true,
+                    reason: "already_running",
+                    storage: "ready",
+                    authenticatedDaemonId: wrongDaemonId,
+                }),
+            }),
+        );
+
+        const error = await rejection(
+            transport.call({
+                sessionId: "rotated-daemon",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform", v: 1 },
+            }),
+        );
+        expect(__moduleTransportTest.isConnectionFailure(error)).toBe(true);
+        expect(peer.connections.flatMap((connection) => connection.frames).some(isRouteOpen)).toBe(
+            false,
+        );
     });
 
     it("surfaces a missing managed lifecycle owner before connection work", async () => {
@@ -727,13 +793,13 @@ describe("McHostModuleTransport", () => {
         ] as unknown as McHostClient[];
         const internals = transport as unknown as {
             client: McHostClient | null;
-            ensureConnected(): Promise<McHostClient>;
+            ensureConnected(): Promise<{ client: McHostClient; expectedDaemonId?: Uint8Array }>;
         };
         internals.ensureConnected = async () => {
             const client = clients[connectionCount++];
             if (!client) throw new Error("unexpected third connection attempt");
             internals.client = client;
-            return client;
+            return { client };
         };
 
         await expect(
@@ -773,11 +839,11 @@ describe("McHostModuleTransport", () => {
         } as unknown as McHostClient;
         const internals = transport as unknown as {
             client: McHostClient | null;
-            ensureConnected(): Promise<McHostClient>;
+            ensureConnected(): Promise<{ client: McHostClient; expectedDaemonId?: Uint8Array }>;
         };
         internals.ensureConnected = async () => {
             internals.client = client;
-            return client;
+            return { client };
         };
 
         const error = await rejection(
@@ -814,11 +880,11 @@ describe("McHostModuleTransport", () => {
         } as unknown as McHostClient;
         const internals = transport as unknown as {
             client: McHostClient | null;
-            ensureConnected(): Promise<McHostClient>;
+            ensureConnected(): Promise<{ client: McHostClient; expectedDaemonId?: Uint8Array }>;
         };
         internals.ensureConnected = async () => {
             internals.client = client;
-            return client;
+            return { client };
         };
 
         const error = await rejection(
@@ -848,11 +914,11 @@ describe("McHostModuleTransport", () => {
         } as unknown as McHostClient;
         const internals = transport as unknown as {
             client: McHostClient | null;
-            ensureConnected(): Promise<McHostClient>;
+            ensureConnected(): Promise<{ client: McHostClient; expectedDaemonId?: Uint8Array }>;
         };
         internals.ensureConnected = async () => {
             internals.client = client;
-            return client;
+            return { client };
         };
 
         await expect(
@@ -889,11 +955,11 @@ describe("McHostModuleTransport", () => {
         } as unknown as McHostClient;
         const internals = transport as unknown as {
             client: McHostClient | null;
-            ensureConnected(): Promise<McHostClient>;
+            ensureConnected(): Promise<{ client: McHostClient; expectedDaemonId?: Uint8Array }>;
         };
         internals.ensureConnected = async () => {
             internals.client = client;
-            return client;
+            return { client };
         };
 
         const error = await rejection(
@@ -927,12 +993,12 @@ describe("McHostModuleTransport", () => {
         } as unknown as McHostClient;
         const internals = transport as unknown as {
             client: McHostClient | null;
-            ensureConnected(): Promise<McHostClient>;
+            ensureConnected(): Promise<{ client: McHostClient; expectedDaemonId?: Uint8Array }>;
         };
         internals.ensureConnected = async () => {
             connectionCount += 1;
             internals.client = client;
-            return client;
+            return { client };
         };
         const startedAt = performance.now();
 
@@ -971,12 +1037,12 @@ describe("McHostModuleTransport", () => {
         } as unknown as McHostClient;
         const internals = transport as unknown as {
             client: McHostClient | null;
-            ensureConnected(): Promise<McHostClient>;
+            ensureConnected(): Promise<{ client: McHostClient; expectedDaemonId?: Uint8Array }>;
         };
         internals.ensureConnected = async () => {
             connectionCount += 1;
             internals.client = client;
-            return client;
+            return { client };
         };
         const startedAt = performance.now();
 

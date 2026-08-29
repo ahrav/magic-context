@@ -211,6 +211,36 @@ describe("parseDaemonResult", () => {
             ),
         );
         expect(restart.effects).toEqual({ stop_committed: false, start_committed: false });
+
+        for (const outcome of [
+            {
+                state: "stopped",
+                reason: "internal_error",
+                remediation: "report_bug",
+            },
+            {
+                state: "stopping",
+                reason: "shutdown_timeout",
+                remediation: "inspect_daemon_process",
+            },
+        ] as const) {
+            const committedFailure = parseDaemonResult(
+                JSON.stringify(
+                    validResult({
+                        command: "restart",
+                        ok: false,
+                        ...outcome,
+                        readiness: null,
+                        checks: [],
+                        effects: { stop_committed: true, start_committed: true },
+                    }),
+                ),
+            );
+            expect(committedFailure.effects).toEqual({
+                stop_committed: true,
+                start_committed: true,
+            });
+        }
     });
 
     test("schema violations never echo oversized native text", () => {

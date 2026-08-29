@@ -15,10 +15,18 @@
  * path, stderr text, or native error chain rides on any result.
  */
 
+import type { CatalogEntry } from "../mc-host-client";
 import { checkPlatform, type LifecycleFailureReason, type PlatformReaders } from "./bootstrap";
 import {
+    type CompatibilityVerdict,
+    evaluateCompatibility,
+    evaluateDaemonCompatibility,
+    evaluateEpochCompatibility,
+    evaluateModuleCompatibility,
+    type ObservedEpochs,
+} from "./compatibility";
+import {
     classifyPreNativeRoots,
-    type DaemonCheck,
     type DaemonReadiness,
     type DaemonReason,
     type DaemonResultV1,
@@ -47,9 +55,31 @@ export type LifecycleCommand = "start" | "stop" | "restart" | "status" | "doctor
 
 export type StorageReadiness = "ready" | "starting" | "unavailable";
 
-export interface ObservationalHealth {
-    readiness: DaemonReadiness;
+export type CompatibilityStage = "daemon" | "modules" | "epochs";
+
+export interface CompatibilitySnapshot {
     authenticatedDaemonVersion: string;
+    authenticatedDaemonId: Uint8Array;
+    catalog: CatalogEntry[];
+    epochs: ObservedEpochs;
+    /** Last stage reached by the ordered authenticated compatibility probe. */
+    evaluatedThrough?: CompatibilityStage;
+}
+
+export interface ObservationalHealth extends CompatibilitySnapshot {
+    readiness: DaemonReadiness;
+}
+
+function compatibilityInput(snapshot: CompatibilitySnapshot): {
+    authenticatedDaemonVer: string;
+    catalog: CatalogEntry[];
+    epochs: ObservedEpochs;
+} {
+    return {
+        authenticatedDaemonVer: snapshot.authenticatedDaemonVersion,
+        catalog: snapshot.catalog,
+        epochs: snapshot.epochs,
+    };
 }
 
 export class WaiterDetachedError extends Error {
@@ -77,8 +107,15 @@ export interface LifecyclePolicyOptions {
     /**
      * Post-transport storage probe used by managed Magic Context demand.
      * The default reports `ready` for explicit and test-only policy instances.
+     *
+     * `expectedDaemonId` is the incarnation compatibility just certified. A probe
+     * that cannot observe that incarnation must reject rather than report a
+     * reading from another one, because the caller fences its traffic to the
+     * certified identity and would act on readiness it will never reach.
      */
-    storageProbe?: (budgetMs: number) => Promise<StorageReadiness>;
+    storageProbe?: (budgetMs: number, expectedDaemonId?: Uint8Array) => Promise<StorageReadiness>;
+    /** Authenticated daemon, catalog, and Magic Context epoch snapshot for demand. */
+    compatibilityProbe?: (budgetMs: number, signal?: AbortSignal) => Promise<CompatibilitySnapshot>;
     /** Authenticated route-free component health for status and doctor. */
     readinessProbe?: (budgetMs: number) => Promise<ObservationalHealth>;
     /** Dev/test payload directory forwarded to native start/restart. */
@@ -134,6 +171,8 @@ export interface DemandStartOutcome {
      * Callers must send no Rust application body unless this is `ready`.
      */
     storage: StorageReadiness | null;
+    /** Authenticated incarnation that passed compatibility; bind application traffic to it. */
+    authenticatedDaemonId?: Uint8Array;
 }
 
 export class McHostLifecyclePolicy {
@@ -142,7 +181,13 @@ export class McHostLifecyclePolicy {
     private readonly bootstrapFailure: LifecycleFailureReason | undefined;
     private readonly platformReaders: PlatformReaders | undefined;
     private readonly admissionIo: AdmissionIo | undefined;
-    private readonly storageProbe: (budgetMs: number) => Promise<StorageReadiness>;
+    private readonly storageProbe: (
+        budgetMs: number,
+        expectedDaemonId?: Uint8Array,
+    ) => Promise<StorageReadiness>;
+    private readonly compatibilityProbe:
+        | ((budgetMs: number, signal?: AbortSignal) => Promise<CompatibilitySnapshot>)
+        | undefined;
     private readonly readinessProbe:
         | ((budgetMs: number) => Promise<ObservationalHealth>)
         | undefined;
@@ -152,6 +197,8 @@ export class McHostLifecyclePolicy {
     private readonly defaultStartupEnvelope: NativeStartupEnvelope | undefined;
     private readonly outerAggregateMs: number;
     private readonly inflightStarts = new Map<string, Promise<DaemonResultV1>>();
+    /** One in-flight compatibility probe per data root, keyed independently of capability. */
+    private readonly inflightCompatibility = new Map<string, Promise<CompatibilitySnapshot>>();
 
     constructor(options: LifecyclePolicyOptions = {}) {
         this.env = options.env ?? process.env;
@@ -160,6 +207,7 @@ export class McHostLifecyclePolicy {
         this.platformReaders = options.platformReaders;
         this.admissionIo = options.admissionIo;
         this.storageProbe = options.storageProbe ?? (async () => "ready");
+        this.compatibilityProbe = options.compatibilityProbe;
         this.readinessProbe = options.readinessProbe;
         this.payloadDir = options.payloadDir;
         this.payloadManifestDigest = options.payloadManifestDigest;
@@ -224,24 +272,114 @@ export class McHostLifecyclePolicy {
                 });
         }
         const result = await this.raceWaiter(shared, request);
-        if (request.capability !== "magic-context" || !result.ok) {
+        if (!result.ok) {
             return { result, storage: null };
         }
-        const remainingMs =
+        const remaining = (): number | undefined =>
             request.deadlineMs === undefined
                 ? undefined
                 : Math.max(0, request.deadlineMs - (Date.now() - waiterStartedAt));
+        let remainingMs = remaining();
         if (remainingMs === 0) throw new WaiterDetachedError("deadline");
+        let compatibleResult = result;
+        let authenticatedDaemonId: Uint8Array | undefined;
+        if (this.compatibilityProbe !== undefined) {
+            let snapshot: CompatibilitySnapshot;
+            try {
+                snapshot = await this.raceDetached(
+                    this.sharedCompatibility(
+                        rootResolution.ok ? rootResolution.root : "\u0000no-root",
+                        this.outerAggregateMs,
+                    ),
+                    request.signal,
+                    remainingMs,
+                );
+            } catch (error) {
+                // Detachment is the caller's own deadline or signal and stays a
+                // thrown control outcome. Any other probe failure is an unproven
+                // compatibility claim, so it becomes a typed closed result rather
+                // than an unclassified rejection callers cannot act on.
+                if (error instanceof WaiterDetachedError) throw error;
+                return {
+                    result: {
+                        ...result,
+                        ok: false,
+                        reason: "native_probe_unavailable",
+                        remediation: remediationForReason("native_probe_unavailable"),
+                    },
+                    storage: null,
+                };
+            }
+            const applied = this.applyCompatibility(result, snapshot);
+            compatibleResult = applied.result;
+            if (!applied.verdict.ok) return { result: compatibleResult, storage: null };
+            authenticatedDaemonId = Uint8Array.from(snapshot.authenticatedDaemonId);
+            remainingMs = remaining();
+            if (remainingMs === 0) throw new WaiterDetachedError("deadline");
+        }
+        if (request.capability !== "magic-context") {
+            return { result: compatibleResult, storage: null, authenticatedDaemonId };
+        }
         const storageBudget =
             remainingMs === undefined
                 ? STORAGE_HARD_BUDGET_MS
                 : Math.min(STORAGE_HARD_BUDGET_MS, remainingMs);
-        const storage = await this.raceDetached(
-            this.storageProbe(storageBudget),
-            request.signal,
-            remainingMs,
-        );
-        return { result, storage };
+        let storage: StorageReadiness;
+        try {
+            storage = await this.raceDetached(
+                this.storageProbe(storageBudget, authenticatedDaemonId),
+                request.signal,
+                remainingMs,
+            );
+        } catch (error) {
+            // Detachment stays the caller's own deadline or signal. Anything else
+            // means storage was never observed on the certified incarnation, so
+            // the outcome carries no readiness rather than one read from a daemon
+            // this demand will never publish to.
+            if (error instanceof WaiterDetachedError) throw error;
+            return {
+                result: {
+                    ...compatibleResult,
+                    ok: false,
+                    reason: "native_probe_unavailable",
+                    remediation: remediationForReason("native_probe_unavailable"),
+                },
+                storage: null,
+            };
+        }
+        return { result: compatibleResult, storage, authenticatedDaemonId };
+    }
+
+    /**
+     * One compatibility probe per data root in flight. The snapshot describes the
+     * daemon incarnation, not the requesting capability, so concurrent demands
+     * share one connection and one `catalog.list`/`host.status` pair instead of
+     * each opening its own. The shared probe carries no caller signal; callers
+     * bound their own wait with `raceDetached`, so one detaching caller cannot
+     * cancel the probe another is still awaiting.
+     *
+     * Its budget is the policy's own aggregate, never the creating caller's
+     * remaining deadline: a nearly expired waiter arriving first would otherwise
+     * mint a probe too short for the long-lived waiters that join it, and they
+     * would read that truncated failure as an unproven compatibility claim while
+     * still holding ample time.
+     */
+    private sharedCompatibility(root: string, budgetMs: number): Promise<CompatibilitySnapshot> {
+        const probe = this.compatibilityProbe;
+        if (probe === undefined) {
+            return Promise.reject(new Error("compatibility probe is unavailable"));
+        }
+        const existing = this.inflightCompatibility.get(root);
+        if (existing) return existing;
+        const shared = probe(budgetMs);
+        this.inflightCompatibility.set(root, shared);
+        const evict = (): void => {
+            if (this.inflightCompatibility.get(root) === shared) {
+                this.inflightCompatibility.delete(root);
+            }
+        };
+        void shared.then(evict, evict);
+        return shared;
     }
 
     private raceWaiter(
@@ -383,6 +521,11 @@ export class McHostLifecyclePolicy {
     private async observationalCommand(command: "status" | "doctor"): Promise<DaemonResultV1> {
         const preflight = this.preflight(command);
         if (!preflight.ok) return preflight.result;
+        const platform = checkPlatform(this.platformReaders);
+        if (!platform.ok) {
+            const state = preNativeState(classifyPreNativeRoots(preflight.root));
+            return localResult(command, false, state, "unsupported_platform");
+        }
         if (this.launchTarget === null) {
             // No trusted retained current-release bootstrap: only the bounded
             // no-follow classifier may speak, and it authorizes nothing.
@@ -401,7 +544,13 @@ export class McHostLifecyclePolicy {
                 return { ...native, command };
             }
             const observed = await this.readinessProbe(Math.max(1, deadline - Date.now()));
-            const checks: DaemonCheck[] = [...native.checks];
+            const { result: compatible, verdict: compatibility } = this.applyCompatibility(
+                native,
+                observed,
+            );
+            const checksById = new Map(
+                compatible.checks.map((check) => [check.id, check] as const),
+            );
             const addCheck = (
                 id: "readiness.transport" | "readiness.storage" | "readiness.synapse",
                 record: NonNullable<DaemonReadiness[keyof DaemonReadiness]>,
@@ -412,7 +561,7 @@ export class McHostLifecyclePolicy {
                         : record.state === "unsupported"
                           ? "skip"
                           : "fail";
-                checks.push({
+                checksById.set(id, {
                     id,
                     status,
                     reason: record.reason,
@@ -428,25 +577,99 @@ export class McHostLifecyclePolicy {
             if (observed.readiness.synapse) {
                 addCheck("readiness.synapse", observed.readiness.synapse);
             }
-            checks.sort((left, right) => left.id.localeCompare(right.id));
-            const failed = checks.find((check) => check.status === "fail");
+            const checks = [...checksById.values()].sort((left, right) =>
+                left.id.localeCompare(right.id),
+            );
+            const readinessFailure = [
+                checksById.get("readiness.transport"),
+                checksById.get("readiness.storage"),
+                checksById.get("readiness.synapse"),
+            ].find((check) => check?.status === "fail");
+            // Compatibility outranks readiness: an incompatible daemon explains
+            // the component states, so its reason is the one an operator acts on.
+            const failureReason = compatibility.ok
+                ? readinessFailure?.reason
+                : compatibility.reason;
             return {
-                ...native,
+                ...compatible,
                 command,
-                ok: failed === undefined,
-                reason: failed?.reason ?? "healthy",
-                remediation: failed?.remediation ?? null,
+                ok: failureReason === undefined,
+                reason: failureReason ?? "healthy",
+                remediation:
+                    failureReason === undefined ? null : remediationForReason(failureReason),
                 readiness: observed.readiness,
                 checks,
-                versions: {
-                    ...native.versions,
-                    proof: "current",
-                    daemon: observed.authenticatedDaemonVersion,
-                },
             };
         } catch (error) {
             return this.launchFailure(command, preflight.root, error);
         }
+    }
+
+    private applyCompatibility(
+        result: DaemonResultV1,
+        snapshot: CompatibilitySnapshot,
+    ): { result: DaemonResultV1; verdict: CompatibilityVerdict } {
+        const verdict = evaluateCompatibility(compatibilityInput(snapshot));
+        const stages: ReadonlyArray<{
+            stage: CompatibilityStage;
+            id: "compatibility.daemon" | "compatibility.modules" | "compatibility.epochs";
+            verdict: CompatibilityVerdict;
+        }> = [
+            {
+                stage: "daemon",
+                id: "compatibility.daemon",
+                verdict: evaluateDaemonCompatibility(snapshot.authenticatedDaemonVersion),
+            },
+            {
+                stage: "modules",
+                id: "compatibility.modules",
+                verdict: evaluateModuleCompatibility(snapshot.catalog),
+            },
+            {
+                stage: "epochs",
+                id: "compatibility.epochs",
+                verdict: evaluateEpochCompatibility(snapshot.epochs),
+            },
+        ];
+        const stageOrder: Record<CompatibilityStage, number> = {
+            daemon: 0,
+            modules: 1,
+            epochs: 2,
+        };
+        const evaluatedThrough = snapshot.evaluatedThrough ?? "epochs";
+        const checksById = new Map(result.checks.map((check) => [check.id, check] as const));
+        for (const stage of stages) {
+            if (stageOrder[stage.stage] > stageOrder[evaluatedThrough]) continue;
+            const reason = stage.verdict.ok ? "healthy" : stage.verdict.reason;
+            checksById.set(stage.id, {
+                id: stage.id,
+                status: stage.verdict.ok ? "pass" : "fail",
+                reason,
+                remediation: remediationForReason(reason),
+            });
+        }
+        const moduleVersion = (moduleId: string): string | null =>
+            snapshot.catalog.find((entry) => entry.module_id === moduleId)?.module_version ?? null;
+        return {
+            verdict,
+            result: {
+                ...result,
+                ok: result.ok && verdict.ok,
+                reason: verdict.ok ? result.reason : verdict.reason,
+                remediation: verdict.ok ? result.remediation : remediationForReason(verdict.reason),
+                checks: [...checksById.values()].sort((left, right) =>
+                    left.id.localeCompare(right.id),
+                ),
+                versions: {
+                    ...result.versions,
+                    proof: "current",
+                    daemon: snapshot.authenticatedDaemonVersion,
+                    magic_context: moduleVersion("magic-context"),
+                    synapse: moduleVersion("synapse"),
+                    broca: moduleVersion("broca"),
+                },
+            },
+        };
     }
 
     private nativeEnv(root: string): Record<string, string> {

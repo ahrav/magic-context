@@ -30,7 +30,11 @@ import {
 } from "./embedding-synapse";
 
 class MockSynapseClient implements SynapseClientLike {
-    readonly requests: Array<{ method: string; params: unknown }> = [];
+    readonly requests: Array<{
+        method: string;
+        params: unknown;
+        expectedDaemonId?: Uint8Array;
+    }> = [];
     private batchAttempts = 0;
     constructor(private readonly batchSize = 2) {}
 
@@ -38,8 +42,20 @@ class MockSynapseClient implements SynapseClientLike {
         _module: string,
         method: string,
         params?: unknown,
+        options?: {
+            timeoutMs?: number;
+            identity?: { project_root: string; harness: string; session: string };
+            targetKind?: "management_surface" | "tool_provider";
+            expectedDaemonId?: Uint8Array;
+        },
     ): Promise<Response> {
-        this.requests.push({ method, params });
+        this.requests.push({
+            method,
+            params,
+            ...(options?.expectedDaemonId === undefined
+                ? {}
+                : { expectedDaemonId: options.expectedDaemonId }),
+        });
         if (method === "models.list") {
             return {
                 models: [
@@ -157,6 +173,105 @@ describe("SynapseEmbeddingProvider", () => {
             allow_equivalent: false,
             accept_declared: false,
         });
+    });
+
+    it("binds Synapse calls to the lifecycle-compatible daemon identity", async () => {
+        const client = new MockSynapseClient();
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "daemon-bound",
+            clientFactory: async () => client,
+        });
+        const expectedDaemonId = new Uint8Array([1, 2, 3, 4]);
+        (
+            provider as unknown as {
+                compatibleDaemonId: Uint8Array | null;
+            }
+        ).compatibleDaemonId = expectedDaemonId;
+
+        expect(await provider.initialize()).toBe(true);
+        expect(client.requests[0]?.expectedDaemonId).toEqual(expectedDaemonId);
+    });
+
+    it("refuses to publish on the managed lane without a certified daemon identity", async () => {
+        const client = new MockSynapseClient();
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "fence-required",
+            clientFactory: async () => client,
+        });
+        expect(await provider.initialize()).toBe(true);
+
+        // Reproduce the post-rotation state the failure handler installs: the
+        // lane is managed and its certified identity has been cleared. An
+        // omitted expectation would publish unfenced onto the rotated daemon.
+        const internals = provider as unknown as {
+            connectionOrigin: string;
+            compatibleDaemonId: Uint8Array | null;
+        };
+        internals.connectionOrigin = "managed-default";
+        internals.compatibleDaemonId = null;
+        const published = client.requests.length;
+
+        // `embed` reports a failed lane as null; the load-bearing assertion is
+        // that no request reached the wire without an expectation.
+        expect(await provider.embed("hello")).toBeNull();
+        expect(client.requests.length).toBe(published);
+    });
+
+    it("re-certification leaves an identity a sibling already certified in place", async () => {
+        const client = new MockSynapseClient();
+        const certified = new Uint8Array([9, 1]);
+        const recertified = new Uint8Array([9, 2]);
+        let release = (): void => {};
+        const gate = new Promise<void>((resolve) => {
+            release = () => resolve();
+        });
+        let demands = 0;
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "recertify-sibling",
+            clientFactory: async () => client,
+            demandStart: async () => {
+                demands += 1;
+                await gate;
+                return {
+                    ok: true,
+                    reason: "started",
+                    storage: "ready",
+                    authenticatedDaemonId: recertified,
+                };
+            },
+        });
+        expect(await provider.initialize()).toBe(true);
+
+        const internals = provider as unknown as {
+            connectionOrigin: string;
+            compatibleDaemonId: Uint8Array | null;
+            initialized: boolean;
+            recertifyForRestart(signal?: AbortSignal): Promise<boolean>;
+        };
+        internals.connectionOrigin = "managed-default";
+        internals.compatibleDaemonId = certified;
+
+        const flight = internals.recertifyForRestart();
+        await Promise.resolve();
+        await Promise.resolve();
+
+        // A sibling that already re-established the fence and is dispatching
+        // against it keeps that identity while this demand is in flight. Erasing
+        // it here would fail the sibling's resubmission on a fence it had already
+        // proved, and its one restart budget is already spent.
+        expect(demands).toBe(1);
+        expect(internals.initialized).toBe(false);
+        expect(internals.compatibleDaemonId).toEqual(certified);
+
+        release();
+        expect(await flight).toBe(true);
+        expect(internals.compatibleDaemonId).toEqual(recertified);
     });
 
     it("adopts the catalog's advertised input limits", async () => {

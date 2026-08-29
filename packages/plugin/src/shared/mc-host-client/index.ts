@@ -43,4 +43,5 @@ export {
     type PublicationDiagnostics,
     type RequestOptions,
     type RouteTarget,
+    sameDaemonId,
 } from "./types";

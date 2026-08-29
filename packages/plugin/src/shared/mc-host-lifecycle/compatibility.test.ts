@@ -5,6 +5,7 @@ import {
     evaluateDaemonCompatibility,
     evaluateEpochCompatibility,
     evaluateModuleCompatibility,
+    observedEpochsFromMagicContextMetrics,
     parseSemverTriple,
 } from "./compatibility";
 import { releaseContract } from "./generated-contract";
@@ -67,6 +68,31 @@ describe("module version ranges", () => {
 });
 
 describe("exact epoch comparison", () => {
+    test("maps the five Magic Context wire epoch names to the release contract", () => {
+        expect(
+            observedEpochsFromMagicContextMetrics({
+                epochs: {
+                    memory_render_epoch: 2,
+                    compartment_render_epoch: 2,
+                    profile_epoch: 2,
+                    tagger_epoch: 3,
+                    state_sync_epoch: 1,
+                    state_sync_deltas: true,
+                },
+            }),
+        ).toEqual(healthyEpochs);
+    });
+
+    test("missing or malformed status fields remain absent and fail closed", () => {
+        expect(observedEpochsFromMagicContextMetrics(null)).toEqual({});
+        expect(observedEpochsFromMagicContextMetrics({ epochs: [] })).toEqual({});
+        expect(
+            observedEpochsFromMagicContextMetrics({
+                epochs: { state_sync_epoch: "1" },
+            }),
+        ).toEqual({ state_sync: "1" });
+    });
+
     test("missing, nonnumeric, stale, and future epochs each name the epoch", () => {
         const stale = { ...healthyEpochs, tagger: healthyEpochs.tagger - 1 };
         const future = { ...healthyEpochs, tagger: healthyEpochs.tagger + 1 };

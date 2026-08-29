@@ -94,6 +94,7 @@ export interface SynapseClientLike {
             timeoutMs?: number;
             identity?: { project_root: string; harness: string; session: string };
             targetKind?: "management_surface" | "tool_provider";
+            expectedDaemonId?: Uint8Array;
         },
     ): Promise<Response>;
     close(): void;
@@ -126,7 +127,12 @@ export type SynapseDemandStart = (request: {
     capability: "synapse";
     signal?: AbortSignal;
     deadlineMs?: number;
-}) => Promise<{ ok: boolean; reason: string; storage: StorageReadiness | null }>;
+}) => Promise<{
+    ok: boolean;
+    reason: string;
+    storage: StorageReadiness | null;
+    authenticatedDaemonId?: Uint8Array;
+}>;
 
 let configuredManagedDemandStart: SynapseDemandStart | undefined;
 
@@ -270,6 +276,7 @@ function classifyError(value: unknown): SynapseEmbeddingError {
     else if (normalized.includes("probe_required")) mapped = "probe_required";
     else if (normalized.includes("idempotency_conflict")) mapped = "idempotency_conflict";
     else if (normalized.includes("schema")) mapped = "schema_violation";
+    else if (normalized.includes("daemon_generation_changed")) mapped = "module_restarted";
     else if (normalized.includes("module_restarted") || normalized.includes("module restarted"))
         mapped = "module_restarted";
     const message = value instanceof Error ? value.message : String(value);
@@ -551,10 +558,11 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
     private readonly options: SynapseEmbeddingProviderOptions;
     private readonly connectionOrigin: ConnectionOrigin;
     private readonly demandStart: SynapseDemandStart | undefined;
+    private compatibleDaemonId: Uint8Array | null = null;
     private client: SynapseClientLike | null = null;
     private initialized = false;
     private initializing: Promise<boolean> | null = null;
-    private managedDemand: Promise<{ ok: boolean; reason: string }> | null = null;
+    private managedDemand: ReturnType<SynapseDemandStart> | null = null;
     private permanentFailure = false;
     private batchLimit = 16;
     private tokenBudget: number | null = null;
@@ -677,6 +685,17 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                         `managed Synapse demand failed: ${outcome.reason}`,
                     );
                 }
+                if (outcome.authenticatedDaemonId === undefined) {
+                    throw new SynapseEmbeddingError(
+                        "transport",
+                        "managed lifecycle compatibility returned no daemon identity",
+                    );
+                }
+                // Written only on the success path: a concurrent initialize that
+                // fails must not erase an identity another caller already
+                // certified, and publication is unreachable without a successful
+                // demand because `callWithRetry` refuses a null identity.
+                this.compatibleDaemonId = Uint8Array.from(outcome.authenticatedDaemonId);
             } catch (error) {
                 log(
                     `[magic-context] Synapse lane unavailable: ${error instanceof Error ? error.message : String(error)}`,
@@ -855,6 +874,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                         const classified = classifyError(error);
                         if (classified.code !== "module_restarted" || restarted) throw classified;
                         restarted = true;
+                        if (!(await this.recertifyForRestart(signal))) throw classified;
                     }
                 }
                 const batchEnvelope = responseBody(body);
@@ -1115,6 +1135,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                         terminal.ledgerRowId = row.rowId;
                         throw terminal;
                     }
+                    if (!(await this.recertifyForRestart(signal))) throw classified;
                 }
             }
             markSynapseLedgerObsolete(db, {
@@ -1236,6 +1257,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                             "restart budget or page deadline exhausted",
                         );
                     }
+                    if (!(await this.recertifyForRestart(signal))) throw classified;
                 }
             }
         } catch (error) {
@@ -1522,6 +1544,14 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
             try {
                 if (!this.client)
                     throw new SynapseEmbeddingError("transport", "Synapse client is unavailable");
+                // The managed lane publishes only against the incarnation the
+                // lifecycle owner certified. An absent identity means the fence
+                // cannot be proved, so refuse rather than publish unfenced.
+                if (this.connectionOrigin === "managed-default" && this.compatibleDaemonId === null)
+                    throw new SynapseEmbeddingError(
+                        "module_restarted",
+                        "managed Synapse lane has no certified daemon identity",
+                    );
                 return await this.client.call<T>(
                     this.options.moduleId ?? "synapse",
                     method,
@@ -1537,6 +1567,9 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                             harness: getHarness(),
                             session: this.options.session,
                         },
+                        ...(this.compatibleDaemonId === null
+                            ? {}
+                            : { expectedDaemonId: this.compatibleDaemonId }),
                     },
                 );
             } catch (error) {
@@ -1614,8 +1647,32 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         }
     }
 
+    /**
+     * Re-certify the managed lane after a rotation. A restart budget authorizes
+     * one resubmission, and a resubmission may publish only against a freshly
+     * certified incarnation, so clearing `initialized` forces `initialize` to
+     * re-derive the identity from a fresh demand.
+     *
+     * The identity is not cleared here. `initialize` is its only writer and
+     * writes it on the success path, so one operation entering recertification
+     * cannot erase an incarnation a sibling already certified and is dispatching
+     * against — a sibling that spent its own restart budget would otherwise fail
+     * permanently on a fence it had already re-established. An identity that did
+     * rotate away is refused by the client fence before any byte is written, and
+     * that refusal is the sibling's own `module_restarted` to spend.
+     */
+    private async recertifyForRestart(signal?: AbortSignal): Promise<boolean> {
+        if (this.connectionOrigin !== "managed-default") return true;
+        this.initialized = false;
+        return await this.initialize(signal);
+    }
+
     private logCallFailure(error: unknown, operation: string): void {
         const classified = classifyError(error);
+        if (classified.code === "module_restarted") {
+            this.initialized = false;
+            this.compatibleDaemonId = null;
+        }
         if (classified.permanent && !isPageScopedSynapseCode(classified.code)) {
             this.permanentFailure = true;
         }

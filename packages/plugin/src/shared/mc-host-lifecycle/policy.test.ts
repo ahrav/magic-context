@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { CatalogEntry } from "../mc-host-client";
+import { releaseContract } from "./generated-contract";
 import { buildManagedCredentialEnvelope } from "./managed-policy";
 import { McHostLifecyclePolicy, type WaiterDetachedError } from "./policy";
 
@@ -107,6 +109,30 @@ function policyFor(
     return new McHostLifecyclePolicy(options);
 }
 
+function catalogEntry(moduleId: string, moduleVersion = "0.1.0"): CatalogEntry {
+    return {
+        module_id: moduleId,
+        module_version: moduleVersion,
+        roles: [],
+        control_ops: [],
+    };
+}
+
+const compatibleCatalog = [
+    catalogEntry("magic-context"),
+    catalogEntry("synapse"),
+    catalogEntry("broca"),
+];
+
+function compatibleObservation() {
+    return {
+        authenticatedDaemonVersion: releaseContract.versions.daemon,
+        authenticatedDaemonId: new Uint8Array([7]),
+        catalog: compatibleCatalog,
+        epochs: { ...releaseContract.epochs },
+    };
+}
+
 describe("pre-native outcomes", () => {
     test("no absolute root: unavailable/no_data_dir, restart effects false,false", async () => {
         const policy = policyFor({ env: { HOME: "relative-home" } });
@@ -142,13 +168,62 @@ describe("pre-native outcomes", () => {
         }
     });
 
-    test("an unsupported platform fails before any native invocation", async () => {
+    test("unsupported platforms fail every command before native invocation", async () => {
         const root = tempDir("mc-policy-platform-");
         const { binary, invocationLog } = fakeBinary(root);
         try {
+            for (const platformReaders of [
+                {
+                    platform: "linux" as const,
+                    arch: "x64",
+                    kernelRelease: () => "4.17.0",
+                    glibcVersion: () => "2.34",
+                    procSelfFdUsable: () => true,
+                    macosProductVersion: () => null,
+                },
+                {
+                    platform: "darwin" as const,
+                    arch: "arm64",
+                    kernelRelease: () => "23.0.0",
+                    glibcVersion: () => null,
+                    procSelfFdUsable: () => false,
+                    macosProductVersion: () => "13.4",
+                },
+                {
+                    platform: "linux" as const,
+                    arch: "arm64",
+                    kernelRelease: () => "6.8.0",
+                    glibcVersion: () => "2.39",
+                    procSelfFdUsable: () => true,
+                    macosProductVersion: () => null,
+                },
+            ]) {
+                const policy = policyFor({
+                    env: { XDG_DATA_HOME: root },
+                    launchTarget: { kind: "test-binary", path: binary },
+                    platformReaders,
+                });
+                for (const operation of ["start", "status", "doctor"] as const) {
+                    const result = await policy[operation]();
+                    expect(result.reason).toBe("unsupported_platform");
+                    expect(result.remediation).toBe("use_supported_platform");
+                }
+            }
+            expect(invocations(invocationLog)).toEqual([]);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("filesystem rejection keeps precedence over unsupported platform", async () => {
+        const root = tempDir("mc-policy-platform-fs-precedence-");
+        try {
             const policy = policyFor({
                 env: { XDG_DATA_HOME: root },
-                launchTarget: { kind: "test-binary", path: binary },
+                admissionIo: {
+                    platform: "linux",
+                    readMounts: () => "remote:/x / nfs4 rw 0 0\n",
+                },
                 platformReaders: {
                     platform: "linux",
                     arch: "x64",
@@ -158,9 +233,9 @@ describe("pre-native outcomes", () => {
                     macosProductVersion: () => null,
                 },
             });
-            const result = await policy.start();
-            expect(result.reason).toBe("unsupported_platform");
-            expect(invocations(invocationLog)).toEqual([]);
+            for (const operation of ["status", "doctor"] as const) {
+                expect((await policy[operation]()).reason).toBe("unsupported_filesystem");
+            }
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
@@ -289,7 +364,7 @@ describe("native invocation mapping", () => {
                 env: { XDG_DATA_HOME: root },
                 launchTarget: { kind: "test-binary", path: binary },
                 readinessProbe: async () => ({
-                    authenticatedDaemonVersion: "mc-host/0.1.0",
+                    ...compatibleObservation(),
                     readiness: {
                         transport: { state: "ready", reason: "healthy" },
                         storage: { state: "unavailable", reason: "storage_unavailable" },
@@ -305,10 +380,118 @@ describe("native invocation mapping", () => {
                 expect(result.readiness?.synapse?.state).toBe("degraded");
                 expect(result.versions.daemon).toBe("mc-host/0.1.0");
                 expect(result.checks.map((check) => [check.id, check.status])).toEqual([
+                    ["compatibility.daemon", "pass"],
+                    ["compatibility.epochs", "pass"],
+                    ["compatibility.modules", "pass"],
                     ["readiness.storage", "fail"],
                     ["readiness.synapse", "fail"],
                     ["readiness.transport", "pass"],
                 ]);
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("status and doctor surface authenticated daemon, module, and epoch mismatches", async () => {
+        const cases = [
+            {
+                reason: "incompatible_daemon",
+                observation: {
+                    ...compatibleObservation(),
+                    authenticatedDaemonVersion: "mc-host/0.2.0",
+                },
+                failedCheck: "compatibility.daemon",
+            },
+            {
+                reason: "incompatible_module",
+                observation: {
+                    ...compatibleObservation(),
+                    catalog: compatibleCatalog.map((entry) =>
+                        entry.module_id === "magic-context"
+                            ? catalogEntry("magic-context", "0.2.0")
+                            : entry,
+                    ),
+                },
+                failedCheck: "compatibility.modules",
+            },
+            {
+                reason: "incompatible_epochs",
+                observation: {
+                    ...compatibleObservation(),
+                    epochs: {
+                        ...releaseContract.epochs,
+                        state_sync: releaseContract.epochs.state_sync + 1,
+                    },
+                },
+                failedCheck: "compatibility.epochs",
+            },
+        ] as const;
+
+        for (const { reason, observation, failedCheck } of cases) {
+            const root = tempDir(`mc-policy-${reason}-`);
+            const { binary, invocationLog } = fakeBinary(root);
+            try {
+                const policy = policyFor({
+                    env: { XDG_DATA_HOME: root },
+                    launchTarget: { kind: "test-binary", path: binary },
+                    readinessProbe: async () => ({
+                        ...observation,
+                        readiness: {
+                            transport: { state: "ready", reason: "healthy" },
+                            storage: { state: "ready", reason: "healthy" },
+                            synapse: { state: "ready", reason: "healthy" },
+                        },
+                    }),
+                });
+
+                for (const result of [await policy.status(), await policy.doctor()]) {
+                    expect(result.ok).toBe(false);
+                    expect(result.state).toBe("running");
+                    expect(result.reason).toBe(reason);
+                    expect(result.remediation).toBe("align_versions");
+                    expect(result.checks.find((check) => check.id === failedCheck)).toMatchObject({
+                        status: "fail",
+                        reason,
+                    });
+                }
+                expect(invocations(invocationLog)).toEqual(["probe", "probe"]);
+            } finally {
+                rmSync(root, { recursive: true, force: true });
+            }
+        }
+    });
+
+    test("a short-circuited probe reports no check for an unobserved component", async () => {
+        const root = tempDir("mc-policy-unobserved-");
+        const { binary } = fakeBinary(root);
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                // The daemon stage failed, so host.status never ran: only the
+                // handshake-proven transport state is reported.
+                readinessProbe: async () => ({
+                    ...compatibleObservation(),
+                    authenticatedDaemonVersion: "mc-host/0.2.0",
+                    catalog: [],
+                    epochs: {},
+                    evaluatedThrough: "daemon" as const,
+                    readiness: { transport: { state: "ready", reason: "healthy" } },
+                }),
+            });
+
+            for (const result of [await policy.status(), await policy.doctor()]) {
+                expect(result.reason).toBe("incompatible_daemon");
+                const ids = result.checks.map((check) => check.id);
+                expect(ids).toContain("compatibility.daemon");
+                // Never observed, so they must not be asserted as failures that
+                // would point remediation away from the version mismatch.
+                expect(ids).not.toContain("readiness.storage");
+                expect(ids).not.toContain("readiness.synapse");
+                // Stages the probe never reached emit no verdict either.
+                expect(ids).not.toContain("compatibility.modules");
+                expect(ids).not.toContain("compatibility.epochs");
             }
         } finally {
             rmSync(root, { recursive: true, force: true });
@@ -395,6 +578,203 @@ describe("native invocation mapping", () => {
 });
 
 describe("demand-start coalescing and detachment (U3 scenarios 15-16)", () => {
+    test("compatibility mismatch blocks readiness without stop, restart, or a second start", async () => {
+        const cases = [
+            {
+                reason: "incompatible_daemon",
+                observation: {
+                    ...compatibleObservation(),
+                    authenticatedDaemonVersion: "mc-host/0.2.0",
+                },
+            },
+            {
+                reason: "incompatible_module",
+                observation: {
+                    ...compatibleObservation(),
+                    catalog: compatibleCatalog.map((entry) =>
+                        entry.module_id === "synapse" ? catalogEntry("synapse", "0.2.0") : entry,
+                    ),
+                },
+            },
+            {
+                reason: "incompatible_epochs",
+                observation: {
+                    ...compatibleObservation(),
+                    epochs: {
+                        ...releaseContract.epochs,
+                        memory_render: releaseContract.epochs.memory_render - 1,
+                    },
+                },
+            },
+        ] as const;
+
+        for (const { reason, observation } of cases) {
+            const root = tempDir(`mc-policy-demand-${reason}-`);
+            const { binary, invocationLog } = fakeBinary(root);
+            let storageProbes = 0;
+            try {
+                const policy = policyFor({
+                    env: { XDG_DATA_HOME: root },
+                    launchTarget: { kind: "test-binary", path: binary },
+                    compatibilityProbe: async () => observation,
+                    storageProbe: async () => {
+                        storageProbes += 1;
+                        return "ready";
+                    },
+                });
+                const outcome = await policy.demandStart({
+                    origin: "managed-default",
+                    capability: "magic-context",
+                });
+
+                expect(outcome.result.ok).toBe(false);
+                expect(outcome.result.state).toBe("running");
+                expect(outcome.result.reason).toBe(reason);
+                expect(outcome.result.remediation).toBe("align_versions");
+                expect(outcome.storage).toBeNull();
+                expect(storageProbes).toBe(0);
+                expect(invocations(invocationLog)).toEqual(["start"]);
+            } finally {
+                rmSync(root, { recursive: true, force: true });
+            }
+        }
+    });
+
+    test("concurrent demands share one compatibility probe", async () => {
+        const root = tempDir("mc-policy-probe-coalesce-");
+        const { binary } = fakeBinary(root);
+        let probes = 0;
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                compatibilityProbe: async () => {
+                    probes += 1;
+                    await new Promise((resolve) => setTimeout(resolve, 5));
+                    return compatibleObservation();
+                },
+            });
+
+            // The snapshot describes the daemon incarnation, not the requesting
+            // capability, so distinct capabilities still share one probe.
+            const outcomes = await Promise.all([
+                policy.demandStart({ origin: "managed-default", capability: "magic-context" }),
+                policy.demandStart({ origin: "managed-default", capability: "synapse" }),
+            ]);
+
+            for (const outcome of outcomes) {
+                expect(outcome.result.ok).toBe(true);
+                expect(outcome.authenticatedDaemonId).toEqual(new Uint8Array([7]));
+            }
+            expect(probes).toBe(1);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("the shared compatibility probe budget does not come from the creating waiter", async () => {
+        const root = tempDir("mc-policy-probe-budget-");
+        const { binary } = fakeBinary(root);
+        const budgets: number[] = [];
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                outerAggregateMs: 30_000,
+                compatibilityProbe: async (budgetMs) => {
+                    budgets.push(budgetMs);
+                    return compatibleObservation();
+                },
+            });
+            const outcome = await policy.demandStart({
+                origin: "managed-default",
+                capability: "magic-context",
+                deadlineMs: 5_000,
+            });
+
+            // Every waiter joins whichever probe exists, so a nearly expired
+            // caller must not mint one too short for the long-lived waiters that
+            // join it — they would read the truncated failure as an unproven
+            // compatibility claim while still holding ample time. The caller's own
+            // deadline still bounds its wait through `raceDetached`.
+            expect(budgets).toEqual([30_000]);
+            expect(outcome.result.ok).toBe(true);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("a failed compatibility probe becomes a typed closed result, not a raw rejection", async () => {
+        const root = tempDir("mc-policy-probe-failure-");
+        const { binary, invocationLog } = fakeBinary(root);
+        let storageProbes = 0;
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                compatibilityProbe: async () => {
+                    throw new Error("authenticated peer changed during compatibility probe");
+                },
+                storageProbe: async () => {
+                    storageProbes += 1;
+                    return "ready";
+                },
+            });
+            const outcome = await policy.demandStart({
+                origin: "managed-default",
+                capability: "magic-context",
+            });
+
+            // An unproven compatibility claim authorizes no application traffic,
+            // and callers act on the reason rather than an unclassified throw.
+            expect(outcome.result.ok).toBe(false);
+            expect(outcome.result.reason).toBe("native_probe_unavailable");
+            expect(outcome.result.remediation).toBe("run_daemon_restart");
+            expect(outcome.authenticatedDaemonId).toBeUndefined();
+            expect(outcome.storage).toBeNull();
+            expect(storageProbes).toBe(0);
+            expect(invocations(invocationLog)).toEqual(["start"]);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("storage readiness read on another incarnation is refused, not reported", async () => {
+        const root = tempDir("mc-policy-storage-rotation-");
+        const { binary, invocationLog } = fakeBinary(root);
+        const expectations: Array<Uint8Array | undefined> = [];
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                compatibilityProbe: async () => compatibleObservation(),
+                storageProbe: async (_budgetMs, expectedDaemonId) => {
+                    expectations.push(expectedDaemonId);
+                    throw new Error(
+                        "storage probe observed a different daemon than compatibility certified",
+                    );
+                },
+            });
+            const outcome = await policy.demandStart({
+                origin: "managed-default",
+                capability: "magic-context",
+            });
+
+            // The probe is told which incarnation was certified, and a reading it
+            // could not take there is an unproven readiness claim rather than a
+            // storage failure — remediation must point at the rotation.
+            expect(expectations).toEqual([new Uint8Array([7])]);
+            expect(outcome.result.ok).toBe(false);
+            expect(outcome.result.reason).toBe("native_probe_unavailable");
+            expect(outcome.result.remediation).toBe("run_daemon_restart");
+            expect(outcome.storage).toBeNull();
+            expect(outcome.authenticatedDaemonId).toBeUndefined();
+            expect(invocations(invocationLog)).toEqual(["start"]);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     test("managed harness mismatch never preempts the running daemon", async () => {
         const root = tempDir("mc-policy-converge-");
         const invocationLog = path.join(root, "converge-invocations.log");

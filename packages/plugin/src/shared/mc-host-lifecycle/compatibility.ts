@@ -129,6 +129,33 @@ export type EpochName = keyof typeof releaseContract.epochs;
 
 export type ObservedEpochs = Partial<Record<EpochName, unknown>>;
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+    return value !== null && typeof value === "object" && !Array.isArray(value)
+        ? (value as Record<string, unknown>)
+        : null;
+}
+
+/**
+ * Map the sanitized Magic Context host-health metric names to the generated
+ * release-contract names. Values stay unknown so the exact epoch evaluator,
+ * rather than a coercion here, owns numeric validation.
+ */
+export function observedEpochsFromMagicContextMetrics(metrics: unknown): ObservedEpochs {
+    const epochs = asRecord(asRecord(metrics)?.epochs);
+    if (epochs === null) return {};
+    return {
+        ...("memory_render_epoch" in epochs ? { memory_render: epochs.memory_render_epoch } : {}),
+        ...("compartment_render_epoch" in epochs
+            ? { compartment_render: epochs.compartment_render_epoch }
+            : {}),
+        ...("profile_epoch" in epochs
+            ? { profile_claude_code_anthropic: epochs.profile_epoch }
+            : {}),
+        ...("tagger_epoch" in epochs ? { tagger: epochs.tagger_epoch } : {}),
+        ...("state_sync_epoch" in epochs ? { state_sync: epochs.state_sync_epoch } : {}),
+    };
+}
+
 /**
  * Evaluate the exact five-part Magic Context epoch set. Every contract epoch
  * must be present, numeric, and exactly equal; missing, non-numeric, stale,

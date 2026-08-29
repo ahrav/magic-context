@@ -81,11 +81,14 @@ export {
     sensitiveRootsFor,
 } from "./paths";
 export {
+    type CompatibilitySnapshot,
+    type CompatibilityStage,
     type DemandStartOutcome,
     type DemandStartRequest,
     type LifecycleCommand,
     type LifecyclePolicyOptions,
     McHostLifecyclePolicy,
+    type ObservationalHealth,
     OUTER_AGGREGATE_MS,
     STORAGE_HARD_BUDGET_MS,
     type StorageReadiness,

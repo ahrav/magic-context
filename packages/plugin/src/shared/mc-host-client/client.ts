@@ -80,6 +80,7 @@ import type {
     RequestOptions,
     RouteTarget,
 } from "./types";
+import { sameDaemonId } from "./types";
 
 /** Preserves the repo's current 2-second TypeScript handshake budget. */
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 2_000;
@@ -319,6 +320,9 @@ interface RequestParams {
     deadline: Deadline;
     options: RequestOptions;
     responseMode?: "json" | "binary";
+    mode?: "unary" | "stream";
+    /** Retained-item ceiling for a stream-mode request. */
+    maxStreamItems?: number;
     binary?: boolean;
     /**
      * Retain the raw wire Error terminal on the thrown failure. Only the
@@ -532,9 +536,13 @@ export class McHostClient {
      * attempt under one bounded deadline; retry policy belongs to owners
      * above (managed `call()` owns its own allowlisted retry loop).
      */
-    async routeOpen(target: RouteTarget, identity: BindIdentity): Promise<RouteHandle> {
+    async routeOpen(
+        target: RouteTarget,
+        identity: BindIdentity,
+        options: Pick<RequestOptions, "expectedDaemonId"> = {},
+    ): Promise<RouteHandle> {
         const deadline = Deadline.start(this.routeOpenDeadlineMs, this.clock);
-        const active = await this.ensureConnection(deadline);
+        const active = await this.ensureConnection(deadline, options.expectedDaemonId);
         return this.controlRouteOpen(
             active,
             target,
@@ -554,6 +562,7 @@ export class McHostClient {
         options: RequestOptions = {},
     ): Promise<unknown> {
         const active = this.requireLiveHandle(handle);
+        this.assertExpectedDaemon(active, options.expectedDaemonId);
         const deadline = Deadline.start(options.timeoutMs ?? this.requestTimeoutMs, this.clock);
         const terminal = await this.awaitRequest(active.generation, {
             channel: handle.channel,
@@ -572,6 +581,7 @@ export class McHostClient {
         options: RequestOptions = {},
     ): Promise<ReceiveLease> {
         const active = this.requireLiveHandle(handle);
+        this.assertExpectedDaemon(active, options.expectedDaemonId);
         const deadline = Deadline.start(options.timeoutMs ?? this.requestTimeoutMs, this.clock);
         const terminal = await this.awaitRequest(active.generation, {
             channel: handle.channel,
@@ -590,6 +600,51 @@ export class McHostClient {
             );
         }
         return terminal.body;
+    }
+
+    /**
+     * Collect one bounded JSON stream through StreamEnd, preserving item order.
+     * The stream is bounded by both the connection's pending byte budget and a
+     * retained-item ceiling, so a peer cannot make the client hold unbounded
+     * per-item decode overhead under the byte budget alone.
+     */
+    async requestStream(
+        handle: RouteHandle,
+        body: unknown,
+        options: RequestOptions & { maxStreamItems?: number } = {},
+    ): Promise<unknown[]> {
+        const active = this.requireLiveHandle(handle);
+        this.assertExpectedDaemon(active, options.expectedDaemonId);
+        const deadline = Deadline.start(options.timeoutMs ?? this.requestTimeoutMs, this.clock);
+        const terminal = await this.awaitRequest(active.generation, {
+            channel: handle.channel,
+            epoch: handle.epoch,
+            body: encodeBody(body),
+            deadline,
+            options,
+            mode: "stream",
+            ...(options.maxStreamItems === undefined
+                ? {}
+                : { maxStreamItems: options.maxStreamItems }),
+        });
+        if (terminal.kind !== "stream_end") {
+            throw new McHostCallError(
+                "terminal",
+                "stream request did not receive StreamEnd",
+                "expected_stream_response",
+            );
+        }
+        return terminal.stream.map((item) => {
+            const json = requireJsonReceiveBody(item);
+            if (!json.valid) {
+                throw new McHostCallError(
+                    "terminal",
+                    "stream item body was not valid JSON",
+                    "invalid_response_body",
+                );
+            }
+            return json.value;
+        });
     }
 
     /**
@@ -613,6 +668,7 @@ export class McHostClient {
             const handle = await this.managedRouteHandle(moduleId, options, deadline);
             try {
                 const active = this.requireLiveHandle(handle);
+                this.assertExpectedDaemon(active, options.expectedDaemonId);
                 const terminal = await this.awaitRequest(active.generation, {
                     channel: handle.channel,
                     epoch: handle.epoch,
@@ -642,8 +698,8 @@ export class McHostClient {
     }
 
     /** List catalog entries through a validated tagged `catalog.list`. */
-    async catalogList(): Promise<CatalogEntry[]> {
-        return (await this.catalogSnapshot()).modules;
+    async catalogList(options: { timeoutMs?: number } = {}): Promise<CatalogEntry[]> {
+        return (await this.catalogSnapshot(options)).modules;
     }
 
     /**
@@ -651,9 +707,13 @@ export class McHostClient {
      * host `subc_ops`, and per-module id/version/roles/control_ops. Any
      * duplicate, missing field, unknown field, or out-of-bounds value is a
      * terminal `malformed_control_response` — never a cast.
+     *
+     * `timeoutMs` overrides the client-wide request timeout so a caller holding
+     * an aggregate deadline can spend only the time it has left here instead of
+     * starting a fresh full-length request budget.
      */
-    async catalogSnapshot(): Promise<CatalogSnapshot> {
-        const deadline = Deadline.start(this.requestTimeoutMs, this.clock);
+    async catalogSnapshot(options: { timeoutMs?: number } = {}): Promise<CatalogSnapshot> {
+        const deadline = Deadline.start(options.timeoutMs ?? this.requestTimeoutMs, this.clock);
         const active = await this.ensureConnection(deadline);
         const bodyText = JSON.stringify({ op: "catalog.list" });
         const parsed = await this.controlRequest(active, bodyText, "catalog.list", deadline);
@@ -724,7 +784,10 @@ export class McHostClient {
     // Connection ownership: single-flight connect and retirement reaction.
     // ------------------------------------------------------------------
 
-    private async ensureConnection(deadline: Deadline): Promise<ActiveConnection> {
+    private async ensureConnection(
+        deadline: Deadline,
+        expectedDaemonId?: Uint8Array,
+    ): Promise<ActiveConnection> {
         // R1: one immutable handshake stage per caller, derived once from its
         // own operation deadline and kept through every join and replacement.
         const stage = deadline.stage(this.handshakeTimeoutMs);
@@ -732,7 +795,10 @@ export class McHostClient {
         for (;;) {
             if (this.closeStarted) throw new McHostClientError("client closed", "client_closed");
             const active = this.active;
-            if (active && !active.generation.isRetired()) return active;
+            if (active && !active.generation.isRetired()) {
+                this.assertExpectedDaemon(active, expectedDaemonId);
+                return active;
+            }
             let flight = this.connecting;
             let owner = false;
             if (!flight) {
@@ -764,7 +830,10 @@ export class McHostClient {
             }
             // KTD4: adopt only a still-current, non-retired generation; a
             // stale success re-enters recovery under the unchanged stage.
-            if (this.active === conn && !conn.generation.isRetired()) return conn;
+            if (this.active === conn && !conn.generation.isRetired()) {
+                this.assertExpectedDaemon(conn, expectedDaemonId);
+                return conn;
+            }
             if (stage.isExpired()) throw connectionStageError();
             // Pace the replacement dial unless a live candidate is already
             // installed (the loop head adopts it without new I/O).
@@ -1171,6 +1240,20 @@ export class McHostClient {
         return conn;
     }
 
+    private assertExpectedDaemon(
+        connection: ActiveConnection,
+        expectedDaemonId?: Uint8Array,
+    ): void {
+        if (expectedDaemonId === undefined) return;
+        if (!sameDaemonId(connection.generation.authenticatedDaemonId, expectedDaemonId)) {
+            throw new McHostCallError(
+                "not_sent",
+                "authenticated daemon changed after lifecycle compatibility validation",
+                "daemon_generation_changed",
+            );
+        }
+    }
+
     private evictHandle(handle: RouteHandle): void {
         const conn = this.connectionFor(handle);
         if (conn !== null) conn.liveRoutes.delete(handle.channel);
@@ -1457,7 +1540,10 @@ export class McHostClient {
             epoch: params.epoch,
             body: params.body,
             deadline: params.deadline,
-            mode: "unary",
+            mode: params.mode ?? "unary",
+            ...(params.maxStreamItems === undefined
+                ? {}
+                : { maxStreamItems: params.maxStreamItems }),
             responseMode: params.responseMode,
             binary: params.binary,
             priority: params.options.priority,
@@ -1652,6 +1738,12 @@ export class McHostClient {
             { kind: ManagedRouteKind }
         >;
         const consumerIdentity = this.envConsumerIdentity();
+        // The key stays daemon-independent so one logical binding owns one slot:
+        // a rotation retires the generation, so `isPrimaryLiveHandle` already
+        // refuses a handle from the previous daemon, and `assertExpectedDaemon`
+        // fences publication. Keying by identity instead would strand one entry
+        // per rotation and let a caller without an expectation open a second
+        // concurrent route for the same target.
         const key = routeCacheKey(target, identity, consumerIdentity);
         // R1: one immutable route-open stage per caller, derived once and
         // kept through every join and replacement decision.
@@ -1694,7 +1786,7 @@ export class McHostClient {
                 owner = true;
                 const slot = cached;
                 flight = makeSetupFlight(
-                    (f) => this.openCachedRoute(slot, stage, f),
+                    (f) => this.openCachedRoute(slot, stage, f, options.expectedDaemonId),
                     (f) => {
                         if (slot.opening === f) slot.opening = null;
                     },
@@ -1744,6 +1836,7 @@ export class McHostClient {
         cached: CachedManagedRoute,
         deadline: Deadline,
         flight: SetupFlight<RouteHandle>,
+        expectedDaemonId?: Uint8Array,
     ): Promise<RouteHandle> {
         let delayMs = SETUP_RETRY_BASE_MS;
         const backoff = async (): Promise<boolean> => {
@@ -1766,7 +1859,7 @@ export class McHostClient {
             }
             let active: ActiveConnection;
             try {
-                active = await this.ensureConnection(deadline);
+                active = await this.ensureConnection(deadline, expectedDaemonId);
             } catch (error) {
                 if (error instanceof McHostCallError) throw error;
                 // KTD3: a snapshot that outlives its stage names the clamped
