@@ -116,6 +116,15 @@ jobs:
           bun packages/e2e-tests/scripts/run-historian-eval.ts --mutations "$SELECT_FLAG" "$SELECT_PATH"
 
       - name: Run the live lane
+        # Below the job's 360 and above the script's own 320-minute deadline, so the
+        # three bounds nest. The script normally stops itself and publishes; if a
+        # single scenario hangs past this, only the STEP is killed and the archive
+        # step below still runs, uploading the incremental report. Without a step
+        # bound, a scenario running past the job limit cancels the whole job, and
+        # `if: always()` never gets to execute — the run spends its tokens and loses
+        # every artifact, which is the outcome the incremental report exists to
+        # prevent.
+        timeout-minutes: 330
         env:
           NODE_ENV: ""
           ANTHROPIC_API_KEY: ${{ secrets.HISTORIAN_EVAL_ANTHROPIC_API_KEY }}

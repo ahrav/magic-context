@@ -539,6 +539,37 @@ function historianWaitBudgetMs(mode: RunScenarioOptions["mode"]): number {
     return mode.kind === "live" ? 2 * DEFAULT_HISTORIAN_TIMEOUT_MS : 90_000;
 }
 
+/**
+ * System identity for a run, derived entirely from its OPTIONS — nothing about a
+ * scenario enters it.
+ *
+ * Exported because of that independence: a caller can build the same tuple before
+ * the first scenario starts, which is what lets an interrupted first run publish a
+ * partial report that still names the commit, the OpenCode version, and the model
+ * routes that consumed the tokens. Without it that artifact carries `system: null`
+ * and is useless for the longitudinal comparison the report schema exists for.
+ *
+ * One definition, two call sites, so the pre-run tuple and the recorded one cannot
+ * drift — and `resolveRepoCommitSha` caches per process, so both resolve the same
+ * sha even though the digest is computed lazily.
+ */
+export function runSystemTuple(
+    options: Pick<RunScenarioOptions, "mode"> & { repoCommitSha?: string; opencodeVersion?: string },
+): SystemVersionTuple {
+    const mode = options.mode;
+    return {
+        repoCommitSha: options.repoCommitSha ?? resolveRepoCommitSha(),
+        opencodeVersion: options.opencodeVersion ?? "unknown",
+        historianModelId: mode.kind === "live" ? mode.historianModel : "scripted-mock",
+        probeModelId:
+            mode.kind === "live" ? `${mode.probeModel.providerID}/${mode.probeModel.modelID}` : "scripted-mock",
+        parserImpl: "ts",
+        chunkTokenBudget: deriveHistorianChunkTokens(
+            resolveHistorianContextLimit(mode.kind === "live" ? mode.historianModel : undefined),
+        ),
+    };
+}
+
 class RunAbort extends Error {
     constructor(
         readonly reason: RunErrorReason,
@@ -1147,18 +1178,7 @@ class ScenarioRunner {
     }
 
     private systemTuple(): SystemVersionTuple {
-        const mode = this.options.mode;
-        return {
-            repoCommitSha: this.options.repoCommitSha ?? resolveRepoCommitSha(),
-            opencodeVersion: this.options.opencodeVersion ?? "unknown",
-            historianModelId: mode.kind === "live" ? mode.historianModel : "scripted-mock",
-            probeModelId:
-                mode.kind === "live" ? `${mode.probeModel.providerID}/${mode.probeModel.modelID}` : "scripted-mock",
-            parserImpl: "ts",
-            chunkTokenBudget: deriveHistorianChunkTokens(
-                resolveHistorianContextLimit(mode.kind === "live" ? mode.historianModel : undefined),
-            ),
-        };
+        return runSystemTuple(this.options);
     }
 
     private async execute(): Promise<HistorianEvalRunRecord> {

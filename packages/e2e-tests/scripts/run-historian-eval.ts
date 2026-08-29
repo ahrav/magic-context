@@ -16,7 +16,7 @@
 
 import { execSync } from "node:child_process";
 import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import {
     HARD_NEGATIVE_FAMILIES,
     HistorianEvalContractError,
@@ -28,7 +28,12 @@ import {
 } from "../src/historian-eval/contract";
 import { runMutationBattery } from "../src/historian-eval/mutations";
 import { checkFamilyCoverage, loadRelease } from "../src/historian-eval/promote";
-import { runScenario, type LiveHistorianMode, type SystemVersionTuple } from "../src/historian-eval/runner";
+import {
+    runScenario,
+    runSystemTuple,
+    type LiveHistorianMode,
+    type SystemVersionTuple,
+} from "../src/historian-eval/runner";
 import {
     buildLaneReport,
     laneBudgetExhaustedScore,
@@ -332,17 +337,38 @@ function buildPluginBundle(): number {
  * scenarios that finished, clearly labelled as partial, and a completed run
  * removes it.
  */
-/** Run records and DB snapshots, one directory per scenario, beside the report. */
-const LIVE_RUN_ARTIFACTS_DIR = "historian-eval-runs";
+/**
+ * Run records and DB snapshots for ONE report, one directory per scenario.
+ *
+ * Derived from the report's own name rather than a directory shared by every
+ * report in the folder. The documented multi-run audit writes `run-1.json` then
+ * `run-2.json` side by side, and a shared directory meant the second invocation's
+ * cleanup deleted the first run's records and snapshots while leaving `run-1.json`
+ * in place — a report with no evidence behind it, which is precisely what makes it
+ * re-scorable. Each report now owns and clears only its own records.
+ */
+function liveRunArtifactsDir(reportPath: string): string {
+    const file = basename(resolve(reportPath));
+    const stem = file.endsWith(".json") ? file.slice(0, -".json".length) : file;
+    return join(dirname(resolve(reportPath)), `${stem}-runs`);
+}
 
 function partialReportPath(reportPath: string): string {
     return `${resolve(reportPath)}.partial.json`;
 }
 
-function writePartialReport(reportPath: string, scores: readonly ScenarioScore[], releaseVersion: string | null): void {
+function writePartialReport(
+    reportPath: string,
+    scores: readonly ScenarioScore[],
+    releaseVersion: string | null,
+    system: SystemVersionTuple,
+): void {
     if (scores.length === 0) return;
     try {
-        const report = buildLaneReport(scores, releaseVersion === null ? {} : { releaseVersion });
+        const report = buildLaneReport(scores, {
+            system,
+            ...(releaseVersion === null ? {} : { releaseVersion }),
+        });
         writeFileSync(partialReportPath(reportPath), `${JSON.stringify(report, null, 2)}\n`);
     } catch (error) {
         // Never let progress bookkeeping fail the run it is bookkeeping for.
@@ -362,24 +388,29 @@ async function runLive(args: CliArgs): Promise<number> {
     const admission = liveAdmissionGate(scenarios);
     if (admission !== 0) return admission;
     const opencode = opencodeVersion();
+    // Built BEFORE the first request, from the same function the runner records, so
+    // an interrupted first scenario still publishes a report that names the commit,
+    // OpenCode version, and model routes that spent the tokens. Supplying it to
+    // `buildLaneReport` also cross-checks it: `resolveReportSystem` rejects a
+    // supplied tuple that disagrees with the scored records'.
+    const system = runSystemTuple({ mode, opencodeVersion: opencode });
     const reportDir = dirname(resolve(args.reportPath));
     // Before anything writes into it, including the first partial. Today the
     // directory happens to exist by the time that write lands, because
-    // `runScenario` creates `<reportDir>/<LIVE_RUN_ARTIFACTS_DIR>/<id>`
+    // `runScenario` creates `<reportDir>/<report-stem>-runs/<id>`
     // recursively — but that is an accident of where the run artifacts live and of
     // the runner's internal ordering, and the partial write swallows its errors,
     // so relying on it would make the guarantee silently depend on both.
     // Removal of the PREVIOUS run's artifacts happens earlier still, in
     // `clearPreviousLiveArtifacts`, ahead of everything that can reject.
     mkdirSync(reportDir, { recursive: true });
-    const artifactsRoot = join(reportDir, LIVE_RUN_ARTIFACTS_DIR);
+    const artifactsRoot = liveRunArtifactsDir(args.reportPath);
     // One entry per scenario from the start, replaced in place as each finishes.
     // Seeding the whole corpus is what makes every partial describe the whole
     // corpus, and what leaves evidence when the process dies inside the FIRST
     // scenario — the case "write after each scenario" cannot cover, because
     // nothing has completed while the tokens are already spent.
-    const scores: ScenarioScore[] = scenarios.map((scenario) => scenarioNotCompletedScore(scenario.id, null));
-    let system: SystemVersionTuple | undefined;
+    const scores: ScenarioScore[] = scenarios.map((scenario) => scenarioNotCompletedScore(scenario.id, system));
     // Measured after the build and battery, so the budget covers the part that
     // spends tokens rather than the deterministic preamble.
     const deadlineAt = args.deadlineMinutes === null ? null : Date.now() + args.deadlineMinutes * 60_000;
@@ -390,7 +421,7 @@ async function runLive(args: CliArgs): Promise<number> {
     // one, the first scenario always runs, and a scenario that overruns the
     // estimate costs the partial report rather than the whole artifact.
     let longestScenarioMs = 0;
-    writePartialReport(args.reportPath, scores, releaseVersion);
+    writePartialReport(args.reportPath, scores, releaseVersion, system);
     for (const [index, scenario] of scenarios.entries()) {
         // Checked BEFORE starting, never mid-scenario: a scenario abandoned
         // half-way has spent its tokens and produced no record, so the only useful
@@ -401,9 +432,9 @@ async function runLive(args: CliArgs): Promise<number> {
                 `lane budget: ${unreached.length} scenario(s) not run; ${Math.round(longestScenarioMs / 60_000)} minute(s) needed for the next, ${Math.round((deadlineAt - Date.now()) / 60_000)} remaining`,
             );
             for (const [offset, skipped] of unreached.entries()) {
-                scores[index + offset] = laneBudgetExhaustedScore(skipped.id, system ?? null);
+                scores[index + offset] = laneBudgetExhaustedScore(skipped.id, system);
             }
-            writePartialReport(args.reportPath, scores, releaseVersion);
+            writePartialReport(args.reportPath, scores, releaseVersion, system);
             break;
         }
         const artifactDir = join(artifactsRoot, scenario.id);
@@ -419,18 +450,17 @@ async function runLive(args: CliArgs): Promise<number> {
             artifactDir,
             opencodeVersion: opencode,
         });
-        system = record.system;
         longestScenarioMs = Math.max(longestScenarioMs, Date.now() - startedAt);
         const score = scoreRunRecord(record, scenario);
         scores[index] = score;
         console.log(
             `${scenario.id}: ${score.verdict}${score.failReasons.length > 0 ? ` [${score.failReasons.join(",")}]` : ""}${score.errorReason ? ` (${score.errorReason})` : ""}`,
         );
-        writePartialReport(args.reportPath, scores, releaseVersion);
+        writePartialReport(args.reportPath, scores, releaseVersion, system);
     }
     const report = buildLaneReport(scores, {
+        system,
         ...(releaseVersion === null ? {} : { releaseVersion }),
-        ...(system === undefined ? {} : { system }),
     });
     writeFileSync(resolve(args.reportPath), `${JSON.stringify(report, null, 2)}\n`);
     // The real report exists now, so the partial would only be a second, staler
@@ -458,7 +488,7 @@ function clearPreviousLiveArtifacts(reportPath: string): void {
     const reportDir = dirname(resolve(reportPath));
     rmSync(resolve(reportPath), { force: true });
     rmSync(partialReportPath(reportPath), { force: true });
-    rmSync(join(reportDir, LIVE_RUN_ARTIFACTS_DIR), { recursive: true, force: true });
+    rmSync(liveRunArtifactsDir(reportPath), { recursive: true, force: true });
 }
 
 async function main(): Promise<number> {
