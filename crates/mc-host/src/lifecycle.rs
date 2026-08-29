@@ -1211,16 +1211,21 @@ mod tests {
     /// `mkfifo(2)` directly is not available either. A lock name must classify as
     /// a hostile shape on every platform, so this stays compiled everywhere
     /// rather than being cfg'd out on the one whose absence let a build break
-    /// reach CI unnoticed. `mkfifo` honours the umask, so the mode is set
-    /// explicitly afterwards.
+    /// reach CI unnoticed.
+    ///
+    /// `-m 600` is load-bearing: POSIX has `mkfifo` apply that mode at creation
+    /// rather than deriving it from the umask, so the node is never briefly
+    /// reachable at a wider mode the way a create-then-`chmod` sequence leaves
+    /// it. These tests assert that a coordination node is never accessible
+    /// outside its intended mode, so the setup must not violate that invariant.
     fn plant_fifo(path: &Path) {
         let status = std::process::Command::new("mkfifo")
+            .arg("-m")
+            .arg("600")
             .arg(path)
             .status()
             .expect("mkfifo is a POSIX utility present on every supported platform");
         assert!(status.success(), "mkfifo failed for {}", path.display());
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .expect("owner-only fifo");
     }
 
     fn record_path(guard: &InstanceGuard) -> PathBuf {

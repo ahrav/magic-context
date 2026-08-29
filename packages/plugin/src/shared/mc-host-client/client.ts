@@ -608,11 +608,11 @@ export class McHostClient {
      * retained-item ceiling, so a peer cannot make the client hold unbounded
      * per-item decode overhead under the byte budget alone.
      */
-    async requestStream(
+    async requestStream<Item = unknown>(
         handle: RouteHandle,
         body: unknown,
         options: RequestOptions & { maxStreamItems?: number } = {},
-    ): Promise<unknown[]> {
+    ): Promise<Item[]> {
         const active = this.requireLiveHandle(handle);
         this.assertExpectedDaemon(active, options.expectedDaemonId);
         const deadline = Deadline.start(options.timeoutMs ?? this.requestTimeoutMs, this.clock);
@@ -643,7 +643,7 @@ export class McHostClient {
                     "invalid_response_body",
                 );
             }
-            return json.value;
+            return json.value as Item;
         });
     }
 

@@ -1,4 +1,3 @@
-export { daemonIdEquals } from "./auth";
 export {
     connectionFileExists,
     isConsumerReconnectTransient,

@@ -109,7 +109,6 @@ fn lane() -> LaneInfo {
     LaneInfo {
         model: "synapse-perf-zero-delay".to_owned(),
         fingerprint: FINGERPRINT.to_owned(),
-        execution_provider: "cpu",
         table_epoch: 1,
         dims: 8,
         // The inline engine below computes on the CPU, so it advertises the
