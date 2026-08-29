@@ -879,6 +879,20 @@ function recordShapeError(record: HistorianEvalRunRecord): ScenarioScore | null 
     if (record === null || typeof record !== "object" || Array.isArray(record)) {
         return errorScore("<unknown>", "record-malformed", `run record is not an object: ${typeof record}`, null);
     }
+    // Schema BEFORE the field requirements below, which are version-specific: a real
+    // v1 or v2 record legitimately lacks `system.opencodeVersion` or
+    // `system.bunVersion`, and reporting that as `record-malformed` calls a valid
+    // historical artifact damaged — defeating the point of bumping the schema for
+    // those very fields. Only the root-object check above precedes this, because
+    // reading `.schema` needs it.
+    if (record.schema !== RUN_RECORD_SCHEMA) {
+        return errorScore(
+            typeof record.scenarioId === "string" && record.scenarioId.length > 0 ? record.scenarioId : "<unknown>",
+            "record-schema-unsupported",
+            `run record schema ${JSON.stringify(record.schema)} is not ${RUN_RECORD_SCHEMA}`,
+            null,
+        );
+    }
     const isPair = (value: unknown): boolean =>
         Array.isArray(value) && value.length === 2 && value.every((entry) => typeof entry === "number");
     const problems: string[] = [];
@@ -990,19 +1004,9 @@ function recordIdentityError(
     record: HistorianEvalRunRecord,
     scenario: HistorianEvalScenario,
 ): ScenarioScore | null {
-    // Version first: every check below reads fields by v1 meaning, so an
-    // artifact written under a different schema must be refused rather than
-    // reinterpreted. Otherwise a persisted record whose fields merely still
-    // parse receives an ordinary PASS or FAIL under semantics it never had,
-    // which defeats the point of versioning the record at all.
-    if (record.schema !== RUN_RECORD_SCHEMA) {
-        return errorScore(
-            record.scenarioId,
-            "record-schema-unsupported",
-            `run record schema ${JSON.stringify(record.schema)} is not ${RUN_RECORD_SCHEMA}`,
-            record.system,
-        );
-    }
+    // The schema is already proven supported by `recordShapeError`, which has to
+    // classify it before applying version-specific field requirements — so every
+    // check here may read fields by their current meaning.
     if (record.scenarioId !== scenario.id) {
         return errorScore(
             record.scenarioId,

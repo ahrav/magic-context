@@ -26,7 +26,7 @@ import {
     rmSync,
     writeFileSync,
 } from "node:fs";
-import { basename, dirname, join, resolve, sep } from "node:path";
+import { basename, delimiter, dirname, join, resolve, sep } from "node:path";
 import {
     HARD_NEGATIVE_FAMILIES,
     HistorianEvalContractError,
@@ -312,12 +312,26 @@ function buildPluginBundle(): number {
     // HOME, and the Bun install cache, and enumerating those is how a build breaks
     // on the next toolchain change.
     const { ANTHROPIC_API_KEY: _live, ...credentialFreeEnv } = process.env;
+    // The RUNNING Bun, not whatever `bun` resolves to on PATH. `runSystemTuple`
+    // records `Bun.version` of this process, so shelling out to a different
+    // executable — an absolute version-manager path invoking the lane is enough —
+    // produced a bundle built by Bun B under a tuple claiming Bun A, which is the
+    // drift the field was added to make visible.
+    // PATH is prefixed as well as the argv0 being explicit, because the package's
+    // `build` script itself shells out to `bun` several times — for the TUI build and
+    // the bundle — and those nested calls resolve from PATH. Setting only argv0 left
+    // them on a different executable, which is the same drift one level down.
+    const build = Bun.spawnSync([process.execPath, "run", "--cwd", "packages/plugin", "build"], {
+        cwd: repoRoot,
+        stdout: "inherit",
+        stderr: "inherit",
+        env: {
+            ...credentialFreeEnv,
+            PATH: `${dirname(process.execPath)}${delimiter}${credentialFreeEnv.PATH ?? ""}`,
+        },
+    });
     try {
-        execSync("bun run --cwd packages/plugin build", {
-            cwd: repoRoot,
-            stdio: "inherit",
-            env: credentialFreeEnv,
-        });
+        if (!build.success) throw new Error(`exited with code ${build.exitCode}`);
         return 0;
     } catch (error) {
         console.error(
@@ -619,9 +633,20 @@ async function runLive(args: CliArgs): Promise<number> {
         system,
         ...(releaseVersion === null ? {} : { releaseVersion }),
     });
-    writeFileSync(resolve(args.reportPath), `${JSON.stringify(report, null, 2)}\n`);
-    // The real report exists now, so the partial would only be a second, staler
-    // answer in the same archive.
+    // Same temp-then-rename as the partial, and for a sharper reason: a failure
+    // partway through this write leaves invalid JSON at the path operators are
+    // documented to read as the completed result, which would hide the valid partial
+    // beside it. The partial is removed only after the rename succeeds, so at every
+    // instant at least one complete report exists.
+    const reportDestination = resolve(args.reportPath);
+    const reportStaging = join(laneArtifactsDir(args.reportPath), "report.json.tmp");
+    try {
+        writeFileSync(reportStaging, `${JSON.stringify(report, null, 2)}\n`);
+        renameSync(reportStaging, reportDestination);
+    } catch (error) {
+        rmSync(reportStaging, { force: true });
+        throw error;
+    }
     rmSync(partialReportPath(args.reportPath), { force: true });
     console.log(
         `published ${args.reportPath}: ${report.aggregate.total} scenario(s), red=${report.red}, runFatal=${report.runFatal}`,

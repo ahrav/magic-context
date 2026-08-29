@@ -74,6 +74,17 @@ export type { InjectedClaimRecord } from "./claim-read";
  * producer would be rejected as `record-malformed` rather than as the older schema
  * it is.
  */
+/**
+ * Non-request work inside one live historian pass, bounded generously.
+ *
+ * Child-session setup, output validation, repair-prompt construction, compartment
+ * and claim persistence, and the quiescence poll all sit between and after the two
+ * provider requests, and none is individually bounded. Two minutes is far above what
+ * local SQLite writes and a poll loop take, and it is the difference between the
+ * lane's wait exceeding the plugin's own bound and expiring exactly on it.
+ */
+const LIVE_HISTORIAN_OVERHEAD_MS = 120_000;
+
 /** Claim-capture-time database image; see `ScenarioRunner.capturedClaims`. */
 const PRE_PROBE_SNAPSHOT_FILE = "context-db-snapshot-pre-probe.sqlite";
 
@@ -540,7 +551,13 @@ export interface RunScenarioOptions {
  * already spent. That converts a slow provider into an invalidated experiment.
  *
  * The live budget covers the healthy path: the initial prompt plus one repair
- * prompt, each bounded by the plugin's own per-attempt timeout. Deliberately NOT
+ * prompt, each bounded by the plugin's own per-attempt timeout, PLUS the work that
+ * is not a provider request. Summing only the two request timeouts made the outer
+ * wait expire at exactly their total, so two responses landing near their limits
+ * left no room for child-session setup, output validation, repair-prompt
+ * construction, persistence, or the quiescence poll — and the lane recorded
+ * `run-never-fired` while the plugin was still legitimately finishing a valid
+ * repaired pass it had already paid for. Deliberately NOT
  * the pathological path — `runHistorianPrompt` retries transient failures
  * `MAX_HISTORIAN_RETRIES` times, and budgeting for every retry of both ladders
  * would put one stuck scenario above 30 minutes, enough for a single scenario to
@@ -552,7 +569,7 @@ export interface RunScenarioOptions {
  * it through `historianWaitMs`.
  */
 function historianWaitBudgetMs(mode: RunScenarioOptions["mode"]): number {
-    return mode.kind === "live" ? 2 * DEFAULT_HISTORIAN_TIMEOUT_MS : 90_000;
+    return mode.kind === "live" ? 2 * DEFAULT_HISTORIAN_TIMEOUT_MS + LIVE_HISTORIAN_OVERHEAD_MS : 90_000;
 }
 
 /**

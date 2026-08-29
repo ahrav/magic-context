@@ -1040,6 +1040,29 @@ describe("scoreRunRecord", () => {
         }
     });
 
+    test("an older schema is classified as unsupported, not as a malformed record", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = probeFreeScenario();
+            const record = makeRecord(fixture, scenario);
+            // A real v1/v2 record lacks the system fields v3 requires. Reporting that
+            // as `record-malformed` would call a valid historical artifact damaged and
+            // defeat the schema bump that added those fields.
+            const { bunVersion: _bun, opencodeVersion: _oc, ...olderSystem } = record.system;
+            const older = {
+                ...record,
+                schema: "historian-eval-run-record/v1" as typeof RUN_RECORD_SCHEMA,
+                system: olderSystem as typeof record.system,
+            };
+            const score = scoreRunRecord(older, scenario);
+            expect(score.errorReason).toBe("record-schema-unsupported");
+            expect(score.errorDetail).toContain("historian-eval-run-record/v1");
+            expect(score.scenarioId).toBe(scenario.id);
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
     test("an ERROR artifact under an unsupported schema is an integrity error, not its own stale reason", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {
