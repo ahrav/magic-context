@@ -462,6 +462,42 @@ describe("native invocation mapping", () => {
         }
     });
 
+    test("a short-circuited probe reports no check for an unobserved component", async () => {
+        const root = tempDir("mc-policy-unobserved-");
+        const { binary } = fakeBinary(root);
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                // The daemon stage failed, so host.status never ran: only the
+                // handshake-proven transport state is reported.
+                readinessProbe: async () => ({
+                    ...compatibleObservation(),
+                    authenticatedDaemonVersion: "mc-host/0.2.0",
+                    catalog: [],
+                    epochs: {},
+                    evaluatedThrough: "daemon" as const,
+                    readiness: { transport: { state: "ready", reason: "healthy" } },
+                }),
+            });
+
+            for (const result of [await policy.status(), await policy.doctor()]) {
+                expect(result.reason).toBe("incompatible_daemon");
+                const ids = result.checks.map((check) => check.id);
+                expect(ids).toContain("compatibility.daemon");
+                // Never observed, so they must not be asserted as failures that
+                // would point remediation away from the version mismatch.
+                expect(ids).not.toContain("readiness.storage");
+                expect(ids).not.toContain("readiness.synapse");
+                // Stages the probe never reached emit no verdict either.
+                expect(ids).not.toContain("compatibility.modules");
+                expect(ids).not.toContain("compatibility.epochs");
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     test("restart resolves the certified payload before one native transaction", async () => {
         const root = tempDir("mc-policy-restart-payload-");
         const invocationLog = path.join(root, "restart-invocations.log");
@@ -601,6 +637,73 @@ describe("demand-start coalescing and detachment (U3 scenarios 15-16)", () => {
             } finally {
                 rmSync(root, { recursive: true, force: true });
             }
+        }
+    });
+
+    test("concurrent demands share one compatibility probe", async () => {
+        const root = tempDir("mc-policy-probe-coalesce-");
+        const { binary } = fakeBinary(root);
+        let probes = 0;
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                compatibilityProbe: async () => {
+                    probes += 1;
+                    await new Promise((resolve) => setTimeout(resolve, 5));
+                    return compatibleObservation();
+                },
+            });
+
+            // The snapshot describes the daemon incarnation, not the requesting
+            // capability, so distinct capabilities still share one probe.
+            const outcomes = await Promise.all([
+                policy.demandStart({ origin: "managed-default", capability: "magic-context" }),
+                policy.demandStart({ origin: "managed-default", capability: "synapse" }),
+            ]);
+
+            for (const outcome of outcomes) {
+                expect(outcome.result.ok).toBe(true);
+                expect(outcome.authenticatedDaemonId).toEqual(new Uint8Array([7]));
+            }
+            expect(probes).toBe(1);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("a failed compatibility probe becomes a typed closed result, not a raw rejection", async () => {
+        const root = tempDir("mc-policy-probe-failure-");
+        const { binary, invocationLog } = fakeBinary(root);
+        let storageProbes = 0;
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                compatibilityProbe: async () => {
+                    throw new Error("authenticated peer changed during compatibility probe");
+                },
+                storageProbe: async () => {
+                    storageProbes += 1;
+                    return "ready";
+                },
+            });
+            const outcome = await policy.demandStart({
+                origin: "managed-default",
+                capability: "magic-context",
+            });
+
+            // An unproven compatibility claim authorizes no application traffic,
+            // and callers act on the reason rather than an unclassified throw.
+            expect(outcome.result.ok).toBe(false);
+            expect(outcome.result.reason).toBe("native_probe_unavailable");
+            expect(outcome.result.remediation).toBe("run_daemon_restart");
+            expect(outcome.authenticatedDaemonId).toBeUndefined();
+            expect(outcome.storage).toBeNull();
+            expect(storageProbes).toBe(0);
+            expect(invocations(invocationLog)).toEqual(["start"]);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
         }
     });
 

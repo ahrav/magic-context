@@ -659,7 +659,6 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         if (this.permanentFailure) return false;
         if (this.connectionOrigin === "managed-default") {
             try {
-                this.compatibleDaemonId = null;
                 if (!this.demandStart) {
                     throw Object.assign(
                         new Error("managed mc-host lifecycle owner is unavailable"),
@@ -692,6 +691,10 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                         "managed lifecycle compatibility returned no daemon identity",
                     );
                 }
+                // Written only on the success path: a concurrent initialize that
+                // fails must not erase an identity another caller already
+                // certified, and publication is unreachable without a successful
+                // demand because `callWithRetry` refuses a null identity.
                 this.compatibleDaemonId = Uint8Array.from(outcome.authenticatedDaemonId);
             } catch (error) {
                 log(
@@ -871,6 +874,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                         const classified = classifyError(error);
                         if (classified.code !== "module_restarted" || restarted) throw classified;
                         restarted = true;
+                        if (!(await this.recertifyForRestart(signal))) throw classified;
                     }
                 }
                 const batchEnvelope = responseBody(body);
@@ -1131,6 +1135,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                         terminal.ledgerRowId = row.rowId;
                         throw terminal;
                     }
+                    if (!(await this.recertifyForRestart(signal))) throw classified;
                 }
             }
             markSynapseLedgerObsolete(db, {
@@ -1252,6 +1257,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                             "restart budget or page deadline exhausted",
                         );
                     }
+                    if (!(await this.recertifyForRestart(signal))) throw classified;
                 }
             }
         } catch (error) {
@@ -1538,6 +1544,14 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
             try {
                 if (!this.client)
                     throw new SynapseEmbeddingError("transport", "Synapse client is unavailable");
+                // The managed lane publishes only against the incarnation the
+                // lifecycle owner certified. An absent identity means the fence
+                // cannot be proved, so refuse rather than publish unfenced.
+                if (this.connectionOrigin === "managed-default" && this.compatibleDaemonId === null)
+                    throw new SynapseEmbeddingError(
+                        "module_restarted",
+                        "managed Synapse lane has no certified daemon identity",
+                    );
                 return await this.client.call<T>(
                     this.options.moduleId ?? "synapse",
                     method,
@@ -1631,6 +1645,19 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 `Synapse table epoch changed from ${metadata.table_epoch} to ${epoch}`,
             );
         }
+    }
+
+    /**
+     * Re-certify the managed lane after a rotation. A restart budget authorizes
+     * one resubmission, and a resubmission may publish only against a freshly
+     * certified incarnation, so the identity is re-established here instead of
+     * inherited from the daemon that rotated away.
+     */
+    private async recertifyForRestart(signal?: AbortSignal): Promise<boolean> {
+        if (this.connectionOrigin !== "managed-default") return true;
+        this.initialized = false;
+        this.compatibleDaemonId = null;
+        return await this.initialize(signal);
     }
 
     private logCallFailure(error: unknown, operation: string): void {

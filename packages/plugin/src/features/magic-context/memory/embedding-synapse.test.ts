@@ -194,6 +194,33 @@ describe("SynapseEmbeddingProvider", () => {
         expect(client.requests[0]?.expectedDaemonId).toEqual(expectedDaemonId);
     });
 
+    it("refuses to publish on the managed lane without a certified daemon identity", async () => {
+        const client = new MockSynapseClient();
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "fence-required",
+            clientFactory: async () => client,
+        });
+        expect(await provider.initialize()).toBe(true);
+
+        // Reproduce the post-rotation state the failure handler installs: the
+        // lane is managed and its certified identity has been cleared. An
+        // omitted expectation would publish unfenced onto the rotated daemon.
+        const internals = provider as unknown as {
+            connectionOrigin: string;
+            compatibleDaemonId: Uint8Array | null;
+        };
+        internals.connectionOrigin = "managed-default";
+        internals.compatibleDaemonId = null;
+        const published = client.requests.length;
+
+        // `embed` reports a failed lane as null; the load-bearing assertion is
+        // that no request reached the wire without an expectation.
+        expect(await provider.embed("hello")).toBeNull();
+        expect(client.requests.length).toBe(published);
+    });
+
     it("adopts the catalog's advertised input limits", async () => {
         const client = new MockSynapseClient();
         client.call = async <Response = unknown>(

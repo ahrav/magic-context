@@ -761,13 +761,13 @@ describe("McHostModuleTransport", () => {
         ] as unknown as McHostClient[];
         const internals = transport as unknown as {
             client: McHostClient | null;
-            ensureConnected(): Promise<McHostClient>;
+            ensureConnected(): Promise<{ client: McHostClient; expectedDaemonId?: Uint8Array }>;
         };
         internals.ensureConnected = async () => {
             const client = clients[connectionCount++];
             if (!client) throw new Error("unexpected third connection attempt");
             internals.client = client;
-            return client;
+            return { client };
         };
 
         await expect(
@@ -807,11 +807,11 @@ describe("McHostModuleTransport", () => {
         } as unknown as McHostClient;
         const internals = transport as unknown as {
             client: McHostClient | null;
-            ensureConnected(): Promise<McHostClient>;
+            ensureConnected(): Promise<{ client: McHostClient; expectedDaemonId?: Uint8Array }>;
         };
         internals.ensureConnected = async () => {
             internals.client = client;
-            return client;
+            return { client };
         };
 
         const error = await rejection(
@@ -848,11 +848,11 @@ describe("McHostModuleTransport", () => {
         } as unknown as McHostClient;
         const internals = transport as unknown as {
             client: McHostClient | null;
-            ensureConnected(): Promise<McHostClient>;
+            ensureConnected(): Promise<{ client: McHostClient; expectedDaemonId?: Uint8Array }>;
         };
         internals.ensureConnected = async () => {
             internals.client = client;
-            return client;
+            return { client };
         };
 
         const error = await rejection(
@@ -882,11 +882,11 @@ describe("McHostModuleTransport", () => {
         } as unknown as McHostClient;
         const internals = transport as unknown as {
             client: McHostClient | null;
-            ensureConnected(): Promise<McHostClient>;
+            ensureConnected(): Promise<{ client: McHostClient; expectedDaemonId?: Uint8Array }>;
         };
         internals.ensureConnected = async () => {
             internals.client = client;
-            return client;
+            return { client };
         };
 
         await expect(
@@ -923,11 +923,11 @@ describe("McHostModuleTransport", () => {
         } as unknown as McHostClient;
         const internals = transport as unknown as {
             client: McHostClient | null;
-            ensureConnected(): Promise<McHostClient>;
+            ensureConnected(): Promise<{ client: McHostClient; expectedDaemonId?: Uint8Array }>;
         };
         internals.ensureConnected = async () => {
             internals.client = client;
-            return client;
+            return { client };
         };
 
         const error = await rejection(
@@ -961,12 +961,12 @@ describe("McHostModuleTransport", () => {
         } as unknown as McHostClient;
         const internals = transport as unknown as {
             client: McHostClient | null;
-            ensureConnected(): Promise<McHostClient>;
+            ensureConnected(): Promise<{ client: McHostClient; expectedDaemonId?: Uint8Array }>;
         };
         internals.ensureConnected = async () => {
             connectionCount += 1;
             internals.client = client;
-            return client;
+            return { client };
         };
         const startedAt = performance.now();
 
@@ -1005,12 +1005,12 @@ describe("McHostModuleTransport", () => {
         } as unknown as McHostClient;
         const internals = transport as unknown as {
             client: McHostClient | null;
-            ensureConnected(): Promise<McHostClient>;
+            ensureConnected(): Promise<{ client: McHostClient; expectedDaemonId?: Uint8Array }>;
         };
         internals.ensureConnected = async () => {
             connectionCount += 1;
             internals.client = client;
-            return client;
+            return { client };
         };
         const startedAt = performance.now();
 

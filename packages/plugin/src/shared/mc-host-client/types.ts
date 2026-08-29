@@ -63,6 +63,20 @@ export interface AuthenticatedPeer {
     proof: "current";
 }
 
+/**
+ * Single owner of the daemon-incarnation equality predicate every fence uses.
+ * Absent bytes on either side are never equal, so a caller that cannot name an
+ * identity cannot accidentally satisfy the comparison.
+ */
+export function sameDaemonId(
+    left: Uint8Array | null | undefined,
+    right: Uint8Array | null | undefined,
+): boolean {
+    if (left === null || left === undefined || right === null || right === undefined) return false;
+    if (left.length !== right.length) return false;
+    return left.every((byte, index) => byte === right[index]);
+}
+
 export interface PublicationDiagnostics {
     daemonVer: string;
     pid: number;

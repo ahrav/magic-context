@@ -8,10 +8,10 @@ import {
     type CatalogEntry,
     type HostStatusSnapshot,
     McHostClient,
+    sameDaemonId,
 } from "../mc-host-client";
 import { BootstrapError, checkPlatform, type PlatformReaders, parseTrustIndex } from "./bootstrap";
 import {
-    evaluateCompatibility,
     evaluateDaemonCompatibility,
     evaluateModuleCompatibility,
     observedEpochsFromMagicContextMetrics,
@@ -104,17 +104,10 @@ export interface ManagedCompatibilityClient {
 }
 
 function samePeer(left: AuthenticatedPeer | null, right: AuthenticatedPeer): boolean {
-    if (
-        left === null ||
-        left.daemonVer !== right.daemonVer ||
-        left.proof !== right.proof ||
-        left.daemonId === null ||
-        right.daemonId === null ||
-        left.daemonId.length !== right.daemonId.length
-    ) {
+    if (left === null || left.daemonVer !== right.daemonVer || left.proof !== right.proof) {
         return false;
     }
-    return left.daemonId.every((byte, index) => byte === right.daemonId?.[index]);
+    return sameDaemonId(left.daemonId, right.daemonId);
 }
 
 interface CompatibilityProbeResult {
@@ -122,6 +115,17 @@ interface CompatibilityProbeResult {
     status: HostStatusSnapshot | null;
 }
 
+/**
+ * Read one ordered daemon/modules/epochs observation from a single authenticated
+ * peer, stopping at the first stage that cannot pass and re-checking the peer
+ * across every await so a rotation cannot produce a mixed snapshot.
+ *
+ * The returned snapshot is an observation, not a verdict: `evaluatedThrough`
+ * names the last stage actually reached, and the policy layer owns the verdict
+ * so one place decides precedence and remediation. `status` is null exactly when
+ * the probe short-circuited before `host.status`, meaning storage and Synapse
+ * were never observed.
+ */
 async function readCompatibilityProbe(
     client: ManagedCompatibilityClient,
     deadline: number,
@@ -180,11 +184,6 @@ async function readCompatibilityProbe(
         epochs: observedEpochsFromMagicContextMetrics(magicContextMetrics),
         evaluatedThrough: "epochs" as const,
     };
-    evaluateCompatibility({
-        authenticatedDaemonVer: snapshot.authenticatedDaemonVersion,
-        catalog: snapshot.catalog,
-        epochs: snapshot.epochs,
-    });
     return { snapshot, status };
 }
 
@@ -229,13 +228,14 @@ async function probeManagedReadiness(root: string, budgetMs: number): Promise<Ob
     try {
         const { snapshot: compatibility, status } = await readCompatibilityProbe(client, deadline);
         if (status === null) {
+            // The probe short-circuited at the daemon or module stage, so
+            // `host.status` never ran and storage and Synapse were never
+            // observed. Report only what the handshake proved and leave the
+            // unobserved components absent rather than asserting failures that
+            // would point remediation away from the version mismatch.
             return {
                 ...compatibility,
-                readiness: {
-                    transport: { state: "ready", reason: "healthy" },
-                    storage: { state: "unavailable", reason: "storage_unavailable" },
-                    synapse: { state: "degraded", reason: "synapse_degraded" },
-                },
+                readiness: { transport: { state: "ready", reason: "healthy" } },
             };
         }
         const components = asRecord(status.metrics.components);

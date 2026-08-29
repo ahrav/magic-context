@@ -30,6 +30,24 @@ function peer(daemonVer = releaseContract.versions.daemon, daemonId = 7): Authen
     };
 }
 
+/**
+ * Host-health metrics carry wire epoch names, which differ from the contract
+ * names; building the fixture from the wire spelling is what makes the probe's
+ * mapping observable instead of silently yielding an empty epoch set.
+ */
+function wireEpochs(overrides: Record<string, unknown> = {}) {
+    return {
+        epochs: {
+            memory_render_epoch: releaseContract.epochs.memory_render,
+            compartment_render_epoch: releaseContract.epochs.compartment_render,
+            profile_epoch: releaseContract.epochs.profile_claude_code_anthropic,
+            tagger_epoch: releaseContract.epochs.tagger,
+            state_sync_epoch: releaseContract.epochs.state_sync,
+            ...overrides,
+        },
+    };
+}
+
 function client(options: {
     authenticated?: AuthenticatedPeer;
     catalog?: CatalogEntry[];
@@ -49,7 +67,7 @@ function client(options: {
                 metrics: {
                     components: {
                         "magic-context": {
-                            metrics: options.status ?? { epochs: { ...releaseContract.epochs } },
+                            metrics: options.status ?? wireEpochs(),
                         },
                     },
                 },
@@ -102,19 +120,23 @@ describe("managed authenticated compatibility probe", () => {
         expect(calls).toEqual(["catalog.list"]);
     });
 
+    test("a fully compatible daemon reaches the epoch stage and passes", async () => {
+        const calls: string[] = [];
+        const snapshot = await readCompatibilitySnapshot(client({ calls }), Date.now() + 1_000);
+
+        expect(verdict(snapshot).ok).toBe(true);
+        expect(snapshot.evaluatedThrough).toBe("epochs");
+        expect(snapshot.epochs).toEqual({ ...releaseContract.epochs });
+        expect(calls).toEqual(["catalog.list", "host.status"]);
+    });
+
     test("epoch mismatch uses one bounded host status request", async () => {
         const calls: string[] = [];
         const snapshot = await readCompatibilitySnapshot(
             client({
-                status: {
-                    epochs: {
-                        memory_render_epoch: releaseContract.epochs.memory_render,
-                        compartment_render_epoch: releaseContract.epochs.compartment_render,
-                        profile_epoch: releaseContract.epochs.profile_claude_code_anthropic,
-                        tagger_epoch: releaseContract.epochs.tagger,
-                        state_sync_epoch: releaseContract.epochs.state_sync + 1,
-                    },
-                },
+                status: wireEpochs({
+                    state_sync_epoch: releaseContract.epochs.state_sync + 1,
+                }),
                 calls,
             }),
             Date.now() + 1_000,

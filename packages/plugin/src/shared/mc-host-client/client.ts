@@ -80,6 +80,7 @@ import type {
     RequestOptions,
     RouteTarget,
 } from "./types";
+import { sameDaemonId } from "./types";
 
 /** Preserves the repo's current 2-second TypeScript handshake budget. */
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 2_000;
@@ -320,6 +321,8 @@ interface RequestParams {
     options: RequestOptions;
     responseMode?: "json" | "binary";
     mode?: "unary" | "stream";
+    /** Retained-item ceiling for a stream-mode request. */
+    maxStreamItems?: number;
     binary?: boolean;
     /**
      * Retain the raw wire Error terminal on the thrown failure. Only the
@@ -599,11 +602,16 @@ export class McHostClient {
         return terminal.body;
     }
 
-    /** Collect one bounded JSON stream through StreamEnd, preserving item order. */
+    /**
+     * Collect one bounded JSON stream through StreamEnd, preserving item order.
+     * The stream is bounded by both the connection's pending byte budget and a
+     * retained-item ceiling, so a peer cannot make the client hold unbounded
+     * per-item decode overhead under the byte budget alone.
+     */
     async requestStream(
         handle: RouteHandle,
         body: unknown,
-        options: RequestOptions = {},
+        options: RequestOptions & { maxStreamItems?: number } = {},
     ): Promise<unknown[]> {
         const active = this.requireLiveHandle(handle);
         this.assertExpectedDaemon(active, options.expectedDaemonId);
@@ -615,6 +623,9 @@ export class McHostClient {
             deadline,
             options,
             mode: "stream",
+            ...(options.maxStreamItems === undefined
+                ? {}
+                : { maxStreamItems: options.maxStreamItems }),
         });
         if (terminal.kind !== "stream_end") {
             throw new McHostCallError(
@@ -1230,12 +1241,7 @@ export class McHostClient {
         expectedDaemonId?: Uint8Array,
     ): void {
         if (expectedDaemonId === undefined) return;
-        const actual = connection.generation.authenticatedDaemonId;
-        if (
-            actual === null ||
-            actual.length !== expectedDaemonId.length ||
-            !actual.every((byte, index) => byte === expectedDaemonId[index])
-        ) {
+        if (!sameDaemonId(connection.generation.authenticatedDaemonId, expectedDaemonId)) {
             throw new McHostCallError(
                 "not_sent",
                 "authenticated daemon changed after lifecycle compatibility validation",
@@ -1531,6 +1537,9 @@ export class McHostClient {
             body: params.body,
             deadline: params.deadline,
             mode: params.mode ?? "unary",
+            ...(params.maxStreamItems === undefined
+                ? {}
+                : { maxStreamItems: params.maxStreamItems }),
             responseMode: params.responseMode,
             binary: params.binary,
             priority: params.options.priority,
@@ -1725,13 +1734,13 @@ export class McHostClient {
             { kind: ManagedRouteKind }
         >;
         const consumerIdentity = this.envConsumerIdentity();
-        const expectedDaemonKey =
-            options.expectedDaemonId === undefined
-                ? ""
-                : Array.from(options.expectedDaemonId, (byte) =>
-                      byte.toString(16).padStart(2, "0"),
-                  ).join("");
-        const key = `${routeCacheKey(target, identity, consumerIdentity)}\0${expectedDaemonKey}`;
+        // The key stays daemon-independent so one logical binding owns one slot:
+        // a rotation retires the generation, so `isPrimaryLiveHandle` already
+        // refuses a handle from the previous daemon, and `assertExpectedDaemon`
+        // fences publication. Keying by identity instead would strand one entry
+        // per rotation and let a caller without an expectation open a second
+        // concurrent route for the same target.
+        const key = routeCacheKey(target, identity, consumerIdentity);
         // R1: one immutable route-open stage per caller, derived once and
         // kept through every join and replacement decision.
         const stage = deadline.stage(this.routeOpenDeadlineMs);

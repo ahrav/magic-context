@@ -59,6 +59,14 @@ const RETIREMENT_SETTLE_GRACE_MS = 50;
  * reserved control frames, and small control-plane bodies.
  */
 const DEFAULT_MEMORY_OVERHEAD_BYTES = 1_048_576;
+/**
+ * Retained-item ceiling for one stream-mode request. The pending byte budget
+ * admits roughly 65 MiB of wire bytes, which a peer can fill with millions of
+ * minimal JSON items whose retained decode overhead (object, text, parsed
+ * value) the budget never counts. Bounding item count keeps a stream's heap
+ * cost proportional to a figure the client actually enforces.
+ */
+const DEFAULT_MAX_STREAM_ITEMS = 100_000;
 const EMPTY_JSON_BODY: JsonReceiveBody = Object.freeze({
     kind: "json",
     byteLength: 0,
@@ -142,6 +150,12 @@ export interface RequestParams {
     /** Absolute operation deadline; covers queueing, writing, and terminal wait. */
     deadline: Deadline;
     mode?: PendingMode;
+    /**
+     * Retained-item ceiling for a stream-mode request. The pending byte budget
+     * counts wire bytes only, so a peer emitting many tiny items can retain
+     * unbounded per-item decode overhead under it; this bounds item count too.
+     */
+    maxStreamItems?: number;
     responseMode?: "json" | "binary";
     binary?: boolean;
     priority?: Priority;
@@ -239,6 +253,7 @@ interface PendingEntry {
     epoch: number;
     corr: bigint;
     mode: PendingMode;
+    maxStreamItems: number;
     responseMode: "json" | "binary";
     writeInvoked: boolean;
     callerSettled: boolean;
@@ -515,6 +530,7 @@ export class ConnectionGeneration {
             epoch: params.epoch,
             corr,
             mode: params.mode ?? "unary",
+            maxStreamItems: params.maxStreamItems ?? DEFAULT_MAX_STREAM_ITEMS,
             responseMode: params.responseMode ?? "json",
             writeInvoked: false,
             callerSettled: false,
@@ -818,6 +834,19 @@ export class ConnectionGeneration {
             entry.sawStream = true;
             if (entry.mode === "unary") {
                 releaseQuietly(lease);
+                return;
+            }
+            if (entry.streamItems.length >= entry.maxStreamItems) {
+                releaseQuietly(lease);
+                this.settleCallerReject(
+                    entry,
+                    new McHostCallError(
+                        "terminal",
+                        `stream exceeded ${entry.maxStreamItems} retained items`,
+                        "stream_item_limit",
+                    ),
+                );
+                this.finishEntry(entry);
                 return;
             }
             let body: RequestReceiveBody;

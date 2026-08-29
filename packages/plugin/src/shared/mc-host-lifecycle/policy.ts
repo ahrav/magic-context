@@ -189,6 +189,8 @@ export class McHostLifecyclePolicy {
     private readonly defaultStartupEnvelope: NativeStartupEnvelope | undefined;
     private readonly outerAggregateMs: number;
     private readonly inflightStarts = new Map<string, Promise<DaemonResultV1>>();
+    /** One in-flight compatibility probe per data root, keyed independently of capability. */
+    private readonly inflightCompatibility = new Map<string, Promise<CompatibilitySnapshot>>();
 
     constructor(options: LifecyclePolicyOptions = {}) {
         this.env = options.env ?? process.env;
@@ -275,13 +277,35 @@ export class McHostLifecyclePolicy {
         let authenticatedDaemonId: Uint8Array | undefined;
         if (this.compatibilityProbe !== undefined) {
             const compatibilityBudget = remainingMs ?? this.outerAggregateMs;
-            const snapshot = await this.raceDetached(
-                this.compatibilityProbe(Math.max(1, compatibilityBudget), request.signal),
-                request.signal,
-                remainingMs,
-            );
-            compatibleResult = this.applyCompatibility(result, snapshot);
-            if (!compatibleResult.ok) return { result: compatibleResult, storage: null };
+            let snapshot: CompatibilitySnapshot;
+            try {
+                snapshot = await this.raceDetached(
+                    this.sharedCompatibility(
+                        rootResolution.ok ? rootResolution.root : "\u0000no-root",
+                        Math.max(1, compatibilityBudget),
+                    ),
+                    request.signal,
+                    remainingMs,
+                );
+            } catch (error) {
+                // Detachment is the caller's own deadline or signal and stays a
+                // thrown control outcome. Any other probe failure is an unproven
+                // compatibility claim, so it becomes a typed closed result rather
+                // than an unclassified rejection callers cannot act on.
+                if (error instanceof WaiterDetachedError) throw error;
+                return {
+                    result: {
+                        ...result,
+                        ok: false,
+                        reason: "native_probe_unavailable",
+                        remediation: remediationForReason("native_probe_unavailable"),
+                    },
+                    storage: null,
+                };
+            }
+            const applied = this.applyCompatibility(result, snapshot);
+            compatibleResult = applied.result;
+            if (!applied.verdict.ok) return { result: compatibleResult, storage: null };
             authenticatedDaemonId = Uint8Array.from(snapshot.authenticatedDaemonId);
             remainingMs = remaining();
             if (remainingMs === 0) throw new WaiterDetachedError("deadline");
@@ -299,6 +323,32 @@ export class McHostLifecyclePolicy {
             remainingMs,
         );
         return { result: compatibleResult, storage, authenticatedDaemonId };
+    }
+
+    /**
+     * One compatibility probe per data root in flight. The snapshot describes the
+     * daemon incarnation, not the requesting capability, so concurrent demands
+     * share one connection and one `catalog.list`/`host.status` pair instead of
+     * each opening its own. The shared probe carries no caller signal; callers
+     * bound their own wait with `raceDetached`, so one detaching caller cannot
+     * cancel the probe another is still awaiting.
+     */
+    private sharedCompatibility(root: string, budgetMs: number): Promise<CompatibilitySnapshot> {
+        const probe = this.compatibilityProbe;
+        if (probe === undefined) {
+            return Promise.reject(new Error("compatibility probe is unavailable"));
+        }
+        const existing = this.inflightCompatibility.get(root);
+        if (existing) return existing;
+        const shared = probe(budgetMs);
+        this.inflightCompatibility.set(root, shared);
+        const evict = (): void => {
+            if (this.inflightCompatibility.get(root) === shared) {
+                this.inflightCompatibility.delete(root);
+            }
+        };
+        void shared.then(evict, evict);
+        return shared;
     }
 
     private raceWaiter(
@@ -463,7 +513,10 @@ export class McHostLifecyclePolicy {
                 return { ...native, command };
             }
             const observed = await this.readinessProbe(Math.max(1, deadline - Date.now()));
-            const compatible = this.applyCompatibility(native, observed);
+            const { result: compatible, verdict: compatibility } = this.applyCompatibility(
+                native,
+                observed,
+            );
             const checksById = new Map(
                 compatible.checks.map((check) => [check.id, check] as const),
             );
@@ -501,7 +554,8 @@ export class McHostLifecyclePolicy {
                 checksById.get("readiness.storage"),
                 checksById.get("readiness.synapse"),
             ].find((check) => check?.status === "fail");
-            const compatibility = evaluateCompatibility(compatibilityInput(observed));
+            // Compatibility outranks readiness: an incompatible daemon explains
+            // the component states, so its reason is the one an operator acts on.
             const failureReason = compatibility.ok
                 ? readinessFailure?.reason
                 : compatibility.reason;
@@ -523,7 +577,7 @@ export class McHostLifecyclePolicy {
     private applyCompatibility(
         result: DaemonResultV1,
         snapshot: CompatibilitySnapshot,
-    ): DaemonResultV1 {
+    ): { result: DaemonResultV1; verdict: CompatibilityVerdict } {
         const verdict = evaluateCompatibility(compatibilityInput(snapshot));
         const stages: ReadonlyArray<{
             stage: CompatibilityStage;
@@ -566,18 +620,23 @@ export class McHostLifecyclePolicy {
         const moduleVersion = (moduleId: string): string | null =>
             snapshot.catalog.find((entry) => entry.module_id === moduleId)?.module_version ?? null;
         return {
-            ...result,
-            ok: result.ok && verdict.ok,
-            reason: verdict.ok ? result.reason : verdict.reason,
-            remediation: verdict.ok ? result.remediation : remediationForReason(verdict.reason),
-            checks: [...checksById.values()].sort((left, right) => left.id.localeCompare(right.id)),
-            versions: {
-                ...result.versions,
-                proof: "current",
-                daemon: snapshot.authenticatedDaemonVersion,
-                magic_context: moduleVersion("magic-context"),
-                synapse: moduleVersion("synapse"),
-                broca: moduleVersion("broca"),
+            verdict,
+            result: {
+                ...result,
+                ok: result.ok && verdict.ok,
+                reason: verdict.ok ? result.reason : verdict.reason,
+                remediation: verdict.ok ? result.remediation : remediationForReason(verdict.reason),
+                checks: [...checksById.values()].sort((left, right) =>
+                    left.id.localeCompare(right.id),
+                ),
+                versions: {
+                    ...result.versions,
+                    proof: "current",
+                    daemon: snapshot.authenticatedDaemonVersion,
+                    magic_context: moduleVersion("magic-context"),
+                    synapse: moduleVersion("synapse"),
+                    broca: moduleVersion("broca"),
+                },
             },
         };
     }

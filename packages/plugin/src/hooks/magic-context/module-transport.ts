@@ -26,6 +26,7 @@ import {
     SocketClosedError,
     SocketTimeoutError,
     StaleRouteHandleError,
+    sameDaemonId,
 } from "../../shared/mc-host-client";
 import {
     type ConnectionOrigin,
@@ -93,15 +94,6 @@ function managedCredentialSourceVersion(env: Record<string, string | undefined>)
         hash.update(`${Buffer.byteLength(value)}:${value}`);
     }
     return hash.digest("hex");
-}
-
-function sameDaemonId(left: Uint8Array | null | undefined, right: Uint8Array): boolean {
-    return (
-        left !== null &&
-        left !== undefined &&
-        left.length === right.length &&
-        left.every((byte, index) => byte === right[index])
-    );
 }
 
 interface GeneratedHarnessClosure {
@@ -355,6 +347,11 @@ interface EnsuredRoute {
     route: RouteHandle;
     routeKey: string;
     generation: number;
+    /**
+     * Identity certified for this connection, captured once so a concurrent
+     * invalidation cannot drop the fence between route open and body send.
+     */
+    expectedDaemonId?: Uint8Array;
 }
 
 export interface ModuleTransportGenerationChangedResult {
@@ -758,9 +755,9 @@ export class McHostModuleTransport {
                             admissionClass: AdmissionClass.Normal,
                             timeoutMs: Math.max(1, deadline.remainingMs()),
                             signal: args.signal,
-                            ...(this.compatibleDaemonId === null
+                            ...(ensuredRoute.expectedDaemonId === undefined
                                 ? {}
-                                : { expectedDaemonId: this.compatibleDaemonId }),
+                                : { expectedDaemonId: ensuredRoute.expectedDaemonId }),
                         }),
                         deadline,
                         "waiting for the module response",
@@ -1048,14 +1045,18 @@ export class McHostModuleTransport {
                 : undefined;
         // Read the cached route only after the connection is settled. The generation check
         // makes a route from any earlier connection invisible even if a cache clear is missed.
-        const client = await this.ensureConnected(deadline, signal);
+        const { client, expectedDaemonId } = await this.ensureConnected(deadline, signal);
+        // Every publication on this route carries the identity certified for this
+        // connection, captured here so a concurrent invalidation cannot relax the
+        // fence to "no expectation" across the awaits below.
+        const fence = expectedDaemonId === undefined ? {} : { expectedDaemonId };
         const generation = this.connectionGeneration;
         const existing = this.routes.get(routeKey);
         if (
             existing?.generation === generation &&
             (existing.credentialSourceVersion ?? "") === (credentialSourceVersion ?? "")
         ) {
-            return { client, route: existing.route, routeKey, generation };
+            return { client, route: existing.route, routeKey, generation, ...fence };
         }
         if (existing) {
             this.routes.delete(routeKey);
@@ -1084,11 +1085,7 @@ export class McHostModuleTransport {
                 session: `${this.routeSessionPrefix}${sessionId}`,
             };
             const route = await this.beforeDeadline(
-                client.routeOpen(target, identity, {
-                    ...(this.compatibleDaemonId === null
-                        ? {}
-                        : { expectedDaemonId: this.compatibleDaemonId }),
-                }),
+                client.routeOpen(target, identity, fence),
                 deadline,
                 "opening the module route",
             );
@@ -1107,7 +1104,7 @@ export class McHostModuleTransport {
                 generation,
                 ...(credentialSourceVersion === undefined ? {} : { credentialSourceVersion }),
             });
-            return { client, route, routeKey, generation };
+            return { client, route, routeKey, generation, ...fence };
         })();
         this.routeOpenings.set(routeKey, routeOpening);
         try {
@@ -1210,17 +1207,44 @@ export class McHostModuleTransport {
     private async ensureConnected(
         deadline?: Deadline,
         signal?: AbortSignal,
-    ): Promise<McHostClient> {
-        if (
-            this.client &&
-            (this.connectionOrigin !== "managed-default" ||
-                (this.compatibleDaemonId !== null &&
-                    sameDaemonId(this.client.authenticated?.daemonId, this.compatibleDaemonId)))
-        ) {
-            return this.client;
+    ): Promise<{ client: McHostClient; expectedDaemonId?: Uint8Array }> {
+        const cached = this.client;
+        if (cached) {
+            if (this.connectionOrigin !== "managed-default") {
+                return { client: cached };
+            }
+            const certified = this.compatibleDaemonId;
+            const actual = cached.authenticated?.daemonId;
+            // An unset peer identity is the facade's own generation recovery, not
+            // a rotation, so it reuses the certified identity and lets the facade
+            // reconnect; the per-request fence still asserts against that
+            // identity, so a reconnect onto a different daemon fails not_sent.
+            // Only an identity that is present and different is a real rotation.
+            if (
+                certified !== null &&
+                (actual === null || actual === undefined || sameDaemonId(actual, certified))
+            ) {
+                return { client: cached, expectedDaemonId: certified };
+            }
+            this.invalidateConnection(cached);
         }
-        if (this.client) this.invalidateConnection(this.client);
-        const expectedDaemonId = await this.demandManagedReadiness(deadline, signal);
+        // Backoff gates the lifecycle demand as well as the dial: a rotated or
+        // unreachable daemon must not be re-probed at full request rate. An
+        // in-flight connection is joined below without a new attempt.
+        if (!this.connectionPromise && Date.now() < this.nextProbeMs) {
+            throw this.connectionBackoffError();
+        }
+        let expectedDaemonId: Uint8Array | undefined;
+        try {
+            expectedDaemonId = await this.demandManagedReadiness(deadline, signal);
+        } catch (error) {
+            // A failed demand (probe failure, incompatibility, storage not ready)
+            // must not be re-issued at request rate: arm the same dial backoff a
+            // failed connect arms, so the next caller is gated above.
+            this.nextProbeMs = Date.now() + this.backoffMs;
+            this.backoffMs = Math.min(this.backoffMs * 2, CONNECT_BACKOFF_MAX_MS);
+            throw error;
+        }
         this.compatibleDaemonId =
             expectedDaemonId === undefined ? null : Uint8Array.from(expectedDaemonId);
         if (signal?.aborted) {
@@ -1237,17 +1261,7 @@ export class McHostModuleTransport {
                     "daemon changed after lifecycle compatibility validation",
                 );
             }
-            return candidate;
-        }
-        const now = Date.now();
-        if (now < this.nextProbeMs) {
-            const error = new Error(
-                `mc-host connection backoff active until ${this.nextProbeMs}`,
-            ) as Error & {
-                code?: string;
-            };
-            error.code = "MC_HOST_CONNECTION_BACKOFF";
-            throw error;
+            return { client: candidate, expectedDaemonId };
         }
 
         const generation = this.connectionGeneration;
@@ -1283,10 +1297,18 @@ export class McHostModuleTransport {
         })();
         this.connectionPromise = connecting;
         try {
-            return await connecting;
+            return { client: await connecting, expectedDaemonId };
         } finally {
             if (this.connectionPromise === connecting) this.connectionPromise = null;
         }
+    }
+
+    private connectionBackoffError(): Error & { code?: string } {
+        const error = new Error(
+            `mc-host connection backoff active until ${this.nextProbeMs}`,
+        ) as Error & { code?: string };
+        error.code = "MC_HOST_CONNECTION_BACKOFF";
+        return error;
     }
 
     private invalidateConnection(client: McHostClient | null = this.client): void {
