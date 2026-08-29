@@ -443,7 +443,7 @@ jobs:
         run: bun run --cwd packages/plugin test:mc-host-client:node
 
   check-rust:
-    name: Check (Rust fmt + clippy)
+    name: Check (Rust fmt + mc-core features)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -455,20 +455,21 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt
 
       - name: Provision metadata-only sibling stubs
         run: sh scripts/provision-rust-ci-stubs.sh
 
+      # fmt resolves the workspace from metadata alone, so it works against the
+      # sibling stubs. Clippy would have to compile the cortexkit-* siblings,
+      # which the stubs cannot support, so it stays in the local lint:rust gate.
       - name: Format check (root workspace)
         run: cargo fmt --check
 
-      - name: Clippy (root workspace)
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
       # Every workspace member takes mc-core with default features, so a plain
       # --workspace pass never compiles the cache-core-off configuration; this
-      # check keeps that feature gate building.
+      # check keeps that feature gate building. Without default features,
+      # mc-core does not depend on the stubbed cortexkit crates.
       - name: mc-core feature-off build
         run: cargo check -p mc-core --no-default-features
 
