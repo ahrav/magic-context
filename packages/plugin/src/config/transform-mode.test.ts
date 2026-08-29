@@ -1,35 +1,53 @@
 import { describe, expect, it } from "bun:test";
 
-import { RUST_COMPACTION_OFF_WARNING, resolveTransformMode } from "./transform-mode";
+import {
+    RUST_COMPACTION_OFF_WARNING,
+    RUST_REQUIRES_USER_CONSENT_WARNING,
+    resolveTransformMode,
+} from "./transform-mode";
 
 describe("resolveTransformMode", () => {
-    it("falls back to ts and warns when rust lacks user-level subc", () => {
+    it("keeps rust when the user tier itself selected rust (managed consent)", () => {
         expect(
             resolveTransformMode({
                 configured: "rust",
+                userTierConfiguredRust: true,
                 userTierHasSubc: false,
                 compactionEnabled: true,
             }),
-        ).toEqual({
-            mode: "ts",
-            warnings: ["rust mode requires user-level subc configuration; running ts."],
-        });
+        ).toEqual({ mode: "rust", warnings: [] });
     });
 
     it("keeps rust when trusted user-level subc is present", () => {
         expect(
             resolveTransformMode({
                 configured: "rust",
+                userTierConfiguredRust: false,
                 userTierHasSubc: true,
                 compactionEnabled: true,
             }),
         ).toEqual({ mode: "rust", warnings: [] });
     });
 
+    it("falls back to ts when only project config selects rust without user-tier consent", () => {
+        expect(
+            resolveTransformMode({
+                configured: "rust",
+                userTierConfiguredRust: false,
+                userTierHasSubc: false,
+                compactionEnabled: true,
+            }),
+        ).toEqual({
+            mode: "ts",
+            warnings: [RUST_REQUIRES_USER_CONSENT_WARNING],
+        });
+    });
+
     it("keeps ts without warnings when ts is configured", () => {
         expect(
             resolveTransformMode({
                 configured: "ts",
+                userTierConfiguredRust: false,
                 userTierHasSubc: false,
                 compactionEnabled: true,
             }),
@@ -39,6 +57,7 @@ describe("resolveTransformMode", () => {
     it("keeps rust in the default compaction-on mode without a warning", () => {
         const result = resolveTransformMode({
             configured: "rust",
+            userTierConfiguredRust: false,
             userTierHasSubc: true,
             compactionEnabled: true,
         });
@@ -51,6 +70,7 @@ describe("resolveTransformMode", () => {
         expect(
             resolveTransformMode({
                 configured: "rust",
+                userTierConfiguredRust: false,
                 userTierHasSubc: true,
                 compactionEnabled: false,
             }),

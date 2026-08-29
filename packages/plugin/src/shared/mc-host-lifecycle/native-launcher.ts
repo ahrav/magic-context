@@ -66,6 +66,8 @@ export interface NativeLaunchOptions {
      * the child runs with `cwd: "/"` and resolves it there.
      */
     payloadDir?: string;
+    /** Parent-trusted canonical manifest digest for a production payload directory. */
+    payloadManifestDigest?: string;
     /** JSON-serializable startup envelope written to stdin, or null. */
     envelope?: unknown;
     /** Absolute wall-clock budget; the child is killed at expiry. */
@@ -74,6 +76,18 @@ export interface NativeLaunchOptions {
     env?: Record<string, string>;
     /** Host platform override for the retained-descriptor exec path; tests only. */
     platform?: NodeJS.Platform;
+}
+
+export interface NativeHarnessCandidate {
+    manifest_sha256: string;
+    source_roots: Record<string, string>;
+}
+
+export interface NativeStartupEnvelope {
+    schema: 1;
+    opencode?: NativeHarnessCandidate;
+    pi?: NativeHarnessCandidate;
+    credentials?: Record<string, string>;
 }
 
 const MAX_STDOUT_BYTES = 256 * 1024;
@@ -179,6 +193,9 @@ export async function runNativeLifecycle(
     const args: string[] = [options.command];
     if (options.payloadDir !== undefined) {
         args.push("--payload-dir", options.payloadDir);
+    }
+    if (options.payloadManifestDigest !== undefined) {
+        args.push("--payload-manifest-digest", options.payloadManifestDigest);
     }
     const env = options.env ?? {};
     // Validated before anything is spawned, for the same reason the envelope is:

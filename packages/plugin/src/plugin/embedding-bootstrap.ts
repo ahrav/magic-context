@@ -25,11 +25,7 @@ export async function ensureProjectRegisteredFromOpenCodeDirectory(
         return;
     }
 
-    const routing = await resolveEmbeddingRouting({
-        config: detailed.config,
-        projectRoot: directory,
-        session: `bootstrap:${projectIdentity}`,
-    });
+    const routing = await resolveEmbeddingRouting({ config: detailed.config });
     for (const warning of routing.warnings) {
         log(`[magic-context] ${warning}`);
     }

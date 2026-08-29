@@ -604,6 +604,7 @@ export function loadPluginConfigDetailed(directory: string): LoadResultDetailed 
 
     const resolvedTransformMode = resolveTransformMode({
         configured: config.transform_mode,
+        userTierConfiguredRust: userLoaded?.config?.transform_mode === "rust",
         userTierHasSubc: hasUserTierSubcConfig(userLoaded?.config),
         compactionEnabled: isCompactionEnabled(config),
     });

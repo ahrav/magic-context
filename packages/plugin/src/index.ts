@@ -19,6 +19,7 @@ import {
     createFailClosedController,
     getLastHookInitFailure,
 } from "./features/magic-context/fail-closed-block";
+import { configureSynapseManagedDemandStart } from "./features/magic-context/memory/embedding-synapse";
 import { resolveProjectIdentityForSession } from "./features/magic-context/memory/project-identity";
 import { SIDEKICK_SYSTEM_PROMPT } from "./features/magic-context/sidekick/agent";
 import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "./features/magic-context/smart-notes/compiler-prompt";
@@ -34,7 +35,11 @@ import {
     HISTORIAN_EDITOR_SYSTEM_PROMPT,
 } from "./hooks/magic-context/compartment-prompt";
 import { createLiveSessionState } from "./hooks/magic-context/live-session-state";
-import { McHostModuleTransport } from "./hooks/magic-context/module-transport";
+import {
+    configureManagedDemandStart,
+    createLazyManagedDemandStart,
+    McHostModuleTransport,
+} from "./hooks/magic-context/module-transport";
 import { preloadTokenizer } from "./hooks/magic-context/read-session-formatting";
 import type { RustModeModuleClient } from "./hooks/magic-context/rust-mode-transform";
 import { beginBootQuietPeriod } from "./plugin/boot-quiet";
@@ -62,6 +67,11 @@ import { createPromptSurfaceRuntime } from "./shared/prompt-surface-runtime";
 import { MagicContextRpcServer } from "./shared/rpc-server";
 import { setStoragePrivatePermissionEnforcement } from "./shared/storage-permissions";
 
+const managedDemandStart = createLazyManagedDemandStart({
+    declaringModuleUrl: import.meta.url,
+    parentPackageName: "@cortexkit/opencode-magic-context",
+});
+
 const server: Plugin = async (ctx) => {
     // Broca child processes must not initialize Magic Context. The buffered
     // logger is off limits here: it arms a flush timer and appends to the
@@ -74,6 +84,8 @@ const server: Plugin = async (ctx) => {
         );
         return {};
     }
+    configureManagedDemandStart(managedDemandStart);
+    configureSynapseManagedDemandStart(managedDemandStart);
     beginBootQuietPeriod();
     // Move config from the legacy per-harness locations to the shared CortexKit
     // location BEFORE loading (hard cutover: the loader reads only CortexKit).
@@ -203,17 +215,10 @@ const server: Plugin = async (ctx) => {
     }
 
     const liveSessionState = createLiveSessionState();
-    // The transport dials a connection file written by an externally
-    // launched mc-host daemon; this build ships no host binary, so a
-    // missing daemon otherwise surfaces only as per-request connect
-    // errors. One startup line names the dependency.
-    if (pluginConfig.transform_mode === "rust") {
-        log(
-            '[magic-context] transform_mode "rust" requires an externally launched mc-host daemon; requests will retry until its connection file appears',
-        );
-    }
     const rustModeModuleClient: RustModeModuleClient | undefined =
-        pluginConfig.transform_mode === "rust" ? new McHostModuleTransport() : undefined;
+        pluginConfig.transform_mode === "rust"
+            ? new McHostModuleTransport(pluginConfig.subc?.connection_file)
+            : undefined;
 
     const hooks = await createSessionHooksAsync({
         ctx,

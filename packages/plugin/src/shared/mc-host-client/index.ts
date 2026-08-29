@@ -7,6 +7,13 @@ export {
     type McHostDiagnosticsObserver,
 } from "./client";
 export {
+    BROCA_CREDENTIAL_NAMES,
+    BROCA_CREDENTIAL_ROW_CAP_BYTES,
+    BROCA_CREDENTIAL_VALUE_CAP_BYTES,
+    canonicalCredentialRowEncoding,
+    credentialFingerprints,
+} from "./credential-fingerprint";
+export {
     armExpiryTimer,
     Deadline,
     type ExpiryTimerScheduler,
@@ -29,6 +36,7 @@ export {
     type CatalogSnapshot,
     type ConnectOptions,
     type ConsumerIdentity,
+    type HostStatusSnapshot,
     type ManagedCallOptions,
     type ManagedRouteKind,
     Priority,

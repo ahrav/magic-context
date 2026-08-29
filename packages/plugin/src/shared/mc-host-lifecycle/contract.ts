@@ -186,16 +186,42 @@ function parseReadinessRecord(value: unknown, component: string): ReadinessRecor
     if (typeof reason !== "string" || !isDaemonReason(reason)) {
         fail(`readiness.${component}.reason is outside the closed reason union`);
     }
-    // `ready` asserts the component is usable, so an explicitly failing reason
-    // beside it is self-contradictory and would tell a readiness consumer the
-    // transport is serving while naming the failure that stopped it.
-    //
-    // Only `ready` is constrained. The converse does not hold: `unsupported`
-    // with `synapse_unsupported` is a legitimate non-failing pairing for a
-    // non-ready state, and every `starting` reason is a failing one, so a
-    // blanket "non-ready implies failing" rule would reject conforming output.
-    if (state === "ready" && !NON_FAILING_REASONS.has(reason)) {
-        fail(`readiness.${component} is ready with a failing reason`);
+    // Each component state admits an explicit reason set rather than a blanket
+    // failing/non-failing split. `ready` asserts the component is usable, so a
+    // reason naming the failure that stopped it is self-contradictory — but the
+    // converse does not hold either: `unsupported` with `synapse_unsupported` is
+    // a legitimate non-failing pairing, while every `starting` reason is a
+    // failing one, so "non-ready implies failing" would reject conforming
+    // output. Only the exact pairings the daemon emits are accepted.
+    const allowed = {
+        transport: {
+            ready: ["healthy"],
+            starting: ["starting", "lifecycle_busy"],
+            unavailable: ["startup_timeout", "publication_missing", "authentication_failed"],
+        },
+        storage: {
+            ready: ["healthy"],
+            starting: ["storage_starting", "starting"],
+            unavailable: ["storage_unavailable"],
+        },
+        synapse: {
+            ready: ["healthy"],
+            starting: ["synapse_starting", "starting"],
+            degraded: ["synapse_degraded"],
+            unsupported: ["synapse_unsupported"],
+        },
+    } as const;
+    const componentAllowed = allowed[component as keyof typeof allowed] as
+        | Record<string, readonly string[]>
+        | undefined;
+    if (!componentAllowed?.[state]?.includes(reason)) {
+        // The ready case gets its own wording: it is the one pairing whose
+        // danger is specific — a consumer told the component is serving while
+        // the reason names the failure that stopped it.
+        if (state === "ready" && !NON_FAILING_REASONS.has(reason)) {
+            fail(`readiness.${component} is ready with a failing reason`);
+        }
+        fail(`readiness.${component} state contradicts its reason`);
     }
     return { state, reason };
 }
@@ -267,13 +293,43 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
     ) {
         fail("remediation is outside the closed union");
     }
-    // Membership alone admits a valid remediation borrowed from a *different*
-    // reason — `native_payload_missing` paired with `free_storage` — which sends
-    // an operator to fix storage when the payload is absent. The contract's
-    // reason-to-remediation mapping is total and single-valued, so the reason
-    // already determines the only legal remediation; anything else is skew.
-    if (remediation !== (remediationForReason(reason) as string | null)) {
+    const expectedOk = NON_FAILING_REASONS.has(reason);
+    if (record.ok !== expectedOk) {
+        fail("ok contradicts the selected reason");
+    }
+    // Membership in the remediation set is not enough: it admits a valid
+    // remediation borrowed from a *different* reason — `native_payload_missing`
+    // paired with `free_storage` — which sends an operator to fix storage when
+    // the payload is absent. The reason determines the remediation.
+    //
+    // `harness_unavailable` is the one contract-sanctioned exception: it is
+    // declared `remediation_from_subreason`, so `remediationForReason` answers
+    // null and the conforming result carries whichever remediation its
+    // subreason maps to. Only that reason gets the wider set.
+    const expectedRemediation = remediationForReason(reason);
+    const remediationMatches =
+        reason === "harness_unavailable"
+            ? remediation === null || remediation === "restart_with_supported_harness"
+            : remediation === expectedRemediation;
+    if (!remediationMatches) {
         fail("remediation does not match its reason");
+    }
+    const fixedReasonStates: Partial<Record<DaemonReason, DaemonState>> = {
+        healthy: "running",
+        started: "running",
+        already_running: "running",
+        stopped: "stopped",
+        already_stopped: "stopped",
+        not_running: "stopped",
+        no_data_dir: "unavailable",
+        starting: "starting",
+        stopping: "stopping",
+        wedged: "wedged",
+        shutdown_timeout: "stopping",
+    };
+    const expectedState = fixedReasonStates[reason];
+    if (expectedState !== undefined && state !== expectedState) {
+        fail("state contradicts the selected reason");
     }
     let effects: RestartEffects | null = null;
     if (record.effects !== null) {
@@ -368,14 +424,26 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
         ) {
             fail("check remediation is outside the closed union");
         }
+        // Only `pass` and `fail` are constrained. `warn` and `skip` are not a
+        // class summary at all: a warn is a degraded-but-usable observation and
+        // a skip is an absence of evidence, and the contract does not fix which
+        // reason class either may carry.
+        if (status === "pass" && !NON_FAILING_REASONS.has(checkReason)) {
+            fail("a passing check carries a failing reason");
+        }
+        if (status === "fail" && NON_FAILING_REASONS.has(checkReason)) {
+            fail("a failing check carries a non-failing reason");
+        }
         // Same reason-determines-remediation rule as the top-level result: a
         // per-check remediation borrowed from another reason misdirects the
-        // operator just as effectively.
+        // operator just as effectively. `harness_unavailable` is exempt for the
+        // same contract reason — its remediation comes from the subreason.
+        const expectedCheckRemediation = remediationForReason(checkReason);
         if (
-            checkRemediation !==
-            (remediationForReason(checkReason as DaemonReason) as string | null)
+            checkReason !== "harness_unavailable" &&
+            checkRemediation !== expectedCheckRemediation
         ) {
-            fail("check remediation does not match its reason");
+            fail("check remediation contradicts its reason");
         }
         return {
             id: id as CheckId,
@@ -388,6 +456,9 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
         const prev = checks[i - 1] as DaemonCheck;
         const current = checks[i] as DaemonCheck;
         if (prev.id >= current.id) fail("checks are not lexicographically sorted unique ids");
+    }
+    if (record.ok && checks.some((check) => check.status === "fail")) {
+        fail("successful result contains a failed check");
     }
     const rawVersions = requireObject(record.versions, "versions");
     requireExactKeys(

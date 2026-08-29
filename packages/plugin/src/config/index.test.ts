@@ -925,20 +925,29 @@ describe("loadPluginConfig — raw merge preserves user fields not set in projec
 });
 
 describe("transform_mode resolution", () => {
-    it("keeps project rust mode only when user config supplies subc", () => {
+    it("keeps project rust mode only with user-tier consent", () => {
         const withSubc = loadWithUserAndProjectConfig(
             JSON.stringify({ subc: { connection_file: "~/.local/share/cortexkit/subc.json" } }),
             JSON.stringify({ transform_mode: "rust" }),
         );
         expect(withSubc.transform_mode).toBe("rust");
 
-        const withoutSubc = loadWithUserAndProjectConfig(
+        const withUserRust = loadWithUserAndProjectConfig(
+            JSON.stringify({ transform_mode: "rust" }),
+            JSON.stringify({}),
+        );
+        expect(withUserRust.transform_mode).toBe("rust");
+        expect(withUserRust.configWarnings?.join("\n") ?? "").not.toContain(
+            "rust mode requires user-level consent",
+        );
+
+        const withoutConsent = loadWithUserAndProjectConfig(
             JSON.stringify({}),
             JSON.stringify({ transform_mode: "rust" }),
         );
-        expect(withoutSubc.transform_mode).toBe("ts");
-        expect(withoutSubc.configWarnings?.join("\n")).toContain(
-            "rust mode requires user-level subc configuration; running ts.",
+        expect(withoutConsent.transform_mode).toBe("ts");
+        expect(withoutConsent.configWarnings?.join("\n")).toContain(
+            "rust mode requires user-level consent",
         );
     });
 

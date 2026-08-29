@@ -15,15 +15,20 @@
  * path, stderr text, or native error chain rides on any result.
  */
 
-import { checkPlatform, type PlatformReaders } from "./bootstrap";
+import type { AuthenticatedPeer } from "../mc-host-client/types";
+import { checkPlatform, type LifecycleFailureReason, type PlatformReaders } from "./bootstrap";
+import { evaluateDaemonCompatibility } from "./compatibility";
 import {
     classifyPreNativeRoots,
+    type DaemonCheck,
     type DaemonCommand,
+    type DaemonReadiness,
     type DaemonReason,
     type DaemonResultV1,
     type DaemonState,
     preNativeState,
     probeFallbackVerdict,
+    reasonPrecedence,
     remediationForReason,
 } from "./contract";
 import { releaseContract } from "./generated-contract";
@@ -31,6 +36,7 @@ import {
     NativeLaunchError,
     type NativeLaunchTarget,
     type NativeLifecycleCommand,
+    type NativeStartupEnvelope,
     runNativeLifecycle,
 } from "./native-launcher";
 import { type ConnectionOrigin, mayDemandStart } from "./ownership";
@@ -63,6 +69,17 @@ export function aggregateForTarget(
 export type LifecycleCommand = "start" | "stop" | "restart" | "status" | "doctor";
 
 export type StorageReadiness = "ready" | "starting" | "unavailable";
+
+export interface ObservationalHealth {
+    readiness: DaemonReadiness;
+    /**
+     * The peer the probe authenticated, not just its version string. The
+     * compatibility gate is applied to it here, so handing over only the version
+     * would let an observation report `healthy` for a daemon outside the
+     * supported range while stamping that version with `proof: "current"`.
+     */
+    authenticatedPeer: AuthenticatedPeer;
+}
 
 /**
  * Elapsed-time source for every lifecycle budget.
@@ -101,6 +118,8 @@ export interface LifecyclePolicyOptions {
      * the package-path reason.
      */
     launchTarget?: NativeLaunchTarget | null;
+    /** Pre-resolve failure for mutating commands, already reduced to a closed reason. */
+    bootstrapFailure?: LifecycleFailureReason;
     platformReaders?: PlatformReaders;
     admissionIo?: AdmissionIo;
     /**
@@ -112,8 +131,14 @@ export interface LifecyclePolicyOptions {
      * unaffected — they never reach `demandStart`.
      */
     storageProbe?: (budgetMs: number) => Promise<StorageReadiness>;
+    /** Authenticated route-free component health for status and doctor. */
+    readinessProbe?: (budgetMs: number) => Promise<ObservationalHealth>;
     /** Dev/test payload directory forwarded to native start/restart. */
     payloadDir?: string;
+    /** Parent-trusted payload manifest digest paired with `payloadDir`. */
+    payloadManifestDigest?: string;
+    /** Deferred certified package lookup after native current validation says missing. */
+    payloadDirFallback?: () => string | null;
     outerAggregateMs?: number;
 }
 
@@ -177,6 +202,7 @@ export interface DemandStartRequest {
     capability: "magic-context" | "synapse";
     signal?: AbortSignal;
     deadlineMs?: number;
+    startupEnvelope?: NativeStartupEnvelope;
 }
 
 export interface DemandStartOutcome {
@@ -191,21 +217,31 @@ export interface DemandStartOutcome {
 export class McHostLifecyclePolicy {
     private readonly env: Record<string, string | undefined>;
     private readonly launchTarget: NativeLaunchTarget | null;
+    private readonly bootstrapFailure: LifecycleFailureReason | undefined;
     private readonly platformReaders: PlatformReaders | undefined;
     private readonly admissionIo: AdmissionIo | undefined;
     private readonly storageProbe: (budgetMs: number) => Promise<StorageReadiness>;
+    private readonly readinessProbe:
+        | ((budgetMs: number) => Promise<ObservationalHealth>)
+        | undefined;
     private readonly payloadDir: string | undefined;
+    private readonly payloadManifestDigest: string | undefined;
+    private readonly payloadDirFallback: (() => string | null) | undefined;
     private readonly outerAggregateMs: number | undefined;
     private readonly inflightStarts = new Map<string, Promise<DaemonResultV1>>();
 
     constructor(options: LifecyclePolicyOptions = {}) {
         this.env = options.env ?? process.env;
         this.launchTarget = options.launchTarget ?? null;
+        this.bootstrapFailure = options.bootstrapFailure;
         this.platformReaders = options.platformReaders;
         this.admissionIo = options.admissionIo;
         // Fail closed: an unwired probe must not assert readiness.
         this.storageProbe = options.storageProbe ?? (async () => "unavailable");
+        this.readinessProbe = options.readinessProbe;
         this.payloadDir = options.payloadDir;
+        this.payloadManifestDigest = options.payloadManifestDigest;
+        this.payloadDirFallback = options.payloadDirFallback;
         // Left undefined when the caller does not pin it: the qualified default
         // depends on the platform-gate target, which `preflight` resolves per
         // command rather than in the constructor — `checkPlatform`'s darwin arm
@@ -218,8 +254,8 @@ export class McHostLifecyclePolicy {
         return this.inflightStarts.size;
     }
 
-    async start(): Promise<DaemonResultV1> {
-        return this.mutatingCommand("start");
+    async start(startupEnvelope?: NativeStartupEnvelope): Promise<DaemonResultV1> {
+        return this.mutatingCommand("start", startupEnvelope);
     }
 
     async stop(): Promise<DaemonResultV1> {
@@ -282,7 +318,7 @@ export class McHostLifecyclePolicy {
         const key = rootResolution.ok ? rootResolution.root : "\u0000no-root";
         let shared = this.inflightStarts.get(key);
         if (!shared) {
-            shared = this.start();
+            shared = this.start(request.startupEnvelope);
             this.inflightStarts.set(key, shared);
             void shared
                 .catch(() => {})
@@ -490,22 +526,76 @@ export class McHostLifecyclePolicy {
         return { ok: true, root, deadlineMs };
     }
 
-    private async mutatingCommand(command: "start" | "stop" | "restart"): Promise<DaemonResultV1> {
+    private async mutatingCommand(
+        command: "start" | "stop" | "restart",
+        startupEnvelope?: NativeStartupEnvelope,
+    ): Promise<DaemonResultV1> {
         const preflight = this.preflight(command);
         if (!preflight.ok) return preflight.result;
+        if (this.bootstrapFailure !== undefined) {
+            const state = preNativeState(classifyPreNativeRoots(preflight.root));
+            return localResult(command, false, state, this.bootstrapFailure);
+        }
         if (this.launchTarget === null) {
             const state = preNativeState(classifyPreNativeRoots(preflight.root));
             return localResult(command, false, state, "native_payload_missing");
         }
+        const launchTarget = this.launchTarget;
         try {
-            const native = await runNativeLifecycle(this.launchTarget, {
-                command: command as NativeLifecycleCommand,
-                deadlineMs: preflight.deadlineMs,
-                env: this.nativeEnv(preflight.root),
-                ...(this.payloadDir !== undefined && command !== "stop"
-                    ? { payloadDir: this.payloadDir }
-                    : {}),
-            });
+            // The aggregate is one request-to-transport bound for the whole
+            // command, not per native invocation. The certified-package lookup
+            // and a first launch that answers `native_payload_missing` both spend
+            // from it, so each invocation gets the residual. Handing
+            // `preflight.deadlineMs` to both would let a fallback retry run a
+            // second full aggregate — twice the budget the platform was
+            // qualified for.
+            const startedAt = monotonicNow();
+            const remaining = (): number => preflight.deadlineMs - (monotonicNow() - startedAt);
+            const invoke = (payloadDir: string | undefined, deadlineMs: number) =>
+                runNativeLifecycle(launchTarget, {
+                    command: command as NativeLifecycleCommand,
+                    deadlineMs,
+                    env: this.nativeEnv(preflight.root),
+                    ...(payloadDir !== undefined && command !== "stop" ? { payloadDir } : {}),
+                    ...(command !== "stop" && this.payloadManifestDigest !== undefined
+                        ? { payloadManifestDigest: this.payloadManifestDigest }
+                        : {}),
+                    ...(startupEnvelope === undefined || command === "stop"
+                        ? {}
+                        : { envelope: startupEnvelope }),
+                });
+            let selectedPayloadDir = this.payloadDir;
+            if (
+                command === "restart" &&
+                selectedPayloadDir === undefined &&
+                this.payloadDirFallback !== undefined
+            ) {
+                selectedPayloadDir = this.payloadDirFallback() ?? undefined;
+            }
+            const firstBudget = remaining();
+            if (firstBudget <= 0) {
+                // The lookup consumed the command's budget before any child
+                // existed, so nothing was spawned and nothing committed.
+                const state = preNativeState(classifyPreNativeRoots(preflight.root));
+                return localResult(command, false, state, TIMEOUT_REASON[command]);
+            }
+            let native = await invoke(selectedPayloadDir, firstBudget);
+            if (
+                command === "start" &&
+                this.payloadDir === undefined &&
+                native.reason === "native_payload_missing" &&
+                this.payloadDirFallback !== undefined
+            ) {
+                const fallback = this.payloadDirFallback();
+                if (fallback !== null) {
+                    const retryBudget = remaining();
+                    // With no budget left the retry cannot be attempted, and the
+                    // first launch already answered. Reporting its real result
+                    // beats replacing a completed observation with a synthetic
+                    // timeout.
+                    if (retryBudget > 0) native = await invoke(fallback, retryBudget);
+                }
+            }
             return this.relabel(native, command, command);
         } catch (error) {
             return this.launchFailure(command, preflight.root, error);
@@ -523,12 +613,109 @@ export class McHostLifecyclePolicy {
             return localResult(command, ok, verdict.state, verdict.reason);
         }
         try {
+            const startedAt = monotonicNow();
             const native = await runNativeLifecycle(this.launchTarget, {
                 command: "probe",
                 deadlineMs: preflight.deadlineMs,
                 env: this.nativeEnv(preflight.root),
             });
-            return this.relabel(native, "status", command);
+            const relabeled = this.relabel(native, "status", command);
+            if (
+                !relabeled.ok ||
+                relabeled.state !== "running" ||
+                this.readinessProbe === undefined
+            ) {
+                return relabeled;
+            }
+            // The readiness probe shares the command's aggregate with the probe
+            // child that just ran, so it gets only what that child left behind.
+            // An exhausted budget means there is nothing left to observe with:
+            // granting a 1ms floor would start a probe that can only fail.
+            const remaining = preflight.deadlineMs - (monotonicNow() - startedAt);
+            if (remaining <= 0) return relabeled;
+            // A readiness failure must not erase an observation that already
+            // succeeded. Letting it reach the outer `catch` would answer
+            // `internal_error` for a daemon this call verifiably observed, so it
+            // degrades to the native result — the same rule `boundedStorageProbe`
+            // applies to a storage probe that expires or throws.
+            let observed: ObservationalHealth;
+            try {
+                observed = await this.readinessProbe(remaining);
+            } catch {
+                return relabeled;
+            }
+            const checks: DaemonCheck[] = [...relabeled.checks];
+            const addCheck = (
+                id: "readiness.transport" | "readiness.storage" | "readiness.synapse",
+                record: NonNullable<DaemonReadiness[keyof DaemonReadiness]>,
+            ): void => {
+                const status =
+                    record.state === "ready"
+                        ? "pass"
+                        : record.state === "unsupported"
+                          ? "skip"
+                          : "fail";
+                checks.push({
+                    id,
+                    status,
+                    reason: record.reason,
+                    remediation: remediationForReason(record.reason),
+                });
+            };
+            if (observed.readiness.transport) {
+                addCheck("readiness.transport", observed.readiness.transport);
+            }
+            if (observed.readiness.storage) {
+                addCheck("readiness.storage", observed.readiness.storage);
+            }
+            if (observed.readiness.synapse) {
+                addCheck("readiness.synapse", observed.readiness.synapse);
+            }
+            // Readiness answers "are the components serving", never "may this
+            // client talk to this daemon at all". Without this gate an
+            // observation of a running daemon whose authenticated version is
+            // outside the supported half-open range reported `healthy` and then
+            // stamped that version with `proof: "current"` — a compatibility
+            // verdict inverted by omission. It joins `checks` rather than
+            // short-circuiting so the contract's failing-reason precedence still
+            // decides what gets reported when readiness is also degraded.
+            const compatibility = evaluateDaemonCompatibility(observed.authenticatedPeer);
+            if (!compatibility.ok) {
+                checks.push({
+                    id: "compatibility.daemon",
+                    status: "fail",
+                    reason: compatibility.reason,
+                    remediation: remediationForReason(compatibility.reason),
+                });
+            }
+            // The check list is ordered by id because the v1 result requires
+            // lexicographically sorted unique check ids. The reported reason is
+            // NOT that order: the release contract ships one precedence list for
+            // failing reasons, and a lower-precedence readiness failure must
+            // never mask a higher-precedence one just because its check id
+            // sorts earlier (`readiness.storage` before `readiness.transport`).
+            checks.sort((left, right) => left.id.localeCompare(right.id));
+            const failed = checks
+                .filter((check) => check.status === "fail")
+                .reduce<DaemonCheck | undefined>((winner, check) => {
+                    if (!winner) return check;
+                    const winning = reasonPrecedence(winner.reason) ?? Number.MAX_SAFE_INTEGER;
+                    const candidate = reasonPrecedence(check.reason) ?? Number.MAX_SAFE_INTEGER;
+                    return candidate < winning ? check : winner;
+                }, undefined);
+            return {
+                ...relabeled,
+                ok: failed === undefined,
+                reason: failed?.reason ?? "healthy",
+                remediation: failed?.remediation ?? null,
+                readiness: observed.readiness,
+                checks,
+                versions: {
+                    ...relabeled.versions,
+                    proof: "current",
+                    daemon: observed.authenticatedPeer.daemonVer,
+                },
+            };
         } catch (error) {
             return this.launchFailure(command, preflight.root, error);
         }
@@ -571,6 +758,29 @@ export class McHostLifecyclePolicy {
 
     private launchFailure(command: LifecycleCommand, root: string, error: unknown): DaemonResultV1 {
         const state = preNativeState(classifyPreNativeRoots(root));
+        // A launcher that already reduced the failure to a closed lifecycle
+        // reason speaks for itself; re-deriving one from the error code would
+        // discard the more specific classification it made.
+        if (
+            error !== null &&
+            typeof error === "object" &&
+            "reason" in error &&
+            [
+                "unsupported_platform",
+                "unsupported_install_layout",
+                "native_payload_missing",
+                "native_payload_invalid",
+                "insufficient_storage",
+                "internal_error",
+            ].includes(String((error as { reason?: unknown }).reason))
+        ) {
+            return localResult(
+                command,
+                false,
+                state,
+                (error as { reason: LifecycleFailureReason }).reason,
+            );
+        }
         if (error instanceof NativeLaunchError) {
             switch (error.code) {
                 case "timeout":

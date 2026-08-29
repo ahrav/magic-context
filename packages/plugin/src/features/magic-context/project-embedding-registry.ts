@@ -132,6 +132,7 @@ export interface ProjectEmbeddingRegistrationSnapshot {
 }
 
 interface ProjectEmbeddingRegistration {
+    db: Database;
     projectIdentity: string;
     sourceDirectory: string;
     config: EmbeddingConfig;
@@ -143,6 +144,14 @@ interface ProjectEmbeddingRegistration {
     modelId: string;
     chunkModelId: string;
     observationMode: boolean;
+    /**
+     * Fingerprint of the DEFERRED configuration this registration was created
+     * from, retained across lane resolution. Resolving a lane rewrites `config`,
+     * `providerIdentity`, and `runtimeFingerprint` to the discovered lane, so
+     * without this the next registration from the same unchanged config would
+     * look like a different intent and discard a healthy resolved provider.
+     */
+    deferredIntent?: string;
 }
 
 interface StaleIdentityRow {
@@ -152,6 +161,7 @@ interface StaleIdentityRow {
 const projectRegistrations = new Map<string, ProjectEmbeddingRegistration>();
 
 interface ShadowEmbeddingRegistration {
+    db: Database;
     projectIdentity: string;
     sourceDirectory: string;
     config: EmbeddingConfig;
@@ -160,6 +170,8 @@ interface ShadowEmbeddingRegistration {
     modelId: string;
     chunkModelId: string;
     generation: number;
+    /** See {@link ProjectEmbeddingRegistration.deferredIntent}. */
+    deferredIntent?: string;
 }
 
 type ShadowScope = "commit" | "chunk";
@@ -234,7 +246,25 @@ export function markProjectLoadUntrusted(projectIdentity: string): void {
     untrustedLoadProjects.add(projectIdentity);
 }
 let projectSweepInProgress = false;
-let testProviderFactory: ((config: EmbeddingConfig) => EmbeddingProvider | null) | null = null;
+/** Construction context every provider receives from {@link createProvider}. */
+interface ProviderContext {
+    projectRoot: string;
+    session: string;
+    onSynapseLaneReady?: (
+        metadata: import("./memory/embedding-synapse").SynapseLaneMetadata,
+    ) => void;
+}
+/**
+ * Test factory for the embedding provider. It receives the same context the
+ * real providers get, so a fake can invoke `onSynapseLaneReady` and drive the
+ * deferred-lane resolution path (`commitPrimarySynapseLane` /
+ * `commitShadowSynapseLane`) instead of a hand-rolled imitation of it.
+ */
+type TestProviderFactory = (
+    config: EmbeddingConfig,
+    context?: ProviderContext,
+) => EmbeddingProvider | null;
+let testProviderFactory: TestProviderFactory | null = null;
 
 function synapseConfigFields(config: EmbeddingConfig): {
     model?: string;
@@ -256,6 +286,39 @@ function synapseConfigFields(config: EmbeddingConfig): {
         ...(typeof raw.synapse_dims === "number" ? { dims: raw.synapse_dims } : {}),
         ...(raw.synapse_provenance !== undefined ? { provenance: raw.synapse_provenance } : {}),
     };
+}
+
+type SynapseRuntimeConfig = EmbeddingConfig & {
+    model?: string;
+    max_input_tokens?: number;
+    synapse_max_input_bytes?: number;
+    synapse_connection_file?: string;
+    synapse_connection_origin?: "managed-default" | "explicit" | "injected";
+    synapse_client_factory?: () => Promise<import("./memory/embedding-synapse").SynapseClientLike>;
+    synapse_fallback?: EmbeddingConfig;
+    synapse_fingerprint?: string;
+    synapse_table_epoch?: number;
+    synapse_dims?: number;
+    synapse_recommended_batch?: number;
+    synapse_recommended_token_budget?: number;
+    synapse_provenance?: unknown;
+};
+
+function isDeferredSynapseConfig(config: EmbeddingConfig): config is SynapseRuntimeConfig {
+    return config.provider === "synapse" && !synapseConfigFields(config).fingerprint;
+}
+
+/**
+ * Lane discovery state of a provider, or `undefined` for one that does not
+ * report it. Read structurally rather than by class so a test double or a
+ * non-Synapse provider simply declines to answer instead of being misread as
+ * pending, which would preserve a lane that can never resolve.
+ */
+function synapseLaneDiscoveryState(
+    provider: EmbeddingProvider,
+): "pending" | "resolved" | "failed" | undefined {
+    const state = (provider as { laneDiscoveryState?: unknown }).laneDiscoveryState;
+    return state === "pending" || state === "resolved" || state === "failed" ? state : undefined;
 }
 
 function persistPrimaryDescriptor(db: Database, registration: ProjectEmbeddingRegistration): void {
@@ -371,6 +434,144 @@ function persistShadowDescriptor(db: Database, registration: ShadowEmbeddingRegi
     );
 }
 
+function clearDeferredDescriptor(
+    db: Database,
+    table: "embedding_registrations" | "shadow_embedding_registrations",
+    projectIdentity: string,
+): void {
+    const present = db
+        .prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?")
+        .get(table);
+    if (!present) return;
+    db.prepare(`DELETE FROM ${table} WHERE project_path = ?`).run(projectIdentity);
+}
+
+function resolvedSynapseConfigFromMetadata(
+    config: SynapseRuntimeConfig,
+    metadata: import("./memory/embedding-synapse").SynapseLaneMetadata,
+): EmbeddingConfig {
+    return resolveEmbeddingConfig({
+        ...config,
+        model: metadata.model,
+        synapse_fingerprint: metadata.fingerprint,
+        synapse_table_epoch: metadata.table_epoch,
+        synapse_dims: metadata.dims,
+        ...(metadata.recommended_batch
+            ? { synapse_recommended_batch: metadata.recommended_batch }
+            : {}),
+        ...(metadata.recommended_token_budget
+            ? { synapse_recommended_token_budget: metadata.recommended_token_budget }
+            : {}),
+        ...(metadata.max_input_tokens ? { max_input_tokens: metadata.max_input_tokens } : {}),
+        ...(metadata.max_input_bytes ? { synapse_max_input_bytes: metadata.max_input_bytes } : {}),
+        ...(metadata.provenance !== undefined ? { synapse_provenance: metadata.provenance } : {}),
+    } as unknown as EmbeddingConfig);
+}
+
+function commitPrimarySynapseLane(
+    registration: ProjectEmbeddingRegistration,
+    metadata: import("./memory/embedding-synapse").SynapseLaneMetadata,
+): void {
+    if (
+        projectRegistrations.get(registration.projectIdentity) !== registration ||
+        registration.config.provider !== "synapse"
+    ) {
+        return;
+    }
+    const config = resolvedSynapseConfigFromMetadata(
+        registration.config as SynapseRuntimeConfig,
+        metadata,
+    );
+    const providerIdentity = getEmbeddingProviderIdentity(config);
+    const chunkModelId = getChunkEmbeddingModelId(config, providerIdentity);
+    registration.config = config;
+    registration.providerIdentity = providerIdentity;
+    registration.runtimeFingerprint = getRuntimeFingerprint(config);
+    registration.modelId = providerIdentity;
+    registration.chunkModelId = chunkModelId;
+    registration.generation = ++globalRegistrationGeneration;
+    registration.db.transaction(() => {
+        recordActiveEmbeddingIdentityInCurrentTransaction(
+            registration.db,
+            registration.projectIdentity,
+            providerIdentity,
+            chunkModelId,
+            registration.features,
+        );
+        persistPrimaryDescriptor(registration.db, registration);
+    })();
+}
+
+function activatePrimarySynapseFallback(registration: ProjectEmbeddingRegistration): boolean {
+    if (
+        projectRegistrations.get(registration.projectIdentity) !== registration ||
+        !isDeferredSynapseConfig(registration.config)
+    ) {
+        return false;
+    }
+    const fallback = registration.config.synapse_fallback;
+    if (!fallback) return false;
+    const config = resolveEmbeddingConfig(fallback);
+    const providerIdentity = getEmbeddingProviderIdentity(config);
+    const chunkModelId = getChunkEmbeddingModelId(config, providerIdentity);
+    const previousProvider = registration.provider;
+    registration.config = config;
+    registration.providerIdentity = providerIdentity;
+    registration.runtimeFingerprint = getRuntimeFingerprint(config);
+    registration.provider = null;
+    registration.modelId = providerIdentity === OFF_PROVIDER_IDENTITY ? "off" : providerIdentity;
+    registration.chunkModelId = providerIdentity === OFF_PROVIDER_IDENTITY ? "off" : chunkModelId;
+    registration.generation = ++globalRegistrationGeneration;
+    registration.db.transaction(() => {
+        recordActiveEmbeddingIdentityInCurrentTransaction(
+            registration.db,
+            registration.projectIdentity,
+            providerIdentity,
+            chunkModelId,
+            registration.features,
+        );
+        persistPrimaryDescriptor(registration.db, registration);
+    })();
+    disposeProvider(previousProvider);
+    return true;
+}
+
+function commitShadowSynapseLane(
+    registration: ShadowEmbeddingRegistration,
+    metadata: import("./memory/embedding-synapse").SynapseLaneMetadata,
+): void {
+    if (shadowRegistrations.get(registration.projectIdentity) !== registration) return;
+    const config = resolvedSynapseConfigFromMetadata(
+        registration.config as SynapseRuntimeConfig,
+        metadata,
+    );
+    const providerIdentity = getEmbeddingProviderIdentity(config);
+    registration.config = config;
+    registration.providerIdentity = providerIdentity;
+    registration.modelId = providerIdentity;
+    registration.chunkModelId = getChunkEmbeddingModelId(config, providerIdentity);
+    registration.generation = ++globalRegistrationGeneration;
+    registration.db.transaction(() => {
+        const now = Date.now();
+        recordScopeActiveIdentity(
+            registration.db,
+            registration.projectIdentity,
+            "commit",
+            registration.modelId,
+            now,
+        );
+        recordScopeActiveIdentity(
+            registration.db,
+            registration.projectIdentity,
+            "chunk",
+            registration.chunkModelId,
+            now,
+        );
+        persistShadowDescriptor(registration.db, registration);
+    })();
+    maybeArmShadowBackfill(registration.db, registration.projectIdentity, registration);
+}
+
 function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
     if (!config || config.provider === "local") {
         return {
@@ -425,18 +626,7 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
     }
 
     if (config.provider === "synapse") {
-        const synapse = config as EmbeddingConfig & {
-            model?: string;
-            max_input_tokens?: number;
-            synapse_max_input_bytes?: number;
-            synapse_connection_file?: string;
-            synapse_fingerprint?: string;
-            synapse_table_epoch?: number;
-            synapse_dims?: number;
-            synapse_recommended_batch?: number;
-            synapse_recommended_token_budget?: number;
-            synapse_provenance?: unknown;
-        };
+        const synapse = config as SynapseRuntimeConfig;
         const tokenBudget = normalizeSynapseTokenBudget(synapse.synapse_recommended_token_budget);
         return {
             provider: "synapse",
@@ -456,6 +646,13 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
             ...(synapse.synapse_connection_file
                 ? { synapse_connection_file: synapse.synapse_connection_file }
                 : {}),
+            ...(synapse.synapse_connection_origin
+                ? { synapse_connection_origin: synapse.synapse_connection_origin }
+                : {}),
+            ...(synapse.synapse_client_factory
+                ? { synapse_client_factory: synapse.synapse_client_factory }
+                : {}),
+            ...(synapse.synapse_fallback ? { synapse_fallback: synapse.synapse_fallback } : {}),
             ...(synapse.synapse_fingerprint
                 ? { synapse_fingerprint: synapse.synapse_fingerprint }
                 : {}),
@@ -480,10 +677,10 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
 
 function createProvider(
     config: EmbeddingConfig,
-    context?: { projectRoot: string; session: string },
+    context?: ProviderContext,
 ): EmbeddingProvider | null {
     if (testProviderFactory) {
-        return testProviderFactory(config);
+        return testProviderFactory(config, context);
     }
 
     if (config.provider === "off") {
@@ -511,20 +708,12 @@ function createProvider(
     }
 
     if (config.provider === "synapse") {
-        const synapse = config as EmbeddingConfig & {
-            model?: string;
-            max_input_tokens?: number;
-            synapse_max_input_bytes?: number;
-            synapse_connection_file?: string;
-            synapse_fingerprint?: string;
-            synapse_table_epoch?: number;
-            synapse_dims?: number;
-            synapse_recommended_batch?: number;
-            synapse_recommended_token_budget?: number;
-            synapse_provenance?: unknown;
-        };
+        const synapse = config as SynapseRuntimeConfig;
         return new SynapseEmbeddingProvider({
-            connectionFile: synapse.synapse_connection_file ?? "",
+            ...(synapse.synapse_connection_file
+                ? { connectionFile: synapse.synapse_connection_file }
+                : {}),
+            connectionOrigin: synapse.synapse_connection_origin,
             projectRoot: context?.projectRoot ?? "",
             session: context?.session ?? "embedding",
             model: synapse.model,
@@ -538,6 +727,8 @@ function createProvider(
             maxInputTokens: synapse.max_input_tokens,
             maxInputBytes: synapse.synapse_max_input_bytes,
             provenance: synapse.synapse_provenance,
+            clientFactory: synapse.synapse_client_factory,
+            onLaneReady: context?.onSynapseLaneReady,
         });
     }
 
@@ -603,7 +794,12 @@ function sameFeatures(a: EmbeddingFeatures, b: EmbeddingFeatures): boolean {
 function snapshotFor(
     registration: ProjectEmbeddingRegistration,
 ): ProjectEmbeddingRegistrationSnapshot {
-    const providerIsOn = registration.providerIdentity !== OFF_PROVIDER_IDENTITY;
+    // Enablement follows the configured provider, not the resolved identity:
+    // a deferred Synapse lane carries OFF_PROVIDER_IDENTITY until first use,
+    // but must stay enabled or the embed entry points that resolve it (and
+    // that activate its fallback) would never run. getOrCreateProjectProvider
+    // applies the same provider-based gate.
+    const providerIsOn = (registration.config.provider ?? "local") !== "off";
     const enabled =
         !registration.observationMode && providerIsOn && registration.features.memoryEnabled;
     const gitCommitEnabled =
@@ -719,17 +915,15 @@ function recordActiveEmbeddingIdentity(
         return;
     }
 
-    const now = Date.now();
     db.exec("BEGIN IMMEDIATE");
     try {
-        if (features.gitCommitEnabled) {
-            recordScopeActiveIdentity(db, projectIdentity, "commit", currentProviderIdentity, now);
-        }
-
-        if (features.memoryEnabled) {
-            repairMisScopedCompartmentChunkEmbeddingsForProject(db, projectIdentity);
-            recordScopeActiveIdentity(db, projectIdentity, "chunk", currentChunkIdentity, now);
-        }
+        recordActiveEmbeddingIdentityInCurrentTransaction(
+            db,
+            projectIdentity,
+            currentProviderIdentity,
+            currentChunkIdentity,
+            features,
+        );
         db.exec("COMMIT");
     } catch (error) {
         try {
@@ -738,6 +932,24 @@ function recordActiveEmbeddingIdentity(
             // The transaction may already be closed by SQLite after a fatal error.
         }
         throw error;
+    }
+}
+
+function recordActiveEmbeddingIdentityInCurrentTransaction(
+    db: Database,
+    projectIdentity: string,
+    currentProviderIdentity: string,
+    currentChunkIdentity: string,
+    features: EmbeddingFeatures,
+): void {
+    if (currentProviderIdentity === OFF_PROVIDER_IDENTITY) return;
+    const now = Date.now();
+    if (features.gitCommitEnabled) {
+        recordScopeActiveIdentity(db, projectIdentity, "commit", currentProviderIdentity, now);
+    }
+    if (features.memoryEnabled) {
+        repairMisScopedCompartmentChunkEmbeddingsForProject(db, projectIdentity);
+        recordScopeActiveIdentity(db, projectIdentity, "chunk", currentChunkIdentity, now);
     }
 }
 
@@ -964,16 +1176,61 @@ export function registerProjectEmbedding(
     sourceDirectory: string,
 ): ProjectEmbeddingRegistrationSnapshot {
     const resolvedConfig = resolveEmbeddingConfig(config);
-    const providerIdentity = getEmbeddingProviderIdentity(resolvedConfig);
-    const runtimeFingerprint = getRuntimeFingerprint(resolvedConfig);
-    const chunkModelId = getChunkEmbeddingModelId(resolvedConfig, providerIdentity);
+    const deferredSynapse = isDeferredSynapseConfig(resolvedConfig);
+    const providerIdentity = deferredSynapse
+        ? OFF_PROVIDER_IDENTITY
+        : getEmbeddingProviderIdentity(resolvedConfig);
+    const runtimeFingerprint = deferredSynapse
+        ? `deferred-synapse:${sha256Prefix(stableStringify(resolvedConfig))}`
+        : getRuntimeFingerprint(resolvedConfig);
+    const chunkModelId = deferredSynapse
+        ? "off"
+        : getChunkEmbeddingModelId(resolvedConfig, providerIdentity);
     const prior = projectRegistrations.get(projectIdentity);
+    // Callers re-register from the user's configuration on every tool call, so
+    // the incoming config for an already-resolved deferred lane is still the
+    // deferred one while the registration now carries the discovered lane.
+    // Matching the retained intent keeps that healthy provider and its
+    // descriptor instead of tearing both down and re-demanding per call.
+    const resumesResolvedLane =
+        deferredSynapse &&
+        prior !== undefined &&
+        !prior.observationMode &&
+        prior.deferredIntent === runtimeFingerprint &&
+        // A fallback activation keeps the intent but replaces the config with the
+        // fallback, and that demotion must stay retryable: only a lane that is
+        // still a RESOLVED Synapse config may be carried forward. A prior that is
+        // still unresolved falls through to the ordinary reuse predicate, which
+        // already matches it on the deferred fingerprint.
+        prior.config.provider === "synapse" &&
+        !isDeferredSynapseConfig(prior.config);
     const canReuseProvider =
         prior !== undefined &&
         !prior.observationMode &&
-        prior.runtimeFingerprint === runtimeFingerprint &&
-        prior.providerIdentity === providerIdentity;
-    recordActiveEmbeddingIdentity(db, projectIdentity, providerIdentity, chunkModelId, features);
+        (resumesResolvedLane ||
+            (prior.runtimeFingerprint === runtimeFingerprint &&
+                prior.providerIdentity === providerIdentity));
+    // A resumed lane keeps the prior registration's resolved identity; only a
+    // genuinely new deferred registration publishes the placeholder.
+    const effectiveConfig = resumesResolvedLane ? prior.config : resolvedConfig;
+    const effectiveProviderIdentity = resumesResolvedLane
+        ? prior.providerIdentity
+        : providerIdentity;
+    const effectiveRuntimeFingerprint = resumesResolvedLane
+        ? prior.runtimeFingerprint
+        : runtimeFingerprint;
+    const effectiveChunkModelId = resumesResolvedLane ? prior.chunkModelId : chunkModelId;
+    if (!deferredSynapse) {
+        recordActiveEmbeddingIdentity(
+            db,
+            projectIdentity,
+            providerIdentity,
+            chunkModelId,
+            features,
+        );
+    } else if (!resumesResolvedLane) {
+        clearDeferredDescriptor(db, "embedding_registrations", projectIdentity);
+    }
     // Synthetic ledger sessions (this project's primary and shadow batch keys)
     // are never deleted through session teardown, so prune their expired rows
     // on every (re)registration to keep the ledger bounded.
@@ -984,26 +1241,49 @@ export function registerProjectEmbedding(
     const generationChanged =
         prior === undefined ||
         prior.observationMode ||
-        prior.runtimeFingerprint !== runtimeFingerprint ||
-        prior.chunkModelId !== chunkModelId ||
+        prior.runtimeFingerprint !== effectiveRuntimeFingerprint ||
+        prior.chunkModelId !== effectiveChunkModelId ||
         !sameFeatures(prior.features, features);
     const generation = generationChanged ? ++globalRegistrationGeneration : prior.generation;
-    const registration: ProjectEmbeddingRegistration = {
-        projectIdentity,
+    const nextState = {
+        db,
         sourceDirectory,
-        config: resolvedConfig,
-        providerIdentity,
-        runtimeFingerprint,
-        provider: canReuseProvider ? prior.provider : null,
+        config: effectiveConfig,
+        providerIdentity: effectiveProviderIdentity,
+        runtimeFingerprint: effectiveRuntimeFingerprint,
         generation,
         features: { ...features },
-        modelId: providerIdentity === OFF_PROVIDER_IDENTITY ? "off" : providerIdentity,
-        chunkModelId: providerIdentity === OFF_PROVIDER_IDENTITY ? "off" : chunkModelId,
+        modelId:
+            effectiveProviderIdentity === OFF_PROVIDER_IDENTITY ? "off" : effectiveProviderIdentity,
+        chunkModelId:
+            effectiveProviderIdentity === OFF_PROVIDER_IDENTITY ? "off" : effectiveChunkModelId,
         observationMode: false,
     };
+    let registration: ProjectEmbeddingRegistration;
+    if (canReuseProvider) {
+        // Carrying the provider forward means preserving the registration OBJECT,
+        // not copying its fields into a new one: the provider's
+        // `onSynapseLaneReady` closure captured this object, and
+        // `commitPrimarySynapseLane` only accepts the identity currently in the
+        // map. A fresh object would silently drop the lane resolution of an
+        // initialization already in flight, leaving an initialized provider whose
+        // registration stays at the placeholder identity forever.
+        registration = Object.assign(prior, nextState);
+        if (deferredSynapse) registration.deferredIntent = runtimeFingerprint;
+        else delete registration.deferredIntent;
+    } else {
+        registration = {
+            projectIdentity,
+            provider: null,
+            ...nextState,
+            ...(deferredSynapse ? { deferredIntent: runtimeFingerprint } : {}),
+        };
+    }
 
     projectRegistrations.set(projectIdentity, registration);
-    persistPrimaryDescriptor(db, registration);
+    // A resumed lane is fully resolved, so its descriptor stays authoritative;
+    // only an unresolved deferred registration has nothing to persist.
+    if (!deferredSynapse || resumesResolvedLane) persistPrimaryDescriptor(db, registration);
 
     if (!canReuseProvider) {
         disposeProvider(prior?.provider ?? null);
@@ -1022,24 +1302,82 @@ export function registerProjectShadowEmbedding(
     if (resolvedConfig.provider !== "synapse") {
         throw new Error("Shadow embedding registration requires the synapse provider");
     }
-    const providerIdentity = getEmbeddingProviderIdentity(resolvedConfig);
-    const chunkModelId = getChunkEmbeddingModelId(resolvedConfig, providerIdentity);
+    const deferredSynapse = isDeferredSynapseConfig(resolvedConfig);
+    const deferredIntent = deferredSynapse
+        ? `deferred-synapse:${sha256Prefix(stableStringify(resolvedConfig))}`
+        : undefined;
+    const priorRegistration = shadowRegistrations.get(projectIdentity);
+    // The primary lane's reasoning applies here too: an already-resolved lane
+    // is re-registered from the same deferred config on every tool call, and its
+    // descriptor now describes the discovered lane.
+    const resumesResolvedLane =
+        deferredIntent !== undefined &&
+        priorRegistration?.deferredIntent === deferredIntent &&
+        // Same rule the primary lane applies: only a lane that actually RESOLVED
+        // may be carried forward. A prior whose config is still the deferred one
+        // never received its metadata — lane-wide permanent errors such as
+        // `not_certified` and `artifact_invalid` end discovery that way — and its
+        // provider latches `permanentFailure`, so `initialize()` refuses to
+        // rediscover. Resuming it would keep the shadow experiment disabled for
+        // the process lifetime even after the daemon or model is repaired.
+        // An unresolved prior falls through to the ordinary reuse predicate.
+        priorRegistration.config.provider === "synapse" &&
+        !isDeferredSynapseConfig(priorRegistration.config);
+    // A lane whose first discovery is still in flight is neither resolved nor
+    // failed, and replacing it loses the experiment a different way: the new
+    // provider is installed, the in-flight one is disposed, and its
+    // `onSynapseLaneReady` is then rejected by the identity guard in
+    // `commitShadowSynapseLane`, leaving the replacement's cohort reading `off`.
+    // Two operations re-registering the same deferred lane before `models.list`
+    // returns is the ordinary case, so a pending prior is preserved. Descriptors
+    // are deliberately left alone here: the lane has not resolved, so there is
+    // nothing new to persist.
+    const preservesPendingLane =
+        deferredIntent !== undefined &&
+        priorRegistration?.deferredIntent === deferredIntent &&
+        !resumesResolvedLane &&
+        synapseLaneDiscoveryState(priorRegistration.provider) === "pending";
+    if (deferredSynapse && !resumesResolvedLane) {
+        clearDeferredDescriptor(db, "shadow_embedding_registrations", projectIdentity);
+    }
+    const providerIdentity = deferredSynapse
+        ? OFF_PROVIDER_IDENTITY
+        : getEmbeddingProviderIdentity(resolvedConfig);
+    const chunkModelId = deferredSynapse
+        ? "off"
+        : getChunkEmbeddingModelId(resolvedConfig, providerIdentity);
+    let registrationForCallback: ShadowEmbeddingRegistration | null = null;
     const provider = createProvider(resolvedConfig, {
         projectRoot: sourceDirectory,
         session: `shadow:${projectIdentity}`,
+        onSynapseLaneReady: (metadata) => {
+            if (registrationForCallback) {
+                commitShadowSynapseLane(registrationForCallback, metadata);
+            }
+        },
     });
     if (!provider) return null;
-    const prior = shadowRegistrations.get(projectIdentity);
-    if (prior && prior.providerIdentity === providerIdentity) {
+    const prior = priorRegistration;
+    if (
+        prior &&
+        (resumesResolvedLane ||
+            preservesPendingLane ||
+            (!deferredSynapse && prior.providerIdentity === providerIdentity))
+    ) {
         void provider.dispose();
         dbForShadowQueue.set(projectIdentity, db);
-        persistShadowDescriptor(db, prior);
+        // A pending lane has no resolved identity yet, so persisting here would
+        // write an `off` descriptor over the deferred state the first
+        // registration deliberately cleared. Its descriptor is written by
+        // `commitShadowSynapseLane` when discovery lands.
+        if (!preservesPendingLane) persistShadowDescriptor(db, prior);
         const backfillAlreadyArmed =
             hasPendingShadowBackfill(projectIdentity) ||
             shadowQueue.some((item) => item.projectIdentity === projectIdentity);
         if (!backfillAlreadyArmed) maybeArmShadowBackfill(db, projectIdentity, prior);
         return {
             ...snapshotFor({
+                db: prior.db,
                 projectIdentity,
                 sourceDirectory,
                 config: prior.config,
@@ -1057,6 +1395,7 @@ export function registerProjectShadowEmbedding(
     }
     const generation = ++globalRegistrationGeneration;
     const registration: ShadowEmbeddingRegistration = {
+        db,
         projectIdentity,
         sourceDirectory,
         config: resolvedConfig,
@@ -1065,22 +1404,26 @@ export function registerProjectShadowEmbedding(
         modelId: providerIdentity,
         chunkModelId,
         generation,
+        ...(deferredIntent === undefined ? {} : { deferredIntent }),
     };
+    registrationForCallback = registration;
     shadowRegistrations.set(projectIdentity, registration);
     dbForShadowQueue.set(projectIdentity, db);
     if (prior) disposeProvider(prior.provider);
-    db.transaction(() => {
-        const now = Date.now();
-        recordScopeActiveIdentity(db, projectIdentity, "commit", registration.modelId, now);
-        recordScopeActiveIdentity(db, projectIdentity, "chunk", registration.chunkModelId, now);
-        persistShadowDescriptor(db, registration);
-    })();
+    if (!deferredSynapse) {
+        db.transaction(() => {
+            const now = Date.now();
+            recordScopeActiveIdentity(db, projectIdentity, "commit", registration.modelId, now);
+            recordScopeActiveIdentity(db, projectIdentity, "chunk", registration.chunkModelId, now);
+            persistShadowDescriptor(db, registration);
+        })();
+    }
     // A new shadow identity just landed (rotation, or a first/again registration
     // over a corpus that already has primary rows). Re-embed the historical
     // corpus under it so the measurement cohort keeps its coverage; the old
     // identity's rows age out through the 14-day GC. No-op when nothing is
     // missing (fresh project / identity unchanged path returned above).
-    maybeArmShadowBackfill(db, projectIdentity, registration);
+    if (!deferredSynapse) maybeArmShadowBackfill(db, projectIdentity, registration);
     return {
         projectIdentity,
         sourceDirectory,
@@ -1464,6 +1807,7 @@ function getDetailedLane(
         const registration = shadowRegistrations.get(projectIdentity);
         const provider = registration?.provider;
         if (!registration || !provider?.embedItemsDetailed) return null;
+        if (isDeferredSynapseConfig(registration.config)) return null;
         return {
             provider: provider as DetailedCapableProvider,
             laneRole,
@@ -1476,6 +1820,7 @@ function getDetailedLane(
     }
     const registration = projectRegistrations.get(projectIdentity);
     if (!registration || registration.observationMode) return null;
+    if (isDeferredSynapseConfig(registration.config)) return null;
     const provider = getOrCreateProjectProvider(registration);
     if (!provider?.embedItemsDetailed) return null;
     const generation = registration.generation;
@@ -2129,7 +2474,6 @@ export function registerProjectInObservationMode(
     failedConfig: EmbeddingConfig,
     failureSummary: string,
 ): ProjectEmbeddingRegistrationSnapshot {
-    void db;
     const prior = projectRegistrations.get(projectIdentity);
     const runtimeFingerprint = `observation:${sha256Prefix(failureSummary)}`;
     const generation =
@@ -2137,6 +2481,7 @@ export function registerProjectInObservationMode(
             ? prior.generation
             : ++globalRegistrationGeneration;
     const registration: ProjectEmbeddingRegistration = {
+        db,
         projectIdentity,
         sourceDirectory,
         config: resolveEmbeddingConfig(failedConfig),
@@ -2222,7 +2567,7 @@ export function getProjectEmbeddingMaxInputBytes(projectIdentity: string): numbe
 function getOrCreateProjectProvider(
     registration: ProjectEmbeddingRegistration,
 ): EmbeddingProvider | null {
-    if (registration.providerIdentity === OFF_PROVIDER_IDENTITY || registration.observationMode) {
+    if (registration.config.provider === "off" || registration.observationMode) {
         return null;
     }
     if (registration.provider) {
@@ -2231,6 +2576,7 @@ function getOrCreateProjectProvider(
     const provider = createProvider(registration.config, {
         projectRoot: registration.sourceDirectory,
         session: `project:${registration.projectIdentity}`,
+        onSynapseLaneReady: (metadata) => commitPrimarySynapseLane(registration, metadata),
     });
     registration.provider = provider;
     return provider;
@@ -2249,24 +2595,23 @@ export async function embedTextForProject(
 } | null> {
     const registration = projectRegistrations.get(projectIdentity);
     if (!registration) return null;
-    const generation = registration.generation;
-    const modelId = registration.modelId;
-    const provider = getOrCreateProjectProvider(registration);
+    let provider = getOrCreateProjectProvider(registration);
     if (!provider) return null;
 
-    const vector = await provider.embed(text, signal, purpose);
+    let vector = await provider.embed(text, signal, purpose);
+    if (!vector && !signal?.aborted && activatePrimarySynapseFallback(registration)) {
+        provider = getOrCreateProjectProvider(registration);
+        vector = provider ? await provider.embed(text, signal, purpose) : null;
+    }
     if (!vector) return null;
 
-    const current = projectRegistrations.get(projectIdentity);
-    if (
-        !current ||
-        current.generation !== generation ||
-        current.runtimeFingerprint !== registration.runtimeFingerprint
-    ) {
-        return null;
-    }
-
-    return { vector, modelId, chunkModelId: registration.chunkModelId, generation };
+    if (projectRegistrations.get(projectIdentity) !== registration) return null;
+    return {
+        vector,
+        modelId: registration.modelId,
+        chunkModelId: registration.chunkModelId,
+        generation: registration.generation,
+    };
 }
 
 export async function embedBatchForProject(
@@ -2283,23 +2628,26 @@ export async function embedBatchForProject(
 
     const registration = projectRegistrations.get(projectIdentity);
     if (!registration) return null;
-    const generation = registration.generation;
-    const modelId = registration.modelId;
-    const runtimeFingerprint = registration.runtimeFingerprint;
-    const provider = getOrCreateProjectProvider(registration);
+    let provider = getOrCreateProjectProvider(registration);
     if (!provider) return null;
 
-    const vectors = await provider.embedBatch(texts, signal, purpose);
-    const current = projectRegistrations.get(projectIdentity);
+    let vectors = await provider.embedBatch(texts, signal, purpose);
     if (
-        !current ||
-        current.generation !== generation ||
-        current.runtimeFingerprint !== runtimeFingerprint
+        !signal?.aborted &&
+        vectors.every((vector) => vector === null) &&
+        activatePrimarySynapseFallback(registration)
     ) {
-        return null;
+        provider = getOrCreateProjectProvider(registration);
+        vectors = provider
+            ? await provider.embedBatch(texts, signal, purpose)
+            : texts.map(() => null);
     }
-
-    return { vectors, modelId, generation };
+    if (projectRegistrations.get(projectIdentity) !== registration) return null;
+    return {
+        vectors,
+        modelId: registration.modelId,
+        generation: registration.generation,
+    };
 }
 
 export async function embedItemsForProject(
@@ -2309,10 +2657,7 @@ export async function embedItemsForProject(
 ): Promise<{ vectors: Map<string, Float32Array>; modelId: string; generation: number } | null> {
     const registration = projectRegistrations.get(projectIdentity);
     if (!registration || registration.observationMode || items.length === 0) return null;
-    const generation = registration.generation;
-    const modelId = registration.modelId;
-    const runtimeFingerprint = registration.runtimeFingerprint;
-    const provider = getOrCreateProjectProvider(registration);
+    let provider = getOrCreateProjectProvider(registration);
     if (!provider) return null;
 
     let vectors: Map<string, Float32Array>;
@@ -2331,16 +2676,32 @@ export async function embedItemsForProject(
             }),
         );
     }
-
-    const current = projectRegistrations.get(projectIdentity);
-    if (
-        !current ||
-        current.generation !== generation ||
-        current.runtimeFingerprint !== runtimeFingerprint
-    ) {
-        return null;
+    if (vectors.size === 0 && !signal?.aborted && activatePrimarySynapseFallback(registration)) {
+        provider = getOrCreateProjectProvider(registration);
+        if (!provider) return null;
+        if (provider.embedItems) {
+            vectors = await provider.embedItems(items, signal);
+        } else {
+            const positional = await provider.embedBatch(
+                items.map((item) => item.text),
+                signal,
+                "passage",
+            );
+            vectors = new Map(
+                items.flatMap((item, index) => {
+                    const vector = positional[index];
+                    return vector ? [[item.id, vector] as const] : [];
+                }),
+            );
+        }
     }
-    return { vectors, modelId, generation };
+
+    if (projectRegistrations.get(projectIdentity) !== registration) return null;
+    return {
+        vectors,
+        modelId: registration.modelId,
+        generation: registration.generation,
+    };
 }
 
 /** Keep domain items bounded to the same per-call window cap used by positional providers. */
@@ -3122,9 +3483,7 @@ export async function sweepAllRegisteredProjects(db: Database): Promise<{
     return { commitsEmbedded, chunksEmbedded, perProject };
 }
 
-export function _setTestProviderFactoryForProject(
-    factory: ((config: EmbeddingConfig) => EmbeddingProvider | null) | null,
-): void {
+export function _setTestProviderFactoryForProject(factory: TestProviderFactory | null): void {
     testProviderFactory = factory;
 }
 

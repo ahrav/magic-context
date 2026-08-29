@@ -6,6 +6,7 @@ import {
 import {
 	type EmbeddingFeatures,
 	registerProjectEmbedding,
+	registerProjectShadowEmbedding,
 } from "@magic-context/core/features/magic-context/memory/embedding";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
@@ -13,6 +14,8 @@ import {
 	handleUntrustedLoad,
 	isConfigLoadUntrusted,
 } from "@magic-context/core/plugin/embedding-bootstrap-helpers";
+import { resolveEmbeddingRouting } from "@magic-context/core/plugin/embedding-routing";
+import { log } from "@magic-context/core/shared/logger";
 import { loadPiConfigDetailed } from "./config";
 
 interface RegistrationFingerprint {
@@ -80,13 +83,25 @@ export async function ensureProjectRegisteredFromPiDirectory(
 		memoryEnabled: detailed.config.memory.enabled,
 		gitCommitEnabled: detailed.config.memory.git_commit_indexing.enabled,
 	};
+	const routing = await resolveEmbeddingRouting({ config: detailed.config });
+	for (const warning of routing.warnings) {
+		log(`[magic-context][pi] ${warning}`);
+	}
 	registerProjectEmbedding(
 		db,
 		projectIdentity,
-		detailed.config.embedding,
+		routing.primary,
 		features,
 		directory,
 	);
+	if (routing.shadow) {
+		registerProjectShadowEmbedding(
+			db,
+			projectIdentity,
+			routing.shadow,
+			directory,
+		);
+	}
 	const fingerprintPaths = configCandidatePaths(
 		directory,
 		detailed.loadedFromPaths,

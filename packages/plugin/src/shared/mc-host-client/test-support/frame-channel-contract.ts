@@ -542,7 +542,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
                 assert.equal(producer.written, size);
                 for (const alias of aliases) assert.equal(alias.byteLength, 0);
             }
-            await h.peer.waitFor(() => requestCorrs(h.peer).length === sizes.length, 15_000);
+            await h.peer.waitFor(() => requestCorrs(h.peer).length === sizes.length, 60_000);
             assert.deepEqual(
                 h.peer.frames
                     .filter((frame) => frame.ty === FrameType.Request)

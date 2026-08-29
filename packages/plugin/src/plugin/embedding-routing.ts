@@ -6,14 +6,11 @@ import type {
 import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "../config/schema/magic-context";
 import {
     getSynapseLaneIdentity,
-    normalizeSynapseTokenBudget,
     SYNAPSE_DEFAULT_MODEL,
     SYNAPSE_MAX_INPUT_BYTES,
     SYNAPSE_MAX_INPUT_TOKENS,
-    SynapseEmbeddingProvider,
-    type SynapseLaneMetadata,
 } from "../features/magic-context/memory/embedding-synapse";
-import { log } from "../shared/logger";
+import type { ConnectionOrigin } from "../shared/mc-host-lifecycle";
 
 export interface ResolvedSynapseEmbeddingConfig {
     provider: "synapse";
@@ -23,9 +20,11 @@ export interface ResolvedSynapseEmbeddingConfig {
     max_input_tokens: number;
     /** Advertised UTF-8 byte ceiling for one input. */
     synapse_max_input_bytes: number;
-    synapse_connection_file: string;
-    synapse_fingerprint: string;
-    synapse_table_epoch: number;
+    synapse_connection_file?: string;
+    synapse_connection_origin: ConnectionOrigin;
+    synapse_fallback?: EmbeddingConfig;
+    synapse_fingerprint?: string;
+    synapse_table_epoch?: number;
     // Dims are absent until the first embed response pins them; the registry
     // treats a missing value as adopt-on-first-write.
     synapse_dims?: number;
@@ -33,12 +32,6 @@ export interface ResolvedSynapseEmbeddingConfig {
     synapse_recommended_token_budget?: number;
     synapse_provenance?: unknown;
 }
-
-const SYNAPSE_PROBE_TTL_MS = 60_000;
-const synapseProbeCache = new Map<
-    string,
-    { expiresAt: number; promise: Promise<SynapseLaneMetadata> }
->();
 
 export interface ResolvedEmbeddingRouting {
     /** Provider config for the authoritative lane. */
@@ -85,96 +78,35 @@ function fallbackConfig(
     };
 }
 
-function synapseOptions(
+function deferredSynapseConfig(
     config: EmbeddingConfig,
-    subc: NonNullable<MagicContextConfig["subc"]>,
-    projectRoot: string,
-    session: string,
-    metadata?: SynapseLaneMetadata,
-) {
-    return {
-        connectionFile: subc.connection_file,
-        projectRoot,
-        session,
-        model:
-            metadata?.model ??
-            (config.provider === "synapse" && "model" in config ? config.model : undefined) ??
-            SYNAPSE_DEFAULT_MODEL,
-        ...(metadata
-            ? {
-                  fingerprint: metadata.fingerprint,
-                  tableEpoch: metadata.table_epoch,
-                  dims: metadata.dims,
-                  recommendedBatch: metadata.recommended_batch,
-                  recommendedTokenBudget: normalizeSynapseTokenBudget(
-                      metadata.recommended_token_budget,
-                  ),
-                  maxInputTokens: metadata.max_input_tokens,
-                  maxInputBytes: metadata.max_input_bytes,
-                  provenance: metadata.provenance,
-              }
-            : {}),
-    };
-}
-
-function probeKey(subc: NonNullable<MagicContextConfig["subc"]>, config: EmbeddingConfig): string {
-    const model =
-        config.provider === "synapse" && "model" in config ? config.model : SYNAPSE_DEFAULT_MODEL;
-    return `${subc.connection_file}\u0000${model ?? SYNAPSE_DEFAULT_MODEL}`;
-}
-
-function discoverSynapseLane(
-    config: EmbeddingConfig,
-    subc: NonNullable<MagicContextConfig["subc"]>,
-    projectRoot: string,
-    session: string,
-): Promise<SynapseLaneMetadata> {
-    const key = probeKey(subc, config);
-    const cached = synapseProbeCache.get(key);
-    if (cached && cached.expiresAt > Date.now()) return cached.promise;
-    const promise = SynapseEmbeddingProvider.discover(
-        synapseOptions(config, subc, projectRoot, session),
-    );
-    synapseProbeCache.set(key, { expiresAt: Date.now() + SYNAPSE_PROBE_TTL_MS, promise });
-    void promise.catch(() => undefined);
-    return promise;
-}
-
-function resolvedSynapseConfig(
-    subc: NonNullable<MagicContextConfig["subc"]>,
-    metadata: SynapseLaneMetadata,
-    projectRoot: string,
-    session: string,
+    subc: MagicContextConfig["subc"],
+    fallback?: EmbeddingConfig,
 ): ResolvedSynapseEmbeddingConfig {
-    void projectRoot;
-    void session;
-    const tokenBudget = normalizeSynapseTokenBudget(metadata.recommended_token_budget);
+    const model =
+        config.provider === "synapse" && "model" in config
+            ? config.model || SYNAPSE_DEFAULT_MODEL
+            : SYNAPSE_DEFAULT_MODEL;
     return {
         provider: "synapse",
-        model: metadata.model,
-        max_input_tokens: metadata.max_input_tokens ?? SYNAPSE_MAX_INPUT_TOKENS,
-        synapse_max_input_bytes: metadata.max_input_bytes ?? SYNAPSE_MAX_INPUT_BYTES,
-        synapse_connection_file: subc.connection_file,
-        synapse_fingerprint: metadata.fingerprint,
-        synapse_table_epoch: metadata.table_epoch,
-        ...(typeof metadata.dims === "number" ? { synapse_dims: metadata.dims } : {}),
-        ...(metadata.recommended_batch
-            ? { synapse_recommended_batch: metadata.recommended_batch }
-            : {}),
-        ...(tokenBudget !== undefined ? { synapse_recommended_token_budget: tokenBudget } : {}),
-        ...(metadata.provenance !== undefined ? { synapse_provenance: metadata.provenance } : {}),
+        model,
+        max_input_tokens: SYNAPSE_MAX_INPUT_TOKENS,
+        synapse_max_input_bytes: SYNAPSE_MAX_INPUT_BYTES,
+        synapse_connection_origin: subc ? "explicit" : "managed-default",
+        ...(subc ? { synapse_connection_file: subc.connection_file } : {}),
+        ...(fallback ? { synapse_fallback: fallback } : {}),
     };
 }
 
 /**
- * Resolve daemon availability before registration so a fallback vector can never
- * be written under a Synapse identity. The registry receives only the selected
+ * Translate the configured embedding block into lane intents. Synapse lanes
+ * are deferred (no daemon probe here): the registry resolves them on first
+ * use and only then persists an identity, so a fallback vector can never be
+ * written under a Synapse identity. The registry receives only the selected
  * lane's provider fields, not the raw routing controls.
  */
 export async function resolveEmbeddingRouting(args: {
     config: MagicContextConfig;
-    projectRoot: string;
-    session?: string;
 }): Promise<ResolvedEmbeddingRouting> {
     const config = args.config.embedding;
     const { subc } = args.config;
@@ -185,27 +117,8 @@ export async function resolveEmbeddingRouting(args: {
         let shadow: ResolvedSynapseEmbeddingConfig | null = null;
         if (shadowEnabled && config.provider === "off") {
             warnings.push("shadow_embedding is ignored when embedding.provider is off");
-        } else if (shadowEnabled && !subc) {
-            warnings.push("shadow_embedding requires a subc block; shadow lane is disabled");
-        } else if (shadowEnabled && subc) {
-            try {
-                const metadata = await discoverSynapseLane(
-                    config,
-                    subc,
-                    args.projectRoot,
-                    args.session ?? "routing",
-                );
-                shadow = resolvedSynapseConfig(
-                    subc,
-                    metadata,
-                    args.projectRoot,
-                    args.session ?? "routing",
-                );
-            } catch (error) {
-                warnings.push(
-                    `shadow_embedding is unavailable; using the primary ${config.provider} lane: ${error instanceof Error ? error.message : String(error)}`,
-                );
-            }
+        } else if (shadowEnabled) {
+            shadow = deferredSynapseConfig(config, subc);
         }
         return { primary: config, shadow, warnings };
     }
@@ -216,43 +129,27 @@ export async function resolveEmbeddingRouting(args: {
 
     const fallbackProvider = config.fallback_provider;
     const fallback = fallbackConfig(config, fallbackProvider);
-    if (!subc) {
-        warnings.push("embedding.provider synapse requires a subc block; using fallback provider");
-        return { primary: fallback, shadow: null, warnings };
-    }
     if (!fallbackProvider) {
         warnings.push(
             "embedding.provider synapse requires embedding.fallback_provider; using local fallback",
         );
-        return { primary: fallbackConfig(config, "local"), shadow: null, warnings };
-    }
-
-    try {
-        const metadata = await discoverSynapseLane(
-            config,
-            subc,
-            args.projectRoot,
-            args.session ?? "routing",
-        );
         return {
-            primary: resolvedSynapseConfig(
-                subc,
-                metadata,
-                args.projectRoot,
-                args.session ?? "routing",
-            ),
+            primary: deferredSynapseConfig(config, subc, fallbackConfig(config, "local")),
             shadow: null,
             warnings,
         };
-    } catch (error) {
-        warnings.push(
-            `Synapse is not ready; using embedding.fallback_provider=${fallbackProvider}: ${error instanceof Error ? error.message : String(error)}`,
-        );
-        log(`[magic-context] Synapse routing fell back: ${warnings.at(-1)}`);
-        return { primary: fallback, shadow: null, warnings };
     }
+
+    return {
+        primary: deferredSynapseConfig(config, subc, fallback),
+        shadow: null,
+        warnings,
+    };
 }
 
 export function getResolvedSynapseProviderIdentity(config: ResolvedSynapseEmbeddingConfig): string {
+    if (!config.synapse_fingerprint) {
+        throw new Error("deferred Synapse intent has no resolved provider identity");
+    }
     return getSynapseLaneIdentity(config.model, config.synapse_fingerprint);
 }

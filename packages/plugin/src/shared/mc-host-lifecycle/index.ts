@@ -47,11 +47,16 @@ export {
 } from "./contract";
 export { RELEASE_CONTRACT_SHA256, releaseContract } from "./generated-contract";
 export {
+    createManagedLifecyclePolicy,
+    type ManagedLifecyclePolicyOptions,
+} from "./managed-policy";
+export {
     LAUNCHER_CHILD_FD,
     NativeLaunchError,
     type NativeLaunchFailureCode,
     type NativeLaunchOptions,
     type NativeLaunchTarget,
+    type NativeStartupEnvelope,
     runNativeLifecycle,
 } from "./native-launcher";
 export {

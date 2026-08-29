@@ -15,6 +15,11 @@ function tempDir(prefix: string): string {
     return mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
+/** A handshake-authenticated peer at a given daemon version. */
+function authenticatedPeerAt(daemonVer: string) {
+    return { daemonVer, daemonId: new Uint8Array([1, 2, 3, 4]), proof: "current" as const };
+}
+
 let counter = 0;
 
 function startResultJson(command: string): string {
@@ -39,6 +44,36 @@ function startResultJson(command: string): string {
             synapse: null,
             broca: null,
         },
+    });
+}
+
+function missingPayloadResultJson(): string {
+    return JSON.stringify({
+        schema: "magic-context.daemon/v1",
+        command: "start",
+        ok: false,
+        state: "stopped",
+        reason: "native_payload_missing",
+        remediation: "install_native_payload",
+        effects: null,
+        readiness: null,
+        checks: [],
+        versions: {
+            release: "0.38.0",
+            proof: null,
+            daemon: null,
+            magic_context: null,
+            synapse: null,
+            broca: null,
+        },
+    });
+}
+
+function restartResultJson(): string {
+    return JSON.stringify({
+        ...JSON.parse(startResultJson("restart")),
+        reason: "started",
+        effects: { stop_committed: true, start_committed: true },
     });
 }
 
@@ -225,6 +260,94 @@ describe("observational commands without a trusted bootstrap (U3 scenario 21)", 
 });
 
 describe("native invocation mapping", () => {
+    test("native current validation precedes one deferred certified package lookup", async () => {
+        const root = tempDir("mc-policy-fallback-");
+        const invocationLog = path.join(root, "fallback-invocations.log");
+        const binary = path.join(root, "fallback-ck-mc-host.sh");
+        writeFileSync(
+            binary,
+            `#!/bin/sh\necho "$*" >> ${invocationLog}\n` +
+                `if [ "$2" != "--payload-dir" ]; then echo '${missingPayloadResultJson()}'; exit 1; fi\n` +
+                `echo '${startResultJson("start")}'\nexit 0\n`,
+        );
+        chmodSync(binary, 0o700);
+        let lookups = 0;
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                payloadDirFallback: () => {
+                    lookups += 1;
+                    return "/qualified/package";
+                },
+            });
+
+            const result = await policy.start();
+
+            expect(result.reason).toBe("started");
+            expect(lookups).toBe(1);
+            expect(readFileSync(invocationLog, "utf8").trim().split("\n")).toEqual([
+                "start",
+                "start --payload-dir /qualified/package",
+            ]);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("the fallback retry spends what the first launch left, not a fresh aggregate", async () => {
+        // The aggregate is one request-to-transport bound for the command. A
+        // first launch that answers `native_payload_missing`, plus the package
+        // lookup that follows it, both spend from it — so handing the retry the
+        // full aggregate again would let one `start` run twice the budget its
+        // platform was qualified for.
+        const root = tempDir("mc-policy-fallback-budget-");
+        const invocationLog = path.join(root, "budget-invocations.log");
+        const binary = path.join(root, "budget-ck-mc-host.sh");
+        // The first invocation reports the payload missing after burning a
+        // second; the second (with --payload-dir) succeeds immediately.
+        writeFileSync(
+            binary,
+            `#!/bin/sh\necho "$*" >> ${invocationLog}\n` +
+                `if [ "$2" != "--payload-dir" ]; then sleep 1; echo '${missingPayloadResultJson()}'; exit 1; fi\n` +
+                `echo '${startResultJson("start")}'\nexit 0\n`,
+        );
+        chmodSync(binary, 0o700);
+        const LOOKUP_MS = 500;
+        const AGGREGATE_MS = 20_000;
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                outerAggregateMs: AGGREGATE_MS,
+                payloadDirFallback: () => {
+                    // Stands in for resolving and hashing the certified package,
+                    // which is synchronous on the real path.
+                    const until = Date.now() + LOOKUP_MS;
+                    while (Date.now() < until) {
+                        /* burn budget before the retry */
+                    }
+                    return "/qualified/package";
+                },
+            });
+
+            const started = Date.now();
+            const result = await policy.start();
+            const elapsed = Date.now() - started;
+
+            expect(result.reason).toBe("started");
+            // Both invocations happened, so the retry really did run.
+            expect(readFileSync(invocationLog, "utf8").trim().split("\n")).toEqual([
+                "start",
+                "start --payload-dir /qualified/package",
+            ]);
+            // The whole command stayed inside one aggregate rather than two.
+            expect(elapsed).toBeLessThan(AGGREGATE_MS);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 30_000);
+
     test("status and doctor route through the native probe of the trusted target", async () => {
         const root = tempDir("mc-policy-native-");
         const { binary, invocationLog } = fakeBinary(root);
@@ -239,6 +362,212 @@ describe("native invocation mapping", () => {
             const doctor = await policy.doctor();
             expect(doctor.command).toBe("doctor");
             expect(invocations(invocationLog)).toEqual(["probe", "probe"]);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("status and doctor derive health from authenticated component readiness", async () => {
+        const root = tempDir("mc-policy-readiness-");
+        const { binary } = fakeBinary(root);
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                readinessProbe: async () => ({
+                    authenticatedPeer: authenticatedPeerAt("mc-host/0.1.0"),
+                    readiness: {
+                        transport: { state: "ready", reason: "healthy" },
+                        storage: { state: "unavailable", reason: "storage_unavailable" },
+                        synapse: { state: "degraded", reason: "synapse_degraded" },
+                    },
+                }),
+            });
+
+            for (const result of [await policy.status(), await policy.doctor()]) {
+                expect(result.ok).toBe(false);
+                expect(result.reason).toBe("storage_unavailable");
+                expect(result.readiness?.storage?.state).toBe("unavailable");
+                expect(result.readiness?.synapse?.state).toBe("degraded");
+                expect(result.versions.daemon).toBe("mc-host/0.1.0");
+                expect(result.checks.map((check) => [check.id, check.status])).toEqual([
+                    ["readiness.storage", "fail"],
+                    ["readiness.synapse", "fail"],
+                    ["readiness.transport", "pass"],
+                ]);
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("a failing readiness probe keeps the observation it already proved", async () => {
+        // The native probe child already answered and was validated, so a
+        // readiness failure on top of it must not be reported as an internal
+        // error for a daemon this call verifiably observed. Same rule the
+        // storage probe follows: degrade, never erase a successful observation.
+        const root = tempDir("mc-policy-readiness-failure-");
+        const { binary } = fakeBinary(root);
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                readinessProbe: async () => {
+                    throw new Error("route collapsed mid-probe");
+                },
+            });
+            for (const result of [await policy.status(), await policy.doctor()]) {
+                expect(result.ok).toBe(true);
+                expect(result.state).toBe("running");
+                expect(result.reason).not.toBe("internal_error");
+                // The native result's own readiness survives untouched, and no
+                // probe-derived component is invented on top of it.
+                expect(result.readiness?.storage).toBeUndefined();
+                expect(result.readiness?.synapse).toBeUndefined();
+                expect(result.checks.some((check) => check.id.startsWith("readiness."))).toBe(
+                    false,
+                );
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("the readiness probe is bounded by what the probe child left of the aggregate", async () => {
+        // The aggregate is a request-to-transport bound shared with the child, so
+        // the probe gets the residual rather than a fresh full budget. The floor
+        // is also load-bearing: it must never hand out a token 1ms budget, which
+        // would start a probe that can only fail.
+        const root = tempDir("mc-policy-readiness-residual-");
+        const CHILD_MS = 1_000;
+        const AGGREGATE_MS = 20_000;
+        const { binary } = fakeBinary(root, { sleepSeconds: CHILD_MS / 1_000 });
+        const budgets: number[] = [];
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                outerAggregateMs: AGGREGATE_MS,
+                readinessProbe: async (budgetMs) => {
+                    budgets.push(budgetMs);
+                    return {
+                        authenticatedPeer: authenticatedPeerAt("mc-host/0.1.0"),
+                        readiness: {
+                            transport: { state: "ready", reason: "healthy" },
+                        },
+                    };
+                },
+            });
+            const result = await policy.status();
+            expect(result.ok).toBe(true);
+            expect(budgets).toHaveLength(1);
+            // The child's second of runtime came out of the aggregate.
+            expect(budgets[0]).toBeLessThan(AGGREGATE_MS - CHILD_MS + 1);
+            // And a real budget was handed over, not the old 1ms floor.
+            expect(budgets[0]).toBeGreaterThan(1);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 20_000);
+
+    test("an authenticated daemon outside the supported range is never healthy", async () => {
+        // Readiness answers whether the components are serving, not whether this
+        // client may talk to this daemon at all. Without the compatibility gate a
+        // running daemon on an unsupported version reported `healthy` and stamped
+        // that version with `proof: "current"`.
+        const root = tempDir("mc-policy-incompatible-daemon-");
+        const { binary } = fakeBinary(root);
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                readinessProbe: async () => ({
+                    // Every component is ready, so only the version can fail it.
+                    authenticatedPeer: authenticatedPeerAt("mc-host/9.9.9"),
+                    readiness: {
+                        transport: { state: "ready", reason: "healthy" },
+                        storage: { state: "ready", reason: "healthy" },
+                    },
+                }),
+            });
+            for (const result of [await policy.status(), await policy.doctor()]) {
+                expect(result.ok).toBe(false);
+                expect(result.reason).toBe("incompatible_daemon");
+                expect(result.remediation).toBe("align_versions");
+                expect(
+                    result.checks.find((check) => check.id === "compatibility.daemon")?.status,
+                ).toBe("fail");
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("the reported readiness reason follows contract precedence, not check-id order", async () => {
+        const root = tempDir("mc-policy-readiness-precedence-");
+        const { binary } = fakeBinary(root);
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                readinessProbe: async () => ({
+                    authenticatedPeer: authenticatedPeerAt("mc-host/0.1.0"),
+                    readiness: {
+                        // `readiness.storage` sorts before `readiness.transport`,
+                        // but `authentication_failed` outranks `storage_unavailable`
+                        // in the release contract's failing-reason precedence.
+                        transport: { state: "unavailable", reason: "authentication_failed" },
+                        storage: { state: "unavailable", reason: "storage_unavailable" },
+                        synapse: { state: "degraded", reason: "synapse_degraded" },
+                    },
+                }),
+            });
+
+            for (const result of [await policy.status(), await policy.doctor()]) {
+                expect(result.ok).toBe(false);
+                expect(result.reason).toBe("authentication_failed");
+                expect(result.remediation).toBe("inspect_daemon_process");
+                // The check list itself stays sorted by id: the v1 result
+                // requires lexicographically sorted unique check ids.
+                expect(result.checks.map((check) => check.id)).toEqual([
+                    "readiness.storage",
+                    "readiness.synapse",
+                    "readiness.transport",
+                ]);
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("restart resolves the certified payload before one native transaction", async () => {
+        const root = tempDir("mc-policy-restart-payload-");
+        const invocationLog = path.join(root, "restart-invocations.log");
+        const binary = path.join(root, "restart-ck-mc-host.sh");
+        writeFileSync(
+            binary,
+            `#!/bin/sh\necho "$*" >> ${invocationLog}\necho '${restartResultJson()}'\nexit 0\n`,
+        );
+        chmodSync(binary, 0o700);
+        let lookups = 0;
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                payloadDirFallback: () => {
+                    lookups += 1;
+                    return "/qualified/package";
+                },
+            });
+            const result = await policy.restart();
+            expect(result.effects).toEqual({
+                stop_committed: true,
+                start_committed: true,
+            });
+            expect(lookups).toBe(1);
+            expect(readFileSync(invocationLog, "utf8").trim()).toBe(
+                "restart --payload-dir /qualified/package",
+            );
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
@@ -570,6 +899,43 @@ describe("demand-start coalescing and detachment (U3 scenarios 15-16)", () => {
             const outcome = await survivor;
             expect(outcome.result.reason).toBe("started");
             expect(invocations(invocationLog)).toEqual(["start"]);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 20_000);
+
+    test("the caller deadline also bounds storage readiness", async () => {
+        // The waiter has already cleared its timer and detached its abort
+        // listener by the time the start resolves, so the storage probe needs a
+        // bound of its own or it would keep `demandStart` pending forever with
+        // nothing watching. Expiry degrades to `unavailable` rather than
+        // rejecting: the start itself succeeded, and a caller that must not send
+        // an application body already gates on `storage === "ready"`.
+        const root = tempDir("mc-policy-storage-deadline-");
+        const { binary } = fakeBinary(root);
+        const budgets: number[] = [];
+        const CALLER_BUDGET_MS = 1_000;
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                storageProbe: async (budgetMs) => {
+                    budgets.push(budgetMs);
+                    // Outlasts both the caller budget and STORAGE_HARD_BUDGET_MS.
+                    await new Promise((resolve) => setTimeout(resolve, 30_000));
+                    return "ready";
+                },
+            });
+            const outcome = await policy.demandStart({
+                origin: "managed-default",
+                capability: "magic-context",
+                deadlineMs: CALLER_BUDGET_MS,
+            });
+            expect(outcome.result.ok).toBe(true);
+            expect(outcome.storage).toBe("unavailable");
+            // The caller's residual budget bounded the probe, not the 5s hard cap.
+            expect(budgets).toHaveLength(1);
+            expect(budgets[0]).toBeLessThanOrEqual(CALLER_BUDGET_MS);
         } finally {
             rmSync(root, { recursive: true, force: true });
         }

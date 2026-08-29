@@ -124,6 +124,90 @@ function virtualTime(randomValues: number[] = [0]): {
 }
 
 describe("SynapseEmbeddingProvider", () => {
+    it("keeps injected factory providers lifecycle-neutral", async () => {
+        const client = new MockSynapseClient();
+        let demands = 0;
+        const provider = new SynapseEmbeddingProvider({
+            projectRoot: "/repo",
+            session: "injected-synapse",
+            demandStart: async () => {
+                demands += 1;
+                return { ok: true, reason: "started", storage: null };
+            },
+            clientFactory: async () => client,
+            connectionOrigin: "managed-default",
+        });
+
+        expect(demands).toBe(0);
+        await provider.initialize();
+        await provider.initialize();
+        expect(demands).toBe(0);
+    });
+
+    it("demands before a managed real connection and coalesces initialization", async () => {
+        let demands = 0;
+        const deadlines: (number | undefined)[] = [];
+        const provider = new SynapseEmbeddingProvider({
+            projectRoot: "/repo",
+            session: "managed-synapse",
+            demandStart: async (request) => {
+                demands += 1;
+                deadlines.push(request.deadlineMs);
+                return { ok: false, reason: "startup_timeout", storage: null };
+            },
+            connectionOrigin: "managed-default",
+        });
+
+        expect(demands).toBe(0);
+        await expect(Promise.all([provider.initialize(), provider.initialize()])).resolves.toEqual([
+            false,
+            false,
+        ]);
+        expect(demands).toBe(1);
+        // The demand waits on a shared cold start, not on one query: a
+        // per-query deadline would detach every waiter mid-startup and demote
+        // the lane while startup still succeeds.
+        expect(deadlines[0]).toBeGreaterThanOrEqual(60_000);
+    });
+
+    it("does not demand a managed start for an already-aborted caller", async () => {
+        // Creating the initialization flight is what triggers the demand, and the
+        // demand is not given the caller's signal — so an already-cancelled query
+        // could stage and start mc-host, resolve the lane, and arm backfill with
+        // no live waiter. Detaching from an existing flight is different: another
+        // caller owns it.
+        let demands = 0;
+        const provider = new SynapseEmbeddingProvider({
+            projectRoot: "/repo",
+            session: "managed-aborted-caller",
+            demandStart: async () => {
+                demands += 1;
+                return { ok: true, reason: "started", storage: "ready" };
+            },
+            connectionOrigin: "managed-default",
+        });
+
+        expect(await provider.initialize(AbortSignal.abort())).toBe(false);
+        expect(demands).toBe(0);
+    });
+
+    it("does not re-demand per call after a failed managed demand", async () => {
+        let demands = 0;
+        const provider = new SynapseEmbeddingProvider({
+            projectRoot: "/repo",
+            session: "managed-demand-backoff",
+            demandStart: async () => {
+                demands += 1;
+                return { ok: false, reason: "native_payload_missing", storage: null };
+            },
+            connectionOrigin: "managed-default",
+        });
+
+        expect(await provider.initialize()).toBe(false);
+        expect(await provider.initialize()).toBe(false);
+        expect(demands).toBe(1);
+    });
+
     it("discovers a certified model and sends the required artifact constraints", async () => {
         const client = new MockSynapseClient();
         const provider = new SynapseEmbeddingProvider({

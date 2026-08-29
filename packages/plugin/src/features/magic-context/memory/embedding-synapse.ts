@@ -1,7 +1,16 @@
 import { createHash, randomUUID } from "node:crypto";
+import { getDataDir } from "../../../shared/data-path";
 import { getHarness } from "../../../shared/harness";
 import { log } from "../../../shared/logger";
 import { isMcHostCallError, McHostClient } from "../../../shared/mc-host-client";
+import {
+    type ConnectionOrigin,
+    defaultConnectionFilePath,
+    OUTER_AGGREGATE_MS,
+    resolveConnectionOrigin,
+    STORAGE_HARD_BUDGET_MS,
+    type StorageReadiness,
+} from "../../../shared/mc-host-lifecycle";
 import {
     createSynapseLedgerPage,
     findSynapseLedgerPage,
@@ -107,7 +116,8 @@ export interface SynapseClientLike {
 }
 
 export interface SynapseEmbeddingProviderOptions {
-    connectionFile: string;
+    connectionFile?: string;
+    connectionOrigin?: ConnectionOrigin;
     projectRoot: string;
     session: string;
     model?: string;
@@ -123,11 +133,64 @@ export interface SynapseEmbeddingProviderOptions {
     queryTimeoutMs?: number;
     batchTimeoutMs?: number;
     clientFactory?: () => Promise<SynapseClientLike>;
+    demandStart?: SynapseDemandStart;
+    onLaneReady?: (metadata: SynapseLaneMetadata) => void;
     sleep?: (ms: number) => Promise<void>;
     now?: () => number;
     random?: () => number;
     pollInitialDelayMs?: number;
     pollDefaultDelayMs?: number;
+}
+
+export type SynapseDemandStart = (request: {
+    origin: ConnectionOrigin;
+    capability: "synapse";
+    deadlineMs?: number;
+}) => Promise<{ ok: boolean; reason: string; storage: StorageReadiness | null }>;
+
+let configuredManagedDemandStart: SynapseDemandStart | undefined;
+
+export function configureSynapseManagedDemandStart(
+    demandStart: SynapseDemandStart | undefined,
+): void {
+    configuredManagedDemandStart = demandStart;
+}
+
+/**
+ * A managed cold start may take the full native start budget plus the storage
+ * probe. A per-query timeout here would detach every waiter mid-startup and
+ * demote the lane to its fallback while the shared startup still succeeds.
+ */
+const SYNAPSE_DEMAND_STARTUP_BUDGET_MS = OUTER_AGGREGATE_MS + STORAGE_HARD_BUDGET_MS;
+/** A failed demand is not retried per embed call; each retry spawns a native lifecycle process. */
+const SYNAPSE_DEMAND_RETRY_BACKOFF_MS = 5_000;
+
+function defaultConnectionFile(): string {
+    // The managed lifecycle owner publishes the daemon under the lifecycle
+    // data root; dialing must agree byte-for-byte with that resolver or a
+    // demand can report ready while this client dials a different path. The
+    // application-storage resolver only backstops environments where no
+    // lifecycle root resolves at all.
+    return defaultConnectionFilePath(getDataDir());
+}
+
+async function raceSignal<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+    if (signal.aborted) {
+        throw signal.reason ?? new Error("Synapse initialization aborted");
+    }
+    let onAbort: (() => void) | undefined;
+    try {
+        return await Promise.race([
+            operation,
+            new Promise<never>((_resolve, reject) => {
+                onAbort = () =>
+                    reject(signal.reason ?? new Error("Synapse initialization aborted"));
+                signal.addEventListener("abort", onAbort, { once: true });
+            }),
+        ]);
+    } finally {
+        if (onAbort) signal.removeEventListener("abort", onAbort);
+    }
 }
 
 export class SynapseEmbeddingError extends Error {
@@ -512,10 +575,9 @@ async function getSharedClient(
         }
         return promise;
     }
-    if (sharedClient && sharedClientFile === options.connectionFile) return sharedClient;
-    if (sharedClientPromise && sharedClientFile === options.connectionFile)
-        return sharedClientPromise;
-    const file = options.connectionFile;
+    const file = options.connectionFile ?? defaultConnectionFile();
+    if (sharedClient && sharedClientFile === file) return sharedClient;
+    if (sharedClientPromise && sharedClientFile === file) return sharedClientPromise;
     const promise = McHostClient.connect({
         connectionFile: file,
         handshakeTimeoutMs: SYNAPSE_HANDSHAKE_TIMEOUT_MS,
@@ -549,15 +611,35 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
     maxInputBytes: number;
     metadata: SynapseLaneMetadata | null;
 
+    /**
+     * Where lane discovery stands, for callers deciding whether to replace this
+     * provider.
+     *
+     * `metadata` alone cannot answer that: it is null both while the first
+     * `models.list` is still in flight and after a lane-wide permanent error, and
+     * those need opposite treatment. A failed lane must be replaced, because
+     * `initialize()` refuses to rediscover once `permanentFailure` latches. A
+     * pending lane must be kept, because its `onLaneReady` callback is bound to
+     * this instance and the identity guard in the registry drops the commit if a
+     * replacement has taken its place.
+     */
+    get laneDiscoveryState(): "pending" | "resolved" | "failed" {
+        if (this.metadata) return "resolved";
+        return this.permanentFailure ? "failed" : "pending";
+    }
+
     /// Deadline basis for every ledger page this provider opens. Resolved once
     /// so the provider's own page deadlines and any external reopen of the same
     /// row share one basis instead of each falling back independently.
     readonly pageTimeoutMs: number;
 
     private readonly options: SynapseEmbeddingProviderOptions;
+    private readonly connectionOrigin: ConnectionOrigin;
+    private readonly demandStart: SynapseDemandStart | undefined;
     private client: SynapseClientLike | null = null;
     private initialized = false;
     private initializing: Promise<boolean> | null = null;
+    private demandFailedUntilMs = 0;
     private permanentFailure = false;
     private batchLimit = 16;
     private tokenBudget: number | null = null;
@@ -569,6 +651,11 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
 
     constructor(options: SynapseEmbeddingProviderOptions) {
         this.options = options;
+        this.connectionOrigin = options.clientFactory
+            ? "injected"
+            : (options.connectionOrigin ??
+              resolveConnectionOrigin({ connectionFile: options.connectionFile }));
+        this.demandStart = options.demandStart ?? configuredManagedDemandStart;
         this.sleep = options.sleep ?? wait;
         this.now = options.now ?? Date.now;
         this.random = options.random ?? Math.random;
@@ -660,12 +747,78 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         return provider.metadata;
     }
 
-    async initialize(): Promise<boolean> {
+    /**
+     * Demand the shared managed daemon inside the initialization flight, so
+     * concurrent initializers share one demand and one native invocation. A
+     * missing lifecycle owner keeps this path passive (dial-only): explicit
+     * and CLI contexts must be able to reach an already-running daemon.
+     */
+    private async demandManagedLane(): Promise<void> {
+        if (this.connectionOrigin !== "managed-default" || !this.demandStart) return;
+        if (Date.now() < this.demandFailedUntilMs) {
+            throw new SynapseEmbeddingError(
+                "transport",
+                "managed Synapse demand recently failed; backing off",
+            );
+        }
+        // A rejection arms the same backoff as a negative outcome. The shared
+        // owner signals failure both ways: it resolves `ok: false`, and it
+        // rejects when the start blows the budget or fails outright. Only the
+        // resolved path used to arm the backoff, so a rejection left the window
+        // stale and every later embed call demanded another native lifecycle
+        // invocation — exactly what the backoff exists to prevent. No abort
+        // signal is passed and the deadline is a fixed positive budget, so a
+        // detach here means the start really did exhaust it.
+        let outcome: Awaited<ReturnType<SynapseDemandStart>>;
+        try {
+            outcome = await this.demandStart({
+                origin: this.connectionOrigin,
+                capability: "synapse",
+                deadlineMs: SYNAPSE_DEMAND_STARTUP_BUDGET_MS,
+            });
+        } catch (error) {
+            this.demandFailedUntilMs = Date.now() + SYNAPSE_DEMAND_RETRY_BACKOFF_MS;
+            if (error instanceof SynapseEmbeddingError) throw error;
+            throw new SynapseEmbeddingError(
+                "transport",
+                `managed Synapse demand failed: ${error instanceof Error ? error.message : String(error)}`,
+                { cause: error },
+            );
+        }
+        if (!outcome.ok) {
+            this.demandFailedUntilMs = Date.now() + SYNAPSE_DEMAND_RETRY_BACKOFF_MS;
+            throw new SynapseEmbeddingError(
+                "transport",
+                `managed Synapse demand failed: ${outcome.reason}`,
+            );
+        }
+    }
+
+    async initialize(signal?: AbortSignal): Promise<boolean> {
         if (this.initialized) return true;
         if (this.permanentFailure) return false;
-        if (this.initializing) return this.initializing;
+        if (this.initializing) {
+            const shared = this.initializing;
+            if (!signal) return shared;
+            try {
+                return await raceSignal(shared, signal);
+            } catch {
+                // Detach only. The shared initialization remains owned by the
+                // provider and can complete for another waiter.
+                return false;
+            }
+        }
+        // Checked here, after the join path and before the flight is created,
+        // because the two cases differ. Detaching from an EXISTING flight is
+        // safe: another caller owns it and it completes for them. CREATING one
+        // for a caller with no live interest is not — `demandManagedLane` can
+        // stage and start mc-host, resolve the lane, and arm shadow backfill with
+        // nobody waiting on the result. Same rule the lifecycle policy applies to
+        // its own demand entry.
+        if (signal?.aborted) return false;
         this.initializing = (async () => {
             try {
+                await this.demandManagedLane();
                 this.client = await getSharedClient(this.options);
                 if (!this.metadata) {
                     const discovered = await this.callWithRetry<SynapseCatalogEntry[]>(
@@ -722,6 +875,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                     this.maxInputTokens = metadata.max_input_tokens ?? this.maxInputTokens;
                     this.maxInputBytes = metadata.max_input_bytes ?? this.maxInputBytes;
                 }
+                if (this.metadata) this.options.onLaneReady?.(this.metadata);
                 this.initialized = true;
                 return true;
             } catch (error) {
@@ -740,11 +894,19 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 this.initializing = null;
             }
         })();
-        return this.initializing;
+        const initialization = this.initializing;
+        if (!signal) return initialization;
+        try {
+            return await raceSignal(initialization, signal);
+        } catch {
+            // Detach only. The shared initialization remains owned by the
+            // provider and can complete for another waiter.
+            return false;
+        }
     }
 
     async embed(text: string, signal?: AbortSignal): Promise<Float32Array | null> {
-        if (!(await this.initialize()) || signal?.aborted || !this.metadata) return null;
+        if (!(await this.initialize(signal)) || signal?.aborted || !this.metadata) return null;
         try {
             // retryEmbeddings=true permits a retry after an ambiguous send
             // even though embed.query carries no request_key: the operation
@@ -789,7 +951,12 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         signal?: AbortSignal,
     ): Promise<Map<string, Float32Array>> {
         const output = new Map<string, Float32Array>();
-        if (items.length === 0 || !(await this.initialize()) || !this.metadata || signal?.aborted) {
+        if (
+            items.length === 0 ||
+            !(await this.initialize(signal)) ||
+            !this.metadata ||
+            signal?.aborted
+        ) {
             return output;
         }
         for (let start = 0; start < items.length; ) {

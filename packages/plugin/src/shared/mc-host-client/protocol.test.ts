@@ -451,13 +451,14 @@ describe("route handles", () => {
 describe("committed catalog capability vector", () => {
     test("subc_ops advertises transport.negotiate but never the candidate-only operations", () => {
         const canonical =
-            '{"op":"catalog.list","generation":1,"modules":[],"subc_ops":["route.open","catalog.list","host.shutdown","transport.negotiate"]}';
+            '{"op":"catalog.list","generation":1,"modules":[],"subc_ops":["route.open","catalog.list","host.shutdown","host.status","transport.negotiate"]}';
         const parsed = JSON.parse(canonical) as { op: string; subc_ops: string[] };
         expect(parsed.op).toBe("catalog.list");
         expect(parsed.subc_ops).toEqual([
             "route.open",
             "catalog.list",
             "host.shutdown",
+            "host.status",
             "transport.negotiate",
         ]);
         expect(canonical).not.toContain("transport.activate");

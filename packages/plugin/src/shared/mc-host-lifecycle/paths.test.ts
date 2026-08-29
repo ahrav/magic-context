@@ -220,7 +220,7 @@ describe("filesystem admission (KTD11)", () => {
     });
 
     test("remote filesystem types are unsupported_filesystem / set_data_directory", () => {
-        for (const fsType of ["nfs4", "cifs", "fuse.sshfs", "9p"]) {
+        for (const fsType of ["nfs4", "cifs", "fuse.sshfs", "fuse.rclone", "9p"]) {
             const verdict = admitLifecycleFilesystem(
                 "/home/user/.local/share",
                 mounts(`/dev/root / ext4 rw 0 0\nremote:/x /home ${fsType} rw 0 0\n`),
@@ -271,15 +271,50 @@ describe("filesystem admission (KTD11)", () => {
         ).toBe(false);
     });
 
-    test("darwin admission passes (release-qualified, not runtime-probed)", () => {
+    test("darwin admits only a local executable APFS mount", () => {
         expect(
             admitLifecycleFilesystem("/Users/dev/.local/share", {
                 platform: "darwin",
-                readMounts: () => {
-                    throw new Error("no proc");
-                },
+                readMounts: () =>
+                    "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\n" +
+                    "/dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled)\n",
             }),
         ).toEqual({ ok: true });
+        for (const mount of [
+            "server:/home on /Users (nfs, nodev, nosuid)\n",
+            "rclone on /Users (osxfuse, local, nodev)\n",
+            "/dev/disk3s5 on /Users (apfs, local, noexec)\n",
+        ]) {
+            expect(
+                admitLifecycleFilesystem("/Users/dev/.local/share", {
+                    platform: "darwin",
+                    readMounts: () => mount,
+                }).ok,
+            ).toBe(false);
+        }
+    });
+
+    test('darwin mount lines keep mount points containing " on " and need no option list', () => {
+        // The nearest mount decides the verdict, so a mount point whose own
+        // spelling contains " on " must not be truncated into a shorter,
+        // non-matching path, and an entry with no flags after its filesystem
+        // type must still reach the classifier.
+        expect(
+            admitLifecycleFilesystem("/Volumes/Disk on Server/share", {
+                platform: "darwin",
+                readMounts: () =>
+                    "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\n" +
+                    "server:/export on /Volumes/Disk on Server (nfs, nodev)\n",
+            }).ok,
+        ).toBe(false);
+        expect(
+            admitLifecycleFilesystem("/Volumes/Backup/share", {
+                platform: "darwin",
+                readMounts: () =>
+                    "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\n" +
+                    "server:/export on /Volumes/Backup (nfs)\n",
+            }).ok,
+        ).toBe(false);
     });
 
     test("mount points with octal escapes decode before matching", () => {

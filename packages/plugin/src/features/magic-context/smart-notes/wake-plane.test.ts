@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
+import { connectionFilePath, resolveLifecycleDataRoot } from "../../../shared/mc-host-lifecycle";
 import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { evaluateSmartNotes } from "../dreamer/evaluate-smart-notes";
@@ -150,6 +150,152 @@ describe("wakePlaneStatus", () => {
         expect(await first).toBe("present");
         expect(await second).toBe("present");
         expect(probes).toBe(1);
+    });
+
+    test("does not retain an affirmative answer with no readable publication", async () => {
+        let probes = 0;
+        __wakePlaneTest.setCatalogProbe(async () => {
+            probes += 1;
+            return catalog(true);
+        });
+        __wakePlaneTest.setPublicationReader(() => null);
+
+        expect(await wakePlaneStatus()).toBe("present");
+        expect(await wakePlaneStatus()).toBe("present");
+        expect(probes).toBe(2);
+    });
+
+    test("reuses an affirmative answer while the publishing daemon is unchanged", async () => {
+        let probes = 0;
+        __wakePlaneTest.setCatalogProbe(async () => {
+            probes += 1;
+            return catalog(true);
+        });
+        __wakePlaneTest.setPublicationReader(() => "dev:ino:1000:64");
+
+        expect(await wakePlaneStatus()).toBe("present");
+        expect(await wakePlaneStatus()).toBe("present");
+        expect(probes).toBe(1);
+    });
+
+    test("re-probes an affirmative answer after the daemon republishes", async () => {
+        let probes = 0;
+        let hasWakePlane = true;
+        let publication = "dev:ino:1000:64";
+        __wakePlaneTest.setCatalogProbe(async () => {
+            probes += 1;
+            return catalog(hasWakePlane);
+        });
+        __wakePlaneTest.setPublicationReader(() => publication);
+
+        expect(await wakePlaneStatus()).toBe("present");
+        // A replacement daemon republishes its connection file; the capability
+        // the previous daemon proved must not carry over to it.
+        publication = "dev:ino:2000:64";
+        hasWakePlane = false;
+        expect(await wakePlaneStatus()).toBe("absent");
+        expect(probes).toBe(2);
+    });
+
+    test("discards an in-flight answer when the daemon republishes mid-probe", async () => {
+        // The captured publication was only re-checked on the NEXT call, so the
+        // initiating caller and everyone coalesced on the in-flight probe still
+        // got an answer describing a daemon that had already been replaced.
+        // Reporting `present` from the old incarnation would suppress standalone
+        // evaluation even if the replacement offers no wake plane at all.
+        let probes = 0;
+        let publication = "dev:ino:1000:64";
+        let releaseProbe: (() => void) | undefined;
+        // Synchronize on probe ENTRY rather than sleeping: a timer only makes the
+        // race likely, so on a slow schedule `releaseProbe` would still be unset
+        // and releasing it below would be a no-op that hangs the test.
+        let signalProbeStarted: (() => void) | undefined;
+        const probeStarted = new Promise<void>((resolve) => {
+            signalProbeStarted = resolve;
+        });
+        __wakePlaneTest.setCatalogProbe(async () => {
+            probes += 1;
+            await new Promise<void>((resolve) => {
+                releaseProbe = resolve;
+                signalProbeStarted?.();
+            });
+            return catalog(true);
+        });
+        __wakePlaneTest.setPublicationReader(() => publication);
+
+        const first = wakePlaneStatus();
+        const coalesced = wakePlaneStatus();
+        await probeStarted;
+        // The daemon is replaced while the probe is still parked.
+        publication = "dev:ino:2000:64";
+        releaseProbe?.();
+
+        // Neither the initiator nor the coalesced caller may adopt the old
+        // daemon's affirmative answer.
+        expect(await first).toBe("unknown");
+        expect(await coalesced).toBe("unknown");
+        expect(probes).toBe(1);
+
+        // Nothing was retained, so the next call re-probes against the new owner.
+        releaseProbe = undefined;
+        __wakePlaneTest.setCatalogProbe(async () => {
+            probes += 1;
+            return catalog(true);
+        });
+        expect(await wakePlaneStatus()).toBe("present");
+        expect(probes).toBe(2);
+    });
+
+    test("dials and binds to the connection file the lifecycle owner publishes", () => {
+        // The lifecycle resolver honors MAGIC_CONTEXT_TEST_DATA_DIR; getDataDir()
+        // ignores it. That makes it the discriminator: reading getDataDir() here
+        // would stat a different path, so a managed start would neither answer
+        // the catalog probe nor retire the negative answer cached before it.
+        //
+        // HOME is deliberately not the lever here. Under NODE_ENV=test the
+        // lifecycle resolver backstops to a throwaway root before it ever
+        // consults HOME, so a HOME-derived expectation proves nothing.
+        const root = mkdtempSync(join(tmpdir(), "wake-plane-root-"));
+        const previousXdg = process.env.XDG_DATA_HOME;
+        const previousTestRoot = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+        delete process.env.XDG_DATA_HOME;
+        process.env.MAGIC_CONTEXT_TEST_DATA_DIR = root;
+        try {
+            expect(__wakePlaneTest.connectionFile()).toBe(connectionFilePath(root));
+            const resolved = resolveLifecycleDataRoot(process.env);
+            expect(resolved.ok && resolved.root).toBe(root);
+        } finally {
+            if (previousXdg === undefined) delete process.env.XDG_DATA_HOME;
+            else process.env.XDG_DATA_HOME = previousXdg;
+            if (previousTestRoot === undefined) delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+            else process.env.MAGIC_CONTEXT_TEST_DATA_DIR = previousTestRoot;
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("re-probes a negative answer once a daemon publishes", async () => {
+        // Under lazy demand-start the first passive probe usually runs before
+        // any Rust or Synapse demand, so it caches a negative answer with no
+        // publication. The managed start that follows publishes a connection
+        // file and takes over scheduled wakes; retaining the negative answer for
+        // the rest of its TTL would leave both planes evaluating conditions.
+        let probes = 0;
+        let hasWakePlane = false;
+        let publication: string | null = null;
+        __wakePlaneTest.setCatalogProbe(async () => {
+            probes += 1;
+            return catalog(hasWakePlane);
+        });
+        __wakePlaneTest.setPublicationReader(() => publication);
+
+        expect(await wakePlaneStatus()).toBe("absent");
+        expect(await wakePlaneStatus()).toBe("absent");
+        expect(probes).toBe(1);
+
+        publication = "dev:ino:3000:64";
+        hasWakePlane = true;
+        expect(await wakePlaneStatus()).toBe("present");
+        expect(probes).toBe(2);
     });
 
     test("re-probes after the TTL instead of retaining a stale catalog answer", async () => {

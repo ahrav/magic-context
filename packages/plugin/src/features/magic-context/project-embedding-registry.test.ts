@@ -18,13 +18,18 @@ import {
 import { upsertCommits } from "./git-commits/storage-git-commits";
 import { acquireGitSweepLease, releaseGitSweepLease } from "./git-commits/sweep-coordinator";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-provider";
-import { SynapseEmbeddingError } from "./memory/embedding-synapse";
+import {
+    getSynapseLaneIdentity,
+    type SynapseClientLike,
+    SynapseEmbeddingError,
+} from "./memory/embedding-synapse";
 import {
     _resetProjectEmbeddingRegistryForTests,
     _setTestProviderFactoryForProject,
     drainCommitBacklogForProject,
     embedCompartmentWindowsDetailedForProject,
     embedSessionCompartmentChunks,
+    embedShadowTextForProject,
     embedTextForProject,
     embedUnembeddedCompartmentChunksForProject,
     enqueueShadowEmbeddingItems,
@@ -241,7 +246,9 @@ describe("project embedding registry", () => {
         const dir = mkdtempSync(join(tmpdir(), "project-embedding-registry-"));
         tempDirs.push(dir);
         process.env.XDG_DATA_HOME = dir;
-        return openDatabase();
+        const db = openDatabase();
+        if (!db) throw new Error("failed to open test database");
+        return db;
     }
 
     afterEach(() => {
@@ -256,6 +263,495 @@ describe("project embedding registry", () => {
             }
         }
         tempDirs.length = 0;
+    });
+
+    it("does not persist a pending Synapse lane during registration", () => {
+        const db = useTempDb();
+        const snapshot = registerProjectEmbedding(
+            db,
+            "deferred-synapse",
+            {
+                provider: "synapse",
+                model: "gte-modernbert-base-f16",
+                synapse_connection_origin: "managed-default",
+                synapse_fallback: { provider: "off" },
+            } as EmbeddingConfig,
+            { memoryEnabled: true, gitCommitEnabled: true },
+            "/repo",
+        );
+
+        expect(snapshot.providerIdentity).not.toContain("pending");
+        expect(
+            db
+                .prepare(
+                    "SELECT provider_identity FROM embedding_registrations WHERE project_path = ?",
+                )
+                .get("deferred-synapse"),
+        ).toBeNull();
+    });
+
+    it("keeps a deferred Synapse lane enabled so first use can resolve it", () => {
+        const db = useTempDb();
+        const snapshot = registerProjectEmbedding(
+            db,
+            "deferred-enabled-synapse",
+            {
+                provider: "synapse",
+                model: "gte-modernbert-base-f16",
+                synapse_connection_origin: "managed-default",
+                synapse_fallback: { provider: "off" },
+            } as EmbeddingConfig,
+            { memoryEnabled: true, gitCommitEnabled: true },
+            "/repo",
+        );
+
+        // The embed entry points (memory queue, commit batches, chunk drains,
+        // search) gate on the snapshot; a deferred lane reported as disabled
+        // could never reach the first embed that resolves it or activates the
+        // configured fallback.
+        expect(snapshot.enabled).toBe(true);
+        expect(snapshot.gitCommitEnabled).toBe(true);
+        expect(snapshot.provider).toBe("synapse");
+        // The unresolved lane still exposes no usable identity: stale-identity
+        // GC and chunk search stay gated until the first vector commits it.
+        expect(snapshot.modelId).toBe("off");
+        expect(snapshot.chunkModelId).toBe("off");
+    });
+
+    it("resolved primary and shadow descriptors are removed when Synapse becomes deferred", () => {
+        const db = useTempDb();
+        const projectIdentity = "resolved-to-deferred";
+        const resolved = {
+            provider: "synapse",
+            model: "gte-modernbert-base-f16",
+            synapse_fingerprint: "fp-resolved",
+            synapse_table_epoch: 7,
+            synapse_dims: 3,
+        } as unknown as EmbeddingConfig;
+        const deferred = {
+            provider: "synapse",
+            model: "gte-modernbert-base-f16",
+            synapse_connection_origin: "managed-default",
+            synapse_fallback: { provider: "off" },
+        } as EmbeddingConfig;
+
+        registerProjectEmbedding(
+            db,
+            projectIdentity,
+            resolved,
+            { memoryEnabled: true, gitCommitEnabled: true },
+            "/repo",
+        );
+        registerProjectShadowEmbedding(db, projectIdentity, resolved, "/repo");
+        expect(
+            db
+                .prepare("SELECT 1 FROM embedding_registrations WHERE project_path = ?")
+                .get(projectIdentity),
+        ).not.toBeNull();
+        expect(
+            db
+                .prepare("SELECT 1 FROM shadow_embedding_registrations WHERE project_path = ?")
+                .get(projectIdentity),
+        ).not.toBeNull();
+
+        registerProjectEmbedding(
+            db,
+            projectIdentity,
+            deferred,
+            { memoryEnabled: true, gitCommitEnabled: true },
+            "/repo",
+        );
+        registerProjectShadowEmbedding(db, projectIdentity, deferred, "/repo");
+        expect(
+            db
+                .prepare("SELECT 1 FROM embedding_registrations WHERE project_path = ?")
+                .get(projectIdentity),
+        ).toBeNull();
+        expect(
+            db
+                .prepare("SELECT 1 FROM shadow_embedding_registrations WHERE project_path = ?")
+                .get(projectIdentity),
+        ).toBeNull();
+    });
+
+    it("preserves a shadow lane whose first discovery is still in flight", async () => {
+        // Two operations re-registering the same deferred lane before
+        // `models.list` returns is the ordinary case. Replacing the pending
+        // registration disposes the provider whose discovery is in flight, and its
+        // `onSynapseLaneReady` is then dropped by the identity guard in
+        // `commitShadowSynapseLane`, so the lane never commits and the cohort
+        // stays `off`. Only a lane that already failed may be replaced.
+        const db = useTempDb();
+        const projectIdentity = "shadow-pending-lane";
+        let releaseCatalog: (() => void) | undefined;
+        let catalogCalls = 0;
+        const client: SynapseClientLike = {
+            async call<Response>(_module, method): Promise<Response> {
+                if (method === "models.list") {
+                    catalogCalls += 1;
+                    // Hold discovery open so the second registration observes a
+                    // pending lane rather than a resolved or failed one.
+                    await new Promise<void>((resolve) => {
+                        releaseCatalog = resolve;
+                    });
+                    return [
+                        {
+                            model: "gte-modernbert-base-f16",
+                            fingerprint: "fp-pending",
+                            table_epoch: 2,
+                            dims: 3,
+                            certified: true,
+                        },
+                    ] as Response;
+                }
+                if (method === "embed.query") {
+                    return {
+                        vector: [1, 2, 3],
+                        model: "gte-modernbert-base-f16",
+                        fingerprint: "fp-pending",
+                        table_epoch: 2,
+                        dims: 3,
+                    } as Response;
+                }
+                throw new Error(`unexpected method ${method}`);
+            },
+            close() {},
+        };
+        const deferred = {
+            provider: "synapse",
+            model: "gte-modernbert-base-f16",
+            synapse_connection_origin: "injected",
+            synapse_client_factory: async () => client,
+        } as unknown as EmbeddingConfig;
+
+        registerProjectShadowEmbedding(db, projectIdentity, deferred, "/repo");
+        const inFlight = embedShadowTextForProject(projectIdentity, "first");
+        // Let the provider reach models.list and park there.
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(catalogCalls).toBe(1);
+
+        // The re-registration must not replace the pending lane.
+        registerProjectShadowEmbedding(db, projectIdentity, deferred, "/repo");
+        releaseCatalog?.();
+
+        expect(await inFlight).not.toBeNull();
+        // Discovery ran once and committed, so the lane resolved rather than
+        // being torn down and re-demanded.
+        expect(catalogCalls).toBe(1);
+        expect(
+            db
+                .prepare(
+                    "SELECT fingerprint FROM shadow_embedding_registrations WHERE project_path = ?",
+                )
+                .get(projectIdentity),
+        ).toEqual({ fingerprint: "fp-pending" });
+    });
+
+    it("retries a shadow lane whose first discovery failed permanently", async () => {
+        // A lane-wide permanent error (`not_certified`, `artifact_invalid`) ends
+        // discovery with the registration still holding its deferred intent and
+        // no resolved metadata. Matching on that intent alone would resume the
+        // prior lane, dispose the fresh provider, and hand back the latched one
+        // whose `permanentFailure` flag makes `initialize()` refuse to retry — so
+        // the shadow experiment would stay dead for the process lifetime even
+        // after the model is certified.
+        const db = useTempDb();
+        const projectIdentity = "shadow-permanent-failure";
+        let certified = false;
+        let catalogCalls = 0;
+        const client: SynapseClientLike = {
+            async call<Response>(_module, method): Promise<Response> {
+                if (method === "models.list") {
+                    catalogCalls += 1;
+                    return [
+                        {
+                            model: "gte-modernbert-base-f16",
+                            fingerprint: "fp-repaired",
+                            table_epoch: 1,
+                            dims: 3,
+                            certified,
+                            ...(certified ? {} : { status: "not_certified" }),
+                        },
+                    ] as Response;
+                }
+                if (method === "embed.query") {
+                    return {
+                        vector: [1, 2, 3],
+                        model: "gte-modernbert-base-f16",
+                        fingerprint: "fp-repaired",
+                        table_epoch: 1,
+                        dims: 3,
+                    } as Response;
+                }
+                throw new Error(`unexpected method ${method}`);
+            },
+            close() {},
+        };
+        const deferred = {
+            provider: "synapse",
+            model: "gte-modernbert-base-f16",
+            synapse_connection_origin: "injected",
+            synapse_client_factory: async () => client,
+        } as unknown as EmbeddingConfig;
+
+        registerProjectShadowEmbedding(db, projectIdentity, deferred, "/repo");
+        expect(await embedShadowTextForProject(projectIdentity, "first")).toBeNull();
+        expect(catalogCalls).toBe(1);
+
+        // The model is certified now. Re-registering must build a lane that can
+        // discover again rather than resuming the latched one.
+        certified = true;
+        registerProjectShadowEmbedding(db, projectIdentity, deferred, "/repo");
+        const vector = await embedShadowTextForProject(projectIdentity, "second");
+
+        expect(vector).not.toBeNull();
+        expect(catalogCalls).toBe(2);
+    });
+
+    it("commits the discovered Synapse lane before returning its first vector", async () => {
+        const db = useTempDb();
+        const client: SynapseClientLike = {
+            async call<Response>(_module, method): Promise<Response> {
+                if (method === "models.list") {
+                    return [
+                        {
+                            model: "gte-modernbert-base-f16",
+                            fingerprint: "fp-first-use",
+                            table_epoch: 7,
+                            dims: 3,
+                            certified: true,
+                        },
+                    ] as Response;
+                }
+                if (method === "embed.query") {
+                    return {
+                        vector: [1, 2, 3],
+                        model: "gte-modernbert-base-f16",
+                        fingerprint: "fp-first-use",
+                        table_epoch: 7,
+                        dims: 3,
+                    } as Response;
+                }
+                throw new Error(`unexpected method ${method}`);
+            },
+            close() {},
+        };
+        registerProjectEmbedding(
+            db,
+            "lazy-synapse",
+            {
+                provider: "synapse",
+                model: "gte-modernbert-base-f16",
+                synapse_connection_origin: "injected",
+                synapse_client_factory: async () => client,
+                synapse_fallback: { provider: "off" },
+            } as EmbeddingConfig,
+            { memoryEnabled: true, gitCommitEnabled: true },
+            "/repo",
+        );
+
+        const result = await embedTextForProject("lazy-synapse", "first vector");
+        const expectedIdentity = getSynapseLaneIdentity("gte-modernbert-base-f16", "fp-first-use");
+        expect(result?.modelId).toBe(expectedIdentity);
+        expect(
+            db
+                .prepare(
+                    "SELECT provider_identity, fingerprint, table_epoch, dims FROM embedding_registrations WHERE project_path = ?",
+                )
+                .get("lazy-synapse"),
+        ).toEqual({
+            provider_identity: expectedIdentity,
+            fingerprint: "fp-first-use",
+            table_epoch: 7,
+            dims: 3,
+        });
+    });
+
+    it("re-registering the same deferred config keeps the resolved lane and its provider", async () => {
+        const db = useTempDb();
+        let catalogCalls = 0;
+        const client: SynapseClientLike = {
+            async call<Response>(_module, method): Promise<Response> {
+                if (method === "models.list") {
+                    catalogCalls += 1;
+                    return [
+                        {
+                            model: "gte-modernbert-base-f16",
+                            fingerprint: "fp-stable",
+                            table_epoch: 4,
+                            dims: 3,
+                            certified: true,
+                        },
+                    ] as Response;
+                }
+                if (method === "embed.query") {
+                    return {
+                        vector: [1, 2, 3],
+                        model: "gte-modernbert-base-f16",
+                        fingerprint: "fp-stable",
+                        table_epoch: 4,
+                        dims: 3,
+                    } as Response;
+                }
+                throw new Error(`unexpected method ${method}`);
+            },
+            close() {},
+        };
+        const features = { memoryEnabled: true, gitCommitEnabled: true };
+        const deferred = {
+            provider: "synapse",
+            model: "gte-modernbert-base-f16",
+            synapse_connection_origin: "injected",
+            synapse_client_factory: async () => client,
+            synapse_fallback: { provider: "off" },
+        } as EmbeddingConfig;
+
+        registerProjectEmbedding(db, "stable-deferred", deferred, features, "/repo");
+        const resolvedIdentity = getSynapseLaneIdentity("gte-modernbert-base-f16", "fp-stable");
+        expect((await embedTextForProject("stable-deferred", "first"))?.modelId).toBe(
+            resolvedIdentity,
+        );
+        expect(catalogCalls).toBe(1);
+
+        // Every tool call re-registers from the user's configuration, which is
+        // still the deferred one. That must not discard the resolved lane: doing
+        // so tears down a healthy provider and deletes its descriptor per call,
+        // and a transient rediscovery failure would switch to the fallback.
+        const snapshot = registerProjectEmbedding(
+            db,
+            "stable-deferred",
+            deferred,
+            features,
+            "/repo",
+        );
+        expect(snapshot.modelId).toBe(resolvedIdentity);
+        expect(snapshot.providerIdentity).toBe(resolvedIdentity);
+        expect(
+            db
+                .prepare("SELECT fingerprint FROM embedding_registrations WHERE project_path = ?")
+                .get("stable-deferred"),
+        ).toEqual({ fingerprint: "fp-stable" });
+
+        expect((await embedTextForProject("stable-deferred", "second"))?.modelId).toBe(
+            resolvedIdentity,
+        );
+        // A preserved provider is already initialized, so no second discovery.
+        expect(catalogCalls).toBe(1);
+    });
+
+    it("retries the deferred intent after a fallback activation instead of latching it", async () => {
+        const db = useTempDb();
+        let laneAvailable = false;
+        let catalogCalls = 0;
+        const client: SynapseClientLike = {
+            async call<Response>(_module, method): Promise<Response> {
+                if (method === "models.list") {
+                    catalogCalls += 1;
+                    if (!laneAvailable) throw new Error("catalog unavailable");
+                    return [
+                        {
+                            model: "gte-modernbert-base-f16",
+                            fingerprint: "fp-late",
+                            table_epoch: 2,
+                            dims: 3,
+                            certified: true,
+                        },
+                    ] as Response;
+                }
+                if (method === "embed.query") {
+                    return {
+                        vector: [1, 2, 3],
+                        model: "gte-modernbert-base-f16",
+                        fingerprint: "fp-late",
+                        table_epoch: 2,
+                        dims: 3,
+                    } as Response;
+                }
+                throw new Error(`unexpected method ${method}`);
+            },
+            close() {},
+        };
+        const features = { memoryEnabled: true, gitCommitEnabled: true };
+        const deferred = {
+            provider: "synapse",
+            model: "gte-modernbert-base-f16",
+            synapse_connection_origin: "injected",
+            synapse_client_factory: async () => client,
+            synapse_fallback: { provider: "off" },
+        } as EmbeddingConfig;
+
+        registerProjectEmbedding(db, "transient-deferred", deferred, features, "/repo");
+        // A transient discovery failure activates the configured fallback.
+        expect(await embedTextForProject("transient-deferred", "first")).toBeNull();
+        expect(catalogCalls).toBeGreaterThan(0);
+        expect(getProjectEmbeddingSnapshot("transient-deferred")?.modelId).toBe("off");
+
+        // A fallback activation is a demotion, not a resolved lane: a registration
+        // carrying the same deferred intent must rebuild the Synapse provider
+        // instead of copying the demoted config forward.
+        laneAvailable = true;
+        registerProjectEmbedding(db, "transient-deferred", deferred, features, "/repo");
+        const expectedIdentity = getSynapseLaneIdentity("gte-modernbert-base-f16", "fp-late");
+        expect((await embedTextForProject("transient-deferred", "second"))?.modelId).toBe(
+            expectedIdentity,
+        );
+        expect(getProjectEmbeddingSnapshot("transient-deferred")?.modelId).toBe(expectedIdentity);
+    });
+
+    it("keeps lane resolution attached when a re-registration overlaps initialization", async () => {
+        const db = useTempDb();
+        let releaseCatalog!: () => void;
+        const catalogGate = new Promise<void>((resolve) => {
+            releaseCatalog = resolve;
+        });
+        const client: SynapseClientLike = {
+            async call<Response>(_module, method): Promise<Response> {
+                if (method === "models.list") {
+                    await catalogGate;
+                    return [
+                        {
+                            model: "gte-modernbert-base-f16",
+                            fingerprint: "fp-overlap",
+                            table_epoch: 5,
+                            dims: 3,
+                            certified: true,
+                        },
+                    ] as Response;
+                }
+                if (method === "embed.query") {
+                    return {
+                        vector: [1, 2, 3],
+                        model: "gte-modernbert-base-f16",
+                        fingerprint: "fp-overlap",
+                        table_epoch: 5,
+                        dims: 3,
+                    } as Response;
+                }
+                throw new Error(`unexpected method ${method}`);
+            },
+            close() {},
+        };
+        const features = { memoryEnabled: true, gitCommitEnabled: true };
+        const deferred = {
+            provider: "synapse",
+            model: "gte-modernbert-base-f16",
+            synapse_connection_origin: "injected",
+            synapse_client_factory: async () => client,
+            synapse_fallback: { provider: "off" },
+        } as EmbeddingConfig;
+
+        registerProjectEmbedding(db, "overlapped-deferred", deferred, features, "/repo");
+        // One operation is mid-initialization when a second re-registers from the
+        // same configuration. The provider carried forward announces its lane to
+        // the registration object it was constructed with, so that object has to
+        // stay the one the registry holds.
+        const inFlight = embedTextForProject("overlapped-deferred", "first");
+        registerProjectEmbedding(db, "overlapped-deferred", deferred, features, "/repo");
+        releaseCatalog();
+
+        const expectedIdentity = getSynapseLaneIdentity("gte-modernbert-base-f16", "fp-overlap");
+        expect((await inFlight)?.modelId).toBe(expectedIdentity);
+        expect(getProjectEmbeddingSnapshot("overlapped-deferred")?.modelId).toBe(expectedIdentity);
     });
 
     it("preserves existing provider and runtime identity goldens", () => {
@@ -489,15 +985,16 @@ describe("project embedding registry", () => {
                 new FakeEmbeddingProvider(config.provider === "local" ? config.model : "off"),
         );
 
+        const db = useTempDb();
         registerProjectEmbedding(
-            useTempDb(),
+            db,
             "git:project-a",
             localConfig("model-a"),
             { memoryEnabled: true, gitCommitEnabled: false },
             "/tmp/a",
         );
         registerProjectEmbedding(
-            openDatabase(),
+            db,
             "git:project-b",
             localConfig("model-b-long"),
             { memoryEnabled: true, gitCommitEnabled: true },
@@ -553,8 +1050,9 @@ describe("project embedding registry", () => {
                 })(config.provider === "local" ? config.model : "off"),
         );
 
+        const db = useTempDb();
         registerProjectEmbedding(
-            useTempDb(),
+            db,
             "git:project",
             localConfig("model-a"),
             { memoryEnabled: true, gitCommitEnabled: false },
@@ -562,7 +1060,7 @@ describe("project embedding registry", () => {
         );
         const inFlight = embedTextForProject("git:project", "hello");
         registerProjectEmbedding(
-            openDatabase(),
+            db,
             "git:project",
             localConfig("model-b"),
             { memoryEnabled: true, gitCommitEnabled: false },

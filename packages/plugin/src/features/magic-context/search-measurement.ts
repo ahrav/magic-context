@@ -32,7 +32,7 @@ export async function recordShadowMeasurement(args: {
     // SQLITE_BUSY on the measurement write) would surface as an unhandled
     // promise rejection in the host process, so the whole body is guarded.
     try {
-        const shadowCohort = getShadowEmbeddingMeasurementCohort(args.projectPath);
+        let shadowCohort = getShadowEmbeddingMeasurementCohort(args.projectPath);
         if (!shadowCohort) return;
         const primaryCohort = getPrimaryEmbeddingMeasurementCohort(args.projectPath);
         const shadowStartedAt = Date.now();
@@ -40,6 +40,14 @@ export async function recordShadowMeasurement(args: {
         let shadowResults: UnifiedSearchResult[] = [];
         try {
             const vector = await embedShadowTextForProject(args.projectPath, args.query);
+            // A deferred Synapse lane carries a placeholder identity (modelId
+            // `embedding-provider:off`, empty fingerprint, epoch 0) until its
+            // first embed resolves it, and the embed above is that first use.
+            // Re-read the cohort so the replayed search and the recorded sample
+            // both name the lane that actually answered; the captured
+            // placeholder would search a model_id nothing is stored under and
+            // file the empty result as a successful experimental sample.
+            shadowCohort = getShadowEmbeddingMeasurementCohort(args.projectPath) ?? shadowCohort;
             if (!vector) {
                 shadowFailed = true;
             } else {

@@ -17,6 +17,7 @@
  * reach the user's live tree through either resolver.
  */
 
+import { execFileSync } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
 import * as path from "node:path";
 import { getTestBackstopDataRoot } from "../data-path";
@@ -307,11 +308,64 @@ export interface AdmissionIo {
     realpath?: (value: string) => string;
 }
 
+// Reading the darwin mount table spawns /sbin/mount synchronously, and
+// admission runs on every lifecycle command reached from request-driven
+// demand-start, and spawning `/sbin/mount` per demand would block the event
+// loop each time. The read is therefore cached, but only briefly: the mount
+// table is not process-lifetime stable, because a volume can be mounted after
+// the first read. A data root on a volume mounted later would otherwise never
+// match its own mount, `longestMountFor` would fall back to `/` — apfs and
+// local, so admissible — and an unsupported filesystem would be admitted. The
+// window bounds that staleness while still collapsing a burst of demands onto
+// one spawn. Measured on a monotonic timeline so a wall-clock step cannot
+// stretch it.
+const DARWIN_MOUNTS_CACHE_TTL_MS = 1_000;
+
+let cachedDarwinMounts: string | undefined;
+let cachedDarwinMountsAt = 0;
+
 const defaultAdmissionIo: AdmissionIo = {
     platform: process.platform,
-    readMounts: () => readFileSync("/proc/self/mounts", "utf8"),
+    readMounts: () => {
+        if (process.platform !== "darwin") return readFileSync("/proc/self/mounts", "utf8");
+        const now = performance.now();
+        if (
+            cachedDarwinMounts === undefined ||
+            now - cachedDarwinMountsAt >= DARWIN_MOUNTS_CACHE_TTL_MS
+        ) {
+            cachedDarwinMounts = execFileSync("/sbin/mount", [], {
+                encoding: "utf8",
+                timeout: 2_000,
+                maxBuffer: 1024 * 1024,
+            });
+            cachedDarwinMountsAt = now;
+        }
+        return cachedDarwinMounts;
+    },
     realpath: nativeRealpath,
 };
+
+function parseDarwinMounts(text: string): MountEntry[] {
+    const entries: MountEntry[] = [];
+    for (const line of text.split("\n")) {
+        // `<device> on <mount point> (<fstype>[, <option>...])`. The device is
+        // matched lazily so a mount point containing " on " (volume names are
+        // user-chosen) keeps its full spelling, and the option list is optional
+        // so an entry carrying only a filesystem type is admitted rather than
+        // silently dropped from the mount table.
+        const match = /^(.+?) on (.+) \(([^,()]+)(?:,\s*([^)]*))?\)$/.exec(line);
+        if (!match) continue;
+        entries.push({
+            mountPoint: match[2] as string,
+            fsType: (match[3] as string).trim(),
+            options: (match[4] ?? "")
+                .split(",")
+                .map((option) => option.trim())
+                .filter(Boolean),
+        });
+    }
+    return entries;
+}
 
 /**
  * Practical bounded admission of the selected data root: the root must be
@@ -336,11 +390,10 @@ export function admitLifecycleFilesystem(
         detail,
     });
     if (!path.isAbsolute(dataRoot)) return rejected("data root is not absolute");
-    if (io.platform === "darwin") return { ok: true };
-    if (io.platform !== "linux") {
-        // Not a filesystem judgment: the mount table this function reads is
-        // Linux-specific, so on any other platform there is no filesystem to
-        // admit or reject. The platform itself is what fails.
+    if (io.platform !== "linux" && io.platform !== "darwin") {
+        // Not a filesystem judgment: the mount tables this function reads are
+        // linux- and darwin-specific, so on any other platform there is no
+        // filesystem to admit or reject. The platform itself is what fails.
         return {
             ok: false,
             reason: "unsupported_platform",
@@ -350,7 +403,10 @@ export function admitLifecycleFilesystem(
     }
     let mounts: MountEntry[];
     try {
-        mounts = parseMounts(io.readMounts());
+        mounts =
+            io.platform === "darwin"
+                ? parseDarwinMounts(io.readMounts())
+                : parseMounts(io.readMounts());
     } catch {
         return rejected("mount table is unreadable");
     }
@@ -365,7 +421,15 @@ export function admitLifecycleFilesystem(
     const mount = longestMountFor(lookupRoot, mounts);
     if (!mount) return rejected("no mount contains the data root");
     const baseType = mount.fsType.toLowerCase();
-    if (UNSUPPORTED_FS_TYPES.has(baseType) || baseType.startsWith("nfs")) {
+    if (
+        UNSUPPORTED_FS_TYPES.has(baseType) ||
+        baseType.startsWith("nfs") ||
+        baseType.startsWith("fuse") ||
+        baseType.includes("osxfuse")
+    ) {
+        return rejected(`unsupported filesystem type ${baseType}`);
+    }
+    if (io.platform === "darwin" && (baseType !== "apfs" || !mount.options.includes("local"))) {
         return rejected(`unsupported filesystem type ${baseType}`);
     }
     if (mount.options.includes("noexec")) {

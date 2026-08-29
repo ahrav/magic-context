@@ -1,10 +1,11 @@
 /// <reference types="bun-types" />
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { _resetHarnessForTesting } from "../../shared/harness";
 import {
     Deadline,
     McHostCallError,
@@ -24,7 +25,12 @@ import {
     waitUntil,
     writeConnectionFile,
 } from "../../shared/mc-host-client/test-support/test-util";
-import { __moduleTransportTest, McHostModuleTransport } from "./module-transport";
+import {
+    __moduleTransportTest,
+    buildManagedStartupEnvelope,
+    configureManagedDemandStart,
+    McHostModuleTransport,
+} from "./module-transport";
 
 let tempDir = "";
 let fileCounter = 0;
@@ -50,6 +56,13 @@ afterAll(() => {
 beforeEach(() => {
     peers = [];
     transports = [];
+    _resetHarnessForTesting();
+    // The configured demand-start is process-global: the plugin entry point sets
+    // it at boot, so any earlier test file that booted the plugin would leave a
+    // managed owner installed here. Every test in this file that wants a demand
+    // passes one through options, so clearing it keeps this file hermetic
+    // instead of dependent on suite ordering.
+    configureManagedDemandStart(undefined);
     delete process.env.SUBC_MODULE_ID;
     delete process.env.SUBC_LAUNCH_NONCE;
 });
@@ -208,6 +221,296 @@ function deferred<T = void>(): {
 }
 
 describe("McHostModuleTransport", () => {
+    it("builds a closed bounded startup credential snapshot at demand time", () => {
+        const envelope = buildManagedStartupEnvelope(
+            "@cortexkit/opencode-magic-context",
+            {
+                ANTHROPIC_API_KEY: "anthropic-secret",
+                OPENAI_API_KEY: "openai-secret",
+                AWS_ACCESS_KEY_ID: "ambient-aws",
+                HTTPS_PROXY: "ambient-proxy",
+                PATH: "/attacker/bin",
+                LD_PRELOAD: "/attacker/lib.so",
+            },
+            "/opt/opencode/bin/opencode.exe",
+            undefined,
+            (path) => path,
+        );
+
+        expect(envelope).toEqual({
+            schema: 1,
+            opencode: {
+                manifest_sha256: "e7e86cd1e1e639fb60aed6dfc3c33cd04244f767f6681a13bf26c90429279f2d",
+                source_roots: {
+                    runtime: "/opt/opencode/bin",
+                },
+            },
+            credentials: {
+                ANTHROPIC_API_KEY: "anthropic-secret",
+                OPENAI_API_KEY: "openai-secret",
+            },
+        });
+        expect(() =>
+            buildManagedStartupEnvelope(
+                "@cortexkit/pi-magic-context",
+                { ANTHROPIC_API_KEY: "x".repeat(16 * 1024 + 1) },
+                "/opt/pi/bin/pi",
+            ),
+        ).toThrow(/size cap/);
+        expect(
+            buildManagedStartupEnvelope(
+                "@cortexkit/pi-magic-context",
+                {},
+                "/opt/node/bin/node",
+                "/opt/pi/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+                (path) => path,
+            ),
+        ).toEqual({
+            schema: 1,
+            pi: {
+                manifest_sha256: "cc87481ce798bd84b9cd0d1dd809bc4c72cea9435303705362a3b2be493674e6",
+                source_roots: {
+                    "pi-install": "/opt/pi",
+                    runtime: "/opt/node/bin",
+                },
+            },
+        });
+    });
+
+    it("resolves an npm .bin Pi entrypoint before deriving closure roots", () => {
+        const root = mkdtempSync(join(tmpdir(), "mc-host-pi-bin-"));
+        try {
+            const node = join(root, "node", "bin", "node");
+            const cli = join(
+                root,
+                "install",
+                "node_modules",
+                "@earendil-works",
+                "pi-coding-agent",
+                "dist",
+                "cli.js",
+            );
+            const binDir = join(root, "install", "node_modules", ".bin");
+            mkdirSync(join(root, "node", "bin"), { recursive: true });
+            mkdirSync(join(cli, ".."), { recursive: true });
+            mkdirSync(binDir, { recursive: true });
+            writeFileSync(node, "node");
+            writeFileSync(cli, "cli");
+            const shim = join(binDir, "pi");
+            symlinkSync("../@earendil-works/pi-coding-agent/dist/cli.js", shim);
+
+            expect(
+                buildManagedStartupEnvelope("@cortexkit/pi-magic-context", {}, node, shim),
+            ).toEqual({
+                schema: 1,
+                pi: {
+                    manifest_sha256:
+                        "cc87481ce798bd84b9cd0d1dd809bc4c72cea9435303705362a3b2be493674e6",
+                    source_roots: {
+                        "pi-install": join(root, "install"),
+                        runtime: join(root, "node", "bin"),
+                    },
+                },
+            });
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("keeps construction inert and demands managed storage readiness before connecting", async () => {
+        const events: string[] = [];
+        const transport = trackTransport(
+            new McHostModuleTransport({
+                requestTimeoutMs: 100,
+                demandStart: async () => {
+                    events.push("demand");
+                    return { ok: false, reason: "storage_starting", storage: "starting" };
+                },
+            }),
+        );
+
+        expect(events).toEqual([]);
+        await expect(
+            transport.call({
+                sessionId: "managed-demand",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform", v: 1 },
+            }),
+        ).rejects.toMatchObject({ code: "storage_starting" });
+        expect(events).toEqual(["demand"]);
+    });
+
+    it("a failed demand arms connection backoff instead of re-demanding per call", async () => {
+        let demands = 0;
+        const transport = trackTransport(
+            new McHostModuleTransport({
+                requestTimeoutMs: 1_000,
+                demandStart: async () => {
+                    demands += 1;
+                    return { ok: false, reason: "native_payload_missing", storage: null };
+                },
+            }),
+        );
+        const args = {
+            sessionId: "managed-backoff",
+            projectRoot: "/workspace/project",
+            method: "transform",
+            body: { method: "transform", v: 1 },
+        } as const;
+
+        await expect(transport.call(args)).rejects.toMatchObject({
+            code: "native_payload_missing",
+        });
+        await expect(transport.call(args)).rejects.toMatchObject({
+            code: "MC_HOST_CONNECTION_BACKOFF",
+        });
+        expect(demands).toBe(1);
+    });
+
+    it("credential source changes rebind the managed route before another body", async () => {
+        const peer = await startPeer();
+        const dataHome = join(tempDir, `managed-home-${++fileCounter}`);
+        const connectionFile = join(dataHome, "cortexkit", "run", "subc-connection.json");
+        mkdirSync(join(dataHome, "cortexkit", "run"), { recursive: true });
+        await writeConnectionFile(connectionFile, peer);
+        const oldDataHome = process.env.XDG_DATA_HOME;
+        const oldCredential = process.env.ANTHROPIC_API_KEY;
+        process.env.XDG_DATA_HOME = dataHome;
+        process.env.ANTHROPIC_API_KEY = "first-secret";
+        const transport = trackTransport(
+            new McHostModuleTransport({
+                requestTimeoutMs: 2_000,
+                demandStart: async () => ({
+                    ok: true,
+                    reason: "already_running",
+                    storage: "ready",
+                }),
+            }),
+        );
+        try {
+            const first = transport.call({
+                sessionId: "credential-refresh",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform", v: 1 },
+            });
+            const conn = await peer.waitForConnection();
+            await conn.authenticated;
+            const cursor = frameCursor(conn);
+            const firstOpen = await cursor.next(isRouteOpen);
+            const firstFingerprint = (
+                bodyJson(firstOpen) as {
+                    identity: {
+                        credential_fingerprints: { anthropic: string };
+                    };
+                }
+            ).identity.credential_fingerprints.anthropic;
+            await sendRouteOpenOk(conn, firstOpen.corr, 7, 77);
+            const firstRequest = await cursor.next(isRoutedRequest(7));
+            await sendResponse(conn, firstRequest.corr, { ok: true }, 7, 77);
+            await first;
+            const credentialChangeFrameStart = conn.frames.length;
+
+            process.env.ANTHROPIC_API_KEY = "second-secret";
+            const second = transport.call({
+                sessionId: "credential-refresh",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform", v: 1 },
+            });
+            const secondOpen = await cursor.next(isRouteOpen);
+            const secondFingerprint = (
+                bodyJson(secondOpen) as {
+                    identity: {
+                        credential_fingerprints: { anthropic: string };
+                    };
+                }
+            ).identity.credential_fingerprints.anthropic;
+            expect(secondFingerprint).not.toBe(firstFingerprint);
+            await sendRouteOpenOk(conn, secondOpen.corr, 8, 78);
+            const secondRequest = await cursor.next(isRoutedRequest(8));
+            expect(
+                conn.frames
+                    .slice(credentialChangeFrameStart)
+                    .filter(isRoutedRequest())
+                    .map((frame) => frame.channel),
+            ).toEqual([8]);
+            await sendResponse(conn, secondRequest.corr, { ok: true }, 8, 78);
+            await second;
+        } finally {
+            if (oldDataHome === undefined) delete process.env.XDG_DATA_HOME;
+            else process.env.XDG_DATA_HOME = oldDataHome;
+            if (oldCredential === undefined) delete process.env.ANTHROPIC_API_KEY;
+            else process.env.ANTHROPIC_API_KEY = oldCredential;
+        }
+    });
+
+    it("stays passive without a managed lifecycle owner and dials the default file", async () => {
+        const peer = await startPeer();
+        const dataHome = join(tempDir, `passive-home-${++fileCounter}`);
+        const connectionFile = join(dataHome, "cortexkit", "run", "subc-connection.json");
+        mkdirSync(join(dataHome, "cortexkit", "run"), { recursive: true });
+        await writeConnectionFile(connectionFile, peer);
+        const oldDataHome = process.env.XDG_DATA_HOME;
+        process.env.XDG_DATA_HOME = dataHome;
+        try {
+            const transport = trackTransport(
+                new McHostModuleTransport({ requestTimeoutMs: 2_000 }),
+            );
+            const call = transport.call({
+                sessionId: "missing-owner",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform", v: 1 },
+            });
+            const conn = await peer.waitForConnection();
+            await conn.authenticated;
+            const cursor = frameCursor(conn);
+            const routeOpen = await cursor.next(isRouteOpen);
+            await sendRouteOpenOk(conn, routeOpen.corr, 7, 77);
+            const request = await cursor.next(isRoutedRequest(7));
+            await sendResponse(conn, request.corr, { ok: true }, 7, 77);
+
+            await expect(call).resolves.toEqual({ ok: true });
+        } finally {
+            if (oldDataHome === undefined) delete process.env.XDG_DATA_HOME;
+            else process.env.XDG_DATA_HOME = oldDataHome;
+        }
+    });
+
+    it("keeps an explicit connection lifecycle-neutral", async () => {
+        const peer = await startPeer();
+        const connectionFile = await writeConnFile(peer);
+        let demands = 0;
+        const transport = trackTransport(
+            new McHostModuleTransport({
+                connectionFile,
+                requestTimeoutMs: 1_000,
+                demandStart: async () => {
+                    demands += 1;
+                    return { ok: true, reason: "started", storage: "ready" };
+                },
+            }),
+        );
+        const call = transport.call({
+            sessionId: "explicit-demand",
+            projectRoot: "/workspace/project",
+            method: "transform",
+            body: { method: "transform", v: 1 },
+        });
+        const conn = await peer.waitForConnection();
+        await conn.authenticated;
+        const cursor = frameCursor(conn);
+        const routeOpen = await cursor.next(isRouteOpen);
+        await sendRouteOpenOk(conn, routeOpen.corr, 7, 77);
+        const request = await cursor.next(isRoutedRequest(7));
+        await sendResponse(conn, request.corr, { ok: true }, 7, 77);
+
+        await expect(call).resolves.toEqual({ ok: true });
+        expect(demands).toBe(0);
+    });
+
     it("uses the internal facade while preserving route identity and flat request bytes", async () => {
         const { peer, transport } = await peerTransport(1_000);
         const flatBody = {
@@ -988,12 +1291,29 @@ describe("McHostModuleTransport", () => {
         const internals = transport as unknown as {
             client: McHostClient | null;
             connectionGeneration: number;
-            routes: Map<string, { route: RouteHandle; generation: number }>;
+            routes: Map<
+                string,
+                { route: RouteHandle; generation: number; credentialSourceVersion?: string }
+            >;
             connectClient(): Promise<McHostClient>;
         };
         internals.client = oldClient;
-        internals.routes.set("session-a\0/invalidation-a", { route: oldRouteA, generation: 0 });
-        internals.routes.set("session-b\0/invalidation-b", { route: oldRouteB, generation: 0 });
+        // Seed the credential version the transport now records on every real
+        // connection: a cached route whose version is absent cannot be proven to
+        // match the credentials in force, so it is correctly treated as stale.
+        const credentialSourceVersion = __moduleTransportTest.managedCredentialSourceVersion(
+            process.env,
+        );
+        internals.routes.set("session-a\0/invalidation-a", {
+            route: oldRouteA,
+            generation: 0,
+            credentialSourceVersion,
+        });
+        internals.routes.set("session-b\0/invalidation-b", {
+            route: oldRouteB,
+            generation: 0,
+            credentialSourceVersion,
+        });
         internals.connectClient = async () => {
             connectCount += 1;
             await Bun.sleep(10);
@@ -1209,7 +1529,10 @@ describe("McHostModuleTransport", () => {
         const internals = transport as unknown as {
             client: McHostClient | null;
             connectionGeneration: number;
-            routes: Map<string, { route: RouteHandle; generation: number }>;
+            routes: Map<
+                string,
+                { route: RouteHandle; generation: number; credentialSourceVersion?: string }
+            >;
             ensureRoute: (
                 sessionId: string,
                 rawProjectRoot: string,
@@ -1224,7 +1547,9 @@ describe("McHostModuleTransport", () => {
         expect(routeOpenCount).toBe(1);
         expect(ensured.route).toBe(newRoute);
         expect(ensured.generation).toBe(1);
-        expect(internals.routes.get(routeKey)).toEqual({ route: newRoute, generation: 1 });
+        // Every real connection now records the credential version it presented,
+        // so assert the identity fields rather than the whole record.
+        expect(internals.routes.get(routeKey)).toMatchObject({ route: newRoute, generation: 1 });
     });
 });
 

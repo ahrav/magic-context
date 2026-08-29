@@ -42,6 +42,7 @@ import {
 	type FailClosedReason,
 	formatFailClosedBlockingMessage,
 } from "@magic-context/core/features/magic-context/fail-closed-block";
+import { configureSynapseManagedDemandStart } from "@magic-context/core/features/magic-context/memory/embedding-synapse";
 import {
 	resolveProjectIdentityForSession,
 	resolveProjectRootDirectory,
@@ -72,6 +73,7 @@ import {
 	resolveHistorianContextLimit,
 } from "@magic-context/core/hooks/magic-context/derive-budgets";
 import { resolveCacheTtl } from "@magic-context/core/hooks/magic-context/event-resolvers";
+import { createLazyManagedDemandStart } from "@magic-context/core/hooks/magic-context/module-transport";
 import {
 	clearNoteNudgeTriggerAndCooldown,
 	onNoteTrigger,
@@ -180,6 +182,10 @@ import {
 } from "./tools/todo-view-pi";
 
 const PREFIX = "[magic-context][pi]";
+const managedDemandStart = createLazyManagedDemandStart({
+	declaringModuleUrl: import.meta.url,
+	parentPackageName: "@cortexkit/pi-magic-context",
+});
 
 // ---------------------------------------------------------------------------
 // Process-global init latch (issue #247)
@@ -740,6 +746,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		);
 		return;
 	}
+	configureSynapseManagedDemandStart(managedDemandStart);
 	markPiMagicContextActive();
 	beginBootQuietPeriod();
 

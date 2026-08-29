@@ -284,6 +284,40 @@ describe("parseDaemonResult", () => {
             unknown_reason: validResult({ reason: "mystery" }),
             unknown_remediation: validResult({ remediation: "reboot" }),
             unavailable_without_no_data_dir: validResult({ state: "unavailable" }),
+            ok_reason_mismatch: validResult({
+                ok: false,
+                reason: "healthy",
+            }),
+            state_reason_mismatch: validResult({
+                state: "wedged",
+            }),
+            wrong_remediation_for_reason: validResult({
+                ok: false,
+                state: "stopped",
+                reason: "not_running",
+                remediation: "free_storage",
+                readiness: null,
+                checks: [],
+            }),
+            restart_without_effects: validResult({
+                command: "restart",
+                reason: "started",
+            }),
+            readiness_reason_mismatch: validResult({
+                readiness: {
+                    transport: { state: "ready", reason: "not_running" },
+                },
+            }),
+            successful_result_with_failed_check: validResult({
+                checks: [
+                    {
+                        id: "lifecycle.fences",
+                        status: "fail",
+                        reason: "wedged",
+                        remediation: "inspect_daemon_process",
+                    },
+                ],
+            }),
             effects_on_non_restart: validResult({
                 effects: { stop_committed: true, start_committed: true },
             }),

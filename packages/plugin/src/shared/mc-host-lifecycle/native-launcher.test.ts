@@ -1,5 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+    chmodSync,
+    closeSync,
+    constants,
+    existsSync,
+    mkdtempSync,
+    openSync,
+    rmSync,
+    writeFileSync,
+} from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { NativeLaunchError, runNativeLifecycle } from "./native-launcher";
@@ -43,6 +52,46 @@ function probeResultJson(ok: boolean): string {
 describe("native launcher output handling (U3 scenario 17)", () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), "mc-native-launcher-"));
     process.on("exit", () => rmSync(dir, { recursive: true, force: true }));
+
+    test("retained descriptor execution is refused on an uncertified platform", async () => {
+        const binary = scriptBinary(dir, `echo '${probeResultJson(false)}'\nexit 1`);
+        const fd = openSync(binary, constants.O_RDONLY | constants.O_NOFOLLOW);
+        try {
+            // A host outside the certified namespace table has no
+            // retained-descriptor exec path at all, so it must fail as a
+            // platform reason rather than as a spawn error against a path that
+            // cannot exist. The linux and darwin arms are covered end to end by
+            // the inherited-fd test below, which runs the real path.
+            await expect(
+                runNativeLifecycle(
+                    { kind: "retained-fd", fd },
+                    { command: "probe", deadlineMs: 10_000, platform: "win32" },
+                ),
+            ).rejects.toThrow(NativeLaunchError);
+            await expect(
+                runNativeLifecycle(
+                    { kind: "retained-fd", fd },
+                    { command: "probe", deadlineMs: 10_000, platform: "win32" },
+                ),
+            ).rejects.toMatchObject({ code: "unsupported_platform" });
+        } finally {
+            closeSync(fd);
+        }
+    });
+
+    test("a retained executable descriptor runs through the inherited child fd", async () => {
+        const binary = scriptBinary(dir, `echo '${probeResultJson(false)}'\nexit 1`);
+        const fd = openSync(binary, constants.O_RDONLY | constants.O_NOFOLLOW);
+        try {
+            const result = await runNativeLifecycle(
+                { kind: "retained-fd", fd },
+                { command: "probe", deadlineMs: 10_000 },
+            );
+            expect(result.reason).toBe("not_running");
+        } finally {
+            closeSync(fd);
+        }
+    });
 
     test("a conforming single JSON object with agreeing exit parses", async () => {
         const binary = scriptBinary(dir, `echo '${probeResultJson(false)}'\nexit 1`);
