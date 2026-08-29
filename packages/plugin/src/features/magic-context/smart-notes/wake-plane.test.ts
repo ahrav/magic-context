@@ -206,10 +206,18 @@ describe("wakePlaneStatus", () => {
         let probes = 0;
         let publication = "dev:ino:1000:64";
         let releaseProbe: (() => void) | undefined;
+        // Synchronize on probe ENTRY rather than sleeping: a timer only makes the
+        // race likely, so on a slow schedule `releaseProbe` would still be unset
+        // and releasing it below would be a no-op that hangs the test.
+        let signalProbeStarted: (() => void) | undefined;
+        const probeStarted = new Promise<void>((resolve) => {
+            signalProbeStarted = resolve;
+        });
         __wakePlaneTest.setCatalogProbe(async () => {
             probes += 1;
             await new Promise<void>((resolve) => {
                 releaseProbe = resolve;
+                signalProbeStarted?.();
             });
             return catalog(true);
         });
@@ -217,7 +225,7 @@ describe("wakePlaneStatus", () => {
 
         const first = wakePlaneStatus();
         const coalesced = wakePlaneStatus();
-        await new Promise((resolve) => setTimeout(resolve, 10));
+        await probeStarted;
         // The daemon is replaced while the probe is still parked.
         publication = "dev:ino:2000:64";
         releaseProbe?.();
