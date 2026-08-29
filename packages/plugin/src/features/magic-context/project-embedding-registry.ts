@@ -1253,7 +1253,14 @@ export function registerProjectEmbedding(
         deferredSynapse &&
         prior !== undefined &&
         !prior.observationMode &&
-        prior.deferredIntent === runtimeFingerprint;
+        prior.deferredIntent === runtimeFingerprint &&
+        // A fallback activation keeps the intent but replaces the config with the
+        // fallback, and that demotion must stay retryable: only a lane that is
+        // still a RESOLVED Synapse config may be carried forward. A prior that is
+        // still unresolved falls through to the ordinary reuse predicate, which
+        // already matches it on the deferred fingerprint.
+        prior.config.provider === "synapse" &&
+        !isDeferredSynapseConfig(prior.config);
     const canReuseProvider =
         prior !== undefined &&
         !prior.observationMode &&
@@ -1295,14 +1302,12 @@ export function registerProjectEmbedding(
         prior.chunkModelId !== effectiveChunkModelId ||
         !sameFeatures(prior.features, features);
     const generation = generationChanged ? ++globalRegistrationGeneration : prior.generation;
-    const registration: ProjectEmbeddingRegistration = {
+    const nextState = {
         db,
-        projectIdentity,
         sourceDirectory,
         config: effectiveConfig,
         providerIdentity: effectiveProviderIdentity,
         runtimeFingerprint: effectiveRuntimeFingerprint,
-        provider: canReuseProvider ? prior.provider : null,
         generation,
         features: { ...features },
         modelId:
@@ -1310,8 +1315,27 @@ export function registerProjectEmbedding(
         chunkModelId:
             effectiveProviderIdentity === OFF_PROVIDER_IDENTITY ? "off" : effectiveChunkModelId,
         observationMode: false,
-        ...(deferredSynapse ? { deferredIntent: runtimeFingerprint } : {}),
     };
+    let registration: ProjectEmbeddingRegistration;
+    if (canReuseProvider) {
+        // Carrying the provider forward means preserving the registration OBJECT,
+        // not copying its fields into a new one: the provider's
+        // `onSynapseLaneReady` closure captured this object, and
+        // `commitPrimarySynapseLane` only accepts the identity currently in the
+        // map. A fresh object would silently drop the lane resolution of an
+        // initialization already in flight, leaving an initialized provider whose
+        // registration stays at the placeholder identity forever.
+        registration = Object.assign(prior, nextState);
+        if (deferredSynapse) registration.deferredIntent = runtimeFingerprint;
+        else delete registration.deferredIntent;
+    } else {
+        registration = {
+            projectIdentity,
+            provider: null,
+            ...nextState,
+            ...(deferredSynapse ? { deferredIntent: runtimeFingerprint } : {}),
+        };
+    }
 
     projectRegistrations.set(projectIdentity, registration);
     // A resumed lane is fully resolved, so its descriptor stays authoritative;

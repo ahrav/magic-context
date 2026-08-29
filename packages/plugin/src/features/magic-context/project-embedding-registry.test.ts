@@ -515,6 +515,121 @@ describe("project embedding registry", () => {
         expect(catalogCalls).toBe(1);
     });
 
+    it("retries the deferred intent after a fallback activation instead of latching it", async () => {
+        const db = useTempDb();
+        let laneAvailable = false;
+        let catalogCalls = 0;
+        const client: SynapseClientLike = {
+            async call<Response>(_module, method): Promise<Response> {
+                if (method === "models.list") {
+                    catalogCalls += 1;
+                    if (!laneAvailable) throw new Error("catalog unavailable");
+                    return [
+                        {
+                            model: "gte-modernbert-base-f16",
+                            fingerprint: "fp-late",
+                            table_epoch: 2,
+                            dims: 3,
+                            certified: true,
+                        },
+                    ] as Response;
+                }
+                if (method === "embed.query") {
+                    return {
+                        vector: [1, 2, 3],
+                        model: "gte-modernbert-base-f16",
+                        fingerprint: "fp-late",
+                        table_epoch: 2,
+                        dims: 3,
+                    } as Response;
+                }
+                throw new Error(`unexpected method ${method}`);
+            },
+            close() {},
+        };
+        const features = { memoryEnabled: true, gitCommitEnabled: true };
+        const deferred = {
+            provider: "synapse",
+            model: "gte-modernbert-base-f16",
+            synapse_connection_origin: "injected",
+            synapse_client_factory: async () => client,
+            synapse_fallback: { provider: "off" },
+        } as EmbeddingConfig;
+
+        registerProjectEmbedding(db, "transient-deferred", deferred, features, "/repo");
+        // A transient discovery failure activates the configured fallback.
+        expect(await embedTextForProject("transient-deferred", "first")).toBeNull();
+        expect(catalogCalls).toBeGreaterThan(0);
+        expect(getProjectEmbeddingSnapshot("transient-deferred")?.modelId).toBe("off");
+
+        // A fallback activation is a demotion, not a resolved lane: a registration
+        // carrying the same deferred intent must rebuild the Synapse provider
+        // instead of copying the demoted config forward.
+        laneAvailable = true;
+        registerProjectEmbedding(db, "transient-deferred", deferred, features, "/repo");
+        const expectedIdentity = getSynapseLaneIdentity("gte-modernbert-base-f16", "fp-late");
+        expect((await embedTextForProject("transient-deferred", "second"))?.modelId).toBe(
+            expectedIdentity,
+        );
+        expect(getProjectEmbeddingSnapshot("transient-deferred")?.modelId).toBe(expectedIdentity);
+    });
+
+    it("keeps lane resolution attached when a re-registration overlaps initialization", async () => {
+        const db = useTempDb();
+        let releaseCatalog!: () => void;
+        const catalogGate = new Promise<void>((resolve) => {
+            releaseCatalog = resolve;
+        });
+        const client: SynapseClientLike = {
+            async call<Response>(_module, method): Promise<Response> {
+                if (method === "models.list") {
+                    await catalogGate;
+                    return [
+                        {
+                            model: "gte-modernbert-base-f16",
+                            fingerprint: "fp-overlap",
+                            table_epoch: 5,
+                            dims: 3,
+                            certified: true,
+                        },
+                    ] as Response;
+                }
+                if (method === "embed.query") {
+                    return {
+                        vector: [1, 2, 3],
+                        model: "gte-modernbert-base-f16",
+                        fingerprint: "fp-overlap",
+                        table_epoch: 5,
+                        dims: 3,
+                    } as Response;
+                }
+                throw new Error(`unexpected method ${method}`);
+            },
+            close() {},
+        };
+        const features = { memoryEnabled: true, gitCommitEnabled: true };
+        const deferred = {
+            provider: "synapse",
+            model: "gte-modernbert-base-f16",
+            synapse_connection_origin: "injected",
+            synapse_client_factory: async () => client,
+            synapse_fallback: { provider: "off" },
+        } as EmbeddingConfig;
+
+        registerProjectEmbedding(db, "overlapped-deferred", deferred, features, "/repo");
+        // One operation is mid-initialization when a second re-registers from the
+        // same configuration. The provider carried forward announces its lane to
+        // the registration object it was constructed with, so that object has to
+        // stay the one the registry holds.
+        const inFlight = embedTextForProject("overlapped-deferred", "first");
+        registerProjectEmbedding(db, "overlapped-deferred", deferred, features, "/repo");
+        releaseCatalog();
+
+        const expectedIdentity = getSynapseLaneIdentity("gte-modernbert-base-f16", "fp-overlap");
+        expect((await inFlight)?.modelId).toBe(expectedIdentity);
+        expect(getProjectEmbeddingSnapshot("overlapped-deferred")?.modelId).toBe(expectedIdentity);
+    });
+
     it("preserves existing provider and runtime identity goldens", () => {
         const db = useTempDb();
         const features = { memoryEnabled: true, gitCommitEnabled: true };
