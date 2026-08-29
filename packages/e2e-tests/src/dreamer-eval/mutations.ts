@@ -188,10 +188,16 @@ function passingUpdateContent(
     // arrives within `ledger.size + 1` attempts; the content cap is the real
     // limit, and it is checked below.
     for (let attempt = 0; attempt <= ledger.size && ledger.has(claimIdentity(claim.category, content)); attempt += 1) {
-        content = `${content} ${fillerAbsentFrom(
+        const filler = fillerAbsentFrom(
             gold.forbiddenUpdateAnchors,
             "a pad character absent from every forbidden update anchor",
-        )}`;
+        );
+        // Spend only what the cap leaves: a body one character short of the limit
+        // is still separable, so a two-character suffix would refuse a fixture a
+        // one-character one satisfies.
+        const remaining = VERIFY_UPDATE_CONTENT_MAX_LENGTH - content.length;
+        if (remaining <= 0) break;
+        content = remaining >= 2 ? `${content} ${filler}` : `${content}${filler}`;
     }
     if (ledger.has(claimIdentity(claim.category, content))) {
         throw new Error("mutation fixture needs update anchors that avoid every live claim identity");
@@ -283,7 +289,16 @@ function correctMapManifest(fixture: DreamerMutationFixture): string {
 function correctClassifyManifest(fixture: DreamerMutationFixture): string {
     const entries = fixture.classifyGold.claims.map((gold) => {
         const claim = claimById(fixture.pool, gold.claimId);
-        return `<memory claim="${claim.publicClaimId}" importance="${gold.importance.min}" scope="${gold.scope}" shareable="${gold.shareable}"/>`;
+        const attributes = `importance="${gold.importance.min}" scope="${gold.scope}"`;
+        // Reporting `shareable="true"` for sensitive content is forced back to
+        // false, so gold expecting it to stay shareable is reachable only by
+        // omitting the attribute and letting the stored value stand. The parser
+        // requires at least one classification field, which importance and scope
+        // supply.
+        if (gold.shareable && hasShareabilitySensitiveText(claim.content)) {
+            return `<memory claim="${claim.publicClaimId}" ${attributes}/>`;
+        }
+        return `<memory claim="${claim.publicClaimId}" ${attributes} shareable="${gold.shareable}"/>`;
     });
     return `<classify>\n${entries.join("\n")}\n</classify>`;
 }
@@ -445,17 +460,14 @@ function mutationManifest(
             return { task: "classify", manifest: classify.replace(new RegExp(`(claim="${escapeRegExp(claim.publicClaimId)}"[^>]*scope=")${target.scope}`), `$1${wrong}`) };
         }
         case "wrong-shareable": {
-            // Flipping a `false` gold to `true` is a no-op when the claim's
-            // content is sensitive: production forces the reported `true` back to
-            // false, the applied value still matches gold, and the mutation
-            // scores PASS. Either a `true` gold — which the contract only admits
-            // for non-sensitive content — or non-sensitive content keeps the flip
-            // observable.
+            // Sensitive content rules a claim out either way. With `false` gold,
+            // flipping to `true` is forced back to false and the applied value
+            // still matches; with `true` gold, the baseline omits the attribute
+            // entirely so there is nothing to flip. Non-sensitive content leaves
+            // the flip observable in both directions.
             const target = requiredGold(
                 fixture.classifyGold.claims,
-                (entry) =>
-                    entry.shareable ||
-                    !hasShareabilitySensitiveText(claimById(fixture.pool, entry.claimId).content),
+                (entry) => !hasShareabilitySensitiveText(claimById(fixture.pool, entry.claimId).content),
                 "a classify gold whose flipped shareability survives the production override",
             );
             const claim = claimById(fixture.pool, target.claimId);

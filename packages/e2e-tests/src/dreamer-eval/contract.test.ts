@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { VERIFY_UPDATE_CONTENT_MAX_LENGTH } from "../../../plugin/src/features/magic-context/dreamer/verify";
+import { sha256Utf8Hex } from "../../../plugin/src/features/magic-context/memory/storage-claims";
 import {
     DREAMER_EVAL_REPORT_SCHEMA,
     DREAMER_EVAL_SCENARIO_SCHEMA,
@@ -582,18 +583,26 @@ describe("dreamer eval scenario contract", () => {
 // revision, and a SHA-256 digest.
 const CLAIM_ONE_ID = `mcm_${"1".repeat(32)}`;
 const CLAIM_TWO_ID = `mcm_${"2".repeat(32)}`;
-const CLAIM_ONE_LOCATOR = `${CLAIM_ONE_ID}/r1/${"a".repeat(64)}`;
-const CLAIM_TWO_LOCATOR = `${CLAIM_TWO_ID}/r1/${"b".repeat(64)}`;
+// The locator's third segment is the revision's content hash, so it is derived
+// rather than filled in.
+function locatorFor(publicClaimId: string, content: string): string {
+    return `${publicClaimId}/r1/${sha256Utf8Hex(content)}`;
+}
+
+const SNAPSHOT_CONTENT = "Distinct memory content";
+const CLAIM_ONE_LOCATOR = locatorFor(CLAIM_ONE_ID, SNAPSHOT_CONTENT);
+const CLAIM_TWO_LOCATOR = locatorFor(CLAIM_TWO_ID, SNAPSHOT_CONTENT);
 
 // A completed report has to carry the whole scenario pool, and the contract's
 // floor is ten claims.
 function poolSnapshot(index: number): Record<string, unknown> {
     const publicClaimId = `mcm_${(index + 1).toString(16).padStart(2, "0").repeat(16)}`;
+    const content = `Distinct memory content ${index + 1}`;
     return {
         claimId: `claim-${index + 1}`,
         publicClaimId,
-        revisionLocator: `${publicClaimId}/r1/${"a".repeat(64)}`,
-        content: `Distinct memory content ${index + 1}`,
+        revisionLocator: locatorFor(publicClaimId, content),
+        content,
         category: "CONSTRAINTS",
         importance: 50,
         memoryScope: "project",
@@ -724,7 +733,7 @@ describe("dreamer eval report contract", () => {
             claimId: "claim-1",
             publicClaimId: CLAIM_ONE_ID,
             revisionLocator: CLAIM_ONE_LOCATOR,
-            content: "Distinct memory content",
+            content: SNAPSHOT_CONTENT,
             category: "CONSTRAINTS",
             importance: 50,
             memoryScope: "project",
@@ -762,7 +771,7 @@ describe("dreamer eval report contract", () => {
             claimId: "claim-1",
             publicClaimId: CLAIM_ONE_ID,
             revisionLocator: CLAIM_ONE_LOCATOR,
-            content: "Distinct memory content",
+            content: SNAPSHOT_CONTENT,
             category: "CONSTRAINTS",
             importance: 50,
             memoryScope: "project",
@@ -782,7 +791,10 @@ describe("dreamer eval report contract", () => {
         expect(() =>
             parseRunReport({
                 ...baseReport,
-                poolAfter: captureWithFirst({ publicClaimId: CLAIM_TWO_ID, revisionLocator: CLAIM_TWO_LOCATOR }),
+                poolAfter: captureWithFirst({
+                    publicClaimId: CLAIM_TWO_ID,
+                    revisionLocator: locatorFor(CLAIM_TWO_ID, POOL_CAPTURE[0]!.content as string),
+                }),
             }),
         ).toThrow(/poolAfter: identity-drift/);
         // A result attributed to another claim entirely.
@@ -794,7 +806,7 @@ describe("dreamer eval report contract", () => {
                 poolAfter: captureWithFirst({
                     claimId: "claim-99",
                     publicClaimId: CLAIM_TWO_ID,
-                    revisionLocator: CLAIM_TWO_LOCATOR,
+                    revisionLocator: locatorFor(CLAIM_TWO_ID, POOL_CAPTURE[0]!.content as string),
                 }),
             }),
         ).toThrow(/poolAfter: identity-drift/);
@@ -821,7 +833,7 @@ describe("dreamer eval report contract", () => {
             claimId: "claim-1",
             publicClaimId: CLAIM_ONE_ID,
             revisionLocator: CLAIM_ONE_LOCATOR,
-            content: "Distinct memory content",
+            content: SNAPSHOT_CONTENT,
             category: "CONSTRAINTS",
             importance: 50,
             memoryScope: "project",
@@ -846,6 +858,11 @@ describe("dreamer eval report contract", () => {
         // mismatched pairing even though both halves are well formed.
         expect(() => parse({ revisionLocator: CLAIM_TWO_LOCATOR })).toThrow(
             /revisionLocator: locator-claim-mismatch/,
+        );
+        // The digest is the revision's content hash, so one over other bytes
+        // describes a revision whose content is not the one recorded.
+        expect(() => parse({ revisionLocator: `${OBSERVED_ID}/r1/${"c".repeat(64)}` })).toThrow(
+            /revisionLocator: locator-digest-mismatch/,
         );
         expect(parse({}).poolBefore).toHaveLength(POOL_CAPTURE.length);
     });
@@ -931,6 +948,63 @@ describe("dreamer eval report contract", () => {
             parseRunReport({ ...baseReport, status: "FAIL", reason: "invalid-output", parsedManifest: null })
                 .parsedManifest,
         ).toBeNull();
+        // And it cannot carry evidence: the reason is raised before any parse
+        // result exists.
+        expect(() => parseRunReport({ ...baseReport, status: "FAIL", reason: "invalid-output" })).toThrow(
+            /parsedManifest: invalid-output-has-evidence/,
+        );
+    });
+
+    test("evidence entries must carry the fields their scorer emits", () => {
+        // A map entry always has files and independence; verify's three lists each
+        // have their own field set; a classify entry needs at least one
+        // classification field.
+        expect(() =>
+            parseRunReport({ ...baseReport, task: "map-memories", parsedManifest: [{ publicClaimId: OBSERVED_ID }] }),
+        ).toThrow(/parsedManifest\[0\]: fields-invalid/);
+        expect(() =>
+            parseRunReport({
+                ...baseReport,
+                parsedManifest: { verified: [{ publicClaimId: OBSERVED_ID }], updated: [], archived: [] },
+            }),
+        ).toThrow(/parsedManifest.verified\[0\]: fields-invalid/);
+        expect(() =>
+            parseRunReport({
+                ...baseReport,
+                parsedManifest: {
+                    verified: [],
+                    updated: [{ publicClaimId: OBSERVED_ID, files: ["src/a.ts"] }],
+                    archived: [],
+                },
+            }),
+        ).toThrow(/parsedManifest.updated\[0\]: fields-invalid/);
+        expect(() =>
+            parseRunReport({
+                ...baseReport,
+                task: "classify-memories",
+                parsedManifest: [{ publicClaimId: OBSERVED_ID }],
+            }),
+        ).toThrow(/parsedManifest\[0\]: classification-empty/);
+        // A partial classification is exactly what the parser produces.
+        expect(
+            parseRunReport({
+                ...baseReport,
+                task: "classify-memories",
+                parsedManifest: [{ publicClaimId: OBSERVED_ID, scope: "project" }],
+            }).parsedManifest,
+        ).toEqual([{ publicClaimId: OBSERVED_ID, scope: "project" }]);
+    });
+
+    test("a required anchor's capacity is measured before case folding", () => {
+        // `"İ".toLowerCase()` is two code units, so folding first would double the
+        // measured cost and refuse a body that actually fits.
+        const expanding = validScenarioRaw();
+        const tasks = expanding.tasks as Array<{
+            gold: { claims: Array<{ verdict: string; requiredUpdateAnchors: string[] }> };
+        }>;
+        tasks[0]!.gold.claims[0]!.verdict = "update";
+        tasks[0]!.gold.claims[0]!.requiredUpdateAnchors = ["\u0130".repeat(11_000)];
+        expect(() => parseScenario(expanding)).not.toThrow();
     });
 
     test("a completed report must capture the scenario pool", () => {

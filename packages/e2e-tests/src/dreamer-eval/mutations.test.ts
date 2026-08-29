@@ -386,3 +386,33 @@ describe("dreamer mutation battery baseline planning", () => {
         expect(runMutationBattery(fixture).green).toBe(true);
     });
 });
+
+describe("dreamer mutation battery classify baseline", () => {
+    test("shareability is omitted when the stored value must be preserved", () => {
+        // Sensitive content already stored shareable: gold expects it to stay
+        // shareable, and reporting `true` is forced back to false, so the only
+        // passing baseline omits the attribute.
+        const fixture = {
+            ...dreamerScorerFixture,
+            pool: {
+                ...dreamerScorerFixture.pool,
+                claims: dreamerScorerFixture.pool.claims.map((claim) =>
+                    claim.claimId === "claim-true"
+                        ? {
+                              ...claim,
+                              content: "The box answers on 127.0.0.1:8080 for local runs.",
+                              sharing: "shareable" as const,
+                          }
+                        : claim,
+                ),
+            },
+        };
+        const evidence = runMutationBattery(fixture);
+        expect(evidence.green).toBe(true);
+        // The wrong-shareable class still has a claim whose flip is observable.
+        expect(evidence.results.find((entry) => entry.mutationClass === "wrong-shareable")).toMatchObject({
+            green: true,
+            actualReason: "wrong-classification",
+        });
+    });
+});

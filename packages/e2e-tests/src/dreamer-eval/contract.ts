@@ -5,6 +5,7 @@ import {
     parseRevisionLocator,
 } from "../../../plugin/src/features/magic-context/memory/claim-operation-contract";
 import { normalizeMemoryContent } from "../../../plugin/src/features/magic-context/memory/normalize-hash";
+import { sha256Utf8Hex } from "../../../plugin/src/features/magic-context/memory/storage-claims";
 import { VERIFY_UPDATE_CONTENT_MAX_LENGTH } from "../../../plugin/src/features/magic-context/dreamer/verify";
 import { hasShareabilitySensitiveText } from "../../../plugin/src/shared/redaction";
 
@@ -452,9 +453,18 @@ function parseGoldFilePathArray(raw: unknown, label: string, declared: ReadonlyS
  * Anchor matching is case-insensitive, so overlap is judged folded.
  */
 function disjointAnchorLength(anchors: readonly string[]): number | null {
-    const unique = [...new Set(anchors.map((anchor) => anchor.toLowerCase()))];
-    const maximal = unique.filter(
-        (anchor) => !unique.some((other) => other !== anchor && other.includes(anchor)),
+    // Case folding can lengthen a string — `"İ".toLowerCase()` is two code units
+    // — so folded spellings decide identity and overlap while the cost of
+    // carrying an anchor is measured on what a body actually holds: the authored
+    // spelling, or its folded form when that is somehow shorter.
+    const cost = new Map<string, number>();
+    for (const anchor of anchors) {
+        const folded = anchor.toLowerCase();
+        const weight = Math.min(anchor.length, folded.length);
+        cost.set(folded, Math.min(cost.get(folded) ?? weight, weight));
+    }
+    const maximal = [...cost.keys()].filter(
+        (anchor) => ![...cost.keys()].some((other) => other !== anchor && other.includes(anchor)),
     );
     for (const left of maximal) {
         for (const right of maximal) {
@@ -464,7 +474,7 @@ function disjointAnchorLength(anchors: readonly string[]): number | null {
             }
         }
     }
-    return maximal.reduce((total, anchor) => total + anchor.length, 0);
+    return maximal.reduce((total, anchor) => total + (cost.get(anchor) ?? 0), 0);
 }
 
 function parseVerifyGold(raw: unknown, label: string, pool: ReadonlyMap<string, ScenarioClaim>): ParsedLayerGold {
@@ -869,11 +879,18 @@ function parseSnapshot(raw: unknown, label: string): ClaimSnapshotProjection {
     if (locator.publicClaimId !== publicClaimId) {
         fail(`${label}.revisionLocator: locator-claim-mismatch`);
     }
+    const content = string(value.content, `${label}.content`);
+    // The locator's third segment is the revision's `content_sha256`, which
+    // production computes as `sha256Utf8Hex(content)`. A digest over other bytes
+    // describes a revision whose content is not the one recorded here.
+    if (locator.contentDigest !== sha256Utf8Hex(content)) {
+        fail(`${label}.revisionLocator: locator-digest-mismatch`);
+    }
     return {
         claimId: staticId(value.claimId, `${label}.claimId`, CLAIM_ID_RE),
         publicClaimId,
         revisionLocator,
-        content: string(value.content, `${label}.content`),
+        content,
         category: string(value.category, `${label}.category`),
         importance: boundedInteger(value.importance, `${label}.importance`, 1, 100),
         memoryScope: enumeration(value.memoryScope, CLAIM_SCOPES, `${label}.memoryScope`),
@@ -947,22 +964,69 @@ function parseManifestEvidence(
             fail(`${entryLabel}.publicClaimId: unobserved-claim`);
         }
     };
+    const filesOf = (entry: Record<string, unknown>, entryLabel: string): void => {
+        for (const [index, file] of array(entry.files, `${entryLabel}.files`).entries()) {
+            string(file, `${entryLabel}.files[${index}]`);
+        }
+    };
     if (task === "verify" || task === "verify-broad") {
         const root = record(value, label);
         exact(root, ["verified", "updated", "archived"], label);
         let entries = 0;
-        for (const key of ["verified", "updated", "archived"] as const) {
-            for (const [index, entry] of array(root[key], `${label}.${key}`).entries()) {
-                entryId(record(entry, `${label}.${key}[${index}]`), `${label}.${key}[${index}]`);
-                entries += 1;
-            }
+        // Field sets come straight from `parseVerifyManifest`: a verified entry
+        // carries its backing files, an update adds the replacement body, and an
+        // archive carries the reason instead of files.
+        for (const [index, entry] of array(root.verified, `${label}.verified`).entries()) {
+            const entryLabel = `${label}.verified[${index}]`;
+            const item = record(entry, entryLabel);
+            exact(item, ["publicClaimId", "files"], entryLabel);
+            entryId(item, entryLabel);
+            filesOf(item, entryLabel);
+            entries += 1;
+        }
+        for (const [index, entry] of array(root.updated, `${label}.updated`).entries()) {
+            const entryLabel = `${label}.updated[${index}]`;
+            const item = record(entry, entryLabel);
+            exact(item, ["publicClaimId", "files", "content"], entryLabel);
+            entryId(item, entryLabel);
+            filesOf(item, entryLabel);
+            string(item.content, `${entryLabel}.content`);
+            entries += 1;
+        }
+        for (const [index, entry] of array(root.archived, `${label}.archived`).entries()) {
+            const entryLabel = `${label}.archived[${index}]`;
+            const item = record(entry, entryLabel);
+            exact(item, ["publicClaimId", "reason"], entryLabel);
+            entryId(item, entryLabel);
+            if (typeof item.reason !== "string") fail(`${entryLabel}.reason: string-invalid`);
+            entries += 1;
         }
         if (entries === 0) fail(`${label}: evidence-empty`);
         return root;
     }
     const entries = array(value, label).map((entry, index) => {
-        const item = record(entry, `${label}[${index}]`);
-        entryId(item, `${label}[${index}]`);
+        const entryLabel = `${label}[${index}]`;
+        const item = record(entry, entryLabel);
+        entryId(item, entryLabel);
+        if (task === "map-memories") {
+            exact(item, ["publicClaimId", "files", "independent"], entryLabel);
+            filesOf(item, entryLabel);
+            boolean(item.independent, `${entryLabel}.independent`);
+            return item;
+        }
+        // `parseClassifyManifest` sets only the attributes the entry carried and
+        // refuses one that carried none, so the key set varies within that bound.
+        for (const key of Object.keys(item)) {
+            if (!["publicClaimId", "importance", "scope", "shareable"].includes(key)) {
+                fail(`${entryLabel}: fields-invalid`);
+            }
+        }
+        if (item.importance !== undefined) boundedInteger(item.importance, `${entryLabel}.importance`, 1, 100);
+        if (item.scope !== undefined) enumeration(item.scope, CLAIM_SCOPES, `${entryLabel}.scope`);
+        if (item.shareable !== undefined) boolean(item.shareable, `${entryLabel}.shareable`);
+        if (item.importance === undefined && item.scope === undefined && item.shareable === undefined) {
+            fail(`${entryLabel}: classification-empty`);
+        }
         return item;
     });
     if (entries.length === 0) fail(`${label}: evidence-empty`);
@@ -1058,7 +1122,12 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
         if (rawManifest === null || rawManifest.trim().length === 0) {
             fail(`${label}.rawManifest: fail-requires-evidence`);
         }
-        if (reason !== "invalid-output" && parsedManifest === null) {
+        if (reason === "invalid-output") {
+            // The reason is raised from the catch around validation, which returns
+            // before any parse result exists, so evidence alongside it is a
+            // combination no run produces.
+            if (parsedManifest !== null) fail(`${label}.parsedManifest: invalid-output-has-evidence`);
+        } else if (parsedManifest === null) {
             fail(`${label}.parsedManifest: fail-requires-evidence`);
         }
     }
