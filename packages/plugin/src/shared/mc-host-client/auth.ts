@@ -111,6 +111,25 @@ function constantTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
     return timingSafeEqual(a, b);
 }
 
+/**
+ * Byte equality for authenticated daemon identities, shared by every
+ * daemon-identity fence so their comparison semantics cannot drift. An absent
+ * identity on either side never matches: an unknown identity is not evidence
+ * of the expected daemon, so fences built on this helper fail closed when an
+ * identity is missing. Callers that treat "no expectation" as "skip the
+ * check" must branch on that before calling. Constant-time over equal
+ * lengths.
+ */
+export function daemonIdEquals(
+    left: Uint8Array | null | undefined,
+    right: Uint8Array | null | undefined,
+): boolean {
+    if (left === null || left === undefined || right === null || right === undefined) {
+        return false;
+    }
+    return constantTimeEqual(left, right);
+}
+
 function checkDeadline(deadline: Deadline): void {
     if (deadline.isExpired()) {
         throw new AuthError("authentication deadline expired", "deadline_expired");

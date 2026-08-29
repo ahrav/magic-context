@@ -276,7 +276,11 @@ function classifyError(value: unknown): SynapseEmbeddingError {
     else if (normalized.includes("probe_required")) mapped = "probe_required";
     else if (normalized.includes("idempotency_conflict")) mapped = "idempotency_conflict";
     else if (normalized.includes("schema")) mapped = "schema_violation";
-    else if (normalized.includes("daemon_generation_changed")) mapped = "module_restarted";
+    // A daemon_generation_changed rejection is client-side and pre-publication:
+    // no request reached the daemon, so it is transient transport failure, not
+    // `module_restarted` evidence, which spends a page's single durable restart
+    // budget on an attempt the daemon never saw.
+    else if (normalized.includes("daemon_generation_changed")) mapped = "transport";
     else if (normalized.includes("module_restarted") || normalized.includes("module restarted"))
         mapped = "module_restarted";
     const message = value instanceof Error ? value.message : String(value);
@@ -1626,6 +1630,15 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 );
             } catch (error) {
                 const classified = classifyError(error);
+                // The daemon-identity fence rejected before publication: the
+                // bound identity is stale, and every retry carrying it fails
+                // identically. Drop the binding and surface the failure so the
+                // next initialize() revalidates against the live daemon.
+                if (readErrorCode(error) === "daemon_generation_changed") {
+                    this.initialized = false;
+                    this.compatibleDaemonId = null;
+                    throw classified;
+                }
                 if (classified.code === "idempotency_conflict") throw classified;
                 // R21: module_restarted bypasses generic retry entirely; the
                 // caller owns the single durable restart resubmission.
