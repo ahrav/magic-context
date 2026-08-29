@@ -15,7 +15,17 @@
  */
 
 import { execSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+    existsSync,
+    lstatSync,
+    mkdirSync,
+    readFileSync,
+    readdirSync,
+    realpathSync,
+    renameSync,
+    rmSync,
+    writeFileSync,
+} from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import {
     HARD_NEGATIVE_FAMILIES,
@@ -35,6 +45,7 @@ import {
     type SystemVersionTuple,
 } from "../src/historian-eval/runner";
 import {
+    LANE_REPORT_SCHEMA,
     buildLaneReport,
     laneBudgetExhaustedScore,
     laneExitCode,
@@ -544,6 +555,31 @@ async function runLive(args: CliArgs): Promise<number> {
  * as this invocation's.
  */
 /**
+ * Canonical filesystem location of a path that may not exist yet.
+ *
+ * `resolve` is purely lexical, so it leaves symlink components intact and a
+ * containment test over its output can be defeated by one: with `/tmp/out` linked
+ * to `/tmp/dev`, `--report /tmp/out/hse-a.json` is lexically outside
+ * `--scenarios /tmp/dev` while writing straight into it. Output paths do not exist
+ * when the check runs, and `realpathSync` throws on a missing path, so the nearest
+ * EXISTING ancestor is canonicalized and the remaining segments are rejoined.
+ */
+function canonicalPath(path: string): string {
+    const absolute = resolve(path);
+    const trailing: string[] = [];
+    let probe = absolute;
+    for (;;) {
+        if (existsSync(probe)) return join(realpathSync.native(probe), ...trailing.reverse());
+        const parent = dirname(probe);
+        // Filesystem root: nothing above it exists either, so the lexical form is
+        // the best available answer.
+        if (parent === probe) return absolute;
+        trailing.push(basename(probe));
+        probe = parent;
+    }
+}
+
+/**
  * Whether any path this run will WRITE overlaps the corpus it will READ.
  *
  * Checked before a single removal, because the cleanup runs before `loadCorpus`:
@@ -558,15 +594,59 @@ async function runLive(args: CliArgs): Promise<number> {
  * resolved paths with a separator boundary, so `/tmp/a-runs` is not treated as living
  * inside `/tmp/a`.
  */
+/**
+ * Whether the derived partial path holds an artifact this lane produced.
+ *
+ * The suffix check above stops the lane from ever WRITING a completed report at a
+ * path that is some other report's partial, but a file can already be sitting there
+ * — from a foreign tool, or a lane version predating that check. Deleting it
+ * unseen is how `--report foo` destroyed a completed audit named
+ * `foo.partial.json`, so removal now requires positive identification and anything
+ * unrecognized is refused by `unrecognizedPartialArtifactError` instead.
+ */
+function partialPathIsOurs(reportPath: string): boolean {
+    const path = partialReportPath(reportPath);
+    if (!existsSync(path) || !lstatSync(path).isFile()) return false;
+    try {
+        return (JSON.parse(readFileSync(path, "utf8")) as { schema?: unknown }).schema === LANE_REPORT_SCHEMA;
+    } catch {
+        return false;
+    }
+}
+
+/** Refuses rather than overwriting a file this lane cannot identify as its own partial. */
+function unrecognizedPartialArtifactError(reportPath: string): string | null {
+    const path = partialReportPath(reportPath);
+    if (!existsSync(path)) return null;
+    if (!lstatSync(path).isFile()) return null;
+    if (partialPathIsOurs(reportPath)) return null;
+    return `${path} already exists and is not a ${LANE_REPORT_SCHEMA} artifact; refusing to overwrite a file this lane did not write`;
+}
+
+/**
+ * Whether the report name collides with the partial artifact of another report.
+ *
+ * `partialReportPath` appends a fixed suffix, so the ONLY way a report path can be
+ * some other report's partial is by carrying that suffix itself — which makes one
+ * suffix check exhaustive for the whole class. Left open, a completed audit at
+ * `foo.partial.json` was treated as the partial of `--report foo` and deleted
+ * during cleanup, before admission could reject anything.
+ */
+function reportNameAliasesPartialError(reportPath: string): string | null {
+    const suffix = ".partial.json";
+    if (!resolve(reportPath).endsWith(suffix)) return null;
+    return `a report path may not end in ${suffix}: it is the name this lane derives for another report's partial artifact, and cleanup would delete it`;
+}
+
 function artifactCorpusOverlapError(args: CliArgs): string | null {
     const corpus = args.releaseDir ?? args.scenariosDir;
     if (corpus === null) return null;
-    const root = resolve(corpus);
+    const root = canonicalPath(corpus);
     const within = (inner: string, outer: string): boolean => inner === outer || inner.startsWith(`${outer}${sep}`);
     for (const [label, owned] of [
-        ["report", resolve(args.reportPath)],
-        ["partial report", partialReportPath(args.reportPath)],
-        ["run records directory", liveRunArtifactsDir(args.reportPath)],
+        ["report", canonicalPath(args.reportPath)],
+        ["partial report", canonicalPath(partialReportPath(args.reportPath))],
+        ["run records directory", canonicalPath(liveRunArtifactsDir(args.reportPath))],
     ] as const) {
         if (within(owned, root) || within(root, owned)) {
             return `the ${label} path ${owned} overlaps the selected corpus at ${root}; refusing to clear artifacts that would delete corpus input`;
@@ -588,7 +668,7 @@ function clearPreviousLiveArtifacts(reportPath: string): void {
     // diagnostic — so removal is limited to real files here and the shape is
     // reported as an admission failure by `assertLiveArtifactPathsUsable`.
     removeIfFile(resolve(reportPath));
-    removeIfFile(partialReportPath(reportPath));
+    if (partialPathIsOurs(reportPath)) removeIfFile(partialReportPath(reportPath));
     // Only ever recursive-removes a real DIRECTORY. The suffix is user-spellable, so
     // a completed audit written to `--report foo-runs` sits exactly where a later
     // `--report foo` derives its records — and an unguarded recursive remove would
@@ -602,10 +682,17 @@ function clearPreviousLiveArtifacts(reportPath: string): void {
 async function main(): Promise<number> {
     const args = parseArgs(Bun.argv.slice(2));
     if (args.mode === "live") {
-        const overlap = artifactCorpusOverlapError(args);
-        if (overlap !== null) {
-            console.error(`live admission: ${overlap}`);
-            return 1;
+        // Both refusals precede every removal: cleanup would otherwise destroy the
+        // very artifact the check exists to protect.
+        for (const problem of [
+            reportNameAliasesPartialError(args.reportPath),
+            unrecognizedPartialArtifactError(args.reportPath),
+            artifactCorpusOverlapError(args),
+        ]) {
+            if (problem !== null) {
+                console.error(`live admission: ${problem}`);
+                return 1;
+            }
         }
         clearPreviousLiveArtifacts(args.reportPath);
         return runLive(args);

@@ -75,7 +75,7 @@ import type {
  * incompatible report shapes and a consumer could not tell an archived report from
  * a current one.
  */
-const LANE_REPORT_SCHEMA = "historian-eval-report/v3";
+export const LANE_REPORT_SCHEMA = "historian-eval-report/v3";
 
 /** KTD8 FAIL reason codes. */
 export const FAIL_REASONS = ["false-authoritative", "recall", "structural", "probe", "invalid-output"] as const;

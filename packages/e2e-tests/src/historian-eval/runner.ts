@@ -15,7 +15,7 @@
  * idempotency receipts and score first-attempt state.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
     extractLatestAssistantText,
@@ -74,6 +74,9 @@ export type { InjectedClaimRecord } from "./claim-read";
  * producer would be rejected as `record-malformed` rather than as the older schema
  * it is.
  */
+/** Claim-capture-time database image; see `ScenarioRunner.capturedClaims`. */
+const PRE_PROBE_SNAPSHOT_FILE = "context-db-snapshot-pre-probe.sqlite";
+
 export const RUN_RECORD_SCHEMA = "historian-eval-run-record/v3";
 
 /**
@@ -1044,6 +1047,22 @@ class ScenarioRunner {
         nowMs: number;
         injectedClaims: InjectedClaimRecord[];
         perGoldPredicate: PerGoldPredicateCount[];
+        /**
+         * Database image taken WITH the claim read above, not after the abort.
+         *
+         * The scorer binds an aborted record's claim array to its snapshot by
+         * requiring the two claim sets to be identical, which holds only if they
+         * describe the same instant. A snapshot taken when the abort unwinds does
+         * not: `driveProbes` waits for an undeclared historian pass to FINISH
+         * before reporting it, and a finished pass can promote claims — so the
+         * post-abort store may legitimately differ from this array, and the
+         * scorer would read that as an unbindable artifact and drop an already
+         * observed run-fatal promotion to an integrity ERROR.
+         *
+         * Superseded and deleted on the completion path, where the end-of-run
+         * snapshot is the one facts are scored from.
+         */
+        snapshotPath: string;
     } | null = null;
     private sessionId = "";
 
@@ -1113,15 +1132,20 @@ class ScenarioRunner {
     }
 
     private emptyRecord(error: RunRecordError): HistorianEvalRunRecord {
-        // Best-effort DB snapshot: an ERROR record with the database beside
-        // it is diagnosable without re-running the scenario.
-        let snapshotPath = "";
-        try {
-            if (this.harness !== null && this.harness.hasContextDb()) {
-                snapshotPath = this.snapshotContextDb(this.harness);
+        // The snapshot taken WITH the claim capture, when there is one: the scorer
+        // requires an aborted record's claim array and snapshot to describe the same
+        // instant, and a snapshot taken here does not (see `capturedClaims`). Only
+        // when nothing was captured does a fresh best-effort image apply — an ERROR
+        // record with the database beside it is diagnosable without re-running.
+        let snapshotPath = this.capturedClaims?.snapshotPath ?? "";
+        if (snapshotPath === "") {
+            try {
+                if (this.harness !== null && this.harness.hasContextDb()) {
+                    snapshotPath = this.snapshotContextDb(this.harness);
+                }
+            } catch {
+                snapshotPath = "";
             }
-        } catch {
-            snapshotPath = "";
         }
         return {
             ...this.baseRecord(),
@@ -1266,7 +1290,12 @@ class ScenarioRunner {
         // (KTD1).
         const nowMs = Date.now();
         const { injectedClaims, perGoldPredicate } = this.captureClaimState(harness, nowMs);
-        this.capturedClaims = { nowMs, injectedClaims, perGoldPredicate };
+        this.capturedClaims = {
+            nowMs,
+            injectedClaims,
+            perGoldPredicate,
+            snapshotPath: this.snapshotContextDb(harness, PRE_PROBE_SNAPSHOT_FILE),
+        };
 
         const probes = await this.driveProbes(harness, sessionId);
         // Again, because the probe phase is provider traffic too. The call before the
@@ -1284,6 +1313,10 @@ class ScenarioRunner {
         const claimIdLeak = probeResponseClaimIdLeak({ scenario: this.scenario, exchanges: probes, injectedClaims });
         if (claimIdLeak !== null) throw new RunAbort("probe-response-leak", claimIdLeak);
         const snapshotPath = this.snapshotContextDb(harness);
+        // The completion path scores facts from THIS image, and `driveProbes` has
+        // already proven no undeclared pass moved the store, so the pre-probe copy is
+        // redundant here rather than a second answer to archive.
+        rmSync(join(this.options.artifactDir, PRE_PROBE_SNAPSHOT_FILE), { force: true });
 
         return {
             ...this.baseRecord(),
@@ -2338,7 +2371,15 @@ class ScenarioRunner {
         try {
             const nowMs = Date.now();
             const { injectedClaims, perGoldPredicate } = this.captureClaimState(harness, nowMs);
-            this.capturedClaims = { nowMs, injectedClaims, perGoldPredicate };
+            // Paired with the read, for the same reason the pre-probe capture is:
+            // the scorer requires an aborted record's claims and snapshot to
+            // describe one instant.
+            this.capturedClaims = {
+                nowMs,
+                injectedClaims,
+                perGoldPredicate,
+                snapshotPath: this.snapshotContextDb(harness, PRE_PROBE_SNAPSHOT_FILE),
+            };
         } catch {
             // Intentionally swallowed; see above.
         }
@@ -2369,8 +2410,8 @@ class ScenarioRunner {
         }
     }
 
-    private snapshotContextDb(harness: TestHarness): string {
-        const snapshotPath = join(this.options.artifactDir, "context-db-snapshot.sqlite");
+    private snapshotContextDb(harness: TestHarness, fileName = "context-db-snapshot.sqlite"): string {
+        const snapshotPath = join(this.options.artifactDir, fileName);
         // VACUUM INTO produces a complete single-file image regardless of the
         // live database's WAL state; a plain file copy would silently drop
         // committed pages still sitting in `-wal`.
