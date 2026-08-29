@@ -203,5 +203,13 @@ is unset; every pre-ORT rejection path runs hermetically without it.
 - The Linux native payload stages the qualified manifest, corpus,
   model/tokenizer files, and exact CPU ONNX Runtime together in one
   content-addressed generation. `ck-mc-host serve` derives `SynapseConfig`
-  only from that revalidated generation. macOS uses the host-only lane and
-  reports exact readiness `unsupported` / `synapse_unsupported`.
+  only from that revalidated generation.
+- On macOS the Synapse component is built in its host-only form and carries
+  exact readiness `unsupported` / `synapse_unsupported`. No client observes
+  that value from a macOS daemon, because the daemon does not reach
+  publication: `ck-mc-host serve` composes Synapse alongside Broca, Broca
+  refuses to initialize off Linux (its crash-ownership records and sweeps
+  depend on `/proc` process identity), and the composite requires every
+  child initializer to succeed. Serving this lane on macOS therefore
+  requires a Broca component that initializes off Linux as unavailable
+  rather than failing.
