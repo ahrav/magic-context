@@ -1020,10 +1020,16 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
         }
         const installedEvidencePath = join(rootDir, EVIDENCE_PATH);
         const installedEvidenceBytes = readFileSync(installedEvidencePath);
-        if (
-            canonicalJson(JSON.parse(installedEvidenceBytes.toString("utf8"))) !==
-            canonicalJson(evidence)
-        ) {
+        // Truncated or hand-mangled bytes on disk are a failed attestation, not a
+        // crash: an unguarded parse would abort with a bare SyntaxError instead of
+        // the structured failure every other malformed-input path here reports.
+        let installedEvidenceValue: unknown;
+        try {
+            installedEvidenceValue = JSON.parse(installedEvidenceBytes.toString("utf8"));
+        } catch {
+            fail(`installed release evidence at ${EVIDENCE_PATH} is malformed JSON`);
+        }
+        if (canonicalJson(installedEvidenceValue) !== canonicalJson(evidence)) {
             fail("installed release evidence bytes differ from the validated value");
         }
         const installedEvidenceSha256 = createHash("sha256")

@@ -393,8 +393,8 @@ async fn run(opts: Opts) -> Result<serde_json::Value, String> {
             // Send lag is load-generator debt, never host latency: a slot
             // that starts one full interval late means the delivered
             // arrival process no longer matches the requested rate label.
-            let lag_ns = u64::try_from(now.duration_since(scheduled).as_nanos())
-                .unwrap_or(u64::MAX);
+            let lag_ns =
+                u64::try_from(now.duration_since(scheduled).as_nanos()).unwrap_or(u64::MAX);
             send_lag_max_ns = send_lag_max_ns.max(lag_ns);
             if lag_ns >= interval_ns {
                 missed_slots += 1;

@@ -1203,6 +1203,31 @@ mod tests {
         tempfile::tempdir().expect("temp data root")
     }
 
+    /// Plants a FIFO where a coordination path expects a regular file, so the
+    /// mutators and probes can prove they classify a hostile shape as such.
+    ///
+    /// The POSIX `mkfifo` utility, not rustix: rustix gates `mkfifoat` away from
+    /// Apple targets, and this crate is `deny(unsafe_code)`, so calling
+    /// `mkfifo(2)` directly is not available either. A lock name must classify as
+    /// a hostile shape on every platform, so this stays compiled everywhere
+    /// rather than being cfg'd out on the one whose absence let a build break
+    /// reach CI unnoticed.
+    ///
+    /// `-m 600` is load-bearing: POSIX has `mkfifo` apply that mode at creation
+    /// rather than deriving it from the umask, so the node is never briefly
+    /// reachable at a wider mode the way a create-then-`chmod` sequence leaves
+    /// it. These tests assert that a coordination node is never accessible
+    /// outside its intended mode, so the setup must not violate that invariant.
+    fn plant_fifo(path: &Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg("-m")
+            .arg("600")
+            .arg(path)
+            .status()
+            .expect("mkfifo is a POSIX utility present on every supported platform");
+        assert!(status.success(), "mkfifo failed for {}", path.display());
+    }
+
     fn record_path(guard: &InstanceGuard) -> PathBuf {
         guard.dir_path().join(LIFECYCLE_RECORD_NAME)
     }
@@ -1720,21 +1745,7 @@ mod tests {
             let root = temp_root();
             let coordination = coordination_dir_path(Some(root.path())).expect("path");
             std::fs::create_dir_all(&coordination).expect("coordination root");
-            let fifo = coordination.join(name);
-            // The POSIX `mkfifo` utility, not rustix: rustix gates `mkfifoat`
-            // away from Apple targets, and this crate is `deny(unsafe_code)`, so
-            // calling `mkfifo(2)` directly is not available either. A lock name
-            // must classify as a hostile shape on every platform, so this stays
-            // compiled everywhere rather than being cfg'd out on the one whose
-            // absence let a build break reach CI unnoticed. `mkfifo` honours the
-            // umask, so the mode is set explicitly afterwards.
-            let made = std::process::Command::new("mkfifo")
-                .arg(&fifo)
-                .status()
-                .expect("mkfifo is a POSIX utility present on every supported platform");
-            assert!(made.success(), "mkfifo failed: {made:?}");
-            std::fs::set_permissions(&fifo, std::fs::Permissions::from_mode(0o600))
-                .expect("owner-only fifo");
+            plant_fifo(&coordination.join(name));
             let mutator_err = if name == TRANSACTION_LOCK_NAME {
                 LifecycleTransactionLock::acquire_exclusive(Some(root.path())).err()
             } else {
@@ -1937,8 +1948,7 @@ mod tests {
             // writing, so a blocking open can never complete.
             let path = guard.dir_path().join(name);
             let _ = std::fs::remove_file(&path);
-            rustix::fs::mkfifoat(rustix::fs::CWD, path.as_path(), Mode::from_raw_mode(0o600))
-                .expect("plant fifo");
+            plant_fifo(&path);
 
             let root_path = root.path().to_path_buf();
             let state = within(
@@ -1971,8 +1981,7 @@ mod tests {
         let root = temp_root();
         let guard = acquire(root.path());
         let path = record_path(&guard);
-        rustix::fs::mkfifoat(rustix::fs::CWD, path.as_path(), Mode::from_raw_mode(0o600))
-            .expect("plant fifo");
+        plant_fifo(&path);
 
         within(
             Duration::from_secs(5),
