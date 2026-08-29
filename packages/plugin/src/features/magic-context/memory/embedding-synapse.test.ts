@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { McHostCallError } from "../../../shared/mc-host-client";
+import { WaiterDetachedError } from "../../../shared/mc-host-lifecycle";
 import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import {
@@ -327,12 +328,12 @@ describe("SynapseEmbeddingProvider", () => {
             connectionOrigin: string;
             compatibleDaemonId: Uint8Array | null;
             initialized: boolean;
-            recertifyForRestart(signal?: AbortSignal): Promise<boolean>;
+            rebindAfterModuleRestart(deadlineAt: number, signal?: AbortSignal): Promise<void>;
         };
         internals.connectionOrigin = "managed-default";
         internals.compatibleDaemonId = certified;
 
-        const flight = internals.recertifyForRestart();
+        const flight = internals.rebindAfterModuleRestart(Date.now() + 60_000);
         await Promise.resolve();
         await Promise.resolve();
 
@@ -345,8 +346,35 @@ describe("SynapseEmbeddingProvider", () => {
         expect(internals.compatibleDaemonId).toEqual(certified);
 
         release();
-        expect(await flight).toBe(true);
+        await expect(flight).resolves.toBeUndefined();
         expect(internals.compatibleDaemonId).toEqual(recertified);
+    });
+
+    it("does not arm managed-demand backoff for caller detachment", async () => {
+        const client = new MockSynapseClient();
+        let demands = 0;
+        const provider = new SynapseEmbeddingProvider({
+            projectRoot: "/repo",
+            session: "managed-detachment",
+            connectionOrigin: "managed-default",
+            clientFactory: async () => client,
+            demandStart: async () => {
+                demands += 1;
+                if (demands === 1) throw new WaiterDetachedError("aborted");
+                return {
+                    ok: true,
+                    reason: "started",
+                    storage: "ready",
+                    authenticatedDaemonId: new Uint8Array([1]),
+                };
+            },
+        });
+        const internals = provider as unknown as { connectionOrigin: string };
+        internals.connectionOrigin = "managed-default";
+
+        expect(await provider.initialize()).toBe(false);
+        expect(await provider.initialize()).toBe(true);
+        expect(demands).toBe(2);
     });
 
     it("adopts the catalog's advertised input limits", async () => {
@@ -2133,10 +2161,8 @@ describe("embedItemsDetailed", () => {
 
             expect(result.failures).toEqual([]);
             expect(result.receipts).toHaveLength(1);
-            // At least one re-derivation past the initial demand. The exact
-            // count is not pinned: recovery re-certifies at both the page and
-            // the lane, and that split is not this test's contract.
-            expect(demands).toBeGreaterThanOrEqual(2);
+            // Initial certification plus one bounded rebind for the restart.
+            expect(demands).toBe(2);
             const batches = host.batchCalls();
             expect(batches).toHaveLength(2);
             expect(batches[0].expectedDaemonId).toEqual(daemonIds[0]);
@@ -2979,9 +3005,7 @@ describe("embedItemsDetailed", () => {
     });
 
     it("keeps the original legacy page deadline across daemon rebind and polling", async () => {
-        const realNow = Date.now;
         let now = 1_000;
-        Date.now = () => now;
         try {
             const host = new DetailedHost();
             host.resultPages = (jobId, items) => {
@@ -3008,6 +3032,7 @@ describe("embedItemsDetailed", () => {
                 dims: 3,
                 recommendedBatch: 2,
                 batchTimeoutMs: 100,
+                now: () => now,
                 clientFactory: async () => host,
             });
             const daemonIds = [new Uint8Array([1]), new Uint8Array([2])];
@@ -3047,7 +3072,7 @@ describe("embedItemsDetailed", () => {
                 .find((call) => call.params.job_id === "job-2");
             expect(replacementPoll?.timeoutMs).toBe(60);
         } finally {
-            Date.now = realNow;
+            _resetSynapseClientForTests();
         }
     });
 

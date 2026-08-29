@@ -1374,9 +1374,8 @@ describe("demand-start coalescing and detachment (U3 scenarios 15-16)", () => {
         // The waiter has already cleared its timer and detached its abort
         // listener by the time the start resolves, so the storage probe needs a
         // bound of its own or it would keep `demandStart` pending forever with
-        // nothing watching. Expiry degrades to `unavailable` rather than
-        // rejecting: the start itself succeeded, and a caller that must not send
-        // an application body already gates on `storage === "ready"`.
+        // nothing watching. Expiry remains caller detachment even though the
+        // shared start itself succeeded.
         const root = tempDir("mc-policy-storage-deadline-");
         const { binary } = fakeBinary(root);
         const budgets: number[] = [];
@@ -1392,16 +1391,48 @@ describe("demand-start coalescing and detachment (U3 scenarios 15-16)", () => {
                     return "ready";
                 },
             });
-            const outcome = await policy.demandStart({
-                origin: "managed-default",
-                capability: "magic-context",
-                deadlineMs: CALLER_BUDGET_MS,
+            await expect(
+                policy.demandStart({
+                    origin: "managed-default",
+                    capability: "magic-context",
+                    deadlineMs: CALLER_BUDGET_MS,
+                }),
+            ).rejects.toMatchObject({
+                name: "WaiterDetachedError",
+                cause_kind: "deadline",
             });
-            expect(outcome.result.ok).toBe(true);
-            expect(outcome.storage).toBe("unavailable");
             // The caller's residual budget bounded the probe, not the 5s hard cap.
             expect(budgets).toHaveLength(1);
             expect(budgets[0]).toBeLessThanOrEqual(CALLER_BUDGET_MS);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 20_000);
+
+    test("caller cancellation during storage readiness stays detached", async () => {
+        const root = tempDir("mc-policy-storage-abort-");
+        const { binary } = fakeBinary(root);
+        const controller = new AbortController();
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                storageProbe: () => {
+                    queueMicrotask(() => controller.abort());
+                    return new Promise<never>(() => {});
+                },
+            });
+
+            await expect(
+                policy.demandStart({
+                    origin: "managed-default",
+                    capability: "magic-context",
+                    signal: controller.signal,
+                }),
+            ).rejects.toMatchObject({
+                name: "WaiterDetachedError",
+                cause_kind: "aborted",
+            });
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
@@ -1547,7 +1578,7 @@ describe("demand-start coalescing and detachment (U3 scenarios 15-16)", () => {
         }
     }, 20_000);
 
-    test("a hanging storage probe is bounded and degrades to unavailable", async () => {
+    test("a hanging storage probe detaches at the caller deadline", async () => {
         const root = tempDir("mc-policy-storage-hang-");
         const { binary } = fakeBinary(root);
         try {
@@ -1557,13 +1588,16 @@ describe("demand-start coalescing and detachment (U3 scenarios 15-16)", () => {
                 // Never settles; the policy's own bound must end the wait.
                 storageProbe: () => new Promise<never>(() => {}),
             });
-            const outcome = await policy.demandStart({
-                origin: "managed-default",
-                capability: "magic-context",
-                deadlineMs: 250,
+            await expect(
+                policy.demandStart({
+                    origin: "managed-default",
+                    capability: "magic-context",
+                    deadlineMs: 250,
+                }),
+            ).rejects.toMatchObject({
+                name: "WaiterDetachedError",
+                cause_kind: "deadline",
             });
-            expect(outcome.result.ok).toBe(true);
-            expect(outcome.storage).toBe("unavailable");
         } finally {
             rmSync(root, { recursive: true, force: true });
         }

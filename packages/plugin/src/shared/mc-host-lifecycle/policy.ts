@@ -436,10 +436,11 @@ export class McHostLifecyclePolicy {
                 request.signal,
                 storageBudget,
             );
-        } catch {
-            // Compatibility is already proven. A storage timeout, cancellation,
-            // or failed observation cannot erase that proof; it only means this
-            // demand may not publish application traffic.
+        } catch (error) {
+            if (error instanceof WaiterDetachedError) throw error;
+            // Compatibility is already proven. A failed storage observation
+            // cannot erase that proof; it only means this demand may not publish
+            // application traffic.
             return { result: compatibleResult, storage: "unavailable", authenticatedDaemonId };
         }
         return { result: compatibleResult, storage, authenticatedDaemonId };

@@ -14,6 +14,7 @@ import {
     resolveConnectionOrigin,
     STORAGE_HARD_BUDGET_MS,
     type StorageReadiness,
+    WaiterDetachedError,
 } from "../../../shared/mc-host-lifecycle";
 import {
     createSynapseLedgerPage,
@@ -218,6 +219,14 @@ export class SynapseEmbeddingError extends Error {
      * the binding resubmit the identical request key without that charge.
      */
     prePublicationFence?: boolean;
+    /**
+     * Daemon identity the failed attempt published against, recorded when the
+     * failure reports a rotation. `null` records an attempt made with no bound
+     * identity. The lane's certified identity can advance while an attempt is
+     * in flight, so recovery compares against this value rather than assuming
+     * the installed identity is the one that failed.
+     */
+    attemptDaemonId?: Uint8Array | null;
 
     constructor(
         code: SynapseErrorCode,
@@ -812,6 +821,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         try {
             outcome = await demand;
         } catch (error) {
+            if (error instanceof WaiterDetachedError) throw error;
             this.demandFailedUntilMs = this.now() + SYNAPSE_DEMAND_RETRY_BACKOFF_MS;
             if (error instanceof SynapseEmbeddingError) throw error;
             throw new SynapseEmbeddingError(
@@ -972,11 +982,14 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         if (this.connectionOrigin !== "managed-default") return;
         this.initialized = false;
         this.managedDemand = null;
-        const remainingMs = deadlineAt - Date.now();
+        const remainingMs = deadlineAt - this.now();
         if (remainingMs <= 0) {
             throw new SynapseEmbeddingError("timeout", "Synapse page deadline exhausted");
         }
         if (!(await this.initialize(signal, remainingMs))) {
+            if (signal?.aborted) {
+                throw new SynapseEmbeddingError("cancelled", "Synapse request aborted");
+            }
             throw new SynapseEmbeddingError(
                 "transport",
                 "Synapse daemon compatibility rebind failed",
@@ -1150,15 +1163,20 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
             if (group) group.push(item);
             else groups.set(item.applicationGroup, [item]);
         }
-        const ready = await this.initialize();
+        const ready = await this.initialize(signal);
         if (!ready || !this.metadata) {
+            const cancelled = signal?.aborted === true;
             for (const [applicationGroup, groupItems] of groups) {
                 result.failures.push({
                     applicationGroup,
                     items: groupItems.map(({ id, contentSha256 }) => ({ id, contentSha256 })),
                     rowId: null,
-                    code: this.permanentFailure ? "artifact_invalid" : "transport",
-                    message: "Synapse lane is unavailable",
+                    code: this.permanentFailure
+                        ? "artifact_invalid"
+                        : cancelled
+                          ? "cancelled"
+                          : "transport",
+                    message: cancelled ? "Synapse request aborted" : "Synapse lane is unavailable",
                     disposition: this.permanentFailure ? "permanent" : "retryable",
                 });
             }
@@ -1516,7 +1534,6 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                             "restart budget or page deadline exhausted",
                         );
                     }
-                    if (!(await this.recertifyForRestart(signal))) throw classified;
                 }
             }
         } catch (error) {
@@ -1920,6 +1937,10 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                     `Synapse ${method} deadline of ${timeoutMs}ms exhausted`,
                 );
             const attemptDeadlineMs = Math.floor(remainingMs);
+            // The identity this attempt publishes against, read before the
+            // call so a failure reports the binding it carried rather than a
+            // binding a concurrent re-certification installed since.
+            const attemptDaemonId = this.compatibleDaemonId;
             try {
                 if (!this.client)
                     throw new SynapseEmbeddingError("transport", "Synapse client is unavailable");
@@ -1968,7 +1989,10 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 if (classified.code === "idempotency_conflict") throw classified;
                 // R21: module_restarted bypasses generic retry entirely; the
                 // caller owns the single durable restart resubmission.
-                if (classified.code === "module_restarted") throw classified;
+                if (classified.code === "module_restarted") {
+                    classified.attemptDaemonId = attemptDaemonId;
+                    throw classified;
+                }
                 if (classified.code === "cancelled") throw classified;
                 const outcomeUnknown = isMcHostCallError(error) && error.kind === "outcome_unknown";
                 const retryable = !classified.permanent && (retryEmbeddings || !outcomeUnknown);
@@ -2043,26 +2067,6 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 `Synapse table epoch changed from ${metadata.table_epoch} to ${epoch}`,
             );
         }
-    }
-
-    /**
-     * Re-certify the managed lane after a rotation. A restart budget authorizes
-     * one resubmission, and a resubmission may publish only against a freshly
-     * certified incarnation, so clearing `initialized` forces `initialize` to
-     * re-derive the identity from a fresh demand.
-     *
-     * The identity is not cleared here. `initialize` is its only writer and
-     * writes it on the success path, so one operation entering recertification
-     * cannot erase an incarnation a sibling already certified and is dispatching
-     * against — a sibling that spent its own restart budget would otherwise fail
-     * permanently on a fence it had already re-established. An identity that did
-     * rotate away is refused by the client fence before any byte is written, and
-     * that refusal is the sibling's own `module_restarted` to spend.
-     */
-    private async recertifyForRestart(signal?: AbortSignal): Promise<boolean> {
-        if (this.connectionOrigin !== "managed-default") return true;
-        this.initialized = false;
-        return await this.initialize(signal);
     }
 
     private logCallFailure(error: unknown, operation: string): void {
