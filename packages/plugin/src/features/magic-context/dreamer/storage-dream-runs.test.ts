@@ -186,8 +186,9 @@ describe("dream_runs claim-native change ids", () => {
         expect(changes.archivedIds).toBeUndefined();
         expect(changes.mergedIds).toBeUndefined();
         expect(changes.deletedIds).toBeUndefined();
-        // Counts stay 0: the panel's hasMemoryChanges gate ORs over every value,
-        // so a non-zero legacy count would render a block with no drill-down.
+        // Counts stay 0: a change-presence gate ORs over every value in the
+        // blob, so a non-zero legacy count would render a block with no
+        // drill-down behind it.
         expect({ ...changes, claimUpsertedIds: undefined }).toEqual({
             written: 0,
             deleted: 0,

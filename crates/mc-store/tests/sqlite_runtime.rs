@@ -46,7 +46,7 @@ fn manifest_components(fixture: &Value) -> Vec<(String, Vec<String>, Vec<String>
 fn sqlite_runtime_source() {
     let fixture = fixture();
 
-    // Vocabulary parity with the TypeScript host and the dashboard.
+    // Vocabulary parity with the TypeScript host.
     assert_eq!(
         u64::from(MC_APPLICATION_ID),
         fixture["applicationId"].as_u64().unwrap()

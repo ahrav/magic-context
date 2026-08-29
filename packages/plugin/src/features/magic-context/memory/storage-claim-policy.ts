@@ -503,8 +503,9 @@ export const EXPLICIT_USER_REVISION_PRODUCER = "dashboard:tauri";
 
 /** Exact explicit-user evidence for this revision. First revisions retain
  * their stated provenance. Later revisions qualify only when their bytes still
- * equal the first revision or when the dashboard's explicit-user channel
- * observed the revision's exact bytes. */
+ * equal the first revision or when an observation from the
+ * `EXPLICIT_USER_REVISION_PRODUCER` channel recorded the revision's exact
+ * bytes. */
 export function hasExplicitUserEvidence(db: Database, revisionId: number): boolean {
     return (
         db

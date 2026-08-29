@@ -36,7 +36,7 @@ Not all cache invalidations are equal. Magic Context classifies them into three 
 m[0] re-materializes only for events where the cache was already invalidated or the baseline content genuinely changed:
 
 - **Provider-side eviction:** model or provider change, system prompt hash change, idle timeout past the TTL.
-- **Content change:** first render, project memory epoch change (external edits, such as a CLI doctor repair), pending structural mutations (compartment delete/merge/recomp), project docs hash change.
+- **Content change:** first render, project memory epoch change (external edits, such as a CLI doctor repair path), pending structural mutations (compartment delete/merge/recomp), project docs hash change.
 
 Deliberately **not** triggers: new compartments (those ride the m[1] delta), new memories from in-session writes (those surface via the watermark in m[1]), and new user-profile additions (additive, also in m[1]). Triggering on any of these would bust m[0] on routine background work and defeat the design.
 
@@ -52,7 +52,7 @@ A **pressure backstop** forces a fold when m[1] grows too large relative to m[0]
 
 When the agent writes a memory via `ctx_memory`, it does **not** trigger an m[0] rebuild. Additive writes surface in m[1] via the watermark. Non-additive mutations (update, delete, archive) record a mutation log entry that renders as a `<memory-updates>` delta in m[1]. Both reconcile into m[0] on the next natural HARD bust.
 
-Only **external** memory edits — made outside the running session, such as the CLI `doctor authority` repair path or workspace-member changes — bump the project memory epoch, forcing an immediate m[0] re-materialize. An external editor can't otherwise signal a running session.
+Only **external** memory edits — made outside the running session, such as the CLI `doctor drain-authority` repair path or `doctor merge-identity` — bump the project memory epoch, forcing an immediate m[0] re-materialize. An external editor can't otherwise signal a running session.
 
 ## Honest framing
 

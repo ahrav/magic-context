@@ -59,7 +59,7 @@ The dreamer's **classify-memories** task scores each memory on importance, scope
 
 ## Workspaces
 
-A **workspace** groups multiple project repos so their project memories pool across member sessions — useful for multi-repo microservice setups where the same constraints and architecture decisions apply across services. Workspace membership lives in the shared database; choose which memory categories are shared (CONSTRAINTS only, by default). Shared visibility is read-only: member projects can read shared categories from neighbors, but only the owning project can update, archive, or merge its own memories. A malformed `share_categories` list fails closed to sharing nothing rather than accidentally sharing everything.
+A **workspace** groups multiple project repos so their project memories pool across member sessions — useful for multi-repo microservice setups where the same constraints and architecture decisions apply across services. Workspace membership lives in the shared database; workspaces created before the desktop app was removed keep pooling their shared categories (CONSTRAINTS only, by default), but no shipped surface currently creates a workspace or changes its shared categories. Shared visibility is read-only: member projects can read shared categories from neighbors, but only the owning project can update, archive, or merge its own memories. A malformed `share_categories` list fails closed to sharing nothing rather than accidentally sharing everything.
 
 ## Editing memories
 

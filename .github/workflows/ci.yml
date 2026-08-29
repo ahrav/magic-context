@@ -442,6 +442,36 @@ jobs:
       - name: Adversarial scenarios (Node 24)
         run: bun run --cwd packages/plugin test:mc-host-client:node
 
+  check-rust:
+    name: Check (Rust fmt + clippy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Provision metadata-only sibling stubs
+        run: sh scripts/provision-rust-ci-stubs.sh
+
+      - name: Format check (root workspace)
+        run: cargo fmt --check
+
+      - name: Clippy (root workspace)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Every workspace member takes mc-core with default features, so a plain
+      # --workspace pass never compiles the cache-core-off configuration; this
+      # check keeps that feature gate building.
+      - name: mc-core feature-off build
+        run: cargo check -p mc-core --no-default-features
+
   benchmark-retrieval-check:
     name: Benchmark (retrieval, deterministic CI profile)
     runs-on: ubuntu-latest
