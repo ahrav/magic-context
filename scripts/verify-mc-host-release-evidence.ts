@@ -23,6 +23,7 @@ const PAYLOAD_INDEX_PATH = "release/mc-host-payload-index.json";
 const STOP_PROVENANCE_PATH = "release/mc-host-n-minus-one-stop.json";
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const QUALIFICATION_WORKFLOW_PATH = ".github/workflows/mc-host-release-qualification.yml";
+const EXPECTED_REPOSITORY = "ahrav/magic-context";
 const TEST_REPORT_DIR = "tmp/mc-host-test-reports/";
 const TEST_REPORT_SCHEMA = "magic-context.mc-host-test-report/v1";
 
@@ -69,8 +70,21 @@ export interface WorkflowSource {
     workflow: string;
 }
 
+/**
+ * Returns the run id `runUrl` claims, or undefined when the URL is not an
+ * immutable run URL under `source.repository`.
+ *
+ * The origin and repository prefix are part of the match: a bare trailing
+ * `/actions/runs/<id>` would also accept a run id borrowed from a foreign
+ * host or repository, and the api path this feeds is rebuilt under
+ * `source.repository`, so the borrowed id would be silently requalified as
+ * one of ours. The attempt is deliberately absent here -- it is signed into
+ * the certificate, not carried by the human-facing run URL.
+ */
 function claimedRunId(source: WorkflowSource): string | undefined {
-    return source.runUrl.match(/\/actions\/runs\/(\d+)$/)?.[1];
+    const prefix = `https://github.com/${source.repository}/actions/runs/`;
+    if (!source.runUrl.startsWith(prefix)) return undefined;
+    return source.runUrl.slice(prefix.length).match(/^(\d+)$/)?.[1];
 }
 
 export function workflowRunApiPath(source: WorkflowSource): string | null {
@@ -137,11 +151,16 @@ function matchedAttestationAttempt(
                 );
             });
         const runInvocationUri = fields.runInvocationURI;
-        const invocation =
-            typeof runInvocationUri === "string"
-                ? runInvocationUri.match(/\/actions\/runs\/(\d+)\/attempts\/(\d+)$/)
-                : null;
-        if (invocation === null || invocation[1] !== runId) continue;
+        // Anchored on the full expected origin, repository, and claimed run so a
+        // certificate cannot satisfy this by carrying a matching trailing
+        // `/attempts/<n>` for a run that belongs to another repository.
+        const invocationPrefix = `https://github.com/${source.repository}/actions/runs/${runId}/attempts/`;
+        const attempt =
+            typeof runInvocationUri === "string" &&
+            runInvocationUri.startsWith(invocationPrefix)
+                ? runInvocationUri.slice(invocationPrefix.length).match(/^(\d+)$/)?.[1]
+                : undefined;
+        if (attempt === undefined) continue;
         if (
             fields.sourceRepositoryURI === `https://github.com/${source.repository}` &&
             fields.sourceRepositoryDigest === source.headSha &&
@@ -150,7 +169,7 @@ function matchedAttestationAttempt(
                 `https://github.com/${source.repository}/${source.workflow}` &&
             artifactMatches
         ) {
-            return invocation[2];
+            return attempt;
         }
     }
     return null;
@@ -832,10 +851,10 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
         const headSha = stringField(source, "head_sha", `proof ${proof.path}.source`);
         const workflow = stringField(source, "workflow", `proof ${proof.path}.source`);
         if (
-            !/^https:\/\/github\.com\/ahrav\/magic-context\/actions\/runs\/\d+$/.test(runUrl) ||
-            repository !== "ahrav/magic-context" ||
+            repository !== EXPECTED_REPOSITORY ||
+            claimedRunId({ runUrl, repository, headSha, workflow }) === undefined ||
             !/^[0-9a-f]{40}$/.test(headSha) ||
-            headSha !== expectedHeadSha ||
+            (requireQualified && headSha !== expectedHeadSha) ||
             workflow !== QUALIFICATION_WORKFLOW_PATH
         ) {
             fail(`proof artifact ${proof.kind}:${proof.subject} has no immutable workflow run`);

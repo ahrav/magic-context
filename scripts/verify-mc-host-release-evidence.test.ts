@@ -368,6 +368,67 @@ describe("installed release evidence", () => {
         );
     });
 
+    test("run urls and invocation uris are anchored to the expected repository", () => {
+        const source = {
+            runUrl: "https://github.com/ahrav/magic-context/actions/runs/123456",
+            repository: "ahrav/magic-context",
+            headSha: "a".repeat(40),
+            workflow: ".github/workflows/mc-host-release-qualification.yml",
+        };
+        // The api path is rebuilt under source.repository, so a run id borrowed
+        // from a foreign repository or host must not survive parsing as ours.
+        expect(
+            workflowRunApiPath({
+                ...source,
+                runUrl: "https://github.com/evil/fork/actions/runs/123456",
+            }),
+        ).toBeNull();
+        expect(
+            workflowRunApiPath({
+                ...source,
+                runUrl: "https://evil.example.com/ahrav/magic-context/actions/runs/123456",
+            }),
+        ).toBeNull();
+        // The attempt is signed into the certificate, never carried by the run url.
+        expect(
+            workflowRunApiPath({
+                ...source,
+                runUrl: "https://github.com/ahrav/magic-context/actions/runs/123456/attempts/1",
+            }),
+        ).toBeNull();
+        // A matching trailing /attempts/<n> under a foreign repository is not a binding.
+        expect(
+            attestationMatchesWorkflowSource(
+                matchingAttestation({
+                    runInvocationURI:
+                        "https://github.com/evil/fork/actions/runs/123456/attempts/1",
+                }),
+                source,
+                "0".repeat(64),
+            ),
+        ).toBe(false);
+    });
+
+    test("schema-only validation accepts proofs from another release commit", () => {
+        const root = mkdtempSync(join(tmpdir(), "mc-host-installed-evidence-"));
+        const evidence = qualifiedEvidence();
+        installReleaseArtifacts(root, evidence);
+        installProofArtifacts(root, evidence);
+        // `--check-schema` validates shape, not GA qualification. Binding proofs
+        // to the checked-out commit is a property of the GA gate, so schema-only
+        // runs at any other commit must not fail closed on it.
+        expect(() =>
+            validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, false, {
+                verifyAttestation: (_path, proof) =>
+                    matchingAttestation({ artifactSha256: proof.sha256 }),
+                verifyWorkflowRun: () => true,
+                verifyInstalledEvidenceAttestation: (_path, _source, sha256) =>
+                    matchingAttestation({ artifactSha256: sha256 }),
+                expectedHeadSha: "b".repeat(40),
+            }),
+        ).not.toThrow();
+    });
+
     test("qualified evidence is bound to the release checkout commit", () => {
         const root = mkdtempSync(join(tmpdir(), "mc-host-installed-evidence-"));
         const evidence = qualifiedEvidence();

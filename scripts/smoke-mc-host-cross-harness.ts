@@ -198,6 +198,46 @@ async function daemonIdentity(dataRoot: string): Promise<readonly number[]> {
     return Array.from(connection.daemonId);
 }
 
+/**
+ * Narrows one replay item to its control unit, or undefined when the item is
+ * not a `{kind: "control", unit}` envelope.
+ */
+function controlUnit(item: unknown): Record<string, unknown> | undefined {
+    if (item === null || typeof item !== "object" || Array.isArray(item)) return undefined;
+    const envelope = item as Record<string, unknown>;
+    if (envelope.kind !== "control") return undefined;
+    const unit = envelope.unit;
+    if (unit === null || typeof unit !== "object" || Array.isArray(unit)) return undefined;
+    return unit as Record<string, unknown>;
+}
+
+/**
+ * Concatenates the assistant text the replay carries for one run.
+ *
+ * Mirrors the producer's nested `message.content[].text` shape, so a replay
+ * that keeps its dispatch metadata but drops every response unit yields "".
+ */
+function assistantTextForRun(items: readonly unknown[], runId: string): string {
+    let text = "";
+    for (const item of items) {
+        const unit = controlUnit(item);
+        if (unit === undefined) continue;
+        if (unit.type !== "assistant_message" || unit.run_id !== runId) continue;
+        const message = unit.message;
+        if (message === null || typeof message !== "object" || Array.isArray(message)) {
+            continue;
+        }
+        const content = (message as Record<string, unknown>).content;
+        if (!Array.isArray(content)) continue;
+        for (const block of content) {
+            if (block === null || typeof block !== "object" || Array.isArray(block)) continue;
+            const entry = block as Record<string, unknown>;
+            if (entry.type === "text" && typeof entry.text === "string") text += entry.text;
+        }
+    }
+    return text;
+}
+
 async function verifyBrocaRoutes(dataRoot: string): Promise<void> {
     const canonicalModel = required("MC_HOST_CANARY_BROCA_MODEL");
     const separator = canonicalModel.indexOf("/");
@@ -245,20 +285,28 @@ async function verifyBrocaRoutes(dataRoot: string): Promise<void> {
             const runId = sent.run_id as string;
             const deadline = Date.now() + 60_000;
             for (;;) {
+                // Prove the deadline before dispatching. Clamping an expired
+                // budget to 1 ms would fail the request as a client timeout and
+                // throw before the deadline assertion below could name the real
+                // cause, turning a slow run into an opaque transport error.
+                const remainingMs = deadline - Date.now();
+                assert.ok(
+                    remainingMs > 0,
+                    `${harness} did not complete before deadline`,
+                );
                 const status = (await client.request(
                     handle,
                     {
                         method: "run.status",
                         params: { run_id: runId },
                     },
-                    { timeoutMs: Math.max(1, deadline - Date.now()) },
+                    { timeoutMs: remainingMs },
                 )) as { state?: unknown };
                 if (status.state === "completed") break;
                 assert.ok(
                     status.state === "queued" || status.state === "running",
                     `${harness} terminated in state ${String(status.state)}`,
                 );
-                assert.ok(Date.now() < deadline, `${harness} did not complete before deadline`);
                 await new Promise((resolve) => setTimeout(resolve, 50));
             }
             const replay = await client.requestStream(
@@ -271,23 +319,24 @@ async function verifyBrocaRoutes(dataRoot: string): Promise<void> {
             );
             assert.ok(
                 replay.some((item) => {
-                    if (item === null || typeof item !== "object" || Array.isArray(item)) {
-                        return false;
-                    }
-                    const envelope = item as Record<string, unknown>;
-                    if (envelope.kind !== "control") return false;
-                    const unit = envelope.unit;
-                    if (unit === null || typeof unit !== "object" || Array.isArray(unit)) {
-                        return false;
-                    }
-                    const control = unit as Record<string, unknown>;
+                    const control = controlUnit(item);
                     return (
+                        control !== undefined &&
                         control.type === "harness_dispatch" &&
                         control.run_id === runId &&
                         control.harness === harness
                     );
                 }),
                 `${harness} replay did not prove concrete adapter dispatch`,
+            );
+            // Dispatch metadata alone does not prove the user got an answer: a
+            // replay that retains the harness_dispatch control unit but loses
+            // every response unit would still satisfy the check above while the
+            // run reports completed. Require the assistant text for this run.
+            const assistantText = assistantTextForRun(replay, runId);
+            assert.ok(
+                assistantText.trim() !== "",
+                `${harness} replay carried no assistant text for run ${runId}`,
             );
         }
         await client.closeRoute(opencode);
