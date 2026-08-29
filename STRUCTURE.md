@@ -11,7 +11,7 @@ This repository is a monorepo containing TypeScript packages (under `packages/`)
 │   ├── mc-store/           # Durable cache-state store (SQLite backed)
 │   ├── mc-tokenizer/       # Claude BPE token estimator
 │   ├── mc-host/            # Direct-linked authenticated loopback host runtime
-│   └── mc-module/          # Current subc module and future mc-host adapter
+│   └── mc-module/          # Magic Context adapter and ck-mc-host lifecycle executable
 ├── packages/               # TypeScript packages
 │   ├── plugin/             # OpenCode plugin package (published as @cortexkit/opencode-magic-context)
 │   ├── pi-plugin/          # Pi plugin package (published as @cortexkit/pi-magic-context)
@@ -115,7 +115,7 @@ All paths below are relative to `packages/plugin/` — the published OpenCode np
   - `crates/mc-store/`: Durable SQLite session database schema, metadata, and CAS transitions.
   - `crates/mc-tokenizer/`: tiktoken BPE-based token count estimator.
   - `crates/mc-host/`: Generic direct-linked host library. Owns secure instance publication, HMAC authentication, wire-v2 framing, control/catalog handling for the fixed three-target profile, process-global routes and epochs, bounded request settlement split into general and reserved pending/task permit classes, Ping/Pong capability, and ordered shutdown behind repo-owned handler types. `src/composite.rs` dispatches routes across the three static components, `src/synapse/` serves the certified offline embedding lane (bundle validation, dynamic ONNX Runtime, four-operation protocol, bounded ephemeral jobs), and `src/broca/` serves the five-operation LLM run lane (strict protocol, bounded process-local run supervisor with ordered replay, hardened OpenCode/Pi subprocess adapters behind one `LlmExecutionBackend` seam, and the bundled Pi payload hook in `assets/`). Production `McHandler` adaptation and client cutover are not in this crate.
-  - `crates/mc-module/`: The current `subc` protocol adapter, autonomous historian coordinator, and client, including the harness-bound `HistorianProducer` that consumes the Broca route; a later task adds the one-way adapter from `mc-module` to `mc-host`.
+  - `crates/mc-module/`: The Magic Context adapter, autonomous historian coordinator, and `ck-mc-host` production leaf. The binary depends on both `mc-module` and `mc-host`; the host crate never depends on the module.
 
 **Pi Sibling Package (`packages/pi-plugin/`):**
 
@@ -135,10 +135,12 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `packages/cli/src/commands/migrate.ts`: Migrate OpenCode sessions to Pi or OMP format with phase-tracked `migration_pending` recovery journaling.
 - `packages/cli/src/lib/embedding-runtime.ts`: Probe the presence of the `onnxruntime-node` package and native platform binaries to verify local embedding runtime health.
 - `packages/pi-plugin/src/index.ts`: Entry point for the Pi-specific plugin registering context handlers and hooks.
-- `crates/mc-host/src/`: Generic host ownership boundaries (`instance`, `wire`, `control`, `routing`, `dispatch`, `connection`, `runtime`, and `composite`) plus the public handler and limit contracts; `synapse/` holds the embedding lane (`bundle`, `inference`, `protocol`, `jobs`) and `broca/` holds the LLM run lane (`protocol`, `supervisor`, `backend`, `config`, `subprocess`, `opencode`, `pi`).
+- `crates/mc-host/src/`: Generic host ownership boundaries (`instance`, `wire`, `control`, `routing`, `dispatch`, `connection`, `runtime`, `composite`, and `harness_closure`) plus the public handler and limit contracts; `harness_closure.rs` validates and materializes daemon-owned content-addressed OpenCode/Pi graphs, `synapse/` holds the embedding lane (`bundle`, `inference`, `protocol`, `jobs`), and `broca/` holds the LLM run lane (`protocol`, `supervisor`, `backend`, `config`, `subprocess`, `opencode`, `pi`).
 - `crates/mc-host/tests/`: Independent raw-client, protocol-vector, filesystem-security, routing, dispatch, lifecycle, composite-routing, synapse bundle/protocol/job, broca protocol/supervisor/subprocess, and real-loopback composition tests, with the committed `fixtures/synapse-tiny/` model bundle.
 - `crates/mc-module/tests/broca_roundtrip.rs`: Authenticated cross-crate round-trip proof — the real `HistorianProducer` and module classify path against a real in-process `mc-host` with a deterministic backend, covering both harness selections.
-- `crates/mc-module/src/main.rs`: Entry point for the current `subc` daemon module; direct-host production wiring remains deferred.
+- `crates/mc-module/src/bin/ck-mc-host.rs`: Production leaf executable for `start`, `stop`, `restart`, `probe`, and internal `serve`.
+- `crates/mc-host/src/generation.rs`: Validate, stage, promote, and prune the single current native payload generation.
+- `release/mc-host-harness-closures/`: U9-qualified finite runtime graphs for each supported harness profile; generated Rust/TypeScript catalogs expose only manifest digests, platform scope, and source-root anchors.
 
 **Configuration:**
 
@@ -162,7 +164,7 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `src/hooks/magic-context/sentinel.ts`: Decide provider predicates (such as `modelAcceptsEmptyContent` and `variantChangeBustsProviderCache`) controlling strip/flush behavior.
 - `src/hooks/magic-context/hook-handlers.ts`: Prompt hook event handlers, provider-aware reasoning-variant flushes, and tool execution lifecycle hooks.
 - `src/hooks/magic-context/edit-marker.ts`: Implement `edit_marker` mode to compress superseded edits, keeping the `filePath` and a region-hint prefix while dropping the bulky output content.
-- `src/hooks/magic-context/module-transport.ts`: Send live Rust transform, authority, and tool requests over the subc protocol using `SubcClient` and `RouteHandle`, with bounded serialized request handling.
+- `src/hooks/magic-context/module-transport.ts`: Send live Rust transform, authority, and tool requests over authenticated `mc-host` routes, with managed-default demand start and bounded serialized request handling.
 - `src/hooks/magic-context/rust-mode-transform.ts`: Orchestrate the experimental Rust transform mode, coordinating state sync and LKG (Last Known Good) fallback/replay logic.
 - `src/hooks/magic-context/module-state-sync.ts`: Synchronize database state (memories, commits, tags, markers) between host (TS SQLite) and subc (Rust).
 - `src/hooks/magic-context/module-wire.ts`: Translate wire messages, ordinals, and normalizations between host and Rust formats.
@@ -196,7 +198,7 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `src/features/magic-context/claims-backfill.ts` and `claims-backfill-startup.ts`: v84 eager/lazy row adoption, relationship translation, anti-join reconciliation, startup resume, v22 takeover, and doctor recovery. Production nonempty eager cutoff remains zero pending reviewed calibration.
 - `src/features/magic-context/memory/storage-memory-claims-crash.test.ts` and `memory/fixtures/claims-crash-worker.ts`: Bun/Node two-phase process-crash matrix over live WAL databases; checked evidence is `docs/evidence/claims-backfill/v84-process-crash.json`.
 - `src/features/magic-context/context-authority.ts`: Manage domain authority states (`TS`, `PREPARING`, `MODULE`, `DRAINING`) and changefeed synchronization for shared memory and note state between TS host and Rust module.
-- `src/features/magic-context/memory/embedding-synapse.ts`: The Synapse embedding provider client, which communicates with the `subc` daemon using RPC endpoints for certified local embedding generation.
+- `src/features/magic-context/memory/embedding-synapse.ts`: The lazy Synapse embedding provider client, which communicates with `mc-host` for certified local embedding generation.
 - `src/features/magic-context/storage-db.ts`: Create durable storage; run versioned migrations; resolve runtime SQLite backend.
 - `src/features/magic-context/storage-clone.ts`: Implement transaction-locked session state copy helpers for clone forks.
 - `src/features/magic-context/storage-schema-helpers.ts`: Implement schema-mutation and NULL-healing helpers to avoid dependency cycles between database creation and migrations.

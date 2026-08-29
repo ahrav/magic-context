@@ -279,6 +279,12 @@ jobs:
       - name: Provision metadata-only sibling stubs
         run: sh scripts/provision-rust-ci-stubs.sh
 
+      # Pins the cargo used by the warm-up below and by the same `cargo tree`
+      # inside test:release, matching every other cargo-invoking job. Without
+      # it both resolve to whatever rustc the runner image ships, so an image
+      # change surfaces as a cargo failure inside a TypeScript job.
+      - uses: dtolnay/rust-toolchain@stable
+
       - name: Warm mc-host dependency graph
         run: cargo tree -p mc-host -e normal >/dev/null
 
