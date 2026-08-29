@@ -396,7 +396,13 @@ function reportInsideLaneNamespaceError(reportPath: string): string | null {
     // `<dir>/historian-eval-artifacts/r.json` slipped through and nested a second
     // namespace inside the first.
     const report = canonicalPath(reportPath);
-    if (dirname(report).split(sep).includes(LANE_ARTIFACTS_DIR)) {
+    // The whole path, final segment included. Checking only ancestors let
+    // `--report <dir>/historian-eval-artifacts` through, and then
+    // `laneArtifactsRoot` equalled the report itself: cleanup removed the report,
+    // `mkdirSync` recreated that path as a directory, and the shape check rejected
+    // the run — a report path that can never produce a report but can destroy the
+    // previous one.
+    if (report.split(sep).includes(LANE_ARTIFACTS_DIR)) {
         return `a report may not live inside a ${LANE_ARTIFACTS_DIR} directory (${report}): that is where this lane derives its own artifacts`;
     }
     return null;
@@ -489,6 +495,16 @@ async function runLive(args: CliArgs): Promise<number> {
     // `buildLaneReport` also cross-checks it: `resolveReportSystem` rejects a
     // supplied tuple that disagrees with the scored records'.
     const system = runSystemTuple({ mode, opencodeVersion: opencode });
+    // Same reasoning as the OpenCode version: an exported tree with no `.git` leaves
+    // `resolveRepoCommitSha` at "unknown", and two different code versions then
+    // publish identical tuples after spending tokens. The sha is the primary axis of
+    // this identity, so it is the last thing that should degrade to a placeholder.
+    if (system.repoCommitSha === "unknown") {
+        console.error(
+            "live admission: the checkout commit could not be resolved, so the report could not identify the code it ran",
+        );
+        return 1;
+    }
     const reportDir = dirname(resolve(args.reportPath));
     // Before anything writes into it, including the first partial. Today the
     // directory happens to exist by the time that write lands, because
@@ -648,14 +664,25 @@ function artifactCorpusOverlapError(args: CliArgs): string | null {
     const within = (inner: string, outer: string): boolean => inner === outer || inner.startsWith(`${outer}${sep}`);
     for (const [label, owned] of [
         ["report", canonicalPath(args.reportPath)],
-        ["partial report", canonicalPath(partialReportPath(args.reportPath))],
-        ["run records directory", canonicalPath(liveRunArtifactsDir(args.reportPath))],
+        // The per-report artifact directory, because that is what cleanup removes
+        // RECURSIVELY. Listing only its `partial-report.json` and `runs` children
+        // missed a corpus selected from anywhere else inside it.
+        ["artifact directory", canonicalPath(laneArtifactsDir(args.reportPath))],
     ] as const) {
         if (within(owned, root) || within(root, owned)) {
             return `the ${label} path ${owned} overlaps the selected corpus at ${root}; refusing to clear artifacts that would delete corpus input`;
         }
     }
     return null;
+}
+
+/** True for a symlink, including one whose target is missing (`existsSync` is false). */
+function isSymlink(path: string): boolean {
+    try {
+        return lstatSync(path).isSymbolicLink();
+    } catch {
+        return false;
+    }
 }
 
 /** Removes a path only when it is a regular file; see `clearPreviousLiveArtifacts`. */
@@ -671,8 +698,13 @@ function clearPreviousLiveArtifacts(reportPath: string): void {
     // Everything else lives in this report's own subdirectory of the lane namespace,
     // which no accepted report path can occupy, so one recursive remove is safe
     // where decorated sibling names needed a guard each.
+    // `lstatSync` does not follow the link, so a SYMLINK here is not a directory and
+    // was skipped — after which `mkdirSync` and every artifact write followed it,
+    // landing outside the private namespace. Both branches end with the path absent;
+    // removing a symlink does not touch its target, and anything at this path is the
+    // lane's to clear because reports are refused from the namespace.
     const owned = laneArtifactsDir(reportPath);
-    if (existsSync(owned) && lstatSync(owned).isDirectory()) {
+    if (existsSync(owned) || isSymlink(owned)) {
         rmSync(owned, { recursive: true, force: true });
     }
 }

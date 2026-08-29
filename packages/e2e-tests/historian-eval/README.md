@@ -35,7 +35,12 @@ scripts/run-historian-eval.ts
 | Harness-booting runner tests | opencode-e2e standalone selection (`test:opencode-e2e`) |
 | Freeze lint over the dev split | `bun scripts/run-historian-eval.ts --lint` |
 | Mutation battery | `bun scripts/run-historian-eval.ts --mutations` |
-| Live lane run | `bun scripts/run-historian-eval.ts --live --release historian-eval/releases/v1` |
+| Live lane run (dev split) | `bun scripts/run-historian-eval.ts --live --scenarios historian-eval/dev` |
+| Live lane run (frozen release) | `bun scripts/run-historian-eval.ts --live --release historian-eval/releases/vN` |
+
+No release is frozen yet — `historian-eval/` holds only `dev` — so the release
+form is the shape to use once `promote.ts` has published a `vN`, not a command
+that runs today. The dev form is the one an operator can copy now.
 
 Live runs read `ANTHROPIC_API_KEY`, `HISTORIAN_EVAL_MODEL`, and
 `HISTORIAN_EVAL_PROBE_MODEL` (`provider/model`; both halves must be
