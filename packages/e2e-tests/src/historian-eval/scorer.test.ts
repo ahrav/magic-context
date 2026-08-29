@@ -1124,6 +1124,11 @@ describe("scoreRunRecord", () => {
             };
             for (const [label, edited] of [
                 ["truncated claim array", { ...aborted, injectedClaims: [] }],
+                // The shape the runner writes when abort-path claim capture fails but
+                // the best-effort snapshot succeeds: an empty identity resolves to no
+                // project, so the read is vacuous and two empty sets would otherwise
+                // compare equal while the snapshot holds the forbidden claim.
+                ["unresolvable identity with no recorded claims", { ...aborted, projectIdentity: "", injectedClaims: [] }],
                 ["appended forged claim", { ...aborted, injectedClaims: [...aborted.injectedClaims, forged] }],
                 ["edited project identity", { ...aborted, projectIdentity: "no-such-project" }],
             ] satisfies Array<[string, HistorianEvalRunRecord]>) {

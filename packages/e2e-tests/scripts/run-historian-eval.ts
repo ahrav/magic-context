@@ -348,9 +348,11 @@ function buildPluginBundle(): number {
  * re-scorable. Each report now owns and clears only its own records.
  */
 function liveRunArtifactsDir(reportPath: string): string {
-    const file = basename(resolve(reportPath));
-    const stem = file.endsWith(".json") ? file.slice(0, -".json".length) : file;
-    return join(dirname(resolve(reportPath)), `${stem}-runs`);
+    // The COMPLETE filename, extension included. Stripping `.json` aliased two
+    // report paths the CLI accepts — `run-1` and `run-1.json` both owned
+    // `run-1-runs` — so the second audit cleared the first report's records while
+    // leaving its report intact, which is the evidence loss this exists to prevent.
+    return join(dirname(resolve(reportPath)), `${basename(resolve(reportPath))}-runs`);
 }
 
 function partialReportPath(reportPath: string): string {
@@ -362,17 +364,22 @@ function writePartialReport(
     scores: readonly ScenarioScore[],
     releaseVersion: string | null,
     system: SystemVersionTuple,
-): void {
-    if (scores.length === 0) return;
+): boolean {
+    if (scores.length === 0) return false;
     try {
         const report = buildLaneReport(scores, {
             system,
             ...(releaseVersion === null ? {} : { releaseVersion }),
         });
         writeFileSync(partialReportPath(reportPath), `${JSON.stringify(report, null, 2)}\n`);
+        return true;
     } catch (error) {
-        // Never let progress bookkeeping fail the run it is bookkeeping for.
+        // Never let progress bookkeeping fail a run that already has evidence on
+        // disk — a later write failing leaves the previous partial, which is stale
+        // but real. The caller decides; only the SEED write is fatal, because until
+        // the first scenario finishes it is the only report there is.
         console.error(`partial report not written: ${error instanceof Error ? error.message : String(error)}`);
+        return false;
     }
 }
 
@@ -421,7 +428,14 @@ async function runLive(args: CliArgs): Promise<number> {
     // one, the first scenario always runs, and a scenario that overruns the
     // estimate costs the partial report rather than the whole artifact.
     let longestScenarioMs = 0;
-    writePartialReport(args.reportPath, scores, releaseVersion, system);
+    // Admission, not bookkeeping: this seed is the only report until the first
+    // scenario completes, so a directory that cannot take it means an interruption
+    // would leave nothing to archive — after the tokens were spent. Checked here,
+    // still before the first request.
+    if (!writePartialReport(args.reportPath, scores, releaseVersion, system)) {
+        console.error("live admission: the initial partial report could not be written; refusing to spend tokens");
+        return 1;
+    }
     for (const [index, scenario] of scenarios.entries()) {
         // Checked BEFORE starting, never mid-scenario: a scenario abandoned
         // half-way has spent its tokens and produced no record, so the only useful

@@ -1317,6 +1317,27 @@ function abortedRecordClaimEvidence(
     try {
         const visible = readInjectedClaims(db, record.projectIdentity, record.scenarioId, record.nowMs);
         if (visible === null) return recordedOnly();
+        // The selector has to name something in THIS snapshot before its answer can
+        // bind anything. `readInjectedClaims` is keyed by `record.projectIdentity`,
+        // so an identity that resolves to no project returns an empty visible set —
+        // and two empty sets compare equal, making a vacuous query look like
+        // agreement while a forbidden claim sits in the snapshot under the real
+        // project. The runner reaches exactly that shape when abort-path claim
+        // capture fails and the best-effort snapshot succeeds: `emptyRecord` writes
+        // `projectIdentity: ""` with `injectedClaims: []`.
+        //
+        // Set equality proves the snapshot belongs to this run; identity resolution
+        // proves the question was asked of it at all. Neither substitutes for the
+        // other, and an unresolvable identity is the same unbindable artifact as a
+        // disagreement, so it reports the same way.
+        if (resolveProjectIdsForIdentities(db, [record.projectIdentity]).length === 0) {
+            return {
+                kind: "snapshot-mismatch",
+                detail:
+                    "run record's project identity resolves to no project in its snapshot, " +
+                    "so its claim set cannot be bound to this run",
+            };
+        }
         // Whole claims, locator-ordered: one comparison covers the locator set,
         // every field behind each locator, and cardinality — so a truncation, an
         // appended entry, a content or category edit, a duplicate, and a foreign

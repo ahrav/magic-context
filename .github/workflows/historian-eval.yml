@@ -42,9 +42,10 @@ jobs:
     # size budget allows 30 scenarios declaring two historian runs each, and the
     # runner's live per-wait budget is 10 minutes, so the worst-case waits alone
     # exceed any timeout GitHub permits. The job timeout is therefore not the
-    # bound that protects the report — `--deadline-minutes` below is. This is the
-    # outer backstop, set above that deadline so the script always wins the race
-    # and publishes.
+    # bound that protects the report — `--deadline-minutes` is, with the live
+    # step's own timeout behind it. This is the outer backstop; it must stay
+    # ABOVE the step bound plus worst-case setup, or it fires first and cancels
+    # the job before the archive step can upload anything.
     timeout-minutes: 360
     concurrency:
       group: historian-eval-live
@@ -116,15 +117,16 @@ jobs:
           bun packages/e2e-tests/scripts/run-historian-eval.ts --mutations "$SELECT_FLAG" "$SELECT_PATH"
 
       - name: Run the live lane
-        # Below the job's 360 and above the script's own 320-minute deadline, so the
-        # three bounds nest. The script normally stops itself and publishes; if a
-        # single scenario hangs past this, only the STEP is killed and the archive
-        # step below still runs, uploading the incremental report. Without a step
-        # bound, a scenario running past the job limit cancels the whole job, and
-        # `if: always()` never gets to execute — the run spends its tokens and loses
-        # every artifact, which is the outcome the incremental report exists to
-        # prevent.
-        timeout-minutes: 330
+        # The three bounds nest with room for the preamble between them:
+        #   script --deadline-minutes 290  <  this step 300  <  job 360
+        # The step clock starts when the step starts; the JOB clock started before
+        # checkout, two dependency installs, the plugin build, and the corpus gates.
+        # So the step bound cannot be job_timeout minus a token margin — sized that
+        # way, a slow preamble lets the job timeout fire first, which cancels the job
+        # outright and skips the `if: always()` upload below, losing the very partial
+        # evidence this bound exists to preserve. 60 minutes is left for setup that
+        # normally takes a few.
+        timeout-minutes: 300
         env:
           NODE_ENV: ""
           ANTHROPIC_API_KEY: ${{ secrets.HISTORIAN_EVAL_ANTHROPIC_API_KEY }}
@@ -133,10 +135,10 @@ jobs:
         run: |
           # Stops between scenarios and publishes what it has rather than being
           # killed mid-scenario with no artifact after spending the tokens. Sized
-          # below `timeout-minutes` with room for setup, the plugin build, scoring,
-          # and the artifact upload that follows.
+          # below the step's own timeout, which is itself sized below the job clock
+          # minus worst-case setup — see the two comments above.
           bun packages/e2e-tests/scripts/run-historian-eval.ts --live "$SELECT_FLAG" "$SELECT_PATH" \
-            --deadline-minutes 320 \
+            --deadline-minutes 290 \
             --report packages/e2e-tests/artifacts/historian-eval-report.json
 
       - name: Archive the lane report and run records
