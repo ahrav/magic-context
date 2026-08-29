@@ -23,6 +23,30 @@ const PAYLOAD_INDEX_PATH = "release/mc-host-payload-index.json";
 const STOP_PROVENANCE_PATH = "release/mc-host-n-minus-one-stop.json";
 const SHA256_RE = /^[0-9a-f]{64}$/;
 
+/**
+ * The only repository whose workflows may author a proof or its attestation.
+ *
+ * A proof's `source.run_url` names the run that produced it, so an unconstrained
+ * host/owner there would let a report point at a run in an unrelated repository
+ * while still satisfying the attestation check below.
+ */
+const ATTESTATION_REPO = "ahrav/magic-context";
+
+/**
+ * The workflow whose identity is accepted as authorizing a proof.
+ *
+ * `gh attestation verify --repo` constrains the repository only, so any other
+ * workflow in the same repository could attest an arbitrary passing proof and
+ * clear this GA gate. `gh` validates the signer path only when given
+ * `--signer-workflow` or `--cert-identity`, so the approved workflow is named
+ * here explicitly and every other same-repository workflow is rejected.
+ */
+const ATTESTATION_SIGNER_WORKFLOW = `${ATTESTATION_REPO}/.github/workflows/mc-host-release-qualification.yml`;
+
+const RUN_URL_RE = new RegExp(
+    `^https://github\\.com/${ATTESTATION_REPO}/actions/runs/\\d+`,
+);
+
 interface RegistryPackageEvidence {
     name: string;
     version: string;
@@ -36,6 +60,14 @@ interface TargetEvidence {
     self_fd_verified: boolean;
     process_crash_atomicity_verified: boolean;
     lifecycle_smoke_passed: boolean;
+    /**
+     * Digest of the target's test report, recorded independently of the proof.
+     *
+     * Held here rather than read back out of the proof's own observations so
+     * that the comparison has two sides. `null` records that no report digest
+     * was captured, and the proof must then echo `null` too.
+     */
+    test_report_sha256: string | null;
 }
 
 interface ProductFlowEvidence {
@@ -172,14 +204,27 @@ function exactIdentitySet(
     }
 }
 
+/**
+ * Whether `names` lists every payload package before every parent package.
+ *
+ * Shared by construction and validation so the two cannot drift: the recorded
+ * `publication.payloads_before_parents` boolean is only meaningful if the
+ * verifier derives it from the same order the builder derived it from.
+ * `exactIdentitySet` sorts, so nothing else in validation observes this order.
+ */
+function payloadsBeforeParents(
+    names: readonly string[],
+    contract: ReleaseContract,
+): boolean {
+    return (
+        names.join("\n") ===
+        [...contract.packages.payloads, ...contract.packages.parents].join("\n")
+    );
+}
+
 export function buildInstalledReleaseEvidence(
     options: BuildInstalledReleaseEvidenceOptions,
 ): InstalledReleaseEvidence {
-    const payloadsBeforeParents =
-        options.registryPackages
-            .map((entry) => entry.name)
-            .join("\n") ===
-        [...options.contract.packages.payloads, ...options.contract.packages.parents].join("\n");
     return {
         schema: "magic-context.mc-host-installed-release-evidence/v1",
         release: {
@@ -197,7 +242,10 @@ export function buildInstalledReleaseEvidence(
         publication: {
             oidc_provenance_verified: options.oidcProvenanceVerified,
             long_lived_token_used: options.longLivedTokenUsed,
-            payloads_before_parents: payloadsBeforeParents,
+            payloads_before_parents: payloadsBeforeParents(
+                options.registryPackages.map((entry) => entry.name),
+                options.contract,
+            ),
         },
         production_synapse_verified: options.productionSynapseVerified,
         proof_artifacts: options.proofArtifacts,
@@ -305,9 +353,17 @@ export function validateInstalledReleaseEvidence(
                 "self_fd_verified",
                 "process_crash_atomicity_verified",
                 "lifecycle_smoke_passed",
+                "test_report_sha256",
             ],
             `targets[${index}]`,
         );
+        const testReport = entry.test_report_sha256;
+        if (
+            testReport !== null &&
+            (typeof testReport !== "string" || !SHA256_RE.test(testReport))
+        ) {
+            fail(`targets[${index}].test_report_sha256 must be lowercase SHA-256 or null`);
+        }
         return {
             target: stringField(entry, "target", `targets[${index}]`),
             filesystem_verified: booleanField(
@@ -326,6 +382,7 @@ export function validateInstalledReleaseEvidence(
                 "lifecycle_smoke_passed",
                 `targets[${index}]`,
             ),
+            test_report_sha256: testReport,
         };
     });
     exactIdentitySet(
@@ -373,6 +430,20 @@ export function validateInstalledReleaseEvidence(
         ["oidc_provenance_verified", "long_lived_token_used", "payloads_before_parents"],
         "publication",
     );
+    // The publication proof only echoes this boolean back, so without deriving
+    // it here a hand-authored file could list parents first, claim `true`, and
+    // pass the payload-first invariant after a parents-first release.
+    if (
+        booleanField(publication, "payloads_before_parents", "publication") !==
+        payloadsBeforeParents(
+            registryPackages.map((entry) => entry.name),
+            contract,
+        )
+    ) {
+        fail(
+            "publication.payloads_before_parents does not match the registry_packages order",
+        );
+    }
     const blockers = stringArray(evidence.blockers, "blockers");
     const qualified = booleanField(evidence, "qualified", "evidence");
     if (!Array.isArray(evidence.proof_artifacts)) {
@@ -457,6 +528,45 @@ export function validateInstalledReleaseEvidence(
     return evidence as unknown as InstalledReleaseEvidence;
 }
 
+/**
+ * Requires the artifacts this evidence cites to themselves be release-qualified.
+ *
+ * The digest comparison above only binds the evidence to whatever bytes are
+ * committed; it says nothing about what those bytes claim. Both artifacts are
+ * committed fail-closed between releases, so without parsing them an evidence
+ * document could set `qualified: true`, carry passing proofs, and clear the GA
+ * gate while citing a qualification run that recorded `production_qualified:
+ * false` and payload entries that recorded `qualified: false`.
+ */
+function assertCitedArtifactsQualified(rootDir: string): void {
+    const qualification = record(
+        readJson(rootDir, QUALIFICATION_PATH),
+        "cited qualification",
+    );
+    if (qualification.production_qualified !== true) {
+        fail("cited production-input qualification is not production-qualified");
+    }
+    const payloadIndex = record(
+        readJson(rootDir, PAYLOAD_INDEX_PATH),
+        "cited payload index",
+    );
+    if (payloadIndex.production_qualified !== true) {
+        fail("cited payload index is not production-qualified");
+    }
+    const entries = payloadIndex.entries;
+    if (!Array.isArray(entries) || entries.length === 0) {
+        fail("cited payload index has no entries");
+    }
+    entries.forEach((raw, index) => {
+        const entry = record(raw, `cited payload index entries[${index}]`);
+        if (entry.qualified !== true) {
+            const label =
+                typeof entry.target === "string" ? entry.target : String(index);
+            fail(`cited payload index entry ${label} is not qualified`);
+        }
+    });
+}
+
 export function validateInstalledReleaseEvidenceAgainstArtifacts(
     rootDir: string,
     value: unknown,
@@ -478,6 +588,7 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
             fail(`${field} does not match the current artifact`);
         }
     }
+    if (requireQualified) assertCitedArtifactsQualified(rootDir);
     for (const proof of evidence.proof_artifacts) {
         const bytes = readFileSync(join(rootDir, proof.path));
         const digest = createHash("sha256").update(bytes).digest("hex");
@@ -515,8 +626,10 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
         const source = record(report.source, `proof ${proof.path}.source`);
         exactKeys(source, ["run_url"], `proof ${proof.path}.source`);
         const runUrl = stringField(source, "run_url", `proof ${proof.path}.source`);
-        if (!/^https:\/\/github\.com\/[^/]+\/[^/]+\/actions\/runs\/\d+/.test(runUrl)) {
-            fail(`proof artifact ${proof.kind}:${proof.subject} has no immutable workflow run`);
+        if (!RUN_URL_RE.test(runUrl)) {
+            fail(
+                `proof artifact ${proof.kind}:${proof.subject} has no immutable ${ATTESTATION_REPO} workflow run`,
+            );
         }
         const observations = record(
             report.observations,
@@ -566,11 +679,7 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
                             : "linux",
                         self_fd_verified: target.self_fd_verified,
                         target: target.target,
-                        test_report_sha256:
-                            typeof observations.test_report_sha256 === "string" &&
-                            SHA256_RE.test(observations.test_report_sha256)
-                                ? observations.test_report_sha256
-                                : null,
+                        test_report_sha256: target.test_report_sha256,
                     }
                   : proof.kind === "product_flow" && flow
                     ? {
@@ -610,7 +719,9 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
                         "verify",
                         proofPath,
                         "--repo",
-                        "ahrav/magic-context",
+                        ATTESTATION_REPO,
+                        "--signer-workflow",
+                        ATTESTATION_SIGNER_WORKFLOW,
                     ],
                     { cwd: rootDir, stdio: "ignore" },
                 ).status === 0;
@@ -673,6 +784,7 @@ function buildTemplate(rootDir: string): InstalledReleaseEvidence {
             self_fd_verified: false,
             process_crash_atomicity_verified: false,
             lifecycle_smoke_passed: false,
+            test_report_sha256: null,
         })),
         productFlows: contract.packages.parents.map((name) => ({
             package: name,

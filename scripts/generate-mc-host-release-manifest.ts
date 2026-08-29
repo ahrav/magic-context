@@ -1128,7 +1128,7 @@ export interface RegistryGatePackage {
     ownership_verified: boolean;
     trusted_publisher_configured: boolean;
     synchronized_version_unpublished: boolean;
-    reservation_version?: string;
+    reservation_version?: string | null;
     bootstrap_credential_revoked?: boolean;
 }
 
@@ -1139,13 +1139,28 @@ export interface RegistryGate {
     packages: RegistryGatePackage[];
 }
 
-export function validateRegistryGate(
+function gateFail(message: string): never {
+    throw new Error(`mc-host registry gate: ${message}`);
+}
+
+/**
+ * Validates the gate's structure against the contract without asserting that
+ * the audited conditions are met.
+ *
+ * The gate records a live npm audit, and outside a release window its honest
+ * value is fail-closed — `release/mc-host-registry-gate.json` carries exactly
+ * such an audit today. Folding the audited booleans into every drift check
+ * therefore makes drift permanently red, which trains reviewers to ignore the
+ * one signal that catches a hand-edited gate. Structure is what drift can
+ * meaningfully police, so it lives here: schema, release identity, the exact
+ * package set, per-package kind, and the type of every audited field. A typo'd
+ * `"true"` string fails on the change that introduces it rather than at publish
+ * time, while a truthful `false` passes.
+ */
+export function validateRegistryGateShape(
     gate: unknown,
     contract: ReleaseContract,
-): void {
-    const gateFail = (message: string): never => {
-        throw new Error(`mc-host registry gate: ${message}`);
-    };
+): RegistryGate {
     if (gate === null || typeof gate !== "object")
         gateFail("gate must be an object");
     const g = gate as RegistryGate;
@@ -1169,6 +1184,60 @@ export function validateRegistryGate(
         seen.add(pkg.name);
         if (pkg.kind !== kind)
             gateFail(`package ${pkg.name} must have kind ${kind}`);
+        for (const field of [
+            "ownership_verified",
+            "trusted_publisher_configured",
+            "synchronized_version_unpublished",
+        ] as const) {
+            if (typeof pkg[field] !== "boolean") {
+                gateFail(`${field} for ${pkg.name} must be boolean`);
+            }
+        }
+        if (kind === "payload") {
+            if (typeof pkg.bootstrap_credential_revoked !== "boolean") {
+                gateFail(
+                    `bootstrap_credential_revoked for ${pkg.name} must be boolean`,
+                );
+            }
+            // An unreserved name is recorded as `null`, which readiness rejects.
+            // Any value that is present, though, must be a well-formed inert
+            // prerelease: presence alone is not evidence of inertness. A GA
+            // version is selectable by an ordinary dependent range, and a bare
+            // label is not a version at all; either would report R50 satisfied
+            // while leaving the name takeover-exposed. `release.version` is
+            // exact GA semver, so a prerelease can never collide with it and no
+            // separate inequality check is reachable.
+            const reservation = pkg.reservation_version;
+            if (reservation !== null && reservation !== undefined) {
+                if (
+                    typeof reservation !== "string" ||
+                    !RESERVATION_VERSION_RE.test(reservation)
+                ) {
+                    gateFail(
+                        `reservation version ${String(reservation)} for ${pkg.name} must be an inert prerelease (MAJOR.MINOR.PATCH-<prerelease>)`,
+                    );
+                }
+            }
+        }
+    }
+    if (seen.size !== expected.size) {
+        const missing = [...expected.keys()].filter((name) => !seen.has(name));
+        gateFail(`missing package entries: ${missing.join(", ")}`);
+    }
+    return g;
+}
+
+/**
+ * Asserts the audited conditions npm publication depends on.
+ *
+ * Reachable only from the publication path. A fail-closed gate arriving here is
+ * the intended steady state between releases, so this must never gate a drift
+ * check; see `validateRegistryGateShape` for the half that always runs.
+ * Assumes the gate already passed shape validation, so each field's type is
+ * settled and only its value is in question.
+ */
+export function assertRegistryGateReleaseReady(gate: RegistryGate): void {
+    for (const pkg of gate.packages) {
         if (pkg.ownership_verified !== true)
             gateFail(`ownership not verified for ${pkg.name}`);
         if (pkg.trusted_publisher_configured !== true) {
@@ -1176,10 +1245,10 @@ export function validateRegistryGate(
         }
         if (pkg.synchronized_version_unpublished !== true) {
             gateFail(
-                `synchronized version ${g.release_version} is not unpublished for ${pkg.name}`,
+                `synchronized version ${gate.release_version} is not unpublished for ${pkg.name}`,
             );
         }
-        if (kind === "payload") {
+        if (pkg.kind === "payload") {
             if (pkg.bootstrap_credential_revoked !== true) {
                 gateFail(`bootstrap credential not revoked for ${pkg.name}`);
             }
@@ -1189,23 +1258,16 @@ export function validateRegistryGate(
             ) {
                 gateFail(`missing inert reservation version for ${pkg.name}`);
             }
-            // Presence alone is not evidence of inertness. A GA version is
-            // selectable by an ordinary dependent range, and a bare label is
-            // not a version at all; either would report R50 satisfied while
-            // leaving the name takeover-exposed. `release.version` is exact GA
-            // semver, so a prerelease can never collide with it and no separate
-            // inequality check is reachable.
-            if (!RESERVATION_VERSION_RE.test(pkg.reservation_version)) {
-                gateFail(
-                    `reservation version ${pkg.reservation_version} for ${pkg.name} must be an inert prerelease (MAJOR.MINOR.PATCH-<prerelease>)`,
-                );
-            }
         }
     }
-    if (seen.size !== expected.size) {
-        const missing = [...expected.keys()].filter((name) => !seen.has(name));
-        gateFail(`missing package entries: ${missing.join(", ")}`);
-    }
+}
+
+/** Shape plus release readiness — the full publication-time gate. */
+export function validateRegistryGate(
+    gate: unknown,
+    contract: ReleaseContract,
+): void {
+    assertRegistryGateReleaseReady(validateRegistryGateShape(gate, contract));
 }
 
 // ---------------------------------------------------------------------------
@@ -1664,7 +1726,9 @@ export function generate(
                 (error instanceof Error ? error.message : String(error)),
         );
     }
-    validateRegistryGate(gate, contract);
+    // Drift-only: this runs on every change, so it polices the gate's structure
+    // and leaves the audited release-readiness booleans to the publication path.
+    validateRegistryGateShape(gate, contract);
 
     const canonical = canonicalJson(contract);
     const digest = sha256Hex(canonical);

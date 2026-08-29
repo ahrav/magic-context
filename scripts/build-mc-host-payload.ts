@@ -58,6 +58,7 @@ import {
     type ReleaseContract,
     sha256Hex,
     validateRegistryGate,
+    validateRegistryGateShape,
     validateStopProvenance,
 } from "./generate-mc-host-release-manifest";
 import {
@@ -1691,7 +1692,9 @@ export function runCheck(
     options: { write: boolean; payloadRoot?: string },
 ): CheckResult {
     const context = loadReleaseContext(rootDir);
-    validateRegistryGate(
+    // Drift-only, same as contract generation: structure is checked on every
+    // change, release readiness only where bytes are actually published.
+    validateRegistryGateShape(
         readJson(rootDir, REGISTRY_GATE_PATH),
         context.contract,
     );

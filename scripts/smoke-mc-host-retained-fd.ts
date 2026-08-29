@@ -58,11 +58,18 @@ async function main(): Promise<void> {
         XDG_DATA_HOME: dataRoot,
         HOME: dirname(dirname(node)),
     };
+    // A started daemon holds the lifecycle locks under `dataRoot`, so leaving one
+    // behind makes every later canary run on the same data root fail for the
+    // previous run's reason. The flag is set from the instant `start` returns,
+    // before its assertions, because a daemon that came up and then failed an
+    // assertion is exactly the case that needs tearing down.
+    let started = false;
     try {
         const start = await runNativeLifecycle(
             { kind: "retained-fd", fd: retained.fd },
             { command: "start", envelope, deadlineMs: 60_000, env },
         );
+        started = true;
         assert.equal(start.ok, true);
         assert.equal(start.state, "running");
 
@@ -79,8 +86,20 @@ async function main(): Promise<void> {
         );
         assert.equal(stop.ok, true);
         assert.equal(stop.state, "stopped");
+        started = false;
         console.log("mc-host retained-fd smoke: PASS");
     } finally {
+        if (started) {
+            try {
+                await runNativeLifecycle(
+                    { kind: "retained-fd", fd: retained.fd },
+                    { command: "stop", deadlineMs: 30_000, env },
+                );
+            } catch {
+                // Teardown is best-effort: the original failure is what the
+                // operator needs to see, so it must not be masked here.
+            }
+        }
         closeSync(retained.fd);
     }
 }

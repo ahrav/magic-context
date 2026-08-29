@@ -40,6 +40,7 @@ function qualifiedEvidence(): Record<string, unknown> {
             self_fd_verified: true,
             process_crash_atomicity_verified: true,
             lifecycle_smoke_passed: true,
+            test_report_sha256: sha256Hex(`test report ${platform.target}`),
         })),
         productFlows: contract.packages.parents.map((name) => ({
             package: name,
@@ -59,6 +60,34 @@ function qualifiedEvidence(): Record<string, unknown> {
         qualified: true,
         blockers: [],
     });
+}
+
+/**
+ * Bytes to stage for a cited artifact.
+ *
+ * The GA gate parses the qualification run and the payload index and requires
+ * both to be release-qualified, so those two need real content; the input lock
+ * and stop provenance are only digest-compared and can stay opaque.
+ */
+function citedArtifactBytes(field: string): string {
+    if (field === "qualification_sha256") {
+        return `${canonicalJson({
+            schema: "magic-context.mc-host-release-qualification/v1",
+            production_qualified: true,
+            unqualified: [],
+        })}\n`;
+    }
+    if (field === "payload_index_sha256") {
+        return `${canonicalJson({
+            schema: "magic-context.mc-host-payload-index/v1",
+            production_qualified: true,
+            entries: buildContract().platforms.supported.map((platform) => ({
+                qualified: true,
+                target: platform.target,
+            })),
+        })}\n`;
+    }
+    return `${field} bytes`;
 }
 
 function installProofArtifacts(
@@ -83,6 +112,7 @@ function installProofArtifacts(
         self_fd_verified: boolean;
         process_crash_atomicity_verified: boolean;
         lifecycle_smoke_passed: boolean;
+        test_report_sha256: string | null;
     }[];
     const flows = evidence.product_flows as {
         package: string;
@@ -125,7 +155,7 @@ function installProofArtifacts(
                             : "linux",
                         self_fd_verified: targetEvidence?.self_fd_verified,
                         target: proof.subject,
-                        test_report_sha256: "b".repeat(64),
+                        test_report_sha256: targetEvidence?.test_report_sha256,
                     }
                   : proof.kind === "product_flow"
                     ? {
@@ -168,7 +198,7 @@ describe("installed release evidence", () => {
                 "release/mc-host-n-minus-one-stop.json",
         } as const;
         for (const [field, relative] of Object.entries(files)) {
-            const bytes = `${field} bytes`;
+            const bytes = citedArtifactBytes(field);
             mkdirSync(dirname(join(root, relative)), { recursive: true });
             writeFileSync(join(root, relative), bytes);
             evidence[field] = sha256Hex(bytes);
@@ -241,7 +271,7 @@ describe("installed release evidence", () => {
         const evidence = qualifiedEvidence();
         installProofArtifacts(root, evidence);
         for (const [field, relative] of Object.entries(files)) {
-            const bytes = `${field} bytes`;
+            const bytes = citedArtifactBytes(field);
             mkdirSync(dirname(join(root, relative)), { recursive: true });
             writeFileSync(join(root, relative), bytes);
             evidence[field] = sha256Hex(bytes);
@@ -290,6 +320,127 @@ describe("installed release evidence", () => {
                 /exact release set/,
             );
         }
+    });
+
+    test("a fail-closed cited artifact cannot be laundered by a qualified evidence file", () => {
+        const files = {
+            production_inputs_sha256:
+                "release/mc-host-production-inputs.lock.json",
+            qualification_sha256:
+                "docs/evidence/mc-host-release-qualification.json",
+            payload_index_sha256: "release/mc-host-payload-index.json",
+            stop_provenance_sha256: "release/mc-host-n-minus-one-stop.json",
+        } as const;
+        // Each case rewrites one cited artifact into its committed fail-closed
+        // shape. The evidence still claims `qualified: true` with passing,
+        // attested proofs, so only parsing the artifact's own claim can catch it.
+        const cases: [string, string, RegExp][] = [
+            [
+                "unqualified production inputs",
+                files.qualification_sha256,
+                /cited production-input qualification is not production-qualified/,
+            ],
+            [
+                "unqualified payload index",
+                files.payload_index_sha256,
+                /cited payload index is not production-qualified/,
+            ],
+            [
+                "one unqualified payload entry",
+                files.payload_index_sha256,
+                /cited payload index entry .* is not qualified/,
+            ],
+        ];
+        for (const [label, mutated, pattern] of cases) {
+            const root = mkdtempSync(join(tmpdir(), "mc-host-installed-evidence-"));
+            const evidence = qualifiedEvidence();
+            installProofArtifacts(root, evidence);
+            for (const [field, relative] of Object.entries(files)) {
+                let bytes = citedArtifactBytes(field);
+                if (relative === mutated) {
+                    const parsed = JSON.parse(bytes) as {
+                        production_qualified: boolean;
+                        entries?: { qualified: boolean }[];
+                    };
+                    if (label === "one unqualified payload entry") {
+                        (parsed.entries as { qualified: boolean }[])[0].qualified =
+                            false;
+                    } else {
+                        parsed.production_qualified = false;
+                    }
+                    bytes = `${canonicalJson(parsed)}\n`;
+                }
+                mkdirSync(dirname(join(root, relative)), { recursive: true });
+                writeFileSync(join(root, relative), bytes);
+                evidence[field] = sha256Hex(bytes);
+            }
+            expect(
+                () =>
+                    validateInstalledReleaseEvidenceAgainstArtifacts(
+                        root,
+                        evidence,
+                        true,
+                        { verifyAttestation: () => true },
+                    ),
+                label,
+            ).toThrow(pattern);
+            // Schema-only verification still accepts it: the artifacts are only
+            // required to be qualified when the evidence is gating GA.
+            expect(() =>
+                validateInstalledReleaseEvidenceAgainstArtifacts(
+                    root,
+                    evidence,
+                    false,
+                    { verifyAttestation: () => true },
+                ),
+            ).not.toThrow();
+        }
+    });
+
+    test("a parents-first registry order cannot claim payloads_before_parents", () => {
+        const evidence = qualifiedEvidence();
+        const packages = evidence.registry_packages as { name: string }[];
+        const contract = buildContract();
+        evidence.registry_packages = [
+            ...contract.packages.parents,
+            ...contract.packages.payloads,
+        ].map((name) => packages.find((entry) => entry.name === name));
+        // The published order regressed to parents-first, but the boolean and
+        // the publication proof that echoes it still say otherwise.
+        expect((evidence.publication as { payloads_before_parents: boolean })
+            .payloads_before_parents).toBe(true);
+        expect(() => validateInstalledReleaseEvidence(evidence)).toThrow(
+            /payloads_before_parents does not match the registry_packages order/,
+        );
+    });
+
+    test("a target proof cannot name a test report the evidence never recorded", () => {
+        const root = mkdtempSync(join(tmpdir(), "mc-host-installed-evidence-"));
+        const evidence = qualifiedEvidence();
+        installProofArtifacts(root, evidence);
+        for (const [field, relative] of Object.entries({
+            production_inputs_sha256:
+                "release/mc-host-production-inputs.lock.json",
+            qualification_sha256:
+                "docs/evidence/mc-host-release-qualification.json",
+            payload_index_sha256: "release/mc-host-payload-index.json",
+            stop_provenance_sha256: "release/mc-host-n-minus-one-stop.json",
+        })) {
+            const bytes = citedArtifactBytes(field);
+            mkdirSync(dirname(join(root, relative)), { recursive: true });
+            writeFileSync(join(root, relative), bytes);
+            evidence[field] = sha256Hex(bytes);
+        }
+        // Swapping only the recorded digest proves the comparison has two
+        // independent sides; reading the expected value back out of the proof
+        // made this substitution invisible.
+        (evidence.targets as { test_report_sha256: string }[])[0].test_report_sha256 =
+            "c".repeat(64);
+        expect(() =>
+            validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, {
+                verifyAttestation: () => true,
+            }),
+        ).toThrow(/observations drift/);
     });
 
     test("canonical evidence has a stable digest", () => {

@@ -19,6 +19,7 @@ import {
     buildContract,
     canonicalJson,
     sha256Hex,
+    validateRegistryGate,
 } from "./generate-mc-host-release-manifest";
 import {
     assembleProductionPayload,
@@ -169,10 +170,24 @@ function devManifest(): PayloadManifest {
 }
 
 describe("payload package metadata", () => {
-    test("committed release check fails closed on the live registry contradiction", () => {
-        expect(() => runCheck(repoRoot, { write: false })).toThrow(
-            /synchronized version 0\.38\.0 is not unpublished/,
-        );
+    test("the committed fail-closed gate passes drift but blocks publication", () => {
+        // `runCheck` is the drift lane (`release:payload:check`), which runs on
+        // every change. The committed gate records a live npm audit that is
+        // honestly fail-closed between releases, so asserting readiness here
+        // would leave the drift signal permanently red and unable to catch a
+        // hand-edited gate. Readiness is asserted where bytes get published.
+        expect(() => runCheck(repoRoot, { write: false })).not.toThrow();
+        expect(() =>
+            validateRegistryGate(
+                JSON.parse(
+                    readFileSync(
+                        join(repoRoot, "release/mc-host-registry-gate.json"),
+                        "utf8",
+                    ),
+                ),
+                buildContract(),
+            ),
+        ).toThrow(/synchronized version 0\.38\.0 is not unpublished/);
     });
 
     test("version drift from the contract fails", () => {

@@ -24,6 +24,7 @@ import {
     sha256Hex,
     validateContractSchema,
     validateRegistryGate,
+    validateRegistryGateShape,
     validateStopProvenance,
 } from "./generate-mc-host-release-manifest";
 
@@ -408,13 +409,58 @@ describe("registry gate", () => {
         }
     });
 
-    test("a failing gate blocks file generation end to end", () => {
+    test("a malformed gate blocks file generation end to end", () => {
+        const root = freshRoot();
+        const gate = gateCopy();
+        gate.packages[4].name = "@cortexkit/unknown";
+        writeFileSync(join(root, REGISTRY_GATE_PATH), JSON.stringify(gate));
+        expect(() => generate(root, { check: false })).toThrow(
+            /unexpected package/,
+        );
+    });
+
+    test("a fail-closed gate does not block generation but does block publication", () => {
         const root = freshRoot();
         const gate = gateCopy();
         gate.packages[4].synchronized_version_unpublished = false;
         writeFileSync(join(root, REGISTRY_GATE_PATH), JSON.stringify(gate));
-        expect(() => generate(root, { check: false })).toThrow(
+        // The committed gate records a live npm audit and is honestly
+        // fail-closed for most of a release cycle. Generation and drift must
+        // stay usable in that state, or the drift signal is permanently red and
+        // stops catching hand-edited gates; only publication demands readiness.
+        expect(() => generate(root, { check: false })).not.toThrow();
+        expect(() =>
+            validateRegistryGateShape(gate, buildContract()),
+        ).not.toThrow();
+        expect(() => validateRegistryGate(gate, buildContract())).toThrow(
             /is not unpublished/,
+        );
+    });
+
+    test("a non-boolean audited field is drift, not a readiness question", () => {
+        const gate = gateCopy();
+        gate.packages[0].synchronized_version_unpublished = "true";
+        expect(() => validateRegistryGateShape(gate, buildContract())).toThrow(
+            /synchronized_version_unpublished .* must be boolean/,
+        );
+    });
+
+    test("an unreserved payload name is shape-valid and readiness-invalid", () => {
+        const gate = gateCopy();
+        gate.packages[3].reservation_version = null;
+        expect(() =>
+            validateRegistryGateShape(gate, buildContract()),
+        ).not.toThrow();
+        expect(() => validateRegistryGate(gate, buildContract())).toThrow(
+            /missing inert reservation version/,
+        );
+    });
+
+    test("a reservation version that is present must still be inert", () => {
+        const gate = gateCopy();
+        gate.packages[3].reservation_version = "0.38.0";
+        expect(() => validateRegistryGateShape(gate, buildContract())).toThrow(
+            /must be an inert prerelease/,
         );
     });
 });
