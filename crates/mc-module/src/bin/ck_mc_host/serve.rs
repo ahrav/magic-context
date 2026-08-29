@@ -188,6 +188,10 @@ impl LauncherEnvelope {
         let running = matches!(mode, SelectionMode::Running { .. });
         let (previous, mut credential_identities, require_previous_credentials) = match mode {
             SelectionMode::Fresh => {
+                // A fresh start discards the previous selection, so a stale one
+                // (its cited closure no longer qualified or validatable) is
+                // tolerated here: the commit that follows a successful start
+                // replaces the file. Hostile or unsupported shapes still fail.
                 read_selection(&closure_root, store.as_ref())?;
                 (
                     HarnessSelection {
@@ -202,7 +206,18 @@ impl LauncherEnvelope {
                 credential_identity_key,
                 require_previous_credentials,
             } => (
-                read_selection(&closure_root, store.as_ref())?,
+                match read_selection(&closure_root, store.as_ref())? {
+                    SelectionState::Active(previous) => previous,
+                    SelectionState::Absent => HarnessSelection {
+                        schema: 1,
+                        ..HarnessSelection::default()
+                    },
+                    // The running daemon's committed selection cites a closure
+                    // this binary can no longer qualify or validate, so no
+                    // merge can honor it. `stop` clears stale selections and a
+                    // fresh start replaces them, which is the recovery path.
+                    SelectionState::Stale => return Err("active harness selection is stale"),
+                },
                 credential_identities(&self.credentials, credential_identity_key),
                 require_previous_credentials,
             ),
@@ -475,10 +490,30 @@ fn selected_snapshot(
     })
 }
 
+/// What one read of the active-selection file established.
+///
+/// The split between `Stale` and an `Err` is load-bearing for recovery: an
+/// error names a shape this binary must not touch (hostile metadata, malformed
+/// bytes, or a schema owned by a newer binary), while `Stale` names well-formed
+/// schema-1 state whose cited closure this binary can no longer qualify or
+/// validate — the residue of a qualified-set rotation or a pruned closure
+/// store. Owners may remove stale state and a fresh start may ignore it;
+/// collapsing it into the error class would wedge `stop`, `start`, and
+/// `restart` on a file only manual deletion could clear.
+enum SelectionState {
+    /// No selection file exists.
+    Absent,
+    /// A well-formed selection whose cited closures all qualify and validate.
+    Active(HarnessSelection),
+    /// A well-formed schema-1 selection citing a closure that is no longer
+    /// qualified or no longer validates.
+    Stale,
+}
+
 fn read_selection(
     closure_root: &Path,
     store: Option<&HarnessClosureStore>,
-) -> Result<HarnessSelection, &'static str> {
+) -> Result<SelectionState, &'static str> {
     let path = closure_root.join(ACTIVE_HARNESS_SELECTION);
     let mut file = match std::fs::OpenOptions::new()
         .read(true)
@@ -487,10 +522,7 @@ fn read_selection(
     {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(HarnessSelection {
-                schema: 1,
-                ..HarnessSelection::default()
-            })
+            return Ok(SelectionState::Absent)
         }
         Err(_) => return Err("active harness selection is unreadable"),
     };
@@ -539,11 +571,11 @@ fn read_selection(
                     .and_then(|store| store.validate(digest).ok())
                     .is_none()
             {
-                return Err("active harness selection is invalid");
+                return Ok(SelectionState::Stale);
             }
         }
     }
-    Ok(selection)
+    Ok(SelectionState::Active(selection))
 }
 
 fn write_selection(closure_root: &Path, selection: &HarnessSelection) -> Result<(), &'static str> {
@@ -608,6 +640,10 @@ pub fn clear_active_selection() -> Result<(), &'static str> {
     }
     let store = HarnessClosureStore::open(&closure_root)
         .map_err(|_| "active harness selection root is unavailable")?;
+    // Every readable state — active, absent, or stale — is removable stale
+    // state once the owner decided to clear it. Only hostile shapes and
+    // schemas owned by a newer binary keep failing, preserving the file as
+    // evidence for the binary that understands it.
     read_selection(&closure_root, Some(&store))?;
     match std::fs::remove_file(path) {
         Ok(()) => std::fs::File::open(closure_root)
@@ -1010,7 +1046,10 @@ mod tests {
             credential_identities: credential_identities(&credentials, &[11; 32]),
         };
         write_selection(root.path(), &selection).expect("write selection");
-        let loaded = read_selection(root.path(), Some(&store)).expect("read selection");
+        let loaded = match read_selection(root.path(), Some(&store)).expect("read selection") {
+            SelectionState::Active(loaded) => loaded,
+            _ => panic!("a committed selection must read back as active"),
+        };
         assert_eq!(loaded, selection);
         let bytes =
             std::fs::read(root.path().join(ACTIVE_HARNESS_SELECTION)).expect("selection bytes");
@@ -1022,5 +1061,69 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    /// Plants a well-formed schema-1 selection citing a digest outside the
+    /// qualified closure set, the residue an upgrade that rotates the
+    /// qualified inputs leaves behind.
+    fn plant_stale_selection(closure_root: &Path) {
+        std::fs::create_dir_all(closure_root).expect("closure root");
+        std::fs::set_permissions(closure_root, std::fs::Permissions::from_mode(0o700))
+            .expect("closure root mode");
+        write_selection(
+            closure_root,
+            &HarnessSelection {
+                schema: 1,
+                opencode: Some("f".repeat(64)),
+                pi: None,
+                credential_identities: BTreeMap::new(),
+            },
+        )
+        .expect("write stale selection");
+    }
+
+    #[test]
+    fn a_selection_citing_an_unqualified_closure_reads_as_stale_not_invalid() {
+        let root = tempfile::tempdir().expect("selection root");
+        let closure_root = root.path().join("closures");
+        plant_stale_selection(&closure_root);
+        let store = HarnessClosureStore::open(&closure_root).expect("closure store");
+        assert!(matches!(
+            read_selection(&closure_root, Some(&store)).expect("stale selection reads"),
+            SelectionState::Stale
+        ));
+    }
+
+    #[test]
+    fn fresh_prepare_ignores_a_stale_selection_and_running_prepare_refuses_it() {
+        let root = tempfile::tempdir().expect("data root");
+        let data_dir = root.path().to_path_buf();
+        let closure_root = data_dir.join("cortexkit").join("mc-host-harness-closures");
+        plant_stale_selection(&closure_root);
+
+        let envelope = || LauncherEnvelope {
+            schema: 1,
+            opencode: None,
+            pi: None,
+            credentials: BTreeMap::new(),
+        };
+        // A fresh start discards the previous selection, so stale residue must
+        // not block it; the wedge it would otherwise cause has no CLI recovery.
+        let prepared = envelope()
+            .prepare(data_dir.clone(), SelectionMode::Fresh)
+            .expect("fresh start ignores a stale selection");
+        assert!(!prepared.changed);
+        // A running merge cannot honor a selection whose closure is gone, and
+        // must refuse without adopting or rewriting it.
+        match envelope().prepare(
+            data_dir,
+            SelectionMode::Running {
+                credential_identity_key: &[12; 32],
+                require_previous_credentials: true,
+            },
+        ) {
+            Err(reason) => assert_eq!(reason, "active harness selection is stale"),
+            Ok(_) => panic!("running merge must refuse a stale selection"),
+        }
     }
 }

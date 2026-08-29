@@ -756,6 +756,31 @@ fn credentialed_restart_is_explicit_exact_and_clears_stale_selection() {
         !selection.exists(),
         "already-stopped cleanup must remove stale active selection"
     );
+
+    // A schema-1 selection citing a digest outside the qualified closure set —
+    // the residue an upgrade that rotates the qualified inputs leaves behind —
+    // is stale state this binary owns, not tampering: stop must clear it
+    // rather than wedge on the very file it exists to remove.
+    std::fs::write(
+        &selection,
+        format!("{{\"schema\":1,\"opencode\":\"{}\"}}", "f".repeat(64)).as_bytes(),
+    )
+    .expect("unqualified selection fixture");
+    std::fs::set_permissions(&selection, std::fs::Permissions::from_mode(0o600))
+        .expect("unqualified selection mode");
+    let stale_digest_stop = run(&data, &["stop"]);
+    assert_eq!(stale_digest_stop.code, 0);
+    assert_result(
+        &stale_digest_stop.json(),
+        "stop",
+        true,
+        "stopped",
+        "already_stopped",
+    );
+    assert!(
+        !selection.exists(),
+        "stop must clear a stale selection citing an unqualified closure"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
