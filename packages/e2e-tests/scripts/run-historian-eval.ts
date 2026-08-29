@@ -342,7 +342,15 @@ async function runLive(args: CliArgs): Promise<number> {
     const admission = liveAdmissionGate(scenarios);
     if (admission !== 0) return admission;
     const opencode = opencodeVersion();
-    const artifactsRoot = join(dirname(resolve(args.reportPath)), "historian-eval-runs");
+    const reportDir = dirname(resolve(args.reportPath));
+    // Before anything writes into it, including the first partial. Today the
+    // directory happens to exist by the time that write lands, because
+    // `runScenario` creates `<reportDir>/historian-eval-runs/<id>` recursively —
+    // but that is an accident of `artifactsRoot` living under the report and of
+    // the runner's internal ordering, and the partial write swallows its errors,
+    // so relying on it would make the guarantee silently depend on both.
+    mkdirSync(reportDir, { recursive: true });
+    const artifactsRoot = join(reportDir, "historian-eval-runs");
     // The whole root, once, not each scenario's directory as it is reached. A
     // reused report directory — a direct run over a smaller corpus, or a budget
     // that stops before the end — otherwise leaves `run-record.json` files for
@@ -404,7 +412,6 @@ async function runLive(args: CliArgs): Promise<number> {
         ...(releaseVersion === null ? {} : { releaseVersion }),
         ...(system === undefined ? {} : { system }),
     });
-    mkdirSync(dirname(resolve(args.reportPath)), { recursive: true });
     writeFileSync(resolve(args.reportPath), `${JSON.stringify(report, null, 2)}\n`);
     // The real report exists now, so the partial would only be a second, staler
     // answer in the same archive.
