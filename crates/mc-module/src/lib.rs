@@ -6,33 +6,34 @@
 #![forbid(unsafe_code)]
 
 pub mod boundary;
-pub mod caveman;
+pub(crate) mod caveman;
+pub(crate) mod chunk_text;
 pub mod ck_wire;
 pub mod classify;
 pub mod codec;
-pub mod compartment_coverage;
-pub mod config;
+pub(crate) mod compartment_coverage;
+pub(crate) mod config;
 pub mod decay_render;
 pub mod dispatch;
-pub mod divergence;
+pub(crate) mod divergence;
 pub mod healing;
 pub mod historian;
 pub mod historian_chunk;
 pub mod historian_producer;
-pub mod historian_prompt;
-pub mod historian_validate;
+pub(crate) mod historian_prompt;
+pub(crate) mod historian_validate;
 pub mod injection;
 pub mod m0_compose;
-pub mod m1_compose;
-pub mod memory_render;
+pub(crate) mod m1_compose;
+pub(crate) mod memory_render;
 pub mod memory_tool;
-pub mod project_docs;
-pub mod prompt_surface;
+pub(crate) mod project_docs;
+pub(crate) mod prompt_surface;
 mod retained_size;
 pub mod scheduler;
 pub mod selection;
 pub mod session_resolver;
-pub mod smart_note_evaluation;
+pub(crate) mod smart_note_evaluation;
 mod tail_hygiene;
 pub mod transform;
 
