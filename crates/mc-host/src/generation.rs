@@ -360,7 +360,21 @@ pub fn required_stage_bytes(sizes: &[u64]) -> Option<u64> {
 /// Opens `rel` under `dir` component by component with `O_NOFOLLOW`, so no
 /// intermediate or final symlink is followed. `None` means absent; hostile
 /// shapes surface as `None` too and fail the caller's stricter checks.
+///
+/// The final file open carries `O_NONBLOCK` deliberately: a planted FIFO
+/// passes `O_NOFOLLOW`, and without `NONBLOCK` opening it would block a probe
+/// uncancellably.
 fn open_rel_nofollow(dir: &OwnedFd, rel: &str) -> Option<OwnedFd> {
+    open_rel_walk(dir, rel, false)
+}
+
+/// Directory-only variant of [`open_rel_nofollow`]: every component, including
+/// the last, is opened as a directory without following links.
+fn open_rel_dir_nofollow(dir: &OwnedFd, rel: &str) -> Option<OwnedFd> {
+    open_rel_walk(dir, rel, true)
+}
+
+fn open_rel_walk(dir: &OwnedFd, rel: &str, final_is_dir: bool) -> Option<OwnedFd> {
     let mut components = rel.split('/').peekable();
     let mut current: Option<OwnedFd> = None;
     while let Some(component) = components.next() {
@@ -369,34 +383,12 @@ fn open_rel_nofollow(dir: &OwnedFd, rel: &str) -> Option<OwnedFd> {
         }
         let at = current.as_ref().unwrap_or(dir);
         let last = components.peek().is_none();
-        let flags = if last {
+        let flags = if last && !final_is_dir {
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK
         } else {
             OFlags::DIRECTORY | OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC
         };
         match openat(at, component, flags, Mode::empty()) {
-            Ok(fd) => current = Some(fd),
-            Err(_) => return None,
-        }
-    }
-    current
-}
-
-/// Directory-only variant of [`open_rel_nofollow`]: every component, including
-/// the last, is opened as a directory without following links.
-fn open_rel_dir_nofollow(dir: &OwnedFd, rel: &str) -> Option<OwnedFd> {
-    let mut current: Option<OwnedFd> = None;
-    for component in rel.split('/') {
-        if component.is_empty() || component == "." || component == ".." {
-            return None;
-        }
-        let at = current.as_ref().unwrap_or(dir);
-        match openat(
-            at,
-            component,
-            OFlags::DIRECTORY | OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        ) {
             Ok(fd) => current = Some(fd),
             Err(_) => return None,
         }

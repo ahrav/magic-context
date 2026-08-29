@@ -1936,23 +1936,25 @@ async fn read_active_frame<R: AsyncRead + Unpin>(
     // of the owner's active slots — until the frame deadline, even though byte 4
     // already proved the generation unusable. The host's reader splits the read
     // for the same reason; see `tcp_frame_channel::read_frame`.
-    read_exact_until(
+    crate::frame_read::read_exact(
         read,
         &mut header_bytes[1..FROZEN_PREFIX_LEN],
         deadline,
         &inner.cancel,
     )
-    .await?;
+    .await
+    .map_err(|_| ())?;
     if header_bytes[4] != PROTOCOL_VERSION {
         return Err(());
     }
-    read_exact_until(
+    crate::frame_read::read_exact(
         read,
         &mut header_bytes[FROZEN_PREFIX_LEN..],
         deadline,
         &inner.cancel,
     )
-    .await?;
+    .await
+    .map_err(|_| ())?;
     let header = decode_header(&header_bytes).map_err(|_| ())?;
     validate_inbound(&header)?;
     if header.len == 0 {
@@ -1968,56 +1970,28 @@ async fn read_active_frame<R: AsyncRead + Unpin>(
     // the framing maximum, which `validate_inbound` has already rejected — it
     // survives only as the structural guard for that invariant.
     let Some(charge) = inner.read_budget.charge(header.len as usize) else {
-        drain_until(read, header.len as usize, deadline, &inner.cancel).await?;
+        // Discard the refused body so the failure is reported against a stream
+        // still aligned on a header boundary.
+        crate::frame_read::drain(read, header.len as usize, deadline, &inner.cancel)
+            .await
+            .map_err(|_| ())?;
         return Err(());
     };
-    let body = read_body_until(read, header.len as usize, deadline, &inner.cancel).await?;
+    let mut body = Vec::with_capacity(header.len as usize);
+    crate::frame_read::read_body(
+        read,
+        &mut body,
+        header.len as usize,
+        deadline,
+        &inner.cancel,
+    )
+    .await
+    .map_err(|_| ())?;
     Ok(Some(InboundFrame {
         header,
         body,
         charge,
     }))
-}
-
-/// Fills `buf` under the frame deadline. Every stop is fatal to this generation:
-/// the client resynchronizes by reconnecting, never by guessing where the next
-/// header begins.
-async fn read_exact_until<R: AsyncRead + Unpin>(
-    read: &mut R,
-    buf: &mut [u8],
-    deadline: Instant,
-    cancel: &CancellationToken,
-) -> Result<(), ()> {
-    crate::frame_read::read_exact(read, buf, deadline, cancel)
-        .await
-        .map_err(|_| ())
-}
-
-/// Reads exactly `len` body bytes under one frame deadline.
-async fn read_body_until<R: AsyncRead + Unpin>(
-    read: &mut R,
-    len: usize,
-    deadline: Instant,
-    cancel: &CancellationToken,
-) -> Result<Vec<u8>, ()> {
-    let mut body = Vec::with_capacity(len);
-    crate::frame_read::read_body(read, &mut body, len, deadline, cancel)
-        .await
-        .map_err(|_| ())?;
-    Ok(body)
-}
-
-/// Discards a body this client refused to retain, so the failure is reported
-/// against a stream still aligned on a header boundary.
-async fn drain_until<R: AsyncRead + Unpin>(
-    read: &mut R,
-    remaining: usize,
-    deadline: Instant,
-    cancel: &CancellationToken,
-) -> Result<(), ()> {
-    crate::frame_read::drain(read, remaining, deadline, cancel)
-        .await
-        .map_err(|_| ())
 }
 
 /// Turns a caller-supplied timeout into an absolute deadline.
