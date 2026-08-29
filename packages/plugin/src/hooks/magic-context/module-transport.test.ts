@@ -334,6 +334,33 @@ describe("McHostModuleTransport", () => {
         expect(events).toEqual(["demand"]);
     });
 
+    it("a failed demand arms connection backoff instead of re-demanding per call", async () => {
+        let demands = 0;
+        const transport = trackTransport(
+            new McHostModuleTransport({
+                requestTimeoutMs: 1_000,
+                demandStart: async () => {
+                    demands += 1;
+                    return { ok: false, reason: "native_payload_missing", storage: null };
+                },
+            }),
+        );
+        const args = {
+            sessionId: "managed-backoff",
+            projectRoot: "/workspace/project",
+            method: "transform",
+            body: { method: "transform", v: 1 },
+        } as const;
+
+        await expect(transport.call(args)).rejects.toMatchObject({
+            code: "native_payload_missing",
+        });
+        await expect(transport.call(args)).rejects.toMatchObject({
+            code: "MC_HOST_CONNECTION_BACKOFF",
+        });
+        expect(demands).toBe(1);
+    });
+
     it("credential source changes rebind the managed route before another body", async () => {
         const peer = await startPeer();
         const dataHome = join(tempDir, `managed-home-${++fileCounter}`);
@@ -412,17 +439,37 @@ describe("McHostModuleTransport", () => {
         }
     });
 
-    it("surfaces a missing managed lifecycle owner before connection work", async () => {
-        const transport = trackTransport(new McHostModuleTransport({ requestTimeoutMs: 100 }));
-
-        await expect(
-            transport.call({
+    it("stays passive without a managed lifecycle owner and dials the default file", async () => {
+        const peer = await startPeer();
+        const dataHome = join(tempDir, `passive-home-${++fileCounter}`);
+        const connectionFile = join(dataHome, "cortexkit", "run", "subc-connection.json");
+        mkdirSync(join(dataHome, "cortexkit", "run"), { recursive: true });
+        await writeConnectionFile(connectionFile, peer);
+        const oldDataHome = process.env.XDG_DATA_HOME;
+        process.env.XDG_DATA_HOME = dataHome;
+        try {
+            const transport = trackTransport(
+                new McHostModuleTransport({ requestTimeoutMs: 2_000 }),
+            );
+            const call = transport.call({
                 sessionId: "missing-owner",
                 projectRoot: "/workspace/project",
                 method: "transform",
                 body: { method: "transform", v: 1 },
-            }),
-        ).rejects.toMatchObject({ code: "MC_HOST_LIFECYCLE_OWNER_MISSING" });
+            });
+            const conn = await peer.waitForConnection();
+            await conn.authenticated;
+            const cursor = frameCursor(conn);
+            const routeOpen = await cursor.next(isRouteOpen);
+            await sendRouteOpenOk(conn, routeOpen.corr, 7, 77);
+            const request = await cursor.next(isRoutedRequest(7));
+            await sendResponse(conn, request.corr, { ok: true }, 7, 77);
+
+            await expect(call).resolves.toEqual({ ok: true });
+        } finally {
+            if (oldDataHome === undefined) delete process.env.XDG_DATA_HOME;
+            else process.env.XDG_DATA_HOME = oldDataHome;
+        }
     });
 
     it("keeps an explicit connection lifecycle-neutral", async () => {

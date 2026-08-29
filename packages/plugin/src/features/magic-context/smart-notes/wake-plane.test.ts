@@ -155,15 +155,48 @@ describe("wakePlaneStatus", () => {
         expect(probes).toBe(1);
     });
 
-    test("does not reuse an affirmative answer after its authenticated probe closes", async () => {
+    test("does not retain an affirmative answer with no readable publication", async () => {
         let probes = 0;
         __wakePlaneTest.setCatalogProbe(async () => {
             probes += 1;
             return catalog(true);
         });
+        __wakePlaneTest.setPublicationReader(() => null);
 
         expect(await wakePlaneStatus()).toBe("present");
         expect(await wakePlaneStatus()).toBe("present");
+        expect(probes).toBe(2);
+    });
+
+    test("reuses an affirmative answer while the publishing daemon is unchanged", async () => {
+        let probes = 0;
+        __wakePlaneTest.setCatalogProbe(async () => {
+            probes += 1;
+            return catalog(true);
+        });
+        __wakePlaneTest.setPublicationReader(() => "dev:ino:1000:64");
+
+        expect(await wakePlaneStatus()).toBe("present");
+        expect(await wakePlaneStatus()).toBe("present");
+        expect(probes).toBe(1);
+    });
+
+    test("re-probes an affirmative answer after the daemon republishes", async () => {
+        let probes = 0;
+        let hasWakePlane = true;
+        let publication = "dev:ino:1000:64";
+        __wakePlaneTest.setCatalogProbe(async () => {
+            probes += 1;
+            return catalog(hasWakePlane);
+        });
+        __wakePlaneTest.setPublicationReader(() => publication);
+
+        expect(await wakePlaneStatus()).toBe("present");
+        // A replacement daemon republishes its connection file; the capability
+        // the previous daemon proved must not carry over to it.
+        publication = "dev:ino:2000:64";
+        hasWakePlane = false;
+        expect(await wakePlaneStatus()).toBe("absent");
         expect(probes).toBe(2);
     });
 

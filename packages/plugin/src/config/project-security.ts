@@ -212,7 +212,9 @@ function makeProjectThresholdWarning(field: string, reason: string): string {
  *    the trust boundary for embedding destinations.
  *  - `transform_mode` is intentionally allowed at project tier so a repository
  *    can opt its own runtime into the experimental Rust pipeline. The resolver
- *    requires trusted user-level `subc` configuration before Rust can activate.
+ *    requires user-tier consent (a user-level `transform_mode` selection or
+ *    trusted user-level `subc` configuration) before Rust — and the managed
+ *    native-host lifecycle it may demand-start — can activate.
  *  - `historian.model` / `historian.fallback_models` — historian model spend is
  *    user-level only; a cloned repo cannot force extra compaction cost.
  *  - `mural.model` — mural cue-compressor model selection is user-level only;

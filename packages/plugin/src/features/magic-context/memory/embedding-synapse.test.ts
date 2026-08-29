@@ -116,11 +116,13 @@ describe("SynapseEmbeddingProvider", () => {
 
     it("demands before a managed real connection and coalesces initialization", async () => {
         let demands = 0;
+        const deadlines: (number | undefined)[] = [];
         const provider = new SynapseEmbeddingProvider({
             projectRoot: "/repo",
             session: "managed-synapse",
-            demandStart: async () => {
+            demandStart: async (request) => {
                 demands += 1;
+                deadlines.push(request.deadlineMs);
                 return { ok: false, reason: "startup_timeout", storage: null };
             },
             connectionOrigin: "managed-default",
@@ -131,6 +133,27 @@ describe("SynapseEmbeddingProvider", () => {
             false,
             false,
         ]);
+        expect(demands).toBe(1);
+        // The demand waits on a shared cold start, not on one query: a
+        // per-query deadline would detach every waiter mid-startup and demote
+        // the lane while startup still succeeds.
+        expect(deadlines[0]).toBeGreaterThanOrEqual(60_000);
+    });
+
+    it("does not re-demand per call after a failed managed demand", async () => {
+        let demands = 0;
+        const provider = new SynapseEmbeddingProvider({
+            projectRoot: "/repo",
+            session: "managed-demand-backoff",
+            demandStart: async () => {
+                demands += 1;
+                return { ok: false, reason: "native_payload_missing", storage: null };
+            },
+            connectionOrigin: "managed-default",
+        });
+
+        expect(await provider.initialize()).toBe(false);
+        expect(await provider.initialize()).toBe(false);
         expect(demands).toBe(1);
     });
 

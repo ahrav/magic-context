@@ -300,6 +300,34 @@ describe("project embedding registry", () => {
         ).toBeNull();
     });
 
+    it("keeps a deferred Synapse lane enabled so first use can resolve it", () => {
+        const db = useTempDb();
+        const snapshot = registerProjectEmbedding(
+            db,
+            "deferred-enabled-synapse",
+            {
+                provider: "synapse",
+                model: "gte-modernbert-base-f16",
+                synapse_connection_origin: "managed-default",
+                synapse_fallback: { provider: "off" },
+            } as EmbeddingConfig,
+            { memoryEnabled: true, gitCommitEnabled: true },
+            "/repo",
+        );
+
+        // The embed entry points (memory queue, commit batches, chunk drains,
+        // search) gate on the snapshot; a deferred lane reported as disabled
+        // could never reach the first embed that resolves it or activates the
+        // configured fallback.
+        expect(snapshot.enabled).toBe(true);
+        expect(snapshot.gitCommitEnabled).toBe(true);
+        expect(snapshot.provider).toBe("synapse");
+        // The unresolved lane still exposes no usable identity: stale-identity
+        // GC and chunk search stay gated until the first vector commits it.
+        expect(snapshot.modelId).toBe("off");
+        expect(snapshot.chunkModelId).toBe("off");
+    });
+
     it("resolved primary and shadow descriptors are removed when Synapse becomes deferred", () => {
         const db = useTempDb();
         const projectIdentity = "resolved-to-deferred";

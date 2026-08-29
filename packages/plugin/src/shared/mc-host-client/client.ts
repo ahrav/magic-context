@@ -1673,18 +1673,18 @@ export class McHostClient {
             // Only the primary serves cached managed handles: a handle left on a draining predecessor is stale for NEW managed acquisitions even while raw callers still use it (R10). commentlint: allow(JUDGE)
             if (cached.handle && this.isPrimaryLiveHandle(cached.handle)) {
                 const active = this.active;
-                const currentIdentity =
-                    active === null
-                        ? cached.identity
-                        : this.identityForConnection(active, baseIdentity);
+                // Without a live connection the identity cannot be refreshed;
+                // the cached handle stays authoritative for its channel.
+                if (active === null) return cached.handle;
+                const currentIdentity = this.identityForConnection(active, baseIdentity);
                 if (
                     JSON.stringify(currentIdentity.credential_fingerprints ?? {}) ===
                     JSON.stringify(cached.identity.credential_fingerprints ?? {})
                 ) {
                     return cached.handle;
                 }
-                this.liveRoutes.delete(cached.handle.channel);
-                active?.generation.enqueueRouteGoodbye(cached.handle.channel, cached.handle.epoch);
+                active.liveRoutes.delete(cached.handle.channel);
+                active.generation.enqueueRouteGoodbye(cached.handle.channel, cached.handle.epoch);
                 cached.handle = null;
                 cached.identity = currentIdentity;
             }

@@ -785,7 +785,12 @@ function sameFeatures(a: EmbeddingFeatures, b: EmbeddingFeatures): boolean {
 function snapshotFor(
     registration: ProjectEmbeddingRegistration,
 ): ProjectEmbeddingRegistrationSnapshot {
-    const providerIsOn = registration.providerIdentity !== OFF_PROVIDER_IDENTITY;
+    // Enablement follows the configured provider, not the resolved identity:
+    // a deferred Synapse lane carries OFF_PROVIDER_IDENTITY until first use,
+    // but must stay enabled or the embed entry points that resolve it (and
+    // that activate its fallback) would never run. getOrCreateProjectProvider
+    // applies the same provider-based gate.
+    const providerIsOn = (registration.config.provider ?? "local") !== "off";
     const enabled =
         !registration.observationMode && providerIsOn && registration.features.memoryEnabled;
     const gitCommitEnabled =

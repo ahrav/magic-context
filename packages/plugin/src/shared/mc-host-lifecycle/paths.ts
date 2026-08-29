@@ -171,16 +171,24 @@ export interface AdmissionIo {
     readMounts: () => string;
 }
 
+// Reading the darwin mount table spawns /sbin/mount synchronously, and
+// admission runs on every lifecycle command reached from request-driven
+// demand-start. The verdict-relevant mounts (the data root's filesystem) are
+// process-lifetime stable for admission purposes, so one read serves the
+// process instead of blocking the event loop per demand.
+let cachedDarwinMounts: string | undefined;
+
 const defaultAdmissionIo: AdmissionIo = {
     platform: process.platform,
-    readMounts: () =>
-        process.platform === "darwin"
-            ? execFileSync("/sbin/mount", [], {
-                  encoding: "utf8",
-                  timeout: 2_000,
-                  maxBuffer: 1024 * 1024,
-              })
-            : readFileSync("/proc/self/mounts", "utf8"),
+    readMounts: () => {
+        if (process.platform !== "darwin") return readFileSync("/proc/self/mounts", "utf8");
+        cachedDarwinMounts ??= execFileSync("/sbin/mount", [], {
+            encoding: "utf8",
+            timeout: 2_000,
+            maxBuffer: 1024 * 1024,
+        });
+        return cachedDarwinMounts;
+    },
 };
 
 function parseDarwinMounts(text: string): MountEntry[] {

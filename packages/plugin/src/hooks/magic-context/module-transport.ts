@@ -29,9 +29,11 @@ import {
 } from "../../shared/mc-host-client";
 import {
     type ConnectionOrigin,
+    connectionFilePath,
     createManagedLifecyclePolicy,
     type NativeStartupEnvelope,
     resolveConnectionOrigin,
+    resolveLifecycleDataRoot,
     type StorageReadiness,
 } from "../../shared/mc-host-lifecycle";
 import { qualifiedHarnessClosures } from "../../shared/mc-host-lifecycle/generated-production-inputs";
@@ -51,6 +53,13 @@ const SERIAL_LANE_MIN_REMAINING_MS = 25;
 const CANONICAL_ROOT_CACHE_MAX_ENTRIES = 256;
 
 function getDefaultConnectionFile(): string {
+    // The managed lifecycle owner publishes the daemon under the lifecycle
+    // data root; dialing must agree byte-for-byte with that resolver or a
+    // demand can report ready while this transport dials a different path.
+    // The application-storage resolver only backstops environments where no
+    // lifecycle root resolves at all.
+    const root = resolveLifecycleDataRoot(process.env);
+    if (root.ok) return connectionFilePath(root.root);
     return join(getDataDir(), "cortexkit", "run", "subc-connection.json");
 }
 
@@ -70,7 +79,6 @@ export type ManagedDemandStart = (request: {
 
 export interface McHostModuleTransportOptions {
     connectionFile?: string;
-    connectionOrigin?: ConnectionOrigin;
     moduleId?: string;
     requestTimeoutMs?: number;
     routeSessionPrefix?: string;
@@ -463,9 +471,7 @@ export class McHostModuleTransport {
                       requestTimeoutMs,
                       routeSessionPrefix,
                   };
-        this.connectionOrigin =
-            options.connectionOrigin ??
-            resolveConnectionOrigin({ connectionFile: options.connectionFile });
+        this.connectionOrigin = resolveConnectionOrigin({ connectionFile: options.connectionFile });
         this.connectionFile = options.connectionFile ?? getDefaultConnectionFile();
         this.moduleId = options.moduleId ?? DEFAULT_MODULE_ID;
         this.requestTimeoutMs = options.requestTimeoutMs ?? MODULE_SEND_TIMEOUT_MS;
@@ -1144,13 +1150,10 @@ export class McHostModuleTransport {
 
     private async demandManagedReadiness(deadline?: Deadline, signal?: AbortSignal): Promise<void> {
         if (this.connectionOrigin !== "managed-default") return;
-        if (!this.demandStart) {
-            const error = new Error("managed mc-host lifecycle owner is unavailable") as Error & {
-                code?: string;
-            };
-            error.code = "MC_HOST_LIFECYCLE_OWNER_MISSING";
-            throw error;
-        }
+        // No configured lifecycle owner keeps this transport passive: it can
+        // still dial an externally launched daemon on the default connection
+        // file (CLI doctor/migration paths never wire a managed owner).
+        if (!this.demandStart) return;
         const outcome = await this.demandStart({
             origin: this.connectionOrigin,
             capability: "magic-context",
@@ -1180,13 +1183,8 @@ export class McHostModuleTransport {
         signal?: AbortSignal,
     ): Promise<McHostClient> {
         if (this.client) return this.client;
-        await this.demandManagedReadiness(deadline, signal);
-        if (signal?.aborted) {
-            throw signal.reason ?? new Error("module transport call aborted");
-        }
         if (this.connectionPromise) return await this.connectionPromise;
-        const now = Date.now();
-        if (now < this.nextProbeMs) {
+        if (Date.now() < this.nextProbeMs) {
             const error = new Error(
                 `mc-host connection backoff active until ${this.nextProbeMs}`,
             ) as Error & {
@@ -1195,6 +1193,25 @@ export class McHostModuleTransport {
             error.code = "MC_HOST_CONNECTION_BACKOFF";
             throw error;
         }
+        try {
+            await this.demandManagedReadiness(deadline, signal);
+        } catch (error) {
+            // A failed demand arms the same backoff as a failed connect: each
+            // demand can spawn a native lifecycle process, so traffic must not
+            // drive an unthrottled start loop while the host cannot come up.
+            // Caller aborts and expired deadlines are not host faults.
+            if (!signal?.aborted && !(deadline?.isExpired() ?? false)) {
+                this.nextProbeMs = Date.now() + this.backoffMs;
+                this.backoffMs = Math.min(this.backoffMs * 2, CONNECT_BACKOFF_MAX_MS);
+            }
+            throw error;
+        }
+        if (signal?.aborted) {
+            throw signal.reason ?? new Error("module transport call aborted");
+        }
+        // The demand awaited; another caller may have connected meanwhile.
+        if (this.client) return this.client;
+        if (this.connectionPromise) return await this.connectionPromise;
 
         const generation = this.connectionGeneration;
         const connecting = (async (): Promise<McHostClient> => {

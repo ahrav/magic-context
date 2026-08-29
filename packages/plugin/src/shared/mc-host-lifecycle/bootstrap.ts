@@ -91,6 +91,11 @@ function detectProcSelfFd(): boolean {
     }
 }
 
+// The product version cannot change within a process, and checkPlatform runs
+// on every lifecycle command reached from request-driven demand-start; the
+// synchronous sw_vers spawn must not repeat per demand.
+let cachedMacosProductVersion: string | null | undefined;
+
 export const defaultPlatformReaders: PlatformReaders = {
     platform: process.platform,
     arch: process.arch,
@@ -99,6 +104,7 @@ export const defaultPlatformReaders: PlatformReaders = {
     procSelfFdUsable: detectProcSelfFd,
     macosProductVersion: () => {
         if (process.platform !== "darwin") return null;
+        if (cachedMacosProductVersion !== undefined) return cachedMacosProductVersion;
         try {
             const value = execFileSync("/usr/bin/sw_vers", ["-productVersion"], {
                 encoding: "utf8",
@@ -106,10 +112,11 @@ export const defaultPlatformReaders: PlatformReaders = {
                 maxBuffer: 1_024,
                 stdio: ["ignore", "pipe", "ignore"],
             }).trim();
-            return /^\d+\.\d+(?:\.\d+)?$/.test(value) ? value : null;
+            cachedMacosProductVersion = /^\d+\.\d+(?:\.\d+)?$/.test(value) ? value : null;
         } catch {
-            return null;
+            cachedMacosProductVersion = null;
         }
+        return cachedMacosProductVersion;
     },
 };
 

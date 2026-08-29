@@ -62,11 +62,7 @@ async function runShadowBackfill(
         process.exitCode = 1;
         return;
     }
-    const routing = await resolveEmbeddingRouting({
-        config: detailed.config,
-        projectRoot: directory,
-        session: `shadow-backfill:${projectIdentity}`,
-    });
+    const routing = await resolveEmbeddingRouting({ config: detailed.config });
     for (const warning of routing.warnings) console.warn(`[shadow] ${warning}`);
     if (!routing.shadow) {
         console.error(

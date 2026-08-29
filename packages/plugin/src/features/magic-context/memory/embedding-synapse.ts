@@ -6,7 +6,11 @@ import { log } from "../../../shared/logger";
 import { isMcHostCallError, McHostClient } from "../../../shared/mc-host-client";
 import {
     type ConnectionOrigin,
+    connectionFilePath,
+    OUTER_AGGREGATE_MS,
     resolveConnectionOrigin,
+    resolveLifecycleDataRoot,
+    STORAGE_HARD_BUDGET_MS,
     type StorageReadiness,
 } from "../../../shared/mc-host-lifecycle";
 import {
@@ -124,7 +128,6 @@ export interface SynapseEmbeddingProviderOptions {
 export type SynapseDemandStart = (request: {
     origin: ConnectionOrigin;
     capability: "synapse";
-    signal?: AbortSignal;
     deadlineMs?: number;
 }) => Promise<{ ok: boolean; reason: string; storage: StorageReadiness | null }>;
 
@@ -136,7 +139,23 @@ export function configureSynapseManagedDemandStart(
     configuredManagedDemandStart = demandStart;
 }
 
+/**
+ * A managed cold start may take the full native start budget plus the storage
+ * probe. A per-query timeout here would detach every waiter mid-startup and
+ * demote the lane to its fallback while the shared startup still succeeds.
+ */
+const SYNAPSE_DEMAND_STARTUP_BUDGET_MS = OUTER_AGGREGATE_MS + STORAGE_HARD_BUDGET_MS;
+/** A failed demand is not retried per embed call; each retry spawns a native lifecycle process. */
+const SYNAPSE_DEMAND_RETRY_BACKOFF_MS = 5_000;
+
 function defaultConnectionFile(): string {
+    // The managed lifecycle owner publishes the daemon under the lifecycle
+    // data root; dialing must agree byte-for-byte with that resolver or a
+    // demand can report ready while this client dials a different path. The
+    // application-storage resolver only backstops environments where no
+    // lifecycle root resolves at all.
+    const root = resolveLifecycleDataRoot(process.env);
+    if (root.ok) return connectionFilePath(root.root);
     return join(getDataDir(), "cortexkit", "run", "subc-connection.json");
 }
 
@@ -554,7 +573,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
     private client: SynapseClientLike | null = null;
     private initialized = false;
     private initializing: Promise<boolean> | null = null;
-    private managedDemand: Promise<{ ok: boolean; reason: string }> | null = null;
+    private demandFailedUntilMs = 0;
     private permanentFailure = false;
     private batchLimit = 16;
     private tokenBudget: number | null = null;
@@ -646,47 +665,51 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         return provider.metadata;
     }
 
+    /**
+     * Demand the shared managed daemon inside the initialization flight, so
+     * concurrent initializers share one demand and one native invocation. A
+     * missing lifecycle owner keeps this path passive (dial-only): explicit
+     * and CLI contexts must be able to reach an already-running daemon.
+     */
+    private async demandManagedLane(): Promise<void> {
+        if (this.connectionOrigin !== "managed-default" || !this.demandStart) return;
+        if (Date.now() < this.demandFailedUntilMs) {
+            throw new SynapseEmbeddingError(
+                "transport",
+                "managed Synapse demand recently failed; backing off",
+            );
+        }
+        const outcome = await this.demandStart({
+            origin: this.connectionOrigin,
+            capability: "synapse",
+            deadlineMs: SYNAPSE_DEMAND_STARTUP_BUDGET_MS,
+        });
+        if (!outcome.ok) {
+            this.demandFailedUntilMs = Date.now() + SYNAPSE_DEMAND_RETRY_BACKOFF_MS;
+            throw new SynapseEmbeddingError(
+                "transport",
+                `managed Synapse demand failed: ${outcome.reason}`,
+            );
+        }
+    }
+
     async initialize(signal?: AbortSignal): Promise<boolean> {
         if (this.initialized) return true;
         if (this.permanentFailure) return false;
-        if (this.connectionOrigin === "managed-default") {
+        if (this.initializing) {
+            const shared = this.initializing;
+            if (!signal) return shared;
             try {
-                if (!this.demandStart) {
-                    throw Object.assign(
-                        new Error("managed mc-host lifecycle owner is unavailable"),
-                        { code: "MC_HOST_LIFECYCLE_OWNER_MISSING" },
-                    );
-                }
-                let demand = this.managedDemand;
-                if (!demand) {
-                    demand = this.demandStart({
-                        origin: this.connectionOrigin,
-                        capability: "synapse",
-                        deadlineMs: this.options.queryTimeoutMs ?? SYNAPSE_DEFAULT_QUERY_TIMEOUT_MS,
-                    });
-                    this.managedDemand = demand;
-                    const evict = (): void => {
-                        if (this.managedDemand === demand) this.managedDemand = null;
-                    };
-                    void demand.then(evict, evict);
-                }
-                const outcome = signal ? await raceSignal(demand, signal) : await demand;
-                if (!outcome.ok) {
-                    throw new SynapseEmbeddingError(
-                        "transport",
-                        `managed Synapse demand failed: ${outcome.reason}`,
-                    );
-                }
-            } catch (error) {
-                log(
-                    `[magic-context] Synapse lane unavailable: ${error instanceof Error ? error.message : String(error)}`,
-                );
+                return await raceSignal(shared, signal);
+            } catch {
+                // Detach only. The shared initialization remains owned by the
+                // provider and can complete for another waiter.
                 return false;
             }
         }
-        if (this.initializing) return this.initializing;
         this.initializing = (async () => {
             try {
+                await this.demandManagedLane();
                 this.client = await getSharedClient(this.options);
                 if (!this.metadata) {
                     const discovered = await this.callWithRetry<SynapseCatalogEntry[]>(

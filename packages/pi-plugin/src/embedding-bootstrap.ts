@@ -83,11 +83,7 @@ export async function ensureProjectRegisteredFromPiDirectory(
 		memoryEnabled: detailed.config.memory.enabled,
 		gitCommitEnabled: detailed.config.memory.git_commit_indexing.enabled,
 	};
-	const routing = await resolveEmbeddingRouting({
-		config: detailed.config,
-		projectRoot: directory,
-		session: `pi-bootstrap:${projectIdentity}`,
-	});
+	const routing = await resolveEmbeddingRouting({ config: detailed.config });
 	for (const warning of routing.warnings) {
 		log(`[magic-context][pi] ${warning}`);
 	}

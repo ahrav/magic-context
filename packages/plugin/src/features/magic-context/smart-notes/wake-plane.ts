@@ -1,3 +1,4 @@
+import { statSync } from "node:fs";
 import { join } from "node:path";
 
 import { getDataDir } from "../../../shared/data-path";
@@ -15,19 +16,37 @@ const WAKE_PLANE_CATALOG_TIMEOUT_MS = 2_000;
 
 type CatalogEntry = { control_ops?: unknown };
 type CatalogProbe = () => Promise<readonly CatalogEntry[]>;
+type PublicationReader = () => string | null;
 
 interface WakePlaneStatusCache {
     status: WakePlaneStatus;
     expiresAt: number;
+    /** Publication the answer was proved against; null when none was readable. */
+    publication: string | null;
 }
 
 let cachedStatus: WakePlaneStatusCache | null = null;
 let inFlightProbe: Promise<WakePlaneStatus> | null = null;
 let catalogProbe: CatalogProbe = probeWakePlaneCatalog;
+let readPublication: PublicationReader = readDaemonPublication;
 let now = () => Date.now();
 
 function connectionFile(): string {
     return join(getDataDir(), "cortexkit", "run", "subc-connection.json");
+}
+
+/**
+ * Identity of the daemon publication an answer was proved against. A daemon
+ * replacement republishes this file with a new socket, pid, and auth key, so a
+ * change here retires every capability the previous daemon proved.
+ */
+function readDaemonPublication(): string | null {
+    try {
+        const stat = statSync(connectionFile());
+        return `${stat.dev}:${stat.ino}:${stat.mtimeMs}:${stat.size}`;
+    } catch {
+        return null;
+    }
 }
 
 async function probeWakePlaneCatalog(): Promise<readonly CatalogEntry[]> {
@@ -61,24 +80,37 @@ async function probeStatus(): Promise<WakePlaneStatus> {
 }
 
 /**
+ * An affirmative answer is bound to the authenticated daemon that produced it,
+ * and the probe closes its connection. It may be retained only while that
+ * daemon's publication is unchanged, so a replacement can never inherit the
+ * capability. Negative and unknown answers are plain TTL cache entries.
+ */
+function isRetainedAnswerUsable(cache: WakePlaneStatusCache): boolean {
+    if (cache.status !== "present") return true;
+    return cache.publication !== null && cache.publication === readPublication();
+}
+
+/**
  * Discover whether the fleet's scheduled-wake plane owns condition evaluation.
  * Only an affirmative catalog capability disables standalone smart notes; an
  * unreachable daemon and a catalog without the capability remain fail-open.
  */
 export async function wakePlaneStatus(): Promise<WakePlaneStatus> {
     const cached = cachedStatus;
-    if (cached && now() < cached.expiresAt) return cached.status;
+    if (cached && now() < cached.expiresAt && isRetainedAnswerUsable(cached)) return cached.status;
     if (inFlightProbe) return await inFlightProbe;
 
     const startedAt = now();
+    // Captured before the probe: a daemon that republishes while the probe is
+    // in flight leaves a stale identity here, which the next read rejects.
+    const publication = readPublication();
     const probe = probeStatus().then((status) => {
-        // An affirmative answer is bound to the authenticated daemon that
-        // produced it. Re-probe instead of reusing it after the connection
-        // closes, so daemon replacement can never inherit the old capability.
+        // With no readable publication there is nothing to bind an affirmative
+        // answer to, so it is not retained at all.
         cachedStatus =
-            status === "present"
+            status === "present" && publication === null
                 ? null
-                : { status, expiresAt: startedAt + WAKE_PLANE_STATUS_TTL_MS };
+                : { status, expiresAt: startedAt + WAKE_PLANE_STATUS_TTL_MS, publication };
         return status;
     });
     inFlightProbe = probe;
@@ -94,10 +126,14 @@ export const __wakePlaneTest = {
         cachedStatus = null;
         inFlightProbe = null;
         catalogProbe = probeWakePlaneCatalog;
+        readPublication = readDaemonPublication;
         now = () => Date.now();
     },
     setCatalogProbe(probe: CatalogProbe): void {
         catalogProbe = probe;
+    },
+    setPublicationReader(reader: PublicationReader): void {
+        readPublication = reader;
     },
     setNow(clock: () => number): void {
         now = clock;
