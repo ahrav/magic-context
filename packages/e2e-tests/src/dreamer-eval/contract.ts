@@ -1,5 +1,9 @@
 import { makeContractPrimitives } from "../contract-primitives";
 import { ANTI_MEMORY_CATEGORY } from "../../../plugin/src/features/magic-context/memory/constants";
+import {
+    isValidPublicClaimId,
+    parseRevisionLocator,
+} from "../../../plugin/src/features/magic-context/memory/claim-operation-contract";
 import { normalizeMemoryContent } from "../../../plugin/src/features/magic-context/memory/normalize-hash";
 import { VERIFY_UPDATE_CONTENT_MAX_LENGTH } from "../../../plugin/src/features/magic-context/dreamer/verify";
 import { hasShareabilitySensitiveText } from "../../../plugin/src/shared/redaction";
@@ -82,6 +86,20 @@ const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
  * never reach preflight or scoring.
  */
 const MIN_VERIFIED_AT_MS = 2_001;
+
+/**
+ * Highest verification timestamp the seeder can turn into a commit date.
+ * `prepareFixtureRepository` calls `new Date(commitTimeMs).toISOString()`, which
+ * throws `RangeError` past the maximum representable Date, so a larger value
+ * crashes before any typed seeder check runs.
+ */
+const MAX_VERIFIED_AT_MS = 8_640_000_000_000_000;
+
+/**
+ * `parseVerifyManifest` ends an update entry at the first literal occurrence of
+ * this tag, matched case-sensitively.
+ */
+const UPDATE_CLOSE_TAG = "</update>";
 
 export class DreamerEvalContractError extends Error {
     readonly diagnostics: readonly string[];
@@ -214,9 +232,11 @@ function parseStringArray(raw: unknown, label: string): string[] {
  * entry. A path holding a comma, a quote, an angle bracket, or edge whitespace
  * therefore decodes as something other than what was authored, so no manifest
  * can ever report this path back and the scenario is unpassable by
- * construction.
+ * construction. A NUL is unrepresentable for a different reason: it survives
+ * every string check here and `resolve`, then `writeFileSync` rejects it with a
+ * raw `TypeError` that escapes the typed fixture-drift path.
  */
-const UNREPRESENTABLE_PATH_RE = /[,"<>]/;
+const UNREPRESENTABLE_PATH_RE = /[,"<>\0]/;
 
 function parseFilePath(value: unknown, label: string): string {
     const path = string(value, label);
@@ -316,7 +336,12 @@ function parsePreconditions(raw: unknown, label: string, pool: ReadonlyMap<strin
         return {
             claimId,
             outcome: enumeration(item.outcome, VERIFICATION_OUTCOMES, `${itemLabel}.outcome`),
-            verifiedAt: integer(item.verifiedAt, `${itemLabel}.verifiedAt`, MIN_VERIFIED_AT_MS),
+            verifiedAt: boundedInteger(
+                item.verifiedAt,
+                `${itemLabel}.verifiedAt`,
+                MIN_VERIFIED_AT_MS,
+                MAX_VERIFIED_AT_MS,
+            ),
         };
     });
     unique(verifications.map((entry) => entry.claimId), `${label}.verifications`);
@@ -391,6 +416,12 @@ function parseVerifyGold(raw: unknown, label: string, pool: ReadonlyMap<string, 
         for (const [anchorIndex, anchor] of requiredUpdateAnchors.entries()) {
             if (anchor.length > VERIFY_UPDATE_CONTENT_MAX_LENGTH) {
                 fail(`${itemLabel}.requiredUpdateAnchors[${anchorIndex}]: anchor-exceeds-content-cap`);
+            }
+            // The parser stops the update body at the first `</update>`, so
+            // parsed content cannot retain an anchor holding that tag no matter
+            // what the provider emits.
+            if (anchor.includes(UPDATE_CLOSE_TAG)) {
+                fail(`${itemLabel}.requiredUpdateAnchors[${anchorIndex}]: anchor-holds-close-tag`);
             }
         }
         // Anchors are scored only for an update verdict, so an anchor on any
@@ -538,6 +569,22 @@ function parseTask(raw: unknown, label: string, pool: ReadonlyMap<string, Scenar
     if (task === "verify" && expectedResultMode !== "incremental") {
         fail(`${label}.expectedResultMode: verify-mode-unproducible`);
     }
+    if (task === "verify" || task === "verify-broad") {
+        // Declaring fixtureFiles does not seed a mapping — only an explicit
+        // mapping precondition does — and the gate keeps a normal claim only
+        // when it has mapped files. An in-scope claim without one is filtered
+        // out, so the task terminates with gate-mismatch before scoring. The
+        // anti-memory category, the one kind the gate admits without a mapping,
+        // is already refused at the claim level.
+        const mappedClaimIds = new Set(
+            preconditions.mappings.flatMap((entry) => (entry.files.length > 0 ? [entry.claimId] : [])),
+        );
+        for (const [index, claimId] of expectedInScopeClaimIds.entries()) {
+            if (!mappedClaimIds.has(claimId)) {
+                fail(`${label}.expectedInScopeClaimIds[${index}]: verify-scope-unmapped`);
+            }
+        }
+    }
 
     const gold = task === "verify" || task === "verify-broad"
         ? parseVerifyGold(value.gold, `${label}.gold`, pool)
@@ -663,10 +710,24 @@ function parseSnapshot(raw: unknown, label: string): ClaimSnapshotProjection {
     const verificationOutcome = value.verificationOutcome === null
         ? null
         : enumeration(value.verificationOutcome, VERIFICATION_OUTCOMES, `${label}.verificationOutcome`);
+    // Storage identities, checked with the production predicates rather than a
+    // local restatement: a value outside them names a claim that cannot exist,
+    // so a scorer or report would attribute its result to something no run can
+    // reproduce. The locator canonically embeds the claim's own public id, so a
+    // locator naming a different claim is a mismatched pairing even when both
+    // halves are individually well formed.
+    const publicClaimId = string(value.publicClaimId, `${label}.publicClaimId`);
+    if (!isValidPublicClaimId(publicClaimId)) fail(`${label}.publicClaimId: id-invalid`);
+    const revisionLocator = string(value.revisionLocator, `${label}.revisionLocator`);
+    const locator = parseRevisionLocator(revisionLocator);
+    if (locator === null) return fail(`${label}.revisionLocator: locator-invalid`);
+    if (locator.publicClaimId !== publicClaimId) {
+        fail(`${label}.revisionLocator: locator-claim-mismatch`);
+    }
     return {
         claimId: staticId(value.claimId, `${label}.claimId`, CLAIM_ID_RE),
-        publicClaimId: string(value.publicClaimId, `${label}.publicClaimId`),
-        revisionLocator: string(value.revisionLocator, `${label}.revisionLocator`),
+        publicClaimId,
+        revisionLocator,
         content: string(value.content, `${label}.content`),
         category: string(value.category, `${label}.category`),
         importance: boundedInteger(value.importance, `${label}.importance`, 1, 100),
@@ -775,6 +836,14 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
             outcome: string(item.outcome, `${itemLabel}.outcome`),
         };
     });
+    const rawManifest = nullableRawText(root.rawManifest, `${label}.rawManifest`);
+    const parsedManifest = parseManifestEvidence(root.parsedManifest, `${label}.parsedManifest`);
+    // A scorer reaches PASS only after a nonblank manifest survives validation
+    // and yields parsed evidence, so a PASS carrying neither claims a scored
+    // experiment that left nothing behind to show a model was scored at all.
+    if (status === "PASS" && (rawManifest === null || parsedManifest === null)) {
+        fail(`${label}.parsedManifest: pass-requires-evidence`);
+    }
     return {
         schema: DREAMER_EVAL_REPORT_SCHEMA,
         scenarioId: staticId(root.scenarioId, `${label}.scenarioId`, SCENARIO_ID_RE),
@@ -787,8 +856,8 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
         system: parseSystem(root.system, `${label}.system`),
         poolBefore,
         poolAfter,
-        rawManifest: nullableRawText(root.rawManifest, `${label}.rawManifest`),
-        parsedManifest: parseManifestEvidence(root.parsedManifest, `${label}.parsedManifest`),
+        rawManifest,
+        parsedManifest,
         receiptOutcomes,
     };
 }

@@ -38,7 +38,16 @@ function validScenarioRaw(): Record<string, unknown> {
         tasks: [
             {
                 task: "verify",
-                preconditions: { mappings: [], verifications: [], classifiedClaimIds: [] },
+                preconditions: {
+                    // The gate keeps a normal claim only when it has mapped
+                    // files, and only an explicit precondition seeds one.
+                    mappings: claims.slice(0, 9).map((entry, index) => ({
+                        claimId: entry.id,
+                        files: [`src/file-${index + 1}.ts`],
+                    })),
+                    verifications: [],
+                    classifiedClaimIds: [],
+                },
                 expectedInScopeClaimIds: claims.slice(0, 9).map((entry) => entry.id),
                 expectedSkippedClaimIds: ["claim-10"],
                 expectedResultMode: "incremental",
@@ -266,13 +275,14 @@ describe("dreamer eval scenario contract", () => {
         // declares and rejects anything else as fixture-drift. Unlike gold, this
         // is per-claim: src/file-2.ts belongs to claim-2.
         expectDiagnostic((raw) => {
-            const tasks = raw.tasks as Array<{ preconditions: { mappings: unknown[] } }>;
-            tasks[0]!.preconditions.mappings = [{ claimId: "claim-1", files: ["src/file-2.ts"] }];
+            const tasks = raw.tasks as Array<{ preconditions: { mappings: Array<{ files: string[] }> } }>;
+            // Retarget claim-1's own mapping rather than replacing the array, so
+            // every in-scope claim stays mapped and the path rule is what fails.
+            tasks[0]!.preconditions.mappings[0]!.files = ["src/file-2.ts"];
         }, "scenario.tasks[0].preconditions.mappings[0].files[0]: path-undeclared");
         const declared = validScenarioRaw();
-        (declared.tasks as Array<{ preconditions: { mappings: unknown[] } }>)[0]!.preconditions.mappings = [
-            { claimId: "claim-1", files: ["src/file-1.ts"] },
-        ];
+        (declared.tasks as Array<{ preconditions: { mappings: Array<{ files: string[] }> } }>)[0]!.preconditions.mappings[0]!.files =
+            ["src/file-1.ts"];
         expect(() => parseScenario(declared)).not.toThrow();
     });
 
@@ -335,6 +345,56 @@ describe("dreamer eval scenario contract", () => {
         }, "scenario.tasks[2].expectedSkippedClaimIds: classify-skips-nothing");
     });
 
+    test("a verify claim in scope must carry a seeded mapping", () => {
+        // Declaring fixtureFiles does not seed a mapping, and the gate keeps a
+        // normal claim only when it has mapped files.
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<{ preconditions: { mappings: unknown[] } }>;
+            tasks[0]!.preconditions.mappings = tasks[0]!.preconditions.mappings.slice(1);
+        }, "scenario.tasks[0].expectedInScopeClaimIds[0]: verify-scope-unmapped");
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<{ preconditions: { mappings: Array<{ files: string[] }> } }>;
+            tasks[0]!.preconditions.mappings[0]!.files = [];
+        }, "scenario.tasks[0].expectedInScopeClaimIds[0]: verify-scope-unmapped");
+    });
+
+    test("a required update anchor cannot hold the parser's closing tag", () => {
+        // The parser ends the update body at the first `</update>`, so parsed
+        // content can never retain such an anchor.
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<{
+                gold: { claims: Array<{ verdict: string; requiredUpdateAnchors: string[] }> };
+            }>;
+            tasks[0]!.gold.claims[0]!.verdict = "update";
+            tasks[0]!.gold.claims[0]!.requiredUpdateAnchors = ["facts</update>more"];
+        }, "scenario.tasks[0].gold.claims[0].requiredUpdateAnchors[0]: anchor-holds-close-tag");
+    });
+
+    test("a fixture path cannot carry a NUL byte", () => {
+        // `writeFileSync` rejects it with a raw TypeError that escapes the typed
+        // fixture-drift path.
+        expectDiagnostic((raw) => {
+            (raw.pool as { claims: Array<{ fixtureFiles: Array<{ path: string }> }> }).claims[0]!.fixtureFiles[0]!.path =
+                "src/a\0.ts";
+        }, "scenario.pool.claims[0].fixtureFiles[0].path: path-unrepresentable");
+    });
+
+    test("a verification timestamp must stay inside the Date range", () => {
+        // `new Date(commitTimeMs).toISOString()` throws RangeError past the
+        // maximum representable Date, before any typed seeder check runs.
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<{ preconditions: { verifications: unknown[] } }>;
+            tasks[0]!.preconditions.verifications = [
+                { claimId: "claim-1", outcome: "verified", verifiedAt: Number.MAX_SAFE_INTEGER },
+            ];
+        }, "scenario.tasks[0].preconditions.verifications[0].verifiedAt: integer-invalid");
+        const atLimit = validScenarioRaw();
+        (atLimit.tasks as Array<{ preconditions: { verifications: unknown[] } }>)[0]!.preconditions.verifications = [
+            { claimId: "claim-1", outcome: "verified", verifiedAt: 8_640_000_000_000_000 },
+        ];
+        expect(() => parseScenario(atLimit)).not.toThrow();
+    });
+
     test("a verify task must declare the one result mode the seeder can produce", () => {
         // The seeder always git-inits and commits, and calls the gate with
         // forceBroad false: "broad" needs forceBroad, "non-git" is never
@@ -381,6 +441,14 @@ describe("dreamer eval scenario contract", () => {
         }, "scenario.tasks[2].gold.claims[0].shareable: shareability-override");
     });
 });
+
+// Storage identities the production predicates accept: `mcm_` plus 32 lowercase
+// hexadecimal characters, and a locator embedding that same id, a positive
+// revision, and a SHA-256 digest.
+const CLAIM_ONE_ID = `mcm_${"1".repeat(32)}`;
+const CLAIM_TWO_ID = `mcm_${"2".repeat(32)}`;
+const CLAIM_ONE_LOCATOR = `${CLAIM_ONE_ID}/r1/${"a".repeat(64)}`;
+const CLAIM_TWO_LOCATOR = `${CLAIM_TWO_ID}/r1/${"b".repeat(64)}`;
 
 describe("dreamer eval report contract", () => {
     const baseReport = {
@@ -443,13 +511,18 @@ describe("dreamer eval report contract", () => {
         // Verify parses to one record of verdict lists; map and classify parse
         // to one entry per claim, so a report that only accepted a record could
         // not carry the evidence two of the three scorers produce.
-        const mapShape = [{ publicClaimId: "mcm_one", files: ["src/a.ts"], independent: false }];
+        const mapShape = [{ publicClaimId: CLAIM_ONE_ID, files: ["src/a.ts"], independent: false }];
         expect(parseRunReport({ ...baseReport, task: "map-memories", parsedManifest: mapShape }).parsedManifest).toEqual(
             mapShape,
         );
-        const verifyShape = { verified: [{ publicClaimId: "mcm_one", files: ["src/a.ts"] }], updated: [], archived: [] };
+        const verifyShape = { verified: [{ publicClaimId: CLAIM_ONE_ID, files: ["src/a.ts"] }], updated: [], archived: [] };
         expect(parseRunReport({ ...baseReport, parsedManifest: verifyShape }).parsedManifest).toEqual(verifyShape);
-        expect(parseRunReport({ ...baseReport, parsedManifest: null }).parsedManifest).toBeNull();
+        // Absent evidence belongs to a run that failed before scoring, so the
+        // null case rides on an ERROR report; a PASS must carry both fields.
+        expect(
+            parseRunReport({ ...baseReport, status: "ERROR", reason: "harness-failure", parsedManifest: null })
+                .parsedManifest,
+        ).toBeNull();
         expect(() => parseRunReport({ ...baseReport, parsedManifest: ["not-a-record"] })).toThrow(
             /parsedManifest\[0\]: object-required/,
         );
@@ -461,8 +534,8 @@ describe("dreamer eval report contract", () => {
     test("a report snapshot array cannot repeat a claim", () => {
         const snapshot = {
             claimId: "claim-1",
-            publicClaimId: "mcm_one",
-            revisionLocator: "mcm_one@1",
+            publicClaimId: CLAIM_ONE_ID,
+            revisionLocator: CLAIM_ONE_LOCATOR,
             content: "Distinct memory content",
             category: "CONSTRAINTS",
             importance: 50,
@@ -493,8 +566,8 @@ describe("dreamer eval report contract", () => {
     test("a completed report cannot change which claims it observed", () => {
         const snapshot = {
             claimId: "claim-1",
-            publicClaimId: "mcm_one",
-            revisionLocator: "mcm_one@1",
+            publicClaimId: CLAIM_ONE_ID,
+            revisionLocator: CLAIM_ONE_LOCATOR,
             content: "Distinct memory content",
             category: "CONSTRAINTS",
             importance: 50,
@@ -514,7 +587,7 @@ describe("dreamer eval report contract", () => {
             parseRunReport({
                 ...baseReport,
                 poolBefore: [snapshot],
-                poolAfter: [{ ...snapshot, publicClaimId: "mcm_two" }],
+                poolAfter: [{ ...snapshot, publicClaimId: CLAIM_TWO_ID, revisionLocator: CLAIM_TWO_LOCATOR }],
             }),
         ).toThrow(/poolAfter: identity-drift/);
         expect(() =>
@@ -523,7 +596,7 @@ describe("dreamer eval report contract", () => {
                 status: "FAIL",
                 reason: "wrong-verdict",
                 poolBefore: [snapshot],
-                poolAfter: [{ ...snapshot, claimId: "claim-2", publicClaimId: "mcm_two" }],
+                poolAfter: [{ ...snapshot, claimId: "claim-2", publicClaimId: CLAIM_TWO_ID, revisionLocator: CLAIM_TWO_LOCATOR }],
             }),
         ).toThrow(/poolAfter: identity-drift/);
         // Archival is a lifecycleState change on the same identity, so it is not
@@ -545,6 +618,61 @@ describe("dreamer eval report contract", () => {
                 poolAfter: [],
             }).poolAfter,
         ).toHaveLength(0);
+    });
+
+    test("a snapshot must carry storage identities production can produce", () => {
+        const snapshot = {
+            claimId: "claim-1",
+            publicClaimId: CLAIM_ONE_ID,
+            revisionLocator: CLAIM_ONE_LOCATOR,
+            content: "Distinct memory content",
+            category: "CONSTRAINTS",
+            importance: 50,
+            memoryScope: "project",
+            sharing: "private",
+            lifecycleState: "active",
+            files: ["src/a.ts"],
+            verificationOutcome: null,
+        };
+        const parse = (overrides: Record<string, unknown>) =>
+            parseRunReport({
+                ...baseReport,
+                poolBefore: [{ ...snapshot, ...overrides }],
+                poolAfter: [{ ...snapshot, ...overrides }],
+            });
+        expect(() => parse({ publicClaimId: "mcm_one" })).toThrow(/publicClaimId: id-invalid/);
+        expect(() => parse({ publicClaimId: `mcm_${"A".repeat(32)}` })).toThrow(/publicClaimId: id-invalid/);
+        expect(() => parse({ revisionLocator: `${CLAIM_ONE_ID}@1` })).toThrow(/revisionLocator: locator-invalid/);
+        expect(() => parse({ revisionLocator: `${CLAIM_ONE_ID}/r0/${"a".repeat(64)}` })).toThrow(
+            /revisionLocator: locator-invalid/,
+        );
+        // The locator embeds the claim's own id, so one naming another claim is a
+        // mismatched pairing even though both halves are well formed.
+        expect(() => parse({ revisionLocator: CLAIM_TWO_LOCATOR })).toThrow(
+            /revisionLocator: locator-claim-mismatch/,
+        );
+        expect(parse({}).poolBefore[0]?.publicClaimId).toBe(CLAIM_ONE_ID);
+    });
+
+    test("a passing report must carry the evidence it was scored from", () => {
+        // A scorer reaches PASS only after a nonblank manifest validates and
+        // yields parsed evidence.
+        expect(() => parseRunReport({ ...baseReport, rawManifest: null })).toThrow(
+            /parsedManifest: pass-requires-evidence/,
+        );
+        expect(() => parseRunReport({ ...baseReport, parsedManifest: null })).toThrow(
+            /parsedManifest: pass-requires-evidence/,
+        );
+        // An ERROR run may hold neither.
+        expect(
+            parseRunReport({
+                ...baseReport,
+                status: "ERROR",
+                reason: "provider-failure",
+                rawManifest: null,
+                parsedManifest: null,
+            }).rawManifest,
+        ).toBeNull();
     });
 
     test("an empty aggregation is not a pass", () => {

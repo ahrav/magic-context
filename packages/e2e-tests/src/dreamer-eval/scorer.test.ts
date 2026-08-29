@@ -296,6 +296,36 @@ describe("dreamer manifest scorers", () => {
         expect(scoreClassifyManifest(correctClassify.replace('importance="70"', 'importance="101"'), pool, classifyGold)).toMatchObject({ status: "FAIL", reason: "wrong-classification" });
     });
 
+    test("the applied shareability override decides a sensitive claim's score", () => {
+        // applyClassifications forces a reported `true` to false for sensitive
+        // content, so the pool ends up matching `shareable: false` gold and the
+        // run passes on the applied value rather than the raw report.
+        const sensitivePool = {
+            ...pool,
+            claims: pool.claims.map((claim) =>
+                claim.claimId === "claim-true"
+                    ? { ...claim, content: "The box answers on 127.0.0.1:8080 for local runs." }
+                    : claim,
+            ),
+        };
+        const privateGold = {
+            kind: "classify" as const,
+            claims: classifyGold.claims.map((claim) =>
+                claim.claimId === "claim-true" ? { ...claim, shareable: false } : claim,
+            ),
+        };
+        expect(scoreClassifyManifest(correctClassify, sensitivePool, privateGold)).toMatchObject({
+            status: "PASS",
+            reason: null,
+        });
+        // The override fires only for sensitive content: the same manifest and
+        // gold against non-sensitive content is a genuine wrong classification.
+        expect(scoreClassifyManifest(correctClassify, pool, privateGold)).toMatchObject({
+            status: "FAIL",
+            reason: "wrong-classification",
+        });
+    });
+
     test("a canonicalizable alias of a gold path scores as that path", () => {
         // Production resolves the path before matching it against a tracked file,
         // so a manifest naming a gold file through an alias applies exactly the

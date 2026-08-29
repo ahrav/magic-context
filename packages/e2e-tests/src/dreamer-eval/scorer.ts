@@ -1,4 +1,5 @@
 import { hasLengthCappedOutput } from "../../../plugin/src/shared/assistant-message-extractor";
+import { hasShareabilitySensitiveText } from "../../../plugin/src/shared/redaction";
 import {
     providerOutputFailureFromInvalidManifest,
 } from "../../../plugin/src/features/magic-context/dreamer/provider-output-failure";
@@ -274,7 +275,17 @@ export function scoreClassifyManifest(
         // resulting pool matches gold.
         const importance = observed.importance ?? current.importance;
         const scope = observed.scope ?? current.memoryScope;
-        const shareable = observed.shareable ?? current.sharing === "shareable";
+        const reportedShareable = observed.shareable;
+        const preservedShareable = reportedShareable ?? current.sharing === "shareable";
+        // `applyClassifications` forces a reported `true` to false when the claim
+        // content trips the same predicate, so that is the value the pool ends up
+        // with. Scoring the raw `true` would fail a run whose applied pool
+        // matches gold. The override fires only on a reported `true`, so an
+        // omitted field still resolves to the preserved value.
+        const shareable =
+            reportedShareable === true && hasShareabilitySensitiveText(current.content)
+                ? false
+                : preservedShareable;
         if (
             importance < expected.importance.min ||
             importance > expected.importance.max ||
