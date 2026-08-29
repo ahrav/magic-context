@@ -40,6 +40,7 @@ import {
     formatLocalEmbeddingRuntimeDoctorWarning,
     isLocalEmbeddingRuntimeBroken,
 } from "../lib/embedding-runtime";
+import { readJsoncLenient } from "../lib/jsonc-config";
 import { bundleIssueReport } from "../lib/logs-pi";
 import {
     getMagicContextLogPath,
@@ -216,22 +217,6 @@ function summarize(results: CheckResult[]): Pick<HealthReport, "pass" | "warn" |
         warn: results.filter((result) => result.status === "warn").length,
         fail: results.filter((result) => result.status === "fail").length,
     };
-}
-
-function readJsonc(path: string): {
-    value: Record<string, unknown>;
-    error?: string;
-} {
-    try {
-        return {
-            value: parseJsonc(readFileSync(path, "utf-8")) as Record<string, unknown>,
-        };
-    } catch (error) {
-        return {
-            value: {},
-            error: error instanceof Error ? error.message : String(error),
-        };
-    }
 }
 
 function packagesFrom(settings: Record<string, unknown>): unknown[] {
@@ -491,9 +476,13 @@ async function runHealthChecks(options: {
         add(results, "fail", `Pi settings not found at ${settingsPath}`);
         repairPlan.addPackageEntry = true;
     } else {
-        const parsed = readJsonc(settingsPath);
-        if (parsed.error) {
-            add(results, "fail", `Could not parse Pi settings ${settingsPath}: ${parsed.error}`);
+        const parsed = readJsoncLenient(settingsPath);
+        if (parsed.parseError) {
+            add(
+                results,
+                "fail",
+                `Could not parse Pi settings ${settingsPath}: ${parsed.parseError}`,
+            );
         } else {
             packages = packagesFrom(parsed.value);
             add(results, "pass", `Pi settings found at ${settingsPath}`);
@@ -529,9 +518,13 @@ async function runHealthChecks(options: {
             }
             continue;
         }
-        const parsed = readJsonc(path);
-        if (parsed.error)
-            add(results, "fail", `${label} magic-context.jsonc is invalid JSONC: ${parsed.error}`);
+        const parsed = readJsoncLenient(path);
+        if (parsed.parseError)
+            add(
+                results,
+                "fail",
+                `${label} magic-context.jsonc is invalid JSONC: ${parsed.parseError}`,
+            );
         else add(results, "pass", `${label} magic-context.jsonc is valid JSONC: ${path}`);
     }
 

@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { dirname } from "node:path";
 import { stringify as stringifyJsonc } from "comment-json";
 import { writeFileAtomic } from "../lib/atomic-write";
+import { ensureParentDir } from "../lib/fs-utils";
 import { readJsoncConfig, readJsoncConfigForUpdate } from "../lib/jsonc-config";
 import {
     getMagicContextLogPath,
@@ -180,17 +181,9 @@ function readPiSettingsForUpdate(): PiSettingsLike {
 
 function writePiSettings(settings: PiSettingsLike): void {
     const settingsPath = getPiUserExtensionsPath();
-    ensureDir(settingsPath);
+    ensureParentDir(settingsPath);
     const text = stringifyJsonc(settings, null, 2);
     writeFileAtomic(settingsPath, `${text}\n`);
-}
-
-function ensureDir(filePath: string): void {
-    const dir = dirname(filePath);
-    if (!existsSync(dir)) {
-        const { mkdirSync } = require("node:fs") as typeof import("node:fs");
-        mkdirSync(dir, { recursive: true });
-    }
 }
 
 // SETTINGS_BASENAME is exported for tests that need it.

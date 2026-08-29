@@ -1283,58 +1283,44 @@ async function startPiMagicContextRuntime(
 	});
 	info("registered /ctx-enforce");
 
+	// One derivation for the historian-command dependency slice: the boot and
+	// runtime (project-switch) pairs of each command must stay consistent, or
+	// /ctx-recomp silently uses a stale chunk budget after a project switch.
+	const historianCommandDeps = (
+		deps: typeof bootProjectDeps,
+		runner: typeof recompRunner,
+	) => ({
+		db,
+		runner,
+		historianModel: deps.historianConfig?.model,
+		historianChunkTokens: deriveHistorianChunkTokens(
+			resolveHistorianContextLimit(deps.historianConfig?.model),
+		),
+		historianFallbacks: deps.historianConfig?.fallbackModels,
+		historianTimeoutMs: deps.config.historian_timeout_ms,
+		historianThinkingLevel: deps.historianConfig?.thinkingLevel,
+		language: deps.config.language,
+		memoryEnabled: deps.config.memory.enabled,
+		autoPromote: deps.config.memory.auto_promote,
+		compactionOff,
+	});
+
 	// /ctx-recomp uses its own PiSubagentRunner instance — recomp can run
 	// concurrently with normal historian, and giving each its own runner
 	// avoids cross-cancellation. Same model + fallback chain as historian.
 	registerCtxRecompCommand(pi, {
-		db,
-		runner: recompRunner,
-		historianModel: bootProjectDeps.historianConfig?.model,
-		historianChunkTokens: deriveHistorianChunkTokens(
-			resolveHistorianContextLimit(bootProjectDeps.historianConfig?.model),
-		),
-		historianFallbacks: bootProjectDeps.historianConfig?.fallbackModels,
-		historianTimeoutMs: bootProjectDeps.config.historian_timeout_ms,
-		historianThinkingLevel: bootProjectDeps.historianConfig?.thinkingLevel,
-		language: bootProjectDeps.config.language,
-		memoryEnabled: bootProjectDeps.config.memory.enabled,
-		autoPromote: bootProjectDeps.config.memory.auto_promote,
-		compactionOff,
+		...historianCommandDeps(bootProjectDeps, recompRunner),
 		resolveRuntimeDeps: (ctx) => {
 			const current = resolveCurrentProjectDeps(ctx);
 			return {
-				db,
-				runner: recompRunner,
-				historianModel: current.historianConfig?.model,
-				historianChunkTokens: deriveHistorianChunkTokens(
-					resolveHistorianContextLimit(current.historianConfig?.model),
-				),
-				historianFallbacks: current.historianConfig?.fallbackModels,
-				historianTimeoutMs: current.config.historian_timeout_ms,
-				historianThinkingLevel: current.historianConfig?.thinkingLevel,
-				language: current.config.language,
-				memoryEnabled: current.config.memory.enabled,
-				autoPromote: current.config.memory.auto_promote,
-				compactionOff,
+				...historianCommandDeps(current, recompRunner),
 			};
 		},
 	});
 	info("registered /ctx-recomp");
 
 	registerCtxWrapupCommand(pi, {
-		db,
-		runner: wrapupRunner,
-		historianModel: bootProjectDeps.historianConfig?.model,
-		historianChunkTokens: deriveHistorianChunkTokens(
-			resolveHistorianContextLimit(bootProjectDeps.historianConfig?.model),
-		),
-		historianFallbacks: bootProjectDeps.historianConfig?.fallbackModels,
-		historianTimeoutMs: bootProjectDeps.config.historian_timeout_ms,
-		historianThinkingLevel: bootProjectDeps.historianConfig?.thinkingLevel,
-		language: bootProjectDeps.config.language,
-		memoryEnabled: bootProjectDeps.config.memory.enabled,
-		autoPromote: bootProjectDeps.config.memory.auto_promote,
-		compactionOff,
+		...historianCommandDeps(bootProjectDeps, wrapupRunner),
 		userMemoriesEnabled: userMemoryCollectionEnabled(
 			bootProjectDeps.config.dreamer,
 		),
@@ -1344,19 +1330,7 @@ async function startPiMagicContextRuntime(
 		resolveRuntimeDeps: (ctx) => {
 			const current = resolveCurrentProjectDeps(ctx);
 			return {
-				db,
-				runner: wrapupRunner,
-				historianModel: current.historianConfig?.model,
-				historianChunkTokens: deriveHistorianChunkTokens(
-					resolveHistorianContextLimit(current.historianConfig?.model),
-				),
-				historianFallbacks: current.historianConfig?.fallbackModels,
-				historianTimeoutMs: current.config.historian_timeout_ms,
-				historianThinkingLevel: current.historianConfig?.thinkingLevel,
-				language: current.config.language,
-				memoryEnabled: current.config.memory.enabled,
-				autoPromote: current.config.memory.auto_promote,
-				compactionOff,
+				...historianCommandDeps(current, wrapupRunner),
 				userMemoriesEnabled: userMemoryCollectionEnabled(
 					current.config.dreamer,
 				),
@@ -1371,40 +1345,16 @@ async function startPiMagicContextRuntime(
 	// project memory migration into the 5-category taxonomy. Own runner instance
 	// for the same isolation reasons as /ctx-recomp.
 	registerCtxSessionUpgradeCommand(pi, {
-		db,
-		runner: upgradeRunner,
-		historianModel: bootProjectDeps.historianConfig?.model,
-		historianChunkTokens: deriveHistorianChunkTokens(
-			resolveHistorianContextLimit(bootProjectDeps.historianConfig?.model),
-		),
-		historianFallbacks: bootProjectDeps.historianConfig?.fallbackModels,
-		historianTimeoutMs: bootProjectDeps.config.historian_timeout_ms,
-		historianThinkingLevel: bootProjectDeps.historianConfig?.thinkingLevel,
-		language: bootProjectDeps.config.language,
-		memoryEnabled: bootProjectDeps.config.memory.enabled,
+		...historianCommandDeps(bootProjectDeps, upgradeRunner),
 		allowHomeProject: bootProjectDeps.config.allow_home_project,
-		autoPromote: bootProjectDeps.config.memory.auto_promote,
-		compactionOff,
 		userMemoriesEnabled: userMemoryCollectionEnabled(
 			bootProjectDeps.config.dreamer,
 		),
 		resolveRuntimeDeps: (ctx) => {
 			const current = resolveCurrentProjectDeps(ctx);
 			return {
-				db,
-				runner: upgradeRunner,
-				historianModel: current.historianConfig?.model,
-				historianChunkTokens: deriveHistorianChunkTokens(
-					resolveHistorianContextLimit(current.historianConfig?.model),
-				),
-				historianFallbacks: current.historianConfig?.fallbackModels,
-				historianTimeoutMs: current.config.historian_timeout_ms,
-				historianThinkingLevel: current.historianConfig?.thinkingLevel,
-				language: current.config.language,
-				memoryEnabled: current.config.memory.enabled,
+				...historianCommandDeps(current, upgradeRunner),
 				allowHomeProject: current.config.allow_home_project,
-				autoPromote: current.config.memory.auto_promote,
-				compactionOff,
 				userMemoriesEnabled: userMemoryCollectionEnabled(
 					current.config.dreamer,
 				),

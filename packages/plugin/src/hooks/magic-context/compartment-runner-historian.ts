@@ -35,6 +35,11 @@ import {
     type HistorianValidationChunk,
     validateHistorianOutput,
 } from "./compartment-runner-validation";
+import {
+    getHistorianRetryBackoffMs,
+    isTransientHistorianPromptError,
+    MAX_HISTORIAN_RETRIES,
+} from "./historian-retry-policy";
 
 // Intentionally kept: historian validation failure dumps are preserved for
 // debugging. They land in the project-local historian dir
@@ -46,7 +51,6 @@ import {
 function historianResponseDumpDir(directory: string): string {
     return getProjectMagicContextHistorianDir(directory);
 }
-const MAX_HISTORIAN_RETRIES = 2;
 
 interface HistorianModelOverride {
     providerID: string;
@@ -648,42 +652,6 @@ function parseModelOverride(modelId: string): HistorianModelOverride | null {
     }
 
     return { providerID, modelID };
-}
-
-function getHistorianRetryBackoffMs(retryIndex: number): number {
-    if (retryIndex === 0) {
-        return 2_000 + Math.floor(Math.random() * 1_001);
-    }
-
-    return 6_000 + Math.floor(Math.random() * 2_001);
-}
-
-function isTransientHistorianPromptError(message: string): boolean {
-    const normalized = message.toLowerCase();
-    if (
-        normalized.includes("invalid request") ||
-        normalized.includes("bad request") ||
-        normalized.includes("unauthorized") ||
-        normalized.includes("forbidden") ||
-        normalized.includes("authentication") ||
-        normalized.includes("auth") ||
-        normalized.includes(" 400") ||
-        normalized.startsWith("400")
-    ) {
-        return false;
-    }
-
-    return [
-        "429",
-        "rate limit",
-        "timeout",
-        "econnreset",
-        "etimedout",
-        "503",
-        "502",
-        "500",
-        "overloaded",
-    ].some((token) => normalized.includes(token));
 }
 
 function sleep(ms: number): Promise<void> {

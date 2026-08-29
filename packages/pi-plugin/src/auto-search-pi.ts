@@ -68,6 +68,11 @@ import {
 	packAutoSearchHint,
 } from "@magic-context/core/hooks/magic-context/auto-search-hint";
 import { extractBoundedAutoSearchQuery } from "@magic-context/core/hooks/magic-context/auto-search-prompt";
+import {
+	AUTO_SEARCH_TIMEOUT_MS,
+	hasStackedAugmentation,
+	unifiedSearchWithTimeout,
+} from "@magic-context/core/hooks/magic-context/auto-search-shared";
 import { log, sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
 
@@ -95,43 +100,8 @@ export interface PiAutoSearchOptions {
 	projectPath: string;
 }
 
-const AUTO_SEARCH_TIMEOUT_MS = 3_000;
 const DEFAULT_SCORE_THRESHOLD = 0.55;
 const DEFAULT_MIN_PROMPT_CHARS = 20;
-
-async function unifiedSearchWithTimeout(
-	db: Database,
-	sessionId: string,
-	projectPath: string,
-	prompt: string,
-	options: UnifiedSearchOptions,
-	timeoutMs: number,
-): Promise<UnifiedSearchResult[] | null> {
-	const controller = new AbortController();
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	const timeoutPromise = new Promise<null>((resolve) => {
-		timer = setTimeout(() => {
-			controller.abort();
-			resolve(null);
-		}, timeoutMs);
-	});
-
-	try {
-		return await Promise.race([
-			unifiedSearch(db, sessionId, projectPath, prompt, {
-				...options,
-				signal: controller.signal,
-				// Auto hints are plugin-internal surfacing, not explicit agent
-				// retrievals; match OpenCode's auto-search runner and search.ts.
-				countRetrievals: false,
-				memoryPolicySurface: "auto_search",
-			}),
-			timeoutPromise,
-		]);
-	} finally {
-		if (timer !== undefined) clearTimeout(timer);
-	}
-}
 
 function collectUserPromptParts(message: UserMessage): string {
 	const { content } = message;
@@ -144,14 +114,6 @@ function collectUserPromptParts(message: UserMessage): string {
 		}
 	}
 	return collected;
-}
-
-function hasStackedAugmentation(rawText: string): boolean {
-	return (
-		rawText.includes("<sidekick-augmentation>") ||
-		rawText.includes("<ctx-search-hint>") ||
-		rawText.includes("<ctx-search-auto>")
-	);
 }
 
 function extractUserPromptText(message: UserMessage): string {

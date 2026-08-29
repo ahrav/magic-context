@@ -92,6 +92,11 @@ import {
 	validateHistorianOutput,
 	validateStoredCompartments,
 } from "@magic-context/core/hooks/magic-context/compartment-runner-validation";
+import {
+	getHistorianRetryBackoffMs,
+	isTransientHistorianPromptError,
+	MAX_HISTORIAN_RETRIES,
+} from "@magic-context/core/hooks/magic-context/historian-retry-policy";
 import { onNoteTrigger } from "@magic-context/core/hooks/magic-context/note-nudger";
 import {
 	createDefaultBoundarySnapshotForTests,
@@ -117,7 +122,6 @@ import type {
 	SubagentRunOptions,
 	SubagentRunResult,
 } from "@magic-context/core/shared/subagent-runner";
-
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import {
 	convertEntriesToRawMessages,
@@ -126,47 +130,10 @@ import {
 
 const HISTORIAN_AGENT_NAME = "magic-context-historian";
 const DEFAULT_HISTORIAN_TIMEOUT_MS = 120_000;
-const MAX_HISTORIAN_RETRIES = 2;
 
 /** Keep historian alert noise to once per minute per session. */
 const HISTORIAN_ALERT_COOLDOWN_MS = 60 * 1000;
 const lastHistorianAlertBySession = new Map<string, number>();
-
-function getHistorianRetryBackoffMs(retryIndex: number): number {
-	if (retryIndex === 0) {
-		return 2_000 + Math.floor(Math.random() * 1_001);
-	}
-
-	return 6_000 + Math.floor(Math.random() * 2_001);
-}
-
-function isTransientHistorianPromptError(message: string): boolean {
-	const normalized = message.toLowerCase();
-	if (
-		normalized.includes("invalid request") ||
-		normalized.includes("bad request") ||
-		normalized.includes("unauthorized") ||
-		normalized.includes("forbidden") ||
-		normalized.includes("authentication") ||
-		normalized.includes("auth") ||
-		normalized.includes(" 400") ||
-		normalized.startsWith("400")
-	) {
-		return false;
-	}
-
-	return [
-		"429",
-		"rate limit",
-		"timeout",
-		"econnreset",
-		"etimedout",
-		"503",
-		"502",
-		"500",
-		"overloaded",
-	].some((token) => normalized.includes(token));
-}
 
 function isTransientHistorianRunFailure(
 	result: Extract<SubagentRunResult, { ok: false }>,

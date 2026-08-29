@@ -10,8 +10,18 @@ import {
     getMagicContextStorageDir,
     getProjectMagicContextHistorianDir,
 } from "@magic-context/core/shared/data-path";
+import { escapeRegex } from "@magic-context/core/shared/redaction";
 import { loadPiConfig } from "@magic-context/pi-core/config";
 import { parse as parseJsonc } from "comment-json";
+import {
+    fileSize,
+    formatBytes,
+    type HistorianDumpMeta,
+    type HistorianDumpSummary,
+    listDumpsInDir,
+    parseHistorianDumpMeta,
+} from "./historian-dumps";
+import { readJsoncLenient } from "./jsonc-config";
 import {
     getMagicContextHistorianDir,
     getMagicContextLogPath,
@@ -27,6 +37,10 @@ import {
     isPiMagicContextPackageEntry,
 } from "./pi-package-entry";
 import { redactSecretText } from "./redaction";
+
+/** Alias shims so the exported Pi surface is unchanged by the consolidation. */
+export type PiHistorianDumpMeta = HistorianDumpMeta;
+export type PiHistorianDumpSummary = HistorianDumpSummary;
 
 export interface PiConfigDiagnostic {
     path: string;
@@ -94,27 +108,6 @@ export interface PiRecentSessionSummary {
     lastActiveAt: string;
 }
 
-export interface PiHistorianDumpSummary {
-    name: string;
-    ageMinutes: number;
-    sizeKb: number;
-    /** Parsed structural metadata, when XML is valid. */
-    meta?: PiHistorianDumpMeta;
-    /** Parse error, when XML could not be parsed. */
-    parseError?: string;
-}
-
-export interface PiHistorianDumpMeta {
-    compartmentCount: number;
-    minStart: number | null;
-    maxEnd: number | null;
-    unprocessedFrom: number | null;
-    factCountByCategory: Record<string, number>;
-    userObservationCount: number;
-    ordinalGapCount: number;
-    ordinalOverlapCount: number;
-}
-
 export interface PiProjectHistorianBucket {
     directory: string;
     primarySessionId: string;
@@ -145,18 +138,6 @@ function getSelfVersion(): string {
         }
     }
     return "unknown";
-}
-
-function fileSize(path: string): number {
-    try {
-        return existsSync(path) ? statSync(path).size : 0;
-    } catch {
-        return 0;
-    }
-}
-
-function escapeRegex(value: string): string {
-    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function currentUserHash(): string {
@@ -221,29 +202,12 @@ export function sanitizeValue(value: unknown, key = ""): unknown {
     return value;
 }
 
-function readJsonc(path: string): {
-    value: Record<string, unknown>;
-    parseError?: string;
-} {
-    if (!existsSync(path)) return { value: {} };
-    try {
-        return {
-            value: parseJsonc(readFileSync(path, "utf-8")) as Record<string, unknown>,
-        };
-    } catch (error) {
-        return {
-            value: {},
-            parseError: error instanceof Error ? error.message : String(error),
-        };
-    }
-}
-
 function getProjectConfigPath(cwd: string): string {
     return resolveCortexKitProjectConfigPath(cwd);
 }
 
 function readConfigDiagnostic(path: string): PiConfigDiagnostic {
-    const parsed = readJsonc(path);
+    const parsed = readJsoncLenient(path);
     return {
         path,
         exists: existsSync(path),
@@ -334,78 +298,6 @@ function collectPiRecentSessions(): PiRecentSessionSummary[] {
     }
 }
 
-function parseHistorianDumpMeta(path: string): PiHistorianDumpMeta | { error: string } {
-    try {
-        const xml = readFileSync(path, "utf-8");
-        const parsed = parseCompartmentOutput(xml);
-        const factCountByCategory: Record<string, number> = {};
-        for (const fact of parsed.facts) {
-            factCountByCategory[fact.category] = (factCountByCategory[fact.category] ?? 0) + 1;
-        }
-        const starts = parsed.compartments.map((c) => c.startMessage);
-        const ends = parsed.compartments.map((c) => c.endMessage);
-        let gaps = 0;
-        let overlaps = 0;
-        for (let i = 1; i < parsed.compartments.length; i++) {
-            const prev = parsed.compartments[i - 1];
-            const curr = parsed.compartments[i];
-            if (curr.startMessage > prev.endMessage + 1) gaps += 1;
-            else if (curr.startMessage <= prev.endMessage) overlaps += 1;
-        }
-        return {
-            compartmentCount: parsed.compartments.length,
-            minStart: starts.length > 0 ? Math.min(...starts) : null,
-            maxEnd: ends.length > 0 ? Math.max(...ends) : null,
-            unprocessedFrom: parsed.unprocessedFrom,
-            factCountByCategory,
-            userObservationCount: parsed.userObservations.length,
-            ordinalGapCount: gaps,
-            ordinalOverlapCount: overlaps,
-        };
-    } catch (error) {
-        return { error: error instanceof Error ? error.message : String(error) };
-    }
-}
-
-function listDumpsInDir(
-    dir: string,
-    limit: number,
-): { count: number; recent: PiHistorianDumpSummary[] } {
-    if (!existsSync(dir)) return { count: 0, recent: [] };
-    try {
-        const entries = readdirSync(dir)
-            .filter((name) => name.endsWith(".xml"))
-            .map((name) => {
-                const stat = statSync(join(dir, name));
-                return {
-                    name,
-                    mtime: stat.mtimeMs,
-                    sizeKb: Math.round(stat.size / 1024),
-                };
-            })
-            .sort((a, b) => b.mtime - a.mtime);
-
-        const now = Date.now();
-        const recent: PiHistorianDumpSummary[] = entries.slice(0, limit).map((entry) => {
-            const meta = parseHistorianDumpMeta(join(dir, entry.name));
-            const summary: PiHistorianDumpSummary = {
-                name: entry.name,
-                ageMinutes: Math.round((now - entry.mtime) / 60000),
-                sizeKb: entry.sizeKb,
-            };
-            if ("error" in meta) {
-                summary.parseError = meta.error;
-            } else {
-                summary.meta = meta;
-            }
-            return summary;
-        });
-        return { count: entries.length, recent };
-    } catch {
-        return { count: 0, recent: [] };
-    }
-}
-
 function collectPiHistorianDumps(recentSessions: PiRecentSessionSummary[]): PiHistorianDumpsReport {
     const buckets = new Map<string, PiProjectHistorianBucket>();
     for (const session of recentSessions) {
@@ -446,7 +338,7 @@ function collectPiHistorianDumps(recentSessions: PiRecentSessionSummary[]): PiHi
 export async function collectDiagnostics(cwd = process.cwd()): Promise<PiDiagnosticReport> {
     const pi = detectPiBinary();
     const settingsPath = getPiUserExtensionsPath();
-    const settingsParsed = readJsonc(settingsPath);
+    const settingsParsed = readJsoncLenient(settingsPath);
     const packages = packageEntries(settingsParsed.value);
     const userConfigPath = getPiUserConfigPath();
     const projectConfigPath = getProjectConfigPath(cwd);
@@ -503,13 +395,6 @@ export async function collectDiagnostics(cwd = process.cwd()): Promise<PiDiagnos
         recentSessions,
         historianDumps,
     };
-}
-
-function formatBytes(bytes: number): string {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-    return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
 export function renderDiagnosticsMarkdown(report: PiDiagnosticReport): string {
