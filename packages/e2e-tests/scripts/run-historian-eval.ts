@@ -460,8 +460,40 @@ function writePartialReport(
  */
 function reportPathShapeError(reportPath: string): string | null {
     const report = resolve(reportPath);
+    // Symlinks first, because a DANGLING one makes `existsSync` false and skips the
+    // shape test below — and `canonicalPath` resolves it to its own location rather
+    // than its target, so the corpus-overlap check compares the wrong path while the
+    // final write follows the link. A live symlink is refused for the same reason:
+    // this path is also removed, and following a link to decide what to delete is
+    // how the namespace-root case below went wrong.
+    if (isSymlink(report)) {
+        return `${report} is a symlink; a report path must be a regular file, since this run both writes and clears it`;
+    }
     if (existsSync(report) && !lstatSync(report).isFile()) {
         return `${report} exists and is not a regular file, so this run cannot write its report there`;
+    }
+    return null;
+}
+
+/**
+ * Whether the lane's namespace ROOT is something other than a real directory.
+ *
+ * The per-report path being safe is not enough: with
+ * `<report-dir>/historian-eval-artifacts` linked elsewhere, `laneArtifactsDir`
+ * traverses the link and the recursive clear deletes the matching subtree in the
+ * target — a link to `/data` makes a run for `report.json` remove `/data/report.json`.
+ *
+ * Refused rather than replaced, unlike the per-report path. The root is shared by
+ * every report in the directory, so removing it would discard sibling reports'
+ * evidence, and an operator who linked it did so deliberately.
+ */
+function laneNamespaceRootShapeError(reportPath: string): string | null {
+    const root = laneArtifactsRoot(reportPath);
+    if (isSymlink(root)) {
+        return `${root} is a symlink; this lane will not derive its artifacts through a link it would then clear recursively`;
+    }
+    if (existsSync(root) && !lstatSync(root).isDirectory()) {
+        return `${root} exists and is not a directory, so this lane has nowhere to put its artifacts`;
     }
     return null;
 }
@@ -523,11 +555,6 @@ async function runLive(args: CliArgs): Promise<number> {
     // directory where a report file belongs. `clearPreviousLiveArtifacts` will not
     // remove any of them, so left unchecked the collision surfaces as a raw ENOTDIR
     // or EISDIR from deep inside the first scenario, after its tokens are spent.
-    const shapeError = reportPathShapeError(args.reportPath);
-    if (shapeError !== null) {
-        console.error(`live admission: ${shapeError}`);
-        return 1;
-    }
     // One entry per scenario from the start, replaced in place as each finishes.
     // Seeding the whole corpus is what makes every partial describe the whole
     // corpus, and what leaves evidence when the process dies inside the FIRST
@@ -712,9 +739,13 @@ function clearPreviousLiveArtifacts(reportPath: string): void {
 async function main(): Promise<number> {
     const args = parseArgs(Bun.argv.slice(2));
     if (args.mode === "live") {
-        // Both refusals precede every removal: cleanup would otherwise destroy the
-        // very artifact the check exists to protect.
+        // EVERY path refusal precedes cleanup, which is the whole point: the removals
+        // below are what these checks protect against, so a check running after them
+        // has already lost. Shape first, because a symlinked report or namespace root
+        // makes the containment tests compare the wrong location.
         for (const problem of [
+            reportPathShapeError(args.reportPath),
+            laneNamespaceRootShapeError(args.reportPath),
             reportInsideLaneNamespaceError(args.reportPath),
             artifactCorpusOverlapError(args),
         ]) {
