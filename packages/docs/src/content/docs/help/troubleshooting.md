@@ -124,34 +124,6 @@ If you need to downgrade intentionally, run `doctor --force` afterward — it wi
 
 ---
 
-## Desktop app: first-launch network request
-
-**Symptom:** On first launch, the Magic Context Desktop app makes a network request or seems slow to start.
-
-**Why it happens:** The local embedding model (`Xenova/bge-small-en-v1.5`, ~130 MB) is downloaded on first use when `embedding.provider` is `"local"` (the default). This is a one-time download; subsequent launches use the cached model at `~/.local/share/cortexkit/magic-context/models/`.
-
-**Fix:** If you want to avoid this download, set `embedding.provider: "off"` in your config (full-text search still works) or point it at a remote endpoint. See the [configuration reference](/reference/configuration/) for embedding options.
-
----
-
-## Desktop app: blank window on Linux / WSL2
-
-**Symptom:** The Magic Context Desktop app opens to a blank window (only the top menu, no content), often with `Could not create default EGL display: EGL_BAD_PARAMETER` in the terminal. Most common on non-Ubuntu Linux distributions and under WSL2.
-
-**Why it happens:** The app's embedded WebView (WebKitGTK) cannot create a graphics surface against your host's driver stack. The bundled WebKitGTK is built for one environment and does not always match another distribution's Mesa/driver versions. Environment-variable workarounds (`WEBKIT_DISABLE_DMABUF_RENDERER=1`, etc.) usually do not help for this class.
-
-**Fix:** Run the dashboard in **browser mode** instead of as a desktop window. The same binary, started with `--serve`, runs a local web server you open in your normal browser, so no embedded WebView is created:
-
-```sh
-magic-context-dashboard --serve
-```
-
-It prints a URL with a one-time token; open it in your browser (under WSL2, open it in your Windows browser via `localhost`). See [Browser mode (`--serve`)](/reference/dashboard/#browser-mode---serve) for per-OS invocations and options.
-
-A native package using your system's own WebKitGTK (the `.deb` or `.rpm` rather than the `.AppImage`) can also resolve it on some distributions.
-
----
-
 ## Filing a bug report
 
 Run:

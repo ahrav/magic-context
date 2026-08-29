@@ -16,7 +16,6 @@ This repository is a monorepo containing TypeScript packages (under `packages/`)
 │   ├── plugin/             # OpenCode plugin package (published as @cortexkit/opencode-magic-context)
 │   ├── pi-plugin/          # Pi plugin package (published as @cortexkit/pi-magic-context)
 │   ├── cli/                # Unified setup/doctor/migrate CLI (@cortexkit/magic-context)
-│   ├── dashboard/          # Dashboard (Tauri-based)
 │   ├── docs/               # Project documentation website
 │   └── e2e-tests/          # End-to-end integration tests
 ├── scripts/                # Local maintenance and install scripts
@@ -193,7 +192,7 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `src/features/magic-context/git-anchors/`: Git anchor capture (`git-anchor-reader.ts`: full commit/tree OIDs, stable patch IDs, NUL-delimited changed paths via bounded `execFile`) and storage/resolution (`storage-git-anchors.ts`: idempotent representation appends, strength-ordered ambiguity-preserving lookup over commit → tree → patch levels).
 - `src/features/magic-context/memory/claim-operation-contract.ts`: Versioned canonical operation request/result encoding shared with Rust golden vectors.
 - `src/features/magic-context/memory/storage-claim-operations.ts`: Replay-safe transaction kernel for claim revisions, evidence, applicability, policy, effects, generations, and durable receipts.
-- `src/features/magic-context/memory/storage-claim-current-state.ts`: Batched, fail-closed current claim provider for exact lookup, injection, dashboard, and module publication.
+- `src/features/magic-context/memory/storage-claim-current-state.ts`: Batched, fail-closed current claim provider for exact lookup, injection, and module publication.
 - `src/features/magic-context/memory/storage-claim-operations-crash.test.ts`: Bun/Node process-crash and concurrent replay matrix for the direct operation kernel.
 - `src/features/magic-context/context-authority.ts`: Manage domain authority states (`TS`, `PREPARING`, `MODULE`, `DRAINING`) and changefeed synchronization for shared memory and note state between TS host and Rust module.
 - `src/features/magic-context/memory/embedding-synapse.ts`: The Synapse embedding provider client, which communicates with the `subc` daemon using RPC endpoints for certified local embedding generation.

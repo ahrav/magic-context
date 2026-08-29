@@ -1,6 +1,6 @@
 //! Off-path SQLite runtime probe and connection-contract checks for `store.db`
 //! writers, sharing one vocabulary (application ID, format epoch, marker and
-//! manifest digests) with the TypeScript host and the dashboard. The fixture
+//! manifest digests) with the TypeScript host. The fixture
 //! `packages/plugin/src/features/magic-context/fixtures/direct-format-vocabulary-v1.json`
 //! is the cross-runtime source of truth; the `sqlite_runtime` integration test
 //! proves this module against it.

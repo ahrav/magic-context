@@ -31,7 +31,7 @@ Project memories are **always shared** among OpenCode, Pi, and OMP sessions for 
 
 ## Run the migration
 
-First, find the session ID of the OpenCode session you want to migrate. You can see session IDs in OpenCode's session picker or via the dashboard.
+First, find the session ID of the OpenCode session you want to migrate. You can see session IDs in OpenCode's session picker.
 
 Then run:
 

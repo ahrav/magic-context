@@ -29,14 +29,14 @@ Not all cache invalidations are equal. Magic Context classifies them into three 
 
 **SOFT (m[1] bust).** An execute or cache-busting pass. m[1] re-renders with new compartments, memories, or user-profile additions. m[0] stays byte-identical. The `system + m[0]` prefix stays cached; the bust happens at m[1].
 
-**HARD (m[0] bust).** A materialization event. m[0] re-materializes, folding m[1] into the new decayed baseline and resetting m[1] to the placeholder. Everything rebuilds — but this only fires when the provider cache was already dead (model change, idle timeout, system prompt change) or when m[0] content genuinely changed (memory edits from the dashboard, structural compartment operations).
+**HARD (m[0] bust).** A materialization event. m[0] re-materializes, folding m[1] into the new decayed baseline and resetting m[1] to the placeholder. Everything rebuilds — but this only fires when the provider cache was already dead (model change, idle timeout, system prompt change) or when m[0] content genuinely changed (a project memory epoch bump from an external repair, structural compartment operations).
 
 ## What triggers a HARD bust
 
 m[0] re-materializes only for events where the cache was already invalidated or the baseline content genuinely changed:
 
 - **Provider-side eviction:** model or provider change, system prompt hash change, idle timeout past the TTL.
-- **Content change:** first render, project memory epoch change (dashboard edits), pending structural mutations (compartment delete/merge/recomp), project docs hash change.
+- **Content change:** first render, project memory epoch change (external edits, such as a CLI doctor repair path), pending structural mutations (compartment delete/merge/recomp), project docs hash change.
 
 Deliberately **not** triggers: new compartments (those ride the m[1] delta), new memories from in-session writes (those surface via the watermark in m[1]), and new user-profile additions (additive, also in m[1]). Triggering on any of these would bust m[0] on routine background work and defeat the design.
 
@@ -52,7 +52,7 @@ A **pressure backstop** forces a fold when m[1] grows too large relative to m[0]
 
 When the agent writes a memory via `ctx_memory`, it does **not** trigger an m[0] rebuild. Additive writes surface in m[1] via the watermark. Non-additive mutations (update, delete, archive) record a mutation log entry that renders as a `<memory-updates>` delta in m[1]. Both reconcile into m[0] on the next natural HARD bust.
 
-Only **dashboard** memory edits bump the project memory epoch, forcing an immediate m[0] re-materialize. That is an external editor which can't otherwise signal a running session.
+Only **external** memory edits — made outside the running session, such as the CLI `doctor drain-authority` repair path or `doctor merge-identity` — bump the project memory epoch, forcing an immediate m[0] re-materialize. An external editor can't otherwise signal a running session.
 
 ## Honest framing
 
@@ -60,7 +60,7 @@ Occasional full re-materializations are by design. They happen when:
 
 - The model or provider changes (the cache was dead anyway).
 - The session has been idle past the TTL (the cache expired).
-- You edit memories through the dashboard (an external change the session needs to pick up).
+- Memories change outside the session (an external change the session needs to pick up).
 - The m[1] delta grows too large (the pressure backstop fires).
 
 In a steady-state working session, m[0] stays stable for hours or days. The prompt cache survives the whole session, and you pay cached-token rates for the large prefix.

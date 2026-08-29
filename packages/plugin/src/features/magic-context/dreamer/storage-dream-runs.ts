@@ -24,8 +24,8 @@ export interface DreamRunMemoryChanges {
     archived: number;
     merged: number;
     // Exact ids of the memories changed in each bucket (#221). Persisted in the
-    // same `memory_changes_json` blob (no schema migration) so the dashboard
-    // drill-down can show EXACTLY which memories a run touched instead of
+    // same `memory_changes_json` blob (no schema migration) so a drill-down
+    // consumer can show EXACTLY which memories a run touched instead of
     // reconstructing them with an approximate created_at/updated_at time-window
     // query. Optional: older rows + the manual /ctx-dream summary path carry
     // counts only. Each count stays === its array length when arrays are present.
@@ -63,20 +63,20 @@ export interface DreamRunMemoryChanges {
  * Returns null when nothing was applied, matching `memoryChanges: null` so the
  * caller stores SQL NULL for a no-op run.
  *
- * Two deliberate constraints keep this additive for the dashboard, which parses
- * this blob (`packages/dashboard/src-tauri/src/db.rs`) without any change:
+ * Two deliberate constraints keep this blob's shape stable for readers of
+ * rows already written (the retired dashboard parsed it, and its convention
+ * is the persisted format):
  *
- *  1. The legacy `*Ids` arrays stay ABSENT, not empty. That parser treats
+ *  1. The legacy `*Ids` arrays stay ABSENT, not empty. A reader treats
  *     "all three of writtenIds/archivedIds/mergedIds missing" as its signal to
  *     fall back to the time-window reconstruction. Emitting `[]` instead would
  *     satisfy its presence check and make it report an EXACT-but-empty change
- *     set, suppressing the fallback that runs today.
- *  2. The legacy counts stay 0. The panel's `hasMemoryChanges` gate ORs over
- *     every value in this object, so a non-zero legacy count here would render a
- *     change block whose numeric drill-down has nothing behind it.
+ *     set, suppressing that fallback.
+ *  2. The legacy counts stay 0. A change-presence gate ORs over every value in
+ *     this object, so a non-zero legacy count here would render a change block
+ *     whose numeric drill-down has nothing behind it.
  *
- * Claim-native counts are therefore carried by the arrays' lengths, and
- * surfacing them in the UI is separate follow-up work.
+ * Claim-native counts are therefore carried by the arrays' lengths.
  */
 export function claimEffectMemoryChanges(
     effects: readonly ClaimOperationResultEffect[],
@@ -128,9 +128,9 @@ export interface DreamRunInput {
     smartNotesSurfaced: number;
     smartNotesPending: number;
     memoryChanges?: DreamRunMemoryChanges | null;
-    /** Dreamer child session that produced this run — lets the dashboard scope
-     *  the token join to this run (avoids cross-summing concurrent same-name
-     *  cross-project runs). null when no parent session was resolved. */
+    /** Dreamer child session that produced this run — lets a telemetry reader
+     *  scope the token join to this run (avoids cross-summing concurrent
+     *  same-name cross-project runs). null when no parent session was resolved. */
     parentSessionId?: string | null;
 }
 

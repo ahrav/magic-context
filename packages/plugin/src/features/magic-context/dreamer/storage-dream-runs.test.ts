@@ -50,7 +50,7 @@ describe("dream_runs memory-change id arrays (#221)", () => {
         const [row] = getDreamRuns(db, "dir:proj", 10);
         expect(row).toBeDefined();
         const parsed = JSON.parse(row.memory_changes_json as string);
-        // Counts stay === their array lengths (the contract the dashboard relies on).
+        // Counts stay === their array lengths (the persisted-blob contract).
         expect(parsed.written).toBe(2);
         expect(parsed.writtenIds).toEqual([10, 11]);
         expect(parsed.archived).toBe(1);
@@ -166,12 +166,12 @@ describe("dream_runs claim-native change ids", () => {
         expect(parsed.claimOtherIds).toBeUndefined();
     });
 
-    it("leaves the legacy numeric fields empty so the dashboard keeps its fallback", () => {
-        // The dashboard treats "all three legacy id arrays absent" as its signal to
-        // reconstruct changes from the run's time window
-        // (packages/dashboard/src-tauri/src/db.rs exact_dream_run_memory_changes).
-        // Emitting [] instead of omitting would satisfy its presence check and make
-        // it report an exact-but-empty change set, suppressing that fallback.
+    it("leaves the legacy numeric fields empty so blob readers keep their fallback", () => {
+        // A reader of rows already written (the retired dashboard set this
+        // convention) treats "all three legacy id arrays absent" as its signal
+        // to reconstruct changes from the run's time window. Emitting []
+        // instead of omitting would satisfy its presence check and make it
+        // report an exact-but-empty change set, suppressing that fallback.
         const changes = claimEffectMemoryChanges([
             {
                 effectKey: "upsert:a:r2",
@@ -186,8 +186,9 @@ describe("dream_runs claim-native change ids", () => {
         expect(changes.archivedIds).toBeUndefined();
         expect(changes.mergedIds).toBeUndefined();
         expect(changes.deletedIds).toBeUndefined();
-        // Counts stay 0: the panel's hasMemoryChanges gate ORs over every value,
-        // so a non-zero legacy count would render a block with no drill-down.
+        // Counts stay 0: a change-presence gate ORs over every value in the
+        // blob, so a non-zero legacy count would render a block with no
+        // drill-down behind it.
         expect({ ...changes, claimUpsertedIds: undefined }).toEqual({
             written: 0,
             deleted: 0,

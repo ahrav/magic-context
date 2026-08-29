@@ -191,7 +191,7 @@ the assistant `SessionEntry` wrapper has not been appended yet. Pi therefore
 records the transform decision in memory with a snapshot of the newest assistant
 entry id seen at pass start, then resolves it at the start of the next context
 pass by finding the newest assistant `SessionEntry.id` different from that
-snapshot. The dashboard keys Pi cache rows on that wrapper id, so this delayed
+snapshot. Pi cache rows are keyed on that wrapper id, so this delayed
 bind is the first point where the correct durable key exists. The final turn's
 decision is written on the next prompt; that is accepted telemetry behavior.
 
