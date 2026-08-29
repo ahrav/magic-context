@@ -24,13 +24,6 @@ pub const CLASSIFY_TEMPERATURE: f64 = 0.1;
 pub const CLASSIFY_MAX_OUTPUT_TOKENS: u32 = 32_000;
 pub const CLASSIFY_AWAIT_TIMEOUT: Duration = Duration::from_secs(600);
 pub const CLASSIFY_RECOVERY_TIMEOUT: Duration = Duration::from_secs(60);
-/// Work `handle_dreamer_run_task` still has to do AFTER the payload deadline
-/// expires, and therefore the margin a caller must leave between its own
-/// transport budget and the `timeout_ms` it sends.
-///
-/// The deadline bounds the start, await, and re-drain windows, so the last of
-/// them returns at the deadline. What follows is bounded but not free:
-
 /// This is deliberately a zero-tool system role. The host supplies the pool and
 /// retains the parser because accepting a caller-selected role would reopen the
 /// producer trust boundary.
