@@ -68,12 +68,13 @@ export type { InjectedClaimRecord } from "./claim-read";
 /**
  * Run-record schema identity. The scorer keys record MEANING off this string —
  * it rejects any other value outright — so a change to the required record
- * shape has to move it. `v2` adds `system.opencodeVersion`, which the scorer
- * requires: left at `v1`, one identifier would name two incompatible shapes and
- * a record written by the earlier producer would be rejected as
- * `record-malformed` rather than as the older schema it is.
+ * shape has to move it. `v2` added `system.opencodeVersion` and `v3` adds
+ * `system.bunVersion`, both of which the scorer requires: left unchanged, one
+ * identifier would name two incompatible shapes and a record written by an earlier
+ * producer would be rejected as `record-malformed` rather than as the older schema
+ * it is.
  */
-export const RUN_RECORD_SCHEMA = "historian-eval-run-record/v2";
+export const RUN_RECORD_SCHEMA = "historian-eval-run-record/v3";
 
 /**
  * The canonical internal-agent signature containing `needle`. Request routing
@@ -421,6 +422,18 @@ export interface ProbeExchange {
 export interface SystemVersionTuple {
     repoCommitSha: string;
     /**
+     * `Bun.version` of the process that ran the lane.
+     *
+     * Bun both builds the plugin bundle and executes the runner, so two runs on
+     * different Bun releases execute different bytes. The scheduled workflow pins
+     * it, which makes it a function of the recorded commit THERE — but a direct
+     * operator run uses whatever `bun` is on the path, and the documented
+     * multi-run stability audit is exactly the case where that variance would be
+     * invisible. Recording it makes the difference visible wherever the pin does
+     * not reach.
+     */
+    bunVersion: string;
+    /**
      * Resolved OpenCode release the harness ran against. The installer serves
      * whatever is current, so two otherwise identical scheduled runs can sit on
      * different harness runtimes; without this field they record the same system
@@ -559,6 +572,7 @@ export function runSystemTuple(
     const mode = options.mode;
     return {
         repoCommitSha: options.repoCommitSha ?? resolveRepoCommitSha(),
+        bunVersion: Bun.version,
         opencodeVersion: options.opencodeVersion ?? "unknown",
         historianModelId: mode.kind === "live" ? mode.historianModel : "scripted-mock",
         probeModelId:

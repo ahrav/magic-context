@@ -16,7 +16,7 @@
 
 import { execSync } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import {
     HARD_NEGATIVE_FAMILIES,
     HistorianEvalContractError,
@@ -543,6 +543,38 @@ async function runLive(args: CliArgs): Promise<number> {
  * a directory whose completed report had just been deleted — evidence that reads
  * as this invocation's.
  */
+/**
+ * Whether any path this run will WRITE overlaps the corpus it will READ.
+ *
+ * Checked before a single removal, because the cleanup runs before `loadCorpus`:
+ * `--scenarios dev --report dev/hse-foo.json` deletes a scenario and then evaluates
+ * the silently reduced corpus, publishing a report over a corpus nobody selected and
+ * finally overwriting the input with it. The records directory is worse — a report of
+ * `/tmp/a` derives `/tmp/a-runs`, so `--scenarios /tmp/a-runs` has its entire corpus
+ * recursively removed.
+ *
+ * Containment is tested BOTH ways: an artifact inside the corpus deletes part of it,
+ * and an artifact that contains the corpus deletes all of it. Comparison is on
+ * resolved paths with a separator boundary, so `/tmp/a-runs` is not treated as living
+ * inside `/tmp/a`.
+ */
+function artifactCorpusOverlapError(args: CliArgs): string | null {
+    const corpus = args.releaseDir ?? args.scenariosDir;
+    if (corpus === null) return null;
+    const root = resolve(corpus);
+    const within = (inner: string, outer: string): boolean => inner === outer || inner.startsWith(`${outer}${sep}`);
+    for (const [label, owned] of [
+        ["report", resolve(args.reportPath)],
+        ["partial report", partialReportPath(args.reportPath)],
+        ["run records directory", liveRunArtifactsDir(args.reportPath)],
+    ] as const) {
+        if (within(owned, root) || within(root, owned)) {
+            return `the ${label} path ${owned} overlaps the selected corpus at ${root}; refusing to clear artifacts that would delete corpus input`;
+        }
+    }
+    return null;
+}
+
 /** Removes a path only when it is a regular file; see `clearPreviousLiveArtifacts`. */
 function removeIfFile(path: string): void {
     if (existsSync(path) && lstatSync(path).isFile()) rmSync(path, { force: true });
@@ -570,6 +602,11 @@ function clearPreviousLiveArtifacts(reportPath: string): void {
 async function main(): Promise<number> {
     const args = parseArgs(Bun.argv.slice(2));
     if (args.mode === "live") {
+        const overlap = artifactCorpusOverlapError(args);
+        if (overlap !== null) {
+            console.error(`live admission: ${overlap}`);
+            return 1;
+        }
         clearPreviousLiveArtifacts(args.reportPath);
         return runLive(args);
     }

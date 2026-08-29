@@ -312,6 +312,7 @@ function makeRecord(
         nowMs: fixture.nowMs,
         system: {
             repoCommitSha: "test",
+            bunVersion: "test-bun",
             opencodeVersion: "test",
             historianModelId: "scripted-mock",
             probeModelId: "scripted-mock",
@@ -2449,6 +2450,7 @@ describe("compareProbeAnswer (hidden-probe tier scoring)", () => {
 describe("buildLaneReport", () => {
     const LANE_SYSTEM = {
         repoCommitSha: "c".repeat(40),
+        bunVersion: "test-bun",
         opencodeVersion: "test",
         historianModelId: "scripted-mock",
         probeModelId: "scripted-mock",
@@ -2524,6 +2526,7 @@ describe("buildLaneReport", () => {
     test("a report cannot span two systems, and cannot be labelled with a system the scores contradict", () => {
         const system = {
             repoCommitSha: "a".repeat(40),
+            bunVersion: "test-bun",
             opencodeVersion: "test",
             historianModelId: "anthropic/claude-sonnet-4-5",
             probeModelId: "anthropic/claude-sonnet-4-5",
@@ -2563,6 +2566,7 @@ describe("buildLaneReport", () => {
             parserImpl: system.parserImpl,
             historianModelId: system.historianModelId,
             repoCommitSha: system.repoCommitSha,
+            bunVersion: "test-bun",
             opencodeVersion: "test",
         };
         expect(JSON.stringify(permuted)).not.toBe(JSON.stringify(system));

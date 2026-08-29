@@ -70,11 +70,12 @@ import type {
 /**
  * Lane-report schema identity. Bumped with the run record for the same change:
  * the report embeds a `SystemVersionTuple` both at the top level and on every
- * scenario score, so requiring `opencodeVersion` changed the report's shape too.
- * Left at `v1`, one identifier would name two incompatible report shapes and a
- * consumer could not tell an archived report from a current one.
+ * scenario score, so requiring `opencodeVersion` (v2) and then `bunVersion` (v3)
+ * changed the report's shape too. Left unchanged, one identifier would name two
+ * incompatible report shapes and a consumer could not tell an archived report from
+ * a current one.
  */
-const LANE_REPORT_SCHEMA = "historian-eval-report/v2";
+const LANE_REPORT_SCHEMA = "historian-eval-report/v3";
 
 /** KTD8 FAIL reason codes. */
 export const FAIL_REASONS = ["false-authoritative", "recall", "structural", "probe", "invalid-output"] as const;
@@ -891,6 +892,7 @@ function recordShapeError(record: HistorianEvalRunRecord): ScenarioScore | null 
         record.system === null ||
         typeof record.system !== "object" ||
         typeof record.system.repoCommitSha !== "string" ||
+        typeof record.system.bunVersion !== "string" ||
         typeof record.system.opencodeVersion !== "string" ||
         typeof record.system.historianModelId !== "string" ||
         typeof record.system.probeModelId !== "string" ||
