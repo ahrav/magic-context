@@ -314,18 +314,29 @@ function rejectionEnvelope(args: {
     return {
         producer: args.identity.producer,
         operationKey: operationKey(args.identity),
-        requestDigest: computeClaimOperationRequestDigest({
-            identity: {
-                batchId: args.identity.batchId,
-                leaseGeneration: String(args.identity.leaseGeneration),
-                leaseKey: args.identity.leaseKey,
-                runId: args.identity.runId,
-                task: args.identity.task,
-            },
-            manifestDigest: sha256Utf8Hex(args.rawManifest),
-            operation: "reject-autonomous-project-memory-manifest",
-        }),
+        requestDigest: computeAutonomousManifestRejectionRequestDigest(
+            args.identity,
+            args.rawManifest,
+        ),
     };
+}
+
+export function computeAutonomousManifestRejectionRequestDigest(
+    identity: AutonomousManifestIdentity,
+    rawManifest: string,
+): string {
+    assertIdentity(identity);
+    return computeClaimOperationRequestDigest({
+        identity: {
+            batchId: identity.batchId,
+            leaseGeneration: String(identity.leaseGeneration),
+            leaseKey: identity.leaseKey,
+            runId: identity.runId,
+            task: identity.task,
+        },
+        manifestDigest: sha256Utf8Hex(rawManifest),
+        operation: "reject-autonomous-project-memory-manifest",
+    });
 }
 
 /** Records a rejection result only within an active transaction. */

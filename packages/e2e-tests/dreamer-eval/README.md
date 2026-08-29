@@ -57,7 +57,7 @@ filters, malformed scenarios, and artifact failures exit `1`.
 ## Authoring scenarios
 
 Add one JSON file per scenario under `dev/`; its filename must match its id.
-Every pool has 10-50 hygiene-visible ordinary claims. Gold uses logical claim
+Every pool has at most 50 ordinary claims, including at least 10 hygiene-visible claims. Gold uses logical claim
 ids from the pool, while the runner resolves production public ids after
 seeding. Verify gold excludes file-independent claims. Map and classify gold
 include them. Every task declares the exact in-scope and skipped partition that

@@ -1,7 +1,4 @@
-import { readFileSync } from "node:fs";
-
 import type { DreamerEvalRunReport, DreamerSystemTuple, DreamerTask, ErrorReason, FailReason } from "./contract";
-import { parseRunReport } from "./contract";
 
 export interface DreamerClaimVerdictHistogram {
     claimId: string;
@@ -123,10 +120,4 @@ export function aggregateDreamerEvalVariance(reports: readonly DreamerEvalRunRep
         red: reports.some((report) => report.status !== "PASS"),
         runFatal: reports.some((report) => report.runFatal),
     };
-}
-
-export function aggregateDreamerEvalVarianceFiles(paths: readonly string[]): DreamerVarianceArtifact {
-    return aggregateDreamerEvalVariance(
-        paths.map((path) => parseRunReport(JSON.parse(readFileSync(path, "utf8")), path)),
-    );
 }

@@ -144,6 +144,10 @@ describe("dreamer eval seeder", () => {
         expect(result.pool.claims).toHaveLength(10);
         expect(result.preflight.inScopeClaimIds).toEqual(task("verify").expectedInScopeClaimIds);
         expect(result.preflight.skippedClaimIds).toEqual(task("verify").expectedSkippedClaimIds);
+        expect(result.pool.claims.find((claim) => claim.claimId === "claim-8")).toMatchObject({
+            files: ["src/current.ts"],
+            verificationOutcome: "verified",
+        });
         expect(result.pool.claims.find((claim) => claim.claimId === "claim-9")?.files).toEqual([]);
     });
 

@@ -37,6 +37,13 @@ export type FailReason = (typeof FAIL_REASONS)[number];
 
 export const RUN_FATAL_FAIL_REASONS = ["wrong-archival"] as const satisfies readonly FailReason[];
 
+export function isRunFatalFailure(
+    status: DreamerRunStatus,
+    reason: ErrorReason | FailReason | null,
+): boolean {
+    return status === "FAIL" && RUN_FATAL_FAIL_REASONS.some((fatal) => fatal === reason);
+}
+
 export const CLAIM_SCOPES = ["project", "ecosystem", "universe"] as const;
 export type ClaimScope = (typeof CLAIM_SCOPES)[number];
 
@@ -403,9 +410,10 @@ export interface DreamerSystemTuple {
 export type DreamerRunStatus = "PASS" | "FAIL" | "ERROR";
 
 export interface ClaimOperationReceiptOutcome {
-    claimId: string;
-    operation: string;
+    requestDigest: string;
+    operationKey: string;
     outcome: string;
+    affectedClaimIds: string[];
 }
 
 export interface DreamerEvalRunReport {
@@ -486,17 +494,18 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
         reason = enumeration(root.reason, FAIL_REASONS, `${label}.reason`);
     }
     const runFatal = boolean(root.runFatal, `${label}.runFatal`);
-    if (runFatal !== (status === "FAIL" && reason === "wrong-archival")) fail(`${label}.runFatal: mapping-invalid`);
+    if (runFatal !== isRunFatalFailure(status, reason)) fail(`${label}.runFatal: mapping-invalid`);
     const poolBefore = array(root.poolBefore, `${label}.poolBefore`).map((entry, index) => parseSnapshot(entry, `${label}.poolBefore[${index}]`));
     const poolAfter = array(root.poolAfter, `${label}.poolAfter`).map((entry, index) => parseSnapshot(entry, `${label}.poolAfter[${index}]`));
     const receiptOutcomes = array(root.receiptOutcomes, `${label}.receiptOutcomes`).map((entry, index) => {
         const itemLabel = `${label}.receiptOutcomes[${index}]`;
         const item = record(entry, itemLabel);
-        exact(item, ["claimId", "operation", "outcome"], itemLabel);
+        exact(item, ["requestDigest", "operationKey", "outcome", "affectedClaimIds"], itemLabel);
         return {
-            claimId: staticId(item.claimId, `${itemLabel}.claimId`, CLAIM_ID_RE),
-            operation: string(item.operation, `${itemLabel}.operation`),
+            requestDigest: staticId(item.requestDigest, `${itemLabel}.requestDigest`, /^[0-9a-f]{64}$/),
+            operationKey: string(item.operationKey, `${itemLabel}.operationKey`),
             outcome: string(item.outcome, `${itemLabel}.outcome`),
+            affectedClaimIds: parseClaimIdArray(item.affectedClaimIds, `${itemLabel}.affectedClaimIds`),
         };
     });
     return {

@@ -1,8 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { shouldKeepSubagents } from "../../../plugin/src/shared/keep-subagents";
+import { seedProjectMemoryClaim } from "../../../plugin/src/features/magic-context/test-claim-database";
+import { createDirectTestDatabase } from "../../../plugin/src/features/magic-context/test-database";
 import { dreamerScorerFixture } from "./scorer.test";
 import {
     classifyDreamerRun,
+    readDreamerReceipts,
     reconstructPoolEndState,
     type DreamerRunClassificationInput,
 } from "./runner";
@@ -60,8 +63,8 @@ describe("dreamer runner classification", () => {
                 childMessages: assistantMessages("not XML"),
                 receipts: [
                     {
-                        claimId: "claim-one",
-                        operation: "classify-memories",
+                        affectedClaimIds: [],
+                        operationKey: "reject:one",
                         outcome: "stale",
                         requestDigest: "b".repeat(64),
                     },
@@ -130,8 +133,8 @@ describe("dreamer runner classification", () => {
 
     test("stale apply receipt is infra while stale rejection receipt is invalid output", () => {
         const staleReceipt = {
-            claimId: "claim-one",
-            operation: "classify-memories",
+            affectedClaimIds: ["claim-one"],
+            operationKey: "apply:one",
             outcome: "stale",
             requestDigest: "a".repeat(64),
         };
@@ -176,5 +179,77 @@ describe("dreamer runner classification", () => {
             importance: index === 0 ? 91 : claim.importance,
         }));
         expect(reconstructPoolEndState({ poolAfter: after })).toEqual(after);
+    });
+
+    test("reads one receipt record with only its actual affected claims", () => {
+        const db = createDirectTestDatabase().db;
+        try {
+            const first = seedProjectMemoryClaim(db, {
+                projectIdentity: "dir:/tmp/dreamer-receipt-test",
+                content: "First receipt claim.",
+                operationKey: "seed:first",
+            });
+            const second = seedProjectMemoryClaim(db, {
+                projectIdentity: "dir:/tmp/dreamer-receipt-test",
+                content: "Second receipt claim.",
+                operationKey: "seed:second",
+            });
+            const row = db.prepare(
+                `SELECT claims.id AS claimId, claims.project_id AS projectId,
+                        claims.current_revision_id AS revisionId
+                   FROM claims
+                   JOIN claim_public_ids ON claim_public_ids.claim_id = claims.id
+                  WHERE claim_public_ids.public_id = ?`,
+            ).get(first.publicClaimId) as { claimId: number; projectId: number; revisionId: number };
+            const insertReceipt = db.prepare(
+                `INSERT INTO claim_operation_receipts
+                    (producer, operation_key, request_digest, request_encoding_version,
+                     result_encoding_version, outcome, expected_effect_count,
+                     effect_summary_json, generation_vector_json, result_json, created_at)
+                 VALUES (?, ?, ?, 1, 1, ?, ?, '[]', '{}', '{}', 1)`,
+            );
+            const applied = insertReceipt.run(
+                "dreamer-classify-memories",
+                "apply:one",
+                "a".repeat(64),
+                "applied",
+                1,
+            );
+            db.prepare(
+                `INSERT INTO claim_operation_effects
+                    (receipt_id, effect_key, project_id, claim_id, revision_id,
+                     change_kind, generation, created_at)
+                 VALUES (?, 'effect:one', ?, ?, ?, 'applicability', 1, 1)`,
+            ).run(Number(applied.lastInsertRowid), row.projectId, row.claimId, row.revisionId);
+            insertReceipt.run(
+                "dreamer-classify-memories",
+                "reject:one",
+                "b".repeat(64),
+                "stale",
+                0,
+            );
+
+            expect(
+                readDreamerReceipts(db, "classify-memories", {
+                    "claim-one": first.publicClaimId,
+                    "claim-two": second.publicClaimId,
+                }),
+            ).toEqual([
+                {
+                    requestDigest: "a".repeat(64),
+                    operationKey: "apply:one",
+                    outcome: "applied",
+                    affectedClaimIds: ["claim-one"],
+                },
+                {
+                    requestDigest: "b".repeat(64),
+                    operationKey: "reject:one",
+                    outcome: "stale",
+                    affectedClaimIds: [],
+                },
+            ]);
+        } finally {
+            db.close();
+        }
     });
 });

@@ -1,7 +1,8 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { PluginContext } from "../../../plugin/src/plugin/types";
+import type { Database } from "../../../plugin/src/shared/sqlite";
 import { extractLatestAssistantText } from "../../../plugin/src/shared/assistant-message-extractor";
 import {
     setKeepSubagents,
@@ -17,8 +18,8 @@ import { runVerify, type VerifyResult } from "../../../plugin/src/features/magic
 import { mapMemories } from "../../../plugin/src/features/magic-context/dreamer/map-memories";
 import { runClassify } from "../../../plugin/src/features/magic-context/dreamer/classify";
 import { getSubagentInvocations } from "../../../plugin/src/features/magic-context/storage-subagent-invocations";
-import { computeClaimOperationRequestDigest } from "../../../plugin/src/features/magic-context/memory/claim-operation-contract";
-import { sha256Utf8Hex } from "../../../plugin/src/features/magic-context/memory/storage-claims";
+import { computeAutonomousManifestRejectionRequestDigest } from "../../../plugin/src/features/magic-context/memory/storage-claim-autonomous";
+import { dreamerManifestIdentity } from "../../../plugin/src/features/magic-context/dreamer/claim-manifest";
 import { TestHarness } from "../harness";
 import { openTestDb } from "../test-db";
 import { liveModelSpawnOptions } from "../oracle-arms/presets";
@@ -35,6 +36,7 @@ import {
     type FailReason,
     type ParsedLayerGold,
     type PoolDescriptor,
+    isRunFatalFailure,
 } from "./contract";
 import {
     scoreClassifyManifest,
@@ -109,7 +111,7 @@ function outcome(
     return {
         status,
         reason,
-        runFatal: status === "FAIL" && reason === "wrong-archival",
+        runFatal: isRunFatalFailure(status, reason),
         parsedManifest,
     };
 }
@@ -205,24 +207,27 @@ interface CapturedChildren {
 }
 
 interface ReceiptRow {
+    receiptId: number;
     requestDigest: string;
+    operationKey: string;
     outcome: string;
+    publicClaimId: string | null;
 }
 
-function modelProviderBlock(model: string): Record<string, unknown> {
-    const [providerId, modelId] = model.split("/", 2);
-    if (providerId !== "anthropic" || !modelId) {
-        throw new Error("dreamer-eval live runner requires an anthropic/provider model pin");
+const ANTHROPIC_PROVIDER_BLOCK: Record<string, unknown> = {
+    anthropic: {
+        api: "@ai-sdk/anthropic",
+        name: "Anthropic",
+        npm: "@ai-sdk/anthropic",
+        env: ["ANTHROPIC_API_KEY"],
+        models: {},
+    },
+};
+
+export function assertDreamerModelPin(model: string): void {
+    if (!/^anthropic\/[^/\s]+$/.test(model)) {
+        throw new Error("DREAMER_EVAL_MODEL must use the anthropic/model form");
     }
-    return {
-        anthropic: {
-            api: "@ai-sdk/anthropic",
-            name: "Anthropic",
-            npm: "@ai-sdk/anthropic",
-            env: ["ANTHROPIC_API_KEY"],
-            models: {},
-        },
-    };
 }
 
 function expectedBatchCount(task: DreamerTask, count: number): number {
@@ -272,50 +277,46 @@ function assertDreamerSchedulerDisabled(harness: TestHarness): void {
     }
 }
 
-function rejectionDigest(args: {
-    task: DreamerTask;
-    parentSessionId: string;
-    leaseKey: string;
-    leaseGeneration: number;
-    publicClaimIds: readonly string[];
-    rawManifest: string;
-}): string {
-    const batchId = createHash("sha256")
-        .update([...args.publicClaimIds].sort((left, right) => left.localeCompare(right)).join("\n"))
-        .digest("hex")
-        .slice(0, 24);
-    return computeClaimOperationRequestDigest({
-        identity: {
-            batchId,
-            leaseGeneration: String(args.leaseGeneration),
-            leaseKey: args.leaseKey,
-            runId: args.parentSessionId,
-            task: args.task,
-        },
-        manifestDigest: sha256Utf8Hex(args.rawManifest),
-        operation: "reject-autonomous-project-memory-manifest",
-    });
-}
-
-function readReceipts(
-    db: ReturnType<typeof openTestDb>,
+export function readDreamerReceipts(
+    db: Database,
     task: DreamerTask,
-    logicalClaimIds: readonly string[],
+    publicClaimIds: Readonly<Record<string, string>>,
 ): DreamerReceiptEvidence[] {
     const rows = db.prepare(
-        `SELECT request_digest AS requestDigest, outcome
-           FROM claim_operation_receipts
-          WHERE producer = ?
-          ORDER BY id`,
+        `SELECT receipts.id AS receiptId,
+                receipts.request_digest AS requestDigest,
+                receipts.operation_key AS operationKey,
+                receipts.outcome,
+                public.public_id AS publicClaimId
+           FROM claim_operation_receipts receipts
+           LEFT JOIN claim_operation_effects effects ON effects.receipt_id = receipts.id
+           LEFT JOIN claim_public_ids public ON public.claim_id = effects.claim_id
+          WHERE receipts.producer = ?
+          ORDER BY receipts.id, effects.id`,
     ).all(`dreamer-${task}`) as ReceiptRow[];
-    return rows.flatMap((row) =>
-        logicalClaimIds.map((claimId) => ({
-            claimId,
-            operation: task,
-            outcome: row.outcome,
-            requestDigest: row.requestDigest,
-        })),
+    const logicalByPublic = new Map(
+        Object.entries(publicClaimIds).map(([logical, publicId]) => [publicId, logical]),
     );
+    const receipts = new Map<number, DreamerReceiptEvidence>();
+    for (const row of rows) {
+        const receipt = receipts.get(row.receiptId) ?? {
+            requestDigest: row.requestDigest,
+            operationKey: row.operationKey,
+            outcome: row.outcome,
+            affectedClaimIds: [],
+        };
+        if (row.publicClaimId !== null) {
+            const logicalClaimId = logicalByPublic.get(row.publicClaimId);
+            if (logicalClaimId === undefined) {
+                throw new Error(`dreamer receipt affected unknown claim ${row.publicClaimId}`);
+            }
+            if (!receipt.affectedClaimIds.includes(logicalClaimId)) {
+                receipt.affectedClaimIds.push(logicalClaimId);
+            }
+        }
+        receipts.set(row.receiptId, receipt);
+    }
+    return [...receipts.values()];
 }
 
 function fixturePaths(scenario: DreamerEvalScenario): string[] {
@@ -332,8 +333,7 @@ function gitOutput(workdir: string, args: readonly string[]): string | null {
 }
 
 function systemTuple(options: RunDreamerEvalTaskOptions) {
-    const head = Bun.spawnSync(["git", "rev-parse", "HEAD"], { stdout: "pipe", stderr: "ignore" });
-    const repoCommitSha = options.repoCommitSha ?? head.stdout.toString().trim();
+    const repoCommitSha = options.repoCommitSha ?? gitOutput(process.cwd(), ["rev-parse", "HEAD"]) ?? "";
     if (!/^[0-9a-f]{40,64}$/.test(repoCommitSha)) {
         throw new Error("dreamer-eval could not resolve a concrete repository commit");
     }
@@ -401,8 +401,8 @@ export async function runDreamerEvalTask(
     let acquired: NonNullable<ReturnType<typeof acquireLeaseWithAcquisition>> | null = null;
     const priorKeepSubagents = shouldKeepSubagents();
     try {
-        const providerBlock = modelProviderBlock(options.model);
-        const live = liveModelSpawnOptions({ apiKey: options.apiKey, providerBlock });
+        assertDreamerModelPin(options.model);
+        const live = liveModelSpawnOptions({ apiKey: options.apiKey, providerBlock: ANTHROPIC_PROVIDER_BLOCK });
         const activeHarness = await TestHarness.create({ ...live });
         harness = activeHarness;
         assertDreamerSchedulerDisabled(activeHarness);
@@ -455,8 +455,7 @@ export async function runDreamerEvalTask(
         const captured = await captureChildren(taskClient, parentSessionId, task.task, expectedPublicIds);
         rawManifest = extractLatestAssistantText(captured.messages);
         const rows = getSubagentInvocations(db, parentSessionId, { subagent: "dreamer" })
-            .filter((row) => row.task === task.task);
-        const latest = rows[0];
+        const latest = rows.find((row) => row.task === task.task);
         invocation = latest
             ? {
                   status: latest.status,
@@ -464,17 +463,20 @@ export async function runDreamerEvalTask(
                   modelId: latest.modelId,
               }
             : null;
-        receipts = readReceipts(db, task.task, task.expectedInScopeClaimIds);
+        receipts = readDreamerReceipts(db, task.task, seeded.publicClaimIds);
         const rejectionRequestDigest = rawManifest === null
             ? null
-            : rejectionDigest({
-                  task: task.task,
-                  parentSessionId,
-                  leaseKey,
-                  leaseGeneration: acquired.generation,
-                  publicClaimIds: expectedPublicIds,
+            : computeAutonomousManifestRejectionRequestDigest(
+                  dreamerManifestIdentity({
+                      db,
+                      holderId,
+                      leaseKey,
+                      parentSessionId,
+                      task: task.task,
+                      publicClaimIds: expectedPublicIds,
+                  }),
                   rawManifest,
-              });
+              );
         let fixtureUnchanged = true;
         try {
             assertFixtureFilesCommitted(seeded.workdir, fixturePaths(scenario));
@@ -542,11 +544,7 @@ export async function runDreamerEvalTask(
         poolAfter,
         rawManifest,
         parsedManifest: classification.parsedManifest as Record<string, unknown> | unknown[] | null,
-        receiptOutcomes: receipts.map(({ claimId, operation, outcome: receiptOutcome }) => ({
-            claimId,
-            operation,
-            outcome: receiptOutcome,
-        })),
+        receiptOutcomes: receipts,
     };
     mkdirSync(options.artifactDir, { recursive: true });
     writeFileSync(join(options.artifactDir, `${runId}.json`), `${JSON.stringify(report, null, 2)}\n`);

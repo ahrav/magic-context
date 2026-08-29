@@ -11,8 +11,8 @@ import {
     type DreamerEvalScenario,
     type DreamerTask,
 } from "../src/dreamer-eval/contract";
-import { runDreamerEvalTask } from "../src/dreamer-eval/runner";
-import { aggregateDreamerEvalVarianceFiles } from "../src/dreamer-eval/variance";
+import { assertDreamerModelPin, runDreamerEvalTask } from "../src/dreamer-eval/runner";
+import { aggregateDreamerEvalVariance } from "../src/dreamer-eval/variance";
 
 const E2E_ROOT = resolve(import.meta.dir, "..");
 
@@ -99,9 +99,7 @@ async function main(): Promise<0 | 1 | 2> {
     if (!apiKey || !model) {
         throw new Error("live run needs ANTHROPIC_API_KEY and DREAMER_EVAL_MODEL (anthropic/model)");
     }
-    if (!/^anthropic\/[^/\s]+$/.test(model)) {
-        throw new Error("DREAMER_EVAL_MODEL must use the anthropic/model form");
-    }
+    assertDreamerModelPin(model);
     const scenarios = selectedScenarios(loadScenarios(), args.scenarioIds);
     const taskFilter = new Set(args.tasks);
     const groups = scenarios.flatMap((scenario) =>
@@ -116,7 +114,7 @@ async function main(): Promise<0 | 1 | 2> {
     const version = opencodeVersion();
     for (const { scenario, task } of groups) {
         const groupDir = join(args.outputDir, scenario.id, task.task);
-        const groupReportPaths: string[] = [];
+        const groupReports: DreamerEvalRunReport[] = [];
         for (let repeat = 1; repeat <= args.repeat; repeat += 1) {
             console.log(`${scenario.id}/${task.task}: run ${repeat}/${args.repeat}`);
             const report = await runDreamerEvalTask(scenario, task, {
@@ -125,11 +123,11 @@ async function main(): Promise<0 | 1 | 2> {
                 artifactDir: groupDir,
                 opencodeVersion: version,
             });
-            groupReportPaths.push(join(groupDir, `${report.runId}.json`));
+            groupReports.push(report);
             reports.push(report);
             console.log(`${report.runId}: ${report.status}${report.reason === null ? "" : `:${report.reason}`}`);
         }
-        const variance = aggregateDreamerEvalVarianceFiles(groupReportPaths);
+        const variance = aggregateDreamerEvalVariance(groupReports);
         writeFileSync(join(groupDir, "variance.json"), `${JSON.stringify(variance, null, 2)}\n`);
     }
     return dreamerEvalExitCode(reports);

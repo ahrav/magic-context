@@ -10,25 +10,21 @@ import { seedDreamerEvalTask } from "./seeder";
 
 const CORPUS_DIR = join(import.meta.dir, "../../dreamer-eval/dev");
 
-function corpusFiles(): string[] {
-    return readdirSync(CORPUS_DIR)
-        .filter((file) => file.endsWith(".json"))
-        .sort();
-}
-
-function parseCorpus(): DreamerEvalScenario[] {
-    return corpusFiles().map((file) => parseScenario(JSON.parse(readFileSync(join(CORPUS_DIR, file), "utf8")), file));
-}
+const CORPUS_FILES = readdirSync(CORPUS_DIR)
+    .filter((file) => file.endsWith(".json"))
+    .sort();
+const SCENARIOS: DreamerEvalScenario[] = CORPUS_FILES.map((file) =>
+    parseScenario(JSON.parse(readFileSync(join(CORPUS_DIR, file), "utf8")), file),
+);
 
 describe("dreamer eval dev corpus", () => {
     test("every scenario validates and its filename matches its id", () => {
-        const scenarios = parseCorpus();
-        expect(scenarios.length).toBeGreaterThan(0);
-        expect(corpusFiles()).toEqual(scenarios.map((scenario) => `${scenario.id}.json`).sort());
+        expect(SCENARIOS.length).toBeGreaterThan(0);
+        expect(CORPUS_FILES).toEqual(SCENARIOS.map((scenario) => `${scenario.id}.json`).sort());
     });
 
     test("core pool covers every required maintenance pressure", () => {
-        const core = parseCorpus().find((scenario) => scenario.id === "dme-core-pool");
+        const core = SCENARIOS.find((scenario) => scenario.id === "dme-core-pool");
         expect(core).toBeDefined();
         const contents = core!.pool.claims.map((claim) => claim.content.toLowerCase()).join("\n");
         for (const marker of [
@@ -47,7 +43,7 @@ describe("dreamer eval dev corpus", () => {
     });
 
     test("verify-broad has seeded history and a declared broad partition", () => {
-        const broad = parseCorpus().find((scenario) => scenario.id === "dme-verify-broad-history");
+        const broad = SCENARIOS.find((scenario) => scenario.id === "dme-verify-broad-history");
         expect(broad?.tasks).toHaveLength(1);
         const task = broad!.tasks[0]!;
         expect(task.task).toBe("verify-broad");
@@ -59,7 +55,7 @@ describe("dreamer eval dev corpus", () => {
     });
 
     test("production preflight accepts every declared scenario task", async () => {
-        for (const scenario of parseCorpus()) {
+        for (const scenario of SCENARIOS) {
             for (const task of scenario.tasks) {
                 const database = createDirectTestDatabase().db;
                 const workdir = mkdtempSync(join(tmpdir(), "dreamer-eval-corpus-"));

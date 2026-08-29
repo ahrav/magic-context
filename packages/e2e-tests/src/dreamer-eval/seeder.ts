@@ -66,7 +66,6 @@ export interface SeedDreamerEvalTaskOptions {
 export interface SeededDreamerEvalTask {
     workdir: string;
     projectIdentity: string;
-    fixtureCommitTimeMs: number;
     publicClaimIds: Record<string, string>;
     pool: PoolDescriptor;
     preflight: DreamerGatePreflight;
@@ -307,6 +306,16 @@ export function readDreamerEvalPoolDescriptor(args: {
     };
 }
 
+function readCurrentClaims(db: Database, publicClaimIds: readonly string[]) {
+    if (publicClaimIds.length === 0) return new Map();
+    const snapshot = readProjectMemoryCurrentState(db, {
+        publicClaimIds,
+        surface: "explicit_search",
+    });
+    if (snapshot.status !== "ok") fixtureError("claims current-state projection is stale");
+    return new Map(snapshot.items.map((claim) => [claim.publicClaimId, claim]));
+}
+
 export async function seedDreamerEvalTask(
     options: SeedDreamerEvalTaskOptions,
 ): Promise<SeededDreamerEvalTask> {
@@ -337,7 +346,7 @@ export async function seedDreamerEvalTask(
         fixtureError("normalized claim dedup collapsed seeded rows");
     }
 
-    for (const mapping of options.task.preconditions.mappings) {
+    const mappings = options.task.preconditions.mappings.map((mapping) => {
         const publicClaimId = publicClaimIds[mapping.claimId];
         if (!publicClaimId) fixtureError(`mapping references unknown claim ${mapping.claimId}`);
         const claim = options.scenario.pool.claims.find((entry) => entry.id === mapping.claimId);
@@ -347,11 +356,11 @@ export async function seedDreamerEvalTask(
                 fixtureError(`mapping for ${mapping.claimId} references undeclared fixture ${path}`);
             }
         }
-        const snapshot = readProjectMemoryCurrentState(options.db, {
-            publicClaimIds: [publicClaimId],
-            surface: "explicit_search",
-        });
-        const current = snapshot.status === "ok" ? snapshot.items[0] : undefined;
+        return { mapping, publicClaimId };
+    });
+    const mappingState = readCurrentClaims(options.db, mappings.map(({ publicClaimId }) => publicClaimId));
+    for (const { mapping, publicClaimId } of mappings) {
+        const current = mappingState.get(publicClaimId);
         if (!current) fixtureError(`mapped claim ${mapping.claimId} is not readable`);
         const result = applyProjectMemoryMapping(
             options.db,
@@ -372,14 +381,17 @@ export async function seedDreamerEvalTask(
         }
     }
 
-    for (const verification of options.task.preconditions.verifications) {
+    const verifications = options.task.preconditions.verifications.map((verification) => {
         const publicClaimId = publicClaimIds[verification.claimId];
         if (!publicClaimId) fixtureError(`verification references unknown claim ${verification.claimId}`);
-        const snapshot = readProjectMemoryCurrentState(options.db, {
-            publicClaimIds: [publicClaimId],
-            surface: "explicit_search",
-        });
-        const current = snapshot.status === "ok" ? snapshot.items[0] : undefined;
+        return { verification, publicClaimId };
+    });
+    const verificationState = readCurrentClaims(
+        options.db,
+        verifications.map(({ publicClaimId }) => publicClaimId),
+    );
+    for (const { verification, publicClaimId } of verifications) {
+        const current = verificationState.get(publicClaimId);
         if (!current) fixtureError(`verified claim ${verification.claimId} is not readable`);
         const result = recordProjectMemoryVerification(
             options.db,
@@ -436,7 +448,6 @@ export async function seedDreamerEvalTask(
     return {
         workdir,
         projectIdentity,
-        fixtureCommitTimeMs,
         publicClaimIds,
         pool,
         preflight,

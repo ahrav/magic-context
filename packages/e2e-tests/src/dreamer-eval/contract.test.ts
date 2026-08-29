@@ -184,6 +184,23 @@ describe("dreamer eval report contract", () => {
             .toEqual([{ publicClaimId: "mem-1" }]);
     });
 
+    test("receipt records retain digest, operation identity, and actual affected claims", () => {
+        const receipt = {
+            requestDigest: "b".repeat(64),
+            operationKey: "verify:run:lease:1:batch",
+            outcome: "applied",
+            affectedClaimIds: ["claim-1"],
+        };
+        expect(parseRunReport({ ...baseReport, receiptOutcomes: [receipt] }).receiptOutcomes)
+            .toEqual([receipt]);
+        expect(
+            parseRunReport({
+                ...baseReport,
+                receiptOutcomes: [{ ...receipt, affectedClaimIds: [] }],
+            }).receiptOutcomes[0]?.affectedClaimIds,
+        ).toEqual([]);
+    });
+
     test("exit mapping is 0 for PASS, 1 for ordinary red, and 2 for wrong archival", () => {
         expect(dreamerEvalExitCode(parseRunReport(baseReport))).toBe(0);
         expect(dreamerEvalExitCode(parseRunReport({ ...baseReport, status: "FAIL", reason: "wrong-verdict" }))).toBe(1);

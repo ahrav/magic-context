@@ -11,6 +11,7 @@ import type {
     ParsedLayerGold,
     PoolDescriptor,
 } from "./contract";
+import { isRunFatalFailure } from "./contract";
 
 export type ManifestScoreStage = "infra-rejected" | "validation-rejected" | "scored";
 
@@ -26,7 +27,7 @@ export interface ManifestInfraEvidence {
     messages: unknown;
 }
 
-interface ScoringContext<Gold> {
+interface ScoringContext {
     expectedIds: Set<string>;
     byClaimId: Map<string, { publicClaimId: string; files: string[] }>;
 }
@@ -40,7 +41,7 @@ function score(status: ManifestScore["status"], reason: ManifestScore["reason"],
         stage,
         status,
         reason,
-        runFatal: status === "FAIL" && reason === "wrong-archival",
+        runFatal: isRunFatalFailure(status, reason),
         parsedManifest,
     };
 }
@@ -48,7 +49,7 @@ function score(status: ManifestScore["status"], reason: ManifestScore["reason"],
 function scoringContext<Gold extends { claimId: string }>(
     pool: PoolDescriptor,
     gold: readonly Gold[],
-): ScoringContext<Gold> | ManifestScore {
+): ScoringContext | ManifestScore {
     const poolByClaimId = new Map(pool.claims.map((claim) => [claim.claimId, claim]));
     const byClaimId = new Map<string, { publicClaimId: string; files: string[] }>();
     for (const entry of gold) {
@@ -62,7 +63,7 @@ function scoringContext<Gold extends { claimId: string }>(
     };
 }
 
-function isScore<Gold>(value: ScoringContext<Gold> | ManifestScore): value is ManifestScore {
+function isScore(value: ScoringContext | ManifestScore): value is ManifestScore {
     return "stage" in value;
 }
 
@@ -129,17 +130,16 @@ export function scoreVerifyManifest(
         if (observed?.verdict !== expected.verdict) {
             return score("FAIL", "wrong-verdict", "scored", parsed);
         }
-        if (expected.verdict === "update") {
-            const content = observed.content?.toLowerCase() ?? "";
-            const missingRequired = expected.requiredUpdateAnchors.some(
-                (anchor) => !content.includes(anchor.toLowerCase()),
-            );
-            const containsForbidden = expected.forbiddenUpdateAnchors.some((anchor) =>
-                content.includes(anchor.toLowerCase()),
-            );
-            if (missingRequired || containsForbidden) {
-                return score("FAIL", "wrong-update-content", "scored", parsed);
-            }
+        if (expected.verdict !== "update") continue;
+        const content = observed.content?.toLowerCase() ?? "";
+        const containsForbidden = expected.forbiddenUpdateAnchors.some((anchor) =>
+            content.includes(anchor.toLowerCase()),
+        );
+        const missingRequired = expected.requiredUpdateAnchors.some(
+            (anchor) => !content.includes(anchor.toLowerCase()),
+        );
+        if (containsForbidden || missingRequired) {
+            return score("FAIL", "wrong-update-content", "scored", parsed);
         }
     }
     return score("PASS", null, "scored", parsed);
