@@ -374,6 +374,79 @@ describe("project embedding registry", () => {
         ).toBeNull();
     });
 
+    it("preserves a shadow lane whose first discovery is still in flight", async () => {
+        // Two operations re-registering the same deferred lane before
+        // `models.list` returns is the ordinary case. Replacing the pending
+        // registration disposes the provider whose discovery is in flight, and its
+        // `onSynapseLaneReady` is then dropped by the identity guard in
+        // `commitShadowSynapseLane`, so the lane never commits and the cohort
+        // stays `off`. Only a lane that already failed may be replaced.
+        const db = useTempDb();
+        const projectIdentity = "shadow-pending-lane";
+        let releaseCatalog: (() => void) | undefined;
+        let catalogCalls = 0;
+        const client: SynapseClientLike = {
+            async call<Response>(_module, method): Promise<Response> {
+                if (method === "models.list") {
+                    catalogCalls += 1;
+                    // Hold discovery open so the second registration observes a
+                    // pending lane rather than a resolved or failed one.
+                    await new Promise<void>((resolve) => {
+                        releaseCatalog = resolve;
+                    });
+                    return [
+                        {
+                            model: "gte-modernbert-base-f16",
+                            fingerprint: "fp-pending",
+                            table_epoch: 2,
+                            dims: 3,
+                            certified: true,
+                        },
+                    ] as Response;
+                }
+                if (method === "embed.query") {
+                    return {
+                        vector: [1, 2, 3],
+                        model: "gte-modernbert-base-f16",
+                        fingerprint: "fp-pending",
+                        table_epoch: 2,
+                        dims: 3,
+                    } as Response;
+                }
+                throw new Error(`unexpected method ${method}`);
+            },
+            close() {},
+        };
+        const deferred = {
+            provider: "synapse",
+            model: "gte-modernbert-base-f16",
+            synapse_connection_origin: "injected",
+            synapse_client_factory: async () => client,
+        } as unknown as EmbeddingConfig;
+
+        registerProjectShadowEmbedding(db, projectIdentity, deferred, "/repo");
+        const inFlight = embedShadowTextForProject(projectIdentity, "first");
+        // Let the provider reach models.list and park there.
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(catalogCalls).toBe(1);
+
+        // The re-registration must not replace the pending lane.
+        registerProjectShadowEmbedding(db, projectIdentity, deferred, "/repo");
+        releaseCatalog?.();
+
+        expect(await inFlight).not.toBeNull();
+        // Discovery ran once and committed, so the lane resolved rather than
+        // being torn down and re-demanded.
+        expect(catalogCalls).toBe(1);
+        expect(
+            db
+                .prepare(
+                    "SELECT fingerprint FROM shadow_embedding_registrations WHERE project_path = ?",
+                )
+                .get(projectIdentity),
+        ).toEqual({ fingerprint: "fp-pending" });
+    });
+
     it("retries a shadow lane whose first discovery failed permanently", async () => {
         // A lane-wide permanent error (`not_certified`, `artifact_invalid`) ends
         // discovery with the registration still holding its deferred intent and

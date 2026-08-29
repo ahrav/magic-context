@@ -308,6 +308,19 @@ function isDeferredSynapseConfig(config: EmbeddingConfig): config is SynapseRunt
     return config.provider === "synapse" && !synapseConfigFields(config).fingerprint;
 }
 
+/**
+ * Lane discovery state of a provider, or `undefined` for one that does not
+ * report it. Read structurally rather than by class so a test double or a
+ * non-Synapse provider simply declines to answer instead of being misread as
+ * pending, which would preserve a lane that can never resolve.
+ */
+function synapseLaneDiscoveryState(
+    provider: EmbeddingProvider,
+): "pending" | "resolved" | "failed" | undefined {
+    const state = (provider as { laneDiscoveryState?: unknown }).laneDiscoveryState;
+    return state === "pending" || state === "resolved" || state === "failed" ? state : undefined;
+}
+
 function persistPrimaryDescriptor(db: Database, registration: ProjectEmbeddingRegistration): void {
     const descriptorTable = db
         .prepare(
@@ -1310,6 +1323,20 @@ export function registerProjectShadowEmbedding(
         // An unresolved prior falls through to the ordinary reuse predicate.
         priorRegistration.config.provider === "synapse" &&
         !isDeferredSynapseConfig(priorRegistration.config);
+    // A lane whose first discovery is still in flight is neither resolved nor
+    // failed, and replacing it loses the experiment a different way: the new
+    // provider is installed, the in-flight one is disposed, and its
+    // `onSynapseLaneReady` is then rejected by the identity guard in
+    // `commitShadowSynapseLane`, leaving the replacement's cohort reading `off`.
+    // Two operations re-registering the same deferred lane before `models.list`
+    // returns is the ordinary case, so a pending prior is preserved. Descriptors
+    // are deliberately left alone here: the lane has not resolved, so there is
+    // nothing new to persist.
+    const preservesPendingLane =
+        deferredIntent !== undefined &&
+        priorRegistration?.deferredIntent === deferredIntent &&
+        !resumesResolvedLane &&
+        synapseLaneDiscoveryState(priorRegistration.provider) === "pending";
     if (deferredSynapse && !resumesResolvedLane) {
         clearDeferredDescriptor(db, "shadow_embedding_registrations", projectIdentity);
     }
@@ -1333,11 +1360,17 @@ export function registerProjectShadowEmbedding(
     const prior = priorRegistration;
     if (
         prior &&
-        (resumesResolvedLane || (!deferredSynapse && prior.providerIdentity === providerIdentity))
+        (resumesResolvedLane ||
+            preservesPendingLane ||
+            (!deferredSynapse && prior.providerIdentity === providerIdentity))
     ) {
         void provider.dispose();
         dbForShadowQueue.set(projectIdentity, db);
-        persistShadowDescriptor(db, prior);
+        // A pending lane has no resolved identity yet, so persisting here would
+        // write an `off` descriptor over the deferred state the first
+        // registration deliberately cleared. Its descriptor is written by
+        // `commitShadowSynapseLane` when discovery lands.
+        if (!preservesPendingLane) persistShadowDescriptor(db, prior);
         const backfillAlreadyArmed =
             hasPendingShadowBackfill(projectIdentity) ||
             shadowQueue.some((item) => item.projectIdentity === projectIdentity);

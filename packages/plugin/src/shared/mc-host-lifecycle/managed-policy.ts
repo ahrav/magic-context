@@ -9,7 +9,7 @@ import {
     prepareManagedLaunchTarget,
     resolveManagedPayloadDir,
 } from "./owner";
-import { connectionFilePath, resolveLifecycleDataRoot } from "./paths";
+import { admitLifecycleFilesystem, connectionFilePath, resolveLifecycleDataRoot } from "./paths";
 import {
     type LifecyclePolicyOptions,
     McHostLifecyclePolicy,
@@ -184,6 +184,22 @@ export function createManagedLifecyclePolicy(
     const readers: PlatformReaders | undefined = options.platformReaders;
     const platform = checkPlatform(readers);
     if (!platform.ok) return new McHostLifecyclePolicy({ ...options, env });
+
+    // Admission runs before anything is prepared, because preparation WRITES:
+    // `prepareManagedLaunchTarget` can resolve the payload and call
+    // `stageBootstrap`, which creates directories and copies an executable into
+    // the data root. Admission otherwise happened for the first time in
+    // `preflight()`, at command time, so a root on an unsupported filesystem —
+    // NFS, or a `noexec` mount — was mutated by the very call that was about to
+    // reject it. A rejection that claims to be pre-native must leave no trace.
+    //
+    // The verdict itself is deliberately not reported here. Returning a policy
+    // with no launch target keeps `preflight()` the single authority on the
+    // outcome: it re-runs admission and answers with `admission.reason`, so the
+    // caller still sees `unsupported_filesystem` rather than a substitute.
+    if (!admitLifecycleFilesystem(root.root, options.admissionIo).ok) {
+        return new McHostLifecyclePolicy({ ...options, env });
+    }
 
     try {
         const declaringParentRoot = findDeclaringParentRoot(

@@ -611,6 +611,23 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
     maxInputBytes: number;
     metadata: SynapseLaneMetadata | null;
 
+    /**
+     * Where lane discovery stands, for callers deciding whether to replace this
+     * provider.
+     *
+     * `metadata` alone cannot answer that: it is null both while the first
+     * `models.list` is still in flight and after a lane-wide permanent error, and
+     * those need opposite treatment. A failed lane must be replaced, because
+     * `initialize()` refuses to rediscover once `permanentFailure` latches. A
+     * pending lane must be kept, because its `onLaneReady` callback is bound to
+     * this instance and the identity guard in the registry drops the commit if a
+     * replacement has taken its place.
+     */
+    get laneDiscoveryState(): "pending" | "resolved" | "failed" {
+        if (this.metadata) return "resolved";
+        return this.permanentFailure ? "failed" : "pending";
+    }
+
     /// Deadline basis for every ledger page this provider opens. Resolved once
     /// so the provider's own page deadlines and any external reopen of the same
     /// row share one basis instead of each falling back independently.
