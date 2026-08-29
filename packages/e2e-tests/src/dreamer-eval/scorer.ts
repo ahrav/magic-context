@@ -5,6 +5,7 @@ import {
 import { validateClassifyManifest } from "../../../plugin/src/features/magic-context/dreamer/classify-prompt";
 import { validateMapMemoriesManifest } from "../../../plugin/src/features/magic-context/dreamer/map-memories-prompt";
 import { validateVerifyManifest } from "../../../plugin/src/features/magic-context/dreamer/verify-prompt";
+import { VERIFY_UPDATE_CONTENT_MAX_LENGTH } from "../../../plugin/src/features/magic-context/dreamer/verify";
 import { isRunFatal, sameSet } from "./contract";
 import type {
     ErrorReason,
@@ -152,7 +153,15 @@ export function scoreVerifyManifest(
             return score("FAIL", "wrong-mapping", "scored", parsed);
         }
         if (expected.verdict === "update") {
-            const content = observed.content?.toLowerCase() ?? "";
+            // Production refuses to apply an empty or over-long replacement
+            // body, so a manifest carrying one is not a passing run whatever its
+            // anchors say: the experiment would report success for output the
+            // host would have rejected.
+            const trimmed = observed.content?.trim() ?? "";
+            if (trimmed.length === 0 || trimmed.length > VERIFY_UPDATE_CONTENT_MAX_LENGTH) {
+                return score("FAIL", "wrong-update-content", "scored", parsed);
+            }
+            const content = trimmed.toLowerCase();
             const missingRequired = expected.requiredUpdateAnchors.some(
                 (anchor) => !content.includes(anchor.toLowerCase()),
             );

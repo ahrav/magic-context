@@ -178,6 +178,65 @@ describe("dreamer eval scenario contract", () => {
             tasks[0]!.preconditions.classifiedClaimIds = ["claim-1"];
         }, "scenario.tasks[0].preconditions.classifiedClaimIds: unsupported");
     });
+
+    test("a claim state no seeding step can reproduce is rejected", () => {
+        expectDiagnostic((raw) => {
+            (raw.pool as { claims: Array<{ hygieneVisible: boolean }> }).claims[0]!.hygieneVisible = false;
+        }, "scenario.pool.claims[0].hygieneVisible: unsupported");
+        expectDiagnostic((raw) => {
+            (raw.pool as { claims: Array<{ category: string }> }).claims[0]!.category = "REJECTED_APPROACH";
+        }, "scenario.pool.claims[0].category: unsupported");
+    });
+
+    test("update anchors are rejected on a verdict that never scores them", () => {
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<{ gold: { claims: Array<{ requiredUpdateAnchors: string[] }> } }>;
+            tasks[0]!.gold.claims[0]!.requiredUpdateAnchors = ["still true"];
+        }, "scenario.tasks[0].gold.claims[0]: anchors-require-update");
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<{ gold: { claims: Array<{ forbiddenUpdateAnchors: string[] }> } }>;
+            tasks[0]!.gold.claims[0]!.forbiddenUpdateAnchors = ["stale"];
+        }, "scenario.tasks[0].gold.claims[0]: anchors-require-update");
+    });
+
+    test("an update whose anchors contradict each other is rejected", () => {
+        // Anchor scoring is a case-insensitive substring test, so a forbidden
+        // anchor contained in a required one demands content that both holds and
+        // omits the same text.
+        for (const forbidden of ["bounded cache", "BOUNDED CACHE", "cache"]) {
+            expectDiagnostic((raw) => {
+                const tasks = raw.tasks as Array<{
+                    gold: { claims: Array<{ verdict: string; requiredUpdateAnchors: string[]; forbiddenUpdateAnchors: string[] }> };
+                }>;
+                const claim = tasks[0]!.gold.claims[0]!;
+                claim.verdict = "update";
+                claim.requiredUpdateAnchors = ["bounded cache"];
+                claim.forbiddenUpdateAnchors = [forbidden];
+            }, "scenario.tasks[0].gold.claims[0]: anchors-overlap");
+        }
+    });
+
+    test("a file path no manifest can encode is rejected", () => {
+        // Production splits the `files` attribute on commas and trims each
+        // entry, so these paths decode as something other than what was
+        // authored and the gold set can never be reported back.
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<{ gold: { claims: Array<{ expectedFiles: string[] }> } }>;
+            tasks[0]!.gold.claims[0]!.expectedFiles = ["src/generated,a.ts"];
+        }, "scenario.tasks[0].gold.claims[0].expectedFiles[0]: path-unrepresentable");
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<{ gold: { claims: Array<{ files: string[] }> } }>;
+            tasks[1]!.gold.claims[0]!.files = [" src/file-1.ts"];
+        }, "scenario.tasks[1].gold.claims[0].files[0]: path-unrepresentable");
+        expectDiagnostic((raw) => {
+            (raw.pool as { claims: Array<{ fixtureFiles: Array<{ path: string }> }> }).claims[0]!.fixtureFiles[0]!.path =
+                'src/quote".ts';
+        }, "scenario.pool.claims[0].fixtureFiles[0].path: path-unrepresentable");
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<{ preconditions: { mappings: unknown[] } }>;
+            tasks[0]!.preconditions.mappings = [{ claimId: "claim-1", files: ["src/a<b>.ts"] }];
+        }, "scenario.tasks[0].preconditions.mappings[0].files[0]: path-unrepresentable");
+    });
 });
 
 describe("dreamer eval report contract", () => {

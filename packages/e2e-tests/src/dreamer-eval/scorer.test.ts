@@ -9,6 +9,7 @@ import {
     type PoolDescriptor,
     type VerifyGoldClaim,
 } from "./contract";
+import { VERIFY_UPDATE_CONTENT_MAX_LENGTH } from "../../../plugin/src/features/magic-context/dreamer/verify";
 import {
     scoreClassifyManifest,
     scoreMapManifest,
@@ -220,6 +221,42 @@ describe("dreamer manifest scorers", () => {
         expect(
             scoreVerifyManifest(correctVerify.replace("4096 ENTRIES.", "4096 entries; formerly 2048 entries."), pool, verifyGold),
         ).toMatchObject({ status: "FAIL", reason: "wrong-update-content" });
+    });
+
+    test("an update body production would refuse never scores PASS", () => {
+        // With no required anchor to miss, only the production content bound
+        // separates a scoreable update from one applyVerifyManifest rejects
+        // outright, which would report a successful experiment for output the
+        // host would have thrown away.
+        const gold = {
+            kind: "verify" as const,
+            claims: verifyGold.claims.map((claim) =>
+                claim.claimId === "claim-update"
+                    ? { ...claim, requiredUpdateAnchors: [], forbiddenUpdateAnchors: [] }
+                    : claim,
+            ) satisfies VerifyGoldClaim[],
+        };
+        const updateEntry = '<update claim="mcm_update" files="src/cache.ts">Uses a BOUNDED CACHE with 4096 ENTRIES.</update>';
+        expect(scoreVerifyManifest(correctVerify, pool, gold)).toMatchObject({ stage: "scored", status: "PASS" });
+        for (const body of ["", "   \n  ", "x".repeat(VERIFY_UPDATE_CONTENT_MAX_LENGTH + 1)]) {
+            expect(
+                scoreVerifyManifest(
+                    correctVerify.replace(updateEntry, `<update claim="mcm_update" files="src/cache.ts">${body}</update>`),
+                    pool,
+                    gold,
+                ),
+            ).toMatchObject({ stage: "scored", status: "FAIL", reason: "wrong-update-content" });
+        }
+        expect(
+            scoreVerifyManifest(
+                correctVerify.replace(
+                    updateEntry,
+                    `<update claim="mcm_update" files="src/cache.ts">${"x".repeat(VERIFY_UPDATE_CONTENT_MAX_LENGTH)}</update>`,
+                ),
+                pool,
+                gold,
+            ),
+        ).toMatchObject({ stage: "scored", status: "PASS" });
     });
 
     test("mapping compares file sets and independence separately", () => {

@@ -1,4 +1,5 @@
 import { makeContractPrimitives } from "../contract-primitives";
+import { ANTI_MEMORY_CATEGORY } from "../../../plugin/src/features/magic-context/memory/constants";
 
 export const DREAMER_EVAL_SCENARIO_SCHEMA = "dreamer-eval-scenario/v1";
 export const DREAMER_EVAL_POOL_SCHEMA = "dreamer-eval-pool/v1";
@@ -180,6 +181,28 @@ function parseStringArray(raw: unknown, label: string): string[] {
     return values;
 }
 
+/**
+ * A manifest carries file paths inside a comma-separated, double-quoted
+ * attribute, and production splits that attribute on commas and trims each
+ * entry. A path holding a comma, a quote, an angle bracket, or edge whitespace
+ * therefore decodes as something other than what was authored, so no manifest
+ * can ever report this path back and the scenario is unpassable by
+ * construction.
+ */
+const UNREPRESENTABLE_PATH_RE = /[,"<>]/;
+
+function parseFilePath(value: unknown, label: string): string {
+    const path = string(value, label);
+    if (path !== path.trim() || UNREPRESENTABLE_PATH_RE.test(path)) fail(`${label}: path-unrepresentable`);
+    return path;
+}
+
+function parseFilePathArray(raw: unknown, label: string): string[] {
+    const values = array(raw, label).map((entry, index) => parseFilePath(entry, `${label}[${index}]`));
+    unique(values, label);
+    return values;
+}
+
 function parseClaimIdArray(raw: unknown, label: string): string[] {
     const values = array(raw, label).map((entry, index) => staticId(entry, `${label}[${index}]`, CLAIM_ID_RE));
     unique(values, label);
@@ -189,7 +212,7 @@ function parseClaimIdArray(raw: unknown, label: string): string[] {
 function parseFixtureFile(raw: unknown, label: string): FixtureFile {
     const value = record(raw, label);
     exact(value, ["path", "content"], label);
-    return { path: string(value.path, `${label}.path`), content: string(value.content, `${label}.content`) };
+    return { path: parseFilePath(value.path, `${label}.path`), content: string(value.content, `${label}.content`) };
 }
 
 function parseScenarioClaim(raw: unknown, label: string): ScenarioClaim {
@@ -206,14 +229,25 @@ function parseScenarioClaim(raw: unknown, label: string): ScenarioClaim {
     const fileIndependent = boolean(value.fileIndependent, `${label}.fileIndependent`);
     if (fileIndependent && fixtureFiles.length > 0) fail(`${label}.fixtureFiles: independent-has-files`);
     if (!fileIndependent && fixtureFiles.length === 0) fail(`${label}.fixtureFiles: mapped-claim-has-no-file`);
+    const category = string(value.category, `${label}.category`);
+    // The generic claim writer refuses the anti-memory category, and the typed
+    // writer that accepts it needs a structured payload this scenario shape does
+    // not carry, so such a claim fails during seeding rather than at authoring.
+    if (category === ANTI_MEMORY_CATEGORY) fail(`${label}.category: unsupported`);
+    const hygieneVisible = boolean(value.hygieneVisible, `${label}.hygieneVisible`);
+    // Hygiene visibility follows from a claim's dispositions, and no seeding
+    // step produces the dispositions that hide one. A false value would declare
+    // a pool the hygiene lane cannot reproduce: the read returns every active
+    // row, so the task fails its gate assertion instead of running.
+    if (!hygieneVisible) fail(`${label}.hygieneVisible: unsupported`);
     return {
         id: staticId(value.id, `${label}.id`, CLAIM_ID_RE),
         content: string(value.content, `${label}.content`),
-        category: string(value.category, `${label}.category`),
+        category,
         importance: boundedInteger(value.importance, `${label}.importance`, 1, 100),
         memoryScope: enumeration(value.memoryScope, CLAIM_SCOPES, `${label}.memoryScope`),
         sharing: enumeration(value.sharing, ["private", "shareable"], `${label}.sharing`),
-        hygieneVisible: boolean(value.hygieneVisible, `${label}.hygieneVisible`),
+        hygieneVisible,
         fileIndependent,
         fixtureFiles,
     };
@@ -232,7 +266,7 @@ function parsePreconditions(raw: unknown, label: string, poolIds: ReadonlySet<st
         exact(item, ["claimId", "files"], itemLabel);
         const claimId = staticId(item.claimId, `${itemLabel}.claimId`, CLAIM_ID_RE);
         assertKnownClaim(claimId, poolIds, `${itemLabel}.claimId`);
-        return { claimId, files: parseStringArray(item.files, `${itemLabel}.files`) };
+        return { claimId, files: parseFilePathArray(item.files, `${itemLabel}.files`) };
     });
     unique(mappings.map((entry) => entry.claimId), `${label}.mappings`);
     const verifications = array(value.verifications, `${label}.verifications`).map((entry, index) => {
@@ -271,19 +305,33 @@ function parseVerifyGold(raw: unknown, label: string, pool: ReadonlyMap<string, 
         if (poolClaim === undefined) return fail(`${itemLabel}.claimId: unknown-claim`);
         if (poolClaim.fileIndependent) fail(`${itemLabel}.claimId: file-independent-verify`);
         const verdict = enumeration(item.verdict, VERIFY_VERDICTS, `${itemLabel}.verdict`);
-        const expectedFiles = parseStringArray(item.expectedFiles, `${itemLabel}.expectedFiles`);
+        const expectedFiles = parseFilePathArray(item.expectedFiles, `${itemLabel}.expectedFiles`);
         if (verdict === "archive" && expectedFiles.length > 0) {
             fail(`${itemLabel}.expectedFiles: archive-has-files`);
         }
         if (verdict !== "archive" && expectedFiles.length === 0) {
             fail(`${itemLabel}.expectedFiles: retained-claim-has-no-file`);
         }
+        const requiredUpdateAnchors = parseStringArray(item.requiredUpdateAnchors, `${itemLabel}.requiredUpdateAnchors`);
+        const forbiddenUpdateAnchors = parseStringArray(item.forbiddenUpdateAnchors, `${itemLabel}.forbiddenUpdateAnchors`);
+        // Anchors are scored only for an update verdict, so an anchor on any
+        // other verdict states a requirement nothing enforces.
+        if (verdict !== "update" && (requiredUpdateAnchors.length > 0 || forbiddenUpdateAnchors.length > 0)) {
+            fail(`${itemLabel}: anchors-require-update`);
+        }
+        // Anchor checks are case-insensitive substring tests, so content holding
+        // a required anchor also holds any forbidden anchor contained in it. Such
+        // a pair demands content that both contains and omits the same text.
+        const unsatisfiable = requiredUpdateAnchors.some((required) =>
+            forbiddenUpdateAnchors.some((forbidden) => required.toLowerCase().includes(forbidden.toLowerCase())),
+        );
+        if (unsatisfiable) fail(`${itemLabel}: anchors-overlap`);
         return {
             claimId,
             verdict,
             expectedFiles,
-            requiredUpdateAnchors: parseStringArray(item.requiredUpdateAnchors, `${itemLabel}.requiredUpdateAnchors`),
-            forbiddenUpdateAnchors: parseStringArray(item.forbiddenUpdateAnchors, `${itemLabel}.forbiddenUpdateAnchors`),
+            requiredUpdateAnchors,
+            forbiddenUpdateAnchors,
         };
     });
     unique(claims.map((entry) => entry.claimId), `${label}.claims`);
@@ -303,7 +351,7 @@ function parseMapGold(raw: unknown, label: string, pool: ReadonlyMap<string, Sce
         if (poolClaim === undefined) return fail(`${itemLabel}.claimId: unknown-claim`);
         const independent = boolean(item.independent, `${itemLabel}.independent`);
         if (independent !== poolClaim.fileIndependent) fail(`${itemLabel}.independent: pool-mismatch`);
-        const files = parseStringArray(item.files, `${itemLabel}.files`);
+        const files = parseFilePathArray(item.files, `${itemLabel}.files`);
         // A manifest reports either an independent claim or a file set, never
         // both, so the opposite pairing describes an outcome no correct model
         // response can produce.
