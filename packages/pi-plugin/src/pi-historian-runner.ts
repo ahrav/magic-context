@@ -1313,7 +1313,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				}
 			}
 
-			// Primers v1 are recall-only side-table writes (dashboard + ctx_search),
+			// Primers v1 are recall-only side-table writes (ctx_search),
 			// never prompt injection. They use the same actual-final weak-lookahead
 			// gate as facts and observations.
 			if (

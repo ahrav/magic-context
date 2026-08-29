@@ -122,7 +122,7 @@ export function getPiAgentDir(): string {
     return join(envFirstHomeDir(), ".pi", "agent");
 }
 
-/** Pi's per-user agent dir; overridable via PI_CODING_AGENT_DIR. */
+/** Zero-argument alias of {@link getPiAgentDir}. */
 export function getPiAgentConfigDir(): string {
     return getPiAgentDir();
 }

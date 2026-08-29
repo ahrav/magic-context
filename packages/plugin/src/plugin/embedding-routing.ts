@@ -5,7 +5,6 @@ import type {
 } from "../config/schema/magic-context";
 import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "../config/schema/magic-context";
 import {
-    getSynapseLaneIdentity,
     SYNAPSE_DEFAULT_MODEL,
     SYNAPSE_MAX_INPUT_BYTES,
     SYNAPSE_MAX_INPUT_TOKENS,

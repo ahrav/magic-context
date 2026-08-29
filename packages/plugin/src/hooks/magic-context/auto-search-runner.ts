@@ -480,11 +480,6 @@ export async function runAutoSearchHint(args: {
     return AUTO_SEARCH_OK;
 }
 
-/** Test hook — wipe the per-turn cache. */
-export function _resetAutoSearchCache(): void {
-    // Decisions are persisted in SQLite; retained as a no-op compatibility hook for tests.
-}
-
 /** Session cleanup hook — call on session.deleted. */
 export function clearAutoSearchForSession(_sessionId: string): void {
     // Decisions are session_meta state and are removed by clearSession().

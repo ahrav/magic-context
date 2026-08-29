@@ -4,7 +4,7 @@ import { createCompactionHandler } from "../../features/magic-context/compaction
 import { DEFAULT_PROTECTED_TAGS } from "../../features/magic-context/defaults";
 import { createScheduler } from "../../features/magic-context/scheduler";
 import { createTagger } from "../../features/magic-context/tagger";
-import { createMagicContextHook, createMagicContextHookAsync } from "../../hooks/magic-context";
+import { createMagicContextHookAsync } from "../../hooks/magic-context";
 import type { LiveSessionState } from "../../hooks/magic-context/live-session-state";
 import type { RustModeModuleClient } from "../../hooks/magic-context/rust-mode-transform";
 import type { PromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";

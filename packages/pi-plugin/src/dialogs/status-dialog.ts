@@ -24,11 +24,11 @@ import {
 	MAX_EXECUTE_THRESHOLD,
 	resolveExecuteThresholdDetail,
 } from "@magic-context/core/hooks/magic-context/event-resolvers";
-import { formatBytes } from "@magic-context/core/shared/format-bytes";
 import { readProjectClaimLaneSnapshot } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import { computeM0BlockTokens } from "@magic-context/core/hooks/magic-context/m0-token-breakdown";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { countCompartmentsNeedingUpgrade } from "@magic-context/core/hooks/magic-context/upgrade-reminder";
+import { formatBytes } from "@magic-context/core/shared/format-bytes";
 import {
 	formatThresholdClampNote,
 	formatThresholdPercent,

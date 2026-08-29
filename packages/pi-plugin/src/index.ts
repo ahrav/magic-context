@@ -1459,10 +1459,9 @@ async function startPiMagicContextRuntime(
 			projectDir,
 			projectIdentity,
 			config: dreamerConfig,
-			// Council finding #7: thread real embedding + memory config so
-			// dreamer can do semantic dedup AND can write memory updates.
-			// Previously hardcoded to off/false, making most dreamer tasks
-			// useless on Pi.
+			// Thread real embedding + memory config so dreamer can do
+			// semantic dedup AND can write memory updates; off/false would
+			// make most dreamer tasks useless on Pi.
 			embeddingConfig: bootProjectDeps.config.embedding,
 			memoryEnabled: bootProjectDeps.config.memory.enabled,
 			retinaHandoff: bootProjectDeps.config.smart_notes.retina_handoff,
@@ -1513,10 +1512,10 @@ async function startPiMagicContextRuntime(
 			if (ctx.hasUI && shouldShowAnnouncement()) {
 				// URLs render as plain text. Modern terminals auto-detect and
 				// let users Cmd-click; older terminals require manual copy.
-				// We previously wrapped URLs in OSC 8 hyperlink escapes, but
-				// not all terminals support them and `ctx.ui.notify` may also
-				// re-render the message through pi-tui's text pipeline that
-				// strips raw escapes. Plain text is the most reliable surface.
+				// OSC 8 hyperlink escapes are avoided: not all terminals
+				// support them and `ctx.ui.notify` may re-render the message
+				// through pi-tui's text pipeline, which strips raw escapes.
+				// Plain text is the most reliable surface.
 				const featureText = ANNOUNCEMENT_FEATURES.map(
 					(line) => `  • ${line}`,
 				).join("\n");

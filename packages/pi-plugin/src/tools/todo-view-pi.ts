@@ -16,7 +16,7 @@ import {
 } from "@magic-context/core/hooks/magic-context/todo-view";
 
 export const TODO_TOOL_NAME = "todowrite";
-export const TODOS_COMMAND_NAME = "todos";
+const TODOS_COMMAND_NAME = "todos";
 
 const WIDGET_KEY = "magic-context-todos";
 const MAX_TODO_CONTENT_ROWS = 12;
@@ -108,7 +108,7 @@ function getCachedTodowriteToolCallTodos(
 	return todos ? cloneTodos(todos) : null;
 }
 
-export function clearTodowriteToolCallTodos(): void {
+function clearTodowriteToolCallTodos(): void {
 	cachedTodowriteTodosByToolCallId.clear();
 }
 
@@ -132,7 +132,7 @@ export function parseTodos(input: unknown): TodoItem[] | null {
 	return todos;
 }
 
-export function parseTodoStateJson(
+function parseTodoStateJson(
 	stateJson: string | null | undefined,
 ): TodoItem[] | null {
 	if (!stateJson) return null;
@@ -150,7 +150,7 @@ export function setTodoSnapshot(sessionId: string, todos: unknown): boolean {
 	return true;
 }
 
-export function seedTodoSnapshotFromStateJson(
+function seedTodoSnapshotFromStateJson(
 	sessionId: string,
 	stateJson: string | null | undefined,
 ): boolean {
@@ -169,7 +169,7 @@ export function getTodoSnapshot(sessionId: string | undefined): TodoSnapshot {
 	return { todos: snapshot ? cloneTodos(snapshot.todos) : [] };
 }
 
-export function clearTodoSnapshot(sessionId: string): void {
+function clearTodoSnapshot(sessionId: string): void {
 	snapshotsBySession.delete(sessionId);
 }
 
