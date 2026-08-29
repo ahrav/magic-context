@@ -1144,6 +1144,19 @@ describe("scoreRunRecord", () => {
             } finally {
                 clean.cleanup();
             }
+
+            // Selector direction: the snapshot is queried with the record's own
+            // unverified `projectIdentity` and `nowMs`, so an edit to either
+            // returns an empty visible set that looks exactly like "no promotion".
+            // An empty result is authoritative only when the record agrees nothing
+            // was captured, so both edits fall back to the recorded claims.
+            const wrongIdentity = scoreRunRecord({ ...aborted, projectIdentity: "no-such-project" }, scenario);
+            expect(wrongIdentity.verdict).toBe("FAIL");
+            expect(wrongIdentity.falseAuthoritativeMatches).toEqual(["abs-redis-active"]);
+
+            const shiftedClock = scoreRunRecord({ ...aborted, nowMs: 1 }, scenario);
+            expect(shiftedClock.verdict).toBe("FAIL");
+            expect(shiftedClock.falseAuthoritativeMatches).toEqual(["abs-redis-active"]);
         } finally {
             fixture.cleanup();
         }

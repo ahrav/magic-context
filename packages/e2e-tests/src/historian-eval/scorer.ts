@@ -1248,23 +1248,36 @@ function renderedClaimIdsInLastMemoryBlock(payloadText: string): Set<string> | n
 /**
  * False-authoritative matches for a record that aborted.
  *
- * Snapshot-derived whenever a snapshot is available, because an ERROR record's
- * serialized `injectedClaims` never reaches the snapshot-binding checks — those
- * run only on the completion path — so an edited or mispaired array could
- * manufacture a run-fatal verdict, and worse, HIDE a real promotion by dropping
- * the entry. Masking is the direction this whole path exists to close, so the
- * array cannot be the authority when a better one is on disk: the snapshot is
- * what the completion path scores facts from, and `emptyRecord` captures it
- * after the claim read, so it supersedes the array in both directions.
+ * Snapshot-derived when the snapshot is readable AND the record's own query
+ * selectors bind to it; otherwise from the serialized `injectedClaims`. Both
+ * halves of that condition are load-bearing, and in opposite directions.
  *
- * Falls back to the recorded array only when there is no readable snapshot.
- * `contextDbSnapshotPath` is best effort on an abort and is frequently `""`,
- * and there the array is the only evidence there is; trusting it is the
- * fail-loud direction, and refusing to score it would restore the masking hole.
- * A snapshot that cannot be opened, queried, or that reads stale degrades to
- * that same fallback rather than becoming an `unreadable-snapshot` ERROR: the
- * abort's own reason is the more informative fact about the run, and replacing
- * it would lose that.
+ * An ERROR record never reaches the snapshot-binding checks below — those run
+ * only on the completion path — so neither side can be trusted unconditionally:
+ *
+ * - Trusting the ARRAY lets a truncated `injectedClaims` HIDE a captured
+ *   promotion, which is the masking this path exists to close.
+ * - Trusting the SNAPSHOT unconditionally lets the record's own unverified
+ *   selectors hide it instead. `readInjectedClaims` is keyed by
+ *   `record.projectIdentity` and `record.nowMs`; an identity absent from the
+ *   snapshot, or a shifted clock, returns an empty visible set that looks
+ *   exactly like "no promotion" while the array still names one.
+ *
+ * So the snapshot's answer is authoritative only when its selectors are
+ * corroborated by the snapshot itself: the identity must resolve to a project in
+ * this database, and an empty visible set is accepted only if the record agrees
+ * that nothing was captured. Otherwise the record and its snapshot disagree,
+ * nothing here can say which side was edited, and the fallback is the array —
+ * the direction that fails loud rather than reporting quality on a run that may
+ * have promoted a forbidden claim.
+ *
+ * Corroborated selectors also keep the opposite direction closed: with a
+ * trustworthy visible set the array is not consulted at all, so a forged
+ * gold-matching entry cannot manufacture an always-run-fatal verdict.
+ *
+ * A missing, unopenable, unqueryable, or stale snapshot degrades to the array
+ * rather than becoming an `unreadable-snapshot` ERROR: the abort's own reason is
+ * the more informative fact about the run, and replacing it would lose it.
  */
 function abortedRecordFalseAuthoritative(
     record: HistorianEvalRunRecord,
@@ -1280,7 +1293,12 @@ function abortedRecordFalseAuthoritative(
     }
     try {
         const visible = readInjectedClaims(db, record.projectIdentity, record.scenarioId, record.nowMs);
-        return visible === null ? recorded() : falseAuthoritativeMatchesIn(scenario, visible);
+        if (visible === null) return recorded();
+        const identityResolves = resolveProjectIdsForIdentities(db, [record.projectIdentity]).length > 0;
+        if (!identityResolves || (visible.length === 0 && record.injectedClaims.length > 0)) {
+            return recorded();
+        }
+        return falseAuthoritativeMatchesIn(scenario, visible);
     } catch {
         return recorded();
     } finally {
