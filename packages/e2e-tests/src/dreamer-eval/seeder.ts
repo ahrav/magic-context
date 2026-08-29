@@ -137,10 +137,16 @@ function fixturePath(workdir: string, path: string): string {
     // fixture content, so a claim declaring it would have its authored content
     // silently overwritten. The commit and `assertFixtureFilesCommitted` would
     // still pass — they only check that the path is tracked and clean — leaving
-    // the evaluation to run against evidence the claim never declared. Folded
-    // like the `.git` check below, because a case-insensitive filesystem maps
-    // `.DREAMER-EVAL-FIXTURE` onto the same file.
-    if (canonical.toLowerCase() === FIXTURE_MARKER) fixtureError(`fixture path is reserved: ${path}`);
+    // the evaluation to run against evidence the claim never declared. A
+    // descendant is reserved for a blunter reason: writing it creates the marker
+    // as a directory, and the marker write then fails with a raw EISDIR outside
+    // the typed fixture-drift path. Folded like the `.git` check below, because a
+    // case-insensitive filesystem maps `.DREAMER-EVAL-FIXTURE` onto the same
+    // name.
+    const foldedCanonical = canonical.toLowerCase();
+    if (foldedCanonical === FIXTURE_MARKER || foldedCanonical.startsWith(`${FIXTURE_MARKER}/`)) {
+        fixtureError(`fixture path is reserved: ${path}`);
+    }
     // The control directory lives inside the workdir but is not fixture
     // content: a write there steers the seeder's own git invocations, and
     // `.git/hooks` would execute during the fixture commit.

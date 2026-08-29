@@ -239,6 +239,48 @@ describe("dreamer manifest mutation battery", () => {
         expect(runMutationBattery(fixture).green).toBe(true);
     });
 
+    test("the forbidden-anchor mutation finds a later update that has one", () => {
+        // The first update gold carries no forbidden anchor while a second does,
+        // so reading only the first would abort the whole battery.
+        const first = { ...dreamerScorerFixture.verifyGold.claims[1]!, forbiddenUpdateAnchors: [] };
+        const fixture = {
+            ...dreamerScorerFixture,
+            pool: {
+                ...dreamerScorerFixture.pool,
+                claims: [
+                    ...dreamerScorerFixture.pool.claims,
+                    {
+                        ...dreamerScorerFixture.pool.claims[1]!,
+                        claimId: "claim-second-update",
+                        publicClaimId: "mcm_second",
+                        revisionLocator: "mcm_second@1",
+                        content: "The retry budget is three attempts.",
+                    },
+                ],
+            },
+            verifyGold: {
+                kind: "verify" as const,
+                claims: [
+                    dreamerScorerFixture.verifyGold.claims[0]!,
+                    first,
+                    {
+                        ...first,
+                        claimId: "claim-second-update",
+                        requiredUpdateAnchors: ["retry budget"],
+                        forbiddenUpdateAnchors: ["three attempts"],
+                    },
+                    dreamerScorerFixture.verifyGold.claims[2]!,
+                ],
+            },
+        };
+        const evidence = runMutationBattery(fixture);
+        expect(evidence.results.find((entry) => entry.mutationClass === "update-forbidden-anchor")).toMatchObject({
+            green: true,
+            actualStage: "scored",
+            actualReason: "wrong-update-content",
+        });
+    });
+
     test("a single-file map gold still yields a changed manifest", () => {
         const fixture = {
             ...dreamerScorerFixture,

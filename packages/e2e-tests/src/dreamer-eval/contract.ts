@@ -118,6 +118,45 @@ const UPDATE_CLOSE_TAG = "</update>";
  */
 const VERIFY_ROOT_CLOSE_TAG = "</verify>";
 
+/**
+ * `parseVerifyManifest` scans the whole body for each entry shape, so one of
+ * these inside an update's content parses as a real sibling entry. Matched
+ * case-sensitively, like the parser's own regexes.
+ */
+const VERIFY_ENTRY_OPEN_RE = /<(?:verified|update|archive)\b/;
+
+/**
+ * Smallest pool a scenario may declare, and therefore the smallest a completed
+ * run can have observed.
+ */
+const MIN_POOL_CLAIMS = 10;
+
+/**
+ * FAIL reasons each task's scorer can actually produce. A report naming another
+ * one attributes an impossible outcome — and, for `wrong-archival`, run-fatal
+ * exit 2 — to an experiment that could never reach it.
+ */
+const TASK_FAIL_REASONS: Record<DreamerTask, readonly FailReason[]> = {
+    verify: [
+        "wrong-archival",
+        "missed-archival",
+        "wrong-verdict",
+        "wrong-mapping",
+        "wrong-update-content",
+        "invalid-output",
+    ],
+    "verify-broad": [
+        "wrong-archival",
+        "missed-archival",
+        "wrong-verdict",
+        "wrong-mapping",
+        "wrong-update-content",
+        "invalid-output",
+    ],
+    "map-memories": ["wrong-independence", "wrong-mapping", "invalid-output"],
+    "classify-memories": ["wrong-classification", "invalid-output"],
+};
+
 export class DreamerEvalContractError extends Error {
     readonly diagnostics: readonly string[];
 
@@ -401,6 +440,33 @@ function parseGoldFilePathArray(raw: unknown, label: string, declared: ReadonlyS
     return values;
 }
 
+/**
+ * A sound lower bound on the shortest update body that can contain every
+ * required anchor, or null when no bound is provable here.
+ *
+ * The true minimum is the shortest-common-superstring length, which is NP-hard,
+ * so this decides only the case where the anchors provably cannot share
+ * characters: anchors contained in another ride along for free and drop out, and
+ * if no ordered pair of the rest overlaps — no suffix of one is a prefix of the
+ * other — then every occurrence is disjoint and the minimum is exactly the sum.
+ * Anchor matching is case-insensitive, so overlap is judged folded.
+ */
+function disjointAnchorLength(anchors: readonly string[]): number | null {
+    const unique = [...new Set(anchors.map((anchor) => anchor.toLowerCase()))];
+    const maximal = unique.filter(
+        (anchor) => !unique.some((other) => other !== anchor && other.includes(anchor)),
+    );
+    for (const left of maximal) {
+        for (const right of maximal) {
+            if (left === right) continue;
+            for (let size = Math.min(left.length, right.length); size > 0; size -= 1) {
+                if (left.endsWith(right.slice(0, size))) return null;
+            }
+        }
+    }
+    return maximal.reduce((total, anchor) => total + anchor.length, 0);
+}
+
 function parseVerifyGold(raw: unknown, label: string, pool: ReadonlyMap<string, ScenarioClaim>): ParsedLayerGold {
     const value = record(raw, label);
     exact(value, ["kind", "claims"], label);
@@ -446,6 +512,19 @@ function parseVerifyGold(raw: unknown, label: string, pool: ReadonlyMap<string, 
             if (anchor.toLowerCase().includes(VERIFY_ROOT_CLOSE_TAG)) {
                 fail(`${itemLabel}.requiredUpdateAnchors[${anchorIndex}]: anchor-holds-root-close-tag`);
             }
+            // The parser collects each entry shape from the whole body, so one
+            // spelled inside the update content becomes a sibling entry carrying
+            // an id the pool does not have, and coverage validation then rejects
+            // every manifest that satisfies the anchor.
+            if (VERIFY_ENTRY_OPEN_RE.test(anchor)) {
+                fail(`${itemLabel}.requiredUpdateAnchors[${anchorIndex}]: anchor-holds-entry`);
+            }
+        }
+        // Individually capped anchors can still be jointly impossible: two that
+        // cannot overlap need a body at least as long as their sum.
+        const disjointLength = disjointAnchorLength(requiredUpdateAnchors);
+        if (disjointLength !== null && disjointLength > VERIFY_UPDATE_CONTENT_MAX_LENGTH) {
+            fail(`${itemLabel}.requiredUpdateAnchors: anchors-exceed-content-cap`);
         }
         // Anchors are scored only for an update verdict, so an anchor on any
         // other verdict states a requirement nothing enforces.
@@ -631,14 +710,21 @@ function parseTask(raw: unknown, label: string, pool: ReadonlyMap<string, Scenar
     }
     if (task === "map-memories") {
         // `selectMapMemoryInputs` always selects a claim with no baseline, and a
-        // mapping precondition is the only thing that creates one — including a
-        // mapping with an empty file set. The converse is not derivable here: a
-        // claim that has a baseline may still be requeued by an independence
-        // heuristic that reads its content and the repository.
-        const seededClaimIds = new Set(preconditions.mappings.map((entry) => entry.claimId));
+        // mapping precondition is the only thing that creates one. The converse
+        // holds for a nonempty mapping too: `shouldRequeueIndependentMapping`
+        // requires an empty sentinel, so a claim with mapped files can never be
+        // pulled back in. Only an empty mapping is genuinely ambiguous, because
+        // the requeue heuristic then reads the claim's content and the
+        // repository.
+        const seededFiles = new Map(preconditions.mappings.map((entry) => [entry.claimId, entry.files]));
         for (const [index, claimId] of expectedSkippedClaimIds.entries()) {
-            if (!seededClaimIds.has(claimId)) {
+            if (!seededFiles.has(claimId)) {
                 fail(`${label}.expectedSkippedClaimIds[${index}]: map-scope-unmapped`);
+            }
+        }
+        for (const [index, claimId] of expectedInScopeClaimIds.entries()) {
+            if ((seededFiles.get(claimId)?.length ?? 0) > 0) {
+                fail(`${label}.expectedInScopeClaimIds[${index}]: map-scope-already-mapped`);
             }
         }
     }
@@ -669,7 +755,7 @@ export function parseScenario(raw: unknown, label = "scenario"): DreamerEvalScen
         parseScenarioClaim(entry, `${label}.pool.claims[${index}]`),
     );
     if (claims.length > 50) fail(`${label}.pool.claims: count-invalid`);
-    if (claims.filter((claim) => claim.hygieneVisible).length < 10) fail(`${label}.pool.claims: hygiene-visible-count-invalid`);
+    if (claims.filter((claim) => claim.hygieneVisible).length < MIN_POOL_CLAIMS) fail(`${label}.pool.claims: hygiene-visible-count-invalid`);
     unique(claims.map((claim) => claim.id), `${label}.pool.claims`);
     // Claim creation dedupes on (project, category, normalized content hash)
     // among active claims, so two rows whose contents normalize alike collapse
@@ -860,6 +946,7 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
     const root = record(raw, label);
     exact(root, ["schema", "scenarioId", "task", "runId", "nowMs", "status", "reason", "runFatal", "system", "poolBefore", "poolAfter", "rawManifest", "parsedManifest", "receiptOutcomes"], label);
     if (root.schema !== DREAMER_EVAL_REPORT_SCHEMA) fail(`${label}.schema: version-invalid`);
+    const task = enumeration(root.task, DREAMER_TASKS, `${label}.task`);
     const status = enumeration(root.status, ["PASS", "FAIL", "ERROR"], `${label}.status`);
     let reason: ErrorReason | FailReason | null = null;
     if (status === "PASS") {
@@ -867,7 +954,12 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
     } else if (status === "ERROR") {
         reason = enumeration(root.reason, ERROR_REASONS, `${label}.reason`);
     } else {
-        reason = enumeration(root.reason, FAIL_REASONS, `${label}.reason`);
+        const failReason = enumeration(root.reason, FAIL_REASONS, `${label}.reason`);
+        // Each task runs one scorer, and a scorer emits only its own reasons.
+        if (!TASK_FAIL_REASONS[task].includes(failReason)) {
+            fail(`${label}.reason: task-reason-mismatch`);
+        }
+        reason = failReason;
     }
     const runFatal = boolean(root.runFatal, `${label}.runFatal`);
     if (runFatal !== isRunFatal(status, reason)) fail(`${label}.runFatal: mapping-invalid`);
@@ -880,8 +972,13 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
     // silently corrupts a before/after comparison. An ERROR run is exempt: it
     // may have failed before capturing the pool, so a partial capture is the
     // honest record there.
-    if (status !== "ERROR" && !sameIdentityBindings(poolBefore, poolAfter)) {
-        fail(`${label}.poolAfter: identity-drift`);
+    if (status !== "ERROR") {
+        // Binding equality is vacuous for two empty captures, and every valid
+        // scenario declares at least MIN_POOL_CLAIMS claims, so a completed run
+        // observed at least that many. Without this floor a report can drop the
+        // whole experiment population and still satisfy the comparison.
+        if (poolBefore.length < MIN_POOL_CLAIMS) fail(`${label}.poolBefore: pool-capture-incomplete`);
+        if (!sameIdentityBindings(poolBefore, poolAfter)) fail(`${label}.poolAfter: identity-drift`);
     }
     const receiptOutcomes = array(root.receiptOutcomes, `${label}.receiptOutcomes`).map((entry, index) => {
         const itemLabel = `${label}.receiptOutcomes[${index}]`;
@@ -903,10 +1000,22 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
     if (status === "PASS" && (rawManifest === null || rawManifest.trim().length === 0 || parsedManifest === null)) {
         fail(`${label}.parsedManifest: pass-requires-evidence`);
     }
+    // A FAIL is reached the same way: `precheck` admits only a nonblank manifest,
+    // so every scorer failure has raw bytes behind it, and every reason except
+    // `invalid-output` — the one raised when validation itself threw — also
+    // carries parsed evidence.
+    if (status === "FAIL") {
+        if (rawManifest === null || rawManifest.trim().length === 0) {
+            fail(`${label}.rawManifest: fail-requires-evidence`);
+        }
+        if (reason !== "invalid-output" && parsedManifest === null) {
+            fail(`${label}.parsedManifest: fail-requires-evidence`);
+        }
+    }
     return {
         schema: DREAMER_EVAL_REPORT_SCHEMA,
         scenarioId: staticId(root.scenarioId, `${label}.scenarioId`, SCENARIO_ID_RE),
-        task: enumeration(root.task, DREAMER_TASKS, `${label}.task`),
+        task,
         runId: staticId(root.runId, `${label}.runId`, RUN_ID_RE),
         nowMs: integer(root.nowMs, `${label}.nowMs`),
         status,

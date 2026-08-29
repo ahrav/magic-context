@@ -322,10 +322,19 @@ function mutationManifest(
             return { task: "verify", manifest: replaceEntry(verify, claim.publicClaimId, `<update claim="${claim.publicClaimId}" files="${target.expectedFiles.join(",")}">${content}</update>`) };
         }
         case "update-forbidden-anchor": {
-            const forbidden = updated.forbiddenUpdateAnchors[0];
-            if (forbidden === undefined) throw new Error("mutation fixture needs forbidden update anchor");
-            const content = [...updated.requiredUpdateAnchors, forbidden].join("; ");
-            return { task: "verify", manifest: replaceEntry(verify, updatedClaim.publicClaimId, `<update claim="${updatedClaim.publicClaimId}" files="${updated.expectedFiles.join(",")}">${content}</update>`) };
+            // Read the gold that actually carries a forbidden anchor rather than
+            // the first update: a fixture whose first update has none but whose
+            // later one does has everything this class needs, and taking the
+            // first would abort the whole battery.
+            const target = requiredGold(
+                fixture.verifyGold.claims,
+                (entry) => entry.verdict === "update" && entry.forbiddenUpdateAnchors.length > 0,
+                "an update gold with a forbidden anchor",
+            );
+            const claim = claimById(fixture.pool, target.claimId);
+            const forbidden = target.forbiddenUpdateAnchors[0]!;
+            const content = [...target.requiredUpdateAnchors, forbidden].join("; ");
+            return { task: "verify", manifest: replaceEntry(verify, claim.publicClaimId, `<update claim="${claim.publicClaimId}" files="${target.expectedFiles.join(",")}">${content}</update>`) };
         }
         case "wrong-independence": {
             const target = requiredGold(fixture.mapGold.claims, (entry) => !entry.independent, "file-bound map gold");

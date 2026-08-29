@@ -453,6 +453,24 @@ describe("dreamer eval seeder", () => {
         expect(result.fixtureCommitTimeMs).toBe(4_102_444_799_000);
     });
 
+    test("a claim cannot declare a descendant of the fixture marker", async () => {
+        const selectedScenario = scenario("verify");
+        // Writing this creates the marker as a directory, after which the marker
+        // write fails with a raw EISDIR outside the typed fixture-drift path.
+        selectedScenario.pool.claims[0]!.fixtureFiles = [
+            { path: ".dreamer-eval-fixture/payload", content: "x\n" },
+        ];
+
+        await expect(
+            seedDreamerEvalTask({
+                db: database(),
+                scenario: selectedScenario,
+                task: selectedScenario.tasks[0]!,
+                workdir: workdir(),
+            }),
+        ).rejects.toThrow("ERROR:fixture-drift: fixture path is reserved: .dreamer-eval-fixture/payload");
+    });
+
     test("reports a result mode the production gate did not return", async () => {
         const selectedScenario = scenario("verify");
         const selectedTask = selectedScenario.tasks[0]!;

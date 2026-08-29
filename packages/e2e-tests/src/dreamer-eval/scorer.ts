@@ -1,4 +1,7 @@
+import { sep } from "node:path";
+
 import { hasLengthCappedOutput } from "../../../plugin/src/shared/assistant-message-extractor";
+import { normalizeMemoryContent } from "../../../plugin/src/features/magic-context/memory/normalize-hash";
 import { hasShareabilitySensitiveText } from "../../../plugin/src/shared/redaction";
 import {
     providerOutputFailureFromInvalidManifest,
@@ -100,13 +103,21 @@ function invalidOutput(manifestText: string, evidence?: ManifestInfraEvidence): 
  * through an alias such as `src/./file.ts` scores `wrong-mapping` even though
  * production canonicalizes it and applies exactly the gold path.
  *
- * An escaping prefix and a leading slash survive on purpose: production drops a
- * path that leaves the project rather than resolving it inward, so neither may
+ * Separator handling follows the running platform, because production's does: on
+ * Windows `path.resolve` treats a backslash as a separator, so `src\file.ts`
+ * resolves to the tracked file and is applied, while on a POSIX host the
+ * backslash is an ordinary filename character and the path is untracked and
+ * dropped. Mirroring that keeps the score equal to what the host would do rather
+ * than to what one platform would do.
+ *
+ * An escaping prefix and a leading separator survive on purpose: production drops
+ * a path that leaves the project rather than resolving it inward, so neither may
  * quietly turn into a tracked path here.
  */
 function canonicalObservedPath(value: string): string {
+    const separators = sep === "\\" ? /[\\/]/ : "/";
     const resolved: string[] = [];
-    for (const segment of value.split("/")) {
+    for (const segment of value.split(separators)) {
         if (segment === "" || segment === ".") continue;
         if (segment === ".." && resolved.length > 0 && resolved[resolved.length - 1] !== "..") {
             resolved.pop();
@@ -115,7 +126,7 @@ function canonicalObservedPath(value: string): string {
         resolved.push(segment);
     }
     const joined = resolved.join("/");
-    return value.startsWith("/") ? `/${joined}` : joined;
+    return /^[\\/]/.test(value) ? `/${joined}` : joined;
 }
 
 function canonicalObservedPaths(values: readonly string[]): string[] {
@@ -202,9 +213,39 @@ export function scoreVerifyManifest(
             if (missingRequired || containsForbidden) {
                 return score("FAIL", "wrong-update-content", "scored", parsed);
             }
+            // Revision refuses content whose normalized hash is already owned by
+            // another live claim in the same category
+            // (`assertNoLiveDuplicate`, exempting only the claim being revised),
+            // so a body colliding with a sibling's content throws instead of
+            // applying. Scoring it green would credit output the host cannot
+            // write.
+            if (collidesWithLiveClaim(pool, expected.claimId, trimmed)) {
+                return score("FAIL", "wrong-update-content", "scored", parsed);
+            }
         }
     }
     return score("PASS", null, "scored", parsed);
+}
+
+/**
+ * Whether replacement content would land on another live claim's
+ * `(category, normalized content)` identity. Production's revision path asserts
+ * that identity is free, exempting only the claim being revised, and throws
+ * otherwise — so such a manifest is unappliable however well its anchors read.
+ * Archived and retired rows are excluded, matching the `lifecycle_state =
+ * 'active'` the assertion queries.
+ */
+function collidesWithLiveClaim(pool: PoolDescriptor, claimId: string, content: string): boolean {
+    const revised = pool.claims.find((claim) => claim.claimId === claimId);
+    if (revised === undefined) return false;
+    const normalized = normalizeMemoryContent(content);
+    return pool.claims.some(
+        (claim) =>
+            claim.claimId !== claimId &&
+            claim.lifecycleState === "active" &&
+            claim.category === revised.category &&
+            normalizeMemoryContent(claim.content) === normalized,
+    );
 }
 
 export function scoreMapManifest(

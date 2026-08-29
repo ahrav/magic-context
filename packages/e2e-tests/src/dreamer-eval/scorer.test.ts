@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { sep } from "node:path";
 
 import {
     DREAMER_EVAL_POOL_SCHEMA,
@@ -326,6 +327,41 @@ describe("dreamer manifest scorers", () => {
         });
     });
 
+    test("an update colliding with another live claim is not appliable", () => {
+        // Revision asserts the (category, normalized content) identity is free,
+        // exempting only the claim being revised, so content equal to a sibling's
+        // throws rather than applying.
+        const collidingGold = {
+            kind: "verify" as const,
+            claims: verifyGold.claims.map((claim) =>
+                claim.claimId === "claim-update"
+                    ? { ...claim, requiredUpdateAnchors: ["removed queue"], forbiddenUpdateAnchors: [] }
+                    : claim,
+            ),
+        };
+        // claim-false is active, same category, content "The removed queue still exists."
+        const collision = correctVerify.replace(
+            "Uses a BOUNDED CACHE with 4096 ENTRIES.",
+            "  the REMOVED QUEUE still exists.  ",
+        );
+        expect(scoreVerifyManifest(collision, pool, collidingGold)).toMatchObject({
+            status: "FAIL",
+            reason: "wrong-update-content",
+        });
+        // The same content is appliable once that sibling is no longer live, so
+        // the identity is free and the run passes.
+        const archivedSibling = {
+            ...pool,
+            claims: pool.claims.map((claim) =>
+                claim.claimId === "claim-false" ? { ...claim, lifecycleState: "archived" as const } : claim,
+            ),
+        };
+        expect(scoreVerifyManifest(collision, archivedSibling, collidingGold)).toMatchObject({
+            status: "PASS",
+            reason: null,
+        });
+    });
+
     test("a canonicalizable alias of a gold path scores as that path", () => {
         // Production resolves the path before matching it against a tracked file,
         // so a manifest naming a gold file through an alias applies exactly the
@@ -344,6 +380,16 @@ describe("dreamer manifest scorers", () => {
         expect(
             scoreMapManifest(correctMap.replace("src/cache.ts", "/src/cache.ts"), pool, mapGold),
         ).toMatchObject({ status: "FAIL", reason: "wrong-mapping" });
+        // Separator handling follows the platform, because production's does. On
+        // a POSIX host a backslash is an ordinary filename character, so this
+        // path is untracked and production drops it — folding it here would
+        // credit output the host would not apply. The win32 branch cannot be
+        // exercised from this runner.
+        if (sep === "/") {
+            expect(
+                scoreMapManifest(correctMap.replace("src/cache.ts", "src\\cache.ts"), pool, mapGold),
+            ).toMatchObject({ status: "FAIL", reason: "wrong-mapping" });
+        }
     });
 
     test("production validation rejects malformed coverage as invalid model output", () => {

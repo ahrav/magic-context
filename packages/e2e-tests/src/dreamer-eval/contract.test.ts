@@ -297,18 +297,43 @@ describe("dreamer eval scenario contract", () => {
             tasks[0]!.gold.claims[0]!.verdict = "update";
             tasks[0]!.gold.claims[0]!.requiredUpdateAnchors = ["a".repeat(VERIFY_UPDATE_CONTENT_MAX_LENGTH + 1)];
         }, "scenario.tasks[0].gold.claims[0].requiredUpdateAnchors[0]: anchor-exceeds-content-cap");
-        // The combined length is deliberately not capped: anchors may overlap
-        // inside one body, so a sum over the cap does not prove impossibility.
-        const atCap = validScenarioRaw();
-        const tasks = atCap.tasks as Array<{
+        // Two anchors that cannot overlap need a body at least as long as their
+        // sum, so a pair at the cap is jointly impossible even though each passes
+        // on its own.
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<{
+                gold: { claims: Array<{ verdict: string; requiredUpdateAnchors: string[] }> };
+            }>;
+            tasks[0]!.gold.claims[0]!.verdict = "update";
+            tasks[0]!.gold.claims[0]!.requiredUpdateAnchors = [
+                "a".repeat(VERIFY_UPDATE_CONTENT_MAX_LENGTH),
+                "b".repeat(VERIFY_UPDATE_CONTENT_MAX_LENGTH),
+            ];
+        }, "scenario.tasks[0].gold.claims[0].requiredUpdateAnchors: anchors-exceed-content-cap");
+        // A pair whose disjoint sum fits still parses, and so does one that only
+        // fits by overlapping — the bound is a proof of impossibility, not a
+        // budget.
+        const withinCap = validScenarioRaw();
+        const tasks = withinCap.tasks as Array<{
             gold: { claims: Array<{ verdict: string; requiredUpdateAnchors: string[] }> };
         }>;
         tasks[0]!.gold.claims[0]!.verdict = "update";
         tasks[0]!.gold.claims[0]!.requiredUpdateAnchors = [
-            "a".repeat(VERIFY_UPDATE_CONTENT_MAX_LENGTH),
-            "b".repeat(VERIFY_UPDATE_CONTENT_MAX_LENGTH),
+            "a".repeat(VERIFY_UPDATE_CONTENT_MAX_LENGTH / 2),
+            "b".repeat(VERIFY_UPDATE_CONTENT_MAX_LENGTH / 2),
         ];
-        expect(() => parseScenario(atCap)).not.toThrow();
+        expect(() => parseScenario(withinCap)).not.toThrow();
+        const overlapping = validScenarioRaw();
+        (overlapping.tasks as Array<{
+            gold: { claims: Array<{ verdict: string; requiredUpdateAnchors: string[] }> };
+        }>)[0]!.gold.claims[0]!.verdict = "update";
+        (overlapping.tasks as Array<{
+            gold: { claims: Array<{ verdict: string; requiredUpdateAnchors: string[] }> };
+        }>)[0]!.gold.claims[0]!.requiredUpdateAnchors = [
+            `${"a".repeat(VERIFY_UPDATE_CONTENT_MAX_LENGTH - 1)}b`,
+            `b${"a".repeat(VERIFY_UPDATE_CONTENT_MAX_LENGTH - 1)}`,
+        ];
+        expect(() => parseScenario(overlapping)).not.toThrow();
     });
 
     test("two claims cannot normalize to one stored claim", () => {
@@ -462,6 +487,40 @@ describe("dreamer eval scenario contract", () => {
         expect(() => parseScenario(atLimit)).not.toThrow();
     });
 
+    test("a map task cannot claim a mapped claim is in scope", () => {
+        // shouldRequeueIndependentMapping needs an empty sentinel, so a claim with
+        // mapped files can never be pulled back into map scope.
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<{ preconditions: { mappings: unknown[] } }>;
+            tasks[1]!.preconditions.mappings = [{ claimId: "claim-1", files: ["src/file-1.ts"] }];
+        }, "scenario.tasks[1].expectedInScopeClaimIds[0]: map-scope-already-mapped");
+        // An empty mapping stays ambiguous: the requeue heuristic reads the
+        // claim's content and the repository, so either partition is admissible.
+        const sentinel = validScenarioRaw();
+        (sentinel.tasks as Array<{ preconditions: { mappings: unknown[] } }>)[1]!.preconditions.mappings = [
+            { claimId: "claim-1", files: [] },
+        ];
+        expect(() => parseScenario(sentinel)).not.toThrow();
+    });
+
+    test("a required update anchor cannot spell a verify entry", () => {
+        // The parser collects entries from the whole body, so one inside the
+        // update content becomes a sibling entry with an unknown id.
+        for (const anchor of [
+            '<verified claim="ghost" files="x"/>',
+            '<archive claim="ghost"/>',
+            '<update claim="ghost" files="x">y',
+        ]) {
+            expectDiagnostic((raw) => {
+                const tasks = raw.tasks as Array<{
+                    gold: { claims: Array<{ verdict: string; requiredUpdateAnchors: string[] }> };
+                }>;
+                tasks[0]!.gold.claims[0]!.verdict = "update";
+                tasks[0]!.gold.claims[0]!.requiredUpdateAnchors = [anchor];
+            }, "scenario.tasks[0].gold.claims[0].requiredUpdateAnchors[0]: anchor-holds-entry");
+        }
+    });
+
     test("a verify task must declare the one result mode the seeder can produce", () => {
         // The seeder always git-inits and commits, and calls the gate with
         // forceBroad false: "broad" needs forceBroad, "non-git" is never
@@ -517,6 +576,32 @@ const CLAIM_TWO_ID = `mcm_${"2".repeat(32)}`;
 const CLAIM_ONE_LOCATOR = `${CLAIM_ONE_ID}/r1/${"a".repeat(64)}`;
 const CLAIM_TWO_LOCATOR = `${CLAIM_TWO_ID}/r1/${"b".repeat(64)}`;
 
+// A completed report has to carry the whole scenario pool, and the contract's
+// floor is ten claims.
+function poolSnapshot(index: number): Record<string, unknown> {
+    const publicClaimId = `mcm_${(index + 1).toString(16).padStart(2, "0").repeat(16)}`;
+    return {
+        claimId: `claim-${index + 1}`,
+        publicClaimId,
+        revisionLocator: `${publicClaimId}/r1/${"a".repeat(64)}`,
+        content: `Distinct memory content ${index + 1}`,
+        category: "CONSTRAINTS",
+        importance: 50,
+        memoryScope: "project",
+        sharing: "private",
+        lifecycleState: "active",
+        files: ["src/a.ts"],
+        verificationOutcome: null,
+    };
+}
+
+const POOL_CAPTURE = Array.from({ length: 10 }, (_, index) => poolSnapshot(index));
+
+/** The same capture with `overrides` folded into its first claim. */
+function captureWithFirst(overrides: Record<string, unknown>): Array<Record<string, unknown>> {
+    return POOL_CAPTURE.map((claim, index) => (index === 0 ? { ...claim, ...overrides } : claim));
+}
+
 describe("dreamer eval report contract", () => {
     const baseReport = {
         schema: DREAMER_EVAL_REPORT_SCHEMA,
@@ -534,8 +619,8 @@ describe("dreamer eval report contract", () => {
             modelId: "model",
             parserImpl: "ts",
         },
-        poolBefore: [],
-        poolAfter: [],
+        poolBefore: POOL_CAPTURE,
+        poolAfter: POOL_CAPTURE,
         rawManifest: "<verify></verify>",
         parsedManifest: {},
         receiptOutcomes: [],
@@ -623,10 +708,16 @@ describe("dreamer eval report contract", () => {
                 }),
             ).toThrow(new RegExp(`${field}.publicClaimId: duplicate`));
         }
-        // Both snapshots carry the claim: a completed run observes the same
-        // identities before and after, which the identity-drift check enforces.
+        // A single-claim capture is only legal for a run that failed before
+        // observing the pool, since a completed one must carry all ten.
         expect(
-            parseRunReport({ ...baseReport, poolBefore: [snapshot], poolAfter: [snapshot] }).poolBefore,
+            parseRunReport({
+                ...baseReport,
+                status: "ERROR",
+                reason: "harness-failure",
+                poolBefore: [snapshot],
+                poolAfter: [snapshot],
+            }).poolBefore,
         ).toHaveLength(1);
     });
 
@@ -647,33 +738,35 @@ describe("dreamer eval report contract", () => {
         // No task creates, deletes, or rekeys a claim, so an omitted or rebound
         // identity is a corrupt before/after comparison rather than a real
         // observation.
-        expect(() => parseRunReport({ ...baseReport, poolBefore: [snapshot], poolAfter: [] })).toThrow(
+        // An omitted claim.
+        expect(() => parseRunReport({ ...baseReport, poolAfter: POOL_CAPTURE.slice(1) })).toThrow(
             /poolAfter: identity-drift/,
         );
+        // A rebound public id on an otherwise identical claim.
         expect(() =>
             parseRunReport({
                 ...baseReport,
-                poolBefore: [snapshot],
-                poolAfter: [{ ...snapshot, publicClaimId: CLAIM_TWO_ID, revisionLocator: CLAIM_TWO_LOCATOR }],
+                poolAfter: captureWithFirst({ publicClaimId: CLAIM_TWO_ID, revisionLocator: CLAIM_TWO_LOCATOR }),
             }),
         ).toThrow(/poolAfter: identity-drift/);
+        // A result attributed to another claim entirely.
         expect(() =>
             parseRunReport({
                 ...baseReport,
                 status: "FAIL",
                 reason: "wrong-verdict",
-                poolBefore: [snapshot],
-                poolAfter: [{ ...snapshot, claimId: "claim-2", publicClaimId: CLAIM_TWO_ID, revisionLocator: CLAIM_TWO_LOCATOR }],
+                poolAfter: captureWithFirst({
+                    claimId: "claim-99",
+                    publicClaimId: CLAIM_TWO_ID,
+                    revisionLocator: CLAIM_TWO_LOCATOR,
+                }),
             }),
         ).toThrow(/poolAfter: identity-drift/);
         // Archival is a lifecycleState change on the same identity, so it is not
         // drift.
         expect(
-            parseRunReport({
-                ...baseReport,
-                poolBefore: [snapshot],
-                poolAfter: [{ ...snapshot, lifecycleState: "archived" }],
-            }).poolAfter[0]?.lifecycleState,
+            parseRunReport({ ...baseReport, poolAfter: captureWithFirst({ lifecycleState: "archived" }) })
+                .poolAfter[0]?.lifecycleState,
         ).toBe("archived");
         // An ERROR run may have failed before capturing the pool.
         expect(
@@ -704,8 +797,8 @@ describe("dreamer eval report contract", () => {
         const parse = (overrides: Record<string, unknown>) =>
             parseRunReport({
                 ...baseReport,
-                poolBefore: [{ ...snapshot, ...overrides }],
-                poolAfter: [{ ...snapshot, ...overrides }],
+                poolBefore: captureWithFirst(overrides),
+                poolAfter: captureWithFirst(overrides),
             });
         expect(() => parse({ publicClaimId: "mcm_one" })).toThrow(/publicClaimId: id-invalid/);
         expect(() => parse({ publicClaimId: `mcm_${"A".repeat(32)}` })).toThrow(/publicClaimId: id-invalid/);
@@ -718,7 +811,7 @@ describe("dreamer eval report contract", () => {
         expect(() => parse({ revisionLocator: CLAIM_TWO_LOCATOR })).toThrow(
             /revisionLocator: locator-claim-mismatch/,
         );
-        expect(parse({}).poolBefore[0]?.publicClaimId).toBe(CLAIM_ONE_ID);
+        expect(parse({}).poolBefore).toHaveLength(POOL_CAPTURE.length);
     });
 
     test("a passing report must carry the evidence it was scored from", () => {
@@ -749,6 +842,83 @@ describe("dreamer eval report contract", () => {
                 parsedManifest: null,
             }).rawManifest,
         ).toBeNull();
+    });
+
+    test("a failure reason must be one its task's scorer can produce", () => {
+        // The map scorer emits only wrong-independence, wrong-mapping, and
+        // invalid-output, so a map report claiming wrong-archival would carry
+        // run-fatal exit 2 for an outcome it could never reach.
+        expect(() =>
+            parseRunReport({
+                ...baseReport,
+                task: "map-memories",
+                status: "FAIL",
+                reason: "wrong-archival",
+                runFatal: true,
+            }),
+        ).toThrow(/reason: task-reason-mismatch/);
+        expect(() =>
+            parseRunReport({
+                ...baseReport,
+                task: "classify-memories",
+                status: "FAIL",
+                reason: "wrong-verdict",
+            }),
+        ).toThrow(/reason: task-reason-mismatch/);
+        expect(
+            parseRunReport({
+                ...baseReport,
+                task: "map-memories",
+                status: "FAIL",
+                reason: "wrong-independence",
+            }).reason,
+        ).toBe("wrong-independence");
+    });
+
+    test("a failing report must carry the evidence it was scored from", () => {
+        // precheck admits only a nonblank manifest, so every scorer failure has
+        // raw bytes; every reason but invalid-output also carries parsed evidence.
+        const failing = { ...baseReport, status: "FAIL", reason: "wrong-verdict" };
+        expect(() => parseRunReport({ ...failing, rawManifest: null })).toThrow(
+            /rawManifest: fail-requires-evidence/,
+        );
+        expect(() => parseRunReport({ ...failing, rawManifest: "  " })).toThrow(
+            /rawManifest: fail-requires-evidence/,
+        );
+        expect(() => parseRunReport({ ...failing, parsedManifest: null })).toThrow(
+            /parsedManifest: fail-requires-evidence/,
+        );
+        // invalid-output is raised when validation threw, so it has no parsed
+        // evidence to carry.
+        expect(
+            parseRunReport({ ...baseReport, status: "FAIL", reason: "invalid-output", parsedManifest: null })
+                .parsedManifest,
+        ).toBeNull();
+    });
+
+    test("a completed report must capture the scenario pool", () => {
+        // Binding equality is vacuous for two empty captures, and every scenario
+        // declares at least ten claims.
+        expect(() => parseRunReport({ ...baseReport, poolBefore: [], poolAfter: [] })).toThrow(
+            /poolBefore: pool-capture-incomplete/,
+        );
+        expect(() =>
+            parseRunReport({
+                ...baseReport,
+                poolBefore: POOL_CAPTURE.slice(0, 9),
+                poolAfter: POOL_CAPTURE.slice(0, 9),
+            }),
+        ).toThrow(/poolBefore: pool-capture-incomplete/);
+        // An ERROR run may have died before observing anything.
+        expect(
+            parseRunReport({
+                ...baseReport,
+                status: "ERROR",
+                reason: "gate-mismatch",
+                poolBefore: [],
+                poolAfter: [],
+            }).poolBefore,
+        ).toHaveLength(0);
     });
 
     test("an empty aggregation is not a pass", () => {
