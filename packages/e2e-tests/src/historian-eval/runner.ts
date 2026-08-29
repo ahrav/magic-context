@@ -535,7 +535,7 @@ export interface RunScenarioOptions {
  * rather than a silently truncated job. Callers with a different budget override
  * it through `historianWaitMs`.
  */
-export function historianWaitBudgetMs(mode: RunScenarioOptions["mode"]): number {
+function historianWaitBudgetMs(mode: RunScenarioOptions["mode"]): number {
     return mode.kind === "live" ? 2 * DEFAULT_HISTORIAN_TIMEOUT_MS : 90_000;
 }
 

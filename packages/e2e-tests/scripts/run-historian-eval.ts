@@ -26,12 +26,7 @@ import {
 } from "../src/historian-eval/contract";
 import { runMutationBattery } from "../src/historian-eval/mutations";
 import { checkFamilyCoverage, loadRelease } from "../src/historian-eval/promote";
-import {
-    historianWaitBudgetMs,
-    runScenario,
-    type LiveHistorianMode,
-    type SystemVersionTuple,
-} from "../src/historian-eval/runner";
+import { runScenario, type LiveHistorianMode, type SystemVersionTuple } from "../src/historian-eval/runner";
 import {
     buildLaneReport,
     laneBudgetExhaustedScore,
@@ -301,18 +296,38 @@ function buildPluginBundle(): number {
 }
 
 /**
- * Worst case wall clock one scenario can spend inside the runner.
+ * Partial report beside the real one, rewritten after every scenario.
  *
- * Derived from the runner's own per-wait budget rather than a second constant, so
- * the two cannot drift: the runner waits once per declared historian run, plus
- * once more for quiescence after the probe phase. Everything else in a scenario —
- * harness boot, transcript replay, probe calls — is bounded well below one of
- * those waits, and this figure only decides whether to START a scenario, so
- * overshooting it costs a skipped scenario and undershooting it costs a killed
- * job.
+ * This — not the deadline below — is what guarantees the run leaves evidence. A
+ * per-scenario worst case cannot be predicted usefully: the contract admits 100
+ * probes, each of which can take two `sendPrompt` attempts at the harness's
+ * 180-second default, so one scenario's true bound is around ten hours, above any
+ * job timeout GitHub allows. Gating on that would refuse to start a scenario the
+ * lane is supposed to run; gating on anything smaller is an estimate a scenario
+ * can exceed. Either way the job can be killed mid-scenario, and the report is
+ * only written at the end.
+ *
+ * So the report becomes incremental instead. A separate `.partial.json` path
+ * rather than the real one, because a truncated report at the documented path
+ * would read as a complete result for a smaller corpus: the aggregate rates are
+ * micro-averaged over whatever it contains. The workflow archives the whole
+ * artifacts directory with `if: always()`, so a killed job now uploads the
+ * scenarios that finished, clearly labelled as partial, and a completed run
+ * removes it.
  */
-function scenarioWorstCaseMs(scenario: HistorianEvalScenario, mode: LiveHistorianMode): number {
-    return (scenario.trigger.expectedHistorianRuns + 1) * historianWaitBudgetMs(mode);
+function partialReportPath(reportPath: string): string {
+    return `${resolve(reportPath)}.partial.json`;
+}
+
+function writePartialReport(reportPath: string, scores: readonly ScenarioScore[], releaseVersion: string | null): void {
+    if (scores.length === 0) return;
+    try {
+        const report = buildLaneReport(scores, releaseVersion === null ? {} : { releaseVersion });
+        writeFileSync(partialReportPath(reportPath), `${JSON.stringify(report, null, 2)}\n`);
+    } catch (error) {
+        // Never let progress bookkeeping fail the run it is bookkeeping for.
+        console.error(`partial report not written: ${error instanceof Error ? error.message : String(error)}`);
+    }
 }
 
 async function runLive(args: CliArgs): Promise<number> {
@@ -328,19 +343,35 @@ async function runLive(args: CliArgs): Promise<number> {
     if (admission !== 0) return admission;
     const opencode = opencodeVersion();
     const artifactsRoot = join(dirname(resolve(args.reportPath)), "historian-eval-runs");
+    // The whole root, once, not each scenario's directory as it is reached. A
+    // reused report directory — a direct run over a smaller corpus, or a budget
+    // that stops before the end — otherwise leaves `run-record.json` files for
+    // scenarios this run never produced sitting beside the new report, and the
+    // archive step collects the directory wholesale. Pairing a current report with
+    // a previous system tuple's records is exactly the comparison the tuple exists
+    // to prevent.
+    rmSync(artifactsRoot, { recursive: true, force: true });
+    rmSync(partialReportPath(args.reportPath), { force: true });
     const scores: ScenarioScore[] = [];
     let system: SystemVersionTuple | undefined;
     // Measured after the build and battery, so the budget covers the part that
     // spends tokens rather than the deterministic preamble.
     const deadlineAt = args.deadlineMinutes === null ? null : Date.now() + args.deadlineMinutes * 60_000;
+    // Reserve for the next scenario, learned from the ones already run rather than
+    // predicted. A scenario's true bound is unusable (see `partialReportPath`), and
+    // an invented one is either too pessimistic to run the corpus or too optimistic
+    // to hold. The longest completed scenario is the honest estimate of the next
+    // one, the first scenario always runs, and a scenario that overruns the
+    // estimate costs the partial report rather than the whole artifact.
+    let longestScenarioMs = 0;
     for (const [index, scenario] of scenarios.entries()) {
         // Checked BEFORE starting, never mid-scenario: a scenario abandoned
         // half-way has spent its tokens and produced no record, so the only useful
-        // decision point is whether there is room for the whole thing.
-        if (deadlineAt !== null && Date.now() + scenarioWorstCaseMs(scenario, mode) > deadlineAt) {
+        // decision point is whether to begin.
+        if (deadlineAt !== null && index > 0 && Date.now() + longestScenarioMs > deadlineAt) {
             const unreached = scenarios.slice(index);
             console.error(
-                `lane budget: ${unreached.length} scenario(s) not run; remaining wall clock cannot cover a worst-case run`,
+                `lane budget: ${unreached.length} scenario(s) not run; ${Math.round(longestScenarioMs / 60_000)} minute(s) needed for the next, ${Math.round((deadlineAt - Date.now()) / 60_000)} remaining`,
             );
             for (const skipped of unreached) {
                 scores.push(laneBudgetExhaustedScore(skipped.id, system ?? null));
@@ -348,8 +379,8 @@ async function runLive(args: CliArgs): Promise<number> {
             break;
         }
         const artifactDir = join(artifactsRoot, scenario.id);
-        rmSync(artifactDir, { recursive: true, force: true });
         console.log(`running ${scenario.id}...`);
+        const startedAt = Date.now();
         // `repoCommitSha` is deliberately not supplied: the runner's own
         // resolver folds an uncommitted tracked diff and the untracked set into
         // the recorded sha, and overriding it with a plain `git rev-parse HEAD`
@@ -361,11 +392,13 @@ async function runLive(args: CliArgs): Promise<number> {
             opencodeVersion: opencode,
         });
         system = record.system;
+        longestScenarioMs = Math.max(longestScenarioMs, Date.now() - startedAt);
         const score = scoreRunRecord(record, scenario);
         scores.push(score);
         console.log(
             `${scenario.id}: ${score.verdict}${score.failReasons.length > 0 ? ` [${score.failReasons.join(",")}]` : ""}${score.errorReason ? ` (${score.errorReason})` : ""}`,
         );
+        writePartialReport(args.reportPath, scores, releaseVersion);
     }
     const report = buildLaneReport(scores, {
         ...(releaseVersion === null ? {} : { releaseVersion }),
@@ -373,6 +406,9 @@ async function runLive(args: CliArgs): Promise<number> {
     });
     mkdirSync(dirname(resolve(args.reportPath)), { recursive: true });
     writeFileSync(resolve(args.reportPath), `${JSON.stringify(report, null, 2)}\n`);
+    // The real report exists now, so the partial would only be a second, staler
+    // answer in the same archive.
+    rmSync(partialReportPath(args.reportPath), { force: true });
     console.log(
         `published ${args.reportPath}: ${report.aggregate.total} scenario(s), red=${report.red}, runFatal=${report.runFatal}`,
     );
