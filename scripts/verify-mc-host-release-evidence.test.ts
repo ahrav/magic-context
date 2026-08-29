@@ -1,11 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildContract, canonicalJson, sha256Hex } from "./generate-mc-host-release-manifest";
 import {
     attestationMatchesWorkflowSource,
     buildInstalledReleaseEvidence,
+    QUALIFICATION_WORKFLOW_PATH,
     validateInstalledReleaseEvidence,
     validateInstalledReleaseEvidenceAgainstArtifacts,
     workflowRunApiPath,
@@ -257,6 +258,11 @@ function installReleaseArtifacts(
         writeFileSync(join(root, relative), bytes);
         evidence[field] = sha256Hex(bytes);
     }
+    // Qualified verification requires the signer workflow the proofs cite to
+    // exist in the checkout under validation.
+    const workflowPath = join(root, QUALIFICATION_WORKFLOW_PATH);
+    mkdirSync(dirname(workflowPath), { recursive: true });
+    writeFileSync(workflowPath, "name: qualification stub\n");
 }
 
 describe("installed release evidence", () => {
@@ -872,6 +878,19 @@ describe("installed release evidence", () => {
         expect(() => validateInstalledReleaseEvidence(evidence)).toThrow(
             /qualified evidence contains a failed proof or blocker/,
         );
+    });
+
+    test("a checkout without the qualification workflow cannot pass the GA gate", () => {
+        const root = mkdtempSync(join(tmpdir(), "mc-host-installed-evidence-"));
+        const evidence = qualifiedEvidence();
+        installReleaseArtifacts(root, evidence);
+        installProofArtifacts(root, evidence);
+        // Every artifact and stub still verifies; only the workflow the evidence
+        // claims to have run under is absent from this checkout.
+        rmSync(join(root, QUALIFICATION_WORKFLOW_PATH));
+        expect(() =>
+            validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, fullStubs()),
+        ).toThrow(/qualification workflow .* does not exist/);
     });
 
     test("qualification evidence cannot substitute for installed release evidence", () => {

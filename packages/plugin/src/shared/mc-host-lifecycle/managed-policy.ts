@@ -217,6 +217,8 @@ async function readCompatibilityProbe(
     if (signal?.aborted) throw signal.reason ?? new Error("compatibility probe aborted");
     const components = asRecord(status.metrics.components);
     const magicContextMetrics = asRecord(asRecord(components?.["magic-context"])?.metrics);
+    // The probe only reports what it observed; the compatibility verdict is
+    // owned by exactly one place, `McHostLifecyclePolicy.applyCompatibility`.
     const snapshot = {
         authenticatedDaemonVersion: authenticated.daemonVer,
         authenticatedDaemonId: Uint8Array.from(authenticated.daemonId),
@@ -239,7 +241,7 @@ async function probeManagedCompatibility(
     root: string,
     budgetMs: number,
     signal?: AbortSignal,
-): Promise<CompatibilitySnapshot> {
+): Promise<CompatibilityProbeResult> {
     const deadline = Date.now() + budgetMs;
     const client = await McHostClient.connect({
         connectionFile: connectionFilePath(root),
@@ -247,7 +249,7 @@ async function probeManagedCompatibility(
         requestTimeoutMs: Math.max(1, budgetMs),
     });
     try {
-        return await readCompatibilitySnapshot(client, deadline, signal);
+        return await readCompatibilityProbe(client, deadline, signal);
     } finally {
         await client.closeAsync().catch(() => {});
     }
@@ -383,18 +385,39 @@ export function createManagedLifecyclePolicy(
                 ? {}
                 : { explicitExternalRoot: options.explicitExternalRoot }),
         });
+        // The default compatibility probe's `host.status` reply already
+        // carries the storage state, so the demand path's storage probe can
+        // consume that observation instead of opening a second connection and
+        // re-issuing `host.status`. The observation is single-use and only a
+        // terminal state short-circuits; a `starting` observation still runs
+        // the polling probe so it can wait out startup within its own budget.
+        let observedStorage: "ready" | "starting" | "unavailable" | null = null;
+        const defaultCompatibilityProbe = async (
+            budgetMs: number,
+            signal?: AbortSignal,
+        ): Promise<CompatibilitySnapshot> => {
+            const probe = await probeManagedCompatibility(root.root, budgetMs, signal);
+            observedStorage = probe.status === null ? null : storageState(probe.status.metrics);
+            return probe.snapshot;
+        };
+        const defaultStorageProbe = (
+            budgetMs: number,
+            expectedDaemonId?: Uint8Array,
+        ): Promise<"ready" | "starting" | "unavailable"> => {
+            const observed = observedStorage;
+            observedStorage = null;
+            if (observed === "ready" || observed === "unavailable") {
+                return Promise.resolve(observed);
+            }
+            return probeManagedStorage(root.root, budgetMs, expectedDaemonId);
+        };
         return new McHostLifecyclePolicy({
             ...options,
             env,
             launchTarget: prepared,
             defaultStartupEnvelope: buildManagedCredentialEnvelope(env),
-            storageProbe:
-                options.storageProbe ??
-                ((budgetMs, expectedDaemonId) =>
-                    probeManagedStorage(root.root, budgetMs, expectedDaemonId)),
-            compatibilityProbe:
-                options.compatibilityProbe ??
-                ((budgetMs, signal) => probeManagedCompatibility(root.root, budgetMs, signal)),
+            storageProbe: options.storageProbe ?? defaultStorageProbe,
+            compatibilityProbe: options.compatibilityProbe ?? defaultCompatibilityProbe,
             readinessProbe:
                 options.readinessProbe ??
                 ((budgetMs) => probeManagedReadiness(root.root, budgetMs)),

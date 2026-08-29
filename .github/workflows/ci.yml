@@ -214,7 +214,8 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Host lifecycle and closure proofs
+      - name: Host lifecycle and closure proofs (Linux)
+        if: runner.os == 'Linux'
         run: |
           cargo test -p mc-host \
             --test broca_protocol \
@@ -222,12 +223,22 @@ jobs:
             --test harness_closure \
             --test protocol_vectors
 
-      - name: Native module adapter and CLI lifecycle
+      - name: Native module adapter and CLI lifecycle (Linux)
+        if: runner.os == 'Linux'
         run: |
           cargo test -p mc-module --bin ck-mc-host
           cargo test -p mc-module \
             --test host_adapter \
             --test lifecycle_cli
+
+      # The release ships darwin payloads and the GA evidence gate requires
+      # darwin target proofs, so the native lifecycle binary and its CLI
+      # contract need macOS proof alongside the Linux integration set.
+      - name: Native lifecycle binary and CLI contract (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cargo build -p mc-module --bin ck-mc-host
+          cargo test -p mc-module --test lifecycle_cli
 
   check-plugin:
     name: Check (plugin)

@@ -182,19 +182,57 @@ export function evaluateEpochCompatibility(observed: ObservedEpochs): Compatibil
     return { ok: true };
 }
 
+export interface CompatibilityInput {
+    authenticatedDaemonVer: string;
+    catalog: CatalogEntry[];
+    epochs: ObservedEpochs;
+}
+
+/**
+ * The single ordered source of truth for the compatibility gate: stage id,
+ * the CLI check id it reports under, and its evaluator. `evaluateCompatibility`,
+ * the managed probe's `evaluatedThrough` labels, and the policy's emitted
+ * `compatibility.*` checks all derive from this list, so a stage added or
+ * reordered in one place cannot leave the probe sequence and the reported
+ * checks disagreeing.
+ */
+export const COMPATIBILITY_STAGES = [
+    {
+        stage: "daemon",
+        checkId: "compatibility.daemon",
+        evaluate: (input: CompatibilityInput): CompatibilityVerdict =>
+            evaluateDaemonCompatibility(input.authenticatedDaemonVer),
+    },
+    {
+        stage: "modules",
+        checkId: "compatibility.modules",
+        evaluate: (input: CompatibilityInput): CompatibilityVerdict =>
+            evaluateModuleCompatibility(input.catalog),
+    },
+    {
+        stage: "epochs",
+        checkId: "compatibility.epochs",
+        evaluate: (input: CompatibilityInput): CompatibilityVerdict =>
+            evaluateEpochCompatibility(input.epochs),
+    },
+] as const;
+
+export type CompatibilityStage = (typeof COMPATIBILITY_STAGES)[number]["stage"];
+
+/** Position of `stage` in the ordered gate; the order is the array order. */
+export function compatibilityStageIndex(stage: CompatibilityStage): number {
+    return COMPATIBILITY_STAGES.findIndex((entry) => entry.stage === stage);
+}
+
 /**
  * The composed demand/status/doctor gate order: daemon range, then modules,
  * then epochs. First failure wins and is reported without any stop, replace,
  * or restart side effect (R17).
  */
-export function evaluateCompatibility(input: {
-    authenticatedDaemonVer: string;
-    catalog: CatalogEntry[];
-    epochs: ObservedEpochs;
-}): CompatibilityVerdict {
-    const daemon = evaluateDaemonCompatibility(input.authenticatedDaemonVer);
-    if (!daemon.ok) return daemon;
-    const modules = evaluateModuleCompatibility(input.catalog);
-    if (!modules.ok) return modules;
-    return evaluateEpochCompatibility(input.epochs);
+export function evaluateCompatibility(input: CompatibilityInput): CompatibilityVerdict {
+    for (const stage of COMPATIBILITY_STAGES) {
+        const verdict = stage.evaluate(input);
+        if (!verdict.ok) return verdict;
+    }
+    return { ok: true };
 }
