@@ -435,6 +435,17 @@ export function prepareCompartmentInjection(
         }
     }
 
+    const cachePopulated = (result: PreparedCompartmentInjection): void => {
+        if (!claimLaneStable) return;
+        injectionCache.set(sessionId, {
+            db,
+            kind: "populated",
+            injection: result,
+            claimSnapshotVector,
+            renderedRevisionLocators,
+        });
+    };
+
     if (compartments.length === 0 && facts.length === 0 && !memoryBlock) {
         if (claimLaneStable) {
             injectionCache.set(sessionId, {
@@ -499,15 +510,7 @@ export function prepareCompartmentInjection(
             memoryCount,
             rebuiltFromDb: true,
         };
-        if (claimLaneStable) {
-            injectionCache.set(sessionId, {
-                db,
-                kind: "populated",
-                injection: result,
-                claimSnapshotVector,
-                renderedRevisionLocators,
-            });
-        }
+        cachePopulated(result);
         return result;
     }
 
@@ -572,15 +575,7 @@ export function prepareCompartmentInjection(
             memoryCount,
             rebuiltFromDb: true,
         };
-        if (claimLaneStable) {
-            injectionCache.set(sessionId, {
-                db,
-                kind: "populated",
-                injection: result,
-                claimSnapshotVector,
-                renderedRevisionLocators,
-            });
-        }
+        cachePopulated(result);
         return result;
     }
 
@@ -667,15 +662,7 @@ export function prepareCompartmentInjection(
     if (needsFreshMaterialization) {
         result.needsFreshMaterialization = true;
     }
-    if (claimLaneStable) {
-        injectionCache.set(sessionId, {
-            db,
-            kind: "populated",
-            injection: result,
-            claimSnapshotVector,
-            renderedRevisionLocators,
-        });
-    }
+    cachePopulated(result);
     return result;
 }
 
@@ -1284,6 +1271,41 @@ function readCurrentM0SnapshotMarkersUncached(args: M0SnapshotMarkerReadArgs): {
                 args.historyBudgetTokens,
             ),
         },
+    };
+}
+
+/** Argument slice for `readCurrentM0SnapshotMarkers` shared by the marker read sites. */
+function m0MarkerReadArgs(
+    options: Pick<
+        M0M1RenderOptions,
+        | "db"
+        | "sessionId"
+        | "injectDocs"
+        | "muralEnabled"
+        | "memoryInjectionBudgetTokens"
+        | "historyBudgetTokens"
+        | "hardSignals"
+    >,
+    workspace: { identities: string[]; namesByIdentity: Map<string, string> },
+    projectPath: string | undefined,
+    projectDirectory: string | undefined,
+    nowMs?: number,
+): M0SnapshotMarkerReadArgs {
+    return {
+        db: options.db,
+        sessionId: options.sessionId,
+        projectPath,
+        projectDirectory,
+        injectDocs: options.injectDocs,
+        muralEnabled: options.muralEnabled,
+        memoryInjectionBudgetTokens: options.memoryInjectionBudgetTokens,
+        historyBudgetTokens: options.historyBudgetTokens,
+        hardSignals: options.hardSignals,
+        workspaceIdentitySet: {
+            identities: workspace.identities,
+            namesByIdentity: workspace.namesByIdentity,
+        },
+        ...(nowMs !== undefined ? { nowMs } : {}),
     };
 }
 
@@ -1995,22 +2017,9 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
     }
     const memoryBudget = options.memoryInjectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS;
     const renderedClaims = trimClaimLane(claimLane, memoryBudget, workspace);
-    const snapshotMarkers = readCurrentM0SnapshotMarkers({
-        db: options.db,
-        sessionId: options.sessionId,
-        projectPath,
-        projectDirectory,
-        injectDocs: options.injectDocs,
-        muralEnabled: options.muralEnabled,
-        memoryInjectionBudgetTokens: options.memoryInjectionBudgetTokens,
-        historyBudgetTokens: options.historyBudgetTokens,
-        hardSignals: options.hardSignals,
-        workspaceIdentitySet: {
-            identities: workspace.identities,
-            namesByIdentity: workspace.namesByIdentity,
-        },
-        nowMs: foldMaterializedAt,
-    });
+    const snapshotMarkers = readCurrentM0SnapshotMarkers(
+        m0MarkerReadArgs(options, workspace, projectPath, projectDirectory, foldMaterializedAt),
+    );
     if (
         snapshotMarkers.claimSnapshotVector === undefined ||
         snapshotMarkers.renderedRevisionLocators === undefined ||
@@ -2422,33 +2431,16 @@ function applyCachedRowToState(state: M0M1State, row: CachedM0M1Row): void {
     if (!row.cached_m0_bytes || !row.cached_m1_bytes || !markers) {
         throw new RenderM1InvalidMarkersError(state.sessionId);
     }
-    state.cachedM0Bytes = toBuffer(row.cached_m0_bytes);
+    applyMarkersToState(
+        state,
+        toBuffer(row.cached_m0_bytes),
+        markers,
+        toBuffer(row.cached_m1_bytes),
+    );
+    // The row is the mural source on the cached-row path: markers carry no
+    // mural data URL, and the row's hash is the persisted truth.
     state.cachedM0MuralDataUrl = row.cached_m0_mural_data_url ?? null;
     state.cachedM0MuralHash = row.cached_m0_mural_hash ?? null;
-    state.cachedM1Bytes = toBuffer(row.cached_m1_bytes);
-    state.cachedM0ClaimFormatEpoch = markers.claimFormatEpoch ?? null;
-    state.cachedM0ClaimSnapshotVector = markers.claimSnapshotVector
-        ? canonicalSnapshotVector(markers.claimSnapshotVector)
-        : null;
-    state.cachedM0RenderedRevisionLocators = markers.renderedRevisionLocators
-        ? JSON.stringify([...markers.renderedRevisionLocators].sort())
-        : null;
-    state.cachedM0ProjectUserProfileVersion = markers.projectUserProfileVersion;
-    state.cachedM0MaxCompartmentSeq = markers.maxCompartmentSeq;
-    state.cachedM0MaxMutationId = markers.maxMutationId;
-    state.cachedM0ProjectDocsHash = markers.projectDocsHash;
-    state.cachedM0MaterializedAt = markers.materializedAt;
-    state.cachedM0SessionFactsVersion = markers.sessionFactsVersion;
-    state.cachedM0UpgradeState = encodeCachedM0UpgradeIdentity(
-        markers.upgradeState,
-        markers.compartmentRenderEpoch,
-        markers.muralEnabled,
-        markers.renderBudgetIdentity,
-    );
-    state.cachedM0SystemHash = markers.systemHash;
-    state.cachedM0ModelKey = markers.modelKey;
-    state.cachedM0ProjectIdentity = markers.projectIdentity;
-    state.snapshotMarkers = markers;
 }
 
 function replayCachedM1(state: M0M1State): string {
@@ -2589,21 +2581,9 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
         projectPath,
         workspaceIdentitySet: options.workspaceIdentitySet,
     });
-    const snapshotMarkers = readCurrentM0SnapshotMarkers({
-        db: options.db,
-        sessionId: options.sessionId,
-        projectPath,
-        projectDirectory,
-        injectDocs: options.injectDocs,
-        muralEnabled: options.muralEnabled,
-        memoryInjectionBudgetTokens: options.memoryInjectionBudgetTokens,
-        historyBudgetTokens: options.historyBudgetTokens,
-        hardSignals: options.hardSignals,
-        workspaceIdentitySet: {
-            identities: workspace.identities,
-            namesByIdentity: workspace.namesByIdentity,
-        },
-    });
+    const snapshotMarkers = readCurrentM0SnapshotMarkers(
+        m0MarkerReadArgs(options, workspace, projectPath, projectDirectory),
+    );
     const claimLane = readClaimLaneSnapshot({ db: options.db, projectPath, workspace });
     const memoryBudget = options.memoryInjectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS;
     let renderedClaims =

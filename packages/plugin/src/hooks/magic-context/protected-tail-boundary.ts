@@ -379,6 +379,38 @@ function applyHeadCap(args: {
     return { eligibleEndOrdinal: Math.min(end, protectedTailStart), oversizeAtomicUnit };
 }
 
+/**
+ * The nine snapshot fields copied verbatim from the resolved boundary context.
+ * Kept as one helper so every snapshot constructor carries the identical
+ * context slice; the exhaustiveness check in the test file pins the field set.
+ */
+function boundaryCtxFields(
+    ctx: ResolvedBoundaryContext,
+): Pick<
+    ProtectedTailBoundarySnapshot,
+    | "usageSource"
+    | "contextLimit"
+    | "executeThresholdPercentage"
+    | "triggerBudget"
+    | "priorBoundaryOrdinal"
+    | "migrationFloorActive"
+    | "emergencyTailScale"
+    | "providerShapeVersion"
+    | "cacheNamespace"
+> {
+    return {
+        usageSource: ctx.usageSource,
+        contextLimit: ctx.contextLimit,
+        executeThresholdPercentage: ctx.executeThresholdPercentage,
+        triggerBudget: ctx.triggerBudget,
+        priorBoundaryOrdinal: ctx.priorBoundaryOrdinal,
+        migrationFloorActive: ctx.migrationFloorActive,
+        emergencyTailScale: ctx.emergencyTailScale,
+        providerShapeVersion: ctx.providerShapeVersion,
+        cacheNamespace: ctx.cacheNamespace,
+    };
+}
+
 export function resolveProtectedTailBoundary(
     ctx: ResolvedBoundaryContext,
 ): ProtectedTailBoundarySnapshot {
@@ -421,15 +453,7 @@ export function resolveProtectedTailBoundary(
             N: 0,
             usagePercentage,
             usageInputTokens,
-            usageSource: ctx.usageSource,
-            contextLimit: ctx.contextLimit,
-            executeThresholdPercentage: ctx.executeThresholdPercentage,
-            triggerBudget: ctx.triggerBudget,
-            priorBoundaryOrdinal: ctx.priorBoundaryOrdinal,
-            migrationFloorActive: ctx.migrationFloorActive,
-            emergencyTailScale: ctx.emergencyTailScale,
-            providerShapeVersion: ctx.providerShapeVersion,
-            cacheNamespace: ctx.cacheNamespace,
+            ...boundaryCtxFields(ctx),
             createdAt,
             rawRangeFingerprint: "",
             trueRawEligibleTokens: 0,
@@ -619,15 +643,7 @@ export function resolveProtectedTailBoundary(
         N: scaledN,
         usagePercentage,
         usageInputTokens,
-        usageSource: ctx.usageSource,
-        contextLimit: ctx.contextLimit,
-        executeThresholdPercentage: ctx.executeThresholdPercentage,
-        triggerBudget: ctx.triggerBudget,
-        priorBoundaryOrdinal: ctx.priorBoundaryOrdinal,
-        migrationFloorActive: ctx.migrationFloorActive,
-        emergencyTailScale: ctx.emergencyTailScale,
-        providerShapeVersion: ctx.providerShapeVersion,
-        cacheNamespace: ctx.cacheNamespace,
+        ...boundaryCtxFields(ctx),
         createdAt,
         rawRangeFingerprint,
         trueRawEligibleTokens: index.rangeTokens(offset, protectedTailStart),
@@ -840,15 +856,7 @@ export function resolveWrapupProtectedTailBoundary(
         N: keep,
         usagePercentage,
         usageInputTokens,
-        usageSource: ctx.usageSource,
-        contextLimit: ctx.contextLimit,
-        executeThresholdPercentage: ctx.executeThresholdPercentage,
-        triggerBudget: ctx.triggerBudget,
-        priorBoundaryOrdinal: ctx.priorBoundaryOrdinal,
-        migrationFloorActive: ctx.migrationFloorActive,
-        emergencyTailScale: ctx.emergencyTailScale,
-        providerShapeVersion: ctx.providerShapeVersion,
-        cacheNamespace: ctx.cacheNamespace,
+        ...boundaryCtxFields(ctx),
         createdAt,
         rawRangeFingerprint,
         trueRawEligibleTokens: index.rangeTokens(offset, targetProtectedTailStart),

@@ -50,6 +50,30 @@ type CacheTtlConfig = string | Record<string, string>;
  * preserves the same catalog, detected-limit, and fallback resolution while
  * exposing the unreserved window for native-usage display metrics only.
  */
+/**
+ * Best-effort read of the detected-overflow limit for a session/model; falls
+ * back to "unknown" provenance when session meta is unreadable.
+ */
+function readDetectedLimit(
+    ctx: { db?: ContextDatabase; sessionID?: string } | undefined,
+    modelKey: string | undefined,
+): { detected?: number; provenance: "prompt_only" | "combined" | "unknown" } {
+    if (ctx?.db && ctx.sessionID) {
+        try {
+            const overflow = getOverflowState(ctx.db, ctx.sessionID, modelKey);
+            if (overflow.detectedContextLimit > 0) {
+                return {
+                    detected: overflow.detectedContextLimit,
+                    provenance: overflow.detectedContextLimitProvenance,
+                };
+            }
+        } catch {
+            // Reading session meta is best-effort — fall through to the catalog.
+        }
+    }
+    return { provenance: "unknown" };
+}
+
 export function resolveContextLimit(
     providerID: string | undefined,
     modelID: string | undefined,
@@ -60,19 +84,7 @@ export function resolveContextLimit(
     },
 ): number {
     const modelKey = resolveModelKey(providerID, modelID);
-    let detected: number | undefined;
-    let detectedLimitProvenance: "prompt_only" | "combined" | "unknown" = "unknown";
-    if (ctx?.db && ctx.sessionID) {
-        try {
-            const overflow = getOverflowState(ctx.db, ctx.sessionID, modelKey);
-            if (overflow.detectedContextLimit > 0) {
-                detected = overflow.detectedContextLimit;
-                detectedLimitProvenance = overflow.detectedContextLimitProvenance;
-            }
-        } catch {
-            // Reading session meta is best-effort — fall through to the catalog.
-        }
-    }
+    const { detected, provenance: detectedLimitProvenance } = readDetectedLimit(ctx, modelKey);
 
     // Combined/unknown detections narrow the raw context before output
     // reservation. Prompt-only detections enter the pre-carved input arm.
@@ -111,19 +123,7 @@ export function resolveTrustedContextLimit(
     ctx?: { db?: ContextDatabase; sessionID?: string },
 ): number | undefined {
     const modelKey = resolveModelKey(providerID, modelID);
-    let detected: number | undefined;
-    let detectedLimitProvenance: "prompt_only" | "combined" | "unknown" = "unknown";
-    if (ctx?.db && ctx.sessionID) {
-        try {
-            const overflow = getOverflowState(ctx.db, ctx.sessionID, modelKey);
-            if (overflow.detectedContextLimit > 0) {
-                detected = overflow.detectedContextLimit;
-                detectedLimitProvenance = overflow.detectedContextLimitProvenance;
-            }
-        } catch {
-            // best-effort; ignore
-        }
-    }
+    const { detected, provenance: detectedLimitProvenance } = readDetectedLimit(ctx, modelKey);
 
     // Apply measured wire truth to the matching resolver arm. Comparing a
     // combined detection against an already-reserved budget would double-count

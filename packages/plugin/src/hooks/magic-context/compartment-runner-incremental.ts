@@ -35,13 +35,13 @@ import { updateSessionMeta } from "../../features/magic-context/storage-meta";
 import { insertPrimerCandidates } from "../../features/magic-context/storage-primers";
 import { getLatestHistorianInvocationId } from "../../features/magic-context/storage-subagent-invocations";
 import { insertUserMemoryCandidates } from "../../features/magic-context/user-memory/storage-user-memory";
-import { normalizeSDKResponse } from "../../shared";
 import { describeError } from "../../shared/error-message";
 import { sessionLog } from "../../shared/logger";
 import { updateCompactionMarkerAfterPublication } from "./compaction-marker-manager";
 import { buildCompartmentAgentPrompt } from "./compartment-prompt";
 import { queueDropsForCompartmentalizedMessages } from "./compartment-runner-drop-queue";
 import { runValidatedHistorianPass } from "./compartment-runner-historian";
+import { resolveSessionDirectory } from "./compartment-runner-mapping";
 import type { CompartmentRunnerDeps } from "./compartment-runner-types";
 import {
     buildHistorianFailureNotice,
@@ -405,16 +405,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             sessionCompartments: priorCompartments,
         });
 
-        // Intentional: session.get failure is non-fatal — we fall back to deps.directory
-        const parentSessionResponse = await client.session
-            .get({ path: { id: sessionId } })
-            .catch(() => null);
-        const parentSession = normalizeSDKResponse(
-            parentSessionResponse,
-            null as { directory?: string } | null,
-            { preferResponseOnMissingData: true },
-        );
-        const sessionDirectory = parentSession?.directory ?? directory;
+        const sessionDirectory = await resolveSessionDirectory(client, sessionId, directory);
 
         const memorySnapshot = readAuthorizedClaimMemorySnapshot(db, {
             authorizedIdentities: [projectPath],
