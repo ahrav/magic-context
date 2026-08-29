@@ -2216,7 +2216,9 @@ function routeCacheKey(
         ? `${consumerIdentity.module_id}\0${consumerIdentity.launch_nonce}`
         : "";
     const credentialPart = Object.entries(identity.credential_fingerprints ?? {})
-        .sort(([left], [right]) => left.localeCompare(right))
+        // Code-point sort (NOT localeCompare), matching `shared/stable-json.ts`:
+        // the key must not depend on the runtime's collation.
+        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
         .map(([provider, fingerprint]) => `${provider}:${fingerprint}`)
         .join(",");
     return `${target.kind}\0${target.module_id}\0${identity.project_root}\0${identity.harness}\0${identity.session}\0${credentialPart}\0${consumerPart}`;

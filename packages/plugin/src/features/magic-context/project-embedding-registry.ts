@@ -256,7 +256,25 @@ export function markProjectLoadUntrusted(projectIdentity: string): void {
     untrustedLoadProjects.add(projectIdentity);
 }
 let projectSweepInProgress = false;
-let testProviderFactory: ((config: EmbeddingConfig) => EmbeddingProvider | null) | null = null;
+/** Construction context every provider receives from {@link createProvider}. */
+interface ProviderContext {
+    projectRoot: string;
+    session: string;
+    onSynapseLaneReady?: (
+        metadata: import("./memory/embedding-synapse").SynapseLaneMetadata,
+    ) => void;
+}
+/**
+ * Test factory for the embedding provider. It receives the same context the
+ * real providers get, so a fake can invoke `onSynapseLaneReady` and drive the
+ * deferred-lane resolution path (`commitPrimarySynapseLane` /
+ * `commitShadowSynapseLane`) instead of a hand-rolled imitation of it.
+ */
+type TestProviderFactory = (
+    config: EmbeddingConfig,
+    context?: ProviderContext,
+) => EmbeddingProvider | null;
+let testProviderFactory: TestProviderFactory | null = null;
 
 function synapseConfigFields(config: EmbeddingConfig): {
     model?: string;
@@ -662,16 +680,10 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
 
 function createProvider(
     config: EmbeddingConfig,
-    context?: {
-        projectRoot: string;
-        session: string;
-        onSynapseLaneReady?: (
-            metadata: import("./memory/embedding-synapse").SynapseLaneMetadata,
-        ) => void;
-    },
+    context?: ProviderContext,
 ): EmbeddingProvider | null {
     if (testProviderFactory) {
-        return testProviderFactory(config);
+        return testProviderFactory(config, context);
     }
 
     if (config.provider === "off") {
@@ -3894,9 +3906,7 @@ export async function sweepAllRegisteredProjects(
     return { memoriesEmbedded, commitsEmbedded, chunksEmbedded, perProject };
 }
 
-export function _setTestProviderFactoryForProject(
-    factory: ((config: EmbeddingConfig) => EmbeddingProvider | null) | null,
-): void {
+export function _setTestProviderFactoryForProject(factory: TestProviderFactory | null): void {
     testProviderFactory = factory;
 }
 

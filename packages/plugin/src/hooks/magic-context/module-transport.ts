@@ -224,7 +224,10 @@ export function createLazyManagedDemandStart(
         });
         const outcome = await policy.demandStart({
             ...request,
-            startupEnvelope: buildManagedStartupEnvelope(options.parentPackageName),
+            // The demand contract lets a caller carry its own envelope; only
+            // default it, so this wrapper cannot silently discard one.
+            startupEnvelope:
+                request.startupEnvelope ?? buildManagedStartupEnvelope(options.parentPackageName),
         });
         return {
             ok: outcome.result.ok,

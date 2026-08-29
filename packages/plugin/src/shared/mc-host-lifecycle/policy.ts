@@ -25,6 +25,7 @@ import {
     type DaemonState,
     preNativeState,
     probeFallbackVerdict,
+    reasonPrecedence,
     remediationForReason,
 } from "./contract";
 import { releaseContract } from "./generated-contract";
@@ -420,8 +421,21 @@ export class McHostLifecyclePolicy {
             if (observed.readiness.synapse) {
                 addCheck("readiness.synapse", observed.readiness.synapse);
             }
+            // The check list is ordered by id because the v1 result requires
+            // lexicographically sorted unique check ids. The reported reason is
+            // NOT that order: the release contract ships one precedence list for
+            // failing reasons, and a lower-precedence readiness failure must
+            // never mask a higher-precedence one just because its check id
+            // sorts earlier (`readiness.storage` before `readiness.transport`).
             checks.sort((left, right) => left.id.localeCompare(right.id));
-            const failed = checks.find((check) => check.status === "fail");
+            const failed = checks
+                .filter((check) => check.status === "fail")
+                .reduce<DaemonCheck | undefined>((winner, check) => {
+                    if (!winner) return check;
+                    const winning = reasonPrecedence(winner.reason) ?? Number.MAX_SAFE_INTEGER;
+                    const candidate = reasonPrecedence(check.reason) ?? Number.MAX_SAFE_INTEGER;
+                    return candidate < winning ? check : winner;
+                }, undefined);
             return {
                 ...native,
                 command,

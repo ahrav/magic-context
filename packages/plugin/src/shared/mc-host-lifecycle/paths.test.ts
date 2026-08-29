@@ -160,6 +160,29 @@ describe("filesystem admission (KTD11)", () => {
         }
     });
 
+    test('darwin mount lines keep mount points containing " on " and need no option list', () => {
+        // The nearest mount decides the verdict, so a mount point whose own
+        // spelling contains " on " must not be truncated into a shorter,
+        // non-matching path, and an entry with no flags after its filesystem
+        // type must still reach the classifier.
+        expect(
+            admitLifecycleFilesystem("/Volumes/Disk on Server/share", {
+                platform: "darwin",
+                readMounts: () =>
+                    "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\n" +
+                    "server:/export on /Volumes/Disk on Server (nfs, nodev)\n",
+            }).ok,
+        ).toBe(false);
+        expect(
+            admitLifecycleFilesystem("/Volumes/Backup/share", {
+                platform: "darwin",
+                readMounts: () =>
+                    "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\n" +
+                    "server:/export on /Volumes/Backup (nfs)\n",
+            }).ok,
+        ).toBe(false);
+    });
+
     test("mount points with octal escapes decode before matching", () => {
         const entries = parseMounts("/dev/sdd1 /mnt/with\\040space ext4 rw 0 0\n");
         expect(entries[0]?.mountPoint).toBe("/mnt/with space");

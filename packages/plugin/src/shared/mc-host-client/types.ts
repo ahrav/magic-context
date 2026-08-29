@@ -56,10 +56,15 @@ export interface HostStatusSnapshot {
 /**
  * AuthenticatedPeer retains handshake-authenticated identity separately from
  * untrusted connection-file `daemon_ver` and `pid` metadata.
+ *
+ * The daemon id is non-null by construction: it is the fencing identity every
+ * consumer authorizes against, so a connection whose handshake produced no
+ * daemon id has no authenticated peer at all and `McHostClient.authenticated`
+ * reports null instead of a partial record.
  */
 export interface AuthenticatedPeer {
     daemonVer: string;
-    daemonId: Uint8Array | null;
+    daemonId: Uint8Array;
     proof: "current";
 }
 

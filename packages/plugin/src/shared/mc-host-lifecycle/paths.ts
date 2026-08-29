@@ -194,12 +194,17 @@ const defaultAdmissionIo: AdmissionIo = {
 function parseDarwinMounts(text: string): MountEntry[] {
     const entries: MountEntry[] = [];
     for (const line of text.split("\n")) {
-        const match = /^.+ on (.+) \(([^,()]+),\s*([^)]*)\)$/.exec(line);
+        // `<device> on <mount point> (<fstype>[, <option>...])`. The device is
+        // matched lazily so a mount point containing " on " (volume names are
+        // user-chosen) keeps its full spelling, and the option list is optional
+        // so an entry carrying only a filesystem type is admitted rather than
+        // silently dropped from the mount table.
+        const match = /^(.+?) on (.+) \(([^,()]+)(?:,\s*([^)]*))?\)$/.exec(line);
         if (!match) continue;
         entries.push({
-            mountPoint: match[1] as string,
-            fsType: (match[2] as string).trim(),
-            options: (match[3] as string)
+            mountPoint: match[2] as string,
+            fsType: (match[3] as string).trim(),
+            options: (match[4] ?? "")
                 .split(",")
                 .map((option) => option.trim())
                 .filter(Boolean),

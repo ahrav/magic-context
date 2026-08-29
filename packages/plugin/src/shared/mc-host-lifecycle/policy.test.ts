@@ -291,6 +291,43 @@ describe("native invocation mapping", () => {
         }
     });
 
+    test("the reported readiness reason follows contract precedence, not check-id order", async () => {
+        const root = tempDir("mc-policy-readiness-precedence-");
+        const { binary } = fakeBinary(root);
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                readinessProbe: async () => ({
+                    authenticatedDaemonVersion: "mc-host/0.1.0",
+                    readiness: {
+                        // `readiness.storage` sorts before `readiness.transport`,
+                        // but `authentication_failed` outranks `storage_unavailable`
+                        // in the release contract's failing-reason precedence.
+                        transport: { state: "unavailable", reason: "authentication_failed" },
+                        storage: { state: "unavailable", reason: "storage_unavailable" },
+                        synapse: { state: "degraded", reason: "synapse_degraded" },
+                    },
+                }),
+            });
+
+            for (const result of [await policy.status(), await policy.doctor()]) {
+                expect(result.ok).toBe(false);
+                expect(result.reason).toBe("authentication_failed");
+                expect(result.remediation).toBe("inspect_daemon_process");
+                // The check list itself stays sorted by id: the v1 result
+                // requires lexicographically sorted unique check ids.
+                expect(result.checks.map((check) => check.id)).toEqual([
+                    "readiness.storage",
+                    "readiness.synapse",
+                    "readiness.transport",
+                ]);
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     test("restart resolves the certified payload before one native transaction", async () => {
         const root = tempDir("mc-policy-restart-payload-");
         const invocationLog = path.join(root, "restart-invocations.log");

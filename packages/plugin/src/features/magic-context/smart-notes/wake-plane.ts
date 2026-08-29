@@ -80,14 +80,21 @@ async function probeStatus(): Promise<WakePlaneStatus> {
 }
 
 /**
- * An affirmative answer is bound to the authenticated daemon that produced it,
- * and the probe closes its connection. It may be retained only while that
- * daemon's publication is unchanged, so a replacement can never inherit the
- * capability. Negative and unknown answers are plain TTL cache entries.
+ * Every retained answer is bound to the daemon publication it was proved
+ * against, and the probe closes its connection. An affirmative answer may only
+ * be reused while that daemon still owns the publication, so a replacement can
+ * never inherit the capability. A negative or unknown answer is bound the same
+ * way: under lazy demand-start the common case is a passive probe that runs
+ * BEFORE the first Rust or Synapse demand, and the managed start that follows
+ * publishes a new connection file. Without this binding that answer would keep
+ * standalone evaluation on for the rest of its TTL while the daemon already
+ * owns scheduled wakes, so both planes would evaluate the same conditions.
  */
 function isRetainedAnswerUsable(cache: WakePlaneStatusCache): boolean {
-    if (cache.status !== "present") return true;
-    return cache.publication !== null && cache.publication === readPublication();
+    // An affirmative answer with no readable publication has nothing that can
+    // retire it, so it is never retained in the first place.
+    if (cache.status === "present" && cache.publication === null) return false;
+    return cache.publication === readPublication();
 }
 
 /**

@@ -200,6 +200,31 @@ describe("wakePlaneStatus", () => {
         expect(probes).toBe(2);
     });
 
+    test("re-probes a negative answer once a daemon publishes", async () => {
+        // Under lazy demand-start the first passive probe usually runs before
+        // any Rust or Synapse demand, so it caches a negative answer with no
+        // publication. The managed start that follows publishes a connection
+        // file and takes over scheduled wakes; retaining the negative answer for
+        // the rest of its TTL would leave both planes evaluating conditions.
+        let probes = 0;
+        let hasWakePlane = false;
+        let publication: string | null = null;
+        __wakePlaneTest.setCatalogProbe(async () => {
+            probes += 1;
+            return catalog(hasWakePlane);
+        });
+        __wakePlaneTest.setPublicationReader(() => publication);
+
+        expect(await wakePlaneStatus()).toBe("absent");
+        expect(await wakePlaneStatus()).toBe("absent");
+        expect(probes).toBe(1);
+
+        publication = "dev:ino:3000:64";
+        hasWakePlane = true;
+        expect(await wakePlaneStatus()).toBe("present");
+        expect(probes).toBe(2);
+    });
+
     test("re-probes after the TTL instead of retaining a stale catalog answer", async () => {
         let clock = 10_000;
         let hasWakePlane = false;
