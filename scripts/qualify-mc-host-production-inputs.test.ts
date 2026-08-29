@@ -200,11 +200,28 @@ describe("deterministic generation and drift", () => {
         expect(result.productionQualified).toBe(false);
     });
 
+    test("check mode ignores local evidence whether absent or present", () => {
+        const root = freshRoot();
+        installManifest(root, fixtureManifest());
+        generate(root, { check: false });
+
+        rmSync(join(root, OUTPUT_PATHS.evidence));
+        expect(generate(root, { check: true }).drift).toEqual([]);
+
+        mkdirSync(join(root, dirname(OUTPUT_PATHS.evidence)), {
+            recursive: true,
+        });
+        writeFileSync(join(root, OUTPUT_PATHS.evidence), '{"stale":true}\n');
+        expect(generate(root, { check: true }).drift).toEqual([]);
+    });
+
     test("pins, floors, budgets, and layout IDs drift only through regeneration", () => {
         const root = freshRoot();
         installManifest(root, fixtureManifest());
         generate(root, { check: false });
-        for (const relative of Object.values(OUTPUT_PATHS)) {
+        for (const relative of Object.values(OUTPUT_PATHS).filter(
+            (path) => path !== OUTPUT_PATHS.evidence,
+        )) {
             const path = join(root, relative);
             const original = readFileSync(path, "utf8");
             writeFileSync(path, `${original.trimEnd()} \n`);
@@ -1247,9 +1264,8 @@ describe("harness runtime closure graph qualification", () => {
 
 describe("build-entrypoint evidence consumption (U2/U6 gate)", () => {
     test("production build rejects absent local qualification evidence", () => {
-        expect(() => requireQualificationEvidence(repoRoot)).toThrow(
-            /absent/,
-        );
+        const root = freshRoot();
+        expect(() => requireQualificationEvidence(root)).toThrow(/absent/);
     });
 
     test("absent, malformed, and test-only evidence are rejected", () => {

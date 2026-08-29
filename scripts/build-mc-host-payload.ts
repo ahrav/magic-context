@@ -243,53 +243,49 @@ export function loadReleaseContext(rootDir: string): ReleaseContext {
         fail(`stale U9 production-input lock at ${U9_OUTPUT_PATHS.lock}`);
     }
 
+    const synthesizedCitations = {
+        production_inputs_lock: {
+            path: U9_OUTPUT_PATHS.lock,
+            sha256: lockSha256,
+        },
+        provider_credentials: {
+            path: U9_OUTPUT_PATHS.credentials,
+            sha256: sha256Hex(artifactBytes.provider_credentials),
+        },
+    };
+
     // Local evidence is optional only for a committed fail-closed lock.
     const evidencePath = join(rootDir, U9_OUTPUT_PATHS.evidence);
-    const hasEvidence = existsSync(evidencePath);
-    const evidence = hasEvidence
-        ? readJson(rootDir, U9_OUTPUT_PATHS.evidence)
-        : {
-              schema: "magic-context.mc-host-release-qualification/v1",
-              release: {
-                  id: contract.release.id,
-                  version: contract.release.version,
-              },
-              release_contract_sha256: u8Digest,
-              artifacts: {
-                  production_inputs_lock: {
-                      path: U9_OUTPUT_PATHS.lock,
-                      sha256: lockSha256,
-                  },
-                  provider_credentials: {
-                      path: U9_OUTPUT_PATHS.credentials,
-                      sha256: sha256Hex(artifactBytes.provider_credentials),
-                  },
-              },
-              production_qualified: false,
-              test_only: false,
-              unqualified: lock.unqualified,
-          };
-    if (!hasEvidence && lock.production_qualified) {
-        fail(
-            "production-qualified U9 lock requires local qualification evidence",
-        );
+    let artifacts: Record<string, { path?: unknown; sha256?: unknown }> | undefined;
+    if (existsSync(evidencePath)) {
+        const evidence = readJson(rootDir, U9_OUTPUT_PATHS.evidence);
+        const release = evidence.release as
+            | { id?: unknown; version?: unknown }
+            | undefined;
+        if (
+            evidence.schema !== "magic-context.mc-host-release-qualification/v1" ||
+            evidence.release_contract_sha256 !== u8Digest ||
+            release?.id !== contract.release.id ||
+            release?.version !== contract.release.version
+        ) {
+            fail(
+                `stale or unknown U9 qualification evidence at ${U9_OUTPUT_PATHS.evidence}`,
+            );
+        }
+        if (lock.production_qualified !== evidence.production_qualified) {
+            fail("U9 lock and evidence disagree on production qualification");
+        }
+        artifacts = evidence.artifacts as
+            | Record<string, { path?: unknown; sha256?: unknown }>
+            | undefined;
+    } else {
+        if (lock.production_qualified) {
+            fail(
+                "production-qualified U9 lock requires local qualification evidence",
+            );
+        }
+        artifacts = synthesizedCitations;
     }
-    const release = evidence.release as
-        | { id?: unknown; version?: unknown }
-        | undefined;
-    if (
-        evidence.schema !== "magic-context.mc-host-release-qualification/v1" ||
-        evidence.release_contract_sha256 !== u8Digest ||
-        release?.id !== contract.release.id ||
-        release?.version !== contract.release.version
-    ) {
-        fail(
-            `stale or unknown U9 qualification evidence at ${U9_OUTPUT_PATHS.evidence}`,
-        );
-    }
-    const artifacts = evidence.artifacts as
-        | Record<string, { path?: unknown; sha256?: unknown }>
-        | undefined;
     for (const [key, relative] of [
         ["production_inputs_lock", U9_OUTPUT_PATHS.lock],
         ["provider_credentials", U9_OUTPUT_PATHS.credentials],
@@ -301,9 +297,6 @@ export function loadReleaseContext(rootDir: string): ReleaseContext {
         const actual = sha256Hex(artifactBytes[key]);
         if (actual !== cited.sha256)
             fail(`stale U9 artifact digest for ${relative}`);
-    }
-    if (lock.production_qualified !== evidence.production_qualified) {
-        fail("U9 lock and evidence disagree on production qualification");
     }
     const limits = lock.package_size_limits_bytes;
     for (const target of PAYLOAD_TARGETS) {
