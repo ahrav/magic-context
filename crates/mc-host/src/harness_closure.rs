@@ -189,7 +189,8 @@ fn invalid(detail: &'static str) -> HarnessClosureError {
 /// 0o700, so the value always fits; a wider one is a validation escape and is
 /// refused rather than silently truncated into a different permission set.
 fn permission_mode(mode: u32) -> Result<Mode, HarnessClosureError> {
-    let raw = RawMode::try_from(mode).map_err(|_| invalid("closure node mode exceeds the platform mode width"))?;
+    let raw = RawMode::try_from(mode)
+        .map_err(|_| invalid("closure node mode exceeds the platform mode width"))?;
     Ok(Mode::from_raw_mode(raw))
 }
 
