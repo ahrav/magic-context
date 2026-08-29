@@ -107,8 +107,13 @@ export interface LifecyclePolicyOptions {
     /**
      * Post-transport storage probe used by managed Magic Context demand.
      * The default reports `ready` for explicit and test-only policy instances.
+     *
+     * `expectedDaemonId` is the incarnation compatibility just certified. A probe
+     * that cannot observe that incarnation must reject rather than report a
+     * reading from another one, because the caller fences its traffic to the
+     * certified identity and would act on readiness it will never reach.
      */
-    storageProbe?: (budgetMs: number) => Promise<StorageReadiness>;
+    storageProbe?: (budgetMs: number, expectedDaemonId?: Uint8Array) => Promise<StorageReadiness>;
     /** Authenticated daemon, catalog, and Magic Context epoch snapshot for demand. */
     compatibilityProbe?: (budgetMs: number, signal?: AbortSignal) => Promise<CompatibilitySnapshot>;
     /** Authenticated route-free component health for status and doctor. */
@@ -176,7 +181,10 @@ export class McHostLifecyclePolicy {
     private readonly bootstrapFailure: LifecycleFailureReason | undefined;
     private readonly platformReaders: PlatformReaders | undefined;
     private readonly admissionIo: AdmissionIo | undefined;
-    private readonly storageProbe: (budgetMs: number) => Promise<StorageReadiness>;
+    private readonly storageProbe: (
+        budgetMs: number,
+        expectedDaemonId?: Uint8Array,
+    ) => Promise<StorageReadiness>;
     private readonly compatibilityProbe:
         | ((budgetMs: number, signal?: AbortSignal) => Promise<CompatibilitySnapshot>)
         | undefined;
@@ -317,11 +325,29 @@ export class McHostLifecyclePolicy {
             remainingMs === undefined
                 ? STORAGE_HARD_BUDGET_MS
                 : Math.min(STORAGE_HARD_BUDGET_MS, remainingMs);
-        const storage = await this.raceDetached(
-            this.storageProbe(storageBudget),
-            request.signal,
-            remainingMs,
-        );
+        let storage: StorageReadiness;
+        try {
+            storage = await this.raceDetached(
+                this.storageProbe(storageBudget, authenticatedDaemonId),
+                request.signal,
+                remainingMs,
+            );
+        } catch (error) {
+            // Detachment stays the caller's own deadline or signal. Anything else
+            // means storage was never observed on the certified incarnation, so
+            // the outcome carries no readiness rather than one read from a daemon
+            // this demand will never publish to.
+            if (error instanceof WaiterDetachedError) throw error;
+            return {
+                result: {
+                    ...compatibleResult,
+                    ok: false,
+                    reason: "native_probe_unavailable",
+                    remediation: remediationForReason("native_probe_unavailable"),
+                },
+                storage: null,
+            };
+        }
         return { result: compatibleResult, storage, authenticatedDaemonId };
     }
 

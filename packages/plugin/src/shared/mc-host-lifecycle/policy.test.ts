@@ -707,6 +707,42 @@ describe("demand-start coalescing and detachment (U3 scenarios 15-16)", () => {
         }
     });
 
+    test("storage readiness read on another incarnation is refused, not reported", async () => {
+        const root = tempDir("mc-policy-storage-rotation-");
+        const { binary, invocationLog } = fakeBinary(root);
+        const expectations: Array<Uint8Array | undefined> = [];
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                compatibilityProbe: async () => compatibleObservation(),
+                storageProbe: async (_budgetMs, expectedDaemonId) => {
+                    expectations.push(expectedDaemonId);
+                    throw new Error(
+                        "storage probe observed a different daemon than compatibility certified",
+                    );
+                },
+            });
+            const outcome = await policy.demandStart({
+                origin: "managed-default",
+                capability: "magic-context",
+            });
+
+            // The probe is told which incarnation was certified, and a reading it
+            // could not take there is an unproven readiness claim rather than a
+            // storage failure — remediation must point at the rotation.
+            expect(expectations).toEqual([new Uint8Array([7])]);
+            expect(outcome.result.ok).toBe(false);
+            expect(outcome.result.reason).toBe("native_probe_unavailable");
+            expect(outcome.result.remediation).toBe("run_daemon_restart");
+            expect(outcome.storage).toBeNull();
+            expect(outcome.authenticatedDaemonId).toBeUndefined();
+            expect(invocations(invocationLog)).toEqual(["start"]);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     test("managed harness mismatch never preempts the running daemon", async () => {
         const root = tempDir("mc-policy-converge-");
         const invocationLog = path.join(root, "converge-invocations.log");

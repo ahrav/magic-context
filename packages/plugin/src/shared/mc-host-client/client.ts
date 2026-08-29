@@ -698,8 +698,8 @@ export class McHostClient {
     }
 
     /** List catalog entries through a validated tagged `catalog.list`. */
-    async catalogList(): Promise<CatalogEntry[]> {
-        return (await this.catalogSnapshot()).modules;
+    async catalogList(options: { timeoutMs?: number } = {}): Promise<CatalogEntry[]> {
+        return (await this.catalogSnapshot(options)).modules;
     }
 
     /**
@@ -707,9 +707,13 @@ export class McHostClient {
      * host `subc_ops`, and per-module id/version/roles/control_ops. Any
      * duplicate, missing field, unknown field, or out-of-bounds value is a
      * terminal `malformed_control_response` — never a cast.
+     *
+     * `timeoutMs` overrides the client-wide request timeout so a caller holding
+     * an aggregate deadline can spend only the time it has left here instead of
+     * starting a fresh full-length request budget.
      */
-    async catalogSnapshot(): Promise<CatalogSnapshot> {
-        const deadline = Deadline.start(this.requestTimeoutMs, this.clock);
+    async catalogSnapshot(options: { timeoutMs?: number } = {}): Promise<CatalogSnapshot> {
+        const deadline = Deadline.start(options.timeoutMs ?? this.requestTimeoutMs, this.clock);
         const active = await this.ensureConnection(deadline);
         const bodyText = JSON.stringify({ op: "catalog.list" });
         const parsed = await this.controlRequest(active, bodyText, "catalog.list", deadline);
