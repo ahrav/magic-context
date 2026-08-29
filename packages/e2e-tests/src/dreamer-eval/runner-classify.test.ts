@@ -4,6 +4,11 @@ import { seedProjectMemoryClaim } from "../../../plugin/src/features/magic-conte
 import { createDirectTestDatabase } from "../../../plugin/src/features/magic-context/test-database";
 import { dreamerScorerFixture } from "./scorer.test";
 import {
+    DREAMER_EVAL_REPORT_SCHEMA,
+    parseRunReport,
+    type ClaimSnapshotProjection,
+} from "./contract";
+import {
     classifyDreamerRun,
     readDreamerReceipts,
     reconstructPoolEndState,
@@ -174,11 +179,51 @@ describe("dreamer runner classification", () => {
     });
 
     test("pool end state reconstructs from report snapshots without a database", () => {
-        const after = dreamerScorerFixture.pool.claims.map((claim, index) => ({
-            ...claim,
-            importance: index === 0 ? 91 : claim.importance,
-        }));
-        expect(reconstructPoolEndState({ poolAfter: after })).toEqual(after);
+        const poolAfter: ClaimSnapshotProjection[] = [{
+            claimId: "claim-one",
+            publicClaimId: "mem-1",
+            revisionLocator: "revision-9",
+            content: "Requests use three attempts.",
+            category: "CONFIG_VALUES",
+            importance: 91,
+            memoryScope: "project",
+            sharing: "private",
+            lifecycleState: "archived",
+            files: ["src/retry.ts"],
+            verificationOutcome: "archive",
+        }];
+        const serialized = JSON.stringify({
+            schema: DREAMER_EVAL_REPORT_SCHEMA,
+            scenarioId: "dme-core-pool",
+            task: "verify",
+            runId: "run-1",
+            nowMs: 1,
+            status: "PASS",
+            reason: null,
+            runFatal: false,
+            system: {
+                repoCommitSha: "a".repeat(40),
+                bunVersion: "1.3.11",
+                opencodeVersion: "1.0.0",
+                modelId: "model",
+                parserImpl: "ts",
+            },
+            poolBefore: [],
+            poolAfter,
+            rawManifest: "<verify></verify>",
+            parsedManifest: {},
+            receiptOutcomes: [],
+        });
+        const report = parseRunReport(JSON.parse(serialized));
+        const reconstructed = reconstructPoolEndState(report);
+        expect(reconstructed).toEqual(poolAfter);
+        expect(reconstructed[0]).not.toBe(report.poolAfter[0]);
+        expect(reconstructed[0]!.files).not.toBe(report.poolAfter[0]!.files);
+
+        reconstructed[0]!.content = "changed copy";
+        reconstructed[0]!.files.push("src/other.ts");
+        expect(report.poolAfter[0]!.content).toBe(poolAfter[0]!.content);
+        expect(report.poolAfter[0]!.files).toEqual(poolAfter[0]!.files);
     });
 
     test("reads one receipt record with only its actual affected claims", () => {

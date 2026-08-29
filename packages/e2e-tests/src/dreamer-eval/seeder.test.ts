@@ -106,6 +106,7 @@ function scenario(taskName: DreamerTask): DreamerEvalScenario {
         schema: DREAMER_EVAL_SCENARIO_SCHEMA,
         id: `dme-${taskName.replaceAll("-", "")}`,
         title: `${taskName} fixture`,
+        pressureRoles: [],
         pool: {
             claims: Array.from({ length: 10 }, (_, index) => ({
                 id: `claim-${index}`,

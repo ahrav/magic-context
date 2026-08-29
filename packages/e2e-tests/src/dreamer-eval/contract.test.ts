@@ -32,6 +32,7 @@ function validScenarioRaw(): Record<string, unknown> {
         schema: DREAMER_EVAL_SCENARIO_SCHEMA,
         id: "dme-core-pool",
         title: "Core dreamer maintenance pool",
+        pressureRoles: [],
         pool: { claims },
         tasks: [
             {
@@ -143,6 +144,15 @@ describe("dreamer eval scenario contract", () => {
             const claims = (raw.pool as { claims: unknown[] }).claims;
             for (let index = 11; index <= 51; index += 1) claims.push(claim(index));
         }, "scenario.pool.claims: count-invalid");
+    });
+
+    test("pressure roles enforce singleton and pair cardinality", () => {
+        expectDiagnostic((raw) => {
+            raw.pressureRoles = [{ role: "stale", claimIds: ["claim-1", "claim-2"] }];
+        }, "scenario.pressureRoles[0].claimIds: role-cardinality-invalid");
+        expectDiagnostic((raw) => {
+            raw.pressureRoles = [{ role: "semantic-duplicate-pair", claimIds: ["claim-1"] }];
+        }, "scenario.pressureRoles[0].claimIds: role-cardinality-invalid");
     });
 });
 
