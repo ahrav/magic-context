@@ -6,11 +6,28 @@ no longer matched were skipped without substitution and recorded here.
 
 ## Pre-existing gate failures (baseline, before any change)
 
-(recorded during U1 preflight)
+Recorded on the untouched worktree at `171ffd3e^` (code identical to
+`9c1eb4d1`). Typecheck and both lints are green. The failing suites below are
+environment-dependent (mc-host native lifecycle) and fail on the untouched
+tree; later gate runs are interpreted modulo this exact set.
+
+- TS (`sh scripts/test-shard.sh packages/plugin`): 31 failures confined to
+  `src/shared/mc-host-lifecycle/policy.test.ts` (28),
+  `src/hooks/magic-context/module-transport.test.ts` (2),
+  `src/features/magic-context/memory/storage-claim-operations-crash.test.ts` (1).
+  `pi-plugin`, `cli`, `retina-local-fs` suites: green.
+- Rust (`cargo nextest run --workspace --no-fail-fast`): 7 failures —
+  `mc-module::lifecycle_cli` (6 tests) and
+  `mc-host::shm_transport preflight_matrix_keeps_static_and_dynamic_states_distinct_and_side_effect_free`.
 
 ## Held items (bead-check verdicts)
 
-(recorded during U1 preflight)
+- `seed_workspace_member` (mc-store/src/lib.rs): HOLD — beads 6bd and a7v are
+  open and both plan mc-store workspace-member prune/write changes; the seam
+  stays.
+- `hardware_matches` (mc-shm-transport/src/descriptor.rs): HOLD — ymc.12 is
+  in-progress (P1) on the shm transport backend qualification; the descriptor
+  predicate stays.
 
 ## Stale findings (dropped)
 
