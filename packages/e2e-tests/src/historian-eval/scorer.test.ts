@@ -1066,6 +1066,56 @@ describe("scoreRunRecord", () => {
         }
     });
 
+    test("an observed false-authoritative promotion survives an aborted run: FAIL run-fatal, not ERROR (R8/KTD8)", () => {
+        const fixture = makeSnapshot({
+            facts: [...goldFacts(), { category: "ARCHITECTURE", content: "Use Redis for the session cache." }],
+        });
+        try {
+            const scenario = validScenario();
+            // The runner captures claim state before the probe tier precisely so a
+            // probe abort keeps this evidence. Left to the ordinary stored-error
+            // passthrough, the always-run-fatal outcome came back as a
+            // `runFatal: false` ERROR and the lane exited 1, so aborting after a
+            // forbidden promotion masked it.
+            const aborted = makeRecord(fixture, scenario, {
+                error: { reason: "probe-response-leak", detail: "probe-capacity leaked a claim id" },
+            });
+            const score = scoreRunRecord(aborted, scenario);
+            expect(score.verdict).toBe("FAIL");
+            expect(score.failReasons).toEqual(["false-authoritative"]);
+            expect(score.falseAuthoritativeMatches).toEqual(["abs-redis-active"]);
+            // The abort is still reported, not replaced: only the verdict changes.
+            expect(score.errorReason).toBe("probe-response-leak");
+            expect(score.errorDetail).toBe("probe-capacity leaked a claim id");
+            // Nothing here measured recall or precision, so the aggregate rates
+            // must not move.
+            expect(score.recall).toBeNull();
+            expect(score.precision).toBeNull();
+            const report = buildLaneReport([score]);
+            expect(report.runFatal).toBe(true);
+            expect(laneExitCode(report)).toBe(2);
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
+    test("an aborted run with no forbidden promotion stays an ordinary ERROR", () => {
+        const fixture = makeSnapshot({ facts: goldFacts() });
+        try {
+            const scenario = validScenario();
+            const aborted = makeRecord(fixture, scenario, {
+                error: { reason: "probe-response-leak", detail: "probe-capacity leaked a claim id" },
+            });
+            const score = scoreRunRecord(aborted, scenario);
+            expect(score.verdict).toBe("ERROR");
+            expect(score.errorReason).toBe("probe-response-leak");
+            expect(score.failReasons).toEqual([]);
+            expect(laneExitCode(buildLaneReport([score]))).toBe(1);
+        } finally {
+            fixture.cleanup();
+        }
+    });
+
     test("a stored record carrying a run that never evaluated the historian is ERROR", () => {
         const fixture = makeSnapshot({ facts: goldFacts() });
         try {

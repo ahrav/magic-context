@@ -382,10 +382,18 @@ jobs:
   # before: test:e2e selects --mode ts and test:opencode-e2e runs the green
   # manifest, and neither reaches historianEvalUnitFiles(), so the contract and
   # freeze lint could regress with every other lane green.
+  #
+  # Every deterministic historian-eval gate lives HERE, and the job declares no
+  # `needs`, for the same reason: a gate placed in a separate job downstream of
+  # check-plugin is skipped whenever check-plugin fails, which reproduces the
+  # silent non-enforcement one job away. Contract lint, scorer tests, the freeze
+  # lint, and the mutation battery all run per-PR with no live model calls and no
+  # credentials (R14); live scenario runs are scheduled or dispatched through
+  # historian-eval.yml only.
   historian-eval-contracts:
     name: Historian eval lane contracts
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -402,6 +410,12 @@ jobs:
 
       - name: Historian eval unit contracts
         run: bun run test:historian-eval-unit
+
+      - name: Freeze lint over the dev corpus
+        run: bun packages/e2e-tests/scripts/run-historian-eval.ts --lint
+
+      - name: Run the invalid-state mutation battery
+        run: bun packages/e2e-tests/scripts/run-historian-eval.ts --mutations
 
   mc-host-client-interop:
     name: mc-host client interop (Bun + Node 24)
@@ -820,33 +834,3 @@ jobs:
           name: incident-pool-ts
           path: packages/e2e-tests/artifacts/incident-pool-ts-report.json
           if-no-files-found: warn
-
-  historian-eval-deterministic:
-    name: Historian eval lane (deterministic)
-    runs-on: ubuntu-latest
-    needs: [check-plugin]
-    # Contract lint, scorer tests, and the mutation battery run per-PR with
-    # no live model calls and no credentials (R14). Live scenario runs are
-    # scheduled/dispatched via historian-eval.yml only.
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 1
-          persist-credentials: false
-
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      - name: Install workspace deps
-        run: bun install --frozen-lockfile
-
-      - name: Run historian-eval unit coverage
-        run: bun run --cwd packages/e2e-tests test:historian-eval-unit
-
-      - name: Freeze lint over the dev corpus
-        run: bun packages/e2e-tests/scripts/run-historian-eval.ts --lint
-
-      - name: Run the invalid-state mutation battery
-        run: bun packages/e2e-tests/scripts/run-historian-eval.ts --mutations

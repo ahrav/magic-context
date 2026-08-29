@@ -8,7 +8,7 @@ plan: `docs/plans/2026-08-26-2356-feat-historian-structural-eval-lane-plan.md`.
 
 ## Layout
 
-```
+```text
 historian-eval/
   dev/                      # development split: one JSON per scenario
                             # (transcript + gold + probes); tune freely
@@ -39,11 +39,16 @@ scripts/run-historian-eval.ts
 
 Live runs read `ANTHROPIC_API_KEY`, `HISTORIAN_EVAL_MODEL`, and
 `HISTORIAN_EVAL_PROBE_MODEL` (`provider/model`; both halves must be
-non-empty, checked before any token is spent). Per-PR CI runs only the
-deterministic parts (`historian-eval-deterministic` job); live runs are
-scheduled or dispatched via `.github/workflows/historian-eval.yml` (R14),
-and manual dispatch is restricted to the default branch because the job puts
-the API key in the environment of a checked-out ref.
+non-empty, checked before any token is spent). A live run also re-applies the
+deterministic gates — freeze lint plus the mutation battery over the corpus it
+loaded — and refuses before the first request, so a direct `--live` against
+locally edited scenarios cannot spend tokens on a corpus CI would reject.
+Per-PR CI runs only the deterministic parts, all of them in the
+`historian-eval-contracts` job, which declares no `needs` so an unrelated
+failure cannot skip them; live runs are scheduled or dispatched via
+`.github/workflows/historian-eval.yml` (R14), and manual dispatch is restricted
+to the default branch because the job puts the API key in the environment of a
+checked-out ref.
 
 Each report records the system-version tuple its scores belong to: repo SHA,
 resolved `opencode --version`, historian and probe model ids, parser
@@ -73,7 +78,7 @@ return a verdict that looks valid.
 `contextDbSnapshotPath` is still an absolute runner-local path, so a
 downloaded artifact does not re-score in place — the snapshot has to be put
 back at the recorded path, or the path rewritten. Tracked as
-`magic-context-bg4`.
+`magic-context-x20`.
 
 ## The raw-output scorer seam (for task x4l.13)
 

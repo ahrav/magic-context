@@ -189,6 +189,25 @@ function augmentGoldMatch(
 }
 
 /**
+ * Expected-absent predicate ids matched by a claim set (R8).
+ *
+ * Extracted from `scoreFacts` because the stored-error passthrough in
+ * `scoreRunRecord` has to ask the same question of a record's CAPTURED claims,
+ * where no snapshot-derived visible set exists. `ExpectedAbsent` carries no
+ * category, so the check is predicate-only by construction and needs nothing
+ * from a claim but its content.
+ */
+function falseAuthoritativeMatchesIn(
+    scenario: HistorianEvalScenario,
+    claims: ReadonlyArray<{ content: string }>,
+): string[] {
+    return scenario.gold.expectedAbsent
+        .filter((absent) => claims.some((item) => predicateMatches(absent.predicate, item.content)))
+        .map((absent) => absent.id)
+        .sort();
+}
+
+/**
  * Facts precision/recall against gold, keyed by the shared `matchesGold`
  * rule (category + content predicate, R7), plus the separately-reported
  * false-authoritative check (R8; `ExpectedAbsent` carries no category, so
@@ -221,10 +240,7 @@ function scoreFacts(
     // claim. Pairing it would penalise a historian for stating two wanted facts in one
     // well-formed claim, which is not an error.
     const matchedVisible = visible.filter((item) => expected.some((claim) => matchesGold(claim, item)));
-    const falseAuthoritativeMatches = scenario.gold.expectedAbsent
-        .filter((absent) => visible.some((item) => predicateMatches(absent.predicate, item.content)))
-        .map((absent) => absent.id)
-        .sort();
+    const falseAuthoritativeMatches = falseAuthoritativeMatchesIn(scenario, visible);
     return {
         precision: visible.length === 0 ? null : matchedVisible.length / visible.length,
         recall: expected.length === 0 ? null : matchedExpectedCount / expected.length,
@@ -1248,8 +1264,30 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
     const identityError = recordIdentityError(record, scenario);
     if (identityError !== null) return identityError;
 
+    // The stored-error passthrough is ordinary infrastructure precedence, and it
+    // must not outrank an authoritative state that was already OBSERVED. The
+    // runner captures claim state BEFORE the probe tier precisely so a probe
+    // abort (`probe-envelope-malformed`, `probe-gold-uncovered`,
+    // `probe-response-leak`, `probe-tool-use`) keeps that evidence on the
+    // record; discarding it here reported the one always-run-fatal outcome as a
+    // `runFatal: false` ERROR — exit 1 instead of 2 — so aborting after a
+    // forbidden promotion was a way to mask it.
+    //
+    // Scored from the record's captured claims rather than the snapshot: an
+    // error record's DB snapshot is best effort and often absent
+    // (`contextDbSnapshotPath: ""`), while the recorded set is what the runner
+    // read from the injection-visible surface at the pinned clock. The abort's
+    // reason and detail stay on the score, so the infrastructure failure is
+    // still reported rather than replaced; only the verdict changes, which is
+    // what puts the scenario where the always-run-fatal rule can see it. Rates
+    // stay null and the claim counts zero — nothing here measures recall or
+    // precision — so the aggregate is unaffected beyond the false-authoritative
+    // rate this outcome belongs in.
     if (record.error !== null) {
-        return errorScore(record.scenarioId, record.error.reason, record.error.detail, record.system);
+        const falseAuthoritativeMatches = falseAuthoritativeMatchesIn(scenario, record.injectedClaims);
+        const errored = errorScore(record.scenarioId, record.error.reason, record.error.detail, record.system);
+        if (falseAuthoritativeMatches.length === 0) return errored;
+        return { ...errored, verdict: "FAIL", failReasons: ["false-authoritative"], falseAuthoritativeMatches };
     }
 
     // Only a record claiming completion is held to the full inventory.
@@ -1550,7 +1588,7 @@ export function scoreRunRecord(record: HistorianEvalRunRecord, scenario: Histori
 
         // The runner's authored-chunk-coverage proof, reapplied to a stored artifact. The
         // live gate rejects a token-capped run before it writes a completed record, but a
-        // record scored independently never passes through it — and a v1 artifact whose
+        // record scored independently never passes through it — and a stored record whose
         // successful chunks stop before a hard-negative suffix passes facts and the early
         // probes while the absence check passes vacuously. The ranges are snapshot-bound by
         // the telemetry cross-check above, and the ordinals by `recordIdentityError`, so

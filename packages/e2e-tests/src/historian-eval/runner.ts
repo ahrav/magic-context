@@ -64,7 +64,15 @@ import { verifyAllActiveClaims } from "./verification-bridge";
 
 export type { InjectedClaimRecord } from "./claim-read";
 
-export const RUN_RECORD_SCHEMA = "historian-eval-run-record/v1";
+/**
+ * Run-record schema identity. The scorer keys record MEANING off this string —
+ * it rejects any other value outright — so a change to the required record
+ * shape has to move it. `v2` adds `system.opencodeVersion`, which the scorer
+ * requires: left at `v1`, one identifier would name two incompatible shapes and
+ * a record written by the earlier producer would be rejected as
+ * `record-malformed` rather than as the older schema it is.
+ */
+export const RUN_RECORD_SCHEMA = "historian-eval-run-record/v2";
 
 /**
  * The canonical internal-agent signature containing `needle`. Request routing

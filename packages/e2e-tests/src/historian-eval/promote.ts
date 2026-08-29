@@ -23,7 +23,7 @@ import {
     writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { canonicalFingerprint, readCanonicalJsonFile } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { hasGitAncestor } from "../../../plugin/scripts/retrieval-benchmark/fs-boundary";
 import { scanForSensitiveContent } from "../../../plugin/scripts/retrieval-benchmark/privacy";
@@ -358,6 +358,22 @@ export function loadRelease(
     // externally assembled release could declare `v01` and be certified here
     // while `promoteRelease` refuses to publish it.
     assertCanonicalVersion(manifest.releaseVersion, "release.manifest.releaseVersion");
+    // The declared version must also be the version this tree is INSTALLED as.
+    // Nothing above compares them: a copied or hand-edited `releases/v2` holding
+    // a valid v1 manifest passes every check, and the lane then runs the v2
+    // corpus while labelling its report v1 — and prior-release traversal reads
+    // the same mislabelled tree as v2. `installedReleases` already enforces this
+    // for predecessors; the consumer path did not.
+    //
+    // Guarded on the directory being version-named, because the promoter loads
+    // its own review and staging trees through here under `historian-eval-promote-*`
+    // and `.staging-*` names that legitimately do not encode a version. Both
+    // names are `RELEASE_VERSION_RE`-bounded when the guard fires, so reporting
+    // them echoes no artifact content.
+    const installedAs = basename(releaseDir);
+    if (RELEASE_VERSION_RE.test(installedAs) && manifest.releaseVersion !== installedAs) {
+        fail([`release.manifest.releaseVersion: declares ${manifest.releaseVersion} in directory ${installedAs}`]);
+    }
     const mutationEvidence = parseMutationEvidence(rawEvidence);
     const scenarios = rawScenarios.map((raw, index) => parseScenario(raw, `release.scenarios[${index}]`));
     // Authenticity before any content is trusted, over all three artifact groups:

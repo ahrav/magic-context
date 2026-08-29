@@ -142,21 +142,19 @@ function liveModeFromEnv(): LiveHistorianMode {
     // The historian route is validated for shape too: it is passed through to
     // the plugin config as a whole string, so an empty model component there
     // also fails only once the historian is invoked.
-    parseModelRoute("HISTORIAN_EVAL_MODEL", historianModel);
+    //
+    // The NORMALIZED components are what travel onward. `parseModelRoute` trims
+    // each side, so forwarding the raw value lets `anthropic / claude-sonnet-4-5`
+    // satisfy this preflight and then fail inside the historian on a provider id
+    // containing a space — after the harness, transcript, and run work is spent.
+    // `modelID` keeps any interior `/`, so reassembly is faithful.
+    const route = parseModelRoute("HISTORIAN_EVAL_MODEL", historianModel);
     return {
         kind: "live",
         apiKey,
-        historianModel,
+        historianModel: `${route.providerID}/${route.modelID}`,
         probeModel: parseModelRoute("HISTORIAN_EVAL_PROBE_MODEL", probeModel),
     };
-}
-
-function repoCommitSha(): string {
-    try {
-        return execSync("git rev-parse HEAD", { cwd: E2E_ROOT, encoding: "utf8" }).trim();
-    } catch {
-        return "unknown";
-    }
 }
 
 /**
@@ -174,10 +172,46 @@ function opencodeVersion(): string {
     }
 }
 
+/**
+ * Deterministic admission for a live run: the same corpus gate and mutation
+ * battery the per-PR lane applies, re-run here against the corpus this
+ * invocation actually loaded.
+ *
+ * Only the GitHub workflow chains `--lint` and `--mutations` ahead of `--live`,
+ * so a direct `--live --scenarios <dir>` — the documented operator command —
+ * would otherwise drive real provider traffic against a semantically invalid or
+ * mutation-red corpus and publish stability verdicts off it. The gates are
+ * deterministic and cost seconds; a live run costs minutes and tokens, so they
+ * run ahead of the loop and refuse rather than warn. Applied to a frozen release
+ * too: the release's own evidence proves the battery was green when it froze, not
+ * that it is green under the scorer in this checkout.
+ */
+function liveAdmissionGate(scenarios: readonly HistorianEvalScenario[]): number {
+    const diagnostics = corpusDiagnostics(scenarios);
+    if (diagnostics.length > 0) {
+        for (const diagnostic of diagnostics) console.error(`live admission: ${diagnostic}`);
+        return 1;
+    }
+    const evidence = runMutationBattery(scenarios);
+    if (!evidence.green) {
+        for (const entry of evidence.scenarios) {
+            for (const result of entry.results) {
+                if (!result.green) console.error(`live admission: ${entry.scenarioId} ${result.mutationClass}: RED (${result.detail})`);
+            }
+        }
+        return 1;
+    }
+    return 0;
+}
+
 async function runLive(args: CliArgs): Promise<number> {
     const { scenarios, releaseVersion } = loadCorpus(args);
+    // Routing first: it is instantaneous, and an operator who forgot a variable
+    // should not wait out the battery to be told so. Both still precede the first
+    // request, which is what "before any token is spent" requires.
     const mode = liveModeFromEnv();
-    const sha = repoCommitSha();
+    const admission = liveAdmissionGate(scenarios);
+    if (admission !== 0) return admission;
     const opencode = opencodeVersion();
     const artifactsRoot = join(dirname(resolve(args.reportPath)), "historian-eval-runs");
     const scores: ScenarioScore[] = [];
@@ -186,10 +220,14 @@ async function runLive(args: CliArgs): Promise<number> {
         const artifactDir = join(artifactsRoot, scenario.id);
         rmSync(artifactDir, { recursive: true, force: true });
         console.log(`running ${scenario.id}...`);
+        // `repoCommitSha` is deliberately not supplied: the runner's own
+        // resolver folds an uncommitted tracked diff and the untracked set into
+        // the recorded sha, and overriding it with a plain `git rev-parse HEAD`
+        // gave two different experimental trees the same system tuple — exactly
+        // the collision that identity exists to prevent.
         const record = await runScenario(scenario, {
             mode,
             artifactDir,
-            repoCommitSha: sha,
             opencodeVersion: opencode,
         });
         system = record.system;
