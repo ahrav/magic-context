@@ -616,6 +616,44 @@ describe("installed release evidence", () => {
         ).toThrow(/must share one workflow run attempt/);
     });
 
+    test("a re-run qualifies on the successful attempt whatever the attestation order", () => {
+        // One digest can be attested in several attempts: a re-run leaves the
+        // proof bytes unchanged because their run_url omits the attempt. `gh
+        // attestation verify` documents no ordering for its array, so neither
+        // order may decide qualification.
+        const attemptEntry = (sha256: string, attempt: string) =>
+            matchingAttestation({
+                artifactSha256: sha256,
+                runInvocationURI: `https://github.com/ahrav/magic-context/actions/runs/123456/attempts/${attempt}`,
+            })[0];
+        for (const order of [
+            ["1", "2"],
+            ["2", "1"],
+        ]) {
+            const root = mkdtempSync(join(tmpdir(), "mc-host-installed-evidence-"));
+            const evidence = qualifiedEvidence();
+            installReleaseArtifacts(root, evidence);
+            installProofArtifacts(root, evidence);
+            const runChecks: string[] = [];
+            expect(() =>
+                validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, {
+                    verifyAttestation: (_path, proof) =>
+                        order.map((attempt) => attemptEntry(proof.sha256, attempt)),
+                    verifyWorkflowRun: (_source, attempt) => {
+                        runChecks.push(attempt);
+                        return attempt === "2";
+                    },
+                    verifyInstalledEvidenceAttestation: (_path, _source, sha256) =>
+                        order.map((attempt) => attemptEntry(sha256, attempt)),
+                    expectedHeadSha: "a".repeat(40),
+                }),
+            ).not.toThrow();
+            // Candidates are tried in attempt order, so the failed attempt 1 is
+            // rejected and attempt 2 carries the release.
+            expect(runChecks).toEqual(["1", "2"]);
+        }
+    });
+
     test("an attestation without a run attempt is not a binding", () => {
         const source = {
             runUrl: "https://github.com/ahrav/magic-context/actions/runs/123456",

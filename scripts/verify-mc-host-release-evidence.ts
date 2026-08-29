@@ -93,21 +93,33 @@ export function workflowRunApiPath(source: WorkflowSource): string | null {
 }
 
 /**
- * Returns the run attempt the certificate was signed in, or null when the
- * attestation does not bind this artifact to the claimed workflow source.
+ * Returns every run attempt whose certificate binds this artifact to the
+ * claimed workflow source, deduplicated and ordered by attempt number.
  *
  * The attempt is required: a run-level conclusion reflects only the latest
  * attempt, so re-running a failed run would otherwise bless artifacts that
  * were signed by the attempt that failed.
+ *
+ * Every matching attempt is returned rather than the first, because one digest
+ * can legitimately carry more than one. A re-run leaves the proof bytes
+ * unchanged -- their `run_url` deliberately omits the attempt -- so the same
+ * subject digest is attested in the failed attempt and again in the successful
+ * one. `gh attestation verify` emits one array entry per verified attestation
+ * and documents no ordering, so returning a single entry would make
+ * qualification depend on array order: the failed attempt could be chosen and
+ * then rejected, or two artifacts could choose different attempts and appear
+ * to disagree about their source. Callers intersect these sets across every
+ * artifact and then require one shared attempt to have succeeded.
  */
-function matchedAttestationAttempt(
+function matchedAttestationAttempts(
     value: unknown,
     source: WorkflowSource,
     artifactSha256: string,
-): string | null {
-    if (!Array.isArray(value) || value.length === 0) return null;
+): string[] {
+    const attempts = new Set<string>();
+    if (!Array.isArray(value) || value.length === 0) return [];
     const runId = claimedRunId(source);
-    if (runId === undefined) return null;
+    if (runId === undefined) return [];
     for (const entry of value) {
         if (entry === null || typeof entry !== "object" || Array.isArray(entry)) continue;
         const verificationResult = (entry as Record<string, unknown>).verificationResult;
@@ -169,10 +181,10 @@ function matchedAttestationAttempt(
                 `https://github.com/${source.repository}/${source.workflow}` &&
             artifactMatches
         ) {
-            return attempt;
+            attempts.add(attempt);
         }
     }
-    return null;
+    return [...attempts].sort((a, b) => Number(a) - Number(b));
 }
 
 /**
@@ -282,7 +294,7 @@ export function attestationMatchesWorkflowSource(
     source: WorkflowSource,
     artifactSha256: string,
 ): boolean {
-    return matchedAttestationAttempt(value, source, artifactSha256) !== null;
+    return matchedAttestationAttempts(value, source, artifactSha256).length > 0;
 }
 
 export interface InstalledReleaseEvidence {
@@ -803,7 +815,7 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
         }
     }
     let qualifiedSource: WorkflowSource | null = null;
-    let qualifiedAttempt: string | null = null;
+    let qualifiedAttempts: string[] | null = null;
     const citedTestReports = new Map<string, string>();
     const workflowRunChecks = new Map<string, { ok: boolean; detail: string }>();
     for (const proof of evidence.proof_artifacts) {
@@ -956,35 +968,28 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
                 fail("qualified proof artifacts must share one workflow source");
             }
             qualifiedSource = workflowSource;
-            // The attestation is checked first because it names the run attempt
-            // the artifact was signed in, which the run check then confirms.
+            // Collect every attempt this artifact is attested in and narrow the
+            // shared set. The run check is deferred until the whole set is known,
+            // because a single artifact cannot tell which shared attempt is the
+            // one that succeeded.
             const attestationResult =
                 options.verifyAttestation !== undefined
                     ? options.verifyAttestation(proofPath, proof, workflowSource)
                     : ghAttestationJson(rootDir, proofPath, workflowSource);
-            const attempt = matchedAttestationAttempt(
+            const attempts = matchedAttestationAttempts(
                 attestationResult,
                 workflowSource,
                 proof.sha256,
             );
-            if (attempt === null) {
+            if (attempts.length === 0) {
                 fail(`proof artifact ${proof.kind}:${proof.subject} lacks a valid attestation`);
             }
-            if (qualifiedAttempt !== null && qualifiedAttempt !== attempt) {
+            qualifiedAttempts =
+                qualifiedAttempts === null
+                    ? attempts
+                    : qualifiedAttempts.filter((candidate) => attempts.includes(candidate));
+            if (qualifiedAttempts.length === 0) {
                 fail("qualified proof artifacts must share one workflow run attempt");
-            }
-            qualifiedAttempt = attempt;
-            const runCheck = cachedWorkflowRunCheck(
-                rootDir,
-                workflowSource,
-                attempt,
-                workflowRunChecks,
-                options.verifyWorkflowRun,
-            );
-            if (!runCheck.ok) {
-                fail(
-                    `proof artifact ${proof.kind}:${proof.subject} workflow run is unverified (${runCheck.detail})`,
-                );
             }
         }
     }
@@ -1011,16 +1016,42 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
                       installedEvidenceSha256,
                   )
                 : ghAttestationJson(rootDir, installedEvidencePath, qualifiedSource);
-        const installedAttempt = matchedAttestationAttempt(
+        const installedAttempts = matchedAttestationAttempts(
             attestationResult,
             qualifiedSource,
             installedEvidenceSha256,
         );
-        if (installedAttempt === null) {
+        if (installedAttempts.length === 0) {
             fail("installed release evidence lacks a valid attestation");
         }
-        if (installedAttempt !== qualifiedAttempt) {
+        const sharedAttempts = (qualifiedAttempts ?? []).filter((candidate) =>
+            installedAttempts.includes(candidate),
+        );
+        if (sharedAttempts.length === 0) {
             fail("installed release evidence was attested by a different workflow run attempt");
+        }
+        // One shared attempt must have concluded successfully. Candidates are
+        // tried in attempt order rather than trusting the attestation array's
+        // order, so a re-run that also attested the failed attempt still
+        // qualifies on the attempt that passed.
+        let verifiedAttempt: string | null = null;
+        let lastDetail = "";
+        for (const candidate of sharedAttempts) {
+            const runCheck = cachedWorkflowRunCheck(
+                rootDir,
+                qualifiedSource,
+                candidate,
+                workflowRunChecks,
+                options.verifyWorkflowRun,
+            );
+            if (runCheck.ok) {
+                verifiedAttempt = candidate;
+                break;
+            }
+            lastDetail = runCheck.detail;
+        }
+        if (verifiedAttempt === null) {
+            fail(`attested workflow run is unverified (${lastDetail})`);
         }
     }
     if (requireQualified && !evidence.qualified) {
