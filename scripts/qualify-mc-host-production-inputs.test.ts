@@ -2983,7 +2983,19 @@ describe("release prerequisite (CLI)", () => {
             encoding: "utf8",
         });
         expect(required.status).toBe(1);
-        expect(required.stderr).toContain("not production-qualified");
+        // The refusal is the claim; its reason depends on the checkout. Evidence
+        // lives at an ignored `tmp/` path, so a clean tree rejects it as absent
+        // while a tree that has already generated it rejects the recorded
+        // verdict. Both are the gate refusing on qualification grounds, so
+        // accepting either keeps this independent of ambient files.
+        expect(required.stderr).toContain("qualification evidence rejected");
+        const refusals = [
+            "not production-qualified",
+            `absent (${OUTPUT_PATHS.evidence})`,
+        ];
+        expect(
+            refusals.filter((reason) => required.stderr.includes(reason)),
+        ).not.toEqual([]);
 
         // The drift check over the same tree stays green, which is what keeps CI
         // usable while the real production bytes are still unqualified.
