@@ -1,0 +1,97 @@
+{
+  "schema": "historian-eval-scenario/v1",
+  "id": "hse-orders-key-conflict",
+  "title": "User's explicit key-type decision beats the assistant's guess",
+  "families": [
+    "conflicting-evidence"
+  ],
+  "transcript": {
+    "turns": [
+      {
+        "user": "What key type does the orders table use? I forget.",
+        "assistant": "I believe it uses UUID v4 primary keys — that is my guess based on the older services."
+      },
+      {
+        "user": "No, your guess is wrong. We explicitly decided the orders table uses bigint identity primary keys; it is entry 12 in the schema decision log.",
+        "assistant": "Confirmed by your decision: the orders table uses bigint identity primary keys. My earlier guess is discarded."
+      },
+      {
+        "user": "And foreign keys referencing orders always use the column name order_id.",
+        "assistant": "Noted: foreign keys reference orders through the order_id column."
+      },
+      {
+        "user": "That wraps the schema review.",
+        "assistant": "Schema review closed; notes captured."
+      }
+    ],
+    "epilogueStartIndex": 3
+  },
+  "trigger": {
+    "expectedHistorianRuns": 2,
+    "modelContextLimit": 200000,
+    "usageTokensPerTurn": 1000,
+    "spikeUsageTokens": 90000,
+    "ballastTokensPerTurn": 1500,
+    "headroomMarginTokens": 2000
+  },
+  "gold": {
+    "expectedClaims": [
+      {
+        "id": "exp-bigint-keys",
+        "category": "ARCHITECTURE",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "bigint identity"
+        },
+        "sourceTurnRange": [
+          1,
+          1
+        ]
+      },
+      {
+        "id": "exp-order-id-naming",
+        "category": "NAMING",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "order_id"
+        },
+        "sourceTurnRange": [
+          2,
+          2
+        ]
+      }
+    ],
+    "expectedAbsent": [
+      {
+        "id": "abs-uuid-keys",
+        "family": "conflicting-evidence",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "uuid v4 primary keys"
+        }
+      }
+    ],
+    "compartments": {
+      "minCount": 1
+    }
+  },
+  "probes": [
+    {
+      "id": "probe-key-type",
+      "question": "What key type does the orders table use?",
+      "answerType": "multiple-choice",
+      "choices": [
+        "uuid v4",
+        "bigint identity"
+      ],
+      "goldAnswer": "bigint identity",
+      "sourceClaimRef": "exp-bigint-keys"
+    },
+    {
+      "id": "probe-fk-naming",
+      "question": "Which claim records the foreign-key column naming?",
+      "answerType": "claim-id",
+      "expectedClaimRef": "exp-order-id-naming"
+    }
+  ]
+}

@@ -16,7 +16,6 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { replaceAllCompartments } from "../../features/magic-context/compartment-storage";
-import { insertMemory as insertMemoryRaw } from "../../features/magic-context/memory";
 import {
     __resetProjectIdentityForTests,
     resolveProjectIdentity,
@@ -42,6 +41,7 @@ import {
     setCompactionModeRecord,
 } from "../../features/magic-context/storage-meta-persisted";
 import { createTagger } from "../../features/magic-context/tagger";
+import { seedProjectMemoryClaim } from "../../features/magic-context/test-claim-database";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { createMessagesTransformHandler } from "../../plugin/messages-transform";
 import type { PluginContext } from "../../plugin/types";
@@ -51,10 +51,24 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { createTransform } from "./transform";
 
-// Policy reclassification: automatic injection requires effective-VERIFIED
-// rows, so these fixtures use explicit-user origin memories.
-const insertMemory: typeof insertMemoryRaw = (db, input) =>
-    insertMemoryRaw(db, { sourceType: "user", ...input });
+function insertMemory(
+    db: Database,
+    input: { projectPath: string; category: string; content: string },
+): void {
+    seedProjectMemoryClaim(db, {
+        projectIdentity: input.projectPath,
+        category: [
+            "PROJECT_RULES",
+            "ARCHITECTURE",
+            "CONSTRAINTS",
+            "CONFIG_VALUES",
+            "NAMING",
+        ].includes(input.category)
+            ? input.category
+            : "PROJECT_RULES",
+        content: input.content,
+    });
+}
 
 type TestMessage = {
     info: {

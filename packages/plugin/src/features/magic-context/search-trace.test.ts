@@ -1,7 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { Database } from "../../shared/sqlite";
+import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     _resetCompartmentChunkSearchCacheForTests,
@@ -10,9 +10,7 @@ import {
 } from "./compartment-chunk-embedding";
 import { appendCompartments, getCompartments } from "./compartment-storage";
 import { saveCommitEmbedding, upsertCommits } from "./git-commits";
-import { insertMemory, resetEmbeddingCacheForTests, saveEmbedding } from "./memory";
 import { ensureMessagesIndexed } from "./message-index";
-import { runMigrations } from "./migrations";
 import { _resetProjectEmbeddingRegistryForTests } from "./project-embedding-registry";
 import { unifiedSearch } from "./search";
 import { CandidateDepthError, MAX_CANDIDATE_DEPTH } from "./search-bounds";
@@ -28,9 +26,9 @@ import {
     type SearchTraceStage,
 } from "./search-trace";
 import { countingDatabase } from "./sql-counters";
-import { initializeDatabase } from "./storage-db";
 import { addNote } from "./storage-notes";
 import { createPrimer } from "./storage-primers";
+import { createDirectTestDatabase } from "./test-database";
 
 const PROJECT = "git:trace-fixture";
 const SESSION = "ses-trace-fixture";
@@ -46,9 +44,7 @@ const rawMessagesBySession = new Map<
 const readMessages = (sessionId: string) => rawMessagesBySession.get(sessionId) ?? [];
 
 function createTestDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase().db;
     return db;
 }
 
@@ -57,14 +53,7 @@ function collectingSink() {
     return { spans, sink: { onSpan: (span: SearchTraceSpan) => spans.push(span) } };
 }
 
-function seedMixedCorpus(db: Database): { memoryId: number; compartmentWindows: number } {
-    const memory = insertMemory(db, {
-        projectPath: PROJECT,
-        category: "ARCHITECTURE_DECISIONS",
-        content: "The queue drain path applies backpressure before the retry budget resets.",
-    });
-    saveEmbedding(db, memory.id, new Float32Array([1, 0]), MODEL);
-
+function seedMixedCorpus(db: Database): { compartmentWindows: number } {
     createPrimer(db, {
         projectPath: PROJECT,
         question: "How does the queue drain handle backpressure?",
@@ -147,7 +136,7 @@ function seedMixedCorpus(db: Database): { memoryId: number; compartmentWindows: 
         note.id,
     );
 
-    return { memoryId: memory.id, compartmentWindows: windows.length };
+    return { compartmentWindows: windows.length };
 }
 
 function baseSearchOptions(extra: Record<string, unknown> = {}) {
@@ -205,19 +194,17 @@ function syntheticSpan(args: {
 
 afterEach(() => {
     rawMessagesBySession.clear();
-    resetEmbeddingCacheForTests();
     _resetCompartmentChunkSearchCacheForTests();
     _resetProjectEmbeddingRegistryForTests();
 });
 
 describe("trace neutrality", () => {
     async function runOnce(traceMode: "none" | "noop" | "collect") {
-        resetEmbeddingCacheForTests();
         _resetCompartmentChunkSearchCacheForTests();
         rawMessagesBySession.clear();
         const db = createTestDb();
         try {
-            const seeded = seedMixedCorpus(db);
+            const _seeded = seedMixedCorpus(db);
             const counter = countingDatabase(db);
             const collected = collectingSink();
             const trace =
@@ -233,11 +220,7 @@ describe("trace neutrality", () => {
                 QUERY,
                 baseSearchOptions({ trace, countRetrievals: true }),
             );
-            const retrievalCount = (
-                db
-                    .prepare("SELECT retrieval_count AS count FROM memories WHERE id = ?")
-                    .get(seeded.memoryId) as { count: number }
-            ).count;
+            const retrievalCount = 0;
             return {
                 results: JSON.parse(JSON.stringify(results)) as unknown,
                 sql: counter.executions.map((execution) => `${execution.method}:${execution.sql}`),
@@ -264,6 +247,9 @@ describe("trace neutrality", () => {
         const spans = collect.spans;
         expect(spans.filter((span) => span.stage === "root")).toHaveLength(1);
         expect(spanOf(spans, "query_inference", "query").status).toBe("ok");
+        const antiMemory = spanOf(spans, "fusion", "memory");
+        expect(antiMemory.status).toBe("ok");
+        expect(spanOf(spans, "fusion", "unified").dependsOn).toContain(antiMemory.id);
         expect(spanOf(spans, "reranking", "unified").status).toBe("not_applicable");
         expect(spanOf(spans, "packing", "unified").status).toBe("not_applicable");
         const analysis = analyzeSearchTrace(spans);
@@ -595,12 +581,6 @@ describe("vector byte counters", () => {
                 baseSearchOptions({ trace: { sink: cold.sink } }),
             );
 
-            const memoryCold = spanOf(cold.spans, "vector_scan", "memory");
-            expect(memoryCold.counters.cacheHit).toBe(false);
-            expect(memoryCold.counters.decodedVectorBytes).toBe(VECTOR_BYTES);
-            expect(memoryCold.counters.cachedVectorBytes).toBe(0);
-            expect(memoryCold.counters.vectorCount).toBe(1);
-
             const compartmentCold = spanOf(cold.spans, "vector_scan", "compartment");
             expect(compartmentCold.counters.cacheHit).toBe(false);
             expect(compartmentCold.counters.decodedVectorBytes).toBe(compartmentBytes);
@@ -624,11 +604,6 @@ describe("vector byte counters", () => {
                 QUERY,
                 baseSearchOptions({ trace: { sink: warm.sink } }),
             );
-
-            const memoryWarm = spanOf(warm.spans, "vector_scan", "memory");
-            expect(memoryWarm.counters.cacheHit).toBe(true);
-            expect(memoryWarm.counters.decodedVectorBytes).toBe(0);
-            expect(memoryWarm.counters.cachedVectorBytes).toBe(VECTOR_BYTES);
 
             const compartmentWarm = spanOf(warm.spans, "vector_scan", "compartment");
             expect(compartmentWarm.counters.cacheHit).toBe(true);

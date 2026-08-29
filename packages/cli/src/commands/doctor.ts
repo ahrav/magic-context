@@ -11,30 +11,19 @@
  */
 import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { databaseResetMarkerPath } from "@magic-context/core/features/magic-context/storage-format-epoch";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import { getInstalledAdapters } from "../adapters";
 import type { HarnessAdapter } from "../adapters/types";
-import {
-    type ClaimsBackfillCommandArgs,
-    hasClaimsBackfillCommand,
-    runClaimsBackfillCommands,
-} from "../lib/claims-backfill-commands";
-import {
-    openExistingContextDatabase,
-    openExistingContextDatabaseForMutation,
-} from "../lib/database-access";
+import { openExistingContextDatabaseForMutation } from "../lib/database-access";
+import { DATABASE_RESET_COMMAND } from "../lib/database-repair-guidance";
 import { resolveAdaptersForCommand } from "../lib/harness-select";
 import { confirm, intro, log, outro, selectMany, spinner } from "../lib/prompts";
-import {
-    hasV22Command,
-    runV22BackfillCommands,
-    type V22BackfillCommandArgs,
-} from "../lib/v22-backfill-commands";
 import { runDoctor as runOmpDoctor } from "./doctor-omp";
 import { runDoctor as runOpenCodeDoctor } from "./doctor-opencode";
 import { doctor as runPiDoctor } from "./doctor-pi";
 
-export interface RunDoctorOptions extends V22BackfillCommandArgs, ClaimsBackfillCommandArgs {
+export interface RunDoctorOptions {
     force?: boolean;
     issue?: boolean;
     clear?: boolean;
@@ -44,63 +33,22 @@ export interface RunDoctorOptions extends V22BackfillCommandArgs, ClaimsBackfill
 export async function runDoctor(options: RunDoctorOptions): Promise<number> {
     if (options.clear) return runClear();
 
-    let sharedCommandExitCode: number | null = null;
-
-    // The v22 and claims backfill commands operate on the SHARED cortexkit DB
-    // (harness-agnostic — the DB path takes no adapter input), so they run
-    // before adapter resolution: resolution prompts interactively and exits 0
-    // on cancel, an empty selection, or a headless host, which would skip the
-    // requested repair while reporting success. Run them exactly ONCE here,
-    // not once per adapter: dispatching to both an OpenCode and a Pi adapter
-    // would run the same rekey/retry/check against the same physical DB
-    // twice, producing confusing doubled output (e.g. the second pass reports
-    // "Re-keyed 0 row(s)" because the first already moved them).
-    if (hasV22Command(options)) {
-        let v22Db: ReturnType<typeof openExistingContextDatabase> = null;
-        const result = await runV22BackfillCommands(
-            {
-                name: "Magic Context",
-                openDatabase: (readonly = true) => {
-                    const dbPath = join(getMagicContextStorageDir(), "context.db");
-                    v22Db = readonly
-                        ? openExistingContextDatabase(dbPath, { readonly: true })
-                        : openExistingContextDatabaseForMutation(dbPath);
-                    return v22Db;
-                },
-                closeDatabase: () => {
-                    v22Db?.close();
-                    v22Db = null;
-                },
-                log,
-            },
-            options,
+    const sharedDbPath = join(getMagicContextStorageDir(), "context.db");
+    // A published marker means a reset crashed between publishing its intent and
+    // moving the family, and it promises that initialization stays blocked until
+    // the reset is completed or rolled back. Warning and continuing broke that
+    // promise: the migration sweep and the backfills below both open
+    // `context.db` read-write, and those writes can change or recreate the
+    // artifacts the marker binds, after which `verifyResetMarkerFamily` refuses
+    // the recovery the marker exists to enable. So stop before any database is
+    // opened. `doctor reset-db` is routed ahead of this function, so the
+    // recovery path itself is unaffected.
+    if (existsSync(databaseResetMarkerPath(sharedDbPath))) {
+        log.error(
+            `A database reset is pending for ${sharedDbPath}. Run \`${DATABASE_RESET_COMMAND}\` to complete or roll it back; doctor cannot run until then.`,
         );
-        sharedCommandExitCode = Math.max(sharedCommandExitCode ?? 0, result.exitCode);
+        return 1;
     }
-
-    if (hasClaimsBackfillCommand(options)) {
-        let claimsDb: ReturnType<typeof openExistingContextDatabase> = null;
-        const result = await runClaimsBackfillCommands(
-            {
-                name: "Magic Context",
-                openDatabase: (readonly = true) => {
-                    const dbPath = join(getMagicContextStorageDir(), "context.db");
-                    claimsDb = readonly
-                        ? openExistingContextDatabase(dbPath, { readonly: true })
-                        : openExistingContextDatabaseForMutation(dbPath);
-                    return claimsDb;
-                },
-                closeDatabase: () => {
-                    claimsDb?.close();
-                    claimsDb = null;
-                },
-                log,
-            },
-            options,
-        );
-        sharedCommandExitCode = Math.max(sharedCommandExitCode ?? 0, result.exitCode);
-    }
-    if (sharedCommandExitCode !== null) return sharedCommandExitCode;
 
     const argv = options.argv ?? [];
     const adapters = await resolveAdaptersForCommand(argv, {
@@ -159,9 +107,6 @@ export async function runDoctor(options: RunDoctorOptions): Promise<number> {
 
 async function dispatchDoctor(adapter: HarnessAdapter, options: RunDoctorOptions): Promise<number> {
     switch (adapter.kind) {
-        // v22 backfill flags are handled once in runDoctor (shared DB), so the
-        // per-harness doctors below are NOT forwarded them — that's what
-        // prevented the doubled-output bug when both harnesses are installed.
         case "opencode": {
             return runOpenCodeDoctor({
                 force: options.force,

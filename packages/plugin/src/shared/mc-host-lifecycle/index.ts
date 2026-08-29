@@ -72,6 +72,7 @@ export {
     connectionFilePath,
     coordinationDirPath,
     type DataRootResolution,
+    defaultConnectionFilePath,
     type FilesystemAdmission,
     managedSubtreePath,
     parseMounts,

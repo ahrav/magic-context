@@ -58,6 +58,7 @@ import {
     type ReleaseContract,
     sha256Hex,
     validateRegistryGate,
+    validateRegistryGateShape,
     validateStopProvenance,
 } from "./generate-mc-host-release-manifest";
 import {
@@ -93,11 +94,17 @@ const PARENT_DIRS: Record<string, string> = {
 export const LAUNCHER_PATH = "payload/bin/ck-mc-host";
 
 /** Linux-only U9-gated production slots (R25). Corpus is a certification input,
- *  not a shipped file. Populated only from qualified locked bytes; never committed. */
+ *  not a shipped file. Populated only from qualified locked bytes; never committed.
+ *
+ *  `bundle_manifest` ships because the daemon requires it: `synapse_component`
+ *  disables the lane outright when the generation carries no
+ *  `payload/model/<model>/manifest.json`, and that file is what names and hashes
+ *  every other model artifact. Omitting it from an exactly-enforced file set made
+ *  a conforming production payload one the certified Synapse lane could never
+ *  activate over, while the manifest still claimed `synapse: certified_cpu`. */
 export const LINUX_PRODUCTION_PAYLOAD_SLOTS: Record<string, string> = {
     ort_runtime: "payload/ort/libonnxruntime.so",
-    bundle_manifest:
-        "payload/model/gte-modernbert-base-f16/manifest.json",
+    bundle_manifest: "payload/model/gte-modernbert-base-f16/manifest.json",
     corpus: "payload/model/gte-modernbert-base-f16/corpus.json",
     model_onnx: "payload/model/gte-modernbert-base-f16/model.onnx",
     tokenizer: "payload/model/gte-modernbert-base-f16/tokenizer.json",
@@ -566,8 +573,8 @@ export function validatePayloadManifest(
 
 /**
  * Verify staged payload bytes against a validated manifest: every listed file
- * exists with exact size/sha256, no symlink appears anywhere, and no unlisted
- * file exists under payload/. One-byte mutation anywhere fails.
+ * exists with exact size/sha256/mode, no symlink appears anywhere, and no
+ * unlisted file exists under payload/. One-byte mutation anywhere fails.
  */
 export function verifyPayloadDir(
     packageRoot: string,
@@ -591,6 +598,18 @@ export function verifyPayloadDir(
         }
         const digest = createHash("sha256").update(bytes).digest("hex");
         if (digest !== entry.sha256) fail(`${entry.path}: digest drift`);
+        // The manifest declares each file's permission bits, and its digest is
+        // what certifies the staged tree. Checking only the bytes would let a
+        // non-executable launcher — or an overly permissive data file — inherit
+        // that certification while contradicting the manifest it is verified
+        // against.
+        const actualMode = stat.mode & 0o777;
+        const expectedMode = Number.parseInt(entry.mode, 8);
+        if (actualMode !== expectedMode) {
+            fail(
+                `${entry.path}: mode drift (${actualMode.toString(8)} != ${entry.mode})`,
+            );
+        }
     }
     const walk = (relative: string): void => {
         for (const name of readdirSync(join(packageRoot, relative))) {
@@ -858,9 +877,21 @@ export function buildTrustArtifacts(
     };
 }
 
+/**
+ * Full trust-index validation: schema, release identity, cited digests, and
+ * every target entry's package identity, platform floors, and size budgets.
+ *
+ * Takes only the fields it reads rather than a whole `ReleaseContext`, for the
+ * same reason `validateStopRecord` does: the wider type is what kept this
+ * validator reachable only from the payload builder, leaving the evidence
+ * verifier to hand-roll a weaker summary check over the same file.
+ */
 export function validateTrustIndex(
     index: unknown,
-    context: ReleaseContext,
+    context: Pick<
+        ReleaseContext,
+        "contract" | "u8Digest" | "lockSha256" | "productionQualified" | "lock"
+    >,
 ): void {
     assertExactKeys(
         index,
@@ -1022,9 +1053,18 @@ export function validateTrustIndex(
  * version, and its embedded manifest must hash to the cited digest (modified
  * N-1 rejected).
  */
+/**
+ * Full stop-record validation: schema plus this release's ancestry rules.
+ *
+ * Takes only the contract and the reservation versions rather than a whole
+ * `ReleaseContext`, because that is its real dependency set — the wider type
+ * kept this validator reachable only from the payload builder, which is why the
+ * evidence verifier previously had to settle for the schema-level
+ * `validateStopProvenance` alone.
+ */
 export function validateStopRecord(
     record: unknown,
-    context: ReleaseContext,
+    context: Pick<ReleaseContext, "contract" | "reservationVersions">,
     expectedPredecessorVersion: string | null,
 ): { legacyStopAuthority: boolean } {
     const { contract } = context;
@@ -1094,6 +1134,30 @@ export function validateStopRecord(
 // Dev payload build (U7-style local smokes and TS bootstrap tests consume this).
 // ---------------------------------------------------------------------------
 
+/**
+ * Runtime glibc version, or `null` when this host does not link glibc.
+ *
+ * `process.platform` is `"linux"` for both glibc and musl systems, so the
+ * platform/arch pair alone cannot name a `-gnu` target. The report header
+ * carries `glibcVersionRuntime` only when the process is glibc-linked, which
+ * makes its absence the musl (or other non-glibc) signal.
+ */
+function runtimeGlibcVersion(): string | null {
+    const report = (
+        process as unknown as {
+            report?: { getReport?: () => unknown };
+        }
+    ).report;
+    if (typeof report?.getReport !== "function") return null;
+    try {
+        const header = (report.getReport() as { header?: Record<string, unknown> }).header;
+        const version = header?.glibcVersionRuntime;
+        return typeof version === "string" && version.length > 0 ? version : null;
+    } catch {
+        return null;
+    }
+}
+
 export function hostTarget(): PayloadTarget {
     const key = `${process.platform}-${process.arch}`;
     const target = PAYLOAD_TARGETS.find((t) =>
@@ -1101,6 +1165,16 @@ export function hostTarget(): PayloadTarget {
     );
     if (target === undefined)
         fail(`no payload target for host ${key} (R24 matrix)`);
+    // The only Linux target in the R24 matrix is glibc, and the release
+    // contract declares `libc: ["glibc"]`. Selecting it from platform/arch
+    // alone would stamp a musl-linked launcher with the glibc target and its
+    // glibc_min floor, so establish glibc rather than assume it.
+    if (target.target.endsWith("-gnu") && runtimeGlibcVersion() === null) {
+        fail(
+            `host is Linux ${process.arch} but not glibc-linked, so ${target.target} ` +
+                "cannot be established; the release contract excludes musl (R24)",
+        );
+    }
     return target;
 }
 
@@ -1676,7 +1750,9 @@ export function runCheck(
     options: { write: boolean; payloadRoot?: string },
 ): CheckResult {
     const context = loadReleaseContext(rootDir);
-    validateRegistryGate(
+    // Drift-only, same as contract generation: structure is checked on every
+    // change, release readiness only where bytes are actually published.
+    validateRegistryGateShape(
         readJson(rootDir, REGISTRY_GATE_PATH),
         context.contract,
     );

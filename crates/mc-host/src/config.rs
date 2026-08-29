@@ -42,14 +42,26 @@ pub(crate) const EGRESS_RESERVED_BYTES: u64 = MAX_BODY_LEN as u64 + HEADER_LEN a
 /// exhausting request scratch can only ever produce a typed rejection on the
 /// request that asked for it.
 ///
-/// Sized for a component whose own body cap is half the frame limit holding
-/// a three-times-body scratch peak, plus per-item and envelope headroom,
-/// plus [`RETAINED_METADATA_RESERVED_BYTES`] so a full retention set can
-/// coexist with a worst-case reservation. `synapse::protocol` pins its
-/// worst-case reservation against the remainder in a unit test, so the two
-/// cannot drift apart.
-pub(crate) const SCRATCH_RESERVED_BYTES: u64 =
-    (MAX_BODY_LEN as u64 * 3 / 2) + (64 * 1024) + RETAINED_METADATA_RESERVED_BYTES;
+/// Sized for Synapse's worst parse reservation, full queued-batch budget,
+/// one admitted maximum query, [`SYNAPSE_WAITER_HEADROOM_BYTES`],
+/// per-item/envelope headroom, and
+/// [`RETAINED_METADATA_RESERVED_BYTES`]. `validate_serving_limits` checks the
+/// same combined bound for configured limits.
+pub(crate) const SCRATCH_RESERVED_BYTES: u64 = (MAX_BODY_LEN as u64 * 5 / 2)
+    + (6 * 1024 * 1024)
+    + 256
+    + (64 * 1024)
+    + SYNAPSE_WAITER_HEADROOM_BYTES
+    + RETAINED_METADATA_RESERVED_BYTES;
+
+/// Scratch headroom for bounded query waiting at default Synapse limits:
+/// four waiter slots of `2 * max_text_bytes + 256` bytes each at the default
+/// 1 MiB `max_text_bytes`. Without this slice the pool admits exactly the
+/// default limits with no waiters, so `max_waiting_queries >= 1` — the knob
+/// the bounded-waiting design exists for — would be rejected at startup
+/// unless the operator also shrinks an unrelated queue budget.
+/// `tests/synapse_bundle.rs` pins the resulting feasible boundary.
+pub(crate) const SYNAPSE_WAITER_HEADROOM_BYTES: u64 = 4 * (2 * 1024 * 1024 + 256);
 
 /// Slice of [`SCRATCH_RESERVED_BYTES`] carved out for retained job metadata,
 /// which lives for the whole retention window. Parse and page reservations
@@ -125,7 +137,7 @@ impl Default for HostLimits {
             // that links components with real retention must size this itself as
             // its own floor plus the sum of their declarations. Startup refuses
             // the composite otherwise rather than silently over-offering ingress.
-            max_resident_bytes: 256 * 1024 * 1024,
+            max_resident_bytes: MIN_RESIDENT_BYTES + MAX_BODY_LEN as u64,
             writer_queue_frames: 64,
         }
     }
@@ -440,7 +452,9 @@ impl std::fmt::Display for ConfigError {
             ),
             Self::ResidentBytesBelowInteropMinimum { configured, minimum } => write!(
                 f,
-                "max_resident_bytes {configured} cannot hold one maximum request and response; need at least {minimum}"
+                "max_resident_bytes {configured} is below the host floor {minimum} \
+                 (one maximum frame plus the egress and scratch reservations); \
+                 raise max_resident_bytes to at least {minimum}"
             ),
             Self::ResidentBytesTooLarge { configured, maximum } => write!(
                 f,
@@ -529,10 +543,7 @@ mod tests {
         assert!(defaults.max_resident_bytes >= MIN_RESIDENT_BYTES);
         let admission_at_default =
             defaults.max_resident_bytes - EGRESS_RESERVED_BYTES - SCRATCH_RESERVED_BYTES;
-        assert!(
-            admission_at_default > frame,
-            "the default must leave admission headroom above the floor"
-        );
+        assert!(admission_at_default > frame);
         // The catalog and declared retained bytes are subtracted from
         // admission only (runtime.rs), so they can never eat the scratch or
         // egress guarantees.

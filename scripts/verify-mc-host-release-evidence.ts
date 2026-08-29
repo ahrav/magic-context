@@ -9,13 +9,18 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { validateStopRecord, validateTrustIndex } from "./build-mc-host-payload";
 import {
     buildContract,
     canonicalJson,
     type ReleaseContract,
     sha256Hex,
 } from "./generate-mc-host-release-manifest";
-import { OUTPUT_PATHS as U9_OUTPUT_PATHS } from "./qualify-mc-host-production-inputs";
+import {
+    isPlaceholderSha256,
+    OUTPUT_PATHS as U9_OUTPUT_PATHS,
+    requireQualificationEvidence,
+} from "./qualify-mc-host-production-inputs";
 
 const EVIDENCE_PATH = "tmp/mc-host-installed-release-evidence.json";
 // The qualifier owns this path and exports it; `build-mc-host-payload.ts`
@@ -31,6 +36,7 @@ export const QUALIFICATION_WORKFLOW_PATH = ".github/workflows/mc-host-release-qu
 const EXPECTED_REPOSITORY = "ahrav/magic-context";
 const TEST_REPORT_DIR = "tmp/mc-host-test-reports/";
 const TEST_REPORT_SCHEMA = "magic-context.mc-host-test-report/v1";
+const REGISTRY_GATE_PATH = "release/mc-host-registry-gate.json";
 
 interface RegistryPackageEvidence {
     name: string;
@@ -45,6 +51,14 @@ interface TargetEvidence {
     self_fd_verified: boolean;
     process_crash_atomicity_verified: boolean;
     lifecycle_smoke_passed: boolean;
+    /**
+     * Digest of the target's test report, recorded independently of the proof.
+     *
+     * Held here rather than read back out of the proof's own observations so
+     * that the comparison has two sides. `null` records that no report digest
+     * was captured, and the proof must then echo `null` too.
+     */
+    test_report_sha256: string | null;
 }
 
 interface ProductFlowEvidence {
@@ -208,11 +222,11 @@ function ghAttestationJson(
             "verify",
             artifactPath,
             "--repo",
-            source.repository,
+            EXPECTED_REPOSITORY,
             "--source-digest",
             source.headSha,
             "--signer-workflow",
-            `${source.repository}/${source.workflow}`,
+            `${EXPECTED_REPOSITORY}/${QUALIFICATION_WORKFLOW_PATH}`,
             "--format",
             "json",
         ],
@@ -343,6 +357,11 @@ export interface InstalledReleaseEvidence {
         payloads_before_parents: boolean;
     };
     production_synapse_verified: boolean;
+    /**
+     * Digest of the production semantic-Synapse report, recorded independently of
+     * the proof that cites it, so the proof cannot be its own witness.
+     */
+    production_synapse_report_sha256: string | null;
     proof_artifacts: ProofArtifactRef[];
     qualified: boolean;
     blockers: string[];
@@ -360,6 +379,7 @@ export interface BuildInstalledReleaseEvidenceOptions {
     oidcProvenanceVerified: boolean;
     longLivedTokenUsed: boolean;
     productionSynapseVerified: boolean;
+    productionSynapseReportSha256: string | null;
     proofArtifacts: ProofArtifactRef[];
     qualified: boolean;
     blockers: string[];
@@ -512,14 +532,27 @@ function exactIdentitySet(
     }
 }
 
+/**
+ * Whether `names` lists every payload package before every parent package.
+ *
+ * Shared by construction and validation so the two cannot drift: the recorded
+ * `publication.payloads_before_parents` boolean is only meaningful if the
+ * verifier derives it from the same order the builder derived it from.
+ * `exactIdentitySet` sorts, so nothing else in validation observes this order.
+ */
+function payloadsBeforeParents(
+    names: readonly string[],
+    contract: ReleaseContract,
+): boolean {
+    return (
+        names.join("\n") ===
+        [...contract.packages.payloads, ...contract.packages.parents].join("\n")
+    );
+}
+
 export function buildInstalledReleaseEvidence(
     options: BuildInstalledReleaseEvidenceOptions,
 ): InstalledReleaseEvidence {
-    const payloadsBeforeParents =
-        options.registryPackages
-            .map((entry) => entry.name)
-            .join("\n") ===
-        [...options.contract.packages.payloads, ...options.contract.packages.parents].join("\n");
     return {
         schema: "magic-context.mc-host-installed-release-evidence/v1",
         release: {
@@ -537,9 +570,13 @@ export function buildInstalledReleaseEvidence(
         publication: {
             oidc_provenance_verified: options.oidcProvenanceVerified,
             long_lived_token_used: options.longLivedTokenUsed,
-            payloads_before_parents: payloadsBeforeParents,
+            payloads_before_parents: payloadsBeforeParents(
+                options.registryPackages.map((entry) => entry.name),
+                options.contract,
+            ),
         },
         production_synapse_verified: options.productionSynapseVerified,
+        production_synapse_report_sha256: options.productionSynapseReportSha256,
         proof_artifacts: options.proofArtifacts,
         qualified: options.qualified,
         blockers: options.blockers,
@@ -568,6 +605,7 @@ export function validateInstalledReleaseEvidence(
             "product_flows",
             "publication",
             "production_synapse_verified",
+            "production_synapse_report_sha256",
             "proof_artifacts",
             "qualified",
             "blockers",
@@ -645,9 +683,17 @@ export function validateInstalledReleaseEvidence(
                 "self_fd_verified",
                 "process_crash_atomicity_verified",
                 "lifecycle_smoke_passed",
+                "test_report_sha256",
             ],
             `targets[${index}]`,
         );
+        const testReport = entry.test_report_sha256;
+        if (
+            testReport !== null &&
+            (typeof testReport !== "string" || !SHA256_RE.test(testReport))
+        ) {
+            fail(`targets[${index}].test_report_sha256 must be lowercase SHA-256 or null`);
+        }
         return {
             target: stringField(entry, "target", `targets[${index}]`),
             filesystem_verified: booleanField(
@@ -666,6 +712,7 @@ export function validateInstalledReleaseEvidence(
                 "lifecycle_smoke_passed",
                 `targets[${index}]`,
             ),
+            test_report_sha256: testReport,
         };
     });
     exactIdentitySet(
@@ -713,6 +760,20 @@ export function validateInstalledReleaseEvidence(
         ["oidc_provenance_verified", "long_lived_token_used", "payloads_before_parents"],
         "publication",
     );
+    // The publication proof only echoes this boolean back, so without deriving
+    // it here a hand-authored file could list parents first, claim `true`, and
+    // pass the payload-first invariant after a parents-first release.
+    if (
+        booleanField(publication, "payloads_before_parents", "publication") !==
+        payloadsBeforeParents(
+            registryPackages.map((entry) => entry.name),
+            contract,
+        )
+    ) {
+        fail(
+            "publication.payloads_before_parents does not match the registry_packages order",
+        );
+    }
     const blockers = stringArray(evidence.blockers, "blockers");
     const qualified = booleanField(evidence, "qualified", "evidence");
     if (!Array.isArray(evidence.proof_artifacts)) {
@@ -783,14 +844,158 @@ export function validateInstalledReleaseEvidence(
         !booleanField(publication, "long_lived_token_used", "publication") &&
         booleanField(publication, "payloads_before_parents", "publication") &&
         booleanField(evidence, "production_synapse_verified", "evidence");
+    const synapseReport = evidence.production_synapse_report_sha256;
+    if (
+        synapseReport !== null &&
+        (typeof synapseReport !== "string" || !SHA256_RE.test(synapseReport))
+    ) {
+        fail(
+            "production_synapse_report_sha256 must be lowercase SHA-256 or null",
+        );
+    }
 
     if (qualified && (!allProofsPass || blockers.length !== 0)) {
         fail("qualified evidence contains a failed proof or blocker");
+    }
+    // `null` is the fail-closed template's value, so it must not survive into
+    // qualified evidence: a proof echoing `null` back agrees with it, and the
+    // Linux semantic lane would be authorized without naming any report at all.
+    // The same holds for each target's lifecycle report.
+    if (qualified) {
+        if (synapseReport === null || isPlaceholderSha256(synapseReport)) {
+            fail(
+                "qualified evidence must record a real production_synapse_report_sha256",
+            );
+        }
+        for (const target of targets) {
+            if (
+                target.test_report_sha256 === null ||
+                isPlaceholderSha256(target.test_report_sha256)
+            ) {
+                fail(
+                    `qualified evidence must record a real test_report_sha256 for ${target.target}`,
+                );
+            }
+        }
     }
     if (!qualified && blockers.length === 0) {
         fail("unqualified evidence must name at least one blocker");
     }
     return evidence as unknown as InstalledReleaseEvidence;
+}
+
+/**
+ * Requires the artifacts this evidence cites to themselves be release-qualified.
+ *
+ * The digest comparison above only binds the evidence to whatever bytes are
+ * committed; it says nothing about what those bytes claim. All three artifacts
+ * are committed fail-closed between releases, so without parsing them an
+ * evidence document could set `qualified: true`, carry passing proofs, and clear
+ * the GA gate while citing a qualification run that recorded
+ * `production_qualified: false`, payload entries that recorded
+ * `qualified: false`, or a stop record that grants no usable stop authority.
+ *
+ * Checking those booleans alone is not enough either: a skeletal file carrying
+ * only the booleans would satisfy them while citing nothing. Each artifact is
+ * therefore bound to this release — its schema, its contract digest, and its
+ * identity set — so a stand-in has to reproduce the real citations to pass.
+ *
+ * Deliberately not re-implemented here: the input-lock byte citations and the
+ * payload manifest/launcher digests. Those are what `release:qualify:check` and
+ * `release:payload:check` validate in full, and duplicating their logic in a
+ * third place would create exactly the drift this gate exists to catch. This
+ * function's job is to stop *these* bytes from being a stand-in for the artifacts
+ * those gates validate.
+ */
+function assertCitedArtifactsQualified(
+    rootDir: string,
+    contract: ReleaseContract,
+    expectedContractDigest: string,
+    requireQualification: (
+        rootDir: string,
+    ) => { u8Digest: string; lockSha256: string },
+): void {
+    // Delegate the qualification run to its own full consumer rather than
+    // re-deriving a weaker version of it here. `requireQualificationEvidence`
+    // checks the schema, the contract digest, the release identity, `test_only`,
+    // the artifact citations against real bytes, and — the part summary fields
+    // can never reach — it re-derives the verdict from the input-lock bytes,
+    // because the evidence's own `production_qualified` bit is self-describing
+    // and therefore not authority. That also stops the separately cited input
+    // lock from being opaque bytes to this gate.
+    const { u8Digest, lockSha256 } = requireQualification(rootDir);
+    const qualification = record(
+        readJson(rootDir, QUALIFICATION_PATH),
+        "cited qualification",
+    );
+    // Retained after the delegation for the citation this gate specifically owns:
+    // the evidence's contract digest and the qualification run's must be the same
+    // one, not merely each current on its own.
+    if (qualification.release_contract_sha256 !== expectedContractDigest) {
+        fail("cited qualification was produced against a different release contract");
+    }
+
+    // Same delegation for the payload index. Summary fields could not reach the
+    // input-lock digest citation, the per-target package identities, the platform
+    // floors, the size budgets, or the payload-manifest and bootstrap-launcher
+    // digests, so a stand-in index with the right booleans passed while carrying
+    // no usable bootstrap trust data. `validateTrustIndex` is the validator the
+    // payload builder already applies to this exact file, and it requires a
+    // qualified entry to carry real non-placeholder digests.
+    //
+    // Note it also requires `publication.published === false`: the index is a
+    // build-time artifact and U6 performs no publication, so completed
+    // publication is recorded on the evidence's own `publication` block — which
+    // `allProofsPass` already gates — and must not be demanded of this file.
+    //
+    // `productionQualified` is `true` rather than re-derived: the qualification
+    // consumer above already re-derived the verdict from the lock bytes and
+    // rejects anything else, so reading the bit back here would only reintroduce
+    // a self-describing value as authority.
+    const lock = record(readJson(rootDir, INPUT_LOCK_PATH), "cited input lock");
+    validateTrustIndex(readJson(rootDir, PAYLOAD_INDEX_PATH), {
+        contract,
+        u8Digest,
+        lockSha256,
+        productionQualified: true,
+        lock: lock as unknown as Parameters<typeof validateTrustIndex>[1]["lock"],
+    });
+    const payloadIndex = record(
+        readJson(rootDir, PAYLOAD_INDEX_PATH),
+        "cited payload index",
+    );
+    if (payloadIndex.release_contract_sha256 !== expectedContractDigest) {
+        fail("cited payload index was produced against a different release contract");
+    }
+
+    // No proof kind covers stop provenance, so a digest match was previously the
+    // only thing standing between qualified evidence and a stop record granting
+    // unusable or unauthorized authority. `validateStopRecord` is the validator
+    // that adds this release's ancestry rules on top of the schema: genesis-only
+    // status, reservation exclusion, exact N-1 adjacency, and the
+    // predecessor-manifest hash. Reservation versions come from the gate file
+    // directly, which is the only thing beyond the contract that it needs.
+    const gate = record(
+        readJson(rootDir, REGISTRY_GATE_PATH),
+        "cited registry gate",
+    );
+    const reservationVersions = (
+        Array.isArray(gate.packages) ? gate.packages : []
+    )
+        .map((entry) =>
+            typeof entry === "object" && entry !== null
+                ? (entry as Record<string, unknown>).reservation_version
+                : undefined,
+        )
+        .filter((version): version is string => typeof version === "string");
+    // `null` for the expected predecessor: this is the first payload-bearing
+    // release, so genesis is the only acceptable ancestry — the same stance
+    // `runCheck` takes. The next payload release must pass its real N-1 here.
+    validateStopRecord(
+        readJson(rootDir, STOP_PROVENANCE_PATH),
+        { contract, reservationVersions },
+        null,
+    );
 }
 
 export function validateInstalledReleaseEvidenceAgainstArtifacts(
@@ -813,6 +1018,14 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
             sha256: string,
         ) => unknown;
         expectedHeadSha?: string;
+        /**
+         * Seam for the production-input qualification consumer, defaulting to the
+         * real one. Tests that are not exercising qualification stub it; the
+         * `--check` path never does, so GA always runs the full validator.
+         */
+        requireQualification?: (
+            rootDir: string,
+        ) => { u8Digest: string; lockSha256: string };
     } = {},
 ): InstalledReleaseEvidence {
     const evidence = validateInstalledReleaseEvidence(value);
@@ -853,6 +1066,14 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
     let qualifiedAttempts: string[] | null = null;
     const citedTestReports = new Map<string, string>();
     const workflowRunChecks = new Map<string, { ok: boolean; detail: string }>();
+    if (requireQualified) {
+        assertCitedArtifactsQualified(
+            rootDir,
+            contract,
+            evidence.release_contract_sha256,
+            options.requireQualification ?? requireQualificationEvidence,
+        );
+    }
     for (const proof of evidence.proof_artifacts) {
         const bytes = readFileSync(join(rootDir, proof.path));
         const digest = createHash("sha256").update(bytes).digest("hex");
@@ -959,12 +1180,24 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
                         self_fd_verified: target.self_fd_verified,
                         target: target.target,
                         test_report_path: verifiedTestReport?.path ?? null,
-                        test_report_sha256: verifiedTestReport?.sha256 ?? null,
+                        test_report_sha256: target.test_report_sha256,
                     }
                   : proof.kind === "product_flow" && flow
                     ? {
                           cli_commands_passed: flow.cli_commands_passed,
                           managed_demand_passed: flow.managed_demand_passed,
+                          // Without this the flow proof is three booleans that
+                          // say nothing about *what* was exercised, so a run
+                          // against a source checkout, a staged tarball, or a
+                          // stale install passes identically to one against the
+                          // published artifact. The registry proof establishes
+                          // that a package with this integrity exists; naming it
+                          // here is what ties those bytes to the behavior. Target
+                          // proofs already carry `package_integrity` for the same
+                          // reason.
+                          package_integrity: evidence.registry_packages.find(
+                              (entry) => entry.name === flow.package,
+                          )?.integrity,
                           offline_verified: flow.offline_verified,
                       }
                     : proof.kind === "publication"
@@ -978,6 +1211,18 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
                         }
                       : proof.kind === "production_synapse"
                         ? {
+                              // The bare boolean said nothing about which bytes ran
+                              // the production semantic lane, so a source checkout,
+                              // staged payload, or stale install produced an
+                              // identical proof. The Linux payload's published
+                              // integrity and the semantic report digest are what
+                              // tie the result to the artifact GA ships.
+                              package_integrity:
+                                  evidence.registry_packages.find((entry) =>
+                                      entry.name.endsWith("linux-x64-gnu"),
+                                  )?.integrity,
+                              production_synapse_report_sha256:
+                                  evidence.production_synapse_report_sha256,
                               production_synapse_verified:
                                   evidence.production_synapse_verified,
                           }
@@ -1149,6 +1394,7 @@ function buildTemplate(rootDir: string): InstalledReleaseEvidence {
             self_fd_verified: false,
             process_crash_atomicity_verified: false,
             lifecycle_smoke_passed: false,
+            test_report_sha256: null,
         })),
         productFlows: contract.packages.parents.map((name) => ({
             package: name,
@@ -1159,6 +1405,7 @@ function buildTemplate(rootDir: string): InstalledReleaseEvidence {
         oidcProvenanceVerified: false,
         longLivedTokenUsed: false,
         productionSynapseVerified: false,
+        productionSynapseReportSha256: null,
         proofArtifacts: [],
         qualified: false,
         blockers,

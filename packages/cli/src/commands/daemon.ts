@@ -2,13 +2,22 @@ import {
     createManagedLifecyclePolicy,
     type DaemonResultV1,
     type LifecycleCommand,
-    redactLifecyclePath,
     resolveLifecycleDataRoot,
     sensitiveRootsFor,
 } from "@magic-context/core/shared/mc-host-lifecycle";
 import { sanitizeDiagnosticText } from "../lib/redaction";
 
 const ACTIONS = new Set<LifecycleCommand>(["start", "stop", "restart", "status", "doctor"]);
+
+/** Display bound for peer-supplied version text, matching the shared
+ *  diagnostic-string limit used by the mc-host client. */
+const MAX_VERSION_TEXT_LEN = 128;
+
+/** C0 and C1 control characters (including ESC and newlines): peer-supplied
+ *  version text must not be able to move the cursor, erase lines, or forge
+ *  additional output lines in the terminal. */
+// biome-ignore lint/suspicious/noControlCharactersInRegex: neutralizing them is the point
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
 
 interface DaemonPolicy {
     start(): Promise<DaemonResultV1>;
@@ -76,7 +85,25 @@ function redactResult(
     const sensitiveRoots = root.ok ? sensitiveRootsFor(root.root, env) : [];
     const redact = (value: string | null): string | null => {
         if (value === null) return null;
-        return sanitizeDiagnosticText(redactLifecyclePath(value, sensitiveRoots));
+        // Failures inside the redaction chain (e.g. os.userInfo() throwing for
+        // a UID with no passwd entry) must not reject the command: the v1
+        // output contract requires exactly one result object, so fall back to
+        // a placeholder instead of leaking or throwing.
+        try {
+            // Replace every occurrence of each sensitive root, not just a
+            // leading prefix: version text is free-form and may embed a path
+            // mid-string (R35 requires no such path reaches output).
+            let redacted = value;
+            for (const sensitiveRoot of sensitiveRoots) {
+                redacted = redacted.split(sensitiveRoot).join("<data-root>");
+            }
+            redacted = sanitizeDiagnosticText(redacted).replace(CONTROL_CHARS, " ");
+            return redacted.length > MAX_VERSION_TEXT_LEN
+                ? redacted.slice(0, MAX_VERSION_TEXT_LEN)
+                : redacted;
+        } catch {
+            return "<REDACTED>";
+        }
     };
     return {
         ...result,
@@ -143,7 +170,20 @@ export async function runDaemonCommand(
         return 1;
     }
 
-    const redacted = redactResult(result, dependencies.env);
-    dependencies.stdout(parsed.json ? JSON.stringify(redacted) : renderDaemonHuman(redacted));
-    return redacted.ok ? 0 : 1;
+    // Redaction and rendering must not reject the command: an escaped throw
+    // would exit without any v1 object, violating the one-result contract.
+    let rendered: string;
+    let ok: boolean;
+    try {
+        const redacted = redactResult(result, dependencies.env);
+        rendered = parsed.json ? JSON.stringify(redacted) : renderDaemonHuman(redacted);
+        ok = redacted.ok;
+    } catch {
+        dependencies.stderr(
+            `Daemon ${parsed.action} produced a result that could not be rendered safely.`,
+        );
+        return 1;
+    }
+    dependencies.stdout(rendered);
+    return ok ? 0 : 1;
 }

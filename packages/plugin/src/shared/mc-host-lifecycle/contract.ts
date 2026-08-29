@@ -9,12 +9,10 @@
  */
 
 import { lstatSync } from "node:fs";
-import * as path from "node:path";
 import { releaseContract } from "./generated-contract";
+import { coordinationDirPath, runtimeDirPath } from "./paths";
 
 export type DaemonCommand = (typeof releaseContract.cli.commands)[number];
-/** The native binary additionally emits `probe` for its read-only command. */
-export type NativeCommand = DaemonCommand | "probe";
 export type DaemonState = (typeof releaseContract.cli.states)[number];
 export type CheckId = (typeof releaseContract.cli.check_ids)[number];
 export type CheckStatus = (typeof releaseContract.cli.check_statuses)[number];
@@ -124,7 +122,7 @@ export interface DaemonVersions {
 /** One validated `magic-context.daemon/v1` result object. */
 export interface DaemonResultV1 {
     schema: typeof DAEMON_RESULT_SCHEMA;
-    command: NativeCommand;
+    command: DaemonCommand;
     ok: boolean;
     state: DaemonState;
     reason: DaemonReason;
@@ -188,6 +186,13 @@ function parseReadinessRecord(value: unknown, component: string): ReadinessRecor
     if (typeof reason !== "string" || !isDaemonReason(reason)) {
         fail(`readiness.${component}.reason is outside the closed reason union`);
     }
+    // Each component state admits an explicit reason set rather than a blanket
+    // failing/non-failing split. `ready` asserts the component is usable, so a
+    // reason naming the failure that stopped it is self-contradictory — but the
+    // converse does not hold either: `unsupported` with `synapse_unsupported` is
+    // a legitimate non-failing pairing, while every `starting` reason is a
+    // failing one, so "non-ready implies failing" would reject conforming
+    // output. Only the exact pairings the daemon emits are accepted.
     const allowed = {
         transport: {
             ready: ["healthy"],
@@ -210,6 +215,12 @@ function parseReadinessRecord(value: unknown, component: string): ReadinessRecor
         | Record<string, readonly string[]>
         | undefined;
     if (!componentAllowed?.[state]?.includes(reason)) {
+        // The ready case gets its own wording: it is the one pairing whose
+        // danger is specific — a consumer told the component is serving while
+        // the reason names the failure that stopped it.
+        if (state === "ready" && !NON_FAILING_REASONS.has(reason)) {
+            fail(`readiness.${component} is ready with a failing reason`);
+        }
         fail(`readiness.${component} state contradicts its reason`);
     }
     return { state, reason };
@@ -248,7 +259,11 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
     );
     if (record.schema !== DAEMON_RESULT_SCHEMA) fail("schema is not magic-context.daemon/v1");
     const command = record.command;
-    if (typeof command !== "string" || !(COMMANDS.has(command) || command === "probe")) {
+    // The contract's command union is exactly start/stop/restart/status/doctor.
+    // `probe` is an accepted argv spelling of the read-only observation, but the
+    // binary answers it as `status`, so a `probe` in a *result* is a
+    // nonconforming payload rather than a dialect to tolerate.
+    if (typeof command !== "string" || !COMMANDS.has(command)) {
         fail("command is outside the closed union");
     }
     if (typeof record.ok !== "boolean") fail("ok is not a boolean");
@@ -259,6 +274,14 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
     const reason = record.reason;
     if (typeof reason !== "string" || !isDaemonReason(reason)) {
         fail("reason is outside the closed union");
+    }
+    // `ok` is the boolean summary of the reason's class, so exactly one of the
+    // two pairings is legal: a non-failing reason with `ok:true`, a failing
+    // reason with `ok:false`. Validating the two fields independently admits
+    // `{ok:true, reason:"internal_error"}`, which agrees with exit 0 and reads
+    // as success to every consumer that branches on `ok`.
+    if (record.ok !== NON_FAILING_REASONS.has(reason)) {
+        fail("ok disagrees with reason class");
     }
     if (state === "unavailable" && reason !== "no_data_dir") {
         fail("unavailable is legal only with no_data_dir");
@@ -274,13 +297,22 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
     if (record.ok !== expectedOk) {
         fail("ok contradicts the selected reason");
     }
+    // Membership in the remediation set is not enough: it admits a valid
+    // remediation borrowed from a *different* reason — `native_payload_missing`
+    // paired with `free_storage` — which sends an operator to fix storage when
+    // the payload is absent. The reason determines the remediation.
+    //
+    // `harness_unavailable` is the one contract-sanctioned exception: it is
+    // declared `remediation_from_subreason`, so `remediationForReason` answers
+    // null and the conforming result carries whichever remediation its
+    // subreason maps to. Only that reason gets the wider set.
     const expectedRemediation = remediationForReason(reason);
     const remediationMatches =
         reason === "harness_unavailable"
             ? remediation === null || remediation === "restart_with_supported_harness"
             : remediation === expectedRemediation;
     if (!remediationMatches) {
-        fail("remediation contradicts the selected reason");
+        fail("remediation does not match its reason");
     }
     const fixedReasonStates: Partial<Record<DaemonReason, DaemonState>> = {
         healthy: "running",
@@ -314,16 +346,34 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
             stop_committed: rawEffects.stop_committed,
             start_committed: rawEffects.start_committed,
         };
-    }
-    if (command === "restart" && effects === null) {
-        fail("restart requires effects");
-    }
-    if (
-        command === "restart" &&
-        record.ok &&
-        (effects?.start_committed !== true || state !== "running" || reason !== "started")
-    ) {
-        fail("successful restart contradicts its start effect");
+        // A restart's `ok` is the successor start's outcome — the native
+        // implementation derives `start_committed` from exactly that value — so
+        // `ok:true` with no committed start is self-contradictory, and exit 0
+        // agrees with it, handing callers a successful restart whose own
+        // transaction record says no successor came up.
+        //
+        // The converse is deliberately allowed: `ok:false` with
+        // `start_committed:true` is an honest report that the start committed
+        // before something later failed, and rejecting it would suppress
+        // evidence of a committed effect, which is the more dangerous error.
+        if (record.ok && !effects.start_committed) {
+            fail("a successful restart must report a committed start");
+        }
+        if (record.ok && (state !== "running" || reason !== "started")) {
+            fail("a successful restart contradicts its start effect");
+        }
+    } else if (command === "restart" && record.ok) {
+        // Guarding only the non-null branch left the evidence-free case open:
+        // `{command:"restart", ok:true, effects:null}` would parse and agree
+        // with exit 0, so a caller learned the restart succeeded but not that
+        // the stop and successor start committed. Every return path in the
+        // native `cmd_restart()` supplies effects, so their absence on a
+        // successful restart is skew rather than a reticent implementation.
+        //
+        // Only successful restarts are required to carry them: a killed
+        // transaction's outcome is genuinely unknown, and the policy's local
+        // results report `effects:null` precisely to avoid claiming otherwise.
+        fail("a successful restart must carry its effects");
     }
     let readiness: DaemonReadiness | null = null;
     if (record.readiness !== null) {
@@ -354,6 +404,22 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
         if (typeof checkReason !== "string" || !isDaemonReason(checkReason)) {
             fail("check reason is outside the closed union");
         }
+        // The same coupling the top-level `ok` gets: a check's status is the
+        // boolean summary of its reason's class, so a `pass` carrying an
+        // explicitly failing reason — or a `fail` carrying a non-failing one —
+        // hands diagnostic automation two contradictory answers about the same
+        // check, on a result that exit code 0 agrees with.
+        //
+        // Only `pass` and `fail` are constrained. `warn` and `skip` are not a
+        // class summary at all: a warn is a degraded-but-usable observation and
+        // a skip is an absence of evidence, and the contract does not fix which
+        // reason class either may carry.
+        if (status === "pass" && !NON_FAILING_REASONS.has(checkReason)) {
+            fail("a passing check carries a failing reason");
+        }
+        if (status === "fail" && NON_FAILING_REASONS.has(checkReason)) {
+            fail("a failing check carries a non-failing reason");
+        }
         const checkRemediation = check.remediation;
         if (
             checkRemediation !== null &&
@@ -361,16 +427,20 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
         ) {
             fail("check remediation is outside the closed union");
         }
-        const checkReasonIsSuccess = NON_FAILING_REASONS.has(checkReason);
-        if (
-            (status === "pass" && !checkReasonIsSuccess) ||
-            (status === "fail" && checkReasonIsSuccess) ||
-            (status === "skip" &&
-                checkReason !== "healthy" &&
-                checkReason !== "synapse_unsupported")
-        ) {
-            fail("check status contradicts its reason");
+        // Only `pass` and `fail` are constrained. `warn` and `skip` are not a
+        // class summary at all: a warn is a degraded-but-usable observation and
+        // a skip is an absence of evidence, and the contract does not fix which
+        // reason class either may carry.
+        if (status === "pass" && !NON_FAILING_REASONS.has(checkReason)) {
+            fail("a passing check carries a failing reason");
         }
+        if (status === "fail" && NON_FAILING_REASONS.has(checkReason)) {
+            fail("a failing check carries a non-failing reason");
+        }
+        // Same reason-determines-remediation rule as the top-level result: a
+        // per-check remediation borrowed from another reason misdirects the
+        // operator just as effectively. `harness_unavailable` is exempt for the
+        // same contract reason — its remediation comes from the subreason.
         const expectedCheckRemediation = remediationForReason(checkReason);
         if (
             checkReason !== "harness_unavailable" &&
@@ -409,7 +479,7 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
     };
     return {
         schema: DAEMON_RESULT_SCHEMA,
-        command: command as NativeCommand,
+        command: command as DaemonCommand,
         ok: record.ok,
         state: state as DaemonState,
         reason: reason as DaemonReason,
@@ -458,17 +528,21 @@ function probeEntry(entryPath: string): ProbeOutcome {
 
 /**
  * Classify the two roots that decide the no-probe verdict: the stable
- * coordination directory and the managed `cortexkit` subtree. Only two
+ * coordination directory and the daemon runtime directory. Only two
  * definitely absent roots classify as `absent` (reportable as `stopped`);
  * a symlink, special file, access error, or a presence flip between the two
  * bounded passes is a hazard, and anything else that exists is residual.
  * The classifier never creates, opens, follows, or mutates anything.
+ *
+ * Both roots must be daemon-owned. The enclosing `cortexkit` subtree is not:
+ * `data-path.ts` puts the application SQLite store at
+ * `<dataRoot>/cortexkit/magic-context`, so that directory exists on every
+ * install that has ever run the plugin and its presence says nothing about a
+ * daemon. Probing it would make `residual`/`wedged` the only reachable
+ * verdict in the field.
  */
 export function classifyPreNativeRoots(dataRoot: string): PreNativeRootsClassification {
-    const entries = [
-        path.join(dataRoot, releaseContract.coordination.directory),
-        path.join(dataRoot, "cortexkit"),
-    ];
+    const entries = [coordinationDirPath(dataRoot), runtimeDirPath(dataRoot)];
     const first = entries.map(probeEntry);
     const second = entries.map(probeEntry);
     for (let i = 0; i < entries.length; i++) {

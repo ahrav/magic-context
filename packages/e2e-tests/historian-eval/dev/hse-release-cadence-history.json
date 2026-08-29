@@ -1,0 +1,98 @@
+{
+  "schema": "historian-eval-scenario/v1",
+  "id": "hse-release-cadence-history",
+  "title": "Historical weekly release train must not surface as the current cadence",
+  "families": [
+    "current-vs-historical"
+  ],
+  "transcript": {
+    "turns": [
+      {
+        "user": "Reminder of where we came from: releases used to go out weekly on Fridays with a manual checklist.",
+        "assistant": "Yes \u2014 the weekly Friday release train with the manual checklist was the old process."
+      },
+      {
+        "user": "Now it is different: we ship daily through the canary pipeline, with the canary at 5 percent traffic for the first hour.",
+        "assistant": "Current process recorded: daily releases via the canary pipeline; canary holds 5 percent traffic for the first hour."
+      },
+      {
+        "user": "Rollback is automatic if the error rate doubles during the canary hour.",
+        "assistant": "Noted: automatic rollback when the canary error rate doubles."
+      },
+      {
+        "user": "That covers release process \u2014 thanks.",
+        "assistant": "Release-process notes captured; closing."
+      }
+    ],
+    "epilogueStartIndex": 3
+  },
+  "trigger": {
+    "expectedHistorianRuns": 2,
+    "modelContextLimit": 200000,
+    "usageTokensPerTurn": 1000,
+    "spikeUsageTokens": 90000,
+    "ballastTokensPerTurn": 1500,
+    "headroomMarginTokens": 2000
+  },
+  "gold": {
+    "expectedClaims": [
+      {
+        "id": "exp-daily-canary",
+        "category": "PROJECT_RULES",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "daily releases via the canary pipeline; canary holds 5 percent traffic"
+        },
+        "sourceTurnRange": [
+          1,
+          1
+        ]
+      },
+      {
+        "id": "exp-auto-rollback",
+        "category": "PROJECT_RULES",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "error rate doubles"
+        },
+        "sourceTurnRange": [
+          2,
+          2
+        ]
+      }
+    ],
+    "expectedAbsent": [
+      {
+        "id": "abs-weekly-current",
+        "family": "current-vs-historical",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "weekly"
+        }
+      }
+    ],
+    "compartments": {
+      "minCount": 1
+    }
+  },
+  "probes": [
+    {
+      "id": "probe-canary-traffic",
+      "question": "How much traffic does the canary take in the first hour?",
+      "answerType": "exact",
+      "goldAnswer": "5 percent",
+      "sourceClaimRef": "exp-daily-canary"
+    },
+    {
+      "id": "probe-cadence",
+      "question": "What is the current release cadence?",
+      "answerType": "multiple-choice",
+      "choices": [
+        "weekly",
+        "daily"
+      ],
+      "goldAnswer": "daily",
+      "sourceClaimRef": "exp-daily-canary"
+    }
+  ]
+}

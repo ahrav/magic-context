@@ -318,6 +318,16 @@ impl Supervisor {
         }
     }
 
+    /// The dispatched backend's standing `harness_unavailable` subreason for
+    /// `harness`, if it has one.
+    ///
+    /// Exposed so the component can honor the contract's reason precedence —
+    /// descriptor and closure conditions rank ahead of credential conditions —
+    /// before it verifies a credential snapshot on a send it would refuse anyway.
+    pub fn harness_unavailable_reason(&self, harness: Harness) -> Option<&'static str> {
+        self.inner.backend.unavailable_reason(harness)
+    }
+
     pub fn metrics(&self) -> SupervisorMetrics {
         let inner = &self.inner;
         let index = lock_index(inner);
@@ -758,7 +768,6 @@ impl Supervisor {
             model: request.model,
             max_output_tokens: request.max_output_tokens,
             temperature: request.temperature,
-            project_root: run.key.project_root.clone(),
             harness: run.key.harness,
             session: run.key.session.clone(),
             run_id: run.run_id.clone(),

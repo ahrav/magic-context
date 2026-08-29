@@ -99,14 +99,14 @@ function deferredSynapseConfig(
 }
 
 /**
- * Resolve daemon availability before registration so a fallback vector can never
- * be written under a Synapse identity. The registry receives only the selected
+ * Translate the configured embedding block into lane intents. Synapse lanes
+ * are deferred (no daemon probe here): the registry resolves them on first
+ * use and only then persists an identity, so a fallback vector can never be
+ * written under a Synapse identity. The registry receives only the selected
  * lane's provider fields, not the raw routing controls.
  */
 export async function resolveEmbeddingRouting(args: {
     config: MagicContextConfig;
-    projectRoot: string;
-    session?: string;
 }): Promise<ResolvedEmbeddingRouting> {
     const config = args.config.embedding;
     const { subc } = args.config;

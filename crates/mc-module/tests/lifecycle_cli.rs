@@ -233,7 +233,7 @@ fn probe_on_empty_root_reports_stopped_without_mutation() {
     let out = run(&data, &["probe"]);
     assert_eq!(out.code, 1);
     let value = out.json();
-    assert_result(&value, "probe", false, "stopped", "not_running");
+    assert_result(&value, "status", false, "stopped", "not_running");
     assert_eq!(value["remediation"], "run_daemon_start");
     assert_eq!(value["effects"], Value::Null);
     assert!(
@@ -365,6 +365,123 @@ fn dev_payload_without_explicit_test_self_exec_fails_closed() {
     );
 }
 
+/// A quarantined record with both fences free is classified identically by
+/// every command.
+///
+/// `probe_lifecycle` reports this shape as `stopped` (no fence is held), so a
+/// command that only checked the `wedged` shape would treat it as cleanly
+/// startable: `start`/`restart` would spawn a child that `InstanceGuard`
+/// refuses, then report `startup_timeout`, and `stop` would report a clean
+/// `already_stopped`. All four must surface `unsupported_state_schema`, and
+/// none may touch the preserved bytes.
+#[test]
+fn quarantined_record_is_classified_alike_by_every_command() {
+    let root = tempfile::tempdir().expect("root");
+    let data = root.path().join("data");
+    let run_dir = data.join("cortexkit").join("run");
+    std::fs::create_dir_all(&run_dir).expect("runtime dir");
+    for dir in [&data, &data.join("cortexkit"), &run_dir] {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).expect("dir mode");
+    }
+    // Schema 2 decodes as an unknown schema: preserved, never repaired.
+    let record = run_dir.join("mc-host-lifecycle.json");
+    let original = br#"{"schema":2,"unknown_future_field":true}"#;
+    std::fs::write(&record, original).expect("quarantined record");
+    std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600)).expect("record mode");
+
+    for (args, command, state) in [
+        (vec!["probe"], "status", "stopped"),
+        (vec!["start"], "start", "stopped"),
+        (vec!["stop"], "stop", "stopped"),
+        (vec!["restart"], "restart", "stopped"),
+    ] {
+        let out = run(&data, &args);
+        let value = out.json();
+        assert_eq!(out.code, 1, "{command} must fail closed");
+        assert_result(&value, command, false, state, "unsupported_state_schema");
+        assert_eq!(value["remediation"], "align_versions");
+        if command == "restart" {
+            assert_eq!(
+                effects(&value),
+                (false, false),
+                "restart must not commit a stop over a quarantined record"
+            );
+        }
+        // The quarantined bytes survive every command byte for byte.
+        assert_eq!(
+            std::fs::read(&record).expect("record still present"),
+            original,
+            "{command} must not rewrite the quarantined record"
+        );
+    }
+}
+
+/// `restart` proves the successor is resolvable before committing its stop.
+///
+/// The stop is irreversible, so a successor condition that was already true
+/// on disk must never be discovered after the daemon is down: that yields
+/// `stop_committed:true`, `start_committed:false`, and an outage with no
+/// takeover. The running daemon must still be serving afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_preflights_the_successor_before_committing_the_stop() {
+    let root = tempfile::tempdir().expect("root");
+    let data = root.path().join("data");
+    let payload = root.path().join("payload");
+    write_payload(&payload);
+    let payload_arg = payload.to_str().expect("payload path");
+    let mut janitor = DaemonJanitor {
+        root: data.clone(),
+        active: false,
+    };
+
+    let out = run(&data, &["start", "--payload-dir", payload_arg]);
+    janitor.active = true;
+    assert_eq!(out.code, 0, "start failed: {} {}", out.stdout, out.stderr);
+    assert_result(&out.json(), "start", true, "running", "started");
+
+    // Restart toward a payload that cannot resolve. The failure is detected
+    // before the stop, so neither effect bit is set.
+    let out = run(
+        &data,
+        &[
+            "restart",
+            "--payload-dir",
+            "/nonexistent-ck-mc-host-payload",
+        ],
+    );
+    assert_eq!(out.code, 1);
+    let value = out.json();
+    assert_result(
+        &value,
+        "restart",
+        false,
+        "running",
+        "native_payload_invalid",
+    );
+    assert_eq!(
+        effects(&value),
+        (false, false),
+        "an unresolvable successor must not commit a stop"
+    );
+
+    // The daemon is still serving: the publication still authenticates.
+    let out = run(&data, &["probe"]);
+    assert_eq!(out.code, 0);
+    assert_result(&out.json(), "status", true, "running", "healthy");
+    let publication = mc_host::runtime_dir_path(Some(&data))
+        .expect("runtime dir")
+        .join(mc_host::CONNECTION_FILE_NAME);
+    let client = mc_host::Client::connect(&publication)
+        .await
+        .expect("daemon still authenticates after the refused restart");
+    client.close().await.expect("client closes");
+
+    let out = run(&data, &["stop"]);
+    assert_eq!(out.code, 0, "stop failed: {} {}", out.stdout, out.stderr);
+    assert_result(&out.json(), "stop", true, "stopped", "stopped");
+    janitor.active = false;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn full_dev_mode_lifecycle_roundtrip() {
     let root = tempfile::tempdir().expect("root");
@@ -422,29 +539,18 @@ async fn full_dev_mode_lifecycle_roundtrip() {
     }
     client.close().await.expect("client closes");
 
-    // Publication daemon_ver is diagnostic only. Compatibility uses the
-    // version authenticated in the proof transcript.
-    let mut publication_json: Value =
-        serde_json::from_slice(&std::fs::read(&publication).expect("read publication"))
-            .expect("publication JSON");
-    publication_json["daemon_ver"] = Value::String("mc-host/9.9.9".to_owned());
-    std::fs::write(
-        &publication,
-        serde_json::to_vec(&publication_json).expect("publication serializes"),
-    )
-    .expect("rewrite publication diagnostic");
-    std::fs::set_permissions(&publication, std::fs::Permissions::from_mode(0o600))
-        .expect("publication mode");
+    // Compatibility uses the version authenticated in the proof transcript.
     let out = run(&data, &["start"]);
-    assert_eq!(out.code, 0);
+    assert_eq!(out.code, 0, "start failed: {} {}", out.stdout, out.stderr);
     let value = out.json();
     assert_result(&value, "start", true, "running", "already_running");
     assert_eq!(value["versions"]["daemon"], "mc-host/0.1.0");
 
-    // probe: running and healthy.
-    let out = run(&data, &["probe"]);
+    // status: running and healthy. The contracted verb; `probe` above covers
+    // the historical spelling of the same command.
+    let out = run(&data, &["status"]);
     assert_eq!(out.code, 0);
-    assert_result(&out.json(), "probe", true, "running", "healthy");
+    assert_result(&out.json(), "status", true, "running", "healthy");
 
     // Second start: compatible incarnation already running, no respawn.
     let out = run(&data, &["start", "--payload-dir", payload_arg]);

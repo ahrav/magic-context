@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { CatalogEntry } from "../mc-host-client";
+import type { AuthenticatedPeer, CatalogEntry } from "../mc-host-client";
 import {
     evaluateCompatibility,
     evaluateDaemonCompatibility,
@@ -14,6 +14,10 @@ function entry(id: string, version: string): CatalogEntry {
     return { module_id: id, module_version: version, roles: [], control_ops: [] };
 }
 
+function peer(daemonVer: string): AuthenticatedPeer {
+    return { daemonVer, daemonId: new Uint8Array(16), proof: "current" };
+}
+
 const healthyCatalog = [
     entry("magic-context", "0.1.0"),
     entry("synapse", "0.1.0"),
@@ -24,13 +28,34 @@ const healthyEpochs = { ...releaseContract.epochs };
 
 describe("daemon version range (U3 scenario 12)", () => {
     test("in-range authenticated versions pass; bounds are half-open", () => {
-        expect(evaluateDaemonCompatibility("mc-host/0.1.0")).toEqual({ ok: true });
-        expect(evaluateDaemonCompatibility("mc-host/0.1.99")).toEqual({ ok: true });
-        for (const bad of ["mc-host/0.2.0", "mc-host/0.0.9", "other/0.1.0", "mc-host/1", "0.1.0"]) {
-            const verdict = evaluateDaemonCompatibility(bad);
+        expect(evaluateDaemonCompatibility(peer("mc-host/0.1.0"))).toEqual({ ok: true });
+        expect(evaluateDaemonCompatibility(peer("mc-host/0.1.99"))).toEqual({ ok: true });
+        for (const bad of [
+            "mc-host/0.2.0",
+            "mc-host/0.0.9",
+            "other/0.1.0",
+            "mc-host/1",
+            "0.1.0",
+            "mc-host/00.1.0",
+            "mc-host/0.01.0",
+        ]) {
+            const verdict = evaluateDaemonCompatibility(peer(bad));
             expect(verdict.ok).toBe(false);
             if (!verdict.ok) expect(verdict.reason).toBe("incompatible_daemon");
         }
+    });
+
+    test("the gate consumes an authenticated peer, never a bare version string", () => {
+        // Taking the whole peer is what keeps untrusted publication metadata —
+        // a structurally similar record whose `daemonVer` has the same type —
+        // out of this range check. A bare string carries no `daemonVer` and
+        // reaches no verdict at all.
+        expect(evaluateDaemonCompatibility(peer(releaseContract.versions.daemon))).toEqual({
+            ok: true,
+        });
+        expect(() => evaluateDaemonCompatibility(releaseContract.versions.daemon as never)).toThrow(
+            TypeError,
+        );
     });
 });
 
@@ -106,12 +131,21 @@ describe("exact epoch comparison", () => {
         }
         expect(evaluateEpochCompatibility(healthyEpochs)).toEqual({ ok: true });
     });
+
+    test("an unknown epoch key fails even when every expected epoch matches", () => {
+        // Decoded JSON can carry keys the contract does not name; the observed
+        // set must equal the contract's, not merely cover it.
+        const withFuture = { ...healthyEpochs, future_contract: 99 };
+        const verdict = evaluateEpochCompatibility(withFuture as never);
+        expect(verdict.ok).toBe(false);
+        if (!verdict.ok) expect(verdict.reason).toBe("incompatible_epochs");
+    });
 });
 
 describe("composed gate order", () => {
     test("daemon range failure wins over module and epoch failures", () => {
         const verdict = evaluateCompatibility({
-            authenticatedDaemonVer: "mc-host/0.2.0",
+            authenticatedPeer: peer("mc-host/0.2.0"),
             catalog: [],
             epochs: {},
         });
@@ -122,7 +156,7 @@ describe("composed gate order", () => {
     test("a healthy triple passes end to end", () => {
         expect(
             evaluateCompatibility({
-                authenticatedDaemonVer: releaseContract.versions.daemon,
+                authenticatedPeer: peer(releaseContract.versions.daemon),
                 catalog: healthyCatalog,
                 epochs: healthyEpochs,
             }),
@@ -137,7 +171,6 @@ describe("semver parsing", () => {
             expect(parseSemverTriple(bad)).toBeNull();
         }
     });
-
     test("leading zeroes are rejected rather than normalized", () => {
         expect(parseSemverTriple("0.1.0")).toEqual([0, 1, 0]);
         // Each of these would parse to an in-range triple under `\d+`, so the
@@ -150,11 +183,21 @@ describe("semver parsing", () => {
     test("a non-canonical daemon version fails the compatibility gate", () => {
         // `00.01.000` normalizes to `[0, 1, 0]`, which is inside the supported
         // half-open range, so only canonical-form rejection keeps this closed.
-        const verdict = evaluateDaemonCompatibility("mc-host/00.01.000");
+        const verdict = evaluateDaemonCompatibility(peer("mc-host/00.01.000"));
         expect(verdict.ok).toBe(false);
         if (!verdict.ok) {
             expect(verdict.reason).toBe("incompatible_daemon");
             expect(verdict.detail).toBe("daemon version is not a canonical mc-host/X.Y.Z value");
         }
+    });
+
+    test("leading-zero components are not canonical", () => {
+        // `00.1.0` and `0.1.0` would otherwise parse to the same triple, so two
+        // distinct spellings of one version would both be accepted as canonical.
+        for (const bad of ["00.1.0", "0.01.0", "0.1.00", "01.2.3", "0.0.01"]) {
+            expect(parseSemverTriple(bad)).toBeNull();
+        }
+        expect(parseSemverTriple("0.0.0")).toEqual([0, 0, 0]);
+        expect(parseSemverTriple("10.20.30")).toEqual([10, 20, 30]);
     });
 });

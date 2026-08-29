@@ -44,10 +44,10 @@ impl mc_host::McHostHandler for EchoHandler {
 
     async fn handle(&self, ctx: mc_host::RequestCtx) -> mc_host::RequestOutcome {
         let Ok(mut body) = ctx.reserve_output(ctx.body.len()).await else {
-            return mc_host::RequestOutcome::Error {
-                code: "internal_error".to_owned(),
-                message: "output reservation unavailable".to_owned(),
-            };
+            return mc_host::RequestOutcome::error(
+                "internal_error",
+                "output reservation unavailable",
+            );
         };
         body.extend_from_slice(&ctx.body)
             .expect("reservation matches request length");

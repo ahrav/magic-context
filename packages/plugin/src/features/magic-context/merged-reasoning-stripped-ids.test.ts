@@ -1,9 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { Database } from "../../shared/sqlite";
-import { runMigrations } from "./migrations";
-import { initializeDatabase } from "./storage-db";
+import type { Database } from "../../shared/sqlite";
 import {
     addMergedReasoningStrippedIds,
     addTrailingBlankDecisions,
@@ -11,15 +9,14 @@ import {
     getTrailingBlankDecisions,
 } from "./storage-meta-persisted";
 import { clearSession } from "./storage-meta-session";
+import { createDirectTestDatabase } from "./test-database";
 
 describe("merged_reasoning_stripped_ids", () => {
     let db: Database;
     const sessionId = "ses-merged-reasoning";
 
     beforeEach(() => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
-        runMigrations(db);
+        db = createDirectTestDatabase().db;
     });
 
     afterEach(() => {
@@ -57,9 +54,7 @@ describe("trailing_blank_decisions", () => {
     const sessionId = "ses-trailing-blank";
 
     beforeEach(() => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
-        runMigrations(db);
+        db = createDirectTestDatabase().db;
     });
 
     afterEach(() => {

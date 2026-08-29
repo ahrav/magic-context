@@ -6,7 +6,7 @@
  * so no code path here can stop or replace a live daemon.
  */
 
-import type { CatalogEntry } from "../mc-host-client";
+import type { AuthenticatedPeer, CatalogEntry } from "../mc-host-client";
 import type { DaemonReason } from "./contract";
 import { releaseContract } from "./generated-contract";
 
@@ -32,7 +32,6 @@ type SemverTriple = [number, number, number];
  * satisfy a check whose verdict promises a canonical `X.Y.Z` value.
  */
 const CANONICAL_SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
-
 export function parseSemverTriple(value: string): SemverTriple | null {
     const match = CANONICAL_SEMVER.exec(value);
     if (!match) return null;
@@ -64,11 +63,20 @@ function inHalfOpenRange(
 }
 
 /**
- * Evaluate the authenticated `daemon_ver` (shape `mc-host/X.Y.Z`) against the
- * contract's half-open supported daemon range. Publication metadata must
- * never be passed here — only the handshake-retained value.
+ * Evaluate the handshake-authenticated `daemon_ver` (shape `mc-host/X.Y.Z`)
+ * against the contract's half-open supported daemon range. The parameter is
+ * the whole {@link AuthenticatedPeer} rather than its version string so the
+ * compiler refuses untrusted connection-file publication metadata, whose
+ * `daemonVer` is otherwise an identically typed string.
+ *
+ * The native binary gates the same value against the same contract range in
+ * `daemon_version_compatible` (`crates/mc-module/src/bin/ck-mc-host.rs`). The
+ * two implementations must accept exactly the same inputs; a divergence makes
+ * a native `probe`/`doctor` result and this policy verdict contradict each
+ * other for one daemon. Change both together, or neither.
  */
-export function evaluateDaemonCompatibility(authenticatedDaemonVer: string): CompatibilityVerdict {
+export function evaluateDaemonCompatibility(peer: AuthenticatedPeer): CompatibilityVerdict {
+    const authenticatedDaemonVer = peer.daemonVer;
     const raw = authenticatedDaemonVer.startsWith("mc-host/")
         ? authenticatedDaemonVer.slice("mc-host/".length)
         : null;
@@ -166,11 +174,26 @@ export function observedEpochsFromMagicContextMetrics(metrics: unknown): Observe
 }
 
 /**
- * Evaluate the exact five-part Magic Context epoch set. Every contract epoch
- * must be present, numeric, and exactly equal; missing, non-numeric, stale,
- * and future values all name the failing epoch.
+ * Evaluate the exact five-part Magic Context epoch set. The observed key set
+ * must equal the contract's: `observed` arrives as decoded JSON, which carries
+ * no type at runtime, so an extra key names an epoch this release cannot
+ * interpret and is a mismatch rather than a value to ignore. Every contract
+ * epoch must then be present, numeric, and exactly equal; missing,
+ * non-numeric, stale, and future values all name the failing epoch.
  */
 export function evaluateEpochCompatibility(observed: ObservedEpochs): CompatibilityVerdict {
+    const expectedNames = new Set(Object.keys(releaseContract.epochs));
+    const observedNames = Object.keys(observed);
+    if (
+        observedNames.length !== expectedNames.size ||
+        observedNames.some((name) => !expectedNames.has(name))
+    ) {
+        return {
+            ok: false,
+            reason: "incompatible_epochs",
+            detail: "epoch set does not match the release contract",
+        };
+    }
     for (const [name, expected] of Object.entries(releaseContract.epochs)) {
         const value = observed[name as EpochName];
         if (typeof value !== "number" || !Number.isSafeInteger(value)) {
@@ -192,7 +215,8 @@ export function evaluateEpochCompatibility(observed: ObservedEpochs): Compatibil
 }
 
 export interface CompatibilityInput {
-    authenticatedDaemonVer: string;
+    authenticatedPeer?: AuthenticatedPeer;
+    authenticatedDaemonVer?: string;
     catalog: CatalogEntry[];
     epochs: ObservedEpochs;
 }
@@ -209,8 +233,14 @@ export const COMPATIBILITY_STAGES = [
     {
         stage: "daemon",
         checkId: "compatibility.daemon",
-        evaluate: (input: CompatibilityInput): CompatibilityVerdict =>
-            evaluateDaemonCompatibility(input.authenticatedDaemonVer),
+        evaluate: (input: CompatibilityInput): CompatibilityVerdict => {
+            const peer = input.authenticatedPeer ?? {
+                daemonVer: input.authenticatedDaemonVer ?? "",
+                daemonId: new Uint8Array(),
+                proof: "current" as const,
+            };
+            return evaluateDaemonCompatibility(peer);
+        },
     },
     {
         stage: "modules",

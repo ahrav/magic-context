@@ -113,9 +113,14 @@ async function expectAuthFailure(
     code: AuthError["code"],
     deadline: Deadline = farDeadline(),
 ): Promise<void> {
-    const attempt = authenticateClient(io, { key: KEY, daemonId: DAEMON_ID }, deadline, {
-        ...injectedNonce,
-    });
+    const attempt = authenticateClient(
+        io,
+        { key: KEY, daemonId: DAEMON_ID, daemonVer: DAEMON_VER },
+        deadline,
+        {
+            ...injectedNonce,
+        },
+    );
     const error = await attempt.then(
         () => {
             throw new Error("authentication unexpectedly succeeded");
@@ -217,7 +222,7 @@ describe("authenticateClient transcript", () => {
         const io = new FakeIo(frameJson(serverProofMessage()));
         const result = await authenticateClient(
             io,
-            { key: KEY, daemonId: DAEMON_ID },
+            { key: KEY, daemonId: DAEMON_ID, daemonVer: DAEMON_VER },
             farDeadline(),
             injectedNonce,
         );
@@ -236,7 +241,7 @@ describe("authenticateClient transcript", () => {
         const io = new FakeIo(frameJson(serverProofMessage(), 4_096));
         const result = await authenticateClient(
             io,
-            { key: KEY, daemonId: DAEMON_ID },
+            { key: KEY, daemonId: DAEMON_ID, daemonVer: DAEMON_VER },
             farDeadline(),
             injectedNonce,
         );
@@ -349,6 +354,28 @@ describe("authenticateClient transcript", () => {
         expect(io.writes.length).toBe(1);
     });
 
+    test("a daemon_ver mismatch after a valid proof produces no ClientAuth", async () => {
+        const otherDaemonVer = "mc-host/999.0.0";
+        const proof = computeProof(
+            KEY,
+            "subc-server-v1",
+            CLIENT_NONCE,
+            SERVER_NONCE,
+            otherDaemonVer,
+            DAEMON_ID,
+        );
+        const io = new FakeIo(
+            frameJson(
+                serverProofMessage({
+                    daemon_ver: otherDaemonVer,
+                    server_proof: Array.from(proof),
+                }),
+            ),
+        );
+        await expectAuthFailure(io, "daemon_ver_mismatch");
+        expect(io.writes.length).toBe(1);
+    });
+
     test("EOF during the length prefix or the body fails auth", async () => {
         const emptyIo = new FakeIo(new Uint8Array(0));
         await expectAuthFailure(emptyIo, "io_failure");
@@ -381,7 +408,7 @@ describe("authenticateClient transcript", () => {
         const io = new FakeIo(frameJson(serverProofMessage()));
         const attempt = authenticateClient(
             io,
-            { key: KEY.subarray(0, 31), daemonId: DAEMON_ID },
+            { key: KEY.subarray(0, 31), daemonId: DAEMON_ID, daemonVer: DAEMON_VER },
             farDeadline(),
             injectedNonce,
         );
@@ -396,9 +423,11 @@ describe("authenticateClient transcript", () => {
         const first = new FakeIo(new Uint8Array(0));
         const second = new FakeIo(new Uint8Array(0));
         for (const io of [first, second]) {
-            await authenticateClient(io, { key: KEY, daemonId: DAEMON_ID }, farDeadline()).catch(
-                () => {},
-            );
+            await authenticateClient(
+                io,
+                { key: KEY, daemonId: DAEMON_ID, daemonVer: DAEMON_VER },
+                farDeadline(),
+            ).catch(() => {});
         }
         const nonceOf = (io: FakeIo): number[] =>
             (decodeWrite(io.writes[0] as Uint8Array) as { client_nonce: number[] }).client_nonce;

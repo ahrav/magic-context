@@ -11,9 +11,10 @@
  * `HMAC-SHA256(key, ASCII(domain) || client_nonce || server_nonce ||
  * u32be(len(daemon_ver)) || UTF8(daemon_ver) || daemon_id)`.
  * The client compares the server proof in constant time, then requires the
- * server's daemon ID to equal the connection-file daemon ID, and emits no
- * ClientAuth until both checks pass. Every failure is typed and redacted:
- * no key, nonce, or proof byte ever appears in an error message.
+ * server's daemon ID to equal the connection-file daemon ID and its daemon
+ * version to equal the connection-file `daemon_ver`, and emits no ClientAuth
+ * until every check passes. Every failure is typed and redacted: no key,
+ * nonce, or proof byte ever appears in an error message.
  */
 
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
@@ -48,6 +49,7 @@ export type AuthErrorCode =
     | "malformed_message"
     | "proof_mismatch"
     | "daemon_id_mismatch"
+    | "daemon_ver_mismatch"
     | "invalid_credentials";
 
 /** Typed, redacted authentication failure. Never carries secret bytes. */
@@ -67,9 +69,26 @@ export interface AuthenticateOptions {
     generateNonce?: (length: number) => Uint8Array;
 }
 
+/**
+ * One connection file's validated authentication material.
+ *
+ * `daemonVer` is the file's `daemon_ver`. It is the expected value the peer
+ * must report, not a claim about the peer, and it is required: the version
+ * cross-check runs on every handshake, so a caller with no expected version
+ * has no authenticated connection to make.
+ */
+export interface AuthCredentials {
+    key: Uint8Array;
+    daemonId: Uint8Array;
+    daemonVer: string;
+}
+
 /** Result of a successful handshake. */
 export interface AuthResult {
-    /** The server-reported daemon version string (diagnostic metadata). */
+    /**
+     * The server-reported daemon version string, necessarily equal to
+     * `credentials.daemonVer`: any other value fails the handshake.
+     */
     daemonVer: string;
     daemonId: Uint8Array;
 }
@@ -229,13 +248,14 @@ function parseServerProof(message: unknown): ServerProofFields {
  * Run the client side of the three-message handshake over `io`, bounded by
  * `deadline`. Emits ClientAuth only after the server proof passed a
  * constant-time comparison AND the server's daemon ID equals
- * `credentials.daemonId`. Any malformed field, proof mismatch, daemon-ID
- * mismatch, EOF, or deadline expiry rejects with a typed {@link AuthError}
- * and writes nothing further.
+ * `credentials.daemonId` AND the server's daemon version equals
+ * `credentials.daemonVer`. Any malformed field, proof mismatch, daemon-ID
+ * mismatch, daemon-version mismatch, EOF, or deadline expiry rejects with a
+ * typed {@link AuthError} and writes nothing further.
  */
 export async function authenticateClient(
     io: AuthByteIo,
-    credentials: { key: Uint8Array; daemonId: Uint8Array },
+    credentials: AuthCredentials,
     deadline: Deadline,
     options: AuthenticateOptions = {},
 ): Promise<AuthResult> {
@@ -274,6 +294,14 @@ export async function authenticateClient(
         throw new AuthError(
             "server daemon id does not match the connection file",
             "daemon_id_mismatch",
+        );
+    }
+    // The proof authenticates `daemon_ver`; equality with the connection file
+    // also binds it to the discovery snapshot used to dial this peer.
+    if (server.daemonVer !== credentials.daemonVer) {
+        throw new AuthError(
+            "server daemon version does not match the connection file",
+            "daemon_ver_mismatch",
         );
     }
     const clientAuth = computeProof(

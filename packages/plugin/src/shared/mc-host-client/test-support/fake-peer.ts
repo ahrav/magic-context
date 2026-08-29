@@ -489,6 +489,8 @@ export class FakePeer {
     readonly connections: FakePeerConnection[] = [];
     readonly key: Buffer;
     readonly daemonId: Buffer;
+    /** The `daemon_ver` this peer reports in every ServerProof. */
+    readonly daemonVer: string;
     /**
      * Raw bytes coalesced into the same write as every subsequent
      * ServerHello (for example an encoded Goodbye frame), so the client's
@@ -509,10 +511,11 @@ export class FakePeer {
         this.server = server;
         this.key = options.key ?? randomBytes(32);
         this.daemonId = options.daemonId ?? randomBytes(16);
+        this.daemonVer = options.daemonVer ?? "fake-peer/0.0.1";
         this.negotiateMode = options.negotiate ?? "echo-tcp";
         const connectionOptions = {
             authMode: options.authMode ?? ("accept" as PeerAuthMode),
-            daemonVer: options.daemonVer ?? "fake-peer/0.0.1",
+            daemonVer: this.daemonVer,
             key: this.key,
             daemonId: this.daemonId,
             helloTrailer: () => this.helloTrailer,

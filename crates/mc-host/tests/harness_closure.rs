@@ -1,7 +1,10 @@
+#[path = "../src/file_mode.rs"]
+mod file_mode;
 #[path = "../src/harness_closure.rs"]
 mod harness_closure;
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -160,18 +163,22 @@ fn resolved_descriptor_is_rewound_after_verification() {
         .resolve_node_descriptor("node_modules/pi/dist/helper.js")
         .expect("resolve node");
 
-    // Verification hashes the node to EOF through an offset-sharing dup. A
-    // macOS child opening `/dev/fd/N` receives a dup of this descriptor,
-    // offset included, so a descriptor left at EOF reads as an empty file.
-    let offset = rustix::fs::seek(
-        unsafe { std::os::fd::BorrowedFd::borrow_raw(node.inherited_fd()) },
-        rustix::fs::SeekFrom::Current(0),
-    )
-    .expect("query descriptor offset");
+    // A macOS child opening `/dev/fd/N` receives a dup of this descriptor with
+    // its offset, so the handed-out descriptor must start at the first byte.
+    // Check both the offset and the bytes a child would read.
+    // SAFETY: `node` owns this descriptor for the duration of the borrow.
+    let inherited = unsafe { std::os::fd::BorrowedFd::borrow_raw(node.inherited_fd()) };
+    let offset = rustix::fs::seek(inherited, rustix::fs::SeekFrom::Current(0))
+        .expect("query descriptor offset");
     assert_eq!(
         offset, 0,
         "a handed-out node descriptor must be positioned at the start of the file"
     );
+    let mut bytes = Vec::new();
+    std::fs::File::from(rustix::io::dup(inherited).expect("duplicate inherited descriptor"))
+        .read_to_end(&mut bytes)
+        .expect("read inherited descriptor");
+    assert_eq!(bytes, b"export const answer = 42");
 }
 
 #[test]
@@ -532,5 +539,161 @@ fn retained_closure_rejects_extra_missing_and_wrong_mode_nodes() {
             .expect_err("wrong mode must fail")
             .detail(),
         "closure file is not owner-only single-link"
+    );
+}
+
+#[test]
+fn prune_reclaims_unprotected_digests_and_stale_temps_only() {
+    let (temp, _source, candidate) = setup();
+    let store_root = temp.path().join("closures");
+    let store = HarnessClosureStore::open(&store_root).expect("store");
+    let closure = store.materialize(&candidate).expect("materialize");
+    let digest = closure.digest().to_owned();
+
+    // A staging directory orphaned by an interrupted copy, and an entry the
+    // store did not create (neither digest-named nor `.tmp-`-prefixed).
+    std::fs::create_dir(store_root.join(".tmp-deadbeefdeadbeef")).expect("stale temp");
+    std::fs::set_permissions(
+        store_root.join(".tmp-deadbeefdeadbeef"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("temp mode");
+    std::fs::create_dir(store_root.join("foreign-entry")).expect("foreign entry");
+
+    let protected = std::collections::BTreeSet::from([digest.clone()]);
+    store.prune(&protected).expect("prune with protection");
+    assert!(
+        store_root.join(&digest).is_dir(),
+        "protected digest survives"
+    );
+    assert!(
+        !store_root.join(".tmp-deadbeefdeadbeef").exists(),
+        "stale staging directory is reclaimed"
+    );
+    assert!(
+        store_root.join("foreign-entry").is_dir(),
+        "entries the store did not create are left untouched"
+    );
+    store
+        .validate(&digest)
+        .expect("protected closure still validates");
+
+    store
+        .prune(&std::collections::BTreeSet::new())
+        .expect("prune without protection");
+    assert!(
+        !store_root.join(&digest).is_dir(),
+        "unprotected digest is reclaimed"
+    );
+}
+
+#[test]
+fn native_edges_and_native_addons_must_correspond_exactly() {
+    let (_temp, _source, candidate) = setup();
+
+    // A non-native edge onto a native addon is rejected, matching the
+    // qualification-side biconditional.
+    let mut static_edge = candidate.clone();
+    static_edge.manifest.nodes[2].dependencies = vec![
+        dependency("node_modules/pi/dist/addon.node", DependencyKind::Static),
+        dependency("node_modules/pi/dist/helper.js", DependencyKind::Static),
+    ];
+    assert_eq!(
+        validate_manifest(&static_edge.manifest)
+            .expect_err("static edge onto native addon")
+            .detail(),
+        "native dependency kind must correspond exactly to a native addon target"
+    );
+
+    // A native addon with no inbound native edge is rejected even when the
+    // graph is otherwise reachable.
+    let mut unclaimed = candidate.clone();
+    unclaimed.manifest.nodes[2].dependencies = vec![
+        dependency(
+            "node_modules/pi/dist/addon.node",
+            DependencyKind::FiniteDynamic,
+        ),
+        dependency("node_modules/pi/dist/helper.js", DependencyKind::Static),
+    ];
+    assert_eq!(
+        validate_manifest(&unclaimed.manifest)
+            .expect_err("finite_dynamic edge onto native addon")
+            .detail(),
+        "native dependency kind must correspond exactly to a native addon target"
+    );
+}
+
+/// Paths sort by code point, so a sibling whose next byte after the parent
+/// prefix is below `/` sits between a parent file and its nested child:
+/// `bin/node`, `bin/node.dat`, `bin/node/main.js`. Checking only the
+/// immediately preceding entry read `bin/node.dat` as the parent, missed the
+/// collision with the regular file `bin/node`, and left an unbuildable manifest
+/// to fail during materialization instead of validation.
+#[test]
+fn a_parent_file_collision_is_caught_across_an_intervening_sibling() {
+    let (_temp, _source, candidate) = setup();
+
+    let mut adjacent = candidate.manifest.clone();
+    adjacent.nodes.push(node(
+        "bin/node/main.js",
+        "bin/node/main.js",
+        NodeKind::Module,
+        b"nested under a file",
+        vec![],
+    ));
+    adjacent.nodes.sort_by(|a, b| a.path.cmp(&b.path));
+    assert_eq!(
+        validate_manifest(&adjacent)
+            .expect_err("a child of a regular file is not materializable")
+            .detail(),
+        "manifest node path collides with a parent file"
+    );
+
+    let mut separated = adjacent.clone();
+    separated.nodes.push(node(
+        "bin/node.dat",
+        "bin/node.dat",
+        NodeKind::Data,
+        b"sorts between the parent and its child",
+        vec![],
+    ));
+    separated.nodes.sort_by(|a, b| a.path.cmp(&b.path));
+    let paths: Vec<&str> = separated
+        .nodes
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect();
+    assert_eq!(
+        &paths[..3],
+        &["bin/node", "bin/node.dat", "bin/node/main.js"],
+        "the sibling must sort between the parent file and its child for this case to bite"
+    );
+    assert_eq!(
+        validate_manifest(&separated)
+            .expect_err("an intervening sibling must not hide the collision")
+            .detail(),
+        "manifest node path collides with a parent file"
+    );
+}
+
+/// The qualifier rejects two edges naming one target, whatever their kinds.
+/// `ClosureDependency` orders on `(path, kind)`, so `(p, Static)` then
+/// `(p, Native)` is strictly increasing as a tuple — the runtime admitted a
+/// manifest the qualifier refuses, which is the gap the native-edge rules above
+/// exist to close.
+#[test]
+fn duplicate_dependency_targets_are_rejected_across_kinds() {
+    let (_temp, _source, candidate) = setup();
+    let mut duplicated = candidate.manifest.clone();
+    duplicated.nodes[2].dependencies = vec![
+        dependency("node_modules/pi/dist/addon.node", DependencyKind::Native),
+        dependency("node_modules/pi/dist/helper.js", DependencyKind::Static),
+        dependency("node_modules/pi/dist/helper.js", DependencyKind::Native),
+    ];
+    assert_eq!(
+        validate_manifest(&duplicated)
+            .expect_err("one target named twice")
+            .detail(),
+        "node dependencies are not uniquely sorted by target path"
     );
 }

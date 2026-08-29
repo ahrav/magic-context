@@ -3,6 +3,7 @@ import {
     chmodSync,
     closeSync,
     constants,
+    existsSync,
     mkdtempSync,
     openSync,
     rmSync,
@@ -10,7 +11,7 @@ import {
 } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { NativeLaunchError, retainedExecutablePath, runNativeLifecycle } from "./native-launcher";
+import { NativeLaunchError, runNativeLifecycle } from "./native-launcher";
 
 const SECRET = "hunter2-credential-canary";
 
@@ -27,7 +28,9 @@ function scriptBinary(dir: string, body: string): string {
 function probeResultJson(ok: boolean): string {
     return JSON.stringify({
         schema: "magic-context.daemon/v1",
-        command: "probe",
+        // The `probe` argv is answered as `status`: that is the contracted name
+        // for the read-only observation, and the command union has no `probe`.
+        command: "status",
         ok,
         state: ok ? "running" : "stopped",
         reason: ok ? "healthy" : "not_running",
@@ -50,10 +53,30 @@ describe("native launcher output handling (U3 scenario 17)", () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), "mc-native-launcher-"));
     process.on("exit", () => rmSync(dir, { recursive: true, force: true }));
 
-    test("retained descriptor execution uses the certified platform namespace", () => {
-        expect(retainedExecutablePath("linux", 7)).toBe("/proc/self/fd/7");
-        expect(retainedExecutablePath("darwin", 7)).toBe("/dev/fd/7");
-        expect(() => retainedExecutablePath("win32", 7)).toThrow(/unsupported on this platform/);
+    test("retained descriptor execution is refused on an uncertified platform", async () => {
+        const binary = scriptBinary(dir, `echo '${probeResultJson(false)}'\nexit 1`);
+        const fd = openSync(binary, constants.O_RDONLY | constants.O_NOFOLLOW);
+        try {
+            // A host outside the certified namespace table has no
+            // retained-descriptor exec path at all, so it must fail as a
+            // platform reason rather than as a spawn error against a path that
+            // cannot exist. The linux and darwin arms are covered end to end by
+            // the inherited-fd test below, which runs the real path.
+            await expect(
+                runNativeLifecycle(
+                    { kind: "retained-fd", fd },
+                    { command: "probe", deadlineMs: 10_000, platform: "win32" },
+                ),
+            ).rejects.toThrow(NativeLaunchError);
+            await expect(
+                runNativeLifecycle(
+                    { kind: "retained-fd", fd },
+                    { command: "probe", deadlineMs: 10_000, platform: "win32" },
+                ),
+            ).rejects.toMatchObject({ code: "unsupported_platform" });
+        } finally {
+            closeSync(fd);
+        }
     });
 
     test("a retained executable descriptor runs through the inherited child fd", async () => {
@@ -178,6 +201,103 @@ describe("native launcher output handling (U3 scenario 17)", () => {
         expect(Date.now() - started).toBeLessThan(5_000);
     }, 10_000);
 
+    test("an exhausted deadline is rejected before any child is spawned", async () => {
+        // setTimeout coerces a nonpositive or non-finite delay to 1ms, so
+        // without a pre-spawn check a mutating transaction would start and be
+        // SIGKILLed a millisecond later, leaving effects behind for a call that
+        // had no budget. The sentinel proves no child ran.
+        const sentinel = path.join(dir, "exhausted-deadline-ran");
+        const binary = scriptBinary(dir, `touch ${sentinel}`);
+        for (const deadlineMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+            let error: NativeLaunchError | null = null;
+            try {
+                await runNativeLifecycle(
+                    { kind: "test-binary", path: binary },
+                    { command: "start", deadlineMs },
+                );
+            } catch (caught) {
+                error = caught as NativeLaunchError;
+            }
+            expect(error?.code).toBe("usage_error");
+        }
+        expect(existsSync(sentinel)).toBe(false);
+    }, 10_000);
+
+    test("relative launch paths are rejected before a child is spawned", async () => {
+        // The child runs with cwd: "/", so a relative value silently changes
+        // meaning instead of failing. A first segment colliding with a real root
+        // entry is the dangerous case: "bin/echo" resolves to /bin/echo and
+        // executes the WRONG binary, surfacing later as malformed output.
+        const sentinel = path.join(dir, "relative-path-ran");
+        const absolute = scriptBinary(dir, `touch ${sentinel}\necho '${probeResultJson(false)}'`);
+        const relative = path.relative(process.cwd(), absolute);
+        expect(path.isAbsolute(relative)).toBe(false);
+
+        let targetError: NativeLaunchError | null = null;
+        try {
+            await runNativeLifecycle(
+                { kind: "test-binary", path: relative },
+                { command: "probe", deadlineMs: 10_000 },
+            );
+        } catch (caught) {
+            targetError = caught as NativeLaunchError;
+        }
+        expect(targetError?.code).toBe("usage_error");
+        expect(targetError?.message).toContain("not absolute");
+
+        let payloadError: NativeLaunchError | null = null;
+        try {
+            await runNativeLifecycle(
+                { kind: "test-binary", path: absolute },
+                { command: "start", deadlineMs: 10_000, payloadDir: "./dist" },
+            );
+        } catch (caught) {
+            payloadError = caught as NativeLaunchError;
+        }
+        expect(payloadError?.code).toBe("usage_error");
+        expect(payloadError?.message).toContain("payload directory is not absolute");
+
+        // Neither call reached a child.
+        expect(existsSync(sentinel)).toBe(false);
+    }, 10_000);
+
+    test("byte-invalid stdout fails closed instead of decoding to U+FFFD", async () => {
+        // Buffer.toString("utf8") substitutes U+FFFD for an invalid byte, so a
+        // corrupt byte inside an otherwise well-formed JSON string would parse,
+        // validate, and be accepted as a conforming result carrying a silently
+        // mangled value. The payload here is contract-valid except that one byte
+        // of `versions.release` is 0xFF, which is not legal UTF-8.
+        const valid = probeResultJson(false);
+        const marker = '"release":"0.38.0"';
+        expect(valid).toContain(marker);
+        const [head, tail] = valid.split(marker) as [string, string];
+        const payload = Buffer.concat([
+            Buffer.from(head, "utf8"),
+            Buffer.from('"release":"0.3', "utf8"),
+            Buffer.from([0xff]),
+            Buffer.from('8.0"', "utf8"),
+            Buffer.from(tail, "utf8"),
+        ]);
+        // Sanity: lossy decoding really would accept this, which is the bug.
+        expect(() => JSON.parse(payload.toString("utf8"))).not.toThrow();
+
+        const payloadFile = path.join(dir, "corrupt-stdout.bin");
+        writeFileSync(payloadFile, payload);
+        const binary = scriptBinary(dir, `cat ${payloadFile}\nexit 1`);
+        let error: NativeLaunchError | null = null;
+        try {
+            await runNativeLifecycle(
+                { kind: "test-binary", path: binary },
+                { command: "probe", deadlineMs: 10_000 },
+            );
+        } catch (caught) {
+            error = caught as NativeLaunchError;
+        }
+        expect(error).toBeInstanceOf(NativeLaunchError);
+        expect(error?.code).toBe("malformed_output");
+        expect(error?.message).toContain("not valid UTF-8");
+    }, 10_000);
+
     test("usage exits (2) are a typed contract failure with no lifecycle result", async () => {
         const binary = scriptBinary(dir, `exit 2`);
         let error: NativeLaunchError | null = null;
@@ -204,6 +324,71 @@ describe("native launcher output handling (U3 scenario 17)", () => {
         expect(result.reason).toBe("not_running");
     });
 
+    test("an envelope that cannot be serialized fails before a child exists", async () => {
+        const sentinel = path.join(dir, "unserializable-envelope-child-ran");
+        const binary = scriptBinary(dir, `: > "${sentinel}"\nsleep 2`);
+        const envelope: Record<string, unknown> = {};
+        envelope.self = envelope;
+        let error: NativeLaunchError | null = null;
+        try {
+            await runNativeLifecycle(
+                { kind: "test-binary", path: binary },
+                { command: "probe", deadlineMs: 250, envelope },
+            );
+        } catch (caught) {
+            error = caught as NativeLaunchError;
+        }
+        expect(error).toBeInstanceOf(NativeLaunchError);
+        expect(error?.code).toBe("usage_error");
+        // Serializing after the spawn would let the raw serialization throw
+        // escape with a live child that nothing collects or kills; the absent
+        // marker proves no child ever ran.
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        expect(existsSync(sentinel)).toBe(false);
+    }, 10_000);
+
+    test("an envelope with no JSON form is typed, not a silently empty stdin", async () => {
+        const binary = scriptBinary(dir, `echo '${probeResultJson(false)}'\nexit 1`);
+        let error: NativeLaunchError | null = null;
+        try {
+            await runNativeLifecycle(
+                { kind: "test-binary", path: binary },
+                { command: "probe", deadlineMs: 10_000, envelope: () => "no json form" },
+            );
+        } catch (caught) {
+            error = caught as NativeLaunchError;
+        }
+        expect(error).toBeInstanceOf(NativeLaunchError);
+        expect(error?.code).toBe("usage_error");
+    });
+
+    test("stderr past the cap is discarded without killing a healthy child", async () => {
+        // Stderr must stay drained, not closed: this child writes far past the
+        // cap and then its conforming object, so a closed read end would take
+        // the write side down with EPIPE/SIGPIPE before stdout ever arrives.
+        const binary = scriptBinary(
+            dir,
+            [
+                "chunk=xxxxxxxxxxxxxxxx",
+                "chunk=$chunk$chunk$chunk$chunk",
+                "chunk=$chunk$chunk$chunk$chunk",
+                "chunk=$chunk$chunk$chunk$chunk",
+                "i=0",
+                "while [ $i -lt 512 ]; do",
+                '  echo "$chunk" >&2',
+                "  i=$((i + 1))",
+                "done",
+                `echo '${probeResultJson(false)}'`,
+                "exit 1",
+            ].join("\n"),
+        );
+        const result = await runNativeLifecycle(
+            { kind: "test-binary", path: binary },
+            { command: "probe", deadlineMs: 10_000 },
+        );
+        expect(result.reason).toBe("not_running");
+    }, 15_000);
+
     test("spawn failure for a missing binary is typed", async () => {
         let error: NativeLaunchError | null = null;
         try {
@@ -215,5 +400,39 @@ describe("native launcher output handling (U3 scenario 17)", () => {
             error = caught as NativeLaunchError;
         }
         expect(error?.code).toBe("spawn_failed");
+    });
+
+    test("a platform with no descriptor exec path is a platform failure, not a spawn error", async () => {
+        let error: NativeLaunchError | null = null;
+        try {
+            await runNativeLifecycle(
+                { kind: "retained-fd", fd: 0 },
+                { command: "probe", deadlineMs: 10_000, platform: "win32" },
+            );
+        } catch (caught) {
+            error = caught as NativeLaunchError;
+        }
+        // Neither procfs_self_fd_exec nor dev_fd_exec: report the real reason
+        // instead of spawning a path that cannot exist.
+        expect(error?.code).toBe("unsupported_platform");
+    });
+
+    test("darwin resolves the retained descriptor through /dev/fd, not procfs", async () => {
+        // The contract gives darwin `dev_fd_exec` and linux
+        // `procfs_self_fd_exec`; a darwin launch must not reach /proc.
+        let error: NativeLaunchError | null = null;
+        try {
+            await runNativeLifecycle(
+                { kind: "retained-fd", fd: 0 },
+                { command: "probe", deadlineMs: 10_000, platform: "darwin" },
+            );
+        } catch (caught) {
+            error = caught as NativeLaunchError;
+        }
+        // On this linux host /dev/fd/3 is not an executable image, so the
+        // spawn fails; the point is that it was attempted at all rather than
+        // rejected as an unsupported platform.
+        expect(error).toBeInstanceOf(NativeLaunchError);
+        expect(error?.code).not.toBe("unsupported_platform");
     });
 });

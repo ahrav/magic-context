@@ -111,7 +111,7 @@ Then create `magic-context.jsonc` with the one setting the historian needs:
 - **Optional:** `dreamer` and `sidekick` model/disable blocks. Omit them to leave periodic memory consolidation and `/ctx-aug` off.
 - **Optional:** `embedding`. Omit it to use the local `Xenova/bge-small-en-v1.5`; turning embeddings off removes semantic/embedding-backed search, but keyword search and context management continue.
 
-User-level config is `~/.config/cortexkit/magic-context.jsonc` on macOS/Linux and `%USERPROFILE%\.config\cortexkit\magic-context.jsonc` on Windows (or `$XDG_CONFIG_HOME/cortexkit/magic-context.jsonc` when set). OpenCode Desktop users can use the dashboard's config editor or hand-edit that file; Desktop does not include the CLI setup wizard.
+User-level config is `~/.config/cortexkit/magic-context.jsonc` on macOS/Linux and `%USERPROFILE%\.config\cortexkit\magic-context.jsonc` on Windows (or `$XDG_CONFIG_HOME/cortexkit/magic-context.jsonc` when set). OpenCode Desktop users hand-edit that file; Desktop does not include the CLI setup wizard.
 
 ## Verify the install
 
@@ -150,7 +150,3 @@ Add `--force` to automatically fix what doctor can — it clears stale plugin ca
 ## Model configuration
 
 The setup wizard helps you pick a model for the historian and dreamer agents — they don't need a top-tier model, and a model that bills per request (e.g. GitHub Copilot) keeps background-work cost flat. There's no hidden fallback to models you didn't configure; see the [configuration reference](/reference/configuration/) for `model` and optional `fallback_models`.
-
-## Dashboard
-
-Magic Context ships a companion desktop app for browsing memories, session history, cache diagnostics, and dreamer runs. See the [dashboard reference](/reference/dashboard/) or download it from the [GitHub releases page](https://github.com/cortexkit/magic-context/releases).

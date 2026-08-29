@@ -50,11 +50,14 @@ pub const MAX_BOUND_ROUTES: usize = 1024;
 /// the supervisor's budget: [`MAX_BOUND_ROUTES`] bound identities, each a
 /// project root of up to 4096 bytes plus a session of up to 256 bytes, three
 /// provider fingerprints (bounded provider name + 64 hex bytes), and map/key
-/// overhead. Declared to the host on top of
-/// [`MAX_RETAINED_BYTES`] so the published reservation remains an actual
-/// ceiling on resident bytes.
+/// overhead. The per-route fingerprints live in a `BTreeMap` whose single
+/// leaf node allocates ~11 key/value slots (~528 bytes) regardless of entry
+/// count, on top of the per-entry heap strings and the outer `HashMap`
+/// slot — the 1024-byte overhead term covers that container cost so the
+/// published reservation remains an actual ceiling on resident bytes,
+/// declared to the host on top of [`MAX_RETAINED_BYTES`].
 pub const ROUTE_IDENTITY_HEADROOM_BYTES: u64 =
-    (MAX_BOUND_ROUTES as u64) * (4096 + 256 + 3 * (16 + 64) + 256);
+    (MAX_BOUND_ROUTES as u64) * (4096 + 256 + 3 * (16 + 64) + 1024);
 
 /// Worst case for live backend transcript capture, also outside the
 /// supervisor's budget: each of the [`MAX_BACKEND_PROCESSES`] concurrent

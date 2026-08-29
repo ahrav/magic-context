@@ -30,12 +30,13 @@ const SESSION_META_FALLBACK_SELECTS: Partial<
     cached_m0_mural_data_url: "NULL AS cached_m0_mural_data_url",
     cached_m0_mural_hash: "NULL AS cached_m0_mural_hash",
     cached_m1_bytes: "NULL AS cached_m1_bytes",
+    cached_m0_claim_format_epoch: "NULL AS cached_m0_claim_format_epoch",
+    cached_m0_claim_snapshot_vector: "NULL AS cached_m0_claim_snapshot_vector",
+    cached_m0_rendered_revision_locators: "NULL AS cached_m0_rendered_revision_locators",
     cached_m0_project_memory_epoch: "NULL AS cached_m0_project_memory_epoch",
     cached_m0_project_user_profile_version: "NULL AS cached_m0_project_user_profile_version",
     cached_m0_max_compartment_seq: "NULL AS cached_m0_max_compartment_seq",
-    cached_m0_max_memory_id: "NULL AS cached_m0_max_memory_id",
     cached_m0_max_mutation_id: "NULL AS cached_m0_max_mutation_id",
-    cached_m0_max_memory_mutation_id: "NULL AS cached_m0_max_memory_mutation_id",
     cached_m0_project_docs_hash: "NULL AS cached_m0_project_docs_hash",
     cached_m0_materialized_at: "NULL AS cached_m0_materialized_at",
     cached_m0_session_facts_version: "NULL AS cached_m0_session_facts_version",
@@ -231,7 +232,6 @@ export function clearSession(db: Database, sessionId: string): void {
     db.transaction(() => {
         db.prepare("DELETE FROM pending_ops WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM source_contents WHERE session_id = ?").run(sessionId);
-        db.prepare("DELETE FROM tool_owner_backfill_state WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM tags WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM session_meta WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM session_projects WHERE session_id = ?").run(sessionId);

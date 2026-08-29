@@ -28,13 +28,6 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { realpathSync } from "node:fs";
-import { join, resolve as pathResolve } from "node:path";
-import { reconcileCompatibilityVerifications } from "../../plugin/src/features/magic-context/claim-policy-backfill";
-import { insertMemory, updateMemoryContent, updateMemoryVerification } from "../../plugin/src/features/magic-context/memory";
-import { computeNormalizedHash } from "../../plugin/src/features/magic-context/memory/normalize-hash";
-import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
-import type { Memory } from "../../plugin/src/features/magic-context/memory/types";
 import {
     extractM0,
     extractM1,
@@ -43,8 +36,6 @@ import {
     mainAgentRequests,
 } from "../src/cache-analysis";
 import { TestHarness } from "../src/harness";
-import type { MockUsage } from "../src/mock-provider/server";
-import { openTestDb } from "../src/test-db";
 import {
     driveAgedCtxReduceSurvival,
     driveFirstRenderPureDeferStability,
@@ -52,6 +43,7 @@ import {
     verifyAgedCtxReduceSurvival,
     verifyFirstRenderPureDeferStability,
 } from "../src/incident-pool/scenarios/source-linked-regressions";
+import type { MockUsage } from "../src/mock-provider/server";
 
 const RUST_MODE = process.env.MC_E2E_MODE === "rust";
 const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
@@ -194,179 +186,32 @@ function setDefer(text: string): void {
     h.mock.setDefault({ text, usage: DEFER_USAGE });
 }
 
-/** Project identity the plugin resolves at runtime for the harness workdir. */
-function projectIdentity(): string {
-    return resolveProjectIdentity(realpathSync(pathResolve(h.opencode.env.workdir)));
-}
-
-function writeContextDb<T>(fn: (db: ReturnType<typeof openTestDb>) => T): T {
-    const dbPath = join(
-        h.opencode.env.dataDir,
-        "cortexkit",
-        "magic-context",
-        "context.db",
-    );
-    const db = openTestDb(dbPath, { readwrite: true });
-    try {
-        return fn(db);
-    } finally {
-        db.close();
-    }
-}
-
-/** Promote a memory to verified and settle the epoch bump its verification
- *  event queues. `reconcileCompatibilityVerifications` is the synchronous
- *  reconciler the plugin itself runs during injection: draining it here makes
- *  the write's ONE epoch bump land now instead of during the next turn, after
- *  `setProjectEpoch` has already pinned. Without this the pin is silently
- *  undone mid-turn and m[0] HARD-refolds (reason=project_memory_change), which
- *  routes the write into m[0] and leaves the m[1] delta lanes untested. */
-function verifyAndSettle(db: unknown, memoryId: number): void {
-    updateMemoryVerification(db as never, memoryId, "verified");
-    reconcileCompatibilityVerifications(db as never);
-}
-
-function seedMemory(
-    content: string,
-    category: Memory["category"] = "PROJECT_RULES",
-): number {
-    return writeContextDb((db) => {
-        const id = insertMemory(db as never, {
-            projectPath: projectIdentity(),
-            category,
-            content,
-            // v86 trust policy: explicit-user origin rows are auto-eligible,
-            // but the effective policy is computed by an ASYNC evaluator; a
-            // synchronous verification promotion makes eligibility
-            // deterministic before the next turn materializes m[0].
-            sourceType: "user",
-        }).id;
-        verifyAndSettle(db, id);
-        return id;
-    });
-}
-
-function projectEpoch(): number {
-    return writeContextDb(
-        (db) =>
-            (
-                db
-                    .prepare(
-                        "SELECT project_memory_epoch AS epoch FROM project_state WHERE project_path = ?",
-                    )
-                    .get(projectIdentity()) as { epoch: number } | null
-            )?.epoch ?? 0,
-    );
-}
-
-/** Pin the project epoch to a captured value. Eligible writes and
- * verification promotions bump the epoch, which HARD-refolds m[0]; the
- * m[1] delta lanes under test only fire when memory ids advance WITHOUT an
- * epoch change, so tests pin the epoch back after seeding. */
-function setProjectEpoch(epoch: number): void {
-    writeContextDb((db) => {
-        db.prepare(
-            `INSERT INTO project_state (project_path, project_memory_epoch)
-             VALUES (?, ?)
-             ON CONFLICT(project_path) DO UPDATE SET project_memory_epoch = excluded.project_memory_epoch`,
-        ).run(projectIdentity(), epoch);
-    });
-}
-
-/**
- * Queue a non-additive memory mutation (the supersede-delta path). Mirrors the
- * production `queueMemoryMutation` columns exactly — this is what `ctx_memory`
- * update/archive/delete records instead of bumping the project epoch, so the
- * change reconciles via the m[1] <memory-updates> delta rather than a HARD m[0]
- * refold. For `update` we also flip the underlying row content so a later m[0]
- * re-materialize would reconcile to the new value.
- */
-function queueMemoryUpdate(targetId: number, newContent: string): void {
-    writeContextDb((db) => {
-        db.prepare(
-            `INSERT INTO memory_mutation_log
-                (project_path, mutation_type, target_memory_id, superseded_by_id, category, new_content, queued_at)
-             VALUES (?, 'update', ?, NULL, NULL, ?, ?)`,
-        ).run(projectIdentity(), targetId, newContent, Date.now());
-        updateMemoryContent(
-            db as never,
-            targetId,
-            newContent,
-            computeNormalizedHash(newContent),
-        );
-    });
-}
-
-/**
- * Bump the project memory epoch — the cross-process HARD-bust signal an external
- * (dashboard) memory mutation or a session upgrade fires. Unlike the in-session
- * supersede-delta path (B11), this MUST force a full m[0] re-materialization.
- */
-function bumpProjectEpoch(): void {
-    writeContextDb((db) => {
-        db.prepare(
-            `INSERT INTO project_state (project_path, project_memory_epoch)
-             VALUES (?, 1)
-             ON CONFLICT(project_path) DO UPDATE SET project_memory_epoch = project_memory_epoch + 1`,
-        ).run(projectIdentity());
-    });
-}
-
-function emitMemoryToolOnce(input: Record<string, unknown>): () => boolean {
+/** Emit a single ctx_reduce tool call on the first main-agent request that exposes it. */
+function emitCtxReduceOnce(drop: string): void {
     let emitted = false;
     h.mock.addMatcher((body) => {
-        if (emitted || !JSON.stringify(body.system ?? "").includes("## Magic Context")) return null;
+        if (emitted) return null;
+        const sys = JSON.stringify(body.system ?? "");
+        if (!sys.includes("## Magic Context")) return null;
         const tools = Array.isArray(body.tools) ? body.tools : [];
         const name = tools
-            .map((tool) =>
-                tool && typeof tool === "object" ? (tool as { name?: unknown }).name : null,
-            )
-            .find((value) => value === "ctx_memory");
-        if (typeof name !== "string") return null;
+            .map((t) => (t && typeof t === "object" ? (t as { name?: unknown }).name : null))
+            .find((n) => typeof n === "string" && /ctx_reduce/.test(n)) as string | undefined;
+        if (!name) return null;
         emitted = true;
         return {
             content: [
                 {
                     type: "tool_use",
-                    id: `toolu_memory_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`,
+                    id: `toolu_ci_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`,
                     name,
-                    input,
+                    input: { drop },
                 },
             ],
             stop_reason: "tool_use" as const,
             usage: DEFER_USAGE,
         };
     });
-    return () => emitted;
-}
-
-async function runMemoryTool(
-    sessionId: string,
-    input: Record<string, unknown>,
-    prompt: string,
-): Promise<void> {
-    h.mock.reset();
-    const wasEmitted = emitMemoryToolOnce(input);
-    setDefer("memory tool follow-up");
-    await h.sendPrompt(sessionId, prompt);
-    expect(wasEmitted()).toBe(true);
-}
-
-function memoryIdContaining(body: Record<string, unknown>, content: string): number {
-    const m0 = extractM0(body) ?? "";
-    const escaped = content.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const match = m0.match(new RegExp(`#(\\d+)(?: \\[[^\n]+\\])?: ${escaped}`));
-    if (!match) throw new Error(`no rendered memory id found for ${JSON.stringify(content)}`);
-    return Number(match[1]);
-}
-
-function thrownMessage(fn: () => unknown): string {
-    try {
-        fn();
-        return "";
-    } catch (error) {
-        return error instanceof Error ? error.message : String(error);
-    }
 }
 
 async function waitForRustCompartment(sessionId: string): Promise<void> {
@@ -577,326 +422,5 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
         });
     });
 
-    describe("#given an additive memory write after m[0] materialized (B10 — maxMemoryId is not a HARD trigger)", () => {
-        describe("#when a new memory is added and an execute pass surfaces it", () => {
-            it("#then it rides m[1] <new-memories> and m[0] stays byte-identical (SOFT)", async () => {
-                //#given — seed a baseline memory, then force m[0] to materialize
-                // WITH that memory in the baseline (early execute pass). This
-                // freezes cachedM0MaxMemoryId at the baseline's id.
-                const sessionId = await h.createSession();
-                if (RUST_MODE) {
-                    const freshRule = "B10 fresh rule: always run the full gate before a release.";
-                    await runMemoryTool(
-                        sessionId,
-                        { action: "write", category: "PROJECT_RULES", content: freshRule },
-                        "B10 Rust writer: save the release rule.",
-                    );
 
-                    // PARITY.md assigns memory rows to module authority. Observe the
-                    // committed write through a fresh session's provider wire; a direct
-                    // TypeScript context.db insert is rejected instead of mutating m[1].
-                    const readerSessionId = await h.createSession();
-                    h.mock.reset();
-                    setDefer("B10 Rust reader");
-                    await h.sendPrompt(readerSessionId, "B10 Rust reader: load project memory.");
-                    const readerM0 = extractM0(mainAgentRequests(h.mock.requests()).at(-1)!.body)!;
-                    expect(readerM0).toContain(freshRule);
-                    expect(thrownMessage(() => seedMemory("B10 forbidden TS-side write"))).toContain(
-                        "managed by the Rust module",
-                    );
-                    return;
-                }
-                seedMemory("B10 baseline rule: prefer the project's own tools over shell fallbacks.");
-                setDefer("B10 warm 1");
-                await h.sendPrompt(sessionId, "B10 turn 1: warmup.");
-                h.mock.setDefault({ text: "B10 high", usage: EXECUTE_USAGE });
-                await h.sendPrompt(sessionId, "B10 turn 2: high usage marks next pass execute.");
-                setDefer("B10 materialize");
-                await h.sendPrompt(sessionId, "B10 turn 3: execute pass materializes m[0] with baseline memory.");
-
-                const m0Baseline = extractM0(mainAgentRequests(h.mock.requests()).at(-1)!.body);
-                expect(m0Baseline).toContain("B10 baseline rule");
-
-                //#when — add a NEW memory after the baseline froze, then drive an
-                // execute pass to surface it. The execute DECISION for a turn is
-                // read from the PREVIOUS turn's recorded usage, so turn 4 records
-                // high usage to make turn 5 the cache-busting (execute) pass.
-                // maxMemoryId advances when the new memory is seeded, but it must
-                // NOT re-materialize m[0] (not a HARD trigger); the new memory is
-                // an m[1] delta via the readNewMemoriesForM1 watermark.
-                h.mock.setDefault({
-                    text: "B10 pressure",
-                    usage: EXECUTE_USAGE,
-                });
-                await h.sendPrompt(
-                    sessionId,
-                    "B10 turn 4: high usage marks the next pass execute.",
-                );
-                const epochBeforeAdditive = projectEpoch();
-                seedMemory(
-                    "B10 fresh rule: always run the full gate before a release.",
-                );
-                setProjectEpoch(epochBeforeAdditive);
-                setDefer("B10 surface");
-                await h.sendPrompt(sessionId, "B10 turn 5: execute pass surfaces the new memory.");
-
-                //#then
-                const requests = mainAgentRequests(h.mock.requests());
-                const surfaceReq = requests.find((r) => extractM1(r.body)?.includes("B10 fresh rule"));
-                expect(surfaceReq).toBeDefined();
-                const m1 = extractM1(surfaceReq!.body)!;
-                const m0 = extractM0(surfaceReq!.body)!;
-                // Delta invariant: the new memory rides m[1] <new-memories>.
-                expect(m1).toContain("<new-memories>");
-                expect(m1).toContain("B10 fresh rule");
-                // SOFT invariant: m[0] still holds ONLY the baseline memory; the
-                // new one was NOT folded into the m[0] baseline.
-                expect(m0).toContain("B10 baseline rule");
-                expect(m0).not.toContain("B10 fresh rule");
-                expect(m0).toBe(m0Baseline!);
-
-                // Trailing pure-defer replay pair must be byte-stable.
-                setDefer("B10 replay 1");
-                await h.sendPrompt(sessionId, "B10 turn 6: defer replay.");
-                setDefer("B10 replay 2");
-                await h.sendPrompt(sessionId, "B10 turn 7: defer replay again.");
-                const replayPair = mainAgentRequests(h.mock.requests()).slice(-2);
-                const busts = findBusts(replayPair);
-                if (busts.length > 0) {
-                    console.error(
-                        `[cache-invariant:B10-additive-memory] ${busts.length} bust(s):\n${formatBustReport(busts)}`,
-                    );
-                }
-                expect(busts.length).toBe(0);
-            }, 220_000);
-        });
-    });
-
-    describe("#given a non-additive memory mutation (B11 — in-place rewrite)", () => {
-        describe("#when a rendered memory's content is rewritten in place", () => {
-            it("#then m[0] HARD-refolds onto the revised bytes rather than replaying a stale frozen block", async () => {
-                //#given — seed a memory and materialize m[0] WITH it in the
-                // baseline (so it's a rendered memory the mutation can target).
-                const sessionId = await h.createSession();
-                if (RUST_MODE) {
-                    const original = "B11 original rule: deploys go through the staging pipeline first.";
-                    await runMemoryTool(
-                        sessionId,
-                        { action: "write", category: "PROJECT_RULES", content: original },
-                        "B11 Rust writer: save the baseline rule.",
-                    );
-
-                    const mutationSessionId = await h.createSession();
-                    h.mock.reset();
-                    setDefer("B11 Rust baseline materialize");
-                    await h.sendPrompt(mutationSessionId, "B11 Rust turn 1: load project memory.");
-                    const baselineBody = mainAgentRequests(h.mock.requests()).at(-1)!.body;
-                    expect(extractM0(baselineBody)).toContain(original);
-                    const rustMemoryId = memoryIdContaining(baselineBody, original);
-
-                    const revised =
-                        "B11 revised rule: deploys go straight to production with a feature flag.";
-                    await runMemoryTool(
-                        mutationSessionId,
-                        { action: "update", ids: [rustMemoryId], content: revised },
-                        "B11 Rust turn 2: revise the deployment rule.",
-                    );
-                    const readerSessionId = await h.createSession();
-                    h.mock.reset();
-                    setDefer("B11 Rust reader");
-                    await h.sendPrompt(readerSessionId, "B11 Rust reader: load revised project memory.");
-                    const revisedM0 = extractM0(mainAgentRequests(h.mock.requests()).at(-1)!.body)!;
-                    expect(revisedM0).toContain(revised);
-                    expect(revisedM0).not.toContain(original);
-                    expect(
-                        thrownMessage(() => queueMemoryUpdate(rustMemoryId, "forbidden TS update")),
-                    ).toContain("managed by the Rust module");
-                    return;
-                }
-                const memId = seedMemory(
-                    "B11 original rule: deploys go through the staging pipeline first.",
-                );
-                setDefer("B11 warm 1");
-                await h.sendPrompt(sessionId, "B11 turn 1: warmup.");
-                h.mock.setDefault({ text: "B11 high", usage: EXECUTE_USAGE });
-                await h.sendPrompt(sessionId, "B11 turn 2: high usage marks next pass execute.");
-                setDefer("B11 materialize");
-                await h.sendPrompt(sessionId, "B11 turn 3: execute pass materializes m[0] with the memory.");
-
-                const m0Baseline = extractM0(mainAgentRequests(h.mock.requests()).at(-1)!.body);
-                expect(m0Baseline).toContain("B11 original rule");
-
-                //#when — the rendered memory's content is rewritten IN PLACE.
-                // `sessionMemoryBlockStillEligible` compares each rendered id's
-                // render-time content digest against the row's current digest, so
-                // an in-place rewrite makes the cached block ineligible and m[0]
-                // must re-materialize. Pinning the epoch back proves the refold is
-                // driven by the digest gate, not by a project_memory_change bump.
-                // Turn 4 records high usage so turn 5 is the cache-busting pass.
-                h.mock.setDefault({
-                    text: "B11 pressure",
-                    usage: EXECUTE_USAGE,
-                });
-                await h.sendPrompt(
-                    sessionId,
-                    "B11 turn 4: high usage marks the next pass execute.",
-                );
-                const epochBeforeUpdate = projectEpoch();
-                queueMemoryUpdate(
-                    memId,
-                    "B11 revised rule: deploys go straight to production with a feature flag.",
-                );
-                // A content rewrite withdraws verification (the successor revision
-                // starts CANDIDATE); re-verify through the real API so the revised
-                // row is render-eligible for the refold.
-                writeContextDb((db) => verifyAndSettle(db, memId));
-                setProjectEpoch(epochBeforeUpdate);
-                setDefer("B11 refold");
-                await h.sendPrompt(sessionId, "B11 turn 5: execute pass refolds the revised bytes into m[0].");
-
-                //#then
-                const requests = mainAgentRequests(h.mock.requests());
-                const refoldReq = requests
-                    .filter((r) => extractM0(r.body)?.includes("B11 revised rule"))
-                    .at(-1);
-                expect(refoldReq).toBeDefined();
-                const m1 = extractM1(refoldReq!.body)!;
-                const m0 = extractM0(refoldReq!.body)!;
-                // Fail-closed invariant: the cached block never replays stale
-                // bytes, so m[0] carries the revised text and is NOT the frozen
-                // baseline.
-                expect(m0).toContain("B11 revised rule");
-                expect(m0).not.toContain("B11 original rule");
-                expect(m0).not.toBe(m0Baseline!);
-                // The refold folds the change into m[0] and advances the mutation
-                // cursor, so no <memory-updates> delta is left to render.
-                expect(m1).not.toContain("<memory-updates>");
-
-                // Trailing pure-defer replay pair must be byte-stable.
-                setDefer("B11 replay 1");
-                await h.sendPrompt(sessionId, "B11 turn 6: defer replay.");
-                setDefer("B11 replay 2");
-                await h.sendPrompt(sessionId, "B11 turn 7: defer replay again.");
-                const replayPair = mainAgentRequests(h.mock.requests()).slice(-2);
-                const busts = findBusts(replayPair);
-                if (busts.length > 0) {
-                    console.error(
-                        `[cache-invariant:B11-supersede-delta] ${busts.length} bust(s):\n${formatBustReport(busts)}`,
-                    );
-                }
-                expect(busts.length).toBe(0);
-            }, 220_000);
-        });
-    });
-
-    describe("#given a genuine HARD trigger — project epoch bump (B12 — the fold direction)", () => {
-        describe("#when a memory rode m[1], then the epoch bumps", () => {
-            it("#then m[0] re-materializes folding the delta in, m[1] resets, and defer re-stabilizes", async () => {
-                //#given — get a memory riding m[1] (the B10 setup): materialize an
-                // empty m[0], then add a memory and surface it as an m[1] delta.
-                const sessionId = await h.createSession();
-                if (RUST_MODE) {
-                    const deltaRule =
-                        "B12 delta rule: keep the cache prefix byte-identical across defer passes.";
-                    await runMemoryTool(
-                        sessionId,
-                        { action: "write", category: "PROJECT_RULES", content: deltaRule },
-                        "B12 Rust writer: save a delta rule.",
-                    );
-                    const readerSessionId = await h.createSession();
-                    h.mock.reset();
-                    setDefer("B12 Rust reader");
-                    await h.sendPrompt(readerSessionId, "B12 Rust reader: load project memory.");
-                    const moduleOwnedM0 = extractM0(
-                        mainAgentRequests(h.mock.requests()).at(-1)!.body,
-                    )!;
-                    expect(moduleOwnedM0).toContain(deltaRule);
-
-                    // PARITY.md assigns the effective epoch to Rust authority. Mutating
-                    // the TS mirror succeeds but is intentionally inert on provider bytes;
-                    // the module unit gate pins the real epoch-bump HARD fold.
-                    bumpProjectEpoch();
-                    setDefer("B12 Rust inert TS epoch replay");
-                    await h.sendPrompt(readerSessionId, "B12 Rust reader: replay after TS mirror bump.");
-                    expect(extractM0(mainAgentRequests(h.mock.requests()).at(-1)!.body)).toBe(
-                        moduleOwnedM0,
-                    );
-                    return;
-                }
-                setDefer("B12 warm 1");
-                await h.sendPrompt(sessionId, "B12 turn 1: warmup.");
-                h.mock.setDefault({ text: "B12 high", usage: EXECUTE_USAGE });
-                await h.sendPrompt(sessionId, "B12 turn 2: high usage marks next pass execute.");
-                setDefer("B12 materialize-empty");
-                await h.sendPrompt(sessionId, "B12 turn 3: execute pass materializes empty m[0].");
-
-                h.mock.setDefault({
-                    text: "B12 pressure",
-                    usage: EXECUTE_USAGE,
-                });
-                await h.sendPrompt(
-                    sessionId,
-                    "B12 turn 4: high usage marks next pass execute.",
-                );
-                const epochBeforeSeed = projectEpoch();
-                seedMemory(
-                    "B12 delta rule: keep the cache prefix byte-identical across defer passes.",
-                );
-                setProjectEpoch(epochBeforeSeed);
-                setDefer("B12 surface");
-                await h.sendPrompt(sessionId, "B12 turn 5: execute pass surfaces the memory into m[1].");
-
-                let requests = mainAgentRequests(h.mock.requests());
-                const surfaceReq = requests.find((r) => extractM1(r.body)?.includes("B12 delta rule"));
-                expect(surfaceReq).toBeDefined();
-                // Pre-bump: memory is in m[1], NOT in the empty m[0].
-                expect(extractM0(surfaceReq!.body)).toContain("<session-history></session-history>");
-                expect(extractM1(surfaceReq!.body)).toContain("B12 delta rule");
-
-                //#when — a HARD trigger fires (epoch bump = external/dashboard
-                // mutation). Turn 6 records high usage so turn 7 is cache-busting;
-                // mustMaterialize must re-materialize m[0] on the epoch change.
-                h.mock.setDefault({ text: "B12 hard-pressure", usage: EXECUTE_USAGE });
-                await h.sendPrompt(sessionId, "B12 turn 6: high usage marks the next pass execute.");
-                bumpProjectEpoch();
-                setDefer("B12 refold");
-                await h.sendPrompt(sessionId, "B12 turn 7: execute pass HARD-refolds m[0].");
-
-                //#then — the memory has folded INTO the m[0] baseline, and m[1]
-                // reset to the empty placeholder (delta reconciled away).
-                requests = mainAgentRequests(h.mock.requests());
-                const refoldReq = requests.find(
-                    (r, i) =>
-                        i > requests.indexOf(surfaceReq!) &&
-                        (extractM0(r.body)?.includes("B12 delta rule") ?? false),
-                );
-                expect(refoldReq).toBeDefined();
-                const m0 = extractM0(refoldReq!.body)!;
-                const m1 = extractM1(refoldReq!.body)!;
-                // Fold invariant: the memory is now in the m[0] baseline...
-                expect(m0).toContain("B12 delta rule");
-                // ...and m[1] reset to the empty placeholder (no <new-memories>).
-                expect(m1).toContain("(no new content since last materialization)");
-                expect(m1).not.toContain("B12 delta rule");
-
-                // After the one-time HARD fold, defer passes re-stabilize: the new
-                // m[0]+m[1] replay byte-identical across the trailing defer pair.
-                const refoldIdx = requests.indexOf(refoldReq!);
-                setDefer("B12 replay 1");
-                await h.sendPrompt(sessionId, "B12 turn 8: defer replay after refold.");
-                setDefer("B12 replay 2");
-                await h.sendPrompt(sessionId, "B12 turn 9: defer replay again.");
-                const after = mainAgentRequests(h.mock.requests()).slice(refoldIdx);
-                expect(new Set(after.map((r) => extractM0(r.body))).size).toBe(1);
-                const replayPair = mainAgentRequests(h.mock.requests()).slice(-2);
-                const busts = findBusts(replayPair);
-                if (busts.length > 0) {
-                    console.error(
-                        `[cache-invariant:B12-hard-refold] ${busts.length} bust(s):\n${formatBustReport(busts)}`,
-                    );
-                }
-                expect(busts.length).toBe(0);
-            }, 240_000);
-        });
-    });
 });

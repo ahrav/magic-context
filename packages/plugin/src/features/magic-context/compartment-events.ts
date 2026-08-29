@@ -42,6 +42,18 @@ export interface StoredCompartmentEvent extends CompartmentEventInput {
     createdAt: number;
 }
 
+export interface ProjectCompartmentEvent extends StoredCompartmentEvent {
+    compartmentStartMessage: number | null;
+    compartmentEndMessage: number | null;
+    /**
+     * Harness that wrote the event. Required to read anything else keyed by
+     * session id: the same session id can belong to a different project per
+     * harness, so a consumer joining on session id alone reads another
+     * project's rows.
+     */
+    harness: string;
+}
+
 /**
  * Persist historian-extracted events for a publish.
  *
@@ -100,6 +112,87 @@ export function getCompartmentEvents(db: Database, sessionId: string): StoredCom
         atCompartment: r.at_compartment,
         fields: parseFields(r.fields_json),
         createdAt: r.created_at,
+    }));
+}
+
+/**
+ * Read project-scoped events oldest first for idempotent background consumers.
+ *
+ * `pendingForProducer` excludes events the producer already receipted under the
+ * `event:<id>` operation-key convention, so consumed events are never re-read
+ * and per-call cost stays proportional to the unconsumed backlog rather than
+ * project lifetime. `limit` bounds one call so a large backlog drains across
+ * runs instead of inside one long write transaction.
+ *
+ * The `session_projects` join must match on harness as well as session id.
+ * That table is keyed `(session_id, harness)`, so one session id can carry a
+ * different project binding per harness; joining on session id alone attributes
+ * an event to BOTH bindings. Since the receipt key is `event:<id>` and is not
+ * project-scoped, the first project to harvest such an event writes it into its
+ * own durable memory and receipts it globally, so the owning project never sees
+ * it. Cross-harness leakage is a correctness bug, not a feature.
+ */
+export function getProjectCompartmentEvents(
+    db: Database,
+    projectIdentity: string,
+    kind: string,
+    options: { pendingForProducer?: string; limit?: number } = {},
+): ProjectCompartmentEvent[] {
+    const receiptFilter = options.pendingForProducer
+        ? `AND NOT EXISTS (
+               SELECT 1 FROM claim_operation_receipts receipts
+                WHERE receipts.producer = ?
+                  AND receipts.operation_key = 'event:' || events.id
+           )`
+        : "";
+    const params: Array<string | number> = [projectIdentity, kind];
+    if (options.pendingForProducer) params.push(options.pendingForProducer);
+    let limitClause = "";
+    if (options.limit !== undefined) {
+        limitClause = "LIMIT ?";
+        params.push(options.limit);
+    }
+    const rows = db
+        .prepare(
+            `SELECT DISTINCT events.id, events.session_id, events.compartment_id, events.kind,
+                    events.at_compartment, events.fields_json, events.created_at,
+                    events.harness, compartments.start_message, compartments.end_message
+               FROM compartment_events events
+               JOIN session_projects projects
+                 ON projects.session_id = events.session_id
+                AND projects.harness = events.harness
+               LEFT JOIN compartments
+                 ON compartments.id = events.compartment_id
+                AND compartments.session_id = events.session_id
+                AND compartments.harness = events.harness
+              WHERE projects.project_path = ? AND events.kind = ?
+                ${receiptFilter}
+              ORDER BY events.id ASC
+              ${limitClause}`,
+        )
+        .all(...params) as Array<{
+        id: number;
+        session_id: string;
+        compartment_id: number | null;
+        kind: string;
+        at_compartment: number | null;
+        fields_json: string;
+        created_at: number;
+        harness: string;
+        start_message: number | null;
+        end_message: number | null;
+    }>;
+    return rows.map((row) => ({
+        id: row.id,
+        sessionId: row.session_id,
+        compartmentId: row.compartment_id,
+        kind: row.kind,
+        atCompartment: row.at_compartment,
+        fields: parseFields(row.fields_json),
+        createdAt: row.created_at,
+        harness: row.harness,
+        compartmentStartMessage: row.start_message,
+        compartmentEndMessage: row.end_message,
     }));
 }
 

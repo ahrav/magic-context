@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { completeRegistryGate } from "./__fixtures__/registry-gate";
 import {
     buildContract,
     canonicalJson,
@@ -23,6 +24,7 @@ import {
     sha256Hex,
     validateContractSchema,
     validateRegistryGate,
+    validateRegistryGateShape,
     validateStopProvenance,
 } from "./generate-mc-host-release-manifest";
 
@@ -54,17 +56,9 @@ function contractCopy(): any {
 
 // biome-ignore lint/suspicious/noExplicitAny: tests mutate deep copies of the gate
 function gateCopy(): any {
-    const gate = JSON.parse(readFileSync(join(repoRoot, REGISTRY_GATE_PATH), "utf8"));
-    for (const pkg of gate.packages) {
-        pkg.ownership_verified = true;
-        pkg.trusted_publisher_configured = true;
-        pkg.synchronized_version_unpublished = true;
-        if (pkg.kind === "payload") {
-            pkg.reservation_version = "0.0.1";
-            pkg.bootstrap_credential_revoked = true;
-        }
-    }
-    return gate;
+    return completeRegistryGate(
+        JSON.parse(readFileSync(join(repoRoot, REGISTRY_GATE_PATH), "utf8")),
+    );
 }
 
 describe("deterministic generation", () => {
@@ -143,10 +137,13 @@ describe("rust and typescript embeddings", () => {
             /pub const RELEASE_CONTRACT_JSON: &str = "((?:[^"\\]|\\.)*)";/,
         );
         expect(jsonMatch).not.toBeNull();
-        const rustJson = (jsonMatch as RegExpMatchArray)[1]
-            .replace(/\\n/g, "\n")
-            .replace(/\\"/g, '"')
-            .replace(/\\\\/g, "\\");
+        // Single left-to-right pass: sequential global replaces are not the
+        // inverse of escapeRustString once the content contains a literal
+        // backslash followed by `n` or `"`.
+        const rustJson = (jsonMatch as RegExpMatchArray)[1].replace(
+            /\\(n|"|\\)/g,
+            (_, escaped: string) => (escaped === "n" ? "\n" : escaped),
+        );
         expect(rustJson).toBe(canonical);
         const digestMatch = rust.match(
             /pub const RELEASE_CONTRACT_SHA256: &str = "([0-9a-f]{64})";/,
@@ -179,7 +176,7 @@ describe("pre-build schema", () => {
             const withHashKey = contractCopy();
             withHashKey.model_lane[key] = "pinned-later";
             expect(() => validateContractSchema(withHashKey)).toThrow(
-                /hash-bearing key|model_lane keys/,
+                new RegExp(`hash-bearing key|model_lane: unknown key ${key}`),
             );
         }
     });
@@ -350,7 +347,21 @@ describe("registry gate", () => {
                 (g) => {
                     g.packages[3].reservation_version = g.release_version;
                 },
-                /must differ from the coordinated release version/,
+                /must be an inert prerelease/,
+            ],
+            [
+                "reservation that is a bare label rather than a version",
+                (g) => {
+                    g.packages[3].reservation_version = "reserved";
+                },
+                /must be an inert prerelease/,
+            ],
+            [
+                "reservation that is an installable GA version",
+                (g) => {
+                    g.packages[3].reservation_version = "0.37.0";
+                },
+                /must be an inert prerelease/,
             ],
             [
                 "version already published for one name",
@@ -398,14 +409,87 @@ describe("registry gate", () => {
         }
     });
 
-    test("a failing gate blocks file generation end to end", () => {
+    test("a malformed gate blocks file generation end to end", () => {
+        const root = freshRoot();
+        const gate = gateCopy();
+        gate.packages[4].name = "@cortexkit/unknown";
+        writeFileSync(join(root, REGISTRY_GATE_PATH), JSON.stringify(gate));
+        expect(() => generate(root, { check: false })).toThrow(
+            /unexpected package/,
+        );
+    });
+
+    test("a fail-closed gate does not block generation but does block publication", () => {
         const root = freshRoot();
         const gate = gateCopy();
         gate.packages[4].synchronized_version_unpublished = false;
         writeFileSync(join(root, REGISTRY_GATE_PATH), JSON.stringify(gate));
-        expect(() => generate(root, { check: false })).toThrow(
+        // The committed gate records a live npm audit and is honestly
+        // fail-closed for most of a release cycle. Generation and drift must
+        // stay usable in that state, or the drift signal is permanently red and
+        // stops catching hand-edited gates; only publication demands readiness.
+        expect(() => generate(root, { check: false })).not.toThrow();
+        expect(() =>
+            validateRegistryGateShape(gate, buildContract()),
+        ).not.toThrow();
+        expect(() => validateRegistryGate(gate, buildContract())).toThrow(
             /is not unpublished/,
         );
+    });
+
+    test("a non-boolean audited field is drift, not a readiness question", () => {
+        const gate = gateCopy();
+        gate.packages[0].synchronized_version_unpublished = "true";
+        expect(() => validateRegistryGateShape(gate, buildContract())).toThrow(
+            /synchronized_version_unpublished .* must be boolean/,
+        );
+    });
+
+    test("an unreserved payload name is shape-valid and readiness-invalid", () => {
+        const gate = gateCopy();
+        gate.packages[3].reservation_version = null;
+        expect(() =>
+            validateRegistryGateShape(gate, buildContract()),
+        ).not.toThrow();
+        expect(() => validateRegistryGate(gate, buildContract())).toThrow(
+            /missing inert reservation version/,
+        );
+    });
+
+    test("a reservation version that is present must still be inert", () => {
+        const gate = gateCopy();
+        gate.packages[3].reservation_version = "0.38.0";
+        expect(() => validateRegistryGateShape(gate, buildContract())).toThrow(
+            /must be an inert prerelease/,
+        );
+    });
+
+    test("a reservation version npm could not publish is rejected", () => {
+        // SemVer §9 forbids leading zeroes in numeric prerelease identifiers, so
+        // npm's parser rejects these outright — a gate accepting one would claim a
+        // reserved name that cannot exist. Same rule for the core version.
+        for (const invalid of [
+            "0.0.1-01",
+            "0.0.1-reserved.01",
+            "01.0.1-reserved.0",
+            "0.0.1-reserved.0+meta",
+        ]) {
+            const gate = gateCopy();
+            gate.packages[3].reservation_version = invalid;
+            expect(
+                () => validateRegistryGateShape(gate, buildContract()),
+                invalid,
+            ).toThrow(/must be an inert prerelease/);
+        }
+        // Alphanumeric identifiers and a bare `0` remain valid prereleases.
+        for (const valid of ["0.0.1-reserved.0", "0.0.1-0", "0.0.1-rc.1"]) {
+            const gate = gateCopy();
+            gate.packages[3].reservation_version = valid;
+            expect(
+                () => validateRegistryGateShape(gate, buildContract()),
+                valid,
+            ).not.toThrow();
+        }
     });
 });
 
@@ -431,11 +515,143 @@ describe("platform floors", () => {
                 os: "darwin",
                 arch,
                 osVersion: "13.5",
+                devFdExec: true,
             });
             expect(mac.supported).toBe(true);
             expect(mac.synapse).toBe("unsupported");
             expect(mac.synapseReason).toBe("synapse_unsupported");
         }
+    });
+
+    test("a macOS host without descriptor execution is unsupported_platform", () => {
+        // The Darwin counterpart of the Linux procfs_self_fd_exec gate: the
+        // contract requires dev_fd_exec, so a version-passing host that cannot
+        // execute through a descriptor must be refused here rather than at exec
+        // time. An omitted probe field is not evidence of the capability.
+        for (const arch of ["arm64", "x64"] as const) {
+            expect(
+                evaluatePlatform(contract, {
+                    os: "darwin",
+                    arch,
+                    osVersion: "13.5",
+                    devFdExec: false,
+                }),
+            ).toEqual({ supported: false, reason: "unsupported_platform" });
+            expect(
+                evaluatePlatform(contract, {
+                    os: "darwin",
+                    arch,
+                    osVersion: "13.5",
+                }),
+            ).toEqual({ supported: false, reason: "unsupported_platform" });
+        }
+    });
+
+    test("garbage and prerelease host versions fail the platform gate too", () => {
+        // The U9 oracle-host check rejects these. Sharing only `compareDotted`
+        // once let this gate keep a bare `>= 0` and accept them, so the two
+        // disagreed about the same host; they now share the whole predicate.
+        for (const kernel of [
+            "999garbage",
+            // Above the floor on its first component, so the ordering check returns
+            // early: the component's shape has to be validated regardless.
+            "999garbage.0",
+            // A separator with nothing after it is not a suffix; `compareDotted`
+            // reads the digits and ignores the dangling separator.
+            "4.18-",
+            "4.18_",
+            "5",
+            "4.18-rc1",
+            "4.18.0-rc2",
+            "4.18-pre",
+            // Every separator the shape check admits, not only `-` and `.`.
+            "4.18~rc1",
+            "4.18_rc1",
+            "4.18+beta1",
+        ]) {
+            expect(
+                evaluatePlatform(contract, {
+                    os: "linux",
+                    arch: "x64",
+                    libc: "gnu",
+                    kernel,
+                    glibc: "2.28",
+                    procfsSelfFdExec: true,
+                }),
+                `kernel=${kernel} must not clear the floor`,
+            ).toEqual({ supported: false, reason: "unsupported_platform" });
+        }
+        for (const glibc of ["999garbage", "2.28-pre", "2.28-beta3", "2.28+"]) {
+            expect(
+                evaluatePlatform(contract, {
+                    os: "linux",
+                    arch: "x64",
+                    libc: "gnu",
+                    kernel: "4.18",
+                    glibc,
+                    procfsSelfFdExec: true,
+                }),
+                `glibc=${glibc} must not clear the floor`,
+            ).toEqual({ supported: false, reason: "unsupported_platform" });
+        }
+        expect(
+            evaluatePlatform(contract, {
+                os: "darwin",
+                arch: "arm64",
+                osVersion: "13.5_rc1",
+                devFdExec: true,
+            }),
+        ).toEqual({ supported: false, reason: "unsupported_platform" });
+        // A prerelease genuinely above the floor still clears it.
+        expect(
+            evaluatePlatform(contract, {
+                os: "linux",
+                arch: "x64",
+                libc: "gnu",
+                kernel: "4.19-rc1",
+                glibc: "2.28-236.el8",
+                procfsSelfFdExec: true,
+            }).supported,
+        ).toBe(true);
+    });
+
+    test("real-world version strings at the floor are supported", () => {
+        // RHEL/Rocky 8 report exactly these shapes at the contract floors.
+        const rhel8 = evaluatePlatform(contract, {
+            os: "linux",
+            arch: "x64",
+            libc: "gnu",
+            kernel: "4.18.0-513.el8.x86_64",
+            glibc: "2.28-236.el8",
+            procfsSelfFdExec: true,
+        });
+        expect(rhel8).toEqual({
+            supported: true,
+            target: "linux-x64-gnu",
+            synapse: "certified_cpu",
+        });
+        // A messy string below the floor still fails it.
+        expect(
+            evaluatePlatform(contract, {
+                os: "linux",
+                arch: "x64",
+                libc: "gnu",
+                kernel: "4.17.0-generic",
+                glibc: "2.28",
+                procfsSelfFdExec: true,
+            }),
+        ).toEqual({ supported: false, reason: "unsupported_platform" });
+        // Entirely non-numeric components count as 0, failing closed.
+        expect(
+            evaluatePlatform(contract, {
+                os: "linux",
+                arch: "x64",
+                libc: "gnu",
+                kernel: "rolling",
+                glibc: "2.28",
+                procfsSelfFdExec: true,
+            }),
+        ).toEqual({ supported: false, reason: "unsupported_platform" });
     });
 
     test("below-floor and missing-capability hosts are unsupported_platform", () => {
@@ -578,6 +794,39 @@ describe("stop-provenance schema", () => {
             validateStopProvenance(contract, { ...complete, extra: true })
                 .valid,
         ).toBe(false);
+        // `release_version` binds the claiming release, not the predecessor's;
+        // a record minted under another release carries no authority here.
+        const foreign = validateStopProvenance(contract, {
+            ...complete,
+            release_version: "0.99.0",
+        });
+        expect(foreign.valid).toBe(false);
+        expect(foreign.legacyStopAuthority).toBe(false);
+        // Present-but-invalid values must not reach legacy stop authority: the
+        // required-field loop only rejects undefined, null, and "".
+        for (const [field, value] of [
+            ["legacy_proof_version", false],
+            ["legacy_proof_version", 2],
+            ["payload_manifest_digest", false],
+            ["predecessor_manifest", "not-an-object"],
+            ["predecessor_manifest", []],
+            ["predecessor_release_version", "0.37"],
+            ["predecessor_release_version", "0.38.0"],
+            ["predecessor_release_version", "0.99.0"],
+            ["predecessor_daemon_version", "0.0.9"],
+            ["target", "linux-arm64-musl"],
+            ["target", true],
+        ] as [string, unknown][]) {
+            const result = validateStopProvenance(contract, {
+                ...complete,
+                [field]: value,
+            });
+            expect(
+                result.valid,
+                `${field}=${JSON.stringify(value)} must be rejected`,
+            ).toBe(false);
+            expect(result.legacyStopAuthority).toBe(false);
+        }
     });
 
     test("untagged and unknown-tag records are rejected", () => {
@@ -601,12 +850,9 @@ describe("dependency boundary", () => {
 
 describe("generated typescript location", () => {
     test("the shared lifecycle directory holds the generated contract", () => {
-        mkdirSync(
-            join(repoRoot, "packages/plugin/src/shared/mc-host-lifecycle"),
-            {
-                recursive: true,
-            },
-        );
+        // Reads the committed artifact in place: the assertion is that the
+        // contract path is populated in the repository, so creating the
+        // directory here would only mask the failure it exists to catch.
         const content = readFileSync(
             join(repoRoot, OUTPUT_PATHS.typescript),
             "utf8",

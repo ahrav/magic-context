@@ -19,7 +19,7 @@
  * never peer receipt.
  */
 
-import { AuthError } from "./auth";
+import { type AuthCredentials, AuthError } from "./auth";
 import { armExpiryTimer, type Deadline } from "./deadline";
 import { McHostCallError, SocketClosedError, SocketTimeoutError } from "./errors";
 import {
@@ -181,7 +181,11 @@ export interface PendingRequest {
 export interface ConnectionGenerationOptions {
     host: string;
     port: number;
-    credentials: { key: Uint8Array; daemonId: Uint8Array };
+    /**
+     * Validated connection-file credentials. `daemonVer` is the file's
+     * `daemon_ver`, which the handshake requires the peer to report back.
+     */
+    credentials: AuthCredentials;
     /** Frame deadline starting at the FIRST header byte (wire doc 6.3). */
     frameDeadlineMs?: number;
     /** Injectable body cap for scaled tests; defaults to the exact 64 MiB limit. */
@@ -201,6 +205,13 @@ export interface ConnectionGenerationOptions {
         maxBodyLen: number;
         handlers: FrameChannelHandlers;
     }) => SetupFrameChannel;
+    /**
+     * @internal Not part of the consumer contract. Identity a candidate
+     * generation adopts from the already-authenticated generation that
+     * negotiated it. A `channelFactory` channel runs no handshake and can
+     * report no identity of its own, so this is the candidate's only source.
+     */
+    inheritedIdentity?: { daemonVer: string; daemonId: Uint8Array | null };
     /** Nonce source passthrough to U2's handshake. */
     generateNonce?: (length: number) => Uint8Array;
     onRetired?: (info: RetirementInfo) => void;
@@ -334,8 +345,15 @@ export class ConnectionGeneration {
     authenticatedDaemonId: Uint8Array | null = null;
 
     private readonly channel: SetupFrameChannel;
+    /**
+     * The same channel as {@link channel} when this generation dials and
+     * authenticates for itself, and the only source of a proven identity.
+     * Null for a `channelFactory` channel, which runs no handshake.
+     */
+    private readonly authChannel: TcpFrameChannel | null;
     private readonly budget: ByteBudget;
     private readonly cleanupTicketMs: number;
+    private readonly inheritedIdentity: { daemonVer: string; daemonId: Uint8Array | null } | null;
     private readonly onRetired?: (info: RetirementInfo) => void;
     private readonly onRouteGoodbyeHook?: (channel: number, epoch: number) => void;
     private readonly onPendingZeroHook?: () => void;
@@ -364,6 +382,14 @@ export class ConnectionGeneration {
             options.memoryCapBytes ?? maxBodyLen + DEFAULT_MEMORY_OVERHEAD_BYTES,
         );
         this.cleanupTicketMs = options.cleanupTicketMs ?? DEFAULT_CLEANUP_TICKET_MS;
+        // Copied at construction: the retained identity that authorizes
+        // compatibility and fencing must not alias a caller-mutable array.
+        this.inheritedIdentity = options.inheritedIdentity
+            ? {
+                  daemonVer: options.inheritedIdentity.daemonVer,
+                  daemonId: options.inheritedIdentity.daemonId?.slice() ?? null,
+              }
+            : null;
         this.onRetired = options.onRetired;
         this.onRouteGoodbyeHook = options.onRouteGoodbye;
         this.onPendingZeroHook = options.onPendingZero;
@@ -389,21 +415,25 @@ export class ConnectionGeneration {
                 }
             },
         };
-        this.channel = options.channelFactory
-            ? options.channelFactory({ budget: this.budget, maxBodyLen, handlers })
-            : new TcpFrameChannel({
-                  host: options.host,
-                  port: options.port,
-                  credentials: options.credentials,
-                  budget: this.budget,
-                  frameDeadlineMs: options.frameDeadlineMs,
-                  maxBodyLen,
-                  maxQueuedFrames: options.maxQueuedFrames,
-                  maxQueuedBytes: options.maxQueuedBytes,
-                  controlReserveFrames: options.controlReserveFrames,
-                  generateNonce: options.generateNonce,
-                  handlers,
-              });
+        if (options.channelFactory) {
+            this.authChannel = null;
+            this.channel = options.channelFactory({ budget: this.budget, maxBodyLen, handlers });
+        } else {
+            this.authChannel = new TcpFrameChannel({
+                host: options.host,
+                port: options.port,
+                credentials: options.credentials,
+                budget: this.budget,
+                frameDeadlineMs: options.frameDeadlineMs,
+                maxBodyLen,
+                maxQueuedFrames: options.maxQueuedFrames,
+                maxQueuedBytes: options.maxQueuedBytes,
+                controlReserveFrames: options.controlReserveFrames,
+                generateNonce: options.generateNonce,
+                handlers,
+            });
+            this.channel = this.authChannel;
+        }
     }
 
     /**
@@ -716,10 +746,7 @@ export class ConnectionGeneration {
             // within the window and keeps its richer classification, and
             // both branches attach handlers, so no promise is left
             // unhandled.
-            const result = await new Promise<{
-                daemonVer: string;
-                daemonId?: Uint8Array | null;
-            }>((resolve, reject) => {
+            await new Promise<void>((resolve, reject) => {
                 let settled = false;
                 let fallback: ReturnType<typeof setTimeout> | null = null;
                 const settle = (complete: () => void): void => {
@@ -745,7 +772,7 @@ export class ConnectionGeneration {
                     );
                 });
                 this.channel.start(deadline).then(
-                    (value) => settle(() => resolve(value)),
+                    () => settle(() => resolve()),
                     (error: unknown) =>
                         settle(() =>
                             reject(error instanceof Error ? error : new Error(String(error))),
@@ -764,9 +791,13 @@ export class ConnectionGeneration {
                           `connection retired during setup: ${this.retiredInfo.reason}`,
                       );
             }
-            this.daemonVer = result.daemonVer;
-            this.authenticatedDaemonId =
-                result.daemonId instanceof Uint8Array ? result.daemonId : null;
+            // Identity comes from whichever channel proved it: the TCP
+            // channel's own handshake, or — for a candidate channel, which
+            // runs none — the identity the negotiating generation
+            // authenticated and passed in.
+            const identity = this.authChannel?.authenticated ?? this.inheritedIdentity;
+            this.daemonVer = identity?.daemonVer ?? null;
+            this.authenticatedDaemonId = identity?.daemonId ?? null;
             this.phase = "frames";
         } finally {
             cancelSetupTimer();

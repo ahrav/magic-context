@@ -1,22 +1,17 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, test } from "bun:test";
-import { Database } from "../../../shared/sqlite";
+import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
-import { runMigrations } from "../migrations";
 import { APPLICABILITY_STREAM_KEY_PROTOCOL } from "../storage-claim-applicability-schema";
-import { initializeDatabase } from "../storage-db";
+import { createDirectTestDatabase } from "../test-database";
 import {
     ApplicabilityWriteError,
     appendApplicabilityAssertionInCurrentTransaction,
     computeApplicabilitySourceDigest,
     ensureApplicabilityStreamInCurrentTransaction,
-    hasClaimApplicabilitySchema,
-    legacyMemoryApplicabilityStreamKey,
     readApplicabilityIntervals,
     readCurrentApplicabilityAssertions,
-    readMemoryVerificationPathsState,
-    syncMemoryApplicabilityPathsInCurrentTransaction,
 } from "./storage-claim-applicability";
 import {
     appendClaimRevision,
@@ -26,13 +21,10 @@ import {
     createSourceSpan,
     ensureProject,
 } from "./storage-claims";
-import { runInMemoryClaimsWriteTransaction } from "./storage-memory-claims";
 
 function migratedDb(): Database {
-    const db = new Database(":memory:");
+    const db = createDirectTestDatabase().db;
     db.exec("PRAGMA foreign_keys=ON");
-    initializeDatabase(db);
-    runMigrations(db);
     return db;
 }
 
@@ -146,12 +138,9 @@ describe("claim applicability streams and assertions", () => {
                 revisionId,
                 projectId,
                 ownerKind: "source" as const,
-                streamKey: legacyMemoryApplicabilityStreamKey(42),
+                streamKey: "source-replay:v1",
                 keyProtocol: APPLICABILITY_STREAM_KEY_PROTOCOL,
-                sourceDigest: computeApplicabilitySourceDigest({
-                    kind: "legacy-memory",
-                    memoryId: 42,
-                }),
+                sourceDigest: computeApplicabilitySourceDigest({ source: "replay" }),
             };
             const first = inTx(db, () => ensureApplicabilityStreamInCurrentTransaction(db, input));
             expect(first.created).toBeTrue();
@@ -344,12 +333,9 @@ describe("claim applicability streams and assertions", () => {
                 evidence: [{ observationId }],
                 applicability: {
                     ownerKind: "source",
-                    streamKey: legacyMemoryApplicabilityStreamKey(7),
+                    streamKey: "source-append:v1",
                     keyProtocol: APPLICABILITY_STREAM_KEY_PROTOCOL,
-                    sourceDigest: computeApplicabilitySourceDigest({
-                        kind: "legacy-memory",
-                        memoryId: 7,
-                    }),
+                    sourceDigest: computeApplicabilitySourceDigest({ source: "append" }),
                     assertion: {
                         state: "unknown",
                         paths: { state: "known", exact: ["src/x.ts"] },
@@ -360,7 +346,7 @@ describe("claim applicability streams and assertions", () => {
             if (appended.status !== "applied") throw new Error(appended.status);
             const heads = readCurrentApplicabilityAssertions(db, appended.revisionId);
             expect(heads).toHaveLength(1);
-            expect(heads[0]?.streamKey).toBe(legacyMemoryApplicabilityStreamKey(7));
+            expect(heads[0]?.streamKey).toBe("source-append:v1");
             expect(heads[0]?.paths).toEqual([{ kind: "exact", value: "src/x.ts" }]);
             expect(projectId).toBeGreaterThan(0);
         } finally {
@@ -457,98 +443,6 @@ describe("claim applicability streams and assertions", () => {
                     }),
                 ),
             ).toThrow(/regresses/);
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    test("readMemoryVerificationPathsState distinguishes unknown, known-empty, and exact mappings", () => {
-        const db = migratedDb();
-        try {
-            expect(readMemoryVerificationPathsState(db, 101)).toEqual({ state: "unknown" });
-            runInMemoryClaimsWriteTransaction(db, () => {
-                const insertMemory = db.prepare(
-                    `INSERT INTO memories (id, project_path, category, content, normalized_hash,
-                        seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at)
-                     VALUES (?, 'git:paths-fixture', 'CONSTRAINTS', ?, ?, 1, 0, 1, 1, 1, 1)`,
-                );
-                insertMemory.run(102, "content 102", "hash:102");
-                insertMemory.run(103, "content 103", "hash:103");
-                const insert = db.prepare(
-                    "INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at) VALUES (?, ?, 0, 1)",
-                );
-                insert.run(102, "");
-                insert.run(103, "src/z.ts");
-                insert.run(103, "src/a.ts");
-            });
-            expect(readMemoryVerificationPathsState(db, 101)).toEqual({ state: "unknown" });
-            expect(readMemoryVerificationPathsState(db, 102)).toEqual({
-                state: "known",
-                exact: [],
-            });
-            expect(readMemoryVerificationPathsState(db, 103)).toEqual({
-                state: "known",
-                exact: ["src/a.ts", "src/z.ts"],
-            });
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    test("syncMemoryApplicabilityPaths appends only on path-state change and clamps regressing knowledge time", () => {
-        const db = migratedDb();
-        try {
-            const { projectId, revisionId } = fixture(db);
-            const first = inTx(db, () =>
-                syncMemoryApplicabilityPathsInCurrentTransaction(db, {
-                    revisionId,
-                    projectId,
-                    memoryId: 55,
-                    paths: { state: "known", exact: ["src/a.ts"] },
-                    knownFrom: 5_000,
-                }),
-            );
-            expect(first.appended).toBeTrue();
-            const replay = inTx(db, () =>
-                syncMemoryApplicabilityPathsInCurrentTransaction(db, {
-                    revisionId,
-                    projectId,
-                    memoryId: 55,
-                    paths: { state: "known", exact: ["src/a.ts"] },
-                    knownFrom: 6_000,
-                }),
-            );
-            expect(replay.appended).toBeFalse();
-            const changed = inTx(db, () =>
-                syncMemoryApplicabilityPathsInCurrentTransaction(db, {
-                    revisionId,
-                    projectId,
-                    memoryId: 55,
-                    paths: { state: "known", exact: [] },
-                    knownFrom: 4_000,
-                }),
-            );
-            expect(changed.appended).toBeTrue();
-            const head = readCurrentApplicabilityAssertions(db, revisionId).find(
-                (candidate) => candidate.streamKey === legacyMemoryApplicabilityStreamKey(55),
-            );
-            expect(head?.seq).toBe(2);
-            expect(head?.pathsState).toBe("known");
-            expect(head?.paths).toEqual([]);
-            expect(head?.knownFrom).toBe(5_000);
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    test("hasClaimApplicabilitySchema is false before migrations and true after", () => {
-        const db = new Database(":memory:");
-        try {
-            db.exec("PRAGMA foreign_keys=ON");
-            initializeDatabase(db);
-            expect(hasClaimApplicabilitySchema(db)).toBeFalse();
-            runMigrations(db);
-            expect(hasClaimApplicabilitySchema(db)).toBeTrue();
         } finally {
             closeQuietly(db);
         }

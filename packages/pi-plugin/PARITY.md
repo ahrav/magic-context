@@ -155,8 +155,8 @@ shared resolver's log-only dubious-ownership warning while still using the same
   **stdin** (Pi concatenates stdin + positional) to avoid Linux `MAX_ARG_STRLEN`
   / E2BIG; the positional is omitted when piping.
 - `--no-session` keeps subagent JSONL out of the user's session picker.
-- v84 memory writes are intentionally not divergent. OpenCode and Pi wrappers keep harness-specific authorization, formatting, and post-commit embedding/module dispatch, but both call same transaction-local claim compatibility kernel. Same operation commits crosswalk, immutable revision metadata, `memories` projection, outbox, and generation; existing readers stay on `memories`. Public-tool e2e covers OpenCode→Pi and Pi→OpenCode writes against shared DB.
-- Ship Pi, OpenCode, CLI, and the directly linked mc-host component from same revision before v84 migration. Held-open legacy writers are rejected by shared guard; pending v22 work and lazy backfill use shared startup/doctor recovery (`magic-context doctor --check-claims-backfill`, then `--retry-claims-backfill`, then restart both harnesses). Archive/delete retire projection state and retain claim history; no Pi or OpenCode response promises erasure.
+- Claim writes are intentionally not divergent. OpenCode and Pi wrappers keep harness-specific authorization, formatting, and post-commit embedding/module dispatch, but both call the same transaction-local claim kernel. Same operation commits crosswalk, immutable revision metadata, outbox, and generation. Public-tool e2e covers OpenCode→Pi and Pi→OpenCode writes against shared DB.
+- Ship Pi, OpenCode, CLI, and the directly linked mc-host component from the same revision. There is no migration or backfill lane: the claims-only direct format is the only database family this binary opens, and every other shape is refused before SQLite recovery. A refused family is abandoned with `magic-context doctor reset-db` (or repaired with `magic-context doctor repair-db`), then both harnesses restart. Archive/delete retire claim visibility and retain claim history; no Pi or OpenCode response promises erasure.
 
 ---
 
@@ -191,7 +191,7 @@ the assistant `SessionEntry` wrapper has not been appended yet. Pi therefore
 records the transform decision in memory with a snapshot of the newest assistant
 entry id seen at pass start, then resolves it at the start of the next context
 pass by finding the newest assistant `SessionEntry.id` different from that
-snapshot. The dashboard keys Pi cache rows on that wrapper id, so this delayed
+snapshot. Pi cache rows are keyed on that wrapper id, so this delayed
 bind is the first point where the correct durable key exists. The final turn's
 decision is written on the next prompt; that is accepted telemetry behavior.
 

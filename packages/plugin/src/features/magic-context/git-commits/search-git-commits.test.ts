@@ -1,10 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { Database } from "../../../shared/sqlite";
+import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
-import { runMigrations } from "../migrations";
 import { MAX_LANE_CANDIDATES } from "../search-bounds";
 import { countingDatabase } from "../sql-counters";
-import { initializeDatabase } from "../storage-db";
+import { createDirectTestDatabase } from "../test-database";
 import type { GitCommit } from "./git-log-reader";
 import { searchGitCommitsSync } from "./search-git-commits";
 import { saveCommitEmbedding } from "./storage-git-commit-embeddings";
@@ -25,9 +24,7 @@ describe("searchGitCommitsSync", () => {
     let db: Database;
 
     beforeEach(() => {
-        db = new Database(":memory:");
-        initializeDatabase(db);
-        runMigrations(db);
+        db = createDirectTestDatabase().db;
     });
 
     afterEach(() => {

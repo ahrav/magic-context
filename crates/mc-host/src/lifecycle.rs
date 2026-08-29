@@ -25,6 +25,15 @@ use crate::instance::{
 /// Canonical lifecycle-record name inside the runtime directory.
 pub const LIFECYCLE_RECORD_NAME: &str = "mc-host-lifecycle.json";
 
+/// The probe reason for a quarantined persisted record: the bytes decode to
+/// an unknown schema, so they are preserved untouched rather than repaired.
+///
+/// Exported because it is a load-bearing classification, not a diagnostic
+/// string: `InstanceGuard::acquire` refuses to start over a quarantined
+/// record, so every caller that acts on a probe must recognize this reason in
+/// both its `Stopped` (both fences free) and `Wedged` (fence held) shapes.
+pub const UNSUPPORTED_STATE_SCHEMA_REASON: &str = "unsupported_state_schema";
+
 /// Version-neutral coordination directory name directly under the data root.
 /// Every release resolves this same owner-only directory; supported code
 /// never renames, replaces, or unlinks it.
@@ -186,21 +195,40 @@ fn open_coordination_lock_probe(
 /// after the runtime-directory lock). Because the file is never renamed and
 /// sits outside `cortexkit`, replacing the managed subtree cannot free it,
 /// so a successor cannot overlap a displaced incarnation.
+///
+/// The refusal holds only among coordination-aware incarnations: a release
+/// that predates this fence never opens `lifetime.lock`, so a rollback to
+/// such a release reinstates the replacement-overlap hazard unless the
+/// daemon is fully stopped first. Likewise, the fence binds by name: an
+/// actor that renames or removes `.mc-host-coordination` itself (an
+/// unsupported mutation of the data root) splits it the same way renaming
+/// the runtime directory splits the runtime lock.
 pub(crate) struct LifetimeLock {
     _file: OwnedFd,
 }
 
 impl LifetimeLock {
+    /// One nonblocking attempt: contention is reported as `AlreadyRunning`
+    /// so the caller decides how to wait. `run` retries on its own async
+    /// timer; parking an executor thread here (as the bounded blocking
+    /// retry would) could stall a same-process predecessor drain whose
+    /// completion releases this very lock.
     pub(crate) fn acquire(data_dir_override: Option<&Path>) -> Result<Self, InstanceError> {
         let (file, path) = open_coordination_lock_create(data_dir_override, LIFETIME_LOCK_NAME)?;
-        flock_exclusive_bounded(&file, &path, "flock_lifetime")?;
-        Ok(Self { _file: file })
+        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(rustix::io::Errno::WOULDBLOCK) => Err(InstanceError::AlreadyRunning),
+            Err(e) => Err(io_err("flock_lifetime", &path, e)),
+        }
     }
 }
 
 /// Nonblocking observational test of the lifetime fence. `Ok(true)` means no
-/// incarnation holds it (an absent coordination root or lock file also has
-/// no possible holder). The momentary shared hold is released when the
+/// incarnation holds it. An absent coordination root or lock file also
+/// reports free: absence has no possible holder for a supported deployment,
+/// where the coordination names are never renamed or unlinked — an external
+/// rename of `.mc-host-coordination` under a live daemon is out of contract
+/// and reads as free here. The momentary shared hold is released when the
 /// descriptor drops.
 fn lifetime_lock_free(data_dir_override: Option<&Path>) -> Result<bool, InstanceError> {
     let Some((fd, path)) = open_coordination_lock_probe(data_dir_override, LIFETIME_LOCK_NAME)?
@@ -218,25 +246,41 @@ fn lifetime_lock_free(data_dir_override: Option<&Path>) -> Result<bool, Instance
 /// readable regular file whose JSON carries an unknown schema. Such bytes
 /// are preserved byte-for-byte — supported code must not interpret,
 /// migrate, overwrite, or remove them (plan R22).
-pub(crate) fn quarantined_record_present(dir: &OwnedFd) -> bool {
-    let Ok(fd) = openat(
+///
+/// The gate fails closed where record bytes could exist but cannot be
+/// proven to carry a known schema: an open, stat, or read failure —
+/// including a record larger than [`MAX_EVIDENCE_BYTES`], which a future
+/// schema may legitimately be — refuses the start rather than admit an
+/// overwrite. Non-regular shapes (a planted symlink or FIFO) are not
+/// records: startup's atomic rename replaces the name without following
+/// it, per `a_planted_symlink_at_the_record_name_is_replaced_not_followed`.
+pub(crate) fn quarantined_record_present(
+    dir: &OwnedFd,
+    dir_path: &Path,
+) -> Result<bool, InstanceError> {
+    let path = || dir_path.join(LIFECYCLE_RECORD_NAME);
+    let fd = match openat(
         dir,
         LIFECYCLE_RECORD_NAME,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
         Mode::empty(),
-    ) else {
-        return false;
+    ) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT)
+        | Err(rustix::io::Errno::LOOP)
+        | Err(rustix::io::Errno::NOTDIR) => return Ok(false),
+        Err(e) => return Err(io_err("open_lifecycle_record", &path(), e)),
     };
-    let Ok(stat) = rustix::fs::fstat(&fd) else {
-        return false;
-    };
+    let stat = rustix::fs::fstat(&fd).map_err(|e| io_err("fstat_lifecycle_record", &path(), e))?;
     if (mode_bits(&stat) & S_IFMT) != S_IFREG {
-        return false;
+        return Ok(false);
     }
     let Ok(bytes) = read_all_fd(&fd, MAX_EVIDENCE_BYTES) else {
-        return false;
+        // Unreadable or oversized: cannot prove a known schema, so treat as
+        // quarantined rather than admit an overwrite.
+        return Ok(true);
     };
-    matches!(decode_record(&bytes), RecordDecode::UnknownSchema)
+    Ok(matches!(decode_record(&bytes), RecordDecode::UnknownSchema))
 }
 
 /// Where in an incarnation the daemon reported itself.
@@ -296,10 +340,15 @@ const HEX_DAEMON_LEN: usize = 32;
 /// Outcome of strictly decoding lifecycle-record bytes. Unknown schemas are
 /// distinguished from corruption because they are quarantined, not repaired:
 /// the bytes stay untouched and classification reports
-/// `unsupported_state_schema` instead of a corrupt record.
+/// `unsupported_state_schema` instead of a corrupt record. `Legacy` is the
+/// one pre-coordination shape — schema 1, valid in every field except an
+/// empty payload digest, exactly what releases before the digest fence
+/// persisted — kept distinct so a live pre-coordination incumbent can be
+/// classified instead of read as corruption.
 #[derive(Debug, PartialEq, Eq)]
 enum RecordDecode {
     Valid(LifecycleRecord),
+    Legacy(LifecycleRecord),
     UnknownSchema,
     Malformed,
 }
@@ -324,20 +373,28 @@ fn decode_record(bytes: &[u8]) -> RecordDecode {
             && s.bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     };
+    // Exactly empty is the legacy pre-digest shape; any other noncanonical
+    // digest is corruption.
+    let legacy_digest = wire.payload_manifest_digest.is_empty();
     if !is_hex(&wire.launch_id, HEX_LAUNCH_LEN)
         || !is_hex(&wire.daemon_id, HEX_DAEMON_LEN)
-        || !is_canonical_payload_digest(&wire.payload_manifest_digest)
+        || !(legacy_digest || is_canonical_payload_digest(&wire.payload_manifest_digest))
     {
         return RecordDecode::Malformed;
     }
-    RecordDecode::Valid(LifecycleRecord {
+    let record = LifecycleRecord {
         phase,
         launch_id: wire.launch_id,
         daemon_id: wire.daemon_id,
         payload_manifest_digest: wire.payload_manifest_digest,
         pid: wire.pid,
         written_at_ms: wire.written_at_ms,
-    })
+    };
+    if legacy_digest {
+        RecordDecode::Legacy(record)
+    } else {
+        RecordDecode::Valid(record)
+    }
 }
 
 fn now_ms() -> u64 {
@@ -446,8 +503,19 @@ impl InstanceGuard {
 /// `run`, or the whole `cortexkit` tree cannot mint a second transaction
 /// owner. A holder that mutates named entries must still anchor those
 /// mutations to retained descriptors and abort on identity drift
-/// ([`NamespaceAnchor`]); the lock alone serializes mutators, it does not
-/// prove the names still resolve to the tree the holder opened.
+/// ([`NamespaceAnchor`]); the lock alone serializes mutators, it does not prove
+/// the names still resolve to the tree the holder opened.
+///
+/// Like the lifetime fence, the exclusion holds only among coordination-aware
+/// releases. A release that predates this token serializes transactions on the
+/// `${dataDir}/cortexkit/lifecycle` directory inode instead; that inode and
+/// this file are unrelated, so the two never contend and a pre-coordination
+/// launcher's transaction can overlap one taken here. Mixed-release lifecycle
+/// mutation therefore requires stopping the daemon across the transition
+/// rather than relying on this lock; restoring exclusion against a
+/// pre-coordination peer would mean also acquiring the legacy directory lock in
+/// a fixed order, which no supported deployment needs while adjacent-release
+/// interop stays stop-only.
 pub struct LifecycleTransactionLock {
     _file: OwnedFd,
     path: PathBuf,
@@ -514,6 +582,10 @@ impl LifecycleTransactionLock {
 /// resolves to the same identity — the tree was renamed or replaced — the
 /// holder must abort rather than claim a commit under the canonical names.
 ///
+/// Published because the lifecycle CLI holds the transaction lock from outside
+/// this crate and runs the check before reporting any named-namespace result,
+/// so the drift check has a production caller rather than only tests.
+///
 /// [`verify`]: NamespaceAnchor::verify
 pub struct NamespaceAnchor {
     entries: Vec<AnchorEntry>,
@@ -556,7 +628,7 @@ impl NamespaceAnchor {
     /// Absent entries are simply not captured: creating them later is the
     /// mutator's own work, not drift.
     pub fn capture(data_dir_override: Option<&Path>) -> Result<Self, InstanceError> {
-        let base = data_dir_path(data_dir_override)?.join("cortexkit");
+        let base = crate::instance::managed_dir_path(data_dir_override)?;
         let mut entries = Vec::new();
         for path in [base.clone(), base.join("lifecycle"), base.join("run")] {
             let Some(fd) = open_validated_dir(&path, "managed namespace directory")? else {
@@ -841,12 +913,6 @@ pub fn probe_lifecycle(
     data_dir_override: Option<&Path>,
     freshness: &ProbeFreshness,
 ) -> Result<LifecycleProbe, InstanceError> {
-    // Shared transaction lock when the coordination root exists: an
-    // in-flight mutator is excluded for the duration of the sample. Absence
-    // (or a held exclusive lock) degrades to evidence-only probing, made
-    // coherent by the bounded reread loop below.
-    let _root = LifecycleTransactionLock::acquire_shared(data_dir_override)?;
-
     const MAX_REREADS: usize = 3;
     // A daemon must hold the instance lock before it can write its `starting`
     // record, so a probe landing in that window sees a held lock with no
@@ -908,11 +974,24 @@ pub fn probe_lifecycle(
     let mut grace_rereads = 0;
     let mut disagreement_rereads = 0;
     loop {
-        let lifetime_before = lifetime_lock_free(data_dir_override)?;
-        let before = sample_evidence(&dir);
-        let lock_free = instance_lock_free(&dir, &dir_path)?;
-        let after = sample_evidence(&dir);
-        let lifetime_free = lifetime_lock_free(data_dir_override)?;
+        // Shared transaction lock per sample, when the coordination root
+        // exists: an in-flight mutator is excluded for the duration of one
+        // sample. Absence (or a held exclusive lock) degrades to
+        // evidence-only probing, made coherent by the bounded reread loop.
+        // The hold is released before any grace sleep below: mutators only
+        // tolerate LOCK_RETRY_ATTEMPTS x LOCK_RETRY_DELAY of contention, so
+        // sleeping under a shared hold would make an innocent probe report a
+        // mutator that does not exist as `AlreadyRunning`.
+        let sample = {
+            let _root = LifecycleTransactionLock::acquire_shared(data_dir_override)?;
+            let lifetime_before = lifetime_lock_free(data_dir_override)?;
+            let before = sample_evidence(&dir);
+            let lock_free = instance_lock_free(&dir, &dir_path)?;
+            let after = sample_evidence(&dir);
+            let lifetime_free = lifetime_lock_free(data_dir_override)?;
+            (lifetime_before, before, lock_free, after, lifetime_free)
+        };
+        let (lifetime_before, before, lock_free, after, lifetime_free) = sample;
         if (before != after || lifetime_before != lifetime_free) && torn_rereads + 1 < MAX_REREADS {
             torn_rereads += 1;
             continue;
@@ -922,7 +1001,19 @@ pub fn probe_lifecycle(
             std::thread::sleep(GRACE_DELAY);
             continue;
         }
-        if !lock_free && after.record == EvidenceFile::Absent && grace_rereads < ABSENT_RECORD_GRACE
+        // A coordination-aware daemon that just acquired both fences may not
+        // have replaced a predecessor's record yet: an absent record and a
+        // stale legacy (empty-digest) leftover are both expected in that
+        // startup window, so re-sample before believing either.
+        let stale_legacy = !lock_free
+            && !lifetime_free
+            && matches!(
+                after.record.bytes().map(decode_record),
+                Some(RecordDecode::Legacy(_))
+            );
+        if !lock_free
+            && (after.record == EvidenceFile::Absent || stale_legacy)
+            && grace_rereads < ABSENT_RECORD_GRACE
         {
             grace_rereads += 1;
             std::thread::sleep(GRACE_DELAY);
@@ -949,9 +1040,10 @@ fn classify(
 ) -> LifecycleProbe {
     let decoded = sample.record.bytes().map(decode_record);
     let unknown_schema = matches!(decoded, Some(RecordDecode::UnknownSchema));
-    let record = match decoded {
-        Some(RecordDecode::Valid(record)) => Some(record),
-        _ => None,
+    let (record, legacy_record) = match decoded {
+        Some(RecordDecode::Valid(record)) => (Some(record), None),
+        Some(RecordDecode::Legacy(record)) => (None, Some(record)),
+        _ => (None, None),
     };
     let publication = sample.publication.bytes().and_then(publication_summary);
 
@@ -962,7 +1054,7 @@ fn classify(
         // bytes are still surfaced so callers report them instead of
         // treating the root as cleanly reusable.
         let reason = if unknown_schema {
-            "unsupported_state_schema"
+            UNSUPPORTED_STATE_SCHEMA_REASON
         } else if sample.record != EvidenceFile::Absent
             || sample.publication != EvidenceFile::Absent
         {
@@ -989,15 +1081,20 @@ fn classify(
         lifetime_lock_free: lifetime_free,
     };
 
-    // Exactly one fence held after the bounded rereads: a replaced runtime
-    // directory, a mixed-release holder, or a genuinely stuck teardown. No
-    // combination of evidence can make that a coherent running incarnation.
-    if lock_free != lifetime_free {
+    // Exactly one fence held after the bounded rereads. A held runtime lock
+    // with a free lifetime fence and a legacy record is the one coherent
+    // shape: a live pre-coordination incumbent (a release that predates the
+    // lifetime fence), which classifies by its record below so the launcher
+    // can stop it instead of alarming. Every other single-fence combination
+    // — a replaced runtime directory, a squatter, or a genuinely stuck
+    // teardown — is a fault.
+    let incumbent = !lock_free && lifetime_free && legacy_record.is_some();
+    if lock_free != lifetime_free && !incumbent {
         return wedged("lifetime and runtime locks disagree", record);
     }
 
     if unknown_schema {
-        return wedged("unsupported_state_schema", record);
+        return wedged(UNSUPPORTED_STATE_SCHEMA_REASON, record);
     }
     if sample.record == EvidenceFile::Insecure {
         return wedged("lifecycle record failed security checks", record);
@@ -1005,6 +1102,18 @@ fn classify(
     if sample.publication == EvidenceFile::Insecure {
         return wedged("publication failed security checks", record);
     }
+    // A legacy (empty-digest) record under a coordination-aware holder is a
+    // fault: every release with the lifetime fence writes a canonical
+    // digest, so the holder cannot have written this record. Under a
+    // pre-coordination incumbent the legacy record is its ordinary output
+    // and classifies like a valid one.
+    let record = if incumbent {
+        legacy_record
+    } else if legacy_record.is_some() {
+        return wedged("record carries no payload digest", None);
+    } else {
+        record
+    };
     let Some(record) = record else {
         let reason = if sample.record == EvidenceFile::Absent {
             "instance lock held without a lifecycle record"
@@ -1062,8 +1171,8 @@ fn classify(
         reason,
         record: Some(record),
         publication,
-        instance_lock_free: false,
-        lifetime_lock_free: false,
+        instance_lock_free: lock_free,
+        lifetime_lock_free: lifetime_free,
     }
 }
 
@@ -1203,31 +1312,6 @@ mod tests {
         tempfile::tempdir().expect("temp data root")
     }
 
-    /// Plants a FIFO where a coordination path expects a regular file, so the
-    /// mutators and probes can prove they classify a hostile shape as such.
-    ///
-    /// The POSIX `mkfifo` utility, not rustix: rustix gates `mkfifoat` away from
-    /// Apple targets, and this crate is `deny(unsafe_code)`, so calling
-    /// `mkfifo(2)` directly is not available either. A lock name must classify as
-    /// a hostile shape on every platform, so this stays compiled everywhere
-    /// rather than being cfg'd out on the one whose absence let a build break
-    /// reach CI unnoticed.
-    ///
-    /// `-m 600` is load-bearing: POSIX has `mkfifo` apply that mode at creation
-    /// rather than deriving it from the umask, so the node is never briefly
-    /// reachable at a wider mode the way a create-then-`chmod` sequence leaves
-    /// it. These tests assert that a coordination node is never accessible
-    /// outside its intended mode, so the setup must not violate that invariant.
-    fn plant_fifo(path: &Path) {
-        let status = std::process::Command::new("mkfifo")
-            .arg("-m")
-            .arg("600")
-            .arg(path)
-            .status()
-            .expect("mkfifo is a POSIX utility present on every supported platform");
-        assert!(status.success(), "mkfifo failed for {}", path.display());
-    }
-
     fn record_path(guard: &InstanceGuard) -> PathBuf {
         guard.dir_path().join(LIFECYCLE_RECORD_NAME)
     }
@@ -1338,7 +1422,6 @@ mod tests {
             "unknown fields are rejected"
         );
         for digest in [
-            String::new(),
             "d".repeat(PAYLOAD_MANIFEST_DIGEST_LEN - 1),
             "d".repeat(PAYLOAD_MANIFEST_DIGEST_LEN + 1),
             "d".repeat(129),
@@ -1352,6 +1435,11 @@ mod tests {
                 "digest {digest:?} must be rejected"
             );
         }
+        // Exactly empty is the one legacy pre-coordination shape.
+        assert!(matches!(
+            mutate(&|v| v["payload_manifest_digest"] = "".into()),
+            RecordDecode::Legacy(_)
+        ));
         assert_eq!(decode_record(b"not json"), RecordDecode::Malformed);
         assert_eq!(decode_record(b"[1,2]"), RecordDecode::Malformed);
     }
@@ -1741,20 +1829,36 @@ mod tests {
                 "the symlink target must be untouched"
             );
 
-            // A FIFO at the lock name must classify, not hang.
-            let root = temp_root();
-            let coordination = coordination_dir_path(Some(root.path())).expect("path");
-            std::fs::create_dir_all(&coordination).expect("coordination root");
-            plant_fifo(&coordination.join(name));
-            let mutator_err = if name == TRANSACTION_LOCK_NAME {
-                LifecycleTransactionLock::acquire_exclusive(Some(root.path())).err()
-            } else {
-                InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).err()
-            };
-            assert!(
-                matches!(mutator_err, Some(InstanceError::Insecure { .. })),
-                "a fifo at {name} must fail closed: {mutator_err:?}"
-            );
+            // A FIFO at the lock name must classify, not hang. Linux-gated
+            // like the other two fifo cases in this module: rustix gates
+            // `mkfifoat` away from Apple targets and this crate is
+            // `deny(unsafe_code)`, so the plant has no portable in-process
+            // form. Shelling out to `mkfifo(1)` is not the answer either —
+            // forking from this test binary hands the child duplicates of the
+            // `flock`ed descriptors sibling tests hold in parallel threads,
+            // and the lock outlives its guard until the child execs and exits,
+            // which makes those siblings fail with EWOULDBLOCK.
+            #[cfg(target_os = "linux")]
+            {
+                let root = temp_root();
+                let coordination = coordination_dir_path(Some(root.path())).expect("path");
+                std::fs::create_dir_all(&coordination).expect("coordination root");
+                rustix::fs::mkfifoat(
+                    rustix::fs::CWD,
+                    coordination.join(name).as_path(),
+                    Mode::from_raw_mode(0o600),
+                )
+                .expect("plant fifo");
+                let mutator_err = if name == TRANSACTION_LOCK_NAME {
+                    LifecycleTransactionLock::acquire_exclusive(Some(root.path())).err()
+                } else {
+                    InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).err()
+                };
+                assert!(
+                    matches!(mutator_err, Some(InstanceError::Insecure { .. })),
+                    "a fifo at {name} must fail closed: {mutator_err:?}"
+                );
+            }
 
             // A hard-linked lock file has an owner besides us.
             let root = temp_root();
@@ -1948,7 +2052,8 @@ mod tests {
             // writing, so a blocking open can never complete.
             let path = guard.dir_path().join(name);
             let _ = std::fs::remove_file(&path);
-            plant_fifo(&path);
+            rustix::fs::mkfifoat(rustix::fs::CWD, path.as_path(), Mode::from_raw_mode(0o600))
+                .expect("plant fifo");
 
             let root_path = root.path().to_path_buf();
             let state = within(
@@ -1981,7 +2086,8 @@ mod tests {
         let root = temp_root();
         let guard = acquire(root.path());
         let path = record_path(&guard);
-        plant_fifo(&path);
+        rustix::fs::mkfifoat(rustix::fs::CWD, path.as_path(), Mode::from_raw_mode(0o600))
+            .expect("plant fifo");
 
         within(
             Duration::from_secs(5),
@@ -2287,9 +2393,11 @@ mod tests {
         );
     }
 
-    /// A runtime-lock holder without the lifetime fence (the pre-coordination
-    /// baseline, or a replaced-directory squatter) is a fault, never a
-    /// coherent running incarnation.
+    /// A runtime-lock holder without the lifetime fence whose record carries
+    /// a canonical digest (a replaced-directory squatter, or a stuck
+    /// teardown) is a fault, never a coherent running incarnation: a
+    /// coordination-era record proves the writer knew the lifetime fence, so
+    /// its absence is incoherent.
     #[test]
     fn lifetime_and_runtime_lock_disagreement_is_wedged() {
         let root = temp_root();
@@ -2318,6 +2426,72 @@ mod tests {
         assert_eq!(observed.reason, "lifetime and runtime locks disagree");
         assert!(!observed.instance_lock_free);
         assert!(observed.lifetime_lock_free);
+    }
+
+    /// A pre-coordination incumbent — the runtime lock held with a legacy
+    /// (empty-digest) schema-1 record and no lifetime fence, exactly what a
+    /// release before this one looks like while serving — classifies by its
+    /// record so an upgrade's launcher can stop it, instead of alarming as
+    /// `wedged` on every routine rollout.
+    #[test]
+    fn a_pre_coordination_incumbent_classifies_by_its_record() {
+        let root = temp_root();
+        // Capture genuinely valid record and publication bytes, then let the
+        // guard tear down (its fenced cleanup removes both files and frees
+        // both fences).
+        let (record_file, record_bytes, publication_file, publication_bytes) = {
+            let mut guard = acquire(root.path());
+            guard
+                .write_lifecycle_record(LifecyclePhase::Running)
+                .expect("running");
+            guard.publish(43123, "mc-host/test").expect("publish");
+            let record_file = record_path(&guard);
+            let publication_file = guard.dir_path().join(CONNECTION_FILE_NAME);
+            let record_bytes = std::fs::read(&record_file).expect("read record");
+            let publication_bytes = std::fs::read(&publication_file).expect("read publication");
+            (
+                record_file,
+                record_bytes,
+                publication_file,
+                publication_bytes,
+            )
+        };
+        // Replant the evidence in the pre-U1 shape: schema 1 with an empty
+        // digest, everything else untouched. Timestamp stays fresh.
+        let mut json: serde_json::Value = serde_json::from_slice(&record_bytes).expect("parse");
+        json["payload_manifest_digest"] = serde_json::Value::String(String::new());
+        for (path, bytes) in [
+            (&record_file, serde_json::to_vec(&json).expect("encode")),
+            (&publication_file, publication_bytes),
+        ] {
+            std::fs::write(path, bytes).expect("replant");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("mode");
+        }
+
+        // Hold only the runtime-directory lock, the way a pre-coordination
+        // release does.
+        let dir_path = runtime_dir_path(Some(root.path())).expect("path");
+        let dir = openat(
+            rustix::fs::CWD,
+            dir_path.as_path(),
+            OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("open run dir");
+        flock(&dir, FlockOperation::NonBlockingLockExclusive).expect("exclusive runtime lock");
+
+        let observed = probe(root.path());
+        assert_eq!(
+            observed.state,
+            LifecycleState::Running,
+            "a live pre-coordination incumbent must classify, not alarm: {}",
+            observed.reason
+        );
+        assert!(!observed.instance_lock_free);
+        assert!(
+            observed.lifetime_lock_free,
+            "the free lifetime fence is the incumbent signal for control paths"
+        );
     }
 
     /// Lifecycle temps must be reclaimable: they share the publication's temp

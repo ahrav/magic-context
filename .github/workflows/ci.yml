@@ -67,6 +67,31 @@ jobs:
         working-directory: packages/e2e-tests
         run: bun scripts/validate-shm-hardening-matrix.ts --allow-unresolved
 
+  release-contract-gate:
+    name: mc-host release contract drift gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # The contract is committed in four byte-coupled forms (canonical
+      # JSON, the include!-able Rust constants that feed production epoch
+      # values, and two TypeScript embeddings). This is the only gate that
+      # proves they were regenerated together.
+      - name: Check generated release contract for drift
+        run: bun run release:contract:check
+
   shm-crash-recovery:
     name: SHM crash isolation + recovery (Linux, provisional ring tuple)
     runs-on: ubuntu-latest
@@ -254,7 +279,7 @@ jobs:
       # under Node, not Bun. Node 24 also strips the smoke script's inline TS.
       - uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version: "24.18.0"
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -372,6 +397,102 @@ jobs:
       - name: E2E harness typecheck
         run: bun run --cwd packages/e2e-tests typecheck
 
+  release-qualification-gate:
+    name: Release contract + production-input qualification
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # The release-script suite asserts the mc-host -> mc-module dependency
+      # boundary through `cargo tree`, which needs a resolvable workspace.
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Production payload packing refuses any npm outside the certified 11.x
+      # line, and this job otherwise inherits whichever npm the runner image
+      # ships. Node 24 carries npm 11.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.18.0"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Provision metadata-only sibling stubs
+        run: sh scripts/provision-rust-ci-stubs.sh
+
+      # Same script `check:all` runs, so a contributor's local pass covers
+      # exactly what this gate covers.
+      - name: Release script unit tests
+        run: bun run test:release
+
+      - name: U8 release contract drift
+        run: bun run release:contract:check
+
+      # Drift-only: byte verification needs the real production artifacts,
+      # which live on the qualifying host, so --check stays portable here and
+      # guards the committed lock/credentials/evidence digests.
+      - name: U9 production-input qualification drift
+        run: bun run release:qualify:check
+
+      # The payload packages carry the optionalDependencies that resolve native
+      # bytes, and the trust index is what bootstrap decides against. Without
+      # this step, edited payload package metadata, exact-pin drift in a
+      # parent's optionalDependencies, or a hand-edited trust artifact merges
+      # unchecked.
+      - name: U6 payload package + trust index drift
+        run: bun run release:payload:check
+
+  # Its own job, not a step in prospective-release-holdout: steps in one job
+  # short-circuit, so an unrelated contract lane failing first would skip this
+  # one and leave the historian-eval gate silently unenforced — which is the
+  # state this job exists to end. Nothing invoked test:historian-eval-unit
+  # before: test:e2e selects --mode ts and test:opencode-e2e runs the green
+  # manifest, and neither reaches historianEvalUnitFiles(), so the contract and
+  # freeze lint could regress with every other lane green.
+  #
+  # Every deterministic historian-eval gate lives HERE, and the job declares no
+  # `needs`, for the same reason: a gate placed in a separate job downstream of
+  # check-plugin is skipped whenever check-plugin fails, which reproduces the
+  # silent non-enforcement one job away. Contract lint, scorer tests, the freeze
+  # lint, and the mutation battery all run per-PR with no live model calls and no
+  # credentials (R14); live scenario runs are scheduled or dispatched through
+  # historian-eval.yml only.
+  historian-eval-contracts:
+    name: Historian eval lane contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Historian eval unit contracts
+        run: bun run test:historian-eval-unit
+
+      - name: Freeze lint over the dev corpus
+        run: bun packages/e2e-tests/scripts/run-historian-eval.ts --lint
+
+      - name: Run the invalid-state mutation battery
+        run: bun packages/e2e-tests/scripts/run-historian-eval.ts --mutations
+
   mc-host-client-interop:
     name: mc-host client interop (Bun + Node 24)
     runs-on: ubuntu-latest
@@ -385,7 +506,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version: "24.18.0"
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -397,35 +518,36 @@ jobs:
       - name: Adversarial scenarios (Node 24)
         run: bun run --cwd packages/plugin test:mc-host-client:node
 
-  check-dashboard:
-    name: Check (dashboard)
+  check-rust:
+    name: Check (Rust fmt + mc-core features)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v5
-
-      - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          persist-credentials: false
 
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
 
-      # Frontend-only checks (no Rust/Tauri needed). The key gate is the test
-      # step, which runs config-parity.test.ts — it fails the build if the
-      # plugin config schema gains/renames/removes a field the dashboard's
-      # ConfigEditor coverage manifest doesn't account for, so the form can't
-      # silently drift out of sync with the schema again.
-      - name: TypeScript typecheck
-        run: bun run --cwd packages/dashboard typecheck
+      - name: Provision metadata-only sibling stubs
+        run: sh scripts/provision-rust-ci-stubs.sh
 
-      - name: Lint
-        run: bun run --cwd packages/dashboard lint
+      # fmt resolves the workspace from metadata alone, so it works against the
+      # sibling stubs. Clippy would have to compile the cortexkit-* siblings,
+      # which the stubs cannot support, so it stays in the local lint:rust gate.
+      - name: Format check (root workspace)
+        run: cargo fmt --check
 
-      - name: Test
-        run: bun run --cwd packages/dashboard test
-
-      - name: Build (frontend)
-        run: bun run --cwd packages/dashboard build
+      # Every workspace member takes mc-core with default features, so a plain
+      # --workspace pass never compiles the cache-core-off configuration; this
+      # check keeps that feature gate building. Without default features,
+      # mc-core does not depend on the stubbed cortexkit crates.
+      - name: mc-core feature-off build
+        run: cargo check -p mc-core --no-default-features
 
   benchmark-retrieval-check:
     name: Benchmark (retrieval, deterministic CI profile)
@@ -597,10 +719,11 @@ jobs:
     # Gated on Docker e2e: no point exercising the deep behavior suite if
     # the simpler install+smoke path is broken.
     needs: [e2e-opencode]
-    # The manifest selection includes the incident-pool green wrapper, which
-    # runs its cases sequentially in an isolated second phase, each paying a
-    # cold harness boot; 40 minutes is too tight for that plus the host suite.
-    timeout-minutes: 60
+    # The manifest selection includes the incident-pool green wrapper and the
+    # historian-eval harness tests, both of which run their cases sequentially
+    # with a cold harness boot per case; 60 minutes is too tight for that plus
+    # the host suite, and the margin absorbs cold-runner boot variance.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v5
 

@@ -2,12 +2,10 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Database } from "../../shared/sqlite";
+import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import type { EmbeddingPageReceipt } from "./memory/embedding-provider";
-import { runMigrations } from "./migrations";
 import { closeDatabase, openDatabase } from "./storage";
-import { initializeDatabase } from "./storage-db";
 import {
     applySynapseReceiptGroup,
     completeSynapseLedgerReceipt,
@@ -30,6 +28,7 @@ import {
     SynapseLedgerConflictError,
     type SynapseLedgerPageInput,
 } from "./storage-embedding-measurements";
+import { createDirectTestDatabase } from "./test-database";
 
 describe("embedding measurement corpus", () => {
     const dirs: string[] = [];
@@ -196,10 +195,8 @@ describe("embedding measurement corpus", () => {
 
 describe("synapse batch ledger CAS journal", () => {
     function ledgerDb(): Database {
-        const db = new Database(":memory:");
+        const db = createDirectTestDatabase().db;
         db.exec("PRAGMA foreign_keys=ON");
-        initializeDatabase(db);
-        runMigrations(db);
         return db;
     }
 

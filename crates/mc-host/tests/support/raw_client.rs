@@ -159,6 +159,11 @@ impl RawFrame {
             .expect("error body has a code")
             .to_owned()
     }
+
+    /// Server retry hint carried by an error terminal, when present.
+    pub fn error_retry_after_ms(&self) -> Option<u64> {
+        self.json()["retry_after_ms"].as_u64()
+    }
 }
 
 /// Contents of a published connection file, parsed independently.

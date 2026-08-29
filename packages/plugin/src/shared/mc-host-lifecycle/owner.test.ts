@@ -3,7 +3,15 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type PayloadTrustIndex, prepareManagedLaunchTarget } from "./owner";
+// The producer of every payload_manifest_digest in the parent trust index.
+// Fixture digests are computed with THIS implementation so the test fails if
+// owner.ts's verifier canonicalization ever drifts from the release build's.
+import { canonicalJson } from "../../../../../scripts/generate-mc-host-release-manifest";
+import {
+    canonicalPayloadManifestJson,
+    type PayloadTrustIndex,
+    prepareManagedLaunchTarget,
+} from "./owner";
 
 const roots: string[] = [];
 
@@ -19,17 +27,6 @@ afterEach(() => {
 
 function sha256(bytes: Buffer | string): string {
     return createHash("sha256").update(bytes).digest("hex");
-}
-
-function canonicalJson(value: unknown): string {
-    if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-    if (value !== null && typeof value === "object") {
-        return `{${Object.entries(value as Record<string, unknown>)
-            .sort(([left], [right]) => left.localeCompare(right))
-            .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`)
-            .join(",")}}`;
-    }
-    return JSON.stringify(value);
 }
 
 function fixture(): {
@@ -104,6 +101,15 @@ function fixture(): {
 }
 
 describe("managed lifecycle owner", () => {
+    test("verifier canonicalization is byte-identical to the release producer", () => {
+        const sample = {
+            zeta: [{ b: 1, a: [2, null, "x"] }, 3],
+            alpha: { nested: { z: true, a: "é\u0000" }, empty: {} },
+            num: 1.5,
+        };
+        expect(canonicalPayloadManifestJson(sample)).toBe(canonicalJson(sample));
+    });
+
     test("qualified package bytes stage one retained descriptor", () => {
         const f = fixture();
         const target = prepareManagedLaunchTarget({

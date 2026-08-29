@@ -10,10 +10,6 @@
  * both surfaces.
  */
 import {
-    type FailClosedBlockingProcess,
-    formatFailClosedBlockingMessage,
-} from "@magic-context/core/features/magic-context/fail-closed-block";
-import {
     getPersistedSchemaVersion,
     LATEST_SUPPORTED_VERSION,
 } from "@magic-context/core/features/magic-context/storage-db";
@@ -34,15 +30,7 @@ export interface StorageVersionFenceCheck {
 export const STALE_BUILD_RESTART_INSTRUCTION =
     "Magic Context: plugin build is older than its database — restart OpenCode";
 
-/**
- * Classify storage_versions for doctor. A database below this build's upstream
- * lane fence only means migrations are pending; only a database above the fence strands a stale
- * long-running server and is therefore an alarm.
- */
-export function checkStorageVersionFence(
-    versions: StorageVersions,
-    options: { blockingProcesses?: readonly FailClosedBlockingProcess[] } = {},
-): StorageVersionFenceCheck {
+export function checkStorageVersionFence(versions: StorageVersions): StorageVersionFenceCheck {
     const {
         context_db_schema_version: databaseVersion,
         plugin_supported_version: supportedVersion,
@@ -51,30 +39,21 @@ export function checkStorageVersionFence(
         return {
             alarm: true,
             message:
-                `Upstream migration fence alarm: context.db is v${databaseVersion}, but this build supports through v${supportedVersion}. ` +
+                `Format fence alarm: context.db is v${databaseVersion}, but this build supports through v${supportedVersion}. ` +
                 `${STALE_BUILD_RESTART_INSTRUCTION}.`,
         };
     }
     if (databaseVersion < supportedVersion) {
-        if (options.blockingProcesses && options.blockingProcesses.length > 0) {
-            return {
-                alarm: true,
-                message: formatFailClosedBlockingMessage({
-                    kind: "migration_guard",
-                    persistedVersion: databaseVersion,
-                    supportedVersion,
-                    blockingProcesses: options.blockingProcesses,
-                }),
-            };
-        }
         return {
-            alarm: false,
-            message: `Upstream migrations pending: context.db is v${databaseVersion}; this build supports through v${supportedVersion}.`,
+            alarm: true,
+            message:
+                `Retired-format alarm: context.db is at legacy migration lane v${databaseVersion}; this build only opens the direct claims format (fence v${supportedVersion}) and refuses the database unchanged. ` +
+                `To abandon it and start fresh, run 'npx @cortexkit/magic-context@latest doctor reset-db'.`,
         };
     }
     return {
         alarm: false,
-        message: `Upstream migration fence: context.db and this build are both v${supportedVersion}.`,
+        message: `Format fence: context.db and this build are both v${supportedVersion}.`,
     };
 }
 

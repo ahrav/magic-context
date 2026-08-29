@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
-import { Database } from "../../shared/sqlite";
+import { createDirectTestDatabase } from "../../features/magic-context/test-database";
+import type { Database } from "../../shared/sqlite";
 import { computeM0BlockTokens } from "./m0-token-breakdown";
 import { estimateTokens } from "./read-session-formatting";
 
@@ -15,8 +15,7 @@ import { estimateTokens } from "./read-session-formatting";
 const SESSION_ID = "ses_m0_breakdown";
 
 function makeDb(): Database {
-    const d = new Database(":memory:");
-    initializeDatabase(d);
+    const d = createDirectTestDatabase().db;
     getOrCreateSessionMeta(d, SESSION_ID);
     return d;
 }

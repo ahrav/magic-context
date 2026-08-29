@@ -58,6 +58,9 @@ export class McHostCallError extends Error {
      */
     errorTerminal?: { bodyText: string | null; flags: number; streamed: boolean };
 
+    /** Host-advised delay before retrying this operation. */
+    retry_after_ms?: number;
+
     constructor(
         readonly kind: McHostCallErrorKind,
         message: string,

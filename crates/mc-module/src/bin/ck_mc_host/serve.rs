@@ -7,21 +7,22 @@
 //! then runtime lock), the `starting` record, publication, and the
 //! post-publication activation split all live inside `mc_host::run`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use hmac::{Hmac, Mac};
 use mc_host::broca::backend::{
-    BackendError, BackendFuture, BackendRequest, BackendTerminal, ErrorClass, EventSink,
+    BackendError, BackendFuture, BackendRequest, BackendTerminal, ErrorClass, EventSink, Harness,
     HarnessDispatchBackend, LlmExecutionBackend,
 };
 use mc_host::broca::opencode::{OpenCodeBackend, OpenCodeRuntime};
 use mc_host::broca::pi::{PiBackend, PiRuntimeDescriptor};
-use mc_host::broca::subprocess::EnvSnapshot;
+use mc_host::broca::subprocess::{
+    EnvSnapshot, CREDENTIAL_ROW_CAP_BYTES, CREDENTIAL_VALUE_CAP_BYTES,
+};
 use mc_host::broca::BrocaComponent;
 use mc_host::generation::{GenerationStore, ValidatedGeneration};
 use mc_host::harness_closure::{
@@ -30,7 +31,7 @@ use mc_host::harness_closure::{
 };
 use mc_host::synapse::{SynapseComponent, SynapseConfig, SynapseLimits};
 use mc_host::{CancellationToken, HostConfig, HostInit, StaticComposite};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 use crate::spawn::MAX_ENVELOPE_BYTES;
 
@@ -39,8 +40,6 @@ const ACTIVE_HARNESS_SELECTION: &str = "active-selection.json";
 const ACTIVE_SELECTION_CREDENTIAL_DOMAIN: &[u8] = b"mc-host-active-selection-credential-v1";
 const MAX_DESCRIPTOR_ITEMS: usize = 32;
 const MAX_DESCRIPTOR_ITEM_BYTES: usize = 4096;
-const CREDENTIAL_VALUE_CAP_BYTES: usize = 16 * 1024;
-const CREDENTIAL_ROW_CAP_BYTES: usize = 64 * 1024;
 const CREDENTIAL_NAMES: [&str; 3] = ["ANTHROPIC_API_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY"];
 
 /// The bounded launcher-to-serve startup envelope (KTD18). Strict: unknown
@@ -90,8 +89,31 @@ pub struct HarnessCandidate {
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HarnessSnapshot {
     Ready { manifest_sha256: String },
-    Unavailable { reason: String },
+    Unavailable { reason: HarnessUnavailableReason },
 }
+
+/// The closed set of per-harness unavailability reasons the launcher may
+/// hand to serve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessUnavailableReason {
+    DescriptorInvalid,
+    ClosureIncomplete,
+    ArgumentVariantInvalid,
+}
+
+impl HarnessUnavailableReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DescriptorInvalid => "descriptor_invalid",
+            Self::ClosureIncomplete => "closure_incomplete",
+            Self::ArgumentVariantInvalid => "argument_variant_invalid",
+        }
+    }
+}
+
+/// Current startup envelope schema.
+pub const STARTUP_ENVELOPE_SCHEMA: u32 = 2;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -126,7 +148,7 @@ pub enum SelectionMode<'a> {
 impl PreparedLauncherEnvelope {
     pub fn to_startup(&self, payload_manifest_digest: String) -> StartupEnvelope {
         StartupEnvelope {
-            schema: 1,
+            schema: STARTUP_ENVELOPE_SCHEMA,
             data_dir: self.data_dir.clone(),
             payload_manifest_digest,
             opencode: self.opencode.clone(),
@@ -145,7 +167,7 @@ impl PreparedLauncherEnvelope {
 
 impl StartupEnvelope {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.schema != 1 {
+        if self.schema != STARTUP_ENVELOPE_SCHEMA {
             return Err("unsupported startup envelope schema");
         }
         if !self.data_dir.is_absolute() {
@@ -231,6 +253,11 @@ impl LauncherEnvelope {
         }
         let supplied_opencode = self.opencode.is_some();
         let supplied_pi = self.pi.is_some();
+        let candidate_digests: BTreeSet<String> = [self.opencode.as_ref(), self.pi.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|candidate| candidate.manifest_sha256.clone())
+            .collect();
         let opencode_candidate = materialize_snapshot("opencode", self.opencode, &mut validator);
         let pi_candidate = materialize_snapshot("pi", self.pi, &mut validator);
         if running
@@ -266,6 +293,19 @@ impl LauncherEnvelope {
             &mut validator,
         );
         let pi = selected_snapshot("pi", selection.pi.as_deref(), pi_candidate, &mut validator);
+        // Pruning follows all validation and materialization. Protect every
+        // digest visible in the active, candidate, or merged selection so a
+        // failed validation cannot delete the only recoverable closure.
+        if let Some(store) = store.as_ref() {
+            let mut protected = candidate_digests;
+            protected.extend(previous.opencode.iter().cloned());
+            protected.extend(previous.pi.iter().cloned());
+            protected.extend(selection.opencode.iter().cloned());
+            protected.extend(selection.pi.iter().cloned());
+            store
+                .prune(&protected)
+                .map_err(|_| "harness closure prune failed")?;
+        }
         Ok(PreparedLauncherEnvelope {
             data_dir,
             closure_root,
@@ -317,28 +357,41 @@ fn credential_identities(
     credentials: &BTreeMap<String, String>,
     connection_key: &[u8; 32],
 ) -> BTreeMap<String, String> {
-    let mut derive =
-        Hmac::<Sha256>::new_from_slice(connection_key).expect("HMAC accepts any key length");
-    derive.update(ACTIVE_SELECTION_CREDENTIAL_DOMAIN);
-    let derived = derive.finalize().into_bytes();
+    let derived = hmac_sha256(connection_key, &[ACTIVE_SELECTION_CREDENTIAL_DOMAIN]);
     credentials
         .iter()
         .map(|(name, value)| {
-            let mut mac =
-                Hmac::<Sha256>::new_from_slice(&derived).expect("HMAC accepts any key length");
-            mac.update(&(name.len() as u64).to_be_bytes());
-            mac.update(name.as_bytes());
-            mac.update(&(value.len() as u64).to_be_bytes());
-            mac.update(value.as_bytes());
-            let identity = mac
-                .finalize()
-                .into_bytes()
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect();
+            let name_len = (name.len() as u64).to_be_bytes();
+            let value_len = (value.len() as u64).to_be_bytes();
+            let identity = hmac_sha256(
+                &derived,
+                &[&name_len, name.as_bytes(), &value_len, value.as_bytes()],
+            )
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
             (name.clone(), identity)
         })
         .collect()
+}
+
+fn hmac_sha256(key: &[u8], segments: &[&[u8]]) -> [u8; 32] {
+    debug_assert!(key.len() <= 64);
+    let mut inner_pad = [0x36; 64];
+    let mut outer_pad = [0x5c; 64];
+    for (index, byte) in key.iter().enumerate() {
+        inner_pad[index] ^= byte;
+        outer_pad[index] ^= byte;
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    for segment in segments {
+        inner.update(segment);
+    }
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner.finalize());
+    outer.finalize().into()
 }
 
 pub fn credential_identity_key(publication: &Path) -> Result<[u8; 32], &'static str> {
@@ -412,32 +465,37 @@ fn validate_snapshot(snapshot: Option<&HarnessSnapshot>) -> Result<(), &'static 
                 Err("harness snapshot digest is noncanonical")
             }
         }
-        Some(HarnessSnapshot::Unavailable { reason })
-            if matches!(
-                reason.as_str(),
-                "descriptor_invalid" | "closure_incomplete" | "argument_variant_invalid"
-            ) =>
-        {
-            Ok(())
-        }
-        Some(HarnessSnapshot::Unavailable { .. }) => {
-            Err("harness snapshot unavailable reason is invalid")
-        }
+        // The reason set is closed by the `HarnessUnavailableReason` enum:
+        // serde already rejected anything outside it during decode.
+        Some(HarnessSnapshot::Unavailable { .. }) => Ok(()),
     }
 }
 
-fn qualified_manifest(harness: &str, expected_digest: &str) -> Option<ClosureManifest> {
+fn qualified_manifest(
+    harness: &str,
+    expected_digest: &str,
+) -> Result<ClosureManifest, HarnessUnavailableReason> {
     let (_, _, bytes) = mc_module::production_inputs::QUALIFIED_HARNESS_CLOSURES
         .iter()
-        .find(|(name, digest, _)| *name == harness && *digest == expected_digest)?;
-    let manifest: ClosureManifest = serde_json::from_str(bytes).ok()?;
+        .find(|(name, digest, _)| *name == harness && *digest == expected_digest)
+        .ok_or(HarnessUnavailableReason::DescriptorInvalid)?;
+    let manifest: ClosureManifest =
+        serde_json::from_str(bytes).map_err(|_| HarnessUnavailableReason::DescriptorInvalid)?;
     if manifest.harness != harness
-        || manifest.argument_variant != "run_prompt"
-        || manifest_digest(&manifest).ok()?.as_str() != expected_digest
+        || manifest_digest(&manifest)
+            .map_err(|_| HarnessUnavailableReason::DescriptorInvalid)?
+            .as_str()
+            != expected_digest
     {
-        return None;
+        return Err(HarnessUnavailableReason::DescriptorInvalid);
     }
-    Some(manifest)
+    // The variant mismatch has its own reason so operators see "this build
+    // does not speak the qualified argument shape" rather than a generic
+    // invalid descriptor.
+    if manifest.argument_variant != "run_prompt" {
+        return Err(HarnessUnavailableReason::ArgumentVariantInvalid);
+    }
+    Ok(manifest)
 }
 
 /// One `prepare()`-scoped memo over `HarnessClosureStore::validate`.
@@ -499,14 +557,13 @@ fn materialize_snapshot(
     validator: &mut ClosureValidator<'_>,
 ) -> Option<HarnessSnapshot> {
     let candidate = candidate?;
-    let Some(manifest) = qualified_manifest(harness, &candidate.manifest_sha256) else {
-        return Some(HarnessSnapshot::Unavailable {
-            reason: "descriptor_invalid".to_owned(),
-        });
+    let manifest = match qualified_manifest(harness, &candidate.manifest_sha256) {
+        Ok(manifest) => manifest,
+        Err(reason) => return Some(HarnessSnapshot::Unavailable { reason }),
     };
     let Some(store) = validator.store() else {
         return Some(HarnessSnapshot::Unavailable {
-            reason: "closure_incomplete".to_owned(),
+            reason: HarnessUnavailableReason::ClosureIncomplete,
         });
     };
     // A digest already proven valid in this `prepare()` needs no second pass:
@@ -529,7 +586,7 @@ fn materialize_snapshot(
             })
         }
         Err(_) => Some(HarnessSnapshot::Unavailable {
-            reason: "closure_incomplete".to_owned(),
+            reason: HarnessUnavailableReason::ClosureIncomplete,
         }),
     }
 }
@@ -544,9 +601,9 @@ fn selected_snapshot(
         return candidate;
     }
     let digest = digest?;
-    if qualified_manifest(harness, digest).is_none() || !validator.is_valid(digest) {
+    if qualified_manifest(harness, digest).is_err() || !validator.is_valid(digest) {
         return Some(HarnessSnapshot::Unavailable {
-            reason: "closure_incomplete".to_owned(),
+            reason: HarnessUnavailableReason::ClosureIncomplete,
         });
     }
     Some(HarnessSnapshot::Ready {
@@ -630,7 +687,7 @@ fn read_selection(
         ("pi", selection.pi.as_deref()),
     ] {
         if let Some(digest) = digest {
-            if qualified_manifest(harness, digest).is_none() || !validator.is_valid(digest) {
+            if qualified_manifest(harness, digest).is_err() || !validator.is_valid(digest) {
                 return Ok(SelectionState::Stale);
             }
         }
@@ -682,14 +739,8 @@ fn write_selection(closure_root: &Path, selection: &HarnessSelection) -> Result<
 }
 
 pub fn clear_active_selection() -> Result<(), &'static str> {
-    let data_dir = mc_host::runtime_dir_path(None)
+    let data_dir = mc_host::data_dir_path(None)
         .ok()
-        .and_then(|run_dir| {
-            run_dir
-                .parent()
-                .and_then(Path::parent)
-                .map(Path::to_path_buf)
-        })
         .ok_or("active harness selection root is unavailable")?;
     let closure_root = data_dir.join("cortexkit").join("mc-host-harness-closures");
     let path = closure_root.join(ACTIVE_HARNESS_SELECTION);
@@ -741,6 +792,10 @@ impl LlmExecutionBackend for UnavailableBackend {
                 provider_code: None,
             })
         })
+    }
+
+    fn unavailable_reason(&self, _harness: Harness) -> Option<&'static str> {
+        Some(self.subreason)
     }
 }
 
@@ -803,21 +858,17 @@ fn open_snapshot(
         return Err("descriptor_absent");
     };
     match snapshot {
-        HarnessSnapshot::Unavailable { reason } => match reason.as_str() {
-            "descriptor_invalid" => Err("descriptor_invalid"),
-            "closure_incomplete" => Err("closure_incomplete"),
-            "argument_variant_invalid" => Err("argument_variant_invalid"),
-            _ => Err("descriptor_invalid"),
-        },
+        HarnessSnapshot::Unavailable { reason } => Err(reason.as_str()),
         HarnessSnapshot::Ready { manifest_sha256 } => {
             let store = store.ok_or("closure_incomplete")?;
             let closure = store
                 .validate(manifest_sha256)
                 .map_err(|_| "closure_incomplete")?;
-            if closure.manifest().harness != harness
-                || closure.manifest().argument_variant != "run_prompt"
-            {
+            if closure.manifest().harness != harness {
                 return Err("descriptor_invalid");
+            }
+            if closure.manifest().argument_variant != "run_prompt" {
+                return Err("argument_variant_invalid");
             }
             Ok(Arc::new(closure))
         }
@@ -841,6 +892,13 @@ fn read_envelope() -> Result<StartupEnvelope, &'static str> {
 }
 
 pub fn read_launcher_envelope() -> Result<LauncherEnvelope, &'static str> {
+    // A terminal never sends EOF on its own, so reading to end would hang an
+    // interactive `ck-mc-host start` forever. A TTY carries no envelope by
+    // definition — the launcher always redirects or closes stdin — so treat it as
+    // the absent envelope it is instead of blocking on a human.
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Ok(LauncherEnvelope::empty());
+    }
     let mut bytes = Vec::new();
     std::io::stdin()
         .lock()
@@ -860,10 +918,21 @@ pub fn read_launcher_envelope() -> Result<LauncherEnvelope, &'static str> {
 }
 
 fn storage_init(root: &Path) -> Result<HostInit, &'static str> {
-    let managed = root.join("cortexkit");
-    std::fs::create_dir_all(&managed).map_err(|_| "managed directory creation failed")?;
-    std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o700))
-        .map_err(|_| "managed directory permissions failed")?;
+    // The managed segment is the library's definition, not a second copy: a
+    // rename here would otherwise leave the store outside the tree that
+    // `mc_host::run` creates and validates.
+    let managed =
+        mc_host::managed_dir_path(Some(root)).map_err(|_| "managed directory path failed")?;
+    // Mode is applied by mkdir(2) at creation rather than by a follow-up
+    // chmod: `set_permissions` follows symlinks, so on a pre-existing
+    // symlinked path it would change the mode of the target instead. The
+    // authoritative owner-only creation and ancestor validation of this tree
+    // stay with `mc_host::run`.
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&managed)
+        .map_err(|_| "managed directory creation failed")?;
     let descriptor = cortexkit_store_types::StorageDescriptor {
         module_id: "magic-context".to_owned(),
         storage_namespace: "mc_cache".to_owned(),
@@ -898,17 +967,25 @@ fn synapse_component(generation: &ValidatedGeneration) -> SynapseComponent {
         };
         let descriptor_root = generation.descriptor_root_path();
         let bundle_dir = descriptor_root.join(BUNDLE_DIR);
-        if !generation
+        // The generation manifest is the trust root: its digest already covers
+        // these bytes, so carrying the bundle manifest's own hash forward binds
+        // every artifact `load_bundle` verifies to the generation that was
+        // selected. Presence alone was not enough — the loader would then prove
+        // only that whatever sits at this pathname is self-consistent, so a
+        // directory replaced after validation could serve different embedding
+        // bytes under a generation the daemon still reported as valid.
+        let Some(bundle_manifest) = generation
             .manifest
             .files
             .iter()
-            .any(|entry| entry.path == format!("{BUNDLE_DIR}/manifest.json"))
-        {
+            .find(|entry| entry.path == format!("{BUNDLE_DIR}/manifest.json"))
+        else {
             return SynapseComponent::new(None);
-        }
+        };
         SynapseComponent::new(Some(SynapseConfig {
             bundle_dir,
             ort_library: descriptor_root.join(ORT_LIBRARY),
+            bundle_manifest_sha256: Some(bundle_manifest.sha256.clone()),
             ort_library_sha256: ort.sha256.clone(),
             limits: SynapseLimits::default(),
         }))
@@ -943,13 +1020,21 @@ pub fn run() -> Result<(), &'static str> {
     )
     .map_err(|_| "credential snapshot exceeds bounds")?;
     let synapse = synapse_component(&generation);
+    // The credential verifier fails closed on every Broca send, so it is
+    // installed only when the launcher actually admitted credential rows —
+    // an envelope with none (older parents, credential-less deployments)
+    // keeps the harness lane on its pre-credential behavior instead of
+    // hard-failing every send with `credential_snapshot_mismatch`.
+    let backend: Arc<dyn LlmExecutionBackend> = Arc::new(harness_backend(&envelope, &env));
+    let broca = if envelope.credentials.is_empty() {
+        BrocaComponent::new(backend)
+    } else {
+        BrocaComponent::new_with_credentials(backend, env.clone())
+    };
     let composite = StaticComposite::new(
         mc_module::McHandler::new_with_connection_file(Some(publication)),
         synapse,
-        BrocaComponent::new_with_credentials(
-            Arc::new(harness_backend(&envelope, &env)),
-            env.clone(),
-        ),
+        broca,
     )
     .map_err(|_| "composite construction failed")?;
 
@@ -975,19 +1060,31 @@ pub fn run() -> Result<(), &'static str> {
     let shutdown = CancellationToken::new();
     runtime.block_on(async {
         let signal_shutdown = shutdown.clone();
+        // Installed before the host future starts. Creating a stream inside the
+        // spawned task races `mc_host::run`: a signal arriving before
+        // registration takes the default disposition and kills the daemon
+        // outright, so the runtime never observes the cancellation and the
+        // fenced teardown in `mc_host::run` never runs. An installation failure
+        // is also fatal to the shutdown path, so it fails startup here rather
+        // than panicking a detached task and leaving `run` serving with no
+        // signal handling and nothing reporting it.
+        //
+        // SIGINT is handled alongside SIGTERM: the spawn path resets every
+        // inherited disposition to its default, so an interrupt from an operator
+        // or a process supervisor would otherwise terminate the daemon without
+        // draining routes and components.
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|_| "SIGTERM handler installation failed")?;
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .map_err(|_| "SIGINT handler installation failed")?;
         let signal_task = tokio::spawn(async move {
-            let mut terminate =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("SIGTERM handler installs");
-            let mut interrupt =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                    .expect("SIGINT handler installs");
-            if tokio::select! {
-                received = terminate.recv() => received,
-                received = interrupt.recv() => received,
-            }
-            .is_some()
-            {
+            let received = tokio::select! {
+                signal = terminate.recv() => signal,
+                signal = interrupt.recv() => signal,
+            };
+            if received.is_some() {
                 signal_shutdown.cancel();
             }
         });
@@ -1001,6 +1098,16 @@ pub fn run() -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_mac_matches_hmac_sha256() {
+        let digest = hmac_sha256(b"key", &[b"The quick brown fox jumps over the lazy dog"]);
+        let encoded: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(
+            encoded,
+            "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+        );
+    }
 
     #[test]
     fn harness_selection_merges_without_losing_prior_credentials() {

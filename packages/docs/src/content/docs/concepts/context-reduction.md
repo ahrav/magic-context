@@ -67,7 +67,7 @@ So if your session's bulk is **tool calls** (common for heavy file-reading or bu
 
 **What to do about it:**
 
-- **Let the agent reduce.** `ctx_reduce` is the primary lever for tool output. Capable models call it in response to the built-in nudges. The dashboard and `/ctx-status` show how much reclaimable tool output is sitting unreduced.
+- **Let the agent reduce.** `ctx_reduce` is the primary lever for tool output. Capable models call it in response to the built-in nudges. `/ctx-status` shows how much reclaimable tool output is sitting unreduced.
 - **Lower the emergency line is not configurable, but you can lower the execute threshold** so the historian compresses conversation earlier. Note this only helps the *conversation* portion, not tool outputs.
 - **Check the breakdown.** In the TUI sidebar or `/ctx-status`, look at the token breakdown. If **Tool Calls** dominates, the fix is `ctx_reduce` usage (or waiting for 85%), not the threshold. If **Conversation** dominates and the historian is idle, the eligible history above the protected tail is already compressed — what remains is the protected recent window.
 

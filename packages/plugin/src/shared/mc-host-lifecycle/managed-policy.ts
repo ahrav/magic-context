@@ -22,7 +22,7 @@ import {
     prepareManagedLaunchTarget,
     resolveManagedPayloadDir,
 } from "./owner";
-import { connectionFilePath, resolveLifecycleDataRoot } from "./paths";
+import { admitLifecycleFilesystem, connectionFilePath, resolveLifecycleDataRoot } from "./paths";
 import {
     type CompatibilitySnapshot,
     type LifecyclePolicyOptions,
@@ -173,10 +173,14 @@ async function readCompatibilityProbe(
     if (authenticated === null || authenticated.daemonId === null) {
         throw new Error("authenticated peer disappeared");
     }
-    const daemon = evaluateDaemonCompatibility(authenticated.daemonVer);
+    const daemon = evaluateDaemonCompatibility(authenticated);
     if (!daemon.ok) {
         return {
             snapshot: {
+                authenticatedPeer: {
+                    ...authenticated,
+                    daemonId: Uint8Array.from(authenticated.daemonId),
+                },
                 authenticatedDaemonVersion: authenticated.daemonVer,
                 authenticatedDaemonId: Uint8Array.from(authenticated.daemonId),
                 catalog: [],
@@ -197,6 +201,10 @@ async function readCompatibilityProbe(
     if (!modules.ok) {
         return {
             snapshot: {
+                authenticatedPeer: {
+                    ...authenticated,
+                    daemonId: Uint8Array.from(authenticated.daemonId),
+                },
                 authenticatedDaemonVersion: authenticated.daemonVer,
                 authenticatedDaemonId: Uint8Array.from(authenticated.daemonId),
                 catalog,
@@ -220,6 +228,10 @@ async function readCompatibilityProbe(
     // The probe only reports what it observed; the compatibility verdict is
     // owned by exactly one place, `McHostLifecyclePolicy.applyCompatibility`.
     const snapshot = {
+        authenticatedPeer: {
+            ...authenticated,
+            daemonId: Uint8Array.from(authenticated.daemonId),
+        },
         authenticatedDaemonVersion: authenticated.daemonVer,
         authenticatedDaemonId: Uint8Array.from(authenticated.daemonId),
         catalog,
@@ -294,7 +306,22 @@ async function probeManagedReadiness(root: string, budgetMs: number): Promise<Ob
                     }
                   : synapseState === "starting"
                     ? { state: "starting" as const, reason: "synapse_starting" as const }
-                    : { state: "degraded" as const, reason: "synapse_degraded" as const };
+                    : synapseState === undefined
+                      ? // The status payload omits a component whose state it
+                        // cannot report: the daemon skips any module missing from
+                        // `components`, missing a usable `status`, or missing its
+                        // state key. Absence means the lane is not offered, so it
+                        // reports `unsupported` — the one non-failing readiness
+                        // state, which `addCheck` maps to a skipped check. Calling
+                        // it `degraded` would make `status` and `doctor` answer
+                        // `ok: false` for a daemon that is serving correctly and
+                        // simply has no Synapse lane, which is the normal shape on
+                        // every platform the model lane does not cover.
+                        {
+                            state: "unsupported" as const,
+                            reason: "synapse_unsupported" as const,
+                        }
+                      : { state: "degraded" as const, reason: "synapse_degraded" as const };
         return {
             ...compatibility,
             readiness: {
@@ -369,6 +396,22 @@ export function createManagedLifecyclePolicy(
     const platform = checkPlatform(readers);
     if (!platform.ok) return new McHostLifecyclePolicy({ ...options, env });
 
+    // Admission runs before anything is prepared, because preparation WRITES:
+    // `prepareManagedLaunchTarget` can resolve the payload and call
+    // `stageBootstrap`, which creates directories and copies an executable into
+    // the data root. Admission otherwise happened for the first time in
+    // `preflight()`, at command time, so a root on an unsupported filesystem —
+    // NFS, or a `noexec` mount — was mutated by the very call that was about to
+    // reject it. A rejection that claims to be pre-native must leave no trace.
+    //
+    // The verdict itself is deliberately not reported here. Returning a policy
+    // with no launch target keeps `preflight()` the single authority on the
+    // outcome: it re-runs admission and answers with `admission.reason`, so the
+    // caller still sees `unsupported_filesystem` rather than a substitute.
+    if (!admitLifecycleFilesystem(root.root, options.admissionIo).ok) {
+        return new McHostLifecyclePolicy({ ...options, env });
+    }
+
     try {
         const declaringParentRoot = findDeclaringParentRoot(
             options.declaringModuleUrl,
@@ -413,7 +456,7 @@ export function createManagedLifecyclePolicy(
                 probe.status === null
                     ? null
                     : {
-                          daemonId: Uint8Array.from(probe.snapshot.authenticatedDaemonId),
+                          daemonId: Uint8Array.from(probe.snapshot.authenticatedPeer.daemonId),
                           state: storageState(probe.status.metrics),
                       };
             return probe.snapshot;

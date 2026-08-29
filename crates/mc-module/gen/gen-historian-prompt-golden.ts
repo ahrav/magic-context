@@ -12,7 +12,9 @@ const resolve = (m: string) => Bun.resolveSync(m, pluginDir);
 
 const promptMod = await import(resolve("./src/hooks/magic-context/compartment-prompt"));
 const referenceMod = await import(resolve("./src/hooks/magic-context/reference-retrieval"));
-const injectMod = await import(resolve("./src/hooks/magic-context/inject-compartments"));
+const claimRenderMod = await import(
+    resolve("./src/features/magic-context/memory/claim-memory-render"),
+);
 const seedsMod = await import(resolve("./src/hooks/magic-context/reference-seeds.generated"));
 
 const { buildCompartmentAgentPrompt } = promptMod as {
@@ -38,8 +40,8 @@ const { buildReferenceBlocks, selectSeeds, renderSeedExamplesBlock } = reference
     ) => Array<{ importance: number; block: string }>;
     renderSeedExamplesBlock: (seeds: Array<{ importance: number; block: string }>) => string;
 };
-const { renderMemoryBlock } = injectMod as {
-    renderMemoryBlock: (memories: TsMemory[]) => string | null;
+const { renderClaimMemoryBlock } = claimRenderMod as {
+    renderClaimMemoryBlock: (claims: TsClaimMemory[]) => string;
 };
 const { REFERENCE_SEEDS } = seedsMod as {
     REFERENCE_SEEDS: ReadonlyArray<{ importance: number; block: string }>;
@@ -77,28 +79,13 @@ interface MemoryJson {
     content: string;
 }
 
-interface TsMemory extends MemoryJson {
-    projectPath: string;
-    normalizedHash: string;
+interface TsClaimMemory {
+    publicClaimId: string;
+    revisionLocator: string;
+    projectId: number;
+    category: string;
+    content: string;
     importance: number;
-    scope: string;
-    shareable: number;
-    sourceSessionId: string | null;
-    sourceType: string;
-    seenCount: number;
-    retrievalCount: number;
-    firstSeenAt: number;
-    createdAt: number;
-    updatedAt: number;
-    lastSeenAt: number;
-    lastRetrievedAt: number | null;
-    status: string;
-    expiresAt: number | null;
-    verificationStatus: string;
-    verifiedAt: number | null;
-    supersededByMemoryId: number | null;
-    mergedFrom: string | null;
-    metadataJson: string | null;
 }
 
 interface SeedCaseSpec {
@@ -147,32 +134,15 @@ function toTsCompartment(c: ReferenceCompartmentJson): TsReferenceCompartment {
     };
 }
 
-function toTsMemory(m: MemoryJson): TsMemory {
+function toTsClaim(m: MemoryJson): TsClaimMemory {
+    const publicClaimId = `mcm_${m.id.toString(16).padStart(32, "0")}`;
     return {
-        id: m.id,
-        projectPath: "/repo/project",
+        publicClaimId,
+        revisionLocator: `${publicClaimId}/r1/${"a".repeat(64)}`,
+        projectId: 1,
         category: m.category,
         content: m.content,
-        normalizedHash: `hash-${m.id}`,
         importance: 50,
-        scope: "project",
-        shareable: 0,
-        sourceSessionId: "source-session",
-        sourceType: "historian",
-        seenCount: 1,
-        retrievalCount: 0,
-        firstSeenAt: 1,
-        createdAt: 1,
-        updatedAt: 1,
-        lastSeenAt: 1,
-        lastRetrievedAt: null,
-        status: "active",
-        expiresAt: null,
-        verificationStatus: "unverified",
-        verifiedAt: null,
-        supersededByMemoryId: null,
-        mergedFrom: null,
-        metadataJson: null,
     };
 }
 
@@ -295,7 +265,12 @@ const promptCaseSpecs: PromptCaseSpec[] = [
             { id: 4, category: "CONSTRAINTS", content: "Escape \"quotes\" but content leaves them literal" },
             { id: 5, category: "CONFIG_VALUES", content: "timeout_ms=5000 & mode=fast" },
             { id: 6, category: "USER_DIRECTIVES", content: "Legacy user directive survives" },
-            { id: 7, category: "UNKNOWN", content: "unknown category is not rendered" },
+            // Two categories outside the five-entry render order, so the golden pins the
+            // alphabetical tie-break both renderers fall back to. Both are allow-listed
+            // project-memory categories: a category outside the allow-list never reaches
+            // either renderer, so pinning one here would assert bytes the surfaces refuse
+            // to produce.
+            { id: 7, category: "KNOWN_ISSUES", content: "Legacy known issue survives" },
         ],
         input_source: "Messages 53-56:\n\n[53] U: continue with XML chars & < >\n[54] A: implementing\n[55] TC: read(src/lib.rs)\n[56] A: finished",
         memory_enabled: true,
@@ -356,7 +331,7 @@ const promptCases: PromptCase[] = promptCaseSpecs.map((spec) => {
         chunkStart: spec.chunk_start,
         sessionCompartments,
     });
-    const projectMemory = renderMemoryBlock(spec.memories.map(toTsMemory)) ?? "";
+    const projectMemory = renderClaimMemoryBlock(spec.memories.map(toTsClaim));
     const prompt = buildCompartmentAgentPrompt({
         seedExamples: refs.seedExamples,
         sessionReferences: refs.sessionReferences,
