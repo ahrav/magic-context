@@ -51,6 +51,7 @@ function qualifiedEvidence(): Record<string, unknown> {
         oidcProvenanceVerified: true,
         longLivedTokenUsed: false,
         productionSynapseVerified: true,
+        productionSynapseReportSha256: sha256Hex("production synapse report"),
         proofArtifacts: proofIdentities.map(([kind, subject], index) => ({
             kind,
             subject,
@@ -223,9 +224,17 @@ function installProofArtifacts(
                           )?.integrity,
                           offline_verified: flowEvidence?.offline_verified,
                       }
-                    : proof.kind === "publication"
+                      : proof.kind === "publication"
                       ? publication
-                      : { production_synapse_verified: evidence.production_synapse_verified };
+                      : {
+                            package_integrity: registry.find((entry) =>
+                                entry.name.endsWith("linux-x64-gnu"),
+                            )?.integrity,
+                            production_synapse_report_sha256:
+                                evidence.production_synapse_report_sha256,
+                            production_synapse_verified:
+                                evidence.production_synapse_verified,
+                        };
         const report = {
             schema: "magic-context.mc-host-release-proof/v1",
             kind: proof.kind,
@@ -268,11 +277,13 @@ describe("installed release evidence", () => {
         expect(() =>
             validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, {
                 verifyAttestation: () => true,
+                requireQualification: () => {},
             }),
         ).not.toThrow();
         expect(() =>
             validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, {
                 verifyAttestation: () => false,
+                requireQualification: () => {},
             }),
         ).toThrow(/lacks a valid attestation/);
         const proofs = evidence.proof_artifacts as {
@@ -282,6 +293,7 @@ describe("installed release evidence", () => {
         const checked: string[] = [];
         expect(() =>
             validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, {
+                requireQualification: () => {},
                 verifyAttestation: (_path, proof) => {
                     checked.push(proof.subject);
                     return proof.subject !== lastSubject;
@@ -343,7 +355,8 @@ describe("installed release evidence", () => {
                 root,
                 evidence,
                 true,
-                { verifyAttestation: () => true },
+                { verifyAttestation: () => true,
+                requireQualification: () => {} },
             ),
         ).not.toThrow();
 
@@ -355,7 +368,8 @@ describe("installed release evidence", () => {
                     root,
                     drifted,
                     true,
-                    { verifyAttestation: () => true },
+                    { verifyAttestation: () => true,
+                requireQualification: () => {} },
                 ),
             ).toThrow(new RegExp(`${field} does not match`));
         }
@@ -369,7 +383,8 @@ describe("installed release evidence", () => {
                 root,
                 evidence,
                 true,
-                { verifyAttestation: () => true },
+                { verifyAttestation: () => true,
+                requireQualification: () => {} },
             ),
         ).toThrow(/payload_index_sha256 does not match/);
     });
@@ -400,37 +415,16 @@ describe("installed release evidence", () => {
         // evidence stays byte-consistent with what it cites.
         const cases: [string, string, (parsed: Record<string, unknown>) => void, RegExp][] = [
             [
-                "unqualified production inputs",
-                files.qualification_sha256,
-                (parsed) => {
-                    parsed.production_qualified = false;
-                },
-                /cited production-input qualification is not production-qualified/,
-            ],
-            [
-                "qualified inputs that still name blockers",
-                files.qualification_sha256,
-                (parsed) => {
-                    parsed.unqualified = ["oracle evidence not recorded"];
-                },
-                /production-qualified but still names blockers/,
-            ],
-            [
+                // The qualification run's own contents are validated by its full
+                // consumer, which this test stubs; only the citation this gate owns
+                // is checked here — that the evidence and the run name the *same*
+                // contract, not merely that each is current on its own.
                 "qualification from another release contract",
                 files.qualification_sha256,
                 (parsed) => {
                     parsed.release_contract_sha256 = "e".repeat(64);
                 },
                 /qualification was produced against a different release contract/,
-            ],
-            [
-                "skeletal qualification carrying only the verdict",
-                files.qualification_sha256,
-                (parsed) => {
-                    for (const key of Object.keys(parsed)) delete parsed[key];
-                    parsed.production_qualified = true;
-                },
-                /not a production-input qualification run/,
             ],
             [
                 "unqualified payload index",
@@ -507,7 +501,8 @@ describe("installed release evidence", () => {
                         root,
                         evidence,
                         true,
-                        { verifyAttestation: () => true },
+                        { verifyAttestation: () => true,
+                requireQualification: () => {} },
                     ),
                 label,
             ).toThrow(pattern);
@@ -518,7 +513,8 @@ describe("installed release evidence", () => {
                     root,
                     evidence,
                     false,
-                    { verifyAttestation: () => true },
+                    { verifyAttestation: () => true,
+                requireQualification: () => {} },
                 ),
             ).not.toThrow();
         }
@@ -567,6 +563,7 @@ describe("installed release evidence", () => {
         expect(() =>
             validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, {
                 verifyAttestation: () => true,
+                requireQualification: () => {},
             }),
         ).toThrow(/observations drift/);
     });
@@ -645,7 +642,8 @@ describe("installed release evidence", () => {
                         root,
                         evidence,
                         true,
-                        { verifyAttestation: () => true },
+                        { verifyAttestation: () => true,
+                requireQualification: () => {} },
                     ),
                 label,
             ).toThrow(pattern);
@@ -654,7 +652,8 @@ describe("installed release evidence", () => {
                     root,
                     evidence,
                     false,
-                    { verifyAttestation: () => true },
+                    { verifyAttestation: () => true,
+                requireQualification: () => {} },
                 ),
             ).not.toThrow();
         }
@@ -681,9 +680,12 @@ describe("installed release evidence", () => {
         // No `verifyAttestation` stub, so the real `gh` path is selected and the
         // pinned signer identity has to be satisfiable. Until the lane exists it
         // is not, and the failure must say so rather than reporting six proofs
-        // as unattested.
+        // as unattested. Qualification is stubbed to isolate the attestation
+        // preconditions; the assertion below covers the unstubbed default.
         expect(() =>
-            validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true),
+            validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, {
+                requireQualification: () => {},
+            }),
         ).toThrow(/qualification workflow at .*mc-host-release-qualification\.yml/);
         // With the workflow present the next unmet precondition must surface, not
         // a permissive verification: an unpinned source ref lets the approved
@@ -692,12 +694,21 @@ describe("installed release evidence", () => {
         mkdirSync(dirname(join(root, workflow)), { recursive: true });
         writeFileSync(join(root, workflow), "name: placeholder\n");
         expect(() =>
-            validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true),
+            validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, {
+                requireQualification: () => {},
+            }),
         ).toThrow(/requires an attestation source ref/);
-        // A stub still bypasses both: the preconditions are about the `gh` path.
+        // Unstubbed, the real production-input qualification consumer runs and its
+        // rejection surfaces — proof that GA delegates to the full validator
+        // rather than to the summary fields this file used to check.
+        expect(() =>
+            validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true),
+        ).toThrow(/qualification evidence rejected/);
+        // Both stubs bypass it: the preconditions are about the `gh` path.
         expect(() =>
             validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, {
                 verifyAttestation: () => true,
+                requireQualification: () => {},
             }),
         ).not.toThrow();
     });
@@ -741,6 +752,7 @@ describe("installed release evidence", () => {
         expect(() =>
             validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, {
                 verifyAttestation: () => true,
+                requireQualification: () => {},
             }),
         ).toThrow(/product_flow:.* observations drift/);
     });

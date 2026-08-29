@@ -489,8 +489,15 @@ const SEMVER_RE = /^\d+\.\d+\.\d+$/;
  * label ("reserved") or an ordinary GA version is not evidence of a reservation
  * and must not satisfy the gate.
  */
+// A reservation must be a valid npm-publishable SemVer prerelease, so this
+// follows SemVer's own grammar rather than a loose approximation: numeric
+// identifiers carry no leading zeroes (SemVer §9), which is why `0.0.1-01` and
+// `0.0.1-reserved.01` are rejected here — npm's parser rejects them too, so such
+// a value could never be the published inert reservation the gate claims to
+// verify. Build metadata stays excluded: `+meta` is not part of the published
+// version identity.
 const RESERVATION_VERSION_RE =
-    /^\d+\.\d+\.\d+-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*$/;
+    /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*$/;
 const DOTTED_FLOOR_RE = /^\d+\.\d+$/;
 
 function fail(message: string): never {

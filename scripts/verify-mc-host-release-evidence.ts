@@ -16,6 +16,7 @@ import {
     type ReleaseContract,
     sha256Hex,
 } from "./generate-mc-host-release-manifest";
+import { requireQualificationEvidence } from "./qualify-mc-host-production-inputs";
 
 const EVIDENCE_PATH = "docs/evidence/mc-host-installed-release-evidence.json";
 const QUALIFICATION_PATH = "docs/evidence/mc-host-release-qualification.json";
@@ -140,6 +141,11 @@ export interface InstalledReleaseEvidence {
         payloads_before_parents: boolean;
     };
     production_synapse_verified: boolean;
+    /**
+     * Digest of the production semantic-Synapse report, recorded independently of
+     * the proof that cites it, so the proof cannot be its own witness.
+     */
+    production_synapse_report_sha256: string | null;
     proof_artifacts: ProofArtifactRef[];
     qualified: boolean;
     blockers: string[];
@@ -157,6 +163,7 @@ export interface BuildInstalledReleaseEvidenceOptions {
     oidcProvenanceVerified: boolean;
     longLivedTokenUsed: boolean;
     productionSynapseVerified: boolean;
+    productionSynapseReportSha256: string | null;
     proofArtifacts: ProofArtifactRef[];
     qualified: boolean;
     blockers: string[];
@@ -277,6 +284,7 @@ export function buildInstalledReleaseEvidence(
             ),
         },
         production_synapse_verified: options.productionSynapseVerified,
+        production_synapse_report_sha256: options.productionSynapseReportSha256,
         proof_artifacts: options.proofArtifacts,
         qualified: options.qualified,
         blockers: options.blockers,
@@ -305,6 +313,7 @@ export function validateInstalledReleaseEvidence(
             "product_flows",
             "publication",
             "production_synapse_verified",
+            "production_synapse_report_sha256",
             "proof_artifacts",
             "qualified",
             "blockers",
@@ -547,6 +556,15 @@ export function validateInstalledReleaseEvidence(
         !booleanField(publication, "long_lived_token_used", "publication") &&
         booleanField(publication, "payloads_before_parents", "publication") &&
         booleanField(evidence, "production_synapse_verified", "evidence");
+    const synapseReport = evidence.production_synapse_report_sha256;
+    if (
+        synapseReport !== null &&
+        (typeof synapseReport !== "string" || !SHA256_RE.test(synapseReport))
+    ) {
+        fail(
+            "production_synapse_report_sha256 must be lowercase SHA-256 or null",
+        );
+    }
 
     if (qualified && (!allProofsPass || blockers.length !== 0)) {
         fail("qualified evidence contains a failed proof or blocker");
@@ -584,27 +602,26 @@ function assertCitedArtifactsQualified(
     rootDir: string,
     contract: ReleaseContract,
     expectedContractDigest: string,
+    requireQualification: (rootDir: string) => void,
 ): void {
+    // Delegate the qualification run to its own full consumer rather than
+    // re-deriving a weaker version of it here. `requireQualificationEvidence`
+    // checks the schema, the contract digest, the release identity, `test_only`,
+    // the artifact citations against real bytes, and — the part summary fields
+    // can never reach — it re-derives the verdict from the input-lock bytes,
+    // because the evidence's own `production_qualified` bit is self-describing
+    // and therefore not authority. That also stops the separately cited input
+    // lock from being opaque bytes to this gate.
+    requireQualification(rootDir);
     const qualification = record(
         readJson(rootDir, QUALIFICATION_PATH),
         "cited qualification",
     );
-    if (
-        qualification.schema !== "magic-context.mc-host-release-qualification/v1"
-    ) {
-        fail("cited qualification is not a production-input qualification run");
-    }
+    // Retained after the delegation for the citation this gate specifically owns:
+    // the evidence's contract digest and the qualification run's must be the same
+    // one, not merely each current on its own.
     if (qualification.release_contract_sha256 !== expectedContractDigest) {
         fail("cited qualification was produced against a different release contract");
-    }
-    if (qualification.production_qualified !== true) {
-        fail("cited production-input qualification is not production-qualified");
-    }
-    // A qualified run carries no outstanding reasons; a populated list next to a
-    // `true` verdict is a contradiction the run itself should never emit.
-    const unqualified = qualification.unqualified;
-    if (!Array.isArray(unqualified) || unqualified.length !== 0) {
-        fail("cited qualification is production-qualified but still names blockers");
     }
 
     const payloadIndex = record(
@@ -690,6 +707,12 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
     requireQualified: boolean,
     options: {
         verifyAttestation?: (path: string, proof: ProofArtifactRef) => boolean;
+        /**
+         * Seam for the production-input qualification consumer, defaulting to the
+         * real one. Tests that are not exercising qualification stub it; the
+         * `--check` path never does, so GA always runs the full validator.
+         */
+        requireQualification?: (rootDir: string) => void;
     } = {},
 ): InstalledReleaseEvidence {
     const evidence = validateInstalledReleaseEvidence(value);
@@ -710,6 +733,10 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
             rootDir,
             contract,
             evidence.release_contract_sha256,
+            options.requireQualification ??
+                ((root) => {
+                    requireQualificationEvidence(root);
+                }),
         );
     }
     if (requireQualified && options.verifyAttestation === undefined) {
@@ -856,6 +883,18 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
                         }
                       : proof.kind === "production_synapse"
                         ? {
+                              // The bare boolean said nothing about which bytes ran
+                              // the production semantic lane, so a source checkout,
+                              // staged payload, or stale install produced an
+                              // identical proof. The Linux payload's published
+                              // integrity and the semantic report digest are what
+                              // tie the result to the artifact GA ships.
+                              package_integrity:
+                                  evidence.registry_packages.find((entry) =>
+                                      entry.name.endsWith("linux-x64-gnu"),
+                                  )?.integrity,
+                              production_synapse_report_sha256:
+                                  evidence.production_synapse_report_sha256,
                               production_synapse_verified:
                                   evidence.production_synapse_verified,
                           }
@@ -956,6 +995,7 @@ function buildTemplate(rootDir: string): InstalledReleaseEvidence {
         oidcProvenanceVerified: false,
         longLivedTokenUsed: false,
         productionSynapseVerified: false,
+        productionSynapseReportSha256: null,
         proofArtifacts: [],
         qualified: false,
         blockers,

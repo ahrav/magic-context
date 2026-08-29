@@ -463,6 +463,34 @@ describe("registry gate", () => {
             /must be an inert prerelease/,
         );
     });
+
+    test("a reservation version npm could not publish is rejected", () => {
+        // SemVer §9 forbids leading zeroes in numeric prerelease identifiers, so
+        // npm's parser rejects these outright — a gate accepting one would claim a
+        // reserved name that cannot exist. Same rule for the core version.
+        for (const invalid of [
+            "0.0.1-01",
+            "0.0.1-reserved.01",
+            "01.0.1-reserved.0",
+            "0.0.1-reserved.0+meta",
+        ]) {
+            const gate = gateCopy();
+            gate.packages[3].reservation_version = invalid;
+            expect(
+                () => validateRegistryGateShape(gate, buildContract()),
+                invalid,
+            ).toThrow(/must be an inert prerelease/);
+        }
+        // Alphanumeric identifiers and a bare `0` remain valid prereleases.
+        for (const valid of ["0.0.1-reserved.0", "0.0.1-0", "0.0.1-rc.1"]) {
+            const gate = gateCopy();
+            gate.packages[3].reservation_version = valid;
+            expect(
+                () => validateRegistryGateShape(gate, buildContract()),
+                valid,
+            ).not.toThrow();
+        }
+    });
 });
 
 describe("platform floors", () => {
