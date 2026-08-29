@@ -2,10 +2,9 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 
-import { Database } from "../../../shared/sqlite";
+import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
-import { runMigrations } from "../migrations";
-import { initializeDatabase } from "../storage-db";
+import { createDirectTestDatabase } from "../test-database";
 import {
     type RetrospectiveProjectSession,
     type RetrospectiveRawMessage,
@@ -89,9 +88,7 @@ afterEach(() => {
     db = null;
 });
 function freshDb(): Database {
-    const database = new Database(":memory:");
-    initializeDatabase(database);
-    runMigrations(database);
+    const database = createDirectTestDatabase().db;
     return database;
 }
 

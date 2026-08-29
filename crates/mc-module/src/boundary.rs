@@ -1346,9 +1346,7 @@ fn fence_boundary_for_tool_arcs(
         if arc.res_ordinal.is_some() || arc.inv_ordinal < recent_open_arc_cutoff {
             continue;
         }
-        if (arc.inv_ordinal >= publication_floor_ordinal && arc.inv_ordinal < boundary)
-            || arc.inv_ordinal >= boundary
-        {
+        if arc.inv_ordinal >= publication_floor_ordinal || arc.inv_ordinal >= boundary {
             boundary = arc.inv_ordinal;
             open_arc = true;
             break;

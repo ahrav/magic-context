@@ -5,79 +5,38 @@
 //! visibility is read-only for primary agents; facade mutations require project ownership,
 //! which the store rechecks inside the mutation transaction.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+
+use serde_json::Value;
 
 use mc_store::{
-    McStore, McStoreError, StoredCompartmentSearchRow, StoredMemoryFull, StoredMemorySearchRow,
-    StoredNoteSearchRow,
+    claim_mirror::{ClaimMirrorError, CommittedClaimMirrorRow},
+    ClaimIntentRecord, McStore, McStoreError, StoredCompartmentSearchRow, StoredNoteSearchRow,
 };
 
-pub use mc_store::FOREIGN_VISIBLE_SQL;
+use crate::memory_render::is_positive_memory_category;
+
+pub use mc_core::claim_operation::{
+    ClaimCommandIdentity, ClaimIntentAckKind, ClaimIntentAckRequest, ClaimIntentAckResponse,
+    ClaimIntentBinding, ClaimIntentInspectRequest, ClaimIntentInspectResponse,
+    ClaimIntentStageRequest, ClaimIntentStageResponse, ClaimIntentState, ClaimIntentWireRecord,
+    CLAIM_INTENT_PROTOCOL_VERSION, CLAIM_REQUEST_ENCODING_VERSION,
+};
 
 #[derive(Debug)]
 pub enum MemoryToolError {
     Store(McStoreError),
-    EmptyContent,
-    EmptyMerge,
-    DuplicateSourceId {
-        id: i64,
-    },
-    NotFound {
-        id: i64,
-    },
-    Inactive {
-        id: i64,
-        status: String,
-    },
-    Superseded {
-        id: i64,
-        superseded_by: i64,
-    },
-    CrossCategoryMerge {
-        categories: Vec<String>,
-    },
-    /// Cap on the `get` op's per-call id list (matches the plugin/pi twins). Returning a
-    /// dedicated error lets the facade translate it into a clear user-facing message
-    /// instead of papering over the difference with a generic "not found".
-    TooManyIds {
-        requested: usize,
-        max: usize,
-    },
-    /// A `get` call with no ids is an input error distinct from merge validation, so the
-    /// message names the read action instead of talking about merge sources.
-    EmptyGet,
+    ClaimMirror(ClaimMirrorError),
+    IntentProtocol(String),
 }
 
 impl std::fmt::Display for MemoryToolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MemoryToolError::Store(e) => write!(f, "store: {e}"),
-            MemoryToolError::EmptyContent => write!(f, "memory content is required"),
-            MemoryToolError::EmptyMerge => write!(f, "merge requires at least one source memory"),
-            MemoryToolError::DuplicateSourceId { id } => {
-                write!(f, "duplicate source memory id {id}")
-            }
-            MemoryToolError::NotFound { id } => write!(f, "memory {id} was not found"),
-            MemoryToolError::Inactive { id, status } => {
-                write!(f, "memory {id} is not mutable in status {status}")
-            }
-            MemoryToolError::Superseded { id, superseded_by } => {
-                write!(f, "memory {id} was superseded by {superseded_by}")
-            }
-            MemoryToolError::CrossCategoryMerge { categories } => write!(
-                f,
-                "cannot merge memories from different categories ({})",
-                categories.join(", ")
-            ),
-            MemoryToolError::TooManyIds { requested, max } => write!(
-                f,
-                "'ids' must contain at most {max} memory IDs when action is 'get' (got {requested})"
-            ),
-            MemoryToolError::EmptyGet => {
-                write!(
-                    f,
-                    "'ids' must contain at least one memory ID when action is 'get'"
-                )
+            MemoryToolError::ClaimMirror(e) => write!(f, "claim mirror: {e}"),
+            MemoryToolError::IntentProtocol(reason) => {
+                write!(f, "claim intent protocol: {reason}")
             }
         }
     }
@@ -89,10 +48,139 @@ impl From<McStoreError> for MemoryToolError {
         MemoryToolError::Store(e)
     }
 }
+impl From<ClaimMirrorError> for MemoryToolError {
+    fn from(e: ClaimMirrorError) -> Self {
+        MemoryToolError::ClaimMirror(e)
+    }
+}
+
+pub fn list_committed_claims(
+    store: &McStore,
+    public_claim_ids: &BTreeSet<String>,
+    category: Option<&str>,
+    limit: usize,
+) -> Result<Vec<CommittedClaimMirrorRow>, MemoryToolError> {
+    let Some(state) = store.claim_mirror_state()? else {
+        return Ok(Vec::new());
+    };
+    Ok(store
+        .list_claim_mirror(&state.database_incarnation_id, None)?
+        .into_iter()
+        .filter(|row| {
+            public_claim_ids.is_empty() || public_claim_ids.contains(&row.public_claim_id)
+        })
+        .filter(|row| {
+            row.attributes
+                .get("category")
+                .and_then(Value::as_str)
+                .is_some_and(is_positive_memory_category)
+        })
+        // Category narrowing precedes truncation so a requested category is not
+        // crowded out of the limit by rows the caller did not ask for.
+        .filter(|row| {
+            category.is_none_or(|category| {
+                row.attributes.get("category").and_then(Value::as_str) == Some(category)
+            })
+        })
+        .take(limit)
+        .collect())
+}
+
+fn require_intent_protocol(version: u32) -> Result<(), MemoryToolError> {
+    if version == CLAIM_INTENT_PROTOCOL_VERSION {
+        Ok(())
+    } else {
+        Err(MemoryToolError::IntentProtocol(format!(
+            "unsupported protocol version {version}"
+        )))
+    }
+}
+
+fn intent_wire_record(record: ClaimIntentRecord) -> ClaimIntentWireRecord {
+    ClaimIntentWireRecord {
+        binding: record.binding,
+        command: record.command,
+        request_digest: record.request_digest,
+        state: record.state,
+        result_json: record.result_json,
+    }
+}
+
+pub fn stage_claim_intent(
+    store: &McStore,
+    route_project_root: &str,
+    request: &ClaimIntentStageRequest,
+    now_ms: i64,
+) -> Result<ClaimIntentStageResponse, MemoryToolError> {
+    require_intent_protocol(request.protocol_version)?;
+    if request.request_encoding_version != CLAIM_REQUEST_ENCODING_VERSION {
+        return Err(MemoryToolError::IntentProtocol(format!(
+            "unsupported request encoding version {}",
+            request.request_encoding_version
+        )));
+    }
+    let outcome = store.stage_claim_intent(
+        route_project_root,
+        &request.binding,
+        &request.command,
+        &request.request,
+        now_ms,
+    )?;
+    Ok(ClaimIntentStageResponse {
+        protocol_version: CLAIM_INTENT_PROTOCOL_VERSION,
+        replayed: outcome.replayed,
+        intent: intent_wire_record(outcome.record),
+    })
+}
+
+pub fn inspect_claim_intents(
+    store: &McStore,
+    request: &ClaimIntentInspectRequest,
+) -> Result<ClaimIntentInspectResponse, MemoryToolError> {
+    require_intent_protocol(request.protocol_version)?;
+    if request.limit == 0 || request.limit > 10_000 {
+        return Err(MemoryToolError::IntentProtocol(
+            "inspect limit must be in 1..=10000".to_string(),
+        ));
+    }
+    let records = if let Some(command) = &request.command {
+        store
+            .inspect_claim_intent(command)?
+            .filter(|record| !request.unresolved_only || record.state.is_unresolved())
+            .into_iter()
+            .collect()
+    } else {
+        store.list_claim_intents(request.unresolved_only, request.limit as usize)?
+    };
+    Ok(ClaimIntentInspectResponse {
+        protocol_version: CLAIM_INTENT_PROTOCOL_VERSION,
+        intents: records.into_iter().map(intent_wire_record).collect(),
+    })
+}
+
+pub fn acknowledge_claim_intent(
+    store: &McStore,
+    request: &ClaimIntentAckRequest,
+    now_ms: i64,
+) -> Result<ClaimIntentAckResponse, MemoryToolError> {
+    require_intent_protocol(request.protocol_version)?;
+    let outcome = store.acknowledge_claim_intent(
+        &request.binding,
+        &request.command,
+        &request.request_digest,
+        request.kind,
+        request.result_json.as_deref(),
+        now_ms,
+    )?;
+    Ok(ClaimIntentAckResponse {
+        protocol_version: CLAIM_INTENT_PROTOCOL_VERSION,
+        replayed: outcome.replayed,
+        intent: intent_wire_record(outcome.record),
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemorySearchSourceKind {
-    Memory,
     CompartmentTitle,
     CompartmentBody,
     Note,
@@ -119,197 +207,13 @@ struct RankedSearchResult {
     recency: i64,
 }
 
-/// Update an owned, primary (active/permanent and not superseded) memory.
-pub fn update_memory(
-    store: &McStore,
-    project_path: &str,
-    id: i64,
-    content: &str,
-    now_ms: i64,
-) -> Result<StoredMemoryFull, MemoryToolError> {
-    let content = content.trim();
-    if content.is_empty() {
-        return Err(MemoryToolError::EmptyContent);
-    }
-    let memory = load_owned_memory(store, project_path, id)?;
-    ensure_primary_mutable(&memory)?;
-    store
-        .update_memory_content(project_path, id, content, now_ms)?
-        .ok_or(MemoryToolError::NotFound { id })
-}
-
-/// Cap on the `get` op's per-call id list. Mirrors the plugin/pi twins so the same
-/// user-facing "got 21 ids" error is produced regardless of which harness dispatches
-/// the action.
-pub const GET_MAX_IDS: usize = 20;
-
-/// Read memories by id through the project's workspace-visibility scope.
-///
-/// Returns memories in the caller's id order; ids that are not visible to the project
-/// (missing, hard-deleted, or foreign to a non-shared category) are absent from the
-/// returned vector. The facade wrapper translates those misses into the per-id
-/// "not found or not visible" message — sharing one wording between not-found and
-/// not-visible avoids an existence oracle for foreign memories (the same discipline
-/// the plugin layer follows).
-///
-/// Any status is readable: active, permanent, AND archived. A primary agent may
-/// need to surface an archived memory to the user when they reference it by id
-/// from <project-memory>'s history or a prior transcript.
-pub fn get_memories(
-    store: &McStore,
-    project_path: &str,
-    ids: &[i64],
-) -> Result<Vec<StoredMemoryFull>, MemoryToolError> {
-    if ids.is_empty() {
-        return Err(MemoryToolError::EmptyGet);
-    }
-    if ids.len() > GET_MAX_IDS {
-        return Err(MemoryToolError::TooManyIds {
-            requested: ids.len(),
-            max: GET_MAX_IDS,
-        });
-    }
-    // Dedupe while preserving first-seen order so the per-id report maps 1:1 to the
-    // caller's id list even when the same id is passed twice.
-    let mut seen = BTreeSet::new();
-    let mut unique_ids: Vec<i64> = Vec::with_capacity(ids.len());
-    for id in ids {
-        if seen.insert(*id) {
-            unique_ids.push(*id);
-        }
-    }
-    let by_id: HashMap<i64, StoredMemoryFull> =
-        store.get_visible_memories_by_ids(project_path, &unique_ids)?;
-    let mut ordered: Vec<StoredMemoryFull> = Vec::with_capacity(unique_ids.len());
-    for id in &unique_ids {
-        if let Some(memory) = by_id.get(id) {
-            ordered.push(memory.clone());
-        }
-    }
-    Ok(ordered)
-}
-
-/// Archive a visible memory. Re-archiving an already archived, non-superseded row is a
-/// no-op success and returns `Ok(false)` so callers can avoid reporting a new mutation.
-pub fn archive_memory(
-    store: &McStore,
-    project_path: &str,
-    id: i64,
-    reason: Option<&str>,
-    now_ms: i64,
-) -> Result<bool, MemoryToolError> {
-    let memory = load_owned_memory(store, project_path, id)?;
-    ensure_not_superseded(&memory)?;
-    if memory.status == "archived" {
-        return Ok(false);
-    }
-    ensure_active_or_permanent(&memory)?;
-    store
-        .archive_memory(project_path, id, reason, now_ms)?
-        .ok_or(MemoryToolError::NotFound { id })?;
-    Ok(true)
-}
-
-/// Archive a batch only after every owned row passes validation. The store repeats these
-/// checks while locked and commits the batch atomically.
-pub fn archive_memories(
-    store: &McStore,
-    project_path: &str,
-    ids: &[i64],
-    reason: Option<&str>,
-    now_ms: i64,
-) -> Result<Vec<i64>, MemoryToolError> {
-    let Some(first_id) = ids.first().copied() else {
-        return Err(MemoryToolError::EmptyMerge);
-    };
-    for id in ids {
-        let memory = load_owned_memory(store, project_path, *id)?;
-        ensure_not_superseded(&memory)?;
-        if memory.status != "archived" {
-            ensure_active_or_permanent(&memory)?;
-        }
-    }
-    store
-        .archive_memories(project_path, ids, reason, now_ms)?
-        .ok_or(MemoryToolError::NotFound { id: first_id })
-}
-
-/// Merge owned, primary source memories into an owned, primary target. The target and
-/// every source must share exactly one category; cross-category merges are rejected before
-/// any store mutation so a miscategorization cannot silently destroy a distinct fact.
-pub fn merge_memories(
-    store: &McStore,
-    project_path: &str,
-    target_id: i64,
-    source_ids: &[i64],
-    merged_content: &str,
-    now_ms: i64,
-) -> Result<StoredMemoryFull, MemoryToolError> {
-    let merged_content = merged_content.trim();
-    if merged_content.is_empty() {
-        return Err(MemoryToolError::EmptyContent);
-    }
-    if source_ids.is_empty() {
-        return Err(MemoryToolError::EmptyMerge);
-    }
-
-    let mut seen = BTreeSet::new();
-    for id in source_ids {
-        if *id == target_id || !seen.insert(*id) {
-            return Err(MemoryToolError::DuplicateSourceId { id: *id });
-        }
-    }
-
-    let target = load_owned_memory(store, project_path, target_id)?;
-    ensure_primary_mutable(&target)?;
-    let mut rows = vec![target.clone()];
-    for source_id in source_ids {
-        let source = load_owned_memory(store, project_path, *source_id)?;
-        ensure_primary_mutable(&source)?;
-        rows.push(source);
-    }
-
-    let mut categories: Vec<String> = rows.iter().map(|m| m.category.clone()).collect();
-    categories.sort();
-    categories.dedup();
-    if categories.len() > 1 {
-        return Err(MemoryToolError::CrossCategoryMerge { categories });
-    }
-
-    store
-        .merge_memories(project_path, target_id, source_ids, merged_content, now_ms)?
-        .ok_or(MemoryToolError::NotFound { id: target_id })
-}
-
-/// Convenience wrapper for the identity-independent unit where the project key also names
-/// the test session. Production routing should call
-/// [`search_memories_and_compartments_for_session`] with the resolved session id.
-pub fn search_memories_and_compartments(
-    store: &McStore,
-    project_path: &str,
-    query: &str,
-    limit: usize,
-) -> Result<Vec<MemorySearchResult>, MemoryToolError> {
-    search_memories_and_compartments_for_session(
-        store,
-        project_path,
-        project_path,
-        query,
-        limit,
-        true,
-    )
-}
-
-/// Keyword search over visible project memories and the resolved session's compartments.
-/// Ranking is intentionally simple and honest: memory content substring hits first, then
-/// compartment-title hits, then compartment body/tier-text hits; recency breaks ties.
-pub fn search_memories_and_compartments_for_session(
+/// Keyword search over the resolved session's compartments and project notes.
+pub fn search_compartments_and_notes_for_session(
     store: &McStore,
     project_path: &str,
     session_id: &str,
     query: &str,
     limit: usize,
-    include_memories: bool,
 ) -> Result<Vec<MemorySearchResult>, MemoryToolError> {
     let query = query.trim();
     if query.is_empty() || limit == 0 {
@@ -317,13 +221,6 @@ pub fn search_memories_and_compartments_for_session(
     }
 
     let mut ranked = Vec::new();
-    if include_memories {
-        for memory in store.search_visible_memory_contents(project_path, query)? {
-            if first_match(&memory.content, query).is_some() {
-                ranked.push(memory_search_hit(memory, query));
-            }
-        }
-    }
     for compartment in store.search_compartments_like(session_id, query)? {
         if let Some(hit) = compartment_search_hit(compartment, query) {
             ranked.push(hit);
@@ -348,61 +245,6 @@ pub fn search_memories_and_compartments_for_session(
     });
     ranked.truncate(limit);
     Ok(ranked.into_iter().map(|r| r.result).collect())
-}
-
-fn load_owned_memory(
-    store: &McStore,
-    project_path: &str,
-    id: i64,
-) -> Result<StoredMemoryFull, MemoryToolError> {
-    let memory = store
-        .get_memory_full(id)?
-        .filter(|memory| memory.project_path == project_path)
-        .ok_or(MemoryToolError::NotFound { id })?;
-    Ok(memory)
-}
-
-fn ensure_primary_mutable(memory: &StoredMemoryFull) -> Result<(), MemoryToolError> {
-    ensure_not_superseded(memory)?;
-    ensure_active_or_permanent(memory)
-}
-
-fn ensure_not_superseded(memory: &StoredMemoryFull) -> Result<(), MemoryToolError> {
-    if let Some(superseded_by) = memory.superseded_by_memory_id {
-        return Err(MemoryToolError::Superseded {
-            id: memory.id,
-            superseded_by,
-        });
-    }
-    Ok(())
-}
-
-fn ensure_active_or_permanent(memory: &StoredMemoryFull) -> Result<(), MemoryToolError> {
-    if matches!(memory.status.as_str(), "active" | "permanent") {
-        Ok(())
-    } else {
-        Err(MemoryToolError::Inactive {
-            id: memory.id,
-            status: memory.status.clone(),
-        })
-    }
-}
-
-fn memory_search_hit(memory: StoredMemorySearchRow, query: &str) -> RankedSearchResult {
-    RankedSearchResult {
-        recency: memory.updated_at,
-        rank: 0,
-        result: MemorySearchResult {
-            source_kind: MemorySearchSourceKind::Memory,
-            id: memory.id,
-            snippet: snippet_around_match(&memory.content, query),
-            category: Some(memory.category),
-            sequence: None,
-            title: None,
-            note_status: None,
-            surface_condition: None,
-        },
-    }
 }
 
 fn note_search_hit(note: StoredNoteSearchRow, query: &str) -> RankedSearchResult {
@@ -519,407 +361,87 @@ fn snippet_around_match(text: &str, query: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
-    use mc_store::{InsertMemoryInput, StoredCompartment};
+    use std::collections::BTreeMap;
 
-    fn descriptor(dir: &std::path::Path) -> StorageDescriptor {
-        StorageDescriptor {
-            module_id: "magic-context-test".to_string(),
-            storage_namespace: "mc_cache".to_string(),
-            isolation: Isolation::Module,
-            backend: StorageBackend::Sqlite {
-                path: dir.join("store.db").to_string_lossy().to_string(),
-            },
-        }
-    }
+    use mc_core::claim_operation::{sha256_hex_utf8, SnapshotVector};
+    use mc_store::claim_mirror::{ClaimMirrorLifecycle, ClaimMirrorSnapshot, CLAIM_MIRROR_VERSION};
+    use serde_json::json;
 
-    fn store(dir: &std::path::Path) -> McStore {
-        McStore::open(&descriptor(dir)).unwrap()
-    }
-
-    fn input<'a>(
-        project: &'a str,
-        category: &'a str,
-        content: &'a str,
-        now: i64,
-    ) -> InsertMemoryInput<'a> {
-        InsertMemoryInput {
-            project_path: project,
-            route_project_root: None,
-            category,
-            content,
-            source_session_id: None,
-            source_type: Some("tool"),
-            importance: Some(50),
-            expires_at: None,
-            metadata_json: None,
-            now_ms: now,
-        }
-    }
-
-    fn insert(store: &McStore, project: &str, category: &str, content: &str, now: i64) -> i64 {
-        store
-            .insert_memory(input(project, category, content, now))
-            .unwrap()
-    }
-
-    fn workspace(store: &McStore, own: &str, foreign: &str) {
-        store
-            .seed_workspace_member("ws", own, "[\"CONSTRAINTS\"]")
-            .unwrap();
-        store
-            .seed_workspace_member("ws", foreign, "[\"CONSTRAINTS\"]")
-            .unwrap();
-    }
-
-    fn comp(seq: i64, title: &str, content: &str, p2: Option<&str>) -> StoredCompartment {
-        StoredCompartment {
-            sequence: seq,
-            start_message: seq,
-            end_message: seq,
-            start_message_id: format!("m{seq}"),
-            end_message_id: format!("m{seq}"),
-            title: title.to_string(),
+    fn mirror_claim(
+        public_claim_id: &str,
+        category: &str,
+        content: &str,
+    ) -> CommittedClaimMirrorRow {
+        let content_digest = sha256_hex_utf8(content);
+        CommittedClaimMirrorRow {
+            public_claim_id: public_claim_id.to_string(),
+            project_id: 41,
+            revision_locator: format!("{public_claim_id}/r1/{content_digest}"),
             content: content.to_string(),
-            p1: Some(content.to_string()),
-            p2: p2.map(str::to_string),
-            created_at: seq,
-            ..Default::default()
+            content_digest,
+            attributes: json!({
+                "category": category,
+                "importance": 80,
+            }),
+            lifecycle: ClaimMirrorLifecycle::Active,
+            applicability: json!({}),
+            policy: json!({}),
+            provenance_label: None,
+            project_generation: 1,
+            policy_generation: 1,
         }
     }
 
     #[test]
-    fn foreign_unshared_mutation_denied_for_update_merge_and_archive() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let own = "git:own";
-        let foreign = "git:foreign";
-        workspace(&store, own, foreign);
-        let foreign_private = insert(&store, foreign, "PREFERENCES", "private fact", 1);
-        let own_private = insert(&store, own, "PREFERENCES", "own fact", 1);
-
-        assert!(matches!(
-            update_memory(&store, own, foreign_private, "edited", 2),
-            Err(MemoryToolError::NotFound { id }) if id == foreign_private
-        ));
-        assert!(matches!(
-            archive_memory(&store, own, foreign_private, None, 2),
-            Err(MemoryToolError::NotFound { id }) if id == foreign_private
-        ));
-        assert!(matches!(
-            merge_memories(&store, own, foreign_private, &[own_private], "merged", 2),
-            Err(MemoryToolError::NotFound { id }) if id == foreign_private
-        ));
-    }
-
-    #[test]
-    fn foreign_shared_mutation_rejected_for_update_merge_and_archive() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let own = "git:own";
-        let foreign = "git:foreign";
-        workspace(&store, own, foreign);
-        let updatable = insert(&store, foreign, "CONSTRAINTS", "shared update", 1);
-        let archivable = insert(&store, foreign, "CONSTRAINTS", "shared archive", 1);
-        let target = insert(&store, foreign, "CONSTRAINTS", "shared target", 1);
-        let source = insert(&store, foreign, "CONSTRAINTS", "shared source", 1);
-
-        assert!(matches!(
-            update_memory(&store, own, updatable, "shared edited", 2),
-            Err(MemoryToolError::NotFound { id }) if id == updatable
-        ));
-        assert!(matches!(
-            archive_memory(&store, own, archivable, Some("old"), 2),
-            Err(MemoryToolError::NotFound { id }) if id == archivable
-        ));
-        assert!(matches!(
-            merge_memories(&store, own, target, &[source], "shared merged", 2),
-            Err(MemoryToolError::NotFound { id }) if id == target
-        ));
-        assert_eq!(
-            store.get_memory_full(updatable).unwrap().unwrap().content,
-            "shared update"
+    fn list_committed_claims_excludes_anti_memory_even_when_requested() {
+        let fixture = crate::test_support::FixtureBuilder::store();
+        let anti_memory = mirror_claim(
+            "mcm_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "REJECTED_APPROACH",
+            "Rejected Redis for session caching.",
         );
-        assert_eq!(
-            store.get_memory_full(archivable).unwrap().unwrap().status,
-            "active"
-        );
-        assert_eq!(
-            store
-                .get_memory_full(source)
-                .unwrap()
-                .unwrap()
-                .superseded_by_memory_id,
-            None
-        );
-    }
-
-    #[test]
-    fn merge_duplicate_content_returns_specific_error_without_partial_lineage() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let project = "git:proj";
-        let target = insert(&store, project, "CONSTRAINTS", "target", 1);
-        let source = insert(&store, project, "CONSTRAINTS", "canonical", 1);
-
-        let error = merge_memories(&store, project, target, &[source], "canonical", 2)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains(&format!("memory content already exists as ID {source}")));
-        assert_eq!(
-            store.get_memory_full(target).unwrap().unwrap().content,
-            "target"
-        );
-        let source_row = store.get_memory_full(source).unwrap().unwrap();
-        assert_eq!(source_row.status, "active");
-        assert_eq!(source_row.superseded_by_memory_id, None);
-    }
-
-    #[test]
-    fn cross_category_merge_rejected_before_store_mutation() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let project = "git:proj";
-        let target = insert(&store, project, "CONSTRAINTS", "constraint", 1);
-        let source = insert(&store, project, "PREFERENCES", "preference", 1);
-        let before = store
-            .max_memory_mutation_id(&[project.to_string()])
-            .unwrap();
-
-        assert!(matches!(
-            merge_memories(&store, project, target, &[source], "merged", 2),
-            Err(MemoryToolError::CrossCategoryMerge { categories })
-                if categories == vec!["CONSTRAINTS".to_string(), "PREFERENCES".to_string()]
-        ));
-        assert_eq!(
-            store
-                .max_memory_mutation_id(&[project.to_string()])
-                .unwrap(),
-            before
-        );
-    }
-
-    #[test]
-    fn superseded_row_mutations_are_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let project = "git:proj";
-        let target = insert(&store, project, "CONSTRAINTS", "target", 1);
-        let source = insert(&store, project, "CONSTRAINTS", "source", 1);
-        let extra = insert(&store, project, "CONSTRAINTS", "extra", 1);
-        merge_memories(&store, project, target, &[source], "merged", 2).unwrap();
-
-        assert!(matches!(
-            update_memory(&store, project, source, "edit", 3),
-            Err(MemoryToolError::Superseded { id, superseded_by })
-                if id == source && superseded_by == target
-        ));
-        assert!(matches!(
-            archive_memory(&store, project, source, None, 3),
-            Err(MemoryToolError::Superseded { id, superseded_by })
-                if id == source && superseded_by == target
-        ));
-        assert!(matches!(
-            merge_memories(&store, project, source, &[extra], "again", 3),
-            Err(MemoryToolError::Superseded { id, superseded_by })
-                if id == source && superseded_by == target
-        ));
-    }
-
-    #[test]
-    fn archive_is_idempotent_for_already_archived_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let project = "git:proj";
-        let id = insert(&store, project, "CONSTRAINTS", "old", 1);
-        assert!(archive_memory(&store, project, id, None, 2).unwrap());
-        let after_first = store
-            .max_memory_mutation_id(&[project.to_string()])
-            .unwrap();
-
-        assert!(!archive_memory(&store, project, id, Some("again"), 3).unwrap());
-        assert_eq!(
-            store
-                .max_memory_mutation_id(&[project.to_string()])
-                .unwrap(),
-            after_first
-        );
-    }
-
-    #[test]
-    fn batch_archive_rolls_back_when_any_id_is_not_owned() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let own = "git:own";
-        let foreign = "git:foreign";
-        let own_id = insert(&store, own, "CONSTRAINTS", "owned", 1);
-        let foreign_id = insert(&store, foreign, "CONSTRAINTS", "foreign", 1);
-
-        assert!(matches!(
-            archive_memories(&store, own, &[own_id, foreign_id], None, 2),
-            Err(MemoryToolError::NotFound { id }) if id == foreign_id
-        ));
-        assert_eq!(
-            store.get_memory_full(own_id).unwrap().unwrap().status,
-            "active"
-        );
-        assert_eq!(
-            store.get_memory_full(foreign_id).unwrap().unwrap().status,
-            "active"
-        );
-    }
-
-    #[test]
-    fn keyword_search_ranks_limits_and_filters_workspace_visibility() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let own = "git:own";
-        let foreign = "git:foreign";
-        workspace(&store, own, foreign);
-        let memory_id = insert(
-            &store,
-            own,
+        // Positive control: proves the filter excludes exactly the anti-memory
+        // row rather than draining the whole mirror.
+        let positive = mirror_claim(
+            "mcm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "CONSTRAINTS",
-            "memory has Needle in content",
-            10,
+            "Session data must stay in Postgres.",
         );
-        let foreign_private = insert(&store, foreign, "PREFERENCES", "Needle secret", 20);
-        store
-            .replace_compartments(
-                own,
-                &[
-                    comp(1, "Needle title", "ordinary body", None),
-                    comp(
-                        2,
-                        "ordinary title",
-                        "ordinary body",
-                        Some("tier text has Needle"),
-                    ),
-                ],
+        let generations = BTreeMap::from([("41".to_string(), 1)]);
+        fixture
+            .store
+            .replace_claim_mirror_snapshot(
+                &ClaimMirrorSnapshot {
+                    mirror_version: CLAIM_MIRROR_VERSION,
+                    vector: SnapshotVector {
+                        vector_version: 1,
+                        database_incarnation_id: "0123456789abcdef0123456789abcdef".to_string(),
+                        workspace_epoch: "workspace-epoch-1".to_string(),
+                        project_generations: generations.clone(),
+                        policy_generations: generations,
+                    },
+                    project_checkpoints: BTreeMap::from([(41, 0)]),
+                    claims: vec![anti_memory, positive],
+                },
+                1,
             )
             .unwrap();
 
-        let results = search_memories_and_compartments(&store, own, "needle", 10).unwrap();
+        let rows = list_committed_claims(
+            &fixture.store,
+            &BTreeSet::new(),
+            Some("REJECTED_APPROACH"),
+            10,
+        )
+        .unwrap();
+        assert!(rows.is_empty());
+
+        let rows = list_committed_claims(&fixture.store, &BTreeSet::new(), None, 10).unwrap();
         assert_eq!(
-            results.len(),
-            3,
-            "foreign unshared memory must be excluded: {results:?}"
+            rows.iter()
+                .map(|row| row.public_claim_id.as_str())
+                .collect::<Vec<_>>(),
+            ["mcm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
         );
-        assert_eq!(results[0].source_kind, MemorySearchSourceKind::Memory);
-        assert_eq!(results[0].id, memory_id);
-        assert_eq!(
-            results[1].source_kind,
-            MemorySearchSourceKind::CompartmentTitle
-        );
-        assert_eq!(results[1].sequence, Some(1));
-        assert_eq!(
-            results[2].source_kind,
-            MemorySearchSourceKind::CompartmentBody
-        );
-        assert_eq!(results[2].sequence, Some(2));
-        assert!(results.iter().all(
-            |result| result.source_kind != MemorySearchSourceKind::Memory
-                || result.id != foreign_private
-        ));
-        assert!(results[0].snippet.len() <= 203);
-
-        let limited = search_memories_and_compartments(&store, own, "needle", 2).unwrap();
-        assert_eq!(limited.len(), 2);
-        assert_eq!(limited[0].source_kind, MemorySearchSourceKind::Memory);
-        assert_eq!(
-            limited[1].source_kind,
-            MemorySearchSourceKind::CompartmentTitle
-        );
-    }
-
-    #[test]
-    fn get_memories_returns_own_project_hits_in_call_order() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let own = "git:own";
-        let first = insert(&store, own, "CONSTRAINTS", "own first", 1);
-        let second = insert(&store, own, "CONSTRAINTS", "own second", 2);
-
-        let fetched = get_memories(&store, own, &[second, first]).unwrap();
-        assert_eq!(fetched.len(), 2);
-        assert_eq!(fetched[0].id, second);
-        assert_eq!(fetched[1].id, first);
-        assert_eq!(fetched[0].content, "own second");
-    }
-
-    #[test]
-    fn get_memories_surfaces_archived_rows_with_status_label() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let own = "git:own";
-        let memory = insert(&store, own, "KNOWN_ISSUES", "retired issue", 1);
-        store
-            .archive_memory(own, memory, Some("superseded"), 2)
-            .unwrap();
-
-        let fetched = get_memories(&store, own, &[memory]).unwrap();
-        assert_eq!(fetched.len(), 1);
-        assert_eq!(fetched[0].status, "archived");
-        assert_eq!(fetched[0].content, "retired issue");
-    }
-
-    #[test]
-    fn get_memories_skips_foreign_non_shared_category_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let own = "git:own";
-        let foreign = "git:foreign";
-        // Workspace shares only CONSTRAINTS; the foreign ARCHITECTURE row is
-        // off-limits and must not be returned (no existence oracle: callers
-        // see the id as "not visible" via the tool layer's per-id report).
-        workspace(&store, own, foreign);
-        let foreign_hidden = insert(&store, foreign, "ARCHITECTURE", "hidden", 1);
-
-        let fetched = get_memories(&store, own, &[foreign_hidden]).unwrap();
-        assert!(
-            fetched.is_empty(),
-            "foreign non-shared memory leaked: {fetched:?}"
-        );
-    }
-
-    #[test]
-    fn get_memories_returns_foreign_shared_category_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let own = "git:own";
-        let foreign = "git:foreign";
-        workspace(&store, own, foreign);
-        let foreign_shared = insert(&store, foreign, "CONSTRAINTS", "shared", 1);
-        // Foreign visibility is fail-closed: a workspace neighbor's memory is readable
-        // only once classification marks it shareable with a workspace-eligible scope.
-        store
-            .set_memory_sharing_for_test(foreign_shared, "project", true)
-            .unwrap();
-
-        let fetched = get_memories(&store, own, &[foreign_shared]).unwrap();
-        assert_eq!(fetched.len(), 1);
-        assert_eq!(fetched[0].id, foreign_shared);
-        assert_eq!(fetched[0].content, "shared");
-    }
-
-    #[test]
-    fn get_memories_rejects_more_than_the_per_call_cap() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let own = "git:own";
-        let ids: Vec<i64> = (1..=(GET_MAX_IDS as i64) + 1).collect();
-        let error = get_memories(&store, own, &ids).unwrap_err().to_string();
-        assert!(error.contains("at most 20"), "got: {error}");
-    }
-
-    #[test]
-    fn get_memories_rejects_an_empty_id_list() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let own = "git:own";
-        assert!(matches!(
-            get_memories(&store, own, &[]),
-            Err(MemoryToolError::EmptyGet)
-        ));
     }
 }

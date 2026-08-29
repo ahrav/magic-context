@@ -7,8 +7,7 @@ import { join } from "node:path";
 import { $ } from "bun";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
-import { runMigrations } from "../migrations";
-import { initializeDatabase } from "../storage-db";
+import { createDirectTestDatabase } from "../test-database";
 import {
     acquireLease,
     acquireLeaseWithAcquisition,
@@ -27,9 +26,7 @@ function expireLease(db: Database, key = "dreaming_lease_expiry"): void {
 }
 
 function makeDb(path = ":memory:"): Database {
-    const db = new Database(path);
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase({ path: path }).db;
     return db;
 }
 
@@ -154,7 +151,10 @@ describe("dreamer lease (atomic CAS)", () => {
         const dir = mkdtempSync(join(tmpdir(), "mc-dream-lease-handles-"));
         const path = join(dir, "context.db");
         const dbA = makeDb(path);
-        const dbB = makeDb(path);
+        const dbB = new Database(path);
+        dbB.exec("PRAGMA busy_timeout=5000");
+        dbB.exec("PRAGMA foreign_keys=ON");
+        dbB.exec("PRAGMA journal_mode=WAL");
         try {
             const results = [acquireLease(dbA, "holder-a"), acquireLease(dbB, "holder-b")];
             // Exactly one process may hold the global dream lease at a time.
@@ -177,12 +177,9 @@ describe("dreamer lease (atomic CAS)", () => {
                 : join(process.cwd(), "packages", "plugin");
             const script = `
                 const sqlite = await import(${JSON.stringify(`file://${pluginRoot}/src/shared/sqlite.ts`)});
-                const storageDb = await import(${JSON.stringify(`file://${pluginRoot}/src/features/magic-context/storage-db.ts`)});
-                const migrations = await import(${JSON.stringify(`file://${pluginRoot}/src/features/magic-context/migrations.ts`)});
                 const lease = await import(${JSON.stringify(`file://${pluginRoot}/src/features/magic-context/dreamer/lease.ts`)});
                 const db = new sqlite.Database(${JSON.stringify(path)});
-                storageDb.initializeDatabase(db);
-                migrations.runMigrations(db);
+                db.exec("PRAGMA busy_timeout=5000");
                 const ok = lease.acquireLease(db, process.argv.at(-1) ?? "missing-holder");
                 db.close();
                 console.log(JSON.stringify({ ok }));

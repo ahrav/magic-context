@@ -1,5 +1,4 @@
 import * as crypto from "node:crypto";
-import { revalidateEnforcementArtifacts } from "../../features/magic-context/claim-policy-backfill";
 import {
     type AuthorityModuleClient,
     checksumAuthoritySeedRows,
@@ -7,6 +6,7 @@ import {
     ensureContextStoreUuid,
     getAuthorityManagedMarker,
 } from "../../features/magic-context/context-authority";
+import { revalidateEnforcementArtifacts } from "../../features/magic-context/memory/enforcement-artifact-revalidation";
 import {
     isLinkedGitWorktree,
     resolveProjectIdentity,
@@ -412,9 +412,9 @@ export async function recoverTsAuthorityProject(args: {
                 domain,
                 module,
                 checksum: () => {
-                    const table = domain === "memories" ? "memories" : "notes";
+                    if (domain === "memories") return checksumAuthoritySeedRows([]);
                     const rows = args.db
-                        .prepare(`SELECT * FROM ${table} WHERE project_path = ? ORDER BY id ASC`)
+                        .prepare("SELECT * FROM notes WHERE project_path = ? ORDER BY id ASC")
                         .all(args.projectPath)
                         .filter(
                             (row): row is Record<string, unknown> =>
@@ -665,7 +665,6 @@ export interface TransformDeps {
     tsAuthorityRecoveryModuleClient?: RustModeModuleClient;
     onRustModeParked?: (sessionId: string, message: string) => void;
     onRustModeProjectPrepared?: (projectPath: string, projectRoot: string) => void;
-    rustMemorySyncRequestedSessions?: Set<string>;
 }
 
 export function createTransform(deps: TransformDeps) {
@@ -678,7 +677,6 @@ export function createTransform(deps: TransformDeps) {
                   projectRoot: deps.rustModeProjectRoot,
                   notifyParked: deps.onRustModeParked,
                   onProjectPrepared: deps.onRustModeProjectPrepared,
-                  memorySyncRequestedSessions: deps.rustMemorySyncRequestedSessions,
                   allowAuthorityProtocolBypassForTests:
                       deps.rustModeAllowAuthorityProtocolBypassForTests,
               })

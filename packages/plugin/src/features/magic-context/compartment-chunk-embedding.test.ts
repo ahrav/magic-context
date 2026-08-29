@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { estimateTokens } from "../../hooks/magic-context/read-session-formatting";
-import { Database } from "../../shared/sqlite";
+import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     _resetCompartmentChunkSearchCacheForTests,
@@ -16,7 +16,6 @@ import {
 import { embedAndStoreCompartmentChunks } from "./compartment-embedding";
 import { appendCompartments, getCompartments } from "./compartment-storage";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-provider";
-import { runMigrations } from "./migrations";
 import {
     _resetProjectEmbeddingRegistryForTests,
     _setTestProviderFactoryForProject,
@@ -25,13 +24,13 @@ import {
     getProjectEmbeddingSnapshot,
     registerProjectEmbedding,
 } from "./project-embedding-registry";
-import { initializeDatabase } from "./storage-db";
 import { clearSession } from "./storage-meta-session";
 import {
     DetailedSynapseTestHost,
     detailedSynapseTestProvider,
     synapseTestConfig,
 } from "./synapse-detailed-test-support";
+import { createDirectTestDatabase } from "./test-database";
 
 function referenceRecursiveSplit(text: string, chunkSize: number): string[] {
     const lengthFunction = estimateTokens;
@@ -152,9 +151,7 @@ class CapturingEmbeddingProvider implements EmbeddingProvider {
 }
 
 function createDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase().db;
     return db;
 }
 

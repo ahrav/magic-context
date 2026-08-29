@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 
 import type { RawMessage } from "../../hooks/magic-context/read-session-raw";
 import { BOOT_QUIET_MS, setBootQuietPeriodForTests } from "../../plugin/boot-quiet";
-import { Database } from "../../shared/sqlite";
+import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { getDirtyIndexFloor } from "./message-index";
 import {
@@ -15,11 +15,10 @@ import {
     scheduleIncrementalIndex,
     scheduleReconciliation,
 } from "./message-index-async";
-import { initializeDatabase } from "./storage-db";
+import { createDirectTestDatabase } from "./test-database";
 
 function createTestDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
+    const db = createDirectTestDatabase().db;
     return db;
 }
 

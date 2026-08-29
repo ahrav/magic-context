@@ -6,9 +6,16 @@ import { join } from "node:path";
 import { type CliDispatchDependencies, dispatchCli, usageText } from "./dispatch";
 
 const builtCliRoot = mkdtempSync(join(tmpdir(), "magic-context-cli-built-"));
+// A per-run home keeps concurrent runs on a shared host from racing on one
+// fixed path while still pointing the CLI away from the real home directory.
+const entrypointHome = mkdtempSync(join(tmpdir(), "magic-context-cli-entrypoint-"));
+// An absolute data root so lifecycle resolution stops at XDG_DATA_HOME instead
+// of reaching the NODE_ENV=test backstop, which warns once on stderr.
+const entrypointDataRoot = join(entrypointHome, ".local", "share");
 
 afterAll(() => {
     rmSync(builtCliRoot, { recursive: true, force: true });
+    rmSync(entrypointHome, { recursive: true, force: true });
 });
 
 function dependencies() {
@@ -101,6 +108,34 @@ describe("import-safe CLI dispatch", () => {
         expect(stderr).toBe("");
     });
 
+    test("an unresolvable entry path reports the failure instead of exiting 0 silently", async () => {
+        const cliRoot = join(import.meta.dir, "..");
+        const missingEntry = join(builtCliRoot, "vanished", "magic-context");
+        const child = Bun.spawn({
+            cmd: [
+                process.execPath,
+                "-e",
+                // A bin path that cannot be realpath-resolved (removed or
+                // unreadable) must not look the same as "imported as a module".
+                `process.argv[1] = ${JSON.stringify(missingEntry)}; await import("./src/index.ts")`,
+            ],
+            cwd: cliRoot,
+            stdout: "pipe",
+            stderr: "pipe",
+        });
+
+        const [exit, stdout, stderr] = await Promise.all([
+            child.exited,
+            new Response(child.stdout).text(),
+            new Response(child.stderr).text(),
+        ]);
+
+        expect(exit).toBe(1);
+        expect(stdout).toBe("");
+        expect(stderr).toContain("cannot resolve the invoked path");
+        expect(stderr).toContain(missingEntry);
+    });
+
     test("Node dispatches a built CLI invoked through an npm-style bin symlink", async () => {
         const cliRoot = join(import.meta.dir, "..");
         const built = spawnSync("bun", ["run", "build"], {
@@ -141,9 +176,9 @@ describe("import-safe CLI dispatch", () => {
             cwd: cliRoot,
             env: {
                 ...process.env,
-                XDG_DATA_HOME: "relative",
-                MAGIC_CONTEXT_TEST_DATA_DIR: "relative",
-                HOME: "/tmp/magic-context-cli-entrypoint-test",
+                XDG_DATA_HOME: entrypointDataRoot,
+                MAGIC_CONTEXT_TEST_DATA_DIR: entrypointDataRoot,
+                HOME: entrypointHome,
             },
             stdout: "pipe",
             stderr: "pipe",

@@ -1,11 +1,9 @@
 import { describe, expect, it } from "bun:test";
 
-import { runMigrations } from "../../features/magic-context/migrations";
-import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { updateSessionMeta } from "../../features/magic-context/storage-meta";
 import { recordDetectedContextLimit } from "../../features/magic-context/storage-meta-persisted";
+import { createDirectTestDatabase } from "../../features/magic-context/test-database";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
-import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     resolveCacheTtl,
@@ -50,9 +48,7 @@ describe("event-resolvers", () => {
         });
 
         it("does not reserve output twice from a detected prompt-only ceiling", async () => {
-            const db = new Database(":memory:");
-            initializeDatabase(db);
-            runMigrations(db);
+            const db = createDirectTestDatabase().db;
             const sessionId = "ses-prompt-only-limit";
             try {
                 clearModelsDevCache();
@@ -120,9 +116,7 @@ describe("event-resolvers", () => {
         });
 
         it("uses a matching persisted usage limit for token thresholds on an unknown model", () => {
-            const db = new Database(":memory:");
-            initializeDatabase(db);
-            runMigrations(db);
+            const db = createDirectTestDatabase().db;
             const sessionId = "ses-usage-limit-threshold";
             const modelKey = "custom-proxy/gemini-agent";
             try {
@@ -152,9 +146,7 @@ describe("event-resolvers", () => {
         });
 
         it("does not trust a persisted usage limit after the model key changes", () => {
-            const db = new Database(":memory:");
-            initializeDatabase(db);
-            runMigrations(db);
+            const db = createDirectTestDatabase().db;
             const sessionId = "ses-usage-limit-model-switch";
             try {
                 updateSessionMeta(db, sessionId, {
@@ -181,9 +173,7 @@ describe("event-resolvers", () => {
             }
         });
         it("trusts a legacy native-spelling usage key for its canonical model", () => {
-            const db = new Database(":memory:");
-            initializeDatabase(db);
-            runMigrations(db);
+            const db = createDirectTestDatabase().db;
             const sessionId = "ses-usage-limit-native-alias";
             try {
                 updateSessionMeta(db, sessionId, {

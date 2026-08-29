@@ -83,6 +83,10 @@ const FINGERPRINT_FIELDS = new Set([
     "case_commitment",
     "incident_bytes_fingerprint",
     "subject_fingerprint",
+    // Historian-eval approvals bind to the whole release under this key; it is
+    // a declared artifact fingerprint, so only the hash-like heuristic is
+    // skipped. The operator-authored `approver` beside it stays fully scanned.
+    "releaseFingerprint",
 ]);
 
 // biome-ignore lint/suspicious/noControlCharactersInRegex: control-character rejection is the point

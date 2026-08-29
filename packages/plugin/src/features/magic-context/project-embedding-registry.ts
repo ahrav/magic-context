@@ -33,7 +33,6 @@ import {
     releaseGitSweepLease,
     renewGitSweepLease,
 } from "./git-commits/sweep-coordinator";
-import { invalidateProject } from "./memory/embedding-cache";
 import { getEmbeddingProviderIdentity } from "./memory/embedding-identity";
 import { LocalEmbeddingProvider } from "./memory/embedding-local";
 import { OpenAICompatibleEmbeddingProvider } from "./memory/embedding-openai";
@@ -52,17 +51,6 @@ import {
     SynapseEmbeddingProvider,
 } from "./memory/embedding-synapse";
 import {
-    exactMemoryContentDigests,
-    memoriesEligibleForEmbedding,
-} from "./memory/storage-claim-visibility";
-import { sha256Utf8Hex } from "./memory/storage-claims";
-import {
-    getMemoryEmbedCoverage,
-    hasMemoryEmbedding,
-    saveEmbedding,
-    saveEmbeddingIfHashMatches,
-} from "./memory/storage-memory-embeddings";
-import {
     recordSessionProjectIdentity,
     repairMisScopedCompartmentChunkEmbeddingsForProject,
 } from "./session-project-storage";
@@ -74,7 +62,6 @@ import {
 
 const OFF_PROVIDER_IDENTITY = "embedding-provider:off";
 const SWEEP_MAX_WALL_CLOCK_MS = 10 * 60 * 1000;
-const SWEEP_MAX_CONSECUTIVE_EMPTY = 3;
 // Backlog-drain caps for the commit-embedding path. The drain loops within one
 // held coordinator lease so a large backlog (e.g. a 2000-commit repo that was
 // indexed before embeddings were enabled) clears in a few ticks instead of
@@ -157,15 +144,15 @@ interface ProjectEmbeddingRegistration {
     modelId: string;
     chunkModelId: string;
     observationMode: boolean;
+    /**
+     * Fingerprint of the DEFERRED configuration this registration was created
+     * from, retained across lane resolution. Resolving a lane rewrites `config`,
+     * `providerIdentity`, and `runtimeFingerprint` to the discovered lane, so
+     * without this the next registration from the same unchanged config would
+     * look like a different intent and discard a healthy resolved provider.
+     */
+    deferredIntent?: string;
 }
-
-interface UnembeddedMemoryRow {
-    id: number;
-    content: string;
-    normalized_hash: string;
-}
-
-type EmbeddingIdentityScope = "memory" | "commit" | "chunk";
 
 interface StaleIdentityRow {
     modelId: string;
@@ -183,9 +170,13 @@ interface ShadowEmbeddingRegistration {
     modelId: string;
     chunkModelId: string;
     generation: number;
+    /** See {@link ProjectEmbeddingRegistration.deferredIntent}. */
+    deferredIntent?: string;
 }
 
-type ShadowScope = "memory" | "commit" | "chunk";
+type ShadowScope = "commit" | "chunk";
+
+type EmbeddingIdentityScope = ShadowScope;
 interface ShadowQueueItem {
     projectIdentity: string;
     scope: ShadowScope;
@@ -223,12 +214,11 @@ export type ShadowBackfillStopReason = "drained" | "stalled_no_progress";
 /** Stop reason for a scope's last backfill retirement, for status surfaces. */
 export function getShadowBackfillStopReason(
     projectIdentity: string,
-    scope: "memory" | "commit" | "chunk",
+    scope: "commit" | "chunk",
 ): ShadowBackfillStopReason | undefined {
     return shadowBackfillStopReasons.get(`${projectIdentity}:${scope}`);
 }
 
-const loadUnembeddedMemoriesStatements = new WeakMap<Database, PreparedStatement>();
 const upsertActiveIdentityStatements = new WeakMap<Database, PreparedStatement>();
 const backfillActiveIdentityStatements = new Map<
     EmbeddingIdentityScope,
@@ -256,7 +246,25 @@ export function markProjectLoadUntrusted(projectIdentity: string): void {
     untrustedLoadProjects.add(projectIdentity);
 }
 let projectSweepInProgress = false;
-let testProviderFactory: ((config: EmbeddingConfig) => EmbeddingProvider | null) | null = null;
+/** Construction context every provider receives from {@link createProvider}. */
+interface ProviderContext {
+    projectRoot: string;
+    session: string;
+    onSynapseLaneReady?: (
+        metadata: import("./memory/embedding-synapse").SynapseLaneMetadata,
+    ) => void;
+}
+/**
+ * Test factory for the embedding provider. It receives the same context the
+ * real providers get, so a fake can invoke `onSynapseLaneReady` and drive the
+ * deferred-lane resolution path (`commitPrimarySynapseLane` /
+ * `commitShadowSynapseLane`) instead of a hand-rolled imitation of it.
+ */
+type TestProviderFactory = (
+    config: EmbeddingConfig,
+    context?: ProviderContext,
+) => EmbeddingProvider | null;
+let testProviderFactory: TestProviderFactory | null = null;
 
 function synapseConfigFields(config: EmbeddingConfig): {
     model?: string;
@@ -265,6 +273,7 @@ function synapseConfigFields(config: EmbeddingConfig): {
     dims?: number;
     provenance?: unknown;
 } {
+    // SAFETY: The function reads only fields guarded by typeof checks.
     const raw = config as unknown as Record<string, unknown>;
     return {
         ...(typeof raw.model === "string" ? { model: raw.model } : {}),
@@ -297,6 +306,19 @@ type SynapseRuntimeConfig = EmbeddingConfig & {
 
 function isDeferredSynapseConfig(config: EmbeddingConfig): config is SynapseRuntimeConfig {
     return config.provider === "synapse" && !synapseConfigFields(config).fingerprint;
+}
+
+/**
+ * Lane discovery state of a provider, or `undefined` for one that does not
+ * report it. Read structurally rather than by class so a test double or a
+ * non-Synapse provider simply declines to answer instead of being misread as
+ * pending, which would preserve a lane that can never resolve.
+ */
+function synapseLaneDiscoveryState(
+    provider: EmbeddingProvider,
+): "pending" | "resolved" | "failed" | undefined {
+    const state = (provider as { laneDiscoveryState?: unknown }).laneDiscoveryState;
+    return state === "pending" || state === "resolved" || state === "failed" ? state : undefined;
 }
 
 function persistPrimaryDescriptor(db: Database, registration: ProjectEmbeddingRegistration): void {
@@ -534,13 +556,6 @@ function commitShadowSynapseLane(
         recordScopeActiveIdentity(
             registration.db,
             registration.projectIdentity,
-            "memory",
-            registration.modelId,
-            now,
-        );
-        recordScopeActiveIdentity(
-            registration.db,
-            registration.projectIdentity,
             "commit",
             registration.modelId,
             now,
@@ -662,16 +677,10 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
 
 function createProvider(
     config: EmbeddingConfig,
-    context?: {
-        projectRoot: string;
-        session: string;
-        onSynapseLaneReady?: (
-            metadata: import("./memory/embedding-synapse").SynapseLaneMetadata,
-        ) => void;
-    },
+    context?: ProviderContext,
 ): EmbeddingProvider | null {
     if (testProviderFactory) {
-        return testProviderFactory(config);
+        return testProviderFactory(config, context);
     }
 
     if (config.provider === "off") {
@@ -785,7 +794,12 @@ function sameFeatures(a: EmbeddingFeatures, b: EmbeddingFeatures): boolean {
 function snapshotFor(
     registration: ProjectEmbeddingRegistration,
 ): ProjectEmbeddingRegistrationSnapshot {
-    const providerIsOn = registration.providerIdentity !== OFF_PROVIDER_IDENTITY;
+    // Enablement follows the configured provider, not the resolved identity:
+    // a deferred Synapse lane carries OFF_PROVIDER_IDENTITY until first use,
+    // but must stay enabled or the embed entry points that resolve it (and
+    // that activate its fallback) would never run. getOrCreateProjectProvider
+    // applies the same provider-based gate.
+    const providerIsOn = (registration.config.provider ?? "local") !== "off";
     const enabled =
         !registration.observationMode && providerIsOn && registration.features.memoryEnabled;
     const gitCommitEnabled =
@@ -860,10 +874,6 @@ function getBackfillActiveIdentityStatement(
     let stmt = map.get(db);
     if (!stmt) {
         const selectByScope: Record<EmbeddingIdentityScope, string> = {
-            memory: `SELECT DISTINCT e.model_id AS model_id
-                     FROM memory_embeddings e
-                     JOIN memories m ON m.id = e.memory_id
-                     WHERE m.project_path = ?`,
             commit: `SELECT DISTINCT e.model_id AS model_id
                      FROM git_commit_embeddings e
                      JOIN git_commits c ON c.sha = e.sha
@@ -934,9 +944,6 @@ function recordActiveEmbeddingIdentityInCurrentTransaction(
 ): void {
     if (currentProviderIdentity === OFF_PROVIDER_IDENTITY) return;
     const now = Date.now();
-    if (features.memoryEnabled) {
-        recordScopeActiveIdentity(db, projectIdentity, "memory", currentProviderIdentity, now);
-    }
     if (features.gitCommitEnabled) {
         recordScopeActiveIdentity(db, projectIdentity, "commit", currentProviderIdentity, now);
     }
@@ -995,7 +1002,6 @@ function staleModelsForScope(
 }
 
 export interface StaleEmbeddingSweepResult {
-    memoryRowsDeleted: number;
     commitRowsDeleted: number;
     chunkRowsDeleted: number;
     trackingRowsDeleted: number;
@@ -1008,20 +1014,6 @@ function deleteStaleEmbeddingBatch(
     modelId: string,
     limit: number,
 ): number {
-    if (scope === "memory") {
-        return db
-            .prepare(
-                `DELETE FROM memory_embeddings
-                 WHERE rowid IN (
-                     SELECT me.rowid
-                     FROM memory_embeddings me
-                     JOIN memories m ON m.id = me.memory_id
-                     WHERE m.project_path = ? AND me.model_id = ?
-                     LIMIT ?
-                 )`,
-            )
-            .run(projectIdentity, modelId, limit).changes;
-    }
     if (scope === "commit") {
         return db
             .prepare(
@@ -1055,19 +1047,6 @@ function hasStaleEmbeddingRows(
     projectIdentity: string,
     modelId: string,
 ): boolean {
-    if (scope === "memory") {
-        return Boolean(
-            db
-                .prepare(
-                    `SELECT 1
-                     FROM memory_embeddings me
-                     JOIN memories m ON m.id = me.memory_id
-                     WHERE m.project_path = ? AND me.model_id = ?
-                     LIMIT 1`,
-                )
-                .get(projectIdentity, modelId),
-        );
-    }
     if (scope === "commit") {
         return Boolean(
             db
@@ -1100,7 +1079,6 @@ export function sweepStaleEmbeddingIdentitiesForProject(
 ): StaleEmbeddingSweepResult {
     const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
     const result: StaleEmbeddingSweepResult = {
-        memoryRowsDeleted: 0,
         commitRowsDeleted: 0,
         chunkRowsDeleted: 0,
         trackingRowsDeleted: 0,
@@ -1117,7 +1095,6 @@ export function sweepStaleEmbeddingIdentitiesForProject(
     const deleteTracking = getDeleteActiveIdentityStatement(db);
     const shadow = shadowRegistrations.get(projectIdentity);
     const protectedModels = {
-        memory: new Set([snapshot.modelId, ...(shadow ? [shadow.modelId] : [])]),
         commit: new Set([snapshot.modelId, ...(shadow ? [shadow.modelId] : [])]),
         chunk: new Set([snapshot.chunkModelId, ...(shadow ? [shadow.chunkModelId] : [])]),
     };
@@ -1126,11 +1103,6 @@ export function sweepStaleEmbeddingIdentitiesForProject(
         enabled: boolean;
         currentModelId: string;
     }> = [
-        {
-            scope: "memory",
-            enabled: snapshot.enabled && snapshot.modelId !== "off",
-            currentModelId: snapshot.modelId,
-        },
         {
             scope: "commit",
             enabled: snapshot.gitCommitEnabled && snapshot.modelId !== "off",
@@ -1168,8 +1140,7 @@ export function sweepStaleEmbeddingIdentitiesForProject(
                     remainingBudget,
                 );
                 remainingBudget -= deleted;
-                if (scope === "memory") result.memoryRowsDeleted += deleted;
-                else if (scope === "commit") result.commitRowsDeleted += deleted;
+                if (scope === "commit") result.commitRowsDeleted += deleted;
                 else result.chunkRowsDeleted += deleted;
 
                 if (!hasStaleEmbeddingRows(db, scope, projectIdentity, modelId)) {
@@ -1194,7 +1165,6 @@ export function sweepStaleEmbeddingIdentitiesForProject(
         throw error;
     }
 
-    if (result.memoryRowsDeleted > 0) invalidateProject(projectIdentity);
     return result;
 }
 
@@ -1217,11 +1187,39 @@ export function registerProjectEmbedding(
         ? "off"
         : getChunkEmbeddingModelId(resolvedConfig, providerIdentity);
     const prior = projectRegistrations.get(projectIdentity);
+    // Callers re-register from the user's configuration on every tool call, so
+    // the incoming config for an already-resolved deferred lane is still the
+    // deferred one while the registration now carries the discovered lane.
+    // Matching the retained intent keeps that healthy provider and its
+    // descriptor instead of tearing both down and re-demanding per call.
+    const resumesResolvedLane =
+        deferredSynapse &&
+        prior !== undefined &&
+        !prior.observationMode &&
+        prior.deferredIntent === runtimeFingerprint &&
+        // A fallback activation keeps the intent but replaces the config with the
+        // fallback, and that demotion must stay retryable: only a lane that is
+        // still a RESOLVED Synapse config may be carried forward. A prior that is
+        // still unresolved falls through to the ordinary reuse predicate, which
+        // already matches it on the deferred fingerprint.
+        prior.config.provider === "synapse" &&
+        !isDeferredSynapseConfig(prior.config);
     const canReuseProvider =
         prior !== undefined &&
         !prior.observationMode &&
-        prior.runtimeFingerprint === runtimeFingerprint &&
-        prior.providerIdentity === providerIdentity;
+        (resumesResolvedLane ||
+            (prior.runtimeFingerprint === runtimeFingerprint &&
+                prior.providerIdentity === providerIdentity));
+    // A resumed lane keeps the prior registration's resolved identity; only a
+    // genuinely new deferred registration publishes the placeholder.
+    const effectiveConfig = resumesResolvedLane ? prior.config : resolvedConfig;
+    const effectiveProviderIdentity = resumesResolvedLane
+        ? prior.providerIdentity
+        : providerIdentity;
+    const effectiveRuntimeFingerprint = resumesResolvedLane
+        ? prior.runtimeFingerprint
+        : runtimeFingerprint;
+    const effectiveChunkModelId = resumesResolvedLane ? prior.chunkModelId : chunkModelId;
     if (!deferredSynapse) {
         recordActiveEmbeddingIdentity(
             db,
@@ -1230,7 +1228,7 @@ export function registerProjectEmbedding(
             chunkModelId,
             features,
         );
-    } else {
+    } else if (!resumesResolvedLane) {
         clearDeferredDescriptor(db, "embedding_registrations", projectIdentity);
     }
     // Synthetic ledger sessions (this project's primary and shadow batch keys)
@@ -1243,27 +1241,49 @@ export function registerProjectEmbedding(
     const generationChanged =
         prior === undefined ||
         prior.observationMode ||
-        prior.runtimeFingerprint !== runtimeFingerprint ||
-        prior.chunkModelId !== chunkModelId ||
+        prior.runtimeFingerprint !== effectiveRuntimeFingerprint ||
+        prior.chunkModelId !== effectiveChunkModelId ||
         !sameFeatures(prior.features, features);
     const generation = generationChanged ? ++globalRegistrationGeneration : prior.generation;
-    const registration: ProjectEmbeddingRegistration = {
+    const nextState = {
         db,
-        projectIdentity,
         sourceDirectory,
-        config: resolvedConfig,
-        providerIdentity,
-        runtimeFingerprint,
-        provider: canReuseProvider ? prior.provider : null,
+        config: effectiveConfig,
+        providerIdentity: effectiveProviderIdentity,
+        runtimeFingerprint: effectiveRuntimeFingerprint,
         generation,
         features: { ...features },
-        modelId: providerIdentity === OFF_PROVIDER_IDENTITY ? "off" : providerIdentity,
-        chunkModelId: providerIdentity === OFF_PROVIDER_IDENTITY ? "off" : chunkModelId,
+        modelId:
+            effectiveProviderIdentity === OFF_PROVIDER_IDENTITY ? "off" : effectiveProviderIdentity,
+        chunkModelId:
+            effectiveProviderIdentity === OFF_PROVIDER_IDENTITY ? "off" : effectiveChunkModelId,
         observationMode: false,
     };
+    let registration: ProjectEmbeddingRegistration;
+    if (canReuseProvider) {
+        // Carrying the provider forward means preserving the registration OBJECT,
+        // not copying its fields into a new one: the provider's
+        // `onSynapseLaneReady` closure captured this object, and
+        // `commitPrimarySynapseLane` only accepts the identity currently in the
+        // map. A fresh object would silently drop the lane resolution of an
+        // initialization already in flight, leaving an initialized provider whose
+        // registration stays at the placeholder identity forever.
+        registration = Object.assign(prior, nextState);
+        if (deferredSynapse) registration.deferredIntent = runtimeFingerprint;
+        else delete registration.deferredIntent;
+    } else {
+        registration = {
+            projectIdentity,
+            provider: null,
+            ...nextState,
+            ...(deferredSynapse ? { deferredIntent: runtimeFingerprint } : {}),
+        };
+    }
 
     projectRegistrations.set(projectIdentity, registration);
-    if (!deferredSynapse) persistPrimaryDescriptor(db, registration);
+    // A resumed lane is fully resolved, so its descriptor stays authoritative;
+    // only an unresolved deferred registration has nothing to persist.
+    if (!deferredSynapse || resumesResolvedLane) persistPrimaryDescriptor(db, registration);
 
     if (!canReuseProvider) {
         disposeProvider(prior?.provider ?? null);
@@ -1283,7 +1303,41 @@ export function registerProjectShadowEmbedding(
         throw new Error("Shadow embedding registration requires the synapse provider");
     }
     const deferredSynapse = isDeferredSynapseConfig(resolvedConfig);
-    if (deferredSynapse) {
+    const deferredIntent = deferredSynapse
+        ? `deferred-synapse:${sha256Prefix(stableStringify(resolvedConfig))}`
+        : undefined;
+    const priorRegistration = shadowRegistrations.get(projectIdentity);
+    // The primary lane's reasoning applies here too: an already-resolved lane
+    // is re-registered from the same deferred config on every tool call, and its
+    // descriptor now describes the discovered lane.
+    const resumesResolvedLane =
+        deferredIntent !== undefined &&
+        priorRegistration?.deferredIntent === deferredIntent &&
+        // Same rule the primary lane applies: only a lane that actually RESOLVED
+        // may be carried forward. A prior whose config is still the deferred one
+        // never received its metadata — lane-wide permanent errors such as
+        // `not_certified` and `artifact_invalid` end discovery that way — and its
+        // provider latches `permanentFailure`, so `initialize()` refuses to
+        // rediscover. Resuming it would keep the shadow experiment disabled for
+        // the process lifetime even after the daemon or model is repaired.
+        // An unresolved prior falls through to the ordinary reuse predicate.
+        priorRegistration.config.provider === "synapse" &&
+        !isDeferredSynapseConfig(priorRegistration.config);
+    // A lane whose first discovery is still in flight is neither resolved nor
+    // failed, and replacing it loses the experiment a different way: the new
+    // provider is installed, the in-flight one is disposed, and its
+    // `onSynapseLaneReady` is then rejected by the identity guard in
+    // `commitShadowSynapseLane`, leaving the replacement's cohort reading `off`.
+    // Two operations re-registering the same deferred lane before `models.list`
+    // returns is the ordinary case, so a pending prior is preserved. Descriptors
+    // are deliberately left alone here: the lane has not resolved, so there is
+    // nothing new to persist.
+    const preservesPendingLane =
+        deferredIntent !== undefined &&
+        priorRegistration?.deferredIntent === deferredIntent &&
+        !resumesResolvedLane &&
+        synapseLaneDiscoveryState(priorRegistration.provider) === "pending";
+    if (deferredSynapse && !resumesResolvedLane) {
         clearDeferredDescriptor(db, "shadow_embedding_registrations", projectIdentity);
     }
     const providerIdentity = deferredSynapse
@@ -1303,11 +1357,20 @@ export function registerProjectShadowEmbedding(
         },
     });
     if (!provider) return null;
-    const prior = shadowRegistrations.get(projectIdentity);
-    if (!deferredSynapse && prior && prior.providerIdentity === providerIdentity) {
+    const prior = priorRegistration;
+    if (
+        prior &&
+        (resumesResolvedLane ||
+            preservesPendingLane ||
+            (!deferredSynapse && prior.providerIdentity === providerIdentity))
+    ) {
         void provider.dispose();
         dbForShadowQueue.set(projectIdentity, db);
-        persistShadowDescriptor(db, prior);
+        // A pending lane has no resolved identity yet, so persisting here would
+        // write an `off` descriptor over the deferred state the first
+        // registration deliberately cleared. Its descriptor is written by
+        // `commitShadowSynapseLane` when discovery lands.
+        if (!preservesPendingLane) persistShadowDescriptor(db, prior);
         const backfillAlreadyArmed =
             hasPendingShadowBackfill(projectIdentity) ||
             shadowQueue.some((item) => item.projectIdentity === projectIdentity);
@@ -1341,6 +1404,7 @@ export function registerProjectShadowEmbedding(
         modelId: providerIdentity,
         chunkModelId,
         generation,
+        ...(deferredIntent === undefined ? {} : { deferredIntent }),
     };
     registrationForCallback = registration;
     shadowRegistrations.set(projectIdentity, registration);
@@ -1349,7 +1413,6 @@ export function registerProjectShadowEmbedding(
     if (!deferredSynapse) {
         db.transaction(() => {
             const now = Date.now();
-            recordScopeActiveIdentity(db, projectIdentity, "memory", registration.modelId, now);
             recordScopeActiveIdentity(db, projectIdentity, "commit", registration.modelId, now);
             recordScopeActiveIdentity(db, projectIdentity, "chunk", registration.chunkModelId, now);
             persistShadowDescriptor(db, registration);
@@ -1464,17 +1527,6 @@ function shadowBackfillMissingBase(
     shadowModelId: string,
     projectIdentity: string,
 ): { sql: string; params: unknown[]; orderBy: string } {
-    if (scope === "memory") {
-        return {
-            sql: `SELECT m.id AS id
-                  FROM memories m
-                  JOIN memory_embeddings mp ON mp.memory_id = m.id AND mp.model_id = ?
-                  LEFT JOIN memory_embeddings ms ON ms.memory_id = m.id AND ms.model_id = ?
-                  WHERE m.project_path = ? AND m.status = 'active' AND ms.memory_id IS NULL`,
-            params: [primaryModelId, shadowModelId, projectIdentity],
-            orderBy: " ORDER BY m.id",
-        };
-    }
     if (scope === "commit") {
         return {
             sql: `SELECT gc.sha AS id
@@ -1514,35 +1566,6 @@ function shadowBackfillMissingIds(
         shadowModelId,
         projectIdentity,
     );
-    if (scope === "memory") {
-        // Policy-hidden rows must be excluded HERE, not only at drain: the
-        // id-ordered missing set otherwise re-selects the same hidden head
-        // every pump, the drain filter writes nothing, the stall detector
-        // retires the scope as stalled_no_progress, and every eligible row
-        // with a higher id stays unbackfilled until re-registration. Page
-        // past hidden prefixes with a cursor, exactly like the primary
-        // backfill walk.
-        const pageSize = Math.max(limit * 4, 64);
-        let cursor = 0;
-        const out: string[] = [];
-        for (;;) {
-            const page = db
-                .prepare(`${sql} AND m.id > ?${orderBy} LIMIT ?`)
-                .all(...params, cursor, pageSize) as Array<{ id: number }>;
-            if (page.length === 0) break;
-            const eligible = memoriesEligibleForEmbedding(
-                db,
-                page.map((row) => row.id),
-            );
-            for (const row of page) {
-                if (out.length >= limit) break;
-                if (eligible.has(row.id)) out.push(String(row.id));
-            }
-            if (out.length >= limit || page.length < pageSize) break;
-            cursor = page[page.length - 1].id;
-        }
-        return out;
-    }
     const rows = db.prepare(`${sql}${orderBy} LIMIT ?`).all(...params, limit) as Array<{
         id: number | string;
     }>;
@@ -1563,19 +1586,6 @@ function countShadowBackfillMissing(
         shadowModelId,
         projectIdentity,
     );
-    if (scope === "memory") {
-        // Same policy predicate the selector applies: a quarantined or
-        // rejected row is deliberately never drained, so counting it here
-        // would leave a permanent nonzero "Remaining" with no queued work
-        // that can reduce it.
-        const rows = db.prepare(sql).all(...params) as Array<{ id: number }>;
-        if (rows.length === 0) return 0;
-        const eligible = memoriesEligibleForEmbedding(
-            db,
-            rows.map((row) => row.id),
-        );
-        return rows.filter((row) => eligible.has(row.id)).length;
-    }
     return (
         db.prepare(`SELECT COUNT(*) AS count FROM (${sql})`).get(...params) as { count: number }
     ).count;
@@ -1678,7 +1688,7 @@ function maybeArmShadowBackfill(
     const primary = projectRegistrations.get(projectIdentity);
     if (!primary) return; // No primary cohort to mirror yet.
     const pending = new Set<ShadowScope>();
-    for (const scope of ["memory", "commit", "chunk"] as const) {
+    for (const scope of ["commit", "chunk"] as const) {
         const primaryModelId = shadowModelIdForScope(primary, scope);
         const shadowModelId = shadowModelIdForScope(shadow, scope);
         if (primaryModelId === "off" || shadowModelId === "off") continue;
@@ -1702,12 +1712,12 @@ function maybeArmShadowBackfill(
 export function getShadowBackfillRemaining(
     db: Database,
     projectIdentity: string,
-): { memory: number; commit: number; chunk: number } {
-    const remaining = { memory: 0, commit: 0, chunk: 0 };
+): { commit: number; chunk: number } {
+    const remaining = { commit: 0, chunk: 0 };
     const primary = projectRegistrations.get(projectIdentity);
     const shadow = shadowRegistrations.get(projectIdentity);
     if (!primary || !shadow) return remaining;
-    for (const scope of ["memory", "commit", "chunk"] as const) {
+    for (const scope of ["commit", "chunk"] as const) {
         const primaryModelId = shadowModelIdForScope(primary, scope);
         const shadowModelId = shadowModelIdForScope(shadow, scope);
         if (primaryModelId === "off" || shadowModelId === "off") continue;
@@ -1778,6 +1788,8 @@ interface DetailedLane {
  *  it; a provider that does not publish one is a non-journaling lane, which
  *  falls back to the same default the ledger helpers assume. */
 function providerBatchTimeoutMs(provider: EmbeddingProvider): number {
+    // SAFETY: Providers may expose an undeclared pageTimeoutMs; the return
+    // path accepts only finite positive numbers.
     const published = (provider as unknown as { pageTimeoutMs?: unknown }).pageTimeoutMs;
     return typeof published === "number" && Number.isFinite(published) && published > 0
         ? published
@@ -1996,147 +2008,6 @@ async function embedAndApplyDetailed(spec: DetailedApplySpec): Promise<Map<strin
         );
     }
     return applied;
-}
-
-function memoryIdFromItemId(itemId: string): number {
-    return Number(itemId.slice("memory:".length));
-}
-
-/** Memory application-group size. Memory vectors are independent rows with no
- *  cross-row atomicity requirement, so the group only bounds how much
- *  completed inference one failed page can discard. Chunking id-sorted
- *  memories keeps group identity stable when the caller's candidate set
- *  shifts: new (higher-id) memories perturb only the tail group. */
-const MEMORY_APPLICATION_GROUP_SIZE = 32;
-
-async function embedMemoryRowsDetailed(
-    db: Database,
-    projectIdentity: string,
-    lane: DetailedLane,
-    memories: readonly { id: number; content: string }[],
-    signal?: AbortSignal,
-): Promise<Map<number, Float32Array>> {
-    // The caller's eligibility check can be arbitrarily stale by the time
-    // this runs (batches wait behind other awaited provider work, and other
-    // processes share the database): re-filter at the provider boundary and
-    // bind each row to the exact captured bytes, so a quarantine/rejection
-    // or rewrite landing after selection cannot leak content to the
-    // provider.
-    const eligibleAtDrain = memoriesEligibleForEmbedding(
-        db,
-        memories.map((memory) => memory.id),
-    );
-    const digestsAtDrain = exactMemoryContentDigests(
-        db,
-        memories.map((memory) => memory.id),
-    );
-    // Policy again AFTER the digest read (two autocommit snapshots): a hide
-    // committed between them leaves the digest unchanged.
-    const eligibleAfterDrain = memoriesEligibleForEmbedding(
-        db,
-        memories.map((memory) => memory.id),
-    );
-    memories = memories.filter(
-        (memory) =>
-            eligibleAtDrain.has(memory.id) &&
-            digestsAtDrain.get(memory.id) === sha256Utf8Hex(memory.content) &&
-            eligibleAfterDrain.has(memory.id),
-    );
-    if (memories.length === 0) return new Map();
-    const specs = [...memories]
-        .sort((a, b) => a.id - b.id)
-        .map((memory) => ({
-            id: `memory:${memory.id}`,
-            text: memory.content,
-            contentSha256: contentSha256(memory.content),
-        }));
-    const items: DetailedEmbedItem[] = [];
-    for (let start = 0; start < specs.length; start += MEMORY_APPLICATION_GROUP_SIZE) {
-        const chunk = specs.slice(start, start + MEMORY_APPLICATION_GROUP_SIZE);
-        const group = `memory:${sha256Prefix(
-            stableStringify(chunk.map(({ id, contentSha256: hash }) => [id, hash])),
-        )}`;
-        for (const spec of chunk) items.push({ ...spec, applicationGroup: group });
-    }
-    const inferred = new Map<string, Float32Array>();
-    const applied = await embedAndApplyDetailed({
-        db,
-        projectIdentity,
-        scope: "memory",
-        lane,
-        items,
-        signal,
-        readCurrentHashes: (ids) => {
-            const map = new Map<string, string>();
-            if (ids.length === 0) return map;
-            const placeholders = ids.map(() => "?").join(",");
-            const rows = db
-                .prepare(
-                    `SELECT id, content FROM memories
-                     WHERE project_path = ? AND status = 'active' AND id IN (${placeholders})`,
-                )
-                .all(projectIdentity, ...ids.map(memoryIdFromItemId)) as Array<{
-                id: number;
-                content: unknown;
-            }>;
-            for (const row of rows) {
-                if (typeof row.content === "string") {
-                    map.set(`memory:${row.id}`, contentSha256(row.content));
-                }
-            }
-            return map;
-        },
-        writeGroup: (_group, vectors) => {
-            for (const [id, vector] of vectors) {
-                saveEmbedding(db, memoryIdFromItemId(id), vector, lane.modelId);
-                inferred.set(id, vector);
-            }
-        },
-        // Memory staleness is unprovable from the destination row (no per-row
-        // source hash), so the probe never reports "stale"; content edits
-        // delete the row, which reads as "absent".
-        makeDestinationProbe: () => ({
-            state: (item) =>
-                hasMemoryEmbedding(db, memoryIdFromItemId(item.id), lane.modelId)
-                    ? "current"
-                    : "absent",
-            invalidate: (item) => {
-                db.prepare(
-                    "DELETE FROM memory_embeddings WHERE memory_id = ? AND model_id = ?",
-                ).run(memoryIdFromItemId(item.id), lane.modelId);
-            },
-        }),
-    });
-    // writeGroup runs inside the apply transaction, so `inferred` also holds
-    // vectors whose destination write was rolled back with a failed receipt
-    // CAS. The applied ids are the committed set; nothing else may be returned.
-    const written = new Map<number, Float32Array>();
-    for (const ids of applied.values()) {
-        for (const id of ids) {
-            const vector = inferred.get(id);
-            if (vector) written.set(memoryIdFromItemId(id), vector);
-        }
-    }
-    return written;
-}
-
-/** Read-path and drain entry: memory batch through versioned receipts. Returns
- *  the committed vectors (merge caches only from this), or null when the lane
- *  has no durable page journal and the caller must use its legacy path. */
-export async function embedMemoriesDetailedForProject(
-    db: Database,
-    projectIdentity: string,
-    memories: readonly { id: number; content: string }[],
-): Promise<Map<number, { embedding: Float32Array; modelId: string }> | null> {
-    const lane = getDetailedLane(projectIdentity, "primary");
-    if (!lane) return null;
-    const written = await embedMemoryRowsDetailed(db, projectIdentity, lane, memories);
-    const out = new Map<number, { embedding: Float32Array; modelId: string }>();
-    for (const [id, embedding] of written) out.set(id, { embedding, modelId: lane.modelId });
-    if (out.size > 0) {
-        enqueueShadowEmbeddingItems(projectIdentity, "memory", [...out.keys()].map(String));
-    }
-    return out;
 }
 
 async function embedCommitRowsDetailed(
@@ -2428,94 +2299,6 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
     if (!registration) return;
     if (item.ids.length > SHADOW_MAX_ITEMS_PER_TICK) {
         throw new Error("shadow worker must split oversized queue items");
-    }
-    if (item.scope === "memory") {
-        const db = dbForShadowQueue.get(item.projectIdentity);
-        if (!db) return;
-        const placeholders = item.ids.map(() => "?").join(",");
-        const loaded = db
-            .prepare(
-                `SELECT id, content, normalized_hash FROM memories
-                 WHERE project_path = ? AND id IN (${placeholders}) AND status = 'active'`,
-            )
-            .all(item.projectIdentity, ...item.ids.map((id) => Number(id))) as Array<{
-            id: number;
-            content: string;
-            normalized_hash: string;
-        }>;
-        // Re-check policy at drain time: a memory embedded while eligible can
-        // be quarantined or rejected while its shadow item waits behind other
-        // queue or backfill work, and uniform-absence content must not leave
-        // the process through the shadow provider. Every shadow path drains
-        // through this function, so this is the single choke point.
-        const eligibleIds = memoriesEligibleForEmbedding(
-            db,
-            loaded.map((row) => row.id),
-        );
-        const rows = loaded.filter((row) => eligibleIds.has(row.id));
-        const shadowLane = getDetailedLane(item.projectIdentity, "shadow");
-        if (shadowLane) {
-            await embedMemoryRowsDetailed(
-                db,
-                item.projectIdentity,
-                shadowLane,
-                rows.map((row) => ({ id: row.id, content: row.content })),
-            );
-            return;
-        }
-        // The fallback lane needs the same exact-byte drain filter as the
-        // detailed lane: a rewrite to an eligible revision differing only in
-        // case/whitespace keeps the normalized hash equal, so
-        // saveEmbeddingIfHashMatches alone would persist the loaded
-        // revision's vector for the new bytes.
-        const digestsAtDrain = exactMemoryContentDigests(
-            db,
-            rows.map((row) => row.id),
-        );
-        // Policy again AFTER the digest read (two autocommit snapshots,
-        // mirroring the detailed lane): a hide committed after `eligibleIds`
-        // was read leaves the digest unchanged, and these bytes are about to
-        // reach the embedding provider.
-        const eligibleAfterDrain = memoriesEligibleForEmbedding(
-            db,
-            rows.map((row) => row.id),
-        );
-        const boundRows = rows.filter(
-            (row) =>
-                digestsAtDrain.get(row.id) === sha256Utf8Hex(row.content) &&
-                eligibleAfterDrain.has(row.id),
-        );
-        if (boundRows.length === 0) return;
-        const vectors = await embedShadowItems(
-            registration,
-            boundRows.map((row) => ({
-                id: `memory:${row.id}`,
-                text: row.content,
-                contentSha256: contentSha256(row.content),
-            })),
-        );
-        db.transaction(() => {
-            // Re-bind inside the write transaction: the provider call above
-            // yielded, and the normalized-hash guard alone cannot reject a
-            // case/whitespace-only rewrite that landed meanwhile.
-            const digestsAtSave = exactMemoryContentDigests(
-                db,
-                boundRows.map((row) => row.id),
-            );
-            for (const row of boundRows) {
-                if (digestsAtSave.get(row.id) !== sha256Utf8Hex(row.content)) continue;
-                const vector = vectors.get(`memory:${row.id}`);
-                if (vector)
-                    saveEmbeddingIfHashMatches(
-                        db,
-                        row.id,
-                        vector,
-                        registration.modelId,
-                        row.normalized_hash,
-                    );
-            }
-        })();
-        return;
     }
     if (item.scope === "commit") {
         const db = dbForShadowQueue.get(item.projectIdentity);
@@ -2949,164 +2732,6 @@ async function embedItemsWindowBounded(
         for (const [id, vector] of result.vectors) vectors.set(id, vector);
     }
     return modelId === null || generation === null ? null : { vectors, modelId, generation };
-}
-
-function isUnembeddedMemoryRow(row: unknown): row is UnembeddedMemoryRow {
-    if (row === null || typeof row !== "object") return false;
-    const candidate = row as Record<string, unknown>;
-    return (
-        typeof candidate.id === "number" &&
-        typeof candidate.content === "string" &&
-        typeof candidate.normalized_hash === "string"
-    );
-}
-
-function getLoadUnembeddedMemoriesStatement(db: Database): PreparedStatement {
-    let stmt = loadUnembeddedMemoriesStatements.get(db);
-    if (!stmt) {
-        stmt = db.prepare(
-            "SELECT m.id AS id, m.content AS content, m.normalized_hash AS normalized_hash FROM memories m LEFT JOIN memory_embeddings me ON m.id = me.memory_id AND me.model_id = ? WHERE m.project_path = ? AND m.status = 'active' AND me.memory_id IS NULL AND m.id > ? ORDER BY m.id LIMIT ?",
-        );
-        loadUnembeddedMemoriesStatements.set(db, stmt);
-    }
-    return stmt;
-}
-
-export async function embedUnembeddedMemoriesForProject(
-    db: Database,
-    projectIdentity: string,
-    batchSize = 10,
-): Promise<number> {
-    const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
-    if (!snapshot?.enabled) return 0;
-
-    const normalizedBatchSize = Math.max(1, Math.floor(batchSize));
-    // Hard-hidden / rejected content never leaves the process, remote
-    // embedding providers included — and hidden rows are deliberately never
-    // embedded, so they sit in this backlog indefinitely. Walk the backlog in
-    // fixed-size id-ordered pages: each page bounds memory (a growing LIMIT
-    // would page most of the table in at once), and the walk runs to table
-    // exhaustion so no hidden prefix — of any length — can starve an eligible
-    // row behind it.
-    const pageSize = Math.max(normalizedBatchSize * 4, 64);
-    let cursor = 0;
-    const memories: { id: number; content: string; normalized_hash: string }[] = [];
-    for (;;) {
-        const page = getLoadUnembeddedMemoriesStatement(db).all(
-            snapshot.modelId,
-            projectIdentity,
-            cursor,
-            pageSize,
-        );
-        const fetched = page.filter(isUnembeddedMemoryRow);
-        const nextCursor = fetched.length > 0 ? fetched[fetched.length - 1].id : cursor;
-        const embeddable = memoriesEligibleForEmbedding(
-            db,
-            fetched.map((memory) => memory.id),
-        );
-        for (const memory of fetched) {
-            if (memories.length >= normalizedBatchSize) break;
-            if (embeddable.has(memory.id)) memories.push(memory);
-        }
-        if (
-            memories.length >= normalizedBatchSize ||
-            page.length < pageSize ||
-            nextCursor <= cursor
-        ) {
-            break;
-        }
-        cursor = nextCursor;
-    }
-    if (memories.length === 0) return 0;
-
-    try {
-        const lane = getDetailedLane(projectIdentity, "primary");
-        if (lane) {
-            const written = await embedMemoryRowsDetailed(
-                db,
-                projectIdentity,
-                lane,
-                memories.map((memory) => ({ id: memory.id, content: memory.content })),
-            );
-            if (written.size > 0) {
-                enqueueShadowEmbeddingItems(
-                    projectIdentity,
-                    "memory",
-                    [...written.keys()].map(String),
-                );
-            }
-            return written.size;
-        }
-        // Same drain-boundary recheck as the detailed lane: the page-walk
-        // precheck above is stale once any await has run. Bind each row to
-        // the exact captured bytes too — a rewrite to an eligible revision
-        // differing only in case/whitespace keeps the normalized hash equal,
-        // so saveEmbeddingIfHashMatches alone would persist the superseded
-        // revision's vector for the new bytes.
-        const eligibleAtDrain = memoriesEligibleForEmbedding(
-            db,
-            memories.map((memory) => memory.id),
-        );
-        const digestsAtDrain = exactMemoryContentDigests(
-            db,
-            memories.map((memory) => memory.id),
-        );
-        const stillEligible = memories.filter(
-            (memory) =>
-                eligibleAtDrain.has(memory.id) &&
-                digestsAtDrain.get(memory.id) === sha256Utf8Hex(memory.content),
-        );
-        if (stillEligible.length === 0) return 0;
-        const result = await embedItemsForProject(
-            projectIdentity,
-            stillEligible.map((memory) => ({
-                id: `memory:${memory.id}`,
-                text: memory.content,
-                contentSha256: contentSha256(memory.content),
-            })),
-        );
-        if (!result) return 0;
-
-        let embeddedCount = 0;
-        db.transaction(() => {
-            // Re-bind inside the write transaction: the provider call above
-            // yielded, and the normalized-hash guard alone cannot reject a
-            // case/whitespace-only rewrite that landed meanwhile — the save
-            // would reinstate the predecessor's vector under the successor
-            // bytes. Same discipline as the shadow drain.
-            const digestsAtSave = exactMemoryContentDigests(
-                db,
-                stillEligible.map((memory) => memory.id),
-            );
-            for (const memory of stillEligible) {
-                if (digestsAtSave.get(memory.id) !== sha256Utf8Hex(memory.content)) continue;
-                const embedding = result.vectors.get(`memory:${memory.id}`);
-                if (!embedding) continue;
-                if (
-                    saveEmbeddingIfHashMatches(
-                        db,
-                        memory.id,
-                        embedding,
-                        result.modelId,
-                        memory.normalized_hash,
-                    )
-                ) {
-                    embeddedCount += 1;
-                }
-            }
-        })();
-        enqueueShadowEmbeddingItems(
-            projectIdentity,
-            "memory",
-            stillEligible
-                .filter((memory) => result.vectors.has(`memory:${memory.id}`))
-                .map((memory) => String(memory.id)),
-        );
-        return embeddedCount;
-    } catch (error) {
-        log("[magic-context] failed to proactively embed missing memories:", error);
-        return 0;
-    }
 }
 
 interface CommitBatchResult {
@@ -3762,16 +3387,13 @@ export interface EmbeddingCoverageStatus {
     provider: string;
     /** This session's compartment-chunk coverage. */
     session: { embedded: number; total: number };
-    /** Project-wide active-memory coverage. */
-    memories: { embedded: number; total: number };
     /** Project-wide git-commit coverage (only meaningful when gitEnabled). */
     commits: { embedded: number; total: number; gitEnabled: boolean };
 }
 
 /**
- * Gather the embedding-coverage status for `/ctx-embed` (no-arg): which model is
- * active, and how much of this session's history / the project's memories /
- * git commits are embedded under it. Pure reads — no provider calls.
+ * The no-argument `/ctx-embed` status reports session and project git-commit
+ * coverage for the active model. Pure reads — no provider calls.
  */
 export function getEmbeddingCoverageStatus(
     db: Database,
@@ -3785,7 +3407,6 @@ export function getEmbeddingCoverageStatus(
             model: snapshot?.model ?? "off",
             provider: snapshot?.provider ?? "off",
             session: { embedded: 0, total: 0 },
-            memories: { embedded: 0, total: 0 },
             commits: { embedded: 0, total: 0, gitEnabled: false },
         };
     }
@@ -3795,7 +3416,6 @@ export function getEmbeddingCoverageStatus(
         sessionId,
         snapshot.chunkModelId,
     );
-    const memories = getMemoryEmbedCoverage(db, projectIdentity, snapshot.modelId);
     const gitEnabled = snapshot.gitCommitEnabled;
     const commits = gitEnabled
         ? {
@@ -3809,24 +3429,18 @@ export function getEmbeddingCoverageStatus(
         model: snapshot.model,
         provider: snapshot.provider,
         session,
-        memories,
         commits,
     };
 }
 
-export async function sweepAllRegisteredProjects(
-    db: Database,
-    batchSize = 10,
-): Promise<{
-    memoriesEmbedded: number;
+export async function sweepAllRegisteredProjects(db: Database): Promise<{
     commitsEmbedded: number;
     chunksEmbedded: number;
-    perProject: Map<string, { memories: number; commits: number; chunks: number }>;
+    perProject: Map<string, { commits: number; chunks: number }>;
 }> {
     if (projectSweepInProgress) {
         log("[magic-context] project embedding sweep already in progress, skipping this tick");
         return {
-            memoriesEmbedded: 0,
             commitsEmbedded: 0,
             chunksEmbedded: 0,
             perProject: new Map(),
@@ -3836,34 +3450,14 @@ export async function sweepAllRegisteredProjects(
     projectSweepInProgress = true;
     const startedAt = Date.now();
     const deadline = startedAt + SWEEP_MAX_WALL_CLOCK_MS;
-    const perProject = new Map<string, { memories: number; commits: number; chunks: number }>();
-    let memoriesEmbedded = 0;
+    const perProject = new Map<string, { commits: number; chunks: number }>();
     let commitsEmbedded = 0;
     let chunksEmbedded = 0;
 
     try {
         for (const projectIdentity of projectRegistrations.keys()) {
-            let memories = 0;
             let commits = 0;
             let chunks = 0;
-            let consecutiveEmpty = 0;
-
-            while (Date.now() < deadline) {
-                const count = await embedUnembeddedMemoriesForProject(
-                    db,
-                    projectIdentity,
-                    batchSize,
-                );
-                if (count === 0) {
-                    consecutiveEmpty += 1;
-                    if (consecutiveEmpty >= SWEEP_MAX_CONSECUTIVE_EMPTY) break;
-                    break;
-                }
-                consecutiveEmpty = 0;
-                memories += count;
-                memoriesEmbedded += count;
-                if (count < batchSize) break;
-            }
 
             if (Date.now() < deadline) {
                 commits = await drainCommitBacklogForProject(db, projectIdentity, deadline);
@@ -3879,19 +3473,17 @@ export async function sweepAllRegisteredProjects(
                 chunksEmbedded += chunks;
             }
 
-            perProject.set(projectIdentity, { memories, commits, chunks });
+            perProject.set(projectIdentity, { commits, chunks });
             if (Date.now() >= deadline) break;
         }
     } finally {
         projectSweepInProgress = false;
     }
 
-    return { memoriesEmbedded, commitsEmbedded, chunksEmbedded, perProject };
+    return { commitsEmbedded, chunksEmbedded, perProject };
 }
 
-export function _setTestProviderFactoryForProject(
-    factory: ((config: EmbeddingConfig) => EmbeddingProvider | null) | null,
-): void {
+export function _setTestProviderFactoryForProject(factory: TestProviderFactory | null): void {
     testProviderFactory = factory;
 }
 

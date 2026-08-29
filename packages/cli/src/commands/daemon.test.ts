@@ -144,6 +144,28 @@ describe("daemon command contract", () => {
         });
     });
 
+    test("default human output reports an operational failure and exits 1", async () => {
+        const h = harness((command) =>
+            result(command, {
+                ok: false,
+                state: "wedged",
+                reason: "native_probe_unavailable",
+                remediation: "run_daemon_restart",
+            }),
+        );
+
+        const exit = await runDaemonCommand(["status"], h.dependencies);
+
+        expect(exit).toBe(1);
+        expect(h.stderr).toEqual([]);
+        expect(h.stdout).toHaveLength(1);
+        const rendered = h.stdout[0] ?? "";
+        // Human mode renders text, never the JSON object.
+        expect(() => JSON.parse(rendered)).toThrow();
+        expect(rendered).toContain("Daemon status: wedged (native_probe_unavailable)");
+        expect(rendered).toContain("Remediation: run_daemon_restart");
+    });
+
     test.each([
         { args: [] },
         { args: ["bogus"] },

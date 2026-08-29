@@ -99,7 +99,7 @@ Magic Context also auto-embeds the active session's missing compartments in the 
 
 ## /ctx-session-upgrade
 
-**What it does.** Upgrades **this session** to the current history layout (full recomp of legacy compartments) and runs **once-per-project** memory category migration when available.
+**What it does.** Upgrades **this session** to the current history layout (full recomp of legacy compartments). It does not migrate project memories: project memory is stored as claims, and no memory-category migration runs.
 
 **When to use it.** After upgrades when compartments are legacy or docs recommend upgrading session history.
 

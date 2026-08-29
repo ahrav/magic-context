@@ -5,8 +5,7 @@
  *
  * These exercise the real bun:sqlite-backed paths that the lighter mock-based
  * tagger.test.ts cannot reach: UNIQUE-constraint collisions, monotonic counter
- * upserts, initFromDb refresh on memory drift, and the migration v6 startup
- * heal that brings session_meta.counter back up to MAX(tag_number).
+ * upserts and initFromDb refresh on memory drift.
  *
  * The bug these protect against is the cache-bust cascade traced in the
  * v0.15.7 incident — once session_meta.counter dropped below the tags table's
@@ -23,15 +22,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database as DatabaseType } from "../../shared/sqlite";
 import { Database } from "../../shared/sqlite";
-import { runMigrations } from "./migrations";
-import { initializeDatabase } from "./storage-db";
 import { getMaxTagNumberBySession, getTagNumberByMessageId } from "./storage-tags";
 import { createTagger } from "./tagger";
+import { createDirectTestDatabase } from "./test-database";
 
 function openTestDb(): DatabaseType {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase().db;
     return db;
 }
 
@@ -41,11 +37,7 @@ function openTestDb(): DatabaseType {
  * since `:memory:` databases are private to one connection.
  */
 function openFileBackedTestDb(filePath: string): DatabaseType {
-    const db = new Database(filePath);
-    db.exec("PRAGMA journal_mode = WAL");
-    initializeDatabase(db);
-    runMigrations(db);
-    return db;
+    return createDirectTestDatabase({ path: filePath }).db;
 }
 
 function getCounter(db: Database, sessionId: string): number {
@@ -242,77 +234,6 @@ describe("getTagNumberByMessageId helper", () => {
         tagger.assignTag("s1", "msg-shared", "message", 100, db);
         // Different session, same messageId — must not leak.
         expect(getTagNumberByMessageId(db, "s2", "msg-shared")).toBeNull();
-    });
-});
-
-describe("migration v6 — counter heal", () => {
-    it("heals divergent counters where MAX(tag_number) > session_meta.counter", () => {
-        //#given — fresh DB, mark migrations v1-v5 as already applied (so v1
-        // already created `notes`, allowing v7 to ALTER it later), then
-        // build divergent state, then run migrations to apply v6 and v7.
-        const db = new Database(":memory:");
-        initializeDatabase(db);
-        // v1 creates `notes`; we have to actually run that part for v7 to
-        // succeed. Easiest path: run migrations once normally, then
-        // delete v6's record so the heal logic is forced to run again on
-        // the already-divergent state we'll build below.
-        runMigrations(db);
-        // Build a session with counter=2, max(tag_number)=5
-        db.prepare(
-            "INSERT INTO session_meta (session_id, counter, last_response_time, cache_ttl) VALUES (?, ?, 0, '5m')",
-        ).run("s-divergent", 2);
-        for (let n = 1; n <= 5; n++) {
-            db.prepare(
-                "INSERT INTO tags (session_id, message_id, type, byte_size, tag_number) VALUES (?, ?, 'message', 0, ?)",
-            ).run("s-divergent", `msg-${n}`, n);
-        }
-        // And a session that's already in sync — must NOT be touched.
-        db.prepare(
-            "INSERT INTO session_meta (session_id, counter, last_response_time, cache_ttl) VALUES (?, ?, 0, '5m')",
-        ).run("s-clean", 3);
-        for (let n = 1; n <= 3; n++) {
-            db.prepare(
-                "INSERT INTO tags (session_id, message_id, type, byte_size, tag_number) VALUES (?, ?, 'message', 0, ?)",
-            ).run("s-clean", `clean-${n}`, n);
-        }
-        // Run the v6 heal SQL directly. We can't trigger it via runMigrations
-        // again because getCurrentVersion uses MAX(version), and v7 is
-        // already applied — runMigrations would consider everything done.
-        // What we're testing is that the SQL itself heals divergent state
-        // correctly; the wiring (invocation on the v5→v6 schema upgrade) is
-        // covered by runMigrations() running it once on fresh-DB setup.
-        db.prepare(
-            `UPDATE session_meta
-             SET counter = (
-                 SELECT MAX(tag_number)
-                 FROM tags
-                 WHERE tags.session_id = session_meta.session_id
-             )
-             WHERE EXISTS (
-                 SELECT 1
-                 FROM tags
-                 WHERE tags.session_id = session_meta.session_id
-                   AND tags.tag_number > session_meta.counter
-             )`,
-        ).run();
-
-        //#then — divergent session is healed, clean session is unchanged.
-        expect(getCounter(db, "s-divergent")).toBe(5);
-        expect(getCounter(db, "s-clean")).toBe(3);
-    });
-
-    it("is idempotent on a fresh DB with no divergent sessions", () => {
-        //#given — fresh DB, migrations applied.
-        const db = openTestDb();
-
-        //#when — running migrations again is a no-op.
-        runMigrations(db);
-
-        //#then — schema_migrations only has each version once.
-        const v6Count = db
-            .prepare("SELECT COUNT(*) as c FROM schema_migrations WHERE version = 6")
-            .get() as { c: number };
-        expect(v6Count.c).toBe(1);
     });
 });
 

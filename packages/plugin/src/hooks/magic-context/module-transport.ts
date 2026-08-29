@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { join } from "node:path";
 import type {
     AuthorityDrainResponse,
     AuthorityStatus,
@@ -35,7 +34,34 @@ import {
     type StorageReadiness,
 } from "../../shared/mc-host-lifecycle";
 import { qualifiedHarnessClosures } from "../../shared/mc-host-lifecycle/generated-production-inputs";
+import { defaultConnectionFilePath } from "../../shared/mc-host-lifecycle/paths";
 import { isRecord } from "../../shared/record-type-guard";
+import {
+    buildClaimEffectDeliveryWireBody,
+    buildClaimIntentAckWireBody,
+    buildClaimIntentInspectWireBody,
+    buildClaimIntentStageWireBody,
+    buildClaimMirrorReceiptWireBody,
+    buildClaimMirrorSnapshotWireBody,
+    type ClaimEffectDeliveryRequest,
+    type ClaimEffectDeliveryResponse,
+    type ClaimIntentAckRequest,
+    type ClaimIntentAckResponse,
+    type ClaimIntentInspectRequest,
+    type ClaimIntentInspectResponse,
+    type ClaimIntentStageRequest,
+    type ClaimIntentStageResponse,
+    type ClaimMirrorReceiptRequest,
+    type ClaimMirrorReceiptResponse,
+    type ClaimMirrorSnapshotRequest,
+    type ClaimMirrorSnapshotResponse,
+    decodeClaimEffectDeliveryResponse,
+    decodeClaimIntentAckResponse,
+    decodeClaimIntentInspectResponse,
+    decodeClaimIntentStageResponse,
+    decodeClaimMirrorReceiptResponse,
+    decodeClaimMirrorSnapshotResponse,
+} from "./module-wire";
 
 const DEFAULT_MODULE_ID = "magic-context";
 const CONNECT_BACKOFF_INITIAL_MS = 1_000;
@@ -51,7 +77,12 @@ const SERIAL_LANE_MIN_REMAINING_MS = 25;
 const CANONICAL_ROOT_CACHE_MAX_ENTRIES = 256;
 
 function getDefaultConnectionFile(): string {
-    return join(getDataDir(), "cortexkit", "run", "subc-connection.json");
+    // The managed lifecycle owner publishes the daemon under the lifecycle
+    // data root; dialing must agree byte-for-byte with that resolver or a
+    // demand can report ready while this transport dials a different path.
+    // The application-storage resolver only backstops environments where no
+    // lifecycle root resolves at all.
+    return defaultConnectionFilePath(getDataDir());
 }
 
 export interface ManagedDemandResult {
@@ -70,7 +101,6 @@ export type ManagedDemandStart = (request: {
 
 export interface McHostModuleTransportOptions {
     connectionFile?: string;
-    connectionOrigin?: ConnectionOrigin;
     moduleId?: string;
     requestTimeoutMs?: number;
     routeSessionPrefix?: string;
@@ -209,14 +239,31 @@ export function createLazyManagedDemandStart(
 ): ManagedDemandStart {
     let policy: ReturnType<typeof createManagedLifecyclePolicy> | undefined;
     return async (request): Promise<ManagedDemandResult> => {
+        // The caller's budget starts here, not at `demandStart`. Building the
+        // policy on a fresh install synchronously resolves the payload package,
+        // hashes every manifest file, and stages the bootstrap, and being
+        // synchronous it also blocks the abort timer from firing. Charging that
+        // preparation to the request keeps the demand inside the deadline the
+        // caller actually granted, instead of launching a daemon for a request
+        // whose budget was already gone and then running a full aggregate.
+        const startedAt = performance.now();
         policy ??= createManagedLifecyclePolicy({
             mode: "mutating",
             declaringModuleUrl: options.declaringModuleUrl,
             parentPackageName: options.parentPackageName,
         });
+        const preparationMs = performance.now() - startedAt;
+        // A non-positive residual is refused by `demandStart`'s entry guard,
+        // which rejects before any native start is created.
+        const deadlineMs =
+            request.deadlineMs === undefined ? undefined : request.deadlineMs - preparationMs;
         const outcome = await policy.demandStart({
             ...request,
-            startupEnvelope: buildManagedStartupEnvelope(options.parentPackageName),
+            ...(deadlineMs === undefined ? {} : { deadlineMs }),
+            // The demand contract lets a caller carry its own envelope; only
+            // default it, so this wrapper cannot silently discard one.
+            startupEnvelope:
+                request.startupEnvelope ?? buildManagedStartupEnvelope(options.parentPackageName),
         });
         return {
             ok: outcome.result.ok,
@@ -378,8 +425,10 @@ interface SerialLane {
 interface OpeningRoute {
     client: McHostClient;
     generation: number;
-    /** Set by `closeSession` while the open is in flight; the open must not cache its route. */
-    closed: boolean;
+    state: {
+        /** Set by `closeSession` while the open is in flight; the open must not cache its route. */
+        closed: boolean;
+    };
     promise: Promise<EnsuredRoute>;
 }
 
@@ -463,9 +512,7 @@ export class McHostModuleTransport {
                       requestTimeoutMs,
                       routeSessionPrefix,
                   };
-        this.connectionOrigin =
-            options.connectionOrigin ??
-            resolveConnectionOrigin({ connectionFile: options.connectionFile });
+        this.connectionOrigin = resolveConnectionOrigin({ connectionFile: options.connectionFile });
         this.connectionFile = options.connectionFile ?? getDefaultConnectionFile();
         this.moduleId = options.moduleId ?? DEFAULT_MODULE_ID;
         this.requestTimeoutMs = options.requestTimeoutMs ?? MODULE_SEND_TIMEOUT_MS;
@@ -659,6 +706,12 @@ export class McHostModuleTransport {
             | "mirror.pull"
             | "ctx_note"
             | "ctx_memory"
+            | "claim.intent.stage"
+            | "claim.intent.inspect"
+            | "claim.intent.ack"
+            | "claim.effects.apply"
+            | "claim.mirror.replace"
+            | "claim.mirror.apply"
             | "note.evaluate"
             | "note.evaluation.register"
             | "note.evaluation.heartbeat"
@@ -970,6 +1023,99 @@ export class McHostModuleTransport {
         return { page: response.page as unknown as ChangefeedPage };
     }
 
+    async claimIntentStage(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimIntentStageRequest;
+    }): Promise<ClaimIntentStageResponse> {
+        const response = await this.call({
+            sessionId: args.sessionId,
+            projectRoot: args.projectRoot,
+            method: "claim.intent.stage",
+            body: buildClaimIntentStageWireBody(args.request),
+        });
+        return decodeClaimIntentStageResponse(response, args.request);
+    }
+
+    async claimIntentInspect(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimIntentInspectRequest;
+    }): Promise<ClaimIntentInspectResponse> {
+        const response = await this.call({
+            sessionId: args.sessionId,
+            projectRoot: args.projectRoot,
+            method: "claim.intent.inspect",
+            body: buildClaimIntentInspectWireBody(args.request),
+        });
+        return decodeClaimIntentInspectResponse(response);
+    }
+
+    async claimIntentAck(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimIntentAckRequest;
+    }): Promise<ClaimIntentAckResponse> {
+        const response = await this.call({
+            sessionId: args.sessionId,
+            projectRoot: args.projectRoot,
+            method: "claim.intent.ack",
+            body: buildClaimIntentAckWireBody(args.request),
+        });
+        return decodeClaimIntentAckResponse(response, args.request);
+    }
+
+    async claimEffectsApply(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimEffectDeliveryRequest;
+    }): Promise<ClaimEffectDeliveryResponse> {
+        // The last effect is the delivery checkpoint (same contract as the outbox drain
+        // and the mirror receipt decoder). An effects receipt must carry at least one
+        // effect, so an empty list is an upstream invariant violation, not a zero ack.
+        const expectedEffectId = args.request.receipt.effects.at(-1)?.id;
+        if (expectedEffectId === undefined) {
+            throw new Error(
+                `claim effect receipt ${args.request.receipt.receiptId} has no effects`,
+            );
+        }
+        const response = await this.call({
+            sessionId: args.sessionId,
+            projectRoot: args.projectRoot,
+            method: "claim.effects.apply",
+            body: buildClaimEffectDeliveryWireBody(args.request),
+        });
+        return decodeClaimEffectDeliveryResponse(response, expectedEffectId);
+    }
+
+    async claimMirrorReplace(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimMirrorSnapshotRequest;
+    }): Promise<ClaimMirrorSnapshotResponse> {
+        const response = await this.call({
+            sessionId: args.sessionId,
+            projectRoot: args.projectRoot,
+            method: "claim.mirror.replace",
+            body: buildClaimMirrorSnapshotWireBody(args.request),
+        });
+        return decodeClaimMirrorSnapshotResponse(response, args.request);
+    }
+
+    async claimMirrorApply(args: {
+        sessionId: string;
+        projectRoot: string;
+        request: ClaimMirrorReceiptRequest;
+    }): Promise<ClaimMirrorReceiptResponse> {
+        const response = await this.call({
+            sessionId: args.sessionId,
+            projectRoot: args.projectRoot,
+            method: "claim.mirror.apply",
+            body: buildClaimMirrorReceiptWireBody(args.request),
+        });
+        return decodeClaimMirrorReceiptResponse(response, args.request);
+    }
+
     async deleteSession(sessionId: string, projectRoot: string): Promise<void> {
         await this.call({
             sessionId,
@@ -987,7 +1133,7 @@ export class McHostModuleTransport {
         let closedOpenings = false;
         for (const [key, opening] of [...this.routeOpenings.entries()]) {
             if (!key.startsWith(prefix)) continue;
-            opening.closed = true;
+            opening.state.closed = true;
             this.routeOpenings.delete(key);
             closedOpenings = true;
         }
@@ -1024,10 +1170,12 @@ export class McHostModuleTransport {
         // One identity may legitimately have multiple filesystem routes (for example,
         // worktrees). Reusing a route across roots would bind authority to the wrong tree.
         const routeKey = `${sessionId}\0${projectRoot}`;
-        const credentialSourceVersion =
-            this.connectionOrigin === "managed-default"
-                ? managedCredentialSourceVersion(process.env)
-                : undefined;
+        // Tracks the credentials this connection presents, so a rotation
+        // invalidates the cached route. Computed for every origin for the same
+        // reason the credentials themselves are presented for every origin: an
+        // explicit connection to a credential-bearing daemon is authenticated
+        // too, and a stale route there would outlive the key it was bound with.
+        const credentialSourceVersion = managedCredentialSourceVersion(process.env);
         // Read the cached route only after the connection is settled. The generation check
         // makes a route from any earlier connection invisible even if a cache clear is missed.
         const client = await this.ensureConnected(deadline, signal);
@@ -1051,14 +1199,8 @@ export class McHostModuleTransport {
             return await opening.promise;
         }
 
-        const routeOpening: OpeningRoute = {
-            client,
-            generation,
-            closed: false,
-            // SAFETY: placeholder for two-phase construction. commentlint: allow(JUDGE)
-            promise: undefined as unknown as Promise<EnsuredRoute>,
-        };
-        routeOpening.promise = (async (): Promise<EnsuredRoute> => {
+        const state = { closed: false };
+        const promise = (async (): Promise<EnsuredRoute> => {
             const target: RouteTarget = { kind: "tool_provider", module_id: this.moduleId };
             const identity: BindIdentity = {
                 project_root: projectRoot,
@@ -1071,7 +1213,7 @@ export class McHostModuleTransport {
                 "opening the module route",
             );
             if (
-                routeOpening.closed ||
+                state.closed ||
                 this.client !== client ||
                 generation !== this.connectionGeneration
             ) {
@@ -1087,6 +1229,7 @@ export class McHostModuleTransport {
             });
             return { client, route, routeKey, generation };
         })();
+        const routeOpening: OpeningRoute = { client, generation, state, promise };
         this.routeOpenings.set(routeKey, routeOpening);
         try {
             return await routeOpening.promise;
@@ -1136,21 +1279,25 @@ export class McHostModuleTransport {
         return McHostClient.connect({
             connectionFile: this.connectionFile,
             handshakeTimeoutMs,
-            ...(this.connectionOrigin === "managed-default"
-                ? { credentialSource: process.env }
-                : {}),
+            // Credentials are presented on every real connection, not only the
+            // one this transport is allowed to start. Lifecycle ownership and
+            // route authentication are independent: an explicit
+            // `subc.connection_file` can point at a shared daemon that another
+            // managed harness started with a credential envelope, and that
+            // daemon installs `CredentialVerifier`, which fails every Broca send
+            // with `credential_snapshot_mismatch` when the route presents no
+            // fingerprint. Gating this on `managed-default` let such a client
+            // complete its handshake and then fail every provider call.
+            credentialSource: process.env,
         });
     }
 
     private async demandManagedReadiness(deadline?: Deadline, signal?: AbortSignal): Promise<void> {
         if (this.connectionOrigin !== "managed-default") return;
-        if (!this.demandStart) {
-            const error = new Error("managed mc-host lifecycle owner is unavailable") as Error & {
-                code?: string;
-            };
-            error.code = "MC_HOST_LIFECYCLE_OWNER_MISSING";
-            throw error;
-        }
+        // No configured lifecycle owner keeps this transport passive: it can
+        // still dial an externally launched daemon on the default connection
+        // file (CLI doctor/migration paths never wire a managed owner).
+        if (!this.demandStart) return;
         const outcome = await this.demandStart({
             origin: this.connectionOrigin,
             capability: "magic-context",
@@ -1180,13 +1327,8 @@ export class McHostModuleTransport {
         signal?: AbortSignal,
     ): Promise<McHostClient> {
         if (this.client) return this.client;
-        await this.demandManagedReadiness(deadline, signal);
-        if (signal?.aborted) {
-            throw signal.reason ?? new Error("module transport call aborted");
-        }
         if (this.connectionPromise) return await this.connectionPromise;
-        const now = Date.now();
-        if (now < this.nextProbeMs) {
+        if (Date.now() < this.nextProbeMs) {
             const error = new Error(
                 `mc-host connection backoff active until ${this.nextProbeMs}`,
             ) as Error & {
@@ -1195,6 +1337,25 @@ export class McHostModuleTransport {
             error.code = "MC_HOST_CONNECTION_BACKOFF";
             throw error;
         }
+        try {
+            await this.demandManagedReadiness(deadline, signal);
+        } catch (error) {
+            // A failed demand arms the same backoff as a failed connect: each
+            // demand can spawn a native lifecycle process, so traffic must not
+            // drive an unthrottled start loop while the host cannot come up.
+            // Caller aborts and expired deadlines are not host faults.
+            if (!signal?.aborted && !(deadline?.isExpired() ?? false)) {
+                this.nextProbeMs = Date.now() + this.backoffMs;
+                this.backoffMs = Math.min(this.backoffMs * 2, CONNECT_BACKOFF_MAX_MS);
+            }
+            throw error;
+        }
+        if (signal?.aborted) {
+            throw signal.reason ?? new Error("module transport call aborted");
+        }
+        // The demand awaited; another caller may have connected meanwhile.
+        if (this.client) return this.client;
+        if (this.connectionPromise) return await this.connectionPromise;
 
         const generation = this.connectionGeneration;
         const connecting = (async (): Promise<McHostClient> => {
@@ -1237,4 +1398,8 @@ export class McHostModuleTransport {
     }
 }
 
-export const __moduleTransportTest = { isConnectionFailure, isStaleOrDeadRouteFailure };
+export const __moduleTransportTest = {
+    isConnectionFailure,
+    isStaleOrDeadRouteFailure,
+    managedCredentialSourceVersion,
+};

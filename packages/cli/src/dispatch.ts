@@ -34,14 +34,6 @@ function getVersion(): string {
     return "0.0.0";
 }
 
-function valueAfter(args: string[], flag: string): string | null {
-    const index = args.indexOf(flag);
-    if (index === -1) return null;
-    const next = args[index + 1];
-    if (next === undefined || next.startsWith("--")) return null;
-    return next;
-}
-
 export function usageText(): string {
     return [
         "",
@@ -64,17 +56,12 @@ export function usageText(): string {
         "    doctor --force   Force-clear plugin cache",
         "    doctor --issue   Collect diagnostics and open a GitHub issue",
         "    doctor --clear   Interactive cache cleanup picker",
-        "    doctor --check-v22-backfill       Show v22 memory backfill status",
-        "    doctor --retry-v22-backfill       Retry failed v22 memory backfill rows",
-        "    doctor --rekey-v22-dir-identity <path>  Re-key legacy dir identity rows",
-        "    doctor --check-claims-backfill    Show v84 claims backfill status",
-        "    doctor --retry-claims-backfill    Repair and resume the v84 claims backfill",
-        '    doctor --waive-claims-backfill-failure <id> --rationale "<why>"',
         "    doctor drain-authority <project>  Drain module memory/note authority to TypeScript",
         "    doctor migrate   Migrate OpenCode session to Pi or OMP JSONL",
         "    doctor migrate-session   Re-home an OpenCode session to another directory",
         "    doctor merge-identity   Merge project rows (--from ID --to ID [--dry-run] [--yes])",
         "    doctor repair-db   Back up and salvage a corrupted shared database",
+        "    doctor reset-db    Abandon an unsupported database family (--dry-run/--yes)",
         "",
         "  Harness selection:",
         "    --harness opencode    Target OpenCode only",
@@ -84,7 +71,11 @@ export function usageText(): string {
         "",
         "  Usage:",
         "    npx @cortexkit/magic-context@latest setup",
+        "        # add --dry-run to preview the wizard without writing any files",
         "    npx @cortexkit/magic-context@latest doctor",
+        "    npx @cortexkit/magic-context@latest doctor --issue",
+        "    npx @cortexkit/magic-context@latest doctor migrate \\",
+        "        --from opencode --to <pi|omp> --session ses_xxx --dry-run",
         "    npx @cortexkit/magic-context@latest daemon status --json",
         "",
     ].join("\n");
@@ -145,6 +136,10 @@ export async function dispatchCli(
                 const { runRepairDbCli } = await import("./commands/doctor-repair-db");
                 return runRepairDbCli(rest.slice(1));
             }
+            if (rest[0] === "reset-db") {
+                const { runResetDbCli } = await import("./commands/doctor-reset-db");
+                return runResetDbCli(rest.slice(1));
+            }
             if (rest[0] === "migrate") {
                 const { runMigrateCli } = await import("./commands/migrate");
                 return runMigrateCli(rest.slice(1));
@@ -154,22 +149,10 @@ export async function dispatchCli(
                 return runMigrateSessionCli(rest.slice(1));
             }
             const { runDoctor } = await import("./commands/doctor");
-            const rekeyV22DirIdentity = valueAfter(rest, "--rekey-v22-dir-identity");
-            const waiveClaimsBackfillFailure = valueAfter(rest, "--waive-claims-backfill-failure");
-            const waiveRationale = valueAfter(rest, "--rationale");
             return runDoctor({
                 force: rest.includes("--force"),
                 issue: rest.includes("--issue"),
                 clear: rest.includes("--clear"),
-                checkV22Backfill: rest.includes("--check-v22-backfill"),
-                retryV22Backfill: rest.includes("--retry-v22-backfill"),
-                ...(rekeyV22DirIdentity !== null ? { rekeyV22DirIdentity } : {}),
-                checkClaimsBackfill: rest.includes("--check-claims-backfill"),
-                retryClaimsBackfill: rest.includes("--retry-claims-backfill"),
-                ...(rest.includes("--waive-claims-backfill-failure")
-                    ? { waiveClaimsBackfillFailure }
-                    : {}),
-                ...(waiveRationale !== null ? { waiveRationale } : {}),
                 argv: rest,
             });
         }

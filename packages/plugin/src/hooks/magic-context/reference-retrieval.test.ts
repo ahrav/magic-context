@@ -228,3 +228,54 @@ describe("buildReferenceBlocks", () => {
         expect(a).toEqual(b);
     });
 });
+
+describe("seed corpus matches the historian's required event fields", () => {
+    // The seeds are runtime examples: `selectSeeds` puts them in front of the
+    // historian to calibrate output shape. A seed that omits a field the prompt
+    // marks required teaches the model to omit it too, and for
+    // `reason_for_change` the consequence is silent — `mappedPayload` skips such
+    // an event and receipts it, so the anti-memory is never created and never
+    // retried.
+    const REQUIRED_TRAJECTORY_FIELDS = [
+        "summary",
+        "before_strategy",
+        "correction_source",
+        "correction_signal",
+        "after_strategy",
+        "reason_for_change",
+        "evidence",
+    ] as const;
+
+    const trajectoryBlocks = REFERENCE_SEEDS.flatMap((seed) => [
+        ...seed.block.matchAll(/<trajectory_correction[^>]*>([\s\S]*?)<\/trajectory_correction>/g),
+    ]).map((match) => match[1] ?? "");
+
+    it("has trajectory corrections to check", () => {
+        expect(trajectoryBlocks.length).toBeGreaterThan(0);
+    });
+
+    it("gives every trajectory correction every required field", () => {
+        const missing = trajectoryBlocks.flatMap((block, index) =>
+            REQUIRED_TRAJECTORY_FIELDS.filter((field) => !block.includes(`<${field}>`)).map(
+                (field) => `seed trajectory_correction #${index + 1} is missing <${field}>`,
+            ),
+        );
+        expect(missing).toEqual([]);
+    });
+
+    it("keeps the rejection reason distinct from the evidence quote", () => {
+        // `evidence` proves the pivot happened; `reason_for_change` must say why
+        // the old strategy was wrong. A seed that repeats one as the other
+        // demonstrates exactly the conflation the harvest refuses to persist.
+        const conflated = trajectoryBlocks.flatMap((block, index) => {
+            const field = (tag: string) =>
+                block.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`))?.[1]?.trim();
+            const reason = field("reason_for_change");
+            const evidence = field("evidence");
+            return reason && evidence && reason === evidence
+                ? [`seed trajectory_correction #${index + 1} reuses evidence as the reason`]
+                : [];
+        });
+        expect(conflated).toEqual([]);
+    });
+});

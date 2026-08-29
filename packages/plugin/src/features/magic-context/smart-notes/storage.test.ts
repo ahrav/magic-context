@@ -5,13 +5,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { Database } from "../../../shared/sqlite";
+import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { evaluateSmartNotes } from "../dreamer/evaluate-smart-notes";
 import { acquireLease } from "../dreamer/lease";
-import { runMigrations } from "../migrations";
-import { initializeDatabase } from "../storage-db";
 import { addNote, dismissNote, getNotes, getPendingSmartNotes, updateNote } from "../storage-notes";
+import { createDirectTestDatabase } from "../test-database";
 import {
     applySmartNoteReduction,
     lifecycleStateFromNote,
@@ -30,9 +29,7 @@ const PROJECT = "git:test";
 const tempDirs: string[] = [];
 
 function freshDb(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase().db;
     return db;
 }
 

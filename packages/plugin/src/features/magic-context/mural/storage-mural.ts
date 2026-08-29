@@ -6,7 +6,7 @@ export interface MuralManifestRow {
     contentHash: string;
     renderedAt: number;
     model: string | null;
-    memoryIds: number[];
+    memoryIds: string[];
     width: number;
     height: number;
 }
@@ -30,11 +30,11 @@ export function getMural(db: Database, projectPath: string): MuralManifestRow | 
             )
             .get(projectPath);
         if (!row) return null;
-        let memoryIds: number[] = [];
+        let memoryIds: string[] = [];
         try {
             const parsed = JSON.parse(row.memory_ids_json);
             if (Array.isArray(parsed))
-                memoryIds = parsed.filter((id): id is number => typeof id === "number");
+                memoryIds = parsed.filter((id): id is string => typeof id === "string");
         } catch {
             // A malformed sidecar must not make m0 injection fail closed.
         }

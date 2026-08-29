@@ -2,21 +2,20 @@
 
 import { afterEach, describe, expect, it } from "bun:test";
 import { Database } from "../../shared/sqlite";
-import { FORK_MIGRATION_VERSION_FLOOR, runMigrations } from "./migrations";
+import { FORK_MIGRATION_VERSION_FLOOR } from "./migrations";
 import {
     __resetChildSpawnFenceProbeForTests,
     getChildSpawnFenceFailure,
     probeChildSpawnFence,
     STALE_CHILD_SPAWN_FAILURE,
 } from "./schema-fence-probe";
-import { initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
+import { LATEST_SUPPORTED_VERSION } from "./storage-db";
+import { createDirectTestDatabase } from "./test-database";
 
 const dbs: Database[] = [];
 
 function staleDatabase(): Database {
-    const db = new Database(":memory:");
-    initializeDatabase(db);
-    runMigrations(db);
+    const db = createDirectTestDatabase().db;
     db.prepare(
         "INSERT INTO schema_migrations(version, description, applied_at) VALUES (?, ?, ?)",
     ).run(LATEST_SUPPORTED_VERSION + 1, "future schema", Date.now());
@@ -68,7 +67,6 @@ describe("child spawn schema-fence probe", () => {
 
     it("refuses a child spawn when the live schema probe cannot be read", () => {
         const db = new Database(":memory:");
-        initializeDatabase(db);
         db.close();
 
         const verdict = probeChildSpawnFence(db);
@@ -84,10 +82,8 @@ describe("child spawn schema-fence probe", () => {
         });
     });
 
-    it("ignores downstream rows when probing a fully migrated upstream lane", () => {
-        const db = new Database(":memory:");
-        initializeDatabase(db);
-        runMigrations(db);
+    it("ignores downstream rows when probing the current direct-format fence", () => {
+        const db = createDirectTestDatabase().db;
         db.prepare(
             "INSERT INTO schema_migrations(version, description, applied_at) VALUES (?, ?, ?)",
         ).run(FORK_MIGRATION_VERSION_FLOOR, "fork row", Date.now());

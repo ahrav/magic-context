@@ -9,11 +9,7 @@ describe("embedding routing", () => {
             embedding: { provider: "synapse", fallback_provider: "local" },
             subc: { connection_file: "~/run/subc.json" },
         });
-        const routing = await resolveEmbeddingRouting({
-            config,
-            projectRoot: "/repo",
-            session: "ses-routing",
-        });
+        const routing = await resolveEmbeddingRouting({ config });
         expect(routing.primary).toMatchObject({
             provider: "synapse",
             synapse_connection_origin: "explicit",
@@ -29,7 +25,7 @@ describe("embedding routing", () => {
         const config = MagicContextConfigSchema.parse({
             embedding: { provider: "synapse", fallback_provider: "off" },
         });
-        const routing = await resolveEmbeddingRouting({ config, projectRoot: "/repo" });
+        const routing = await resolveEmbeddingRouting({ config });
         expect(routing.primary).toMatchObject({
             provider: "synapse",
             synapse_connection_origin: "managed-default",

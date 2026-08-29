@@ -1,181 +1,149 @@
-import { sessionLog } from "../../../shared/logger";
 import type { Database } from "../../../shared/sqlite";
-import { CATEGORY_DEFAULT_TTL, PROMOTABLE_CATEGORIES } from "./constants";
-import { embedTextForProject } from "./embedding";
-import { computeNormalizedHash } from "./normalize-hash";
+import { isInTransaction } from "../../../shared/sqlite";
+import type { CanonicalJsonValue } from "./claim-operation-contract";
+import { V2_MEMORY_CATEGORIES } from "./constants";
 import {
-    exactMemoryContentDigests,
-    memoriesEligibleForEmbedding,
-} from "./storage-claim-visibility";
-import { sha256Utf8Hex } from "./storage-claims";
-import {
-    getMemoryByHash,
-    getMemoryById,
-    insertMemory,
-    updateMemorySeenCount,
-} from "./storage-memory";
-import { saveEmbeddingIfHashMatches } from "./storage-memory-embeddings";
-import type { MemoryCategory, MemoryInput } from "./types";
+    type AutonomousManifestIdentity,
+    runAutonomousCreationManifestInCurrentTransaction,
+} from "./storage-claim-autonomous";
+import { stageCreateProjectMemoryClaimInCurrentTransaction } from "./storage-claim-operations";
+import { ensureProject, sha256Utf8Hex } from "./storage-claims";
+import type { MemoryCategory } from "./types";
 
 interface SessionFact {
     category: string;
     content: string;
 }
 
+export interface HistorianPromotionIdentity {
+    producer: "opencode-historian" | "pi-historian" | "test-historian";
+    runId: string;
+    leaseKey: string;
+    leaseGeneration: string | number;
+    batchId: string;
+}
+
 export interface PromotedMemoryRef {
-    memoryId: number;
+    publicClaimId: string;
+    revisionLocator: string;
+    contentDigest: string;
     content: string;
 }
 
 function isPromotableCategory(category: string): category is MemoryCategory {
-    return PROMOTABLE_CATEGORIES.some((promotableCategory) => promotableCategory === category);
+    return V2_MEMORY_CATEGORIES.includes(category as (typeof V2_MEMORY_CATEGORIES)[number]);
 }
 
-function resolveExpiresAt(category: MemoryCategory): number | null {
-    const ttl = CATEGORY_DEFAULT_TTL[category];
-    return ttl === undefined ? null : Date.now() + ttl;
+function assertIdentity(identity: HistorianPromotionIdentity): void {
+    if (
+        !identity.producer ||
+        !identity.runId ||
+        !identity.leaseKey ||
+        !identity.batchId ||
+        (typeof identity.leaseGeneration === "number"
+            ? !Number.isSafeInteger(identity.leaseGeneration) || identity.leaseGeneration < 1
+            : identity.leaseGeneration.length === 0)
+    ) {
+        throw new Error("historian promotion identity is incomplete");
+    }
 }
 
-/**
- * Synchronously promote eligible session facts to cross-session memories.
- *
- * Transaction contract: callers may run this inside their publish transaction.
- * Storage failures deliberately propagate so the enclosing publication rolls
- * back atomically with the boundary; malformed/unpromotable facts are validation
- * skips and do not abort the publish.
- */
-export function promoteSessionFactsDurable(
-    db: Database,
-    sessionId: string,
-    projectPath: string,
-    facts: SessionFact[],
-): PromotedMemoryRef[] {
+function refsFromPayload(payload: CanonicalJsonValue): PromotedMemoryRef[] {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) return [];
+    const items = (payload as { items?: unknown }).items;
+    if (!Array.isArray(items)) return [];
     const refs: PromotedMemoryRef[] = [];
-    for (const fact of facts) {
+    for (const item of items) {
+        if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+        const claim = (item as { claim?: unknown }).claim;
+        if (!claim || typeof claim !== "object" || Array.isArray(claim)) continue;
+        const row = claim as Record<string, unknown>;
         if (
-            !fact ||
-            typeof fact.category !== "string" ||
-            typeof fact.content !== "string" ||
-            fact.content.trim().length === 0
+            typeof row.publicClaimId !== "string" ||
+            typeof row.revisionLocator !== "string" ||
+            typeof row.contentDigest !== "string"
         ) {
             continue;
         }
-        if (!isPromotableCategory(fact.category)) {
-            continue;
-        }
-
-        const normalizedHash = computeNormalizedHash(fact.content);
-        const existingMemory = getMemoryByHash(db, projectPath, fact.category, normalizedHash);
-
-        if (existingMemory) {
-            updateMemorySeenCount(db, existingMemory.id);
-            continue;
-        }
-
-        const memoryInput: MemoryInput = {
-            projectPath,
-            category: fact.category,
-            content: fact.content,
-            sourceSessionId: sessionId,
-            sourceType: "historian",
-            expiresAt: resolveExpiresAt(fact.category),
-        };
-
-        const memory = insertMemory(db, memoryInput);
-        refs.push({ memoryId: memory.id, content: memory.content });
+        refs.push({
+            publicClaimId: row.publicClaimId,
+            revisionLocator: row.revisionLocator,
+            contentDigest: row.contentDigest,
+            content: "",
+        });
     }
-
     return refs;
 }
 
-/**
- * Best-effort asynchronous embedding for newly promoted facts. Must run after
- * the durable publish transaction commits.
- */
-export async function embedPromotedFacts(
+export function promoteSessionFactsDurable(
     db: Database,
     sessionId: string,
-    projectPath: string,
-    refs: PromotedMemoryRef[],
-): Promise<void> {
-    // One batched eligibility read for the whole promotion batch: the
-    // underlying policy-row query already chunks an IN list, and the surface
-    // is identical for every ref. Each ref still re-checks membership at its
-    // own turn below (the loop awaits provider calls, so eligibility is
-    // re-read per ref against this stale-but-conservative snapshot only for
-    // the initial skip; the hash-guarded save rejects mid-flight edits).
-    const eligible = memoriesEligibleForEmbedding(
-        db,
-        refs.map((ref) => ref.memoryId),
-    );
-    for (const ref of refs) {
-        if (!eligible.has(ref.memoryId)) continue;
-        await embedAndStoreMemory(db, sessionId, projectPath, ref.memoryId, ref.content);
-    }
-}
+    projectIdentity: string,
+    facts: readonly SessionFact[],
+    identity: HistorianPromotionIdentity,
+): PromotedMemoryRef[] {
+    assertIdentity(identity);
+    const seen = new Set<string>();
+    const promotable = facts.flatMap((fact) => {
+        const content = fact.content.trim();
+        if (!isPromotableCategory(fact.category) || !content) return [];
+        const key = `${fact.category}:${sha256Utf8Hex(content)}`;
+        if (seen.has(key)) return [];
+        seen.add(key);
+        return [{ category: fact.category, content }];
+    });
 
-async function embedAndStoreMemory(
-    db: Database,
-    sessionId: string,
-    projectPath: string,
-    memoryId: number,
-    content: string,
-): Promise<void> {
-    try {
-        // Hard-hidden / rejected content never leaves the process, remote
-        // embedding providers included. Re-checked here (cheap single-id
-        // read) because earlier refs' provider calls yield arbitrarily long.
-        if (!memoriesEligibleForEmbedding(db, [memoryId]).has(memoryId)) {
-            return;
+    const apply = (): PromotedMemoryRef[] => {
+        const projectId = ensureProject(db, projectIdentity);
+        const manifestIdentity: AutonomousManifestIdentity = {
+            ...identity,
+            task: "historian-promotion",
+        };
+        const operation = runAutonomousCreationManifestInCurrentTransaction({
+            db,
+            identity: manifestIdentity,
+            items: promotable.map((fact, index) => ({
+                key: {
+                    category: fact.category,
+                    contentDigest: sha256Utf8Hex(fact.content),
+                    index,
+                },
+                value: { ...fact, index },
+            })),
+            manifest: promotable.map((fact) => ({
+                category: fact.category,
+                content: fact.content,
+            })),
+            resultSummary: { promotableFacts: promotable.length },
+            stageItem: (database, item, nowMs) =>
+                stageCreateProjectMemoryClaimInCurrentTransaction(
+                    database,
+                    {
+                        projectId,
+                        content: item.value.content,
+                        category: item.value.category,
+                        provenance: {
+                            sourceLocator: `historian://${identity.producer}/${sessionId}/${identity.batchId}/${item.value.index}`,
+                            sourceContent: item.value.content,
+                            sourceSessionId: sessionId,
+                            extractor: "historian",
+                            extractorVersion: "direct-claims-v1",
+                            extractorRunId: identity.runId,
+                            independenceKey: `${identity.producer}:${identity.runId}:${item.value.index}`,
+                            sourceTrustClass: "model_inference",
+                        },
+                        actor: identity.producer,
+                        nowMs,
+                    },
+                    nowMs,
+                ),
+        });
+        const refs = refsFromPayload(operation.operation.result.payload);
+        for (let index = 0; index < refs.length; index += 1) {
+            refs[index].content = promotable[index]?.content ?? "";
         }
-        // Bind the captured bytes to the current revision: a rewrite after
-        // publication makes eligibility (and the hash captured below)
-        // describe the NEW revision while `content` still holds the old
-        // promoted bytes — embedding them would disclose a superseded
-        // revision to the provider and store its vector as if it described
-        // the replacement.
-        if (exactMemoryContentDigests(db, [memoryId]).get(memoryId) !== sha256Utf8Hex(content)) {
-            return;
-        }
-        // Policy again AFTER the digest read (two autocommit snapshots): a
-        // hide committed between them leaves the digest unchanged.
-        if (!memoriesEligibleForEmbedding(db, [memoryId]).has(memoryId)) {
-            return;
-        }
-        // Capture the row's content hash BEFORE the async provider call: the
-        // vector it returns is only valid for the content stored right now. If
-        // the memory is edited while the call is in flight, the row's
-        // normalized_hash changes and the guarded save below discards the stale
-        // vector instead of resurrecting an out-of-date row — the memory then
-        // stays unembedded until the proactive drain re-embeds current content.
-        const hashBeforeEmbed = getMemoryById(db, memoryId)?.normalizedHash;
-        if (!hashBeforeEmbed) {
-            return;
-        }
-        const result = await embedTextForProject(projectPath, content);
-        if (result) {
-            db.transaction(() => {
-                // Re-bind inside the write transaction: the provider call
-                // above yielded, and the normalized-hash guard alone cannot
-                // reject a case/whitespace-only rewrite that landed
-                // meanwhile — the save would reinstate the predecessor's
-                // vector under the successor bytes.
-                if (
-                    exactMemoryContentDigests(db, [memoryId]).get(memoryId) !==
-                    sha256Utf8Hex(content)
-                ) {
-                    return;
-                }
-                saveEmbeddingIfHashMatches(
-                    db,
-                    memoryId,
-                    result.vector,
-                    result.modelId,
-                    hashBeforeEmbed,
-                );
-            })();
-        }
-    } catch (error) {
-        sessionLog(sessionId, `memory embedding failed for memory ${memoryId}:`, error);
-    }
+        return refs;
+    };
+
+    return isInTransaction(db) ? apply() : db.transaction(apply).immediate();
 }

@@ -5,7 +5,7 @@ members = ["crates/mc-core", "crates/mc-store", "crates/mc-host", "crates/mc-mod
 # sibling sources, so it must never join this workspace's dependency graph.
 # The cargo-fuzz workspace under crates/mc-shm-transport/fuzz declares its own
 # [workspace] and stays excluded here.
-exclude = ["packages/dashboard/src-tauri", "docs/evidence/subc-surface-probe", "crates/mc-shm-transport/fuzz"]
+exclude = ["docs/evidence/subc-surface-probe", "crates/mc-shm-transport/fuzz"]
 
 [workspace.dependencies]
 # CortexKit cache-stability core + storage substrate. Sibling path-deps for local
@@ -26,5 +26,7 @@ mc-store = { path = "crates/mc-store" }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+# 0.32 bundles SQLite 3.46.0 (pre-3.47.1 WAL-reset fix, sqlite.org/wal.html#walresetbug). commentlint: allow(JUDGE)
+# Raising it requires bumping cortexkit-store in the same change. commentlint: allow(JUDGE)
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"

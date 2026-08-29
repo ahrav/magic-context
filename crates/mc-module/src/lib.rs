@@ -64,7 +64,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use mc_store::MEMORY_VISIBILITY_MUTATION_CATEGORY;
 use tokio::sync::Notify;
 
 use crate::smart_note_evaluation::{
@@ -87,17 +86,15 @@ use mc_host::{
 use mc_store::TagNumberRow;
 use mc_store::{
     canonical_root, validate_state_import_compartments, AuthoritySeedRow, DeferredExecuteState,
-    FacadeMutationOutcome, HistorianPhase, InsertMemoryInput, MappingUpdate, McStore, McStoreError,
-    ModuleDropSeedRow, ModuleMemoryMutationRow, ModuleMemoryRow, ModuleStateSyncError,
-    ModuleStateSyncRequest, ModuleStripSeedRow, ModuleWorkspaceMemberRow, ModuleWorkspaceRow,
-    NoteCasOutcome, NoteConditionCompile, NoteEvalAbandonOutcome, NoteEvalAcquireOutcome,
-    NoteEvalCandidate, NoteEvalClaim, NoteEvalCompleteOutcome, NoteEvalReducedState,
-    NoteEvalRenewOutcome, NoteEvalSelection, NoteInput, NoteNudgeAnchorSeed, NoteWriteInput,
-    PendingAgentDrop, PendingAgentDropSeedRow, PendingCompactionMarkerState,
+    FacadeMutationOutcome, HistorianPhase, McStore, McStoreError, ModuleDropSeedRow,
+    ModuleStateSyncError, ModuleStateSyncRequest, ModuleStripSeedRow, ModuleWorkspaceMemberRow,
+    ModuleWorkspaceRow, NoteCasOutcome, NoteConditionCompile, NoteEvalAbandonOutcome,
+    NoteEvalAcquireOutcome, NoteEvalCandidate, NoteEvalClaim, NoteEvalCompleteOutcome,
+    NoteEvalReducedState, NoteEvalRenewOutcome, NoteEvalSelection, NoteInput, NoteNudgeAnchorSeed,
+    NoteWriteInput, PendingAgentDrop, PendingAgentDropSeedRow, PendingCompactionMarkerState,
     RecordWrapupCommandOutcome, StateImportError, StateImportPreflight, StateImportValidationError,
-    StoredChunkTranscript, StoredCompartment, StoredMemoryMutation, StoredNote,
-    TodoStateSetOutcome, UserHintSeedRow, VerificationUpdate, WrapupCommandRecord,
-    LATEST_MIGRATION_VERSION,
+    StoredChunkTranscript, StoredCompartment, StoredNote, TodoStateSetOutcome, UserHintSeedRow,
+    WrapupCommandRecord, LATEST_MIGRATION_VERSION,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -138,6 +135,20 @@ use transform::{
     transform_with_projection_cached, HistorianDiagnostics, ProjectionCacheInput,
     SerializedOutputCache, TransformRequest,
 };
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ClaimMirrorSnapshotRequest {
+    protocol_version: u32,
+    snapshot: mc_store::claim_mirror::ClaimMirrorSnapshot,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ClaimMirrorReceiptRequest {
+    protocol_version: u32,
+    receipt: mc_store::claim_mirror::ClaimMirrorReceiptGroup,
+}
 
 /// The per-route binding: the project, harness, session-slot value, and fallback render
 /// budget frozen at bind. Transform routes carry the durable session in `session`. Facade
@@ -686,21 +697,6 @@ struct ModuleStateSyncWire {
     seed_boundary_id: Option<String>,
     #[serde(default)]
     compartments: Vec<ModuleCompartmentWire>,
-    #[serde(default)]
-    memories: Vec<ModuleMemoryWire>,
-    /// Present when `memories` is a FULL policy snapshot for these projects:
-    /// the store prunes mirrored rows absent from the payload within this
-    /// scope. Absent means incremental upsert-only semantics.
-    #[serde(default)]
-    memories_replace_projects: Option<Vec<String>>,
-    /// Explicit prune: mirrored rows with these ids are deleted before the
-    /// snapshot upsert. Covers policy-hidden rows the replace scope cannot
-    /// name — a foreign workspace member's rows — without granting a
-    /// project-wide prune over that member's non-shared rows.
-    #[serde(default)]
-    memories_delete_ids: Option<Vec<i64>>,
-    #[serde(default)]
-    memory_mutations: Vec<ModuleMemoryMutationWire>,
     #[serde(default)]
     user_profile: Option<Vec<String>>,
     /// None means omitted; Some(None) is an explicit workspace clear.
@@ -1669,86 +1665,6 @@ struct ModuleWorkspaceWire {
 #[derive(Debug, Clone, Deserialize)]
 struct ModuleWorkspaceMemberWire {
     project_path: String,
-    #[serde(default)]
-    share_categories: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ModuleMemoryWire {
-    id: i64,
-    #[serde(default)]
-    project_path: Option<String>,
-    #[serde(default)]
-    category: String,
-    #[serde(default)]
-    content: String,
-    #[serde(default)]
-    normalized_hash: Option<String>,
-    #[serde(default)]
-    importance: Option<i32>,
-    #[serde(default = "default_memory_scope")]
-    scope: String,
-    #[serde(default)]
-    shareable: i32,
-    #[serde(default)]
-    source_session_id: Option<String>,
-    #[serde(default)]
-    source_type: Option<String>,
-    #[serde(default = "default_seen_count")]
-    seen_count: i64,
-    #[serde(default)]
-    retrieval_count: i64,
-    #[serde(default)]
-    first_seen_at: i64,
-    #[serde(default)]
-    created_at: i64,
-    #[serde(default)]
-    updated_at: i64,
-    #[serde(default)]
-    last_seen_at: i64,
-    #[serde(default)]
-    last_retrieved_at: Option<i64>,
-    #[serde(default = "default_memory_status")]
-    status: String,
-    #[serde(default)]
-    expires_at: Option<i64>,
-    #[serde(default = "default_verification_status")]
-    verification_status: String,
-    #[serde(default)]
-    verified_at: Option<i64>,
-    #[serde(default)]
-    classified_at: Option<i64>,
-    #[serde(default)]
-    superseded_by_memory_id: Option<i64>,
-    #[serde(default)]
-    merged_from: Option<String>,
-    #[serde(default)]
-    metadata_json: Option<String>,
-    #[serde(default)]
-    mural_cue: Option<String>,
-    #[serde(default)]
-    mural_cue_hash: Option<String>,
-    #[serde(default)]
-    mural_cue_at: Option<i64>,
-    #[serde(default)]
-    mural_cue_rejection_count: i64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ModuleMemoryMutationWire {
-    id: i64,
-    #[serde(default)]
-    project_path: Option<String>,
-    mutation_type: String,
-    target_memory_id: i64,
-    #[serde(default)]
-    superseded_by_id: Option<i64>,
-    #[serde(default)]
-    category: Option<String>,
-    #[serde(default)]
-    new_content: Option<String>,
-    #[serde(default)]
-    queued_at: i64,
 }
 
 struct FacadeScope {
@@ -1762,22 +1678,6 @@ struct FacadeScope {
 
 fn default_importance() -> i32 {
     50
-}
-
-fn default_memory_scope() -> String {
-    "project".to_string()
-}
-
-fn default_seen_count() -> i64 {
-    1
-}
-
-fn default_memory_status() -> String {
-    "active".to_string()
-}
-
-fn default_verification_status() -> String {
-    "unverified".to_string()
 }
 
 impl From<ModuleCompartmentWire> for StoredCompartment {
@@ -1800,65 +1700,6 @@ impl From<ModuleCompartmentWire> for StoredCompartment {
             episode_type: value.episode_type,
             legacy: value.legacy,
             created_at: value.created_at,
-        }
-    }
-}
-
-impl ModuleMemoryWire {
-    fn into_row(self, project_path: String) -> ModuleMemoryRow {
-        let normalized_hash = self
-            .normalized_hash
-            .unwrap_or_else(|| mc_store::compute_normalized_memory_hash(&self.content));
-        ModuleMemoryRow {
-            id: self.id,
-            project_path,
-            category: self.category,
-            content: self.content,
-            normalized_hash,
-            importance: self.importance,
-            scope: self.scope,
-            shareable: self.shareable,
-            source_session_id: self.source_session_id,
-            source_type: self.source_type,
-            seen_count: self.seen_count,
-            retrieval_count: self.retrieval_count,
-            first_seen_at: self.first_seen_at,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
-            last_seen_at: self.last_seen_at,
-            last_retrieved_at: self.last_retrieved_at,
-            status: self.status,
-            expires_at: self.expires_at,
-            verification_status: self.verification_status,
-            verified_at: self.verified_at,
-            classified_at: self.classified_at,
-            superseded_by_memory_id: self.superseded_by_memory_id,
-            merged_from: self.merged_from,
-            metadata_json: self.metadata_json,
-            mural_cue: self.mural_cue,
-            mural_cue_hash: self.mural_cue_hash,
-            mural_cue_at: self.mural_cue_at,
-            mural_cue_rejection_count: self.mural_cue_rejection_count,
-        }
-    }
-}
-
-impl ModuleMemoryMutationWire {
-    fn into_row(self, project_path: String) -> ModuleMemoryMutationRow {
-        let visibility_changed =
-            self.category.as_deref() == Some(MEMORY_VISIBILITY_MUTATION_CATEGORY);
-        ModuleMemoryMutationRow {
-            project_path,
-            mutation: StoredMemoryMutation {
-                id: self.id,
-                mutation_type: self.mutation_type,
-                target_memory_id: self.target_memory_id,
-                superseded_by_id: self.superseded_by_id,
-                category: self.category,
-                new_content: self.new_content,
-                visibility_changed,
-                queued_at: self.queued_at,
-            },
         }
     }
 }
@@ -3082,8 +2923,6 @@ pub struct McHandler {
     /// before the fenced state-sync transaction.
     #[cfg(test)]
     state_sync_before_apply_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
-    #[cfg(test)]
-    classification_before_apply_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     connect_failure_commit_hook: ConnectFailureCommitHook,
     #[cfg(test)]
     publication_fence_write_hook: ConnectFailureCommitHook,
@@ -3186,16 +3025,8 @@ pub trait HistorianProducerFactory: Send + Sync {
         &self,
         project_root: &Path,
         harness: &str,
+        credential_fingerprints: &std::collections::BTreeMap<String, String>,
     ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError>;
-
-    async fn connect_with_credentials(
-        &self,
-        project_root: &Path,
-        harness: &str,
-        _credential_fingerprints: &std::collections::BTreeMap<String, String>,
-    ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
-        self.connect(project_root, harness).await
-    }
 }
 
 struct RealHistorianProducerFactory {
@@ -3206,15 +3037,6 @@ struct RealHistorianProducerFactory {
 #[async_trait]
 impl HistorianProducerFactory for RealHistorianProducerFactory {
     async fn connect(
-        &self,
-        project_root: &Path,
-        harness: &str,
-    ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
-        self.connect_with_credentials(project_root, harness, &std::collections::BTreeMap::new())
-            .await
-    }
-
-    async fn connect_with_credentials(
         &self,
         project_root: &Path,
         harness: &str,
@@ -3562,6 +3384,7 @@ impl HistorianProducerFactory for MissingProducerFactory {
         &self,
         _project_root: &Path,
         _harness: &str,
+        _credential_fingerprints: &std::collections::BTreeMap<String, String>,
     ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
         Err(HistorianProducerError::Client(
             historian_producer::HistorianClientFailure {
@@ -3628,8 +3451,6 @@ impl McHandler {
             state_sync_seed_now: Mutex::new(None),
             #[cfg(test)]
             state_sync_before_apply_hook: Mutex::new(None),
-            #[cfg(test)]
-            classification_before_apply_hook: Mutex::new(None),
             connect_failure_commit_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             publication_fence_write_hook: Arc::new(Mutex::new(None)),
@@ -3928,7 +3749,6 @@ impl McHandler {
             status_snapshot_hook: Mutex::new(None),
             state_sync_seed_now: Mutex::new(None),
             state_sync_before_apply_hook: Mutex::new(None),
-            classification_before_apply_hook: Mutex::new(None),
             connect_failure_commit_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             publication_fence_write_hook: Arc::new(Mutex::new(None)),
@@ -4923,11 +4743,7 @@ impl McHandler {
                             historian::RestartAction::ReattachProducer { .. } => {}
                         }
                         let mut producer = factory
-                            .connect_with_credentials(
-                                &project_root,
-                                &harness,
-                                &credential_fingerprints,
-                            )
+                            .connect(&project_root, &harness, &credential_fingerprints)
                             .await?;
                         reattach_historian_producer(
                             &mut *producer,
@@ -5271,6 +5087,11 @@ impl McHandler {
                 token_budget: derive_historian_chunk_tokens(cfg.historian_context_limit_tokens),
                 boundary,
                 memory_enabled: cfg.memory_enabled,
+                claim_snapshot_vector: parsed
+                    .claim_lane
+                    .as_ref()
+                    .filter(|lane| lane.enabled)
+                    .and_then(|lane| lane.snapshot_vector.clone()),
                 auto_promote: cfg.auto_promote,
                 user_memory_collection_enabled: cfg.user_memory_collection_enabled,
                 extraction_free: false,
@@ -5429,6 +5250,11 @@ impl McHandler {
                 token_budget: derive_historian_chunk_tokens(cfg.historian_context_limit_tokens),
                 boundary: boundary.clone(),
                 memory_enabled: cfg.memory_enabled,
+                claim_snapshot_vector: parsed
+                    .claim_lane
+                    .as_ref()
+                    .filter(|lane| lane.enabled)
+                    .and_then(|lane| lane.snapshot_vector.clone()),
                 auto_promote: cfg.auto_promote,
                 user_memory_collection_enabled: cfg.user_memory_collection_enabled,
                 extraction_free: false,
@@ -5530,7 +5356,7 @@ impl McHandler {
         let failure_started_at_ms = firing.now_ms;
         let configured_failure_backoff_at_ms = firing.failure_backoff_at_ms;
         match factory
-            .connect_with_credentials(&project_root, &harness, &credential_fingerprints)
+            .connect(&project_root, &harness, &credential_fingerprints)
             .await
         {
             Ok(mut producer) => {
@@ -6464,14 +6290,14 @@ impl McHandler {
         // Structured fields accompany the prose so reconciliation code can determine
         // completion without parsing the summary or issuing another operation: a retained
         // delivered-command record includes its coverage, row version, and current wrapup state.
-        let m1_signal = match crate::m1_compose::m1_revision_signal_parts_for_pass(
+        let m1_signal = match crate::m1_compose::m1_revision_signal_parts_for_claims_timed(
             &store,
-            &binding.project_root.to_string_lossy(),
             &binding.project_root.to_string_lossy(),
             &session_id,
             loaded.meta.user_profile_version,
             !loaded.meta.memory_disabled,
-            now_ms(),
+            loaded.meta.claim_snapshot_vector.as_ref(),
+            None,
         ) {
             Ok(signal) => Some(signal),
             Err(error) => {
@@ -7609,18 +7435,10 @@ impl McHandler {
         };
         let cursor = request.get("cursor").and_then(Value::as_i64).unwrap_or(0);
         let limit = request.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
-        let page = if request
-            .get("live_only")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            if domain != "memories" {
-                return invalid_params_error("live mirror snapshots currently support memories");
-            }
-            store.pull_live_memory_snapshot(cursor, limit)
-        } else {
-            store.pull_changefeed(domain, cursor, limit)
-        };
+        if request.get("live_only").is_some() {
+            return invalid_params_error("mirror.pull live snapshots are not supported");
+        }
+        let page = store.pull_changefeed(domain, cursor, limit);
         match page {
             Ok(page) => respond(json!({ "ok": true, "page": page })),
             Err(error) => PreparedOutcome::Error {
@@ -8458,6 +8276,7 @@ impl McHandler {
                 },
             );
             let producer_ctx = transform::ProducerContext {
+                claim_lane: parsed.claim_lane.as_ref(),
                 project_path: &project_path,
                 note_project_path: &note_project_path,
                 project_directory: &route_project_root,
@@ -8816,17 +8635,6 @@ impl McHandler {
         let inbound_bytes = serde_json::to_vec(&request)
             .map(|bytes| bytes.len())
             .unwrap_or(MAX_TRANSFORM_FRAME_BYTES);
-        self.handle_transform_dispatch(route, request, Some(inbound_bytes))
-            .await
-    }
-
-    #[cfg(test)]
-    async fn handle_transform_for_test_with_body_size(
-        &self,
-        route: RouteHandle,
-        request: Value,
-        inbound_bytes: usize,
-    ) -> PreparedOutcome {
         self.handle_transform_dispatch(route, request, Some(inbound_bytes))
             .await
     }
@@ -9402,85 +9210,22 @@ impl McHandler {
             }
         }
         let root_path = binding.project_root.to_string_lossy().to_string();
-        let authority_project = match store.authority_project_for_route(&root_path, "memories") {
-            Ok(project) => project,
-            Err(error) => {
-                return PreparedOutcome::Error {
-                    code: "authority_project_resolution_failed".to_string(),
-                    message: error.to_string(),
-                };
-            }
-        };
-        let store_project_path = authority_project.as_deref().unwrap_or(&root_path);
-        let has_workspace = workspace.is_some();
-        let (workspace, member_paths) =
-            match prepare_authority_workspace(store_project_path, workspace) {
-                Ok(prepared) => prepared,
-                Err(error) => return invalid_params_error(error),
-            };
-        let memories = match parsed
-            .memories
-            .into_iter()
-            .map(|memory| {
-                authority_source_path(
-                    memory.project_path.as_deref(),
-                    store_project_path,
-                    &member_paths,
-                    has_workspace,
-                )
-                .map(|project_path| memory.into_row(project_path))
-            })
-            .collect::<Result<Vec<ModuleMemoryRow>, String>>()
-        {
-            Ok(memories) => memories,
-            Err(error) => return invalid_params_error(error),
-        };
-        let memory_mutations = match parsed
-            .memory_mutations
-            .into_iter()
-            .map(|mutation| {
-                authority_source_path(
-                    mutation.project_path.as_deref(),
-                    store_project_path,
-                    &member_paths,
-                    has_workspace,
-                )
-                .map(|project_path| mutation.into_row(project_path))
-            })
-            .collect::<Result<Vec<ModuleMemoryMutationRow>, String>>()
-        {
-            Ok(mutations) => mutations,
-            Err(error) => return invalid_params_error(error),
-        };
-        // Replace-scope entries are project assertions exactly like memory
-        // rows: validate each against the bound owner / workspace membership
-        // so one sync cannot prune rows outside its authority.
-        let memories_replace_projects = match parsed
-            .memories_replace_projects
-            .take()
-            .map(|projects| {
-                projects
-                    .into_iter()
-                    .map(|project| {
-                        authority_source_path(
-                            Some(&project),
-                            store_project_path,
-                            &member_paths,
-                            has_workspace,
-                        )
-                    })
-                    .collect::<Result<Vec<String>, String>>()
-            })
-            .transpose()
-        {
-            Ok(scope) => scope,
-            Err(error) => return invalid_params_error(error),
-        };
+        let workspace = workspace.map(|workspace| ModuleWorkspaceRow {
+            name: workspace.fingerprint,
+            share_categories: Vec::new(),
+            members: workspace
+                .members
+                .into_iter()
+                .map(|member| ModuleWorkspaceMemberRow {
+                    project_path: member.project_path.clone(),
+                    display_name: member.project_path.clone(),
+                    display_path: member.project_path,
+                })
+                .collect(),
+        });
         let acked_watermarks = parsed.acked_watermarks.unwrap_or_else(|| {
             json!({
                 "compartment_seq": compartments.iter().map(|c| c.sequence).max(),
-                "memory_id": memories.iter().map(|m| m.id).max(),
-                "memory_mutation_id": memory_mutations.iter().map(|m| m.mutation.id).max(),
                 "last_todo_state": parsed.last_todo_state.is_some(),
             })
         });
@@ -9530,10 +9275,6 @@ impl McHandler {
             strip_seed_skipped: parsed.strip_seed_skipped,
             reasoning_cleared_through_tag: parsed.reasoning_cleared_through_tag,
             compartments: &compartments,
-            memories: &memories,
-            memories_replace_projects: memories_replace_projects.as_deref(),
-            memories_delete_ids: parsed.memories_delete_ids.as_deref(),
-            memory_mutations: &memory_mutations,
             user_profile: &user_profile,
             user_profile_present,
             workspace: workspace.as_ref(),
@@ -9553,7 +9294,6 @@ impl McHandler {
                     "shadow_generation": result.shadow_generation,
                     "shadow_seq": result.shadow_seq,
                     "row_version": result.row_version,
-                    "memories_skipped": result.memories_skipped,
                     "drop_seeds_skipped": result.drop_seeds_skipped,
                     "pending_agent_drops_seeded": result.pending_agent_drops_seeded,
                     "pending_agent_drops_skipped": result.pending_agent_drops_skipped,
@@ -9971,14 +9711,23 @@ impl McHandler {
         let Some(items) = payload.get("items").and_then(Value::as_array) else {
             return invalid_params_error("classify payload requires items");
         };
-        // The requested IDs are the accept predicate's oracle: an attempt is
-        // successful only if its manifest covers exactly these.
-        let mut expected_ids: BTreeSet<i64> = BTreeSet::new();
+        // The requested claims are the accept predicate's oracle: an attempt
+        // is successful only if its manifest covers exactly these. Identity is
+        // the claim's opaque public ID, which is also what
+        // `CLASSIFY_SYSTEM_PROMPT` asks the model to echo back — a request
+        // parser and a manifest validator that disagreed on the identity type
+        // would reject every attempt the prompt can produce.
+        let mut expected_ids: BTreeSet<String> = BTreeSet::new();
         for item in items {
-            let Some(memory_id) = item.get("memory_id").and_then(Value::as_i64) else {
-                return invalid_params_error("classify items require an integer memory_id");
+            let Some(public_claim_id) = item.get("public_claim_id").and_then(Value::as_str) else {
+                return invalid_params_error("classify items require a public_claim_id string");
             };
-            expected_ids.insert(memory_id);
+            if !mc_core::claim_operation::is_valid_public_claim_id(public_claim_id) {
+                return invalid_params_error(
+                    "classify items require a well-formed public_claim_id",
+                );
+            }
+            expected_ids.insert(public_claim_id.to_owned());
         }
         let Some(models) = payload.get("model_chain").and_then(Value::as_array) else {
             return invalid_params_error("classify payload requires model_chain");
@@ -10007,20 +9756,28 @@ impl McHandler {
             model_chain.push(model.to_string());
         }
         // The deadline prevents new producer runs after the caller's supplied
-        // budget expires.
-        let deadline = match payload.get("timeout_ms") {
-            None => None,
-            Some(value) => {
-                let Some(ms) = value.as_u64().filter(|ms| *ms > 0) else {
-                    return invalid_params_error("classify timeout_ms must be a positive integer");
-                };
-                // `Instant + Duration` panics on overflow, so an absurd
-                // budget is a parameter error, not a crashed handler task.
-                let Some(deadline) = Instant::now().checked_add(Duration::from_millis(ms)) else {
-                    return invalid_params_error("classify timeout_ms is out of range");
-                };
-                Some(deadline)
-            }
+        // budget expires, and it is the ONLY bound relating this handler's
+        // work to the caller's transport budget. Without it a single model can
+        // burn CLASSIFY_AWAIT_TIMEOUT on the start, CLASSIFY_AWAIT_TIMEOUT on
+        // the await, and CLASSIFY_RECOVERY_TIMEOUT on the re-drain — 21
+        // minutes — and a full MAX_CLASSIFY_MODEL_CHAIN chain multiplies that
+        // by eight, so the caller's cancel would always land mid-chain,
+        // between a producer run and its purge. Required, not optional: a
+        // payload that omits it is asking for an unbounded billable chain.
+        let deadline = {
+            let Some(ms) = payload
+                .get("timeout_ms")
+                .and_then(Value::as_u64)
+                .filter(|ms| *ms > 0)
+            else {
+                return invalid_params_error("classify payload requires a positive timeout_ms");
+            };
+            // `Instant + Duration` panics on overflow, so an absurd
+            // budget is a parameter error, not a crashed handler task.
+            let Some(deadline) = Instant::now().checked_add(Duration::from_millis(ms)) else {
+                return invalid_params_error("classify timeout_ms is out of range");
+            };
+            deadline
         };
 
         // Exactly one execution per (ledger_session, command_id): a
@@ -10074,7 +9831,7 @@ impl McHandler {
         let mut last_error = String::new();
         let mut output = None;
         for (attempt, model) in model_chain.iter().enumerate() {
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            if Instant::now() >= deadline {
                 last_error =
                     "classify time budget exhausted before starting a producer run".to_string();
                 break;
@@ -10090,7 +9847,7 @@ impl McHandler {
             let _dreamer_run_guard = self.register_dreamer_run(&child_session);
             let mut producer = match self
                 .producer_factory
-                .connect_with_credentials(
+                .connect(
                     &binding.project_root,
                     &binding.harness,
                     &binding.credential_fingerprints,
@@ -10106,7 +9863,7 @@ impl McHandler {
             // Connection and route setup can consume the remaining budget;
             // a send after the promised deadline would start a billable run
             // only to time out its zero-length await immediately.
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            if Instant::now() >= deadline {
                 last_error = "classify time budget exhausted during producer startup".to_string();
                 break;
             }
@@ -10282,486 +10039,300 @@ impl McHandler {
         }
     }
 
-    async fn handle_memory_set_classification(
-        &self,
-        channel: RouteHandle,
-        request: &Value,
-    ) -> PreparedOutcome {
-        let Some(args) = facade_arguments(request, &["rows"]) else {
-            return invalid_params_error("memory.set_classification requires arguments");
-        };
-        let Some(memory_project) = non_empty_string_arg(&args, "memory_project") else {
-            return invalid_params_error("memory.set_classification requires memory_project");
-        };
-        if let Err(outcome) = self.bind_facade_route_for_write(channel, &args, "memories") {
-            return outcome;
-        }
-        let binding = match self.facade_binding(channel) {
-            Ok(binding) => binding,
-            Err(_) => return session_unresolved_error(),
-        };
-        let route_root = binding.project_root.to_string_lossy().to_string();
-        let Some(store) = self.store() else {
-            return store_unavailable_error();
-        };
-        let authority_project =
-            match store.authority_project_state_for_route(&route_root, "memories") {
-                Ok(Some((project, state))) if state == "MODULE" => project,
-                Ok(Some(_)) => return authority_draining_error("memories"),
-                Ok(None) => {
-                    return PreparedOutcome::Error {
-                        code: "authority_not_module".to_string(),
-                        message: "classification requires MODULE memories authority".to_string(),
-                    };
-                }
-                Err(error) => {
-                    return PreparedOutcome::Error {
-                        code: "authority_lookup_failed".to_string(),
-                        message: error.to_string(),
-                    };
-                }
-            };
-        if authority_project != memory_project {
-            return PreparedOutcome::Error {
-                code: "facade_project_vocabulary_mismatch".to_string(),
-                message: format!(
-                    "classification route is owned by {authority_project}, not {memory_project}"
-                ),
-            };
-        }
-        let Some(context_store_uuid) = args.get("context_store_uuid").and_then(Value::as_str)
-        else {
-            return invalid_params_error("memory.set_classification requires context_store_uuid");
-        };
-        let Some(authority_generation) = args.get("authority_generation").and_then(Value::as_u64)
-        else {
-            return invalid_params_error("memory.set_classification requires authority_generation");
-        };
-        let Some(rows) = args.get("rows").and_then(Value::as_array) else {
-            return invalid_params_error("memory.set_classification requires rows");
-        };
-        let mut updates = Vec::with_capacity(rows.len());
-        for row in rows {
-            let Some(row) = row.as_object() else {
-                return invalid_params_error("classification rows must be objects");
-            };
-            let Some(memory_id) = row.get("memory_id").and_then(Value::as_i64) else {
-                return invalid_params_error("classification row requires memory_id");
-            };
-            let Some(hash) = row.get("content_hash_at_prompt").and_then(Value::as_str) else {
-                return invalid_params_error("classification row requires content_hash_at_prompt");
-            };
-            updates.push(mc_store::ClassificationUpdate {
-                memory_id,
-                content_hash_at_prompt: hash.to_string(),
-                content_sha256_at_prompt: row
-                    .get("content_sha256_at_prompt")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                importance: row
-                    .get("importance")
-                    .and_then(Value::as_i64)
-                    .map(|value| value as i32),
-                scope: row
-                    .get("scope")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string),
-                shareable: row.get("shareable").and_then(Value::as_bool),
-            });
-        }
-        #[cfg(test)]
-        if let Some(hook) = self
-            .classification_before_apply_hook
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
-            hook();
-        }
-        match store.with_facade_mutation(&route_root, "memories", || {
-            store.set_memory_classification(
-                context_store_uuid,
-                memory_project,
-                authority_generation,
-                &updates,
-                now_ms(),
-            )
-        }) {
-            Ok(result) => respond(json!({
-                "accepted": result.accepted,
-                "rejected": result.rejected.iter().map(|row| json!({ "memory_id": row.memory_id, "reason": row.reason })).collect::<Vec<_>>(),
-            })),
-            Err(McStoreError::AuthorityGenerationMismatch { expected, found }) => {
-                PreparedOutcome::Error {
-                    code: "authority_generation_mismatch".to_string(),
-                    message: format!("authority generation is {found}, request used {expected}"),
-                }
-            }
-            Err(McStoreError::AuthorityStateMismatch { found, .. }) if found == "DRAINING" => {
-                authority_draining_error("memories")
-            }
-            Err(McStoreError::AuthorityStateMismatch { expected, found }) => {
-                PreparedOutcome::Error {
-                    code: "authority_state_mismatch".to_string(),
-                    message: format!("authority state is {found}, expected {expected}"),
-                }
-            }
-            Err(error) if store_error_is_authority_draining(&error) => {
-                authority_draining_error("memories")
-            }
-            Err(error) => PreparedOutcome::Error {
-                code: "classification_apply_failed".to_string(),
-                message: error.to_string(),
-            },
-        }
-    }
-
-    async fn handle_memory_set_mural_cue(
-        &self,
-        channel: RouteHandle,
-        request: &Value,
-    ) -> PreparedOutcome {
-        let Some(args) = facade_arguments(request, &["rows"]) else {
-            return invalid_params_error("memory.set_mural_cue requires arguments");
-        };
-        let Some(memory_project) = non_empty_string_arg(&args, "memory_project") else {
-            return invalid_params_error("memory.set_mural_cue requires memory_project");
-        };
-        if let Err(outcome) = self.bind_facade_route_for_write(channel, &args, "memories") {
-            return outcome;
-        }
-        let binding = match self.facade_binding(channel) {
-            Ok(binding) => binding,
-            Err(_) => return session_unresolved_error(),
-        };
-        let route_root = binding.project_root.to_string_lossy().to_string();
-        let Some(store) = self.store() else {
-            return store_unavailable_error();
-        };
-        let command_id = args
-            .get("command_id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty());
-        if let Some(command_id) = command_id {
-            if let Some(replayed) =
-                replayed_memory_apply_command(&store, &binding.session, "set_mural_cue", command_id)
-            {
-                return replayed;
-            }
-        }
-        let Some(context_store_uuid) = args.get("context_store_uuid").and_then(Value::as_str)
-        else {
-            return invalid_params_error("memory.set_mural_cue requires context_store_uuid");
-        };
-        let Some(authority_generation) = args.get("authority_generation").and_then(Value::as_u64)
-        else {
-            return invalid_params_error("memory.set_mural_cue requires authority_generation");
-        };
-        let Some(rows) = args.get("rows").and_then(Value::as_array) else {
-            return invalid_params_error("memory.set_mural_cue requires rows");
-        };
-        let mut updates = Vec::with_capacity(rows.len());
-        for row in rows {
-            let Some(row) = row.as_object() else {
-                return invalid_params_error("mural cue rows must be objects");
-            };
-            let Some(memory_id) = row.get("memory_id").and_then(Value::as_i64) else {
-                return invalid_params_error("mural cue row requires memory_id");
-            };
-            let Some(hash) = row.get("content_hash_at_prompt").and_then(Value::as_str) else {
-                return invalid_params_error("mural cue row requires content_hash_at_prompt");
-            };
-            let Some(rejection_count) = row.get("rejection_count").and_then(Value::as_i64) else {
-                return invalid_params_error("mural cue row requires rejection_count");
-            };
-            let cue = match row.get("cue") {
-                Some(Value::Null) | None => None,
-                Some(Value::String(cue)) => Some(cue.to_string()),
-                Some(_) => {
-                    return invalid_params_error("mural cue row cue must be a string or null");
-                }
-            };
-            updates.push(mc_store::MuralCueUpdate {
-                memory_id,
-                content_hash_at_prompt: hash.to_string(),
-                cue,
-                rejection_count,
-            });
-        }
-        let now = now_ms();
-        dream_apply_command_outcome(
-            store.with_facade_command(
-                &route_root,
-                memory_project,
-                "memories",
-                &binding.session,
-                "memory",
-                "set_mural_cue",
-                command_id,
-                |tx| {
-                    let result = tx.set_memory_mural_cue(
-                        context_store_uuid,
-                        memory_project,
-                        authority_generation,
-                        &updates,
-                        now,
-                    )?;
-                    serde_json::to_vec(&json!({
-                        "ok": true,
-                        "accepted": result.accepted,
-                        "rejected": result.rejected.iter().map(|row| json!({
-                            "memory_id": row.memory_id,
-                            "reason": row.reason,
-                        })).collect::<Vec<_>>(),
-                    }))
-                    .map_err(|error| error.to_string())
-                },
-            ),
-            "mural_cue_apply_failed",
-        )
-    }
-
-    async fn handle_memory_set_verification(
-        &self,
-        channel: RouteHandle,
-        request: &Value,
-    ) -> PreparedOutcome {
-        let Some(args) = facade_arguments(request, &["rows"]) else {
-            return invalid_params_error("memory.set_verification requires arguments");
-        };
-        let Some(memory_project) = non_empty_string_arg(&args, "memory_project") else {
-            return invalid_params_error("memory.set_verification requires memory_project");
-        };
-        if let Err(outcome) = self.bind_facade_route_for_write(channel, &args, "memories") {
-            return outcome;
-        }
-        let binding = match self.facade_binding(channel) {
-            Ok(binding) => binding,
-            Err(_) => return session_unresolved_error(),
-        };
-        let route_root = binding.project_root.to_string_lossy().to_string();
-        let Some(store) = self.store() else {
-            return store_unavailable_error();
-        };
-        let command_id = args
-            .get("command_id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty());
-        if let Some(command_id) = command_id {
-            if let Some(replayed) = replayed_memory_apply_command(
-                &store,
-                &binding.session,
-                "set_verification",
-                command_id,
-            ) {
-                return replayed;
-            }
-        }
-        let Some(context_store_uuid) = args.get("context_store_uuid").and_then(Value::as_str)
-        else {
-            return invalid_params_error("memory.set_verification requires context_store_uuid");
-        };
-        let Some(authority_generation) = args.get("authority_generation").and_then(Value::as_u64)
-        else {
-            return invalid_params_error("memory.set_verification requires authority_generation");
-        };
-        let Some(rows) = args.get("rows").and_then(Value::as_array) else {
-            return invalid_params_error("memory.set_verification requires rows");
-        };
-        let mut updates = Vec::with_capacity(rows.len());
-        for row in rows {
-            let Some(row) = row.as_object() else {
-                return invalid_params_error("verification rows must be objects");
-            };
-            let Some(memory_id) = row.get("memory_id").and_then(Value::as_i64) else {
-                return invalid_params_error("verification row requires memory_id");
-            };
-            let Some(hash) = row.get("content_hash_at_prompt").and_then(Value::as_str) else {
-                return invalid_params_error("verification row requires content_hash_at_prompt");
-            };
-            let Some(status) = row.get("verification_status").and_then(Value::as_str) else {
-                return invalid_params_error("verification row requires verification_status");
-            };
-            updates.push(VerificationUpdate {
-                memory_id,
-                content_hash_at_prompt: hash.to_string(),
-                content_sha256_at_prompt: row
-                    .get("content_sha256_at_prompt")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                verification_status: status.to_string(),
-                updated_content: row
-                    .get("updated_content")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                archive_reason: row
-                    .get("archive_reason")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            });
-        }
-        let now = now_ms();
-        dream_apply_command_outcome(
-            store.with_facade_command(
-                &route_root,
-                memory_project,
-                "memories",
-                &binding.session,
-                "memory",
-                "set_verification",
-                command_id,
-                |tx| {
-                    let result = tx.set_memory_verification(
-                        context_store_uuid,
-                        memory_project,
-                        authority_generation,
-                        &updates,
-                        now,
-                    )?;
-                    serde_json::to_vec(&json!({
-                        "ok": true,
-                        "accepted": result.accepted,
-                        "rejected": result.rejected.iter().map(|row| json!({
-                            "memory_id": row.memory_id,
-                            "reason": row.reason,
-                        })).collect::<Vec<_>>(),
-                    }))
-                    .map_err(|error| error.to_string())
-                },
-            ),
-            "verification_apply_failed",
-        )
-    }
-
-    async fn handle_memory_set_mapping(
-        &self,
-        channel: RouteHandle,
-        request: &Value,
-    ) -> PreparedOutcome {
-        let Some(args) = facade_arguments(request, &["rows"]) else {
-            return invalid_params_error("memory.set_mapping requires arguments");
-        };
-        let Some(memory_project) = non_empty_string_arg(&args, "memory_project") else {
-            return invalid_params_error("memory.set_mapping requires memory_project");
-        };
-        if let Err(outcome) = self.bind_facade_route_for_write(channel, &args, "memories") {
-            return outcome;
-        }
-        let binding = match self.facade_binding(channel) {
-            Ok(binding) => binding,
-            Err(_) => return session_unresolved_error(),
-        };
-        let route_root = binding.project_root.to_string_lossy().to_string();
-        let Some(store) = self.store() else {
-            return store_unavailable_error();
-        };
-        let command_id = args
-            .get("command_id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty());
-        if let Some(command_id) = command_id {
-            if let Some(replayed) =
-                replayed_memory_apply_command(&store, &binding.session, "set_mapping", command_id)
-            {
-                return replayed;
-            }
-        }
-        let Some(context_store_uuid) = args.get("context_store_uuid").and_then(Value::as_str)
-        else {
-            return invalid_params_error("memory.set_mapping requires context_store_uuid");
-        };
-        let Some(authority_generation) = args.get("authority_generation").and_then(Value::as_u64)
-        else {
-            return invalid_params_error("memory.set_mapping requires authority_generation");
-        };
-        let Some(rows) = args.get("rows").and_then(Value::as_array) else {
-            return invalid_params_error("memory.set_mapping requires rows");
-        };
-        let mut updates = Vec::with_capacity(rows.len());
-        for row in rows {
-            let Some(row) = row.as_object() else {
-                return invalid_params_error("mapping rows must be objects");
-            };
-            let Some(memory_id) = row.get("memory_id").and_then(Value::as_i64) else {
-                return invalid_params_error("mapping row requires memory_id");
-            };
-            let Some(hash) = row.get("content_hash_at_prompt").and_then(Value::as_str) else {
-                return invalid_params_error("mapping row requires content_hash_at_prompt");
-            };
-            let mapped_files = match row.get("mapped_files") {
-                Some(Value::Null) | None => None,
-                Some(Value::Array(files)) => Some(
-                    files
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_owned)
-                        .collect(),
-                ),
-                _ => return invalid_params_error("mapped_files must be an array or null"),
-            };
-            updates.push(MappingUpdate {
-                memory_id,
-                content_hash_at_prompt: hash.to_string(),
-                content_sha256_at_prompt: row
-                    .get("content_sha256_at_prompt")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                mapped_files,
-            });
-        }
-        let now = now_ms();
-        dream_apply_command_outcome(
-            store.with_facade_command(
-                &route_root,
-                memory_project,
-                "memories",
-                &binding.session,
-                "memory",
-                "set_mapping",
-                command_id,
-                |tx| {
-                    let result = tx.set_memory_mapping(
-                        context_store_uuid,
-                        memory_project,
-                        authority_generation,
-                        &updates,
-                        now,
-                    )?;
-                    serde_json::to_vec(&json!({
-                        "ok": true,
-                        "accepted": result.accepted,
-                        "rejected": result.rejected.iter().map(|row| json!({
-                            "memory_id": row.memory_id,
-                            "reason": row.reason,
-                        })).collect::<Vec<_>>(),
-                    }))
-                    .map_err(|error| error.to_string())
-                },
-            ),
-            "mapping_apply_failed",
-        )
-    }
-
     async fn handle_facade_value(&self, channel: RouteHandle, request: Value) -> PreparedOutcome {
         let Some(name) = request.get("name").and_then(Value::as_str) else {
             return unrecognized_request_error(&request);
         };
         match name {
-            "memory.set_classification" => {
-                self.handle_memory_set_classification(channel, &request)
-                    .await
-            }
-            "memory.set_mural_cue" => self.handle_memory_set_mural_cue(channel, &request).await,
-            "memory.set_verification" => {
-                self.handle_memory_set_verification(channel, &request).await
-            }
-            "memory.set_mapping" => self.handle_memory_set_mapping(channel, &request).await,
             "ctx_memory" => self.handle_ctx_memory_facade(channel, &request).await,
+            "claim.intent.stage" => self.handle_claim_intent_stage(channel, &request),
+            "claim.intent.inspect" => self.handle_claim_intent_inspect(channel, &request),
+            "claim.intent.ack" => self.handle_claim_intent_ack(channel, &request),
+            "claim.effects.apply" => self.handle_claim_effects_apply(channel, &request),
+            "claim.mirror.replace" => self.handle_claim_mirror_replace(channel, &request),
+            "claim.mirror.apply" => self.handle_claim_mirror_apply(channel, &request),
             "ctx_search" => self.handle_ctx_search_facade(channel, &request).await,
             "ctx_expand" => self.handle_ctx_expand_facade(channel, &request).await,
             "ctx_reduce" => self.handle_ctx_reduce_facade(channel, &request).await,
             "ctx_note" => self.handle_ctx_note_facade(channel, &request).await,
             _ => unrecognized_request_error(&request),
+        }
+    }
+
+    /// Resolve the daemon-bound route root for a claim facade request.
+    ///
+    /// Every claim handler must go through this. The claim wire carries
+    /// caller-supplied identity (`binding.authorityProject`,
+    /// `binding.databaseIncarnationId`), so the bound route is the only
+    /// trustworthy authority identity on the request.
+    fn claim_route_root(
+        &self,
+        channel: RouteHandle,
+        request_name: &str,
+    ) -> Result<String, PreparedOutcome> {
+        match self.facade_binding(channel) {
+            Ok(binding) => Ok(binding.project_root.to_string_lossy().into_owned()),
+            Err(_) => Err(PreparedOutcome::Error {
+                code: "route_unbound".to_string(),
+                message: format!("{request_name} requires a bound facade route"),
+            }),
+        }
+    }
+
+    fn handle_claim_intent_stage(&self, channel: RouteHandle, request: &Value) -> PreparedOutcome {
+        let route_root = match self.claim_route_root(channel, "claim.intent.stage") {
+            Ok(route_root) => route_root,
+            Err(outcome) => return outcome,
+        };
+        let Some(arguments) = request.get("arguments").cloned() else {
+            return invalid_params_error("claim.intent.stage requires arguments");
+        };
+        let parsed = match serde_json::from_value::<memory_tool::ClaimIntentStageRequest>(arguments)
+        {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return invalid_params_error(format!("invalid claim intent stage: {error}"))
+            }
+        };
+        let Some(store) = self.store() else {
+            return store_unavailable_error();
+        };
+        match memory_tool::stage_claim_intent(&store, &route_root, &parsed, now_ms()) {
+            Ok(response) => match serde_json::to_value(response) {
+                Ok(value) => respond(value),
+                Err(error) => PreparedOutcome::Error {
+                    code: "claim_intent_encode_failed".to_string(),
+                    message: error.to_string(),
+                },
+            },
+            Err(error) => PreparedOutcome::Error {
+                code: "claim_intent_stage_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn handle_claim_intent_inspect(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
+        if let Err(outcome) = self.claim_route_root(channel, "claim.intent.inspect") {
+            return outcome;
+        }
+        let Some(arguments) = request.get("arguments").cloned() else {
+            return invalid_params_error("claim.intent.inspect requires arguments");
+        };
+        let parsed =
+            match serde_json::from_value::<memory_tool::ClaimIntentInspectRequest>(arguments) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    return invalid_params_error(format!(
+                        "invalid claim intent inspection: {error}"
+                    ));
+                }
+            };
+        let Some(store) = self.store() else {
+            return store_unavailable_error();
+        };
+        match memory_tool::inspect_claim_intents(&store, &parsed) {
+            Ok(response) => match serde_json::to_value(response) {
+                Ok(value) => respond(value),
+                Err(error) => PreparedOutcome::Error {
+                    code: "claim_intent_encode_failed".to_string(),
+                    message: error.to_string(),
+                },
+            },
+            Err(error) => PreparedOutcome::Error {
+                code: "claim_intent_inspect_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn handle_claim_intent_ack(&self, channel: RouteHandle, request: &Value) -> PreparedOutcome {
+        if let Err(outcome) = self.claim_route_root(channel, "claim.intent.ack") {
+            return outcome;
+        }
+        let Some(arguments) = request.get("arguments").cloned() else {
+            return invalid_params_error("claim.intent.ack requires arguments");
+        };
+        let parsed = match serde_json::from_value::<memory_tool::ClaimIntentAckRequest>(arguments) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return invalid_params_error(format!("invalid claim intent ack: {error}"))
+            }
+        };
+        let Some(store) = self.store() else {
+            return store_unavailable_error();
+        };
+        match memory_tool::acknowledge_claim_intent(&store, &parsed, now_ms()) {
+            Ok(response) => match serde_json::to_value(response) {
+                Ok(value) => respond(value),
+                Err(error) => PreparedOutcome::Error {
+                    code: "claim_intent_encode_failed".to_string(),
+                    message: error.to_string(),
+                },
+            },
+            Err(error) => PreparedOutcome::Error {
+                code: "claim_intent_ack_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn handle_claim_effects_apply(&self, channel: RouteHandle, request: &Value) -> PreparedOutcome {
+        if let Err(outcome) = self.claim_route_root(channel, "claim.effects.apply") {
+            return outcome;
+        }
+        let Some(arguments) = request.get("arguments").and_then(Value::as_object) else {
+            return invalid_params_error("claim.effects.apply requires arguments");
+        };
+        if arguments.get("protocolVersion").and_then(Value::as_u64)
+            != Some(u64::from(
+                mc_core::claim_operation::CLAIM_INTENT_PROTOCOL_VERSION,
+            ))
+        {
+            return invalid_params_error("claim.effects.apply protocolVersion is unsupported");
+        }
+        if arguments
+            .get("consumer")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return invalid_params_error("claim.effects.apply consumer is required");
+        }
+        let Some(receipt) = arguments.get("receipt").and_then(Value::as_object) else {
+            return invalid_params_error("claim.effects.apply receipt is required");
+        };
+        let Some(result_json) = receipt.get("resultJson").and_then(Value::as_str) else {
+            return invalid_params_error("claim.effects.apply resultJson is required");
+        };
+        let result = match mc_core::claim_operation::decode_claim_operation_result(result_json) {
+            Ok(result) => result,
+            Err(error) => {
+                return invalid_params_error(format!(
+                    "claim.effects.apply result is invalid: {error}"
+                ));
+            }
+        };
+        let Some(effects) = receipt.get("effects").and_then(Value::as_array) else {
+            return invalid_params_error("claim.effects.apply effects are required");
+        };
+        if effects.is_empty() || effects.len() != result.effects.len() {
+            return invalid_params_error("claim.effects.apply receipt group is incomplete");
+        }
+        let mut previous = 0_u64;
+        for (index, effect) in effects.iter().enumerate() {
+            let Some(effect) = effect.as_object() else {
+                return invalid_params_error("claim.effects.apply effect must be an object");
+            };
+            let Some(id) = effect.get("id").and_then(Value::as_u64) else {
+                return invalid_params_error("claim.effects.apply effect id is required");
+            };
+            if id <= previous {
+                return invalid_params_error("claim.effects.apply effect ids must increase");
+            }
+            let Some(result_effect) = result.effects.get(index) else {
+                return invalid_params_error("claim.effects.apply result effect is missing");
+            };
+            if effect.get("effectKey").and_then(Value::as_str)
+                != Some(result_effect.effect_key.as_str())
+                || effect.get("projectId").and_then(Value::as_i64) != Some(result_effect.project_id)
+                || effect.get("generation").and_then(Value::as_i64)
+                    != Some(result_effect.generation)
+                || effect.get("changeKind").and_then(Value::as_str)
+                    != Some(result_effect.change_kind.as_str())
+            {
+                return invalid_params_error("claim.effects.apply effect disagrees with result");
+            }
+            previous = id;
+        }
+        respond(json!({
+            "protocolVersion": mc_core::claim_operation::CLAIM_INTENT_PROTOCOL_VERSION,
+            "ackedEffectId": previous,
+        }))
+    }
+
+    fn handle_claim_mirror_replace(
+        &self,
+        channel: RouteHandle,
+        request: &Value,
+    ) -> PreparedOutcome {
+        if self.facade_binding(channel).is_err() {
+            return PreparedOutcome::Error {
+                code: "route_unbound".to_string(),
+                message: "claim mirror replace requires a bound facade route".to_string(),
+            };
+        }
+        let Some(arguments) = request.get("arguments").cloned() else {
+            return invalid_params_error("claim.mirror.replace requires arguments");
+        };
+        let parsed = match serde_json::from_value::<ClaimMirrorSnapshotRequest>(arguments) {
+            Ok(parsed)
+                if parsed.protocol_version
+                    == mc_store::claim_mirror::CLAIM_MIRROR_PROTOCOL_VERSION =>
+            {
+                parsed
+            }
+            Ok(_) => {
+                return invalid_params_error("claim.mirror.replace protocolVersion is unsupported")
+            }
+            Err(error) => {
+                return invalid_params_error(format!("invalid claim mirror snapshot: {error}"))
+            }
+        };
+        let Some(store) = self.store() else {
+            return store_unavailable_error();
+        };
+        match store.replace_claim_mirror_snapshot(&parsed.snapshot, now_ms()) {
+            Ok(()) => respond(json!({
+                "protocolVersion": mc_store::claim_mirror::CLAIM_MIRROR_PROTOCOL_VERSION,
+                "mirrorVersion": mc_store::claim_mirror::CLAIM_MIRROR_VERSION,
+                "databaseIncarnationId": parsed.snapshot.vector.database_incarnation_id,
+                "projectCheckpoints": parsed.snapshot.project_checkpoints,
+            })),
+            Err(error) => claim_mirror_error(error, "claim_mirror_replace_failed"),
+        }
+    }
+
+    fn handle_claim_mirror_apply(&self, channel: RouteHandle, request: &Value) -> PreparedOutcome {
+        if self.facade_binding(channel).is_err() {
+            return PreparedOutcome::Error {
+                code: "route_unbound".to_string(),
+                message: "claim mirror apply requires a bound facade route".to_string(),
+            };
+        }
+        let Some(arguments) = request.get("arguments").cloned() else {
+            return invalid_params_error("claim.mirror.apply requires arguments");
+        };
+        let parsed = match serde_json::from_value::<ClaimMirrorReceiptRequest>(arguments) {
+            Ok(parsed)
+                if parsed.protocol_version
+                    == mc_store::claim_mirror::CLAIM_MIRROR_PROTOCOL_VERSION =>
+            {
+                parsed
+            }
+            Ok(_) => {
+                return invalid_params_error("claim.mirror.apply protocolVersion is unsupported")
+            }
+            Err(error) => {
+                return invalid_params_error(format!("invalid claim mirror receipt: {error}"))
+            }
+        };
+        let Some(store) = self.store() else {
+            return store_unavailable_error();
+        };
+        match store.apply_claim_mirror_receipt(&parsed.receipt, now_ms()) {
+            Ok(result) => respond(json!({
+                "protocolVersion": mc_store::claim_mirror::CLAIM_MIRROR_PROTOCOL_VERSION,
+                "mirrorVersion": mc_store::claim_mirror::CLAIM_MIRROR_VERSION,
+                "receiptId": parsed.receipt.receipt_id,
+                "replayed": result.replayed,
+                "appliedEffectCount": result.applied_effect_count,
+                "ackedEffectId": parsed.receipt.effects.last().map(|effect| effect.effect_id).unwrap_or(0),
+            })),
+            Err(error) => claim_mirror_error(error, "claim_mirror_apply_failed"),
         }
     }
 
@@ -11024,19 +10595,11 @@ impl McHandler {
         let Some(args) = facade_arguments(request, &["action"]) else {
             return invalid_params_error("ctx_memory arguments must be an object");
         };
-        let args = &args;
-        let Some(action) = string_arg(args, "action") else {
+        let Some(action) = string_arg(&args, "action") else {
             return invalid_params_error("ctx_memory requires an action");
         };
-        if let Err(error) = validate_memory_id_arguments(args)
-            .and_then(|_| validate_string_cap(args, "content", MAX_MEMORY_CONTENT_BYTES))
-            .and_then(|_| validate_string_cap(args, "reason", MAX_SHORT_FIELD_BYTES))
-        {
-            return tool_error_result(format!("Error: {error}."));
-        }
-        let is_mutation = matches!(action, "write" | "update" | "archive" | "merge");
         let facade_scope = match self
-            .resolve_facade_scope(channel, Some(args), "memories", is_mutation)
+            .resolve_facade_scope(channel, Some(&args), "memories", false)
             .await
         {
             Ok(scope) => scope,
@@ -11045,232 +10608,90 @@ impl McHandler {
         if !facade_scope.memory_enabled {
             return tool_error_result("Error: memory is disabled for this project.".to_string());
         }
-        let store = match self.store() {
-            Some(store) => store,
-            None => return store_unavailable_error(),
+        let Some(store) = self.store() else {
+            return store_unavailable_error();
         };
-        let memory_project = facade_scope.memory_project_path.as_str();
-        let conversation_key = facade_scope.conversation_key.as_str();
-        if is_mutation {
-            if let Err(error) = store.enforce_facade_project_vocabulary(
-                facade_scope.route_project_root.as_str(),
-                memory_project,
-                "memories",
-            ) {
-                return tool_error_result(format!("Error: {error}"));
-            }
-        }
-        let command_id = if is_mutation {
-            match command_id_from_facade_request(request, args) {
-                Ok(command_id) => command_id,
-                Err(error) => return tool_error_result(format!("Error: {error}.")),
-            }
-        } else {
-            None
-        };
-        if is_mutation && command_id.is_none() {
-            self.log_missing_facade_command_id(conversation_key, "ctx_memory", action);
-        }
-
         match action {
-            "write" => {
-                let Some(category) = non_empty_string_arg(args, "category") else {
-                    return tool_error_result(
-                        "Error: 'category' is required when action is 'write'.",
-                    );
-                };
-                if !MEMORY_CATEGORIES.contains(&category) {
-                    return tool_error_result(format!(
-                        "Error: category must be one of {}.",
-                        MEMORY_CATEGORIES.join(", ")
-                    ));
-                }
-                let Some(content) = non_empty_string_arg(args, "content") else {
-                    return tool_error_result(
-                        "Error: 'content' is required when action is 'write'.",
-                    );
-                };
-                facade_command_outcome(
-                    store.with_facade_command(
-                        facade_scope.route_project_root.as_str(),
-                        memory_project,
-                        "memories",
-                        conversation_key,
-                        "ctx_memory",
-                        action,
-                        command_id.as_deref(),
-                        |tx| {
-                            let id = tx
-                                .insert_memory(InsertMemoryInput {
-                                    project_path: memory_project,
-                                    route_project_root: Some(
-                                        facade_scope.route_project_root.as_str(),
-                                    ),
-                                    category,
-                                    content,
-                                    source_session_id: Some(conversation_key),
-                                    source_type: Some("agent"),
-                                    importance: Some(50),
-                                    expires_at: None,
-                                    metadata_json: None,
-                                    now_ms: now_ms(),
-                                })
-                                .map_err(|error| error.to_string())?;
-                            facade_text_response(
-                                format!("Saved memory [ID: {id}] in {category}."),
-                                false,
-                            )
-                        },
-                    ),
-                    "memories",
-                )
-            }
-            "update" => {
-                let Some(id) = single_memory_id(args, "update") else {
-                    return tool_error_result(
-                        "Error: provide exactly one memory id when action is 'update'.",
-                    );
-                };
-                let Some(content) = non_empty_string_arg(args, "content") else {
-                    return tool_error_result(
-                        "Error: 'content' is required when action is 'update'.",
-                    );
-                };
-                facade_command_outcome(
-                    store.with_facade_command(
-                        facade_scope.route_project_root.as_str(),
-                        memory_project,
-                        "memories",
-                        conversation_key,
-                        "ctx_memory",
-                        action,
-                        command_id.as_deref(),
-                        |tx| {
-                            let memory = tx
-                                .update_memory_content(memory_project, id, content, now_ms())
-                                .map_err(|error| error.to_string())?
-                                .ok_or_else(|| format!("memory {id} was not found"))?;
-                            facade_text_response(
-                                format!(
-                                    "Updated memory [ID: {}] in {}.",
-                                    memory.id, memory.category
-                                ),
-                                false,
-                            )
-                        },
-                    ),
-                    "memories",
-                )
-            }
-            "archive" => {
-                let ids = memory_ids(args, "archive");
-                if ids.is_empty() {
-                    return tool_error_result(
-                        "Error: provide at least one memory id when action is 'archive'.",
-                    );
-                }
-                let reason = string_arg(args, "reason");
-                facade_command_outcome(
-                    store.with_facade_command(
-                        facade_scope.route_project_root.as_str(),
-                        memory_project,
-                        "memories",
-                        conversation_key,
-                        "ctx_memory",
-                        action,
-                        command_id.as_deref(),
-                        |tx| {
-                            let archived = tx
-                                .archive_memories(memory_project, &ids, reason, now_ms())
-                                .map_err(|error| error.to_string())?
-                                .ok_or_else(|| "memories could not be archived".to_string())?;
-                            if archived.is_empty() {
-                                facade_text_response(
-                                    "No active memories needed archiving.".to_string(),
-                                    false,
-                                )
-                            } else {
-                                facade_text_response(
-                                    format!("Archived memory IDs [{}].", join_i64s(&archived)),
-                                    false,
-                                )
-                            }
-                        },
-                    ),
-                    "memories",
-                )
-            }
-            "merge" => {
-                let Some((target_id, source_ids)) = merge_ids(args) else {
-                    return tool_error_result(
-                        "Error: provide target_id plus source_ids, or ids with the target first, when action is 'merge'.",
-                    );
-                };
-                let Some(content) = non_empty_string_arg(args, "content") else {
-                    return tool_error_result(
-                        "Error: 'content' is required when action is 'merge'.",
-                    );
-                };
-                facade_command_outcome(
-                    store.with_facade_command(
-                        facade_scope.route_project_root.as_str(),
-                        memory_project,
-                        "memories",
-                        conversation_key,
-                        "ctx_memory",
-                        action,
-                        command_id.as_deref(),
-                        |tx| {
-                            let memory = tx
-                                .merge_memories(
-                                    memory_project,
-                                    target_id,
-                                    &source_ids,
-                                    content,
-                                    now_ms(),
-                                )
-                                .map_err(|error| error.to_string())?
-                                .ok_or_else(|| format!("memory {target_id} was not found"))?;
-                            facade_text_response(
-                                format!(
-                                    "Merged memories into [ID: {}] in {}; superseded [{}].",
-                                    memory.id,
-                                    memory.category,
-                                    join_i64s(&source_ids)
-                                ),
-                                false,
-                            )
-                        },
-                    ),
-                    "memories",
-                )
-            }
-            "get" => {
-                let ids = memory_ids(args, "get");
-                match memory_tool::get_memories(&store, memory_project, &ids) {
-                    Ok(memories) => {
-                        let by_id = memories
-                            .into_iter()
-                            .map(|memory| (memory.id, memory))
-                            .collect::<std::collections::HashMap<_, _>>();
-                        let lines = ids
-                            .iter()
-                            .map(|id| match by_id.get(id) {
-                                Some(memory) => format!(
-                                    "Memory [ID: {}] in {} (status: {}): {}",
-                                    memory.id, memory.category, memory.status, memory.content
-                                ),
-                                None => {
-                                    format!("id {id}: not found or not visible from this project")
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n\n");
-                        mcp_text_result(lines, false)
+            "get" | "list" => {
+                // Bulk enumeration returns every workspace-authorized row, which
+                // can include shared foreign-project claims, so it stays limited
+                // to dreamer maintenance exactly as the host tool contract does.
+                // The registry is module-owned state for child sessions this
+                // handler minted, unlike the client-supplied harness label.
+                if action == "list" {
+                    let bound_session = match self.facade_binding(channel) {
+                        Ok(binding) => binding.session.trim().to_string(),
+                        Err(_) => return session_unresolved_error(),
+                    };
+                    if !self.dreamer_run_registered(&bound_session) {
+                        return tool_error_result(
+                            "Error: list is restricted to dreamer maintenance sessions."
+                                .to_string(),
+                        );
                     }
-                    Err(error) => tool_error_result(format!("Error: {error}")),
                 }
+                let requested = if action == "get" {
+                    let mut ids = args
+                        .get("publicClaimIds")
+                        .and_then(Value::as_array)
+                        .map(|ids| {
+                            ids.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    if let Some(id) = args.get("publicClaimId").and_then(Value::as_str) {
+                        ids.push(id.to_string());
+                    }
+                    ids
+                } else {
+                    Vec::new()
+                };
+                if action == "get" && (requested.is_empty() || requested.len() > 20) {
+                    return tool_error_result(
+                        "Error: get requires 1-20 publicClaimIds.".to_string(),
+                    );
+                }
+                if requested
+                    .iter()
+                    .any(|id| !mc_core::claim_operation::is_valid_public_claim_id(id))
+                {
+                    return tool_error_result("Error: malformed public claim ID.".to_string());
+                }
+                let requested = requested.into_iter().collect::<BTreeSet<_>>();
+                // `limit` narrows enumeration. An explicit `get` names its rows,
+                // so honoring a smaller limit there would silently drop claims the
+                // caller asked for by ID.
+                let limit = if requested.is_empty() {
+                    usize_arg(&args, "limit").unwrap_or(20).clamp(1, 100)
+                } else {
+                    requested.len()
+                };
+                let category = string_arg(&args, "category");
+                let rows =
+                    match memory_tool::list_committed_claims(&store, &requested, category, limit) {
+                        Ok(rows) => rows,
+                        Err(error) => return tool_error_result(format!("Error: {error}")),
+                    };
+                let claims = rows
+                    .into_iter()
+                    .map(|row| {
+                        json!({
+                            "publicClaimId": row.public_claim_id,
+                            "revisionLocator": row.revision_locator,
+                            "content": row.content,
+                            "attributes": row.attributes,
+                            "lifecycle": row.lifecycle,
+                            "provenanceLabel": row.provenance_label,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                mcp_text_result(json!({ "claims": claims }).to_string(), false)
             }
+            "create" | "revise" | "archive" | "restore" | "merge" => tool_error_result(
+                "Error: claim mutations require the host claim-operation commit path.".to_string(),
+            ),
             _ => tool_error_result("Error: Unknown ctx_memory action.".to_string()),
         }
     }
@@ -11304,13 +10725,12 @@ impl McHandler {
         };
         let memory_project = facade_scope.memory_project_path.as_str();
         let conversation_key = facade_scope.conversation_key.as_str();
-        match memory_tool::search_memories_and_compartments_for_session(
+        match memory_tool::search_compartments_and_notes_for_session(
             &store,
             memory_project,
             conversation_key,
             query,
             limit,
-            facade_scope.memory_enabled,
         ) {
             Ok(results) => {
                 let rendered = results
@@ -11318,7 +10738,6 @@ impl McHandler {
                     .map(|result| {
                         json!({
                             "source": match result.source_kind {
-                                memory_tool::MemorySearchSourceKind::Memory => "memory",
                                 memory_tool::MemorySearchSourceKind::CompartmentTitle => "compartment_title",
                                 memory_tool::MemorySearchSourceKind::CompartmentBody => "compartment_body",
                                 memory_tool::MemorySearchSourceKind::Note => "note",
@@ -12590,10 +12009,15 @@ impl CompositeComponent for McHandler {
                 detail: Some("storage is opening".to_owned()),
                 metrics: None,
             },
+            // `waiting_report` re-reads the phase and returns `None` when the
+            // store finished opening between the two loads. Falling back to
+            // the dispatch report keeps that benign race non-fatal: a panic
+            // here propagates through the health probe's lifecycle join and
+            // trips daemon shutdown.
             STORE_OPEN_WAITING => self
                 .store_open
                 .waiting_report(now)
-                .expect("waiting phase has a waiting report"),
+                .unwrap_or_else(|| DISPATCH_HEALTH.report(now)),
             STORE_OPENED => DISPATCH_HEALTH.report(now),
             _ if self.store().is_some() => DISPATCH_HEALTH.report(now),
             _ => HealthReport {
@@ -12792,7 +12216,7 @@ async fn settle_prepared(ctx: &RequestCtx, outcome: PreparedOutcome) -> RequestO
             body,
             binary: false,
         },
-        PreparedSettlement::Error { code, message } => RequestOutcome::Error { code, message },
+        PreparedSettlement::Error { code, message } => RequestOutcome::error(code, message),
         PreparedSettlement::Streamed => RequestOutcome::Streamed,
     }
 }
@@ -13733,11 +13157,8 @@ fn need_full_sync_response(request: &TransformRequest) -> PreparedOutcome {
     )
 }
 
-fn classify_attempt_timeout(ceiling: Duration, deadline: Option<Instant>) -> Duration {
-    match deadline {
-        None => ceiling,
-        Some(deadline) => ceiling.min(deadline.saturating_duration_since(Instant::now())),
-    }
+fn classify_attempt_timeout(ceiling: Duration, deadline: Instant) -> Duration {
+    ceiling.min(deadline.saturating_duration_since(Instant::now()))
 }
 
 /// The accept predicate for one classify attempt: usable output, then a
@@ -13748,7 +13169,7 @@ fn classify_attempt_timeout(ceiling: Duration, deadline: Option<Instant>) -> Dur
 /// every retry.
 fn length_capped_or_invalid(
     result: &historian_producer::ProducerOutput,
-    expected_ids: &BTreeSet<i64>,
+    expected_ids: &BTreeSet<String>,
 ) -> Result<(), String> {
     if result.length_capped {
         return Err("a length-capped generation".to_owned());
@@ -14288,8 +13709,6 @@ fn assemble_state_sync_seed(
         .find_map(|batch| batch.note_evaluation_available);
     let mut final_batch = batches.pop().expect("final seed batch");
     let mut compartments = Vec::new();
-    let mut memories = Vec::new();
-    let mut memory_mutations = Vec::new();
     let mut drop_seeds = Vec::new();
     let mut pending_agent_drops = Vec::new();
     let mut auto_search_hint_decisions = Vec::new();
@@ -14297,11 +13716,8 @@ fn assemble_state_sync_seed(
     let mut note_nudge_anchors_present = false;
     let mut strip_seeds = Vec::new();
     let mut user_profile = None;
-    let mut memories_delete_ids: Option<Vec<i64>> = None;
     for mut batch in batches {
         compartments.append(&mut batch.compartments);
-        memories.append(&mut batch.memories);
-        memory_mutations.append(&mut batch.memory_mutations);
         drop_seeds.append(&mut batch.drop_seeds);
         pending_agent_drops.append(&mut batch.pending_agent_drops);
         auto_search_hint_decisions.append(&mut batch.auto_search_hint_decisions);
@@ -14315,15 +13731,8 @@ fn assemble_state_sync_seed(
                 .get_or_insert_with(Vec::new)
                 .append(&mut profile);
         }
-        if let Some(mut ids) = batch.memories_delete_ids.take() {
-            memories_delete_ids
-                .get_or_insert_with(Vec::new)
-                .append(&mut ids);
-        }
     }
     compartments.append(&mut final_batch.compartments);
-    memories.append(&mut final_batch.memories);
-    memory_mutations.append(&mut final_batch.memory_mutations);
     drop_seeds.append(&mut final_batch.drop_seeds);
     pending_agent_drops.append(&mut final_batch.pending_agent_drops);
     auto_search_hint_decisions.append(&mut final_batch.auto_search_hint_decisions);
@@ -14346,21 +13755,6 @@ fn assemble_state_sync_seed(
         seed_complete: None,
         seed_boundary_id: final_batch.seed_boundary_id,
         compartments,
-        memories,
-        // Replace scope rides the completing batch and applies to the whole
-        // assembled snapshot; earlier batches never carry it.
-        memories_replace_projects: final_batch.memories_replace_projects,
-        // Delete ids page with the seed items; concatenate every page's list.
-        memories_delete_ids: match (memories_delete_ids, final_batch.memories_delete_ids) {
-            (None, None) => None,
-            (Some(ids), None) => Some(ids),
-            (None, Some(ids)) => Some(ids),
-            (Some(mut ids), Some(mut tail)) => {
-                ids.append(&mut tail);
-                Some(ids)
-            }
-        },
-        memory_mutations,
         user_profile,
         workspace: final_batch.workspace,
         last_todo_state: final_batch.last_todo_state,
@@ -14444,6 +13838,21 @@ fn store_unavailable_error() -> PreparedOutcome {
     PreparedOutcome::Error {
         code: "store_unavailable".to_string(),
         message: "store not opened (no HELLO_ACK storage seam yet)".to_string(),
+    }
+}
+
+fn claim_mirror_error(
+    error: mc_store::claim_mirror::ClaimMirrorError,
+    fallback_code: &str,
+) -> PreparedOutcome {
+    let code = match &error {
+        mc_store::claim_mirror::ClaimMirrorError::NotSeeded => "claim_mirror_not_seeded",
+        mc_store::claim_mirror::ClaimMirrorError::Invalid(_) => "invalid_params",
+        _ => fallback_code,
+    };
+    PreparedOutcome::Error {
+        code: code.to_string(),
+        message: error.to_string(),
     }
 }
 
@@ -14981,18 +14390,15 @@ fn enforce_request_byte_cap(body: &[u8]) -> Result<(), PreparedOutcome> {
     Err(invalid_params_error("request body exceeds the 1 MiB limit"))
 }
 const MAX_AGENT_DROPS_COMMAND_ID_BYTES: usize = 128;
+#[cfg(test)]
 const MAX_MEMORY_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_NOTE_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_SHORT_FIELD_BYTES: usize = 4 * 1024;
 const MAX_QUERY_BYTES: usize = 1024;
-const MAX_MEMORY_IDS: usize = 100;
 const CTX_EXPAND_BYTE_BUDGET: usize = 15_000 * 4;
 const CTX_EXPAND_MAX_ORDINAL_SPAN: i64 = 10_000;
 const CTX_EXPAND_MAX_ROWS: usize = 64;
 const CTX_EXPAND_TRUNCATION_MARKER: &str = "\n\n[truncated at the ~15,000-token ctx_expand budget]";
-/// Accepted write categories — the canonical V2 taxonomy, single-sourced from the
-/// renderer's category order so the facade and the render path never disagree.
-use crate::memory_render::MEMORY_CATEGORY_ORDER as MEMORY_CATEGORIES;
 
 fn validate_string_cap(
     args: &Map<String, Value>,
@@ -15002,45 +14408,6 @@ fn validate_string_cap(
     if let Some(value) = args.get(key).and_then(Value::as_str) {
         if value.len() > max_bytes {
             return Err(format!("'{key}' exceeds the {max_bytes}-byte limit"));
-        }
-    }
-    Ok(())
-}
-
-fn validate_memory_id_arguments(args: &Map<String, Value>) -> Result<(), String> {
-    for key in ["id", "target_id"] {
-        if let Some(value) = args.get(key) {
-            if value.as_i64().is_none_or(|id| id <= 0) {
-                return Err(format!("'{key}' must be a positive 64-bit integer"));
-            }
-        }
-    }
-    for key in ["ids", "source_ids"] {
-        if let Some(value) = args.get(key) {
-            let Some(values) = value.as_array() else {
-                return Err(format!(
-                    "'{key}' must be an array of positive 64-bit integers"
-                ));
-            };
-            if values.len() > MAX_MEMORY_IDS {
-                return Err(format!("'{key}' exceeds the {MAX_MEMORY_IDS}-item limit"));
-            }
-            if values
-                .iter()
-                .any(|value| value.as_i64().is_none_or(|id| id <= 0))
-            {
-                return Err(format!(
-                    "'{key}' must contain only positive 64-bit integers"
-                ));
-            }
-        }
-    }
-    if let (Some(target), Some(sources)) = (
-        args.get("target_id").and_then(Value::as_i64),
-        args.get("source_ids").and_then(Value::as_array),
-    ) {
-        if sources.iter().any(|source| source.as_i64() == Some(target)) {
-            return Err("merge target must not appear in source_ids".to_string());
         }
     }
     Ok(())
@@ -15795,64 +15162,6 @@ fn render_notes(
     )
 }
 
-// The facade never panics on agent input; an absent or malformed id stays a typed tool error.
-fn single_memory_id(args: &Map<String, Value>, action: &str) -> Option<i64> {
-    if let Some(id) = i64_arg(args, "id") {
-        return Some(id);
-    }
-    let ids = memory_ids(args, action);
-    ids.first().copied().filter(|_| ids.len() == 1)
-}
-
-fn memory_ids(args: &Map<String, Value>, _action: &str) -> Vec<i64> {
-    let mut ids = Vec::new();
-    if let Some(id) = i64_arg(args, "id") {
-        ids.push(id);
-    }
-    if let Some(values) = args.get("ids").and_then(Value::as_array) {
-        for value in values {
-            if let Some(id) = value.as_i64() {
-                if !ids.contains(&id) {
-                    ids.push(id);
-                }
-            }
-        }
-    }
-    ids
-}
-
-fn merge_ids(args: &Map<String, Value>) -> Option<(i64, Vec<i64>)> {
-    if let Some(target_id) = i64_arg(args, "target_id") {
-        let source_ids = args
-            .get("source_ids")
-            .and_then(Value::as_array)?
-            .iter()
-            .filter_map(Value::as_i64)
-            .collect::<Vec<_>>();
-        if source_ids.is_empty() {
-            return None;
-        }
-        return Some((target_id, dedup_i64s(source_ids)));
-    }
-    let ids = memory_ids(args, "merge");
-    if ids.len() < 2 {
-        return None;
-    }
-    Some((ids[0], ids[1..].to_vec()))
-}
-
-fn dedup_i64s(ids: Vec<i64>) -> Vec<i64> {
-    let mut seen = HashSet::with_capacity(ids.len());
-    ids.into_iter().filter(|id| seen.insert(*id)).collect()
-}
-
-fn join_i64s(ids: &[i64]) -> String {
-    ids.iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 fn parse_tag_range_string(input: &str) -> Result<Vec<u64>, String> {
     const MAX_RANGE_ELEMENTS: u64 = 1000;
     let trimmed = input.replace('§', "").trim().to_string();
@@ -15978,57 +15287,6 @@ fn facade_text_response(text: impl Into<String>, is_error: bool) -> Result<Vec<u
     .map_err(|error| error.to_string())
 }
 
-fn replayed_memory_apply_command(
-    store: &McStore,
-    session_id: &str,
-    action: &str,
-    command_id: &str,
-) -> Option<PreparedOutcome> {
-    if let Ok(Some(response)) =
-        store.facade_mutation_ledger_response(session_id, "memory", action, command_id)
-    {
-        return Some(PreparedOutcome::Response(PreparedOutput::cached_bytes(
-            response,
-        )));
-    }
-    store
-        .load_dream_task_command(session_id, command_id)
-        .ok()
-        .flatten()
-        .map(|recorded| replay_dream_task_response(&recorded.response_json))
-}
-
-fn dream_apply_command_outcome(
-    result: Result<FacadeMutationOutcome, McStoreError>,
-    failure_code: &str,
-) -> PreparedOutcome {
-    match result {
-        Ok(FacadeMutationOutcome::Applied(bytes) | FacadeMutationOutcome::Duplicate(bytes)) => {
-            PreparedOutcome::Response(PreparedOutput::cached_bytes(bytes))
-        }
-        Err(error) if store_error_is_authority_draining(&error) => {
-            authority_draining_error("memories")
-        }
-        Err(error) if error.to_string().contains("authority_generation_mismatch:") => {
-            PreparedOutcome::Error {
-                code: "authority_generation_mismatch".to_string(),
-                message: "memory authority generation changed while applying the command"
-                    .to_string(),
-            }
-        }
-        Err(error) if error.to_string().contains("authority_state_mismatch:") => {
-            PreparedOutcome::Error {
-                code: "authority_state_mismatch".to_string(),
-                message: "memory authority state changed while applying the command".to_string(),
-            }
-        }
-        Err(error) => PreparedOutcome::Error {
-            code: failure_code.to_string(),
-            message: error.to_string(),
-        },
-    }
-}
-
 fn facade_command_outcome(
     result: Result<FacadeMutationOutcome, McStoreError>,
     domain: &str,
@@ -16078,97 +15336,6 @@ fn refuse_conditioned_note_without_evaluator(
         }
     }
     tool_error_result(refusal)
-}
-
-fn authority_source_path(
-    source_path: Option<&str>,
-    store_project_path: &str,
-    member_paths: &HashMap<String, String>,
-    has_workspace: bool,
-) -> Result<String, String> {
-    let Some(source_path) = source_path else {
-        return Ok(store_project_path.to_string());
-    };
-    if !has_workspace {
-        // Wire paths are assertions, not alternate keys: accepting a route root or a third
-        // identity here would let one atomic state-sync mint rows outside the bound owner.
-        return (source_path == store_project_path)
-            .then(|| store_project_path.to_string())
-            .ok_or_else(|| {
-                format!(
-                    "authority memory project must equal the resolved project key {store_project_path}: {source_path}"
-                )
-            });
-    }
-    member_paths
-        .get(source_path)
-        .cloned()
-        .ok_or_else(|| format!("authority memory project is not a workspace member: {source_path}"))
-}
-
-fn prepare_authority_workspace(
-    authority_project_path: &str,
-    workspace: Option<ModuleWorkspaceWire>,
-) -> Result<(Option<ModuleWorkspaceRow>, HashMap<String, String>), String> {
-    let Some(workspace) = workspace else {
-        return Ok((None, HashMap::new()));
-    };
-    let Some(owner) = workspace.members.first() else {
-        return Err("authority workspace must include its owning project first".to_string());
-    };
-    let share_categories = owner.share_categories.clone();
-    if workspace
-        .members
-        .iter()
-        .any(|member| member.share_categories != share_categories)
-    {
-        return Err(
-            "authority workspace members must carry one consistent share policy".to_string(),
-        );
-    }
-
-    let mut member_paths = HashMap::new();
-    let mut members = Vec::with_capacity(workspace.members.len());
-    for (index, member) in workspace.members.into_iter().enumerate() {
-        if member.project_path.is_empty() {
-            return Err("authority workspace member project_path must not be empty".to_string());
-        }
-        let stored_path = if index == 0 {
-            authority_project_path.to_string()
-        } else {
-            member.project_path.clone()
-        };
-        if member_paths
-            .insert(member.project_path.clone(), stored_path.clone())
-            .is_some()
-        {
-            return Err("authority workspace contains a duplicate member".to_string());
-        }
-        let display_name = Path::new(&member.project_path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .unwrap_or(&member.project_path)
-            .to_string();
-        members.push(ModuleWorkspaceMemberRow {
-            project_path: stored_path,
-            display_name,
-            display_path: member.project_path,
-        });
-    }
-    let name = format!(
-        "authority-workspace-{}-{}",
-        sha256_hex(authority_project_path.as_bytes()),
-        workspace.fingerprint
-    );
-    Ok((
-        Some(ModuleWorkspaceRow {
-            name,
-            share_categories,
-            members,
-        }),
-        member_paths,
-    ))
 }
 
 fn canonical_value(value: &Value) -> String {
@@ -16605,7 +15772,7 @@ pub fn dev_descriptor_at(data_home: &str) -> StorageDescriptor {
 }
 
 fn ctx_memory_description() -> String {
-    "Save and maintain durable project memories for facts that should stay useful in later turns. Use write for a new standalone fact, update when an existing memory changed, archive when a memory is wrong or obsolete, and merge when several memories describe the same fact. Keep each memory concise and understandable without this chat's surrounding context.".to_string()
+    "Read and maintain durable project-memory claims. Use public claim IDs and exact revision-bound mutation tokens; never use local row IDs. Create standalone facts, revise changed claims, archive or restore lifecycle state, and merge duplicate claims through the host commit path.".to_string()
 }
 
 fn ctx_search_description() -> String {
@@ -16621,56 +15788,138 @@ fn ctx_note_description() -> String {
 }
 
 fn ctx_memory_schema() -> Value {
+    let mutation_token = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "tokenVersion", "publicClaimId", "revision", "contentDigest",
+            "lifecycleSeq", "applicabilityHeadsDigest", "policyHeadsDigest"
+        ],
+        "properties": {
+            "tokenVersion": { "type": "integer", "minimum": 1 },
+            "publicClaimId": { "type": "string", "pattern": "^mcm_[0-9a-f]{32}$" },
+            "revision": { "type": "integer", "minimum": 1 },
+            "contentDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "lifecycleSeq": { "type": "integer", "minimum": 1 },
+            "applicabilityHeadsDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "policyHeadsDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        }
+    });
+    let positive_categories = json!([
+        "PROJECT_RULES",
+        "ARCHITECTURE",
+        "CONSTRAINTS",
+        "CONFIG_VALUES",
+        "NAMING"
+    ]);
+    // The advertised enum is derived, never hand-written: every advertised
+    // category must match a oneOf write arm (positive arms use
+    // `positive_categories`; REJECTED_APPROACH has its own arms). A second
+    // hand-kept list could drift and advertise a category no arm accepts.
+    let all_categories = {
+        let mut categories = positive_categories
+            .as_array()
+            .expect("positive categories are a json array")
+            .clone();
+        categories.push(json!("REJECTED_APPROACH"));
+        categories
+    };
+    let anti_memory = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["trigger", "rejectedStrategy", "rejectionReason"],
+        "properties": {
+            "trigger": { "type": "string", "minLength": 1 },
+            "rejectedStrategy": { "type": "string", "minLength": 1 },
+            "rejectionReason": { "type": "string", "minLength": 1 },
+            "saferAlternative": { "type": ["string", "null"] },
+            "preconditions": { "type": ["string", "null"] },
+            "attemptedApproach": { "type": ["string", "null"] },
+            "observedFailure": { "type": ["string", "null"] },
+            "rootCause": { "type": ["string", "null"] },
+            "recovery": { "type": ["string", "null"] },
+            "nonApplicableWhen": { "type": ["string", "null"] }
+        }
+    });
     json!({
         "type": "object",
         "additionalProperties": true,
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["write", "update", "archive", "merge", "get"],
-                "description": "Operation to perform."
+                "enum": ["create", "get", "list", "revise", "archive", "restore", "merge"]
             },
             "category": {
                 "type": "string",
-                "description": "Memory category for a new memory: one of PROJECT_RULES, ARCHITECTURE, CONSTRAINTS, CONFIG_VALUES, or NAMING. Required for write."
+                "enum": all_categories
             },
-            "content": {
-                "type": "string",
-                "maxLength": 65536,
-                "description": "Standalone memory text. Required for write, update, and merge."
+            "content": { "type": "string", "maxLength": 65536 },
+            "antiMemory": anti_memory,
+            "publicClaimId": { "type": "string", "pattern": "^mcm_[0-9a-f]{32}$" },
+            "publicClaimIds": {
+                "type": "array",
+                "maxItems": 20,
+                "items": { "type": "string", "pattern": "^mcm_[0-9a-f]{32}$" }
             },
-            "id": {
-                "type": "integer",
-                "minimum": 1,
-                "description": "Single memory id for update or archive."
-            },
-            "ids": {
+            "mutationToken": mutation_token,
+            "mutationTokens": {
                 "type": "array",
                 "maxItems": 100,
-                "items": { "type": "integer", "minimum": 1 },
-                "description": "Memory ids. For update provide exactly one. For archive provide one or more. For merge, the first id is kept and updated, and the remaining ids are superseded. For get provide one to twenty ids."
+                "items": mutation_token
             },
-            "target_id": {
-                "type": "integer",
-                "minimum": 1,
-                "description": "Merge form: memory id to keep and update."
+            "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+            "reason": { "type": "string", "maxLength": 4096 },
+            "memory_project": { "type": "string" }
+        },
+        "oneOf": [
+            {
+                "required": ["action", "category", "content"],
+                "properties": {
+                    "action": { "const": "create" },
+                    "category": { "enum": positive_categories }
+                },
+                "not": { "required": ["antiMemory"] }
             },
-            "source_ids": {
-                "type": "array",
-                "maxItems": 100,
-                "items": { "type": "integer", "minimum": 1 },
-                "description": "Merge form: memory ids to supersede into target_id."
+            {
+                "required": ["action", "category", "antiMemory"],
+                "properties": {
+                    "action": { "const": "create" },
+                    "category": { "const": "REJECTED_APPROACH" }
+                },
+                "not": { "required": ["content"] }
             },
-            "reason": {
-                "type": "string",
-                "maxLength": 4096,
-                "description": "Optional short reason for archive."
+            {
+                "required": ["action"],
+                "properties": {
+                    "action": { "const": "revise" },
+                    "category": { "enum": positive_categories }
+                },
+                "anyOf": [{ "required": ["content"] }, { "required": ["category"] }],
+                "not": { "required": ["antiMemory"] }
             },
-            "memory_project": {
-                "type": "string",
-                "description": "Resolved MC project identity supplied by the host transport."
+            {
+                "required": ["action", "category", "antiMemory"],
+                "properties": {
+                    "action": { "const": "revise" },
+                    "category": { "const": "REJECTED_APPROACH" }
+                },
+                "not": { "required": ["content"] }
             },
-        }
+            {
+                "required": ["action"],
+                "properties": {
+                    "action": { "enum": ["get", "list", "archive", "restore", "merge"] }
+                }
+            },
+            {
+                "required": ["reduced", "summary"],
+                "properties": {
+                    "reduced": { "const": true },
+                    "summary": { "type": "string" }
+                },
+                "not": { "required": ["action"] }
+            }
+        ]
     })
 }
 
@@ -16763,7 +16012,7 @@ mod tests {
         CkIngressMessage, CkKind, CkOutputKind, CkToolOutput, CkWireBlock, CkWireMessage,
         HarnessMeta, ProviderExtras,
     };
-    use historian_producer::{ErrorClass, ProducerOutput, RunHandle, RunState};
+    use historian_producer::{ProducerOutput, RunHandle, RunState};
     use mc_core::CoreState;
     use mc_store::{
         HistorianChunkRange, HistorianDurableState, ModuleMeta, ModuleUsage, NoteEvaluationInput,
@@ -18559,6 +17808,7 @@ mod tests {
             &self,
             _project_root: &Path,
             _harness: &str,
+            _credential_fingerprints: &std::collections::BTreeMap<String, String>,
         ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
             Ok(Box::new(BlockingLifecycleProducer {
                 state: Arc::clone(&self.state),
@@ -18649,6 +17899,7 @@ mod tests {
             &self,
             _project_root: &Path,
             harness: &str,
+            _credential_fingerprints: &std::collections::BTreeMap<String, String>,
         ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
             self.state.connects.fetch_add(1, Ordering::SeqCst);
             self.state
@@ -19288,29 +18539,6 @@ mod tests {
         serde_json::from_str(text).unwrap_or_else(|error| panic!("tool text was not JSON: {error}"))
     }
 
-    fn insert_memory(
-        store: &McStore,
-        project: &str,
-        category: &str,
-        content: &str,
-        now: i64,
-    ) -> i64 {
-        store
-            .insert_memory(InsertMemoryInput {
-                project_path: project,
-                route_project_root: None,
-                category,
-                content,
-                source_session_id: Some(project),
-                source_type: Some("test"),
-                importance: Some(50),
-                expires_at: None,
-                metadata_json: None,
-                now_ms: now,
-            })
-            .unwrap()
-    }
-
     fn activate_module_authority(
         store: &McStore,
         context_store_uuid: &str,
@@ -19340,15 +18568,6 @@ mod tests {
         assert_eq!(module.state, "MODULE");
         store
             .bind_authority_route(context_store_uuid, identity, route_project_root)
-            .unwrap();
-    }
-
-    fn seed_workspace(store: &McStore, own: &str, foreign: &str) {
-        store
-            .seed_workspace_member("ws", own, "[\"CONSTRAINTS\"]")
-            .unwrap();
-        store
-            .seed_workspace_member("ws", foreign, "[\"CONSTRAINTS\"]")
             .unwrap();
     }
 
@@ -25177,8 +24396,6 @@ mod tests {
                 },
                 project_path: project.to_str().unwrap(),
                 compartments: &[stored_comp(1, 10, 12, "m12#0", "summary")],
-                facts: &[],
-                promote_facts: true,
                 events: &[],
                 primer_candidates: &[],
                 user_memory_candidates: &[],
@@ -25380,19 +24597,6 @@ mod tests {
             .or_default()
             .insert(canonical_root(project_root));
 
-        let memory = call_facade(
-            &handler,
-            "ctx_memory",
-            json!({
-                "action": "write",
-                "category": "CONSTRAINTS",
-                "content": "OpenCode route identity is durable",
-                "memory_project": project_root,
-            }),
-        )
-        .await;
-        assert!(!tool_is_error(memory));
-
         let note = call_facade(
             &handler,
             "ctx_note",
@@ -25446,10 +24650,9 @@ mod tests {
         let outcome = call_facade_on_channel(
             &handler,
             8,
-            "ctx_memory",
+            "ctx_note",
             json!({
                 "action": "write",
-                "category": "CONSTRAINTS",
                 "content": "symlink lineage resolves",
                 "memory_project": target_text,
             }),
@@ -25489,10 +24692,9 @@ mod tests {
         let outcome = call_facade_on_channel(
             &handler,
             8,
-            "ctx_memory",
+            "ctx_note",
             json!({
                 "action": "write",
-                "category": "CONSTRAINTS",
                 "content": "reverse symlink lineage resolves",
                 "memory_project": link_text,
             }),
@@ -25548,8 +24750,6 @@ mod tests {
         let transformed =
             call_transform_request_on_channel(&handler, 7, request(vec![ck("m0", 0, "a")])).await;
         assert_eq!(transformed["action"], "HARD");
-        activate_module_authority(&store, "context", "git:identity", root_a, "memories");
-
         let root_b = project.join("other-root");
         std::fs::create_dir_all(&root_b).unwrap();
         let root_b = root_b.to_str().unwrap();
@@ -25560,10 +24760,9 @@ mod tests {
         let outcome = call_facade_on_channel(
             &handler,
             8,
-            "ctx_memory",
+            "ctx_note",
             json!({
                 "action": "write",
-                "category": "CONSTRAINTS",
                 "content": "must not cross roots",
                 "memory_project": "git:identity",
             }),
@@ -25613,9 +24812,6 @@ mod tests {
             assert!(store
                 .knows_transform_session_root("ses", root_a_text)
                 .unwrap());
-            for domain in ["memories", "notes"] {
-                activate_module_authority(&store, "context", identity, root_a_text, domain);
-            }
         }
 
         let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::None)]);
@@ -25633,18 +24829,6 @@ mod tests {
             binding_with_harness(root_a_text, OPENCODE_HARNESS, "ses"),
         );
 
-        let memory = call_facade(
-            &handler,
-            "ctx_memory",
-            json!({
-                "action": "write",
-                "category": "CONSTRAINTS",
-                "content": "durable root proof",
-                "memory_project": identity,
-            }),
-        )
-        .await;
-        assert!(!tool_is_error(memory));
         let note = call_facade(
             &handler,
             "ctx_note",
@@ -25665,10 +24849,9 @@ mod tests {
         let cross_root = call_facade_on_channel(
             &handler,
             8,
-            "ctx_memory",
+            "ctx_note",
             json!({
                 "action": "write",
-                "category": "CONSTRAINTS",
                 "content": "must not cross roots",
                 "memory_project": identity,
             }),
@@ -25839,39 +25022,6 @@ mod tests {
             .search_notes_like("/repo", "ses", "identity note lifecycle")
             .unwrap()
             .is_empty());
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn note_facade_reads_a_preexisting_seeded_ts_note_after_authority_flip() {
-        let producer = Arc::new(ProducerState::default());
-        let resolver =
-            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
-        let (handler, store, _dir, _project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(test_route(7), binding("/repo", "token"));
-        store
-            .seed_authority_row(
-                "context-db",
-                "notes",
-                42,
-                &json!({
-                    "type": "smart",
-                    "project_path": "/repo",
-                    "session_id": "session",
-                    "content": "seeded before Rust mode",
-                    "status": "ready",
-                    "surface_condition": "condition",
-                    "ready_reason": "condition met",
-                    "status_version": 2,
-                    "created_at": 1,
-                    "updated_at": 2
-                }),
-            )
-            .unwrap();
-
-        let output = tool_text(call_facade(&handler, "ctx_note", json!({"action": "read"})).await);
-        assert!(output.contains("## 🔔 Ready Smart Notes"));
-        assert!(output.contains("seeded before Rust mode"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -26146,148 +25296,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn facade_authority_lookup_failure_is_retryable_and_never_falls_back() {
-        let resolver =
-            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
-        let (handler, store, _dir, project) = handler_with_store_and_resolver(
-            Arc::new(ProducerState::default()),
-            default_test_config(),
-            resolver,
-        );
-        let project_root = project.to_str().unwrap();
-        handler.bind_route(test_route(7), binding(project_root, "token"));
-        store.fail_next_authority_project_resolution_for_test();
-        let arguments = json!({
-            "action": "write",
-            "category": "CONSTRAINTS",
-            "content": "retry after authority lookup",
-        });
-
-        let failed = call_facade(&handler, "ctx_memory", arguments.clone()).await;
-        assert_eq!(error_code(failed), "authority_project_resolution_failed");
-        assert!(store
-            .load_active_memories(project_root, now_ms())
-            .unwrap()
-            .is_empty());
-
-        let retried = call_facade(&handler, "ctx_memory", arguments).await;
-        assert!(!tool_is_error(retried));
-        assert_eq!(
-            store
-                .load_active_memories(project_root, now_ms())
-                .unwrap()
-                .len(),
-            1
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn facade_multi_instance_shares_memory_pool_and_splits_compartment_scope() {
-        let producer = Arc::new(ProducerState::default());
-        let project_root = "/same/repo";
-        let key_a = "pm_a5ee3bf8/session-A/epoch-1";
-        let key_b = "pm_a5ee3bf8/session-B/epoch-1";
-        let resolver = FakeSessionResolver::with(&[
-            ("token-a", FakeResolve::Hit(key_a.to_string())),
-            ("token-b", FakeResolve::Hit(key_b.to_string())),
-        ]);
-        let (handler, store, _dir, _project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(test_route(7), binding(project_root, "token-a"));
-        handler.bind_route(test_route(8), binding(project_root, "token-b"));
-        store
-            .replace_compartments(
-                key_a,
-                &[stored_comp(1, 1, 10, "a10", "alpha-compartment-only")],
-            )
-            .unwrap();
-        store
-            .replace_compartments(
-                key_b,
-                &[stored_comp(1, 1, 10, "b10", "beta-compartment-only")],
-            )
-            .unwrap();
-
-        let a = call_facade_on_channel(
-            &handler,
-            7,
-            "ctx_memory",
-            json!({ "action": "write", "category": "CONSTRAINTS", "content": "shared project fact" }),
-        )
-        .await;
-        assert!(!tool_is_error(a));
-        let b_search = tool_json_array(
-            call_facade_on_channel(
-                &handler,
-                8,
-                "ctx_search",
-                json!({ "query": "shared project fact", "limit": 5 }),
-            )
-            .await,
-        );
-        assert!(b_search.iter().any(|row| row["source"] == "memory"));
-
-        let b = call_facade_on_channel(
-            &handler,
-            8,
-            "ctx_memory",
-            json!({ "action": "write", "category": "CONSTRAINTS", "content": "second shared fact" }),
-        )
-        .await;
-        assert!(!tool_is_error(b));
-
-        let project_rows = store.load_active_memories(project_root, now_ms()).unwrap();
-        assert_eq!(project_rows.len(), 2);
-        assert!(project_rows
-            .iter()
-            .any(|memory| memory.content == "shared project fact"));
-        assert!(project_rows
-            .iter()
-            .any(|memory| memory.content == "second shared fact"));
-        let first = store.get_memory_full(project_rows[0].id).unwrap().unwrap();
-        assert_eq!(first.source_session_id.as_deref(), Some(key_a));
-        assert!(store
-            .load_active_memories(key_a, now_ms())
-            .unwrap()
-            .is_empty());
-        assert!(store
-            .load_active_memories(key_b, now_ms())
-            .unwrap()
-            .is_empty());
-
-        let a_comp = tool_json_array(
-            call_facade_on_channel(
-                &handler,
-                7,
-                "ctx_search",
-                json!({ "query": "alpha-compartment-only", "limit": 5 }),
-            )
-            .await,
-        );
-        assert!(a_comp.iter().any(|row| row["source"] == "compartment_body"));
-        let a_cannot_see_b = tool_json_array(
-            call_facade_on_channel(
-                &handler,
-                7,
-                "ctx_search",
-                json!({ "query": "beta-compartment-only", "limit": 5 }),
-            )
-            .await,
-        );
-        assert!(a_cannot_see_b.is_empty());
-        let b_comp = tool_json_array(
-            call_facade_on_channel(
-                &handler,
-                8,
-                "ctx_search",
-                json!({ "query": "beta-compartment-only", "limit": 5 }),
-            )
-            .await,
-        );
-        assert!(b_comp.iter().any(|row| row["source"] == "compartment_body"));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
     async fn facade_flat_envelope_precedence_keeps_kind_arm_and_gates_ctx_reduce_name() {
         let producer = Arc::new(ProducerState::default());
         let resolver = FakeSessionResolver::with(&[(
@@ -26534,12 +25542,14 @@ mod tests {
                 "ctx_memory",
                 vec![
                     "action",
+                    "antiMemory",
                     "category",
                     "content",
-                    "id",
-                    "ids",
-                    "target_id",
-                    "source_ids",
+                    "publicClaimId",
+                    "publicClaimIds",
+                    "mutationToken",
+                    "mutationTokens",
+                    "limit",
                     "reason",
                     "memory_project",
                 ],
@@ -26582,6 +25592,42 @@ mod tests {
             json!("boolean"),
             "ctx_expand must advertise verbose range previews"
         );
+        assert_eq!(
+            by_name["ctx_memory"].schema["oneOf"]
+                .as_array()
+                .map(Vec::len),
+            Some(6),
+            "ctx_memory write arms must stay discriminated"
+        );
+        assert_eq!(
+            by_name["ctx_memory"].schema["oneOf"][5],
+            json!({
+                "required": ["reduced", "summary"],
+                "properties": {
+                    "reduced": { "const": true },
+                    "summary": { "type": "string" }
+                },
+                "not": { "required": ["action"] }
+            }),
+            "ctx_memory must advertise only the action-less imitated-reduced envelope"
+        );
+        {
+            // Every advertised category must match a oneOf write arm: the enum
+            // must equal the positive-arm categories plus REJECTED_APPROACH.
+            let ctx_memory_schema = &by_name["ctx_memory"].schema;
+            let advertised = ctx_memory_schema["properties"]["category"]["enum"]
+                .as_array()
+                .expect("ctx_memory category enum");
+            let mut expected = ctx_memory_schema["oneOf"][0]["properties"]["category"]["enum"]
+                .as_array()
+                .expect("ctx_memory create arm positive categories")
+                .clone();
+            expected.push(json!("REJECTED_APPROACH"));
+            assert_eq!(
+                advertised, &expected,
+                "ctx_memory category enum must be the positive write-arm categories plus REJECTED_APPROACH"
+            );
+        }
 
         for (name, expected) in expected_fields {
             let tool = by_name
@@ -26612,75 +25658,6 @@ mod tests {
         let output = truncate_expand_output("x".repeat(CTX_EXPAND_BYTE_BUDGET * 2));
         assert!(output.len() <= CTX_EXPAND_BYTE_BUDGET + 64);
         assert!(output.contains("~15,000-token ctx_expand budget"));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn authority_complete_uses_the_module_seed_digest_before_ack() {
-        let producer = Arc::new(ProducerState::default());
-        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
-        let begin = call_dispatch_request(
-            &handler,
-            json!({
-                "method": "authority.prepare",
-                "phase": "begin",
-                "context_store_uuid": "store-uuid",
-                "project": "/repo",
-                "domain": "memories"
-            }),
-        )
-        .await;
-        let generation = begin["authority"]["generation"].as_u64().unwrap();
-        let _ = call_dispatch_request(
-            &handler,
-            json!({
-                "method": "authority.seed",
-                "context_store_uuid": "store-uuid",
-                "project": "/repo",
-                "domain": "memories",
-                "rows": [{
-                    "source_row_id": 1,
-                    "snapshot": {
-                        "id": 1,
-                        "project_path": "/repo",
-                        "category": "CONSTRAINTS",
-                        "content": "seeded",
-                        "normalized_hash": "hash"
-                    }
-                }]
-            }),
-        )
-        .await;
-        let actual = store
-            .authority_seed_checksum("store-uuid", "/repo", "memories")
-            .unwrap();
-        let verified = call_dispatch_request(
-            &handler,
-            json!({
-                "method": "authority.prepare",
-                "phase": "complete",
-                "context_store_uuid": "store-uuid",
-                "project": "/repo",
-                "domain": "memories",
-                "generation": generation,
-                "checksum_expected": actual
-            }),
-        )
-        .await;
-        assert_eq!(verified["authority"]["state"], "PREPARING");
-        assert_eq!(verified["authority"]["checksum_ok"], true);
-        let acked = call_dispatch_request(
-            &handler,
-            json!({
-                "method": "authority.prepare",
-                "phase": "ack",
-                "context_store_uuid": "store-uuid",
-                "project": "/repo",
-                "domain": "memories",
-                "generation": generation
-            }),
-        )
-        .await;
-        assert_eq!(acked["authority"]["state"], "MODULE");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -26782,814 +25759,41 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn facade_unwraps_imitated_reduced_arguments_without_overriding_real_values() {
+    async fn facade_advertises_anti_memory_but_keeps_mutation_host_owned() {
         let producer = Arc::new(ProducerState::default());
-        let resolver =
-            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
-        let (handler, store, _dir, _project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(test_route(7), binding("/repo", "token"));
-        let id = insert_memory(&store, "/repo", "CONSTRAINTS", "Run focused tests.", 1);
-
-        let plain = tool_text(
-            call_facade(
-                &handler,
-                "ctx_memory",
-                json!({ "action": "get", "ids": [id] }),
-            )
-            .await,
-        );
-        let imitated = tool_text(
-            call_facade(
-                &handler,
-                "ctx_memory",
-                json!({
-                    "reduced": true,
-                    "summary": json!({ "action": "get", "ids": [id] }).to_string(),
-                }),
-            )
-            .await,
-        );
-        let real_arguments = tool_text(
-            call_facade(
-                &handler,
-                "ctx_memory",
-                json!({
-                    "action": "get",
-                    "ids": [id],
-                    "reduced": true,
-                    "summary": json!({ "action": "archive", "ids": [id] }).to_string(),
-                }),
-            )
-            .await,
-        );
-        let malformed = error_frame(
-            call_facade(
-                &handler,
-                "ctx_memory",
-                json!({ "reduced": true, "summary": "not JSON" }),
-            )
-            .await,
-        );
-        let plain_missing = error_frame(call_facade(&handler, "ctx_memory", json!({})).await);
-        let reduce_plain =
-            tool_text(call_facade(&handler, "ctx_reduce", json!({ "drop": "1" })).await);
-        let reduce_imitated = tool_text(
-            call_facade(
-                &handler,
-                "ctx_reduce",
-                json!({
-                    "reduced": true,
-                    "summary": json!({ "drop": "1" }).to_string(),
-                }),
-            )
-            .await,
-        );
-
-        assert_eq!(imitated, plain);
-        assert_eq!(real_arguments, plain);
-        assert_eq!(store.get_memory_full(id).unwrap().unwrap().status, "active");
-        assert_eq!(malformed, plain_missing);
-        assert_eq!(reduce_imitated, reduce_plain);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn memory_facade_routes_all_authority_actions_into_store_and_changefeed() {
-        let producer = Arc::new(ProducerState::default());
-        let resolver =
-            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
-        let (handler, store, _dir, _project) =
+        let resolver = FakeSessionResolver::with(&[(
+            "token",
+            FakeResolve::Hit("opaque-own-conversation".to_string()),
+        )]);
+        let (handler, _store, _dir, _project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
         handler.bind_route(test_route(7), binding("/repo", "token"));
 
-        for arguments in [
-            json!({"action": "write", "category": "CONSTRAINTS", "content": "first"}),
-            json!({"action": "update", "ids": [1], "content": "first updated"}),
-            json!({"action": "write", "category": "CONSTRAINTS", "content": "second"}),
-            json!({"action": "merge", "ids": [1, 2], "content": "merged"}),
-            json!({"action": "get", "ids": [1]}),
-            json!({"action": "archive", "ids": [1]}),
-        ] {
-            let outcome = call_facade(&handler, "ctx_memory", arguments.clone()).await;
-            assert!(!tool_is_error(outcome), "action failed: {arguments}");
-        }
-        let memory = store.get_memory_full(1).unwrap().unwrap();
-        assert_eq!(memory.content, "merged");
-        assert_eq!(memory.status, "archived");
-        assert!(store
-            .get_memory_full(2)
-            .unwrap()
-            .unwrap()
-            .superseded_by_memory_id
-            .is_some());
-        let feed = store.pull_changefeed("memories", 0, 100).unwrap();
-        assert!(
-            feed.rows.len() >= 6,
-            "every mutation must append changefeed state"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn facade_mutation_commands_replay_each_memory_and_note_action_without_advancing_state() {
-        let producer = Arc::new(ProducerState::default());
-        let resolver =
-            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
-        let (handler, store, _dir, _project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(test_route(7), binding("/route/facade-ledger", "token"));
-        let project = "/route/facade-ledger";
-
-        async fn call_and_replay(
-            handler: &McHandler,
-            store: &McStore,
-            name: &str,
-            action: &str,
-            command_id: &str,
-            arguments: Value,
-        ) {
-            let first = call_facade(handler, name, arguments.clone()).await;
-            let first_bytes = match first {
-                PreparedOutcome::Response(bytes) => bytes,
-                other => panic!("first {name}/{action} failed: {other:?}"),
-            };
-            let mut retry_arguments = arguments;
-            retry_arguments["command_id"] = json!(command_id);
-            let retry = call_facade(handler, name, retry_arguments).await;
-            let retry_body = tool_body(retry);
-            let mut original_body: Value = serde_json::from_slice(&first_bytes).unwrap();
-            assert_eq!(
-                store
-                    .facade_mutation_ledger_response("session", name, action, command_id)
-                    .unwrap(),
-                Some(first_bytes.as_ref().to_vec()),
-                "ledger must retain the exact first response for {name}/{action}"
-            );
-            original_body["replayed"] = Value::Bool(true);
-            assert_eq!(retry_body, original_body);
-        }
-
-        call_and_replay(
-            &handler,
-            &store,
-            "ctx_memory",
-            "write",
-            "memory-write",
-            json!({
-                "action": "write",
-                "category": "CONSTRAINTS",
-                "content": "first",
-                "command_id": "memory-write"
-            }),
-        )
-        .await;
-        let memory_revision_after_write =
-            crate::m1_compose::m1_revision_signal(&store, project, "session").unwrap();
-        call_and_replay(
-            &handler,
-            &store,
-            "ctx_memory",
-            "update",
-            "memory-update",
-            json!({
-                "action": "update",
-                "ids": [1],
-                "content": "updated",
-                "command_id": "memory-update"
-            }),
-        )
-        .await;
-        let memory_revision_after_update =
-            crate::m1_compose::m1_revision_signal(&store, project, "session").unwrap();
-        assert_ne!(memory_revision_after_update, memory_revision_after_write);
-        let memory_feed_after_update = store
-            .pull_changefeed("memories", 0, 100)
-            .unwrap()
-            .rows
-            .len();
-        call_and_replay(
-            &handler,
-            &store,
-            "ctx_memory",
-            "archive",
-            "memory-archive",
-            json!({
-                "action": "archive",
-                "ids": [1],
-                "command_id": "memory-archive"
-            }),
-        )
-        .await;
-        let memory_revision_after_archive =
-            crate::m1_compose::m1_revision_signal(&store, project, "session").unwrap();
-        assert_ne!(memory_revision_after_archive, memory_revision_after_update);
-        assert_eq!(
-            store
-                .pull_changefeed("memories", 0, 100)
-                .unwrap()
-                .rows
-                .len(),
-            memory_feed_after_update + 1
-        );
-
-        call_and_replay(
-            &handler,
-            &store,
-            "ctx_note",
-            "write",
-            "note-write",
-            json!({
-                "action": "write",
-                "content": "remember this",
-                "command_id": "note-write"
-            }),
-        )
-        .await;
-        let note_revision_after_write = store.max_note_status_version(project).unwrap();
-        let note_feed_after_write = store.pull_changefeed("notes", 0, 100).unwrap().rows.len();
-        call_and_replay(
-            &handler,
-            &store,
-            "ctx_note",
-            "update",
-            "note-update",
-            json!({
-                "action": "update",
-                "note_id": 1,
-                "content": "updated note",
-                "command_id": "note-update"
-            }),
-        )
-        .await;
-        let note_revision_after_update = store.max_note_status_version(project).unwrap();
-        assert_eq!(note_revision_after_update, note_revision_after_write + 1);
-        assert_eq!(
-            store.pull_changefeed("notes", 0, 100).unwrap().rows.len(),
-            note_feed_after_write + 1
-        );
-        call_and_replay(
-            &handler,
-            &store,
-            "ctx_note",
-            "dismiss",
-            "note-dismiss",
-            json!({
-                "action": "dismiss",
-                "note_id": 1,
-                "command_id": "note-dismiss"
-            }),
-        )
-        .await;
-        let note_revision_after_dismiss = store.max_note_status_version(project).unwrap();
-        assert_eq!(note_revision_after_dismiss, note_revision_after_update + 1);
-        assert_eq!(
-            store.pull_changefeed("notes", 0, 100).unwrap().rows.len(),
-            note_feed_after_write + 2
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn classification_facade_hash_fences_rows_and_keeps_m1_revision_stable() {
-        let producer = Arc::new(ProducerState::default());
-        let resolver =
-            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
-        let (handler, store, _dir, project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        let route_project_root = project.to_str().unwrap();
-        handler.bind_route(test_route(7), binding(route_project_root, "token"));
-        activate_module_authority(
-            &store,
-            "context",
-            "git:classify",
-            route_project_root,
-            "memories",
-        );
-        let fresh_id = insert_memory(
-            &store,
-            "git:classify",
-            "PROJECT_RULES",
-            "fresh classification",
-            1,
-        );
-        let stale_id = insert_memory(
-            &store,
-            "git:classify",
-            "PROJECT_RULES",
-            "stale classification",
-            1,
-        );
-        let fresh_hash = store
-            .get_memory_full(fresh_id)
-            .unwrap()
-            .unwrap()
-            .normalized_hash;
-        let generation = store
-            .authority_status("context", "git:classify", "memories")
-            .unwrap()
-            .unwrap()
-            .generation;
-        let before =
-            crate::m1_compose::m1_revision_signal(&store, "git:classify", "session").unwrap();
         let outcome = call_facade(
             &handler,
-            "memory.set_classification",
+            "ctx_memory",
             json!({
-                "memory_project": "git:classify",
-                "context_store_uuid": "context",
-                "authority_generation": generation,
-                "rows": [
-                    {
-                        "memory_id": fresh_id,
-                        "content_hash_at_prompt": fresh_hash,
-                        "importance": 91,
-                        "scope": "project",
-                        "shareable": true
-                    },
-                    {
-                        "memory_id": stale_id,
-                        "content_hash_at_prompt": "stale-hash",
-                        "importance": 1,
-                        "scope": "project",
-                        "shareable": true
-                    }
-                ]
+                "action": "create",
+                "category": "REJECTED_APPROACH",
+                "antiMemory": {
+                    "trigger": "Choosing a cache backend",
+                    "rejectedStrategy": "Use Redis",
+                    "rejectionReason": "The project must work offline"
+                }
             }),
         )
         .await;
-        let response = match outcome {
-            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
-            other => panic!("classification facade failed: {other:?}"),
-        };
-        assert_eq!(response["accepted"], json!([fresh_id]));
-        assert_eq!(response["rejected"][0]["reason"], "stale");
-        assert_eq!(
-            store.get_memory_full(fresh_id).unwrap().unwrap().importance,
-            Some(91)
-        );
-        let after =
-            crate::m1_compose::m1_revision_signal(&store, "git:classify", "session").unwrap();
-        assert_eq!(before, after, "classification metadata must not change m1");
-        let feed = store.pull_changefeed("memories", 0, 100).unwrap();
-        assert!(feed
-            .rows
-            .iter()
-            .any(|row| row.op == "update" && row.module_row_id == fresh_id));
+        let body = tool_body(outcome);
+        assert_eq!(body["isError"], json!(true));
+        assert!(body["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("host claim-operation commit path")));
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn verification_and_mapping_facades_are_fenced_hash_guarded_and_idempotent() {
-        let producer = Arc::new(ProducerState::default());
-        let resolver =
-            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
-        let (handler, store, _dir, project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        let route_root = project.to_str().unwrap();
-        let identity = "git:dreamer-applies";
-        handler.bind_route(test_route(7), binding(route_root, "token"));
-        activate_module_authority(&store, "context", identity, route_root, "memories");
-        let verified_id = insert_memory(&store, identity, "CONSTRAINTS", "verified", 1);
-        let updated_id = insert_memory(&store, identity, "CONSTRAINTS", "updated", 1);
-        let archived_id = insert_memory(&store, identity, "CONSTRAINTS", "archived", 1);
-        let foreign_id = insert_memory(&store, "git:other", "CONSTRAINTS", "foreign", 1);
-        let generation = store
-            .authority_status("context", identity, "memories")
-            .unwrap()
-            .unwrap()
-            .generation;
-        let hash = |id: i64| store.get_memory_full(id).unwrap().unwrap().normalized_hash;
-        let before_verified =
-            crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
-        let verified = call_facade(&handler, "memory.set_verification", json!({
-            "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
-            "command_id": "verify-once", "rows": [
-                {"memory_id": verified_id, "content_hash_at_prompt": hash(verified_id), "verification_status": "verified"},
-                {"memory_id": updated_id, "content_hash_at_prompt": "stale", "verification_status": "verified"},
-                {"memory_id": 999999, "content_hash_at_prompt": "missing", "verification_status": "verified"},
-                {"memory_id": foreign_id, "content_hash_at_prompt": hash(foreign_id), "verification_status": "verified"}
-            ]
-        })).await;
-        let verified_body = match verified {
-            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
-            other => panic!("verification facade failed: {other:?}"),
-        };
-        assert_eq!(verified_body["accepted"], json!([verified_id]));
-        assert_eq!(verified_body["rejected"].as_array().unwrap().len(), 3);
-        let verified_feed_head = store
-            .pull_changefeed("memories", 0, 1000)
-            .unwrap()
-            .next_cursor;
-        let after_verified =
-            crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
-        assert_eq!(
-            before_verified, after_verified,
-            "verification stamps are cache-neutral"
-        );
-        let replay = call_facade(&handler, "memory.set_verification", json!({
-            "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
-            "command_id": "verify-once", "rows": [{"memory_id": verified_id, "content_hash_at_prompt": hash(verified_id), "verification_status": "verified"}]
-        })).await;
-        let replay_body = match replay {
-            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
-            other => panic!("verification replay failed: {other:?}"),
-        };
-        assert_eq!(
-            replay_body, verified_body,
-            "command replay must return the stored terminal response"
-        );
-        assert_eq!(
-            store
-                .pull_changefeed("memories", 0, 1000)
-                .unwrap()
-                .next_cursor,
-            verified_feed_head,
-            "verification replay must not emit another feed row"
-        );
-
-        let before_update =
-            crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
-        let update = call_facade(&handler, "memory.set_verification", json!({
-            "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
-            "rows": [{"memory_id": updated_id, "content_hash_at_prompt": hash(updated_id), "verification_status": "update", "updated_content": "updated by verifier"}]
-        })).await;
-        let update_body = match update {
-            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
-            other => panic!("update facade failed: {other:?}"),
-        };
-        let after_update =
-            crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
-        assert_eq!(update_body["accepted"], json!([updated_id]));
-        assert_ne!(
-            after_update, before_update,
-            "content updates advance the m1 mutation signal"
-        );
-
-        let before_archive =
-            crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
-        let archive = call_facade(&handler, "memory.set_verification", json!({
-            "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
-            "rows": [{"memory_id": archived_id, "content_hash_at_prompt": hash(archived_id), "verification_status": "archive", "archive_reason": "obsolete"}]
-        })).await;
-        assert!(matches!(archive, PreparedOutcome::Response(_)));
-        let after_archive =
-            crate::m1_compose::m1_revision_signal(&store, identity, "session").unwrap();
-        assert!(
-            after_archive > before_archive,
-            "archives advance the m1 mutation signal"
-        );
-
-        let mapping = call_facade(&handler, "memory.set_mapping", json!({
-            "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
-            "command_id": "mapping-once", "rows": [{"memory_id": verified_id, "content_hash_at_prompt": hash(verified_id), "mapped_files": ["src/lib.rs", "src/lib.rs"]}]
-        })).await;
-        assert!(matches!(mapping, PreparedOutcome::Response(_)));
-        let mapping_feed_head = store
-            .pull_changefeed("memories", 0, 1000)
-            .unwrap()
-            .next_cursor;
-        let mapping_replay = call_facade(&handler, "memory.set_mapping", json!({
-            "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
-            "command_id": "mapping-once", "rows": [{"memory_id": verified_id, "content_hash_at_prompt": "stale", "mapped_files": null}]
-        })).await;
-        assert!(
-            matches!(mapping_replay, PreparedOutcome::Response(_)),
-            "mapping command replay must be idempotent"
-        );
-        assert_eq!(
-            store
-                .pull_changefeed("memories", 0, 1000)
-                .unwrap()
-                .next_cursor,
-            mapping_feed_head,
-            "mapping replay must not emit another feed row"
-        );
-        let feed = store.pull_changefeed("memories", 0, 1000).unwrap();
-        assert!(feed
-            .rows
-            .iter()
-            .any(|row| row.full_row_snapshot.get("mapping").is_some()));
-        let generation_error = call_facade(&handler, "memory.set_mapping", json!({
-            "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation - 1,
-            "rows": []
-        })).await;
-        assert_eq!(
-            error_code(generation_error),
-            "authority_generation_mismatch"
-        );
-        store
-            .authority_begin_drain("context", identity, "memories", "test-drain", 9_999_999, 1)
-            .unwrap();
-        let draining = call_facade(&handler, "memory.set_verification", json!({
-            "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
-            "rows": []
-        })).await;
-        assert_eq!(error_code(draining), "authority_draining");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn raced_classification_drain_returns_the_transition_specific_code() {
-        let producer = Arc::new(ProducerState::default());
-        let resolver =
-            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
-        let (handler, store, _dir, project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        let route_root = project.to_str().unwrap();
-        let identity = "git:classification-race";
-        handler.bind_route(test_route(7), binding(route_root, "token"));
-        activate_module_authority(&store, "context", identity, route_root, "memories");
-        let memory_id = insert_memory(&store, identity, "CONSTRAINTS", "classify me", 1);
-        let before = store.get_memory_full(memory_id).unwrap().unwrap();
-        let generation = store
-            .authority_status("context", identity, "memories")
-            .unwrap()
-            .unwrap()
-            .generation;
-        let feed_head = store
-            .pull_changefeed("memories", 0, 100)
-            .unwrap()
-            .next_cursor;
-        let hook_store = Arc::clone(&store);
-        *handler
-            .classification_before_apply_hook
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(move || {
-            hook_store
-                .authority_begin_drain(
-                    "context",
-                    identity,
-                    "memories",
-                    "classification-race",
-                    i64::MAX,
-                    2,
-                )
-                .unwrap();
-        }));
-
-        let outcome = call_facade(
-            &handler,
-            "memory.set_classification",
-            json!({
-                "memory_project": identity,
-                "context_store_uuid": "context",
-                "authority_generation": generation,
-                "rows": [{
-                    "memory_id": memory_id,
-                    "content_hash_at_prompt": before.normalized_hash.clone(),
-                    "importance": 99
-                }]
-            }),
-        )
-        .await;
-
-        assert_eq!(error_code(outcome), "authority_draining");
-        assert_eq!(
-            store
-                .get_memory_full(memory_id)
-                .unwrap()
-                .unwrap()
-                .importance,
-            before.importance
-        );
-        assert_eq!(
-            store
-                .pull_changefeed("memories", 0, 100)
-                .unwrap()
-                .next_cursor,
-            feed_head
-        );
-        assert_eq!(
-            store
-                .authority_status("context", identity, "memories")
-                .unwrap()
-                .unwrap()
-                .state,
-            "DRAINING"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn draining_authority_rejects_every_facade_mutation_but_keeps_reads_resolved() {
-        let producer = Arc::new(ProducerState::default());
-        let resolver =
-            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
-        let (handler, store, _dir, project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        let route_root = project.to_str().unwrap();
-        let identity = "git:draining";
-        handler.bind_route(test_route(7), binding(route_root, "token"));
-        for domain in ["memories", "notes"] {
-            activate_module_authority(&store, "context", identity, route_root, domain);
-        }
-        let first = insert_memory(&store, identity, "CONSTRAINTS", "first", 1);
-        let second = insert_memory(&store, identity, "CONSTRAINTS", "second", 1);
-        let note = store
-            .insert_note(NoteInput {
-                project_path: identity,
-                route_project_root: Some(route_root),
-                session_id: "session",
-                content: "note",
-                surface_condition: None,
-                anchor_block_id: None,
-                now_ms: 1,
-            })
-            .unwrap();
-        let memory_drain = store
-            .authority_begin_drain("context", identity, "memories", "lease-memory", i64::MAX, 2)
-            .unwrap();
-        store
-            .authority_begin_drain("context", identity, "notes", "lease-notes", i64::MAX, 2)
-            .unwrap();
-        let memory_head = store
-            .pull_changefeed("memories", 0, 100)
-            .unwrap()
-            .next_cursor;
-        let note_head = store.pull_changefeed("notes", 0, 100).unwrap().next_cursor;
-
-        for arguments in [
-            json!({"action": "write", "category": "CONSTRAINTS", "content": "late"}),
-            json!({"action": "update", "ids": [first], "content": "late"}),
-            json!({"action": "archive", "ids": [first]}),
-            json!({"action": "merge", "ids": [first, second], "content": "late"}),
-        ] {
-            assert_eq!(
-                error_code(call_facade(&handler, "ctx_memory", arguments).await),
-                "authority_draining"
-            );
-        }
-        for arguments in [
-            json!({"action": "write", "content": "late"}),
-            json!({"action": "update", "note_id": note.id, "content": "late"}),
-            json!({"action": "dismiss", "note_id": note.id}),
-        ] {
-            assert_eq!(
-                error_code(call_facade(&handler, "ctx_note", arguments).await),
-                "authority_draining"
-            );
-        }
-        assert_eq!(
-            error_code(
-                call_facade(
-                    &handler,
-                    "memory.set_classification",
-                    json!({
-                        "memory_project": identity,
-                        "context_store_uuid": "context",
-                        "authority_generation": memory_drain.generation,
-                        "rows": []
-                    }),
-                )
-                .await
-            ),
-            "authority_draining"
-        );
-        assert!(!tool_is_error(
-            call_facade(
-                &handler,
-                "ctx_memory",
-                json!({"action": "get", "ids": [first]})
-            )
-            .await
-        ));
-        assert!(!tool_is_error(
-            call_facade(&handler, "ctx_note", json!({"action": "read"})).await
-        ));
-        assert_eq!(
-            store
-                .pull_changefeed("memories", 0, 100)
-                .unwrap()
-                .next_cursor,
-            memory_head
-        );
-        assert_eq!(
-            store.pull_changefeed("notes", 0, 100).unwrap().next_cursor,
-            note_head
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn dreamer_run_task_advances_model_chain_after_outage_text() {
-        let producer = Arc::new(ProducerState::default());
-        producer
-            .await_results
-            .lock()
-            .expect("await results mutex")
-            .extend([
-                Ok(ProducerOutput {
-                    text: "All Antigravity endpoints failed".to_string(),
-                    length_capped: false,
-                }),
-                Ok(ProducerOutput {
-                    text: "<classify></classify>".to_string(),
-                    length_capped: false,
-                }),
-            ]);
-        let (handler, store, _dir, project) =
-            handler_with_store(Arc::clone(&producer), default_test_config());
-        let route_root = project.to_str().unwrap();
-        handler.bind_route(test_route(7), binding(route_root, "ses"));
-        activate_module_authority(&store, "context", "git:identity", route_root, "memories");
-        let generation = store
-            .authority_status("context", "git:identity", "memories")
-            .unwrap()
-            .unwrap()
-            .generation;
-
-        let outcome = handler
-            .handle_dreamer_run_task(
-                test_route(7),
-                &json!({
-                    "v": 1,
-                    "session_id": "ses",
-                    "task": CLASSIFY_TASK,
-                    "command_id": "model-chain-command",
-                    "authority_generation": generation,
-                    "payload": {
-                        "prompt_body": "classify",
-                        "items": [],
-                        "model_chain": ["test/bad-model", "test/good-model"],
-                    },
-                }),
-            )
-            .await;
-        let response = match outcome {
-            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
-            other => panic!("dreamer run failed: {other:?}"),
-        };
-
-        assert_eq!(producer.starts.load(Ordering::SeqCst), 2);
-        assert_eq!(response["manifest_text"], json!("<classify></classify>"));
-        assert_eq!(response["diagnostics"]["model"], json!("test/good-model"));
-        assert_eq!(response["diagnostics"]["attempts"], json!(2));
-        let sessions = producer.sessions.lock().unwrap().clone();
-        assert_eq!(
-            sessions,
-            vec![
-                attempt_child_session_id(
-                    "git:identity",
-                    "ses",
-                    "model-chain-command",
-                    0,
-                    "test/bad-model"
-                ),
-                attempt_child_session_id(
-                    "git:identity",
-                    "ses",
-                    "model-chain-command",
-                    1,
-                    "test/good-model"
-                ),
-            ],
-            "fallback attempts must run in distinct deterministic child sessions"
-        );
-        assert_eq!(
-            producer.purges.lock().unwrap().clone(),
-            sessions,
-            "every attempt must purge its own session before the next starts"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn cancelled_dreamer_run_unregisters_its_child_session() {
-        let producer = Arc::new(ProducerState::default());
-        producer.block_output.store(true, Ordering::SeqCst);
-        let (handler, store, _dir, project) =
-            handler_with_store(Arc::clone(&producer), default_test_config());
-        let route_root = project.to_str().unwrap();
-        handler.bind_route(test_route(7), binding(route_root, "parent"));
-        activate_module_authority(&store, "context", "git:identity", route_root, "memories");
-        let generation = store
-            .authority_status("context", "git:identity", "memories")
-            .unwrap()
-            .unwrap()
-            .generation;
-        let child_session =
-            attempt_child_session_id("git:identity", "parent", "cancel-command", 0, "test/model");
-        let handler = Arc::new(handler);
-        let running_handler = Arc::clone(&handler);
-        let task = tokio::spawn(async move {
-            running_handler
-                .handle_dreamer_run_task(
-                    test_route(7),
-                    &json!({
-                        "v": 1,
-                        "session_id": "parent",
-                        "task": CLASSIFY_TASK,
-                        "command_id": "cancel-command",
-                        "authority_generation": generation,
-                        "payload": {
-                            "prompt_body": "classify",
-                            "items": [],
-                            "model_chain": ["test/model"],
-                        },
-                    }),
-                )
-                .await
-        });
-        wait_for_count(&producer.await_outputs, 1).await;
-        assert!(handler.dreamer_run_registered(&child_session));
-
-        task.abort();
-        let _ = task.await;
-        assert!(!handler.dreamer_run_registered(&child_session));
-    }
+    /// A classify budget large enough that no test's own setup can exhaust it,
+    /// so a payload's shape is what the test proves. Deadline behaviour has its
+    /// own tests with deliberately small budgets.
+    const TEST_CLASSIFY_TIMEOUT_MS: u64 = 600_000;
 
     async fn dreamer_classify_outcome(
         producer: &Arc<ProducerState>,
@@ -27626,1015 +25830,182 @@ mod tests {
         (Arc::clone(producer), outcome)
     }
 
-    fn classify_envelope_output() -> Result<ProducerOutput, HistorianProducerError> {
-        Ok(ProducerOutput {
-            text: "<classify></classify>".to_string(),
-            length_capped: false,
+    /// A well-formed public claim ID, distinct per `seed`.
+    fn test_claim_id(seed: u8) -> String {
+        format!("mcm_{}", format!("{seed:02x}").repeat(16))
+    }
+
+    /// The exact payload `runClassifyThroughModule` sends for a claim-native
+    /// chunk, and the manifest shape `CLASSIFY_SYSTEM_PROMPT` asks for.
+    fn claim_native_payload(claims: &[String], timeout_ms: u64) -> Value {
+        json!({
+            "prompt_body": "classify",
+            "model_chain": ["test/model"],
+            "timeout_ms": timeout_ms,
+            "items": claims.iter().map(|claim| json!({
+                "public_claim_id": claim,
+                "revision_locator": format!("{claim}/r1/{}", "b".repeat(64)),
+                "content_digest": "b".repeat(64),
+                "mutation_token": { "publicClaimId": claim },
+            })).collect::<Vec<_>>(),
         })
     }
 
-    /// A length-capped generation is an attempt failure even when its
-    /// truncated prefix parses: the caller refuses `truncated` output, so
-    /// accepting one would ledger a response no caller can use and leave no
-    /// fallback model for any retry.
-    #[tokio::test(flavor = "current_thread")]
-    async fn dreamer_run_task_advances_past_a_length_capped_attempt() {
-        let producer = Arc::new(ProducerState::default());
-        producer.await_results.lock().unwrap().extend([
-            Ok(ProducerOutput {
-                text: "<classify></classify>".to_string(),
-                length_capped: true,
-            }),
-            classify_envelope_output(),
-        ]);
-        let (producer, outcome) = dreamer_classify_outcome(
-            &producer,
-            json!({
-                "prompt_body": "classify",
-                "items": [],
-                "model_chain": ["test/capped-model", "test/whole-model"],
-            }),
-            "length-capped",
-        )
-        .await;
-        let response = match outcome {
-            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
-            other => panic!("the chain must recover from a capped attempt: {other:?}"),
-        };
-        assert_eq!(response["ok"], json!(true));
-        assert_eq!(response["truncated"], json!(false));
-        assert_eq!(
-            response["diagnostics"]["model"],
-            json!("test/whole-model"),
-            "the capped attempt must not be the accepted one"
-        );
-        assert_eq!(producer.starts.load(Ordering::SeqCst), 2);
-        assert_eq!(
-            producer.purges.lock().unwrap().len(),
-            2,
-            "the capped attempt's session must be purged before advancing"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn dreamer_run_task_requires_explicit_canonical_model_chain() {
-        // One entry past the attempt cap: every entry is a potential
-        // billable provider run, so an oversized chain must die before
-        // any run starts.
-        let oversized_chain = json!({
-            "prompt_body": "classify",
-            "items": [],
-            "model_chain": (0..=MAX_CLASSIFY_MODEL_CHAIN)
-                .map(|i| format!("prov/m{i}"))
-                .collect::<Vec<_>>(),
-        });
-        for payload in [
-            json!({ "prompt_body": "classify", "items": [] }),
-            json!({ "prompt_body": "classify", "items": [], "model_chain": [] }),
-            json!({ "prompt_body": "classify", "items": [], "model_chain": ["flat-model"] }),
-            json!({ "prompt_body": "classify", "items": [], "model_chain": ["/model"] }),
-            json!({ "prompt_body": "classify", "items": [], "model_chain": ["prov/"] }),
-            json!({ "prompt_body": "classify", "items": [], "model_chain": [7] }),
-            oversized_chain,
-        ] {
-            let producer = Arc::new(ProducerState::default());
-            let (producer, outcome) =
-                dreamer_classify_outcome(&producer, payload.clone(), "chain-shape").await;
-            match outcome {
-                PreparedOutcome::Error { code, .. } => {
-                    assert_eq!(code, "invalid_params", "payload {payload}")
-                }
-                other => panic!("expected invalid_params for {payload}, got {other:?}"),
-            }
-            assert_eq!(
-                producer.starts.load(Ordering::SeqCst),
-                0,
-                "a rejected chain must never start a run: {payload}"
-            );
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn dreamer_run_task_uses_request_chain_and_route_harness() {
-        let producer = Arc::new(ProducerState::default());
-        producer
-            .await_results
-            .lock()
-            .unwrap()
-            .push_back(classify_envelope_output());
-        let (producer, outcome) = dreamer_classify_outcome(
-            &producer,
-            json!({
-                "prompt_body": "classify",
-                "items": [],
-                "model_chain": ["test/payload-model"],
-            }),
-            "request-chain",
-        )
-        .await;
-        let response = match outcome {
-            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
-            other => panic!("dreamer run failed: {other:?}"),
-        };
-        assert_eq!(
-            response["diagnostics"]["model"],
-            json!("test/payload-model")
-        );
-        assert_eq!(
-            producer.harnesses.lock().unwrap().clone(),
-            vec!["pi"],
-            "the classify producer must connect with the route-bound harness"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn dreamer_run_task_purges_each_attempt_session_on_every_outcome_kind() {
-        let producer = Arc::new(ProducerState::default());
-        producer.await_results.lock().unwrap().extend([
-            // provider failure
-            Err(HistorianProducerError::tagged_call(
-                "provider_error",
-                "boom",
-                ErrorClass::Transient,
-                None,
-            )),
-            // invalid envelope
-            Ok(ProducerOutput {
-                text: "no envelope here".to_string(),
-                length_capped: false,
-            }),
-            // timeout, then the recovery re-drain also times out
-            Err(HistorianProducerError::TimedOut),
-            Err(HistorianProducerError::TimedOut),
-            // provider-reported cancellation
-            Err(HistorianProducerError::aborted("run cancelled")),
-            // valid output
-            classify_envelope_output(),
-        ]);
-        let models = [
-            "test/failing",
-            "test/enveloping",
-            "test/timing-out",
-            "test/cancelling",
-            "test/succeeding",
-        ];
-        let (producer, outcome) = dreamer_classify_outcome(
-            &producer,
-            json!({
-                "prompt_body": "classify",
-                "items": [],
-                "model_chain": models,
-            }),
-            "purge-outcomes",
-        )
-        .await;
-        let response = match outcome {
-            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
-            other => panic!("dreamer run failed: {other:?}"),
-        };
-        assert_eq!(response["diagnostics"]["attempts"], json!(5));
-        let expected: Vec<String> = models
+    fn claim_manifest(claims: &[String]) -> String {
+        let entries: String = claims
             .iter()
-            .enumerate()
-            .map(|(attempt, model)| {
-                attempt_child_session_id("git:identity", "ses", "purge-outcomes", attempt, model)
+            .map(|claim| {
+                format!(
+                    "<memory claim=\"{claim}\" importance=\"80\" scope=\"project\" shareable=\"true\"/>"
+                )
             })
             .collect();
-        assert_eq!(
-            producer.purges.lock().unwrap().clone(),
-            expected,
-            "every outcome kind must delete its attempt session before advancing"
-        );
-        let interleaved: Vec<String> = expected
-            .iter()
-            .flat_map(|session| [format!("start:{session}"), format!("purge:{session}")])
-            .collect();
-        assert_eq!(
-            producer.session_events.lock().unwrap().clone(),
-            interleaved,
-            "each attempt's purge must land before the next attempt's start"
-        );
+        format!("<classify>{entries}</classify>")
     }
 
+    /// The request parser, the expected-id set, and the manifest validator
+    /// must all speak the claim's public ID. While the parser demanded an
+    /// integer `memory_id`, this payload died at `invalid_params` with zero
+    /// producer starts; while the validator demanded a numeric `id`, the
+    /// manifest the prompt asks for was rejected too.
     #[tokio::test(flavor = "current_thread")]
-    async fn dreamer_run_task_success_survives_cleanup_failure_after_ledger_record() {
-        let producer = Arc::new(ProducerState::default());
-        producer
-            .await_results
-            .lock()
-            .unwrap()
-            .push_back(classify_envelope_output());
-        producer
-            .purge_errors
-            .lock()
-            .unwrap()
-            .push_back(HistorianProducerError::TimedOut);
-        let (producer, outcome) = dreamer_classify_outcome(
-            &producer,
-            json!({
-                "prompt_body": "classify",
-                "items": [],
-                "model_chain": ["test/model"],
-            }),
-            "cleanup-on-success",
-        )
-        .await;
-        // The response was durably recorded before the purge ran, so the
-        // purge failure cannot fail the command — a retry would replay the
-        // recorded success anyway; the leftover session is bounded by host
-        // terminal retention.
-        let response = match outcome {
-            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
-            other => panic!("a recorded success must survive a cleanup failure: {other:?}"),
-        };
-        assert_eq!(response["ok"], json!(true));
-        assert_eq!(
-            producer.starts.load(Ordering::SeqCst),
-            1,
-            "a successful classification must not burn fallback attempts on cleanup failure"
-        );
-        assert_eq!(
-            producer.purges.lock().unwrap().len(),
-            1,
-            "the purge must still be attempted after the ledger write"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn dreamer_run_task_retains_provider_error_and_cleanup_failure_together() {
-        let producer = Arc::new(ProducerState::default());
-        producer
-            .await_results
-            .lock()
-            .unwrap()
-            .push_back(Err(HistorianProducerError::tagged_call(
-                "provider_error",
-                "model gone",
-                ErrorClass::Permanent,
-                None,
-            )));
-        producer
-            .purge_errors
-            .lock()
-            .unwrap()
-            .push_back(HistorianProducerError::TimedOut);
-        let (_producer, outcome) = dreamer_classify_outcome(
-            &producer,
-            json!({
-                "prompt_body": "classify",
-                "items": [],
-                "model_chain": ["test/model"],
-            }),
-            "cleanup-with-failure",
-        )
-        .await;
-        let PreparedOutcome::Error { code, message } = outcome else {
-            panic!("expected dreamer_run_failed");
-        };
-        assert_eq!(code, "dreamer_run_failed");
-        assert!(
-            message.contains("model gone") && message.contains("cleanup also failed"),
-            "both the provider failure and the cleanup failure must survive: {message}"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn dreamer_run_task_backs_off_on_idempotency_conflict_without_purging() {
-        let producer = Arc::new(ProducerState::default());
-        producer.await_results.lock().unwrap().extend([
-            Err(HistorianProducerError::tagged_call(
-                "idempotency_conflict",
-                "a byte-different send holds this session",
-                ErrorClass::Permanent,
-                None,
-            )),
-            classify_envelope_output(),
-        ]);
-        let (handler, store, _dir, project) =
-            handler_with_store(Arc::clone(&producer), default_test_config());
-        let route_root = project.to_str().unwrap();
-        handler.bind_route(test_route(7), binding_with_harness(route_root, "pi", "ses"));
-        activate_module_authority(&store, "context", "git:identity", route_root, "memories");
-        let generation = store
-            .authority_status("context", "git:identity", "memories")
-            .unwrap()
-            .unwrap()
-            .generation;
-        let request = json!({
-            "v": 1,
-            "session_id": "ses",
-            "task": CLASSIFY_TASK,
-            "command_id": "conflict-command",
-            "authority_generation": generation,
-            "payload": {
-                "prompt_body": "classify",
-                "items": [],
-                "model_chain": ["test/model-a", "test/model-b"],
-            },
-        });
-
-        let outcome = handler
-            .handle_dreamer_run_task(test_route(7), &request)
-            .await;
-        let PreparedOutcome::Error { code, .. } = outcome else {
-            panic!("an idempotency conflict must fail the command");
-        };
-        assert_eq!(code, "dreamer_run_failed");
-        // The conflicting session belongs to a concurrent command's live
-        // run: purging would cancel it, and a chain advance would start a
-        // duplicate billable attempt for a command already executing.
-        assert!(
-            producer.purges.lock().unwrap().is_empty(),
-            "the losing caller must not purge the winner's session"
-        );
-        assert_eq!(
-            producer.starts.load(Ordering::SeqCst),
-            1,
-            "the chain must not advance past an idempotency conflict"
-        );
-
-        // Crucially the loser recorded nothing: a failure row would win the
-        // ledger's INSERT OR IGNORE race and mask the in-flight winner's
-        // outcome. The command's slot stays open, so a later attempt can
-        // still commit success.
-        let outcome = handler
-            .handle_dreamer_run_task(test_route(7), &request)
-            .await;
-        let response = match outcome {
-            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
-            other => panic!("the command slot must remain open after a conflict: {other:?}"),
-        };
-        assert_eq!(response["ok"], json!(true));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn dreamer_run_task_exhausted_budget_starts_no_new_run() {
+    async fn dreamer_run_task_accepts_claim_native_items_and_manifest() {
+        let claims = [test_claim_id(1), test_claim_id(2)];
         let producer = Arc::new(ProducerState::default());
         producer
             .await_results
             .lock()
             .unwrap()
             .push_back(Ok(ProducerOutput {
-                text: "no envelope".to_string(),
+                text: claim_manifest(&claims),
                 length_capped: false,
             }));
-        // The first attempt outlives the 10ms budget, so the second configured
-        // model must never start.
-        *producer.on_await_output.lock().unwrap() = Some(Box::new(|| {
-            std::thread::sleep(Duration::from_millis(30));
-        }));
         let (producer, outcome) = dreamer_classify_outcome(
             &producer,
-            json!({
-                "prompt_body": "classify",
-                "items": [],
-                "model_chain": ["test/slow", "test/never-started"],
-                "timeout_ms": 10,
-            }),
-            "budget-exhausted",
+            claim_native_payload(&claims, TEST_CLASSIFY_TIMEOUT_MS),
+            "claim-native",
         )
         .await;
-        let PreparedOutcome::Error { code, message } = outcome else {
-            panic!("expected dreamer_run_failed");
+        let response = match outcome {
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("a claim-native classify must be accepted: {other:?}"),
         };
-        assert_eq!(code, "dreamer_run_failed");
-        assert!(
-            message.contains("budget exhausted"),
-            "the failure must name the exhausted budget: {message}"
-        );
-        assert_eq!(
-            producer.starts.load(Ordering::SeqCst),
-            1,
-            "an exhausted budget must start no new LLM run"
-        );
-        let await_timeouts = producer.await_timeouts.lock().unwrap().clone();
-        assert_eq!(await_timeouts.len(), 1);
-        assert!(
-            await_timeouts[0] <= Duration::from_millis(10),
-            "the await window must be bounded by the remaining budget, not the 600s ceiling: {await_timeouts:?}"
-        );
+        assert_eq!(response["ok"], json!(true));
+        assert_eq!(response["manifest_text"], json!(claim_manifest(&claims)));
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn organic_fire_connects_producer_with_route_bound_harness() {
-        let producer = Arc::new(ProducerState::default());
-        let (handler, store, _dir, project) =
-            handler_with_store(Arc::clone(&producer), default_test_config());
-        handler.bind_route(
-            test_route(7),
-            binding_with_harness(project.to_str().unwrap(), "pi", "ses"),
-        );
-
-        let first = call_transform(&handler, big_messages()).await;
-        assert_eq!(first["historian"]["fired"], true);
-        wait_for_count(&producer.starts, 1).await;
-        wait_for_idle(&store).await;
-
-        assert_eq!(producer.harnesses.lock().unwrap().clone(), vec!["pi"]);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn wrapup_fire_connects_producer_with_route_bound_harness() {
-        let producer = Arc::new(ProducerState::default());
-        let (handler, _store, _dir, project) =
-            handler_with_store(Arc::clone(&producer), default_test_config());
-        handler.bind_route(
-            test_route(7),
-            binding_with_harness(project.to_str().unwrap(), "opencode", "ses"),
-        );
-        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
-
-        let body = tool_body(
-            handler
-                .dispatch_value(
-                    test_route(7),
-                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses" }),
-                )
-                .await,
-        );
-
-        assert_eq!(body["ok"], json!(true), "{body}");
-        let harnesses = producer.harnesses.lock().unwrap().clone();
-        assert!(
-            !harnesses.is_empty() && harnesses.iter().all(|harness| harness == "opencode"),
-            "every wrapup round must connect with the route harness: {harnesses:?}"
-        );
-    }
-
-    /// Reattach must target the run's OWN Broca identity, which is scoped by
-    /// `(project_root, harness, session)` — not the harness of whatever
-    /// route happens to resume the session. Using the resuming binding after
-    /// a cross-harness handoff queries a different key, observes `missing`,
-    /// and can abandon-then-refire a run the original harness is still
-    /// executing.
-    #[tokio::test(flavor = "current_thread")]
-    async fn reattach_connects_producer_with_the_runs_own_harness() {
-        let producer = Arc::new(ProducerState::default());
-        let (handler, store, _dir, project) =
-            handler_with_store(Arc::clone(&producer), default_test_config());
-        handler.bind_route(
-            test_route(7),
-            binding_with_harness(project.to_str().unwrap(), "pi", "ses"),
-        );
-        let messages = big_messages();
-        // The run was started under opencode; the resuming route is pi.
-        seed_awaiting_with_harness(&store, &messages, Some("opencode"));
-
-        let response = call_transform(&handler, messages).await;
-        assert_eq!(response["historian"]["no_fire"], "reattaching");
-        wait_for_count(&producer.connects, 1).await;
-        wait_for_idle(&store).await;
-
-        assert_eq!(
-            producer.harnesses.lock().unwrap().clone(),
-            vec!["opencode"],
-            "reattach must use the harness the run was started under"
-        );
-    }
-
-    /// A state written before the harness was persisted came from the
-    /// producer factory that hardcoded `opencode`, so that — not the
-    /// resuming route's harness — is the correct recovery target for a
-    /// legacy row.
-    #[tokio::test(flavor = "current_thread")]
-    async fn reattach_treats_a_legacy_awaiting_row_as_opencode() {
-        let producer = Arc::new(ProducerState::default());
-        let (handler, store, _dir, project) =
-            handler_with_store(Arc::clone(&producer), default_test_config());
-        handler.bind_route(
-            test_route(7),
-            binding_with_harness(project.to_str().unwrap(), "pi", "ses"),
-        );
-        let messages = big_messages();
-        seed_awaiting(&store, &messages);
-
-        let response = call_transform(&handler, messages).await;
-        assert_eq!(response["historian"]["no_fire"], "reattaching");
-        wait_for_count(&producer.connects, 1).await;
-        wait_for_idle(&store).await;
-
-        assert_eq!(producer.harnesses.lock().unwrap().clone(), vec!["opencode"]);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn module_authority_facade_write_uses_identity_not_route_path() {
-        let producer = Arc::new(ProducerState::default());
-        let resolver =
-            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
-        let (handler, store, _dir, project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        let route_project_root = project.to_str().unwrap();
-        handler.bind_route(test_route(7), binding(route_project_root, "token"));
-        activate_module_authority(
-            &store,
-            "context",
-            "git:identity",
-            route_project_root,
-            "memories",
-        );
-
-        let outcome = call_facade(
-            &handler,
-            "ctx_memory",
-            json!({
-                "action": "write",
-                "category": "CONSTRAINTS",
-                "content": "identity scoped",
-                "memory_project": "git:identity",
-            }),
-        )
-        .await;
-        assert!(!tool_is_error(outcome));
-        assert_eq!(
-            store.get_memory_full(1).unwrap().unwrap().project_path,
-            "git:identity"
-        );
-        assert!(store
-            .load_active_memories(route_project_root, 10)
-            .unwrap()
-            .is_empty());
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn facade_merge_renders_a_budget_trimmed_target_then_defer_replays_bytes() {
-        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
-        let (handler, store, _dir, project) = handler_with_store_and_resolver(
-            Arc::new(ProducerState::default()),
-            default_test_config(),
-            resolver,
-        );
-        let project = project.to_str().unwrap();
-        store
-            .replace_compartments("ses", &[stored_comp(1, 0, 0, "m0", "initial summary")])
-            .unwrap();
-        let source = insert_memory(&store, project, "CONSTRAINTS", "source fact", 1);
-        let target = insert_memory(
-            &store,
-            project,
-            "CONSTRAINTS",
-            &format!("trimmed target {}", "large ".repeat(20_000)),
-            1,
-        );
-        let request = request(vec![ck("m0", 0, "live input")]);
-        let initial = call_transform_request(&handler, request.clone()).await;
-        assert_eq!(initial["action"], "HARD");
-        assert_eq!(initial["rendered_memory_ids"], json!([source]));
-        assert_eq!(
-            store.load("ses").unwrap().meta.rendered_memory_ids,
-            vec![source]
-        );
-        let revision_before =
-            crate::m1_compose::m1_revision_signal(&store, project, "ses").unwrap();
-
-        let merge = call_facade(
-            &handler,
-            "ctx_memory",
-            json!({"action": "merge", "ids": [target, source], "content": "merged correction"}),
-        )
-        .await;
-        assert!(!tool_is_error(merge));
-        let revision_after = crate::m1_compose::m1_revision_signal(&store, project, "ses").unwrap();
-        assert_ne!(revision_before, revision_after);
-        assert_eq!(
-            revision_after,
-            crate::m1_compose::m1_revision_signal(&store, project, "ses").unwrap(),
-            "the merge's atomic mutation rows move the existing revision input once"
-        );
-
-        let transition = call_transform_request(&handler, request.clone()).await;
-        assert_eq!(transition["action"], "SOFT");
-        let transition_m1 = transition["ck_messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|message| message["meta"]["synthetic"] == json!(true))
-            .nth(1)
-            .and_then(|message| message["content"][0]["kind"]["text"].as_str())
-            .unwrap();
-        assert!(
-            transition_m1.contains("merged correction"),
-            "{transition_m1}"
-        );
-        assert!(
-            transition_m1.contains(&format!("<superseded id=\"{source}\" by=\"{target}\"/>")),
-            "{transition_m1}"
-        );
-        let stable = call_transform_request(&handler, request).await;
-        assert_eq!(stable["action"], "SOFT+");
-        assert_eq!(transition["ck_messages"], stable["ck_messages"]);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn authority_activation_moves_render_reads_once_through_the_m1_revision() {
-        let (handler, store, _dir, project) =
-            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
-        let route_project_root = project.to_str().unwrap();
-        store
-            .replace_compartments("ses", &[stored_comp(1, 0, 0, "m0", "initial summary")])
-            .unwrap();
-        let request = request(vec![ck("m0", 0, "live input")]);
-        let initial = call_transform_request(&handler, request.clone()).await;
-        assert_eq!(initial["action"], "HARD");
-
-        insert_memory(
-            &store,
-            "git:identity",
-            "CONSTRAINTS",
-            "identity-only memory",
-            1,
-        );
-        assert_eq!(store.load("ses").unwrap().meta.max_memory_id, 0);
-        assert_eq!(
-            store
-                .load_active_memories("git:identity", now_ms())
-                .unwrap()
-                .len(),
-            1
-        );
-        activate_module_authority(
-            &store,
-            "context",
-            "git:identity",
-            route_project_root,
-            "memories",
-        );
-
-        assert_eq!(
-            store
-                .authority_project_for_route(route_project_root, "memories")
-                .unwrap()
-                .as_deref(),
-            Some("git:identity")
-        );
-        let before_transition = store.load("ses").unwrap();
-        let identity_revision =
-            crate::m1_compose::m1_revision_signal(&store, "git:identity", "ses").unwrap();
-        assert_ne!(before_transition.meta.m1_revision, identity_revision);
-        let direct_m1 = crate::m1_compose::compose_m1_from_store(
-            &store,
-            "git:identity",
-            route_project_root,
-            "ses",
-            &before_transition.meta,
-            before_transition.meta.expiry_cutoff_ms,
-            true,
-            8_000.0,
-            4_000.0,
-            true,
-            |_| 0,
-        )
-        .unwrap();
-        assert!(
-            direct_m1.body.contains("identity-only memory"),
-            "{}",
-            direct_m1.body
-        );
-        let transition = call_transform_request(&handler, request.clone()).await;
-        assert_eq!(transition["action"], "SOFT");
-        assert!(
-            transition.to_string().contains("identity-only memory"),
-            "the coordinated soft pass must read the identity-keyed row: {transition}"
-        );
-        let stable = call_transform_request(&handler, request).await;
-        assert_eq!(stable["action"], "SOFT+");
-        assert_eq!(transition["ck_messages"], stable["ck_messages"]);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn authority_historian_publication_promotes_facts_under_the_identity_key() {
-        let producer = Arc::new(ProducerState::default());
-        producer.block_output.store(true, Ordering::SeqCst);
-        let (handler, store, _dir, project) =
-            handler_with_store(Arc::clone(&producer), default_test_config());
-        let route_project_root = project.to_str().unwrap();
-        activate_module_authority(
-            &store,
-            "context",
-            "git:identity",
-            route_project_root,
-            "memories",
-        );
-
-        let response = call_transform(&handler, big_messages()).await;
-        assert_eq!(response["historian"]["fired"], true);
-        wait_for_count(&producer.starts, 1).await;
-        let prompt = producer.prompts.lock().unwrap()[0].clone();
-        let (start, end) = prompt_ordinal_range(&prompt).unwrap();
-        {
-            let mut outputs = producer.outputs.lock().unwrap();
-            outputs.clear();
-            outputs.push_back(historian_output_with_fact(
-                start,
-                end,
-                "identity historian fact",
-            ));
+    async fn dreamer_run_task_rejects_items_that_are_not_claim_identities() {
+        let claim = test_claim_id(1);
+        for items in [
+            // The retired integer identity.
+            json!([{ "memory_id": 7 }]),
+            json!([{ "public_claim_id": 7 }]),
+            json!([{ "public_claim_id": "" }]),
+            json!([{ "public_claim_id": "mcm_short" }]),
+            json!([{ "public_claim_id": &claim[4..] }]),
+        ] {
+            let producer = Arc::new(ProducerState::default());
+            let mut payload = claim_native_payload(&[], TEST_CLASSIFY_TIMEOUT_MS);
+            payload["items"] = items.clone();
+            let (producer, outcome) =
+                dreamer_classify_outcome(&producer, payload, "claim-items-shape").await;
+            match outcome {
+                PreparedOutcome::Error { code, .. } => {
+                    assert_eq!(code, "invalid_params", "items {items}")
+                }
+                other => panic!("expected invalid_params for {items}, got {other:?}"),
+            }
+            assert_eq!(
+                producer.starts.load(Ordering::SeqCst),
+                0,
+                "a rejected identity must never start a run: {items}"
+            );
         }
-        producer.block_output.store(false, Ordering::SeqCst);
-        producer.notify.notify_waiters();
-        wait_for_idle(&store).await;
-
-        assert!(store
-            .load_active_memories("git:identity", 0)
-            .unwrap()
-            .iter()
-            .any(|memory| memory.content == "identity historian fact"));
-        assert!(store
-            .load_active_memories(route_project_root, 0)
-            .unwrap()
-            .is_empty());
     }
 
+    /// A manifest naming a claim the request never asked about must advance
+    /// the chain, not end it and be ledgered as this command's response.
     #[tokio::test(flavor = "current_thread")]
-    async fn module_authority_rejects_mismatched_facade_project_vocabulary() {
+    async fn dreamer_run_task_rejects_a_manifest_naming_an_unexpected_claim() {
+        let requested = test_claim_id(1);
+        let unexpected = test_claim_id(9);
         let producer = Arc::new(ProducerState::default());
-        let resolver =
-            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
-        let (handler, store, _dir, project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        let route_project_root = project.to_str().unwrap();
-        handler.bind_route(test_route(7), binding(route_project_root, "token"));
-        activate_module_authority(
-            &store,
-            "context",
-            "git:identity",
-            route_project_root,
-            "memories",
-        );
-
-        let (code, message) = error_frame(
-            call_facade(
-                &handler,
-                "ctx_memory",
-                json!({
-                    "action": "write",
-                    "category": "CONSTRAINTS",
-                    "content": "must fail",
-                    "memory_project": route_project_root,
-                }),
-            )
-            .await,
-        );
-        assert_eq!(code, "facade_project_vocabulary_mismatch");
-        assert!(message.contains("git:identity"));
-        assert!(message.contains(route_project_root));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn facade_without_authority_keeps_path_scoped_writes() {
-        let producer = Arc::new(ProducerState::default());
-        let resolver =
-            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
-        let (handler, store, _dir, project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        let route_project_root = project.to_str().unwrap();
-        handler.bind_route(test_route(7), binding(route_project_root, "token"));
-
-        let outcome = call_facade(
-            &handler,
-            "ctx_memory",
-            json!({
-                "action": "write",
-                "category": "CONSTRAINTS",
-                "content": "path scoped",
+        producer.await_results.lock().unwrap().extend([
+            // Covers the requested claim AND one nobody asked about.
+            Ok(ProducerOutput {
+                text: claim_manifest(&[requested.clone(), unexpected]),
+                length_capped: false,
             }),
-        )
-        .await;
-        assert!(!tool_is_error(outcome));
-        assert_eq!(
-            store.get_memory_full(1).unwrap().unwrap().project_path,
-            route_project_root
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn memory_disabled_rejects_mutation_and_excludes_memory_search() {
-        let producer = Arc::new(ProducerState::default());
-        let resolver = FakeSessionResolver::with(&[("token", FakeResolve::Hit("ses".to_string()))]);
-        let mut config = default_test_config();
-        config.memory_enabled = false;
-        let (handler, store, _dir, _project) =
-            handler_with_store_and_resolver(producer, config, resolver);
-        let mut disabled_binding = binding("/repo", "token");
-        disabled_binding.config.memory_enabled = false;
-        handler.bind_route(test_route(7), disabled_binding);
-        insert_memory(&store, "/repo", "CONSTRAINTS", "hidden needle", 1);
-
-        assert!(tool_is_error(
-            call_facade(
-                &handler,
-                "ctx_memory",
-                json!({"action": "write", "category": "CONSTRAINTS", "content": "blocked"}),
-            )
-            .await
-        ));
-        let results =
-            tool_json_array(call_facade(&handler, "ctx_search", json!({"query": "needle"})).await);
-        assert!(results.iter().all(|result| result["source"] != "memory"));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn facade_security_guards_run_through_public_handler_path() {
-        let producer = Arc::new(ProducerState::default());
-        let own = "/repo";
-        let foreign = "opaque-foreign-key";
-        let resolver = FakeSessionResolver::with(&[(
-            "token",
-            FakeResolve::Hit("opaque-own-conversation".to_string()),
-        )]);
-        let (handler, store, _dir, _project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(test_route(7), binding(own, "token"));
-        seed_workspace(&store, own, foreign);
-
-        let foreign_private_update =
-            insert_memory(&store, foreign, "PREFERENCES", "private update", 1);
-        let foreign_private_archive =
-            insert_memory(&store, foreign, "PREFERENCES", "private archive", 1);
-        let foreign_private_merge =
-            insert_memory(&store, foreign, "PREFERENCES", "private merge", 1);
-        let own_private = insert_memory(&store, own, "PREFERENCES", "own private", 1);
-
-        assert!(tool_is_error(
-            call_facade(
-                &handler,
-                "ctx_memory",
-                json!({ "action": "update", "id": foreign_private_update, "content": "edited" }),
-            )
-            .await
-        ));
-        assert!(tool_is_error(
-            call_facade(
-                &handler,
-                "ctx_memory",
-                json!({ "action": "archive", "ids": [foreign_private_archive] }),
-            )
-            .await
-        ));
-        assert!(tool_is_error(
-            call_facade(
-                &handler,
-                "ctx_memory",
-                json!({ "action": "merge", "ids": [foreign_private_merge, own_private], "content": "merged" }),
-            )
-            .await
-        ));
-
-        let shared_update = insert_memory(&store, foreign, "CONSTRAINTS", "shared update", 1);
-        let shared_archive = insert_memory(&store, foreign, "CONSTRAINTS", "shared archive", 1);
-        let shared_target = insert_memory(&store, foreign, "CONSTRAINTS", "shared target", 1);
-        let shared_source = insert_memory(&store, foreign, "CONSTRAINTS", "shared source", 1);
-
-        assert!(tool_is_error(
-            call_facade(
-                &handler,
-                "ctx_memory",
-                json!({ "action": "update", "id": shared_update, "content": "shared edited" }),
-            )
-            .await
-        ));
-        assert!(tool_is_error(
-            call_facade(
-                &handler,
-                "ctx_memory",
-                json!({ "action": "archive", "ids": [shared_archive] }),
-            )
-            .await
-        ));
-        assert!(tool_is_error(
-            call_facade(
-                &handler,
-                "ctx_memory",
-                json!({ "action": "merge", "ids": [shared_target, shared_source], "content": "shared merged" }),
-            )
-            .await
-        ));
-        assert_eq!(
-            store
-                .get_memory_full(shared_source)
-                .unwrap()
-                .unwrap()
-                .superseded_by_memory_id,
-            None
-        );
-
-        let cross_target = insert_memory(&store, own, "CONSTRAINTS", "constraint", 1);
-        let cross_source = insert_memory(&store, own, "PREFERENCES", "preference", 1);
-        assert!(tool_is_error(
-            call_facade(
-                &handler,
-                "ctx_memory",
-                json!({ "action": "merge", "ids": [cross_target, cross_source], "content": "bad merge" }),
-            )
-            .await
-        ));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn facade_cache_mutations_drive_soft_memory_deltas_through_public_path() {
-        let producer = Arc::new(ProducerState::default());
-        let project_root = "/repo/cache-project";
-        let scope = "pm_a5ee3bf8/parent-session/epoch-1";
-        let additive_project_root = "/repo/additive-project";
-        let additive_scope = "pm_a5ee3bf8/additive-session/epoch-1";
-        let resolver = FakeSessionResolver::with(&[
-            ("token", FakeResolve::Hit(scope.to_string())),
-            (
-                "token-additive",
-                FakeResolve::Hit(additive_scope.to_string()),
-            ),
+            Ok(ProducerOutput {
+                text: claim_manifest(std::slice::from_ref(&requested)),
+                length_capped: false,
+            }),
         ]);
-        let (handler, store, _dir, _project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(test_route(7), binding(project_root, "token"));
-        handler.bind_route(test_route(8), binding(project_root, scope));
-        store
-            .replace_compartments(scope, &[stored_comp(1, 1, 10, "m10", "SUMMARY")])
-            .unwrap();
-        let memory_id = insert_memory(&store, project_root, "CONSTRAINTS", "original rule", 1);
-
-        let mut boot_req = request(vec![ck("m10", 10, "raw covered")]);
-        boot_req["session_id"] = json!(scope);
-        let boot = call_transform_request_on_channel(&handler, 8, boot_req.clone()).await;
-        assert_eq!(boot["action"], "HARD");
-        assert!(synthetic_text(&boot, 0).contains("original rule"));
-
-        let before = store
-            .max_memory_mutation_id(&[project_root.to_string()])
-            .unwrap();
-        assert!(!tool_is_error(
-            call_facade(
-                &handler,
-                "ctx_memory",
-                json!({ "action": "update", "id": memory_id, "content": "updated rule" }),
-            )
-            .await
-        ));
-        let after = store
-            .max_memory_mutation_id(&[project_root.to_string()])
-            .unwrap();
-        assert!(
-            after > before,
-            "facade update must advance the mutation log"
-        );
-
-        let update_delta = call_transform_request_on_channel(&handler, 8, boot_req.clone()).await;
-        assert_eq!(update_delta["action"], "SOFT");
-        assert!(synthetic_text(&update_delta, 1).contains("<memory-updates>"));
-        assert!(synthetic_text(&update_delta, 1).contains("updated rule"));
-
-        handler.bind_route(
-            test_route(9),
-            binding(additive_project_root, additive_scope),
-        );
-        store
-            .replace_compartments(
-                additive_scope,
-                &[stored_comp(1, 1, 10, "m10", "ADDITIVE-SUMMARY")],
-            )
-            .unwrap();
-        let mut add_req = request(vec![ck("m10", 10, "raw covered")]);
-        add_req["session_id"] = json!(additive_scope);
-        let add_boot = call_transform_request_on_channel(&handler, 9, add_req.clone()).await;
-        assert_eq!(add_boot["action"], "HARD");
-        let add_before = store
-            .max_memory_mutation_id(&[additive_project_root.to_string()])
-            .unwrap();
-        handler.bind_route(
-            test_route(7),
-            binding(additive_project_root, "token-additive"),
-        );
-        let resolver_scope_memory = call_facade(
-            &handler,
-            "ctx_memory",
-            json!({ "action": "write", "category": "CONSTRAINTS", "content": "new additive memory" }),
-        )
-        .await;
-        assert!(!tool_is_error(resolver_scope_memory));
+        let mut payload =
+            claim_native_payload(std::slice::from_ref(&requested), TEST_CLASSIFY_TIMEOUT_MS);
+        payload["model_chain"] = json!(["test/unexpected-claim", "test/exact"]);
+        let (producer, outcome) =
+            dreamer_classify_outcome(&producer, payload, "unexpected-claim").await;
+        let response = match outcome {
+            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("the chain must recover from an unexpected claim: {other:?}"),
+        };
         assert_eq!(
-            store
-                .max_memory_mutation_id(&[additive_project_root.to_string()])
-                .unwrap(),
-            add_before,
-            "additive writes must not append mutation-log rows"
+            response["diagnostics"]["model"],
+            json!("test/exact"),
+            "the over-covering manifest must not be the accepted one"
         );
-        assert!(store
-            .load_active_memories(additive_project_root, now_ms())
-            .unwrap()
-            .iter()
-            .any(|memory| {
-                memory.content == "new additive memory"
-                    && store
-                        .get_memory_full(memory.id)
-                        .unwrap()
-                        .unwrap()
-                        .source_session_id
-                        .as_deref()
-                        == Some(additive_scope)
-            }));
-        let add_delta = call_transform_request_on_channel(&handler, 9, add_req).await;
-        assert_eq!(add_delta["action"], "SOFT");
-        assert!(synthetic_text(&add_delta, 1).contains("<new-memories>"));
-        assert!(synthetic_text(&add_delta, 1).contains("new additive memory"));
+        assert_eq!(
+            response["manifest_text"],
+            json!(claim_manifest(&[requested]))
+        );
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            producer.purges.lock().unwrap().len(),
+            2,
+            "the rejected attempt's session must be purged before advancing"
+        );
+    }
+
+    /// The payload deadline is the only bound relating this handler's work to
+    /// the caller's transport budget, so a payload without one is refused
+    /// before any billable run rather than granted the 21-minute per-model
+    /// ceiling.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dreamer_run_task_requires_a_positive_timeout_ms() {
+        let claims = [test_claim_id(1)];
+        for timeout in [None, Some(json!(0)), Some(json!(-1)), Some(json!("600000"))] {
+            let producer = Arc::new(ProducerState::default());
+            let mut payload = claim_native_payload(&claims, TEST_CLASSIFY_TIMEOUT_MS);
+            match &timeout {
+                None => {
+                    payload
+                        .as_object_mut()
+                        .expect("payload object")
+                        .remove("timeout_ms");
+                }
+                Some(value) => payload["timeout_ms"] = value.clone(),
+            }
+            let (producer, outcome) =
+                dreamer_classify_outcome(&producer, payload, "deadline-required").await;
+            match outcome {
+                PreparedOutcome::Error { code, message } => {
+                    assert_eq!(code, "invalid_params", "timeout {timeout:?}");
+                    assert!(
+                        message.contains("timeout_ms"),
+                        "the failure must name the missing deadline: {message}"
+                    );
+                }
+                other => panic!("expected invalid_params for {timeout:?}, got {other:?}"),
+            }
+            assert_eq!(
+                producer.starts.load(Ordering::SeqCst),
+                0,
+                "a deadline-less payload must never start a run: {timeout:?}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -29061,8 +26432,6 @@ mod tests {
         max_compartment_seq: i64,
         transcript_count: usize,
         max_transcript_seq: i64,
-        fact_count: usize,
-        max_fact_id: i64,
         publication_floor_ordinal: Option<u64>,
     }
 
@@ -29075,8 +26444,7 @@ mod tests {
         let transcripts = store
             .load_chunk_transcripts_for_range(session_id, 0, i64::MAX)
             .unwrap();
-        let project_path = project_path.to_string_lossy().to_string();
-        let facts = store.load_active_memories(&project_path, 0).unwrap();
+        let _ = project_path;
         HistorianAdditiveRows {
             compartment_count: compartments.len(),
             max_compartment_seq: store.max_compartment_seq(session_id).unwrap(),
@@ -29086,8 +26454,6 @@ mod tests {
                 .map(|transcript| transcript.compartment_seq)
                 .max()
                 .unwrap_or(0),
-            fact_count: facts.len(),
-            max_fact_id: store.max_memory_id(&[project_path]).unwrap(),
             publication_floor_ordinal: store
                 .load(session_id)
                 .unwrap()
@@ -30051,87 +27417,6 @@ mod tests {
     }
 
     #[test]
-    fn session_status_summarizes_seeded_store_with_identity_and_durable_age() {
-        let producer = Arc::new(ProducerState::default());
-        let (handler, store, _dir, project) = handler_with_store(producer, default_test_config());
-        let session_id = "ccm-8518e338-extra";
-        handler.bind_route(
-            test_route(7),
-            binding(project.to_str().unwrap(), session_id),
-        );
-        store
-            .commit_state_import(
-                session_id,
-                "status-seed",
-                &[
-                    stored_comp(1, 1, 5, "m5", "first"),
-                    stored_comp(2, 6, 10, "m10", "second"),
-                ],
-                1,
-            )
-            .unwrap();
-        let loaded = store.load(session_id).unwrap();
-        let mut core = loaded.core.clone();
-        core.boundary_id = "m10#0".to_string();
-        let mut meta = loaded.meta.clone();
-        meta.coverage_ordinal = Some(10);
-        meta.cc_u1_active = true;
-        meta.initialized = true;
-        meta.m1_revision = 1;
-        meta.last_committed_pass_at_ms = now_ms() - 125_000;
-        meta.historian.firing_seq = 3;
-        store
-            .commit(session_id, loaded.row_version, &core, &meta)
-            .unwrap();
-        store
-            .append_pending_agent_drops(session_id, &["m8#0".to_string()], 2)
-            .unwrap();
-        store
-            .seed_memory(5, project.to_str().unwrap(), "ARCHITECTURE", "pending", 70)
-            .unwrap();
-        store
-            .seed_tags_for_test(
-                session_id,
-                &[
-                    TagMintInput {
-                        block_id: "m8#0".to_string(),
-                        kind: "message".to_string(),
-                        token_count: 2,
-                        source_bytes: b"eight".to_vec(),
-                    },
-                    TagMintInput {
-                        block_id: "m9#0".to_string(),
-                        kind: "message".to_string(),
-                        token_count: 2,
-                        source_bytes: b"nine".to_vec(),
-                    },
-                ],
-                2,
-            )
-            .unwrap();
-
-        let body = tool_body(handler.handle_session_status_value(
-            test_route(7),
-            &json!({ "method": "session.status", "v": 1, "session_id": session_id }),
-        ));
-        let summary = body["summary"].as_str().unwrap();
-
-        assert!(summary.starts_with("session ccm-8518e338 (last active 2m ago):"));
-        assert!(summary.contains("2 compartments"));
-        assert!(summary.contains("coverage ordinal 10"));
-        assert!(summary.contains("boundary present"));
-        assert!(summary.contains("1 pending drop"));
-        assert!(summary.contains("2 tags"));
-        assert!(summary.contains("pending m1 delta true age_ms=0"));
-        assert!(summary.contains("last historian: published seq 3"));
-        assert_eq!(body["tag_count"], json!(2));
-        assert_eq!(body["pending_m1_delta"], json!(true));
-        assert_eq!(body["pending_m1_age_ms"], json!(0));
-        assert_eq!(body["tail_identity_re_adopt_count"], json!(0));
-        assert!(summary.ends_with("surface active"));
-    }
-
-    #[test]
     fn session_delete_clears_durable_state_for_the_bound_lineage() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, project) = handler_with_store(producer, default_test_config());
@@ -30950,43 +28235,6 @@ mod tests {
             final_end, 2,
             "the geometry-sized snap must retain the user message at ordinal 3: {body}"
         );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn authority_wrapup_publication_promotes_facts_under_the_identity_key() {
-        let producer = Arc::new(ProducerState::default());
-        *producer.next_fact.lock().unwrap() = Some("identity wrapup fact".to_string());
-        let (handler, store, _dir, project) =
-            handler_with_store(Arc::clone(&producer), default_test_config());
-        let route_project_root = project.to_str().unwrap();
-        activate_module_authority(
-            &store,
-            "context",
-            "git:identity",
-            route_project_root,
-            "memories",
-        );
-        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
-
-        let response = tool_body(
-            handler
-                .dispatch_value(
-                    test_route(7),
-                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses" }),
-                )
-                .await,
-        );
-
-        assert_eq!(response["disposition"], json!("completed"), "{response}");
-        assert!(store
-            .load_active_memories("git:identity", 0)
-            .unwrap()
-            .iter()
-            .any(|memory| memory.content == "identity wrapup fact"));
-        assert!(store
-            .load_active_memories(route_project_root, 0)
-            .unwrap()
-            .is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -32257,6 +29505,7 @@ mod tests {
             &baseline_store,
             &expected_request,
             &transform::ProducerContext {
+                claim_lane: None,
                 project_path: &baseline_project_path,
                 note_project_path: &baseline_project_path,
                 project_directory: &baseline_project_path,
@@ -32810,8 +30059,6 @@ mod tests {
                 },
                 project_path: "git:proj",
                 compartments: &[stored_comp(1, 10, 20, "m20", "summary")],
-                facts: &[],
-                promote_facts: false,
                 events: std::slice::from_ref(&event),
                 primer_candidates: &[],
                 user_memory_candidates: &[],
@@ -32999,2001 +30246,6 @@ mod tests {
         assert!(store.load_pass_trace(&session).unwrap().is_none());
         assert!(v.get("historian").is_none());
     }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn trigger_false_no_fire_detail_carries_quantized_numbers() {
-        // Small content: the trigger honestly declines, and the durable discriminant
-        // must carry the measurement (eligible vs bar vs protected N) so a rig can
-        // distinguish "bar uncrossed" from "eligible measuring zero" in one query.
-        let producer = Arc::new(ProducerState::default());
-        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
-        let messages = vec![ck("m1", 1, "small turn")];
-        let _ = call_transform(&handler, messages.clone()).await;
-        let _ = call_transform(&handler, messages).await;
-        let loaded = store.load("ses").unwrap();
-        let detail = loaded
-            .meta
-            .historian
-            .last_no_fire
-            .expect("trigger_false recorded");
-        assert!(
-            detail.starts_with("trigger_false{")
-                && detail.contains("bar~")
-                && detail.contains("ctx_limit="),
-            "detail carries the numbers: {detail}"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn defer_pass_historian_diagnostics_are_byte_pure_and_non_vacuous() {
-        let producer = Arc::new(ProducerState::default());
-        let mut config = default_test_config();
-        config.model_chain.clear();
-        let (handler, store, _dir, _project) = handler_with_store(producer, config);
-        let messages = big_messages();
-
-        let _ = call_transform(&handler, messages.clone()).await;
-        let with_historian = call_transform(&handler, messages.clone()).await;
-        assert_eq!(with_historian["action"], "SOFT+");
-        assert_eq!(with_historian["historian"]["no_fire"], "no_models");
-        assert!(with_historian["historian"]["reason"].is_string());
-        // Progress numbers surface on every boundary-resolving pass so a stalled rig
-        // drive can watch eligible content approach the fire bar.
-        let progress = &with_historian["historian"]["progress"];
-        assert!(progress["tail_size_bar"].as_f64().unwrap() > 0.0);
-        assert!(progress["protected_tail_n_tokens"].as_f64().unwrap() > 0.0);
-        assert!(progress["eligible_chunk_tokens"].is_number());
-
-        let req: TransformRequest = serde_json::from_value(request(messages)).unwrap();
-        let project_path = handler
-            .resolve_binding(test_route(7), "ses")
-            .unwrap()
-            .project_root;
-        let project_path_string = project_path.to_string_lossy().to_string();
-        let response_without_historian = transform::transform(
-            &store,
-            &req,
-            &transform::ProducerContext {
-                project_path: &project_path_string,
-                note_project_path: &project_path_string,
-                project_directory: &project_path_string,
-                history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
-                memory_budget_tokens: 8_000.0,
-                user_profile_budget_tokens: 4_000.0,
-                memory_enabled: true,
-                inject_docs: true,
-                temporal_awareness: true,
-                now_ms: now_ms(),
-                execute_threshold_percentage: 65.0,
-                compaction_enabled: true,
-                smart_drops: false,
-                cache_ttl: "5m".to_string(),
-                cache_ttl_provenance: config::CacheTtlProvenance::Default,
-                model_key: None,
-                observed_last_response_at_ms: None,
-                guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
-                historian_active: false,
-                wrapup_active: false,
-                injected_reductions: Vec::new(),
-            },
-        )
-        .unwrap();
-        let without_value = serde_json::to_value(response_without_historian).unwrap();
-        assert_eq!(with_historian["ck_messages"], without_value["ck_messages"]);
-    }
-
-    fn state_sync_compartment(sequence: i64, content: &str) -> Value {
-        json!({
-            "sequence": sequence,
-            "start_message": sequence,
-            "end_message": sequence,
-            "start_message_id": format!("m{sequence}#0"),
-            "end_message_id": format!("m{sequence}#0"),
-            "title": format!("c{sequence}"),
-            "content": content,
-            "p1": format!("{content}-p1"),
-        })
-    }
-
-    fn paged_seed_batch(
-        session: &str,
-        seed_id: &str,
-        generation: u64,
-        expected_seq: u64,
-        index: usize,
-        total: usize,
-        compartments: Vec<Value>,
-    ) -> Value {
-        let complete = index + 1 == total;
-        let mut batch = json!({
-            "kind": "state_sync",
-            "session_id": session,
-            "shadow_generation": generation,
-            "expected_shadow_seq": expected_seq,
-            "seed_id": seed_id,
-            "seed_generation": generation,
-            "seed_batch_index": index,
-            "seed_batch_total": total,
-            "seed_complete": complete,
-            "compartments": compartments,
-            "memories": [],
-            "memory_mutations": [],
-            "user_profile": [],
-        });
-        if complete {
-            let object = batch.as_object_mut().unwrap();
-            object.insert("seed_boundary_id".to_string(), Value::Null);
-            object.insert("workspace".to_string(), Value::Null);
-            object.insert("last_todo_state".to_string(), json!("[]"));
-            object.insert("acked_watermarks".to_string(), json!({ "complete": true }));
-        }
-        batch
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn paged_transform_page(
-        _method: &str,
-        session: &str,
-        page_id: &str,
-        generation: u64,
-        index: usize,
-        total: usize,
-        complete: bool,
-        messages: Vec<Value>,
-    ) -> Value {
-        let mut page = json!({
-            "method": "transform",
-            "session_id": session,
-            "transform_page_id": page_id,
-            "transform_generation": generation,
-            "transform_page_index": index,
-            "transform_page_total": total,
-            "transform_page_complete": complete,
-            "messages": messages,
-        });
-        if complete {
-            page.as_object_mut().expect("transform page body").extend([
-                ("kind".to_string(), json!("transform")),
-                ("v".to_string(), json!(2)),
-                ("serializer_profile".to_string(), json!("owned-llmrunner")),
-                ("render_config".to_string(), json!("cfg0")),
-                (
-                    "usage".to_string(),
-                    json!({
-                        "current_total_input_tokens": 45_000,
-                        "context_limit_tokens": 50_000,
-                    }),
-                ),
-            ]);
-        }
-        page["transform_page_digest"] = json!(transform_page_content_digest(&page));
-        page
-    }
-
-    #[test]
-    fn transform_page_assembly_matches_golden_fixture() {
-        let first_page = json!({
-            "method": "transform",
-            "session_id": "golden-session",
-            "messages": [
-                {"mid": "m0", "text": "first"},
-                {
-                    (ITEM_CONTINUATION_KEY): {
-                        "field": "messages",
-                        "item_index": 1,
-                        "chunk_index": 0,
-                        "chunk_total": 2
-                    },
-                    "chunk": "{\"mid\":\"m1\",\"text\":\"golden "
-                }
-            ],
-            "native_messages": [{"text": "native first"}],
-            "transform_page_id": "golden-page",
-            "transform_generation": 4,
-            "transform_page_index": 0,
-            "transform_page_total": 2,
-            "transform_page_complete": false,
-            "transform_page_digest": "ignored-first-digest"
-        });
-        let final_page = json!({
-            "method": "transform",
-            "session_id": "golden-session",
-            "messages": [
-                {
-                    (ITEM_CONTINUATION_KEY): {
-                        "field": "messages",
-                        "item_index": 1,
-                        "chunk_index": 1,
-                        "chunk_total": 2
-                    },
-                    "chunk": "fixture\"}"
-                },
-                {"mid": "m2", "text": "last"}
-            ],
-            "native_messages": [{"text": "native last"}],
-            "extra": "preserved",
-            "transform_page_id": "golden-page",
-            "transform_generation": 4,
-            "transform_page_index": 1,
-            "transform_page_total": 2,
-            "transform_page_complete": true,
-            "transform_page_digest": "ignored-final-digest"
-        });
-
-        let assembled = assemble_transform_pages(vec![first_page, final_page]).unwrap();
-        assert_eq!(
-            assembled,
-            json!({
-                "method": "transform",
-                "session_id": "golden-session",
-                "messages": [
-                    {"mid": "m0", "text": "first"},
-                    {"mid": "m1", "text": "golden fixture"},
-                    {"mid": "m2", "text": "last"}
-                ],
-                "native_messages": [
-                    {"text": "native first"},
-                    {"text": "native last"}
-                ],
-                "extra": "preserved"
-            })
-        );
-    }
-
-    #[test]
-    fn transform_request_retained_bytes_tracks_typed_original_and_native_trees() {
-        use std::mem::size_of;
-
-        fn manual_value_retained_bytes(value: &Value) -> usize {
-            fn heap(value: &Value) -> usize {
-                match value {
-                    Value::Null | Value::Bool(_) | Value::Number(_) => 0,
-                    Value::String(value) => value.capacity(),
-                    Value::Array(values) => values
-                        .capacity()
-                        .saturating_mul(size_of::<Value>())
-                        .saturating_add(values.iter().map(heap).sum::<usize>()),
-                    Value::Object(values) => values
-                        .len()
-                        .saturating_mul(
-                            size_of::<String>() + size_of::<Value>() + size_of::<usize>() * 3,
-                        )
-                        .saturating_add(
-                            values
-                                .iter()
-                                .map(|(key, value)| key.capacity().saturating_add(heap(value)))
-                                .sum::<usize>(),
-                        ),
-                }
-            }
-            size_of::<Value>().saturating_add(heap(value))
-        }
-
-        let input = Value::Object(
-            (0..48)
-                .map(|index| {
-                    (
-                        format!("k{index}"),
-                        json!({"flag": index % 2 == 0, "value": format!("v{index}")}),
-                    )
-                })
-                .collect(),
-        );
-        let message = CkIngressMessage {
-            mid: "tool-heavy-mid".to_string(),
-            ordinal: 1,
-            ck: CkWireMessage::from_parts(
-                "assistant",
-                vec![CkWireBlock::bare(CkKind::ToolCall {
-                    id: "call-tool-heavy".to_string(),
-                    name: "fixture_tool".to_string(),
-                    input: input.clone(),
-                    provider_executed: false,
-                })],
-                None,
-                ProviderExtras::new(),
-                HarnessMeta {
-                    harness_id: Some("tool-heavy-mid".to_string()),
-                    ..Default::default()
-                },
-            ),
-        };
-        let mut raw = request(vec![message]);
-        raw["native_messages"] = json!([{
-            "id": "native-tool-heavy",
-            "parts": [{"type": "tool", "input": input}]
-        }]);
-        raw["channel2_delivered_id"] = json!("directive-echo".repeat(100));
-        let wire_bytes = serde_json::to_vec(&raw).unwrap().len();
-        let parsed: TransformRequest = serde_json::from_value(raw).unwrap();
-        let block = &parsed.messages[0].ck.content[0];
-        let block_original = serde_json::to_value(block).unwrap();
-        let message_original = serde_json::to_value(&parsed.messages[0].ck).unwrap();
-        let CkKind::ToolCall {
-            id, name, input, ..
-        } = &block.kind
-        else {
-            panic!("fixture must retain a tool call");
-        };
-        let typed_block_heap = id
-            .capacity()
-            .saturating_add(name.capacity())
-            .saturating_add(manual_value_retained_bytes(input).saturating_sub(size_of::<Value>()));
-        let block_extra =
-            typed_block_heap.saturating_add(manual_value_retained_bytes(&block_original));
-        let ck_tree = size_of::<CkWireMessage>()
-            .saturating_add(parsed.messages[0].ck.role.capacity())
-            .saturating_add(
-                parsed.messages[0]
-                    .ck
-                    .content
-                    .capacity()
-                    .saturating_mul(size_of::<CkWireBlock>()),
-            )
-            .saturating_add(block_extra)
-            .saturating_add(
-                parsed.messages[0]
-                    .ck
-                    .meta
-                    .harness_id
-                    .as_ref()
-                    .map_or(0, String::capacity),
-            )
-            .saturating_add(manual_value_retained_bytes(&message_original));
-        let message_tree = parsed
-            .messages
-            .capacity()
-            .saturating_mul(size_of::<CkIngressMessage>())
-            .saturating_add(parsed.messages[0].mid.capacity())
-            .saturating_add(ck_tree.saturating_sub(size_of::<CkWireMessage>()));
-        let native_tree = parsed.native_messages.as_ref().map_or(0, |messages| {
-            messages
-                .capacity()
-                .saturating_mul(size_of::<Value>())
-                .saturating_add(
-                    messages
-                        .iter()
-                        .map(|message| {
-                            manual_value_retained_bytes(message).saturating_sub(size_of::<Value>())
-                        })
-                        .sum::<usize>(),
-                )
-        });
-        let direct_strings = parsed
-            .kind
-            .capacity()
-            .saturating_add(parsed.serializer_profile.capacity())
-            .saturating_add(parsed.session_id.capacity())
-            .saturating_add(parsed.render_config.capacity())
-            .saturating_add(parsed.system_prompt_hash.capacity())
-            .saturating_add(parsed.upgrade_state.capacity())
-            .saturating_add(parsed.prompt_surface_config_identity.capacity())
-            .saturating_add(parsed.channel2_nudge_state.capacity())
-            .saturating_add(
-                parsed
-                    .channel2_delivered_id
-                    .as_ref()
-                    .map_or(0, String::capacity),
-            )
-            .saturating_add(parsed.prior_conversation_key.capacity());
-        let cache_metadata = size_of::<TransformSnapshot>()
-            .saturating_add(size_of::<usize>() * 3)
-            .saturating_add((size_of::<String>() + parsed.session_id.len()).saturating_mul(2));
-        let expected = size_of::<TransformRequest>()
-            .saturating_add(direct_strings)
-            .saturating_add(message_tree)
-            .saturating_add(native_tree)
-            .saturating_add(crate::retained_size::ARC_ALLOCATION_OVERHEAD_BYTES)
-            .saturating_add(cache_metadata);
-        let retained = parsed.retained_bytes();
-        let delta = retained.abs_diff(expected);
-
-        assert!(
-            retained >= wire_bytes.saturating_mul(2),
-            "legacy wire-length charge was not at least 2x low: retained={retained} wire={wire_bytes}"
-        );
-        assert!(
-            delta <= expected / 10,
-            "retained-size estimate left 10% fixture tolerance: retained={retained} expected={expected}"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn tail_delta_snapshot_charges_expanded_tree_and_evicts_at_budget() {
-        let (handler, _store, _dir, _project) =
-            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
-        let mut full = request(vec![ck("m1", 1, &"history ".repeat(2_000))]);
-        full["full_array_fingerprint"] = json!("fp-full");
-        full["native_messages"] = json!([]);
-        let full_body_bytes = serde_json::to_vec(&full).unwrap().len();
-        let outcome = handler
-            .handle_transform_for_test_with_body_size(test_route(7), full, full_body_bytes)
-            .await;
-        assert!(
-            matches!(outcome, PreparedOutcome::Response(_)),
-            "{outcome:?}"
-        );
-        let full_charge = {
-            let snapshots = handler
-                .transform_snapshots
-                .lock()
-                .expect("transform snapshots mutex");
-            let Some(TransformSnapshot::Ready { retained_bytes, .. }) =
-                snapshots.entries.get("ses")
-            else {
-                panic!("expected retained full transform snapshot");
-            };
-            *retained_bytes
-        };
-
-        let mut first_delta = request(vec![ck("m2", 2, "small tail")]);
-        first_delta["full_array_fingerprint"] = json!("fp-delta-1");
-        first_delta["native_messages"] = json!([]);
-        first_delta["tail_delta"] = json!({
-            "after": "fp-full",
-            "replace_from": 1,
-            "native_replace_from": 0,
-        });
-        let delta_body_bytes = serde_json::to_vec(&first_delta).unwrap().len();
-        let outcome = handler
-            .handle_transform_for_test_with_body_size(test_route(7), first_delta, delta_body_bytes)
-            .await;
-        assert!(
-            matches!(outcome, PreparedOutcome::Response(_)),
-            "{outcome:?}"
-        );
-        let expanded_charge = {
-            let snapshots = handler
-                .transform_snapshots
-                .lock()
-                .expect("transform snapshots mutex");
-            let Some(TransformSnapshot::Ready { retained_bytes, .. }) =
-                snapshots.entries.get("ses")
-            else {
-                panic!("expected retained expanded transform snapshot");
-            };
-            *retained_bytes
-        };
-        assert!(expanded_charge >= full_charge);
-        assert!(expanded_charge >= delta_body_bytes.saturating_mul(2));
-
-        {
-            let mut snapshots = handler
-                .transform_snapshots
-                .lock()
-                .expect("transform snapshots mutex");
-            snapshots.max_ready_bytes = expanded_charge.saturating_sub(1);
-        }
-        let mut second_delta = request(vec![ck("m3", 3, "tiny tail")]);
-        second_delta["full_array_fingerprint"] = json!("fp-delta-2");
-        second_delta["native_messages"] = json!([]);
-        second_delta["tail_delta"] = json!({
-            "after": "fp-delta-1",
-            "replace_from": 2,
-            "native_replace_from": 0,
-        });
-        let second_delta_body_bytes = serde_json::to_vec(&second_delta).unwrap().len();
-        let outcome = handler
-            .handle_transform_for_test_with_body_size(
-                test_route(7),
-                second_delta,
-                second_delta_body_bytes,
-            )
-            .await;
-        assert!(
-            matches!(outcome, PreparedOutcome::Response(_)),
-            "{outcome:?}"
-        );
-        assert!(matches!(
-            handler
-                .transform_snapshots
-                .lock()
-                .expect("transform snapshots mutex")
-                .get("ses"),
-            TransformSnapshotLookup::Missing
-        ));
-    }
-
-    #[allow(dead_code)]
-    fn seed_accounting(handler: &McHandler) -> (usize, usize) {
-        let seeds = handler
-            .state_sync_seeds
-            .lock()
-            .expect("state sync seed mutex");
-        (seeds.total_staged_bytes, seeds.pending_seed_count)
-    }
-
-    #[tokio::test]
-    async fn compartment_state_sync_retries_while_historian_is_firing() {
-        let (handler, store, _dir, _project) =
-            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
-        seed_historian_phase(&store, HistorianPhase::Firing);
-
-        let rejected = handler
-            .dispatch_value(
-                test_route(7),
-                json!({
-                    "kind": "state_sync",
-                    "session_id": "ses",
-                    "shadow_generation": 0,
-                    "expected_shadow_seq": 0,
-                    "compartments": [state_sync_compartment(0, "must wait")],
-                }),
-            )
-            .await;
-        assert_eq!(error_code(rejected), "historian_compartment_sync_busy");
-        assert!(store.load_compartments("ses").unwrap().is_empty());
-        assert_eq!(store.load("ses").unwrap().meta.shadow_seq, 0);
-
-        // Non-compartment state remains safe during the firing; the fence protects only
-        // the rows that could invalidate the producer's compartment snapshot.
-        let metadata_only = handler
-            .dispatch_value(
-                test_route(7),
-                json!({
-                    "kind": "state_sync",
-                    "session_id": "ses",
-                    "shadow_generation": 0,
-                    "expected_shadow_seq": 0,
-                    "last_todo_state": "[]",
-                }),
-            )
-            .await;
-        assert!(matches!(metadata_only, PreparedOutcome::Response(_)));
-        assert_eq!(store.load("ses").unwrap().meta.shadow_seq, 1);
-
-        seed_idle(&store);
-        let retried = handler
-            .dispatch_value(
-                test_route(7),
-                json!({
-                    "kind": "state_sync",
-                    "session_id": "ses",
-                    "shadow_generation": 0,
-                    "expected_shadow_seq": 1,
-                    "compartments": [state_sync_compartment(0, "safe after idle")],
-                }),
-            )
-            .await;
-        assert!(matches!(retried, PreparedOutcome::Response(_)));
-        assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn compartment_state_sync_rechecks_historian_phase_inside_transaction() {
-        let (handler, store, _dir, _project) =
-            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
-        let hook_store = Arc::clone(&store);
-        *handler
-            .state_sync_before_apply_hook
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(move || {
-            seed_historian_phase(&hook_store, HistorianPhase::Firing);
-        }));
-
-        let rejected = handler
-            .dispatch_value(
-                test_route(7),
-                json!({
-                    "kind": "state_sync",
-                    "session_id": "ses",
-                    "shadow_generation": 0,
-                    "expected_shadow_seq": 0,
-                    "compartments": [state_sync_compartment(0, "raced writer")],
-                }),
-            )
-            .await;
-
-        assert_eq!(error_code(rejected), "historian_compartment_sync_busy");
-        assert!(store.load_compartments("ses").unwrap().is_empty());
-        assert_eq!(store.load("ses").unwrap().meta.shadow_seq, 0);
-        assert_eq!(
-            store.load("ses").unwrap().meta.historian.state,
-            HistorianPhase::Firing
-        );
-    }
-
-    #[tokio::test]
-    async fn interleaved_authority_senders_keep_the_seq_fence() {
-        let state = Arc::new(ProducerState::default());
-        let (handler, store, _dir, _project) = handler_with_store(state, default_test_config());
-        let request = || {
-            json!({
-                "kind": "state_sync",
-                "session_id": "ses",
-                "shadow_generation": 0,
-                "expected_shadow_seq": 0,
-                "compartments": [state_sync_compartment(0, "first sender")],
-                "user_profile": [],
-            })
-        };
-
-        let (first, second) = tokio::join!(
-            handler.dispatch_value(test_route(7), request()),
-            handler.dispatch_value(test_route(7), request()),
-        );
-        let outcomes = [first, second];
-        assert_eq!(
-            outcomes
-                .iter()
-                .filter(|outcome| matches!(outcome, PreparedOutcome::Response(_)))
-                .count(),
-            1
-        );
-        let errors = outcomes
-            .into_iter()
-            .filter_map(|outcome| match outcome {
-                PreparedOutcome::Error { code, .. } => Some(code),
-                PreparedOutcome::Response(_) | PreparedOutcome::Streamed => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(errors, vec!["authority_seq_mismatch"]);
-        assert_eq!(store.load("ses").unwrap().meta.shadow_seq, 1);
-    }
-
-    #[tokio::test]
-    async fn authority_state_sync_enforces_resolved_owner_and_preserves_foreign_members() {
-        let (handler, store, _dir, project) =
-            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
-        let route_project_root = project.to_str().unwrap();
-        activate_module_authority(
-            &store,
-            "context",
-            "git:identity",
-            route_project_root,
-            "memories",
-        );
-
-        let mismatched = handler
-            .dispatch_value(
-                test_route(7),
-                json!({
-                    "kind": "state_sync",
-                    "session_id": "ses",
-                    "shadow_generation": 0,
-                    "expected_shadow_seq": 0,
-                    "memories": [{
-                        "id": 1,
-                        "project_path": "tenant:third-key",
-                        "category": "CONSTRAINTS",
-                        "content": "must roll back"
-                    }]
-                }),
-            )
-            .await;
-        assert_eq!(error_code(mismatched), "invalid_params");
-        assert!(store
-            .load_active_memories("tenant:third-key", 0)
-            .unwrap()
-            .is_empty());
-        assert!(store
-            .load_active_memories("git:identity", 0)
-            .unwrap()
-            .is_empty());
-        assert_eq!(store.load("ses").unwrap().meta.shadow_seq, 0);
-
-        let absent = handler
-            .dispatch_value(
-                test_route(7),
-                json!({
-                    "kind": "state_sync",
-                    "session_id": "ses",
-                    "shadow_generation": 0,
-                    "expected_shadow_seq": 0,
-                    "memories": [{
-                        "id": 2,
-                        "category": "CONSTRAINTS",
-                        "content": "resolved owner"
-                    }],
-                    "memory_mutations": [{
-                        "id": 1,
-                        "mutation_type": "update",
-                        "target_memory_id": 2,
-                        "new_content": "resolved owner"
-                    }]
-                }),
-            )
-            .await;
-        assert!(matches!(absent, PreparedOutcome::Response(_)), "{absent:?}");
-        let absent_response = match &absent {
-            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(bytes).unwrap(),
-            PreparedOutcome::Error { .. } | PreparedOutcome::Streamed => Value::Null,
-        };
-        assert_eq!(absent_response["memories_skipped"], json!(true));
-        assert!(store
-            .load_active_memories("git:identity", 0)
-            .unwrap()
-            .is_empty());
-        assert_eq!(
-            store
-                .max_memory_mutation_id(&["git:identity".to_string()])
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            store
-                .max_memory_mutation_id(&[route_project_root.to_string()])
-                .unwrap(),
-            0
-        );
-
-        let workspace = handler
-            .dispatch_value(
-                test_route(7),
-                json!({
-                    "kind": "state_sync",
-                    "session_id": "ses",
-                    "shadow_generation": 0,
-                    "expected_shadow_seq": 1,
-                    "workspace": {
-                        "fingerprint": "workspace-v1",
-                        "members": [
-                            {"project_path": route_project_root, "share_categories": ["CONSTRAINTS"]},
-                            {"project_path": "git:foreign", "share_categories": ["CONSTRAINTS"]}
-                        ]
-                    },
-                    "memories": [
-                        {
-                            "id": 3,
-                            "project_path": route_project_root,
-                            "category": "CONSTRAINTS",
-                            "content": "workspace owner"
-                        },
-                        {
-                            "id": 4,
-                            "project_path": "git:foreign",
-                            "category": "CONSTRAINTS",
-                            "content": "workspace foreign"
-                        }
-                    ]
-                }),
-            )
-            .await;
-        assert!(matches!(workspace, PreparedOutcome::Response(_)));
-        let workspace_response = match &workspace {
-            PreparedOutcome::Response(bytes) => serde_json::from_slice::<Value>(bytes).unwrap(),
-            PreparedOutcome::Error { .. } | PreparedOutcome::Streamed => Value::Null,
-        };
-        assert_eq!(workspace_response["memories_skipped"], json!(true));
-        assert!(store
-            .load_active_memories("git:identity", 0)
-            .unwrap()
-            .is_empty());
-        assert!(store
-            .load_active_memories("git:foreign", 0)
-            .unwrap()
-            .is_empty());
-        assert!(store
-            .load_active_memories(route_project_root, 0)
-            .unwrap()
-            .is_empty());
-    }
-
-    #[tokio::test]
-    async fn state_sync_wire_sections_preserve_absent_rows_and_clear_explicit_empty() {
-        let (handler, store, _dir, project) =
-            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
-        let project_path = project.to_string_lossy().to_string();
-
-        let present = handler
-            .dispatch_value(
-                test_route(7),
-                json!({
-                    "method": "state_sync",
-                    "session_id": "ses",
-                    "shadow_generation": 0,
-                    "expected_shadow_seq": 0,
-                    "workspace": {
-                        "fingerprint": "wire-workspace-v1",
-                        "members": [
-                            {"project_path": project_path.clone(), "share_categories": ["CONSTRAINTS"]},
-                            {"project_path": "foreign", "share_categories": ["CONSTRAINTS"]}
-                        ]
-                    },
-                    "user_profile": ["wire-profile-v1"],
-                    "acked_watermarks": {}
-                }),
-            )
-            .await;
-        assert!(
-            matches!(present, PreparedOutcome::Response(_)),
-            "{present:?}"
-        );
-        let before_absent = store.workspace_fingerprint(&project_path, 0).unwrap();
-
-        let absent = handler
-            .dispatch_value(
-                test_route(7),
-                json!({
-                    "method": "state_sync",
-                    "session_id": "ses",
-                    "shadow_generation": 0,
-                    "expected_shadow_seq": 1,
-                    "acked_watermarks": {}
-                }),
-            )
-            .await;
-        assert!(matches!(absent, PreparedOutcome::Response(_)), "{absent:?}");
-        assert_eq!(
-            store.workspace_fingerprint(&project_path, 0).unwrap(),
-            before_absent,
-            "omitted workspace section must preserve the stored workspace"
-        );
-        let transformed_before_clear = call_transform_request(
-            &handler,
-            request(vec![ck("wire-profile-message", 0, "wire profile input")]),
-        )
-        .await;
-        assert!(m0_text(&transformed_before_clear).contains("wire-profile-v1"));
-
-        let explicit_empty = handler
-            .dispatch_value(
-                test_route(7),
-                json!({
-                    "method": "state_sync",
-                    "session_id": "ses",
-                    "shadow_generation": 0,
-                    "expected_shadow_seq": 2,
-                    "workspace": null,
-                    "user_profile": [],
-                    "acked_watermarks": {}
-                }),
-            )
-            .await;
-        assert!(
-            matches!(explicit_empty, PreparedOutcome::Response(_)),
-            "{explicit_empty:?}"
-        );
-        assert_ne!(
-            store.workspace_fingerprint(&project_path, 0).unwrap(),
-            before_absent
-        );
-        assert_eq!(store.load("ses").unwrap().meta.shadow_seq, 3);
-    }
-
-    #[tokio::test]
-    async fn authority_state_sync_storage_feeds_real_transform_m0() {
-        let state = Arc::new(ProducerState::default());
-        let (handler, store, _dir, project) = handler_with_store(state, default_test_config());
-        let project_path = project.to_string_lossy().to_string();
-        let sync = handler
-            .dispatch_value(
-                test_route(7),
-                json!({
-                    "kind": "state_sync",
-                    "session_id": "ses",
-                    "shadow_generation": 0,
-                    "expected_shadow_seq": 0,
-                    "seed_id": "authority-seed",
-                    "seed_generation": 0,
-                    "seed_batch_index": 0,
-                    "seed_batch_total": 1,
-                    "seed_complete": true,
-                    "seed_boundary_id": "m0#0",
-                    "workspace": null,
-                    "acked_watermarks": {},
-                    "compartments": [state_sync_compartment(0, "authority summary")],
-                    "memories": [{
-                        "id": 42,
-                        "category": "CONSTRAINTS",
-                        "content": "authority memory"
-                    }],
-                    "user_profile": ["authority profile"],
-                    "last_todo_state": "[]"
-                }),
-            )
-            .await;
-        assert!(matches!(sync, PreparedOutcome::Response(_)));
-
-        let response =
-            call_transform_request(&handler, request(vec![ck("m0", 0, "live authority input")]))
-                .await;
-        let m0 = m0_text(&response);
-        assert!(m0.contains("authority summary"), "{m0}");
-        assert!(m0.contains("authority memory"), "{m0}");
-        assert!(m0.contains("authority profile"), "{m0}");
-        assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
-        assert_eq!(
-            store.load_active_memories(&project_path, 0).unwrap()[0].content,
-            "authority memory"
-        );
-    }
-
-    #[tokio::test]
-    async fn disabled_todowrite_clears_cold_start_seed_on_first_bust() {
-        let (handler, store, _dir, _project) =
-            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
-        let state_json =
-            r#"[{"content":"Seeded before disable","status":"in_progress","priority":"high"}]"#;
-        let pair = injection::build_synthetic_todo_pair(state_json).unwrap();
-        let call_id = pair.call_id.clone();
-        let seeded = handler
-            .dispatch_value(
-                test_route(7),
-                json!({
-                    "method": "state_sync",
-                    "session_id": "ses",
-                    "shadow_generation": 0,
-                    "expected_shadow_seq": 0,
-                    "last_todo_state": state_json,
-                    "todo_synthetic_anchor": {
-                        "call_id": call_id,
-                        "message_id": "tail",
-                        "state_json": state_json
-                    },
-                    "acked_watermarks": {}
-                }),
-            )
-            .await;
-        assert!(matches!(seeded, PreparedOutcome::Response(_)), "{seeded:?}");
-        assert!(store.load("ses").unwrap().meta.synthetic_todo.is_some());
-
-        let mut first_request = request(vec![ck("tail", 0, "live tail")]);
-        first_request["todo_tool_present"] = json!(false);
-        let first = call_transform_request(&handler, first_request).await;
-
-        assert!(
-            matches!(first["decision"].as_str(), Some("HARD" | "SOFT+")),
-            "{first}"
-        );
-        assert!(first["ck_messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .flat_map(|message| message["content"].as_array().into_iter().flatten())
-            .all(|block| block["kind"]["name"] != json!("todowrite")));
-        assert!(store.load("ses").unwrap().meta.synthetic_todo.is_none());
-    }
-
-    #[tokio::test]
-    async fn cold_start_state_seed_cannot_rewind_a_materialized_boundary() {
-        let (handler, store, _dir, _project) =
-            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
-        store
-            .replace_compartments(
-                "ses",
-                &[
-                    stored_comp(0, 0, 0, "m0", "older summary"),
-                    stored_comp(1, 1, 1, "m1", "latest summary"),
-                ],
-            )
-            .unwrap();
-        let live = vec![
-            ck("m0", 0, "covered zero"),
-            ck("m1", 1, "covered one"),
-            ck("m2", 2, "live tail"),
-        ];
-
-        let folded = call_transform_request(&handler, request(live.clone())).await;
-        assert_eq!(folded["boundary_id"], json!("m1#0"));
-        assert!(m0_text(&folded).contains("latest summary"));
-        let folded_m0_bytes = m0_text(&folded).into_bytes();
-        assert_eq!(
-            folded["ck_messages"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|message| message["meta"]["synthetic"] != json!(true))
-                .map(|message| message["meta"]["harness_id"].as_str().unwrap())
-                .collect::<Vec<_>>(),
-            vec!["m2"]
-        );
-
-        // A second adapter process force-seeds its stale TypeScript mirror before transforming.
-        // The seed must add compatibility rows without replacing the module's newer fold cursor.
-        let second_seed = handler
-            .dispatch_value(
-                test_route(7),
-                json!({
-                    "kind": "state_sync",
-                    "session_id": "ses",
-                    "shadow_generation": 0,
-                    "expected_shadow_seq": 0,
-                    "seed_boundary_id": "m0#0",
-                    "compartments": [state_sync_compartment(0, "stale mirror summary")],
-                    "acked_watermarks": { "compartment_sequence": 0 }
-                }),
-            )
-            .await;
-        assert!(
-            matches!(second_seed, PreparedOutcome::Response(_)),
-            "{second_seed:?}"
-        );
-
-        assert_eq!(
-            store.load_compartments("ses").unwrap()[0].content,
-            "older summary"
-        );
-        let after_restart = call_transform_request(&handler, request(live.clone())).await;
-        assert_eq!(after_restart["decision"], json!("SOFT+"));
-        assert_eq!(after_restart["boundary_id"], json!("m1#0"));
-        assert!(m0_text(&after_restart).contains("latest summary"));
-        assert_eq!(
-            after_restart["ck_messages"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|message| message["meta"]["synthetic"] != json!(true))
-                .map(|message| message["meta"]["harness_id"].as_str().unwrap())
-                .collect::<Vec<_>>(),
-            vec!["m2"],
-            "the stale seed must not reclassify already-folded messages as live tail"
-        );
-
-        let mut next_hard_request = request(live);
-        next_hard_request["render_config"] = json!("cfg1");
-        let next_hard = call_transform_request(&handler, next_hard_request).await;
-        assert_eq!(next_hard["decision"], json!("HARD"));
-        assert_eq!(m0_text(&next_hard).as_bytes(), folded_m0_bytes);
-    }
-
-    #[tokio::test]
-    async fn bootstrap_seed_initializes_before_a_second_force_seed() {
-        let (handler, store, _dir, _project) =
-            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
-
-        let first_seed = handler
-            .dispatch_value(
-                test_route(7),
-                json!({
-                    "kind": "state_sync",
-                    "session_id": "ses",
-                    "shadow_generation": 0,
-                    "expected_shadow_seq": 0,
-                    "seed_boundary_id": "m1#0",
-                    "compartments": [
-                        state_sync_compartment(0, "first zero"),
-                        state_sync_compartment(1, "first one"),
-                    ],
-                }),
-            )
-            .await;
-        assert!(matches!(first_seed, PreparedOutcome::Response(_)));
-        let adopted = store.load("ses").unwrap();
-        assert!(adopted.meta.initialized);
-        assert_eq!(adopted.core.boundary_id, "m1#0");
-
-        let second_seed = handler
-            .dispatch_value(
-                test_route(7),
-                json!({
-                    "kind": "state_sync",
-                    "session_id": "ses",
-                    "shadow_generation": 0,
-                    "expected_shadow_seq": 1,
-                    "seed_boundary_id": "m0#0",
-                    "compartments": [state_sync_compartment(0, "second divergent zero")],
-                }),
-            )
-            .await;
-        assert!(matches!(second_seed, PreparedOutcome::Response(_)));
-
-        let retained = store.load("ses").unwrap();
-        assert!(retained.meta.initialized);
-        assert_eq!(retained.meta.shadow_seq, 2);
-        assert_eq!(retained.core.boundary_id, "m1#0");
-        assert_eq!(
-            store.load_compartments("ses").unwrap()[0].content,
-            "first zero"
-        );
-    }
-
-    #[tokio::test]
-    async fn paged_authority_transform_charges_reassembled_request_tree() {
-        let state = Arc::new(ProducerState::default());
-        let (handler, _store, _dir, _project) = handler_with_store(state, default_test_config());
-        let first = paged_transform_page(
-            "transform",
-            "ses",
-            "authority-page",
-            0,
-            0,
-            2,
-            false,
-            vec![json!({
-                "mid": "m0",
-                "ordinal": 0,
-                "ck": ck("m0", 0, "authority first").ck,
-            })],
-        );
-        let final_page = paged_transform_page(
-            "transform",
-            "ses",
-            "authority-page",
-            0,
-            1,
-            2,
-            true,
-            vec![json!({
-                "mid": "m1",
-                "ordinal": 1,
-                "ck": ck("m1", 1, "authority final").ck,
-            })],
-        );
-        let mut first = first;
-        first["native_messages"] = json!([{ "text": "a".repeat(280 * 1024) }]);
-        first["transform_page_digest"] = json!(transform_page_content_digest(&first));
-        let mut final_page = final_page;
-        final_page["native_messages"] = json!([{ "text": "b".repeat(280 * 1024) }]);
-        final_page["transform_page_digest"] = json!(transform_page_content_digest(&final_page));
-        let inbound_bytes = serde_json::to_vec(&first).unwrap().len()
-            + serde_json::to_vec(&final_page).unwrap().len();
-
-        let first_ack = handler.dispatch_value(test_route(7), first).await;
-        assert!(matches!(first_ack, PreparedOutcome::Response(_)));
-        let response = handler.dispatch_value(test_route(7), final_page).await;
-        let PreparedOutcome::Response(bytes) = response else {
-            panic!("authority page assembly should execute: {response:?}");
-        };
-        let response: Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(response["action"].is_string(), "{response}");
-
-        let snapshots = handler
-            .transform_snapshots
-            .lock()
-            .expect("transform snapshots mutex");
-        let Some(TransformSnapshot::Ready {
-            request,
-            retained_bytes,
-            ..
-        }) = snapshots.entries.get("ses")
-        else {
-            panic!("expected retained transform snapshot");
-        };
-        assert_eq!(*retained_bytes, request.retained_bytes());
-        assert!(
-            *retained_bytes > inbound_bytes,
-            "paged snapshot must charge its parsed request tree, not staged wire length"
-        );
-    }
-
-    #[tokio::test]
-    async fn paged_authority_tail_delta_reassembles_before_full_sync_gate() {
-        let state = Arc::new(ProducerState::default());
-        let (handler, _store, _dir, _project) = handler_with_store(state, default_test_config());
-        let mut initial = request(vec![ck("m0", 0, "acknowledged prefix")]);
-        initial["full_array_fingerprint"] = json!("fp-prefix");
-        initial["native_messages"] = json!([]);
-        let initial_response = call_transform_request(&handler, initial).await;
-        assert_eq!(initial_response["status"], "ok");
-
-        let mut first = paged_transform_page(
-            "transform",
-            "ses",
-            "paged-tail-delta",
-            0,
-            0,
-            2,
-            false,
-            vec![serde_json::to_value(ck("m1", 1, "delta first")).unwrap()],
-        );
-        first["native_messages"] = json!([{ "text": "a".repeat(280 * 1024) }]);
-        first["transform_page_digest"] = json!(transform_page_content_digest(&first));
-
-        let mut final_page = paged_transform_page(
-            "transform",
-            "ses",
-            "paged-tail-delta",
-            0,
-            1,
-            2,
-            true,
-            vec![serde_json::to_value(ck("m2", 2, "delta final")).unwrap()],
-        );
-        final_page["native_messages"] = json!([{ "text": "b".repeat(280 * 1024) }]);
-        final_page["full_array_fingerprint"] = json!("fp-delta");
-        final_page["tail_delta"] = json!({
-            "after": "fp-prefix",
-            "replace_from": 1,
-            "native_replace_from": 0,
-        });
-        final_page["transform_page_digest"] = json!(transform_page_content_digest(&final_page));
-        assert!(
-            serde_json::to_vec(&first).unwrap().len()
-                + serde_json::to_vec(&final_page).unwrap().len()
-                > TRANSFORM_PAGE_MAX_BYTES
-        );
-
-        let first_ack = handler.dispatch_value(test_route(7), first).await;
-        let PreparedOutcome::Response(first_ack) = first_ack else {
-            panic!("first delta page should stage: {first_ack:?}");
-        };
-        let first_ack: Value = serde_json::from_slice(&first_ack).unwrap();
-        assert_eq!(first_ack["staged"], true);
-        assert_eq!(first_ack["next_expected_index"], 1);
-
-        let response = handler.dispatch_value(test_route(7), final_page).await;
-        let PreparedOutcome::Response(response) = response else {
-            panic!("reassembled tail delta should execute: {response:?}");
-        };
-        let response: Value = serde_json::from_slice(&response).unwrap();
-        assert_eq!(response["status"], "ok", "{response}");
-        assert_eq!(response["full_array_fingerprint"], "fp-delta");
-        assert!(response["ck_messages"].is_array());
-        let reconstructed = handler
-            .transform_snapshots
-            .lock()
-            .expect("transform snapshots mutex")
-            .ready_request_clone("ses")
-            .expect("reassembled delta snapshot");
-        assert_eq!(reconstructed.messages.len(), 3);
-        assert!(reconstructed.tail_delta.is_none());
-    }
-
-    #[tokio::test]
-    async fn paged_authority_transform_rejections_discard_partial_assembly() {
-        let state = Arc::new(ProducerState::default());
-        let (handler, _store, _dir, _project) = handler_with_store(state, default_test_config());
-
-        let first = paged_transform_page(
-            "transform",
-            "ses",
-            "order-page",
-            0,
-            0,
-            3,
-            false,
-            vec![json!({
-                "mid": "m0",
-                "ordinal": 0,
-                "ck": ck("m0", 0, "first").ck,
-            })],
-        );
-        assert!(matches!(
-            handler.dispatch_value(test_route(7), first).await,
-            PreparedOutcome::Response(_)
-        ));
-        let newer = paged_transform_page(
-            "transform",
-            "ses",
-            "newer-page",
-            0,
-            0,
-            2,
-            false,
-            vec![json!({
-                "mid": "newer-m0",
-                "ordinal": 0,
-                "ck": ck("newer-m0", 0, "newer").ck,
-            })],
-        );
-        assert_eq!(
-            error_code(handler.dispatch_value(test_route(7), newer).await),
-            "authority_transform_page_attempt_mismatch"
-        );
-        let retry_first = paged_transform_page(
-            "transform",
-            "ses",
-            "order-page",
-            0,
-            0,
-            3,
-            false,
-            vec![json!({
-                "mid": "m0",
-                "ordinal": 0,
-                "ck": ck("m0", 0, "first").ck,
-            })],
-        );
-        assert!(matches!(
-            handler.dispatch_value(test_route(7), retry_first).await,
-            PreparedOutcome::Response(_)
-        ));
-        let gap = paged_transform_page(
-            "transform",
-            "ses",
-            "order-page",
-            0,
-            2,
-            3,
-            true,
-            vec![json!({
-                "mid": "m2",
-                "ordinal": 2,
-                "ck": ck("m2", 2, "gap").ck,
-            })],
-        );
-        assert_eq!(
-            error_code(handler.dispatch_value(test_route(7), gap).await),
-            "authority_transform_page_order_mismatch"
-        );
-
-        let replacement = paged_transform_page(
-            "transform",
-            "ses",
-            "replacement-page",
-            0,
-            0,
-            1,
-            true,
-            vec![json!({
-                "mid": "m0",
-                "ordinal": 0,
-                "ck": ck("m0", 0, "replacement").ck,
-            })],
-        );
-        assert!(matches!(
-            handler.dispatch_value(test_route(7), replacement).await,
-            PreparedOutcome::Response(_)
-        ));
-
-        let digest_first = paged_transform_page(
-            "transform",
-            "ses",
-            "digest-page",
-            0,
-            0,
-            2,
-            false,
-            vec![json!({
-                "mid": "m0",
-                "ordinal": 0,
-                "ck": ck("m0", 0, "digest-first").ck,
-            })],
-        );
-        assert!(matches!(
-            handler.dispatch_value(test_route(7), digest_first).await,
-            PreparedOutcome::Response(_)
-        ));
-        let mut changed_final = paged_transform_page(
-            "transform",
-            "ses",
-            "digest-page",
-            0,
-            1,
-            2,
-            true,
-            vec![json!({
-                "mid": "m1",
-                "ordinal": 1,
-                "ck": ck("m1", 1, "original-final").ck,
-            })],
-        );
-        changed_final["messages"] = json!([{
-            "mid": "m1",
-            "ordinal": 1,
-            "ck": ck("m1", 1, "changed-final").ck,
-        }]);
-        assert_eq!(
-            error_code(handler.dispatch_value(test_route(7), changed_final).await),
-            "authority_transform_page_digest_mismatch"
-        );
-
-        let generation_first = paged_transform_page(
-            "transform",
-            "ses",
-            "generation-page",
-            1,
-            0,
-            2,
-            false,
-            vec![json!({
-                "mid": "m0",
-                "ordinal": 0,
-                "ck": ck("m0", 0, "generation-first").ck,
-            })],
-        );
-        assert!(matches!(
-            handler
-                .dispatch_value(test_route(7), generation_first)
-                .await,
-            PreparedOutcome::Response(_)
-        ));
-        let generation_changed = paged_transform_page(
-            "transform",
-            "ses",
-            "generation-page",
-            2,
-            1,
-            2,
-            true,
-            vec![json!({
-                "mid": "m1",
-                "ordinal": 1,
-                "ck": ck("m1", 1, "generation-final").ck,
-            })],
-        );
-        assert_eq!(
-            error_code(
-                handler
-                    .dispatch_value(test_route(7), generation_changed)
-                    .await
-            ),
-            "authority_transform_page_attempt_mismatch"
-        );
-
-        let partial_envelope = json!({
-            "method": "transform",
-            "session_id": "ses",
-            "transform_page_id": "partial",
-        });
-        assert_eq!(
-            error_code(
-                handler
-                    .dispatch_value(test_route(7), partial_envelope)
-                    .await
-            ),
-            "invalid_params"
-        );
-    }
-
-    #[tokio::test]
-    async fn paged_transform_sessions_are_isolated() {
-        let state = Arc::new(ProducerState::default());
-        let (handler, _store, _dir, project) = handler_with_store(state, default_test_config());
-        handler.bind_route(
-            test_route(8),
-            binding(project.to_str().unwrap(), "authority-a"),
-        );
-        handler.bind_route(
-            test_route(9),
-            binding(project.to_str().unwrap(), "authority-b"),
-        );
-
-        for (channel, session, mid, text) in [
-            (8, "authority-a", "a0", "authority a"),
-            (9, "authority-b", "b0", "authority b"),
-        ] {
-            let first = paged_transform_page(
-                "transform",
-                session,
-                &format!("page-{session}"),
-                0,
-                0,
-                2,
-                false,
-                vec![json!({
-                    "mid": mid,
-                    "ordinal": 0,
-                    "ck": ck(mid, 0, text).ck,
-                })],
-            );
-            assert!(matches!(
-                handler.dispatch_value(test_route(channel), first).await,
-                PreparedOutcome::Response(_)
-            ));
-        }
-        for (channel, session, mid, text) in [
-            (8, "authority-a", "a1", "authority a final"),
-            (9, "authority-b", "b1", "authority b final"),
-        ] {
-            let final_page = paged_transform_page(
-                "transform",
-                session,
-                &format!("page-{session}"),
-                0,
-                1,
-                2,
-                true,
-                vec![json!({
-                    "mid": mid,
-                    "ordinal": 1,
-                    "ck": ck(mid, 1, text).ck,
-                })],
-            );
-            let response = handler
-                .dispatch_value(test_route(channel), final_page)
-                .await;
-            assert!(matches!(response, PreparedOutcome::Response(_)));
-        }
-    }
-
-    #[tokio::test]
-    async fn route_discard_logs_partial_transform_pages_and_allows_a_fresh_series() {
-        let state = Arc::new(ProducerState::default());
-        let (handler, _store, _dir, project) = handler_with_store(state, default_test_config());
-        let project_root = project.to_str().expect("test project path");
-        let first = paged_transform_page(
-            "transform",
-            "ses",
-            "discarded-series",
-            0,
-            0,
-            2,
-            false,
-            vec![serde_json::to_value(ck("discarded-m0", 0, "discarded first")).unwrap()],
-        );
-        assert!(matches!(
-            handler.dispatch_value(test_route(7), first).await,
-            PreparedOutcome::Response(_)
-        ));
-
-        handler.bind_route(test_route(7), binding(project_root, "replacement"));
-        let discard_logs = handler
-            .transform_page_discard_logs
-            .lock()
-            .expect("transform page discard logs mutex")
-            .clone();
-        assert_eq!(
-            discard_logs,
-            vec![
-                "transform_page_collection_discarded session=ses staged_pages=1 trigger=route_replaced"
-                    .to_string()
-            ]
-        );
-
-        handler.bind_route(test_route(7), binding(project_root, "ses"));
-        let fresh_first = paged_transform_page(
-            "transform",
-            "ses",
-            "fresh-series",
-            0,
-            0,
-            2,
-            false,
-            vec![serde_json::to_value(ck("fresh-m0", 0, "fresh first")).unwrap()],
-        );
-        assert!(matches!(
-            handler.dispatch_value(test_route(7), fresh_first).await,
-            PreparedOutcome::Response(_)
-        ));
-        let fresh_final = paged_transform_page(
-            "transform",
-            "ses",
-            "fresh-series",
-            0,
-            1,
-            2,
-            true,
-            vec![serde_json::to_value(ck("fresh-m1", 1, "fresh final")).unwrap()],
-        );
-        assert!(matches!(
-            handler.dispatch_value(test_route(7), fresh_final).await,
-            PreparedOutcome::Response(_)
-        ));
-
-        handler.unbind_route(test_route(7));
-        assert_eq!(
-            handler
-                .transform_page_discard_logs
-                .lock()
-                .expect("transform page discard logs mutex")
-                .len(),
-            1,
-            "route teardown must not log when no transform pages were staged"
-        );
-
-        handler.bind_route(test_route(7), binding(project_root, "ses"));
-        let teardown_first = paged_transform_page(
-            "transform",
-            "ses",
-            "teardown-series",
-            0,
-            0,
-            2,
-            false,
-            vec![serde_json::to_value(ck("teardown-m0", 0, "teardown first")).unwrap()],
-        );
-        assert!(matches!(
-            handler.dispatch_value(test_route(7), teardown_first).await,
-            PreparedOutcome::Response(_)
-        ));
-        handler.unbind_route(test_route(7));
-        assert_eq!(
-            handler
-                .transform_page_discard_logs
-                .lock()
-                .expect("transform page discard logs mutex")
-                .as_slice(),
-            [
-                "transform_page_collection_discarded session=ses staged_pages=1 trigger=route_replaced",
-                "transform_page_collection_discarded session=ses staged_pages=1 trigger=route_teardown",
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn paged_state_sync_seed_replaces_stale_collector_after_lost_ack() {
-        let state = Arc::new(ProducerState::default());
-        let (handler, store, _dir, _project) = handler_with_store(state, default_test_config());
-        let session = "ses";
-
-        let mut old_first = paged_seed_batch(session, "lost-ack", 0, 0, 0, 3, vec![]);
-        old_first["user_profile"] = json!(["old first"]);
-        let mut old_second = paged_seed_batch(session, "lost-ack", 0, 0, 1, 3, vec![]);
-        old_second["user_profile"] = json!(["old second"]);
-        assert_eq!(
-            call_dispatch_request(&handler, old_first).await["next_expected_index"],
-            json!(1)
-        );
-        assert_eq!(
-            call_dispatch_request(&handler, old_second).await["next_expected_index"],
-            json!(2)
-        );
-
-        let mut replacement_first = paged_seed_batch(session, "replacement", 0, 0, 0, 3, vec![]);
-        replacement_first["user_profile"] = json!(["new first"]);
-        let replacement_first_bytes = serde_json::to_vec(&replacement_first).unwrap().len();
-        assert_eq!(
-            call_dispatch_request(&handler, replacement_first).await["next_expected_index"],
-            json!(1)
-        );
-        assert_eq!(seed_accounting(&handler).0, replacement_first_bytes);
-
-        let mut replacement_second = paged_seed_batch(session, "replacement", 0, 0, 1, 3, vec![]);
-        replacement_second["user_profile"] = json!(["new second"]);
-        let mut replacement_final = paged_seed_batch(session, "replacement", 0, 0, 2, 3, vec![]);
-        replacement_final["user_profile"] = json!(["new final"]);
-        assert_eq!(
-            call_dispatch_request(&handler, replacement_second).await["next_expected_index"],
-            json!(2)
-        );
-        let completed = call_dispatch_request(&handler, replacement_final).await;
-
-        assert_eq!(completed["shadow_seq"], json!(1));
-        assert_eq!(
-            store.load_active_user_memories().unwrap(),
-            vec!["new first", "new second", "new final"]
-        );
-        assert_eq!(seed_accounting(&handler), (0, 0));
-    }
-
-    #[tokio::test]
-    async fn paged_state_sync_seed_eviction_releases_lost_sender_bytes() {
-        let state = Arc::new(ProducerState::default());
-        let (handler, store, _dir, project) = handler_with_store(state, default_test_config());
-        let initial_now = Instant::now();
-        *handler
-            .state_sync_seed_now
-            .lock()
-            .expect("state sync seed clock mutex") = Some(initial_now);
-
-        handler.bind_route(test_route(8), binding(project.to_str().unwrap(), "dead"));
-        handler.bind_route(test_route(9), binding(project.to_str().unwrap(), "live"));
-        let dead_first = paged_seed_batch("dead", "lost", 0, 0, 0, 2, vec![]);
-        let dead_bytes = serde_json::to_vec(&dead_first).unwrap().len();
-        assert_eq!(
-            match handler.dispatch_value(test_route(8), dead_first).await {
-                PreparedOutcome::Response(bytes) =>
-                    serde_json::from_slice::<Value>(&bytes).unwrap(),
-                other => panic!("unexpected handler outcome: {other:?}"),
-            }["next_expected_index"],
-            json!(1)
-        );
-        assert_eq!(seed_accounting(&handler), (dead_bytes, 0));
-
-        *handler
-            .state_sync_seed_now
-            .lock()
-            .expect("state sync seed clock mutex") =
-            Some(initial_now + STATE_SYNC_SEED_COLLECTOR_TTL + Duration::from_secs(1));
-        let live_first = paged_seed_batch("live", "active", 0, 0, 0, 2, vec![]);
-        let live_bytes = serde_json::to_vec(&live_first).unwrap().len();
-        assert_eq!(
-            match handler.dispatch_value(test_route(9), live_first).await {
-                PreparedOutcome::Response(bytes) =>
-                    serde_json::from_slice::<Value>(&bytes).unwrap(),
-                other => panic!("unexpected handler outcome: {other:?}"),
-            }["next_expected_index"],
-            json!(1)
-        );
-        assert_eq!(seed_accounting(&handler), (live_bytes, 0));
-
-        let live_final = paged_seed_batch("live", "active", 0, 0, 1, 2, vec![]);
-        assert_eq!(
-            match handler.dispatch_value(test_route(9), live_final).await {
-                PreparedOutcome::Response(bytes) =>
-                    serde_json::from_slice::<Value>(&bytes).unwrap(),
-                other => panic!("unexpected handler outcome: {other:?}"),
-            }["ok"],
-            json!(true)
-        );
-        assert_eq!(seed_accounting(&handler), (0, 0));
-
-        let fresh_dead = paged_seed_batch("dead", "fresh", 0, 0, 0, 2, vec![]);
-        let fresh_dead_bytes = serde_json::to_vec(&fresh_dead).unwrap().len();
-        assert_eq!(
-            match handler.dispatch_value(test_route(8), fresh_dead).await {
-                PreparedOutcome::Response(bytes) =>
-                    serde_json::from_slice::<Value>(&bytes).unwrap(),
-                other => panic!("unexpected handler outcome: {other:?}"),
-            }["next_expected_index"],
-            json!(1)
-        );
-        assert_eq!(seed_accounting(&handler), (fresh_dead_bytes, 0));
-        assert_eq!(
-            store.load_active_user_memories().unwrap(),
-            Vec::<String>::new()
-        );
-    }
-
-    #[tokio::test]
-    async fn paged_state_sync_seed_full_retry_replaces_later_batch_timeout() {
-        let state = Arc::new(ProducerState::default());
-        let (handler, store, _dir, _project) = handler_with_store(state, default_test_config());
-        let session = "ses";
-
-        let mut interrupted = paged_seed_batch(session, "timed-out", 0, 0, 0, 3, vec![]);
-        interrupted["user_profile"] = json!(["interrupted"]);
-        assert_eq!(
-            call_dispatch_request(&handler, interrupted).await["next_expected_index"],
-            json!(1)
-        );
-
-        let mut retry_first = paged_seed_batch(session, "full-retry", 0, 0, 0, 2, vec![]);
-        retry_first["user_profile"] = json!(["retry first"]);
-        let mut retry_final = paged_seed_batch(session, "full-retry", 0, 0, 1, 2, vec![]);
-        retry_final["user_profile"] = json!(["retry final"]);
-        assert_eq!(
-            call_dispatch_request(&handler, retry_first).await["next_expected_index"],
-            json!(1)
-        );
-        let completed = call_dispatch_request(&handler, retry_final).await;
-
-        assert_eq!(completed["shadow_seq"], json!(1));
-        assert_eq!(
-            store.load_active_user_memories().unwrap(),
-            vec!["retry first", "retry final"]
-        );
-        assert_eq!(seed_accounting(&handler), (0, 0));
-    }
-
-    #[tokio::test]
-    async fn paged_state_sync_seed_midstream_crossover_still_errors() {
-        let state = Arc::new(ProducerState::default());
-        let (handler, _store, _dir, _project) = handler_with_store(state, default_test_config());
-        let session = "ses";
-
-        let first = paged_seed_batch(session, "active", 0, 0, 0, 4, vec![]);
-        assert_eq!(
-            call_dispatch_request(&handler, first).await["next_expected_index"],
-            json!(1)
-        );
-        let foreign_midstream = paged_seed_batch(session, "foreign", 0, 0, 3, 4, vec![]);
-
-        assert_eq!(
-            error_code(
-                handler
-                    .dispatch_value(test_route(7), foreign_midstream)
-                    .await
-            ),
-            "state_sync_seed_attempt_mismatch"
-        );
-        assert_eq!(seed_accounting(&handler), (0, 0));
-    }
-
-    #[tokio::test]
-    async fn paged_state_sync_seed_completed_result_cache_is_unchanged() {
-        let state = Arc::new(ProducerState::default());
-        let (handler, store, _dir, _project) = handler_with_store(state, default_test_config());
-        let session = "ses";
-
-        let first = paged_seed_batch(session, "cached", 0, 0, 0, 2, vec![]);
-        let final_batch = paged_seed_batch(session, "cached", 0, 0, 1, 2, vec![]);
-        assert_eq!(
-            call_dispatch_request(&handler, first).await["next_expected_index"],
-            json!(1)
-        );
-        let completed = call_dispatch_request(&handler, final_batch.clone()).await;
-        let redriven = call_dispatch_request(&handler, final_batch).await;
-
-        assert_eq!(redriven, completed);
-        assert_eq!(store.load(session).unwrap().meta.shadow_seq, 1);
-        assert_eq!(seed_accounting(&handler), (0, 0));
-    }
-
-    #[tokio::test]
-    async fn paged_state_sync_seed_profiles_reach_store_and_module_m0() {
-        let state = Arc::new(ProducerState::default());
-        let (handler, store, _dir, project) = handler_with_store(state, default_test_config());
-        let session = "paged-profile";
-        handler.bind_route(test_route(8), binding(project.to_str().unwrap(), session));
-
-        let mut first = paged_seed_batch(session, "profile-seed", 0, 0, 0, 3, vec![]);
-        first["user_profile"] = json!(["prefers root cause"]);
-        let mut second = paged_seed_batch(
-            session,
-            "profile-seed",
-            0,
-            0,
-            1,
-            3,
-            vec![state_sync_compartment(0, "first compartment")],
-        );
-        second["user_profile"] = json!(["x < y & z"]);
-        let final_batch = paged_seed_batch(session, "profile-seed", 0, 0, 2, 3, vec![]);
-
-        assert!(matches!(
-            handler.dispatch_value(test_route(8), first).await,
-            PreparedOutcome::Response(_)
-        ));
-        assert!(store.load_active_user_memories().unwrap().is_empty());
-        assert!(matches!(
-            handler.dispatch_value(test_route(8), second).await,
-            PreparedOutcome::Response(_)
-        ));
-        assert!(store.load_active_user_memories().unwrap().is_empty());
-        assert!(matches!(
-            handler.dispatch_value(test_route(8), final_batch).await,
-            PreparedOutcome::Response(_)
-        ));
-
-        let profile = store.load_active_user_memories().unwrap();
-        assert_eq!(profile, vec!["prefers root cause", "x < y & z"]);
-        let composed = crate::m0_compose::compose_m0_from_store(
-            &store,
-            &crate::m0_compose::M0ComposeInputs {
-                session_id: session,
-                project_path: session,
-                project_directory: project.to_str().unwrap(),
-                now_ms: 0,
-                history_budget_tokens: 60_000.0,
-                covered_system_messages: &[],
-                memory_enabled: true,
-                memory_budget_tokens: 8_000.0,
-                user_profile_budget_tokens: 4_000.0,
-                inject_docs: true,
-                temporal_awareness: true,
-                mural: None,
-            },
-            |_| 0,
-        )
-        .unwrap();
-        assert_eq!(
-            composed.m0_bytes,
-            "<user-profile>\n- prefers root cause\n- x &lt; y &amp; z\n</user-profile>\n\n<session-history>\n## 0-0 · c0\nfirst compartment-p1\n</session-history>"
-        );
-    }
-    fn publish_ctx_expand_fixture(
-        store: &McStore,
-        session_id: &str,
-        project_path: &str,
-        messages: &[CkIngressMessage],
-    ) {
-        let start = i64::try_from(messages.first().expect("fixture messages").ordinal).unwrap();
-        let end = i64::try_from(messages.last().expect("fixture messages").ordinal).unwrap();
-        let selected_range_identities = messages
-            .iter()
-            .map(|message| mc_store::HistorianSelectedMessageIdentity {
-                mid: message.mid.clone(),
-                block_identities: vec![mc_store::BlockIdentity {
-                    kind_tag: "text".to_string(),
-                    byte_fingerprint: format!("{}-identity", message.mid),
-                }],
-            })
-            .collect::<Vec<_>>();
-        let meta = ModuleMeta {
-            block_identity_by_mid: selected_range_identities
-                .iter()
-                .map(|identity| (identity.mid.clone(), identity.block_identities.clone()))
-                .collect(),
-            historian: HistorianDurableState {
-                state: HistorianPhase::Publishing,
-                firing_seq: 1,
-                chunk_range: Some(HistorianChunkRange {
-                    from_ordinal: start as u64,
-                    to_ordinal: end as u64,
-                }),
-                chunk_fingerprint: "ctx-expand-fixture".to_string(),
-                selected_range_identities: selected_range_identities.clone(),
-                producer_session_id: Some("ctx-expand-producer".to_string()),
-                producer_run_id: Some("ctx-expand-run".to_string()),
-                producer_harness: None,
-                fired_at_ms: Some(1),
-                expected_revert_epoch: 0,
-                compartment_set_generation: mc_store::CompartmentSetGeneration::default(),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        store
-            .commit(session_id, None, &CoreState::default(), &meta)
-            .unwrap();
-        let raw_messages = serde_json::to_string(messages).unwrap();
-        let predicate = mc_store::HistorianPublishPredicate {
-            firing_seq: 1,
-            producer_run_id: "ctx-expand-run".to_string(),
-            chunk_fingerprint: "ctx-expand-fixture".to_string(),
-            selected_range_identities,
-            compartment_set_generation: mc_store::CompartmentSetGeneration::default(),
-        };
-        store
-            .publish_historian_chunk(mc_store::HistorianPublishRequest {
-                session_id,
-                expected_row_version: store.load(session_id).unwrap().row_version,
-                expected_revert_epoch: 0,
-                predicate: &predicate,
-                project_path,
-                compartments: &[stored_comp(
-                    1,
-                    start,
-                    end,
-                    &format!("{}#0", messages.last().unwrap().mid),
-                    "condensed fixture",
-                )],
-                facts: &[],
-                promote_facts: false,
-                events: &[],
-                primer_candidates: &[],
-                user_memory_candidates: &[],
-                publication_floor_ordinal: end as u64,
-                chunk_transcript: Some(&format!("[{start}-{end}] U: condensed fixture")),
-                raw_chunk_messages: Some(&raw_messages),
-            })
-            .unwrap();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn ctx_expand_uses_durable_raw_messages_for_exact_ranges_and_snapshot_loss() {
-        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
-        let (handler, store, _dir, project) = handler_with_store_and_resolver(
-            Arc::new(ProducerState::default()),
-            default_test_config(),
-            resolver,
-        );
-        let full_tool_output = "durable full tool output\n".repeat(20_000);
-        let mut messages = (1..=100)
-            .map(|ordinal| {
-                ck_with_role(
-                    &format!("m{ordinal}"),
-                    ordinal,
-                    "user",
-                    &format!("ordinal-{ordinal}"),
-                )
-            })
-            .collect::<Vec<_>>();
-        messages[51] = tool_result("m52", 52, &full_tool_output);
-        publish_ctx_expand_fixture(&store, "ses", project.to_str().unwrap(), &messages);
-
-        // R5-09: a persisted transcript covering 1-100 must expose only the requested ordinals.
-        let sliced =
-            tool_text(call_facade(&handler, "ctx_expand", json!({"start": 50, "end": 55})).await);
-        assert!(sliced.contains("Messages 50-55"));
-        assert!(sliced.contains("[50] U: ordinal-50"));
-        assert!(sliced.contains("[55] U: ordinal-55"));
-        assert!(!sliced.contains("[1] U:"));
-        assert!(!sliced.contains("[100] U:"));
-
-        // R5-10: no transform snapshot is installed, so both routes must decode the durable
-        // original-message payload instead of falling back to the condensed historian line.
-        let full = tool_text(call_facade(&handler, "ctx_expand", json!({"message": 52})).await);
-        assert!(full.contains("[52] tool — full recovery:"), "{full}");
-        assert!(full.contains(&full_tool_output));
-        let verbose = tool_text(
-            call_facade(
-                &handler,
-                "ctx_expand",
-                json!({"start": 52, "end": 52, "verbose": true}),
-            )
-            .await,
-        );
-        assert!(verbose.contains("[52] tool"));
-        assert!(verbose.contains(&format!(
-            "output ~{} tok",
-            mc_tokenizer::estimate_tokens(&full_tool_output)
-        )));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn ctx_expand_accepts_native_ordinal_zero_in_message_and_range_forms() {
-        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
-        let (handler, store, _dir, project) = handler_with_store_and_resolver(
-            Arc::new(ProducerState::default()),
-            default_test_config(),
-            resolver,
-        );
-        publish_ctx_expand_fixture(
-            &store,
-            "ses",
-            project.to_str().unwrap(),
-            &[ck_with_role("m0", 0, "user", "ordinal zero")],
-        );
-
-        // R5-11: the shape published by a zero-based native history round-trips exactly.
-        let by_message =
-            tool_text(call_facade(&handler, "ctx_expand", json!({"message": 0})).await);
-        assert!(by_message.contains("[0] U (user) — full recovery:"));
-        assert!(by_message.contains("ordinal zero"));
-        let by_range =
-            tool_text(call_facade(&handler, "ctx_expand", json!({"start": 0, "end": 0})).await);
-        assert!(by_range.contains("Messages 0-0"));
-        assert!(by_range.contains("[0] U: ordinal zero"));
-        let schema = ctx_expand_schema();
-        assert_eq!(schema["properties"]["message"]["minimum"], json!(0));
-        assert_eq!(schema["properties"]["start"]["minimum"], json!(0));
-        assert_eq!(schema["properties"]["end"]["minimum"], json!(0));
-    }
-
     #[test]
     fn module_status_emits_exact_numeric_state_sync_epoch_alongside_boolean_signal() {
         let (handler, _store, _dir, _project) =
@@ -35139,6 +30391,23 @@ mod release_contract_tests {
         );
         assert_eq!(release_contract::TRANSACTION_LOCK_NAME, "transaction.lock");
         assert_eq!(release_contract::LIFETIME_LOCK_NAME, "lifetime.lock");
+        // Bind the frozen contract to the constants the daemon actually
+        // locks: the coordination names exist in two authorities (mc-host
+        // cannot depend on the contract-bearing mc-module), and drift
+        // between them is mixed-release lock-splitting — the exact failure
+        // the stable coordination files exist to prevent.
+        assert_eq!(
+            release_contract::COORDINATION_DIRECTORY,
+            mc_host::COORDINATION_DIR_NAME
+        );
+        assert_eq!(
+            release_contract::TRANSACTION_LOCK_NAME,
+            mc_host::TRANSACTION_LOCK_NAME
+        );
+        assert_eq!(
+            release_contract::LIFETIME_LOCK_NAME,
+            mc_host::LIFETIME_LOCK_NAME
+        );
         let coordination = contract()["coordination"].clone();
         assert_eq!(
             coordination["directory"],
@@ -35151,6 +30420,19 @@ mod release_contract_tests {
         assert_eq!(
             coordination["lifetime_lock"],
             json!(release_contract::LIFETIME_LOCK_NAME)
+        );
+    }
+
+    /// The contract freezes the daemon version, while mc-host derives its
+    /// advertised `daemon_ver` from `CARGO_PKG_VERSION`. Binding them here
+    /// makes a crate version bump force contract regeneration instead of
+    /// shipping a daemon that trips `incompatible_daemon` against its own
+    /// launcher.
+    #[test]
+    fn the_default_daemon_ver_matches_the_frozen_contract() {
+        assert_eq!(
+            mc_host::HostConfig::default().daemon_ver,
+            release_contract::DAEMON_VERSION
         );
     }
 

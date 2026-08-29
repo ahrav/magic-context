@@ -54,15 +54,30 @@ function fail(message: string): never {
     throw new BootstrapError("native_payload_invalid", message);
 }
 
-function canonicalJson(value: unknown): string {
-    if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+function sortKeys(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(sortKeys);
     if (value !== null && typeof value === "object") {
-        return `{${Object.entries(value as Record<string, unknown>)
-            .sort(([left], [right]) => left.localeCompare(right))
-            .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`)
-            .join(",")}}`;
+        const out: Record<string, unknown> = {};
+        // Code-point sort: deterministic across runtimes/locales.
+        for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+            out[key] = sortKeys((value as Record<string, unknown>)[key]);
+        }
+        return out;
     }
-    return JSON.stringify(value);
+    return value;
+}
+
+/**
+ * Byte-identical to `canonicalJson` in
+ * `scripts/generate-mc-host-release-manifest.ts`: recursively key-sorted with
+ * code-point ordering, 2-space indentation, arrays keeping their order. The
+ * `payload_manifest_digest` in the parent trust index is produced by the build
+ * over exactly these bytes (`scripts/build-mc-host-payload.ts`), so any
+ * divergence here fails every qualified package closed. `owner.test.ts`
+ * asserts agreement against the producer implementation.
+ */
+export function canonicalPayloadManifestJson(value: unknown): string {
+    return JSON.stringify(sortKeys(value), null, 2);
 }
 
 function sha256(value: string): string {
@@ -229,7 +244,7 @@ function verifyPackage(
     );
     if (
         manifest.schema !== "magic-context.mc-host-payload-manifest/v1" ||
-        sha256(canonicalJson(manifest)) !== entry.payload_manifest_digest
+        sha256(canonicalPayloadManifestJson(manifest)) !== entry.payload_manifest_digest
     ) {
         fail("payload manifest digest does not match parent trust");
     }

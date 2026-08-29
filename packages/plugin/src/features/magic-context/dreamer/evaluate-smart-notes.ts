@@ -429,9 +429,11 @@ export async function confirmSmartNoteReadOnly(
             db: args.db,
             parentSessionId: args.parentSessionId,
             harness: "opencode",
-            // Dashboard token rollups group dream-task invocations under the
-            // historical "dreamer" bucket. The actual child agent remains the
-            // no-tool SMART_NOTE_COMPILER_AGENT passed to session.prompt below.
+            // Token rollups group dream-task invocations under the historical
+            // "dreamer" bucket persisted in subagent_invocations rows; changing
+            // the label would split rollups over rows already written. The
+            // actual child agent remains the no-tool SMART_NOTE_COMPILER_AGENT
+            // passed to session.prompt below.
             subagent: "dreamer",
             task: "evaluate-smart-notes",
             startedAt,

@@ -8,23 +8,6 @@ afterEach(() => {
 	__test.resetLoggedPiConfigDirs();
 });
 
-describe("Pi startup backfills", () => {
-	it("calls the shared claims/v22 startup helper once", async () => {
-		let calls = 0;
-		const db = {} as never;
-		await __test.scheduleStartupBackfills(
-			db,
-			async (seenDb: unknown, options: { log?: (message: string) => void }) => {
-				calls += 1;
-				expect(seenDb).toBe(db);
-				expect(options.log).toBeFunction();
-				return { ranV22Backfill: false, summary: null };
-			},
-		);
-		expect(calls).toBe(1);
-	});
-});
-
 describe("Pi config load logging", () => {
 	it("dedupes /cd config warnings per directory", () => {
 		const logSpy = spyOn(loggerModule, "log").mockImplementation(

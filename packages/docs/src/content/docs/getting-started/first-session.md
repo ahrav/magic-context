@@ -84,7 +84,7 @@ As the historian compresses your history, it extracts durable knowledge — deci
 
 At the start of the next session, these memories are injected automatically into the agent's context. Your agent starts already knowing what was decided in previous sessions.
 
-You can also view and edit memories from the [desktop dashboard](https://github.com/cortexkit/magic-context/releases) or have the agent manage them directly with `ctx_memory`.
+You can also have the agent view and manage memories directly with `ctx_memory`.
 
 ## The ctx_reduce nudge
 

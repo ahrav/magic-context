@@ -3,10 +3,8 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { McHostCallError } from "../../../shared/mc-host-client";
-import { Database } from "../../../shared/sqlite";
+import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
-import { runMigrations } from "../migrations";
-import { initializeDatabase } from "../storage-db";
 import {
     createSynapseLedgerPage,
     getSynapseLedgerPage,
@@ -18,6 +16,7 @@ import {
     recordSynapseLedgerJob,
     recordSynapseLedgerRestart,
 } from "../storage-embedding-measurements";
+import { createDirectTestDatabase } from "../test-database";
 import type { DetailedEmbedContext, DetailedEmbedItem } from "./embedding-provider";
 import {
     _resetSynapseClientForTests,
@@ -27,6 +26,7 @@ import {
     SYNAPSE_MAX_INPUT_TOKENS,
     type SynapseClientLike,
     SynapseEmbeddingProvider,
+    type SynapseEmbeddingProviderOptions,
 } from "./embedding-synapse";
 
 class MockSynapseClient implements SynapseClientLike {
@@ -93,6 +93,36 @@ afterEach(() => {
     _resetSynapseClientForTests();
 });
 
+function virtualTime(randomValues: number[] = [0]): {
+    now: () => number;
+    sleep: (ms: number) => Promise<void>;
+    random: () => number;
+    sleeps: number[];
+} {
+    let time = 0;
+    let randomIndex = 0;
+    const sleeps: number[] = [];
+    return {
+        now: () => time,
+        sleep: async (ms) => {
+            sleeps.push(ms);
+            time += ms;
+        },
+        // Each test declares exactly the draws its scenario consumes; an
+        // extra draw is a changed jitter schedule the test must account
+        // for, not a silent repeat of the last declared value.
+        random: () => {
+            if (randomIndex >= randomValues.length) {
+                throw new Error(
+                    `virtualTime: draw ${randomIndex + 1} exceeds the ${randomValues.length} declared random value(s)`,
+                );
+            }
+            return randomValues[randomIndex++];
+        },
+        sleeps,
+    };
+}
+
 describe("SynapseEmbeddingProvider", () => {
     it("keeps injected factory providers lifecycle-neutral", async () => {
         const client = new MockSynapseClient();
@@ -116,11 +146,13 @@ describe("SynapseEmbeddingProvider", () => {
 
     it("demands before a managed real connection and coalesces initialization", async () => {
         let demands = 0;
+        const deadlines: (number | undefined)[] = [];
         const provider = new SynapseEmbeddingProvider({
             projectRoot: "/repo",
             session: "managed-synapse",
-            demandStart: async () => {
+            demandStart: async (request) => {
                 demands += 1;
+                deadlines.push(request.deadlineMs);
                 return { ok: false, reason: "startup_timeout", storage: null };
             },
             connectionOrigin: "managed-default",
@@ -131,6 +163,48 @@ describe("SynapseEmbeddingProvider", () => {
             false,
             false,
         ]);
+        expect(demands).toBe(1);
+        // The demand waits on a shared cold start, not on one query: a
+        // per-query deadline would detach every waiter mid-startup and demote
+        // the lane while startup still succeeds.
+        expect(deadlines[0]).toBeGreaterThanOrEqual(60_000);
+    });
+
+    it("does not demand a managed start for an already-aborted caller", async () => {
+        // Creating the initialization flight is what triggers the demand, and the
+        // demand is not given the caller's signal — so an already-cancelled query
+        // could stage and start mc-host, resolve the lane, and arm backfill with
+        // no live waiter. Detaching from an existing flight is different: another
+        // caller owns it.
+        let demands = 0;
+        const provider = new SynapseEmbeddingProvider({
+            projectRoot: "/repo",
+            session: "managed-aborted-caller",
+            demandStart: async () => {
+                demands += 1;
+                return { ok: true, reason: "started", storage: "ready" };
+            },
+            connectionOrigin: "managed-default",
+        });
+
+        expect(await provider.initialize(AbortSignal.abort())).toBe(false);
+        expect(demands).toBe(0);
+    });
+
+    it("does not re-demand per call after a failed managed demand", async () => {
+        let demands = 0;
+        const provider = new SynapseEmbeddingProvider({
+            projectRoot: "/repo",
+            session: "managed-demand-backoff",
+            demandStart: async () => {
+                demands += 1;
+                return { ok: false, reason: "native_payload_missing", storage: null };
+            },
+            connectionOrigin: "managed-default",
+        });
+
+        expect(await provider.initialize()).toBe(false);
+        expect(await provider.initialize()).toBe(false);
         expect(demands).toBe(1);
     });
 
@@ -144,6 +218,7 @@ describe("SynapseEmbeddingProvider", () => {
         });
 
         expect(await provider.initialize()).toBe(true);
+        expect(client.requests.find((entry) => entry.method === "models.list")?.params).toEqual({});
         expect(provider.maxInputTokens).toBe(SYNAPSE_MAX_INPUT_TOKENS);
         expect(provider.modelId).toBe(getSynapseLaneIdentity("gte-modernbert-base-f16", "fp-live"));
 
@@ -704,7 +779,129 @@ describe("connect discovery and retry policy", () => {
         expect(queryCalls).toBe(4);
     });
 
-    it("retries queue-full admission through the request deadline", async () => {
+    it("retries queue-full admission through the deadline under the safety cap", async () => {
+        let queryCalls = 0;
+        // A pathologically small served hint (0ms) floors the base at 1ms;
+        // the 64-attempt safety cap binds long before the 5s deadline.
+        const time = virtualTime(new Array(63).fill(0));
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "ses-1",
+            fingerprint: "fp-live",
+            tableEpoch: 0,
+            dims: 3,
+            queryTimeoutMs: 5_000,
+            now: time.now,
+            sleep: time.sleep,
+            random: time.random,
+            clientFactory: async () =>
+                ({
+                    async call<Response = unknown>(): Promise<Response> {
+                        queryCalls += 1;
+                        const error = new Error("query admission is full") as Error & {
+                            code: string;
+                            retry_after_ms: number;
+                        };
+                        error.code = "queue_full";
+                        error.retry_after_ms = 0;
+                        throw error;
+                    },
+                    close() {},
+                }) as SynapseClientLike,
+        });
+
+        expect(await provider.embed("hello")).toBeNull();
+        expect(queryCalls).toBe(64);
+        expect(time.sleeps).toEqual(new Array(63).fill(1));
+    });
+
+    it("ends a retry delay as soon as the caller aborts", async () => {
+        let queryCalls = 0;
+        const controller = new AbortController();
+        // The injected sleep never settles, so only the abort can end the race.
+        // A delay that ignored the signal would hang here rather than return a
+        // wrong value: the retry ladder waits a served 2s hint, and the whole
+        // point is that an aborted caller must not be held for it.
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "ses-1",
+            fingerprint: "fp-live",
+            tableEpoch: 0,
+            dims: 3,
+            queryTimeoutMs: 30_000,
+            now: () => 0,
+            sleep: () => {
+                controller.abort();
+                return new Promise<void>(() => {});
+            },
+            random: () => 0,
+            clientFactory: async () =>
+                ({
+                    async call<Response = unknown>(): Promise<Response> {
+                        queryCalls += 1;
+                        const error = new Error("query admission is full") as Error & {
+                            code: string;
+                            retry_after_ms: number;
+                        };
+                        error.code = "queue_full";
+                        error.retry_after_ms = 2_000;
+                        throw error;
+                    },
+                    close() {},
+                }) as SynapseClientLike,
+        });
+
+        expect(await provider.embed("hello", controller.signal)).toBeNull();
+        // The wait was abandoned, so the next attempt was never dispatched.
+        expect(queryCalls).toBe(1);
+    });
+
+    it("lets the deadline, not the four-attempt cap, budget queue-full retries", async () => {
+        let queryCalls = 0;
+        // The host-served 50ms hint with zero jitter draws: attempts at
+        // t = 0, 50, ..., 300; the next sleep would land on the 350ms
+        // deadline, so the sequence stops after 7 attempts — more than the
+        // generic four-attempt budget, bounded by the deadline instead.
+        const time = virtualTime(new Array(6).fill(0));
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "ses-1",
+            fingerprint: "fp-live",
+            tableEpoch: 0,
+            dims: 3,
+            queryTimeoutMs: 350,
+            now: time.now,
+            sleep: time.sleep,
+            random: time.random,
+            clientFactory: async () =>
+                ({
+                    async call<Response = unknown>(): Promise<Response> {
+                        queryCalls += 1;
+                        const error = new Error("query admission is full") as Error & {
+                            code: string;
+                            retry_after_ms: number;
+                        };
+                        error.code = "queue_full";
+                        error.retry_after_ms = 50;
+                        throw error;
+                    },
+                    close() {},
+                }) as SynapseClientLike,
+        });
+
+        expect(await provider.embed("hello")).toBeNull();
+        expect(queryCalls).toBe(7);
+        expect(time.sleeps).toEqual(new Array(6).fill(50));
+    });
+
+    it("gives overlapping embed calls independent retry jitter", async () => {
+        // Two overlapping queries, one jitter draw each: their first-retry
+        // sleeps must differ, otherwise every concurrent caller retries in
+        // lockstep and the jitter buys nothing.
+        const time = virtualTime([0.25, 0.75]);
         let queryCalls = 0;
         const provider = new SynapseEmbeddingProvider({
             connectionFile: "fixture",
@@ -714,17 +911,20 @@ describe("connect discovery and retry policy", () => {
             tableEpoch: 0,
             dims: 3,
             queryTimeoutMs: 5_000,
+            now: time.now,
+            sleep: time.sleep,
+            random: time.random,
             clientFactory: async () =>
                 ({
                     async call<Response = unknown>(): Promise<Response> {
                         queryCalls += 1;
-                        if (queryCalls <= 4) {
-                            const error = new Error("query admission is full") as Error & {
+                        if (queryCalls <= 2) {
+                            const error = new Error("full") as Error & {
                                 code: string;
                                 retry_after_ms: number;
                             };
                             error.code = "queue_full";
-                            error.retry_after_ms = 0;
+                            error.retry_after_ms = 100;
                             throw error;
                         }
                         return {
@@ -737,8 +937,124 @@ describe("connect discovery and retry policy", () => {
                 }) as SynapseClientLike,
         });
 
+        const [first, second] = await Promise.all([
+            provider.embed("first"),
+            provider.embed("second"),
+        ]);
+
+        expect(first).toEqual(new Float32Array([1, 2, 3]));
+        expect(second).toEqual(new Float32Array([1, 2, 3]));
+        expect(queryCalls).toBe(4);
+        // base 100 jittered by draws 0.25 and 0.75: 150 and 250.
+        expect([...time.sleeps].sort((left, right) => left - right)).toEqual([150, 250]);
+        expect(time.sleeps[0]).not.toBe(time.sleeps[1]);
+    });
+
+    it("uses authoritative retry-after jitter and rebuilds attempt deadlines", async () => {
+        const time = virtualTime([0.25, 0.75]);
+        const calls: Array<Record<string, unknown>> = [];
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "ses-1",
+            fingerprint: "fp-live",
+            tableEpoch: 0,
+            dims: 3,
+            queryTimeoutMs: 100,
+            now: time.now,
+            sleep: time.sleep,
+            random: time.random,
+            clientFactory: async () => ({
+                async call<Response = unknown>(_m: string, _method: string, params?: unknown) {
+                    calls.push(params as Record<string, unknown>);
+                    if (calls.length < 3) {
+                        const error = new Error("full") as Error & {
+                            code: string;
+                            retry_after_ms: number;
+                        };
+                        error.code = "queue_full";
+                        error.retry_after_ms = 20;
+                        throw error;
+                    }
+                    return {
+                        vector: [1, 2, 3],
+                        fingerprint: "fp-live",
+                        table_epoch: 0,
+                    } as Response;
+                },
+                close() {},
+            }),
+        });
+
         expect(await provider.embed("hello")).toEqual(new Float32Array([1, 2, 3]));
-        expect(queryCalls).toBe(5);
+        expect(time.sleeps).toEqual([30, 50]);
+        expect(calls.map((params) => params.deadline_ms)).toEqual([100, 70, 20]);
+    });
+
+    it("retries a host-shutdown cancellation and never condemns the lane", async () => {
+        let calls = 0;
+        // One retry sleep, one jitter draw.
+        const time = virtualTime([0]);
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "ses-1",
+            fingerprint: "fp-live",
+            tableEpoch: 0,
+            dims: 3,
+            now: time.now,
+            sleep: time.sleep,
+            random: time.random,
+            clientFactory: async () => ({
+                async call<Response = unknown>(): Promise<Response> {
+                    calls += 1;
+                    if (calls === 1) {
+                        // The host's teardown rejection: wire code
+                        // `cancelled`, sent while the host restarts. It is
+                        // evidence about one incarnation, so the retry can
+                        // land on the next one.
+                        const error = new Error("the host is shutting down") as Error & {
+                            code: string;
+                        };
+                        error.code = "cancelled";
+                        throw error;
+                    }
+                    return {
+                        vector: [1, 2, 3],
+                        fingerprint: "fp-live",
+                        table_epoch: 0,
+                    } as Response;
+                },
+                close() {},
+            }),
+        });
+
+        expect(await provider.embed("hello")).toEqual(new Float32Array([1, 2, 3]));
+        expect(calls).toBe(2);
+    });
+
+    it("maps a code-less AbortError to cancelled by its name and never retries it", async () => {
+        let calls = 0;
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "ses-1",
+            fingerprint: "fp-live",
+            tableEpoch: 0,
+            dims: 3,
+            clientFactory: async () => ({
+                async call() {
+                    calls += 1;
+                    // DOM/undici-style abort: no `code` field at all, the
+                    // classification must come from the error's name.
+                    throw Object.assign(new Error("aborted"), { name: "AbortError" });
+                },
+                close() {},
+            }),
+        });
+
+        expect(await provider.embed("hello")).toBeNull();
+        expect(calls).toBe(1);
     });
 
     it("stops retrying when the next delay would cross the absolute deadline", async () => {
@@ -800,6 +1116,81 @@ describe("connect discovery and retry policy", () => {
     });
 });
 
+describe("embedItems page budget", () => {
+    it("spans submission and polling with one page deadline", async () => {
+        // The page budget is 1s. The submission burns 400ms of it on one
+        // queue_full retry, then the job stays pending forever. Polling must
+        // draw on what is left of that same 1s rather than re-anchoring, so
+        // the whole page settles at the deadline instead of at 1.4s.
+        const pageTimeoutMs = 1_000;
+        let batchCalls = 0;
+        let resultCalls = 0;
+        // Zero jitter draws; declared generously because the poll ladder's
+        // draw count is a property of the schedule under test, not of the
+        // deadline bound this test pins.
+        const time = virtualTime(new Array(64).fill(0));
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "ses-1",
+            fingerprint: "fp-live",
+            tableEpoch: 0,
+            dims: 3,
+            batchTimeoutMs: pageTimeoutMs,
+            now: time.now,
+            sleep: time.sleep,
+            random: time.random,
+            clientFactory: async () =>
+                ({
+                    async call<Response = unknown>(
+                        _module: string,
+                        method: string,
+                    ): Promise<Response> {
+                        if (method === "models.list") {
+                            return {
+                                models: [
+                                    {
+                                        model: "gte-modernbert-base-f16",
+                                        fingerprint: "fp-live",
+                                        table_epoch: 0,
+                                        dims: 3,
+                                    },
+                                ],
+                            } as Response;
+                        }
+                        if (method === "embed.batch") {
+                            batchCalls += 1;
+                            if (batchCalls === 1) {
+                                const error = new Error("batch admission is full") as Error & {
+                                    code: string;
+                                    retry_after_ms: number;
+                                };
+                                error.code = "queue_full";
+                                error.retry_after_ms = 400;
+                                throw error;
+                            }
+                            return { result: { job_id: "job-1" } } as Response;
+                        }
+                        if (method !== "embed.result") throw new Error(`unexpected ${method}`);
+                        resultCalls += 1;
+                        // The canonical pending shape: no items, no cursor.
+                        return { result: { retry_after_ms: 100 } } as Response;
+                    },
+                    close() {},
+                }) as SynapseClientLike,
+        });
+
+        const text = "hello";
+        const contentSha256 = createHash("sha256").update(text).digest("hex");
+        const vectors = await provider.embedItems([{ id: "a", text, contentSha256 }]);
+
+        // The page never completed, and it gave up inside its own budget.
+        expect(vectors.size).toBe(0);
+        expect(resultCalls).toBeGreaterThan(0);
+        expect(time.now()).toBeLessThanOrEqual(pageTimeoutMs);
+    });
+});
+
 describe("embedItemsDetailed", () => {
     const MODEL = "gte-modernbert-base-f16";
     const FP = "fp-live";
@@ -820,6 +1211,7 @@ describe("embedItemsDetailed", () => {
             string,
             Array<{ id: string; content_sha256: string }>
         >();
+        batchRetryAfterMs = 50;
         batchError?: (batchCallIndex: number) => Error | null;
         resultPages?: (
             jobId: string,
@@ -858,7 +1250,7 @@ describe("embedItemsDetailed", () => {
                         request_key: record.params.request_key,
                         done: false,
                         status: "queued",
-                        retry_after_ms: 0,
+                        retry_after_ms: this.batchRetryAfterMs,
                     },
                 } as Response;
             }
@@ -905,10 +1297,8 @@ describe("embedItemsDetailed", () => {
     }
 
     function ledgerDb(): Database {
-        const db = new Database(":memory:");
+        const db = createDirectTestDatabase().db;
         db.exec("PRAGMA foreign_keys=ON");
-        initializeDatabase(db);
-        runMigrations(db);
         return db;
     }
 
@@ -922,7 +1312,10 @@ describe("embedItemsDetailed", () => {
         };
     }
 
-    function detailedProvider(client: SynapseClientLike): SynapseEmbeddingProvider {
+    function detailedProvider(
+        client: SynapseClientLike,
+        overrides: Partial<SynapseEmbeddingProviderOptions> = {},
+    ): SynapseEmbeddingProvider {
         return new SynapseEmbeddingProvider({
             connectionFile: "fixture",
             projectRoot: "/repo",
@@ -934,6 +1327,7 @@ describe("embedItemsDetailed", () => {
             recommendedBatch: 2,
             batchTimeoutMs: 5_000,
             clientFactory: async () => client,
+            ...overrides,
         });
     }
 
@@ -1034,6 +1428,7 @@ describe("embedItemsDetailed", () => {
     it("persists polling state at admission, records cursors as diagnostics, and stops at ready", async () => {
         const db = ledgerDb();
         try {
+            const time = virtualTime([0.5]);
             const host = new DetailedHost();
             let stateAtFirstPoll: Record<string, unknown> | null = null;
             host.resultPages = (_jobId, items, index) => {
@@ -1068,7 +1463,11 @@ describe("embedItemsDetailed", () => {
                     },
                 };
             };
-            const provider = detailedProvider(host);
+            const provider = detailedProvider(host, {
+                now: time.now,
+                sleep: time.sleep,
+                random: time.random,
+            });
             const items = detailedItems([
                 { id: "memory:1", group: "g1" },
                 { id: "memory:2", group: "g1" },
@@ -1083,13 +1482,17 @@ describe("embedItemsDetailed", () => {
             expect(firstPoll?.state).toBe("polling");
             expect(firstPoll?.job_id).toBe("job-1");
             expect(typeof firstPoll?.attempt_id).toBe("string");
-            expect(firstPoll?.deadline_at as number).toBeGreaterThan(Date.now());
+            expect(firstPoll?.deadline_at as number).toBeGreaterThan(time.now());
 
             const row = ledgerRows(db)[0];
             expect(row.state).toBe("ready");
             expect(row.cursor).toBe("cursor-1");
             expect(row.state_version).toBe(result.receipts[0].stateVersion);
             expect(result.receipts[0].vectors.get("memory:2")).toEqual(new Float32Array([4, 5, 6]));
+            // Every reply carried a page, so the immediate-first-poll path
+            // never slept: a ready job pays only wire round trips.
+            expect(time.sleeps).toEqual([]);
+            expect(host.calls.every((call) => !("deadline_ms" in call.params))).toBe(true);
         } finally {
             closeQuietly(db);
         }
@@ -1098,10 +1501,11 @@ describe("embedItemsDetailed", () => {
     it("treats done:false without a cursor as explicit pending and keeps polling", async () => {
         const db = ledgerDb();
         try {
+            const time = virtualTime([0.5]);
             const host = new DetailedHost();
             host.resultPages = (_jobId, items, index) => {
                 if (index < 2) {
-                    return { result: { done: false, status: "running", retry_after_ms: 0 } };
+                    return { result: { done: false, status: "running", retry_after_ms: 50 } };
                 }
                 return {
                     result: {
@@ -1115,14 +1519,99 @@ describe("embedItemsDetailed", () => {
                     },
                 };
             };
-            const provider = detailedProvider(host);
+            const provider = detailedProvider(host, {
+                now: time.now,
+                sleep: time.sleep,
+                random: time.random,
+                pollDefaultDelayMs: 50,
+            });
             const result = await provider.embedItemsDetailed(
                 detailedItems([{ id: "memory:1", group: "g1" }]),
                 detailedContext(db),
             );
             expect(result.receipts).toHaveLength(1);
             expect(host.resultCalls()).toHaveLength(3);
+            // Exact schedule from the constants: the first poll goes out
+            // immediately, the first pending reply waits the jittered
+            // fast-first seed min(1 * (1 + 0.5), 50) = 1.5, and the second
+            // pending waits the escalated max(10, 1.5 * 1.6) = 10, under
+            // the served 50ms cap.
+            expect(time.sleeps).toEqual([1.5, 10]);
             expect(ledgerRows(db)[0].state).toBe("ready");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("clamps escalating polls to the page deadline and keeps the 120s count finite", async () => {
+        const db = ledgerDb();
+        try {
+            const time = virtualTime([0]);
+            const host = new DetailedHost();
+            host.batchRetryAfterMs = 50_000;
+            host.resultPages = () => ({
+                result: { done: false, status: "running", retry_after_ms: 50_000 },
+            });
+            const provider = detailedProvider(host, {
+                batchTimeoutMs: 120_000,
+                now: time.now,
+                sleep: time.sleep,
+                random: time.random,
+                pollInitialDelayMs: 30_000,
+                pollDefaultDelayMs: 50_000,
+            });
+
+            const result = await provider.embedItemsDetailed(
+                detailedItems([{ id: "memory:1", group: "g1" }]),
+                detailedContext(db),
+            );
+
+            expect(result.receipts).toEqual([]);
+            expect(result.failures[0]?.code).toBe("timeout");
+            // Exact schedule: an immediate first poll at t=0, then waits of
+            // 30_000 (jitter draw 0), the escalated 30_000 * 1.6 = 48_000,
+            // and the 42_000 remainder of the 120s deadline. Exactly three
+            // polls fit before exhaustion.
+            expect(host.resultCalls()).toHaveLength(3);
+            expect(time.sleeps).toEqual([30_000, 48_000, 42_000]);
+            expect(time.now()).toBe(120_000);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("bounds the default-configuration poll count over the full 120s deadline", async () => {
+        const db = ledgerDb();
+        try {
+            // One jitter draw for the fast-first poll; every later delay is
+            // deterministic escalation.
+            const time = virtualTime([0]);
+            const host = new DetailedHost();
+            host.resultPages = () => ({
+                result: { done: false, status: "running", retry_after_ms: 50 },
+            });
+            const provider = detailedProvider(host, {
+                batchTimeoutMs: 120_000,
+                now: time.now,
+                sleep: time.sleep,
+                random: time.random,
+                pollDefaultDelayMs: 50,
+            });
+
+            const result = await provider.embedItemsDetailed(
+                detailedItems([{ id: "memory:1", group: "g1" }]),
+                detailedContext(db),
+            );
+
+            expect(result.receipts).toEqual([]);
+            expect(result.failures[0]?.code).toBe("timeout");
+            // Immediate first poll, then escalation and flatline: sleeps 1,
+            // 10, 16, 25.6, ~40.96, then 50ms repeated to the deadline.
+            // That is 1 immediate poll + 5 escalation polls + 2398 flatline
+            // polls = 2404, the ceiling a never-finishing job can cost
+            // under defaults.
+            expect(host.resultCalls()).toHaveLength(2404);
+            expect(time.now()).toBe(120_000);
         } finally {
             closeQuietly(db);
         }
@@ -2087,6 +2576,7 @@ describe("embedItemsDetailed", () => {
     it("keeps polling the canonical pending reply on the legacy embedItems path", async () => {
         const db = ledgerDb();
         try {
+            const time = virtualTime([0]);
             const host = new DetailedHost();
             host.resultPages = (_jobId, items, index) => {
                 if (index === 0) {
@@ -2104,12 +2594,20 @@ describe("embedItemsDetailed", () => {
                     },
                 };
             };
-            const provider = detailedProvider(host);
+            const provider = detailedProvider(host, {
+                now: time.now,
+                sleep: time.sleep,
+                random: time.random,
+            });
             const vectors = await provider.embedItems([
                 { id: "memory:1", text: "one", contentSha256: "a" },
             ]);
             expect(vectors.get("memory:1")).toEqual(new Float32Array([1, 2, 3]));
             expect(host.resultCalls()).toHaveLength(2);
+            // Immediate first poll; the pending reply consumes the 1ms
+            // fast-first seed (jitter draw 0).
+            expect(time.sleeps).toEqual([1]);
+            expect(host.calls.every((call) => !("deadline_ms" in call.params))).toBe(true);
             expect(ledgerRows(db)).toEqual([]);
         } finally {
             closeQuietly(db);
@@ -2119,6 +2617,7 @@ describe("embedItemsDetailed", () => {
     it("keeps the cursor while a later legacy result page is pending", async () => {
         const db = ledgerDb();
         try {
+            const time = virtualTime([0]);
             const host = new DetailedHost();
             const cursors: unknown[] = [];
             host.resultPages = (_jobId, items, index, cursor) => {
@@ -2156,7 +2655,11 @@ describe("embedItemsDetailed", () => {
                     },
                 };
             };
-            const provider = detailedProvider(host);
+            const provider = detailedProvider(host, {
+                now: time.now,
+                sleep: time.sleep,
+                random: time.random,
+            });
 
             const vectors = await provider.embedItems([
                 { id: "memory:1", text: "one", contentSha256: "a" },
@@ -2166,6 +2669,9 @@ describe("embedItemsDetailed", () => {
             expect([...vectors.keys()]).toEqual(["memory:1", "memory:2"]);
             expect(vectors.get("memory:2")).toEqual(new Float32Array([4, 5, 6]));
             expect(cursors).toEqual([null, "cursor-1", "cursor-1"]);
+            // Immediate first poll; the single pending reply consumes the
+            // 1ms fast-first seed (jitter draw 0).
+            expect(time.sleeps).toEqual([1]);
             expect(ledgerRows(db)).toEqual([]);
         } finally {
             closeQuietly(db);

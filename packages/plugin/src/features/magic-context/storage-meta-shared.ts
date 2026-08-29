@@ -32,13 +32,14 @@ export interface SessionMetaRow {
     cached_m0_mural_data_url: string | null;
     cached_m0_mural_hash: string | null;
     cached_m1_bytes: Buffer | Uint8Array | null;
+    cached_m0_claim_format_epoch: number | null;
+    cached_m0_claim_snapshot_vector: string | null;
+    cached_m0_rendered_revision_locators: string | null;
     cached_m0_project_memory_epoch: number | null;
     cached_m0_workspace_fingerprint: string | null;
     cached_m0_project_user_profile_version: number | null;
     cached_m0_max_compartment_seq: number | null;
-    cached_m0_max_memory_id: number | null;
     cached_m0_max_mutation_id: number | null;
-    cached_m0_max_memory_mutation_id: number | null;
     cached_m0_project_docs_hash: string | null;
     cached_m0_materialized_at: number | null;
     cached_m0_session_facts_version: number | null;
@@ -90,13 +91,14 @@ export const SESSION_META_SELECT_COLUMNS = [
     "cached_m0_mural_data_url",
     "cached_m0_mural_hash",
     "cached_m1_bytes",
+    "cached_m0_claim_format_epoch",
+    "cached_m0_claim_snapshot_vector",
+    "cached_m0_rendered_revision_locators",
     "cached_m0_project_memory_epoch",
     "cached_m0_workspace_fingerprint",
     "cached_m0_project_user_profile_version",
     "cached_m0_max_compartment_seq",
-    "cached_m0_max_memory_id",
     "cached_m0_max_mutation_id",
-    "cached_m0_max_memory_mutation_id",
     "cached_m0_project_docs_hash",
     "cached_m0_materialized_at",
     "cached_m0_session_facts_version",
@@ -147,13 +149,14 @@ export const META_COLUMNS: Record<string, string> = {
     cachedM0MuralDataUrl: "cached_m0_mural_data_url",
     cachedM0MuralHash: "cached_m0_mural_hash",
     cachedM1Bytes: "cached_m1_bytes",
+    cachedM0ClaimFormatEpoch: "cached_m0_claim_format_epoch",
+    cachedM0ClaimSnapshotVector: "cached_m0_claim_snapshot_vector",
+    cachedM0RenderedRevisionLocators: "cached_m0_rendered_revision_locators",
     cachedM0ProjectMemoryEpoch: "cached_m0_project_memory_epoch",
     cachedM0WorkspaceFingerprint: "cached_m0_workspace_fingerprint",
     cachedM0ProjectUserProfileVersion: "cached_m0_project_user_profile_version",
     cachedM0MaxCompartmentSeq: "cached_m0_max_compartment_seq",
-    cachedM0MaxMemoryId: "cached_m0_max_memory_id",
     cachedM0MaxMutationId: "cached_m0_max_mutation_id",
-    cachedM0MaxMemoryMutationId: "cached_m0_max_memory_mutation_id",
     cachedM0ProjectDocsHash: "cached_m0_project_docs_hash",
     cachedM0MaterializedAt: "cached_m0_materialized_at",
     cachedM0SessionFactsVersion: "cached_m0_session_facts_version",
@@ -195,13 +198,14 @@ export const NULL_BIND_META_KEYS = new Set([
     "cachedM0MuralDataUrl",
     "cachedM0MuralHash",
     "cachedM1Bytes",
+    "cachedM0ClaimFormatEpoch",
+    "cachedM0ClaimSnapshotVector",
+    "cachedM0RenderedRevisionLocators",
     "cachedM0ProjectMemoryEpoch",
     "cachedM0WorkspaceFingerprint",
     "cachedM0ProjectUserProfileVersion",
     "cachedM0MaxCompartmentSeq",
-    "cachedM0MaxMemoryId",
     "cachedM0MaxMutationId",
-    "cachedM0MaxMemoryMutationId",
     "cachedM0ProjectDocsHash",
     "cachedM0MaterializedAt",
     "cachedM0SessionFactsVersion",
@@ -272,13 +276,14 @@ export function isSessionMetaRow(row: unknown): row is SessionMetaRow {
         isStringOrNull(r.cached_m0_mural_data_url) &&
         isStringOrNull(r.cached_m0_mural_hash) &&
         isBlobOrNull(r.cached_m1_bytes) &&
+        isNumberOrNull(r.cached_m0_claim_format_epoch) &&
+        isStringOrNull(r.cached_m0_claim_snapshot_vector) &&
+        isStringOrNull(r.cached_m0_rendered_revision_locators) &&
         isNumberOrNull(r.cached_m0_project_memory_epoch) &&
         isStringOrNull(r.cached_m0_workspace_fingerprint) &&
         isNumberOrNull(r.cached_m0_project_user_profile_version) &&
         isNumberOrNull(r.cached_m0_max_compartment_seq) &&
-        isNumberOrNull(r.cached_m0_max_memory_id) &&
         isNumberOrNull(r.cached_m0_max_mutation_id) &&
-        isNumberOrNull(r.cached_m0_max_memory_mutation_id) &&
         isStringOrNull(r.cached_m0_project_docs_hash) &&
         isNumberOrNull(r.cached_m0_materialized_at) &&
         isNumberOrNull(r.cached_m0_session_facts_version) &&
@@ -331,13 +336,14 @@ export function getDefaultSessionMeta(sessionId: string): SessionMeta {
         cachedM0MuralDataUrl: null,
         cachedM0MuralHash: null,
         cachedM1Bytes: null,
+        cachedM0ClaimFormatEpoch: null,
+        cachedM0ClaimSnapshotVector: null,
+        cachedM0RenderedRevisionLocators: null,
         cachedM0ProjectMemoryEpoch: null,
         cachedM0WorkspaceFingerprint: null,
         cachedM0ProjectUserProfileVersion: null,
         cachedM0MaxCompartmentSeq: null,
-        cachedM0MaxMemoryId: null,
         cachedM0MaxMutationId: null,
-        cachedM0MaxMemoryMutationId: null,
         cachedM0ProjectDocsHash: null,
         cachedM0MaterializedAt: null,
         cachedM0SessionFactsVersion: null,
@@ -451,13 +457,14 @@ export function toSessionMeta(row: SessionMetaRow): SessionMeta {
         cachedM0MuralDataUrl: stringOrNull(row.cached_m0_mural_data_url),
         cachedM0MuralHash: stringOrNull(row.cached_m0_mural_hash),
         cachedM1Bytes: toBufferOrNull(row.cached_m1_bytes),
+        cachedM0ClaimFormatEpoch: numOrNull(row.cached_m0_claim_format_epoch),
+        cachedM0ClaimSnapshotVector: stringOrNull(row.cached_m0_claim_snapshot_vector),
+        cachedM0RenderedRevisionLocators: stringOrNull(row.cached_m0_rendered_revision_locators),
         cachedM0ProjectMemoryEpoch: numOrNull(row.cached_m0_project_memory_epoch),
         cachedM0WorkspaceFingerprint: stringOrNull(row.cached_m0_workspace_fingerprint),
         cachedM0ProjectUserProfileVersion: numOrNull(row.cached_m0_project_user_profile_version),
         cachedM0MaxCompartmentSeq: numOrNull(row.cached_m0_max_compartment_seq),
-        cachedM0MaxMemoryId: numOrNull(row.cached_m0_max_memory_id),
         cachedM0MaxMutationId: numOrNull(row.cached_m0_max_mutation_id),
-        cachedM0MaxMemoryMutationId: numOrNull(row.cached_m0_max_memory_mutation_id),
         cachedM0ProjectDocsHash: stringOrNull(row.cached_m0_project_docs_hash),
         cachedM0MaterializedAt: numOrNull(row.cached_m0_materialized_at),
         cachedM0SessionFactsVersion: numOrNull(row.cached_m0_session_facts_version),
@@ -486,13 +493,14 @@ export interface PersistCachedM0Payload {
     m0Bytes: Buffer;
     muralDataUrl?: string | null;
     muralHash?: string | null;
-    projectMemoryEpoch: number | null;
+    claimFormatEpoch?: number | null;
+    claimSnapshotVector?: string | null;
+    renderedRevisionLocators?: string | null;
+    projectMemoryEpoch?: number | null;
     workspaceFingerprint?: string | null;
     projectUserProfileVersion: number | null;
     maxCompartmentSeq: number;
-    maxMemoryId: number | null;
     maxMutationId: number | null;
-    maxMemoryMutationId?: number | null;
     m1Bytes?: Buffer | null;
     projectDocsHash: string | null;
     materializedAt: number;
@@ -514,13 +522,14 @@ export function persistCachedM0(
             cached_m0_bytes = ?,
             cached_m0_mural_data_url = ?,
             cached_m0_mural_hash = ?,
+            cached_m0_claim_format_epoch = ?,
+            cached_m0_claim_snapshot_vector = ?,
+            cached_m0_rendered_revision_locators = ?,
             cached_m0_project_memory_epoch = ?,
             cached_m0_workspace_fingerprint = ?,
             cached_m0_project_user_profile_version = ?,
             cached_m0_max_compartment_seq = ?,
-            cached_m0_max_memory_id = ?,
             cached_m0_max_mutation_id = ?,
-            cached_m0_max_memory_mutation_id = ?,
             cached_m1_bytes = ?,
             cached_m0_project_docs_hash = ?,
             cached_m0_materialized_at = ?,
@@ -534,13 +543,14 @@ export function persistCachedM0(
         Buffer.from(payload.m0Bytes),
         payload.muralDataUrl ?? null,
         payload.muralHash ?? null,
-        payload.projectMemoryEpoch,
+        payload.claimFormatEpoch ?? null,
+        payload.claimSnapshotVector ?? null,
+        payload.renderedRevisionLocators ?? null,
+        payload.projectMemoryEpoch ?? null,
         payload.workspaceFingerprint ?? null,
         payload.projectUserProfileVersion,
         payload.maxCompartmentSeq,
-        payload.maxMemoryId,
         payload.maxMutationId,
-        payload.maxMemoryMutationId ?? null,
         payload.m1Bytes ? Buffer.from(payload.m1Bytes) : null,
         payload.projectDocsHash,
         payload.materializedAt,
@@ -565,13 +575,14 @@ export function clearCachedM0M1(db: Database, sessionId: string): void {
         ["cached_m0_mural_data_url", null],
         ["cached_m0_mural_hash", null],
         ["cached_m1_bytes", null],
+        ["cached_m0_claim_format_epoch", null],
+        ["cached_m0_claim_snapshot_vector", null],
+        ["cached_m0_rendered_revision_locators", null],
         ["cached_m0_project_memory_epoch", null],
         ["cached_m0_workspace_fingerprint", null],
         ["cached_m0_project_user_profile_version", null],
         ["cached_m0_max_compartment_seq", null],
-        ["cached_m0_max_memory_id", null],
         ["cached_m0_max_mutation_id", null],
-        ["cached_m0_max_memory_mutation_id", null],
         ["cached_m0_project_docs_hash", null],
         ["cached_m0_materialized_at", null],
         ["cached_m0_session_facts_version", null],

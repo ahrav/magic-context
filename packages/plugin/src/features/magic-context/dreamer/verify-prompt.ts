@@ -13,6 +13,8 @@
  * prompt and the host apply both bias hard toward keeping memories.
  */
 
+import type { ClaimMutationToken } from "../memory/claim-operation-contract";
+import { ANTI_MEMORY_CATEGORY } from "../memory/constants";
 import {
     assertManifestCoversExactly,
     assertNoDuplicateManifestIds,
@@ -34,20 +36,25 @@ Decide ONE of three outcomes per memory:
 
 BE CONSERVATIVE ABOUT ARCHIVING. Wrong archival of a TRUE memory is the worst possible outcome — far worse than leaving a slightly-stale memory. If you cannot find the code, or you are unsure, or it might still be true somewhere you didn't look: mark it VERIFIED, never archived. Archive ONLY when you have positive evidence the code contradicts it.
 
+Anti-memory records (${ANTI_MEMORY_CATEGORY}) invert that archival bias because retaining an obsolete rejection creates a false warning. Check current project evidence even when no backing files are listed. Use ARCHIVE when the rejection no longer clearly holds; the host preserves it as labeled stale history rather than deleting it. VERIFIED extends its validity window. UPDATE must return the complete field-labeled anti-memory content.
+
 Output ONE XML manifest at the very end and NOTHING else — no narration, no per-memory commentary, no reasoning:
 <verify>
-<verified id="N" files="path/a.ts,path/b.ts"/>
-<update id="M" files="path/c.ts">corrected present-tense content</update>
-<archive id="K" reason="specific evidence the code contradicts it"/>
+<verified claim="mcm_..." files="path/a.ts,path/b.ts"/>
+<update claim="mcm_..." files="path/c.ts">corrected present-tense content</update>
+<archive claim="mcm_..." reason="specific evidence the code contradicts it"/>
 </verify>
 
 Rules:
-- Every input memory id MUST appear exactly once, in exactly one of verified/update/archive.
+- Every input public claim id MUST appear exactly once, in exactly one of verified/update/archive.
 - files = the COMPLETE current backing set (repo-relative, comma-separated). It may differ from the given mapping if a file moved — record what you actually verified against.
 - Default to VERIFIED. update and archive are the exceptions, not the norm.`;
 
 export interface VerifyPromptMemory {
-    id: number;
+    publicClaimId: string;
+    revisionLocator: string;
+    contentDigest: string;
+    mutationToken: ClaimMutationToken;
     category: string;
     content: string;
     mappedFiles: string[];
@@ -57,14 +64,14 @@ export function buildVerifyPrompt(projectPath: string, memories: VerifyPromptMem
     const list = memories
         .map(
             (m) =>
-                `[${m.id}] ${m.category}\nContent: ${m.content}\nBacking files: ${m.mappedFiles.join(", ")}`,
+                `[${m.publicClaimId}] ${m.category}\nRevision: ${m.revisionLocator}\nContent digest: ${m.contentDigest}\nContent: ${m.content}\nBacking files: ${m.mappedFiles.length === 0 ? "(none; inspect current project evidence)" : m.mappedFiles.join(", ")}`,
         )
         .join("\n\n");
     return `## Verify these memories against the code
 
 Project: ${projectPath}
 
-Read each memory's backing files, decide verified / update / archive (default verified; be conservative about archiving), then output ONE <verify> manifest covering every id.
+Read each memory's backing files, decide verified / update / archive (default verified; be conservative about archiving), then output ONE <verify> manifest covering every public claim id.
 
 <memories>
 ${list}
@@ -72,9 +79,9 @@ ${list}
 }
 
 export interface ParsedVerifyManifest {
-    verified: Array<{ id: number; files: string[] }>;
-    updated: Array<{ id: number; files: string[]; content: string }>;
-    archived: Array<{ id: number; reason: string }>;
+    verified: Array<{ publicClaimId: string; files: string[] }>;
+    updated: Array<{ publicClaimId: string; files: string[]; content: string }>;
+    archived: Array<{ publicClaimId: string; reason: string }>;
 }
 
 function attrOf(s: string, name: string): string | null {
@@ -89,8 +96,10 @@ function filesOf(s: string): string[] {
         .filter(Boolean);
 }
 
-function verifyIds(parsed: ParsedVerifyManifest): number[] {
-    return [...parsed.verified, ...parsed.updated, ...parsed.archived].map((entry) => entry.id);
+function verifyIds(parsed: ParsedVerifyManifest): string[] {
+    return [...parsed.verified, ...parsed.updated, ...parsed.archived].map(
+        (entry) => entry.publicClaimId,
+    );
 }
 
 function verifyBody(text: string): string {
@@ -106,24 +115,39 @@ function verifyBody(text: string): string {
 /** Parse the agent's complete `<verify>` manifest. The root close tag is
  *  mandatory so truncated output cannot apply a partial set of verdicts.
  *  A well-formed root with no recognized entries is a format miss, not success. */
-export function parseVerifyManifest(text: string): ParsedVerifyManifest {
+export function parseVerifyManifest(
+    text: string,
+    allowFilelessClaimIds: ReadonlySet<string> = new Set(),
+): ParsedVerifyManifest {
     const out: ParsedVerifyManifest = { verified: [], updated: [], archived: [] };
     const body = verifyBody(text);
 
     for (const m of body.matchAll(/<verified\b([^>]*)\/?>/g)) {
-        const id = Number.parseInt(attrOf(m[1], "id") ?? "", 10);
-        if (!Number.isInteger(id)) throw new Error("verify manifest entry missing numeric id");
-        out.verified.push({ id, files: filesOf(m[1]) });
+        const publicClaimId = attrOf(m[1], "claim");
+        if (!publicClaimId) throw new Error("verify manifest entry missing public claim id");
+        const files = filesOf(m[1]);
+        if (files.length === 0 && !allowFilelessClaimIds.has(publicClaimId)) {
+            throw new Error(`verify manifest entry ${publicClaimId} is missing backing files`);
+        }
+        out.verified.push({ publicClaimId, files });
     }
     for (const m of body.matchAll(/<update\b([^>]*?)(?:\/>|>([\s\S]*?)<\/update>)/g)) {
-        const id = Number.parseInt(attrOf(m[1], "id") ?? "", 10);
-        if (!Number.isInteger(id)) throw new Error("verify manifest entry missing numeric id");
-        out.updated.push({ id, files: filesOf(m[1]), content: (m[2] ?? "").trim() });
+        const publicClaimId = attrOf(m[1], "claim");
+        if (!publicClaimId) throw new Error("verify manifest entry missing public claim id");
+        const files = filesOf(m[1]);
+        if (files.length === 0 && !allowFilelessClaimIds.has(publicClaimId)) {
+            throw new Error(`verify manifest entry ${publicClaimId} is missing backing files`);
+        }
+        out.updated.push({
+            publicClaimId,
+            files,
+            content: (m[2] ?? "").trim(),
+        });
     }
     for (const m of body.matchAll(/<archive\b([^>]*)\/?>/g)) {
-        const id = Number.parseInt(attrOf(m[1], "id") ?? "", 10);
-        if (!Number.isInteger(id)) throw new Error("verify manifest entry missing numeric id");
-        out.archived.push({ id, reason: attrOf(m[1], "reason") ?? "" });
+        const publicClaimId = attrOf(m[1], "claim");
+        if (!publicClaimId) throw new Error("verify manifest entry missing public claim id");
+        out.archived.push({ publicClaimId, reason: attrOf(m[1], "reason") ?? "" });
     }
     if (verifyIds(out).length === 0 && body.trim().length > 0) {
         throw new Error(describeUnrecognizedManifestShape(text, "verify", "verified"));
@@ -136,9 +160,10 @@ export function parseVerifyManifest(text: string): ParsedVerifyManifest {
  *  re-asserts coverage as the final belt. */
 export function validateVerifyManifest(
     text: string,
-    expectedIds: ReadonlySet<number>,
+    expectedIds: ReadonlySet<string>,
+    allowFilelessClaimIds: ReadonlySet<string> = new Set(),
 ): ParsedVerifyManifest {
-    const parsed = parseVerifyManifest(text);
+    const parsed = parseVerifyManifest(text, allowFilelessClaimIds);
     const ids = verifyIds(parsed);
     assertParsedManifestNonEmpty(ids.length, expectedIds.size, text, "verify", "verified");
     assertManifestCoversExactly(ids, expectedIds, "verify");

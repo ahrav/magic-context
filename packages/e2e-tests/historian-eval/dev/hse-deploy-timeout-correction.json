@@ -1,0 +1,98 @@
+{
+  "schema": "historian-eval-scenario/v1",
+  "id": "hse-deploy-timeout-correction",
+  "title": "Corrected health-check timeout must supersede the pre-correction value",
+  "families": [
+    "user-correction"
+  ],
+  "transcript": {
+    "turns": [
+      {
+        "user": "Set the deploy health-check timeout to 30 seconds.",
+        "assistant": "Set: health-check timeout is 30 seconds."
+      },
+      {
+        "user": "Correction \u2014 I misread the runbook. The health-check timeout must be 45 seconds, not 30. The 30 value was wrong.",
+        "assistant": "Corrected: health-check timeout is 45 seconds. The earlier 30-second value is superseded."
+      },
+      {
+        "user": "And rollouts always proceed one availability zone at a time.",
+        "assistant": "Recorded: rollouts proceed one availability zone at a time."
+      },
+      {
+        "user": "That's everything for the deployment settings.",
+        "assistant": "Wrapping up the deployment thread."
+      }
+    ],
+    "epilogueStartIndex": 3
+  },
+  "trigger": {
+    "expectedHistorianRuns": 2,
+    "modelContextLimit": 200000,
+    "usageTokensPerTurn": 1000,
+    "spikeUsageTokens": 90000,
+    "ballastTokensPerTurn": 1500,
+    "headroomMarginTokens": 2000
+  },
+  "gold": {
+    "expectedClaims": [
+      {
+        "id": "exp-timeout-45",
+        "category": "CONFIG_VALUES",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "45 seconds"
+        },
+        "sourceTurnRange": [
+          1,
+          1
+        ]
+      },
+      {
+        "id": "exp-az-rollout",
+        "category": "PROJECT_RULES",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "one availability zone at a time"
+        },
+        "sourceTurnRange": [
+          2,
+          2
+        ]
+      }
+    ],
+    "expectedAbsent": [
+      {
+        "id": "abs-timeout-30",
+        "family": "user-correction",
+        "predicate": {
+          "kind": "normalized-substring",
+          "value": "timeout is 30 seconds"
+        }
+      }
+    ],
+    "compartments": {
+      "minCount": 1
+    }
+  },
+  "probes": [
+    {
+      "id": "probe-timeout",
+      "question": "What is the deploy health-check timeout?",
+      "answerType": "exact",
+      "goldAnswer": "45 seconds",
+      "sourceClaimRef": "exp-timeout-45"
+    },
+    {
+      "id": "probe-az-rollout",
+      "question": "How do rollouts proceed across availability zones?",
+      "answerType": "multiple-choice",
+      "choices": [
+        "all availability zones at once",
+        "one availability zone at a time"
+      ],
+      "goldAnswer": "one availability zone at a time",
+      "sourceClaimRef": "exp-az-rollout"
+    }
+  ]
+}

@@ -4,12 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { LATEST_SUPPORTED_VERSION } from "@magic-context/core/features/magic-context/storage-db";
+import { createDirectTestDatabase } from "@magic-context/core/features/magic-context/test-database";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { parse as parseJsonc } from "comment-json";
 import { openExistingContextDatabase } from "../lib/database-access";
 import type { PiDiagnosticReport } from "../lib/diagnostics-pi";
 import type { PromptIO, PromptSpinner, SelectOption } from "../lib/prompts";
-import { parseDoctorArgs, type RunDoctorOptions, runDoctor } from "./doctor-pi";
+import { type RunDoctorOptions, runDoctor } from "./doctor-pi";
 
 setDefaultTimeout(30_000);
 
@@ -146,23 +147,13 @@ function writePiCachePackage(cacheRoot: string, version: string): string {
 }
 
 function createMockDb(): Database {
-    const db = new Database(":memory:");
-    db.exec(`
-		CREATE TABLE tags (id INTEGER);
-		CREATE TABLE compartments (id INTEGER);
-		CREATE TABLE memories (id INTEGER);
-		CREATE TABLE notes (id INTEGER);
-		CREATE TABLE dream_runs (id INTEGER);
-		INSERT INTO tags VALUES (1);
-		INSERT INTO memories VALUES (1);
-	`);
-    return db;
+    return createDirectTestDatabase().db;
 }
 
 function baseOptions(root: string, cwd: string, prompts: MockPrompts): RunDoctorOptions {
     const storageDir = join(root, ".local", "share", "cortexkit", "magic-context");
     mkdirSync(storageDir, { recursive: true });
-    writeFileSync(join(storageDir, "context.db"), "mock");
+    createDirectTestDatabase({ path: join(storageDir, "context.db") }).db.close();
     return {
         cwd,
         prompts,
@@ -201,58 +192,6 @@ afterEach(() => {
 });
 
 describe("Pi doctor", () => {
-    it("parses v22 and claims backfill flags", () => {
-        expect(
-            parseDoctorArgs([
-                "--check-v22-backfill",
-                "--retry-v22-backfill",
-                "--rekey-v22-dir-identity",
-                "/tmp/project",
-                "--check-claims-backfill",
-                "--retry-claims-backfill",
-                "--waive-claims-backfill-failure",
-                "7",
-                "--rationale",
-                "reviewed source",
-            ]),
-        ).toMatchObject({
-            checkV22Backfill: true,
-            retryV22Backfill: true,
-            rekeyV22DirIdentity: "/tmp/project",
-            checkClaimsBackfill: true,
-            retryClaimsBackfill: true,
-            waiveClaimsBackfillFailure: "7",
-            waiveRationale: "reviewed source",
-        });
-    });
-
-    it("preserves malformed or missing waiver ids for exact command rejection", () => {
-        for (const args of [
-            ["--waive-claims-backfill-failure"],
-            ["--waive-claims-backfill-failure", "--force"],
-            ["--waive-claims-backfill-failure", "7junk"],
-        ]) {
-            const parsed = parseDoctorArgs(args);
-            expect(Object.hasOwn(parsed, "waiveClaimsBackfillFailure")).toBeTrue();
-            expect(parsed.waiveClaimsBackfillFailure).toBe(
-                args[1] && !args[1].startsWith("--") ? args[1] : null,
-            );
-        }
-    });
-
-    it("runs mixed v22 and claims commands sequentially with one combined exit", () => {
-        const source = readFileSync(new URL("./doctor-pi.ts", import.meta.url), "utf8");
-        expect(source.indexOf("runV22BackfillCommands(")).toBeLessThan(
-            source.indexOf("runClaimsBackfillCommands("),
-        );
-        expect(source).toContain(
-            "if (sharedCommandExitCode !== null) return sharedCommandExitCode",
-        );
-        expect(
-            source.match(/Math\.max\(sharedCommandExitCode \?\? 0, \w+Result\.exitCode\)/g),
-        ).toHaveLength(2);
-    });
-
     it("passes Phase 1 with a healthy mocked environment", async () => {
         const root = makeTempRoot();
         const cwd = makeTempRoot("mc-pi-doctor-cwd-");
@@ -306,7 +245,7 @@ describe("Pi doctor", () => {
         expect(output).toContain("bunx @cortexkit/magic-context@latest doctor repair-db");
     });
 
-    it("leaves an older supported shared DB schema unchanged", async () => {
+    it("refuses an older migration-lane database unchanged", async () => {
         const root = makeTempRoot();
         const cwd = makeTempRoot("mc-pi-doctor-cwd-");
         const agentDir = setEnv(root, cwd);
@@ -331,7 +270,7 @@ describe("Pi doctor", () => {
 
         const code = await runDoctor(options);
 
-        expect(code).toBe(0);
+        expect(code).toBe(1);
         const reopened = new Database(dbPath);
         const version = reopened
             .prepare("SELECT MAX(version) AS version FROM schema_migrations")

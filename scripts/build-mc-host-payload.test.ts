@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+    chmodSync,
     cpSync,
     mkdirSync,
     mkdtempSync,
@@ -20,6 +21,7 @@ import {
 import {
     buildDevPayload,
     buildTrustArtifacts,
+    hostTarget,
     LAUNCHER_PATH,
     loadReleaseContext,
     OUTPUT_PATHS,
@@ -93,6 +95,12 @@ function writeJson(root: string, relative: string, value: unknown): void {
 
 function context() {
     return loadReleaseContext(repoRoot);
+}
+
+function successorContext() {
+    const ctx = structuredClone(context());
+    (ctx.contract.release as { version: string }).version = "0.39.0";
+    return ctx;
 }
 
 function targetFor(name: string) {
@@ -395,6 +403,10 @@ describe("staged payload verification", () => {
         writeFileSync(launcher, bytes);
         manifest.files[0].size = Buffer.byteLength(bytes);
         manifest.files[0].sha256 = sha256Hex(bytes);
+        // A staged tree that contradicts its own manifest's declared mode is
+        // not a valid starting point for the drift cases below: the mode check
+        // would fire first and mask the mutation each one targets.
+        chmodSync(launcher, Number.parseInt(manifest.files[0].mode, 8));
         return root;
     }
 
@@ -404,6 +416,26 @@ describe("staged payload verification", () => {
         expect(() => verifyPayloadDir(root, manifest)).not.toThrow();
         writeFileSync(join(root, LAUNCHER_PATH), "mc-hosT\n");
         expect(() => verifyPayloadDir(root, manifest)).toThrow(/digest drift/);
+    });
+
+    test("declared mode is enforced, not just the bytes", () => {
+        const manifest = devManifest();
+        const root = stage(manifest, "mc-host\n");
+        const launcher = join(root, LAUNCHER_PATH);
+        expect(() => verifyPayloadDir(root, manifest)).not.toThrow();
+        // Right bytes, wrong permissions: a launcher staged non-executable
+        // still carries the manifest digest that certifies the tree.
+        chmodSync(launcher, 0o644);
+        expect(() => verifyPayloadDir(root, manifest)).toThrow(
+            /mode drift \(644 != 755\)/,
+        );
+        // Over-permissive fails the same way; the manifest names one mode.
+        chmodSync(launcher, 0o777);
+        expect(() => verifyPayloadDir(root, manifest)).toThrow(
+            /mode drift \(777 != 755\)/,
+        );
+        chmodSync(launcher, 0o755);
+        expect(() => verifyPayloadDir(root, manifest)).not.toThrow();
     });
 
     test("unlisted extra file fails", () => {
@@ -485,7 +517,7 @@ describe("stop-provenance record", () => {
     });
 
     test("a predecessor record on the genesis release fails", () => {
-        const ctx = context();
+        const ctx = successorContext();
         expect(() =>
             validateStopRecord(predecessorRecord(), ctx, "0.38.0"),
         ).not.toThrow();
@@ -495,26 +527,26 @@ describe("stop-provenance record", () => {
     });
 
     test("reservation versions can never be ancestry", () => {
-        const ctx = context();
+        const ctx = successorContext();
         const record = predecessorRecord();
         record.predecessor_release_version = "0.0.1-reserved.0";
         expect(() =>
             validateStopRecord(record, ctx, "0.0.1-reserved.0"),
-        ).toThrow(/reservation version/);
+        ).toThrow(/exact semver/);
     });
 
     test("self-authored, N-2, unknown-target, and modified-manifest records fail", () => {
-        const ctx = context();
+        const ctx = successorContext();
 
         const selfAuthored = predecessorRecord();
-        selfAuthored.predecessor_release_version = "0.38.0";
+        selfAuthored.predecessor_release_version = "0.39.0";
         expect(() =>
             validateStopRecord(
-                { ...selfAuthored, release_version: "0.38.0" },
+                selfAuthored,
                 ctx,
-                "0.38.0",
+                "0.39.0",
             ),
-        ).toThrow(/cite itself/);
+        ).toThrow(/older than the current release/);
 
         const nMinusTwo = predecessorRecord();
         nMinusTwo.predecessor_release_version = "0.37.0";
@@ -525,7 +557,7 @@ describe("stop-provenance record", () => {
         const badTarget = predecessorRecord();
         badTarget.target = "win32-x64";
         expect(() => validateStopRecord(badTarget, ctx, "0.38.0")).toThrow(
-            /unsupported target/,
+            /not a supported platform/,
         );
 
         const modified = predecessorRecord();
@@ -540,7 +572,7 @@ describe("stop-provenance record", () => {
         const badProof = predecessorRecord();
         badProof.legacy_proof_version = 2;
         expect(() => validateStopRecord(badProof, ctx, "0.38.0")).toThrow(
-            /legacy proof version/,
+            /legacy stop-only proof version/,
         );
     });
 });
@@ -662,6 +694,36 @@ describe("trust index", () => {
 });
 
 describe("dev payload build", () => {
+    // `process.platform` reads "linux" on musl systems too, so the only signal
+    // separating them is whether the running process is glibc-linked.
+    function withReportHeader<T>(header: unknown, body: () => T): T {
+        const host = process as unknown as { report?: unknown };
+        const original = host.report;
+        host.report = { getReport: () => ({ header }) };
+        try {
+            return body();
+        } finally {
+            host.report = original;
+        }
+    }
+
+    test("a Linux host that cannot prove glibc is refused, not labeled -gnu", () => {
+        if (process.platform !== "linux") {
+            // The gate only guards the matrix's `-gnu` target.
+            expect(hostTarget().target).not.toMatch(/-gnu$/);
+            return;
+        }
+        expect(withReportHeader({ glibcVersionRuntime: "2.28" }, () => hostTarget().target)).toBe(
+            "linux-x64-gnu",
+        );
+        // A musl host reports no runtime glibc version. Selecting linux-x64-gnu
+        // anyway would stamp a musl-linked launcher with the glibc floor.
+        expect(() => withReportHeader({}, () => hostTarget())).toThrow(/not glibc-linked/);
+        expect(() => withReportHeader(undefined, () => hostTarget())).toThrow(
+            /not glibc-linked/,
+        );
+    });
+
     test("dev payload manifest recomputes to the same digest from disk", () => {
         const root = mkdtempSync(join(tmpdir(), "mc-host-dev-"));
         tempRoots.push(root);

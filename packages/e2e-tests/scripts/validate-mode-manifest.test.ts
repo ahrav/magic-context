@@ -1,11 +1,16 @@
 import { describe, expect, it } from "bun:test";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { parseIncidentCatalog } from "../src/incident-pool/contract";
 import {
+    HISTORIAN_EVAL_HARNESS_TESTS,
     assertSrcTestsClassified,
+    historianEvalUnitFiles,
     incidentUnitFiles,
     prospectiveUnitFiles,
+    standaloneFilesForSelection,
+    tsOpenCodeStandaloneFiles,
 } from "./run-test-selection";
 import {
     E2E_ROOT,
@@ -38,7 +43,7 @@ function manifestWith(entries: ModeManifest["entries"]): ModeManifest {
 
 describe("mode manifest validator", () => {
     it("covers every live e2e test exactly once", () => {
-        expect(validation.files.length).toBe(60);
+        expect(validation.files.length).toBe(62);
         expect(validation.manifest.entries).toHaveLength(
             validation.files.length,
         );
@@ -54,12 +59,12 @@ describe("mode manifest validator", () => {
     it("derives separate TS and Rust invocation lists", () => {
         const ts = filesForMode(validation, "ts");
         const rust = filesForMode(validation, "rust");
-        expect(ts).toHaveLength(41);
-        expect(rust).toHaveLength(31);
+        expect(ts).toHaveLength(43);
+        expect(rust).toHaveLength(32);
         expect(ts.filter((path) => path.startsWith("tests/pi-")).length).toBe(
             21,
         );
-        expect(filesForMode(validation, "ts", "opencode")).toHaveLength(20);
+        expect(filesForMode(validation, "ts", "opencode")).toHaveLength(22);
         expect(filesForMode(validation, "ts", "pi")).toHaveLength(21);
         expect(new Set([...ts, ...rust]).size).toBe(validation.files.length);
         expect(filesForMode(validation, "ts", "pi")).not.toContain(
@@ -177,6 +182,54 @@ describe("mode manifest validator", () => {
             ]),
         );
         expect(() => assertSrcTestsClassified()).not.toThrow();
+    });
+
+    it("owns OpenCode oracle units only in TypeScript OpenCode selections", () => {
+        const opencodeOnly = [
+            "src/oracle-arms/presets.test.ts",
+            "src/oracle-arms/scripted-ctx-search.test.ts",
+        ];
+        expect(standaloneFilesForSelection("ts", "opencode")).toEqual(
+            expect.arrayContaining(opencodeOnly),
+        );
+        for (const file of opencodeOnly) {
+            expect(standaloneFilesForSelection("ts", "pi")).not.toContain(file);
+            expect(standaloneFilesForSelection("rust", "all")).not.toContain(file);
+        }
+        for (const files of [
+            standaloneFilesForSelection("ts", "opencode"),
+            standaloneFilesForSelection("ts", "pi"),
+            standaloneFilesForSelection("rust", "all"),
+        ]) {
+            expect(files).toContain("src/oracle-arms/seed-gold-memories.test.ts");
+        }
+    });
+
+    it("claims a historian-eval harness test in the OpenCode selection once it exists", () => {
+        // `assertSrcTestsClassified` runs on every CLI path, so a harness test
+        // excluded from `historianEvalUnitFiles` with no other claimant would
+        // break `--mode ts` and `--incident-unit` the moment the file lands.
+        // Proven against a temp root because the declared name has no file yet.
+        const root = mkdtempSync(join(tmpdir(), "hse-selection-"));
+        try {
+            const files = [
+                "src/oracle-arms/presets.test.ts",
+                "src/oracle-arms/scripted-ctx-search.test.ts",
+                "src/historian-eval/contract.test.ts",
+                ...HISTORIAN_EVAL_HARNESS_TESTS,
+            ];
+            for (const file of files) {
+                mkdirSync(dirname(resolve(root, file)), { recursive: true });
+                writeFileSync(resolve(root, file), "");
+            }
+            for (const harnessTest of HISTORIAN_EVAL_HARNESS_TESTS) {
+                expect(tsOpenCodeStandaloneFiles(root)).toContain(harnessTest);
+                expect(historianEvalUnitFiles(root)).not.toContain(harnessTest);
+            }
+            expect(historianEvalUnitFiles(root)).toContain("src/historian-eval/contract.test.ts");
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
     });
 
     it("rejects broad-glob green package scripts", () => {

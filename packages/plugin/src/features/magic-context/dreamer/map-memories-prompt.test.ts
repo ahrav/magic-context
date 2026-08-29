@@ -1,8 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
+import type { ClaimMutationToken } from "../memory/claim-operation-contract";
 import {
     buildMapMemoriesPrompt,
     extractMemoryCandidatePaths,
@@ -10,196 +11,96 @@ import {
     validateMapMemoriesManifest,
 } from "./map-memories-prompt";
 
-/** Real model deviations from the map-memories contract. Each used to parse
- *  to zero entries (or silently flip independent) and skip the fallback chain. */
-const GEMINI_MAP_CHILDREN = `<mappings>
-<map id="1">
-config/magic-default.jsonc
-</map>
-</mappings>`;
+const A = `mcm_${"a".repeat(32)}`;
+const B = `mcm_${"b".repeat(32)}`;
 
-const GLM52_JSON_ARRAY = `<mappings>
-[
-  { "id": "CONFIG_VALUES", "files": ["config/magic-default.jsonc"] }
-]
-</mappings>`;
+function token(publicClaimId: string): ClaimMutationToken {
+    return {
+        tokenVersion: 1,
+        publicClaimId,
+        revision: 1,
+        contentDigest: "1".repeat(64),
+        lifecycleSeq: 1,
+        applicabilityHeadsDigest: "2".repeat(64),
+        policyHeadsDigest: "3".repeat(64),
+    };
+}
 
-const GLM53_MAPPING_ELEMENT = `<mappings>
-  <mapping id="CONFIG_VALUES">
-    <files><file path="config/magic-default.jsonc">claim</file></files>
-    <status>confirmed</status>
-  </mapping>
-</mappings>`;
-
-const DEEPSEEK_NESTED_FILE = `<mappings>
-  <memory id="1" name="CONFIG_VALUES">
-    <file path="config/magic-default.jsonc" claim="defaults live here" verified="true" line="14"/>
-  </memory>
-</mappings>`;
-
-describe("parseMapMemoriesManifest", () => {
-    it("parses files and independent flags, tolerant of attribute order", () => {
-        const text = `prose before
-<mappings>
-<memory id="1" files="a/b.ts,c/d.ts"/>
-<memory id="2" independent="true"/>
-<memory files="x/y.ts" id="3"/>
-</mappings>`;
-        const out = parseMapMemoriesManifest(text);
-        expect(out).toEqual([
-            { id: 1, files: ["a/b.ts", "c/d.ts"], independent: false },
-            { id: 2, files: [], independent: true },
-            { id: 3, files: ["x/y.ts"], independent: false },
+describe("map manifest", () => {
+    it("parses public claim ids, files, independent sentinels, and nested files", () => {
+        expect(
+            parseMapMemoriesManifest(
+                `<mappings><memory claim="${A}" files="a/b.ts,c/d.ts"/><memory claim="${B}" independent="true"/></mappings>`,
+            ),
+        ).toEqual([
+            { publicClaimId: A, files: ["a/b.ts", "c/d.ts"], independent: false },
+            { publicClaimId: B, files: [], independent: true },
         ]);
+        expect(
+            parseMapMemoriesManifest(
+                `<mappings><memory claim="${A}"><file path="src/a.ts"/></memory></mappings>`,
+            ),
+        ).toEqual([{ publicClaimId: A, files: ["src/a.ts"], independent: false }]);
     });
 
-    it("rejects a memory that has neither files nor the independent sentinel", () => {
-        // Mutation: flipping the default back to `independent || files.length === 0`
-        // makes this parse succeed as independent=true instead of throwing.
-        expect(() => parseMapMemoriesManifest(`<mappings><memory id="9"/></mappings>`)).toThrow(
-            /neither files nor independent/,
-        );
-    });
-
-    it("honors independent only when the explicit sentinel is present", () => {
-        const out = parseMapMemoriesManifest(
-            `<mappings><memory id="2" independent="true"/></mappings>`,
-        );
-        expect(out).toEqual([{ id: 2, files: [], independent: true }]);
-    });
-
-    it("rescues nested <file path> children instead of marking independent", () => {
-        const out = parseMapMemoriesManifest(DEEPSEEK_NESTED_FILE);
-        expect(out).toEqual([{ id: 1, files: ["config/magic-default.jsonc"], independent: false }]);
-    });
-
-    it("rejects wrong-but-rooted empty parses with a named retry-visible error", () => {
-        expect(() => parseMapMemoriesManifest(GEMINI_MAP_CHILDREN)).toThrow(
-            /root <map> unrecognized; expected <mappings> with <memory> entries/,
-        );
-        expect(() => parseMapMemoriesManifest(GLM52_JSON_ARRAY)).toThrow(
-            /JSON array unrecognized; expected <mappings> with <memory> entries/,
-        );
-        expect(() => parseMapMemoriesManifest(GLM53_MAPPING_ELEMENT)).toThrow(
-            /root <mapping> unrecognized; expected <mappings> with <memory> entries/,
-        );
-    });
-
-    it("rejects a wrong document root and a bare JSON array", () => {
-        expect(() => parseMapMemoriesManifest(`<map><memory id="1" files="a.ts"/></map>`)).toThrow(
-            /root <map> unrecognized; expected <mappings> with <memory> entries/,
-        );
-        expect(() => parseMapMemoriesManifest(`[{ "id": 1, "files": ["a.ts"] }]`)).toThrow(
-            /JSON array unrecognized; expected <mappings> with <memory> entries/,
-        );
-    });
-
-    it("still accepts an empty mappings body (no unrecognized children)", () => {
-        expect(parseMapMemoriesManifest(`<mappings></mappings>`)).toEqual([]);
-    });
-
-    it("trims file whitespace", () => {
-        const out = parseMapMemoriesManifest(
-            `<mappings><memory id="5" files=" a.ts ,  b.ts "/></mappings>`,
-        );
-        expect(out).toEqual([{ id: 5, files: ["a.ts", "b.ts"], independent: false }]);
-    });
-
-    it("rejects truncated, duplicate, and invalid entries", () => {
-        expect(() => parseMapMemoriesManifest(`<mappings><memory id="5" files="a.ts"/>`)).toThrow(
-            /closing root/,
-        );
+    it("rejects malformed, duplicate, missing, and extra entries", () => {
+        expect(() =>
+            parseMapMemoriesManifest(`<mappings><memory claim="${A}"/></mappings>`),
+        ).toThrow(/neither files nor independent/);
         expect(() =>
             parseMapMemoriesManifest(
-                `<mappings><memory id="5" files="a.ts"/><memory id="5" independent="true"/></mappings>`,
+                `<mappings><memory claim="${A}" files="a.ts"/><memory claim="${A}" independent="true"/></mappings>`,
             ),
         ).toThrow(/duplicate id/);
         expect(() =>
-            parseMapMemoriesManifest(`<mappings><memory id="x" files="a.ts"/></mappings>`),
-        ).toThrow(/numeric id/);
-    });
-});
-
-describe("extractMemoryCandidatePaths", () => {
-    const dir = mkdtempSync(path.join(tmpdir(), "mc-map-prompt-"));
-    writeFileSync(path.join(dir, "real.ts"), "x");
-    const sub = path.join(dir, "pkg");
-    require("node:fs").mkdirSync(sub, { recursive: true });
-    writeFileSync(path.join(sub, "file.ts"), "x");
-
-    it("returns only repo-relative paths that actually exist", () => {
-        const found = extractMemoryCandidatePaths(
-            "In `pkg/file.ts`, X does Y; also nonexistent/ghost.ts is referenced.",
-            dir,
-        );
-        expect(found).toEqual(["pkg/file.ts"]);
-    });
-
-    it("does not seed when the memory names no path (conceptual memory)", () => {
-        const found = extractMemoryCandidatePaths(
-            "The classify task scores importance, scope, and shareability.",
-            dir,
-        );
-        expect(found).toEqual([]);
-    });
-
-    it("ignores traversal paths", () => {
-        const found = extractMemoryCandidatePaths("see ../escape/file.ts", dir);
-        expect(found).toEqual([]);
-    });
-
-    it("resets regex state per call (no lastIndex bleed across memories)", () => {
-        // The bug this guards: a module-level /g regex carries lastIndex; calling
-        // twice must each resolve the leading path.
-        const a = extractMemoryCandidatePaths("pkg/file.ts is here", dir);
-        const b = extractMemoryCandidatePaths("pkg/file.ts is here", dir);
-        expect(a).toEqual(["pkg/file.ts"]);
-        expect(b).toEqual(["pkg/file.ts"]);
-        rmSync(dir, { recursive: true, force: true });
-    });
-});
-
-describe("validateMapMemoriesManifest", () => {
-    it("rejects an empty parse against a non-empty batch", () => {
-        expect(() => validateMapMemoriesManifest(`<mappings></mappings>`, new Set([1]))).toThrow(
-            /parsed zero entries; expected <mappings> with <memory> entries/,
-        );
-    });
-
-    it("rejects missing and extra ids at retry time", () => {
+            validateMapMemoriesManifest(
+                `<mappings><memory claim="${A}" files="a.ts"/></mappings>`,
+                new Set([A, B]),
+            ),
+        ).toThrow(/missing id/);
         expect(() =>
             validateMapMemoriesManifest(
-                `<mappings><memory id="1" files="a.ts"/></mappings>`,
-                new Set([1, 2]),
+                `<mappings><memory claim="${A}" files="a.ts"/><memory claim="${B}" independent="true"/></mappings>`,
+                new Set([A]),
             ),
-        ).toThrow(/missing id 2/);
-        expect(() =>
-            validateMapMemoriesManifest(
-                `<mappings><memory id="1" files="a.ts"/><memory id="9" independent="true"/></mappings>`,
-                new Set([1]),
-            ),
-        ).toThrow(/unknown id 9/);
-    });
-
-    it("accepts exact coverage", () => {
-        const out = validateMapMemoriesManifest(
-            `<mappings><memory id="1" files="a.ts"/><memory id="2" independent="true"/></mappings>`,
-            new Set([1, 2]),
-        );
-        expect(out).toHaveLength(2);
+        ).toThrow(/unknown id/);
     });
 });
 
-describe("buildMapMemoriesPrompt", () => {
-    it("includes the seed line only when candidates exist", () => {
+describe("map prompt", () => {
+    it("renders exact claim snapshot and candidate paths", () => {
+        const contentDigest = "1".repeat(64);
         const prompt = buildMapMemoriesPrompt("git:abc", [
-            { id: 1, category: "ARCHITECTURE", content: "foo", candidates: ["a/b.ts"] },
-            { id: 2, category: "CONSTRAINTS", content: "bar", candidates: [] },
+            {
+                publicClaimId: A,
+                revisionLocator: `${A}/r1/${contentDigest}`,
+                contentDigest,
+                mutationToken: token(A),
+                category: "ARCHITECTURE",
+                content: "Fact in src/fact.ts",
+                candidates: ["src/fact.ts"],
+            },
         ]);
-        expect(prompt).toContain("[1] ARCHITECTURE");
-        expect(prompt).toContain("Likely files (named in the memory, confirmed to exist): a/b.ts");
-        expect(prompt).toContain("[2] CONSTRAINTS\nbar");
-        // memory 2 has no candidates → no seed line for it
-        expect(prompt).not.toContain("Likely files (named in the memory, confirmed to exist): \n");
+        expect(prompt).toContain(`[${A}] ARCHITECTURE`);
+        expect(prompt).toContain(`${A}/r1/${contentDigest}`);
+        expect(prompt).toContain(`digest=${contentDigest}`);
+        expect(prompt).toContain(
+            "Likely files (named in the memory, confirmed to exist): src/fact.ts",
+        );
+    });
+
+    it("extracts only existing in-repository paths on every call", () => {
+        const dir = mkdtempSync(path.join(tmpdir(), "mc-map-prompt-"));
+        try {
+            mkdirSync(path.join(dir, "pkg"));
+            writeFileSync(path.join(dir, "pkg", "file.ts"), "x");
+            expect(extractMemoryCandidatePaths("pkg/file.ts and missing/ghost.ts", dir)).toEqual([
+                "pkg/file.ts",
+            ]);
+            expect(extractMemoryCandidatePaths("pkg/file.ts", dir)).toEqual(["pkg/file.ts"]);
+            expect(extractMemoryCandidatePaths("../escape/file.ts", dir)).toEqual([]);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
     });
 });
