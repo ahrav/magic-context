@@ -239,13 +239,27 @@ export function createLazyManagedDemandStart(
 ): ManagedDemandStart {
     let policy: ReturnType<typeof createManagedLifecyclePolicy> | undefined;
     return async (request): Promise<ManagedDemandResult> => {
+        // The caller's budget starts here, not at `demandStart`. Building the
+        // policy on a fresh install synchronously resolves the payload package,
+        // hashes every manifest file, and stages the bootstrap, and being
+        // synchronous it also blocks the abort timer from firing. Charging that
+        // preparation to the request keeps the demand inside the deadline the
+        // caller actually granted, instead of launching a daemon for a request
+        // whose budget was already gone and then running a full aggregate.
+        const startedAt = performance.now();
         policy ??= createManagedLifecyclePolicy({
             mode: "mutating",
             declaringModuleUrl: options.declaringModuleUrl,
             parentPackageName: options.parentPackageName,
         });
+        const preparationMs = performance.now() - startedAt;
+        // A non-positive residual is refused by `demandStart`'s entry guard,
+        // which rejects before any native start is created.
+        const deadlineMs =
+            request.deadlineMs === undefined ? undefined : request.deadlineMs - preparationMs;
         const outcome = await policy.demandStart({
             ...request,
+            ...(deadlineMs === undefined ? {} : { deadlineMs }),
             // The demand contract lets a caller carry its own envelope; only
             // default it, so this wrapper cannot silently discard one.
             startupEnvelope:

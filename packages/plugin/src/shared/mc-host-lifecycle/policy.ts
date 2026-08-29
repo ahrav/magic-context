@@ -534,10 +534,19 @@ export class McHostLifecyclePolicy {
         }
         const launchTarget = this.launchTarget;
         try {
-            const invoke = (payloadDir: string | undefined) =>
+            // The aggregate is one request-to-transport bound for the whole
+            // command, not per native invocation. The certified-package lookup
+            // and a first launch that answers `native_payload_missing` both spend
+            // from it, so each invocation gets the residual. Handing
+            // `preflight.deadlineMs` to both would let a fallback retry run a
+            // second full aggregate — twice the budget the platform was
+            // qualified for.
+            const startedAt = monotonicNow();
+            const remaining = (): number => preflight.deadlineMs - (monotonicNow() - startedAt);
+            const invoke = (payloadDir: string | undefined, deadlineMs: number) =>
                 runNativeLifecycle(launchTarget, {
                     command: command as NativeLifecycleCommand,
-                    deadlineMs: preflight.deadlineMs,
+                    deadlineMs,
                     env: this.nativeEnv(preflight.root),
                     ...(payloadDir !== undefined && command !== "stop" ? { payloadDir } : {}),
                     ...(command !== "stop" && this.payloadManifestDigest !== undefined
@@ -555,7 +564,14 @@ export class McHostLifecyclePolicy {
             ) {
                 selectedPayloadDir = this.payloadDirFallback() ?? undefined;
             }
-            let native = await invoke(selectedPayloadDir);
+            const firstBudget = remaining();
+            if (firstBudget <= 0) {
+                // The lookup consumed the command's budget before any child
+                // existed, so nothing was spawned and nothing committed.
+                const state = preNativeState(classifyPreNativeRoots(preflight.root));
+                return localResult(command, false, state, TIMEOUT_REASON[command]);
+            }
+            let native = await invoke(selectedPayloadDir, firstBudget);
             if (
                 command === "start" &&
                 this.payloadDir === undefined &&
@@ -563,7 +579,14 @@ export class McHostLifecyclePolicy {
                 this.payloadDirFallback !== undefined
             ) {
                 const fallback = this.payloadDirFallback();
-                if (fallback !== null) native = await invoke(fallback);
+                if (fallback !== null) {
+                    const retryBudget = remaining();
+                    // With no budget left the retry cannot be attempted, and the
+                    // first launch already answered. Reporting its real result
+                    // beats replacing a completed observation with a synthetic
+                    // timeout.
+                    if (retryBudget > 0) native = await invoke(fallback, retryBudget);
+                }
             }
             return this.relabel(native, command, command);
         } catch (error) {

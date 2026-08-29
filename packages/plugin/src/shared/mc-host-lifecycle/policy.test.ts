@@ -290,6 +290,59 @@ describe("native invocation mapping", () => {
         }
     });
 
+    test("the fallback retry spends what the first launch left, not a fresh aggregate", async () => {
+        // The aggregate is one request-to-transport bound for the command. A
+        // first launch that answers `native_payload_missing`, plus the package
+        // lookup that follows it, both spend from it — so handing the retry the
+        // full aggregate again would let one `start` run twice the budget its
+        // platform was qualified for.
+        const root = tempDir("mc-policy-fallback-budget-");
+        const invocationLog = path.join(root, "budget-invocations.log");
+        const binary = path.join(root, "budget-ck-mc-host.sh");
+        // The first invocation reports the payload missing after burning a
+        // second; the second (with --payload-dir) succeeds immediately.
+        writeFileSync(
+            binary,
+            `#!/bin/sh\necho "$*" >> ${invocationLog}\n` +
+                `if [ "$2" != "--payload-dir" ]; then sleep 1; echo '${missingPayloadResultJson()}'; exit 1; fi\n` +
+                `echo '${startResultJson("start")}'\nexit 0\n`,
+        );
+        chmodSync(binary, 0o700);
+        const LOOKUP_MS = 500;
+        const AGGREGATE_MS = 20_000;
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                outerAggregateMs: AGGREGATE_MS,
+                payloadDirFallback: () => {
+                    // Stands in for resolving and hashing the certified package,
+                    // which is synchronous on the real path.
+                    const until = Date.now() + LOOKUP_MS;
+                    while (Date.now() < until) {
+                        /* burn budget before the retry */
+                    }
+                    return "/qualified/package";
+                },
+            });
+
+            const started = Date.now();
+            const result = await policy.start();
+            const elapsed = Date.now() - started;
+
+            expect(result.reason).toBe("started");
+            // Both invocations happened, so the retry really did run.
+            expect(readFileSync(invocationLog, "utf8").trim().split("\n")).toEqual([
+                "start",
+                "start --payload-dir /qualified/package",
+            ]);
+            // The whole command stayed inside one aggregate rather than two.
+            expect(elapsed).toBeLessThan(AGGREGATE_MS);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 30_000);
+
     test("status and doctor route through the native probe of the trusted target", async () => {
         const root = tempDir("mc-policy-native-");
         const { binary, invocationLog } = fakeBinary(root);
