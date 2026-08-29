@@ -20,6 +20,7 @@ export {
     type MonotonicClock,
 } from "./deadline";
 export {
+    DAEMON_GENERATION_CHANGED_CODE,
     isMcHostCallError,
     McHostCallError,
     McHostClientError,

@@ -923,6 +923,8 @@ describe("embedItemsDetailed", () => {
     interface RecordedCall {
         method: string;
         params: Record<string, unknown>;
+        expectedDaemonId?: Uint8Array;
+        timeoutMs?: number;
     }
 
     /** Deterministic host double: embed.batch answers with a job descriptor
@@ -955,8 +957,16 @@ describe("embedItemsDetailed", () => {
             _module: string,
             method: string,
             params?: unknown,
+            options?: { expectedDaemonId?: Uint8Array; timeoutMs?: number },
         ): Promise<Response> {
-            const record = { method, params: (params ?? {}) as Record<string, unknown> };
+            const record = {
+                method,
+                params: (params ?? {}) as Record<string, unknown>,
+                ...(options?.expectedDaemonId === undefined
+                    ? {}
+                    : { expectedDaemonId: options.expectedDaemonId }),
+                ...(options?.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+            };
             this.calls.push(record);
             if (method === "embed.batch") {
                 const scripted = this.batchError?.(this.batchCalls().length - 1);
@@ -1008,6 +1018,17 @@ describe("embedItemsDetailed", () => {
     function moduleRestartedError(): Error {
         const error = new Error("module restarted") as Error & { code: string };
         error.code = "module_restarted";
+        return error;
+    }
+
+    /** The client's own pre-publication fence: the authenticated daemon no
+     *  longer matches the certified incarnation, refused before any byte is
+     *  enqueued, so the request never reached the daemon. */
+    function daemonGenerationChangedError(): Error {
+        const error = new Error(
+            "authenticated daemon changed after lifecycle compatibility validation",
+        ) as Error & { code: string };
+        error.code = "daemon_generation_changed";
         return error;
     }
 
@@ -1566,6 +1587,134 @@ describe("embedItemsDetailed", () => {
         }
     });
 
+    it("rebinds a restarted page to the compatible replacement daemon", async () => {
+        const db = ledgerDb();
+        try {
+            const host = new DetailedHost();
+            const daemonIds = [new Uint8Array([1]), new Uint8Array([2])];
+            // One rotation, observed when the retained job's reply reports the
+            // restart. Identity is a function of that generation, not of the
+            // demand count: the lifecycle owner coalesces demands and reports
+            // whichever daemon is live, so every demand raised while recovering
+            // from the same restart must observe the same replacement.
+            let rotated = false;
+            host.resultPages = (jobId, items) => {
+                if (jobId === "job-1") {
+                    rotated = true;
+                    return moduleRestartedError();
+                }
+                return {
+                    result: {
+                        ...ENVELOPE,
+                        done: true,
+                        vectors: items.map((item) => ({
+                            id: item.id,
+                            content_sha256: item.content_sha256,
+                            vector: [1, 2, 3],
+                        })),
+                    },
+                };
+            };
+            const provider = detailedProvider(host);
+            let demands = 0;
+            const mutable = provider as unknown as {
+                connectionOrigin: "managed-default";
+                demandStart: () => Promise<{
+                    ok: true;
+                    reason: "started";
+                    storage: null;
+                    authenticatedDaemonId: Uint8Array;
+                }>;
+            };
+            mutable.connectionOrigin = "managed-default";
+            mutable.demandStart = async () => {
+                demands += 1;
+                return {
+                    ok: true,
+                    reason: "started",
+                    storage: null,
+                    authenticatedDaemonId: (rotated ? daemonIds[1] : daemonIds[0]) as Uint8Array,
+                };
+            };
+
+            const result = await provider.embedItemsDetailed(
+                detailedItems([{ id: "memory:1", group: "g1" }]),
+                detailedContext(db),
+            );
+
+            expect(result.failures).toEqual([]);
+            expect(result.receipts).toHaveLength(1);
+            // At least one re-derivation past the initial demand. The exact
+            // count is not pinned: recovery re-certifies at both the page and
+            // the lane, and that split is not this test's contract.
+            expect(demands).toBeGreaterThanOrEqual(2);
+            const batches = host.batchCalls();
+            expect(batches).toHaveLength(2);
+            expect(batches[0].expectedDaemonId).toEqual(daemonIds[0]);
+            expect(batches[1].expectedDaemonId).toEqual(daemonIds[1]);
+            expect(batches[0].params.request_key).toBe(batches[1].params.request_key);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("rebinds a page refused by the pre-publication daemon fence without spending the restart budget", async () => {
+        const db = ledgerDb();
+        try {
+            const host = new DetailedHost();
+            const daemonIds = [new Uint8Array([1]), new Uint8Array([2])];
+            let rotated = false;
+            // The client fence refuses the first submission before publishing.
+            // It is `not_sent`, so nothing reached the daemon and the same
+            // request key may be resubmitted against the replacement.
+            host.batchError = (index) => {
+                if (index !== 0) return null;
+                rotated = true;
+                return daemonGenerationChangedError();
+            };
+            const provider = detailedProvider(host);
+            const mutable = provider as unknown as {
+                connectionOrigin: "managed-default";
+                demandStart: () => Promise<{
+                    ok: true;
+                    reason: "started";
+                    storage: null;
+                    authenticatedDaemonId: Uint8Array;
+                }>;
+            };
+            mutable.connectionOrigin = "managed-default";
+            mutable.demandStart = async () => ({
+                ok: true,
+                reason: "started",
+                storage: null,
+                authenticatedDaemonId: (rotated ? daemonIds[1] : daemonIds[0]) as Uint8Array,
+            });
+
+            const result = await provider.embedItemsDetailed(
+                detailedItems([{ id: "memory:1", group: "g1" }]),
+                detailedContext(db),
+            );
+
+            // The fence is absorbed in-page: the page succeeds rather than
+            // being reported as a failure the caller must retry.
+            expect(result.failures).toEqual([]);
+            expect(result.receipts).toHaveLength(1);
+            const batches = host.batchCalls();
+            expect(batches).toHaveLength(2);
+            // Same key, so the replacement daemon dedupes rather than
+            // double-embedding, and the retry rides the replacement identity.
+            expect(batches[0].params.request_key).toBe(batches[1].params.request_key);
+            expect(batches[1].expectedDaemonId).toEqual(daemonIds[1]);
+            // The durable restart budget belongs to observed daemon restarts.
+            // A pre-publication refusal must not consume it, so a genuine
+            // restart afterwards is still absorbable.
+            const row = getSynapseLedgerPage(db, result.receipts[0].rowId);
+            expect(row?.restartCount ?? 0).toBe(0);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     it("fails the page when the single restart budget is spent instead of resubmitting again", async () => {
         const db = ledgerDb();
         try {
@@ -1698,8 +1847,10 @@ describe("embedItemsDetailed", () => {
         const db = ledgerDb();
         try {
             const host = new DetailedHost();
-            // The submit itself restarts, so the durable restart CAS never
-            // runs and the page's single restart stays unspent.
+            // Every submit restarts: the first restart consumes the one
+            // submission-time rebind and resubmits the same request key; the
+            // second propagates. The durable restart CAS never runs, so the
+            // page's single durable restart stays unspent.
             host.batchError = () => moduleRestartedError();
             const provider = detailedProvider(host);
             const result = await provider.embedItemsDetailed(
@@ -1711,7 +1862,9 @@ describe("embedItemsDetailed", () => {
             expect(result.failures).toHaveLength(1);
             expect(result.failures[0].code).toBe("module_restarted");
             expect(result.failures[0].disposition).toBe("retryable");
-            expect(host.batchCalls()).toHaveLength(1);
+            const batchCalls = host.batchCalls();
+            expect(batchCalls).toHaveLength(2);
+            expect(batchCalls[1].params.request_key).toBe(batchCalls[0].params.request_key);
             const row = ledgerRows(db)[0];
             expect(row.state).toBe("failed");
             expect(row.failure_disposition).toBe("retryable");
@@ -2324,6 +2477,79 @@ describe("embedItemsDetailed", () => {
             expect(ledgerRows(db)).toEqual([]);
         } finally {
             closeQuietly(db);
+        }
+    });
+
+    it("keeps the original legacy page deadline across daemon rebind and polling", async () => {
+        const realNow = Date.now;
+        let now = 1_000;
+        Date.now = () => now;
+        try {
+            const host = new DetailedHost();
+            host.resultPages = (jobId, items) => {
+                if (jobId === "job-1") return moduleRestartedError();
+                return {
+                    result: {
+                        ...ENVELOPE,
+                        done: true,
+                        vectors: items.map((item) => ({
+                            id: item.id,
+                            content_sha256: item.content_sha256,
+                            vector: [1, 2, 3],
+                        })),
+                    },
+                };
+            };
+            const provider = new SynapseEmbeddingProvider({
+                connectionFile: "fixture",
+                projectRoot: "/repo",
+                session: "legacy-deadline",
+                model: MODEL,
+                fingerprint: FP,
+                tableEpoch: 0,
+                dims: 3,
+                recommendedBatch: 2,
+                batchTimeoutMs: 100,
+                clientFactory: async () => host,
+            });
+            const daemonIds = [new Uint8Array([1]), new Uint8Array([2])];
+            let demands = 0;
+            const mutable = provider as unknown as {
+                connectionOrigin: "managed-default";
+                demandStart: () => Promise<{
+                    ok: true;
+                    reason: "started";
+                    storage: null;
+                    authenticatedDaemonId: Uint8Array;
+                }>;
+            };
+            mutable.connectionOrigin = "managed-default";
+            mutable.demandStart = async () => {
+                if (demands === 1) now += 40;
+                return {
+                    ok: true,
+                    reason: "started",
+                    storage: null,
+                    authenticatedDaemonId: daemonIds[demands++] as Uint8Array,
+                };
+            };
+
+            const vectors = await provider.embedItems([
+                { id: "memory:1", text: "one", contentSha256: "a" },
+            ]);
+
+            expect(vectors.get("memory:1")).toEqual(new Float32Array([1, 2, 3]));
+            expect(demands).toBe(2);
+            const batches = host.batchCalls();
+            expect(batches[0].expectedDaemonId).toEqual(daemonIds[0]);
+            expect(batches[1].expectedDaemonId).toEqual(daemonIds[1]);
+            expect(batches[0].params.request_key).toBe(batches[1].params.request_key);
+            const replacementPoll = host
+                .resultCalls()
+                .find((call) => call.params.job_id === "job-2");
+            expect(replacementPoll?.timeoutMs).toBe(60);
+        } finally {
+            Date.now = realNow;
         }
     });
 

@@ -3,7 +3,11 @@ import { join } from "node:path";
 import { getDataDir } from "../../../shared/data-path";
 import { getHarness } from "../../../shared/harness";
 import { log } from "../../../shared/logger";
-import { isMcHostCallError, McHostClient } from "../../../shared/mc-host-client";
+import {
+    DAEMON_GENERATION_CHANGED_CODE,
+    isMcHostCallError,
+    McHostClient,
+} from "../../../shared/mc-host-client";
 import {
     type ConnectionOrigin,
     resolveConnectionOrigin,
@@ -171,6 +175,15 @@ export class SynapseEmbeddingError extends Error {
     readonly permanent: boolean;
     /** Ledger receipt this failure was recorded against, when one exists. */
     ledgerRowId?: number;
+    /**
+     * Set when this failure is the client's pre-publication daemon fence. The
+     * fence refuses before any byte is enqueued (`not_sent`), so the request
+     * provably never reached the daemon. Classification maps it to `transport`
+     * so it cannot masquerade as `module_restarted` evidence and spend a page's
+     * single durable restart budget; this flag lets a caller that can re-derive
+     * the binding resubmit the identical request key without that charge.
+     */
+    prePublicationFence?: boolean;
 
     constructor(
         code: SynapseErrorCode,
@@ -1237,7 +1250,12 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         const deadlineAt = row.deadlineAt ?? Date.now() + timeoutMs;
         try {
             if (row.state === "pending") {
-                const jobId = await this.submitBatchPage(page, requestKey, deadlineAt, signal);
+                const jobId = await this.submitBatchPageWithRebind(
+                    page,
+                    requestKey,
+                    deadlineAt,
+                    signal,
+                );
                 row = markSynapseLedgerPolling(db, {
                     rowId: row.rowId,
                     expectedStateVersion: row.stateVersion,
@@ -1249,7 +1267,12 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 if (!row.jobId) {
                     // A crash between the restart CAS and resubmission leaves a
                     // polling row without a job; resubmit the same page key.
-                    const jobId = await this.submitBatchPage(page, requestKey, deadlineAt, signal);
+                    const jobId = await this.submitBatchPageWithRebind(
+                        page,
+                        requestKey,
+                        deadlineAt,
+                        signal,
+                    );
                     row = recordSynapseLedgerJob(db, {
                         rowId: row.rowId,
                         expectedStateVersion: row.stateVersion,
@@ -1393,6 +1416,41 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
             );
         }
         return jobId;
+    }
+
+    /**
+     * Submit one page, absorbing at most one daemon rotation observed at
+     * submission time. A rotation during submission is the normal first
+     * symptom after a replacement (`initialize` short-circuits on a live
+     * provider, leaving a stale binding), and the replacement daemon dedupes
+     * by `request_key`, so one rebind-and-resubmit under the page's original
+     * absolute deadline is safe. A second rotation propagates to the caller's
+     * disposition handling.
+     *
+     * Two codes describe that rotation, and both belong here. `module_restarted`
+     * is the daemon's own report. `daemon_generation_changed` is the client
+     * fence refusing before publication: it is `not_sent`, so the page is
+     * provably unpublished and resubmitting the same key duplicates nothing.
+     * Classification maps the fence to `transport` precisely so it never spends
+     * the page's single durable restart budget, and rebinding here keeps that
+     * property — the budget is spent by the ledger, never by this helper.
+     */
+    private async submitBatchPageWithRebind(
+        page: readonly { id: string; text: string; contentSha256: string }[],
+        requestKey: string,
+        deadlineAt: number,
+        signal?: AbortSignal,
+    ): Promise<string> {
+        try {
+            return await this.submitBatchPage(page, requestKey, deadlineAt, signal);
+        } catch (error) {
+            const classified = classifyError(error);
+            const rotated =
+                classified.code === "module_restarted" || classified.prePublicationFence === true;
+            if (!rotated) throw classified;
+            await this.rebindAfterModuleRestart(deadlineAt, signal);
+            return this.submitBatchPage(page, requestKey, deadlineAt, signal);
+        }
     }
 
     private async collectJobPages(
@@ -1668,9 +1726,10 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 // bound identity is stale, and every retry carrying it fails
                 // identically. Drop the binding and surface the failure so the
                 // next initialize() revalidates against the live daemon.
-                if (readErrorCode(error) === "daemon_generation_changed") {
+                if (readErrorCode(error) === DAEMON_GENERATION_CHANGED_CODE) {
                     this.initialized = false;
                     this.compatibleDaemonId = null;
+                    classified.prePublicationFence = true;
                     throw classified;
                 }
                 if (classified.code === "idempotency_conflict") throw classified;

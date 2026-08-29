@@ -19,6 +19,7 @@ import type { CatalogEntry } from "../mc-host-client";
 import { checkPlatform, type LifecycleFailureReason, type PlatformReaders } from "./bootstrap";
 import {
     COMPATIBILITY_STAGES,
+    type CompatibilityInput,
     type CompatibilityStage,
     type CompatibilityVerdict,
     compatibilityStageIndex,
@@ -70,11 +71,7 @@ export interface ObservationalHealth extends CompatibilitySnapshot {
     readiness: DaemonReadiness;
 }
 
-function compatibilityInput(snapshot: CompatibilitySnapshot): {
-    authenticatedDaemonVer: string;
-    catalog: CatalogEntry[];
-    epochs: ObservedEpochs;
-} {
+function compatibilityInput(snapshot: CompatibilitySnapshot): CompatibilityInput {
     return {
         authenticatedDaemonVer: snapshot.authenticatedDaemonVersion,
         catalog: snapshot.catalog,
