@@ -5,7 +5,6 @@
  */
 
 import type { EmbeddingConfig } from "../../config/schema/magic-context";
-import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
 import {
     getSynapseLaneIdentity,
     type SynapseClientLike,

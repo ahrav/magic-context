@@ -37,7 +37,9 @@ records behind them.
 - [nudge-hygiene-calibration-2026-08-16.md](nudge-hygiene-calibration-2026-08-16.md)
   — note-nudge calibration record.
 - `perf/` — frozen benchmark contracts and evidence bundles;
-  [perf/runs/README.md](perf/runs/README.md) indexes the synapse-tail epochs.
+  [perf/synapse-tail-contract.md](perf/synapse-tail-contract.md) is the frozen
+  acceptance contract and [perf/runs/README.md](perf/runs/README.md) indexes
+  the synapse-tail epochs.
 
 ## Evidence and inventories
 

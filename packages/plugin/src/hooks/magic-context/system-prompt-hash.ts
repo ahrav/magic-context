@@ -514,10 +514,6 @@ export function createSystemPromptHashHandler(deps: {
         // Early returns at lines 375 / 388 also benefit: they preserve
         // any pre-existing flag set by `/ctx-flush` or variant change so
         // the next valid pass can consume it.
-        //
-        // Draining unconditionally would drop a flag added later in the same
-        // pass and leave adjuncts stale forever; the conditional drain fixes
-        // that.
         if (isCacheBusting) {
             deps.systemPromptRefreshSessions.delete(sessionId);
         }

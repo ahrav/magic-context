@@ -1,7 +1,6 @@
 /* eslint-disable no-console */
 /**
- * Microbenchmark for `getPersistedToolOwnerNearestPrior` — plan v3.3.1
- * Layer C, Test #45.
+ * Microbenchmark for the nearest-prior tool-owner pick (inlined SQL below).
  *
  * Plan budget: average added latency from JOIN to `oc.message` must be
  * under 0.5 ms per invocation on a session with ≥30k tool tags.

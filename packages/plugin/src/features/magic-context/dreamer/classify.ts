@@ -90,8 +90,7 @@ function promptEntryBytes(claim: ProjectMemoryClaimSnapshot): number {
 
 /**
  * The margin between the transport request budget and the `timeout_ms` handed
- * to the module, mirroring `CLASSIFY_CLEANUP_RESERVE` in
- * `crates/mc-module/src/classify.rs`.
+ * to the module.
  *
  * The module's deadline bounds its start, await, and re-drain windows, so its
  * last producer window closes at `timeout_ms`. The work after that is bounded

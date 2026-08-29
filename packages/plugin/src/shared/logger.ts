@@ -96,13 +96,6 @@ export function flushLogger(): void {
     flush();
 }
 
-/**
- * Resolve the current log file path. The path is harness-aware (see
- * {@link getMagicContextLogPath}) and re-evaluated on every call, so callers
- * who format diagnostic output with this value always see the path the next
- * flush will actually use.
- */
-
 // Flush remaining buffer on process exit
 if (!isTestEnv) {
     process.on("exit", flush);

@@ -15,8 +15,8 @@ export type TransformSchedulerDecision =
 /**
  * Max transform_decisions rows kept per (session_id, harness). Pruned newest-first
  * after every insert so a long session's cache-affecting passes never grow this
- * telemetry table without bound (the dashboard loads all matching rows for cause
- * attribution).
+ * telemetry table without bound (cause-attribution readers load all
+ * matching rows).
  */
 export const TRANSFORM_DECISIONS_RETENTION = 2000;
 
@@ -434,11 +434,11 @@ function writeTransformDecisionRowOnDatabase(
         Math.max(0, Math.floor(row.inputTokens)),
     );
     // Enforce the per-(session,harness) retention cap so a long session's
-    // cache-affecting passes can't grow this telemetry table unbounded (the
-    // dashboard loads all matching rows for cause attribution). Deleting
+    // cache-affecting passes can't grow this telemetry table unbounded
+    // (cause-attribution readers load all matching rows). Deleting
     // exactly `over` rowids in (ts_ms, rowid) order evicts the oldest entries
     // without over-deleting when many rows share the minimum timestamp; the
-    // rowid tie-breaker matches the ordering the dashboard relies on.
+    // rowid tie-breaker matches the reader's ordering.
     const cap = retentionOverrideForTests ?? TRANSFORM_DECISIONS_RETENTION;
     const probe = db
         .prepare(

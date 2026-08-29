@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { CACHE_DIR, NPM_FETCH_TIMEOUT, NPM_REGISTRY_URL, PACKAGE_NAME } from "./constants";
+import { CACHE_DIR, PACKAGE_NAME } from "./constants";
 
 describe("auto-update-checker/constants", () => {
     test("PACKAGE_NAME matches the published package identity", async () => {

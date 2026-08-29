@@ -441,8 +441,8 @@ export async function runAutoSearchHintForPi(args: {
 }
 
 /**
- * Session cleanup hook, kept as a deliberate lifecycle placeholder: auto-search
- * decisions live in `session_meta` and are cleared by `clearSession()`.
+ * Session cleanup hook. No-op: auto-search decisions live in `session_meta`
+ * and are cleared by `clearSession()`.
  */
 export function clearAutoSearchForPiSession(_sessionId: string): void {
 	// Auto-search decisions live in session_meta and are cleared by clearSession().

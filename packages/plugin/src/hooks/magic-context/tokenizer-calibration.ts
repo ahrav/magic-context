@@ -41,7 +41,8 @@ const CALIBRATION_TABLE: CalibrationEntry[] = [
     { prefix: "anthropic/claude-opus-4-8", systemRatio: 1.51, toolsRatio: 1.57 },
     { prefix: "anthropic/claude-opus-4.8", systemRatio: 1.51, toolsRatio: 1.57 },
     // Anthropic Opus 4.7 — ai-tokenizer's claude encoding lacks its tokenizer,
-    // so the measured 4.8 ratios apply.
+    // so its empirically-measured ratios are pinned here (the 4.8 rows above
+    // reuse them).
     { prefix: "anthropic/claude-opus-4-7", systemRatio: 1.51, toolsRatio: 1.57 },
     { prefix: "anthropic/claude-opus-4.7", systemRatio: 1.51, toolsRatio: 1.57 },
     // Claude 4.5/4.6 family — ai-tokenizer's claude encoding matches well.

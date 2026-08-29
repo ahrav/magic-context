@@ -2437,7 +2437,7 @@ export function createTransform(deps: TransformDeps) {
         logTransformTiming(sessionId, "postTransformPhase", tPostProcess);
 
         // Estimate the total token size of the transformed messages array so
-        // the sidebar / dashboard can attribute inputTokens between System
+        // the sidebar can attribute inputTokens between System
         // (from system.transform), Tool Definitions (inferred as the
         // remainder), and Conversation (actual messages minus injected
         // compartments/facts/memories).

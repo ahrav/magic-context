@@ -124,8 +124,9 @@ pub const fn coverage(profile: SerializerProfile) -> HealingCoverage {
 /// profile default is true. Full-array apply is the only serving path — the
 /// Thalamus gateway does not byte-splice the live tail — and the fail-open arm
 /// forwards the current raw request, never stale or retained bytes, so Claude
-/// Code is full-array too and phantom reclaims (mutations frozen by the module
-/// that a splice never carries into the real context) cannot occur. A fenced pass forwards strictly more
+/// Code is full-array too, which is what keeps phantom reclaims (mutations
+/// frozen by the module that a splice never carries into the real context)
+/// out of the serving path. A fenced pass forwards strictly more
 /// current content, and any tail mutation a fence skips simply reapplies on the next
 /// healthy pass. Prefix folding remains available regardless of the tail setting.
 pub const fn tail_reclaim(profile: SerializerProfile) -> bool {

@@ -538,8 +538,8 @@ export function seedApplicabilityBaselines(db: Database, nowMs: number): void {
 }
 
 /**
- * Targeted per-new-table foreign-key validation, mirroring
- * `assertClaimsSchemaForeignKeys` so unrelated legacy corruption cannot turn
+ * Targeted per-new-table foreign-key validation, so unrelated legacy
+ * corruption cannot turn
  * this migration into a whole-database repair gate.
  */
 export function assertClaimApplicabilitySchemaForeignKeys(db: Database): void {

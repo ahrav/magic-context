@@ -59,8 +59,8 @@ export type AgentBySession = Map<string, string>;
 /**
  * Cache-busting signal sets — replaces the old monolithic `flushedSessions`.
  *
- * The old `Set<string>` conflated three independent lifetimes into one flag,
- * which caused defer passes blocked by an in-progress historian to keep
+ * Three separate sets keep three independent lifetimes apart; one shared
+ * flag would let defer passes blocked by an in-progress historian keep
  * re-firing the same flush signal across multiple turns. Each set has
  * exactly one consumer and one lifetime.
  *
