@@ -1,22 +1,10 @@
 import { embedAndStoreCompartmentChunks } from "../../features/magic-context/compartment-embedding";
 import { insertCompartmentEvents } from "../../features/magic-context/compartment-events";
+import { isCompartmentLeaseHeld } from "../../features/magic-context/compartment-lease";
 import {
     appendCompartments,
     getCompartments,
 } from "../../features/magic-context/compartment-storage";
-// Re-export the historian-state-file helpers so existing callers
-// (compartment-runner-recomp.ts, compartment-runner.ts, tests) keep working
-// unchanged. The implementation moved to ./historian-state-file.ts so Pi
-// can import it without pulling in the full incremental runner.
-import { cleanupHistorianStateFile } from "./historian-state-file";
-
-export {
-    cleanupHistorianStateFile,
-    HISTORIAN_STATE_INLINE_THRESHOLD,
-    maybeWriteHistorianStateFile,
-} from "./historian-state-file";
-
-import { isCompartmentLeaseHeld } from "../../features/magic-context/compartment-lease";
 import { promoteSessionFactsDurable } from "../../features/magic-context/memory";
 import {
     readAuthorizedClaimMemorySnapshot,
@@ -62,6 +50,7 @@ import {
     validateChunkCoverage,
     validateStoredCompartments,
 } from "./compartment-runner-validation";
+import { cleanupHistorianStateFile } from "./historian-state-file";
 import { clearInjectionCache } from "./inject-compartments";
 import { onNoteTrigger } from "./note-nudger";
 import {
@@ -89,11 +78,6 @@ function shouldSuppressHistorianAlert(sessionId: string): boolean {
     }
     lastHistorianAlertBySession.set(sessionId, Date.now());
     return false;
-}
-
-/** Clean up module-level session state on session deletion. */
-export function clearHistorianAlertState(sessionId: string): void {
-    lastHistorianAlertBySession.delete(sessionId);
 }
 
 export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<void> {

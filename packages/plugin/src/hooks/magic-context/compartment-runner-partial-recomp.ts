@@ -297,10 +297,10 @@ export async function executePartialRecompInternal(
             // prior + new + tail. `validateStoredCompartments` then passes because
             // the full set is contiguous from message 1.
             // Sequences are 0-indexed (continuing from candidateCompartments.length).
-            // The `+ 1` off-by-one here previously created a gap between "prior + new"
-            // and "tail" that broke the invariant MAX(sequence) = count - 1 and
-            // caused incremental historian's sequenceOffset to collide with an
-            // existing sequence — producing UNIQUE constraint failures.
+            // Starting exactly at candidateCompartments.length keeps the set
+            // gapless, preserving the invariant MAX(sequence) = count - 1 that
+            // incremental historian's sequenceOffset relies on; a gap would
+            // collide sequences and produce UNIQUE constraint failures.
             const merged: CompartmentInput[] = [
                 ...candidateCompartments,
                 ...tailCompartments.map((c, idx) =>

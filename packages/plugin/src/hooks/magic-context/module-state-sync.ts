@@ -647,10 +647,7 @@ export function loadModuleWatermarks(args: {
     };
 }
 
-export function moduleWatermarksEqual(
-    left: ModuleWatermarks | null,
-    right: ModuleWatermarks,
-): boolean {
+function moduleWatermarksEqual(left: ModuleWatermarks | null, right: ModuleWatermarks): boolean {
     return (
         left !== null &&
         left.compartment_sequence === right.compartment_sequence &&
@@ -678,7 +675,7 @@ function flatBlockIdForRawMessage(
  * synthetic summary rows. Resolve module boundaries from the summary-excluding
  * basis so the shared memo compares one canonical value everywhere.
  */
-export function canonicalOrdinalForMessageId(args: {
+function canonicalOrdinalForMessageId(args: {
     sessionId: string;
     raw: RawMessageParts | null;
     messageId: string;

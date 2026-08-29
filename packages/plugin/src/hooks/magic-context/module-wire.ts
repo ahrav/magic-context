@@ -1063,7 +1063,7 @@ export async function resolveOrdinalsForModule(args: {
 }
 
 /** Flatten the typed builder shape to the module's top-level wire envelope. */
-export function toFlatModuleWireBody(payload: {
+function toFlatModuleWireBody(payload: {
     method: string;
     params: Record<string, unknown>;
 }): Record<string, unknown> {

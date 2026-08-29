@@ -68,15 +68,6 @@ export function appendReminderToUserMessageById(
     return false;
 }
 
-export function countMessagesSinceLastUser(messages: MessageLike[]): number {
-    let messagesSinceLastUser = 0;
-    for (let i = messages.length - 1; i >= 0; i -= 1) {
-        if (isMeaningfulUserMessage(messages[i])) break;
-        messagesSinceLastUser += 1;
-    }
-    return messagesSinceLastUser;
-}
-
 /**
  * Inject a tool part into the latest replayable assistant message that has an ID.
  *

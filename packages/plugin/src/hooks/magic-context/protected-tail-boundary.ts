@@ -3,7 +3,6 @@ import {
     loadProtectedTailMeta,
     markProtectedTailPolicyV3Seeded,
     recordProtectedTailNoEligibleHead,
-    resetProtectedTailNoEligibleHead,
 } from "../../features/magic-context/storage-meta-persisted";
 import { getAllStatusTagTokenTotalsFlat } from "../../features/magic-context/storage-tags";
 import { escalationBands } from "../../shared/escalation-bands";
@@ -203,18 +202,18 @@ export function deriveProtectedTailTokenTarget(args: {
     return { usable, rawN, floorN, ceilingN, effectiveFloor, N, headroom, triggerBudget, reserve };
 }
 
-export function nonEmergencyPerRunCap(usable: number, N: number): number {
+function nonEmergencyPerRunCap(usable: number, N: number): number {
     return Math.min(
         NON_EMERGENCY_MAX_CAP,
         Math.max(2 * N, Math.min(Math.round(0.25 * usable), 100_000)),
     );
 }
 
-export function force80PerRunCap(usable: number, N: number): number {
+function force80PerRunCap(usable: number, N: number): number {
     return Math.min(FORCE80_MAX_CAP, Math.max(3 * N, Math.min(Math.round(0.35 * usable), 150_000)));
 }
 
-export function force95PerRunCap(usable: number, N: number): number {
+function force95PerRunCap(usable: number, N: number): number {
     return Math.min(FORCE95_MAX_CAP, Math.max(4 * N, Math.min(Math.round(0.5 * usable), 250_000)));
 }
 
@@ -991,10 +990,6 @@ export function recordHighPressureNoEligibleHead(
         return 0;
     }
     return recordProtectedTailNoEligibleHead(db, snapshot.sessionId);
-}
-
-export function resetHighPressureNoEligibleHead(db: Database, sessionId: string): void {
-    resetProtectedTailNoEligibleHead(db, sessionId);
 }
 
 export function createDefaultBoundarySnapshotForTests(

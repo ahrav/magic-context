@@ -2968,16 +2968,6 @@ export function createRustModeTransform(
     };
 }
 
-export async function runRustModeTransform(
-    transform: ReturnType<typeof createRustModeTransform>,
-    sessionId: string,
-    messages: MessageLike[],
-    output: { messages: unknown[] },
-    sessionMeta: ReturnType<typeof getOrCreateSessionMeta>,
-): Promise<void> {
-    await transform.run(sessionId, messages, output, sessionMeta);
-}
-
 export const __rustModeTransformTest = {
     applyNativeMessagesVerbatim,
     contentSnapshotsFor,

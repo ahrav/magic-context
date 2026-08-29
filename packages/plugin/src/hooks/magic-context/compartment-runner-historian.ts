@@ -41,8 +41,8 @@ import {
 // (<project>/.opencode/magic-context/historian/) so they sit inside the
 // project boundary OpenCode's permission system already trusts AND so users
 // debugging a failed run can find dumps next to the project they belong to.
-// The user has explicitly requested keeping these dumps for now (see audit
-// #21); they survive until manual cleanup.
+// Dumps are kept deliberately for debugging and survive until manual
+// cleanup.
 function historianResponseDumpDir(directory: string): string {
     return getProjectMagicContextHistorianDir(directory);
 }
@@ -408,7 +408,7 @@ async function runHistorianPrompt(args: {
                             ...(modelOverride ? { model: modelOverride } : {}),
                             // synthetic: true keeps this big internal prompt out of the
                             // OpenCode TUI subagent pane (would otherwise render as a huge
-                            // unreadable visible message — see issue #50). The historian
+                            // unreadable visible message). The historian
                             // model still receives the part because toModelMessages only
                             // filters `ignored`, not `synthetic`.
                             parts: [{ type: "text", text: prompt, synthetic: true }],

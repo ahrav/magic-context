@@ -259,9 +259,3 @@ export function resetLkgSlotsForTest(): void {
     slots.clear();
     totalBytes = 0;
 }
-
-export function getLkgSlotStatsForTest(): { totalBytes: number; count: number } {
-    return { totalBytes, count: slots.size };
-}
-
-export const __resetLkgSlotStoreForTest = resetLkgSlotsForTest;

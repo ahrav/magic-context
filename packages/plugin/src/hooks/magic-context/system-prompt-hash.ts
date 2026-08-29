@@ -34,7 +34,7 @@ const SYSTEM_PROMPT_GUIDANCE_SEPARATOR = "\n\n";
  * sticky-date/cached-docs maps (the latter passed in via the cleanup handle).
  * Called from the session-deleted event path.
  */
-export function clearSystemPromptHashSession(
+function clearSystemPromptHashSession(
     sessionId: string,
     handleMaps: {
         stickyDateBySession: Map<string, string>;
@@ -515,7 +515,9 @@ export function createSystemPromptHashHandler(deps: {
         // any pre-existing flag set by `/ctx-flush` or variant change so
         // the next valid pass can consume it.
         //
-        // See Oracle review 2026-04-26 Finding A1 for the bug this fixes.
+        // Draining unconditionally would drop a flag added later in the same
+        // pass and leave adjuncts stale forever; the conditional drain fixes
+        // that.
         if (isCacheBusting) {
             deps.systemPromptRefreshSessions.delete(sessionId);
         }

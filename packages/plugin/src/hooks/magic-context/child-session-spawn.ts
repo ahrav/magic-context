@@ -61,7 +61,7 @@ async function surfaceSchemaFenceFailure(
         // The toast's companion action makes the persisted sidebar error visible
         // immediately instead of waiting for the next session event or poll.
         pushNotification("action", { action: "refresh-sidebar" }, args.parentSessionId);
-        // This is the same out-of-band boot-warning surface used for #266 mode
+        // This is the same out-of-band boot-warning surface used for compaction-off mode
         // transitions. It never joins the transform message array or nudge path.
         await sendIgnoredMessage(
             args.client,

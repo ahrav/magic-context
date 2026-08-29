@@ -601,7 +601,8 @@ interface RunPostTransformPhaseArgs {
      * Survives across defer passes when `compartmentRunning` blocks the
      * heuristic pass. Drained ONLY after `shouldRunHeuristics` succeeds —
      * preserving `/ctx-flush` intent across blocked passes is the entire
-     * reason for the three-set split (see Oracle review 2026-04-26).
+     * reason for the three-set split (see the lifetime notes on
+     * `hook-handlers.ts`).
      */
     pendingMaterializationSessions: Set<string>;
     deferredHistoryRefreshSessions: Set<string>;
@@ -878,7 +879,7 @@ export async function runPostTransformPhase(
     // leaves the mutation gates closed, preserving byte-identical defer replay.
     // injectM0M1 still rechecks later, so a cross-process marker bump after this
     // pre-execution can fold safely without retroactively authorizing mutations.
-    // Re-gated for compaction-off mode (issue #266): injection runs when the
+    // Re-gated for compaction-off mode: injection runs when the
     // memory/docs identity is present AND (fullFeatureMode || compactionOff),
     // so the mode cannot swallow m[0]/m[1] delivery — and a compaction-off
     // SUBAGENT session receives the additive blocks too (injectM0M1's

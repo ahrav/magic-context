@@ -30,13 +30,13 @@ import { updateCompactionMarkerAfterPublication } from "./compaction-marker-mana
 import { buildCompartmentAgentPrompt } from "./compartment-prompt";
 import { queueDropsForCompartmentalizedMessages } from "./compartment-runner-drop-queue";
 import { runValidatedHistorianPass } from "./compartment-runner-historian";
-import { cleanupHistorianStateFile } from "./compartment-runner-incremental";
 import type { CandidateCompartment, CompartmentRunnerDeps } from "./compartment-runner-types";
 import {
     getReducedRecompTokenBudget,
     validateChunkCoverage,
     validateStoredCompartments,
 } from "./compartment-runner-validation";
+import { cleanupHistorianStateFile } from "./historian-state-file";
 import { clearInjectionCache } from "./inject-compartments";
 import {
     createDefaultBoundarySnapshotForTests,

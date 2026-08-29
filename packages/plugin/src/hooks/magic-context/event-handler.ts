@@ -81,7 +81,7 @@ export interface EventHandlerDeps {
     contextUsageMap: Map<string, ContextUsageEntry>;
     compactionHandler: ReturnType<typeof createCompactionHandler>;
     /**
-     * Compaction-off mode (issue #266), boot-resolved. Overflow recovery is
+     * Compaction-off mode, boot-resolved. Overflow recovery is
      * never armed in this mode (record the provider-reported limit only, so
      * raw-usage math stays accurate) and Channel-2 delivery stays silent;
      * the off-transition clears any persisted intent.

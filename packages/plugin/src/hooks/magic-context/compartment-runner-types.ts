@@ -94,14 +94,14 @@ export interface CompartmentRunnerDeps {
     /**
      * Cross-session memory feature gate (`memory.enabled` config). When false,
      * historian/recomp must NOT promote session facts into project memories
-     * and must NOT generate or store embeddings. Issue #44.
+     * and must NOT generate or store embeddings.
      */
     memoryEnabled?: boolean;
     /**
      * Automatic-promotion gate (`memory.auto_promote` config). When false (and
      * memory is otherwise enabled), tools and search still work, but historian
      * does not auto-promote session facts to memories. Users can still write
-     * memories explicitly via `ctx_memory write`. Issue #44.
+     * memories explicitly via `ctx_memory write`.
      */
     autoPromote?: boolean;
     /**

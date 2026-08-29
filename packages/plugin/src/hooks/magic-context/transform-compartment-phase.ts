@@ -29,7 +29,7 @@ import type { MessageLike } from "./transform-operations";
 interface RunCompartmentPhaseArgs {
     canRunCompartments: boolean;
     fullFeatureMode: boolean;
-    /** Compaction-off mode (issue #266): no historian start, no 95% block,
+    /** Compaction-off mode: no historian start, no 95% block,
      *  no boundary resolution — the phase degrades to a stale-flag cleanup. */
     compactionOff?: boolean;
     /** False when historian.disable=true, blocking historian-backed child agents. */
@@ -67,9 +67,9 @@ interface RunCompartmentPhaseArgs {
     experimentalTemporalAwareness?: boolean;
     /** When true, run a second editor pass after historian to clean U: lines. */
     historianTwoPass?: boolean;
-    /** Cross-session memory feature gate (`memory.enabled`). Issue #44. */
+    /** Cross-session memory feature gate (`memory.enabled`). */
     memoryEnabled?: boolean;
-    /** Auto-promotion gate (`memory.auto_promote`). Issue #44. */
+    /** Auto-promotion gate (`memory.auto_promote`). */
     autoPromote?: boolean;
     /** Forwarded to compartment runner — see CompartmentRunnerDeps.onCompartmentStatePublished. */
     onCompartmentStatePublished?: (sessionId: string) => void;
@@ -175,7 +175,7 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
     let rebuiltHistoryThisPass = false;
     const historianRunnable = args.historianRunnable !== false;
 
-    // Compaction-off mode (issue #266): the historian/compartment phase is
+    // Compaction-off mode: the historian/compartment phase is
     // fully gated off — no fires, no boundary resolution, no await. A stale
     // compartmentInProgress flag (a run interrupted before the flip) is
     // cleared so the session state is honest and flip-back starts clean.
