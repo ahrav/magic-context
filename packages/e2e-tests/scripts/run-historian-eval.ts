@@ -19,6 +19,8 @@ import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "nod
 import { dirname, join, resolve } from "node:path";
 import {
     HARD_NEGATIVE_FAMILIES,
+    HistorianEvalContractError,
+    buildReleaseTuple,
     lintScenario,
     parseModelRoute,
     parseScenario,
@@ -31,6 +33,7 @@ import {
     buildLaneReport,
     laneBudgetExhaustedScore,
     laneExitCode,
+    scenarioNotCompletedScore,
     scoreRunRecord,
     type ScenarioScore,
 } from "../src/historian-eval/scorer";
@@ -129,18 +132,32 @@ function loadCorpus(args: CliArgs): { scenarios: HistorianEvalScenario[]; releas
 
 /**
  * Corpus admission for the per-PR gate, built from the same rules freeze
- * promotion applies: per-scenario lint, unique ids, and hard-negative family
- * coverage. Mirroring promotion is the point — a corpus this gate accepts but
- * promotion would reject could never be frozen, and the reverse would let a
- * release freeze in a state that keeps this gate permanently red. The release
- * size budget is promotion-only: the dev split is deliberately smaller than a
- * releasable corpus.
+ * promotion applies: per-scenario lint, the release tuple's corpus-level identity
+ * rules, and hard-negative family coverage. Mirroring promotion is the point — a
+ * corpus this gate accepts but promotion would reject could never be frozen, and
+ * the reverse would let a release freeze in a state that keeps this gate
+ * permanently red. The release size budget is promotion-only: the dev split is
+ * deliberately smaller than a releasable corpus.
+ *
+ * `buildReleaseTuple` is CALLED rather than its rules restated, because one of
+ * them cannot be reproduced by any check written here. Hand-rolled id uniqueness
+ * misses a scenario copied under a new id and title: every per-scenario lint stays
+ * clean, the ids differ, family coverage is unchanged — and `scenarioFingerprint`
+ * covers id and title, so the copy has a new identity by construction and no
+ * identity-based test can see it, while it double-weights one evaluation in every
+ * aggregate the report publishes. The tuple's name-independent semantic
+ * fingerprint is the check that catches it, and promotion already refuses such a
+ * corpus. Calling the same function keeps the two exactly as strict as each other
+ * instead of as strict as whoever last edited both.
  */
 function corpusDiagnostics(scenarios: readonly HistorianEvalScenario[]): string[] {
     const diagnostics = scenarios.flatMap((scenario) => lintScenario(scenario));
-    if (scenarios.length === 0) diagnostics.push("corpus: empty");
-    const ids = new Set(scenarios.map((scenario) => scenario.id));
-    if (ids.size !== scenarios.length) diagnostics.push("corpus: duplicate scenario ids");
+    try {
+        buildReleaseTuple(scenarios);
+    } catch (error) {
+        if (!(error instanceof HistorianEvalContractError)) throw error;
+        diagnostics.push(...error.diagnostics);
+    }
     diagnostics.push(...checkFamilyCoverage(scenarios));
     return diagnostics.sort();
 }
@@ -356,7 +373,12 @@ async function runLive(args: CliArgs): Promise<number> {
     // `clearPreviousLiveArtifacts`, ahead of everything that can reject.
     mkdirSync(reportDir, { recursive: true });
     const artifactsRoot = join(reportDir, LIVE_RUN_ARTIFACTS_DIR);
-    const scores: ScenarioScore[] = [];
+    // One entry per scenario from the start, replaced in place as each finishes.
+    // Seeding the whole corpus is what makes every partial describe the whole
+    // corpus, and what leaves evidence when the process dies inside the FIRST
+    // scenario — the case "write after each scenario" cannot cover, because
+    // nothing has completed while the tokens are already spent.
+    const scores: ScenarioScore[] = scenarios.map((scenario) => scenarioNotCompletedScore(scenario.id, null));
     let system: SystemVersionTuple | undefined;
     // Measured after the build and battery, so the budget covers the part that
     // spends tokens rather than the deterministic preamble.
@@ -368,6 +390,7 @@ async function runLive(args: CliArgs): Promise<number> {
     // one, the first scenario always runs, and a scenario that overruns the
     // estimate costs the partial report rather than the whole artifact.
     let longestScenarioMs = 0;
+    writePartialReport(args.reportPath, scores, releaseVersion);
     for (const [index, scenario] of scenarios.entries()) {
         // Checked BEFORE starting, never mid-scenario: a scenario abandoned
         // half-way has spent its tokens and produced no record, so the only useful
@@ -377,9 +400,10 @@ async function runLive(args: CliArgs): Promise<number> {
             console.error(
                 `lane budget: ${unreached.length} scenario(s) not run; ${Math.round(longestScenarioMs / 60_000)} minute(s) needed for the next, ${Math.round((deadlineAt - Date.now()) / 60_000)} remaining`,
             );
-            for (const skipped of unreached) {
-                scores.push(laneBudgetExhaustedScore(skipped.id, system ?? null));
+            for (const [offset, skipped] of unreached.entries()) {
+                scores[index + offset] = laneBudgetExhaustedScore(skipped.id, system ?? null);
             }
+            writePartialReport(args.reportPath, scores, releaseVersion);
             break;
         }
         const artifactDir = join(artifactsRoot, scenario.id);
@@ -398,7 +422,7 @@ async function runLive(args: CliArgs): Promise<number> {
         system = record.system;
         longestScenarioMs = Math.max(longestScenarioMs, Date.now() - startedAt);
         const score = scoreRunRecord(record, scenario);
-        scores.push(score);
+        scores[index] = score;
         console.log(
             `${scenario.id}: ${score.verdict}${score.failReasons.length > 0 ? ` [${score.failReasons.join(",")}]` : ""}${score.errorReason ? ` (${score.errorReason})` : ""}`,
         );

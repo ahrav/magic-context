@@ -2219,6 +2219,30 @@ export function buildLaneReport(
 }
 
 /**
+ * Placeholder for a scenario the lane has not finished yet.
+ *
+ * Seeded for every scenario before the first one is attempted, and replaced in
+ * place as each completes, so an incremental report always describes the WHOLE
+ * corpus rather than the prefix that happened to finish. Two things follow from
+ * that. A report killed mid-run cannot be mistaken for a complete result over a
+ * smaller corpus — the aggregate is micro-averaged, so a prefix-only report would
+ * publish rates for scenarios nobody selected. And a run terminated during its
+ * very first scenario still leaves evidence, which "write after each scenario"
+ * alone does not provide: nothing had completed, so nothing had been written,
+ * while the tokens were already spent.
+ *
+ * An ERROR verdict, so an unfinished run is never green.
+ */
+export function scenarioNotCompletedScore(scenarioId: string, system: SystemVersionTuple | null): ScenarioScore {
+    return errorScore(
+        scenarioId,
+        "scenario-not-completed",
+        "the lane had not finished this scenario when the report was written",
+        system,
+    );
+}
+
+/**
  * Score for a scenario the lane never got to because its wall-clock budget ran
  * out.
  *
