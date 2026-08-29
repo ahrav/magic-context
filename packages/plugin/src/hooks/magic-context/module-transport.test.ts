@@ -1291,12 +1291,29 @@ describe("McHostModuleTransport", () => {
         const internals = transport as unknown as {
             client: McHostClient | null;
             connectionGeneration: number;
-            routes: Map<string, { route: RouteHandle; generation: number }>;
+            routes: Map<
+                string,
+                { route: RouteHandle; generation: number; credentialSourceVersion?: string }
+            >;
             connectClient(): Promise<McHostClient>;
         };
         internals.client = oldClient;
-        internals.routes.set("session-a\0/invalidation-a", { route: oldRouteA, generation: 0 });
-        internals.routes.set("session-b\0/invalidation-b", { route: oldRouteB, generation: 0 });
+        // Seed the credential version the transport now records on every real
+        // connection: a cached route whose version is absent cannot be proven to
+        // match the credentials in force, so it is correctly treated as stale.
+        const credentialSourceVersion = __moduleTransportTest.managedCredentialSourceVersion(
+            process.env,
+        );
+        internals.routes.set("session-a\0/invalidation-a", {
+            route: oldRouteA,
+            generation: 0,
+            credentialSourceVersion,
+        });
+        internals.routes.set("session-b\0/invalidation-b", {
+            route: oldRouteB,
+            generation: 0,
+            credentialSourceVersion,
+        });
         internals.connectClient = async () => {
             connectCount += 1;
             await Bun.sleep(10);
@@ -1512,7 +1529,10 @@ describe("McHostModuleTransport", () => {
         const internals = transport as unknown as {
             client: McHostClient | null;
             connectionGeneration: number;
-            routes: Map<string, { route: RouteHandle; generation: number }>;
+            routes: Map<
+                string,
+                { route: RouteHandle; generation: number; credentialSourceVersion?: string }
+            >;
             ensureRoute: (
                 sessionId: string,
                 rawProjectRoot: string,
@@ -1527,7 +1547,9 @@ describe("McHostModuleTransport", () => {
         expect(routeOpenCount).toBe(1);
         expect(ensured.route).toBe(newRoute);
         expect(ensured.generation).toBe(1);
-        expect(internals.routes.get(routeKey)).toEqual({ route: newRoute, generation: 1 });
+        // Every real connection now records the credential version it presented,
+        // so assert the identity fields rather than the whole record.
+        expect(internals.routes.get(routeKey)).toMatchObject({ route: newRoute, generation: 1 });
     });
 });
 

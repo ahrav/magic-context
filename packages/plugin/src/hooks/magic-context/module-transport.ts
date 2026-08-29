@@ -1170,10 +1170,12 @@ export class McHostModuleTransport {
         // One identity may legitimately have multiple filesystem routes (for example,
         // worktrees). Reusing a route across roots would bind authority to the wrong tree.
         const routeKey = `${sessionId}\0${projectRoot}`;
-        const credentialSourceVersion =
-            this.connectionOrigin === "managed-default"
-                ? managedCredentialSourceVersion(process.env)
-                : undefined;
+        // Tracks the credentials this connection presents, so a rotation
+        // invalidates the cached route. Computed for every origin for the same
+        // reason the credentials themselves are presented for every origin: an
+        // explicit connection to a credential-bearing daemon is authenticated
+        // too, and a stale route there would outlive the key it was bound with.
+        const credentialSourceVersion = managedCredentialSourceVersion(process.env);
         // Read the cached route only after the connection is settled. The generation check
         // makes a route from any earlier connection invisible even if a cache clear is missed.
         const client = await this.ensureConnected(deadline, signal);
@@ -1277,9 +1279,16 @@ export class McHostModuleTransport {
         return McHostClient.connect({
             connectionFile: this.connectionFile,
             handshakeTimeoutMs,
-            ...(this.connectionOrigin === "managed-default"
-                ? { credentialSource: process.env }
-                : {}),
+            // Credentials are presented on every real connection, not only the
+            // one this transport is allowed to start. Lifecycle ownership and
+            // route authentication are independent: an explicit
+            // `subc.connection_file` can point at a shared daemon that another
+            // managed harness started with a credential envelope, and that
+            // daemon installs `CredentialVerifier`, which fails every Broca send
+            // with `credential_snapshot_mismatch` when the route presents no
+            // fingerprint. Gating this on `managed-default` let such a client
+            // complete its handshake and then fail every provider call.
+            credentialSource: process.env,
         });
     }
 
@@ -1389,4 +1398,8 @@ export class McHostModuleTransport {
     }
 }
 
-export const __moduleTransportTest = { isConnectionFailure, isStaleOrDeadRouteFailure };
+export const __moduleTransportTest = {
+    isConnectionFailure,
+    isStaleOrDeadRouteFailure,
+    managedCredentialSourceVersion,
+};
