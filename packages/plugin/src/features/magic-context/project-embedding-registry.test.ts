@@ -443,6 +443,78 @@ describe("project embedding registry", () => {
         });
     });
 
+    it("re-registering the same deferred config keeps the resolved lane and its provider", async () => {
+        const db = useTempDb();
+        let catalogCalls = 0;
+        const client: SynapseClientLike = {
+            async call<Response>(_module, method): Promise<Response> {
+                if (method === "models.list") {
+                    catalogCalls += 1;
+                    return [
+                        {
+                            model: "gte-modernbert-base-f16",
+                            fingerprint: "fp-stable",
+                            table_epoch: 4,
+                            dims: 3,
+                            certified: true,
+                        },
+                    ] as Response;
+                }
+                if (method === "embed.query") {
+                    return {
+                        vector: [1, 2, 3],
+                        model: "gte-modernbert-base-f16",
+                        fingerprint: "fp-stable",
+                        table_epoch: 4,
+                        dims: 3,
+                    } as Response;
+                }
+                throw new Error(`unexpected method ${method}`);
+            },
+            close() {},
+        };
+        const features = { memoryEnabled: true, gitCommitEnabled: true };
+        const deferred = {
+            provider: "synapse",
+            model: "gte-modernbert-base-f16",
+            synapse_connection_origin: "injected",
+            synapse_client_factory: async () => client,
+            synapse_fallback: { provider: "off" },
+        } as EmbeddingConfig;
+
+        registerProjectEmbedding(db, "stable-deferred", deferred, features, "/repo");
+        const resolvedIdentity = getSynapseLaneIdentity("gte-modernbert-base-f16", "fp-stable");
+        expect((await embedTextForProject("stable-deferred", "first"))?.modelId).toBe(
+            resolvedIdentity,
+        );
+        expect(catalogCalls).toBe(1);
+
+        // Every tool call re-registers from the user's configuration, which is
+        // still the deferred one. That must not discard the resolved lane: doing
+        // so tears down a healthy provider and deletes its descriptor per call,
+        // and a transient rediscovery failure would switch to the fallback.
+        const snapshot = registerProjectEmbedding(
+            db,
+            "stable-deferred",
+            deferred,
+            features,
+            "/repo",
+        );
+        expect(snapshot.modelId).toBe(resolvedIdentity);
+        expect(snapshot.providerIdentity).toBe(resolvedIdentity);
+        expect(
+            db
+                .prepare("SELECT fingerprint FROM embedding_registrations WHERE project_path = ?")
+                .get("stable-deferred"),
+        ).toEqual({ fingerprint: "fp-stable" });
+
+        expect((await embedTextForProject("stable-deferred", "second"))?.modelId).toBe(
+            resolvedIdentity,
+        );
+        // A preserved provider is already initialized, so no second discovery.
+        expect(catalogCalls).toBe(1);
+    });
+
     it("preserves existing provider and runtime identity goldens", () => {
         const db = useTempDb();
         const features = { memoryEnabled: true, gitCommitEnabled: true };

@@ -782,9 +782,11 @@ fn trusted_payload_sources(
     let mut bytes = Vec::with_capacity(meta.len() as usize);
     file.read_to_end(&mut bytes).map_err(|_| invalid)?;
     let canonical = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
-    if canonical.contains(&b'\n')
-        || format!("{:x}", sha2::Sha256::digest(canonical)) != expected_manifest_digest
-    {
+    // The digest is what binds these bytes, so the encoding only has to match
+    // the producer's byte-for-byte. `scripts/build-mc-host-payload.ts` writes
+    // `canonicalJson(manifest)` — key-sorted, two-space indented, one trailing
+    // newline — and hashes exactly that, so interior newlines are expected here.
+    if format!("{:x}", sha2::Sha256::digest(canonical)) != expected_manifest_digest {
         return Err(invalid);
     }
     let manifest: TrustedPayloadManifest =
@@ -1501,8 +1503,19 @@ mod tests {
                 }
             ]
         });
-        let manifest_bytes = serde_json::to_vec(&manifest).expect("manifest");
-        let manifest_digest = hash(&manifest_bytes);
+        let manifest_bytes = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&manifest).expect("manifest")
+        )
+        .into_bytes();
+        // The producer writes the manifest indented with a trailing newline and
+        // hashes those exact bytes; a compact encoding here would let the
+        // verifier drift back to rejecting every real payload.
+        let manifest_digest = hash(
+            manifest_bytes
+                .strip_suffix(b"\n")
+                .expect("trailing newline"),
+        );
         std::fs::write(
             payload.path().join("payload-manifest.json"),
             &manifest_bytes,

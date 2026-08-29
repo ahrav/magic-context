@@ -157,6 +157,14 @@ interface ProjectEmbeddingRegistration {
     modelId: string;
     chunkModelId: string;
     observationMode: boolean;
+    /**
+     * Fingerprint of the DEFERRED configuration this registration was created
+     * from, retained across lane resolution. Resolving a lane rewrites `config`,
+     * `providerIdentity`, and `runtimeFingerprint` to the discovered lane, so
+     * without this the next registration from the same unchanged config would
+     * look like a different intent and discard a healthy resolved provider.
+     */
+    deferredIntent?: string;
 }
 
 interface UnembeddedMemoryRow {
@@ -183,6 +191,8 @@ interface ShadowEmbeddingRegistration {
     modelId: string;
     chunkModelId: string;
     generation: number;
+    /** See {@link ProjectEmbeddingRegistration.deferredIntent}. */
+    deferredIntent?: string;
 }
 
 type ShadowScope = "memory" | "commit" | "chunk";
@@ -1234,11 +1244,32 @@ export function registerProjectEmbedding(
         ? "off"
         : getChunkEmbeddingModelId(resolvedConfig, providerIdentity);
     const prior = projectRegistrations.get(projectIdentity);
+    // Callers re-register from the user's configuration on every tool call, so
+    // the incoming config for an already-resolved deferred lane is still the
+    // deferred one while the registration now carries the discovered lane.
+    // Matching the retained intent keeps that healthy provider and its
+    // descriptor instead of tearing both down and re-demanding per call.
+    const resumesResolvedLane =
+        deferredSynapse &&
+        prior !== undefined &&
+        !prior.observationMode &&
+        prior.deferredIntent === runtimeFingerprint;
     const canReuseProvider =
         prior !== undefined &&
         !prior.observationMode &&
-        prior.runtimeFingerprint === runtimeFingerprint &&
-        prior.providerIdentity === providerIdentity;
+        (resumesResolvedLane ||
+            (prior.runtimeFingerprint === runtimeFingerprint &&
+                prior.providerIdentity === providerIdentity));
+    // A resumed lane keeps the prior registration's resolved identity; only a
+    // genuinely new deferred registration publishes the placeholder.
+    const effectiveConfig = resumesResolvedLane ? prior.config : resolvedConfig;
+    const effectiveProviderIdentity = resumesResolvedLane
+        ? prior.providerIdentity
+        : providerIdentity;
+    const effectiveRuntimeFingerprint = resumesResolvedLane
+        ? prior.runtimeFingerprint
+        : runtimeFingerprint;
+    const effectiveChunkModelId = resumesResolvedLane ? prior.chunkModelId : chunkModelId;
     if (!deferredSynapse) {
         recordActiveEmbeddingIdentity(
             db,
@@ -1247,7 +1278,7 @@ export function registerProjectEmbedding(
             chunkModelId,
             features,
         );
-    } else {
+    } else if (!resumesResolvedLane) {
         clearDeferredDescriptor(db, "embedding_registrations", projectIdentity);
     }
     // Synthetic ledger sessions (this project's primary and shadow batch keys)
@@ -1260,27 +1291,32 @@ export function registerProjectEmbedding(
     const generationChanged =
         prior === undefined ||
         prior.observationMode ||
-        prior.runtimeFingerprint !== runtimeFingerprint ||
-        prior.chunkModelId !== chunkModelId ||
+        prior.runtimeFingerprint !== effectiveRuntimeFingerprint ||
+        prior.chunkModelId !== effectiveChunkModelId ||
         !sameFeatures(prior.features, features);
     const generation = generationChanged ? ++globalRegistrationGeneration : prior.generation;
     const registration: ProjectEmbeddingRegistration = {
         db,
         projectIdentity,
         sourceDirectory,
-        config: resolvedConfig,
-        providerIdentity,
-        runtimeFingerprint,
+        config: effectiveConfig,
+        providerIdentity: effectiveProviderIdentity,
+        runtimeFingerprint: effectiveRuntimeFingerprint,
         provider: canReuseProvider ? prior.provider : null,
         generation,
         features: { ...features },
-        modelId: providerIdentity === OFF_PROVIDER_IDENTITY ? "off" : providerIdentity,
-        chunkModelId: providerIdentity === OFF_PROVIDER_IDENTITY ? "off" : chunkModelId,
+        modelId:
+            effectiveProviderIdentity === OFF_PROVIDER_IDENTITY ? "off" : effectiveProviderIdentity,
+        chunkModelId:
+            effectiveProviderIdentity === OFF_PROVIDER_IDENTITY ? "off" : effectiveChunkModelId,
         observationMode: false,
+        ...(deferredSynapse ? { deferredIntent: runtimeFingerprint } : {}),
     };
 
     projectRegistrations.set(projectIdentity, registration);
-    if (!deferredSynapse) persistPrimaryDescriptor(db, registration);
+    // A resumed lane is fully resolved, so its descriptor stays authoritative;
+    // only an unresolved deferred registration has nothing to persist.
+    if (!deferredSynapse || resumesResolvedLane) persistPrimaryDescriptor(db, registration);
 
     if (!canReuseProvider) {
         disposeProvider(prior?.provider ?? null);
@@ -1300,7 +1336,16 @@ export function registerProjectShadowEmbedding(
         throw new Error("Shadow embedding registration requires the synapse provider");
     }
     const deferredSynapse = isDeferredSynapseConfig(resolvedConfig);
-    if (deferredSynapse) {
+    const deferredIntent = deferredSynapse
+        ? `deferred-synapse:${sha256Prefix(stableStringify(resolvedConfig))}`
+        : undefined;
+    const priorRegistration = shadowRegistrations.get(projectIdentity);
+    // The primary lane's reasoning applies here too: an already-resolved lane
+    // is re-registered from the same deferred config on every tool call, and its
+    // descriptor now describes the discovered lane.
+    const resumesResolvedLane =
+        deferredIntent !== undefined && priorRegistration?.deferredIntent === deferredIntent;
+    if (deferredSynapse && !resumesResolvedLane) {
         clearDeferredDescriptor(db, "shadow_embedding_registrations", projectIdentity);
     }
     const providerIdentity = deferredSynapse
@@ -1320,8 +1365,11 @@ export function registerProjectShadowEmbedding(
         },
     });
     if (!provider) return null;
-    const prior = shadowRegistrations.get(projectIdentity);
-    if (!deferredSynapse && prior && prior.providerIdentity === providerIdentity) {
+    const prior = priorRegistration;
+    if (
+        prior &&
+        (resumesResolvedLane || (!deferredSynapse && prior.providerIdentity === providerIdentity))
+    ) {
         void provider.dispose();
         dbForShadowQueue.set(projectIdentity, db);
         persistShadowDescriptor(db, prior);
@@ -1358,6 +1406,7 @@ export function registerProjectShadowEmbedding(
         modelId: providerIdentity,
         chunkModelId,
         generation,
+        ...(deferredIntent === undefined ? {} : { deferredIntent }),
     };
     registrationForCallback = registration;
     shadowRegistrations.set(projectIdentity, registration);
