@@ -1021,6 +1021,17 @@ describe("embedItemsDetailed", () => {
         return error;
     }
 
+    /** The client's own pre-publication fence: the authenticated daemon no
+     *  longer matches the certified incarnation, refused before any byte is
+     *  enqueued, so the request never reached the daemon. */
+    function daemonGenerationChangedError(): Error {
+        const error = new Error(
+            "authenticated daemon changed after lifecycle compatibility validation",
+        ) as Error & { code: string };
+        error.code = "daemon_generation_changed";
+        return error;
+    }
+
     /** The host's answer for a request whose own content it refuses, such as a
      *  text over the per-input byte cap. */
     function schemaViolationError(): Error {
@@ -1642,6 +1653,63 @@ describe("embedItemsDetailed", () => {
             expect(batches[0].expectedDaemonId).toEqual(daemonIds[0]);
             expect(batches[1].expectedDaemonId).toEqual(daemonIds[1]);
             expect(batches[0].params.request_key).toBe(batches[1].params.request_key);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("rebinds a page refused by the pre-publication daemon fence without spending the restart budget", async () => {
+        const db = ledgerDb();
+        try {
+            const host = new DetailedHost();
+            const daemonIds = [new Uint8Array([1]), new Uint8Array([2])];
+            let rotated = false;
+            // The client fence refuses the first submission before publishing.
+            // It is `not_sent`, so nothing reached the daemon and the same
+            // request key may be resubmitted against the replacement.
+            host.batchError = (index) => {
+                if (index !== 0) return null;
+                rotated = true;
+                return daemonGenerationChangedError();
+            };
+            const provider = detailedProvider(host);
+            const mutable = provider as unknown as {
+                connectionOrigin: "managed-default";
+                demandStart: () => Promise<{
+                    ok: true;
+                    reason: "started";
+                    storage: null;
+                    authenticatedDaemonId: Uint8Array;
+                }>;
+            };
+            mutable.connectionOrigin = "managed-default";
+            mutable.demandStart = async () => ({
+                ok: true,
+                reason: "started",
+                storage: null,
+                authenticatedDaemonId: (rotated ? daemonIds[1] : daemonIds[0]) as Uint8Array,
+            });
+
+            const result = await provider.embedItemsDetailed(
+                detailedItems([{ id: "memory:1", group: "g1" }]),
+                detailedContext(db),
+            );
+
+            // The fence is absorbed in-page: the page succeeds rather than
+            // being reported as a failure the caller must retry.
+            expect(result.failures).toEqual([]);
+            expect(result.receipts).toHaveLength(1);
+            const batches = host.batchCalls();
+            expect(batches).toHaveLength(2);
+            // Same key, so the replacement daemon dedupes rather than
+            // double-embedding, and the retry rides the replacement identity.
+            expect(batches[0].params.request_key).toBe(batches[1].params.request_key);
+            expect(batches[1].expectedDaemonId).toEqual(daemonIds[1]);
+            // The durable restart budget belongs to observed daemon restarts.
+            // A pre-publication refusal must not consume it, so a genuine
+            // restart afterwards is still absorbable.
+            const row = getSynapseLedgerPage(db, result.receipts[0].rowId);
+            expect(row?.restartCount ?? 0).toBe(0);
         } finally {
             closeQuietly(db);
         }
