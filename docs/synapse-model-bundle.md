@@ -142,7 +142,7 @@ version, target triple, CPU-only build provenance, and the SHA-256 the host
 configuration pins. A nominally matching library with a different hash is
 refused by design.
 
-The qualified Linux lane uses the pinned
+The pinned Linux lane uses the
 `keisuke-miyako/gte-modernbert-base-onnx-f16` commit
 `3d5fc87c1790e6846bad06013655b0703da47be9`, rooted in Apache-2.0
 `Alibaba-NLP/gte-modernbert-base`, with CLS pooling, 768 dimensions, and an
@@ -152,7 +152,15 @@ The qualified Linux lane uses the pinned
 The semantic corpus tolerance is `0.005`, which covers measured FP16
 single-item versus batch-shape drift while still rejecting pooling,
 normalization, tokenizer, model, and runtime substitutions. The offline
-oracle passes with networking disabled on glibc 2.28.
+oracle runs with networking disabled on glibc 2.28.
+
+These pins define the candidate the release gate evaluates; they do not
+assert that the candidate is production-qualified. That verdict lives in
+`release/mc-host-production-inputs.lock.json` (`production_qualified`, with
+any blocking reasons under `unqualified`) together with the target's
+`qualified` and `published` entries in `release/mc-host-payload-index.json`.
+Read the gate for the lane's qualification state; this document only fixes
+the identities the gate checks.
 
 ## 4. Startup, readiness, and degraded mode
 
@@ -200,7 +208,7 @@ is unset; every pre-ORT rejection path runs hermetically without it.
   configuration at it. The host never watches, reloads, or mutates a bundle.
 - The lane serves exactly one model; there is no registry, no download path,
   and no per-request model selection.
-- The Linux native payload stages the qualified manifest, corpus,
+- The Linux native payload stages the pinned manifest, corpus,
   model/tokenizer files, and exact CPU ONNX Runtime together in one
   content-addressed generation. `ck-mc-host serve` derives `SynapseConfig`
   only from that revalidated generation.
