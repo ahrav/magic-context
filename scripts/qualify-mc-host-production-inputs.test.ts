@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { completeRegistryGate } from "./__fixtures__/registry-gate";
 import { buildContract } from "./generate-mc-host-release-manifest";
 import {
     assertPinsMatchContract,
@@ -97,6 +98,18 @@ function freshRoot(): string {
         mkdirSync(join(root, dirname(relative)), { recursive: true });
         cpSync(join(repoRoot, relative), join(root, relative));
     }
+    // The committed gate is fail-closed by design, and generation refuses to run
+    // against it, so every case here would fail on the gate instead of the rule
+    // it means to exercise. Stage a synthetic complete gate instead.
+    const gatePath = join(root, "release/mc-host-registry-gate.json");
+    writeFileSync(
+        gatePath,
+        `${JSON.stringify(
+            completeRegistryGate(JSON.parse(readFileSync(gatePath, "utf8"))),
+            null,
+            2,
+        )}\n`,
+    );
     return root;
 }
 

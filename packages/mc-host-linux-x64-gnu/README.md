@@ -21,6 +21,8 @@ Files not listed in the manifest are rejected.
 payload/
   bin/ck-mc-host                                   daemon launcher binary
   ort/libonnxruntime.so                            CPU ONNX Runtime (U9-gated slot)
+  model/gte-modernbert-base-f16/manifest.json      qualified bundle manifest
+  model/gte-modernbert-base-f16/corpus.json        offline certification corpus
   model/gte-modernbert-base-f16/model.onnx         production model (U9-gated slot)
   model/gte-modernbert-base-f16/tokenizer.json               (U9-gated slot)
   model/gte-modernbert-base-f16/tokenizer_config.json        (U9-gated slot)

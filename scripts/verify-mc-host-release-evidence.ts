@@ -1,0 +1,1040 @@
+/**
+ * Validates the installed non-GA release evidence that gates mc-host GA tags.
+ *
+ * `--check` requires complete qualified evidence. `--write-template` refreshes
+ * the fail-closed repository template from the current release artifacts.
+ */
+import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { validateStopRecord, validateTrustIndex } from "./build-mc-host-payload";
+import {
+    buildContract,
+    canonicalJson,
+    type ReleaseContract,
+    sha256Hex,
+} from "./generate-mc-host-release-manifest";
+import {
+    isPlaceholderSha256,
+    requireQualificationEvidence,
+} from "./qualify-mc-host-production-inputs";
+
+const EVIDENCE_PATH = "docs/evidence/mc-host-installed-release-evidence.json";
+const QUALIFICATION_PATH = "docs/evidence/mc-host-release-qualification.json";
+const INPUT_LOCK_PATH = "release/mc-host-production-inputs.lock.json";
+const PAYLOAD_INDEX_PATH = "release/mc-host-payload-index.json";
+const STOP_PROVENANCE_PATH = "release/mc-host-n-minus-one-stop.json";
+const SHA256_RE = /^[0-9a-f]{64}$/;
+const REGISTRY_GATE_PATH = "release/mc-host-registry-gate.json";
+
+/**
+ * The only repository whose workflows may author a proof or its attestation.
+ *
+ * A proof's `source.run_url` names the run that produced it, so an unconstrained
+ * host/owner there would let a report point at a run in an unrelated repository
+ * while still satisfying the attestation check below.
+ */
+const ATTESTATION_REPO = "ahrav/magic-context";
+
+/**
+ * The workflow whose identity is accepted as authorizing a proof.
+ *
+ * `gh attestation verify --repo` constrains the repository only, so any other
+ * workflow in the same repository could attest an arbitrary passing proof and
+ * clear this GA gate. `gh` validates the signer path only when given
+ * `--signer-workflow` or `--cert-identity`, so the approved workflow is named
+ * here explicitly and every other same-repository workflow is rejected.
+ *
+ * The workflow does not exist yet — the qualification lane that publishes,
+ * attests, and collects these proofs is still to be built. Naming its path here
+ * ahead of time is deliberate and fail-closed: nothing can satisfy this signer
+ * until the lane exists, so the lane must be created at this path rather than
+ * the check loosened to accept whatever happens to sign.
+ */
+const ATTESTATION_SIGNER_WORKFLOW_PATH =
+    ".github/workflows/mc-host-release-qualification.yml";
+const ATTESTATION_SIGNER_WORKFLOW = `${ATTESTATION_REPO}/${ATTESTATION_SIGNER_WORKFLOW_PATH}`;
+
+/**
+ * The source ref an attestation must have been produced from, or `null` if the
+ * release-qualification policy has not chosen one yet.
+ *
+ * `--repo` plus `--signer-workflow` still admits any revision of the approved
+ * workflow, so the same workflow run from a feature branch authorizes GA. `gh`
+ * constrains this with `--source-ref` (and `--source-digest` for an exact
+ * revision), but the correct value is a policy decision this repository has not
+ * made: there is no release-tag convention to derive it from — the only tag is
+ * `premerge-pr32` — and inventing one here would bake in a rule nobody agreed
+ * to.
+ *
+ * So the slot is declared and left empty rather than defaulted to permissive:
+ * GA verification refuses while it is `null`, which forces the decision instead
+ * of silently trusting every revision. Set it to the ref GA releases are cut
+ * from (`refs/tags/...` or `refs/heads/main`) when that is settled.
+ */
+const ATTESTATION_SOURCE_REF: string | null = null;
+
+const RUN_URL_RE = new RegExp(
+    `^https://github\\.com/${ATTESTATION_REPO}/actions/runs/\\d+`,
+);
+
+interface RegistryPackageEvidence {
+    name: string;
+    version: string;
+    integrity: string;
+    provenance_verified: boolean;
+}
+
+interface TargetEvidence {
+    target: string;
+    filesystem_verified: boolean;
+    self_fd_verified: boolean;
+    process_crash_atomicity_verified: boolean;
+    lifecycle_smoke_passed: boolean;
+    /**
+     * Digest of the target's test report, recorded independently of the proof.
+     *
+     * Held here rather than read back out of the proof's own observations so
+     * that the comparison has two sides. `null` records that no report digest
+     * was captured, and the proof must then echo `null` too.
+     */
+    test_report_sha256: string | null;
+}
+
+interface ProductFlowEvidence {
+    package: string;
+    cli_commands_passed: boolean;
+    managed_demand_passed: boolean;
+    offline_verified: boolean;
+}
+
+type ProofKind =
+    | "registry_package"
+    | "target"
+    | "product_flow"
+    | "publication"
+    | "production_synapse";
+
+interface ProofArtifactRef {
+    kind: ProofKind;
+    subject: string;
+    path: string;
+    sha256: string;
+}
+
+export interface InstalledReleaseEvidence {
+    schema: "magic-context.mc-host-installed-release-evidence/v1";
+    release: {
+        id: string;
+        version: string;
+    };
+    release_contract_sha256: string;
+    production_inputs_sha256: string;
+    qualification_sha256: string;
+    payload_index_sha256: string;
+    stop_provenance_sha256: string;
+    registry_packages: RegistryPackageEvidence[];
+    targets: TargetEvidence[];
+    product_flows: ProductFlowEvidence[];
+    publication: {
+        oidc_provenance_verified: boolean;
+        long_lived_token_used: boolean;
+        payloads_before_parents: boolean;
+    };
+    production_synapse_verified: boolean;
+    /**
+     * Digest of the production semantic-Synapse report, recorded independently of
+     * the proof that cites it, so the proof cannot be its own witness.
+     */
+    production_synapse_report_sha256: string | null;
+    proof_artifacts: ProofArtifactRef[];
+    qualified: boolean;
+    blockers: string[];
+}
+
+export interface BuildInstalledReleaseEvidenceOptions {
+    contract: ReleaseContract;
+    productionInputsSha256: string;
+    qualificationSha256: string;
+    payloadIndexSha256: string;
+    stopProvenanceSha256: string;
+    registryPackages: RegistryPackageEvidence[];
+    targets: TargetEvidence[];
+    productFlows: ProductFlowEvidence[];
+    oidcProvenanceVerified: boolean;
+    longLivedTokenUsed: boolean;
+    productionSynapseVerified: boolean;
+    productionSynapseReportSha256: string | null;
+    proofArtifacts: ProofArtifactRef[];
+    qualified: boolean;
+    blockers: string[];
+}
+
+function fail(message: string): never {
+    throw new Error(`mc-host installed release evidence: ${message}`);
+}
+
+function record(value: unknown, where: string): Record<string, unknown> {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        fail(`${where} must be an object`);
+    }
+    return value as Record<string, unknown>;
+}
+
+function exactKeys(
+    value: Record<string, unknown>,
+    keys: readonly string[],
+    where: string,
+): void {
+    const actual = Object.keys(value).sort();
+    const expected = [...keys].sort();
+    if (canonicalJson(actual) !== canonicalJson(expected)) {
+        fail(`${where} keys must be exactly ${expected.join(", ")}`);
+    }
+}
+
+function stringField(
+    value: Record<string, unknown>,
+    key: string,
+    where: string,
+): string {
+    const field = value[key];
+    if (typeof field !== "string" || field.length === 0) {
+        fail(`${where}.${key} must be a nonempty string`);
+    }
+    return field;
+}
+
+function booleanField(
+    value: Record<string, unknown>,
+    key: string,
+    where: string,
+): boolean {
+    const field = value[key];
+    if (typeof field !== "boolean") fail(`${where}.${key} must be boolean`);
+    return field;
+}
+
+function stringArray(value: unknown, where: string): string[] {
+    if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string")) {
+        fail(`${where} must be a string array`);
+    }
+    return value;
+}
+
+function sha256File(rootDir: string, relative: string): string {
+    return createHash("sha256")
+        .update(readFileSync(join(rootDir, relative)))
+        .digest("hex");
+}
+
+function exactIdentitySet(
+    actual: readonly string[],
+    expected: readonly string[],
+    where: string,
+): void {
+    if (
+        new Set(actual).size !== actual.length ||
+        canonicalJson([...actual].sort()) !== canonicalJson([...expected].sort())
+    ) {
+        fail(`${where} must contain the exact release set`);
+    }
+}
+
+/**
+ * Whether `names` lists every payload package before every parent package.
+ *
+ * Shared by construction and validation so the two cannot drift: the recorded
+ * `publication.payloads_before_parents` boolean is only meaningful if the
+ * verifier derives it from the same order the builder derived it from.
+ * `exactIdentitySet` sorts, so nothing else in validation observes this order.
+ */
+function payloadsBeforeParents(
+    names: readonly string[],
+    contract: ReleaseContract,
+): boolean {
+    return (
+        names.join("\n") ===
+        [...contract.packages.payloads, ...contract.packages.parents].join("\n")
+    );
+}
+
+export function buildInstalledReleaseEvidence(
+    options: BuildInstalledReleaseEvidenceOptions,
+): InstalledReleaseEvidence {
+    return {
+        schema: "magic-context.mc-host-installed-release-evidence/v1",
+        release: {
+            id: options.contract.release.id,
+            version: options.contract.packages.version,
+        },
+        release_contract_sha256: sha256Hex(canonicalJson(options.contract)),
+        production_inputs_sha256: options.productionInputsSha256,
+        qualification_sha256: options.qualificationSha256,
+        payload_index_sha256: options.payloadIndexSha256,
+        stop_provenance_sha256: options.stopProvenanceSha256,
+        registry_packages: options.registryPackages,
+        targets: options.targets,
+        product_flows: options.productFlows,
+        publication: {
+            oidc_provenance_verified: options.oidcProvenanceVerified,
+            long_lived_token_used: options.longLivedTokenUsed,
+            payloads_before_parents: payloadsBeforeParents(
+                options.registryPackages.map((entry) => entry.name),
+                options.contract,
+            ),
+        },
+        production_synapse_verified: options.productionSynapseVerified,
+        production_synapse_report_sha256: options.productionSynapseReportSha256,
+        proof_artifacts: options.proofArtifacts,
+        qualified: options.qualified,
+        blockers: options.blockers,
+    };
+}
+
+export function validateInstalledReleaseEvidence(
+    input: unknown,
+): InstalledReleaseEvidence {
+    const evidence = record(input, "evidence");
+    if (evidence.schema !== "magic-context.mc-host-installed-release-evidence/v1") {
+        fail("expected the installed-release schema; qualification evidence is not interchangeable");
+    }
+    exactKeys(
+        evidence,
+        [
+            "schema",
+            "release",
+            "release_contract_sha256",
+            "production_inputs_sha256",
+            "qualification_sha256",
+            "payload_index_sha256",
+            "stop_provenance_sha256",
+            "registry_packages",
+            "targets",
+            "product_flows",
+            "publication",
+            "production_synapse_verified",
+            "production_synapse_report_sha256",
+            "proof_artifacts",
+            "qualified",
+            "blockers",
+        ],
+        "evidence",
+    );
+
+    const contract = buildContract();
+    const release = record(evidence.release, "release");
+    exactKeys(release, ["id", "version"], "release");
+    if (
+        stringField(release, "id", "release") !== contract.release.id ||
+        stringField(release, "version", "release") !== contract.packages.version
+    ) {
+        fail("release identity drift");
+    }
+    const expectedContractDigest = sha256Hex(canonicalJson(contract));
+    if (evidence.release_contract_sha256 !== expectedContractDigest) {
+        fail("release contract digest drift");
+    }
+    for (const key of [
+        "production_inputs_sha256",
+        "qualification_sha256",
+        "payload_index_sha256",
+        "stop_provenance_sha256",
+    ] as const) {
+        const digest = stringField(evidence, key, "evidence");
+        if (!SHA256_RE.test(digest)) fail(`${key} must be lowercase SHA-256`);
+    }
+
+    if (!Array.isArray(evidence.registry_packages)) {
+        fail("registry_packages must be an array");
+    }
+    const registryPackages = evidence.registry_packages.map((raw, index) => {
+        const entry = record(raw, `registry_packages[${index}]`);
+        exactKeys(
+            entry,
+            ["name", "version", "integrity", "provenance_verified"],
+            `registry_packages[${index}]`,
+        );
+        return {
+            name: stringField(entry, "name", `registry_packages[${index}]`),
+            version: stringField(entry, "version", `registry_packages[${index}]`),
+            integrity: stringField(entry, "integrity", `registry_packages[${index}]`),
+            provenance_verified: booleanField(
+                entry,
+                "provenance_verified",
+                `registry_packages[${index}]`,
+            ),
+        };
+    });
+    exactIdentitySet(
+        registryPackages.map((entry) => entry.name),
+        [...contract.packages.payloads, ...contract.packages.parents],
+        "registry_packages",
+    );
+    if (
+        registryPackages.some(
+            (entry) =>
+                entry.version !== contract.packages.version ||
+                !entry.integrity.startsWith("sha512-"),
+        )
+    ) {
+        fail("registry package version or integrity drift");
+    }
+
+    if (!Array.isArray(evidence.targets)) fail("targets must be an array");
+    const targets = evidence.targets.map((raw, index) => {
+        const entry = record(raw, `targets[${index}]`);
+        exactKeys(
+            entry,
+            [
+                "target",
+                "filesystem_verified",
+                "self_fd_verified",
+                "process_crash_atomicity_verified",
+                "lifecycle_smoke_passed",
+                "test_report_sha256",
+            ],
+            `targets[${index}]`,
+        );
+        const testReport = entry.test_report_sha256;
+        if (
+            testReport !== null &&
+            (typeof testReport !== "string" || !SHA256_RE.test(testReport))
+        ) {
+            fail(`targets[${index}].test_report_sha256 must be lowercase SHA-256 or null`);
+        }
+        return {
+            target: stringField(entry, "target", `targets[${index}]`),
+            filesystem_verified: booleanField(
+                entry,
+                "filesystem_verified",
+                `targets[${index}]`,
+            ),
+            self_fd_verified: booleanField(entry, "self_fd_verified", `targets[${index}]`),
+            process_crash_atomicity_verified: booleanField(
+                entry,
+                "process_crash_atomicity_verified",
+                `targets[${index}]`,
+            ),
+            lifecycle_smoke_passed: booleanField(
+                entry,
+                "lifecycle_smoke_passed",
+                `targets[${index}]`,
+            ),
+            test_report_sha256: testReport,
+        };
+    });
+    exactIdentitySet(
+        targets.map((entry) => entry.target),
+        contract.platforms.supported.map((entry) => entry.target),
+        "targets",
+    );
+
+    if (!Array.isArray(evidence.product_flows)) fail("product_flows must be an array");
+    const productFlows = evidence.product_flows.map((raw, index) => {
+        const entry = record(raw, `product_flows[${index}]`);
+        exactKeys(
+            entry,
+            ["package", "cli_commands_passed", "managed_demand_passed", "offline_verified"],
+            `product_flows[${index}]`,
+        );
+        return {
+            package: stringField(entry, "package", `product_flows[${index}]`),
+            cli_commands_passed: booleanField(
+                entry,
+                "cli_commands_passed",
+                `product_flows[${index}]`,
+            ),
+            managed_demand_passed: booleanField(
+                entry,
+                "managed_demand_passed",
+                `product_flows[${index}]`,
+            ),
+            offline_verified: booleanField(
+                entry,
+                "offline_verified",
+                `product_flows[${index}]`,
+            ),
+        };
+    });
+    exactIdentitySet(
+        productFlows.map((entry) => entry.package),
+        contract.packages.parents,
+        "product_flows",
+    );
+
+    const publication = record(evidence.publication, "publication");
+    exactKeys(
+        publication,
+        ["oidc_provenance_verified", "long_lived_token_used", "payloads_before_parents"],
+        "publication",
+    );
+    // The publication proof only echoes this boolean back, so without deriving
+    // it here a hand-authored file could list parents first, claim `true`, and
+    // pass the payload-first invariant after a parents-first release.
+    if (
+        booleanField(publication, "payloads_before_parents", "publication") !==
+        payloadsBeforeParents(
+            registryPackages.map((entry) => entry.name),
+            contract,
+        )
+    ) {
+        fail(
+            "publication.payloads_before_parents does not match the registry_packages order",
+        );
+    }
+    const blockers = stringArray(evidence.blockers, "blockers");
+    const qualified = booleanField(evidence, "qualified", "evidence");
+    if (!Array.isArray(evidence.proof_artifacts)) {
+        fail("proof_artifacts must be an array");
+    }
+    const proofArtifacts = evidence.proof_artifacts.map((raw, index) => {
+        const entry = record(raw, `proof_artifacts[${index}]`);
+        exactKeys(entry, ["kind", "subject", "path", "sha256"], `proof_artifacts[${index}]`);
+        const kind = stringField(entry, "kind", `proof_artifacts[${index}]`);
+        if (
+            ![
+                "registry_package",
+                "target",
+                "product_flow",
+                "publication",
+                "production_synapse",
+            ].includes(kind)
+        ) {
+            fail(`proof_artifacts[${index}].kind is outside the closed union`);
+        }
+        const path = stringField(entry, "path", `proof_artifacts[${index}]`);
+        if (
+            path.startsWith("/") ||
+            path.includes("\\") ||
+            path.split("/").some((part) => part.length === 0 || part === "." || part === "..")
+        ) {
+            fail(`proof_artifacts[${index}].path must be a safe relative path`);
+        }
+        const sha256 = stringField(entry, "sha256", `proof_artifacts[${index}]`);
+        if (!SHA256_RE.test(sha256)) {
+            fail(`proof_artifacts[${index}].sha256 must be lowercase SHA-256`);
+        }
+        return {
+            kind: kind as ProofKind,
+            subject: stringField(entry, "subject", `proof_artifacts[${index}]`),
+            path,
+            sha256,
+        };
+    });
+    const expectedProofs = [
+        ...contract.packages.payloads.map((subject) => `registry_package:${subject}`),
+        ...contract.packages.parents.map((subject) => `registry_package:${subject}`),
+        ...contract.platforms.supported.map((entry) => `target:${entry.target}`),
+        ...contract.packages.parents.map((subject) => `product_flow:${subject}`),
+        `publication:${contract.release.id}`,
+        "production_synapse:linux-x64-gnu",
+    ];
+    if (qualified) {
+        exactIdentitySet(
+            proofArtifacts.map((entry) => `${entry.kind}:${entry.subject}`),
+            expectedProofs,
+            "proof_artifacts",
+        );
+    }
+    const allProofsPass =
+        registryPackages.every((entry) => entry.provenance_verified) &&
+        targets.every(
+            (entry) =>
+                entry.filesystem_verified &&
+                entry.self_fd_verified &&
+                entry.process_crash_atomicity_verified &&
+                entry.lifecycle_smoke_passed,
+        ) &&
+        productFlows.every(
+            (entry) =>
+                entry.managed_demand_passed &&
+                entry.offline_verified &&
+                (entry.package !== "@cortexkit/magic-context" ||
+                    entry.cli_commands_passed),
+        ) &&
+        booleanField(publication, "oidc_provenance_verified", "publication") &&
+        !booleanField(publication, "long_lived_token_used", "publication") &&
+        booleanField(publication, "payloads_before_parents", "publication") &&
+        booleanField(evidence, "production_synapse_verified", "evidence");
+    const synapseReport = evidence.production_synapse_report_sha256;
+    if (
+        synapseReport !== null &&
+        (typeof synapseReport !== "string" || !SHA256_RE.test(synapseReport))
+    ) {
+        fail(
+            "production_synapse_report_sha256 must be lowercase SHA-256 or null",
+        );
+    }
+
+    if (qualified && (!allProofsPass || blockers.length !== 0)) {
+        fail("qualified evidence contains a failed proof or blocker");
+    }
+    // `null` is the fail-closed template's value, so it must not survive into
+    // qualified evidence: a proof echoing `null` back agrees with it, and the
+    // Linux semantic lane would be authorized without naming any report at all.
+    // The same holds for each target's lifecycle report.
+    if (qualified) {
+        if (synapseReport === null || isPlaceholderSha256(synapseReport)) {
+            fail(
+                "qualified evidence must record a real production_synapse_report_sha256",
+            );
+        }
+        for (const target of targets) {
+            if (
+                target.test_report_sha256 === null ||
+                isPlaceholderSha256(target.test_report_sha256)
+            ) {
+                fail(
+                    `qualified evidence must record a real test_report_sha256 for ${target.target}`,
+                );
+            }
+        }
+    }
+    if (!qualified && blockers.length === 0) {
+        fail("unqualified evidence must name at least one blocker");
+    }
+    return evidence as unknown as InstalledReleaseEvidence;
+}
+
+/**
+ * Requires the artifacts this evidence cites to themselves be release-qualified.
+ *
+ * The digest comparison above only binds the evidence to whatever bytes are
+ * committed; it says nothing about what those bytes claim. All three artifacts
+ * are committed fail-closed between releases, so without parsing them an
+ * evidence document could set `qualified: true`, carry passing proofs, and clear
+ * the GA gate while citing a qualification run that recorded
+ * `production_qualified: false`, payload entries that recorded
+ * `qualified: false`, or a stop record that grants no usable stop authority.
+ *
+ * Checking those booleans alone is not enough either: a skeletal file carrying
+ * only the booleans would satisfy them while citing nothing. Each artifact is
+ * therefore bound to this release — its schema, its contract digest, and its
+ * identity set — so a stand-in has to reproduce the real citations to pass.
+ *
+ * Deliberately not re-implemented here: the input-lock byte citations and the
+ * payload manifest/launcher digests. Those are what `release:qualify:check` and
+ * `release:payload:check` validate in full, and duplicating their logic in a
+ * third place would create exactly the drift this gate exists to catch. This
+ * function's job is to stop *these* bytes from being a stand-in for the artifacts
+ * those gates validate.
+ */
+function assertCitedArtifactsQualified(
+    rootDir: string,
+    contract: ReleaseContract,
+    expectedContractDigest: string,
+    requireQualification: (
+        rootDir: string,
+    ) => { u8Digest: string; lockSha256: string },
+): void {
+    // Delegate the qualification run to its own full consumer rather than
+    // re-deriving a weaker version of it here. `requireQualificationEvidence`
+    // checks the schema, the contract digest, the release identity, `test_only`,
+    // the artifact citations against real bytes, and — the part summary fields
+    // can never reach — it re-derives the verdict from the input-lock bytes,
+    // because the evidence's own `production_qualified` bit is self-describing
+    // and therefore not authority. That also stops the separately cited input
+    // lock from being opaque bytes to this gate.
+    const { u8Digest, lockSha256 } = requireQualification(rootDir);
+    const qualification = record(
+        readJson(rootDir, QUALIFICATION_PATH),
+        "cited qualification",
+    );
+    // Retained after the delegation for the citation this gate specifically owns:
+    // the evidence's contract digest and the qualification run's must be the same
+    // one, not merely each current on its own.
+    if (qualification.release_contract_sha256 !== expectedContractDigest) {
+        fail("cited qualification was produced against a different release contract");
+    }
+
+    // Same delegation for the payload index. Summary fields could not reach the
+    // input-lock digest citation, the per-target package identities, the platform
+    // floors, the size budgets, or the payload-manifest and bootstrap-launcher
+    // digests, so a stand-in index with the right booleans passed while carrying
+    // no usable bootstrap trust data. `validateTrustIndex` is the validator the
+    // payload builder already applies to this exact file, and it requires a
+    // qualified entry to carry real non-placeholder digests.
+    //
+    // Note it also requires `publication.published === false`: the index is a
+    // build-time artifact and U6 performs no publication, so completed
+    // publication is recorded on the evidence's own `publication` block — which
+    // `allProofsPass` already gates — and must not be demanded of this file.
+    //
+    // `productionQualified` is `true` rather than re-derived: the qualification
+    // consumer above already re-derived the verdict from the lock bytes and
+    // rejects anything else, so reading the bit back here would only reintroduce
+    // a self-describing value as authority.
+    const lock = record(readJson(rootDir, INPUT_LOCK_PATH), "cited input lock");
+    validateTrustIndex(readJson(rootDir, PAYLOAD_INDEX_PATH), {
+        contract,
+        u8Digest,
+        lockSha256,
+        productionQualified: true,
+        lock: lock as unknown as Parameters<typeof validateTrustIndex>[1]["lock"],
+    });
+    const payloadIndex = record(
+        readJson(rootDir, PAYLOAD_INDEX_PATH),
+        "cited payload index",
+    );
+    if (payloadIndex.release_contract_sha256 !== expectedContractDigest) {
+        fail("cited payload index was produced against a different release contract");
+    }
+
+    // No proof kind covers stop provenance, so a digest match was previously the
+    // only thing standing between qualified evidence and a stop record granting
+    // unusable or unauthorized authority. `validateStopRecord` is the validator
+    // that adds this release's ancestry rules on top of the schema: genesis-only
+    // status, reservation exclusion, exact N-1 adjacency, and the
+    // predecessor-manifest hash. Reservation versions come from the gate file
+    // directly, which is the only thing beyond the contract that it needs.
+    const gate = record(
+        readJson(rootDir, REGISTRY_GATE_PATH),
+        "cited registry gate",
+    );
+    const reservationVersions = (
+        Array.isArray(gate.packages) ? gate.packages : []
+    )
+        .map((entry) =>
+            typeof entry === "object" && entry !== null
+                ? (entry as Record<string, unknown>).reservation_version
+                : undefined,
+        )
+        .filter((version): version is string => typeof version === "string");
+    // `null` for the expected predecessor: this is the first payload-bearing
+    // release, so genesis is the only acceptable ancestry — the same stance
+    // `runCheck` takes. The next payload release must pass its real N-1 here.
+    validateStopRecord(
+        readJson(rootDir, STOP_PROVENANCE_PATH),
+        { contract, reservationVersions },
+        null,
+    );
+}
+
+export function validateInstalledReleaseEvidenceAgainstArtifacts(
+    rootDir: string,
+    value: unknown,
+    requireQualified: boolean,
+    options: {
+        verifyAttestation?: (path: string, proof: ProofArtifactRef) => boolean;
+        /**
+         * Seam for the production-input qualification consumer, defaulting to the
+         * real one. Tests that are not exercising qualification stub it; the
+         * `--check` path never does, so GA always runs the full validator.
+         */
+        requireQualification?: (
+            rootDir: string,
+        ) => { u8Digest: string; lockSha256: string };
+    } = {},
+): InstalledReleaseEvidence {
+    const evidence = validateInstalledReleaseEvidence(value);
+    const contract = buildContract();
+    const expected = {
+        production_inputs_sha256: sha256File(rootDir, INPUT_LOCK_PATH),
+        qualification_sha256: sha256File(rootDir, QUALIFICATION_PATH),
+        payload_index_sha256: sha256File(rootDir, PAYLOAD_INDEX_PATH),
+        stop_provenance_sha256: sha256File(rootDir, STOP_PROVENANCE_PATH),
+    };
+    for (const [field, digest] of Object.entries(expected)) {
+        if (evidence[field as keyof typeof expected] !== digest) {
+            fail(`${field} does not match the current artifact`);
+        }
+    }
+    if (requireQualified) {
+        assertCitedArtifactsQualified(
+            rootDir,
+            contract,
+            evidence.release_contract_sha256,
+            options.requireQualification ?? requireQualificationEvidence,
+        );
+    }
+    if (requireQualified && options.verifyAttestation === undefined) {
+        // Without this the pinned signer is unsatisfiable and every proof fails
+        // with an opaque `lacks a valid attestation`, which reads as a bad proof
+        // rather than a lane that was never built. Name the real precondition
+        // once, before spawning `gh` six times against an identity that cannot
+        // exist. This is a clarity gate, not a security one: a workflow file
+        // being present says nothing about what signed a given attestation, so
+        // `--signer-workflow` still does the enforcing.
+        if (!existsSync(join(rootDir, ATTESTATION_SIGNER_WORKFLOW_PATH))) {
+            fail(
+                `GA verification requires the qualification workflow at ${ATTESTATION_SIGNER_WORKFLOW_PATH}, which does not exist; ` +
+                    "no attestation can match the pinned signer identity until that lane is built",
+            );
+        }
+        // Refusing beats defaulting to permissive: without a source-ref
+        // constraint the approved workflow authorizes GA from any branch.
+        if (ATTESTATION_SOURCE_REF === null) {
+            fail(
+                "GA verification requires an attestation source ref, which release policy has not chosen; " +
+                    "set ATTESTATION_SOURCE_REF to the ref GA releases are cut from",
+            );
+        }
+    }
+    for (const proof of evidence.proof_artifacts) {
+        const bytes = readFileSync(join(rootDir, proof.path));
+        const digest = createHash("sha256").update(bytes).digest("hex");
+        if (digest !== proof.sha256) {
+            fail(`proof artifact ${proof.kind}:${proof.subject} digest mismatch`);
+        }
+        let report: Record<string, unknown>;
+        try {
+            report = record(JSON.parse(bytes.toString("utf8")), `proof ${proof.path}`);
+        } catch {
+            fail(`proof artifact ${proof.kind}:${proof.subject} is malformed`);
+        }
+        exactKeys(
+            report,
+            [
+                "schema",
+                "kind",
+                "subject",
+                "release_version",
+                "passed",
+                "source",
+                "observations",
+            ],
+            `proof ${proof.path}`,
+        );
+        if (
+            report.schema !== "magic-context.mc-host-release-proof/v1" ||
+            report.kind !== proof.kind ||
+            report.subject !== proof.subject ||
+            report.release_version !== evidence.release.version ||
+            report.passed !== true
+        ) {
+            fail(`proof artifact ${proof.kind}:${proof.subject} does not match its claim`);
+        }
+        const source = record(report.source, `proof ${proof.path}.source`);
+        exactKeys(source, ["run_url"], `proof ${proof.path}.source`);
+        const runUrl = stringField(source, "run_url", `proof ${proof.path}.source`);
+        if (!RUN_URL_RE.test(runUrl)) {
+            fail(
+                `proof artifact ${proof.kind}:${proof.subject} has no immutable ${ATTESTATION_REPO} workflow run`,
+            );
+        }
+        const observations = record(
+            report.observations,
+            `proof ${proof.path}.observations`,
+        );
+        const registry = evidence.registry_packages.find(
+            (entry) => entry.name === proof.subject,
+        );
+        const target = evidence.targets.find((entry) => entry.target === proof.subject);
+        const targetPackageName =
+            proof.kind === "target"
+                ? contract.packages.payloads.find((name) =>
+                      name.endsWith(proof.subject),
+                  )
+                : undefined;
+        const targetPackage = evidence.registry_packages.find(
+            (entry) => entry.name === targetPackageName,
+        );
+        const flow = evidence.product_flows.find(
+            (entry) => entry.package === proof.subject,
+        );
+        const expectedObservations =
+            proof.kind === "registry_package" && registry
+                ? {
+                      integrity: registry.integrity,
+                      provenance_verified: registry.provenance_verified,
+                  }
+                : proof.kind === "target" && target
+                  ? {
+                        filesystem_verified: target.filesystem_verified,
+                        lifecycle_commands: [
+                            "doctor",
+                            "restart",
+                            "start",
+                            "status",
+                            "stop",
+                        ],
+                        lifecycle_smoke_passed: target.lifecycle_smoke_passed,
+                        package_integrity: targetPackage?.integrity,
+                        process_crash_atomicity_verified:
+                            target.process_crash_atomicity_verified,
+                        runner_arch: target.target.endsWith("arm64")
+                            ? "arm64"
+                            : "x64",
+                        runner_os: target.target.startsWith("darwin")
+                            ? "darwin"
+                            : "linux",
+                        self_fd_verified: target.self_fd_verified,
+                        target: target.target,
+                        test_report_sha256: target.test_report_sha256,
+                    }
+                  : proof.kind === "product_flow" && flow
+                    ? {
+                          cli_commands_passed: flow.cli_commands_passed,
+                          managed_demand_passed: flow.managed_demand_passed,
+                          // Without this the flow proof is three booleans that
+                          // say nothing about *what* was exercised, so a run
+                          // against a source checkout, a staged tarball, or a
+                          // stale install passes identically to one against the
+                          // published artifact. The registry proof establishes
+                          // that a package with this integrity exists; naming it
+                          // here is what ties those bytes to the behavior. Target
+                          // proofs already carry `package_integrity` for the same
+                          // reason.
+                          package_integrity: evidence.registry_packages.find(
+                              (entry) => entry.name === flow.package,
+                          )?.integrity,
+                          offline_verified: flow.offline_verified,
+                      }
+                    : proof.kind === "publication"
+                      ? {
+                            long_lived_token_used:
+                                evidence.publication.long_lived_token_used,
+                            oidc_provenance_verified:
+                                evidence.publication.oidc_provenance_verified,
+                            payloads_before_parents:
+                                evidence.publication.payloads_before_parents,
+                        }
+                      : proof.kind === "production_synapse"
+                        ? {
+                              // The bare boolean said nothing about which bytes ran
+                              // the production semantic lane, so a source checkout,
+                              // staged payload, or stale install produced an
+                              // identical proof. The Linux payload's published
+                              // integrity and the semantic report digest are what
+                              // tie the result to the artifact GA ships.
+                              package_integrity:
+                                  evidence.registry_packages.find((entry) =>
+                                      entry.name.endsWith("linux-x64-gnu"),
+                                  )?.integrity,
+                              production_synapse_report_sha256:
+                                  evidence.production_synapse_report_sha256,
+                              production_synapse_verified:
+                                  evidence.production_synapse_verified,
+                          }
+                        : null;
+        if (
+            expectedObservations === null ||
+            canonicalJson(observations) !== canonicalJson(expectedObservations)
+        ) {
+            fail(`proof artifact ${proof.kind}:${proof.subject} observations drift`);
+        }
+        if (requireQualified) {
+            const proofPath = join(rootDir, proof.path);
+            const verified =
+                options.verifyAttestation?.(proofPath, proof) ??
+                spawnSync(
+                    "gh",
+                    [
+                        "attestation",
+                        "verify",
+                        proofPath,
+                        "--repo",
+                        ATTESTATION_REPO,
+                        "--signer-workflow",
+                        ATTESTATION_SIGNER_WORKFLOW,
+                        ...(ATTESTATION_SOURCE_REF === null
+                            ? []
+                            : ["--source-ref", ATTESTATION_SOURCE_REF]),
+                    ],
+                    { cwd: rootDir, stdio: "ignore" },
+                ).status === 0;
+            if (!verified) {
+                fail(`proof artifact ${proof.kind}:${proof.subject} lacks a valid attestation`);
+            }
+        }
+    }
+    if (requireQualified && !evidence.qualified) {
+        fail(`installed release evidence is not qualified: ${evidence.blockers.join("; ")}`);
+    }
+    return evidence;
+}
+
+function readJson(rootDir: string, relative: string): unknown {
+    return JSON.parse(readFileSync(join(rootDir, relative), "utf8")) as unknown;
+}
+
+function buildTemplate(rootDir: string): InstalledReleaseEvidence {
+    const contract = buildContract();
+    const qualification = record(
+        readJson(rootDir, QUALIFICATION_PATH),
+        "qualification",
+    );
+    const qualificationBlockers = Array.isArray(qualification.unqualified)
+        ? qualification.unqualified.filter(
+              (value): value is string =>
+                  typeof value === "string" && value.length > 0,
+          )
+        : [];
+    const blockers = [
+        ...(qualification.production_qualified === true
+            ? []
+            : [
+                  `production inputs are not qualified: ${
+                      qualificationBlockers.join("; ") || "reason unavailable"
+                  }`,
+              ]),
+        "npm publication intentionally skipped; registry provenance and installed package flows are unavailable",
+        "macOS targets and an exact kernel 4.18 canary have not run",
+    ];
+    return buildInstalledReleaseEvidence({
+        contract,
+        productionInputsSha256: sha256File(rootDir, INPUT_LOCK_PATH),
+        qualificationSha256: sha256File(rootDir, QUALIFICATION_PATH),
+        payloadIndexSha256: sha256File(rootDir, PAYLOAD_INDEX_PATH),
+        stopProvenanceSha256: sha256File(rootDir, STOP_PROVENANCE_PATH),
+        registryPackages: [
+            ...contract.packages.payloads,
+            ...contract.packages.parents,
+        ].map((name) => ({
+            name,
+            version: contract.packages.version,
+            integrity: "sha512-unverified",
+            provenance_verified: false,
+        })),
+        targets: contract.platforms.supported.map((platform) => ({
+            target: platform.target,
+            filesystem_verified: false,
+            self_fd_verified: false,
+            process_crash_atomicity_verified: false,
+            lifecycle_smoke_passed: false,
+            test_report_sha256: null,
+        })),
+        productFlows: contract.packages.parents.map((name) => ({
+            package: name,
+            cli_commands_passed: false,
+            managed_demand_passed: false,
+            offline_verified: false,
+        })),
+        oidcProvenanceVerified: false,
+        longLivedTokenUsed: false,
+        productionSynapseVerified: false,
+        productionSynapseReportSha256: null,
+        proofArtifacts: [],
+        qualified: false,
+        blockers,
+    });
+}
+
+function main(): void {
+    const rootDir = join(dirname(fileURLToPath(import.meta.url)), "..");
+    const flag = process.argv[2] ?? "--check";
+    if (flag === "--write-template") {
+        const template = buildTemplate(rootDir);
+        writeFileSync(join(rootDir, EVIDENCE_PATH), `${canonicalJson(template)}\n`);
+        console.log(`wrote fail-closed ${EVIDENCE_PATH}`);
+        return;
+    }
+    if (flag !== "--check" && flag !== "--check-schema") {
+        console.error("usage: verify-mc-host-release-evidence.ts [--check|--check-schema|--write-template]");
+        process.exit(2);
+    }
+    const evidence = readJson(rootDir, EVIDENCE_PATH);
+    validateInstalledReleaseEvidenceAgainstArtifacts(
+        rootDir,
+        evidence,
+        flag === "--check",
+    );
+    console.log(
+        `checked mc-host installed release evidence (${flag === "--check" ? "GA-qualified" : "schema only"})`,
+    );
+}
+
+if (import.meta.main) main();

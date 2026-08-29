@@ -12,10 +12,11 @@ use std::path::{Component, Path, PathBuf};
 
 use rustix::fd::OwnedFd;
 use rustix::fs::{
-    fsync, mkdirat, openat, renameat_with, unlinkat, AtFlags, Dir, Mode, OFlags, RawMode,
-    RenameFlags, CWD,
+    fsync, mkdirat, openat, renameat_with, unlinkat, AtFlags, Dir, Mode, OFlags, RenameFlags, CWD,
 };
 use sha2::{Digest, Sha256};
+
+use crate::file_mode::raw_mode;
 
 const MANIFEST_NAME: &str = "manifest.json";
 const FILES_NAME: &str = "files";
@@ -180,18 +181,6 @@ impl std::error::Error for HarnessClosureError {}
 
 fn invalid(detail: &'static str) -> HarnessClosureError {
     HarnessClosureError { detail }
-}
-
-/// Converts a manifest permission word to the platform's raw mode type.
-///
-/// The manifest stores a portable `u32`, while `RawMode` is `libc::mode_t` —
-/// `u32` on Linux and `u16` on Darwin. Manifest validation admits only 0o600 and
-/// 0o700, so the value always fits; a wider one is a validation escape and is
-/// refused rather than silently truncated into a different permission set.
-fn permission_mode(mode: u32) -> Result<Mode, HarnessClosureError> {
-    let raw = RawMode::try_from(mode)
-        .map_err(|_| invalid("closure node mode exceeds the platform mode width"))?;
-    Ok(Mode::from_raw_mode(raw))
 }
 
 /// Returns the SHA-256 of the validated canonical manifest encoding.
@@ -712,10 +701,10 @@ fn copy_node(
         &parent,
         basename.as_str(),
         OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        permission_mode(node.mode)?,
+        Mode::from_raw_mode(raw_mode(node.mode)),
     )
     .map_err(|_| invalid("closure node creation failed"))?;
-    rustix::fs::fchmod(&destination, permission_mode(node.mode)?)
+    rustix::fs::fchmod(&destination, Mode::from_raw_mode(raw_mode(node.mode)))
         .map_err(|_| invalid("closure node chmod failed"))?;
 
     let mut reader = std::fs::File::from(
@@ -987,10 +976,10 @@ fn write_new_file(
         parent,
         name,
         OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        permission_mode(mode)?,
+        Mode::from_raw_mode(raw_mode(mode)),
     )
     .map_err(|_| invalid("closure metadata file creation failed"))?;
-    rustix::fs::fchmod(&fd, permission_mode(mode)?)
+    rustix::fs::fchmod(&fd, Mode::from_raw_mode(raw_mode(mode)))
         .map_err(|_| invalid("closure metadata file chmod failed"))?;
     let mut writer = std::fs::File::from(
         rustix::io::dup(&fd).map_err(|_| invalid("closure metadata descriptor dup failed"))?,
