@@ -57,7 +57,16 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          # Pinned, not `latest`, because Bun both builds the plugin bundle and
+          # runs the lane: two scheduled runs resolving different `latest`
+          # releases would carry identical system tuples while executing
+          # different harness and bundle bytes, which is the drift
+          # `opencodeVersion` was added to make visible. Pinning makes the
+          # toolchain a function of the recorded commit instead. Matches
+          # retrieval-benchmark.yml, the sibling measurement lane; the per-PR
+          # gates in ci.yml deliberately stay on `latest` so they catch
+          # new-Bun breakage.
+          bun-version: "1.4.0"
 
       - name: Install workspace deps
         run: bun install --frozen-lockfile

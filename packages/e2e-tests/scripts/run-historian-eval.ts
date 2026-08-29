@@ -315,6 +315,9 @@ function buildPluginBundle(): number {
  * scenarios that finished, clearly labelled as partial, and a completed run
  * removes it.
  */
+/** Run records and DB snapshots, one directory per scenario, beside the report. */
+const LIVE_RUN_ARTIFACTS_DIR = "historian-eval-runs";
+
 function partialReportPath(reportPath: string): string {
     return `${resolve(reportPath)}.partial.json`;
 }
@@ -345,21 +348,14 @@ async function runLive(args: CliArgs): Promise<number> {
     const reportDir = dirname(resolve(args.reportPath));
     // Before anything writes into it, including the first partial. Today the
     // directory happens to exist by the time that write lands, because
-    // `runScenario` creates `<reportDir>/historian-eval-runs/<id>` recursively —
-    // but that is an accident of `artifactsRoot` living under the report and of
+    // `runScenario` creates `<reportDir>/<LIVE_RUN_ARTIFACTS_DIR>/<id>`
+    // recursively — but that is an accident of where the run artifacts live and of
     // the runner's internal ordering, and the partial write swallows its errors,
     // so relying on it would make the guarantee silently depend on both.
+    // Removal of the PREVIOUS run's artifacts happens earlier still, in
+    // `clearPreviousLiveArtifacts`, ahead of everything that can reject.
     mkdirSync(reportDir, { recursive: true });
-    const artifactsRoot = join(reportDir, "historian-eval-runs");
-    // The whole root, once, not each scenario's directory as it is reached. A
-    // reused report directory — a direct run over a smaller corpus, or a budget
-    // that stops before the end — otherwise leaves `run-record.json` files for
-    // scenarios this run never produced sitting beside the new report, and the
-    // archive step collects the directory wholesale. Pairing a current report with
-    // a previous system tuple's records is exactly the comparison the tuple exists
-    // to prevent.
-    rmSync(artifactsRoot, { recursive: true, force: true });
-    rmSync(partialReportPath(args.reportPath), { force: true });
+    const artifactsRoot = join(reportDir, LIVE_RUN_ARTIFACTS_DIR);
     const scores: ScenarioScore[] = [];
     let system: SystemVersionTuple | undefined;
     // Measured after the build and battery, so the budget covers the part that
@@ -422,12 +418,29 @@ async function runLive(args: CliArgs): Promise<number> {
     return laneExitCode(report);
 }
 
+/**
+ * Every artifact a previous live run may have left behind, removed together and
+ * before anything that can fail.
+ *
+ * The completed report was already cleared here so an always-run archive step
+ * could not collect a stale success after a failure. The partial report and the
+ * run-record tree need the same treatment and the same timing: corpus loading,
+ * route validation, the plugin build, and the admission gate can all reject, and
+ * clearing downstream of them left a previous run's partial and records sitting in
+ * a directory whose completed report had just been deleted — evidence that reads
+ * as this invocation's.
+ */
+function clearPreviousLiveArtifacts(reportPath: string): void {
+    const reportDir = dirname(resolve(reportPath));
+    rmSync(resolve(reportPath), { force: true });
+    rmSync(partialReportPath(reportPath), { force: true });
+    rmSync(join(reportDir, LIVE_RUN_ARTIFACTS_DIR), { recursive: true, force: true });
+}
+
 async function main(): Promise<number> {
     const args = parseArgs(Bun.argv.slice(2));
     if (args.mode === "live") {
-        // A stale successful report must never be collected by an always-run
-        // artifact step after a failed run.
-        rmSync(resolve(args.reportPath), { force: true });
+        clearPreviousLiveArtifacts(args.reportPath);
         return runLive(args);
     }
     const { scenarios } = loadCorpus(args);
