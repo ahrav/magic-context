@@ -87,6 +87,21 @@ function citedArtifactBytes(field: string): string {
             })),
         })}\n`;
     }
+    if (field === "stop_provenance_sha256") {
+        // Genesis is the only acceptable ancestry for the first payload-bearing
+        // release, and `validateStopProvenance` requires exactly the contract's
+        // genesis fields with the current release identity.
+        const contract = buildContract();
+        const genesis: Record<string, unknown> = {};
+        for (const key of contract.stop_provenance_schema.genesis
+            .required_fields) {
+            genesis[key] =
+                key === contract.stop_provenance_schema.tag_field
+                    ? "genesis"
+                    : contract.release.version;
+        }
+        return `${canonicalJson(genesis)}\n`;
+    }
     return `${field} bytes`;
 }
 
@@ -441,6 +456,101 @@ describe("installed release evidence", () => {
                 verifyAttestation: () => true,
             }),
         ).toThrow(/observations drift/);
+    });
+
+    test("an unusable cited stop-provenance record cannot gate GA", () => {
+        const files = {
+            production_inputs_sha256:
+                "release/mc-host-production-inputs.lock.json",
+            qualification_sha256:
+                "docs/evidence/mc-host-release-qualification.json",
+            payload_index_sha256: "release/mc-host-payload-index.json",
+            stop_provenance_sha256: "release/mc-host-n-minus-one-stop.json",
+        } as const;
+        // No proof kind covers stop provenance, so a digest match was the only
+        // thing between qualified evidence and a stop record granting no usable
+        // authority. Each replacement is byte-consistent with its digest.
+        const cases: [string, unknown, RegExp][] = [
+            ["unknown tag", { tag: "whatever" }, /unknown stop-provenance tag/],
+            [
+                "genesis bound to another release",
+                { tag: "genesis", release_version: "0.37.0" },
+                /genesis must bind the current release identity/,
+            ],
+            [
+                "genesis carrying legacy authority",
+                {
+                    tag: "genesis",
+                    release_version: buildContract().release.version,
+                    predecessor_release_version: "0.37.0",
+                },
+                /forbidden field predecessor_release_version/,
+            ],
+        ];
+        for (const [label, stopRecord, pattern] of cases) {
+            const root = mkdtempSync(join(tmpdir(), "mc-host-installed-evidence-"));
+            const evidence = qualifiedEvidence();
+            installProofArtifacts(root, evidence);
+            for (const [field, relative] of Object.entries(files)) {
+                const bytes =
+                    field === "stop_provenance_sha256"
+                        ? `${canonicalJson(stopRecord)}\n`
+                        : citedArtifactBytes(field);
+                mkdirSync(dirname(join(root, relative)), { recursive: true });
+                writeFileSync(join(root, relative), bytes);
+                evidence[field] = sha256Hex(bytes);
+            }
+            expect(
+                () =>
+                    validateInstalledReleaseEvidenceAgainstArtifacts(
+                        root,
+                        evidence,
+                        true,
+                        { verifyAttestation: () => true },
+                    ),
+                label,
+            ).toThrow(pattern);
+            expect(() =>
+                validateInstalledReleaseEvidenceAgainstArtifacts(
+                    root,
+                    evidence,
+                    false,
+                    { verifyAttestation: () => true },
+                ),
+            ).not.toThrow();
+        }
+    });
+
+    test("GA verification names the missing qualification workflow instead of blaming the proofs", () => {
+        const root = mkdtempSync(join(tmpdir(), "mc-host-installed-evidence-"));
+        const evidence = qualifiedEvidence();
+        installProofArtifacts(root, evidence);
+        for (const [field, relative] of Object.entries({
+            production_inputs_sha256:
+                "release/mc-host-production-inputs.lock.json",
+            qualification_sha256:
+                "docs/evidence/mc-host-release-qualification.json",
+            payload_index_sha256: "release/mc-host-payload-index.json",
+            stop_provenance_sha256: "release/mc-host-n-minus-one-stop.json",
+        })) {
+            const bytes = citedArtifactBytes(field);
+            mkdirSync(dirname(join(root, relative)), { recursive: true });
+            writeFileSync(join(root, relative), bytes);
+            evidence[field] = sha256Hex(bytes);
+        }
+        // No `verifyAttestation` stub, so the real `gh` path is selected and the
+        // pinned signer identity has to be satisfiable. Until the lane exists it
+        // is not, and the failure must say so rather than reporting six proofs
+        // as unattested.
+        expect(() =>
+            validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true),
+        ).toThrow(/qualification workflow at .*mc-host-release-qualification\.yml/);
+        // A stub still bypasses it: the precondition is about the `gh` path only.
+        expect(() =>
+            validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, {
+                verifyAttestation: () => true,
+            }),
+        ).not.toThrow();
     });
 
     test("canonical evidence has a stable digest", () => {

@@ -60,16 +60,18 @@ async function main(): Promise<void> {
     };
     // A started daemon holds the lifecycle locks under `dataRoot`, so leaving one
     // behind makes every later canary run on the same data root fail for the
-    // previous run's reason. The flag is set from the instant `start` returns,
-    // before its assertions, because a daemon that came up and then failed an
-    // assertion is exactly the case that needs tearing down.
-    let started = false;
+    // previous run's residue. The flag therefore records that a start was
+    // *attempted*, and is set before the await: `runNativeLifecycle` can reject
+    // on a response timeout, an output cap, or a malformed reply after the
+    // daemon is already up, and any assignment after the await is unreachable on
+    // exactly that path. Stopping a daemon that never launched is harmless.
+    let startAttempted = false;
     try {
+        startAttempted = true;
         const start = await runNativeLifecycle(
             { kind: "retained-fd", fd: retained.fd },
             { command: "start", envelope, deadlineMs: 60_000, env },
         );
-        started = true;
         assert.equal(start.ok, true);
         assert.equal(start.state, "running");
 
@@ -86,10 +88,12 @@ async function main(): Promise<void> {
         );
         assert.equal(stop.ok, true);
         assert.equal(stop.state, "stopped");
-        started = false;
+        // Only a stop that returned and asserted clean retires the obligation; a
+        // wrong reported state still gets the teardown retry below.
+        startAttempted = false;
         console.log("mc-host retained-fd smoke: PASS");
     } finally {
-        if (started) {
+        if (startAttempted) {
             try {
                 await runNativeLifecycle(
                     { kind: "retained-fd", fd: retained.fd },

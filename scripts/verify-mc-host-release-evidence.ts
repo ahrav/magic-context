@@ -6,7 +6,7 @@
  */
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -14,6 +14,7 @@ import {
     canonicalJson,
     type ReleaseContract,
     sha256Hex,
+    validateStopProvenance,
 } from "./generate-mc-host-release-manifest";
 
 const EVIDENCE_PATH = "docs/evidence/mc-host-installed-release-evidence.json";
@@ -40,8 +41,16 @@ const ATTESTATION_REPO = "ahrav/magic-context";
  * clear this GA gate. `gh` validates the signer path only when given
  * `--signer-workflow` or `--cert-identity`, so the approved workflow is named
  * here explicitly and every other same-repository workflow is rejected.
+ *
+ * The workflow does not exist yet — the qualification lane that publishes,
+ * attests, and collects these proofs is still to be built. Naming its path here
+ * ahead of time is deliberate and fail-closed: nothing can satisfy this signer
+ * until the lane exists, so the lane must be created at this path rather than
+ * the check loosened to accept whatever happens to sign.
  */
-const ATTESTATION_SIGNER_WORKFLOW = `${ATTESTATION_REPO}/.github/workflows/mc-host-release-qualification.yml`;
+const ATTESTATION_SIGNER_WORKFLOW_PATH =
+    ".github/workflows/mc-host-release-qualification.yml";
+const ATTESTATION_SIGNER_WORKFLOW = `${ATTESTATION_REPO}/${ATTESTATION_SIGNER_WORKFLOW_PATH}`;
 
 const RUN_URL_RE = new RegExp(
     `^https://github\\.com/${ATTESTATION_REPO}/actions/runs/\\d+`,
@@ -532,13 +541,17 @@ export function validateInstalledReleaseEvidence(
  * Requires the artifacts this evidence cites to themselves be release-qualified.
  *
  * The digest comparison above only binds the evidence to whatever bytes are
- * committed; it says nothing about what those bytes claim. Both artifacts are
- * committed fail-closed between releases, so without parsing them an evidence
- * document could set `qualified: true`, carry passing proofs, and clear the GA
- * gate while citing a qualification run that recorded `production_qualified:
- * false` and payload entries that recorded `qualified: false`.
+ * committed; it says nothing about what those bytes claim. All three artifacts
+ * are committed fail-closed between releases, so without parsing them an
+ * evidence document could set `qualified: true`, carry passing proofs, and clear
+ * the GA gate while citing a qualification run that recorded
+ * `production_qualified: false`, payload entries that recorded
+ * `qualified: false`, or a stop record that grants no usable stop authority.
  */
-function assertCitedArtifactsQualified(rootDir: string): void {
+function assertCitedArtifactsQualified(
+    rootDir: string,
+    contract: ReleaseContract,
+): void {
     const qualification = record(
         readJson(rootDir, QUALIFICATION_PATH),
         "cited qualification",
@@ -565,6 +578,17 @@ function assertCitedArtifactsQualified(rootDir: string): void {
             fail(`cited payload index entry ${label} is not qualified`);
         }
     });
+    // No proof kind covers stop provenance, so a digest match was previously the
+    // only thing standing between qualified evidence and a malformed or
+    // foreign-release stop record. `validateStopProvenance` is the existing
+    // consumer-facing gate and needs only the contract, which is already here.
+    const stop = validateStopProvenance(
+        contract,
+        readJson(rootDir, STOP_PROVENANCE_PATH),
+    );
+    if (!stop.valid) {
+        fail(`cited stop-provenance record is unusable: ${stop.error}`);
+    }
 }
 
 export function validateInstalledReleaseEvidenceAgainstArtifacts(
@@ -588,7 +612,22 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
             fail(`${field} does not match the current artifact`);
         }
     }
-    if (requireQualified) assertCitedArtifactsQualified(rootDir);
+    if (requireQualified) assertCitedArtifactsQualified(rootDir, contract);
+    if (requireQualified && options.verifyAttestation === undefined) {
+        // Without this the pinned signer is unsatisfiable and every proof fails
+        // with an opaque `lacks a valid attestation`, which reads as a bad proof
+        // rather than a lane that was never built. Name the real precondition
+        // once, before spawning `gh` six times against an identity that cannot
+        // exist. This is a clarity gate, not a security one: a workflow file
+        // being present says nothing about what signed a given attestation, so
+        // `--signer-workflow` still does the enforcing.
+        if (!existsSync(join(rootDir, ATTESTATION_SIGNER_WORKFLOW_PATH))) {
+            fail(
+                `GA verification requires the qualification workflow at ${ATTESTATION_SIGNER_WORKFLOW_PATH}, which does not exist; ` +
+                    "no attestation can match the pinned signer identity until that lane is built",
+            );
+        }
+    }
     for (const proof of evidence.proof_artifacts) {
         const bytes = readFileSync(join(rootDir, proof.path));
         const digest = createHash("sha256").update(bytes).digest("hex");
