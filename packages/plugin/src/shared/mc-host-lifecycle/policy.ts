@@ -15,7 +15,9 @@
  * path, stderr text, or native error chain rides on any result.
  */
 
+import type { AuthenticatedPeer } from "../mc-host-client/types";
 import { checkPlatform, type LifecycleFailureReason, type PlatformReaders } from "./bootstrap";
+import { evaluateDaemonCompatibility } from "./compatibility";
 import {
     classifyPreNativeRoots,
     type DaemonCheck,
@@ -70,7 +72,13 @@ export type StorageReadiness = "ready" | "starting" | "unavailable";
 
 export interface ObservationalHealth {
     readiness: DaemonReadiness;
-    authenticatedDaemonVersion: string;
+    /**
+     * The peer the probe authenticated, not just its version string. The
+     * compatibility gate is applied to it here, so handing over only the version
+     * would let an observation report `healthy` for a daemon outside the
+     * supported range while stamping that version with `proof: "current"`.
+     */
+    authenticatedPeer: AuthenticatedPeer;
 }
 
 /**
@@ -663,6 +671,23 @@ export class McHostLifecyclePolicy {
             if (observed.readiness.synapse) {
                 addCheck("readiness.synapse", observed.readiness.synapse);
             }
+            // Readiness answers "are the components serving", never "may this
+            // client talk to this daemon at all". Without this gate an
+            // observation of a running daemon whose authenticated version is
+            // outside the supported half-open range reported `healthy` and then
+            // stamped that version with `proof: "current"` — a compatibility
+            // verdict inverted by omission. It joins `checks` rather than
+            // short-circuiting so the contract's failing-reason precedence still
+            // decides what gets reported when readiness is also degraded.
+            const compatibility = evaluateDaemonCompatibility(observed.authenticatedPeer);
+            if (!compatibility.ok) {
+                checks.push({
+                    id: "compatibility.daemon",
+                    status: "fail",
+                    reason: compatibility.reason,
+                    remediation: remediationForReason(compatibility.reason),
+                });
+            }
             // The check list is ordered by id because the v1 result requires
             // lexicographically sorted unique check ids. The reported reason is
             // NOT that order: the release contract ships one precedence list for
@@ -688,7 +713,7 @@ export class McHostLifecyclePolicy {
                 versions: {
                     ...relabeled.versions,
                     proof: "current",
-                    daemon: observed.authenticatedDaemonVersion,
+                    daemon: observed.authenticatedPeer.daemonVer,
                 },
             };
         } catch (error) {

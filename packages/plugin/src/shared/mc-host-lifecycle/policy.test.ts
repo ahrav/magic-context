@@ -15,6 +15,11 @@ function tempDir(prefix: string): string {
     return mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
+/** A handshake-authenticated peer at a given daemon version. */
+function authenticatedPeerAt(daemonVer: string) {
+    return { daemonVer, daemonId: new Uint8Array([1, 2, 3, 4]), proof: "current" as const };
+}
+
 let counter = 0;
 
 function startResultJson(command: string): string {
@@ -370,7 +375,7 @@ describe("native invocation mapping", () => {
                 env: { XDG_DATA_HOME: root },
                 launchTarget: { kind: "test-binary", path: binary },
                 readinessProbe: async () => ({
-                    authenticatedDaemonVersion: "mc-host/0.1.0",
+                    authenticatedPeer: authenticatedPeerAt("mc-host/0.1.0"),
                     readiness: {
                         transport: { state: "ready", reason: "healthy" },
                         storage: { state: "unavailable", reason: "storage_unavailable" },
@@ -446,7 +451,7 @@ describe("native invocation mapping", () => {
                 readinessProbe: async (budgetMs) => {
                     budgets.push(budgetMs);
                     return {
-                        authenticatedDaemonVersion: "mc-host/0.1.0",
+                        authenticatedPeer: authenticatedPeerAt("mc-host/0.1.0"),
                         readiness: {
                             transport: { state: "ready", reason: "healthy" },
                         },
@@ -465,6 +470,39 @@ describe("native invocation mapping", () => {
         }
     }, 20_000);
 
+    test("an authenticated daemon outside the supported range is never healthy", async () => {
+        // Readiness answers whether the components are serving, not whether this
+        // client may talk to this daemon at all. Without the compatibility gate a
+        // running daemon on an unsupported version reported `healthy` and stamped
+        // that version with `proof: "current"`.
+        const root = tempDir("mc-policy-incompatible-daemon-");
+        const { binary } = fakeBinary(root);
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                readinessProbe: async () => ({
+                    // Every component is ready, so only the version can fail it.
+                    authenticatedPeer: authenticatedPeerAt("mc-host/9.9.9"),
+                    readiness: {
+                        transport: { state: "ready", reason: "healthy" },
+                        storage: { state: "ready", reason: "healthy" },
+                    },
+                }),
+            });
+            for (const result of [await policy.status(), await policy.doctor()]) {
+                expect(result.ok).toBe(false);
+                expect(result.reason).toBe("incompatible_daemon");
+                expect(result.remediation).toBe("align_versions");
+                expect(
+                    result.checks.find((check) => check.id === "compatibility.daemon")?.status,
+                ).toBe("fail");
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     test("the reported readiness reason follows contract precedence, not check-id order", async () => {
         const root = tempDir("mc-policy-readiness-precedence-");
         const { binary } = fakeBinary(root);
@@ -473,7 +511,7 @@ describe("native invocation mapping", () => {
                 env: { XDG_DATA_HOME: root },
                 launchTarget: { kind: "test-binary", path: binary },
                 readinessProbe: async () => ({
-                    authenticatedDaemonVersion: "mc-host/0.1.0",
+                    authenticatedPeer: authenticatedPeerAt("mc-host/0.1.0"),
                     readiness: {
                         // `readiness.storage` sorts before `readiness.transport`,
                         // but `authentication_failed` outranks `storage_unavailable`

@@ -808,6 +808,14 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 return false;
             }
         }
+        // Checked here, after the join path and before the flight is created,
+        // because the two cases differ. Detaching from an EXISTING flight is
+        // safe: another caller owns it and it completes for them. CREATING one
+        // for a caller with no live interest is not — `demandManagedLane` can
+        // stage and start mc-host, resolve the lane, and arm shadow backfill with
+        // nobody waiting on the result. Same rule the lifecycle policy applies to
+        // its own demand entry.
+        if (signal?.aborted) return false;
         this.initializing = (async () => {
             try {
                 await this.demandManagedLane();

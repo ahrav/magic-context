@@ -112,7 +112,7 @@ async function probeManagedReadiness(root: string, budgetMs: number): Promise<Ob
                         }
                       : { state: "degraded" as const, reason: "synapse_degraded" as const };
         return {
-            authenticatedDaemonVersion: authenticated.daemonVer,
+            authenticatedPeer: authenticated,
             readiness: {
                 transport: { state: "ready", reason: "healthy" },
                 storage: {

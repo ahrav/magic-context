@@ -113,10 +113,26 @@ export async function wakePlaneStatus(): Promise<WakePlaneStatus> {
     if (inFlightProbe) return await inFlightProbe;
 
     const startedAt = now();
-    // Captured before the probe: a daemon that republishes while the probe is
-    // in flight leaves a stale identity here, which the next read rejects.
+    // Captured before the probe so the answer can be bound to the daemon that
+    // produced it.
     const publication = readPublication();
     const probe = probeStatus().then((status) => {
+        // Re-read on settle. Rejecting a stale identity only on the NEXT call
+        // protected the cache but not this result: the initiating caller and
+        // every caller coalesced on `inFlightProbe` still received an answer
+        // describing a daemon that is no longer serving. Across a restart that
+        // could report `present` from the old incarnation and suppress
+        // standalone evaluation even though the replacement may not offer
+        // `wake.create` at all.
+        //
+        // A changed publication discards the answer rather than retrying: the
+        // result is unbound, `unknown` is this module's fail-open value, and the
+        // next call re-probes against the new owner. Nothing is cached, so that
+        // next call cannot inherit this one's uncertainty.
+        if (readPublication() !== publication) {
+            cachedStatus = null;
+            return "unknown" as WakePlaneStatus;
+        }
         // With no readable publication there is nothing to bind an affirmative
         // answer to, so it is not retained at all.
         cachedStatus =

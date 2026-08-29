@@ -197,6 +197,47 @@ describe("wakePlaneStatus", () => {
         expect(probes).toBe(2);
     });
 
+    test("discards an in-flight answer when the daemon republishes mid-probe", async () => {
+        // The captured publication was only re-checked on the NEXT call, so the
+        // initiating caller and everyone coalesced on the in-flight probe still
+        // got an answer describing a daemon that had already been replaced.
+        // Reporting `present` from the old incarnation would suppress standalone
+        // evaluation even if the replacement offers no wake plane at all.
+        let probes = 0;
+        let publication = "dev:ino:1000:64";
+        let releaseProbe: (() => void) | undefined;
+        __wakePlaneTest.setCatalogProbe(async () => {
+            probes += 1;
+            await new Promise<void>((resolve) => {
+                releaseProbe = resolve;
+            });
+            return catalog(true);
+        });
+        __wakePlaneTest.setPublicationReader(() => publication);
+
+        const first = wakePlaneStatus();
+        const coalesced = wakePlaneStatus();
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        // The daemon is replaced while the probe is still parked.
+        publication = "dev:ino:2000:64";
+        releaseProbe?.();
+
+        // Neither the initiator nor the coalesced caller may adopt the old
+        // daemon's affirmative answer.
+        expect(await first).toBe("unknown");
+        expect(await coalesced).toBe("unknown");
+        expect(probes).toBe(1);
+
+        // Nothing was retained, so the next call re-probes against the new owner.
+        releaseProbe = undefined;
+        __wakePlaneTest.setCatalogProbe(async () => {
+            probes += 1;
+            return catalog(true);
+        });
+        expect(await wakePlaneStatus()).toBe("present");
+        expect(probes).toBe(2);
+    });
+
     test("dials and binds to the connection file the lifecycle owner publishes", () => {
         // The lifecycle resolver honors MAGIC_CONTEXT_TEST_DATA_DIR; getDataDir()
         // ignores it. That makes it the discriminator: reading getDataDir() here

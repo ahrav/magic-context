@@ -170,6 +170,27 @@ describe("SynapseEmbeddingProvider", () => {
         expect(deadlines[0]).toBeGreaterThanOrEqual(60_000);
     });
 
+    it("does not demand a managed start for an already-aborted caller", async () => {
+        // Creating the initialization flight is what triggers the demand, and the
+        // demand is not given the caller's signal — so an already-cancelled query
+        // could stage and start mc-host, resolve the lane, and arm backfill with
+        // no live waiter. Detaching from an existing flight is different: another
+        // caller owns it.
+        let demands = 0;
+        const provider = new SynapseEmbeddingProvider({
+            projectRoot: "/repo",
+            session: "managed-aborted-caller",
+            demandStart: async () => {
+                demands += 1;
+                return { ok: true, reason: "started", storage: "ready" };
+            },
+            connectionOrigin: "managed-default",
+        });
+
+        expect(await provider.initialize(AbortSignal.abort())).toBe(false);
+        expect(demands).toBe(0);
+    });
+
     it("does not re-demand per call after a failed managed demand", async () => {
         let demands = 0;
         const provider = new SynapseEmbeddingProvider({
