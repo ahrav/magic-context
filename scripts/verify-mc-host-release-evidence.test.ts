@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { buildContract, canonicalJson, sha256Hex } from "./generate-mc-host-release-manifest";
 import {
     buildInstalledReleaseEvidence,
@@ -63,42 +64,69 @@ function qualifiedEvidence(): Record<string, unknown> {
     });
 }
 
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+const LOCK_PATH = "release/mc-host-production-inputs.lock.json";
+const INDEX_PATH = "release/mc-host-payload-index.json";
+
+/**
+ * Stand-in for the production-input qualification consumer.
+ *
+ * Returns the digests the real consumer returns, derived the same way, so the
+ * trust-index validation downstream of it is exercised against real citations
+ * rather than being skipped along with the qualification check.
+ */
+function stubQualification(): { u8Digest: string; lockSha256: string } {
+    return {
+        u8Digest: sha256Hex(canonicalJson(buildContract())),
+        lockSha256: sha256Hex(readFileSync(join(repoRoot, LOCK_PATH), "utf8")),
+    };
+}
+
 /**
  * Bytes to stage for a cited artifact.
  *
- * The GA gate binds each cited artifact to this release — schema, contract
- * digest, and identity set — so these fixtures have to reproduce the real
- * citations rather than just the qualified booleans. The input lock is only
- * digest-compared and can stay opaque.
+ * The lock and payload index are taken from the committed artifacts rather than
+ * hand-built, because the GA gate now runs the real trust-index validator over
+ * the index: package identities, platform floors, size budgets against the lock,
+ * and real payload-manifest and bootstrap-launcher digests. A synthetic index
+ * cannot satisfy that, and a fixture that diverges from the shipped shape is how
+ * a gate ends up passing tests while failing on real artifacts.
+ *
+ * The committed index is fail-closed, so the only edits are the ones a qualified
+ * release would make: flip the verdict and each entry to qualified, drop the
+ * unqualified reason, and supply real digests.
  */
 function citedArtifactBytes(field: string): string {
     const contract = buildContract();
     const contractDigest = sha256Hex(canonicalJson(contract));
+    if (field === "production_inputs_sha256") {
+        return readFileSync(join(repoRoot, LOCK_PATH), "utf8");
+    }
+    if (field === "payload_index_sha256") {
+        const index = JSON.parse(
+            readFileSync(join(repoRoot, INDEX_PATH), "utf8"),
+        ) as {
+            production_qualified: boolean;
+            entries: Record<string, unknown>[];
+        };
+        index.production_qualified = true;
+        index.entries = index.entries.map((entry, position) => {
+            const { unqualified_reason: _dropped, ...rest } = entry;
+            return {
+                ...rest,
+                qualified: true,
+                payload_manifest_digest: sha256Hex(`payload manifest ${position}`),
+                bootstrap_launcher_digest: sha256Hex(`bootstrap launcher ${position}`),
+            };
+        });
+        return `${canonicalJson(index)}\n`;
+    }
     if (field === "qualification_sha256") {
         return `${canonicalJson({
             schema: "magic-context.mc-host-release-qualification/v1",
             release_contract_sha256: contractDigest,
             production_qualified: true,
             unqualified: [],
-        })}\n`;
-    }
-    if (field === "payload_index_sha256") {
-        return `${canonicalJson({
-            schema: "magic-context.mc-host-payload-index/v1",
-            release: {
-                id: contract.release.id,
-                version: contract.packages.version,
-            },
-            release_contract_sha256: contractDigest,
-            production_qualified: true,
-            publication: {
-                payloads_before_parents: true,
-                published: true,
-            },
-            entries: contract.platforms.supported.map((platform) => ({
-                qualified: true,
-                target: platform.target,
-            })),
         })}\n`;
     }
     if (field === "stop_provenance_sha256") {
@@ -277,13 +305,13 @@ describe("installed release evidence", () => {
         expect(() =>
             validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, {
                 verifyAttestation: () => true,
-                requireQualification: () => {},
+                requireQualification: () => stubQualification(),
             }),
         ).not.toThrow();
         expect(() =>
             validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, {
                 verifyAttestation: () => false,
-                requireQualification: () => {},
+                requireQualification: () => stubQualification(),
             }),
         ).toThrow(/lacks a valid attestation/);
         const proofs = evidence.proof_artifacts as {
@@ -293,7 +321,7 @@ describe("installed release evidence", () => {
         const checked: string[] = [];
         expect(() =>
             validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, {
-                requireQualification: () => {},
+                requireQualification: () => stubQualification(),
                 verifyAttestation: (_path, proof) => {
                     checked.push(proof.subject);
                     return proof.subject !== lastSubject;
@@ -356,7 +384,7 @@ describe("installed release evidence", () => {
                 evidence,
                 true,
                 { verifyAttestation: () => true,
-                requireQualification: () => {} },
+                requireQualification: () => stubQualification() },
             ),
         ).not.toThrow();
 
@@ -369,7 +397,7 @@ describe("installed release evidence", () => {
                     drifted,
                     true,
                     { verifyAttestation: () => true,
-                requireQualification: () => {} },
+                requireQualification: () => stubQualification() },
                 ),
             ).toThrow(new RegExp(`${field} does not match`));
         }
@@ -384,7 +412,7 @@ describe("installed release evidence", () => {
                 evidence,
                 true,
                 { verifyAttestation: () => true,
-                requireQualification: () => {} },
+                requireQualification: () => stubQualification() },
             ),
         ).toThrow(/payload_index_sha256 does not match/);
     });
@@ -432,7 +460,7 @@ describe("installed release evidence", () => {
                 (parsed) => {
                     parsed.production_qualified = false;
                 },
-                /cited payload index is not production-qualified/,
+                /trust index disagrees with U9 qualification state/,
             ],
             [
                 "one unqualified payload entry",
@@ -440,7 +468,7 @@ describe("installed release evidence", () => {
                 (parsed) => {
                     (parsed.entries as { qualified: boolean }[])[0].qualified = false;
                 },
-                /cited payload index entry .* is not qualified/,
+                /entries\[0\]: missing key unqualified_reason/,
             ],
             [
                 "index qualifying only one easy target",
@@ -448,7 +476,7 @@ describe("installed release evidence", () => {
                 (parsed) => {
                     parsed.entries = (parsed.entries as unknown[]).slice(0, 1);
                 },
-                /cited payload index targets must contain the exact release set/,
+                /must carry exactly one entry per payload package/,
             ],
             [
                 "skeletal index carrying only qualified entries",
@@ -458,15 +486,7 @@ describe("installed release evidence", () => {
                     for (const key of Object.keys(parsed)) delete parsed[key];
                     parsed.entries = entries;
                 },
-                /not a payload index/,
-            ],
-            [
-                "index recording no completed publication",
-                files.payload_index_sha256,
-                (parsed) => {
-                    (parsed.publication as { published: boolean }).published = false;
-                },
-                /records no completed publication/,
+                /trust index: missing key schema/,
             ],
             [
                 "index recording a parents-first publication",
@@ -476,7 +496,7 @@ describe("installed release evidence", () => {
                         parsed.publication as { payloads_before_parents: boolean }
                     ).payloads_before_parents = false;
                 },
-                /records a parents-first publication/,
+                /payloads must publish before parents/,
             ],
         ];
         for (const [label, mutated, mutate, pattern] of cases) {
@@ -502,7 +522,7 @@ describe("installed release evidence", () => {
                         evidence,
                         true,
                         { verifyAttestation: () => true,
-                requireQualification: () => {} },
+                requireQualification: () => stubQualification() },
                     ),
                 label,
             ).toThrow(pattern);
@@ -514,7 +534,7 @@ describe("installed release evidence", () => {
                     evidence,
                     false,
                     { verifyAttestation: () => true,
-                requireQualification: () => {} },
+                requireQualification: () => stubQualification() },
                 ),
             ).not.toThrow();
         }
@@ -559,11 +579,11 @@ describe("installed release evidence", () => {
         // independent sides; reading the expected value back out of the proof
         // made this substitution invisible.
         (evidence.targets as { test_report_sha256: string }[])[0].test_report_sha256 =
-            "c".repeat(64);
+            sha256Hex("a different test report");
         expect(() =>
             validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, {
                 verifyAttestation: () => true,
-                requireQualification: () => {},
+                requireQualification: () => stubQualification(),
             }),
         ).toThrow(/observations drift/);
     });
@@ -643,7 +663,7 @@ describe("installed release evidence", () => {
                         evidence,
                         true,
                         { verifyAttestation: () => true,
-                requireQualification: () => {} },
+                requireQualification: () => stubQualification() },
                     ),
                 label,
             ).toThrow(pattern);
@@ -653,7 +673,7 @@ describe("installed release evidence", () => {
                     evidence,
                     false,
                     { verifyAttestation: () => true,
-                requireQualification: () => {} },
+                requireQualification: () => stubQualification() },
                 ),
             ).not.toThrow();
         }
@@ -684,7 +704,7 @@ describe("installed release evidence", () => {
         // preconditions; the assertion below covers the unstubbed default.
         expect(() =>
             validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, {
-                requireQualification: () => {},
+                requireQualification: () => stubQualification(),
             }),
         ).toThrow(/qualification workflow at .*mc-host-release-qualification\.yml/);
         // With the workflow present the next unmet precondition must surface, not
@@ -695,7 +715,7 @@ describe("installed release evidence", () => {
         writeFileSync(join(root, workflow), "name: placeholder\n");
         expect(() =>
             validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, {
-                requireQualification: () => {},
+                requireQualification: () => stubQualification(),
             }),
         ).toThrow(/requires an attestation source ref/);
         // Unstubbed, the real production-input qualification consumer runs and its
@@ -708,7 +728,7 @@ describe("installed release evidence", () => {
         expect(() =>
             validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, {
                 verifyAttestation: () => true,
-                requireQualification: () => {},
+                requireQualification: () => stubQualification(),
             }),
         ).not.toThrow();
     });
@@ -752,9 +772,55 @@ describe("installed release evidence", () => {
         expect(() =>
             validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, {
                 verifyAttestation: () => true,
-                requireQualification: () => {},
+                requireQualification: () => stubQualification(),
             }),
         ).toThrow(/product_flow:.* observations drift/);
+    });
+
+    test("qualified evidence cannot leave a report digest unrecorded", () => {
+        // `null` is the fail-closed template's value. Left in qualified evidence
+        // the proof simply echoes it back and agrees, so the lane is authorized
+        // without naming any report — the binding would look present and enforce
+        // nothing. A placeholder digest is the same hole with extra steps.
+        for (const [label, mutate, pattern] of [
+            [
+                "null synapse report",
+                (evidence: Record<string, unknown>) => {
+                    evidence.production_synapse_report_sha256 = null;
+                },
+                /must record a real production_synapse_report_sha256/,
+            ],
+            [
+                "placeholder synapse report",
+                (evidence: Record<string, unknown>) => {
+                    evidence.production_synapse_report_sha256 = "a".repeat(64);
+                },
+                /must record a real production_synapse_report_sha256/,
+            ],
+            [
+                "null target test report",
+                (evidence: Record<string, unknown>) => {
+                    (
+                        evidence.targets as { test_report_sha256: string | null }[]
+                    )[0].test_report_sha256 = null;
+                },
+                /must record a real test_report_sha256 for/,
+            ],
+        ] as [string, (evidence: Record<string, unknown>) => void, RegExp][]) {
+            const evidence = qualifiedEvidence();
+            mutate(evidence);
+            expect(
+                () => validateInstalledReleaseEvidence(evidence),
+                label,
+            ).toThrow(pattern);
+        }
+        // Unqualified evidence may still carry `null`: that is the template's own
+        // shape, and `--write-template` must keep producing it.
+        const template = qualifiedEvidence();
+        template.qualified = false;
+        template.blockers = ["target smoke has not run"];
+        template.production_synapse_report_sha256 = null;
+        expect(() => validateInstalledReleaseEvidence(template)).not.toThrow();
     });
 
     test("canonical evidence has a stable digest", () => {

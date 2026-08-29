@@ -9,14 +9,17 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { validateStopRecord } from "./build-mc-host-payload";
+import { validateStopRecord, validateTrustIndex } from "./build-mc-host-payload";
 import {
     buildContract,
     canonicalJson,
     type ReleaseContract,
     sha256Hex,
 } from "./generate-mc-host-release-manifest";
-import { requireQualificationEvidence } from "./qualify-mc-host-production-inputs";
+import {
+    isPlaceholderSha256,
+    requireQualificationEvidence,
+} from "./qualify-mc-host-production-inputs";
 
 const EVIDENCE_PATH = "docs/evidence/mc-host-installed-release-evidence.json";
 const QUALIFICATION_PATH = "docs/evidence/mc-host-release-qualification.json";
@@ -569,6 +572,27 @@ export function validateInstalledReleaseEvidence(
     if (qualified && (!allProofsPass || blockers.length !== 0)) {
         fail("qualified evidence contains a failed proof or blocker");
     }
+    // `null` is the fail-closed template's value, so it must not survive into
+    // qualified evidence: a proof echoing `null` back agrees with it, and the
+    // Linux semantic lane would be authorized without naming any report at all.
+    // The same holds for each target's lifecycle report.
+    if (qualified) {
+        if (synapseReport === null || isPlaceholderSha256(synapseReport)) {
+            fail(
+                "qualified evidence must record a real production_synapse_report_sha256",
+            );
+        }
+        for (const target of targets) {
+            if (
+                target.test_report_sha256 === null ||
+                isPlaceholderSha256(target.test_report_sha256)
+            ) {
+                fail(
+                    `qualified evidence must record a real test_report_sha256 for ${target.target}`,
+                );
+            }
+        }
+    }
     if (!qualified && blockers.length === 0) {
         fail("unqualified evidence must name at least one blocker");
     }
@@ -602,7 +626,9 @@ function assertCitedArtifactsQualified(
     rootDir: string,
     contract: ReleaseContract,
     expectedContractDigest: string,
-    requireQualification: (rootDir: string) => void,
+    requireQualification: (
+        rootDir: string,
+    ) => { u8Digest: string; lockSha256: string },
 ): void {
     // Delegate the qualification run to its own full consumer rather than
     // re-deriving a weaker version of it here. `requireQualificationEvidence`
@@ -612,7 +638,7 @@ function assertCitedArtifactsQualified(
     // because the evidence's own `production_qualified` bit is self-describing
     // and therefore not authority. That also stops the separately cited input
     // lock from being opaque bytes to this gate.
-    requireQualification(rootDir);
+    const { u8Digest, lockSha256 } = requireQualification(rootDir);
     const qualification = record(
         readJson(rootDir, QUALIFICATION_PATH),
         "cited qualification",
@@ -624,51 +650,37 @@ function assertCitedArtifactsQualified(
         fail("cited qualification was produced against a different release contract");
     }
 
+    // Same delegation for the payload index. Summary fields could not reach the
+    // input-lock digest citation, the per-target package identities, the platform
+    // floors, the size budgets, or the payload-manifest and bootstrap-launcher
+    // digests, so a stand-in index with the right booleans passed while carrying
+    // no usable bootstrap trust data. `validateTrustIndex` is the validator the
+    // payload builder already applies to this exact file, and it requires a
+    // qualified entry to carry real non-placeholder digests.
+    //
+    // Note it also requires `publication.published === false`: the index is a
+    // build-time artifact and U6 performs no publication, so completed
+    // publication is recorded on the evidence's own `publication` block — which
+    // `allProofsPass` already gates — and must not be demanded of this file.
+    //
+    // `productionQualified` is `true` rather than re-derived: the qualification
+    // consumer above already re-derived the verdict from the lock bytes and
+    // rejects anything else, so reading the bit back here would only reintroduce
+    // a self-describing value as authority.
+    const lock = record(readJson(rootDir, INPUT_LOCK_PATH), "cited input lock");
+    validateTrustIndex(readJson(rootDir, PAYLOAD_INDEX_PATH), {
+        contract,
+        u8Digest,
+        lockSha256,
+        productionQualified: true,
+        lock: lock as unknown as Parameters<typeof validateTrustIndex>[1]["lock"],
+    });
     const payloadIndex = record(
         readJson(rootDir, PAYLOAD_INDEX_PATH),
         "cited payload index",
     );
-    if (payloadIndex.schema !== "magic-context.mc-host-payload-index/v1") {
-        fail("cited payload index is not a payload index");
-    }
     if (payloadIndex.release_contract_sha256 !== expectedContractDigest) {
         fail("cited payload index was produced against a different release contract");
-    }
-    if (payloadIndex.production_qualified !== true) {
-        fail("cited payload index is not production-qualified");
-    }
-    const entries = payloadIndex.entries;
-    if (!Array.isArray(entries)) fail("cited payload index has no entries");
-    entries.forEach((raw, index) => {
-        const entry = record(raw, `cited payload index entries[${index}]`);
-        if (entry.qualified !== true) {
-            const label =
-                typeof entry.target === "string" ? entry.target : String(index);
-            fail(`cited payload index entry ${label} is not qualified`);
-        }
-    });
-    // Every supported target exactly once: a stand-in index cannot qualify the
-    // release by listing one easy target, or by listing none at all.
-    exactIdentitySet(
-        entries.map((raw, index) =>
-            stringField(
-                record(raw, `cited payload index entries[${index}]`),
-                "target",
-                `cited payload index entries[${index}]`,
-            ),
-        ),
-        contract.platforms.supported.map((platform) => platform.target),
-        "cited payload index targets",
-    );
-    const indexPublication = record(
-        payloadIndex.publication,
-        "cited payload index publication",
-    );
-    if (indexPublication.published !== true) {
-        fail("cited payload index records no completed publication");
-    }
-    if (indexPublication.payloads_before_parents !== true) {
-        fail("cited payload index records a parents-first publication");
     }
 
     // No proof kind covers stop provenance, so a digest match was previously the
@@ -712,7 +724,9 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
          * real one. Tests that are not exercising qualification stub it; the
          * `--check` path never does, so GA always runs the full validator.
          */
-        requireQualification?: (rootDir: string) => void;
+        requireQualification?: (
+            rootDir: string,
+        ) => { u8Digest: string; lockSha256: string };
     } = {},
 ): InstalledReleaseEvidence {
     const evidence = validateInstalledReleaseEvidence(value);
@@ -733,10 +747,7 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
             rootDir,
             contract,
             evidence.release_contract_sha256,
-            options.requireQualification ??
-                ((root) => {
-                    requireQualificationEvidence(root);
-                }),
+            options.requireQualification ?? requireQualificationEvidence,
         );
     }
     if (requireQualified && options.verifyAttestation === undefined) {

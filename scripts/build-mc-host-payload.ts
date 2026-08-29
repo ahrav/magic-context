@@ -840,9 +840,21 @@ export function buildTrustArtifacts(
     };
 }
 
+/**
+ * Full trust-index validation: schema, release identity, cited digests, and
+ * every target entry's package identity, platform floors, and size budgets.
+ *
+ * Takes only the fields it reads rather than a whole `ReleaseContext`, for the
+ * same reason `validateStopRecord` does: the wider type is what kept this
+ * validator reachable only from the payload builder, leaving the evidence
+ * verifier to hand-roll a weaker summary check over the same file.
+ */
 export function validateTrustIndex(
     index: unknown,
-    context: ReleaseContext,
+    context: Pick<
+        ReleaseContext,
+        "contract" | "u8Digest" | "lockSha256" | "productionQualified" | "lock"
+    >,
 ): void {
     assertExactKeys(
         index,

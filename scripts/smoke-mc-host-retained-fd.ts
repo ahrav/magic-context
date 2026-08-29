@@ -18,6 +18,16 @@ function required(name: string): string {
 
 async function main(): Promise<void> {
     const dataRoot = required("MC_HOST_CANARY_DATA_ROOT");
+    // `stageBootstrap` resolves this relative to the script's working directory,
+    // but the daemon resolves its data root through `data_dir_path`, which ignores
+    // a relative `XDG_DATA_HOME` and falls back to `$HOME/.local/share` — and
+    // `HOME` here is derived from the Node install below. A relative value would
+    // therefore stage into one tree and exercise lifecycle state in another,
+    // failing qualification for a reason that has nothing to do with the payload
+    // while polluting an unintended location.
+    if (!isAbsolute(dataRoot)) {
+        throw new Error("MC_HOST_CANARY_DATA_ROOT must be absolute");
+    }
     const launcher = required("MC_HOST_CANARY_LAUNCHER");
     const opencode = required("MC_HOST_CANARY_OPENCODE");
     const node = required("MC_HOST_CANARY_NODE");
