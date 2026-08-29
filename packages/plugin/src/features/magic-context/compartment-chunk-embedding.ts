@@ -1014,9 +1014,10 @@ function mapBackfillCandidateRows(rows: unknown[]): CompartmentChunkBackfillCand
  * SELECTs and the `/ctx-embed-history` progress COUNT interpolate this same
  * predicate, so the progress total and the actual work can never disagree.
  * Compile-time constant; binds are positional (`project_path`, `session_id`,
- * then the NOT EXISTS `project_path`, `model_id`).
+ * then any inline exclusion-id binds, then the NOT EXISTS `project_path`,
+ * `model_id`).
  */
-const UNEMBEDDED_SESSION_COMPARTMENT_PREDICATE = `FROM compartments c
+const UNEMBEDDED_SESSION_COMPARTMENT_FROM_WHERE = `FROM compartments c
              JOIN session_projects sp
                ON sp.session_id = c.session_id
               AND sp.harness = c.harness
@@ -1064,7 +1065,7 @@ export function loadUnembeddedSessionChunkCandidates(
                     c.end_message AS endMessage,
                     c.title AS title,
                     c.created_at AS createdAt
-             ${UNEMBEDDED_SESSION_COMPARTMENT_PREDICATE}
+             ${UNEMBEDDED_SESSION_COMPARTMENT_FROM_WHERE}
                AND c.id NOT IN (${placeholders})
                ${UNEMBEDDED_COMPARTMENT_NOT_EXISTS}
              ORDER BY c.start_message ASC, c.id ASC
@@ -1089,7 +1090,7 @@ export function loadUnembeddedSessionChunkCandidates(
                     c.end_message AS endMessage,
                     c.title AS title,
                     c.created_at AS createdAt
-             ${UNEMBEDDED_SESSION_COMPARTMENT_PREDICATE}
+             ${UNEMBEDDED_SESSION_COMPARTMENT_FROM_WHERE}
                ${UNEMBEDDED_COMPARTMENT_NOT_EXISTS}
              ORDER BY c.start_message ASC, c.id ASC
              LIMIT ?`,
@@ -1117,7 +1118,7 @@ export function countUnembeddedSessionCompartments(
     const row = db
         .prepare(
             `SELECT COUNT(*) AS n
-             ${UNEMBEDDED_SESSION_COMPARTMENT_PREDICATE}
+             ${UNEMBEDDED_SESSION_COMPARTMENT_FROM_WHERE}
                ${UNEMBEDDED_COMPARTMENT_NOT_EXISTS}`,
         )
         .get(projectPath, sessionId, projectPath, modelId) as { n?: number } | undefined;

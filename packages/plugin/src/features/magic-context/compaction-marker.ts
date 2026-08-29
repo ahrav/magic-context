@@ -408,10 +408,6 @@ function removeLegacyMarkerLineageRows(
     ).run(args.sessionId, args.boundaryMessageId, args.compactionPartId);
 }
 
-/**
- * Inject a compaction marker into OpenCode's DB.
- * Returns the marker state if successful, null if boundary couldn't be found.
- */
 /** Upsert one `part` row by deterministic id; retries rewrite the exact canonical row. */
 function upsertPartRow(
     db: Database,
@@ -436,6 +432,10 @@ function upsertPartRow(
     ).run(row.id, row.messageId, row.sessionId, row.timeCreated, row.timeUpdated, row.data);
 }
 
+/**
+ * Inject a compaction marker into OpenCode's DB.
+ * Returns the marker state if successful, null if boundary couldn't be found.
+ */
 export function injectCompactionMarker(
     args: InjectCompactionMarkerArgs,
 ): CompactionMarkerState | null {

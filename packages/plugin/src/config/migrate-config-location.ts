@@ -103,8 +103,6 @@ export function resolveCortexKitProjectConfigPath(directory: string): string {
     return `${cortexKitProjectConfigBasePath(directory)}.jsonc`;
 }
 
-type LegacyHarness = "opencode" | "pi" | "any";
-
 /**
  * The single legacy-base table every consumer derives from. `userScopeConfigPaths`
  * is the guard that stops a project-scope migration from eating the user's own
@@ -114,7 +112,7 @@ type LegacyHarness = "opencode" | "pi" | "any";
  */
 const LEGACY_BASES: ReadonlyArray<{
     scope: "user" | "project";
-    harness: LegacyHarness;
+    harness: "opencode" | "pi";
     base: (directory: string) => string;
     label: string;
 }> = [

@@ -45,12 +45,6 @@ export function resolveContextWindowGeometry(
 type CacheTtlConfig = string | Record<string, string>;
 
 /**
- * Resolve the effective context limit for a provider/model pair. By default
- * this returns the output-reserved safe input budget. `reservation: "none"`
- * preserves the same catalog, detected-limit, and fallback resolution while
- * exposing the unreserved window for native-usage display metrics only.
- */
-/**
  * Best-effort read of the detected-overflow limit for a session/model; falls
  * back to "unknown" provenance when session meta is unreadable.
  */
@@ -73,6 +67,13 @@ function readDetectedLimit(
     }
     return { provenance: "unknown" };
 }
+
+/**
+ * Resolve the effective context limit for a provider/model pair. By default
+ * this returns the output-reserved safe input budget. `reservation: "none"`
+ * preserves the same catalog, detected-limit, and fallback resolution while
+ * exposing the unreserved window for native-usage display metrics only.
+ */
 
 export function resolveContextLimit(
     providerID: string | undefined,

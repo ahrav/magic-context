@@ -382,7 +382,7 @@ function applyHeadCap(args: {
 /**
  * The nine snapshot fields copied verbatim from the resolved boundary context.
  * Kept as one helper so every snapshot constructor carries the identical
- * context slice; the exhaustiveness check in the test file pins the field set.
+ * context slice; the Pick return type pins the field set at compile time.
  */
 function boundaryCtxFields(
     ctx: ResolvedBoundaryContext,

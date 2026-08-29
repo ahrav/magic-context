@@ -262,6 +262,7 @@ function recordLimitWithoutArming(
     >,
     modelKey: string | undefined,
     logSuffix: string,
+    note?: string,
 ): void {
     if (typeof detection.reportedLimit === "number" && detection.reportedLimit > 0) {
         recordDetectedContextLimit(
@@ -274,7 +275,7 @@ function recordLimitWithoutArming(
     }
     sessionLog(
         sessionId,
-        `overflow detected ${logSuffix}: reportedLimit=${detection.reportedLimit ?? "unknown"} provenance=${detection.reportedLimitProvenance ?? "n/a"} pattern=${detection.matchedPattern ?? "n/a"} — recorded limit only`,
+        `overflow detected ${logSuffix}: reportedLimit=${detection.reportedLimit ?? "unknown"} provenance=${detection.reportedLimitProvenance ?? "n/a"} pattern=${detection.matchedPattern ?? "n/a"} — recorded limit only${note ? ` (${note})` : ""}`,
     );
 }
 
@@ -358,6 +359,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                         detection,
                         undefined,
                         "on subagent",
+                        "subagents cannot run historian",
                     );
                     return;
                 }
@@ -375,6 +377,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                         detection,
                         undefined,
                         "in compaction-off mode",
+                        "recovery disarmed; native compaction owns the window",
                     );
                     return;
                 }

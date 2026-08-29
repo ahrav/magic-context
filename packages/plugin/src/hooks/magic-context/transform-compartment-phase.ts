@@ -243,7 +243,7 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
         return cachedBoundarySnapshot;
     }
 
-    const startForcedCompartmentAgent = (client: NonNullable<typeof args.client>): void => {
+    const startCompartmentAgentWithPhaseArgs = (client: NonNullable<typeof args.client>): void => {
         startCompartmentAgent({
             client,
             db: args.db,
@@ -340,7 +340,7 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
             compartmentInProgress = false;
         } else {
             sessionLog(args.sessionId, "transform: compartmentInProgress flag set, starting agent");
-            startForcedCompartmentAgent(args.client);
+            startCompartmentAgentWithPhaseArgs(args.client);
             compartmentInProgress = true;
         }
     }
@@ -364,7 +364,7 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
                 args.sessionId,
                 `transform: 95% reached (${args.contextUsage.percentage.toFixed(1)}%), force-starting compartment agent and blocking`,
             );
-            startForcedCompartmentAgent(args.client);
+            startCompartmentAgentWithPhaseArgs(args.client);
             activeRun = getActiveCompartmentRun(args.sessionId);
         } else if (!activeRun && hasEligibleHistoryForCompartment()) {
             sessionLog(
