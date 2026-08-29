@@ -11,6 +11,7 @@ import {
     scoreClassifyManifest,
     scoreMapManifest,
     scoreVerifyManifest,
+    updateTakesLiveIdentity,
     type ManifestScore,
     type ManifestScoreStage,
 } from "./scorer";
@@ -148,8 +149,22 @@ function fillerAbsentFrom(phrases: readonly string[], description: string): stri
  * a fixture whose anchors only fit when interleaved gets a named error here
  * rather than the opaque "baseline must pass all scorers".
  */
-function passingUpdateContent(gold: VerifyGoldClaim): string {
-    const content = buildUpdateContent(gold);
+function passingUpdateContent(fixture: DreamerMutationFixture, gold: VerifyGoldClaim): string {
+    let content = buildUpdateContent(gold);
+    // The scorer refuses content landing on another active claim's identity, so a
+    // baseline whose anchors happen to spell a sibling's content needs padding
+    // that shifts the normalized identity while keeping every anchor present.
+    // Padding is the reason this is still satisfiable rather than a bad fixture.
+    if (updateTakesLiveIdentity(fixture.pool, gold.claimId, content)) {
+        const pad = fillerAbsentFrom(
+            gold.forbiddenUpdateAnchors,
+            "a pad character absent from every forbidden update anchor",
+        );
+        content = `${content} ${pad}`;
+        if (updateTakesLiveIdentity(fixture.pool, gold.claimId, content)) {
+            throw new Error("mutation fixture needs update anchors that avoid every live claim identity");
+        }
+    }
     if (content.length > VERIFY_UPDATE_CONTENT_MAX_LENGTH) {
         throw new Error("mutation fixture needs required update anchors that join within the content cap");
     }
@@ -214,7 +229,7 @@ function correctVerifyManifest(fixture: DreamerMutationFixture): string {
             return `<verified claim="${claim.publicClaimId}" files="${gold.expectedFiles.join(",")}"/>`;
         }
         if (gold.verdict === "archive") return `<archive claim="${claim.publicClaimId}" reason="contradicted"/>`;
-        return `<update claim="${claim.publicClaimId}" files="${gold.expectedFiles.join(",")}">${passingUpdateContent(gold)}</update>`;
+        return `<update claim="${claim.publicClaimId}" files="${gold.expectedFiles.join(",")}">${passingUpdateContent(fixture, gold)}</update>`;
     });
     return `<verify>\n${entries.join("\n")}\n</verify>`;
 }
@@ -273,6 +288,29 @@ function replaceMapFiles(manifest: string, publicClaimId: string, files: readonl
     return changed;
 }
 
+/**
+ * Constructs the parser treats as an entry boundary, matched case-sensitively
+ * because every one of the parser's own regexes is.
+ */
+const PARSER_ACTIVE_RE = /<\/?(?:verified|update|archive)\b/;
+
+/**
+ * A spelling of `anchor` that can sit inside an update body, or null when none
+ * can.
+ *
+ * The forbidden check is case-insensitive while the entry regexes are not, so
+ * raising an entry construct's case keeps the anchor matchable while making it
+ * inert to the parser. The root close tag has no such escape: the body extraction
+ * folds case, so any spelling of it truncates the body and no equivalent
+ * survives.
+ */
+function embeddableForbiddenAnchor(anchor: string): string | null {
+    if (/<\/verify>/i.test(anchor)) return null;
+    if (!PARSER_ACTIVE_RE.test(anchor)) return anchor;
+    const raised = anchor.replace(/<\/?(?:verified|update|archive)\b/g, (match) => match.toUpperCase());
+    return PARSER_ACTIVE_RE.test(raised) ? null : raised;
+}
+
 function mutationManifest(
     mutationClass: DreamerMutationClass,
     fixture: DreamerMutationFixture,
@@ -322,17 +360,23 @@ function mutationManifest(
             return { task: "verify", manifest: replaceEntry(verify, claim.publicClaimId, `<update claim="${claim.publicClaimId}" files="${target.expectedFiles.join(",")}">${content}</update>`) };
         }
         case "update-forbidden-anchor": {
-            // Read the gold that actually carries a forbidden anchor rather than
-            // the first update: a fixture whose first update has none but whose
-            // later one does has everything this class needs, and taking the
-            // first would abort the whole battery.
+            // Read the gold that actually carries an embeddable forbidden anchor
+            // rather than the first update: a fixture whose first update has none
+            // but whose later one does has everything this class needs, and
+            // taking the first would abort the whole battery. Embeddability
+            // matters because a forbidden anchor spelling an entry boundary would
+            // end the entry before the scorer could observe it.
             const target = requiredGold(
                 fixture.verifyGold.claims,
-                (entry) => entry.verdict === "update" && entry.forbiddenUpdateAnchors.length > 0,
-                "an update gold with a forbidden anchor",
+                (entry) =>
+                    entry.verdict === "update" &&
+                    entry.forbiddenUpdateAnchors.some((anchor) => embeddableForbiddenAnchor(anchor) !== null),
+                "an update gold with a forbidden anchor that can appear in an update body",
             );
             const claim = claimById(fixture.pool, target.claimId);
-            const forbidden = target.forbiddenUpdateAnchors[0]!;
+            const forbidden = target.forbiddenUpdateAnchors
+                .map((anchor) => embeddableForbiddenAnchor(anchor))
+                .find((anchor): anchor is string => anchor !== null)!;
             const content = [...target.requiredUpdateAnchors, forbidden].join("; ");
             return { task: "verify", manifest: replaceEntry(verify, claim.publicClaimId, `<update claim="${claim.publicClaimId}" files="${target.expectedFiles.join(",")}">${content}</update>`) };
         }

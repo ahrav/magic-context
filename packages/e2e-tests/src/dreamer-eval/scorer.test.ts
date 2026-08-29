@@ -327,6 +327,43 @@ describe("dreamer manifest scorers", () => {
         });
     });
 
+    test("update appliability is judged across the batch, not against the snapshot", () => {
+        // Production stages updates in order, each taking its new identity for the
+        // rest of the batch, so two converging on one identity fail on the second
+        // even though neither collides with the unchanged pool.
+        const twoUpdates = {
+            kind: "verify" as const,
+            claims: [
+                { ...verifyGold.claims[0]!, verdict: "update" as const, requiredUpdateAnchors: ["shared"], forbiddenUpdateAnchors: [] },
+                { ...verifyGold.claims[1]!, requiredUpdateAnchors: ["shared"], forbiddenUpdateAnchors: [] },
+                verifyGold.claims[2]!,
+            ],
+        };
+        const converging = `<verify>
+<update claim="mcm_true" files="src/cache.ts,src/config.ts">one shared body</update>
+<update claim="mcm_update" files="src/cache.ts">one shared body</update>
+<archive claim="mcm_false" reason="queue removed"/>
+</verify>`;
+        expect(scoreVerifyManifest(converging, pool, twoUpdates)).toMatchObject({
+            status: "FAIL",
+            reason: "wrong-update-content",
+        });
+        // Distinct bodies satisfying the same anchor stay appliable.
+        const distinct = converging.replace(
+            '<update claim="mcm_update" files="src/cache.ts">one shared body</update>',
+            '<update claim="mcm_update" files="src/cache.ts">another shared body</update>',
+        );
+        expect(scoreVerifyManifest(distinct, pool, twoUpdates)).toMatchObject({ status: "PASS", reason: null });
+        // An update may take an identity an earlier update in the same batch
+        // vacated, which a snapshot-only check would have refused.
+        const handoff = `<verify>
+<update claim="mcm_true" files="src/cache.ts,src/config.ts">shared moved along</update>
+<update claim="mcm_update" files="src/cache.ts">The cache limit is 4096 entries.  shared</update>
+<archive claim="mcm_false" reason="queue removed"/>
+</verify>`;
+        expect(scoreVerifyManifest(handoff, pool, twoUpdates)).toMatchObject({ status: "PASS", reason: null });
+    });
+
     test("an update colliding with another live claim is not appliable", () => {
         // Revision asserts the (category, normalized content) identity is free,
         // exempting only the claim being revised, so content equal to a sibling's

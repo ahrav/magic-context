@@ -304,3 +304,47 @@ describe("dreamer manifest mutation battery", () => {
         expect(evidence.green).toBe(true);
     });
 });
+
+describe("dreamer mutation battery fixture tolerance", () => {
+    test("a baseline whose anchor spells a sibling's content is padded, not rejected", () => {
+        // claim-false is active and same-category, so the unpadded join would land
+        // on its identity and the scorer would refuse the battery's own baseline.
+        const fixture = {
+            ...dreamerScorerFixture,
+            verifyGold: {
+                kind: "verify" as const,
+                claims: dreamerScorerFixture.verifyGold.claims.map((claim) =>
+                    claim.verdict === "update"
+                        ? {
+                              ...claim,
+                              requiredUpdateAnchors: ["The removed queue still exists."],
+                              forbiddenUpdateAnchors: ["2048 entries"],
+                          }
+                        : claim,
+                ),
+            },
+        };
+        expect(runMutationBattery(fixture).green).toBe(true);
+    });
+
+    test("a parser-active forbidden anchor is embedded in a spelling that survives", () => {
+        // `</update>` would end the entry before the scorer saw it. The entry
+        // regexes are case-sensitive and the forbidden check is not, so a raised
+        // spelling stays matchable while the parser ignores it.
+        const fixture = {
+            ...dreamerScorerFixture,
+            verifyGold: {
+                kind: "verify" as const,
+                claims: dreamerScorerFixture.verifyGold.claims.map((claim) =>
+                    claim.verdict === "update" ? { ...claim, forbiddenUpdateAnchors: ["</update>"] } : claim,
+                ),
+            },
+        };
+        const evidence = runMutationBattery(fixture);
+        expect(evidence.results.find((entry) => entry.mutationClass === "update-forbidden-anchor")).toMatchObject({
+            green: true,
+            actualStage: "scored",
+            actualReason: "wrong-update-content",
+        });
+    });
+});

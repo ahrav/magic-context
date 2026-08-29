@@ -213,39 +213,75 @@ export function scoreVerifyManifest(
             if (missingRequired || containsForbidden) {
                 return score("FAIL", "wrong-update-content", "scored", parsed);
             }
-            // Revision refuses content whose normalized hash is already owned by
-            // another live claim in the same category
-            // (`assertNoLiveDuplicate`, exempting only the claim being revised),
-            // so a body colliding with a sibling's content throws instead of
-            // applying. Scoring it green would credit output the host cannot
-            // write.
-            if (collidesWithLiveClaim(pool, expected.claimId, trimmed)) {
-                return score("FAIL", "wrong-update-content", "scored", parsed);
-            }
         }
+    }
+    // Appliability is a property of the batch, not of one entry, so it runs once
+    // over the parsed updates in the order production stages them.
+    if (firstUnappliableUpdate(pool, parsed.updated)) {
+        return score("FAIL", "wrong-update-content", "scored", parsed);
     }
     return score("PASS", null, "scored", parsed);
 }
 
+/** A claim's dedup identity: its category plus its normalized content. */
+function claimIdentity(category: string, content: string): string {
+    return `${category}\u0000${normalizeMemoryContent(content)}`;
+}
+
 /**
- * Whether replacement content would land on another live claim's
- * `(category, normalized content)` identity. Production's revision path asserts
- * that identity is free, exempting only the claim being revised, and throws
- * otherwise — so such a manifest is unappliable however well its anchors read.
- * Archived and retired rows are excluded, matching the `lifecycle_state =
- * 'active'` the assertion queries.
+ * Whether `content` would land on another active claim's identity as the pool
+ * stands. Callers staging a batch must use `firstUnappliableUpdate` instead,
+ * which tracks identities the batch itself moves.
  */
-function collidesWithLiveClaim(pool: PoolDescriptor, claimId: string, content: string): boolean {
+export function updateTakesLiveIdentity(pool: PoolDescriptor, claimId: string, content: string): boolean {
     const revised = pool.claims.find((claim) => claim.claimId === claimId);
     if (revised === undefined) return false;
-    const normalized = normalizeMemoryContent(content);
+    const next = claimIdentity(revised.category, content);
     return pool.claims.some(
         (claim) =>
             claim.claimId !== claimId &&
             claim.lifecycleState === "active" &&
-            claim.category === revised.category &&
-            normalizeMemoryContent(claim.content) === normalized,
+            claimIdentity(claim.category, claim.content) === next,
     );
+}
+
+/**
+ * Whether any update in the batch is one the host could not apply, judged in the
+ * order production stages them.
+ *
+ * `applyVerifyManifest` stages verified entries, then updates, then archives, and
+ * each revision asserts its `(category, normalized content)` identity is free
+ * among active claims, exempting only the claim being revised. Two consequences
+ * a snapshot-only comparison gets wrong in both directions: an update takes its
+ * new identity for the rest of the batch, so two updates converging on one
+ * identity fail on the second; and an update may legitimately take an identity an
+ * earlier update in the same batch vacated. Archives are staged last, so one
+ * cannot free an identity for an update.
+ */
+function firstUnappliableUpdate(
+    pool: PoolDescriptor,
+    updates: readonly { publicClaimId: string; content: string | null }[],
+): boolean {
+    const byPublicId = new Map(pool.claims.map((claim) => [claim.publicClaimId, claim]));
+    const owner = new Map<string, string>();
+    for (const claim of pool.claims) {
+        if (claim.lifecycleState === "active") {
+            owner.set(claimIdentity(claim.category, claim.content), claim.publicClaimId);
+        }
+    }
+    for (const entry of updates) {
+        const claim = byPublicId.get(entry.publicClaimId);
+        if (claim === undefined) continue;
+        // The revision vacates whatever the claim held before taking its new
+        // identity, which is what exempting the claim from its own assertion
+        // amounts to across a batch.
+        owner.delete(claimIdentity(claim.category, claim.content));
+        const next = claimIdentity(claim.category, (entry.content ?? "").trim());
+        const held = owner.get(next);
+        if (held !== undefined && held !== entry.publicClaimId) return true;
+        owner.set(next, entry.publicClaimId);
+    }
+    return false;
 }
 
 export function scoreMapManifest(
