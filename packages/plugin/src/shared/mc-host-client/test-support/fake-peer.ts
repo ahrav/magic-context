@@ -14,7 +14,7 @@ import { createHmac, randomBytes } from "node:crypto";
 import { createServer, type Server, type Socket } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 
-export const PEER_HEADER_LEN = 21;
+const PEER_HEADER_LEN = 21;
 export const PEER_PROTOCOL_VERSION = 2;
 
 /** Frame type bytes duplicated from the wire doc, not from protocol.ts. */
@@ -73,7 +73,7 @@ export function encodePeerFrame(fields: PeerFrameFields): Buffer {
 }
 
 /** `u32 LE length || UTF-8 JSON` auth message framing (wire doc 5.1). */
-export function encodePeerAuthMessage(value: unknown): Buffer {
+function encodePeerAuthMessage(value: unknown): Buffer {
     const body = Buffer.from(JSON.stringify(value), "utf8");
     const framed = Buffer.alloc(4 + body.length);
     framed.writeUInt32LE(body.length, 0);

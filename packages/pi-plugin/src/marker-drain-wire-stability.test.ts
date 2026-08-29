@@ -26,7 +26,7 @@ import {
 	createTestDb,
 	toolResultMessage,
 	userMessage,
-} from "./test-utils.test";
+} from "./test-utils";
 
 const tempDirs: string[] = [];
 
