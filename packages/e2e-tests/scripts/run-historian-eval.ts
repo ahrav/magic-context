@@ -45,7 +45,6 @@ import {
     type SystemVersionTuple,
 } from "../src/historian-eval/runner";
 import {
-    LANE_REPORT_SCHEMA,
     buildLaneReport,
     laneBudgetExhaustedScore,
     laneExitCode,
@@ -237,12 +236,12 @@ function liveModeFromEnv(): LiveHistorianMode {
  * harness runtimes. Without this, their system identity would match and the
  * reports would look longitudinally comparable when they are not.
  */
-function opencodeVersion(): string {
+function opencodeVersion(): string | null {
     try {
         const version = execSync("opencode --version", { encoding: "utf8" }).trim();
-        return version.length > 0 ? version : "unknown";
+        return version.length > 0 ? version : null;
     } catch {
-        return "unknown";
+        return null;
     }
 }
 
@@ -349,26 +348,60 @@ function buildPluginBundle(): number {
  * removes it.
  */
 /**
- * Run records and DB snapshots for ONE report, one directory per scenario.
+ * Directory holding every artifact this lane derives, beside the report.
  *
- * Derived from the report's own name rather than a directory shared by every
- * report in the folder. The documented multi-run audit writes `run-1.json` then
- * `run-2.json` side by side, and a shared directory meant the second invocation's
- * cleanup deleted the first run's records and snapshots while leaving `run-1.json`
- * in place — a report with no evidence behind it, which is precisely what makes it
- * re-scorable. Each report now owns and clears only its own records.
+ * A PRIVATE namespace, and reports are refused inside it — that pairing is what
+ * makes the derived paths unreachable. Decorating the operator's report path
+ * instead put each artifact at a name the CLI also accepts as a report, and every
+ * such name became a collision to patch: `foo-runs` versus a report named
+ * `foo-runs`, `foo.partial.json`, `foo.partial.json.tmp`, then a report nested
+ * under `foo-runs/`. One containment refusal covers all of them and every name
+ * added later, which is why the per-name guards are gone.
+ *
+ * Per-report subdirectory keyed by the report's complete filename: distinct reports
+ * in one directory have distinct filenames, so their artifacts cannot collide, and
+ * a run only ever clears its own subdirectory.
  */
+const LANE_ARTIFACTS_DIR = "historian-eval-artifacts";
+
+function laneArtifactsRoot(reportPath: string): string {
+    return join(dirname(resolve(reportPath)), LANE_ARTIFACTS_DIR);
+}
+
+function laneArtifactsDir(reportPath: string): string {
+    return join(laneArtifactsRoot(reportPath), basename(resolve(reportPath)));
+}
+
+/** Run records and DB snapshots, one subdirectory per scenario. */
 function liveRunArtifactsDir(reportPath: string): string {
-    // The COMPLETE filename, extension included. Stripping `.json` aliased two
-    // report paths the CLI accepts — `run-1` and `run-1.json` both owned
-    // `run-1-runs` — so the second audit cleared the first report's records while
-    // leaving its report intact, which is the evidence loss this exists to prevent.
-    return join(dirname(resolve(reportPath)), `${basename(resolve(reportPath))}-runs`);
+    return join(laneArtifactsDir(reportPath), "runs");
 }
 
 function partialReportPath(reportPath: string): string {
-    return `${resolve(reportPath)}.partial.json`;
+    return join(laneArtifactsDir(reportPath), "partial-report.json");
 }
+
+/**
+ * Whether the report itself was aimed inside the lane's private namespace.
+ *
+ * The one refusal the namespace needs: with reports kept out, no accepted report
+ * path can equal or contain any artifact path, so staging files, records trees, and
+ * partial reports are all unreachable without a per-name check.
+ */
+function reportInsideLaneNamespaceError(reportPath: string): string | null {
+    // Tested against every ancestor SEGMENT, not against this report's own derived
+    // root. `laneArtifactsRoot` is relative to the report's directory, so a report
+    // already sitting inside a namespace has its root computed one level deeper and
+    // a containment test against that root passes — which is how
+    // `<dir>/historian-eval-artifacts/r.json` slipped through and nested a second
+    // namespace inside the first.
+    const report = canonicalPath(reportPath);
+    if (dirname(report).split(sep).includes(LANE_ARTIFACTS_DIR)) {
+        return `a report may not live inside a ${LANE_ARTIFACTS_DIR} directory (${report}): that is where this lane derives its own artifacts`;
+    }
+    return null;
+}
+
 
 function writePartialReport(
     reportPath: string,
@@ -389,7 +422,7 @@ function writePartialReport(
         // below. `renameSync` within one directory is atomic, so the partial is
         // either the previous complete report or the new one.
         const destination = partialReportPath(reportPath);
-        const staging = `${destination}.tmp`;
+        const staging = join(dirname(destination), "partial-report.json.tmp");
         try {
             writeFileSync(staging, `${JSON.stringify(report, null, 2)}\n`);
             renameSync(staging, destination);
@@ -410,20 +443,19 @@ function writePartialReport(
 }
 
 /**
- * Whether the three paths this run owns already exist in a shape it cannot use.
+ * Whether the operator-named report path already exists in a shape this run cannot
+ * write.
  *
- * Returns a diagnostic instead of throwing, so the caller can refuse as an
- * admission failure before any provider traffic rather than surfacing a raw
- * filesystem error from inside a scenario.
+ * Only the report needs this now. Every other artifact lives inside the lane's
+ * private subdirectory, which `clearPreviousLiveArtifacts` removes and recreates
+ * wholesale, so it cannot be occupied by something of the wrong shape. Reported as
+ * an admission failure so the run refuses before provider traffic instead of
+ * surfacing a bare EISDIR from the final write.
  */
-function liveArtifactPathShapeError(reportPath: string, artifactsRoot: string): string | null {
-    for (const file of [resolve(reportPath), partialReportPath(reportPath)]) {
-        if (existsSync(file) && !lstatSync(file).isFile()) {
-            return `${file} exists and is not a regular file, so this run cannot write its report there`;
-        }
-    }
-    if (existsSync(artifactsRoot) && !lstatSync(artifactsRoot).isDirectory()) {
-        return `${artifactsRoot} exists and is not a directory, so this report's run records have nowhere to go`;
+function reportPathShapeError(reportPath: string): string | null {
+    const report = resolve(reportPath);
+    if (existsSync(report) && !lstatSync(report).isFile()) {
+        return `${report} exists and is not a regular file, so this run cannot write its report there`;
     }
     return null;
 }
@@ -439,7 +471,18 @@ async function runLive(args: CliArgs): Promise<number> {
     if (built !== 0) return built;
     const admission = liveAdmissionGate(scenarios);
     if (admission !== 0) return admission;
+    // An unresolved version is refused rather than recorded as "unknown". The
+    // installer serves whatever release is current, so this field is the only thing
+    // distinguishing two runs on different OpenCode releases — and a wrapper that
+    // answers `serve` but not `--version` would let a costly evaluation publish a
+    // tuple that silently matches a different release's.
     const opencode = opencodeVersion();
+    if (opencode === null) {
+        console.error(
+            "live admission: `opencode --version` did not resolve, so the report could not identify the release it ran against",
+        );
+        return 1;
+    }
     // Built BEFORE the first request, from the same function the runner records, so
     // an interrupted first scenario still publishes a report that names the commit,
     // OpenCode version, and model routes that spent the tokens. Supplying it to
@@ -456,6 +499,7 @@ async function runLive(args: CliArgs): Promise<number> {
     // Removal of the PREVIOUS run's artifacts happens earlier still, in
     // `clearPreviousLiveArtifacts`, ahead of everything that can reject.
     mkdirSync(reportDir, { recursive: true });
+    mkdirSync(laneArtifactsDir(args.reportPath), { recursive: true });
     const artifactsRoot = liveRunArtifactsDir(args.reportPath);
     // Refused here rather than discovered inside the first scenario. All three paths
     // are derived from a user-supplied report name, so each can already exist in the
@@ -463,7 +507,7 @@ async function runLive(args: CliArgs): Promise<number> {
     // directory where a report file belongs. `clearPreviousLiveArtifacts` will not
     // remove any of them, so left unchecked the collision surfaces as a raw ENOTDIR
     // or EISDIR from deep inside the first scenario, after its tokens are spent.
-    const shapeError = liveArtifactPathShapeError(args.reportPath, artifactsRoot);
+    const shapeError = reportPathShapeError(args.reportPath);
     if (shapeError !== null) {
         console.error(`live admission: ${shapeError}`);
         return 1;
@@ -594,49 +638,8 @@ function canonicalPath(path: string): string {
  * resolved paths with a separator boundary, so `/tmp/a-runs` is not treated as living
  * inside `/tmp/a`.
  */
-/**
- * Whether the derived partial path holds an artifact this lane produced.
- *
- * The suffix check above stops the lane from ever WRITING a completed report at a
- * path that is some other report's partial, but a file can already be sitting there
- * — from a foreign tool, or a lane version predating that check. Deleting it
- * unseen is how `--report foo` destroyed a completed audit named
- * `foo.partial.json`, so removal now requires positive identification and anything
- * unrecognized is refused by `unrecognizedPartialArtifactError` instead.
- */
-function partialPathIsOurs(reportPath: string): boolean {
-    const path = partialReportPath(reportPath);
-    if (!existsSync(path) || !lstatSync(path).isFile()) return false;
-    try {
-        return (JSON.parse(readFileSync(path, "utf8")) as { schema?: unknown }).schema === LANE_REPORT_SCHEMA;
-    } catch {
-        return false;
-    }
-}
 
-/** Refuses rather than overwriting a file this lane cannot identify as its own partial. */
-function unrecognizedPartialArtifactError(reportPath: string): string | null {
-    const path = partialReportPath(reportPath);
-    if (!existsSync(path)) return null;
-    if (!lstatSync(path).isFile()) return null;
-    if (partialPathIsOurs(reportPath)) return null;
-    return `${path} already exists and is not a ${LANE_REPORT_SCHEMA} artifact; refusing to overwrite a file this lane did not write`;
-}
 
-/**
- * Whether the report name collides with the partial artifact of another report.
- *
- * `partialReportPath` appends a fixed suffix, so the ONLY way a report path can be
- * some other report's partial is by carrying that suffix itself — which makes one
- * suffix check exhaustive for the whole class. Left open, a completed audit at
- * `foo.partial.json` was treated as the partial of `--report foo` and deleted
- * during cleanup, before admission could reject anything.
- */
-function reportNameAliasesPartialError(reportPath: string): string | null {
-    const suffix = ".partial.json";
-    if (!resolve(reportPath).endsWith(suffix)) return null;
-    return `a report path may not end in ${suffix}: it is the name this lane derives for another report's partial artifact, and cleanup would delete it`;
-}
 
 function artifactCorpusOverlapError(args: CliArgs): string | null {
     const corpus = args.releaseDir ?? args.scenariosDir;
@@ -661,21 +664,16 @@ function removeIfFile(path: string): void {
 }
 
 function clearPreviousLiveArtifacts(reportPath: string): void {
-    const reportDir = dirname(resolve(reportPath));
-    // Both of these are derived from a user-supplied name, so neither is guaranteed
-    // to be the file shape this expects. `rmSync` without `recursive` throws on a
-    // directory, which would abort the run with a raw filesystem error instead of a
-    // diagnostic — so removal is limited to real files here and the shape is
-    // reported as an admission failure by `assertLiveArtifactPathsUsable`.
+    // The report is operator-named, so it is only removed when it is a real file —
+    // `rmSync` without `recursive` throws on a directory, and that shape is reported
+    // as an admission failure rather than as a bare filesystem error.
     removeIfFile(resolve(reportPath));
-    if (partialPathIsOurs(reportPath)) removeIfFile(partialReportPath(reportPath));
-    // Only ever recursive-removes a real DIRECTORY. The suffix is user-spellable, so
-    // a completed audit written to `--report foo-runs` sits exactly where a later
-    // `--report foo` derives its records — and an unguarded recursive remove would
-    // delete that finished report to make room for a directory.
-    const records = liveRunArtifactsDir(reportPath);
-    if (existsSync(records) && lstatSync(records).isDirectory()) {
-        rmSync(records, { recursive: true, force: true });
+    // Everything else lives in this report's own subdirectory of the lane namespace,
+    // which no accepted report path can occupy, so one recursive remove is safe
+    // where decorated sibling names needed a guard each.
+    const owned = laneArtifactsDir(reportPath);
+    if (existsSync(owned) && lstatSync(owned).isDirectory()) {
+        rmSync(owned, { recursive: true, force: true });
     }
 }
 
@@ -685,8 +683,7 @@ async function main(): Promise<number> {
         // Both refusals precede every removal: cleanup would otherwise destroy the
         // very artifact the check exists to protect.
         for (const problem of [
-            reportNameAliasesPartialError(args.reportPath),
-            unrecognizedPartialArtifactError(args.reportPath),
+            reportInsideLaneNamespaceError(args.reportPath),
             artifactCorpusOverlapError(args),
         ]) {
             if (problem !== null) {
