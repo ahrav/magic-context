@@ -615,6 +615,10 @@ function poolSnapshot(index: number): Record<string, unknown> {
 
 const POOL_CAPTURE = Array.from({ length: 10 }, (_, index) => poolSnapshot(index));
 const OBSERVED_ID = POOL_CAPTURE[0]!.publicClaimId as string;
+const CLASSIFY_EVIDENCE = POOL_CAPTURE.map((claim) => ({
+    publicClaimId: claim.publicClaimId as string,
+    scope: "project",
+}));
 const VERIFY_EVIDENCE = {
     verified: [{ publicClaimId: OBSERVED_ID, files: ["src/a.ts"] }],
     updated: [],
@@ -882,8 +886,13 @@ describe("dreamer eval report contract", () => {
             /parsedManifest: pass-requires-evidence/,
         );
         expect(
-            parseRunReport({ ...baseReport, status: "ERROR", reason: "provider-failure", rawManifest: "   " })
-                .rawManifest,
+            parseRunReport({
+                ...baseReport,
+                status: "ERROR",
+                reason: "provider-failure",
+                rawManifest: "   ",
+                parsedManifest: null,
+            }).rawManifest,
         ).toBe("   ");
         // An ERROR run may hold neither.
         expect(
@@ -982,17 +991,49 @@ describe("dreamer eval report contract", () => {
             parseRunReport({
                 ...baseReport,
                 task: "classify-memories",
-                parsedManifest: [{ publicClaimId: OBSERVED_ID }],
+                parsedManifest: CLASSIFY_EVIDENCE.map((entry, index) =>
+                    index === 0 ? { publicClaimId: entry.publicClaimId } : entry,
+                ),
             }),
         ).toThrow(/parsedManifest\[0\]: classification-empty/);
         // A partial classification is exactly what the parser produces.
         expect(
+            parseRunReport({ ...baseReport, task: "classify-memories", parsedManifest: CLASSIFY_EVIDENCE })
+                .parsedManifest,
+        ).toEqual(CLASSIFY_EVIDENCE);
+        // Classify validation demands exact id coverage, so evidence for a subset
+        // of the observed pool is an artifact no scorer produces.
+        expect(() =>
             parseRunReport({
                 ...baseReport,
                 task: "classify-memories",
-                parsedManifest: [{ publicClaimId: OBSERVED_ID, scope: "project" }],
-            }).parsedManifest,
-        ).toEqual([{ publicClaimId: OBSERVED_ID, scope: "project" }]);
+                parsedManifest: CLASSIFY_EVIDENCE.slice(0, 1),
+            }),
+        ).toThrow(/parsedManifest: coverage-incomplete/);
+    });
+
+    test("an anchor's own edge whitespace costs a character on each side", () => {
+        // The parser trims the body, so whitespace at an anchor's edge survives
+        // only with a non-whitespace character outside it.
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<{
+                gold: { claims: Array<{ verdict: string; requiredUpdateAnchors: string[] }> };
+            }>;
+            tasks[0]!.gold.claims[0]!.verdict = "update";
+            tasks[0]!.gold.claims[0]!.requiredUpdateAnchors = [
+                ` ${"a".repeat(VERIFY_UPDATE_CONTENT_MAX_LENGTH - 2)} `,
+            ];
+        }, "scenario.tasks[0].gold.claims[0].requiredUpdateAnchors[0]: anchor-exceeds-content-cap");
+        // Two characters shorter leaves room for the padding on both sides.
+        const fits = validScenarioRaw();
+        const tasks = fits.tasks as Array<{
+            gold: { claims: Array<{ verdict: string; requiredUpdateAnchors: string[] }> };
+        }>;
+        tasks[0]!.gold.claims[0]!.verdict = "update";
+        tasks[0]!.gold.claims[0]!.requiredUpdateAnchors = [
+            ` ${"a".repeat(VERIFY_UPDATE_CONTENT_MAX_LENGTH - 4)} `,
+        ];
+        expect(() => parseScenario(fits)).not.toThrow();
     });
 
     test("a required anchor's capacity is measured before case folding", () => {
@@ -1060,7 +1101,13 @@ describe("dreamer eval report contract", () => {
         // Every scorer records a blank manifest as ERROR:provider-failure, so the
         // observed bytes have to survive the report; null stays reserved for "no
         // output was captured".
-        const blank = { ...baseReport, status: "ERROR", reason: "provider-failure", rawManifest: "   " };
+        const blank = {
+            ...baseReport,
+            status: "ERROR",
+            reason: "provider-failure",
+            rawManifest: "   ",
+            parsedManifest: null,
+        };
         expect(parseRunReport(blank).rawManifest).toBe("   ");
         expect(parseRunReport({ ...blank, rawManifest: "" }).rawManifest).toBe("");
         expect(parseRunReport({ ...blank, rawManifest: null }).rawManifest).toBeNull();

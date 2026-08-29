@@ -416,3 +416,29 @@ describe("dreamer mutation battery classify baseline", () => {
         });
     });
 });
+
+describe("dreamer mutation battery preserved shareability", () => {
+    test("a preserved sensitive claim is mutated by inserting the attribute", () => {
+        // Every classify claim is sensitive with `true` gold, so the baseline omits
+        // shareability everywhere and there is no attribute to flip — the mutation
+        // has to insert one.
+        const sensitive = "The box answers on 127.0.0.1:8080 for local runs.";
+        const fixture = {
+            ...dreamerScorerFixture,
+            pool: {
+                ...dreamerScorerFixture.pool,
+                claims: dreamerScorerFixture.pool.claims.map((claim, index) => ({
+                    ...claim,
+                    content: `${sensitive} Row ${index}.`,
+                    sharing: "shareable" as const,
+                })),
+            },
+        };
+        const evidence = runMutationBattery(fixture);
+        expect(evidence.results.find((entry) => entry.mutationClass === "wrong-shareable")).toMatchObject({
+            green: true,
+            actualStage: "scored",
+            actualReason: "wrong-classification",
+        });
+    });
+});

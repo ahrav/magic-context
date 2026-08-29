@@ -460,18 +460,29 @@ function mutationManifest(
             return { task: "classify", manifest: classify.replace(new RegExp(`(claim="${escapeRegExp(claim.publicClaimId)}"[^>]*scope=")${target.scope}`), `$1${wrong}`) };
         }
         case "wrong-shareable": {
-            // Sensitive content rules a claim out either way. With `false` gold,
-            // flipping to `true` is forced back to false and the applied value
-            // still matches; with `true` gold, the baseline omits the attribute
-            // entirely so there is nothing to flip. Non-sensitive content leaves
-            // the flip observable in both directions.
+            // Two usable shapes. Non-sensitive content lets the emitted attribute
+            // be flipped either way. Sensitive content with `true` gold has no
+            // emitted attribute — the baseline omits it so the stored value is
+            // preserved — so the mutation inserts `shareable="false"`, which
+            // changes the applied value. Only sensitive content with `false` gold
+            // is unusable: the attribute is emitted, and flipping it to `true` is
+            // rescued by the override, leaving the applied value equal to gold.
             const target = requiredGold(
                 fixture.classifyGold.claims,
-                (entry) => !hasShareabilitySensitiveText(claimById(fixture.pool, entry.claimId).content),
+                (entry) =>
+                    entry.shareable ||
+                    !hasShareabilitySensitiveText(claimById(fixture.pool, entry.claimId).content),
                 "a classify gold whose flipped shareability survives the production override",
             );
             const claim = claimById(fixture.pool, target.claimId);
-            return { task: "classify", manifest: classify.replace(new RegExp(`(claim="${escapeRegExp(claim.publicClaimId)}"[^>]*shareable=")${target.shareable}`), `$1${!target.shareable}`) };
+            const omitted = target.shareable && hasShareabilitySensitiveText(claim.content);
+            const pattern = omitted
+                ? new RegExp(`(<memory claim="${escapeRegExp(claim.publicClaimId)}"[^>]*)(/>)`)
+                : new RegExp(`(claim="${escapeRegExp(claim.publicClaimId)}"[^>]*shareable=")${target.shareable}`);
+            const replacement = omitted
+                ? (_match: string, head: string) => `${head} shareable="false"/>`
+                : (_match: string, head: string) => `${head}${!target.shareable}`;
+            return { task: "classify", manifest: classify.replace(pattern, replacement) };
         }
         case "truncated-root":
             return { task: "verify", manifest: verify.replace("</verify>", "") };

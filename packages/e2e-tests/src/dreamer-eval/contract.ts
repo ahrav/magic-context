@@ -507,7 +507,11 @@ function parseVerifyGold(raw: unknown, label: string, pool: ReadonlyMap<string, 
         // combined length is deliberately not checked: anchors may overlap
         // inside one body, so a sum over the cap does not prove impossibility.
         for (const [anchorIndex, anchor] of requiredUpdateAnchors.entries()) {
-            if (anchor.length > VERIFY_UPDATE_CONTENT_MAX_LENGTH) {
+            // The parser trims the body, so whitespace at an anchor's own edge only
+            // survives with a non-whitespace character outside it on that side.
+            const edgePadding =
+                (/^\s/.test(anchor) ? 1 : 0) + (/\s$/.test(anchor) ? 1 : 0);
+            if (anchor.length + edgePadding > VERIFY_UPDATE_CONTENT_MAX_LENGTH) {
                 fail(`${itemLabel}.requiredUpdateAnchors[${anchorIndex}]: anchor-exceeds-content-cap`);
             }
             // The parser stops the update body at the first `</update>`, so
@@ -990,7 +994,10 @@ function parseManifestEvidence(
             exact(item, ["publicClaimId", "files", "content"], entryLabel);
             entryId(item, entryLabel);
             filesOf(item, entryLabel);
-            string(item.content, `${entryLabel}.content`);
+            // A self-closing update, or one whose body is whitespace, parses to an
+            // empty string and the scorer reports wrong-update-content for it, so
+            // the nonblank `string` primitive would refuse genuine evidence.
+            if (typeof item.content !== "string") fail(`${entryLabel}.content: string-invalid`);
             entries += 1;
         }
         for (const [index, entry] of array(root.archived, `${label}.archived`).entries()) {
@@ -1030,6 +1037,14 @@ function parseManifestEvidence(
         return item;
     });
     if (entries.length === 0) fail(`${label}: evidence-empty`);
+    if (task === "classify-memories" && observedPublicIds !== null) {
+        // `validateClassifyManifest` demands exact id coverage, and a classify task
+        // takes the whole pool, so a completed run's evidence names every observed
+        // claim exactly once.
+        const covered = new Set(entries.map((entry) => entry.publicClaimId as string));
+        if (covered.size !== entries.length) fail(`${label}: duplicate`);
+        if (covered.size !== observedPublicIds.size) fail(`${label}: coverage-incomplete`);
+    }
     return entries;
 }
 
@@ -1118,6 +1133,16 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
     // so every scorer failure has raw bytes behind it, and every reason except
     // `invalid-output` — the one raised when validation itself threw — also
     // carries parsed evidence.
+    // `precheck` returns these two before a manifest is ever parsed, so evidence
+    // alongside them is impossible. Post-parse errors such as apply-not-applied
+    // may still retain it.
+    if (
+        status === "ERROR" &&
+        (reason === "provider-failure" || reason === "output-length-capped") &&
+        parsedManifest !== null
+    ) {
+        fail(`${label}.parsedManifest: prevalidation-error-has-evidence`);
+    }
     if (status === "FAIL") {
         if (rawManifest === null || rawManifest.trim().length === 0) {
             fail(`${label}.rawManifest: fail-requires-evidence`);
