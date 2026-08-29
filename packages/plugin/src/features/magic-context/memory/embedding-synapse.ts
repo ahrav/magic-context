@@ -895,6 +895,11 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         }
         for (let start = 0; start < items.length; ) {
             if (signal?.aborted || this.permanentFailure) break;
+            // A `module_restarted` failure on an earlier page invalidated the
+            // compatible daemon identity. Re-run the full initialization so
+            // the remaining pages only proceed against an incarnation that
+            // re-passed lifecycle compatibility validation.
+            if (!this.initialized && !(await this.initialize(signal))) break;
             const page = this.nextPage(items, start);
             start += page.length;
             try {
@@ -1020,6 +1025,35 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                         message: this.permanentFailure
                             ? "Synapse lane disabled after a permanent failure"
                             : "Synapse request aborted",
+                        disposition: this.permanentFailure ? "permanent" : "retryable",
+                    });
+                    continue;
+                }
+                // A `module_restarted` failure on an earlier page invalidated
+                // the compatible daemon identity; re-validate before this page
+                // so it never rides an unverified incarnation.
+                if (!this.initialized && !(await this.initialize(signal))) {
+                    // `initialize` reports an abort raised during its own await
+                    // as a plain `false`, so the signal is re-read here. Without
+                    // it a caller-cancelled request records this one page as a
+                    // retryable `transport` failure — inviting a retry of work
+                    // the caller withdrew — while every later page correctly
+                    // reports `cancelled` from the check above.
+                    const aborted = signal?.aborted === true;
+                    result.failures.push({
+                        applicationGroup,
+                        items: manifest,
+                        rowId: null,
+                        code: this.permanentFailure
+                            ? "artifact_invalid"
+                            : aborted
+                              ? "cancelled"
+                              : "transport",
+                        message: this.permanentFailure
+                            ? "Synapse lane disabled after a permanent failure"
+                            : aborted
+                              ? "Synapse request aborted"
+                              : "Synapse lane is unavailable",
                         disposition: this.permanentFailure ? "permanent" : "retryable",
                     });
                     continue;

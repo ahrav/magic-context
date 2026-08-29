@@ -1,11 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildContract, canonicalJson, sha256Hex } from "./generate-mc-host-release-manifest";
 import {
     attestationMatchesWorkflowSource,
     buildInstalledReleaseEvidence,
+    QUALIFICATION_WORKFLOW_PATH,
     validateInstalledReleaseEvidence,
     validateInstalledReleaseEvidenceAgainstArtifacts,
     workflowRunApiPath,
@@ -257,6 +258,11 @@ function installReleaseArtifacts(
         writeFileSync(join(root, relative), bytes);
         evidence[field] = sha256Hex(bytes);
     }
+    // Qualified verification requires the signer workflow the proofs cite to
+    // exist in the checkout under validation.
+    const workflowPath = join(root, QUALIFICATION_WORKFLOW_PATH);
+    mkdirSync(dirname(workflowPath), { recursive: true });
+    writeFileSync(workflowPath, "name: qualification stub\n");
 }
 
 describe("installed release evidence", () => {
@@ -523,36 +529,50 @@ describe("installed release evidence", () => {
         ).toThrow(/must cite a test report under tmp\/mc-host-test-reports\//);
     });
 
-    test("a test report must attest the target that cites it", () => {
-        const root = mkdtempSync(join(tmpdir(), "mc-host-installed-evidence-"));
-        const evidence = qualifiedEvidence();
-        installReleaseArtifacts(root, evidence);
-        installProofArtifacts(root, evidence);
-        const targetProof = (evidence.proof_artifacts as { kind: string; path: string }[]).find(
-            (proof) => proof.kind === "target",
-        );
-        if (targetProof === undefined) throw new Error("missing target proof");
-        const report = JSON.parse(
-            readFileSync(join(root, targetProof.path), "utf8"),
-        ) as Record<string, unknown>;
-        const reportPath = (report.observations as Record<string, unknown>)
-            .test_report_path as string;
-        // Same path and a matching digest, but the report names another target.
-        const forged = `${canonicalJson({
-            schema: "magic-context.mc-host-test-report/v1",
-            target: "some-other-target",
-            passed: true,
-        })}\n`;
-        writeFileSync(join(root, reportPath), forged);
-        rewriteProof(root, evidence, targetProof.path, (current) => {
-            const observations = current.observations as Record<string, unknown>;
-            observations.test_report_sha256 = sha256Hex(forged);
-        });
+    // Schema, target, and verdict share a single reject condition, so one case
+    // per clause keeps a regression in any one of them from riding on its
+    // neighbours still being enforced.
+    for (const mutation of ["failed", "wrong-schema", "wrong-target"] as const) {
+        test(`a test report must attest a passing run for its target (${mutation})`, () => {
+            const root = mkdtempSync(join(tmpdir(), "mc-host-installed-evidence-"));
+            const evidence = qualifiedEvidence();
+            installReleaseArtifacts(root, evidence);
+            installProofArtifacts(root, evidence);
+            const targetProof = (
+                evidence.proof_artifacts as { kind: string; path: string; subject: string }[]
+            ).find((proof) => proof.kind === "target");
+            if (targetProof === undefined) throw new Error("missing target proof");
+            const report = JSON.parse(
+                readFileSync(join(root, targetProof.path), "utf8"),
+            ) as Record<string, unknown>;
+            const reportPath = (report.observations as Record<string, unknown>)
+                .test_report_path as string;
+            // The citation path and digest stay consistent, so only the report's
+            // own content can carry the rejection.
+            const forged = `${canonicalJson({
+                schema:
+                    mutation === "wrong-schema"
+                        ? "magic-context.mc-host-test-report/v0"
+                        : "magic-context.mc-host-test-report/v1",
+                target: mutation === "wrong-target" ? "some-other-target" : targetProof.subject,
+                passed: mutation !== "failed",
+            })}\n`;
+            writeFileSync(join(root, reportPath), forged);
+            rewriteProof(root, evidence, targetProof.path, (current) => {
+                const observations = current.observations as Record<string, unknown>;
+                observations.test_report_sha256 = sha256Hex(forged);
+            });
 
-        expect(() =>
-            validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, fullStubs()),
-        ).toThrow(/test report does not attest a passing/);
-    });
+            expect(() =>
+                validateInstalledReleaseEvidenceAgainstArtifacts(
+                    root,
+                    evidence,
+                    true,
+                    fullStubs(),
+                ),
+            ).toThrow(/test report does not attest a passing/);
+        });
+    }
 
     test("one test report cannot satisfy two targets", () => {
         const root = mkdtempSync(join(tmpdir(), "mc-host-installed-evidence-"));
@@ -858,6 +878,19 @@ describe("installed release evidence", () => {
         expect(() => validateInstalledReleaseEvidence(evidence)).toThrow(
             /qualified evidence contains a failed proof or blocker/,
         );
+    });
+
+    test("a checkout without the qualification workflow cannot pass the GA gate", () => {
+        const root = mkdtempSync(join(tmpdir(), "mc-host-installed-evidence-"));
+        const evidence = qualifiedEvidence();
+        installReleaseArtifacts(root, evidence);
+        installProofArtifacts(root, evidence);
+        // Every artifact and stub still verifies; only the workflow the evidence
+        // claims to have run under is absent from this checkout.
+        rmSync(join(root, QUALIFICATION_WORKFLOW_PATH));
+        expect(() =>
+            validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, fullStubs()),
+        ).toThrow(/qualification workflow .* does not exist/);
     });
 
     test("qualification evidence cannot substitute for installed release evidence", () => {

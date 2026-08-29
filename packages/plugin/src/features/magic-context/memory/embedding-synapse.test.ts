@@ -1721,6 +1721,102 @@ describe("embedItemsDetailed", () => {
         }
     });
 
+    it("reports a page cancelled when the abort lands inside its re-validation", async () => {
+        const db = ledgerDb();
+        try {
+            const host = new DetailedHost();
+            const controller = new AbortController();
+            let demands = 0;
+            const provider = new SynapseEmbeddingProvider({
+                connectionFile: "fixture",
+                projectRoot: "/repo",
+                session: "ses-1",
+                model: MODEL,
+                fingerprint: FP,
+                tableEpoch: 0,
+                dims: 3,
+                recommendedBatch: 2,
+                batchTimeoutMs: 5_000,
+                clientFactory: async () => host,
+                demandStart: async () => {
+                    demands += 1;
+                    // The abort lands while the managed demand is in flight, so
+                    // `initialize` observes it on its own await and reports the
+                    // plain `false` a rejected `raceSignal` is folded into.
+                    controller.abort();
+                    await new Promise((resolve) => setTimeout(resolve, 0));
+                    return {
+                        ok: true,
+                        reason: "started",
+                        storage: "ready",
+                        authenticatedDaemonId: new Uint8Array([7, 7]),
+                    };
+                },
+            });
+            // Certify the lane before installing the managed origin: `initialize`
+            // is the only writer of the identity, and the pre-loop initialize
+            // must return from the already-certified state so the first page
+            // dispatches instead of demanding.
+            expect(await provider.initialize()).toBe(true);
+            const internals = provider as unknown as {
+                connectionOrigin: string;
+                compatibleDaemonId: Uint8Array | null;
+                initialized: boolean;
+            };
+            internals.connectionOrigin = "managed-default";
+            internals.compatibleDaemonId = new Uint8Array([7, 7]);
+
+            // Reproduce the state a rotation on an earlier page installs: the
+            // lane is managed and no longer certified, which is precisely the
+            // precondition the per-page re-validation exists to answer. Doing it
+            // from the first page's own response keeps the second page's
+            // `signal.aborted` check ahead of the abort, so the abort can only
+            // be observed inside the re-validation itself.
+            host.resultPages = (_jobId, items) => {
+                if (items.some((item) => item.id === "memory:1")) internals.initialized = false;
+                return {
+                    result: {
+                        ...ENVELOPE,
+                        done: true,
+                        vectors: items.map((item) => ({
+                            id: item.id,
+                            content_sha256: item.content_sha256,
+                            vector: [1, 2, 3],
+                        })),
+                    },
+                };
+            };
+
+            const result = await provider.embedItemsDetailed(
+                detailedItems([
+                    { id: "memory:1", group: "g1" },
+                    { id: "memory:2", group: "g2" },
+                ]),
+                detailedContext(db),
+                controller.signal,
+            );
+
+            // The first page completed before the identity was invalidated.
+            expect(result.receipts).toHaveLength(1);
+            expect(result.receipts[0].applicationGroup).toBe("g1");
+            // Exactly one demand: the second page's re-validation.
+            expect(demands).toBe(1);
+            expect(result.failures).toHaveLength(1);
+            const g2 = result.failures[0];
+            expect(g2.applicationGroup).toBe("g2");
+            // This read `transport`/`retryable` before the signal was re-checked
+            // after initialization, which invites a retry of a request the caller
+            // withdrew and disagrees with the `cancelled` every later page reports.
+            expect(g2.code).toBe("cancelled");
+            expect(g2.message).toBe("Synapse request aborted");
+            expect(g2.disposition).toBe("retryable");
+            // The cancelled page must never have reached the wire.
+            expect(host.batchCalls()).toHaveLength(1);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     it("scopes an exhausted restart budget to its page and leaves sibling pages runnable", async () => {
         const db = ledgerDb();
         try {

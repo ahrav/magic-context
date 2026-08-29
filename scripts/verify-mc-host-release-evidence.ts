@@ -6,7 +6,7 @@
  */
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -22,7 +22,7 @@ const INPUT_LOCK_PATH = "release/mc-host-production-inputs.lock.json";
 const PAYLOAD_INDEX_PATH = "release/mc-host-payload-index.json";
 const STOP_PROVENANCE_PATH = "release/mc-host-n-minus-one-stop.json";
 const SHA256_RE = /^[0-9a-f]{64}$/;
-const QUALIFICATION_WORKFLOW_PATH = ".github/workflows/mc-host-release-qualification.yml";
+export const QUALIFICATION_WORKFLOW_PATH = ".github/workflows/mc-host-release-qualification.yml";
 const EXPECTED_REPOSITORY = "ahrav/magic-context";
 const TEST_REPORT_DIR = "tmp/mc-host-test-reports/";
 const TEST_REPORT_SCHEMA = "magic-context.mc-host-test-report/v1";
@@ -823,6 +823,15 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
         })();
     if (requireQualified && !/^[0-9a-f]{40}$/.test(expectedHeadSha)) {
         fail("cannot bind qualified evidence to the current release commit");
+    }
+    // Every qualified proof must cite this signer workflow, so a checkout
+    // that does not carry it can never have produced (or reproduce) the
+    // attested evidence. Failing here names the gap directly instead of
+    // surfacing it later as an opaque per-proof attestation mismatch.
+    if (requireQualified && !existsSync(join(rootDir, QUALIFICATION_WORKFLOW_PATH))) {
+        fail(
+            `qualification workflow ${QUALIFICATION_WORKFLOW_PATH} does not exist in this checkout`,
+        );
     }
     const expected = {
         production_inputs_sha256: sha256File(rootDir, INPUT_LOCK_PATH),

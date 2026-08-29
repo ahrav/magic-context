@@ -18,11 +18,11 @@
 import type { CatalogEntry } from "../mc-host-client";
 import { checkPlatform, type LifecycleFailureReason, type PlatformReaders } from "./bootstrap";
 import {
+    COMPATIBILITY_STAGES,
+    type CompatibilityStage,
     type CompatibilityVerdict,
+    compatibilityStageIndex,
     evaluateCompatibility,
-    evaluateDaemonCompatibility,
-    evaluateEpochCompatibility,
-    evaluateModuleCompatibility,
     type ObservedEpochs,
 } from "./compatibility";
 import {
@@ -55,7 +55,7 @@ export type LifecycleCommand = "start" | "stop" | "restart" | "status" | "doctor
 
 export type StorageReadiness = "ready" | "starting" | "unavailable";
 
-export type CompatibilityStage = "daemon" | "modules" | "epochs";
+export type { CompatibilityStage } from "./compatibility";
 
 export interface CompatibilitySnapshot {
     authenticatedDaemonVersion: string;
@@ -609,41 +609,21 @@ export class McHostLifecyclePolicy {
         result: DaemonResultV1,
         snapshot: CompatibilitySnapshot,
     ): { result: DaemonResultV1; verdict: CompatibilityVerdict } {
-        const verdict = evaluateCompatibility(compatibilityInput(snapshot));
-        const stages: ReadonlyArray<{
-            stage: CompatibilityStage;
-            id: "compatibility.daemon" | "compatibility.modules" | "compatibility.epochs";
-            verdict: CompatibilityVerdict;
-        }> = [
-            {
-                stage: "daemon",
-                id: "compatibility.daemon",
-                verdict: evaluateDaemonCompatibility(snapshot.authenticatedDaemonVersion),
-            },
-            {
-                stage: "modules",
-                id: "compatibility.modules",
-                verdict: evaluateModuleCompatibility(snapshot.catalog),
-            },
-            {
-                stage: "epochs",
-                id: "compatibility.epochs",
-                verdict: evaluateEpochCompatibility(snapshot.epochs),
-            },
-        ];
-        const stageOrder: Record<CompatibilityStage, number> = {
-            daemon: 0,
-            modules: 1,
-            epochs: 2,
-        };
-        const evaluatedThrough = snapshot.evaluatedThrough ?? "epochs";
+        const input = compatibilityInput(snapshot);
+        const verdict = evaluateCompatibility(input);
+        const evaluatedThroughIndex = compatibilityStageIndex(
+            snapshot.evaluatedThrough ?? "epochs",
+        );
         const checksById = new Map(result.checks.map((check) => [check.id, check] as const));
-        for (const stage of stages) {
-            if (stageOrder[stage.stage] > stageOrder[evaluatedThrough]) continue;
-            const reason = stage.verdict.ok ? "healthy" : stage.verdict.reason;
-            checksById.set(stage.id, {
-                id: stage.id,
-                status: stage.verdict.ok ? "pass" : "fail",
+        for (const [index, stage] of COMPATIBILITY_STAGES.entries()) {
+            // Only stages the probe actually reached are reported; a check for
+            // an unevaluated stage would assert an observation never made.
+            if (index > evaluatedThroughIndex) continue;
+            const stageVerdict = stage.evaluate(input);
+            const reason = stageVerdict.ok ? "healthy" : stageVerdict.reason;
+            checksById.set(stage.checkId, {
+                id: stage.checkId,
+                status: stageVerdict.ok ? "pass" : "fail",
                 reason,
                 remediation: remediationForReason(reason),
             });

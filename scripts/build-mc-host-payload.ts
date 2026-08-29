@@ -64,6 +64,7 @@ import {
     INPUT_KEYS,
     isPlaceholderSha256,
     OUTPUT_PATHS as U9_OUTPUT_PATHS,
+    qualificationEvidenceIdentityMismatch,
     requireQualificationEvidence,
     SOURCE_MANIFEST_PATH,
 } from "./qualify-mc-host-production-inputs";
@@ -259,17 +260,17 @@ export function loadReleaseContext(rootDir: string): ReleaseContext {
     let artifacts: Record<string, { path?: unknown; sha256?: unknown }> | undefined;
     if (existsSync(evidencePath)) {
         const evidence = readJson(rootDir, U9_OUTPUT_PATHS.evidence);
-        const release = evidence.release as
-            | { id?: unknown; version?: unknown }
-            | undefined;
-        if (
-            evidence.schema !== "magic-context.mc-host-release-qualification/v1" ||
-            evidence.release_contract_sha256 !== u8Digest ||
-            release?.id !== contract.release.id ||
-            release?.version !== contract.release.version
-        ) {
+        // The identity rules are shared with `requireQualificationEvidence`
+        // (the U2/U6 consumption gate) so the two validators of this document
+        // cannot drift apart.
+        const identityMismatch = qualificationEvidenceIdentityMismatch(
+            evidence,
+            contract,
+            u8Digest,
+        );
+        if (identityMismatch !== null) {
             fail(
-                `stale or unknown U9 qualification evidence at ${U9_OUTPUT_PATHS.evidence}`,
+                `stale or unknown U9 qualification evidence at ${U9_OUTPUT_PATHS.evidence}: ${identityMismatch}`,
             );
         }
         if (lock.production_qualified !== evidence.production_qualified) {
