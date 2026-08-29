@@ -140,6 +140,38 @@ describe("dreamer manifest mutation battery", () => {
         expect(runMutationBattery(fixture).green).toBe(true);
     });
 
+    test("forbidden anchors naming many punctuation characters still yield evidence", () => {
+        // The filler domain must outlast a fixture that forbids the obvious
+        // separator characters one by one.
+        const fixture = {
+            ...dreamerScorerFixture,
+            verifyGold: {
+                kind: "verify" as const,
+                claims: dreamerScorerFixture.verifyGold.claims.map((claim) =>
+                    claim.verdict === "update"
+                        ? {
+                              ...claim,
+                              requiredUpdateAnchors: ["alpha", "beta"],
+                              forbiddenUpdateAnchors: [
+                                  "alpha; beta",
+                                  "#",
+                                  "@",
+                                  "%",
+                                  "~",
+                                  "^",
+                                  "+",
+                                  "=",
+                                  "!",
+                                  "?",
+                              ],
+                          }
+                        : claim,
+                ),
+            },
+        };
+        expect(runMutationBattery(fixture).green).toBe(true);
+    });
+
     test("a single-file map gold still yields a changed manifest", () => {
         const fixture = {
             ...dreamerScorerFixture,

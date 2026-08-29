@@ -282,16 +282,27 @@ function assertKnownClaim(claimId: string, poolIds: ReadonlySet<string>, label: 
     if (!poolIds.has(claimId)) fail(`${label}: unknown-claim`);
 }
 
-function parsePreconditions(raw: unknown, label: string, poolIds: ReadonlySet<string>): TaskPreconditions {
+function parsePreconditions(raw: unknown, label: string, pool: ReadonlyMap<string, ScenarioClaim>): TaskPreconditions {
     const value = record(raw, label);
     exact(value, ["mappings", "verifications", "classifiedClaimIds"], label);
+    const poolIds = new Set(pool.keys());
     const mappings = array(value.mappings, `${label}.mappings`).map((entry, index) => {
         const itemLabel = `${label}.mappings[${index}]`;
         const item = record(entry, itemLabel);
         exact(item, ["claimId", "files"], itemLabel);
         const claimId = staticId(item.claimId, `${itemLabel}.claimId`, CLAIM_ID_RE);
-        assertKnownClaim(claimId, poolIds, `${itemLabel}.claimId`);
-        return { claimId, files: parseFilePathArray(item.files, `${itemLabel}.files`) };
+        const poolClaim = pool.get(claimId);
+        if (poolClaim === undefined) return fail(`${itemLabel}.claimId: unknown-claim`);
+        const files = parseFilePathArray(item.files, `${itemLabel}.files`);
+        // The seeder applies a mapping only for a path the mapped claim itself
+        // declares and rejects anything else as `fixture-drift`. This is
+        // per-claim, unlike gold: a precondition states the claim's existing
+        // mapping, so it cannot name another claim's file.
+        const declared = new Set(poolClaim.fixtureFiles.map((file) => file.path));
+        for (const [fileIndex, file] of files.entries()) {
+            if (!declared.has(file)) fail(`${itemLabel}.files[${fileIndex}]: path-undeclared`);
+        }
+        return { claimId, files };
     });
     unique(mappings.map((entry) => entry.claimId), `${label}.mappings`);
     const verifications = array(value.verifications, `${label}.verifications`).map((entry, index) => {
@@ -472,7 +483,7 @@ function parseTask(raw: unknown, label: string, pool: ReadonlyMap<string, Scenar
     exact(value, ["task", "preconditions", "expectedInScopeClaimIds", "expectedSkippedClaimIds", "expectedResultMode", "gold"], label);
     const task = enumeration(value.task, DREAMER_TASKS, `${label}.task`);
     const poolIds = new Set(pool.keys());
-    const preconditions = parsePreconditions(value.preconditions, `${label}.preconditions`, poolIds);
+    const preconditions = parsePreconditions(value.preconditions, `${label}.preconditions`, pool);
     const expectedInScopeClaimIds = parseClaimIdArray(value.expectedInScopeClaimIds, `${label}.expectedInScopeClaimIds`);
     const expectedSkippedClaimIds = parseClaimIdArray(value.expectedSkippedClaimIds, `${label}.expectedSkippedClaimIds`);
     for (const [index, claimId] of expectedInScopeClaimIds.entries()) assertKnownClaim(claimId, poolIds, `${label}.expectedInScopeClaimIds[${index}]`);

@@ -260,6 +260,21 @@ describe("dreamer eval scenario contract", () => {
         expect(() => parseScenario(moved)).not.toThrow();
     });
 
+    test("a mapping cannot name a path its claim does not declare", () => {
+        // The seeder applies a mapping only for a path the mapped claim itself
+        // declares and rejects anything else as fixture-drift. Unlike gold, this
+        // is per-claim: src/file-2.ts belongs to claim-2.
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<{ preconditions: { mappings: unknown[] } }>;
+            tasks[0]!.preconditions.mappings = [{ claimId: "claim-1", files: ["src/file-2.ts"] }];
+        }, "scenario.tasks[0].preconditions.mappings[0].files[0]: path-undeclared");
+        const declared = validScenarioRaw();
+        (declared.tasks as Array<{ preconditions: { mappings: unknown[] } }>)[0]!.preconditions.mappings = [
+            { claimId: "claim-1", files: ["src/file-1.ts"] },
+        ];
+        expect(() => parseScenario(declared)).not.toThrow();
+    });
+
     test("a verify task must declare the one result mode the seeder can produce", () => {
         // The seeder always git-inits and commits, and calls the gate with
         // forceBroad false: "broad" needs forceBroad, "non-git" is never

@@ -82,11 +82,31 @@ function claimById(pool: PoolDescriptor, claimId: string) {
 }
 
 /**
- * Punctuation only: these characters survive a manifest attribute and body
- * without changing how the parser splits them, and none is whitespace, so
- * content built from one is never trimmed away.
+ * Characters a filler is never drawn from: whitespace would be trimmed away, and
+ * these five change how a manifest is split or parsed.
  */
-const FILLER_ALPHABET = "#@%~^+=!?";
+const FILLER_EXCLUDED = new Set(["<", ">", "&", '"', ","]);
+
+/**
+ * Filler candidates, widest first: printable ASCII, then Latin-1 and Latin
+ * Extended letters. Roughly 480 distinct characters, so exhausting the domain
+ * takes a fixture that names that many distinct characters among its forbidden
+ * anchors. That is not literally unbounded — no fixed alphabet can be — but a
+ * fixture reaching it gets a named error rather than a wrong baseline, because
+ * every caller verifies the content it builds.
+ */
+function* fillerCandidates(): Generator<string> {
+    for (const [start, end] of [
+        [0x21, 0x7e],
+        [0xc0, 0x24f],
+    ] as const) {
+        for (let code = start; code <= end; code += 1) {
+            const candidate = String.fromCodePoint(code);
+            if (FILLER_EXCLUDED.has(candidate) || candidate.trim() === "") continue;
+            yield candidate;
+        }
+    }
+}
 
 function containsAny(content: string, phrases: readonly string[]): boolean {
     const lowered = content.toLowerCase();
@@ -99,12 +119,14 @@ function containsAny(content: string, phrases: readonly string[]): boolean {
  * phrase, and any substring spanning it cannot match one either.
  */
 function fillerAbsentFrom(phrases: readonly string[], description: string): string {
-    const lowered = phrases.map((phrase) => phrase.toLowerCase());
-    const filler = [...FILLER_ALPHABET].find(
-        (candidate) => !lowered.some((phrase) => phrase.includes(candidate)),
-    );
-    if (filler === undefined) throw new Error(`mutation fixture needs ${description}`);
-    return filler;
+    const used = new Set<string>();
+    for (const phrase of phrases) {
+        for (const character of phrase.toLowerCase()) used.add(character);
+    }
+    for (const candidate of fillerCandidates()) {
+        if (!used.has(candidate.toLowerCase())) return candidate;
+    }
+    throw new Error(`mutation fixture needs ${description}`);
 }
 
 /**
