@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CliDispatchDependencies, dispatchCli, usageText } from "./dispatch";
+import { PromptCancelledError } from "./lib/prompts";
 
 const builtCliRoot = mkdtempSync(join(tmpdir(), "magic-context-cli-built-"));
 // A per-run home keeps concurrent runs on a shared host from racing on one
@@ -82,6 +83,21 @@ describe("import-safe CLI dispatch", () => {
         expect(exit).toBe(1);
         expect(h.sqliteCalls()).toBe(1);
         expect(h.daemonArgs).toEqual([]);
+    });
+
+    test("a cancelled prompt exits 0 rather than escaping as an error", async () => {
+        const h = dependencies();
+        // The command rejects the way a cancelled clack prompt does. Without
+        // `return await` in dispatchCli the rejection settles dispatchCli's own
+        // promise, bypassing its isPromptCancelledError branch entirely.
+        h.deps.runDaemon = async () => {
+            throw new PromptCancelledError("Cancelled.");
+        };
+
+        const exit = await dispatchCli(["daemon", "status"], h.deps);
+
+        expect(exit).toBe(0);
+        expect(h.stderr).toEqual([]);
     });
 
     test("importing the executable module does not run or exit", async () => {

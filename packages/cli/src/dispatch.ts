@@ -100,12 +100,12 @@ export async function dispatchCli(
 
     try {
         if (command === "daemon") {
-            return dependencies.runDaemon(rest);
+            return await dependencies.runDaemon(rest);
         }
 
         if (command === "setup") {
             const { runSetup } = await import("./commands/setup");
-            return runSetup(rest);
+            return await runSetup(rest);
         }
 
         if (command === "doctor") {
@@ -123,33 +123,33 @@ export async function dispatchCli(
                         import("@magic-context/core/shared/data-path"),
                         import("node:path"),
                     ]);
-                return runDoctorDrainAuthority(
+                return await runDoctorDrainAuthority(
                     projectRoot,
                     join(getMagicContextStorageDir(), "context.db"),
                 );
             }
             if (rest[0] === "merge-identity") {
                 const { runMergeIdentityCli } = await import("./commands/doctor-merge-identity");
-                return runMergeIdentityCli(rest.slice(1));
+                return await runMergeIdentityCli(rest.slice(1));
             }
             if (rest[0] === "repair-db") {
                 const { runRepairDbCli } = await import("./commands/doctor-repair-db");
-                return runRepairDbCli(rest.slice(1));
+                return await runRepairDbCli(rest.slice(1));
             }
             if (rest[0] === "reset-db") {
                 const { runResetDbCli } = await import("./commands/doctor-reset-db");
-                return runResetDbCli(rest.slice(1));
+                return await runResetDbCli(rest.slice(1));
             }
             if (rest[0] === "migrate") {
                 const { runMigrateCli } = await import("./commands/migrate");
-                return runMigrateCli(rest.slice(1));
+                return await runMigrateCli(rest.slice(1));
             }
             if (rest[0] === "migrate-session") {
                 const { runMigrateSessionCli } = await import("./commands/migrate-session");
-                return runMigrateSessionCli(rest.slice(1));
+                return await runMigrateSessionCli(rest.slice(1));
             }
             const { runDoctor } = await import("./commands/doctor");
-            return runDoctor({
+            return await runDoctor({
                 force: rest.includes("--force"),
                 issue: rest.includes("--issue"),
                 clear: rest.includes("--clear"),
@@ -157,6 +157,9 @@ export async function dispatchCli(
             });
         }
     } catch (error) {
+        // `return await` is load-bearing above: a bare `return promise` settles
+        // the async function's own promise, so a rejection bypasses this block
+        // and a cancelled prompt would exit 1 instead of 0.
         if (isPromptCancelledError(error)) return 0;
         throw error;
     }
