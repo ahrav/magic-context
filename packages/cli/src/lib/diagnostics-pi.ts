@@ -10,7 +10,6 @@ import {
     getMagicContextStorageDir,
     getProjectMagicContextHistorianDir,
 } from "@magic-context/core/shared/data-path";
-import { escapeRegex } from "@magic-context/core/shared/redaction";
 import { loadPiConfig } from "@magic-context/pi-core/config";
 import { parse as parseJsonc } from "comment-json";
 import {
@@ -36,9 +35,9 @@ import {
     hasPiMagicContextPackage,
     isPiMagicContextPackageEntry,
 } from "./pi-package-entry";
-import { redactSecretText } from "./redaction";
+import { escapeRegex, redactSecretText } from "./redaction";
 
-/** Alias shims so the exported Pi surface is unchanged by the consolidation. */
+/** Pi-named aliases of the shared historian-dump shapes. */
 export type PiHistorianDumpMeta = HistorianDumpMeta;
 export type PiHistorianDumpSummary = HistorianDumpSummary;
 

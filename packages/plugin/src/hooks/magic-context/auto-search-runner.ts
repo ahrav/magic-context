@@ -29,7 +29,6 @@ import type {
     UnifiedSearchOptions,
     UnifiedSearchResult,
 } from "../../features/magic-context/search";
-import { unifiedSearch } from "../../features/magic-context/search";
 import {
     type AutoSearchHintDecision,
     type AutoSearchHintNoHintReason,
@@ -433,5 +432,3 @@ export async function runAutoSearchHint(args: {
 export function clearAutoSearchForSession(_sessionId: string): void {
     // Decisions are session_meta state and are removed by clearSession().
 }
-
-export { hasStackedAugmentation } from "./auto-search-shared";

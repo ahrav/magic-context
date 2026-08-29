@@ -66,6 +66,13 @@ import { sessionLog } from "@magic-context/core/shared/logger";
  */
 export const PI_CTX_REDUCE_KEEP = CTX_REDUCE_KEEP;
 
+/**
+ * Dedup applies only to read-only tools whose outputs are deterministic given
+ * the same input — duplicate calls are wasted context. Anything mutating
+ * (write/edit/bash/etc.) is intentionally excluded because two identical
+ * calls may have different semantics in different positions of the
+ * conversation.
+ */
 const DEDUP_SAFE_TOOLS = new Set([
 	"mcp_grep",
 	"mcp_read",

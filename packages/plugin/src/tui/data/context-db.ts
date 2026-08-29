@@ -2,8 +2,6 @@
  * TUI data layer — pure RPC client, no direct SQLite access.
  * All data is fetched from the server plugin via HTTP RPC.
  */
-import os from "node:os";
-import path from "node:path";
 import { getMagicContextStorageDir } from "../../shared/data-path";
 import { MagicContextRpcClient } from "../../shared/rpc-client";
 import type { EmbedDetail, SidebarSnapshot, StatusDetail } from "../../shared/rpc-types";

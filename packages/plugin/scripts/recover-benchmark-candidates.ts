@@ -46,8 +46,8 @@ import { getAutoSearchHintDecisions } from "../src/features/magic-context/storag
 import { extractBoundedAutoSearchQuery } from "../src/hooks/magic-context/auto-search-prompt";
 import {
     collectUserPromptParts,
-    hasStackedAugmentation,
 } from "../src/hooks/magic-context/auto-search-runner";
+import { hasStackedAugmentation } from "../src/hooks/magic-context/auto-search-shared";
 import { hasMeaningfulUserText } from "../src/hooks/magic-context/read-session-formatting";
 import type { RawMessage } from "../src/hooks/magic-context/read-session-raw";
 import { parseIdShapedQuery } from "../src/features/magic-context/search";
