@@ -236,12 +236,13 @@ function liveAdmissionGate(scenarios: readonly HistorianEvalScenario[]): number 
  * this is the same command, so the documented direct command behaves the same
  * way.
  *
- * Rebuilding rather than staleness-checking, because it is correct in both
- * branches of that `existsSync`. `spawn.ts` binds its entry at import time: if
- * the bundle exists it is already the chosen path and this refreshes the bytes
- * before the spawn reads them; if it does not, the entry is already bound to the
- * current source and building only affects later processes. An mtime comparison
- * would have to be right about which one applies.
+ * Rebuilding rather than staleness-checking: an mtime comparison is a weak oracle
+ * across checkouts, and building makes the loaded bytes current by construction.
+ * `spawn.ts` resolves its plugin entry per spawn rather than at module load, so
+ * this build is visible to the run that follows it — including the case where no
+ * bundle existed beforehand, which previously latched the entry to `src/` for the
+ * whole process and made a direct run exercise a different plugin entrypoint than
+ * a prebuilt scheduled run under the same recorded identity.
  */
 function buildPluginBundle(): number {
     const repoRoot = resolve(E2E_ROOT, "..", "..");
