@@ -34,7 +34,7 @@
     "fmt:rust": "cargo fmt",
     "release:contract": "bun scripts/generate-mc-host-release-manifest.ts",
     "release:contract:check": "bun scripts/generate-mc-host-release-manifest.ts --check",
-    "release:qualify": "bun scripts/qualify-mc-host-production-inputs.ts && bun scripts/run-mc-host-closure-qualification.ts",
+    "release:qualify": "bun scripts/run-mc-host-closure-qualification.ts && bun scripts/qualify-mc-host-production-inputs.ts",
     "release:qualify:check": "bun scripts/qualify-mc-host-production-inputs.ts --check",
     "release:qualify:require": "bun scripts/qualify-mc-host-production-inputs.ts --require-qualified --verify-bytes",
     "release:closures:check": "bun scripts/run-mc-host-closure-qualification.ts",

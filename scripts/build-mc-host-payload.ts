@@ -1004,9 +1004,18 @@ export function validateTrustIndex(
  * version, and its embedded manifest must hash to the cited digest (modified
  * N-1 rejected).
  */
+/**
+ * Full stop-record validation: schema plus this release's ancestry rules.
+ *
+ * Takes only the contract and the reservation versions rather than a whole
+ * `ReleaseContext`, because that is its real dependency set — the wider type
+ * kept this validator reachable only from the payload builder, which is why the
+ * evidence verifier previously had to settle for the schema-level
+ * `validateStopProvenance` alone.
+ */
 export function validateStopRecord(
     record: unknown,
-    context: ReleaseContext,
+    context: Pick<ReleaseContext, "contract" | "reservationVersions">,
     expectedPredecessorVersion: string | null,
 ): { legacyStopAuthority: boolean } {
     const { contract } = context;

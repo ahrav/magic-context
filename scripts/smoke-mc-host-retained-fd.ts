@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { closeSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 
 import { buildManagedStartupEnvelope } from "../packages/plugin/src/hooks/magic-context/module-transport";
 import { stageBootstrap } from "../packages/plugin/src/shared/mc-host-lifecycle/bootstrap";
@@ -22,6 +22,21 @@ async function main(): Promise<void> {
     const opencode = required("MC_HOST_CANARY_OPENCODE");
     const node = required("MC_HOST_CANARY_NODE");
     const piEntrypoint = required("MC_HOST_CANARY_PI_ENTRYPOINT");
+    // Native `start` without `--payload-dir` accepts only an already-promoted
+    // current generation from the generation store. `stageBootstrap` populates
+    // the separate bootstrap store, so on a clean canary root nothing has ever
+    // promoted a generation and `start` answers `native_payload_missing`. The
+    // payload root is what lets this run stage and promote one, which is also
+    // the path a real install takes.
+    const payloadDir = required("MC_HOST_CANARY_PAYLOAD_DIR");
+    if (!isAbsolute(payloadDir)) {
+        throw new Error("MC_HOST_CANARY_PAYLOAD_DIR must be absolute");
+    }
+    // Optional: when supplied, the daemon rejects a promoted generation whose
+    // recorded source manifest disagrees, so a canary can pin which payload the
+    // generation must come from instead of accepting whatever staged.
+    const payloadManifestDigest =
+        process.env.MC_HOST_CANARY_PAYLOAD_MANIFEST_SHA256;
     const digest = createHash("sha256").update(readFileSync(launcher)).digest("hex");
     const retained = stageBootstrap({
         sourcePath: launcher,
@@ -70,7 +85,16 @@ async function main(): Promise<void> {
         startAttempted = true;
         const start = await runNativeLifecycle(
             { kind: "retained-fd", fd: retained.fd },
-            { command: "start", envelope, deadlineMs: 60_000, env },
+            {
+                command: "start",
+                envelope,
+                deadlineMs: 60_000,
+                env,
+                payloadDir,
+                ...(payloadManifestDigest === undefined
+                    ? {}
+                    : { payloadManifestDigest }),
+            },
         );
         assert.equal(start.ok, true);
         assert.equal(start.state, "running");

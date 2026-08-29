@@ -9,12 +9,12 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { validateStopRecord } from "./build-mc-host-payload";
 import {
     buildContract,
     canonicalJson,
     type ReleaseContract,
     sha256Hex,
-    validateStopProvenance,
 } from "./generate-mc-host-release-manifest";
 
 const EVIDENCE_PATH = "docs/evidence/mc-host-installed-release-evidence.json";
@@ -23,6 +23,7 @@ const INPUT_LOCK_PATH = "release/mc-host-production-inputs.lock.json";
 const PAYLOAD_INDEX_PATH = "release/mc-host-payload-index.json";
 const STOP_PROVENANCE_PATH = "release/mc-host-n-minus-one-stop.json";
 const SHA256_RE = /^[0-9a-f]{64}$/;
+const REGISTRY_GATE_PATH = "release/mc-host-registry-gate.json";
 
 /**
  * The only repository whose workflows may author a proof or its attestation.
@@ -547,29 +548,61 @@ export function validateInstalledReleaseEvidence(
  * the GA gate while citing a qualification run that recorded
  * `production_qualified: false`, payload entries that recorded
  * `qualified: false`, or a stop record that grants no usable stop authority.
+ *
+ * Checking those booleans alone is not enough either: a skeletal file carrying
+ * only the booleans would satisfy them while citing nothing. Each artifact is
+ * therefore bound to this release — its schema, its contract digest, and its
+ * identity set — so a stand-in has to reproduce the real citations to pass.
+ *
+ * Deliberately not re-implemented here: the input-lock byte citations and the
+ * payload manifest/launcher digests. Those are what `release:qualify:check` and
+ * `release:payload:check` validate in full, and duplicating their logic in a
+ * third place would create exactly the drift this gate exists to catch. This
+ * function's job is to stop *these* bytes from being a stand-in for the artifacts
+ * those gates validate.
  */
 function assertCitedArtifactsQualified(
     rootDir: string,
     contract: ReleaseContract,
+    expectedContractDigest: string,
 ): void {
     const qualification = record(
         readJson(rootDir, QUALIFICATION_PATH),
         "cited qualification",
     );
+    if (
+        qualification.schema !== "magic-context.mc-host-release-qualification/v1"
+    ) {
+        fail("cited qualification is not a production-input qualification run");
+    }
+    if (qualification.release_contract_sha256 !== expectedContractDigest) {
+        fail("cited qualification was produced against a different release contract");
+    }
     if (qualification.production_qualified !== true) {
         fail("cited production-input qualification is not production-qualified");
     }
+    // A qualified run carries no outstanding reasons; a populated list next to a
+    // `true` verdict is a contradiction the run itself should never emit.
+    const unqualified = qualification.unqualified;
+    if (!Array.isArray(unqualified) || unqualified.length !== 0) {
+        fail("cited qualification is production-qualified but still names blockers");
+    }
+
     const payloadIndex = record(
         readJson(rootDir, PAYLOAD_INDEX_PATH),
         "cited payload index",
     );
+    if (payloadIndex.schema !== "magic-context.mc-host-payload-index/v1") {
+        fail("cited payload index is not a payload index");
+    }
+    if (payloadIndex.release_contract_sha256 !== expectedContractDigest) {
+        fail("cited payload index was produced against a different release contract");
+    }
     if (payloadIndex.production_qualified !== true) {
         fail("cited payload index is not production-qualified");
     }
     const entries = payloadIndex.entries;
-    if (!Array.isArray(entries) || entries.length === 0) {
-        fail("cited payload index has no entries");
-    }
+    if (!Array.isArray(entries)) fail("cited payload index has no entries");
     entries.forEach((raw, index) => {
         const entry = record(raw, `cited payload index entries[${index}]`);
         if (entry.qualified !== true) {
@@ -578,17 +611,58 @@ function assertCitedArtifactsQualified(
             fail(`cited payload index entry ${label} is not qualified`);
         }
     });
-    // No proof kind covers stop provenance, so a digest match was previously the
-    // only thing standing between qualified evidence and a malformed or
-    // foreign-release stop record. `validateStopProvenance` is the existing
-    // consumer-facing gate and needs only the contract, which is already here.
-    const stop = validateStopProvenance(
-        contract,
-        readJson(rootDir, STOP_PROVENANCE_PATH),
+    // Every supported target exactly once: a stand-in index cannot qualify the
+    // release by listing one easy target, or by listing none at all.
+    exactIdentitySet(
+        entries.map((raw, index) =>
+            stringField(
+                record(raw, `cited payload index entries[${index}]`),
+                "target",
+                `cited payload index entries[${index}]`,
+            ),
+        ),
+        contract.platforms.supported.map((platform) => platform.target),
+        "cited payload index targets",
     );
-    if (!stop.valid) {
-        fail(`cited stop-provenance record is unusable: ${stop.error}`);
+    const indexPublication = record(
+        payloadIndex.publication,
+        "cited payload index publication",
+    );
+    if (indexPublication.published !== true) {
+        fail("cited payload index records no completed publication");
     }
+    if (indexPublication.payloads_before_parents !== true) {
+        fail("cited payload index records a parents-first publication");
+    }
+
+    // No proof kind covers stop provenance, so a digest match was previously the
+    // only thing standing between qualified evidence and a stop record granting
+    // unusable or unauthorized authority. `validateStopRecord` is the validator
+    // that adds this release's ancestry rules on top of the schema: genesis-only
+    // status, reservation exclusion, exact N-1 adjacency, and the
+    // predecessor-manifest hash. Reservation versions come from the gate file
+    // directly, which is the only thing beyond the contract that it needs.
+    const gate = record(
+        readJson(rootDir, REGISTRY_GATE_PATH),
+        "cited registry gate",
+    );
+    const reservationVersions = (
+        Array.isArray(gate.packages) ? gate.packages : []
+    )
+        .map((entry) =>
+            typeof entry === "object" && entry !== null
+                ? (entry as Record<string, unknown>).reservation_version
+                : undefined,
+        )
+        .filter((version): version is string => typeof version === "string");
+    // `null` for the expected predecessor: this is the first payload-bearing
+    // release, so genesis is the only acceptable ancestry — the same stance
+    // `runCheck` takes. The next payload release must pass its real N-1 here.
+    validateStopRecord(
+        readJson(rootDir, STOP_PROVENANCE_PATH),
+        { contract, reservationVersions },
+        null,
+    );
 }
 
 export function validateInstalledReleaseEvidenceAgainstArtifacts(
@@ -612,7 +686,13 @@ export function validateInstalledReleaseEvidenceAgainstArtifacts(
             fail(`${field} does not match the current artifact`);
         }
     }
-    if (requireQualified) assertCitedArtifactsQualified(rootDir, contract);
+    if (requireQualified) {
+        assertCitedArtifactsQualified(
+            rootDir,
+            contract,
+            evidence.release_contract_sha256,
+        );
+    }
     if (requireQualified && options.verifyAttestation === undefined) {
         // Without this the pinned signer is unsatisfiable and every proof fails
         // with an opaque `lacks a valid attestation`, which reads as a bad proof
