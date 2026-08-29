@@ -421,7 +421,7 @@ export interface DreamerEvalRunReport {
     poolBefore: ClaimSnapshotProjection[];
     poolAfter: ClaimSnapshotProjection[];
     rawManifest: string | null;
-    parsedManifest: Record<string, unknown> | null;
+    parsedManifest: Record<string, unknown> | unknown[] | null;
     receiptOutcomes: ClaimOperationReceiptOutcome[];
 }
 
@@ -512,7 +512,12 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
         poolBefore,
         poolAfter,
         rawManifest: nullableString(root.rawManifest, `${label}.rawManifest`),
-        parsedManifest: root.parsedManifest === null ? null : record(root.parsedManifest, `${label}.parsedManifest`),
+        parsedManifest:
+            root.parsedManifest === null
+                ? null
+                : Array.isArray(root.parsedManifest)
+                  ? root.parsedManifest
+                  : record(root.parsedManifest, `${label}.parsedManifest`),
         receiptOutcomes,
     };
 }

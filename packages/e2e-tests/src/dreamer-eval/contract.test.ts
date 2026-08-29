@@ -179,6 +179,11 @@ describe("dreamer eval report contract", () => {
         );
     });
 
+    test("parsed manifest retains array-shaped map and classify output", () => {
+        expect(parseRunReport({ ...baseReport, parsedManifest: [{ publicClaimId: "mem-1" }] }).parsedManifest)
+            .toEqual([{ publicClaimId: "mem-1" }]);
+    });
+
     test("exit mapping is 0 for PASS, 1 for ordinary red, and 2 for wrong archival", () => {
         expect(dreamerEvalExitCode(parseRunReport(baseReport))).toBe(0);
         expect(dreamerEvalExitCode(parseRunReport({ ...baseReport, status: "FAIL", reason: "wrong-verdict" }))).toBe(1);
