@@ -558,13 +558,22 @@ describe("dreamer eval scenario contract", () => {
     });
 
     test("classify gold cannot request shareable for content production forces private", () => {
-        // applyClassifications rewrites shareable to false for this content, so
-        // the model's "true" would score PASS while the stored claim came out
-        // private.
+        // applyClassifications rewrites a reported `true` to false for this
+        // content, so the model's "true" would score PASS while the stored claim
+        // came out private.
         expectDiagnostic((raw) => {
-            (raw.pool as { claims: Array<{ content: string }> }).claims[0]!.content =
-                "The provider answers on 127.0.0.1:8080 during local runs.";
+            const claims = (raw.pool as { claims: Array<{ content: string; sharing: string }> }).claims;
+            claims[0]!.content = "The provider answers on 127.0.0.1:8080 during local runs.";
+            claims[0]!.sharing = "private";
         }, "scenario.tasks[2].gold.claims[0].shareable: shareability-override");
+        // The override only fires on an explicitly reported `true`. A sensitive
+        // claim already stored shareable keeps that value when an entry omits the
+        // field, so this gold is achievable and must not be refused.
+        const alreadyShareable = validScenarioRaw();
+        const claims = (alreadyShareable.pool as { claims: Array<{ content: string; sharing: string }> }).claims;
+        claims[0]!.content = "The provider answers on 127.0.0.1:8080 during local runs.";
+        claims[0]!.sharing = "shareable";
+        expect(() => parseScenario(alreadyShareable)).not.toThrow();
     });
 });
 
@@ -596,6 +605,12 @@ function poolSnapshot(index: number): Record<string, unknown> {
 }
 
 const POOL_CAPTURE = Array.from({ length: 10 }, (_, index) => poolSnapshot(index));
+const OBSERVED_ID = POOL_CAPTURE[0]!.publicClaimId as string;
+const VERIFY_EVIDENCE = {
+    verified: [{ publicClaimId: OBSERVED_ID, files: ["src/a.ts"] }],
+    updated: [],
+    archived: [],
+};
 
 /** The same capture with `overrides` folded into its first claim. */
 function captureWithFirst(overrides: Record<string, unknown>): Array<Record<string, unknown>> {
@@ -622,7 +637,7 @@ describe("dreamer eval report contract", () => {
         poolBefore: POOL_CAPTURE,
         poolAfter: POOL_CAPTURE,
         rawManifest: "<verify></verify>",
-        parsedManifest: {},
+        parsedManifest: VERIFY_EVIDENCE,
         receiptOutcomes: [],
     };
 
@@ -663,11 +678,11 @@ describe("dreamer eval report contract", () => {
         // Verify parses to one record of verdict lists; map and classify parse
         // to one entry per claim, so a report that only accepted a record could
         // not carry the evidence two of the three scorers produce.
-        const mapShape = [{ publicClaimId: CLAIM_ONE_ID, files: ["src/a.ts"], independent: false }];
+        const mapShape = [{ publicClaimId: OBSERVED_ID, files: ["src/a.ts"], independent: false }];
         expect(parseRunReport({ ...baseReport, task: "map-memories", parsedManifest: mapShape }).parsedManifest).toEqual(
             mapShape,
         );
-        const verifyShape = { verified: [{ publicClaimId: CLAIM_ONE_ID, files: ["src/a.ts"] }], updated: [], archived: [] };
+        const verifyShape = VERIFY_EVIDENCE;
         expect(parseRunReport({ ...baseReport, parsedManifest: verifyShape }).parsedManifest).toEqual(verifyShape);
         // Absent evidence belongs to a run that failed before scoring, so the
         // null case rides on an ERROR report; a PASS must carry both fields.
@@ -675,12 +690,33 @@ describe("dreamer eval report contract", () => {
             parseRunReport({ ...baseReport, status: "ERROR", reason: "harness-failure", parsedManifest: null })
                 .parsedManifest,
         ).toBeNull();
-        expect(() => parseRunReport({ ...baseReport, parsedManifest: ["not-a-record"] })).toThrow(
-            /parsedManifest\[0\]: object-required/,
-        );
+        expect(() =>
+            parseRunReport({ ...baseReport, task: "map-memories", parsedManifest: ["not-a-record"] }),
+        ).toThrow(/parsedManifest\[0\]: object-required/);
         expect(() => parseRunReport({ ...baseReport, parsedManifest: "not-a-manifest" })).toThrow(
             /parsedManifest: object-required/,
         );
+        // A shape no scorer emits, and evidence naming a claim the run never
+        // observed, are both refused.
+        expect(() => parseRunReport({ ...baseReport, parsedManifest: {} })).toThrow(
+            /parsedManifest: fields-invalid/,
+        );
+        expect(() =>
+            parseRunReport({ ...baseReport, parsedManifest: { verified: [], updated: [], archived: [] } }),
+        ).toThrow(/parsedManifest: evidence-empty/);
+        expect(() => parseRunReport({ ...baseReport, task: "map-memories", parsedManifest: [] })).toThrow(
+            /parsedManifest: evidence-empty/,
+        );
+        expect(() =>
+            parseRunReport({
+                ...baseReport,
+                parsedManifest: {
+                    verified: [{ publicClaimId: CLAIM_TWO_ID, files: ["src/a.ts"] }],
+                    updated: [],
+                    archived: [],
+                },
+            }),
+        ).toThrow(/verified\[0\].publicClaimId: unobserved-claim/);
     });
 
     test("a report snapshot array cannot repeat a claim", () => {
@@ -871,6 +907,7 @@ describe("dreamer eval report contract", () => {
                 task: "map-memories",
                 status: "FAIL",
                 reason: "wrong-independence",
+                parsedManifest: [{ publicClaimId: OBSERVED_ID, files: ["src/a.ts"], independent: false }],
             }).reason,
         ).toBe("wrong-independence");
     });

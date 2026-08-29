@@ -183,15 +183,18 @@ function passingUpdateContent(
     ledger.delete(claimIdentity(claim.category, claim.content));
     let content = buildUpdateContent(gold);
     // Padding shifts the normalized identity while keeping every anchor present,
-    // which is what makes such a fixture satisfiable rather than broken.
-    for (let attempt = 0; ledger.has(claimIdentity(claim.category, content)); attempt += 1) {
-        if (attempt >= MAX_IDENTITY_PAD_ATTEMPTS) {
-            throw new Error("mutation fixture needs update anchors that avoid every live claim identity");
-        }
+    // which is what makes such a fixture satisfiable rather than broken. Each pad
+    // appends a distinct suffix and the ledger is finite, so a free identity
+    // arrives within `ledger.size + 1` attempts; the content cap is the real
+    // limit, and it is checked below.
+    for (let attempt = 0; attempt <= ledger.size && ledger.has(claimIdentity(claim.category, content)); attempt += 1) {
         content = `${content} ${fillerAbsentFrom(
             gold.forbiddenUpdateAnchors,
             "a pad character absent from every forbidden update anchor",
         )}`;
+    }
+    if (ledger.has(claimIdentity(claim.category, content))) {
+        throw new Error("mutation fixture needs update anchors that avoid every live claim identity");
     }
     if (content.length > VERIFY_UPDATE_CONTENT_MAX_LENGTH) {
         throw new Error("mutation fixture needs required update anchors that join within the content cap");
@@ -200,8 +203,6 @@ function passingUpdateContent(
     return content;
 }
 
-/** Each pad appends a distinct suffix, so a free identity arrives immediately or the fixture is pathological. */
-const MAX_IDENTITY_PAD_ATTEMPTS = 8;
 
 function buildUpdateContent(gold: VerifyGoldClaim): string {
     if (gold.requiredUpdateAnchors.length === 0) {

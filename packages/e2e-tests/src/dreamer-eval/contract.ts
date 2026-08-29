@@ -595,11 +595,13 @@ function parseClassifyGold(raw: unknown, label: string, pool: ReadonlyMap<string
         if (min > max) fail(`${importanceLabel}: range-invalid`);
         const shareable = boolean(item.shareable, `${itemLabel}.shareable`);
         // `applyClassifications` forces shareable to false before writing the
-        // revision whenever the claim content trips the same predicate, so gold
-        // asking for shareable on sensitive content describes a pool the host
-        // will never produce: the model's "true" would score PASS while the
-        // stored claim came out private.
-        if (shareable && hasShareabilitySensitiveText(poolClaim.content)) {
+        // revision whenever the claim content trips the same predicate — but only
+        // when the entry explicitly reports `true`. An entry that omits the field
+        // preserves the stored value, so gold asking for shareable is achievable
+        // for a sensitive claim already stored that way, and unachievable for one
+        // stored private: the model's "true" would score PASS while the stored
+        // claim came out private.
+        if (shareable && poolClaim.sharing !== "shareable" && hasShareabilitySensitiveText(poolClaim.content)) {
             fail(`${itemLabel}.shareable: shareability-override`);
         }
         return {
@@ -918,10 +920,53 @@ function parseSystem(raw: unknown, label: string): DreamerSystemTuple {
     };
 }
 
-function parseManifestEvidence(value: unknown, label: string): ParsedManifestEvidence | null {
+/**
+ * Parsed evidence, validated against the shape the declared task's scorer
+ * actually produces.
+ *
+ * Verify parses to one record of three verdict lists, map and classify to one
+ * entry per claim, and each parser refuses a manifest that yielded no entries —
+ * so an empty record or array is evidence no scorer could have emitted.
+ *
+ * `observedPublicIds` is null for an ERROR run, whose pool capture may be
+ * partial; for a completed one every public id must name a claim the report
+ * captured, since evidence about a claim absent from the pool describes a
+ * different experiment.
+ */
+function parseManifestEvidence(
+    value: unknown,
+    label: string,
+    task: DreamerTask,
+    observedPublicIds: ReadonlySet<string> | null,
+): ParsedManifestEvidence | null {
     if (value === null) return null;
-    if (Array.isArray(value)) return array(value, label).map((entry, index) => record(entry, `${label}[${index}]`));
-    return record(value, label);
+    const entryId = (entry: Record<string, unknown>, entryLabel: string): void => {
+        const publicClaimId = string(entry.publicClaimId, `${entryLabel}.publicClaimId`);
+        if (!isValidPublicClaimId(publicClaimId)) fail(`${entryLabel}.publicClaimId: id-invalid`);
+        if (observedPublicIds !== null && !observedPublicIds.has(publicClaimId)) {
+            fail(`${entryLabel}.publicClaimId: unobserved-claim`);
+        }
+    };
+    if (task === "verify" || task === "verify-broad") {
+        const root = record(value, label);
+        exact(root, ["verified", "updated", "archived"], label);
+        let entries = 0;
+        for (const key of ["verified", "updated", "archived"] as const) {
+            for (const [index, entry] of array(root[key], `${label}.${key}`).entries()) {
+                entryId(record(entry, `${label}.${key}[${index}]`), `${label}.${key}[${index}]`);
+                entries += 1;
+            }
+        }
+        if (entries === 0) fail(`${label}: evidence-empty`);
+        return root;
+    }
+    const entries = array(value, label).map((entry, index) => {
+        const item = record(entry, `${label}[${index}]`);
+        entryId(item, `${label}[${index}]`);
+        return item;
+    });
+    if (entries.length === 0) fail(`${label}: evidence-empty`);
+    return entries;
 }
 
 /**
@@ -991,7 +1036,12 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
         };
     });
     const rawManifest = nullableRawText(root.rawManifest, `${label}.rawManifest`);
-    const parsedManifest = parseManifestEvidence(root.parsedManifest, `${label}.parsedManifest`);
+    const parsedManifest = parseManifestEvidence(
+        root.parsedManifest,
+        `${label}.parsedManifest`,
+        task,
+        status === "ERROR" ? null : new Set(poolBefore.map((claim) => claim.publicClaimId)),
+    );
     // A scorer reaches PASS only after a nonblank manifest survives validation
     // and yields parsed evidence, so a PASS carrying blank bytes or no evidence
     // claims a scored experiment with nothing showing a model was scored. Blank
