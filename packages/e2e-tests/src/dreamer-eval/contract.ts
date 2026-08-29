@@ -702,6 +702,24 @@ function parseManifestEvidence(value: unknown, label: string): ParsedManifestEvi
     return record(value, label);
 }
 
+/**
+ * Whether both snapshots carry the same claim identities under the same public
+ * bindings. Each array is already unique on both keys, so comparing sorted
+ * pairs decides set equality; NUL joins the pair because neither identifier can
+ * contain it.
+ */
+function sameIdentityBindings(
+    before: readonly ClaimSnapshotProjection[],
+    after: readonly ClaimSnapshotProjection[],
+): boolean {
+    if (before.length !== after.length) return false;
+    const bindings = (claims: readonly ClaimSnapshotProjection[]) =>
+        claims.map((claim) => `${claim.claimId}\u0000${claim.publicClaimId}`).sort();
+    const left = bindings(before);
+    const right = bindings(after);
+    return left.every((binding, index) => binding === right[index]);
+}
+
 export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunReport {
     const root = record(raw, label);
     exact(root, ["schema", "scenarioId", "task", "runId", "nowMs", "status", "reason", "runFatal", "system", "poolBefore", "poolAfter", "rawManifest", "parsedManifest", "receiptOutcomes"], label);
@@ -719,6 +737,16 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
     if (runFatal !== isRunFatal(status, reason)) fail(`${label}.runFatal: mapping-invalid`);
     const poolBefore = parseSnapshotArray(root.poolBefore, `${label}.poolBefore`);
     const poolAfter = parseSnapshotArray(root.poolAfter, `${label}.poolAfter`);
+    // No evaluated task creates, deletes, or rekeys a claim — archival shows up
+    // as lifecycleState on the same row — so a completed run observes the same
+    // identities before and after. Drift means the report either omitted an
+    // affected claim or bound one claim's result to another identity, and each
+    // silently corrupts a before/after comparison. An ERROR run is exempt: it
+    // may have failed before capturing the pool, so a partial capture is the
+    // honest record there.
+    if (status !== "ERROR" && !sameIdentityBindings(poolBefore, poolAfter)) {
+        fail(`${label}.poolAfter: identity-drift`);
+    }
     const receiptOutcomes = array(root.receiptOutcomes, `${label}.receiptOutcomes`).map((entry, index) => {
         const itemLabel = `${label}.receiptOutcomes[${index}]`;
         const item = record(entry, itemLabel);
@@ -749,6 +777,10 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
 
 export function dreamerEvalExitCode(report: DreamerEvalRunReport | readonly DreamerEvalRunReport[]): 0 | 1 | 2 {
     const reports = Array.isArray(report) ? report : [report];
+    // Every valid scenario carries at least one task, so an empty aggregation
+    // means no evaluation ran. Returning 0 for it would report success for a
+    // selection that silently produced nothing.
+    if (reports.length === 0) return 1;
     if (reports.some((entry) => entry.runFatal)) return 2;
     if (reports.some((entry) => entry.status !== "PASS")) return 1;
     return 0;

@@ -449,7 +449,75 @@ describe("dreamer eval report contract", () => {
                 }),
             ).toThrow(new RegExp(`${field}.publicClaimId: duplicate`));
         }
-        expect(parseRunReport({ ...baseReport, poolBefore: [snapshot] }).poolBefore).toHaveLength(1);
+        // Both snapshots carry the claim: a completed run observes the same
+        // identities before and after, which the identity-drift check enforces.
+        expect(
+            parseRunReport({ ...baseReport, poolBefore: [snapshot], poolAfter: [snapshot] }).poolBefore,
+        ).toHaveLength(1);
+    });
+
+    test("a completed report cannot change which claims it observed", () => {
+        const snapshot = {
+            claimId: "claim-1",
+            publicClaimId: "mcm_one",
+            revisionLocator: "mcm_one@1",
+            content: "Distinct memory content",
+            category: "CONSTRAINTS",
+            importance: 50,
+            memoryScope: "project",
+            sharing: "private",
+            lifecycleState: "active",
+            files: ["src/a.ts"],
+            verificationOutcome: null,
+        };
+        // No task creates, deletes, or rekeys a claim, so an omitted or rebound
+        // identity is a corrupt before/after comparison rather than a real
+        // observation.
+        expect(() => parseRunReport({ ...baseReport, poolBefore: [snapshot], poolAfter: [] })).toThrow(
+            /poolAfter: identity-drift/,
+        );
+        expect(() =>
+            parseRunReport({
+                ...baseReport,
+                poolBefore: [snapshot],
+                poolAfter: [{ ...snapshot, publicClaimId: "mcm_two" }],
+            }),
+        ).toThrow(/poolAfter: identity-drift/);
+        expect(() =>
+            parseRunReport({
+                ...baseReport,
+                status: "FAIL",
+                reason: "wrong-verdict",
+                poolBefore: [snapshot],
+                poolAfter: [{ ...snapshot, claimId: "claim-2", publicClaimId: "mcm_two" }],
+            }),
+        ).toThrow(/poolAfter: identity-drift/);
+        // Archival is a lifecycleState change on the same identity, so it is not
+        // drift.
+        expect(
+            parseRunReport({
+                ...baseReport,
+                poolBefore: [snapshot],
+                poolAfter: [{ ...snapshot, lifecycleState: "archived" }],
+            }).poolAfter[0]?.lifecycleState,
+        ).toBe("archived");
+        // An ERROR run may have failed before capturing the pool.
+        expect(
+            parseRunReport({
+                ...baseReport,
+                status: "ERROR",
+                reason: "harness-failure",
+                poolBefore: [snapshot],
+                poolAfter: [],
+            }).poolAfter,
+        ).toHaveLength(0);
+    });
+
+    test("an empty aggregation is not a pass", () => {
+        // Every valid scenario carries at least one task, so nothing to
+        // aggregate means no evaluation ran.
+        expect(dreamerEvalExitCode([])).toBe(1);
+        expect(dreamerEvalExitCode([parseRunReport(baseReport)])).toBe(0);
     });
 
     test("a commit sha must be a full object id, not an intermediate length", () => {

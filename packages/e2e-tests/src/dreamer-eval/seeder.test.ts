@@ -377,6 +377,41 @@ describe("dreamer eval seeder", () => {
         );
     });
 
+    test("a claim cannot declare a case alias of the reserved fixture marker", async () => {
+        const selectedScenario = scenario("verify");
+        // A case-insensitive filesystem maps this onto the marker, so the marker
+        // write would replace the authored content while every check passed.
+        selectedScenario.pool.claims[0]!.fixtureFiles = [
+            { path: ".DREAMER-EVAL-FIXTURE", content: "not the marker\n" },
+        ];
+
+        await expect(
+            seedDreamerEvalTask({
+                db: database(),
+                scenario: selectedScenario,
+                task: selectedScenario.tasks[0]!,
+                workdir: workdir(),
+            }),
+        ).rejects.toThrow("ERROR:fixture-drift: fixture path is reserved: .DREAMER-EVAL-FIXTURE");
+    });
+
+    test("two fixture paths cannot differ only by case", async () => {
+        const selectedScenario = scenario("verify");
+        // Every other mapped claim declares src/current.ts, so this differs from
+        // them only in case and would share one file on a case-insensitive
+        // volume.
+        selectedScenario.pool.claims[0]!.fixtureFiles = [{ path: "src/Current.ts", content: "a\n" }];
+
+        await expect(
+            seedDreamerEvalTask({
+                db: database(),
+                scenario: selectedScenario,
+                task: selectedScenario.tasks[0]!,
+                workdir: workdir(),
+            }),
+        ).rejects.toThrow("differ only by case");
+    });
+
     test("reports a result mode the production gate did not return", async () => {
         const selectedScenario = scenario("verify");
         const selectedTask = selectedScenario.tasks[0]!;
