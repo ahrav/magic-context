@@ -366,7 +366,7 @@ function persistShadowDescriptor(db: Database, registration: ShadowEmbeddingRegi
     if (!descriptorTable) return;
     const fields = synapseConfigFields(registration.config);
     const now = Date.now();
-    db.prepare(
+    const upsert = db.prepare(
         `INSERT INTO shadow_embedding_registrations
             (project_path, scope, model_id, generation, fingerprint, table_epoch, dims, provenance_json, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -377,61 +377,25 @@ function persistShadowDescriptor(db: Database, registration: ShadowEmbeddingRegi
             dims = excluded.dims,
             provenance_json = excluded.provenance_json,
             updated_at = excluded.updated_at`,
-    ).run(
-        registration.projectIdentity,
-        "memory",
-        registration.modelId,
-        registration.generation,
-        fields.fingerprint ?? "",
-        fields.tableEpoch ?? 0,
-        fields.dims ?? 0,
-        JSON.stringify(fields.provenance ?? {}),
-        now,
     );
-    db.prepare(
-        `INSERT INTO shadow_embedding_registrations
-            (project_path, scope, model_id, generation, fingerprint, table_epoch, dims, provenance_json, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(project_path, scope, model_id) DO UPDATE SET
-            generation = excluded.generation,
-            fingerprint = excluded.fingerprint,
-            table_epoch = excluded.table_epoch,
-            dims = excluded.dims,
-            provenance_json = excluded.provenance_json,
-            updated_at = excluded.updated_at`,
-    ).run(
-        registration.projectIdentity,
-        "commit",
-        registration.modelId,
-        registration.generation,
-        fields.fingerprint ?? "",
-        fields.tableEpoch ?? 0,
-        fields.dims ?? 0,
-        JSON.stringify(fields.provenance ?? {}),
-        now,
-    );
-    db.prepare(
-        `INSERT INTO shadow_embedding_registrations
-            (project_path, scope, model_id, generation, fingerprint, table_epoch, dims, provenance_json, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(project_path, scope, model_id) DO UPDATE SET
-            generation = excluded.generation,
-            fingerprint = excluded.fingerprint,
-            table_epoch = excluded.table_epoch,
-            dims = excluded.dims,
-            provenance_json = excluded.provenance_json,
-            updated_at = excluded.updated_at`,
-    ).run(
-        registration.projectIdentity,
-        "chunk",
-        registration.chunkModelId,
-        registration.generation,
-        fields.fingerprint ?? "",
-        fields.tableEpoch ?? 0,
-        fields.dims ?? 0,
-        JSON.stringify(fields.provenance ?? {}),
-        now,
-    );
+    const scopedModels = [
+        ["memory", registration.modelId],
+        ["commit", registration.modelId],
+        ["chunk", registration.chunkModelId],
+    ] as const;
+    for (const [scope, modelId] of scopedModels) {
+        upsert.run(
+            registration.projectIdentity,
+            scope,
+            modelId,
+            registration.generation,
+            fields.fingerprint ?? "",
+            fields.tableEpoch ?? 0,
+            fields.dims ?? 0,
+            JSON.stringify(fields.provenance ?? {}),
+            now,
+        );
+    }
 }
 
 function clearDeferredDescriptor(
@@ -468,6 +432,35 @@ function resolvedSynapseConfigFromMetadata(
     } as unknown as EmbeddingConfig);
 }
 
+/**
+ * Adopt a newly resolved primary identity onto the registration and persist it
+ * (active-identity rows + primary descriptor) in one transaction.
+ */
+function adoptPrimaryIdentity(
+    registration: ProjectEmbeddingRegistration,
+    config: EmbeddingConfig,
+    providerIdentity: string,
+    chunkModelId: string,
+    modelIds: { modelId: string; chunkModelId: string },
+): void {
+    registration.config = config;
+    registration.providerIdentity = providerIdentity;
+    registration.runtimeFingerprint = getRuntimeFingerprint(config);
+    registration.modelId = modelIds.modelId;
+    registration.chunkModelId = modelIds.chunkModelId;
+    registration.generation = ++globalRegistrationGeneration;
+    registration.db.transaction(() => {
+        recordActiveEmbeddingIdentityInCurrentTransaction(
+            registration.db,
+            registration.projectIdentity,
+            providerIdentity,
+            chunkModelId,
+            registration.features,
+        );
+        persistPrimaryDescriptor(registration.db, registration);
+    })();
+}
+
 function commitPrimarySynapseLane(
     registration: ProjectEmbeddingRegistration,
     metadata: import("./memory/embedding-synapse").SynapseLaneMetadata,
@@ -484,22 +477,10 @@ function commitPrimarySynapseLane(
     );
     const providerIdentity = getEmbeddingProviderIdentity(config);
     const chunkModelId = getChunkEmbeddingModelId(config, providerIdentity);
-    registration.config = config;
-    registration.providerIdentity = providerIdentity;
-    registration.runtimeFingerprint = getRuntimeFingerprint(config);
-    registration.modelId = providerIdentity;
-    registration.chunkModelId = chunkModelId;
-    registration.generation = ++globalRegistrationGeneration;
-    registration.db.transaction(() => {
-        recordActiveEmbeddingIdentityInCurrentTransaction(
-            registration.db,
-            registration.projectIdentity,
-            providerIdentity,
-            chunkModelId,
-            registration.features,
-        );
-        persistPrimaryDescriptor(registration.db, registration);
-    })();
+    adoptPrimaryIdentity(registration, config, providerIdentity, chunkModelId, {
+        modelId: providerIdentity,
+        chunkModelId,
+    });
 }
 
 function activatePrimarySynapseFallback(registration: ProjectEmbeddingRegistration): boolean {
@@ -515,23 +496,11 @@ function activatePrimarySynapseFallback(registration: ProjectEmbeddingRegistrati
     const providerIdentity = getEmbeddingProviderIdentity(config);
     const chunkModelId = getChunkEmbeddingModelId(config, providerIdentity);
     const previousProvider = registration.provider;
-    registration.config = config;
-    registration.providerIdentity = providerIdentity;
-    registration.runtimeFingerprint = getRuntimeFingerprint(config);
     registration.provider = null;
-    registration.modelId = providerIdentity === OFF_PROVIDER_IDENTITY ? "off" : providerIdentity;
-    registration.chunkModelId = providerIdentity === OFF_PROVIDER_IDENTITY ? "off" : chunkModelId;
-    registration.generation = ++globalRegistrationGeneration;
-    registration.db.transaction(() => {
-        recordActiveEmbeddingIdentityInCurrentTransaction(
-            registration.db,
-            registration.projectIdentity,
-            providerIdentity,
-            chunkModelId,
-            registration.features,
-        );
-        persistPrimaryDescriptor(registration.db, registration);
-    })();
+    adoptPrimaryIdentity(registration, config, providerIdentity, chunkModelId, {
+        modelId: providerIdentity === OFF_PROVIDER_IDENTITY ? "off" : providerIdentity,
+        chunkModelId: providerIdentity === OFF_PROVIDER_IDENTITY ? "off" : chunkModelId,
+    });
     disposeProvider(previousProvider);
     return true;
 }
@@ -2648,40 +2617,29 @@ export async function embedItemsForProject(
     let provider = getOrCreateProjectProvider(registration);
     if (!provider) return null;
 
-    let vectors: Map<string, Float32Array>;
-    if (provider.embedItems) {
-        vectors = await provider.embedItems(items, signal);
-    } else {
-        const positional = await provider.embedBatch(
+    const embedVia = async (
+        p: NonNullable<typeof provider>,
+    ): Promise<Map<string, Float32Array>> => {
+        if (p.embedItems) {
+            return p.embedItems(items, signal);
+        }
+        const positional = await p.embedBatch(
             items.map((item) => item.text),
             signal,
             "passage",
         );
-        vectors = new Map(
+        return new Map(
             items.flatMap((item, index) => {
                 const vector = positional[index];
                 return vector ? [[item.id, vector] as const] : [];
             }),
         );
-    }
+    };
+    let vectors = await embedVia(provider);
     if (vectors.size === 0 && !signal?.aborted && activatePrimarySynapseFallback(registration)) {
         provider = getOrCreateProjectProvider(registration);
         if (!provider) return null;
-        if (provider.embedItems) {
-            vectors = await provider.embedItems(items, signal);
-        } else {
-            const positional = await provider.embedBatch(
-                items.map((item) => item.text),
-                signal,
-                "passage",
-            );
-            vectors = new Map(
-                items.flatMap((item, index) => {
-                    const vector = positional[index];
-                    return vector ? [[item.id, vector] as const] : [];
-                }),
-            );
-        }
+        vectors = await embedVia(provider);
     }
 
     if (projectRegistrations.get(projectIdentity) !== registration) return null;

@@ -240,25 +240,32 @@ export function scheduleOpenCodeTransformDecisionWrite(args: {
     return true;
 }
 
+/** The entry id when `entries[i]` is an assistant message entry with a non-empty id. */
+function assistantEntryIdAt(entries: readonly unknown[], i: number): string | null {
+    const entry = entries[i];
+    if (!entry || typeof entry !== "object") return null;
+    const row = entry as { id?: unknown; type?: unknown; message?: unknown };
+    if (row.type !== "message" || typeof row.id !== "string" || row.id.length === 0) {
+        return null;
+    }
+    const message = row.message;
+    if (
+        message &&
+        typeof message === "object" &&
+        (message as { role?: unknown }).role === "assistant"
+    ) {
+        return row.id;
+    }
+    return null;
+}
+
 export function findNewestPiAssistantEntryId(
     entries: readonly unknown[] | null | undefined,
 ): string | null {
     if (!Array.isArray(entries)) return null;
     for (let i = entries.length - 1; i >= 0; i--) {
-        const entry = entries[i];
-        if (!entry || typeof entry !== "object") continue;
-        const row = entry as { id?: unknown; type?: unknown; message?: unknown };
-        if (row.type !== "message" || typeof row.id !== "string" || row.id.length === 0) {
-            continue;
-        }
-        const message = row.message;
-        if (
-            message &&
-            typeof message === "object" &&
-            (message as { role?: unknown }).role === "assistant"
-        ) {
-            return row.id;
-        }
+        const id = assistantEntryIdAt(entries, i);
+        if (id !== null) return id;
     }
     return null;
 }
@@ -352,20 +359,8 @@ function findNewestPiAssistantEntryIdAfter(
     }
 
     for (let i = startIndex; i < entries.length; i++) {
-        const entry = entries[i];
-        if (!entry || typeof entry !== "object") continue;
-        const row = entry as { id?: unknown; type?: unknown; message?: unknown };
-        if (row.type !== "message" || typeof row.id !== "string" || row.id.length === 0) {
-            continue;
-        }
-        const message = row.message;
-        if (
-            message &&
-            typeof message === "object" &&
-            (message as { role?: unknown }).role === "assistant"
-        ) {
-            return row.id;
-        }
+        const id = assistantEntryIdAt(entries, i);
+        if (id !== null) return id;
     }
     return null;
 }

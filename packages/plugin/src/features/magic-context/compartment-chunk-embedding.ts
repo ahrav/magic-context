@@ -1009,6 +1009,30 @@ function mapBackfillCandidateRows(rows: unknown[]): CompartmentChunkBackfillCand
         }));
 }
 
+/**
+ * Shared body of the "unembedded session compartment" queries: the candidate
+ * SELECTs and the `/ctx-embed-history` progress COUNT interpolate this same
+ * predicate, so the progress total and the actual work can never disagree.
+ * Compile-time constant; binds are positional (`project_path`, `session_id`,
+ * then the NOT EXISTS `project_path`, `model_id`).
+ */
+const UNEMBEDDED_SESSION_COMPARTMENT_PREDICATE = `FROM compartments c
+             JOIN session_projects sp
+               ON sp.session_id = c.session_id
+              AND sp.harness = c.harness
+              AND sp.project_path = ?
+             WHERE c.session_id = ?
+               AND c.start_message IS NOT NULL
+               AND c.end_message IS NOT NULL`;
+
+const UNEMBEDDED_COMPARTMENT_NOT_EXISTS = `AND NOT EXISTS (
+                   SELECT 1
+                   FROM compartment_chunk_embeddings current
+                   WHERE current.compartment_id = c.id
+                     AND current.project_path = ?
+                     AND current.model_id = ?
+               )`;
+
 const sessionBackfillCandidateStatements = new WeakMap<Database, PreparedStatement>();
 
 /** Session-scoped variant of {@link loadUnembeddedCompartmentChunkCandidates}.
@@ -1040,22 +1064,9 @@ export function loadUnembeddedSessionChunkCandidates(
                     c.end_message AS endMessage,
                     c.title AS title,
                     c.created_at AS createdAt
-             FROM compartments c
-             JOIN session_projects sp
-               ON sp.session_id = c.session_id
-              AND sp.harness = c.harness
-              AND sp.project_path = ?
-             WHERE c.session_id = ?
-               AND c.start_message IS NOT NULL
-               AND c.end_message IS NOT NULL
+             ${UNEMBEDDED_SESSION_COMPARTMENT_PREDICATE}
                AND c.id NOT IN (${placeholders})
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM compartment_chunk_embeddings current
-                   WHERE current.compartment_id = c.id
-                     AND current.project_path = ?
-                     AND current.model_id = ?
-               )
+               ${UNEMBEDDED_COMPARTMENT_NOT_EXISTS}
              ORDER BY c.start_message ASC, c.id ASC
              LIMIT ?`,
         );
@@ -1078,21 +1089,8 @@ export function loadUnembeddedSessionChunkCandidates(
                     c.end_message AS endMessage,
                     c.title AS title,
                     c.created_at AS createdAt
-             FROM compartments c
-             JOIN session_projects sp
-               ON sp.session_id = c.session_id
-              AND sp.harness = c.harness
-              AND sp.project_path = ?
-             WHERE c.session_id = ?
-               AND c.start_message IS NOT NULL
-               AND c.end_message IS NOT NULL
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM compartment_chunk_embeddings current
-                   WHERE current.compartment_id = c.id
-                     AND current.project_path = ?
-                     AND current.model_id = ?
-               )
+             ${UNEMBEDDED_SESSION_COMPARTMENT_PREDICATE}
+               ${UNEMBEDDED_COMPARTMENT_NOT_EXISTS}
              ORDER BY c.start_message ASC, c.id ASC
              LIMIT ?`,
         );
@@ -1119,21 +1117,8 @@ export function countUnembeddedSessionCompartments(
     const row = db
         .prepare(
             `SELECT COUNT(*) AS n
-             FROM compartments c
-             JOIN session_projects sp
-               ON sp.session_id = c.session_id
-              AND sp.harness = c.harness
-              AND sp.project_path = ?
-             WHERE c.session_id = ?
-               AND c.start_message IS NOT NULL
-               AND c.end_message IS NOT NULL
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM compartment_chunk_embeddings current
-                   WHERE current.compartment_id = c.id
-                     AND current.project_path = ?
-                     AND current.model_id = ?
-               )`,
+             ${UNEMBEDDED_SESSION_COMPARTMENT_PREDICATE}
+               ${UNEMBEDDED_COMPARTMENT_NOT_EXISTS}`,
         )
         .get(projectPath, sessionId, projectPath, modelId) as { n?: number } | undefined;
     return typeof row?.n === "number" ? row.n : 0;

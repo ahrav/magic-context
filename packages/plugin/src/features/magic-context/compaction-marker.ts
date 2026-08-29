@@ -34,6 +34,7 @@ import { getDataDir } from "../../shared/data-path";
 import { log } from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { tableColumnSet } from "./storage-schema-helpers";
 
 // ── ID Generation ────────────────────────────────────────────────
 
@@ -121,16 +122,8 @@ function isOpenCodeSchemaCompatible(db: Database, dbPath: string): boolean {
     }
 
     try {
-        const messageCols = new Set(
-            (db.prepare("PRAGMA table_info(message)").all() as Array<{ name?: string }>)
-                .map((r) => r.name ?? "")
-                .filter((n) => n.length > 0),
-        );
-        const partCols = new Set(
-            (db.prepare("PRAGMA table_info(part)").all() as Array<{ name?: string }>)
-                .map((r) => r.name ?? "")
-                .filter((n) => n.length > 0),
-        );
+        const messageCols = tableColumnSet(db, "message");
+        const partCols = tableColumnSet(db, "part");
 
         const missingMessage = REQUIRED_MESSAGE_COLUMNS.filter((c) => !messageCols.has(c));
         const missingPart = REQUIRED_PART_COLUMNS.filter((c) => !partCols.has(c));
@@ -419,6 +412,30 @@ function removeLegacyMarkerLineageRows(
  * Inject a compaction marker into OpenCode's DB.
  * Returns the marker state if successful, null if boundary couldn't be found.
  */
+/** Upsert one `part` row by deterministic id; retries rewrite the exact canonical row. */
+function upsertPartRow(
+    db: Database,
+    row: {
+        id: string;
+        messageId: string;
+        sessionId: string;
+        timeCreated: number;
+        timeUpdated: number;
+        data: string;
+    },
+): void {
+    db.prepare(
+        `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+             message_id = excluded.message_id,
+             session_id = excluded.session_id,
+             time_created = excluded.time_created,
+             time_updated = excluded.time_updated,
+             data = excluded.data`,
+    ).run(row.id, row.messageId, row.sessionId, row.timeCreated, row.timeUpdated, row.data);
+}
+
 export function injectCompactionMarker(
     args: InjectCompactionMarkerArgs,
 ): CompactionMarkerState | null {
@@ -480,23 +497,14 @@ export function injectCompactionMarker(
 
             // Deterministic IDs make this transaction an upsert on retry. Rewriting
             // the exact canonical row also repairs a partial or stale prior write.
-            db.prepare(
-                `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
-                 VALUES (?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(id) DO UPDATE SET
-                     message_id = excluded.message_id,
-                     session_id = excluded.session_id,
-                     time_created = excluded.time_created,
-                     time_updated = excluded.time_updated,
-                     data = excluded.data`,
-            ).run(
-                compactionPartId,
-                boundary.id,
-                args.sessionId,
-                boundaryTime,
-                boundaryTime,
-                '{"type":"compaction","auto":true}',
-            );
+            upsertPartRow(db, {
+                id: compactionPartId,
+                messageId: boundary.id,
+                sessionId: args.sessionId,
+                timeCreated: boundaryTime,
+                timeUpdated: boundaryTime,
+                data: '{"type":"compaction","auto":true}',
+            });
 
             db.prepare(
                 `INSERT INTO message (id, session_id, time_created, time_updated, data)
@@ -508,23 +516,14 @@ export function injectCompactionMarker(
                      data = excluded.data`,
             ).run(summaryMsgId, args.sessionId, boundaryTime + 1, boundaryTime + 1, summaryMsgData);
 
-            db.prepare(
-                `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
-                 VALUES (?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(id) DO UPDATE SET
-                     message_id = excluded.message_id,
-                     session_id = excluded.session_id,
-                     time_created = excluded.time_created,
-                     time_updated = excluded.time_updated,
-                     data = excluded.data`,
-            ).run(
-                summaryPartId,
-                summaryMsgId,
-                args.sessionId,
-                boundaryTime + 1,
-                boundaryTime + 1,
-                JSON.stringify({ type: "text", text: args.summaryText }),
-            );
+            upsertPartRow(db, {
+                id: summaryPartId,
+                messageId: summaryMsgId,
+                sessionId: args.sessionId,
+                timeCreated: boundaryTime + 1,
+                timeUpdated: boundaryTime + 1,
+                data: JSON.stringify({ type: "text", text: args.summaryText }),
+            });
         })();
 
         log(

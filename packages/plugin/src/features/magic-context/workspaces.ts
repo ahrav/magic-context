@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
+import { runImmediate } from "../../shared/sqlite";
 import { V2_MEMORY_CATEGORIES } from "./memory/constants";
 import { normalizeStoredProjectPath, storedPathBelongsToIdentity } from "./project-identity";
 import { collectAliasesForTargets, tableExists } from "./storage-project-identities";
@@ -338,16 +339,5 @@ export function bumpEpochsForWorkspaceMembers(
         run();
         return;
     }
-    db.exec("BEGIN IMMEDIATE");
-    try {
-        run();
-        db.exec("COMMIT");
-    } catch (error) {
-        try {
-            db.exec("ROLLBACK");
-        } catch {
-            // ignore rollback failures from an already-closed transaction
-        }
-        throw error;
-    }
+    runImmediate(db, run);
 }

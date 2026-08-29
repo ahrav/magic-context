@@ -2328,34 +2328,28 @@ async function executeUnifiedSearch(args: {
         return results;
     };
 
+    const vectorLaneArgs = (
+        onVectorLoad: VectorLoadObserver | undefined,
+        stages: HybridLaneStageMarks | undefined,
+    ) => ({
+        db,
+        projectPath,
+        query: trimmedQuery,
+        limit: tierLimit,
+        queryEmbedding,
+        queryModelId: embeddingModelId && embeddingModelId !== "off" ? embeddingModelId : null,
+        onVectorLoad,
+        stages,
+    });
+
     const runGitCommitLane = (): GitCommitSearchResult[] =>
         runVectorLane("git_commit", (onVectorLoad, stages) =>
-            searchGitCommits({
-                db,
-                projectPath,
-                query: trimmedQuery,
-                limit: tierLimit,
-                queryEmbedding,
-                queryModelId:
-                    embeddingModelId && embeddingModelId !== "off" ? embeddingModelId : null,
-                onVectorLoad,
-                stages,
-            }),
+            searchGitCommits(vectorLaneArgs(onVectorLoad, stages)),
         );
 
     const runPrimerLane = (): PrimerSearchResult[] =>
         runVectorLane("primer", (onVectorLoad, stages) =>
-            searchPrimers({
-                db,
-                projectPath,
-                query: trimmedQuery,
-                limit: tierLimit,
-                queryEmbedding,
-                queryModelId:
-                    embeddingModelId && embeddingModelId !== "off" ? embeddingModelId : null,
-                onVectorLoad,
-                stages,
-            }),
+            searchPrimers(vectorLaneArgs(onVectorLoad, stages)),
         );
 
     const runNoteLane = (): NoteSearchResult[] => {

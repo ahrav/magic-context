@@ -1008,14 +1008,12 @@ function maxNullableNumber(a: number | null, b: number | null): number | null {
     return null;
 }
 
-function getPiFallbackFoldTagRowByNumber(
-    db: Database,
-    sessionId: string,
-    tagNumber: number,
-): PiFallbackFoldTagRow | null {
-    const row = db
-        .prepare(
-            `SELECT tag_number AS tagNumber,
+/**
+ * Alias projection consumed by `isPiFallbackFoldTagRow`: every reader that
+ * gates rows through that predicate must select exactly this column list, or
+ * rows are silently filtered out.
+ */
+const PI_FALLBACK_FOLD_TAG_PROJECTION = `SELECT tag_number AS tagNumber,
                     message_id AS messageId,
                     tool_owner_message_id AS toolOwnerMessageId,
                     type,
@@ -1026,7 +1024,16 @@ function getPiFallbackFoldTagRowByNumber(
                     token_count AS tokenCount,
                     input_token_count AS inputTokenCount,
                     reasoning_token_count AS reasoningTokenCount
-             FROM tags
+             FROM tags`;
+
+function getPiFallbackFoldTagRowByNumber(
+    db: Database,
+    sessionId: string,
+    tagNumber: number,
+): PiFallbackFoldTagRow | null {
+    const row = db
+        .prepare(
+            `${PI_FALLBACK_FOLD_TAG_PROJECTION}
              WHERE session_id = ? AND tag_number = ?`,
         )
         .get(sessionId, tagNumber);
@@ -1041,18 +1048,7 @@ function getPiFallbackToolFoldTagRowByOwner(
 ): PiFallbackFoldTagRow | null {
     const row = db
         .prepare(
-            `SELECT tag_number AS tagNumber,
-                    message_id AS messageId,
-                    tool_owner_message_id AS toolOwnerMessageId,
-                    type,
-                    status,
-                    byte_size AS byteSize,
-                    reasoning_byte_size AS reasoningByteSize,
-                    input_byte_size AS inputByteSize,
-                    token_count AS tokenCount,
-                    input_token_count AS inputTokenCount,
-                    reasoning_token_count AS reasoningTokenCount
-             FROM tags
+            `${PI_FALLBACK_FOLD_TAG_PROJECTION}
              WHERE session_id = ?
                AND message_id = ?
                AND type = 'tool'
@@ -1070,18 +1066,7 @@ function getPiFallbackMessageFoldTagRowsByMessageId(
 ): PiFallbackFoldTagRow[] {
     return db
         .prepare(
-            `SELECT tag_number AS tagNumber,
-                    message_id AS messageId,
-                    tool_owner_message_id AS toolOwnerMessageId,
-                    type,
-                    status,
-                    byte_size AS byteSize,
-                    reasoning_byte_size AS reasoningByteSize,
-                    input_byte_size AS inputByteSize,
-                    token_count AS tokenCount,
-                    input_token_count AS inputTokenCount,
-                    reasoning_token_count AS reasoningTokenCount
-             FROM tags
+            `${PI_FALLBACK_FOLD_TAG_PROJECTION}
              WHERE session_id = ?
                AND message_id = ?
                AND type = 'message'
