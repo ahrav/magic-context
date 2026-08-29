@@ -103,11 +103,70 @@ export function resolveCortexKitProjectConfigPath(directory: string): string {
     return `${cortexKitProjectConfigBasePath(directory)}.jsonc`;
 }
 
+type LegacyHarness = "opencode" | "pi" | "any";
+
+/**
+ * The single legacy-base table every consumer derives from. `userScopeConfigPaths`
+ * is the guard that stops a project-scope migration from eating the user's own
+ * config, so the user-scope half of this table and the migration sources must
+ * stay one list: a base added to one but not the other silently escapes the
+ * guard.
+ */
+const LEGACY_BASES: ReadonlyArray<{
+    scope: "user" | "project";
+    harness: LegacyHarness;
+    base: (directory: string) => string;
+    label: string;
+}> = [
+    {
+        scope: "user",
+        harness: "opencode",
+        base: () => join(configHome(), "opencode", CONFIG_FILE_BASENAME),
+        label: "OpenCode user",
+    },
+    {
+        scope: "user",
+        harness: "pi",
+        base: () => join(homeDir(), ".pi", "agent", CONFIG_FILE_BASENAME),
+        label: "Pi user",
+    },
+    // The bare project-root `<root>/magic-context.*` was OpenCode-only historically.
+    {
+        scope: "project",
+        harness: "opencode",
+        base: (directory) => join(directory, CONFIG_FILE_BASENAME),
+        label: "project root",
+    },
+    {
+        scope: "project",
+        harness: "opencode",
+        base: (directory) => join(directory, ".opencode", CONFIG_FILE_BASENAME),
+        label: "OpenCode project",
+    },
+    {
+        scope: "project",
+        harness: "pi",
+        base: (directory) => join(directory, ".pi", CONFIG_FILE_BASENAME),
+        label: "Pi project",
+    },
+];
+
 function legacySourcesForBase(basePath: string, label: string): LegacyConfigSource[] {
     return [
         { path: `${basePath}.jsonc`, label: `${label} magic-context.jsonc` },
         { path: `${basePath}.json`, label: `${label} magic-context.json` },
     ];
+}
+
+/** Legacy sources from the table, filtered by scope and owning harness. */
+function legacyBaseSources(
+    scope: "user" | "project",
+    harness: ConfigHarness | "any",
+    directory: string,
+): LegacyConfigSource[] {
+    return LEGACY_BASES.filter(
+        (entry) => entry.scope === scope && (harness === "any" || entry.harness === harness),
+    ).flatMap((entry) => legacySourcesForBase(entry.base(directory), entry.label));
 }
 
 /**
@@ -122,10 +181,10 @@ function userScopeConfigPaths(): Set<string> {
         // `~/.config/cortexkit/magic-context.json` would still be eaten.
         `${cortexKitUserConfigBasePath()}.jsonc`,
         `${cortexKitUserConfigBasePath()}.json`,
-        join(configHome(), "opencode", `${CONFIG_FILE_BASENAME}.jsonc`),
-        join(configHome(), "opencode", `${CONFIG_FILE_BASENAME}.json`),
-        join(homeDir(), ".pi", "agent", `${CONFIG_FILE_BASENAME}.jsonc`),
-        join(homeDir(), ".pi", "agent", `${CONFIG_FILE_BASENAME}.json`),
+        ...LEGACY_BASES.filter((entry) => entry.scope === "user").flatMap((entry) => [
+            `${entry.base("")}.jsonc`,
+            `${entry.base("")}.json`,
+        ]),
     ]);
 }
 
@@ -149,24 +208,10 @@ export function resolveLegacyConfigSources(directory: string): {
 } {
     const userPaths = userScopeConfigPaths();
     return {
-        user: [
-            ...legacySourcesForBase(
-                join(configHome(), "opencode", CONFIG_FILE_BASENAME),
-                "OpenCode user",
-            ),
-            ...legacySourcesForBase(
-                join(homeDir(), ".pi", "agent", CONFIG_FILE_BASENAME),
-                "Pi user",
-            ),
-        ],
-        project: [
-            ...legacySourcesForBase(join(directory, CONFIG_FILE_BASENAME), "project root"),
-            ...legacySourcesForBase(
-                join(directory, ".opencode", CONFIG_FILE_BASENAME),
-                "OpenCode project",
-            ),
-            ...legacySourcesForBase(join(directory, ".pi", CONFIG_FILE_BASENAME), "Pi project"),
-        ].filter((source) => !userPaths.has(source.path)),
+        user: legacyBaseSources("user", "any", directory),
+        project: legacyBaseSources("project", "any", directory).filter(
+            (source) => !userPaths.has(source.path),
+        ),
     };
 }
 
@@ -186,30 +231,9 @@ export function resolveLegacyConfigSourcesForHarness(
     directory: string,
     harness: ConfigHarness,
 ): { user: LegacyConfigSource[]; project: LegacyConfigSource[] } {
-    if (harness === "pi") {
-        return {
-            user: legacySourcesForBase(
-                join(homeDir(), ".pi", "agent", CONFIG_FILE_BASENAME),
-                "Pi user",
-            ),
-            project: legacySourcesForBase(
-                join(directory, ".pi", CONFIG_FILE_BASENAME),
-                "Pi project",
-            ),
-        };
-    }
     return {
-        user: legacySourcesForBase(
-            join(configHome(), "opencode", CONFIG_FILE_BASENAME),
-            "OpenCode user",
-        ),
-        project: [
-            ...legacySourcesForBase(join(directory, CONFIG_FILE_BASENAME), "project root"),
-            ...legacySourcesForBase(
-                join(directory, ".opencode", CONFIG_FILE_BASENAME),
-                "OpenCode project",
-            ),
-        ],
+        user: legacyBaseSources("user", harness, directory),
+        project: legacyBaseSources("project", harness, directory),
     };
 }
 

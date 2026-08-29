@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-
+import type { LoadOutcome } from "../config/load-outcome";
 import type { EmbeddingConfig } from "../config/schema/magic-context";
 import {
     getProjectEmbeddingSnapshot,
@@ -9,13 +9,7 @@ import {
 import { log } from "../shared/logger";
 import type { Database } from "../shared/sqlite";
 
-export type LoadOutcome =
-    | "ok"
-    | "project-file-parse-error"
-    | "project-file-io-error"
-    | "legacy-config-unmigrated"
-    | "schema-recovery"
-    | "substitution-failure";
+export type { LoadOutcome };
 
 export interface EmbeddingLoadResultDetailed<TConfig extends { embedding: EmbeddingConfig }> {
     config: TConfig;
