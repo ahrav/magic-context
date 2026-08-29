@@ -30,15 +30,6 @@ pub const CLASSIFY_RECOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 ///
 /// The deadline bounds the start, await, and re-drain windows, so the last of
 /// them returns at the deadline. What follows is bounded but not free:
-/// `HistorianProducer::purge_session` wraps its whole `session.delete` plus
-/// `close` in `request_timeout` (30s), the host then reaps the Broca
-/// subprocess group under `SubprocessLimits::termination_grace` (5s between
-/// SIGTERM and SIGKILL), and the ledger write plus response dispatch need
-/// slack on top. A caller whose transport budget equals `timeout_ms` cancels
-/// inside that window: the handler task is dropped between the producer run
-/// and the purge, so nothing is recorded, no fallback can complete, and the
-/// attempt's billable run stays alive holding the memory-pool prompt.
-pub const CLASSIFY_CLEANUP_RESERVE: Duration = Duration::from_secs(40);
 
 /// This is deliberately a zero-tool system role. The host supplies the pool and
 /// retains the parser because accepting a caller-selected role would reopen the

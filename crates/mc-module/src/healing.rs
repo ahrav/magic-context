@@ -121,12 +121,11 @@ pub const fn coverage(profile: SerializerProfile) -> HealingCoverage {
 ///
 /// Every shipping profile is a full-array consumer: the provider request is rebuilt from
 /// the transformed array each pass, so prefix and tail rewrites both round-trip and the
-/// profile default is true. Claude Code was historically the one verbatim-tail profile —
-/// its Thalamus gateway byte-spliced the live tail, so a false default avoided phantom
-/// reclaims (mutations frozen by the module that the splice never carried into the real
-/// context). The peer retired that byte-splice at U0: full-array apply is now the only
-/// serving path and the fail-open arm forwards the current raw request, never stale or
-/// retained bytes, so Claude Code is full-array too. A fenced pass forwards strictly more
+/// profile default is true. Full-array apply is the only serving path — the
+/// Thalamus gateway does not byte-splice the live tail — and the fail-open arm
+/// forwards the current raw request, never stale or retained bytes, so Claude
+/// Code is full-array too and phantom reclaims (mutations frozen by the module
+/// that a splice never carries into the real context) cannot occur. A fenced pass forwards strictly more
 /// current content, and any tail mutation a fence skips simply reapplies on the next
 /// healthy pass. Prefix folding remains available regardless of the tail setting.
 pub const fn tail_reclaim(profile: SerializerProfile) -> bool {

@@ -982,21 +982,6 @@ pub fn wrapup_round_wait_budget() -> Duration {
 /// the consumers.
 pub const MAX_EMERGENCY_REQUEST_BUDGET: Duration = Duration::from_secs(1500);
 
-/// The transform-call deadline a consumer sets, VERBATIM, for every request whose fill
-/// signal is BELOW the emergency band (or unknown). Same no-consumer-arithmetic rule as
-/// `MAX_EMERGENCY_REQUEST_BUDGET`.
-///
-/// Derivation: below `scheduler::EMERGENCY_PERCENTAGE` a transform request NEVER blocks
-/// on historian model work — a fire spawns in the background (`spawn_historian_firing`)
-/// and the request path does classification, compose, and store I/O only. The measured
-/// request-path work is sub-second; the budget covers worst-case SQLite busy storms and
-/// scheduler stalls with wide margin. A hang past this value is a wedge, and failing
-/// open to the raw array is cheap at sub-emergency fill. Deliberately NOT tiered on the
-/// execute threshold: execute-band passes do more local work than defers but still no
-/// model work, so one non-emergency bound covers both and stays immune to
-/// `execute_threshold_percentage` retunes.
-pub const MAX_NONEMERGENCY_REQUEST_BUDGET: Duration = Duration::from_secs(120);
-
 /// Build the llm-runner session id owned by Magic Context for one historian firing.
 /// The firing sequence is part of the id so a fallback model attempt never resumes a
 /// failed run under a different model.

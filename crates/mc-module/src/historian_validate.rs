@@ -1481,7 +1481,7 @@ mod tests {
 
     #[test]
     fn mismatched_tier_close_parses_leniently_while_tierless_output_still_rejects() {
-        // Exact observed shape from issue #246: deepseek-v4-flash-free closes
+        // Exact observed provider shape: deepseek-v4-flash-free closes
         // <p1> with </p2>. The lenient parser terminates the opened <p1> at the
         // NEXT closing tier tag (any digit) and the real <p2> still parses, so
         // validation passes (the legacy=0 tiered path) instead of retrying.

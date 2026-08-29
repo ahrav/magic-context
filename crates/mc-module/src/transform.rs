@@ -506,17 +506,6 @@ thread_local! {
     static USER_HINT_LEXICAL_QUERY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// The m1 delta content + its byte-affecting digest. `revision` is a digest over ALL
-/// byte-affecting m1 render inputs such that `render` is a pure function of what the
-/// digest covers: if the rendered bytes would differ, `revision` differs. NEVER a
-/// max-id counter (a same-id update changes bytes without raising a max id).
-/// `revision == 0` is the placeholder (no delta).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct M1Content {
-    pub revision: u64,
-    pub body: String,
-}
-
 /// One tail-reduction decision: the target tail item and the byte-complete reduced
 /// payload that replaces its bytes (`[dropped N]`, or a `filePath + region-hint +
 /// [dropped N]` skeleton). The payload is captured at FREEZE and is authoritative
@@ -1880,14 +1869,6 @@ impl std::fmt::Display for TransformError {
     }
 }
 impl std::error::Error for TransformError {}
-
-impl TransformError {
-    /// These failures are deterministic for the same request, while store and search failures
-    /// remain retryable because their cause may be transient.
-    pub fn is_deterministic_reject(&self) -> bool {
-        !matches!(self, Self::Store(_) | Self::Search(_))
-    }
-}
 
 impl From<CkWireError> for TransformError {
     fn from(e: CkWireError) -> Self {
@@ -3502,7 +3483,7 @@ fn apply_once(
         && serializer_profile == Some(SerializerProfile::ClaudeCodeAnthropic);
     let tagging_active =
         tagging_surface_requested && (persisted_tagging_surface_active || bootstrap_tagging_active);
-    // Previously stored overlay rows may still replay when boundary-lineage validation
+    // Stored overlay rows from earlier passes may still replay when boundary-lineage validation
     // later forces pass-through. Decisions from this request stay in memory until the
     // final cache-state compare-and-swap accepts the pass.
     // Tags are also the durable token-accounting source for host directives. Keeping them
@@ -25239,12 +25220,11 @@ pub(crate) mod tests {
         )
     }
 
-    /// Claude Code is a full-array consumer since the Thalamus peer retired the
-    /// byte-splice at U0: every pass rebuilds the provider request from the transformed
-    /// array, so tail mutations round-trip into the real context instead of being lost to
-    /// a splice (the old "phantom reclaim" hazard). This is the inverse of the retired
-    /// verbatim-tail guarantee — a tool-absent CC session now selects reclaim candidates
-    /// under pressure, where it selected none before U0. Drives execute- and emergency-class
+    /// Claude Code is a full-array consumer: every pass rebuilds the provider request
+    /// from the transformed array, so tail mutations round-trip into the real context
+    /// instead of being lost to a splice (the "phantom reclaim" hazard). A tool-absent
+    /// CC session therefore selects reclaim candidates
+    /// under pressure. Drives execute- and emergency-class
     /// passes over reclaim-eligible content with a queued agent drop and asserts the tail is
     /// mutated and the drop drains.
     #[test]
