@@ -683,6 +683,15 @@ describe("promoteRelease", () => {
             expect(() => loadRelease(copy)).toThrow(
                 /release\.manifest\.releaseVersion: declares v1 in directory v2/,
             );
+            // `basename` is lexical, so a terminal `.`, a trailing separator, or a
+            // `..` component names the same tree while yielding a basename the
+            // version guard skips. The path is resolved before the basename is
+            // taken, so every spelling of the directory binds to v2.
+            for (const spelling of [join(copy, "."), `${copy}/`, join(copy, "..", "v2")]) {
+                expect(() => loadRelease(spelling)).toThrow(
+                    /release\.manifest\.releaseVersion: declares v1 in directory v2/,
+                );
+            }
             // The genuine install still loads: the check is about the pairing, not
             // the tree, and the promoter's own review and staging directories are
             // not version-named so they stay unaffected.

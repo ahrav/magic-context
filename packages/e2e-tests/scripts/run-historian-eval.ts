@@ -42,17 +42,34 @@ function parseArgs(args: string[]): CliArgs {
     let scenariosDir: string | null = null;
     let releaseDir: string | null = null;
     let reportPath = join(E2E_ROOT, "artifacts", "historian-eval-report.json");
+    /**
+     * Value for an option that requires one, or a diagnostic naming the option.
+     *
+     * A bare `args[++index]` yields `undefined` for a trailing flag, and
+     * `undefined !== null` skips the default fallback below — so `--lint
+     * --scenarios` reached `resolve(undefined)` and died on `The "paths[0]"
+     * property must be of type string`, which names neither the flag nor the
+     * mistake. Omitting a value mid-command is worse: `--scenarios --report x`
+     * consumed `--report` as the directory and then blamed `x` as an unknown
+     * argument. Rejecting a leading `-` catches that case at the flag that is
+     * actually missing its value.
+     */
+    const requireValue = (flag: string, value: string | undefined): string => {
+        if (value === undefined || value.length === 0) throw new Error(`${flag} requires a value`);
+        if (value.startsWith("-")) throw new Error(`${flag} requires a value (got the option ${value})`);
+        return value;
+    };
     for (let index = 0; index < args.length; index += 1) {
         const arg = args[index];
         if (arg === "--lint" || arg === "--mutations" || arg === "--live") {
             if (mode !== null) throw new Error("select exactly one of --lint, --mutations, --live");
             mode = arg.slice(2) as CliArgs["mode"];
         } else if (arg === "--scenarios") {
-            scenariosDir = args[++index];
+            scenariosDir = requireValue(arg, args[++index]);
         } else if (arg === "--release") {
-            releaseDir = args[++index];
+            releaseDir = requireValue(arg, args[++index]);
         } else if (arg === "--report") {
-            reportPath = args[++index];
+            reportPath = requireValue(arg, args[++index]);
         } else if (arg === "--help" || arg === "-h") {
             console.log(
                 "Usage: run-historian-eval.ts (--lint | --mutations | --live) [--scenarios <dir> | --release <dir>] [--report <path>]",

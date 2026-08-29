@@ -1183,12 +1183,25 @@ export function renderedTranscriptBlocks(scenario: HistorianEvalScenario): strin
  * done. Both halves must be non-empty, and both are trimmed, because these
  * strings are handed to OpenCode as model identifiers and a provider of
  * `"anthropic "` does not resolve.
+ *
+ * EVERY segment is trimmed and required to be non-empty, not just the two
+ * halves. Trimming the joined model id only reaches its outer edges, so
+ * `anthropic//` produced a model id of `"/"` — non-empty, therefore accepted —
+ * and `openrouter / vendor / model-1` kept its interior spaces. Both then failed
+ * only at provider dispatch, which is the failure this preflight exists to move
+ * forward. A slash-bearing model id like `vendor/model-1` is legitimate and
+ * survives unchanged; an empty segment never is.
  */
 export function parseModelRoute(variable: string, value: string): { providerID: string; modelID: string } {
     const [rawProvider, ...modelParts] = value.split("/");
     const providerID = (rawProvider ?? "").trim();
-    const modelID = modelParts.join("/").trim();
-    if (providerID.length === 0 || modelParts.length === 0 || modelID.length === 0) {
+    const modelSegments = modelParts.map((part) => part.trim());
+    const modelID = modelSegments.join("/");
+    if (
+        providerID.length === 0 ||
+        modelSegments.length === 0 ||
+        modelSegments.some((segment) => segment.length === 0)
+    ) {
         throw new HistorianEvalContractError([
             `${variable}: expected provider/model with both parts non-empty (got "${value}")`,
         ]);

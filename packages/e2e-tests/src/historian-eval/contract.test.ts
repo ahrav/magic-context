@@ -1599,6 +1599,13 @@ describe("parseModelRoute", () => {
             providerID: "anthropic",
             modelID: "claude-sonnet-4-5",
         });
+        // Per SEGMENT, not just the outer edges: trimming the joined model id
+        // leaves interior padding around a legitimate slash in place, and the
+        // route then fails at provider dispatch instead of here.
+        expect(parseModelRoute("HISTORIAN_EVAL_MODEL", "openrouter / vendor / model-1")).toEqual({
+            providerID: "openrouter",
+            modelID: "vendor/model-1",
+        });
     });
 
     test.each([
@@ -1607,6 +1614,11 @@ describe("parseModelRoute", () => {
         ["empty provider component", "/claude-sonnet-4-5"],
         ["no separator", "claude-sonnet-4-5"],
         ["empty value", ""],
+        // `modelParts.join("/")` is non-empty for all three, so checking the
+        // joined value alone accepted a model id of "/" or "a//b".
+        ["trailing separator", "anthropic//"],
+        ["whitespace-only interior segment", "anthropic/ / "],
+        ["empty interior segment", "anthropic/a//b"],
     ])("rejects %s before the lane spends a token", (_label, value) => {
         expect(() => parseModelRoute("HISTORIAN_EVAL_PROBE_MODEL", value)).toThrow(HistorianEvalContractError);
     });
