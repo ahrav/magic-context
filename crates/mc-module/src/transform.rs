@@ -6720,7 +6720,7 @@ fn first_applied_pending_command_ids(
         .iter()
         .filter_map(|drop| {
             let command_id = drop.command_id.as_ref()?;
-            let applied = !drop.command_first_applied_at_ms.is_some()
+            let applied = drop.command_first_applied_at_ms.is_none()
                 && !frozen_before.contains(&drop.target_id)
                 && frozen_after.contains(&drop.target_id);
             applied.then(|| command_id.clone())
@@ -12447,7 +12447,7 @@ fn clear_served_native_reasoning_from_iter<'a>(
                 continue;
             };
             if !matches!(part_type, "reasoning" | "thinking")
-                || (!part.get("thinking").is_some() && !part.get("text").is_some())
+                || (part.get("thinking").is_none() && part.get("text").is_none())
             {
                 continue;
             }
