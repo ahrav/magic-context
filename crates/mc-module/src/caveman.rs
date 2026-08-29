@@ -159,9 +159,25 @@ fn find_phrase_at<'a>(text: &str, offset: usize, phrases: &'a [&'a str]) -> Opti
 }
 
 fn protect_regex(text: &str, regex: &Regex, preserved: &mut Vec<PreservedRegion>) -> String {
+    protect_regex_filtered(text, regex, preserved, |_, _, _| true)
+}
+
+/// Like `protect_regex`, but a match is preserved only when `accept(text,
+/// start, end)` holds; rejected matches pass through unchanged. This keeps the
+/// placeholder-minting invariant (`\u{0}MC_PRES_{index}\u{0}` with
+/// `preserved.len()` as the index) in one owner.
+fn protect_regex_filtered(
+    text: &str,
+    regex: &Regex,
+    preserved: &mut Vec<PreservedRegion>,
+    accept: impl Fn(&str, usize, usize) -> bool,
+) -> String {
     let mut output = String::with_capacity(text.len());
     let mut cursor = 0;
     for matched in regex.find_iter(text) {
+        if !accept(text, matched.start(), matched.end()) {
+            continue;
+        }
         output.push_str(&text[cursor..matched.start()]);
         let placeholder = format!("\u{0}MC_PRES_{}\u{0}", preserved.len());
         preserved.push(PreservedRegion {
@@ -178,49 +194,18 @@ fn protect_regex(text: &str, regex: &Regex, preserved: &mut Vec<PreservedRegion>
 fn protect_identifier_regions(text: &str, preserved: &mut Vec<PreservedRegion>) -> String {
     static IDENTIFIER: OnceLock<Regex> = OnceLock::new();
     let regex = IDENTIFIER.get_or_init(|| Regex::new(r"(?:msg|ses|toolu)_[A-Za-z0-9]+").unwrap());
-    let mut output = String::with_capacity(text.len());
-    let mut cursor = 0;
-    for matched in regex.find_iter(text) {
-        if !has_word_boundary_before(text, matched.start())
-            || !has_word_boundary_after(text, matched.end())
-        {
-            continue;
-        }
-        output.push_str(&text[cursor..matched.start()]);
-        let placeholder = format!("\u{0}MC_PRES_{}\u{0}", preserved.len());
-        preserved.push(PreservedRegion {
-            placeholder: placeholder.clone(),
-            original: matched.as_str().to_string(),
-        });
-        output.push_str(&placeholder);
-        cursor = matched.end();
-    }
-    output.push_str(&text[cursor..]);
-    output
+    protect_regex_filtered(text, regex, preserved, |text, start, end| {
+        has_word_boundary_before(text, start) && has_word_boundary_after(text, end)
+    })
 }
 
 fn protect_hash_regions(text: &str, preserved: &mut Vec<PreservedRegion>) -> String {
     static HASH: OnceLock<Regex> = OnceLock::new();
     let regex = HASH.get_or_init(|| Regex::new(r"[0-9a-fA-F]{7,40}").unwrap());
-    let mut output = String::with_capacity(text.len());
-    let mut cursor = 0;
-    for matched in regex.find_iter(text) {
-        if previous_char(text, matched.start()).is_some_and(|ch| ch.is_ascii_alphanumeric())
-            || next_char(text, matched.end()).is_some_and(|ch| ch.is_ascii_alphanumeric())
-        {
-            continue;
-        }
-        output.push_str(&text[cursor..matched.start()]);
-        let placeholder = format!("\u{0}MC_PRES_{}\u{0}", preserved.len());
-        preserved.push(PreservedRegion {
-            placeholder: placeholder.clone(),
-            original: matched.as_str().to_string(),
-        });
-        output.push_str(&placeholder);
-        cursor = matched.end();
-    }
-    output.push_str(&text[cursor..]);
-    output
+    protect_regex_filtered(text, regex, preserved, |text, start, end| {
+        !previous_char(text, start).is_some_and(|ch| ch.is_ascii_alphanumeric())
+            && !next_char(text, end).is_some_and(|ch| ch.is_ascii_alphanumeric())
+    })
 }
 
 fn protect_regions(text: &str) -> (String, Vec<PreservedRegion>) {

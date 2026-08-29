@@ -1794,8 +1794,8 @@ fn format_block(block: &ChunkBlock) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::chunk_text::MAX_COMMITS_PER_BLOCK;
     use super::*;
+    use crate::chunk_text::MAX_COMMITS_PER_BLOCK;
     use serde::Deserialize;
 
     #[derive(Deserialize)]

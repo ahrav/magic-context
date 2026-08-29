@@ -1806,6 +1806,46 @@ fn abandon_matching_run_with_detail(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Shared reattach-test prologue: fire the trigger, mark the producer
+    /// started ("producer-session"/"run-1" on pi), and commit the awaiting
+    /// historian state for session "ses".
+    fn seed_awaiting_historian(store: &McStore) {
+        let fired = match fire(
+            &HistorianDurableState::default(),
+            2,
+            4,
+            "fp".into(),
+            test_selected_range_identities(),
+            0,
+            CompartmentSetGeneration {
+                max_sequence: 1,
+                count: 1,
+            },
+            1,
+        )
+        .unwrap()
+        {
+            FireOutcome::Fired(state) => state,
+            FireOutcome::Busy(_) => unreachable!(),
+        };
+        let awaiting = producer_started(
+            &fired,
+            "producer-session".into(),
+            "run-1".into(),
+            "pi".into(),
+        )
+        .unwrap();
+        store
+            .commit(
+                "ses",
+                None,
+                &CoreState::default(),
+                &test_meta_with_historian(awaiting),
+            )
+            .unwrap();
+    }
+
     use std::collections::VecDeque;
 
     use crate::historian_producer::HistorianSendOutcome;
@@ -2869,39 +2909,7 @@ mod tests {
         seed_prior_compartment(&store);
         let chunk = historian_chunk();
         let prior = prior_ranges();
-        let fired = match fire(
-            &HistorianDurableState::default(),
-            2,
-            4,
-            "fp".into(),
-            test_selected_range_identities(),
-            0,
-            CompartmentSetGeneration {
-                max_sequence: 1,
-                count: 1,
-            },
-            1,
-        )
-        .unwrap()
-        {
-            FireOutcome::Fired(state) => state,
-            FireOutcome::Busy(_) => unreachable!(),
-        };
-        let awaiting = producer_started(
-            &fired,
-            "producer-session".into(),
-            "run-1".into(),
-            "pi".into(),
-        )
-        .unwrap();
-        store
-            .commit(
-                "ses",
-                None,
-                &CoreState::default(),
-                &test_meta_with_historian(awaiting),
-            )
-            .unwrap();
+        seed_awaiting_historian(&store);
         let mut producer = ScriptedProducer::default()
             .with_status(Ok(RunState::Terminal))
             .with_output(Ok(producer_output(historian_xml(
@@ -2930,39 +2938,7 @@ mod tests {
         seed_prior_compartment(&store);
         let chunk = historian_chunk();
         let prior = prior_ranges();
-        let fired = match fire(
-            &HistorianDurableState::default(),
-            2,
-            4,
-            "fp".into(),
-            test_selected_range_identities(),
-            0,
-            CompartmentSetGeneration {
-                max_sequence: 1,
-                count: 1,
-            },
-            1,
-        )
-        .unwrap()
-        {
-            FireOutcome::Fired(state) => state,
-            FireOutcome::Busy(_) => unreachable!(),
-        };
-        let awaiting = producer_started(
-            &fired,
-            "producer-session".into(),
-            "run-1".into(),
-            "pi".into(),
-        )
-        .unwrap();
-        store
-            .commit(
-                "ses",
-                None,
-                &CoreState::default(),
-                &test_meta_with_historian(awaiting),
-            )
-            .unwrap();
+        seed_awaiting_historian(&store);
         let loaded = store.load("ses").unwrap();
         let mut meta = loaded.meta;
         meta.block_identity_by_mid.get_mut("m2").unwrap()[0].byte_fingerprint =
@@ -3126,39 +3102,7 @@ mod tests {
         seed_prior_compartment(&store);
         let chunk = historian_chunk();
         let prior = prior_ranges();
-        let fired = match fire(
-            &HistorianDurableState::default(),
-            2,
-            4,
-            "fp".into(),
-            test_selected_range_identities(),
-            0,
-            CompartmentSetGeneration {
-                max_sequence: 1,
-                count: 1,
-            },
-            1,
-        )
-        .unwrap()
-        {
-            FireOutcome::Fired(state) => state,
-            FireOutcome::Busy(_) => unreachable!(),
-        };
-        let awaiting = producer_started(
-            &fired,
-            "producer-session".into(),
-            "run-1".into(),
-            "pi".into(),
-        )
-        .unwrap();
-        store
-            .commit(
-                "ses",
-                None,
-                &CoreState::default(),
-                &test_meta_with_historian(awaiting),
-            )
-            .unwrap();
+        seed_awaiting_historian(&store);
         let mut producer = ScriptedProducer::default()
             .with_status(Ok(RunState::Terminal))
             .with_output(Ok(producer_output(historian_xml("full replay summary"))));
@@ -3768,39 +3712,7 @@ mod tests {
         seed_prior_compartment(&store);
         let chunk = historian_chunk();
         let prior = prior_ranges();
-        let fired = match fire(
-            &HistorianDurableState::default(),
-            2,
-            4,
-            "fp".into(),
-            test_selected_range_identities(),
-            0,
-            CompartmentSetGeneration {
-                max_sequence: 1,
-                count: 1,
-            },
-            1,
-        )
-        .unwrap()
-        {
-            FireOutcome::Fired(state) => state,
-            FireOutcome::Busy(_) => unreachable!(),
-        };
-        let awaiting = producer_started(
-            &fired,
-            "producer-session".into(),
-            "run-1".into(),
-            "pi".into(),
-        )
-        .unwrap();
-        store
-            .commit(
-                "ses",
-                None,
-                &CoreState::default(),
-                &test_meta_with_historian(awaiting),
-            )
-            .unwrap();
+        seed_awaiting_historian(&store);
         let mut producer = ScriptedProducer::default()
             .with_status(Ok(RunState::Terminal))
             .with_output(Ok(producer_output(historian_xml(

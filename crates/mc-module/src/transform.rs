@@ -1530,13 +1530,16 @@ impl TransformResponse {
         self.ck_messages.as_deref().unwrap_or(&[])
     }
 
-    pub fn need_full_sync(full_array_fingerprint: Option<String>) -> Self {
+    /// The single exhaustive literal for the wire response: both public
+    /// constructors delegate here, so adding a field forces exactly one edit
+    /// while keeping the compiler's exhaustive-literal check.
+    fn base(status: TransformStatus, action: &str, full_array_fingerprint: Option<String>) -> Self {
         Self {
-            status: TransformStatus::NeedFullSync,
+            status,
             served_from: ServedFrom::Transform,
             full_array_fingerprint,
-            action: "NEED_FULL_SYNC".to_string(),
-            decision: "NEED_FULL_SYNC".to_string(),
+            action: action.to_string(),
+            decision: action.to_string(),
             materialize_reason: None,
             first_divergence: None,
             timings: None,
@@ -1563,44 +1566,26 @@ impl TransformResponse {
         }
     }
 
+    pub fn need_full_sync(full_array_fingerprint: Option<String>) -> Self {
+        Self::base(
+            TransformStatus::NeedFullSync,
+            "NEED_FULL_SYNC",
+            full_array_fingerprint,
+        )
+    }
+
     pub fn passthrough(
         ck_messages: Vec<CkWireMessage>,
         full_array_fingerprint: Option<String>,
     ) -> Self {
         Self {
-            status: TransformStatus::Ok,
-            served_from: ServedFrom::Transform,
-            full_array_fingerprint,
-            action: "PASSTHROUGH".to_string(),
-            decision: "PASSTHROUGH".to_string(),
-            materialize_reason: None,
-            first_divergence: None,
-            timings: None,
-            boundary_id: String::new(),
-            reconcile_pending: false,
-            version: 0,
-            row_version: 0,
-            surface_state: SurfaceState::Inactive,
-            committed: false,
-            coverage_ordinal: None,
-            rendered_revision_locators: None,
-            memory_snapshot_vector: None,
-            lineage_switch_consumed_id: None,
-            lineage_descent_disposition: None,
-            cache_ttl: None,
-            ordinal_continuation_base: None,
-            historian: None,
             ck_messages: Some(
                 ck_messages
                     .into_iter()
                     .map(ServedMessage::from_message)
                     .collect(),
             ),
-            native_messages: None,
-            native_messages_delta: None,
-            host_directives: None,
-            channel2_directive: None,
-            note_deliveries: None,
+            ..Self::base(TransformStatus::Ok, "PASSTHROUGH", full_array_fingerprint)
         }
     }
 }
@@ -2071,7 +2056,10 @@ fn compose_m1_for_context(
 /// only change bytes during an intentional HARD rematerialization; determinism (the same
 /// text always counts identically, via the vendored+pinned vocab) is what preserves
 /// byte-identical replay between HARDs.
-pub fn transform(
+/// Test entry point; production enters the pipeline only through
+/// `transform_with_projection_cached`.
+#[cfg(test)]
+pub(crate) fn transform(
     store: &McStore,
     req: &TransformRequest,
     ctx: &ProducerContext<'_>,
@@ -2079,7 +2067,10 @@ pub fn transform(
     transform_with_projection(store, req, ctx).map(|result| result.response)
 }
 
-pub fn transform_with_projection(
+/// Test entry point; production enters the pipeline only through
+/// `transform_with_projection_cached`.
+#[cfg(test)]
+pub(crate) fn transform_with_projection(
     store: &McStore,
     req: &TransformRequest,
     ctx: &ProducerContext<'_>,
@@ -2152,6 +2143,7 @@ fn pass_scheduler_observation(
 /// The retry wrapper around [`apply_once`], parameterized by the token estimator so tests
 /// can inject a panicking/counting one to prove the estimator is HARD-only (never called
 /// on SOFT/defer). Production always passes [`mc_tokenizer::estimate_tokens`].
+#[cfg(test)]
 fn apply_once_with_estimator(
     store: &McStore,
     req: &TransformRequest,
@@ -5375,6 +5367,7 @@ fn apply_once(
         transition_committed,
         output_cache_snapshot.as_ref(),
         is_bust_pass,
+        true,
     )?;
     let new_merged_reasoning_units = new_merged_reasoning_strip_units(
         &core,
@@ -5397,6 +5390,7 @@ fn apply_once(
                 .max(meta.reasoning_cleared_through_ordinal),
             transition_committed,
             output_cache_snapshot.as_ref(),
+            true,
             true,
         )?;
     }
@@ -5427,6 +5421,7 @@ fn apply_once(
             transition_committed,
             output_cache_snapshot.as_ref(),
             true,
+            true,
         )?;
     }
     #[cfg(test)]
@@ -5444,6 +5439,7 @@ fn apply_once(
                 .max(meta.reasoning_cleared_through_ordinal),
             transition_committed,
             None,
+            true,
             true,
         )?;
         let cached_bytes = built_output
@@ -11578,6 +11574,7 @@ fn build_output(
         transition_renderer_active(core),
         None,
         true,
+        true,
     )
     .map(|built| {
         built
@@ -11588,75 +11585,8 @@ fn build_output(
     })
 }
 
-// Keep the provider and durable-watermark arguments explicit in this builder: they affect cache
-// identity and differ across replay paths, so grouping them would make those inputs less visible.
 #[allow(clippy::too_many_arguments)]
 fn build_output_with_tags(
-    core: &CoreState,
-    meta: &ModuleMeta,
-    projection: &FlatProjection,
-    req: &TransformRequest,
-    tag_overlay: Option<&TagOverlayState>,
-    synthetic_todo_enabled: bool,
-    mutation_exempt_mid: Option<&str>,
-    tag_numbers: &BTreeMap<String, u64>,
-    reasoning_watermark: u64,
-    renderer_transition_active: bool,
-    cache_snapshot: Option<&SerializedOutputCacheSnapshot>,
-    prefix_dirty: bool,
-) -> Result<BuiltOutput, TransformError> {
-    build_output_with_tags_inner(
-        core,
-        meta,
-        projection,
-        req,
-        tag_overlay,
-        synthetic_todo_enabled,
-        mutation_exempt_mid,
-        tag_numbers,
-        reasoning_watermark,
-        renderer_transition_active,
-        cache_snapshot,
-        prefix_dirty,
-        true,
-    )
-}
-
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-fn build_output_with_tags_unindexed(
-    core: &CoreState,
-    meta: &ModuleMeta,
-    projection: &FlatProjection,
-    req: &TransformRequest,
-    tag_overlay: Option<&TagOverlayState>,
-    synthetic_todo_enabled: bool,
-    mutation_exempt_mid: Option<&str>,
-    tag_numbers: &BTreeMap<String, u64>,
-    reasoning_watermark: u64,
-    renderer_transition_active: bool,
-    cache_snapshot: Option<&SerializedOutputCacheSnapshot>,
-    prefix_dirty: bool,
-) -> Result<BuiltOutput, TransformError> {
-    build_output_with_tags_inner(
-        core,
-        meta,
-        projection,
-        req,
-        tag_overlay,
-        synthetic_todo_enabled,
-        mutation_exempt_mid,
-        tag_numbers,
-        reasoning_watermark,
-        renderer_transition_active,
-        cache_snapshot,
-        prefix_dirty,
-        false,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_output_with_tags_inner(
     core: &CoreState,
     meta: &ModuleMeta,
     projection: &FlatProjection,
@@ -18869,6 +18799,7 @@ pub(crate) mod tests {
             u64::MAX,
             false,
             None,
+            true,
             true,
         )
         .unwrap();
@@ -27155,6 +27086,7 @@ pub(crate) mod tests {
             false,
             None,
             true,
+            true,
         )
         .unwrap();
         let first_bytes = serde_json::to_vec(&first.messages).unwrap();
@@ -27185,6 +27117,7 @@ pub(crate) mod tests {
             false,
             Some(&snapshot),
             false,
+            true,
         )
         .unwrap();
         assert!(replay.cache_stats.reused_items > 0);
@@ -27288,6 +27221,7 @@ pub(crate) mod tests {
             false,
             None,
             true,
+            true,
         )
         .unwrap();
         let first_bytes = canonical_output(&first.messages);
@@ -27307,6 +27241,7 @@ pub(crate) mod tests {
             false,
             Some(&snapshot),
             false,
+            true,
         )
         .unwrap();
         assert!(replay.cache_stats.reused_items > 0);
@@ -28220,6 +28155,7 @@ pub(crate) mod tests {
             transition_consumed(core),
             snapshot,
             prefix_dirty,
+            true,
         )
         .unwrap()
     }
@@ -28479,7 +28415,7 @@ pub(crate) mod tests {
         );
 
         let first = build_cached_fixture(&core, &meta, &request, &projection, None, None, true);
-        let unindexed = build_output_with_tags_unindexed(
+        let unindexed = build_output_with_tags(
             &core,
             &meta,
             &projection,
@@ -28492,6 +28428,7 @@ pub(crate) mod tests {
             transition_consumed(&core),
             None,
             true,
+            false,
         )
         .unwrap();
         assert_eq!(
