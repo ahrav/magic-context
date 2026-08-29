@@ -1203,14 +1203,29 @@ mod tests {
         tempfile::tempdir().expect("temp data root")
     }
 
+    /// Plants a FIFO where a coordination path expects a regular file, so the
+    /// mutators and probes can prove they classify a hostile shape as such.
+    ///
+    /// The POSIX `mkfifo` utility, not rustix: rustix gates `mkfifoat` away from
+    /// Apple targets, and this crate is `deny(unsafe_code)`, so calling
+    /// `mkfifo(2)` directly is not available either. A lock name must classify as
+    /// a hostile shape on every platform, so this stays compiled everywhere
+    /// rather than being cfg'd out on the one whose absence let a build break
+    /// reach CI unnoticed.
+    ///
+    /// `-m 600` is load-bearing: POSIX has `mkfifo` apply that mode at creation
+    /// rather than deriving it from the umask, so the node is never briefly
+    /// reachable at a wider mode the way a create-then-`chmod` sequence leaves
+    /// it. These tests assert that a coordination node is never accessible
+    /// outside its intended mode, so the setup must not violate that invariant.
     fn plant_fifo(path: &Path) {
         let status = std::process::Command::new("mkfifo")
+            .arg("-m")
+            .arg("600")
             .arg(path)
             .status()
-            .expect("run mkfifo");
+            .expect("mkfifo is a POSIX utility present on every supported platform");
         assert!(status.success(), "mkfifo failed for {}", path.display());
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .expect("set fifo mode");
     }
 
     fn record_path(guard: &InstanceGuard) -> PathBuf {
@@ -1699,6 +1714,8 @@ mod tests {
 
     #[test]
     fn hostile_shapes_at_the_lock_names_fail_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
         for name in [TRANSACTION_LOCK_NAME, LIFETIME_LOCK_NAME] {
             // A symlink at the lock name.
             let root = temp_root();

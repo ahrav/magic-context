@@ -137,4 +137,24 @@ describe("semver parsing", () => {
             expect(parseSemverTriple(bad)).toBeNull();
         }
     });
+
+    test("leading zeroes are rejected rather than normalized", () => {
+        expect(parseSemverTriple("0.1.0")).toEqual([0, 1, 0]);
+        // Each of these would parse to an in-range triple under `\d+`, so the
+        // range gate would accept a non-canonical version.
+        for (const bad of ["00.1.0", "0.01.0", "0.1.00", "00.01.000", "01.2.3"]) {
+            expect(parseSemverTriple(bad)).toBeNull();
+        }
+    });
+
+    test("a non-canonical daemon version fails the compatibility gate", () => {
+        // `00.01.000` normalizes to `[0, 1, 0]`, which is inside the supported
+        // half-open range, so only canonical-form rejection keeps this closed.
+        const verdict = evaluateDaemonCompatibility("mc-host/00.01.000");
+        expect(verdict.ok).toBe(false);
+        if (!verdict.ok) {
+            expect(verdict.reason).toBe("incompatible_daemon");
+            expect(verdict.detail).toBe("daemon version is not a canonical mc-host/X.Y.Z value");
+        }
+    });
 });

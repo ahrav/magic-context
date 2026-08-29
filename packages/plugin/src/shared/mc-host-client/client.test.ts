@@ -840,6 +840,36 @@ describe("McHostClient facade", () => {
         expect(await pending).toEqual([{ harness: "opencode" }, { terminal: "completed" }]);
     });
 
+    test("requestStream refuses a stream that exceeds its retained-item ceiling", async () => {
+        const { client, conn } = await connected();
+        const cursor = frameCursor(conn);
+        const handle = await openRoute(client, conn, cursor, 7, 77);
+
+        const pending = client.requestStream(handle, { subscribe: true }, { maxStreamItems: 2 });
+        const frame = await cursor.next(isRoutedRequest(7));
+        // A peer can stay far under the pending byte budget with tiny bodies, so
+        // the item ceiling is what bounds retained decode overhead.
+        for (let index = 0; index < 3; index += 1) {
+            await conn.send({
+                ty: PeerFrameType.StreamData,
+                channel: 7,
+                epoch: 77,
+                corr: frame.corr,
+                body: Buffer.from(JSON.stringify({ index })),
+            });
+        }
+
+        expectCallError(await rejection(pending), "terminal", "stream_item_limit");
+        // The caller is settled but the host is still producing. A Cancel scoped
+        // to this correlation stops it; without one the peer keeps sending frames
+        // this connection can only drop, spending capacity unrelated requests
+        // need.
+        const cancel = await cursor.next((f) => f.ty === PeerFrameType.Cancel);
+        expect(cancel.channel).toBe(7);
+        expect(cancel.epoch).toBe(77);
+        expect(cancel.corr).toBe(frame.corr);
+    });
+
     test("abort before write settles not_sent with an already-resolved cleanup ticket", async () => {
         const { client, conn } = await connected({ shutdownDeadlineMs: 200 });
         const cursor = frameCursor(conn);

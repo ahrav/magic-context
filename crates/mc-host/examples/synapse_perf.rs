@@ -109,9 +109,11 @@ fn lane() -> LaneInfo {
     LaneInfo {
         model: "synapse-perf-zero-delay".to_owned(),
         fingerprint: FINGERPRINT.to_owned(),
-        execution_provider: "cpu",
         table_epoch: 1,
         dims: 8,
+        // The inline engine below computes on the CPU, so it advertises the
+        // same provider a bundle-backed CPU lane does.
+        execution_provider: "cpu",
         max_tokens: 512,
         max_text_bytes: 1024,
         provenance: serde_json::json!({"source": "inline zero-delay engine"}),

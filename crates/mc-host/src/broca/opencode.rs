@@ -210,10 +210,12 @@ async fn run_opencode(
         env: child_env,
         working_dir: dir.path().to_path_buf(),
         stdin: request.prompt.clone().into_bytes(),
-        inherit_fds: vec![
-            runtime.closure.inherited_fd(),
-            executable_node.inherited_fd(),
-        ],
+        // Only the exec'd executable's descriptor, which is the one path the
+        // child's arguments name. The closure directory descriptor is
+        // deliberately absent: nothing references it, and inheriting it would
+        // hand the harness a rename-immune handle it can write back through
+        // into the validated closure tree.
+        inherit_fds: vec![executable_node.inherited_fd()],
     };
 
     // No terminal probe: the OpenCode CLI closes its streams and exits when

@@ -94,18 +94,42 @@ pub fn spawn_detached(
     };
 
     let mut pipe_fds = [0 as libc::c_int; 2];
+    // Linux creates the pipe already close-on-exec. Darwin has no `pipe2`, so
+    // there the flag is applied in a second step below.
+    #[cfg(target_os = "linux")]
     // SAFETY: pipe2 writes exactly two descriptors into the array.
     cvt(
         unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) },
         "envelope pipe creation failed",
     )?;
-    // SAFETY: the descriptors were just returned by pipe2 and are owned here.
+    #[cfg(target_os = "macos")]
+    // SAFETY: pipe writes exactly two descriptors into the array.
+    cvt(
+        unsafe { libc::pipe(pipe_fds.as_mut_ptr()) },
+        "envelope pipe creation failed",
+    )?;
+    // SAFETY: the descriptors were just returned by pipe2/pipe and are owned here.
     let (pipe_r, pipe_w) = unsafe {
         (
             OwnedFd::from_raw_fd(pipe_fds[0]),
             OwnedFd::from_raw_fd(pipe_fds[1]),
         )
     };
+    // Both ends are owned before the flag is set, so a failure here closes them
+    // instead of leaking a descriptor pair. Unlike `pipe2` this is not atomic
+    // with creation: a concurrent exec in another thread could inherit the ends
+    // in that window. The child below is the only exec this binary performs, it
+    // happens after this point, and it keeps the read end deliberately by
+    // dup2-ing it onto stdin (which clears close-on-exec) while closing every
+    // descriptor above 3.
+    #[cfg(target_os = "macos")]
+    for fd in [pipe_r.as_raw_fd(), pipe_w.as_raw_fd()] {
+        // SAFETY: fd is owned by pipe_r/pipe_w and open for this call.
+        cvt(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+            "envelope pipe cloexec failed",
+        )?;
+    }
 
     // Everything the child touches is prepared before fork: with tokio
     // worker threads alive, the child may only use async-signal-safe calls

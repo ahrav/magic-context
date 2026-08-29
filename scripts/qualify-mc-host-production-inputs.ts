@@ -2640,6 +2640,36 @@ export function generate(
  * mismatch), test-only, or non-production evidence. Returns the verified
  * evidence and artifact digests for embedding into build inputs.
  */
+/**
+ * Shared identity gate for one U9 qualification-evidence document: shape,
+ * schema, U8 release-contract digest, and release identity. Both the build's
+ * release-context loader and the production consumption gate call this, so
+ * what counts as "this release's evidence" cannot drift between the two
+ * validators. Returns the mismatch reason, or null when the document is this
+ * release's evidence.
+ */
+export function qualificationEvidenceIdentityMismatch(
+    evidence: unknown,
+    contract: { release: { id: string; version: string } },
+    u8Digest: string,
+): string | null {
+    if (evidence === null || typeof evidence !== "object" || Array.isArray(evidence)) {
+        return "malformed evidence document";
+    }
+    const document = evidence as Record<string, unknown>;
+    if (document.schema !== "magic-context.mc-host-release-qualification/v1") {
+        return "malformed or unknown schema";
+    }
+    if (document.release_contract_sha256 !== u8Digest) {
+        return "stale U8 release-contract digest";
+    }
+    const release = document.release as { id?: unknown; version?: unknown } | undefined;
+    if (release?.id !== contract.release.id || release?.version !== contract.release.version) {
+        return "release identity mismatch";
+    }
+    return null;
+}
+
 export function requireQualificationEvidence(rootDir: string): {
     evidence: Record<string, unknown>;
     u8Digest: string;
@@ -2658,28 +2688,11 @@ export function requireQualificationEvidence(rootDir: string): {
     } catch {
         reject("malformed JSON");
     }
-    if (
-        evidence === null ||
-        typeof evidence !== "object" ||
-        Array.isArray(evidence) ||
-        (evidence as { schema?: unknown }).schema !==
-            "magic-context.mc-host-release-qualification/v1"
-    ) {
-        reject("malformed or unknown schema");
-    }
     const contract = buildContract();
     const u8Digest = sha256Hex(canonicalJson(contract));
-    if (evidence.release_contract_sha256 !== u8Digest) {
-        reject("stale U8 release-contract digest");
-    }
-    const release = evidence.release as
-        | { id?: unknown; version?: unknown }
-        | undefined;
-    if (
-        release?.id !== contract.release.id ||
-        release?.version !== contract.release.version
-    ) {
-        reject("release identity mismatch");
+    const identityMismatch = qualificationEvidenceIdentityMismatch(evidence, contract, u8Digest);
+    if (identityMismatch !== null) {
+        reject(identityMismatch);
     }
     if (evidence.test_only !== false) {
         reject("test-only evidence can never qualify a production build");

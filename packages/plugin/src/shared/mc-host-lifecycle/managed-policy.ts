@@ -8,10 +8,10 @@ import {
     type CatalogEntry,
     type HostStatusSnapshot,
     McHostClient,
+    sameDaemonId,
 } from "../mc-host-client";
 import { BootstrapError, checkPlatform, type PlatformReaders, parseTrustIndex } from "./bootstrap";
 import {
-    evaluateCompatibility,
     evaluateDaemonCompatibility,
     evaluateModuleCompatibility,
     observedEpochsFromMagicContextMetrics,
@@ -62,9 +62,43 @@ function storageState(metrics: Record<string, unknown>): "ready" | "starting" | 
     return state === "ready" || state === "unavailable" ? state : "starting";
 }
 
+/**
+ * The storage probe observed an incarnation other than the one compatibility
+ * certified. It escapes `probeManagedStorage`'s catch-all because it is not a
+ * storage observation at all: reducing it to `unavailable` would blame storage
+ * for a rotation and send remediation at the wrong component.
+ */
+class StorageProbeDaemonMismatchError extends Error {
+    constructor() {
+        super("storage probe observed a different daemon than compatibility certified");
+        this.name = "StorageProbeDaemonMismatchError";
+    }
+}
+
+function assertStorageProbePeer(
+    client: McHostClient,
+    expectedDaemonId: Uint8Array | undefined,
+): void {
+    if (expectedDaemonId === undefined) return;
+    const daemonId = client.authenticated?.daemonId ?? null;
+    if (daemonId === null || !sameDaemonId(daemonId, expectedDaemonId)) {
+        throw new StorageProbeDaemonMismatchError();
+    }
+}
+
+/**
+ * Poll storage readiness on its own connection until it leaves `starting`.
+ *
+ * `expectedDaemonId` binds the observation to the incarnation compatibility
+ * certified. The probe cannot share the compatibility connection because it
+ * waits across restarts of `host.status`, so it re-checks identity after the
+ * handshake and after every response instead: a rotation mid-poll makes the
+ * reading describe a daemon the caller will never publish to.
+ */
 async function probeManagedStorage(
     root: string,
     budgetMs: number,
+    expectedDaemonId?: Uint8Array,
 ): Promise<"ready" | "starting" | "unavailable"> {
     const deadline = Date.now() + budgetMs;
     let client: McHostClient | null = null;
@@ -74,14 +108,13 @@ async function probeManagedStorage(
             handshakeTimeoutMs: Math.max(1, budgetMs),
             requestTimeoutMs: Math.max(1, budgetMs),
         });
+        assertStorageProbePeer(client, expectedDaemonId);
         for (;;) {
-            const state = storageState(
-                (
-                    await client.hostStatus({
-                        timeoutMs: Math.max(1, deadline - Date.now()),
-                    })
-                ).metrics,
-            );
+            const snapshot = await client.hostStatus({
+                timeoutMs: Math.max(1, deadline - Date.now()),
+            });
+            assertStorageProbePeer(client, expectedDaemonId);
+            const state = storageState(snapshot.metrics);
             if (state !== "starting" || Date.now() >= deadline) return state;
             await new Promise((resolve) =>
                 setTimeout(
@@ -90,7 +123,8 @@ async function probeManagedStorage(
                 ),
             );
         }
-    } catch {
+    } catch (error) {
+        if (error instanceof StorageProbeDaemonMismatchError) throw error;
         return Date.now() >= deadline ? "starting" : "unavailable";
     } finally {
         await client?.closeAsync().catch(() => {});
@@ -99,22 +133,15 @@ async function probeManagedStorage(
 
 export interface ManagedCompatibilityClient {
     readonly authenticated: AuthenticatedPeer | null;
-    catalogList(): Promise<CatalogEntry[]>;
+    catalogList(options?: { timeoutMs?: number }): Promise<CatalogEntry[]>;
     hostStatus(options?: { timeoutMs?: number }): Promise<HostStatusSnapshot>;
 }
 
 function samePeer(left: AuthenticatedPeer | null, right: AuthenticatedPeer): boolean {
-    if (
-        left === null ||
-        left.daemonVer !== right.daemonVer ||
-        left.proof !== right.proof ||
-        left.daemonId === null ||
-        right.daemonId === null ||
-        left.daemonId.length !== right.daemonId.length
-    ) {
+    if (left === null || left.daemonVer !== right.daemonVer || left.proof !== right.proof) {
         return false;
     }
-    return left.daemonId.every((byte, index) => byte === right.daemonId?.[index]);
+    return sameDaemonId(left.daemonId, right.daemonId);
 }
 
 interface CompatibilityProbeResult {
@@ -122,6 +149,21 @@ interface CompatibilityProbeResult {
     status: HostStatusSnapshot | null;
 }
 
+/**
+ * Read one ordered daemon/modules/epochs observation from a single authenticated
+ * peer, stopping at the first stage that cannot pass and re-checking the peer
+ * across every await so a rotation cannot produce a mixed snapshot.
+ *
+ * The returned snapshot is an observation, not a verdict: `evaluatedThrough`
+ * names the last stage actually reached, and the policy layer owns the verdict
+ * so one place decides precedence and remediation. `status` is null exactly when
+ * the probe short-circuited before `host.status`, meaning storage and Synapse
+ * were never observed.
+ *
+ * Every request is bounded by the time left until `deadline`, not by the
+ * client-wide request timeout, so a slow handshake cannot leave a later stage
+ * free to spend another full budget past the aggregate the caller promised.
+ */
 async function readCompatibilityProbe(
     client: ManagedCompatibilityClient,
     deadline: number,
@@ -144,7 +186,9 @@ async function readCompatibilityProbe(
             status: null,
         };
     }
-    const catalog = await client.catalogList();
+    const catalogMs = deadline - Date.now();
+    if (catalogMs <= 0) throw new Error("compatibility probe deadline expired");
+    const catalog = await client.catalogList({ timeoutMs: catalogMs });
     if (!samePeer(client.authenticated, authenticated)) {
         throw new Error("authenticated peer changed during compatibility probe");
     }
@@ -173,6 +217,8 @@ async function readCompatibilityProbe(
     if (signal?.aborted) throw signal.reason ?? new Error("compatibility probe aborted");
     const components = asRecord(status.metrics.components);
     const magicContextMetrics = asRecord(asRecord(components?.["magic-context"])?.metrics);
+    // The probe only reports what it observed; the compatibility verdict is
+    // owned by exactly one place, `McHostLifecyclePolicy.applyCompatibility`.
     const snapshot = {
         authenticatedDaemonVersion: authenticated.daemonVer,
         authenticatedDaemonId: Uint8Array.from(authenticated.daemonId),
@@ -180,11 +226,6 @@ async function readCompatibilityProbe(
         epochs: observedEpochsFromMagicContextMetrics(magicContextMetrics),
         evaluatedThrough: "epochs" as const,
     };
-    evaluateCompatibility({
-        authenticatedDaemonVer: snapshot.authenticatedDaemonVersion,
-        catalog: snapshot.catalog,
-        epochs: snapshot.epochs,
-    });
     return { snapshot, status };
 }
 
@@ -200,7 +241,7 @@ async function probeManagedCompatibility(
     root: string,
     budgetMs: number,
     signal?: AbortSignal,
-): Promise<CompatibilitySnapshot> {
+): Promise<CompatibilityProbeResult> {
     const deadline = Date.now() + budgetMs;
     const client = await McHostClient.connect({
         connectionFile: connectionFilePath(root),
@@ -208,7 +249,7 @@ async function probeManagedCompatibility(
         requestTimeoutMs: Math.max(1, budgetMs),
     });
     try {
-        return await readCompatibilitySnapshot(client, deadline, signal);
+        return await readCompatibilityProbe(client, deadline, signal);
     } finally {
         await client.closeAsync().catch(() => {});
     }
@@ -229,13 +270,14 @@ async function probeManagedReadiness(root: string, budgetMs: number): Promise<Ob
     try {
         const { snapshot: compatibility, status } = await readCompatibilityProbe(client, deadline);
         if (status === null) {
+            // The probe short-circuited at the daemon or module stage, so
+            // `host.status` never ran and storage and Synapse were never
+            // observed. Report only what the handshake proved and leave the
+            // unobserved components absent rather than asserting failures that
+            // would point remediation away from the version mismatch.
             return {
                 ...compatibility,
-                readiness: {
-                    transport: { state: "ready", reason: "healthy" },
-                    storage: { state: "unavailable", reason: "storage_unavailable" },
-                    synapse: { state: "degraded", reason: "synapse_degraded" },
-                },
+                readiness: { transport: { state: "ready", reason: "healthy" } },
             };
         }
         const components = asRecord(status.metrics.components);
@@ -343,16 +385,62 @@ export function createManagedLifecyclePolicy(
                 ? {}
                 : { explicitExternalRoot: options.explicitExternalRoot }),
         });
+        // The default compatibility probe's `host.status` reply already
+        // carries the storage state, so the demand path's storage probe can
+        // consume that observation instead of opening a second connection and
+        // re-issuing `host.status`. The observation is single-use and only a
+        // terminal state short-circuits; a `starting` observation still runs
+        // the polling probe so it can wait out startup within its own budget.
+        //
+        // The observation is tagged with the daemon incarnation whose
+        // `host.status` produced it and is only consumed by a demand that
+        // certified that same incarnation. Concurrent probes share this slot:
+        // `sharedCompatibility` dedupes per data root, so a real-root and a
+        // no-root key can be in flight together, and a non-`magic-context`
+        // demand writes an observation it never consumes. Untagged reuse would
+        // let a waiter read a state observed on a different request or daemon
+        // generation and publish module traffic against it.
+        let observedStorage: {
+            daemonId: Uint8Array;
+            state: "ready" | "starting" | "unavailable";
+        } | null = null;
+        const defaultCompatibilityProbe = async (
+            budgetMs: number,
+            signal?: AbortSignal,
+        ): Promise<CompatibilitySnapshot> => {
+            const probe = await probeManagedCompatibility(root.root, budgetMs, signal);
+            observedStorage =
+                probe.status === null
+                    ? null
+                    : {
+                          daemonId: Uint8Array.from(probe.snapshot.authenticatedDaemonId),
+                          state: storageState(probe.status.metrics),
+                      };
+            return probe.snapshot;
+        };
+        const defaultStorageProbe = (
+            budgetMs: number,
+            expectedDaemonId?: Uint8Array,
+        ): Promise<"ready" | "starting" | "unavailable"> => {
+            const observed = observedStorage;
+            observedStorage = null;
+            if (
+                expectedDaemonId !== undefined &&
+                observed !== null &&
+                sameDaemonId(observed.daemonId, expectedDaemonId) &&
+                (observed.state === "ready" || observed.state === "unavailable")
+            ) {
+                return Promise.resolve(observed.state);
+            }
+            return probeManagedStorage(root.root, budgetMs, expectedDaemonId);
+        };
         return new McHostLifecyclePolicy({
             ...options,
             env,
             launchTarget: prepared,
             defaultStartupEnvelope: buildManagedCredentialEnvelope(env),
-            storageProbe:
-                options.storageProbe ?? ((budgetMs) => probeManagedStorage(root.root, budgetMs)),
-            compatibilityProbe:
-                options.compatibilityProbe ??
-                ((budgetMs, signal) => probeManagedCompatibility(root.root, budgetMs, signal)),
+            storageProbe: options.storageProbe ?? defaultStorageProbe,
+            compatibilityProbe: options.compatibilityProbe ?? defaultCompatibilityProbe,
             readinessProbe:
                 options.readinessProbe ??
                 ((budgetMs) => probeManagedReadiness(root.root, budgetMs)),

@@ -207,26 +207,16 @@ pub struct ValidatedGeneration {
     pub digest: String,
     pub manifest: GenerationManifest,
     dir: OwnedFd,
-    path: PathBuf,
 }
 
 impl ValidatedGeneration {
-    /// Stable managed path for libraries that require pathname-based loading.
-    /// Every consumer must still perform its own no-follow/hash validation;
-    /// the retained directory descriptor remains the generation identity.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     /// Stable descriptor-rooted path for in-process loaders. The generation
     /// object must remain alive while the path is used.
+    ///
+    /// Directory traversal through this path is Linux-only; see
+    /// [`crate::harness_closure::descriptor_path`] for the platform contract.
     pub fn descriptor_root_path(&self) -> PathBuf {
-        let root = if cfg!(target_os = "macos") {
-            "/dev/fd"
-        } else {
-            "/proc/self/fd"
-        };
-        PathBuf::from(root).join(self.dir.as_raw_fd().to_string())
+        crate::harness_closure::descriptor_path(self.dir.as_raw_fd())
     }
 
     /// Opens one manifest-listed file through the retained validated
@@ -465,7 +455,6 @@ impl GenerationStore {
             digest: digest.to_owned(),
             manifest,
             dir,
-            path: self.generation_path(digest),
         })
     }
 
