@@ -1650,13 +1650,20 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
     /**
      * Re-certify the managed lane after a rotation. A restart budget authorizes
      * one resubmission, and a resubmission may publish only against a freshly
-     * certified incarnation, so the identity is re-established here instead of
-     * inherited from the daemon that rotated away.
+     * certified incarnation, so clearing `initialized` forces `initialize` to
+     * re-derive the identity from a fresh demand.
+     *
+     * The identity is not cleared here. `initialize` is its only writer and
+     * writes it on the success path, so one operation entering recertification
+     * cannot erase an incarnation a sibling already certified and is dispatching
+     * against — a sibling that spent its own restart budget would otherwise fail
+     * permanently on a fence it had already re-established. An identity that did
+     * rotate away is refused by the client fence before any byte is written, and
+     * that refusal is the sibling's own `module_restarted` to spend.
      */
     private async recertifyForRestart(signal?: AbortSignal): Promise<boolean> {
         if (this.connectionOrigin !== "managed-default") return true;
         this.initialized = false;
-        this.compatibleDaemonId = null;
         return await this.initialize(signal);
     }
 

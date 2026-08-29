@@ -672,6 +672,38 @@ describe("demand-start coalescing and detachment (U3 scenarios 15-16)", () => {
         }
     });
 
+    test("the shared compatibility probe budget does not come from the creating waiter", async () => {
+        const root = tempDir("mc-policy-probe-budget-");
+        const { binary } = fakeBinary(root);
+        const budgets: number[] = [];
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                outerAggregateMs: 30_000,
+                compatibilityProbe: async (budgetMs) => {
+                    budgets.push(budgetMs);
+                    return compatibleObservation();
+                },
+            });
+            const outcome = await policy.demandStart({
+                origin: "managed-default",
+                capability: "magic-context",
+                deadlineMs: 5_000,
+            });
+
+            // Every waiter joins whichever probe exists, so a nearly expired
+            // caller must not mint one too short for the long-lived waiters that
+            // join it — they would read the truncated failure as an unproven
+            // compatibility claim while still holding ample time. The caller's own
+            // deadline still bounds its wait through `raceDetached`.
+            expect(budgets).toEqual([30_000]);
+            expect(outcome.result.ok).toBe(true);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     test("a failed compatibility probe becomes a typed closed result, not a raw rejection", async () => {
         const root = tempDir("mc-policy-probe-failure-");
         const { binary, invocationLog } = fakeBinary(root);

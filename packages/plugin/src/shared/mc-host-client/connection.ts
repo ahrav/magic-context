@@ -847,6 +847,16 @@ export class ConnectionGeneration {
                     ),
                 );
                 this.finishEntry(entry);
+                // The caller is settled but the host is still producing. Without
+                // a Cancel it keeps sending frames this connection can only drop,
+                // spending socket and frame-processing capacity that unrelated
+                // requests need. Settle first so the caller reads the ceiling it
+                // hit rather than a retirement; a refused Cancel retires the
+                // generation inside `enqueueControlHeader`, which is the bounded
+                // fallback when the stream cannot be stopped politely.
+                if (header.channel !== 0) {
+                    this.enqueueCancel(header.channel, header.epoch, header.corr);
+                }
                 return;
             }
             let body: RequestReceiveBody;

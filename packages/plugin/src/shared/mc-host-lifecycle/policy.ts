@@ -284,13 +284,12 @@ export class McHostLifecyclePolicy {
         let compatibleResult = result;
         let authenticatedDaemonId: Uint8Array | undefined;
         if (this.compatibilityProbe !== undefined) {
-            const compatibilityBudget = remainingMs ?? this.outerAggregateMs;
             let snapshot: CompatibilitySnapshot;
             try {
                 snapshot = await this.raceDetached(
                     this.sharedCompatibility(
                         rootResolution.ok ? rootResolution.root : "\u0000no-root",
-                        Math.max(1, compatibilityBudget),
+                        this.outerAggregateMs,
                     ),
                     request.signal,
                     remainingMs,
@@ -358,6 +357,12 @@ export class McHostLifecyclePolicy {
      * each opening its own. The shared probe carries no caller signal; callers
      * bound their own wait with `raceDetached`, so one detaching caller cannot
      * cancel the probe another is still awaiting.
+     *
+     * Its budget is the policy's own aggregate, never the creating caller's
+     * remaining deadline: a nearly expired waiter arriving first would otherwise
+     * mint a probe too short for the long-lived waiters that join it, and they
+     * would read that truncated failure as an unproven compatibility claim while
+     * still holding ample time.
      */
     private sharedCompatibility(root: string, budgetMs: number): Promise<CompatibilitySnapshot> {
         const probe = this.compatibilityProbe;

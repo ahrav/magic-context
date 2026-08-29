@@ -860,6 +860,14 @@ describe("McHostClient facade", () => {
         }
 
         expectCallError(await rejection(pending), "terminal", "stream_item_limit");
+        // The caller is settled but the host is still producing. A Cancel scoped
+        // to this correlation stops it; without one the peer keeps sending frames
+        // this connection can only drop, spending capacity unrelated requests
+        // need.
+        const cancel = await cursor.next((f) => f.ty === PeerFrameType.Cancel);
+        expect(cancel.channel).toBe(7);
+        expect(cancel.epoch).toBe(77);
+        expect(cancel.corr).toBe(frame.corr);
     });
 
     test("abort before write settles not_sent with an already-resolved cleanup ticket", async () => {
