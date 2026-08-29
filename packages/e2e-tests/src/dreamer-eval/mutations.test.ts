@@ -89,4 +89,77 @@ describe("dreamer manifest mutation battery", () => {
         });
         expect(evidence.green).toBe(true);
     });
+
+    test("the missing-anchor mutation omits an anchor the gold actually requires", () => {
+        // A fixed replacement sentence can contain the gold's anchors by
+        // accident: with `facts` required, the old sentence scored PASS, so the
+        // battery reported a red case while exercising nothing.
+        const fixture = {
+            ...dreamerScorerFixture,
+            verifyGold: {
+                kind: "verify" as const,
+                claims: dreamerScorerFixture.verifyGold.claims.map((claim) =>
+                    claim.verdict === "update"
+                        ? {
+                              ...claim,
+                              requiredUpdateAnchors: ["facts"],
+                              forbiddenUpdateAnchors: ["2048 entries"],
+                          }
+                        : claim,
+                ),
+            },
+        };
+        const evidence = runMutationBattery(fixture);
+        expect(evidence.results.find((entry) => entry.mutationClass === "update-missing-anchor")).toMatchObject({
+            green: true,
+            actualStage: "scored",
+            actualReason: "wrong-update-content",
+        });
+        expect(evidence.green).toBe(true);
+    });
+
+    test("the passing baseline avoids a forbidden phrase spanning two anchors", () => {
+        // The contract rejects a forbidden anchor inside one required anchor but
+        // not one spanning their join, so the delimiter-joined baseline would
+        // fail its own scorer and make the battery throw.
+        const fixture = {
+            ...dreamerScorerFixture,
+            verifyGold: {
+                kind: "verify" as const,
+                claims: dreamerScorerFixture.verifyGold.claims.map((claim) =>
+                    claim.verdict === "update"
+                        ? {
+                              ...claim,
+                              requiredUpdateAnchors: ["alpha", "beta"],
+                              forbiddenUpdateAnchors: ["alpha; beta"],
+                          }
+                        : claim,
+                ),
+            },
+        };
+        expect(runMutationBattery(fixture).green).toBe(true);
+    });
+
+    test("a single-file map gold still yields a changed manifest", () => {
+        const fixture = {
+            ...dreamerScorerFixture,
+            mapGold: {
+                kind: "map" as const,
+                claims: [
+                    // Exactly the stand-in path the mutation used to hard-code:
+                    // reusing it produces no textual change and throws instead
+                    // of producing the mutation.
+                    { claimId: "claim-true", files: ["mutation/other.ts"], independent: false },
+                    { claimId: "claim-independent", files: [], independent: true },
+                ],
+            },
+        };
+        const evidence = runMutationBattery(fixture);
+        expect(evidence.results.find((entry) => entry.mutationClass === "missing-gold-file")).toMatchObject({
+            green: true,
+            actualStage: "scored",
+            actualReason: "wrong-mapping",
+        });
+        expect(evidence.green).toBe(true);
+    });
 });

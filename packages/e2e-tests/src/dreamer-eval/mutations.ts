@@ -3,6 +3,7 @@ import type {
     FailReason,
     ParsedLayerGold,
     PoolDescriptor,
+    VerifyGoldClaim,
 } from "./contract";
 import {
     scoreClassifyManifest,
@@ -80,6 +81,76 @@ function claimById(pool: PoolDescriptor, claimId: string) {
     return claim;
 }
 
+/**
+ * Punctuation only: these characters survive a manifest attribute and body
+ * without changing how the parser splits them, and none is whitespace, so
+ * content built from one is never trimmed away.
+ */
+const FILLER_ALPHABET = "#@%~^+=!?";
+
+function containsAny(content: string, phrases: readonly string[]): boolean {
+    const lowered = content.toLowerCase();
+    return phrases.some((phrase) => lowered.includes(phrase.toLowerCase()));
+}
+
+/**
+ * A character present in none of `phrases`. Anchor checks are case-insensitive
+ * substring tests, so a string built only from this character contains no
+ * phrase, and any substring spanning it cannot match one either.
+ */
+function fillerAbsentFrom(phrases: readonly string[], description: string): string {
+    const lowered = phrases.map((phrase) => phrase.toLowerCase());
+    const filler = [...FILLER_ALPHABET].find(
+        (candidate) => !lowered.some((phrase) => phrase.includes(candidate)),
+    );
+    if (filler === undefined) throw new Error(`mutation fixture needs ${description}`);
+    return filler;
+}
+
+/**
+ * Update content that carries every required anchor and no forbidden one.
+ *
+ * The contract rejects a forbidden anchor contained in a single required anchor
+ * but not one spanning their join: required `alpha` and `beta` with forbidden
+ * `alpha; beta` validates, yet the delimiter-joined baseline would contain the
+ * forbidden phrase and fail scoring, making `runMutationBattery` throw on its
+ * own supposedly-correct baseline. A separator holding a character absent from
+ * every forbidden anchor makes a spanning match impossible.
+ */
+function passingUpdateContent(gold: VerifyGoldClaim): string {
+    if (gold.requiredUpdateAnchors.length === 0) {
+        // Production refuses an empty replacement body, so the baseline still
+        // needs content when the gold requires no anchor.
+        return fillerAbsentFrom(
+            gold.forbiddenUpdateAnchors,
+            "a filler character absent from every forbidden update anchor",
+        ).repeat(3);
+    }
+    const joined = gold.requiredUpdateAnchors.join("; ");
+    if (!containsAny(joined, gold.forbiddenUpdateAnchors)) return joined;
+    const filler = fillerAbsentFrom(
+        gold.forbiddenUpdateAnchors,
+        "a separator absent from every forbidden update anchor",
+    );
+    const spaced = gold.requiredUpdateAnchors.join(` ${filler} `);
+    if (containsAny(spaced, gold.forbiddenUpdateAnchors)) {
+        throw new Error("mutation fixture needs update anchors joinable without a forbidden phrase");
+    }
+    return spaced;
+}
+
+/**
+ * A path outside `files`. Among `files.length + 1` distinct candidates at least
+ * one cannot collide, so the loop always returns.
+ */
+function pathAbsentFrom(files: readonly string[]): string {
+    for (let index = 0; index <= files.length; index += 1) {
+        const candidate = index === 0 ? "mutation/other.ts" : `mutation/other-${index}.ts`;
+        if (!files.includes(candidate)) return candidate;
+    }
+    throw new Error("mutation fixture could not synthesize a path absent from the map gold");
+}
+
 function correctVerifyManifest(fixture: DreamerMutationFixture): string {
     const entries = fixture.verifyGold.claims.map((gold) => {
         const claim = claimById(fixture.pool, gold.claimId);
@@ -87,7 +158,7 @@ function correctVerifyManifest(fixture: DreamerMutationFixture): string {
             return `<verified claim="${claim.publicClaimId}" files="${gold.expectedFiles.join(",")}"/>`;
         }
         if (gold.verdict === "archive") return `<archive claim="${claim.publicClaimId}" reason="contradicted"/>`;
-        return `<update claim="${claim.publicClaimId}" files="${gold.expectedFiles.join(",")}">${gold.requiredUpdateAnchors.join("; ")}</update>`;
+        return `<update claim="${claim.publicClaimId}" files="${gold.expectedFiles.join(",")}">${passingUpdateContent(gold)}</update>`;
     });
     return `<verify>\n${entries.join("\n")}\n</verify>`;
 }
@@ -170,8 +241,25 @@ function mutationManifest(
             return { task: "verify", manifest: replaceEntry(verify, verifiedClaim.publicClaimId, `<update claim="${verifiedClaim.publicClaimId}" files="${verifiedClaim.files.join(",")}">still true</update>`) };
         case "verified-for-update":
             return { task: "verify", manifest: replaceEntry(verify, updatedClaim.publicClaimId, `<verified claim="${updatedClaim.publicClaimId}" files="${updatedClaim.files.join(",")}"/>`) };
-        case "update-missing-anchor":
-            return { task: "verify", manifest: replaceEntry(verify, updatedClaim.publicClaimId, `<update claim="${updatedClaim.publicClaimId}" files="${updated.expectedFiles.join(",")}">replacement omits required facts</update>`) };
+        case "update-missing-anchor": {
+            // The mutation has to actually omit a required anchor, so it needs
+            // an update gold that has one: with none, any replacement is valid
+            // content and the case would score PASS. A fixed sentence is not
+            // enough either — ordinary anchors such as `required` or `facts`
+            // occur in it and score PASS the same way. Content built from a
+            // character absent from every anchor provably omits all of them.
+            const target = requiredGold(
+                fixture.verifyGold.claims,
+                (entry) => entry.verdict === "update" && entry.requiredUpdateAnchors.length > 0,
+                "an update gold with a required anchor",
+            );
+            const claim = claimById(fixture.pool, target.claimId);
+            const content = fillerAbsentFrom(
+                [...target.requiredUpdateAnchors, ...target.forbiddenUpdateAnchors],
+                "a filler character absent from every update anchor",
+            ).repeat(3);
+            return { task: "verify", manifest: replaceEntry(verify, claim.publicClaimId, `<update claim="${claim.publicClaimId}" files="${target.expectedFiles.join(",")}">${content}</update>`) };
+        }
         case "update-forbidden-anchor": {
             const forbidden = updated.forbiddenUpdateAnchors[0];
             if (forbidden === undefined) throw new Error("mutation fixture needs forbidden update anchor");
@@ -186,7 +274,11 @@ function mutationManifest(
         case "missing-gold-file": {
             const target = requiredGold(fixture.mapGold.claims, (entry) => !entry.independent && entry.files.length > 0, "mapped gold file");
             const claim = claimById(fixture.pool, target.claimId);
-            const remaining = target.files.length > 1 ? target.files.slice(1) : ["mutation/other.ts"];
+            // Dropping the first path is the mutation. A single-file gold has
+            // nothing to drop, so it needs a stand-in the gold does not already
+            // name — otherwise `replaceMapFiles` sees no textual change and
+            // throws instead of producing the mutation.
+            const remaining = target.files.length > 1 ? target.files.slice(1) : [pathAbsentFrom(target.files)];
             return { task: "map", manifest: replaceMapFiles(map, claim.publicClaimId, remaining) };
         }
         case "importance-outside-band": {

@@ -337,6 +337,25 @@ describe("dreamer eval seeder", () => {
         );
     });
 
+    test("a claim cannot declare the reserved fixture marker path", async () => {
+        const selectedScenario = scenario("verify");
+        // The marker is rewritten after fixture content is written, so authored
+        // content here would be silently replaced while the tracked-and-clean
+        // commit check still passed.
+        selectedScenario.pool.claims[0]!.fixtureFiles = [
+            { path: ".dreamer-eval-fixture", content: "not the marker\n" },
+        ];
+
+        await expect(
+            seedDreamerEvalTask({
+                db: database(),
+                scenario: selectedScenario,
+                task: selectedScenario.tasks[0]!,
+                workdir: workdir(),
+            }),
+        ).rejects.toThrow("ERROR:fixture-drift: fixture path is reserved: .dreamer-eval-fixture");
+    });
+
     test("reports a result mode the production gate did not return", async () => {
         const selectedScenario = scenario("verify");
         const selectedTask = selectedScenario.tasks[0]!;

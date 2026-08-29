@@ -1,5 +1,6 @@
 import { makeContractPrimitives } from "../contract-primitives";
 import { ANTI_MEMORY_CATEGORY } from "../../../plugin/src/features/magic-context/memory/constants";
+import { hasShareabilitySensitiveText } from "../../../plugin/src/shared/redaction";
 
 export const DREAMER_EVAL_SCENARIO_SCHEMA = "dreamer-eval-scenario/v1";
 export const DREAMER_EVAL_POOL_SCHEMA = "dreamer-eval-pool/v1";
@@ -63,7 +64,22 @@ export type VerificationOutcome = (typeof VERIFICATION_OUTCOMES)[number];
 const SCENARIO_ID_RE = /^dme-[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const CLAIM_ID_RE = /^claim-[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const RUN_ID_RE = /^run-[a-z0-9]+(?:-[a-z0-9]+)*$/;
-const SHA_RE = /^[0-9a-f]{40,64}$/;
+/**
+ * A full Git object ID is 40 hexadecimal characters under SHA-1 and 64 under
+ * SHA-256, with nothing in between. Accepting the intermediate lengths would let
+ * a report name a commit that cannot exist, so the recorded source revision
+ * could not be checked out or verified.
+ */
+const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
+/**
+ * Lowest verification timestamp the seeder can build a fixture around.
+ * `prepareFixtureRepository` derives the fixture commit time as the earliest
+ * verification minus 2_000 ms and rejects a non-positive result as
+ * `fixture-drift`, so anything at or below 2_000 describes a scenario that can
+ * never reach preflight or scoring.
+ */
+const MIN_VERIFIED_AT_MS = 2_001;
 
 export class DreamerEvalContractError extends Error {
     readonly diagnostics: readonly string[];
@@ -88,8 +104,17 @@ function boundedInteger(value: unknown, label: string, minimum: number, maximum:
     return parsed;
 }
 
-function nullableString(value: unknown, label: string): string | null {
-    return value === null ? null : string(value, label);
+/**
+ * Provider bytes verbatim, with `null` reserved for "nothing was captured".
+ * `string` rejects a blank value, but a blank or whitespace-only manifest is
+ * exactly what every scorer records as `ERROR:provider-failure`, so that
+ * evidence has to round-trip through the report instead of collapsing into the
+ * absence case and losing the distinction.
+ */
+function nullableRawText(value: unknown, label: string): string | null {
+    if (value === null) return null;
+    if (typeof value !== "string") fail(`${label}: string-invalid`);
+    return value as string;
 }
 
 export interface FixtureFile {
@@ -278,7 +303,7 @@ function parsePreconditions(raw: unknown, label: string, poolIds: ReadonlySet<st
         return {
             claimId,
             outcome: enumeration(item.outcome, VERIFICATION_OUTCOMES, `${itemLabel}.outcome`),
-            verifiedAt: integer(item.verifiedAt, `${itemLabel}.verifiedAt`),
+            verifiedAt: integer(item.verifiedAt, `${itemLabel}.verifiedAt`, MIN_VERIFIED_AT_MS),
         };
     });
     unique(verifications.map((entry) => entry.claimId), `${label}.verifications`);
@@ -292,10 +317,40 @@ function parsePreconditions(raw: unknown, label: string, poolIds: ReadonlySet<st
     return { mappings, verifications, classifiedClaimIds };
 }
 
+/**
+ * Every path the seeder writes and commits, collected across the whole pool
+ * rather than per claim: a fixture may model a file that moved, so one claim's
+ * gold set can legitimately name a path another claim declares.
+ */
+function declaredFixturePaths(pool: ReadonlyMap<string, ScenarioClaim>): ReadonlySet<string> {
+    const paths = new Set<string>();
+    for (const claim of pool.values()) {
+        for (const file of claim.fixtureFiles) paths.add(file.path);
+    }
+    return paths;
+}
+
+/**
+ * Gold file sets are restricted to declared fixture paths. Production routes
+ * manifest paths through `normalizeVerificationFiles`, which canonicalizes
+ * tracked paths, drops untracked ones, and rejects the manifest when none
+ * survives. Gold naming an untracked path (`src/ghost.ts`) or a noncanonical
+ * alias of a tracked one (`src/./file.ts`) would therefore score a green run for
+ * output the host cannot apply.
+ */
+function parseGoldFilePathArray(raw: unknown, label: string, declared: ReadonlySet<string>): string[] {
+    const values = parseFilePathArray(raw, label);
+    for (const [index, value] of values.entries()) {
+        if (!declared.has(value)) fail(`${label}[${index}]: path-untracked`);
+    }
+    return values;
+}
+
 function parseVerifyGold(raw: unknown, label: string, pool: ReadonlyMap<string, ScenarioClaim>): ParsedLayerGold {
     const value = record(raw, label);
     exact(value, ["kind", "claims"], label);
     if (value.kind !== "verify") fail(`${label}.kind: task-gold-mismatch`);
+    const declared = declaredFixturePaths(pool);
     const claims = array(value.claims, `${label}.claims`).map((entry, index) => {
         const itemLabel = `${label}.claims[${index}]`;
         const item = record(entry, itemLabel);
@@ -305,7 +360,7 @@ function parseVerifyGold(raw: unknown, label: string, pool: ReadonlyMap<string, 
         if (poolClaim === undefined) return fail(`${itemLabel}.claimId: unknown-claim`);
         if (poolClaim.fileIndependent) fail(`${itemLabel}.claimId: file-independent-verify`);
         const verdict = enumeration(item.verdict, VERIFY_VERDICTS, `${itemLabel}.verdict`);
-        const expectedFiles = parseFilePathArray(item.expectedFiles, `${itemLabel}.expectedFiles`);
+        const expectedFiles = parseGoldFilePathArray(item.expectedFiles, `${itemLabel}.expectedFiles`, declared);
         if (verdict === "archive" && expectedFiles.length > 0) {
             fail(`${itemLabel}.expectedFiles: archive-has-files`);
         }
@@ -342,6 +397,7 @@ function parseMapGold(raw: unknown, label: string, pool: ReadonlyMap<string, Sce
     const value = record(raw, label);
     exact(value, ["kind", "claims"], label);
     if (value.kind !== "map") fail(`${label}.kind: task-gold-mismatch`);
+    const declared = declaredFixturePaths(pool);
     const claims = array(value.claims, `${label}.claims`).map((entry, index) => {
         const itemLabel = `${label}.claims[${index}]`;
         const item = record(entry, itemLabel);
@@ -351,7 +407,7 @@ function parseMapGold(raw: unknown, label: string, pool: ReadonlyMap<string, Sce
         if (poolClaim === undefined) return fail(`${itemLabel}.claimId: unknown-claim`);
         const independent = boolean(item.independent, `${itemLabel}.independent`);
         if (independent !== poolClaim.fileIndependent) fail(`${itemLabel}.independent: pool-mismatch`);
-        const files = parseFilePathArray(item.files, `${itemLabel}.files`);
+        const files = parseGoldFilePathArray(item.files, `${itemLabel}.files`, declared);
         // A manifest reports either an independent claim or a file set, never
         // both, so the opposite pairing describes an outcome no correct model
         // response can produce.
@@ -372,18 +428,28 @@ function parseClassifyGold(raw: unknown, label: string, pool: ReadonlyMap<string
         const item = record(entry, itemLabel);
         exact(item, ["claimId", "importance", "scope", "shareable"], itemLabel);
         const claimId = staticId(item.claimId, `${itemLabel}.claimId`, CLAIM_ID_RE);
-        if (!pool.has(claimId)) fail(`${itemLabel}.claimId: unknown-claim`);
+        const poolClaim = pool.get(claimId);
+        if (poolClaim === undefined) return fail(`${itemLabel}.claimId: unknown-claim`);
         const importanceLabel = `${itemLabel}.importance`;
         const importanceValue = record(item.importance, importanceLabel);
         exact(importanceValue, ["min", "max"], importanceLabel);
         const min = boundedInteger(importanceValue.min, `${importanceLabel}.min`, 1, 100);
         const max = boundedInteger(importanceValue.max, `${importanceLabel}.max`, 1, 100);
         if (min > max) fail(`${importanceLabel}: range-invalid`);
+        const shareable = boolean(item.shareable, `${itemLabel}.shareable`);
+        // `applyClassifications` forces shareable to false before writing the
+        // revision whenever the claim content trips the same predicate, so gold
+        // asking for shareable on sensitive content describes a pool the host
+        // will never produce: the model's "true" would score PASS while the
+        // stored claim came out private.
+        if (shareable && hasShareabilitySensitiveText(poolClaim.content)) {
+            fail(`${itemLabel}.shareable: shareability-override`);
+        }
         return {
             claimId,
             importance: { min, max },
             scope: enumeration(item.scope, CLAIM_SCOPES, `${itemLabel}.scope`),
-            shareable: boolean(item.shareable, `${itemLabel}.shareable`),
+            shareable,
         };
     });
     unique(claims.map((entry) => entry.claimId), `${label}.claims`);
@@ -406,6 +472,7 @@ function parseTask(raw: unknown, label: string, pool: ReadonlyMap<string, Scenar
     exact(value, ["task", "preconditions", "expectedInScopeClaimIds", "expectedSkippedClaimIds", "expectedResultMode", "gold"], label);
     const task = enumeration(value.task, DREAMER_TASKS, `${label}.task`);
     const poolIds = new Set(pool.keys());
+    const preconditions = parsePreconditions(value.preconditions, `${label}.preconditions`, poolIds);
     const expectedInScopeClaimIds = parseClaimIdArray(value.expectedInScopeClaimIds, `${label}.expectedInScopeClaimIds`);
     const expectedSkippedClaimIds = parseClaimIdArray(value.expectedSkippedClaimIds, `${label}.expectedSkippedClaimIds`);
     for (const [index, claimId] of expectedInScopeClaimIds.entries()) assertKnownClaim(claimId, poolIds, `${label}.expectedInScopeClaimIds[${index}]`);
@@ -419,8 +486,26 @@ function parseTask(raw: unknown, label: string, pool: ReadonlyMap<string, Scenar
     if ((task === "map-memories" || task === "classify-memories") && expectedResultMode !== null) {
         fail(`${label}.expectedResultMode: task-mode-mismatch`);
     }
-    if (task === "verify-broad" && expectedResultMode !== "broad") fail(`${label}.expectedResultMode: broad-required`);
-    if (task === "verify" && expectedResultMode === null) fail(`${label}.expectedResultMode: verify-mode-required`);
+    if (task === "verify-broad") {
+        if (expectedResultMode !== "broad") fail(`${label}.expectedResultMode: broad-required`);
+        // `seedDreamerEvalTask` cannot construct the broad-cycle watermark
+        // without verification history and rejects such a task as
+        // `fixture-drift`, so accepting one here would admit a scenario that can
+        // never run.
+        if (preconditions.verifications.length === 0) {
+            fail(`${label}.preconditions.verifications: broad-requires-history`);
+        }
+    }
+    // The seeder always git-inits the workdir, commits, and calls
+    // partitionVerifyScope with forceBroad false. That path returns "broad" only
+    // under forceBroad, never returns "non-git" at all, and returns "full" only
+    // when git change-times are unavailable — which the seeder treats as
+    // fixture drift. "incremental" is the one mode a healthy fixture produces,
+    // so any other value here is a scenario that deterministically terminates
+    // with gate-mismatch at preflight.
+    if (task === "verify" && expectedResultMode !== "incremental") {
+        fail(`${label}.expectedResultMode: verify-mode-unproducible`);
+    }
 
     const gold = task === "verify" || task === "verify-broad"
         ? parseVerifyGold(value.gold, `${label}.gold`, pool)
@@ -430,7 +515,7 @@ function parseTask(raw: unknown, label: string, pool: ReadonlyMap<string, Scenar
     if (!sameSet(gold.claims.map((entry) => entry.claimId), expectedInScopeClaimIds)) fail(`${label}.gold.claims: in-scope-mismatch`);
     return {
         task,
-        preconditions: parsePreconditions(value.preconditions, `${label}.preconditions`, poolIds),
+        preconditions,
         expectedInScopeClaimIds,
         expectedSkippedClaimIds,
         expectedResultMode,
@@ -633,7 +718,7 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
         system: parseSystem(root.system, `${label}.system`),
         poolBefore,
         poolAfter,
-        rawManifest: nullableString(root.rawManifest, `${label}.rawManifest`),
+        rawManifest: nullableRawText(root.rawManifest, `${label}.rawManifest`),
         parsedManifest: parseManifestEvidence(root.parsedManifest, `${label}.parsedManifest`),
         receiptOutcomes,
     };

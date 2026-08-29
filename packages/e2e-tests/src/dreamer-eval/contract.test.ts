@@ -164,7 +164,9 @@ describe("dreamer eval scenario contract", () => {
     test("map gold cannot pair independence with a file set", () => {
         expectDiagnostic((raw) => {
             const tasks = raw.tasks as Array<{ gold: { claims: Array<{ files: string[] }> } }>;
-            tasks[1]!.gold.claims[9]!.files = ["src/ghost.ts"];
+            // A declared fixture path, so the independence pairing is what
+            // fails rather than the tracked-path check.
+            tasks[1]!.gold.claims[9]!.files = ["src/file-1.ts"];
         }, "scenario.tasks[1].gold.claims[9].files: independent-has-files");
         expectDiagnostic((raw) => {
             const tasks = raw.tasks as Array<{ gold: { claims: Array<{ files: string[] }> } }>;
@@ -236,6 +238,72 @@ describe("dreamer eval scenario contract", () => {
             const tasks = raw.tasks as Array<{ preconditions: { mappings: unknown[] } }>;
             tasks[0]!.preconditions.mappings = [{ claimId: "claim-1", files: ["src/a<b>.ts"] }];
         }, "scenario.tasks[0].preconditions.mappings[0].files[0]: path-unrepresentable");
+    });
+
+    test("gold file sets are restricted to declared fixture paths", () => {
+        // Production drops an untracked path and rejects the manifest when none
+        // survives, so gold naming one would score green for output the host
+        // cannot apply.
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<{ gold: { claims: Array<{ expectedFiles: string[] }> } }>;
+            tasks[0]!.gold.claims[0]!.expectedFiles = ["src/ghost.ts"];
+        }, "scenario.tasks[0].gold.claims[0].expectedFiles[0]: path-untracked");
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<{ gold: { claims: Array<{ files: string[] }> } }>;
+            tasks[1]!.gold.claims[0]!.files = ["src/./file-1.ts"];
+        }, "scenario.tasks[1].gold.claims[0].files[0]: path-untracked");
+        // A claim may name a path another claim declares: that is how a fixture
+        // models a file that moved.
+        const moved = validScenarioRaw();
+        (moved.tasks as Array<{ gold: { claims: Array<{ expectedFiles: string[] }> } }>)[0]!.gold.claims[0]!.expectedFiles =
+            ["src/file-2.ts"];
+        expect(() => parseScenario(moved)).not.toThrow();
+    });
+
+    test("a verify task must declare the one result mode the seeder can produce", () => {
+        // The seeder always git-inits and commits, and calls the gate with
+        // forceBroad false: "broad" needs forceBroad, "non-git" is never
+        // returned at all, and "full" only appears when git change-times are
+        // unavailable — which the seeder itself treats as fixture drift.
+        for (const mode of ["full", "non-git", "broad", null]) {
+            expectDiagnostic((raw) => {
+                (raw.tasks as Array<Record<string, unknown>>)[0]!.expectedResultMode = mode;
+            }, "scenario.tasks[0].expectedResultMode: verify-mode-unproducible");
+        }
+    });
+
+    test("a broad task must carry the verification history its watermark needs", () => {
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<Record<string, unknown>>;
+            tasks[0]!.task = "verify-broad";
+            tasks[0]!.expectedResultMode = "broad";
+        }, "scenario.tasks[0].preconditions.verifications: broad-requires-history");
+    });
+
+    test("a verification timestamp must leave room for the fixture commit", () => {
+        // The seeder derives the commit time as the earliest verification minus
+        // 2_000 ms and rejects a non-positive result as fixture-drift.
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<{ preconditions: { verifications: unknown[] } }>;
+            tasks[0]!.preconditions.verifications = [
+                { claimId: "claim-1", outcome: "verified", verifiedAt: 2_000 },
+            ];
+        }, "scenario.tasks[0].preconditions.verifications[0].verifiedAt: integer-invalid");
+        const seedable = validScenarioRaw();
+        (seedable.tasks as Array<{ preconditions: { verifications: unknown[] } }>)[0]!.preconditions.verifications = [
+            { claimId: "claim-1", outcome: "verified", verifiedAt: 2_001 },
+        ];
+        expect(() => parseScenario(seedable)).not.toThrow();
+    });
+
+    test("classify gold cannot request shareable for content production forces private", () => {
+        // applyClassifications rewrites shareable to false for this content, so
+        // the model's "true" would score PASS while the stored claim came out
+        // private.
+        expectDiagnostic((raw) => {
+            (raw.pool as { claims: Array<{ content: string }> }).claims[0]!.content =
+                "The provider answers on 127.0.0.1:8080 during local runs.";
+        }, "scenario.tasks[2].gold.claims[0].shareable: shareability-override");
     });
 });
 
@@ -341,5 +409,33 @@ describe("dreamer eval report contract", () => {
             ).toThrow(new RegExp(`${field}.publicClaimId: duplicate`));
         }
         expect(parseRunReport({ ...baseReport, poolBefore: [snapshot] }).poolBefore).toHaveLength(1);
+    });
+
+    test("a commit sha must be a full object id, not an intermediate length", () => {
+        // 40 hex characters under SHA-1, 64 under SHA-256, nothing between: an
+        // intermediate length names a commit that cannot exist, so the recorded
+        // source revision could not be checked out or verified.
+        for (const sha of ["a".repeat(39), "a".repeat(41), "a".repeat(63), "a".repeat(65)]) {
+            expect(() =>
+                parseRunReport({ ...baseReport, system: { ...baseReport.system, repoCommitSha: sha } }),
+            ).toThrow(/repoCommitSha: id-invalid/);
+        }
+        for (const sha of ["a".repeat(40), "a".repeat(64)]) {
+            expect(
+                parseRunReport({ ...baseReport, system: { ...baseReport.system, repoCommitSha: sha } }).system
+                    .repoCommitSha,
+            ).toBe(sha);
+        }
+    });
+
+    test("blank provider output round-trips instead of collapsing into absence", () => {
+        // Every scorer records a blank manifest as ERROR:provider-failure, so the
+        // observed bytes have to survive the report; null stays reserved for "no
+        // output was captured".
+        const blank = { ...baseReport, status: "ERROR", reason: "provider-failure", rawManifest: "   " };
+        expect(parseRunReport(blank).rawManifest).toBe("   ");
+        expect(parseRunReport({ ...blank, rawManifest: "" }).rawManifest).toBe("");
+        expect(parseRunReport({ ...blank, rawManifest: null }).rawManifest).toBeNull();
+        expect(() => parseRunReport({ ...blank, rawManifest: 7 })).toThrow(/rawManifest: string-invalid/);
     });
 });

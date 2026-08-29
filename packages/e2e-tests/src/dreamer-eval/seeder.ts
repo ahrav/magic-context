@@ -5,7 +5,7 @@ import {
     realpathSync,
     writeFileSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
     readProjectMemoryCurrentState,
     resolveProjectIdentity,
@@ -119,14 +119,26 @@ function fixturePath(workdir: string, path: string): string {
     if (isAbsolute(path)) fixtureError(`fixture path must be relative: ${path}`);
     const target = resolve(workdir, path);
     const fromRoot = relative(workdir, target);
-    if (fromRoot === "" || fromRoot === ".." || fromRoot.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`)) {
+    if (fromRoot === "" || fromRoot === ".." || fromRoot.startsWith(`..${sep}`)) {
         fixtureError(`fixture path escapes workdir: ${path}`);
     }
+    // `relative` reports the platform separator, so on Windows the portable
+    // spelling a manifest and `git ls-files` use (`src/file.ts`) comes back as
+    // `src\file.ts`. Compare against a POSIX-normalized copy so forward slashes
+    // stay canonical on every platform; `.` and `..` aliases still differ from
+    // their resolved form and are still rejected.
+    const canonical = sep === "/" ? fromRoot : fromRoot.split(sep).join("/");
     // Aliases of one target (`src/./a.ts`, `src/sub/../a.ts`) must not reach the
     // repository. Mapping preconditions, gold file sets, and `git ls-files`
     // compare the authored string, so two aliases would satisfy every check
     // while writing one file — the second content silently replacing the first.
-    if (fromRoot !== path) fixtureError(`fixture path is not canonical: ${path}`);
+    if (canonical !== path) fixtureError(`fixture path is not canonical: ${path}`);
+    // The marker names the scenario that owns this workdir and is written after
+    // fixture content, so a claim declaring it would have its authored content
+    // silently overwritten. The commit and `assertFixtureFilesCommitted` would
+    // still pass — they only check that the path is tracked and clean — leaving
+    // the evaluation to run against evidence the claim never declared.
+    if (canonical === FIXTURE_MARKER) fixtureError(`fixture path is reserved: ${path}`);
     // The control directory lives inside the workdir but is not fixture
     // content: a write there steers the seeder's own git invocations, and
     // `.git/hooks` would execute during the fixture commit.
