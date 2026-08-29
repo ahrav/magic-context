@@ -104,6 +104,11 @@ tests/docker/.generated/
 .beads-credential-key
 .beads/proxieddb/
 
+# Retired dashboard updater signing keys: maintainer checkouts that generated
+# one still hold the ignored private key on disk after the package deletion,
+# and without this rule a routine `git add -A` would stage it.
+packages/dashboard/.tauri-keys/
+
 docs/plans/
 docs/fork-hardening-audit.md
 

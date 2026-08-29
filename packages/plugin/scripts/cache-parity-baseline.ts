@@ -5,8 +5,10 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { Database } from "bun:sqlite";
 
-const DASHBOARD_FORMULA_SOURCE = "packages/dashboard/src-tauri/src/db.rs:1505-1523,1581-1592,1704-1763";
-const ALTERNATIVE_FORMULA_SOURCE = "packages/dashboard/src/lib/cache-format.ts:105-120";
+const DASHBOARD_FORMULA_SOURCE =
+    "packages/dashboard/src-tauri/src/db.rs:1505-1523,1581-1592,1704-1763 @ 6a4efb07 (retired dashboard; resolve via git history)";
+const ALTERNATIVE_FORMULA_SOURCE =
+    "packages/dashboard/src/lib/cache-format.ts:105-120 @ 6a4efb07 (retired dashboard; resolve via git history)";
 const LOW_CACHE_THRESHOLD = 90;
 const DASHBOARD_WARNING_THRESHOLD = 95;
 const DASHBOARD_BUST_THRESHOLD = 80;
