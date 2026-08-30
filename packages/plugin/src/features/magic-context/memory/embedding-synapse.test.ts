@@ -225,6 +225,27 @@ describe("SynapseEmbeddingProvider", () => {
         expect(demands).toBe(1);
     });
 
+    it("does not re-demand when a managed demand succeeds without a daemon identity", async () => {
+        // A success that omits the identity certifies no incarnation, so the
+        // lane cannot dial. That is a failed demand and must arm the same
+        // backoff; otherwise each later call spawns another native lifecycle
+        // start and storage probe at request rate.
+        let demands = 0;
+        const provider = new SynapseEmbeddingProvider({
+            projectRoot: "/repo",
+            session: "managed-demand-no-identity",
+            demandStart: async () => {
+                demands += 1;
+                return { ok: true, reason: "started", storage: "ready" };
+            },
+            connectionOrigin: "managed-default",
+        });
+
+        expect(await provider.initialize()).toBe(false);
+        expect(await provider.initialize()).toBe(false);
+        expect(demands).toBe(1);
+    });
+
     it("discovers a certified model and sends the required artifact constraints", async () => {
         const client = new MockSynapseClient();
         const provider = new SynapseEmbeddingProvider({
@@ -277,6 +298,17 @@ describe("SynapseEmbeddingProvider", () => {
             projectRoot: "/repo",
             session: "fence-required",
             clientFactory: async () => client,
+            // A lifecycle owner is part of the scenario, not scaffolding: it is
+            // the only writer of a certified identity, so a cleared identity is
+            // reachable only on a lane that has one. The injected factory keeps
+            // the origin non-managed until the state below is installed, so this
+            // owner is never invoked.
+            demandStart: async () => ({
+                ok: true,
+                reason: "started",
+                storage: "ready",
+                authenticatedDaemonId: new Uint8Array([4, 2]),
+            }),
         });
         expect(await provider.initialize()).toBe(true);
 
@@ -295,6 +327,33 @@ describe("SynapseEmbeddingProvider", () => {
         // that no request reached the wire without an expectation.
         expect(await provider.embed("hello")).toBeNull();
         expect(client.requests.length).toBe(published);
+    });
+
+    it("dials a managed-default lane that has no lifecycle owner to certify it", async () => {
+        // With no owner configured the lane is dial-only, and no identity is
+        // ever certified, so requiring one would refuse the very first
+        // discovery call against an already-running daemon.
+        const client = new MockSynapseClient();
+        const provider = new SynapseEmbeddingProvider({
+            projectRoot: "/repo",
+            session: "passive-dial",
+            clientFactory: async () => client,
+        });
+        const internals = provider as unknown as {
+            connectionOrigin: string;
+            demandStart: unknown;
+            compatibleDaemonId: Uint8Array | null;
+        };
+        internals.connectionOrigin = "managed-default";
+        expect(internals.demandStart).toBeUndefined();
+
+        expect(await provider.initialize()).toBe(true);
+        expect(internals.compatibleDaemonId).toBeNull();
+        const discovery = client.requests.find((entry) => entry.method === "models.list");
+        expect(discovery).toBeDefined();
+        // Nothing certified an incarnation, so the call carries no expectation
+        // and the daemon's own handshake is the only fence available.
+        expect(discovery?.expectedDaemonId).toBeUndefined();
     });
 
     it("re-certification leaves an identity a sibling already certified in place", async () => {

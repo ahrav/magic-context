@@ -838,6 +838,12 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
             );
         }
         if (outcome.authenticatedDaemonId === undefined) {
+            // An owner that reports success without the identity has certified
+            // nothing this lane can fence against, so the demand failed on its
+            // own terms and arms the same window as the other failure outcomes.
+            // Without it every later call re-enters the demand and drives
+            // another native start and storage probe at request rate.
+            this.demandFailedUntilMs = this.now() + SYNAPSE_DEMAND_RETRY_BACKOFF_MS;
             throw new SynapseEmbeddingError(
                 "transport",
                 "managed lifecycle compatibility returned no daemon identity",
@@ -1944,10 +1950,22 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
             try {
                 if (!this.client)
                     throw new SynapseEmbeddingError("transport", "Synapse client is unavailable");
-                // The managed lane publishes only against the incarnation the
-                // lifecycle owner certified. An absent identity means the fence
-                // cannot be proved, so refuse rather than publish unfenced.
-                if (this.connectionOrigin === "managed-default" && this.compatibleDaemonId === null)
+                // The managed lane publishes only against the incarnation its
+                // lifecycle owner certified. The owner is the sole writer of
+                // that identity, so when one is configured an absent identity
+                // means the fence was never proved or a rotation invalidated
+                // it, and publishing would go unfenced onto an unknown
+                // incarnation. With no owner configured nothing certifies an
+                // incarnation and the lane is dial-only: there is no fence to
+                // prove, and requiring one would refuse every call against an
+                // already-running daemon. The same field gates the demand, so
+                // certifier and fence cannot disagree about which lanes are
+                // owned.
+                if (
+                    this.connectionOrigin === "managed-default" &&
+                    this.demandStart &&
+                    this.compatibleDaemonId === null
+                )
                     throw new SynapseEmbeddingError(
                         "module_restarted",
                         "managed Synapse lane has no certified daemon identity",
