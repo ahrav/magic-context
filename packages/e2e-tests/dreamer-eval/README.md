@@ -64,6 +64,16 @@ variance contracts are archived evidence older tooling must keep parsing, and
 because a wholly skipped group has no report to aggregate and so can carry no
 variance artifact at all.
 
+`--output-dir` must be empty or absent, and the run refuses before spending model
+credits when it is not. Run ids are per-run UUIDs, so a reused directory
+accumulates reports instead of replacing them: `archivedRuns` would count only the
+newest invocation's reports while the directory held an earlier one's,
+`variance.json` would be rewritten as an aggregate of just those newest reports,
+and a group directory left by an earlier filtered run would sit beside a
+`coverage.json` that does not list it. Keeping one invocation's evidence per tree
+is what makes `archivedRuns` checkable by counting files. Remove the directory or
+pass a fresh path to rerun.
+
 There is no deadline by default. `--deadline-minutes <n>` bounds the live loop
 for callers running under an external timeout: before each run after the
 first, the script checks that the longest completed run still fits in the
@@ -93,8 +103,8 @@ which paths the host would actually store.
 
 Exit codes are `0` when every run passes, `1` for any ordinary FAIL or ERROR,
 and `2` when any run archives a gold-true claim. Missing credentials, invalid
-filters, malformed scenarios, deadline truncation, and artifact failures exit
-`1`.
+filters, malformed scenarios, a non-empty output directory, deadline truncation,
+and artifact failures exit `1`.
 
 ## Authoring scenarios
 

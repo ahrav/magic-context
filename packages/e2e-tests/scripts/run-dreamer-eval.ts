@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import {
@@ -94,16 +94,40 @@ export function canStartDreamerEvalRun(
 
 export const DREAMER_EVAL_COVERAGE_SCHEMA = "dreamer-eval-coverage/v1";
 
+/**
+ * Rejects an output directory that already holds anything, returning the reason or
+ * null when it is safe to write into.
+ *
+ * Run ids are per-run UUIDs, so a reused directory accumulates reports rather than
+ * replacing them, and every archive-backed claim then reads against a tree holding
+ * more than one invocation: `archivedRuns` would count only this run's reports
+ * while the directory held an earlier run's too, `variance.json` would be
+ * overwritten with an aggregate of just the newest ones, and a group directory left
+ * by an earlier filtered run would sit beside a `coverage.json` that does not list
+ * it. Requiring an empty directory keeps the tree one invocation's evidence, which
+ * is what lets a reader check `archivedRuns` by counting files.
+ *
+ * It refuses rather than clearing: the path comes from `--output-dir`, and a
+ * recursive delete of a caller-supplied directory is not worth the convenience.
+ */
+export function dreamerEvalOutputDirConflict(entries: readonly string[]): string | null {
+    if (entries.length === 0) return null;
+    const sorted = [...entries].sort();
+    const shown = sorted.slice(0, 5).join(", ");
+    return `--output-dir must be empty to hold one run's evidence, but it contains ${shown}${sorted.length > 5 ? `, and ${sorted.length - 5} more` : ""}; remove it or pass a fresh path`;
+}
+
 export interface DreamerEvalGroupCoverage {
     scenarioId: string;
     task: DreamerTask;
     /** Repeats this invocation asked for, which is `--repeat` for every group. */
     requestedRuns: number;
     /**
-     * Run reports written under the group directory. Defined against the archive
-     * rather than against runs attempted, so an offline reader can confirm it by
-     * counting files. A run that executed but failed to write its report is
-     * therefore absent here, and `runFailed` is what records that it happened.
+     * Run reports written under the group directory. The output directory is
+     * required to start empty, so this equals the report files present there and
+     * an offline reader can confirm it by counting them. A run that executed but
+     * failed to write its report is therefore absent here, and `runFailed` is what
+     * records that it happened.
      */
     archivedRuns: number;
     /** Whether the group's `variance.json` was written. */
@@ -206,6 +230,10 @@ async function main(): Promise<0 | 1 | 2> {
     );
     if (groups.length === 0) throw new Error("filters selected no scenario tasks");
 
+    // Checked before the directory is created, so the script never trips over its
+    // own tree, and before any paid run, so a reuse mistake costs no model credits.
+    const conflict = dreamerEvalOutputDirConflict(existsSync(args.outputDir) ? readdirSync(args.outputDir) : []);
+    if (conflict !== null) throw new Error(conflict);
     mkdirSync(args.outputDir, { recursive: true });
     const reports: DreamerEvalRunReport[] = [];
     let aggregationFailed = false;

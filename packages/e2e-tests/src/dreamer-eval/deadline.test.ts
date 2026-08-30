@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import {
     DREAMER_EVAL_COVERAGE_SCHEMA,
     canStartDreamerEvalRun,
+    dreamerEvalOutputDirConflict,
     dreamerEvalRunCoverage,
     type DreamerEvalGroupCoverage,
 } from "../../scripts/run-dreamer-eval";
@@ -97,5 +98,34 @@ describe("dreamer eval run coverage", () => {
         const coverage = dreamerEvalRunCoverage(groups, intact);
         groups[0]!.archivedRuns = 3;
         expect(coverage.groups[0]?.archivedRuns).toBe(1);
+    });
+});
+
+describe("dreamer eval output directory", () => {
+    test("an empty or absent directory is accepted", () => {
+        expect(dreamerEvalOutputDirConflict([])).toBeNull();
+    });
+
+    // Run ids are per-run UUIDs, so reports accumulate instead of replacing each
+    // other: without this guard `archivedRuns` counts one invocation's reports
+    // while the directory holds another's, and counting files disproves it.
+    test("a directory holding previous evidence is refused", () => {
+        const conflict = dreamerEvalOutputDirConflict(["coverage.json", "dme-core-pool"]);
+        expect(conflict).not.toBeNull();
+        expect(conflict).toContain("coverage.json");
+        expect(conflict).toContain("dme-core-pool");
+    });
+
+    test("the reason names entries in a stable order and elides a long tail", () => {
+        const conflict = dreamerEvalOutputDirConflict(["g", "f", "e", "d", "c", "b", "a"]);
+        expect(conflict).toContain("a, b, c, d, e");
+        expect(conflict).not.toContain(", f");
+        expect(conflict).toContain("2 more");
+    });
+
+    test("exactly five entries are all named", () => {
+        const conflict = dreamerEvalOutputDirConflict(["a", "b", "c", "d", "e"]);
+        expect(conflict).toContain("a, b, c, d, e");
+        expect(conflict).not.toContain("more");
     });
 });
