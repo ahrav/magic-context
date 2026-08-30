@@ -52,6 +52,31 @@ function pick<T>(values: readonly T[], next: () => number): T {
     return values[Math.floor(next() * values.length)]!;
 }
 
+/**
+ * The first candidate a seed reaches that `accept` allows.
+ *
+ * Proving a candidate costs a full evidence scan, and a scenario at the transcript
+ * and expectation limits generates thousands of them, so proving the whole list to
+ * use one of them is the dominant cost of an application. Probing from a
+ * seed-chosen offset and stopping at the first acceptance keeps the usual case at
+ * one proof while leaving the worst case — nothing acceptable — no worse than
+ * filtering. The offset makes the choice seed-stable, and the wrap makes it
+ * exhaustive.
+ */
+function firstAccepted<T>(
+    candidates: readonly T[],
+    seed: number,
+    accept: (candidate: T) => boolean,
+): T | undefined {
+    if (candidates.length === 0) return undefined;
+    const start = Math.floor(splitmix32(seed)() * candidates.length);
+    for (let offset = 0; offset < candidates.length; offset += 1) {
+        const candidate = candidates[(start + offset) % candidates.length]!;
+        if (accept(candidate)) return candidate;
+    }
+    return undefined;
+}
+
 export function remapGold(
     gold: GoldExpectations,
     turnMap: readonly number[],
@@ -63,12 +88,22 @@ export function remapGold(
                 claim.sourceTurnRange[0],
                 claim.sourceTurnRange[1] + 1,
             );
-            if (mapped.length === 0 || mapped.some((index) => !Number.isInteger(index))) {
+            if (
+                mapped.length === 0 ||
+                mapped.some((index) => !Number.isInteger(index))
+            ) {
                 throw new Error(`turn map does not cover ${claim.id}`);
             }
             const ordered = [...mapped].sort((left, right) => left - right);
-            if (ordered.some((index, offset) => offset > 0 && index !== ordered[offset - 1]! + 1)) {
-                throw new Error(`turn map produces non-contiguous source range for ${claim.id}`);
+            if (
+                ordered.some(
+                    (index, offset) =>
+                        offset > 0 && index !== ordered[offset - 1]! + 1,
+                )
+            ) {
+                throw new Error(
+                    `turn map produces non-contiguous source range for ${claim.id}`,
+                );
             }
             return {
                 ...claim,
@@ -83,7 +118,8 @@ export function remapGold(
  * The frozen corpus must never produce one: it means a transform built a
  * derivative the contract rejects rather than declining the candidate.
  */
-export const CONTRACT_VIOLATION_REASON = "derivative violates the scenario contract";
+export const CONTRACT_VIOLATION_REASON =
+    "derivative violates the scenario contract";
 
 /**
  * A lint diagnostic reduced to what it is about: the scenario ID it is labelled
@@ -143,13 +179,18 @@ function derivative(
         };
     }
     const inherited = new Set(
-        lintScenario(base).map((diagnostic) => diagnosticKey(diagnostic, base.id)),
+        lintScenario(base).map((diagnostic) =>
+            diagnosticKey(diagnostic, base.id),
+        ),
     );
     const introduced = lintScenario(scenario).filter(
         (diagnostic) => !inherited.has(diagnosticKey(diagnostic, scenario.id)),
     );
     if (introduced.length > 0) {
-        return { applicable: false, reason: `${CONTRACT_VIOLATION_REASON}: ${introduced.join("; ")}` };
+        return {
+            applicable: false,
+            reason: `${CONTRACT_VIOLATION_REASON}: ${introduced.join("; ")}`,
+        };
     }
     return { applicable: true, scenario, turnMap };
 }
@@ -157,7 +198,11 @@ function derivative(
 function protectedTurnIndexes(scenario: HistorianEvalScenario): Set<number> {
     const protectedIndexes = new Set<number>();
     for (const claim of scenario.gold.expectedClaims) {
-        for (let index = claim.sourceTurnRange[0]; index <= claim.sourceTurnRange[1]; index += 1) {
+        for (
+            let index = claim.sourceTurnRange[0];
+            index <= claim.sourceTurnRange[1];
+            index += 1
+        ) {
             protectedIndexes.add(index);
         }
     }
@@ -205,7 +250,11 @@ function matchSpans(
     for (const entry of entries) {
         const needle = normalizeContent(entry.predicate.value);
         if (needle.length === 0) continue;
-        for (let at = evidence.indexOf(needle); at !== -1; at = evidence.indexOf(needle, at + 1)) {
+        for (
+            let at = evidence.indexOf(needle);
+            at !== -1;
+            at = evidence.indexOf(needle, at + 1)
+        ) {
             const matchEnd = at + needle.length;
             const crossed = spans
                 .filter((span) => span.start < matchEnd && at < span.end)
@@ -219,16 +268,21 @@ function matchSpans(
 /** Messages that authored negative evidence runs through. */
 function absentEvidenceMessages(scenario: HistorianEvalScenario): Set<string> {
     return new Set(
-        matchSpans(scenario.gold.expectedAbsent, scenario.transcript.turns).flatMap((match) =>
-            match.slice(match.indexOf("|") + 1).split(","),
-        ),
+        matchSpans(
+            scenario.gold.expectedAbsent,
+            scenario.transcript.turns,
+        ).flatMap((match) => match.slice(match.indexOf("|") + 1).split(",")),
     );
 }
 
 /** Turns that authored negative evidence runs through. */
-function absentEvidenceTurnIndexes(scenario: HistorianEvalScenario): Set<number> {
+function absentEvidenceTurnIndexes(
+    scenario: HistorianEvalScenario,
+): Set<number> {
     return new Set(
-        [...absentEvidenceMessages(scenario)].map((key) => Number(key.slice(0, key.indexOf(":")))),
+        [...absentEvidenceMessages(scenario)].map((key) =>
+            Number(key.slice(0, key.indexOf(":"))),
+        ),
     );
 }
 
@@ -256,13 +310,17 @@ function changesVisibleTranscript(
     scenario: HistorianEvalScenario,
     turns: readonly TranscriptTurn[],
 ): boolean {
-    return visibleTranscript(turns) !== visibleTranscript(scenario.transcript.turns);
+    return (
+        visibleTranscript(turns) !==
+        visibleTranscript(scenario.transcript.turns)
+    );
 }
 
 function eligibleMessages(scenario: HistorianEvalScenario): EligibleMessage[] {
     const evidenceMessages = absentEvidenceMessages(scenario);
     return unprotectedMessages(scenario).filter(
-        (message) => !evidenceMessages.has(messageKey(message.turnIndex, message.role)),
+        (message) =>
+            !evidenceMessages.has(messageKey(message.turnIndex, message.role)),
     );
 }
 
@@ -277,7 +335,9 @@ function eligibleMessages(scenario: HistorianEvalScenario): EligibleMessage[] {
  * not have. That is a different transcript, not a perturbation of this one, so a
  * message the historian never sees is not a rewrite candidate.
  */
-function unprotectedMessages(scenario: HistorianEvalScenario): EligibleMessage[] {
+function unprotectedMessages(
+    scenario: HistorianEvalScenario,
+): EligibleMessage[] {
     const protectedIndexes = protectedTurnIndexes(scenario);
     const visible = new Set(
         normalizedEvidenceMessages(scenario.transcript.turns).map((message) =>
@@ -287,7 +347,9 @@ function unprotectedMessages(scenario: HistorianEvalScenario): EligibleMessage[]
     return scenario.transcript.turns.flatMap((turn, turnIndex) => {
         if (protectedIndexes.has(turnIndex)) return [];
         return (["user", "assistant"] as const).flatMap((role) =>
-            visible.has(messageKey(turnIndex, role)) ? [{ turnIndex, role, text: turn[role] }] : [],
+            visible.has(messageKey(turnIndex, role))
+                ? [{ turnIndex, role, text: turn[role] }]
+                : [],
         );
     });
 }
@@ -298,7 +360,9 @@ function replaceMessage(
     text: string,
 ): TranscriptTurn[] {
     return turns.map((turn, index) =>
-        index === message.turnIndex ? { ...turn, [message.role]: text } : { ...turn },
+        index === message.turnIndex
+            ? { ...turn, [message.role]: text }
+            : { ...turn },
     );
 }
 
@@ -310,7 +374,10 @@ function mapForOrder(order: readonly number[]): number[] {
     return turnMap;
 }
 
-function preservesContiguousGold(scenario: HistorianEvalScenario, turnMap: readonly number[]): boolean {
+function preservesContiguousGold(
+    scenario: HistorianEvalScenario,
+    turnMap: readonly number[],
+): boolean {
     try {
         remapGold(scenario.gold, turnMap);
         return true;
@@ -325,7 +392,12 @@ interface EvidenceBaseline {
 }
 
 interface EvidenceBaselines {
+    /** Every forbidden formation. */
     absent: EvidenceBaseline;
+    /** Rejected proposals: the only evidence duplication is allowed to repeat. */
+    rejected: EvidenceBaseline;
+    /** Forbidden formations of every other family. */
+    otherAbsent: EvidenceBaseline;
     claims: EvidenceBaseline;
 }
 
@@ -338,15 +410,24 @@ interface EvidenceBaselines {
  * over a second.
  */
 function evidenceBaselines(scenario: HistorianEvalScenario): EvidenceBaselines {
+    const baseline = (
+        entries: readonly { id: string; predicate: ContentPredicate }[],
+    ) => ({
+        entries,
+        matches: matchSpans(entries, scenario.transcript.turns),
+    });
+    const rejected = scenario.gold.expectedAbsent.filter(
+        (absent) => absent.family === "proposed-but-rejected",
+    );
     return {
-        absent: {
-            entries: scenario.gold.expectedAbsent,
-            matches: matchSpans(scenario.gold.expectedAbsent, scenario.transcript.turns),
-        },
-        claims: {
-            entries: scenario.gold.expectedClaims,
-            matches: matchSpans(scenario.gold.expectedClaims, scenario.transcript.turns),
-        },
+        absent: baseline(scenario.gold.expectedAbsent),
+        rejected: baseline(rejected),
+        otherAbsent: baseline(
+            scenario.gold.expectedAbsent.filter(
+                (absent) => !rejected.includes(absent),
+            ),
+        ),
+        claims: baseline(scenario.gold.expectedClaims),
     };
 }
 
@@ -422,21 +503,24 @@ function preservesEvidenceExactly(
  * Nothing is lost, and only the rejection may be repeated.
  *
  * Duplicating a rejected-proposal turn multiplies its rejection occurrences by
- * design. Gold evidence is a different matter: a rejected turn that also states
- * an accepted claim would, when copied, author that claim a second time outside
- * the range that declares it, changing what the historian may promote for a
- * reason unrelated to rejection density.
+ * design — that is the perturbation. Every other kind of evidence on that turn is
+ * collateral: a copied turn that also states an accepted claim authors it a second
+ * time outside the range that declares it, and one that also carries an injection
+ * canary or a superseded fact strengthens a family the transform does not claim to
+ * vary. A behaviour change could then be attributed to the wrong cause, so
+ * everything but the rejection is held exactly.
  */
 function preservesEvidenceForDuplication(
     baselines: EvidenceBaselines,
     turns: readonly TranscriptTurn[],
     turnMap: readonly number[],
 ): boolean {
-    const claims = matchDelta(baselines.claims, turns, turnMap);
     return (
-        matchDelta(baselines.absent, turns, turnMap).lost === 0 &&
-        claims.lost === 0 &&
-        claims.gained === 0
+        matchDelta(baselines.rejected, turns, turnMap).lost === 0 &&
+        [baselines.otherAbsent, baselines.claims].every((baseline) => {
+            const { lost, gained } = matchDelta(baseline, turns, turnMap);
+            return lost === 0 && gained === 0;
+        })
     );
 }
 
@@ -459,7 +543,10 @@ function duplicatedTurns(
     return turns;
 }
 
-function epilogueStartIndexAfter(scenario: HistorianEvalScenario, insertion: number): number {
+function epilogueStartIndexAfter(
+    scenario: HistorianEvalScenario,
+    insertion: number,
+): number {
     return (
         scenario.transcript.epilogueStartIndex +
         (insertion <= scenario.transcript.epilogueStartIndex ? 1 : 0)
@@ -489,31 +576,43 @@ const paraphraseIrrelevant: Transform = {
         // the rewrites that are safe for it instead of excluding it for the one
         // that is not.
         const pairs = unprotectedMessages(scenario).flatMap((message) =>
-            rewrites.map((rewrite) => ({ message, text: rewrite(message.text) })),
+            rewrites.map((rewrite) => ({
+                message,
+                text: rewrite(message.text),
+            })),
         );
         if (pairs.length === 0) {
-            return { applicable: false, reason: "no irrelevant message to paraphrase" };
+            return {
+                applicable: false,
+                reason: "no irrelevant message to paraphrase",
+            };
         }
         // Probed lazily from a seed-chosen offset rather than filtered eagerly:
         // validating a pair costs a full evidence scan, and a scenario at the
         // transcript and expectation limits has hundreds of pairs, so proving all
         // of them to use one made a single application cost over a second.
         const baselines = evidenceBaselines(scenario);
-        const turnMap = scenario.transcript.turns.map((_, index) => index);
-        const start = Math.floor(splitmix32(seed)() * pairs.length);
-        for (let offset = 0; offset < pairs.length; offset += 1) {
-            const { message, text } = pairs[(start + offset) % pairs.length]!;
-            if (!safeParaphrase(scenario, baselines, message, text)) continue;
-            return derivative(
-                scenario,
-                this,
-                seed,
-                replaceMessage(scenario.transcript.turns, message, text),
-                scenario.transcript.epilogueStartIndex,
-                turnMap,
-            );
+        const chosen = firstAccepted(pairs, seed, ({ message, text }) =>
+            safeParaphrase(scenario, baselines, message, text),
+        );
+        if (chosen === undefined) {
+            return {
+                applicable: false,
+                reason: "no irrelevant message to paraphrase",
+            };
         }
-        return { applicable: false, reason: "no irrelevant message to paraphrase" };
+        return derivative(
+            scenario,
+            this,
+            seed,
+            replaceMessage(
+                scenario.transcript.turns,
+                chosen.message,
+                chosen.text,
+            ),
+            scenario.transcript.epilogueStartIndex,
+            scenario.transcript.turns.map((_, index) => index),
+        );
     },
 };
 
@@ -580,17 +679,26 @@ const reorderIndependentTurns: Transform = {
             if (!rangeSafe) return [];
             const order = scenario.transcript.turns.map((_, index) => index);
             [order[left], order[right]] = [order[right]!, order[left]!];
-            if (!preservesContiguousGold(scenario, mapForOrder(order))) return [];
-            const reordered = reorderedTurns(scenario, order);
-            return preservesEvidenceExactly(baselines, reordered, mapForOrder(order)) &&
-                changesVisibleTranscript(scenario, reordered)
+            return preservesContiguousGold(scenario, mapForOrder(order))
                 ? [order]
                 : [];
         });
-        if (candidates.length === 0) {
-            return { applicable: false, reason: "no independent adjacent turns before epilogue" };
+        const order = firstAccepted(candidates, seed, (candidate) => {
+            const reordered = reorderedTurns(scenario, candidate);
+            return (
+                preservesEvidenceExactly(
+                    baselines,
+                    reordered,
+                    mapForOrder(candidate),
+                ) && changesVisibleTranscript(scenario, reordered)
+            );
+        });
+        if (order === undefined) {
+            return {
+                applicable: false,
+                reason: "no independent adjacent turns before epilogue",
+            };
         }
-        const order = pick(candidates, splitmix32(seed));
         return derivative(
             scenario,
             this,
@@ -615,15 +723,20 @@ const moveAcceptedDecision: Transform = {
         // decision could be moved through it and reverse the order the range
         // declares — the inversion the adjacent-swap transform already refuses.
         const multiTurnRanges = scenario.gold.expectedClaims
-            .filter((claim) => claim.sourceTurnRange[0] !== claim.sourceTurnRange[1])
+            .filter(
+                (claim) =>
+                    claim.sourceTurnRange[0] !== claim.sourceTurnRange[1],
+            )
             .map((claim) => claim.sourceTurnRange);
         const sources = [
             ...new Set(
                 scenario.gold.expectedClaims
                     .filter(
                         (claim) =>
-                            claim.sourceTurnRange[0] === claim.sourceTurnRange[1] &&
-                            claim.sourceTurnRange[0] < scenario.transcript.epilogueStartIndex - 1,
+                            claim.sourceTurnRange[0] ===
+                                claim.sourceTurnRange[1] &&
+                            claim.sourceTurnRange[0] <
+                                scenario.transcript.epilogueStartIndex - 1,
                     )
                     .map((claim) => claim.sourceTurnRange[0]),
             ),
@@ -635,10 +748,17 @@ const moveAcceptedDecision: Transform = {
             // identical derivative transcripts that get scored twice.
             // commentlint: allow(JUDGE)
             Array.from(
-                { length: Math.max(0, scenario.transcript.epilogueStartIndex - 2 - source) },
+                {
+                    length: Math.max(
+                        0,
+                        scenario.transcript.epilogueStartIndex - 2 - source,
+                    ),
+                },
                 (_, index) => {
                     const destination = source + index + 2;
-                    const order = scenario.transcript.turns.map((_, turnIndex) => turnIndex);
+                    const order = scenario.transcript.turns.map(
+                        (_, turnIndex) => turnIndex,
+                    );
                     const [moved] = order.splice(source, 1);
                     order.splice(destination, 0, moved!);
                     return { source, destination, order };
@@ -656,23 +776,26 @@ const moveAcceptedDecision: Transform = {
                     preservesContiguousGold(scenario, mapForOrder(order)) &&
                     !multiTurnRanges.some(
                         ([first, last]) => first <= destination && from <= last,
-                    ) &&
-                    preservesEvidenceExactly(
-                        baselines,
-                        reorderedTurns(scenario, order),
-                        mapForOrder(order),
-                    ) &&
-                    changesVisibleTranscript(scenario, reorderedTurns(scenario, order)),
+                    ),
             ),
         );
-        if (candidates.length === 0) {
+        const chosen = firstAccepted(candidates, seed, ({ order }) => {
+            const reordered = reorderedTurns(scenario, order);
+            return (
+                preservesEvidenceExactly(
+                    baselines,
+                    reordered,
+                    mapForOrder(order),
+                ) && changesVisibleTranscript(scenario, reordered)
+            );
+        });
+        if (chosen === undefined) {
             return {
                 applicable: false,
                 reason: "no movable single-turn accepted decision before epilogue",
             };
         }
-        const next = splitmix32(seed);
-        const { order } = pick(candidates, next);
+        const { order } = chosen;
         return derivative(
             scenario,
             this,
@@ -691,11 +814,13 @@ const duplicateRejectedProposal: Transform = {
     apply(scenario, rawSeed) {
         const seed = normalizedSeed(rawSeed);
         if (scenario.transcript.turns.length >= MAX_TRANSCRIPT_TURNS) {
-            return { applicable: false, reason: "transcript is already at the turn limit" };
+            return {
+                applicable: false,
+                reason: "transcript is already at the turn limit",
+            };
         }
-        const rejected = scenario.gold.expectedAbsent.filter(
-            (absent) => absent.family === "proposed-but-rejected",
-        );
+        const baselines = evidenceBaselines(scenario);
+        const rejected = baselines.rejected.entries;
         // Turns the rejection evidence actually runs through in the text the
         // historian receives. Matching the raw strings instead would select a
         // turn whose only occurrence sits in a reminder block or directive
@@ -713,30 +838,40 @@ const duplicateRejectedProposal: Transform = {
             ),
         );
         const protectedIndexes = protectedTurnIndexes(scenario);
-        const baselines = evidenceBaselines(scenario);
-        const candidates = scenario.transcript.turns.flatMap((turn, turnIndex) => {
-            if (turnIndex >= scenario.transcript.epilogueStartIndex) return [];
-            if (protectedIndexes.has(turnIndex)) return [];
-            if (!rejectedTurns.has(turnIndex)) return [];
-            const insertion = turnIndex + 1;
-            const turnMap = scenario.transcript.turns.map((_, index) =>
-                index < insertion ? index : index + 1,
-            );
-            if (!preservesContiguousGold(scenario, turnMap)) return [];
-            const turns = duplicatedTurns(scenario, turnIndex, insertion);
-            return preservesEvidenceForDuplication(baselines, turns, turnMap)
-                ? [{ source: turnIndex, insertion, turnMap }]
-                : [];
-        });
+        const candidates = scenario.transcript.turns.flatMap(
+            (turn, turnIndex) => {
+                if (turnIndex >= scenario.transcript.epilogueStartIndex)
+                    return [];
+                if (protectedIndexes.has(turnIndex)) return [];
+                if (!rejectedTurns.has(turnIndex)) return [];
+                const insertion = turnIndex + 1;
+                const turnMap = scenario.transcript.turns.map((_, index) =>
+                    index < insertion ? index : index + 1,
+                );
+                if (!preservesContiguousGold(scenario, turnMap)) return [];
+                const turns = duplicatedTurns(scenario, turnIndex, insertion);
+                return preservesEvidenceForDuplication(
+                    baselines,
+                    turns,
+                    turnMap,
+                )
+                    ? [{ source: turnIndex, insertion, turnMap }]
+                    : [];
+            },
+        );
         if (candidates.length === 0) {
             return {
                 applicable: false,
-                reason: rejected.length === 0
-                    ? "no rejected proposal turn"
-                    : "no rejected proposal insertion preserves contiguous gold ranges",
+                reason:
+                    rejected.length === 0
+                        ? "no rejected proposal turn"
+                        : "no rejected proposal insertion preserves contiguous gold ranges",
             };
         }
-        const { source, insertion, turnMap } = pick(candidates, splitmix32(seed));
+        const { source, insertion, turnMap } = pick(
+            candidates,
+            splitmix32(seed),
+        );
         return derivative(
             scenario,
             this,
@@ -752,13 +887,15 @@ const duplicateRejectedProposal: Transform = {
 // segment can also contain separators, a long `-` run after a letter
 // backtracks exponentially when the trailing `\b` fails.
 // commentlint: allow(JUDGE)
-const SYMBOL_RE = /`([^`]+)`|\b(?:[A-Za-z][A-Za-z0-9]*(?:[_./-][A-Za-z0-9]+)+|[a-z]+[A-Z][A-Za-z0-9]*|[A-Z]{2,})\b/g;
+const SYMBOL_RE =
+    /`([^`]+)`|\b(?:[A-Za-z][A-Za-z0-9]*(?:[_./-][A-Za-z0-9]+)+|[a-z]+[A-Z][A-Za-z0-9]*|[A-Z]{2,})\b/g;
 
 // Inline code is not necessarily a name: a backtick span can hold a command or
 // an expression, and replacing the whole span would rewrite the instruction
 // rather than rename an entity. Admitted backtick contents must therefore
 // satisfy the same shape the unquoted alternatives accept.
-const QUOTED_SYMBOL_RE = /^(?:[A-Za-z][A-Za-z0-9]*(?:[_./-][A-Za-z0-9]+)+|[a-z]+[A-Z][A-Za-z0-9]*|[A-Z]{2,})$/;
+const QUOTED_SYMBOL_RE =
+    /^(?:[A-Za-z][A-Za-z0-9]*(?:[_./-][A-Za-z0-9]+)+|[a-z]+[A-Z][A-Za-z0-9]*|[A-Z]{2,})$/;
 
 /** The renameable symbols of `text`, in match order. */
 function symbolsIn(text: string): string[] {
@@ -792,16 +929,20 @@ const renameUnrelatedSymbols: Transform = {
     apply(scenario, rawSeed) {
         const seed = normalizedSeed(rawSeed);
         const messages = eligibleMessages(scenario);
-        const eligibleKeys = new Set(messages.map((message) => `${message.turnIndex}:${message.role}`));
+        const eligibleKeys = new Set(
+            messages.map((message) => `${message.turnIndex}:${message.role}`),
+        );
         // Candidate spellings come from the text the historian receives: a symbol
         // that exists only inside a stripped reminder can be renamed without
         // changing the model input at all, and the derivative would carry no
         // perturbation to compare.
         const visibleText = new Map(
-            visibleEvidenceMessages(scenario.transcript.turns).map((message) => [
-                messageKey(message.turnIndex, message.role),
-                message.text,
-            ]),
+            visibleEvidenceMessages(scenario.transcript.turns).map(
+                (message) => [
+                    messageKey(message.turnIndex, message.role),
+                    message.text,
+                ],
+            ),
         );
         const probeText = scenario.probes.flatMap((probe) => [
             probe.question,
@@ -814,13 +955,18 @@ const renameUnrelatedSymbols: Transform = {
         // `buildAPI` returns against a history that now says `aux_symbol_N`
         // measures a broken query, not naming robustness.
         const allText = [
-            ...scenario.transcript.turns.flatMap((turn) => [turn.user, turn.assistant]),
+            ...scenario.transcript.turns.flatMap((turn) => [
+                turn.user,
+                turn.assistant,
+            ]),
             ...probeText,
         ];
         const blocked = new Set([
             ...scenario.transcript.turns.flatMap((turn, turnIndex) =>
                 (["user", "assistant"] as const).flatMap((role) =>
-                    eligibleKeys.has(messageKey(turnIndex, role)) ? [] : symbolsIn(turn[role]),
+                    eligibleKeys.has(messageKey(turnIndex, role))
+                        ? []
+                        : symbolsIn(turn[role]),
                 ),
             ),
             ...probeText.flatMap((text) => symbolsIn(text)),
@@ -829,12 +975,19 @@ const renameUnrelatedSymbols: Transform = {
         const candidates = [
             ...new Set(
                 messages.flatMap((message) =>
-                    symbolsIn(visibleText.get(messageKey(message.turnIndex, message.role)) ?? ""),
+                    symbolsIn(
+                        visibleText.get(
+                            messageKey(message.turnIndex, message.role),
+                        ) ?? "",
+                    ),
                 ),
             ),
         ].filter((symbol) => !blocked.has(symbol));
         if (candidates.length === 0) {
-            return { applicable: false, reason: "no unrelated symbol to rename" };
+            return {
+                applicable: false,
+                reason: "no unrelated symbol to rename",
+            };
         }
         const next = splitmix32(seed);
         const original = pick(candidates, next);
@@ -856,14 +1009,22 @@ const renameUnrelatedSymbols: Transform = {
         let replacement: string | undefined;
         for (let offset = 0; offset < 10_000; offset += 1) {
             const candidate = `aux_symbol_${(replacementStart + offset) % 10_000}`;
-            if (probeAnswers.some((answer) => containsCompleteValue(candidate, answer))) continue;
+            if (
+                probeAnswers.some((answer) =>
+                    containsCompleteValue(candidate, answer),
+                )
+            )
+                continue;
             if (candidate !== original && !existing.has(candidate)) {
                 replacement = candidate;
                 break;
             }
         }
         if (replacement === undefined) {
-            return { applicable: false, reason: "no unused replacement symbol" };
+            return {
+                applicable: false,
+                reason: "no unused replacement symbol",
+            };
         }
         const turns = scenario.transcript.turns.map((turn) => ({ ...turn }));
         for (const message of messages) {
@@ -871,7 +1032,9 @@ const renameUnrelatedSymbols: Transform = {
                 SYMBOL_RE,
                 (matched, quoted: string | undefined) => {
                     if ((quoted ?? matched) !== original) return matched;
-                    return quoted === undefined ? replacement : `\`${replacement}\``;
+                    return quoted === undefined
+                        ? replacement
+                        : `\`${replacement}\``;
                 },
             );
         }
@@ -885,7 +1048,10 @@ const renameUnrelatedSymbols: Transform = {
                     turn.assistant.length > MAX_TURN_TEXT_CHARS,
             )
         ) {
-            return { applicable: false, reason: "rename does not fit the turn text limit" };
+            return {
+                applicable: false,
+                reason: "rename does not fit the turn text limit",
+            };
         }
         // A generated name can contain a predicate: a claim predicate of
         // `aux_symbol` is newly authored the moment a symbol becomes
@@ -894,8 +1060,17 @@ const renameUnrelatedSymbols: Transform = {
         // exists elsewhere, so the rewritten turns are proven against the same
         // evidence comparison the framing and reordering transforms use.
         const turnMap = scenario.transcript.turns.map((_, index) => index);
-        if (!preservesEvidenceExactly(evidenceBaselines(scenario), turns, turnMap)) {
-            return { applicable: false, reason: "rename would change authored evidence" };
+        if (
+            !preservesEvidenceExactly(
+                evidenceBaselines(scenario),
+                turns,
+                turnMap,
+            )
+        ) {
+            return {
+                applicable: false,
+                reason: "rename would change authored evidence",
+            };
         }
         return derivative(
             scenario,
@@ -916,6 +1091,7 @@ export const TRANSFORMS: readonly Transform[] = [
     renameUnrelatedSymbols,
 ];
 
-export const ALWAYS_APPLICABLE_TRANSFORM_IDS: readonly string[] = TRANSFORMS.filter(
-    (transform) => transform.alwaysApplicable,
-).map((transform) => transform.id);
+export const ALWAYS_APPLICABLE_TRANSFORM_IDS: readonly string[] =
+    TRANSFORMS.filter((transform) => transform.alwaysApplicable).map(
+        (transform) => transform.id,
+    );
