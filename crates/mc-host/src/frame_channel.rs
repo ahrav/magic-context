@@ -6,7 +6,7 @@
 //! single-owner [`FrameReceiver`] yields complete, structurally validated
 //! inbound frames. Direct producers fill bounded transport spans through a
 //! cursor and commit one exact length. Receive bytes are visible only through
-//! a lexical [`ReceiveLease`]; compatibility consumers must use the explicit
+//! a lexical [`ReceiveLease`]; contiguous consumers use the explicit
 //! copying adapter before entering asynchronous work.
 
 use std::future::Future;
@@ -77,8 +77,8 @@ pub(crate) fn validate_inbound_header(header: EnvelopeHeader) -> Result<(), Read
 
 /// Observable count of explicit transport-byte copies.
 ///
-/// Direct/leased paths leave this at zero. TCP and compatibility adapters add
-/// exactly one for each body they copy into owned semantic storage.
+/// Direct/leased paths leave this at zero. Flattening adapters add exactly one
+/// for each body they copy into owned semantic storage.
 #[derive(Clone, Default)]
 pub struct CopyCounter(Arc<AtomicU64>);
 
@@ -365,7 +365,7 @@ impl<'lease> ReceiveLease<'lease> {
         self.second.is_none().then_some(self.first)
     }
 
-    /// Explicit compatibility adapter. One call records one body copy even
+    /// Explicit contiguous-body adapter. One call records one body copy even
     /// when the body is empty.
     pub fn to_owned(&self, counter: &CopyCounter) -> Vec<u8> {
         let mut body = Vec::with_capacity(self.len());
@@ -702,7 +702,7 @@ impl FrameSender {
         self.discard.cancel();
     }
 
-    /// Legacy admission adapter for callers that do not need a ticket.
+    /// Admission adapter for callers that do not need a ticket.
     pub async fn send(&self, frame: OutboundFrame) -> Result<(), WriterGone> {
         self.send_before(frame, self.admission_deadline()).await
     }
@@ -711,7 +711,7 @@ impl FrameSender {
         Instant::now() + self.admission_timeout
     }
 
-    /// Legacy admission adapter for callers that do not need a ticket.
+    /// Admission adapter for callers that do not need a ticket.
     pub async fn send_before(
         &self,
         frame: OutboundFrame,

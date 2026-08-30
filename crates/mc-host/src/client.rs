@@ -1,6 +1,6 @@
 //! Managed Rust consumer for one authenticated mc-host generation.
 //!
-//! This module owns discovery, authentication, mandatory negotiation,
+//! This module owns discovery, authentication, mandatory ring setup,
 //! correlation allocation, framing, liveness, route epochs, bounded queues,
 //! cancellation, and cleanup. Raw frame types never cross the public API.
 
@@ -39,7 +39,7 @@ use crate::{
     },
 };
 
-/// Total deadline for dial, authentication, and mandatory negotiation.
+/// Total deadline for discovery, authentication, and mandatory ring setup.
 pub const CLIENT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Deadline for a frame after its first header byte. Idle header waits are unbounded.
 pub const CLIENT_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
@@ -209,7 +209,7 @@ impl fmt::Display for CallError {
 
 impl Error for CallError {}
 
-/// Discovery, authentication, negotiation, or owner-lifecycle failure.
+/// Discovery, authentication, ring setup, or owner-lifecycle failure.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ClientError {
     code: &'static str,
@@ -300,12 +300,12 @@ impl fmt::Debug for Client {
 }
 
 impl Client {
-    /// Securely discovers, authenticates, and negotiates one TCP generation.
+    /// Securely discovers, authenticates, and attaches one ring generation.
     ///
     /// Discovery validates one descriptor-anchored snapshot before any dial.
     pub async fn connect(path: impl AsRef<Path>) -> Result<Self, ClientError> {
         // The deadline starts before discovery, not after it. §11.2 spends one
-        // 2-second budget on discovery, dial, authentication, and negotiation
+        // 2-second budget on discovery, setup-socket authentication, and ring attachment
         // together, so starting the clock after the snapshot would give a
         // stalled filesystem unbounded time and then hand the handshake a fresh
         // budget. The snapshot also runs on a blocking pool: it is synchronous
@@ -374,8 +374,14 @@ impl Client {
             .set_nonblocking(false)
             .map_err(|_| ClientError::new("setup_failed", "shared-memory setup failed"))?;
         let cancel = CancellationToken::new();
-        let (ring_tx, ring_rx) =
-            start_ring_bridge(descriptor, descriptors, setup_stream, cancel.clone())?;
+        let read_budget = Arc::new(ByteCounter::new(CLIENT_INBOUND_FRAME_BYTES));
+        let (ring_tx, ring_rx) = start_ring_bridge(
+            descriptor,
+            descriptors,
+            setup_stream,
+            cancel.clone(),
+            Arc::clone(&read_budget),
+        )?;
         let (data_tx, data_rx) = mpsc::channel(CLIENT_DATA_QUEUE_FRAMES);
         let (control_tx, control_rx) = mpsc::channel(CLIENT_CONTROL_QUEUE_FRAMES);
         let inner = Arc::new(Inner {
@@ -391,7 +397,7 @@ impl Client {
             routes: Mutex::new(HashSet::new()),
             queue_budget: Arc::new(ByteCounter::new(CLIENT_QUEUED_BYTES)),
             control_budget: Arc::new(ByteCounter::new(CLIENT_CONTROL_QUEUED_BYTES)),
-            read_budget: Arc::new(ByteCounter::new(CLIENT_INBOUND_FRAME_BYTES)),
+            _read_budget: read_budget,
             retained_budget: Arc::new(ByteCounter::new(CLIENT_RETAINED_RESPONSE_BYTES)),
             data_tx,
             control_tx,
@@ -411,7 +417,7 @@ impl Client {
         *inner.reader.lock().await = Some(reader);
         // The reader runs on another worker and can retire this generation
         // before the constructor returns — a peer that closes or sends
-        // connection `Goodbye` right after negotiation does exactly that.
+        // connection `Goodbye` right after setup does exactly that.
         // Returning a "ready" client then defers the failure to the first
         // operation, which reports `connection_retired` as `NotSent`; the
         // historian does not reconnect on that path, so a daemon reload race
@@ -944,7 +950,7 @@ struct Inner {
     /// Reserved for the body of the one frame the reader is decoding. Separate
     /// from `retained_budget` so queue retention can never deny an otherwise
     /// valid inbound frame; see `CLIENT_INBOUND_FRAME_BYTES`.
-    read_budget: Arc<ByteCounter>,
+    _read_budget: Arc<ByteCounter>,
     retained_budget: Arc<ByteCounter>,
     data_tx: mpsc::Sender<QueuedFrame>,
     control_tx: mpsc::Sender<QueuedFrame>,
@@ -1831,13 +1837,14 @@ struct RingWrite {
 }
 
 type RingWriteSender = std::sync::mpsc::SyncSender<RingWrite>;
-type RingFrameReceiver = mpsc::Receiver<(EnvelopeHeader, Vec<u8>)>;
+type RingFrameReceiver = mpsc::Receiver<(EnvelopeHeader, Vec<u8>, ByteCharge)>;
 
 fn start_ring_bridge(
     descriptor: serde_json::Value,
     descriptors: [OwnedFd; 2],
     mut setup: StdUnixStream,
     cancel: CancellationToken,
+    read_budget: Arc<ByteCounter>,
 ) -> Result<(RingWriteSender, RingFrameReceiver), ClientError> {
     let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<RingWrite>(CLIENT_DATA_QUEUE_FRAMES);
     let (read_tx, read_rx) = mpsc::channel(CLIENT_DATA_QUEUE_FRAMES);
@@ -1870,7 +1877,7 @@ fn start_ring_bridge(
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                     Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 }
-                match endpoint.try_recv() {
+                match endpoint.try_recv_with(|bytes| read_budget.charge(bytes)) {
                     Ok(Some(frame)) => {
                         if read_tx.blocking_send(frame).is_err() {
                             break;
@@ -1880,9 +1887,9 @@ fn start_ring_bridge(
                     Err(_) => break,
                 }
             }
-            let body = br#"{"type":"goodbye"}"#;
-            let _ = setup.write_all(&(body.len() as u32).to_le_bytes());
-            let _ = setup.write_all(body);
+            if let Ok(goodbye) = crate::setup_socket::encoded_goodbye() {
+                let _ = setup.write_all(&goodbye);
+            }
             let _ = setup.shutdown(std::net::Shutdown::Both);
         })
         .map_err(|_| ClientError::new("setup_failed", "shared-memory setup failed"))?;
@@ -1966,16 +1973,12 @@ async fn writer_loop(
     }
 }
 
-async fn ring_reader_loop(inner: Arc<Inner>, mut read: mpsc::Receiver<(EnvelopeHeader, Vec<u8>)>) {
-    while let Some((header, body)) = read.recv().await {
+async fn ring_reader_loop(inner: Arc<Inner>, mut read: RingFrameReceiver) {
+    while let Some((header, body, charge)) = read.recv().await {
         if validate_inbound(&header).is_err() || body.len() != header.len as usize {
             inner.retire("protocol_violation");
             return;
         }
-        let Some(charge) = inner.read_budget.charge(body.len()) else {
-            inner.retire("protocol_violation");
-            return;
-        };
         inner.dispatch(header, body, charge);
         if inner.retired.load(Ordering::Acquire) {
             return;
@@ -2287,7 +2290,7 @@ mod tests {
                 routes: Mutex::new(HashSet::from([route(1), route(2)])),
                 queue_budget: Arc::new(ByteCounter::new(queued_bytes)),
                 control_budget: Arc::new(ByteCounter::new(CLIENT_CONTROL_QUEUED_BYTES)),
-                read_budget: Arc::new(ByteCounter::new(CLIENT_INBOUND_FRAME_BYTES)),
+                _read_budget: Arc::new(ByteCounter::new(CLIENT_INBOUND_FRAME_BYTES)),
                 retained_budget: Arc::new(ByteCounter::new(CLIENT_RETAINED_RESPONSE_BYTES)),
                 data_tx,
                 control_tx,
@@ -3795,7 +3798,7 @@ mod tests {
         drop(data_rx.recv().await);
 
         let queued = 2 * 1024 * 1024;
-        let charge = inner.read_budget.charge(queued).expect("read reservation");
+        let charge = inner._read_budget.charge(queued).expect("read reservation");
         inner.dispatch(
             EnvelopeHeader {
                 len: u32::try_from(queued).expect("fits a frame length"),
@@ -3816,12 +3819,12 @@ mod tests {
             "a queued item is accounted against retention, not the read reservation"
         );
         assert_eq!(
-            inner.read_budget.used(),
+            inner._read_budget.used(),
             0,
             "the read reservation is released once the bytes are retained"
         );
         assert!(
-            inner.read_budget.charge(MAX_BODY_LEN as usize).is_some(),
+            inner._read_budget.charge(MAX_BODY_LEN as usize).is_some(),
             "queued bytes must not deny the reader a maximum-sized frame"
         );
         inner.retire("test_done");
@@ -3853,7 +3856,7 @@ mod tests {
             .retained_budget
             .charge(CLIENT_RETAINED_RESPONSE_BYTES)
             .expect("retention fully held by an existing consumer");
-        let charge = inner.read_budget.charge(1).expect("read reservation");
+        let charge = inner._read_budget.charge(1).expect("read reservation");
         inner.dispatch(
             EnvelopeHeader {
                 len: 1,
@@ -3881,7 +3884,7 @@ mod tests {
             "a saturated consumer must not retire the generation"
         );
         assert_eq!(
-            inner.read_budget.used(),
+            inner._read_budget.used(),
             0,
             "the discarded item releases the read reservation"
         );

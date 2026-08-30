@@ -75,7 +75,7 @@ pub use lifecycle::{
     LIFECYCLE_RECORD_NAME, LIFETIME_LOCK_NAME, PAYLOAD_MANIFEST_DIGEST_LEN, TRANSACTION_LOCK_NAME,
     UNSUPPORTED_STATE_SCHEMA_REASON,
 };
-pub use runtime::{run, HostError};
+pub use runtime::{run, run_with_publish_hook, HostError};
 /// The version-2 body cap. Published so a consumer preparing an output can
 /// gate on the same value frame admission enforces, rather than restating it.
 pub use wire::MAX_FRAME_BODY_LEN;

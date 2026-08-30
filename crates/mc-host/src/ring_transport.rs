@@ -28,9 +28,7 @@ use crate::frame_channel::{
 use crate::wire::{ByteBudget, MAX_CONTROL_BODY_LEN};
 
 /// Current ring profile accepted by every process in one release.
-pub const QUALIFIED_TEST_PROFILE: &str = "mc-host-test-ring-v1";
-
-const HARDWARE_PROFILE: &str = "mc-host-test-ring-v1";
+pub const RING_PROFILE: &str = "mc-host-test-ring-v1";
 const DESCRIPTOR_DEPTH: usize = 8;
 const POLL_INTERVAL: Duration = Duration::from_micros(50);
 
@@ -40,11 +38,11 @@ const POLL_INTERVAL: Duration = Duration::from_micros(50);
 #[doc(hidden)]
 pub type PublishHook = Arc<dyn Fn(FrameType, u16) + Send + Sync>;
 
-pub fn qualified_test_profile() -> TargetProfile {
+pub fn ring_profile() -> TargetProfile {
     TargetProfile::new(ProfileConfig {
         descriptor: TransportDescriptor::new(
             SchedulingMode::ColdParkWake,
-            HardwareProfileId::new(HARDWARE_PROFILE).expect("static hardware profile is valid"),
+            HardwareProfileId::new(RING_PROFILE).expect("static hardware profile is valid"),
         ),
         descriptor_depth: DESCRIPTOR_DEPTH,
         arena_bytes: mc_shm_transport::MIN_ARENA_BYTES,
@@ -59,26 +57,32 @@ pub fn qualified_test_profile() -> TargetProfile {
     .expect("static shared-memory profile is valid")
 }
 
-/// Admission limits sufficient for one qualified candidate.
-pub fn single_candidate_limits() -> ShmHostLimits {
-    let charges = qualified_test_profile().charges();
+/// Admission limits sufficient for one connection.
+pub fn per_connection_limits() -> ShmHostLimits {
+    let charges = ring_profile().charges();
     ShmHostLimits {
         descriptors: charges.descriptors,
         arena_bytes: charges.arena_bytes,
         leases: charges.leases,
         mappings: charges.mappings,
+        file_descriptors: charges.file_descriptors,
+        workers: charges.workers,
+        client_instances: charges.client_instances,
         pinned_workers: charges.pinned_workers,
     }
 }
 
 pub fn process_limits(connections: usize) -> Option<ShmHostLimits> {
     let count = u64::try_from(connections).ok()?;
-    let one = single_candidate_limits();
+    let one = per_connection_limits();
     Some(ShmHostLimits {
         descriptors: one.descriptors.checked_mul(count)?,
         arena_bytes: one.arena_bytes.checked_mul(count)?,
         leases: one.leases.checked_mul(count)?,
         mappings: one.mappings.checked_mul(count)?,
+        file_descriptors: one.file_descriptors.checked_mul(count)?,
+        workers: one.workers.checked_mul(count)?,
+        client_instances: one.client_instances.checked_mul(count)?,
         pinned_workers: one.pinned_workers.checked_mul(count)?,
     })
 }
@@ -87,7 +91,12 @@ pub fn process_limits(connections: usize) -> Option<ShmHostLimits> {
 pub struct RingTransport {
     profile: Arc<TargetProfile>,
     admission: Arc<AdmissionController>,
+    limits: ShmHostLimits,
     preparations: AtomicU64,
+    activations: AtomicU64,
+    peer_deaths: AtomicU64,
+    reclamations: AtomicU64,
+    exhaustions: AtomicU64,
     publish_hook: Mutex<Option<PublishHook>>,
 }
 
@@ -114,25 +123,20 @@ impl std::error::Error for RingUnavailable {}
 
 impl RingTransport {
     /// Builds the process-wide transport with finite admission limits.
-    pub fn for_qualified_test_profile(limits: ShmHostLimits) -> Self {
-        let profile = Arc::new(qualified_test_profile());
+    pub fn for_ring_profile(limits: ShmHostLimits) -> Self {
+        let profile = Arc::new(ring_profile());
         let admission = Arc::new(AdmissionController::new(limits));
         Self {
             profile,
             admission,
+            limits,
             preparations: AtomicU64::new(0),
+            activations: AtomicU64::new(0),
+            peer_deaths: AtomicU64::new(0),
+            reclamations: AtomicU64::new(0),
+            exhaustions: AtomicU64::new(0),
             publish_hook: Mutex::new(None),
         }
-    }
-
-    /// Aggregate profile charge used by admission tests.
-    pub fn profile_charges(&self) -> ResourceCharges {
-        self.profile.charges()
-    }
-
-    /// Number of preparations that passed side-effect-free preflight.
-    pub fn preparation_count(&self) -> u64 {
-        self.preparations.load(Ordering::Acquire)
     }
 
     /// Returns redacted aggregate admission accounting.
@@ -145,7 +149,80 @@ impl RingTransport {
         self.admission.snapshot()
     }
 
-    /// Test hook: install a publication observer for candidates prepared
+    /// Bounded, aggregate-only state for authenticated doctor output.
+    pub fn diagnostics(&self) -> serde_json::Value {
+        let charges = |value: ResourceCharges| {
+            serde_json::json!({
+                "descriptors": value.descriptors,
+                "arena_bytes": value.arena_bytes,
+                "leases": value.leases,
+                "mappings": value.mappings,
+                "file_descriptors": value.file_descriptors,
+                "workers": value.workers,
+                "client_instances": value.client_instances,
+                "pinned_workers": value.pinned_workers,
+            })
+        };
+        let limits = serde_json::json!({
+            "descriptors": self.limits.descriptors,
+            "arena_bytes": self.limits.arena_bytes,
+            "leases": self.limits.leases,
+            "mappings": self.limits.mappings,
+            "file_descriptors": self.limits.file_descriptors,
+            "workers": self.limits.workers,
+            "client_instances": self.limits.client_instances,
+            "pinned_workers": self.limits.pinned_workers,
+        });
+        let (state, error_class, accounting) = match self.accounting() {
+            Ok(accounting) => (
+                "healthy",
+                serde_json::Value::Null,
+                serde_json::json!({
+                    "active": charges(accounting.active),
+                    "quarantined": charges(accounting.quarantined),
+                }),
+            ),
+            Err(_) => (
+                "terminal",
+                serde_json::Value::String("setup_failure".to_owned()),
+                serde_json::Value::Null,
+            ),
+        };
+        serde_json::json!({
+            "state": state,
+            "error_class": error_class,
+            "artifact": {
+                "profile": RING_PROFILE,
+                "wire_version": crate::wire::PROTOCOL_VERSION,
+                "descriptor_schema": mc_shm_transport::descriptor::DESCRIPTOR_SCHEMA_VERSION,
+            },
+            "bounds": limits,
+            "accounting": accounting,
+            "attachment": {"completed": self.preparations.load(Ordering::Acquire)},
+            "activation": {"completed": self.activations.load(Ordering::Acquire)},
+            "peer_death": {"observed": self.peer_deaths.load(Ordering::Acquire)},
+            "reclamation": {"completed": self.reclamations.load(Ordering::Acquire)},
+            "exhaustion": {"observed": self.exhaustions.load(Ordering::Acquire)},
+        })
+    }
+
+    pub(crate) fn record_attachment(&self) {
+        self.preparations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_activation(&self) {
+        self.activations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_peer_death(&self) {
+        self.peer_deaths.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_reclamation(&self) {
+        self.reclamations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Test hook: install a publication observer for connections prepared
     /// after this call. The hook runs on the endpoint thread after the ring
     /// commit. commentlint: allow(JUDGE)
     #[doc(hidden)]
@@ -159,11 +236,10 @@ impl RingTransport {
         queue_frames: usize,
         frame_deadline: Duration,
     ) -> Result<PreparedRing, RingUnavailable> {
-        let admission = self
-            .admission
-            .admit(&self.profile, None)
-            .map_err(|_| RingUnavailable)?;
-        self.preparations.fetch_add(1, Ordering::AcqRel);
+        let admission = self.admission.admit(&self.profile, None).map_err(|_| {
+            self.exhaustions.fetch_add(1, Ordering::Relaxed);
+            RingUnavailable
+        })?;
         let root = CancellationToken::new();
         let read_cancel = root.child_token();
         let (sender, queue) = frame_sender(queue_frames, root.clone(), frame_deadline);
@@ -247,7 +323,7 @@ struct WireDescriptor {
 
 fn worker_descriptor(rings: &DuplexRing) -> Result<(serde_json::Value, [OwnedFd; 2]), ()> {
     let descriptor = WireDescriptor {
-        profile: QUALIFIED_TEST_PROFILE.to_owned(),
+        profile: RING_PROFILE.to_owned(),
         host_to_peer_grant: encode_hex(&rings.first.grant().encode()),
         peer_to_host_grant: encode_hex(&rings.second.grant().encode()),
     };
@@ -294,17 +370,18 @@ async fn run_endpoint(
     root: CancellationToken,
     read_cancel: CancellationToken,
     publish_hook: Option<PublishHook>,
-) -> bool {
+) {
     let discard = queue.discard.clone();
     let finish = queue.finish.clone();
+    let mut inbound = Some(inbound);
     let mut finishing = false;
     loop {
         let mut received = false;
-        if !read_cancel.is_cancelled() {
+        if let Some(inbound_sender) = inbound.as_ref() {
             match receive_one(
                 &rings,
                 &mut queue,
-                &inbound,
+                inbound_sender,
                 &ingress,
                 frame_deadline,
                 &read_cancel,
@@ -313,21 +390,18 @@ async fn run_endpoint(
             .await
             {
                 Ok(true) => received = true,
-                Ok(false) => {}
+                Ok(false) => {
+                    if read_cancel.is_cancelled() {
+                        if let Some(inbound) = inbound.take() {
+                            let _ = inbound.send(Err(ReadClose::Cancelled)).await;
+                        }
+                    }
+                }
                 Err(close) => {
-                    // Cancellation and budget-timeout closes are ordinary
-                    // backpressure or retirement — the read side was told to
-                    // stop (or the inbound consumer is gone, or ingress is
-                    // saturated) and the local lease releases safely on drop
-                    // — so they must not quarantine the admission charges:
-                    // with single-candidate limits that would permanently
-                    // block every later shared-memory candidate. Only
-                    // structural faults are unclean.
-                    let clean = matches!(close, ReadClose::Cancelled | ReadClose::Overloaded);
-                    let _ = inbound.send(Err(close)).await;
+                    let _ = inbound_sender.send(Err(close)).await;
                     queue.retired.cancel();
                     root.cancel();
-                    return clean;
+                    return;
                 }
             }
         }
@@ -342,21 +416,28 @@ async fn run_endpoint(
         } else if finishing {
             match queue.try_recv() {
                 Ok(frame) => Some(frame),
-                Err(_) => return true,
+                Err(_) => return,
             }
         } else {
             tokio::select! {
                 biased;
-                () = discard.cancelled() => return true,
+                () = discard.cancelled() => return,
                 () = finish.cancelled() => {
                     finishing = true;
                     None
                 }
-                () = root.cancelled() => return true,
+                () = read_cancel.cancelled(), if inbound.is_some() => {
+                    // Re-enter the receive path once after observing
+                    // cancellation. It drains frames committed before the
+                    // cancellation edge, then reports `Cancelled` after the
+                    // first empty observation.
+                    None
+                }
                 frame = queue.recv() => match frame {
                     Some(frame) => Some(frame),
-                    None => return true,
+                    None => return,
                 },
+                () = root.cancelled() => return,
                 () = tokio::time::sleep(POLL_INTERVAL) => None,
             }
         };
@@ -366,7 +447,7 @@ async fn run_endpoint(
         if publish_one(&rings.first, queued, frame_deadline, publish_hook.as_ref()).is_err() {
             queue.retired.cancel();
             root.cancel();
-            return false;
+            return;
         }
     }
 }
@@ -426,7 +507,13 @@ async fn receive_one(
                     return Err(ReadClose::Corrupt("shared-memory publish failed"));
                 }
             }
-            Err(_) => std::thread::sleep(POLL_INTERVAL),
+            Err(_) => {
+                tokio::select! {
+                    biased;
+                    () = read_cancel.cancelled() => return Err(ReadClose::Cancelled),
+                    () = tokio::time::sleep(POLL_INTERVAL) => {}
+                }
+            }
         }
     };
     let body = lease
@@ -545,31 +632,26 @@ pub struct RingClientEndpoint {
 }
 
 impl RingClientEndpoint {
-    /// Rejects descriptor-only attachment because setup transfers ring
-    /// ownership through `SCM_RIGHTS` rather than process-local descriptor
-    /// numbers embedded in JSON.
-    pub fn attach(_descriptor: &serde_json::Value) -> Result<Self, RingClientError> {
-        Err(RingClientError)
-    }
-
     /// Attaches a descriptor and its setup-socket file descriptors.
     pub fn attach_with_descriptors(
         descriptor: &serde_json::Value,
         descriptors: [OwnedFd; 2],
     ) -> Result<Self, RingClientError> {
-        let mut descriptor = descriptor.clone();
-        descriptor
-            .as_object_mut()
-            .ok_or(RingClientError)?
-            .remove("candidate_id");
         let descriptor: WireDescriptor =
-            serde_json::from_value(descriptor).map_err(|_| RingClientError)?;
-        if descriptor.profile != QUALIFIED_TEST_PROFILE {
+            serde_json::from_value(descriptor.clone()).map_err(|_| RingClientError)?;
+        if descriptor.profile != RING_PROFILE {
             return Err(RingClientError);
         }
         let [from_host_fd, to_host_fd] = descriptors;
-        let from_host = attach_ring(from_host_fd, &descriptor.host_to_peer_grant)?;
-        let to_host = attach_ring(to_host_fd, &descriptor.peer_to_host_grant)?;
+        let from_host_grant = decode_grant(&descriptor.host_to_peer_grant)?;
+        let to_host_grant = decode_grant(&descriptor.peer_to_host_grant)?;
+        if from_host_grant.geometry() != to_host_grant.geometry() {
+            return Err(RingClientError);
+        }
+        let from_host = Ring::attach(from_host_fd, from_host_grant, SchedulingMode::ColdParkWake)
+            .map_err(|_| RingClientError)?;
+        let to_host = Ring::attach(to_host_fd, to_host_grant, SchedulingMode::ColdParkWake)
+            .map_err(|_| RingClientError)?;
         Ok(Self { to_host, from_host })
     }
 
@@ -594,11 +676,8 @@ impl RingClientEndpoint {
     pub fn recv(&self, timeout: Duration) -> Result<(EnvelopeHeader, Vec<u8>), RingClientError> {
         let deadline = StdInstant::now() + timeout;
         loop {
-            if let Some(lease) = self.from_host.try_receive().map_err(|_| RingClientError)? {
-                let header = decode_header(&lease.wire_header()).map_err(|_| RingClientError)?;
-                let body = lease.to_vec().map_err(|_| RingClientError)?;
-                lease.release().map_err(|_| RingClientError)?;
-                return Ok((header, body));
+            if let Some(frame) = self.try_recv()? {
+                return Ok(frame);
             }
             if StdInstant::now() >= deadline {
                 return Err(RingClientError);
@@ -608,29 +687,47 @@ impl RingClientEndpoint {
     }
 
     pub fn try_recv(&self) -> Result<Option<(EnvelopeHeader, Vec<u8>)>, RingClientError> {
+        self.try_recv_with(|_| Some(()))
+            .map(|frame| frame.map(|(header, body, ())| (header, body)))
+    }
+
+    pub(crate) fn try_recv_with<T>(
+        &self,
+        charge: impl FnOnce(usize) -> Option<T>,
+    ) -> Result<Option<(EnvelopeHeader, Vec<u8>, T)>, RingClientError> {
         let Some(lease) = self.from_host.try_receive().map_err(|_| RingClientError)? else {
             return Ok(None);
         };
         let header = decode_header(&lease.wire_header()).map_err(|_| RingClientError)?;
+        let Some(charge) = charge(lease.len()) else {
+            lease.release().map_err(|_| RingClientError)?;
+            return Err(RingClientError);
+        };
         let body = lease.to_vec().map_err(|_| RingClientError)?;
         lease.release().map_err(|_| RingClientError)?;
-        Ok(Some((header, body)))
+        Ok(Some((header, body, charge)))
     }
 }
 
-fn attach_ring(fd: OwnedFd, grant: &str) -> Result<Ring, RingClientError> {
-    let grant = RingGrant::decode(decode_hex(grant)?).map_err(|_| RingClientError)?;
-    Ring::attach(fd, grant, SchedulingMode::ColdParkWake).map_err(|_| RingClientError)
+fn decode_grant(grant: &str) -> Result<RingGrant, RingClientError> {
+    RingGrant::decode(decode_hex(grant)?).map_err(|_| RingClientError)
 }
 
 fn decode_hex<const N: usize>(text: &str) -> Result<[u8; N], RingClientError> {
+    let text = text.as_bytes();
     if text.len() != N * 2 {
         return Err(RingClientError);
     }
+    fn nibble(byte: u8) -> Result<u8, RingClientError> {
+        match byte {
+            b'0'..=b'9' => Ok(byte - b'0'),
+            b'a'..=b'f' => Ok(byte - b'a' + 10),
+            _ => Err(RingClientError),
+        }
+    }
     let mut bytes = [0u8; N];
     for (index, byte) in bytes.iter_mut().enumerate() {
-        *byte =
-            u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).map_err(|_| RingClientError)?;
+        *byte = nibble(text[index * 2])? << 4 | nibble(text[index * 2 + 1])?;
     }
     Ok(bytes)
 }
@@ -658,31 +755,137 @@ mod tests {
     use super::*;
     use crate::wire::{Flags, Priority, PROTOCOL_VERSION};
 
+    struct TestCharge {
+        used: Arc<std::sync::atomic::AtomicUsize>,
+        bytes: usize,
+    }
+
+    impl Drop for TestCharge {
+        fn drop(&mut self) {
+            self.used.fetch_sub(self.bytes, Ordering::SeqCst);
+        }
+    }
+
     #[test]
     fn construction_has_no_ring_side_effects() {
-        let transport = RingTransport::for_qualified_test_profile(single_candidate_limits());
-        assert_eq!(transport.preparation_count(), 0);
+        let transport = RingTransport::for_ring_profile(per_connection_limits());
         let accounting = transport.accounting().unwrap();
         assert_eq!(accounting.active, ResourceCharges::ZERO);
         assert_eq!(accounting.quarantined, ResourceCharges::ZERO);
     }
 
     #[test]
-    fn qualified_test_profile_pins_client_grant_geometry() {
-        let profile = qualified_test_profile();
+    fn diagnostics_report_fixed_identity_bounds_accounting_and_lifecycle_counts() {
+        let limits = per_connection_limits();
+        let transport = RingTransport::for_ring_profile(limits);
+        transport.record_attachment();
+        transport.record_activation();
+        transport.record_peer_death();
+        transport.record_reclamation();
+
+        let diagnostics = transport.diagnostics();
+        assert_eq!(diagnostics["state"], "healthy");
+        assert_eq!(diagnostics["error_class"], serde_json::Value::Null);
+        assert_eq!(diagnostics["artifact"]["profile"], RING_PROFILE);
+        assert_eq!(
+            diagnostics["artifact"]["wire_version"],
+            crate::wire::PROTOCOL_VERSION
+        );
+        assert_eq!(
+            diagnostics["artifact"]["descriptor_schema"],
+            mc_shm_transport::descriptor::DESCRIPTOR_SCHEMA_VERSION
+        );
+        assert_eq!(diagnostics["bounds"]["arena_bytes"], limits.arena_bytes);
+        assert_eq!(diagnostics["accounting"]["active"]["arena_bytes"], 0);
+        assert_eq!(diagnostics["accounting"]["quarantined"]["arena_bytes"], 0);
+        assert_eq!(diagnostics["attachment"]["completed"], 1);
+        assert_eq!(diagnostics["activation"]["completed"], 1);
+        assert_eq!(diagnostics["peer_death"]["observed"], 1);
+        assert_eq!(diagnostics["reclamation"]["completed"], 1);
+        assert_eq!(diagnostics["exhaustion"]["observed"], 0);
+
+        let encoded = diagnostics.to_string();
+        for secret_field in [
+            "socket_path",
+            "native_handle",
+            "mapping_descriptor",
+            "activation_token",
+            "authentication_key",
+            "payload",
+            "mapped_address",
+        ] {
+            assert!(!encoded.contains(secret_field));
+        }
+    }
+
+    #[test]
+    fn ring_profile_pins_per_connection_grant_geometry() {
+        let profile = ring_profile();
         assert_eq!(profile.descriptor_depth(), 8);
         assert_eq!(profile.max_leases(), 8);
         assert_eq!(profile.arena_bytes(), mc_shm_transport::MIN_ARENA_BYTES);
     }
 
+    #[test]
+    fn grant_hex_is_strict_lowercase_ascii_without_panics() {
+        assert_eq!(decode_hex::<2>("00af").unwrap(), [0x00, 0xaf]);
+        assert!(decode_hex::<2>("00AF").is_err());
+        assert!(decode_hex::<1>("+0").is_err());
+        let non_ascii = std::panic::catch_unwind(|| decode_hex::<2>("0é0"));
+        assert!(matches!(non_ascii, Ok(Err(_))));
+    }
+
+    #[test]
+    fn inbound_materialization_cannot_exceed_its_byte_budget() {
+        let rings = DuplexRing::create(&ring_profile()).unwrap();
+        let from_host = rings.first.attachment().unwrap().attach().unwrap();
+        let to_host = rings.second.attachment().unwrap().attach().unwrap();
+        let endpoint = RingClientEndpoint { to_host, from_host };
+        let header = EnvelopeHeader {
+            len: 1,
+            ver: PROTOCOL_VERSION,
+            ty: FrameType::Response,
+            flags: Flags::new(false, Priority::Interactive, false),
+            channel: 0,
+            epoch: 0,
+            corr: 1,
+        };
+        for byte in [1, 2] {
+            let mut reservation = rings.first.try_reserve(1, header.encode()).unwrap();
+            reservation.write(&[byte]).unwrap();
+            reservation.commit(1).unwrap();
+        }
+        let used = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let charge = |bytes| {
+            let previous = used.fetch_add(bytes, Ordering::SeqCst);
+            if previous + bytes > 1 {
+                used.fetch_sub(bytes, Ordering::SeqCst);
+                None
+            } else {
+                Some(TestCharge {
+                    used: Arc::clone(&used),
+                    bytes,
+                })
+            }
+        };
+
+        let first = endpoint.try_recv_with(charge).unwrap().unwrap();
+        assert_eq!(first.1, [1]);
+        assert_eq!(used.load(Ordering::SeqCst), 1);
+        assert!(endpoint.try_recv_with(charge).is_err());
+        assert_eq!(used.load(Ordering::SeqCst), 1);
+        drop(first);
+        assert_eq!(used.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn copied_control_frame_records_one_host_adapter_copy() {
-        let rings = DuplexRing::create(&qualified_test_profile()).unwrap();
-        let encoded = rings.first.grant().encode();
-        assert_eq!(u64::from_le_bytes(encoded[22..30].try_into().unwrap()), 8);
-        assert_eq!(u64::from_le_bytes(encoded[38..46].try_into().unwrap()), 8);
+        let rings = DuplexRing::create(&ring_profile()).unwrap();
+        let geometry = rings.first.grant().geometry();
+        assert_eq!(geometry.descriptor_depth, 8);
+        assert_eq!(geometry.max_leases, 8);
         assert_eq!(
-            u64::from_le_bytes(encoded[46..54].try_into().unwrap()),
+            geometry.mapping_bytes,
             (mc_shm_transport::MIN_ARENA_BYTES + 8_192) as u64
         );
         let body = b"copy";
@@ -720,5 +923,44 @@ mod tests {
             panic!("expected copied frame");
         };
         assert_eq!(frame.copy_counter().copies(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn budget_wait_observes_read_cancellation() {
+        let rings = DuplexRing::create(&ring_profile()).unwrap();
+        let body = [7u8];
+        let header = EnvelopeHeader {
+            len: 1,
+            ver: PROTOCOL_VERSION,
+            ty: FrameType::Request,
+            flags: Flags::new(false, Priority::Interactive, false),
+            channel: 0,
+            epoch: 0,
+            corr: 1,
+        };
+        let mut reservation = rings.second.try_reserve(1, header.encode()).unwrap();
+        reservation.write(&body).unwrap();
+        reservation.commit(1).unwrap();
+        let (_sender, mut queue) =
+            frame_sender(1, CancellationToken::new(), Duration::from_secs(1));
+        let (inbound, _received) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let cancellation = cancel.clone();
+        let budget = ByteBudget::new(0);
+        let receive = receive_one(
+            &rings,
+            &mut queue,
+            &inbound,
+            &budget,
+            Duration::from_secs(1),
+            &cancellation,
+            None,
+        );
+        let cancel_after_poll = async move {
+            tokio::task::yield_now().await;
+            cancel.cancel();
+        };
+        let (result, ()) = tokio::join!(receive, cancel_after_poll);
+        assert!(matches!(result, Err(ReadClose::Cancelled)));
     }
 }

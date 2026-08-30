@@ -58,6 +58,8 @@ struct ActiveProducer {
 }
 
 struct Channel {
+    // Field order is load-bearing: Rust drops fields in declaration order, so
+    // every reservation that borrows `to_host` is dropped before `to_host`.
     producers: HashMap<u32, ActiveProducer>,
     active: HashMap<u32, ActiveLease>,
     // Aliases whose detachment failed; retained so the channel entry (and its
@@ -214,25 +216,25 @@ fn string_field(env: &Env, object: &Object<'_>, name: &str, max_len: usize) -> R
     unsafe { value.cast::<String>() }.map_err(|_| cleared_descriptor_error(env))
 }
 
-fn decode_hex<const N: usize>(text: &str) -> Result<[u8; N]> {
+fn strict_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
     let ascii = text.as_bytes();
     if ascii.len() != N * 2 {
-        return Err(descriptor_error());
+        return None;
     }
     // Strict lowercase hexadecimal only, matching the host encoder;
     // `from_str_radix` would also admit uppercase and sign prefixes.
-    fn nibble(byte: u8) -> Result<u8> {
+    fn nibble(byte: u8) -> Option<u8> {
         match byte {
-            b'0'..=b'9' => Ok(byte - b'0'),
-            b'a'..=b'f' => Ok(byte - b'a' + 10),
-            _ => Err(descriptor_error()),
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
         }
     }
     let mut bytes = [0u8; N];
     for (index, byte) in bytes.iter_mut().enumerate() {
         *byte = nibble(ascii[index * 2])? << 4 | nibble(ascii[index * 2 + 1])?;
     }
-    Ok(bytes)
+    Some(bytes)
 }
 
 fn attach_ring(fd: i32, grant: RingGrant) -> Result<Ring> {
@@ -506,19 +508,25 @@ pub fn attach(env: &Env, descriptor: Unknown<'_>) -> Result<u32> {
             integer_field(env, &object, "hostToPeerFd", 0.0, f64::from(i32::MAX))? as i32;
         let peer_to_host_fd =
             integer_field(env, &object, "peerToHostFd", 0.0, f64::from(i32::MAX))? as i32;
-        let host_to_peer_grant = RingGrant::decode(decode_hex(&string_field(
-            env,
-            &object,
-            "hostToPeerGrant",
-            GRANT_HEX_LEN,
-        )?)?)
+        let host_to_peer_grant = RingGrant::decode(
+            strict_hex(&string_field(
+                env,
+                &object,
+                "hostToPeerGrant",
+                GRANT_HEX_LEN,
+            )?)
+            .ok_or_else(descriptor_error)?,
+        )
         .map_err(|_| descriptor_error())?;
-        let peer_to_host_grant = RingGrant::decode(decode_hex(&string_field(
-            env,
-            &object,
-            "peerToHostGrant",
-            GRANT_HEX_LEN,
-        )?)?)
+        let peer_to_host_grant = RingGrant::decode(
+            strict_hex(&string_field(
+                env,
+                &object,
+                "peerToHostGrant",
+                GRANT_HEX_LEN,
+            )?)
+            .ok_or_else(descriptor_error)?,
+        )
         .map_err(|_| descriptor_error())?;
         // Both directions form one duplex pair over two distinct backing
         // objects; an aliased fd or grant collapses them onto one ring.
@@ -568,7 +576,15 @@ pub fn connect_setup(env: &Env, options: NativeSetupOptions) -> Result<u32> {
         &options.daemon_ver,
         Duration::from_millis(u64::from(options.timeout_ms)),
     )
-    .map_err(|_| error("shared-memory setup failed"))?;
+    .map_err(|failure| {
+        if failure.kind() == std::io::ErrorKind::PermissionDenied
+            && failure.to_string() == "shared-memory identity mismatch"
+        {
+            error("shared-memory identity mismatch")
+        } else {
+            error("shared-memory setup failed")
+        }
+    })?;
     if connected.host_to_peer_grant == connected.peer_to_host_grant {
         return Err(descriptor_error());
     }
@@ -778,7 +794,9 @@ pub fn reserve(
             return Err(error("native channel is closed"));
         }
         let ring_ptr: *const Ring = channel.to_host.as_ref();
-        // SAFETY: `to_host` remains allocated until all `producers` are dropped.
+        // SAFETY: `to_host` is boxed, so moving `Channel` does not move the
+        // ring. `producers` is declared before `to_host`, so every stored
+        // reservation drops before the ring on every Channel destruction path.
         let ring: &'static Ring = unsafe { &*ring_ptr };
         let reservation = ring
             .reserve_until(
@@ -883,6 +901,53 @@ pub fn abort_reservation(env: &Env, channel_id: u32, token: u32) -> Result<()> {
         detach_producer(env, channel, token)?.abort();
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_drops_borrowing_reservations_before_the_ring() {
+        let profile = ring_profile(
+            HardwareProfileId::new(PROFILE).expect("static profile"),
+            SchedulingMode::ColdParkWake,
+        )
+        .expect("profile");
+        let to_host = Box::new(Ring::create(&profile, 1).expect("producer ring"));
+        let from_host = Ring::create(&profile, 2).expect("consumer ring");
+        let ring_ptr: *const Ring = to_host.as_ref();
+        // SAFETY: this mirrors `reserve`: `Channel` declares `producers` before
+        // `to_host`, so the stored reservation is destroyed first.
+        let ring: &'static Ring = unsafe { &*ring_ptr };
+        let reservation = ring
+            .reserve_until(
+                0,
+                [0; WIRE_V2_HEADER_BYTES],
+                Instant::now() + Duration::from_secs(1),
+            )
+            .expect("reservation");
+        let mut producers = HashMap::new();
+        producers.insert(
+            1,
+            ActiveProducer {
+                reservation,
+                buffers: Vec::new(),
+            },
+        );
+        drop(Channel {
+            producers,
+            active: HashMap::new(),
+            stranded: Vec::new(),
+            to_host,
+            from_host,
+            next_producer: 1,
+            next_lease: 0,
+            closed: false,
+            setup: None,
+            _reservation: None,
+        });
+    }
 }
 
 #[napi]

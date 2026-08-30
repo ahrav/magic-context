@@ -49,24 +49,13 @@ pub(crate) fn bind_owner_only(path: &Path) -> io::Result<tokio::net::UnixListene
     Ok(listener)
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename = "grant")]
-pub struct GrantMessage<'a> {
+pub struct GrantMessage {
     pub wire_version: u8,
     pub descriptor_schema: u16,
-    pub activation_token: &'a str,
-    pub descriptor: &'a serde_json::Value,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum OwnedGrantMessage {
-    Grant {
-        wire_version: u8,
-        descriptor_schema: u16,
-        activation_token: String,
-        descriptor: serde_json::Value,
-    },
+    pub activation_token: String,
+    pub descriptor: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -142,7 +131,7 @@ impl std::error::Error for SetupError {
 /// Sends the grant and exactly two ring descriptors in one `SCM_RIGHTS` message.
 pub async fn send_grant(
     stream: &mut UnixStream,
-    grant: &GrantMessage<'_>,
+    grant: &GrantMessage,
     descriptors: &[OwnedFd; RING_DESCRIPTOR_COUNT],
     deadline: Instant,
 ) -> Result<(), SetupError> {
@@ -262,8 +251,8 @@ pub async fn activate_server(
         &GrantMessage {
             wire_version,
             descriptor_schema,
-            activation_token,
-            descriptor,
+            activation_token: activation_token.to_owned(),
+            descriptor: descriptor.clone(),
         },
         descriptors,
         deadline,
@@ -304,7 +293,7 @@ pub async fn activate_client(
         .checked_add(timeout)
         .ok_or(SetupError::Timeout)?;
     let (value, descriptors) = receive_grant(stream, deadline).await?;
-    let OwnedGrantMessage::Grant {
+    let GrantMessage {
         wire_version,
         descriptor_schema,
         activation_token,
@@ -346,6 +335,10 @@ pub async fn goodbye_client(stream: &mut UnixStream) {
     let deadline = Instant::now() + Duration::from_millis(100);
     let _ = write_message(stream, &ClientMessage::Goodbye, deadline).await;
     let _ = stream.shutdown().await;
+}
+
+pub(crate) fn encoded_goodbye() -> Result<Vec<u8>, SetupError> {
+    encode_message(&ClientMessage::Goodbye)
 }
 
 /// Waits for the only legal post-commit setup message or peer EOF.
@@ -464,9 +457,9 @@ mod tests {
                 &mut server,
                 &GrantMessage {
                     wire_version: 2,
-                    descriptor_schema: 1,
-                    activation_token: "token",
-                    descriptor: &serde_json::json!({"ring": "v1"}),
+                    descriptor_schema: mc_shm_transport::descriptor::DESCRIPTOR_SCHEMA_VERSION,
+                    activation_token: "token".to_owned(),
+                    descriptor: serde_json::json!({"ring": "v1"}),
                 },
                 &descriptors,
                 deadline,
@@ -582,7 +575,7 @@ mod tests {
                 &descriptors,
                 &serde_json::json!({"ring": "v1"}),
                 2,
-                1,
+                mc_shm_transport::descriptor::DESCRIPTOR_SCHEMA_VERSION,
                 "token",
                 Duration::from_secs(1),
             )
@@ -613,11 +606,12 @@ mod tests {
                 &descriptors,
                 &serde_json::json!({"ring": "v1"}),
                 2,
-                1,
+                mc_shm_transport::descriptor::DESCRIPTOR_SCHEMA_VERSION,
                 "token",
                 Duration::from_secs(1),
             )
-            .await
+            .await?;
+            Ok::<_, SetupError>(observe_peer(&mut server).await)
         });
         let deadline = Instant::now() + Duration::from_secs(1);
         let _ = receive_grant(&mut client, deadline).await.expect("grant");
@@ -625,7 +619,7 @@ mod tests {
             &mut client,
             &ClientMessage::Activate {
                 wire_version: 2,
-                descriptor_schema: 1,
+                descriptor_schema: mc_shm_transport::descriptor::DESCRIPTOR_SCHEMA_VERSION,
                 activation_token: "token".to_owned(),
             },
             deadline,
@@ -643,7 +637,17 @@ mod tests {
             read_message::<ServerMessage>(&mut client, deadline).await,
             Ok(ServerMessage::Committed)
         ));
-        task.await.expect("server task").expect("activation");
+        write_message(
+            &mut client,
+            &serde_json::json!({"type": "request", "corr": 1}),
+            deadline,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            task.await.expect("server task").expect("activation"),
+            PeerClose::ProtocolError
+        );
     }
 
     #[tokio::test]
@@ -668,7 +672,7 @@ mod tests {
                 &descriptors,
                 &serde_json::json!({"ring": "v1"}),
                 2,
-                1,
+                mc_shm_transport::descriptor::DESCRIPTOR_SCHEMA_VERSION,
                 "token",
                 Duration::from_secs(1),
             )
@@ -696,7 +700,7 @@ mod tests {
             &mut client,
             &ClientMessage::Activate {
                 wire_version: 2,
-                descriptor_schema: 1,
+                descriptor_schema: mc_shm_transport::descriptor::DESCRIPTOR_SCHEMA_VERSION,
                 activation_token: "token".to_owned(),
             },
             deadline,
@@ -718,38 +722,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn activation_identity_mismatch_is_terminal() {
-        let (mut server, mut client) = UnixStream::pair().expect("socket pair");
-        let descriptors = descriptors();
-        let task = tokio::spawn(async move {
-            activate_server(
-                &mut server,
-                &descriptors,
-                &serde_json::json!({}),
-                2,
-                1,
-                "token",
-                Duration::from_secs(1),
+    async fn stale_wire_or_descriptor_schema_is_invalid_identity() {
+        for (wire_version, descriptor_schema) in [
+            (
+                crate::wire::PROTOCOL_VERSION.saturating_sub(1),
+                mc_shm_transport::descriptor::DESCRIPTOR_SCHEMA_VERSION,
+            ),
+            (crate::wire::PROTOCOL_VERSION, 1),
+        ] {
+            let (mut server, mut client) = UnixStream::pair().expect("socket pair");
+            let descriptors = descriptors();
+            let task = tokio::spawn(async move {
+                activate_server(
+                    &mut server,
+                    &descriptors,
+                    &serde_json::json!({}),
+                    crate::wire::PROTOCOL_VERSION,
+                    mc_shm_transport::descriptor::DESCRIPTOR_SCHEMA_VERSION,
+                    "token",
+                    Duration::from_secs(1),
+                )
+                .await
+            });
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let _ = receive_grant(&mut client, deadline).await.expect("grant");
+            write_message(
+                &mut client,
+                &ClientMessage::Activate {
+                    wire_version,
+                    descriptor_schema,
+                    activation_token: "token".to_owned(),
+                },
+                deadline,
             )
             .await
-        });
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let _ = receive_grant(&mut client, deadline).await.expect("grant");
-        write_message(
-            &mut client,
-            &ClientMessage::Activate {
-                wire_version: 3,
-                descriptor_schema: 1,
-                activation_token: "token".to_owned(),
-            },
-            deadline,
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            task.await.expect("server task"),
-            Err(SetupError::InvalidIdentity)
-        ));
+            .unwrap();
+            assert!(matches!(
+                task.await.expect("server task"),
+                Err(SetupError::InvalidIdentity)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn client_rejects_stale_identity_without_activate_write_or_returned_descriptors() {
+        for (wire_version, descriptor_schema) in [
+            (
+                crate::wire::PROTOCOL_VERSION.saturating_sub(1),
+                mc_shm_transport::descriptor::DESCRIPTOR_SCHEMA_VERSION,
+            ),
+            (crate::wire::PROTOCOL_VERSION, 1),
+        ] {
+            let (mut server, mut client) = UnixStream::pair().expect("socket pair");
+            let descriptors = descriptors();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let sent = tokio::spawn(async move {
+                send_grant(
+                    &mut server,
+                    &GrantMessage {
+                        wire_version,
+                        descriptor_schema,
+                        activation_token: "token".to_owned(),
+                        descriptor: serde_json::json!({}),
+                    },
+                    &descriptors,
+                    deadline,
+                )
+                .await?;
+                let mut byte = [0u8; 1];
+                Ok::<_, SetupError>(
+                    tokio::time::timeout(Duration::from_millis(100), server.read(&mut byte)).await,
+                )
+            });
+
+            assert!(matches!(
+                activate_client(&mut client, Duration::from_secs(1)).await,
+                Err(SetupError::InvalidIdentity)
+            ));
+            assert!(sent
+                .await
+                .expect("sender task")
+                .expect("send stale grant")
+                .is_err());
+        }
     }
 
     #[tokio::test]

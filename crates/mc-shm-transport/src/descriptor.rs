@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::arena::{ArenaSpan, MAX_FRAME_BYTES};
 
 /// Shared descriptor schema version.
-pub const DESCRIPTOR_SCHEMA_VERSION: u16 = 1;
+pub const DESCRIPTOR_SCHEMA_VERSION: u16 = 2;
 /// Frozen wire-v2 header length.
 pub const WIRE_V2_HEADER_BYTES: usize = 21;
 /// Maximum shared spans in one complete-frame descriptor.

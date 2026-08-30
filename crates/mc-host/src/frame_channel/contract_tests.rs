@@ -7,7 +7,7 @@
 //! this module and cannot be selected as a production transport.
 
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use tokio::time::{Duration, Instant};
 
@@ -24,6 +24,7 @@ pub(crate) struct ContractConfig {
     pub write_deadline: Duration,
     /// Pool backing every inbound and test-created outbound charge.
     pub budget_bytes: u64,
+    pub publish_hook: Option<crate::ring_transport::PublishHook>,
 }
 
 impl Default for ContractConfig {
@@ -32,6 +33,7 @@ impl Default for ContractConfig {
             queue_frames: 8,
             write_deadline: Duration::from_secs(5),
             budget_bytes: 1 << 20,
+            publish_hook: None,
         }
     }
 }
@@ -330,7 +332,20 @@ pub(crate) async fn graceful_finish_drains_admitted_frames_before_close<F: Chann
 pub(crate) async fn discard_drops_queued_frames_and_releases_charges<F: ChannelFactory>(
     factory: &F,
 ) {
-    let h = factory.connect(ContractConfig::default()).await;
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let hook_release = Arc::clone(&release);
+    let h = factory
+        .connect(ContractConfig {
+            publish_hook: Some(Arc::new(move |_, _| {
+                let (released, changed) = &*hook_release;
+                let mut released = released.lock().expect("publication gate lock");
+                while !*released {
+                    released = changed.wait(released).expect("publication gate wait");
+                }
+            })),
+            ..ContractConfig::default()
+        })
+        .await;
     let baseline = h.budget.available();
     for corr in 1..=3u64 {
         let charge = h.budget.try_charge(1024).expect("charge");
@@ -340,6 +355,11 @@ pub(crate) async fn discard_drops_queued_frames_and_releases_charges<F: ChannelF
     }
     assert!(h.budget.available() < baseline);
     h.sender.discard();
+    {
+        let (released, changed) = &*release;
+        *released.lock().expect("publication gate lock") = true;
+        changed.notify_all();
+    }
     h.io_task.await.expect("transport task");
     assert_eq!(
         h.budget.available(),
@@ -498,9 +518,12 @@ impl ChannelFactory for RingFactory {
 
     async fn connect(&self, cfg: ContractConfig) -> Harness<Self::Channel, Self::Peer> {
         let budget = ByteBudget::new(cfg.budget_bytes);
-        let transport = crate::ring_transport::RingTransport::for_qualified_test_profile(
-            crate::ring_transport::single_candidate_limits(),
+        let transport = crate::ring_transport::RingTransport::for_ring_profile(
+            crate::ring_transport::per_connection_limits(),
         );
+        if let Some(hook) = cfg.publish_hook {
+            transport.set_publish_hook(hook);
+        }
         let prepared = transport
             .prepare(budget.clone(), cfg.queue_frames, cfg.write_deadline)
             .expect("production ring prepares");

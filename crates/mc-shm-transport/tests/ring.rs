@@ -1,5 +1,6 @@
+use std::os::fd::OwnedFd;
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 #[cfg(target_os = "linux")]
@@ -367,6 +368,14 @@ fn duplicate_fd(raw: i32) -> OwnedFd {
 }
 
 #[cfg(target_os = "linux")]
+fn mapped_region_count() -> usize {
+    std::fs::read_to_string("/proc/self/maps")
+        .expect("read process mappings")
+        .lines()
+        .count()
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn artifact_mismatch_fails_before_mapping_and_unsealed_objects_are_rejected() {
     let ring = Ring::create(&profile(), 21).unwrap();
@@ -413,6 +422,7 @@ fn artifact_mismatch_fails_before_mapping_and_unsealed_objects_are_rejected() {
     lane[18] ^= 1;
     for bytes in [incarnation, lane] {
         let grant = RingGrant::decode(bytes).unwrap();
+        let before = mapped_region_count();
         assert!(matches!(
             Ring::attach(
                 duplicate_fd(ring.raw_fd()),
@@ -421,6 +431,10 @@ fn artifact_mismatch_fails_before_mapping_and_unsealed_objects_are_rejected() {
             ),
             Err(RingError::InvalidGrant)
         ));
+        assert!(
+            mapped_region_count() <= before,
+            "identity mismatch increased mapped memory"
+        );
     }
 
     let name = c"mc-shm-unsealed-test";
@@ -440,8 +454,23 @@ fn artifact_mismatch_fails_before_mapping_and_unsealed_objects_are_rejected() {
         0
     );
     assert_eq!(unsafe { libc::fchmod(unsealed.as_raw_fd(), 0o600) }, 0);
+    let before = mapped_region_count();
     assert!(matches!(
         Ring::attach(unsealed, ring.grant(), SchedulingMode::ColdParkWake),
+        Err(RingError::ObjectValidationFailed)
+    ));
+    assert!(
+        mapped_region_count() <= before,
+        "unsealed object increased mapped memory"
+    );
+}
+
+#[test]
+fn non_regular_attachment_object_is_rejected_before_mapping() {
+    let ring = Ring::create(&profile(), 41).unwrap();
+    let fd: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+    assert!(matches!(
+        Ring::attach(fd, ring.grant(), SchedulingMode::ColdParkWake),
         Err(RingError::ObjectValidationFailed)
     ));
 }
@@ -509,6 +538,14 @@ fn golden_grant_fixture_matches_the_frozen_ring_profile_encoding() {
         u16::from_le_bytes([bytes[0], bytes[1]]),
         2,
         "layout version"
+    );
+    assert_eq!(
+        &bytes[2..18],
+        &[
+            0xd4, 0x89, 0xc0, 0x7e, 0xe4, 0x63, 0x33, 0xa5, 0xfe, 0x79, 0x01, 0xdf, 0x35, 0x6f,
+            0x6f, 0x46
+        ],
+        "incarnation identity"
     );
     assert_eq!(
         u32::from_le_bytes(bytes[18..22].try_into().unwrap()),
