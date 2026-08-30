@@ -20,12 +20,9 @@ import {
 } from "@magic-context/core/features/magic-context/memory/embedding-probe";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
-import {
-    isPrototypePollutionKey,
-    sanitizeParsedJson,
-} from "@magic-context/core/shared/jsonc-parser";
+import { isPrototypePollutionKey, parseConfigJsonc } from "@magic-context/core/shared/jsonc-parser";
 import { loadPiConfig } from "@magic-context/pi-core/config";
-import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
+import { stringify as stringifyJsonc } from "comment-json";
 
 import { writeFileAtomic } from "../lib/atomic-write";
 import {
@@ -273,7 +270,7 @@ function readConfigForEmbedding(
             isProjectConfig,
         });
         const rejectedKeyPaths: string[] = [];
-        const parsed = sanitizeParsedJson(parseJsonc(substituted.text) as Record<string, unknown>, {
+        const parsed = parseConfigJsonc<Record<string, unknown>>(substituted.text, {
             onRejectedKey: (keyPath) => rejectedKeyPaths.push(keyPath.join(".")),
         });
         if (rejectedKeyPaths.length > 0) {

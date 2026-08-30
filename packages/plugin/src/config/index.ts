@@ -1,6 +1,10 @@
 import { existsSync, readFileSync } from "node:fs";
 
-import { detectConfigFile, isPrototypePollutionKey, parseJsonc } from "../shared/jsonc-parser";
+import {
+    detectConfigFile,
+    isPrototypePollutionKey,
+    parseConfigJsonc,
+} from "../shared/jsonc-parser";
 import { setOutputReserveConfig } from "../shared/models-dev-cache";
 import type { PromptSurfaceConfig } from "../shared/prompt-surface";
 import { setWindowOverlayPath } from "../shared/window-geometry";
@@ -124,7 +128,7 @@ function loadConfigFileDetailed(
             isProjectConfig: source === "project",
         });
         const rejectedKeyPaths: string[] = [];
-        const config = parseJsonc<Record<string, unknown>>(substituted.text, {
+        const config = parseConfigJsonc<Record<string, unknown>>(substituted.text, {
             onRejectedKey: (path) => rejectedKeyPaths.push(path.join(".")),
         });
         const unsafeKeyWarnings = rejectedKeyPaths.map(

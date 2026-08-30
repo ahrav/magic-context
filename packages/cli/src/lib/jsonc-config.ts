@@ -1,6 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import { sanitizeParsedJson } from "@magic-context/core/shared/jsonc-parser";
-import { parse as parseJsonc } from "comment-json";
+import { parseConfigJsonc } from "@magic-context/core/shared/jsonc-parser";
 
 export type JsoncReadResult =
     | { kind: "missing" }
@@ -54,7 +53,7 @@ export function readJsoncConfig(path: string): JsoncReadResult {
     const content = readFileSync(path, "utf-8");
     try {
         const rejectedKeyPaths: string[] = [];
-        const parsed = sanitizeParsedJson(parseJsonc(content), {
+        const parsed = parseConfigJsonc(content, {
             onRejectedKey: (keyPath) => rejectedKeyPaths.push(keyPath.join(".")),
         });
         if (rejectedKeyPaths.length > 0) {
@@ -94,7 +93,7 @@ export function readJsoncLenient(path: string): {
     if (!existsSync(path)) return { value: {} };
     try {
         return {
-            value: parseJsonc(readFileSync(path, "utf-8")) as Record<string, unknown>,
+            value: parseConfigJsonc<Record<string, unknown>>(readFileSync(path, "utf-8")),
         };
     } catch (error) {
         return {

@@ -1,5 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 
+import { parse as parseCommentJson } from "comment-json";
+
 export function stripJsonComments(content: string): string {
     let result = "";
     let inString = false;
@@ -135,7 +137,10 @@ export function sanitizeParsedJson<T>(
 
     const source = value as Record<string, unknown>;
     const sourcePrototype = Object.getPrototypeOf(source);
-    if (sourcePrototype !== null && sourcePrototype !== Object.prototype) {
+    // Any non-plain prototype (a parser-injected object OR null) is treated
+    // as an attempted __proto__ override; the rebuilt object always gets a
+    // plain prototype either way.
+    if (sourcePrototype !== Object.prototype) {
         options.onRejectedKey?.([...path, "__proto__"]);
     }
 
@@ -161,6 +166,19 @@ export function parseJsonc<T = unknown>(
 ): T {
     const normalized = stripTrailingCommas(stripJsonComments(content));
     return sanitizeParsedJson(JSON.parse(normalized) as T, options);
+}
+
+/**
+ * The config-file JSONC parser for `magic-context.jsonc` readers. One
+ * grammar (`comment-json`) parses the config so the same file cannot load
+ * differently across harnesses; the sanitizer pass rebuilds the tree with
+ * prototype-pollution keys rejected.
+ */
+export function parseConfigJsonc<T = unknown>(
+    content: string,
+    options: ParsedJsonSanitizerOptions = {},
+): T {
+    return sanitizeParsedJson(parseCommentJson(content) as T, options);
 }
 
 export function readJsoncFile<T = unknown>(filePath: string): T | null {
