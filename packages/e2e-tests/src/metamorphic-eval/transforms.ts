@@ -3,6 +3,7 @@ import {
     COMMIT_HASH_TEST_PATTERN,
     COMMIT_VERB_PATTERN,
 } from "../../../plugin/src/shared/commit-detection";
+import { OMO_INTERNAL_INITIATOR_MARKER } from "../../../plugin/src/shared/internal-initiator-marker";
 import {
     MAX_TRANSCRIPT_TURNS,
     MAX_TURN_TEXT_CHARS,
@@ -260,10 +261,10 @@ function messageKey(turnIndex: number, role: "user" | "assistant"): string {
  * the messages the occurrence actually crosses rather than an approximation from
  * turn boundaries.
  */
-function matchSpans(
+function matchCounts(
     entries: readonly { id: string; predicate: ContentPredicate }[],
     turns: readonly TranscriptTurn[],
-): string[] {
+): Map<string, number> {
     const messages = normalizedEvidenceMessages(turns);
     const spans: Array<{ key: string; start: number; end: number }> = [];
     let offset = 0;
@@ -277,32 +278,42 @@ function matchSpans(
         offset += message.text.length + 1;
     }
     const evidence = messages.map((message) => message.text).join(" ");
-    const matches: string[] = [];
+    const counts = new Map<string, number>();
     for (const entry of entries) {
         const needle = normalizeContent(entry.predicate.value);
         if (needle.length === 0) continue;
+        // Spans are ordered and occurrences are found in order, so the first span an
+        // occurrence can touch never moves backwards. Aggregating identical
+        // signatures rather than listing every occurrence keeps a one-character
+        // predicate against a long transcript from materializing hundreds of
+        // thousands of strings and rescanning every span for each of them.
+        let first = 0;
         for (
             let at = evidence.indexOf(needle);
             at !== -1;
             at = evidence.indexOf(needle, at + 1)
         ) {
             const matchEnd = at + needle.length;
-            const crossed = spans
-                .filter((span) => span.start < matchEnd && at < span.end)
-                .map((span) => span.key);
-            matches.push(`${entry.id}|${crossed.join(",")}`);
+            while (first < spans.length && spans[first]!.end <= at) first += 1;
+            const crossed: string[] = [];
+            for (let index = first; index < spans.length; index += 1) {
+                const span = spans[index]!;
+                if (span.start >= matchEnd) break;
+                crossed.push(span.key);
+            }
+            const signature = `${entry.id}|${crossed.join(",")}`;
+            counts.set(signature, (counts.get(signature) ?? 0) + 1);
         }
     }
-    return matches;
+    return counts;
 }
 
 /** Messages that authored negative evidence runs through. */
 function absentEvidenceMessages(scenario: HistorianEvalScenario): Set<string> {
     return new Set(
-        matchSpans(
-            scenario.gold.expectedAbsent,
-            scenario.transcript.turns,
-        ).flatMap((match) => match.slice(match.indexOf("|") + 1).split(",")),
+        [...matchCounts(scenario.gold.expectedAbsent, scenario.transcript.turns).keys()].flatMap(
+            (match) => match.slice(match.indexOf("|") + 1).split(","),
+        ),
     );
 }
 
@@ -422,7 +433,8 @@ function preservesContiguousGold(
 
 interface EvidenceBaseline {
     entries: readonly { id: string; predicate: ContentPredicate }[];
-    matches: readonly string[];
+    /** Occurrence signature to how many times it occurs. */
+    matches: ReadonlyMap<string, number>;
 }
 
 interface EvidenceBaselines {
@@ -448,7 +460,7 @@ function evidenceBaselines(scenario: HistorianEvalScenario): EvidenceBaselines {
         entries: readonly { id: string; predicate: ContentPredicate }[],
     ) => ({
         entries,
-        matches: matchSpans(entries, scenario.transcript.turns),
+        matches: matchCounts(entries, scenario.transcript.turns),
     });
     const rejected = scenario.gold.expectedAbsent.filter(
         (absent) => absent.family === "proposed-but-rejected",
@@ -507,19 +519,14 @@ function matchDelta(
     turns: readonly TranscriptTurn[],
     turnMap: readonly number[],
 ): { lost: number; gained: number } {
-    const remaining = new Map<string, number>();
-    for (const match of matchSpans(baseline.entries, turns)) {
-        remaining.set(match, (remaining.get(match) ?? 0) + 1);
-    }
+    const remaining = new Map(matchCounts(baseline.entries, turns));
     let lost = 0;
-    for (const match of baseline.matches) {
+    for (const [match, occurrences] of baseline.matches) {
         const expected = remapMatch(match, turnMap);
-        const count = remaining.get(expected) ?? 0;
-        if (count === 0) {
-            lost += 1;
-            continue;
-        }
-        remaining.set(expected, count - 1);
+        const available = remaining.get(expected) ?? 0;
+        const matched = Math.min(available, occurrences);
+        lost += occurrences - matched;
+        remaining.set(expected, available - matched);
     }
     let gained = 0;
     for (const count of remaining.values()) gained += count;
@@ -646,22 +653,26 @@ function preservesEvidenceForDuplication(
     insertion: number,
 ): boolean {
     const expected = new Map<string, number>();
-    const add = (match: string) => expected.set(match, (expected.get(match) ?? 0) + 1);
-    for (const match of baselines.rejected.matches) {
-        add(remapMatch(match, turnMap));
+    const add = (match: string, times: number) =>
+        expected.set(match, (expected.get(match) ?? 0) + times);
+    for (const [match, occurrences] of baselines.rejected.matches) {
+        add(remapMatch(match, turnMap), occurrences);
         // An occurrence wholly inside the copied turn appears once more, at the copy.
         // Wholly, not singly: a formation spanning the turn's user and assistant
         // names that turn twice, and requiring a single index would drop the expected
         // copy and reject the very candidate the transform exists to make.
         const crossedTurns = matchTurns(match);
         if (crossedTurns.every((turnIndex) => turnIndex === source)) {
-            add(remapMatch(match, turnMap.map((_, index) => (index === source ? insertion : -1))));
+            add(
+                remapMatch(
+                    match,
+                    turnMap.map((_, index) => (index === source ? insertion : -1)),
+                ),
+                occurrences,
+            );
         }
     }
-    const actual = new Map<string, number>();
-    for (const match of matchSpans(baselines.rejected.entries, turns)) {
-        actual.set(match, (actual.get(match) ?? 0) + 1);
-    }
+    const actual = matchCounts(baselines.rejected.entries, turns);
     if (expected.size !== actual.size) return false;
     for (const [match, count] of expected) {
         if (actual.get(match) !== count) return false;
@@ -984,7 +995,7 @@ const duplicateRejectedProposal: Transform = {
         // transform is for.
         const rejectedTurns = new Set(
             scenario.transcript.turns.flatMap((turn, turnIndex) =>
-                matchSpans(rejected, [turn]).length > 0 ? [turnIndex] : [],
+                matchCounts(rejected, [turn]).size > 0 ? [turnIndex] : [],
             ),
         );
         const protectedIndexes = protectedTurnIndexes(scenario);
@@ -1064,7 +1075,14 @@ const SYMBOL_RE =
  */
 function isMarkupName(symbol: string, text: string): boolean {
     const escaped = symbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return new RegExp(`</?${escaped}\\s*>`, "i").test(text);
+    // An element name, or the internal-initiator marker production strips by exact
+    // string: renaming either rewrites the structure rather than an entity, and the
+    // text it delimited then reaches the historian.
+    return (
+        new RegExp(`</?${escaped}\\s*>`, "i").test(text) ||
+        (OMO_INTERNAL_INITIATOR_MARKER.includes(symbol) &&
+            text.includes(OMO_INTERNAL_INITIATOR_MARKER))
+    );
 }
 
 /** Generated replacement names, and the pattern that finds one already taken. */
@@ -1318,6 +1336,10 @@ const renameUnrelatedSymbols: Transform = {
                 // stripping the block, and text the baseline hid reaches the
                 // historian.
                 !markupNames.has(symbol) &&
+                // A commit verb is what makes production read the hash beside it as
+                // commit metadata, so renaming the verb changes the block's meaning
+                // as surely as renaming the hash would.
+                !COMMIT_VERB_PATTERN.test(symbol) &&
                 !sharesAnEntity(symbol) &&
                 // A symbol can carry a probe answer without being one: renaming
                 // `api/v2` deletes the complete-value occurrence of `api`.

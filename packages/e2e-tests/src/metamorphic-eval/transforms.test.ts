@@ -570,6 +570,67 @@ describe("metamorphic transforms", () => {
         }
     });
 
+    test("rename refuses a commit verb and the internal initiator marker", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        // The uppercase verb is what makes production read the hash beside it as
+        // commit metadata, and the marker is stripped by exact string, so both are
+        // structure rather than entities.
+        turns[0]!.assistant = "COMMITTED ABCDEF1 and noted OMO_INTERNAL_INITIATOR handling.";
+        turns[3] = {
+            user: "<!-- OMO_INTERNAL_INITIATOR --> Background note about aux_worker.ts.",
+            assistant: "Summary recorded.",
+        };
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
+
+        let applied = 0;
+        for (let seed = 0; seed < 30; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            applied += 1;
+            expect(result.scenario.transcript.turns[0]!.assistant, `seed ${seed}`).toContain(
+                "COMMITTED ABCDEF1",
+            );
+            expect(result.scenario.transcript.turns[3]!.user, `seed ${seed}`).toContain(
+                "<!-- OMO_INTERNAL_INITIATOR -->",
+            );
+        }
+        expect(applied, "never applied").toBeGreaterThan(0);
+    });
+
+    test("evidence baselines stay cheap against a one-character predicate", () => {
+        const raw = validScenarioRaw();
+        const transcript = raw.transcript as {
+            turns: Array<{ user: string; assistant: string }>;
+            epilogueStartIndex: number;
+        };
+        const gold = raw.gold as { expectedAbsent: Array<Record<string, unknown>> };
+        // A legal predicate of `a` against a repetitive transcript authors an
+        // occurrence at nearly every position, which listing them one by one turns
+        // into hundreds of thousands of signature strings and span rescans.
+        while (transcript.turns.length < 20) {
+            transcript.turns.push({
+                user: `a ${"a ".repeat(4_000)}`,
+                assistant: `a ${"a ".repeat(4_000)}`,
+            });
+        }
+        transcript.epilogueStartIndex = 19;
+        gold.expectedAbsent.push({
+            id: "abs-single-letter",
+            family: "proposed-but-rejected",
+            predicate: { kind: "normalized-substring", value: "a" },
+        });
+        const scenario = parseScenario(raw);
+
+        for (const transform of TRANSFORMS) {
+            const start = performance.now();
+            transform.apply(scenario, 7);
+            expect(performance.now() - start, transform.id).toBeLessThan(900);
+        }
+    });
+
     test("rename refuses a commit hash in commit context", () => {
         const raw = validScenarioRaw();
         const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
