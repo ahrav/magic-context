@@ -10,6 +10,7 @@ import {
     lintScenario,
     MAX_TURN_TEXT_CHARS,
     normalizeContent,
+    normalizedEvidenceMessages,
     parseScenario,
     predicateMatches,
     type HistorianEvalScenario,
@@ -354,6 +355,74 @@ describe("metamorphic transforms", () => {
             applicable: false,
             reason: "rename does not fit the turn text limit",
         });
+    });
+
+    test("rewrites never materialize a message the historian would have discarded", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        // Both discard paths: production strips reminder blocks and drops a
+        // directive-only user message, so neither reaches the historian.
+        turns[0]!.user = `<system-reminder>internal note</system-reminder> ${turns[0]!.user}`;
+        turns[3]!.user = "[SYSTEM DIRECTIVE: MAGIC-CONTEXT] refresh the working set";
+        const scenario = parseScenario(raw);
+        const visible = (candidate: HistorianEvalScenario) =>
+            normalizedEvidenceMessages(candidate.transcript.turns)
+                .map((message) => `${message.turnIndex}:${message.role}`)
+                .join("|");
+
+        for (const id of ["paraphrase-irrelevant", "rename-unrelated-symbols"]) {
+            const transform = TRANSFORMS.find((candidate) => candidate.id === id)!;
+            for (let seed = 0; seed < 30; seed += 1) {
+                const result = transform.apply(scenario, seed);
+                if (!result.applicable) continue;
+                expect(result.scenario.transcript.turns[3]!.user, `${id}/s${seed}`).toBe(
+                    scenario.transcript.turns[3]!.user,
+                );
+                expect(visible(result.scenario), `${id}/s${seed}`).toBe(visible(scenario));
+            }
+        }
+    });
+
+    test("reorder preserves a second occurrence of the same negative evidence", () => {
+        const raw = validScenarioRaw();
+        const transcript = raw.transcript as {
+            turns: Array<{ user: string; assistant: string }>;
+            epilogueStartIndex: number;
+        };
+        // `legacy bridge` is authored twice: once wholly inside a turn, and once
+        // across the turn-1/turn-2 boundary the swap would separate. A
+        // predicate-level check passes on the survivor alone.
+        transcript.turns.unshift(
+            { user: "Note the legacy bridge stays.", assistant: "Understood." },
+            { user: "Second note.", assistant: "We keep the legacy" },
+            { user: "bridge alive for now.", assistant: "Acknowledged." },
+        );
+        transcript.epilogueStartIndex += 3;
+        const gold = raw.gold as {
+            expectedClaims: Array<{ sourceTurnRange: [number, number] }>;
+            expectedAbsent: Array<Record<string, unknown>>;
+        };
+        for (const claim of gold.expectedClaims) {
+            claim.sourceTurnRange = [claim.sourceTurnRange[0] + 3, claim.sourceTurnRange[1] + 3];
+        }
+        gold.expectedAbsent.push({
+            id: "abs-legacy-bridge",
+            family: "proposed-but-rejected",
+            predicate: { kind: "normalized-substring", value: "legacy bridge" },
+        });
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const occurrences = (candidate: HistorianEvalScenario) =>
+            normalizeContent(authoredEvidenceText(candidate.transcript.turns)).split("legacy bridge")
+                .length - 1;
+        expect(occurrences(scenario)).toBe(2);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "reorder-independent-turns")!;
+
+        for (let seed = 0; seed < 40; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            expect(occurrences(result.scenario), `seed ${seed}`).toBeGreaterThanOrEqual(2);
+        }
     });
 
     test("move refuses a span containing a rejected proposal", () => {

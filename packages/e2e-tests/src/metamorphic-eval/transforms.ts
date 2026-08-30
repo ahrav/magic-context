@@ -2,7 +2,6 @@ import { splitmix32 } from "../../../plugin/scripts/retrieval-benchmark/syntheti
 import {
     MAX_TRANSCRIPT_TURNS,
     MAX_TURN_TEXT_CHARS,
-    authoredEvidenceText,
     containsCompleteValue,
     lintScenario,
     normalizeContent,
@@ -164,28 +163,36 @@ function protectedTurnIndexes(scenario: HistorianEvalScenario): Set<number> {
     return protectedIndexes;
 }
 
+function messageKey(turnIndex: number, role: "user" | "assistant"): string {
+    return `${turnIndex}:${role}`;
+}
+
 /**
- * Messages that authored negative evidence spans, keyed `turnIndex:role`.
+ * One authored occurrence of a forbidden formation, identified by the ordered
+ * messages it runs through: `<absent id>|<turn>:<role>,...`.
  *
- * The expected-absent authorship rule searches the whole evidence range, so a
- * forbidden formation can be authored across a role or a turn boundary and match
- * no single message: one turn's assistant ends with `use` while the next turn's
- * user opens with `API/v2`. Rewriting either side deletes the authored evidence
- * and the derivative then fails lint with `not-authored-before-epilogue`, so
- * every message a match overlaps is off limits — not only the messages that
- * match on their own.
+ * The authorship rule searches the whole evidence range, so an occurrence can
+ * cross a role or a turn boundary and match no single message: one turn's
+ * assistant ends with `use` while the next turn's user opens with `API/v2`.
+ * Naming the messages it crosses is what lets a transform tell a perturbation
+ * that keeps an occurrence intact from one that pulls its halves apart — and
+ * identifying occurrences rather than predicates is what keeps a predicate with
+ * two authored occurrences from hiding the loss of one behind the other.
  *
- * Offsets come from the same normalized view the matcher compares, so the spans
- * name the messages the match actually crosses instead of approximating them
- * from turn boundaries.
+ * Offsets come from the same normalized view the matcher compares, so a span is
+ * the messages the occurrence actually crosses rather than an approximation from
+ * turn boundaries.
  */
-function absentEvidenceMessages(scenario: HistorianEvalScenario): Set<string> {
-    const messages = normalizedEvidenceMessages(scenario.transcript.turns);
+function absentMatchSpans(
+    expectedAbsent: HistorianEvalScenario["gold"]["expectedAbsent"],
+    turns: readonly TranscriptTurn[],
+): string[] {
+    const messages = normalizedEvidenceMessages(turns);
     const spans: Array<{ key: string; start: number; end: number }> = [];
     let offset = 0;
     for (const message of messages) {
         spans.push({
-            key: `${message.turnIndex}:${message.role}`,
+            key: messageKey(message.turnIndex, message.role),
             start: offset,
             end: offset + message.text.length,
         });
@@ -193,18 +200,28 @@ function absentEvidenceMessages(scenario: HistorianEvalScenario): Set<string> {
         offset += message.text.length + 1;
     }
     const evidence = messages.map((message) => message.text).join(" ");
-    const spanned = new Set<string>();
-    for (const absent of scenario.gold.expectedAbsent) {
+    const matches: string[] = [];
+    for (const absent of expectedAbsent) {
         const needle = normalizeContent(absent.predicate.value);
         if (needle.length === 0) continue;
         for (let at = evidence.indexOf(needle); at !== -1; at = evidence.indexOf(needle, at + 1)) {
             const matchEnd = at + needle.length;
-            for (const span of spans) {
-                if (span.start < matchEnd && at < span.end) spanned.add(span.key);
-            }
+            const crossed = spans
+                .filter((span) => span.start < matchEnd && at < span.end)
+                .map((span) => span.key);
+            matches.push(`${absent.id}|${crossed.join(",")}`);
         }
     }
-    return spanned;
+    return matches;
+}
+
+/** Messages that authored negative evidence runs through. */
+function absentEvidenceMessages(scenario: HistorianEvalScenario): Set<string> {
+    return new Set(
+        absentMatchSpans(scenario.gold.expectedAbsent, scenario.transcript.turns).flatMap((match) =>
+            match.slice(match.indexOf("|") + 1).split(","),
+        ),
+    );
 }
 
 /** Turns that authored negative evidence runs through. */
@@ -217,20 +234,33 @@ function absentEvidenceTurnIndexes(scenario: HistorianEvalScenario): Set<number>
 function eligibleMessages(scenario: HistorianEvalScenario): EligibleMessage[] {
     const evidenceMessages = absentEvidenceMessages(scenario);
     return unprotectedMessages(scenario).filter(
-        (message) => !evidenceMessages.has(`${message.turnIndex}:${message.role}`),
+        (message) => !evidenceMessages.has(messageKey(message.turnIndex, message.role)),
     );
 }
 
-/** Messages outside every expected-claim source range. */
+/**
+ * Messages outside every expected-claim source range that the historian actually
+ * receives.
+ *
+ * Production discards a user message that is empty after cleaning or that is a
+ * system directive, so such a message contributes no evidence — and framing text
+ * prepended to one can stop it being recognised as a directive, or survive
+ * reminder stripping, materializing a historian-visible message the baseline did
+ * not have. That is a different transcript, not a perturbation of this one, so a
+ * message the historian never sees is not a rewrite candidate.
+ */
 function unprotectedMessages(scenario: HistorianEvalScenario): EligibleMessage[] {
     const protectedIndexes = protectedTurnIndexes(scenario);
+    const visible = new Set(
+        normalizedEvidenceMessages(scenario.transcript.turns).map((message) =>
+            messageKey(message.turnIndex, message.role),
+        ),
+    );
     return scenario.transcript.turns.flatMap((turn, turnIndex) => {
         if (protectedIndexes.has(turnIndex)) return [];
-        return (["user", "assistant"] as const).map((role) => ({
-            turnIndex,
-            role,
-            text: turn[role],
-        }));
+        return (["user", "assistant"] as const).flatMap((role) =>
+            visible.has(messageKey(turnIndex, role)) ? [{ turnIndex, role, text: turn[role] }] : [],
+        );
     });
 }
 
@@ -262,36 +292,45 @@ function preservesContiguousGold(scenario: HistorianEvalScenario, turnMap: reado
 }
 
 /**
- * Whether `turns` still authors every forbidden formation the source authored.
+ * Whether every authored occurrence of a forbidden formation survives the
+ * perturbation.
  *
- * A predicate can be authored across a turn boundary, so moving, inserting, or
- * duplicating a turn can separate the two halves of a match that no single turn
- * contains. The authorship rule then reports the formation as never authored and
- * the derivative fails lint, so a candidate that loses a match is not a
- * candidate. Both windows are checked because the authorship rule looks at the
- * pre-epilogue evidence while the scorer sees the whole transcript.
+ * An occurrence can be authored across a turn boundary, so moving, inserting, or
+ * duplicating a turn can separate halves that no single turn contains, and
+ * framing text inserted between them does the same. Asking only whether the
+ * predicate still matches somewhere is not enough: a predicate authored twice
+ * would let the surviving occurrence hide the loss of the other, and the
+ * derivative would carry less rejection evidence than the scenario declares while
+ * every check still passed. Each source occurrence is therefore mapped through
+ * `turnMap` and looked for individually, with multiplicity.
  */
 function preservesAbsentEvidence(
     scenario: HistorianEvalScenario,
     turns: readonly TranscriptTurn[],
-    epilogueStartIndex: number,
+    turnMap: readonly number[],
 ): boolean {
-    const windows: Array<readonly [readonly TranscriptTurn[], readonly TranscriptTurn[]]> = [
-        [scenario.transcript.turns, turns],
-        [
-            scenario.transcript.turns.slice(0, scenario.transcript.epilogueStartIndex),
-            turns.slice(0, epilogueStartIndex),
-        ],
-    ];
-    return windows.every(([before, after]) => {
-        const authored = authoredEvidenceText(before);
-        const derived = authoredEvidenceText(after);
-        return scenario.gold.expectedAbsent.every(
-            (absent) =>
-                !predicateMatches(absent.predicate, authored) ||
-                predicateMatches(absent.predicate, derived),
-        );
-    });
+    const remaining = new Map<string, number>();
+    for (const match of absentMatchSpans(scenario.gold.expectedAbsent, turns)) {
+        remaining.set(match, (remaining.get(match) ?? 0) + 1);
+    }
+    for (const match of absentMatchSpans(scenario.gold.expectedAbsent, scenario.transcript.turns)) {
+        const separator = match.indexOf("|");
+        const expected = `${match.slice(0, separator)}|${match
+            .slice(separator + 1)
+            .split(",")
+            .map((key) => {
+                const colon = key.indexOf(":");
+                return messageKey(
+                    turnMap[Number(key.slice(0, colon))]!,
+                    key.slice(colon + 1) as "user" | "assistant",
+                );
+            })
+            .join(",")}`;
+        const count = remaining.get(expected) ?? 0;
+        if (count === 0) return false;
+        remaining.set(expected, count - 1);
+    }
+    return true;
 }
 
 /** The turn list a candidate order produces, without copying gold. */
@@ -378,7 +417,9 @@ function safeParaphrase(
 ): boolean {
     if (text.length > MAX_TURN_TEXT_CHARS) return false;
     const turns = replaceMessage(scenario.transcript.turns, message, text);
-    if (!preservesAbsentEvidence(scenario, turns, scenario.transcript.epilogueStartIndex)) return false;
+    if (!preservesAbsentEvidence(scenario, turns, scenario.transcript.turns.map((_, index) => index))) {
+        return false;
+    }
     return scenario.probes.every((probe) => {
         if (probe.answerType === "claim-id") return true;
         return (
@@ -423,11 +464,7 @@ const reorderIndependentTurns: Transform = {
             const order = scenario.transcript.turns.map((_, index) => index);
             [order[left], order[right]] = [order[right]!, order[left]!];
             if (!preservesContiguousGold(scenario, mapForOrder(order))) return [];
-            return preservesAbsentEvidence(
-                scenario,
-                reorderedTurns(scenario, order),
-                scenario.transcript.epilogueStartIndex,
-            )
+            return preservesAbsentEvidence(scenario, reorderedTurns(scenario, order), mapForOrder(order))
                 ? [order]
                 : [];
         });
@@ -490,11 +527,7 @@ const moveAcceptedDecision: Transform = {
                         (_, offset) => from + 1 + offset,
                     ).some((turnIndex) => absentIndexes.has(turnIndex)) &&
                     preservesContiguousGold(scenario, mapForOrder(order)) &&
-                    preservesAbsentEvidence(
-                        scenario,
-                        reorderedTurns(scenario, order),
-                        scenario.transcript.epilogueStartIndex,
-                    ),
+                    preservesAbsentEvidence(scenario, reorderedTurns(scenario, order), mapForOrder(order)),
             ),
         );
         if (candidates.length === 0) {
@@ -540,7 +573,7 @@ const duplicateRejectedProposal: Transform = {
             );
             if (!preservesContiguousGold(scenario, turnMap)) return [];
             const turns = duplicatedTurns(scenario, turnIndex, insertion);
-            return preservesAbsentEvidence(scenario, turns, epilogueStartIndexAfter(scenario, insertion))
+            return preservesAbsentEvidence(scenario, turns, turnMap)
                 ? [{ source: turnIndex, insertion, turnMap }]
                 : [];
         });
