@@ -24,9 +24,9 @@ import { readJsoncLenient } from "./jsonc-config";
 import {
     getMagicContextHistorianDir,
     getMagicContextLogPath,
-    getPiAgentConfigDir,
+    getPiAgentDir,
     getPiSessionsRoot,
-    getPiUserConfigPath,
+    getSharedUserConfigPath,
     getPiUserExtensionsPath,
 } from "./paths";
 import { detectPiBinary, getPiVersion } from "./pi-helpers";
@@ -339,7 +339,7 @@ export async function collectDiagnostics(cwd = process.cwd()): Promise<PiDiagnos
     const settingsPath = getPiUserExtensionsPath();
     const settingsParsed = readJsoncLenient(settingsPath);
     const packages = packageEntries(settingsParsed.value);
-    const userConfigPath = getPiUserConfigPath();
+    const userConfigPath = getSharedUserConfigPath();
     const projectConfigPath = getProjectConfigPath(cwd);
     const loaded = loadPiConfig({ cwd });
     const storageDirPath = getMagicContextStorageDir();
@@ -369,7 +369,7 @@ export async function collectDiagnostics(cwd = process.cwd()): Promise<PiDiagnos
             packages: sanitizeValue(packages) as unknown[],
         },
         configPaths: {
-            agentDir: getPiAgentConfigDir(),
+            agentDir: getPiAgentDir(),
             userConfig: userConfigPath,
             projectConfig: projectConfigPath,
         },

@@ -41,9 +41,9 @@ import { readJsoncLenient } from "../lib/jsonc-config";
 import { bundleIssueReport } from "../lib/logs-pi";
 import {
     getMagicContextLogPath,
-    getPiAgentConfigDir,
+    getPiAgentDir,
     getPiCacheRoot,
-    getPiUserConfigPath,
+    getSharedUserConfigPath,
     getPiUserExtensionsPath,
 } from "../lib/paths";
 import {
@@ -230,7 +230,7 @@ function packagesFrom(settings: Record<string, unknown>): unknown[] {
  */
 function piPluginDirCandidates(packages: unknown[], cwd: string): string[] {
     const dirs: string[] = [];
-    const agentDir = getPiAgentConfigDir();
+    const agentDir = getPiAgentDir();
 
     // Local dev-path entries: a string spec that is NOT an npm: specifier and
     // resolves to a directory on disk. Relative entries are resolved against the
@@ -352,8 +352,8 @@ function cacheRoots(cwd: string): string[] {
         join(piCacheRoot, "packages"),
         join(cacheHome, "pi", "extensions"),
         join(cacheHome, "pi", "packages"),
-        join(getPiAgentConfigDir(), "cache", "extensions"),
-        join(getPiAgentConfigDir(), "npm", "node_modules", PACKAGE_NAME),
+        join(getPiAgentDir(), "cache", "extensions"),
+        join(getPiAgentDir(), "npm", "node_modules", PACKAGE_NAME),
         join(cwd, ".pi", "npm", "node_modules", PACKAGE_NAME),
     ];
 }
@@ -492,7 +492,7 @@ async function runHealthChecks(options: {
         }
     }
 
-    const userConfigPath = getPiUserConfigPath();
+    const userConfigPath = getSharedUserConfigPath();
     const projectPath = projectConfigPath(options.cwd);
     for (const [label, path, required] of [
         ["user", userConfigPath, true],
@@ -884,7 +884,7 @@ function repair(plan: RepairPlan, prompts: PromptIO): number {
     }
 
     if (plan.writeUserConfig) {
-        const configPath = getPiUserConfigPath();
+        const configPath = getSharedUserConfigPath();
         if (!existsSync(configPath)) {
             try {
                 writeDefaultMagicContextConfig(configPath);

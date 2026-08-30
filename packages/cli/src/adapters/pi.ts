@@ -6,8 +6,8 @@ import { ensureParentDir } from "../lib/fs-utils";
 import { readJsoncConfig, readJsoncConfigForUpdate } from "../lib/jsonc-config";
 import {
     getMagicContextLogPath,
-    getPiAgentConfigDir,
-    getPiUserConfigPath,
+    getPiAgentDir,
+    getSharedUserConfigPath,
     getPiUserExtensionsPath,
 } from "../lib/paths";
 import { detectPiBinary, PI_PACKAGE_SOURCE, runPiCommand } from "../lib/pi-helpers";
@@ -39,11 +39,11 @@ export class PiAdapter implements HarnessAdapter {
     }
 
     getConfigPaths(): HarnessConfigPaths {
-        const dir = getPiAgentConfigDir();
+        const dir = getPiAgentDir();
         return {
             configDir: dir,
             pluginConfigPath: getPiUserExtensionsPath(),
-            magicContextConfigPath: getPiUserConfigPath(),
+            magicContextConfigPath: getSharedUserConfigPath(),
             secondaryConfigPath: null,
         };
     }
