@@ -58,6 +58,33 @@ describe("dreamer eval dev corpus", () => {
         );
     });
 
+    test("classify gold is unreachable by inheriting the seeded classification", () => {
+        const core = parseCorpus().find((scenario) => scenario.id === "dme-core-pool");
+        const task = core!.tasks.find((entry) => entry.task === "classify-memories");
+        const gold = task!.gold;
+        expect(gold.kind).toBe("classify");
+        if (gold.kind !== "classify") return;
+        const seededById = new Map(core!.pool.claims.map((claim) => [claim.id, claim]));
+        expect(gold.claims.length).toBe(core!.pool.claims.length);
+        for (const expected of gold.claims) {
+            const seeded = seededById.get(expected.claimId);
+            expect(seeded).toBeDefined();
+            // `scoreClassifyManifest` resolves an attribute the manifest omits
+            // from the claim's stored value — production-valid behaviour, since
+            // production preserves what an entry leaves out. So any attribute
+            // seeded already inside gold can be scored PASS by a model that
+            // never classified it, and a pool seeded entirely at gold makes the
+            // whole experiment green for a model that echoes the prompt. Every
+            // attribute below therefore starts off gold, which is what forces a
+            // manifest to state all three.
+            expect(
+                seeded!.importance >= expected.importance.min && seeded!.importance <= expected.importance.max,
+            ).toBe(false);
+            expect(seeded!.memoryScope).not.toBe(expected.scope);
+            expect(seeded!.sharing === "shareable").not.toBe(expected.shareable);
+        }
+    });
+
     test("production preflight accepts every declared scenario task", async () => {
         for (const scenario of parseCorpus()) {
             for (const task of scenario.tasks) {
@@ -65,7 +92,21 @@ describe("dreamer eval dev corpus", () => {
                 const workdir = mkdtempSync(join(tmpdir(), "dreamer-eval-corpus-"));
                 try {
                     const seeded = await seedDreamerEvalTask({ db: database, scenario, task, workdir });
-                    expect(seeded.preflight.inScopeClaimIds.sort()).toEqual([...task.expectedInScopeClaimIds].sort());
+                    // Copy before sorting: `sort` is in place, and asserting
+                    // against a preflight field the assertion itself reordered
+                    // proves nothing about what production returned.
+                    expect([...seeded.preflight.inScopeClaimIds].sort()).toEqual(
+                        [...task.expectedInScopeClaimIds].sort(),
+                    );
+                    // `preflightDreamerEvalTask` already refuses a partition or
+                    // mode mismatch with gate-mismatch, so these restate that
+                    // contract where the test names it rather than leaving the
+                    // skipped set and the gate branch proven only by the absence
+                    // of a throw inside the seeder.
+                    expect([...seeded.preflight.skippedClaimIds].sort()).toEqual(
+                        [...task.expectedSkippedClaimIds].sort(),
+                    );
+                    expect(seeded.preflight.mode).toEqual(task.expectedResultMode);
                 } finally {
                     closeQuietly(database);
                     rmSync(workdir, { recursive: true, force: true });

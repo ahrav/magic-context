@@ -6,7 +6,9 @@ import {
 } from "../../../plugin/src/features/magic-context/memory/claim-operation-contract";
 import { normalizeMemoryContent } from "../../../plugin/src/features/magic-context/memory/normalize-hash";
 import { sha256Utf8Hex } from "../../../plugin/src/features/magic-context/memory/storage-claims";
-import { VERIFY_UPDATE_CONTENT_MAX_LENGTH } from "../../../plugin/src/features/magic-context/dreamer/verify";
+import { VERIFY_BATCH_SIZE, VERIFY_UPDATE_CONTENT_MAX_LENGTH } from "../../../plugin/src/features/magic-context/dreamer/verify";
+import { MAP_BATCH_SIZE } from "../../../plugin/src/features/magic-context/dreamer/map-memories";
+import { CLASSIFY_CHUNK_SIZE } from "../../../plugin/src/features/magic-context/dreamer/classify";
 import { parseVerifyManifest } from "../../../plugin/src/features/magic-context/dreamer/verify-prompt";
 import { parseMapMemoriesManifest } from "../../../plugin/src/features/magic-context/dreamer/map-memories-prompt";
 import { parseClassifyManifest } from "../../../plugin/src/features/magic-context/dreamer/classify-prompt";
@@ -123,7 +125,32 @@ const VERIFY_ROOT_CLOSE_TAG = "</verify>";
 const MIN_POOL_CLAIMS = 10;
 
 /** Largest pool a scenario may declare, and therefore the largest a capture can hold. */
-const MAX_POOL_CLAIMS = 50;
+export const MAX_POOL_CLAIMS = 50;
+
+/**
+ * Claims production dispatches to one child session per task. The runner
+ * captures a task's children by matching every in-scope public claim id in one
+ * transcript and compares the match count against `ceil(inScope / batchSize)`,
+ * so it can only score a task production sends as a single batch: with the pool
+ * partitioned, no child carries the whole id set, every child is rejected, and
+ * the run terminates as harness failure rather than a scored experiment.
+ *
+ * `MAX_POOL_CLAIMS` is at or below every size here, so a scenario the pool
+ * parser accepts is already single-batch. `partitionUnsupported` keeps that
+ * true if either side moves: raising the pool cap past a task's batch size, or
+ * production lowering one, fails the affected scenario here instead of
+ * producing runs that spend model credits and report harness failure.
+ *
+ * The classify chunker also splits on rendered prompt bytes, but only on the
+ * module route; the child route this lane drives passes an infinite byte budget
+ * and chunks by count alone.
+ */
+export const TASK_BATCH_SIZE: Record<DreamerTask, number> = {
+    verify: VERIFY_BATCH_SIZE,
+    "verify-broad": VERIFY_BATCH_SIZE,
+    "map-memories": MAP_BATCH_SIZE,
+    "classify-memories": CLASSIFY_CHUNK_SIZE,
+};
 
 /**
  * FAIL reasons each task's scorer can actually produce. A report naming another
@@ -657,6 +684,9 @@ function parseTask(raw: unknown, label: string, pool: ReadonlyMap<string, Scenar
     // successful artifact.
     if (expectedInScopeClaimIds.length === 0) {
         fail(`${label}.expectedInScopeClaimIds: scope-empty`);
+    }
+    if (expectedInScopeClaimIds.length > TASK_BATCH_SIZE[task]) {
+        fail(`${label}.expectedInScopeClaimIds: partition-unsupported`);
     }
     if (task === "classify-memories" && expectedSkippedClaimIds.length > 0) {
         fail(`${label}.expectedSkippedClaimIds: classify-skips-nothing`);

@@ -4,8 +4,11 @@ import { sha256Utf8Hex } from "../../../plugin/src/features/magic-context/memory
 import {
     DREAMER_EVAL_REPORT_SCHEMA,
     DREAMER_EVAL_SCENARIO_SCHEMA,
+    DREAMER_TASKS,
     DreamerEvalContractError,
+    MAX_POOL_CLAIMS,
     RUN_FATAL_FAIL_REASONS,
+    TASK_BATCH_SIZE,
     dreamerEvalExitCode,
     parseRunReport,
     parseScenario,
@@ -111,6 +114,18 @@ function expectDiagnostic(edit: (raw: Record<string, unknown>) => void, diagnost
 }
 
 describe("dreamer eval scenario contract", () => {
+    test("every task's production batch size covers the largest declarable pool", () => {
+        // The runner matches a task's child sessions by finding every in-scope
+        // public claim id in one transcript, so it can only score a task
+        // production dispatches as a single batch. In-scope ids are a subset of
+        // the pool, so this bound is what keeps every accepted scenario
+        // single-batch — and `partition-unsupported` is the refusal that fires if
+        // it ever stops holding.
+        for (const task of DREAMER_TASKS) {
+            expect(MAX_POOL_CLAIMS).toBeLessThanOrEqual(TASK_BATCH_SIZE[task]);
+        }
+    });
+
     test("full valid scenario round-trips unchanged", () => {
         const raw = validScenarioRaw();
         const parsed = parseScenario(raw);

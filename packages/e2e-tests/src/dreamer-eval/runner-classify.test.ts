@@ -6,10 +6,16 @@ import {
     type DreamerRunClassificationInput,
 } from "./runner";
 
-const validManifest = `<classifications>
-<memory id="mem-1" importance="85" scope="project" shareable="true" />
-<memory id="mem-2" importance="25" scope="ecosystem" shareable="false" />
-</classifications>`;
+// Production shape: `parseClassifyManifest` reads a `<classify>` root and takes
+// each entry's id from `claim`, and `validateClassifyManifest` demands exact
+// coverage of the scored ids — so the ids here are the fixture's public claim
+// ids, and the values sit inside `dreamerScorerFixture.classifyGold`. A manifest
+// that misses any of that scores ERROR:harness-failure, which would leave every
+// test below asserting only the checks that run before scoring.
+const validManifest = `<classify>
+<memory claim="mcm_true" importance="70" scope="project" shareable="true" />
+<memory claim="mcm_independent" importance="85" scope="universe" shareable="true" />
+</classify>`;
 
 function assistantMessages(text: string, info: Record<string, unknown> = {}): unknown[] {
     return [
@@ -52,6 +58,16 @@ function input(overrides: Partial<DreamerRunClassificationInput> = {}): DreamerR
 }
 
 describe("dreamer runner classification", () => {
+    test("a gold-matching manifest on the pinned model is PASS", () => {
+        const result = classifyDreamerRun(input());
+
+        expect(result).toMatchObject({ status: "PASS", reason: null, runFatal: false });
+        expect(result.parsedManifest).toEqual([
+            { publicClaimId: "mcm_true", importance: 70, scope: "project", shareable: true },
+            { publicClaimId: "mcm_independent", importance: 85, scope: "universe", shareable: true },
+        ]);
+    });
+
     test("completed validator rejection is FAIL:invalid-output", () => {
         const result = classifyDreamerRun(
             input({

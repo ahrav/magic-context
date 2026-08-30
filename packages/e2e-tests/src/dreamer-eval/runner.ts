@@ -312,6 +312,12 @@ function fixturePaths(scenario: DreamerEvalScenario): string[] {
     return [...new Set(scenario.pool.claims.flatMap((claim) => claim.fixtureFiles.map((file) => file.path)))];
 }
 
+function reportCleanupFailure(step: string, error: unknown): void {
+    console.error(
+        `dreamer-eval cleanup failed at ${step}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+}
+
 function gitOutput(workdir: string, args: readonly string[]): string | null {
     const result = Bun.spawnSync(["git", ...args], {
         cwd: workdir,
@@ -520,10 +526,36 @@ export async function runDreamerEvalTask(
             classification = outcome("ERROR", "harness-failure");
         }
     } finally {
-        if (acquired !== null && db !== null) releaseLease(db, holderId, leaseKey);
-        setKeepSubagents(priorKeepSubagents);
-        db?.close();
-        if (harness !== null) await harness.dispose();
+        // Each step stands alone. A throw from one — a busy database on lease
+        // release, a dispose race — used to skip every step after it, leaking
+        // process-global keep-subagents state and a live harness into every
+        // later run in the same process. A cleanup failure does not change this
+        // run's classification: the report's evidence is already captured, and
+        // what a leak damages is the runs that follow.
+        if (acquired !== null && db !== null) {
+            try {
+                releaseLease(db, holderId, leaseKey);
+            } catch (error) {
+                reportCleanupFailure("lease release", error);
+            }
+        }
+        try {
+            setKeepSubagents(priorKeepSubagents);
+        } catch (error) {
+            reportCleanupFailure("keep-subagents restore", error);
+        }
+        try {
+            db?.close();
+        } catch (error) {
+            reportCleanupFailure("database close", error);
+        }
+        if (harness !== null) {
+            try {
+                await harness.dispose();
+            } catch (error) {
+                reportCleanupFailure("harness dispose", error);
+            }
+        }
     }
 
     const report: DreamerEvalRunReport = {

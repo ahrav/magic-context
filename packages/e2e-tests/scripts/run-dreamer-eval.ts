@@ -84,12 +84,18 @@ function selectedScenarios(all: DreamerEvalScenario[], ids: readonly string[]): 
 }
 
 function opencodeVersion(): string {
-    const result = Bun.spawnSync(["opencode", "--version"], {
-        stdout: "pipe",
-        stderr: "ignore",
-    });
-    const version = result.success ? result.stdout.toString().trim() : "";
-    return version || "unknown";
+    // `Bun.spawnSync` throws when the executable is not on PATH, and this runs
+    // before any task, so an absent `opencode` would abort the whole run while
+    // resolving a provenance field the report already accepts as "unknown".
+    try {
+        const result = Bun.spawnSync(["opencode", "--version"], {
+            stdout: "pipe",
+            stderr: "ignore",
+        });
+        return (result.success ? result.stdout.toString().trim() : "") || "unknown";
+    } catch {
+        return "unknown";
+    }
 }
 
 async function main(): Promise<0 | 1 | 2> {
