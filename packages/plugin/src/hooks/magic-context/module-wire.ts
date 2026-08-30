@@ -863,6 +863,22 @@ function isSyntheticWireMessage(message: MessageLike): boolean {
 }
 
 /**
+ * The session's durable ordinal-memo state, passed as one bundle. Callers
+ * project their session-state fields into this shape exactly once so the
+ * field-to-field rename map cannot drift between call sites. The resolver
+ * mutates `entries` in place (clear/set): pass the live session Map, never
+ * a copy, or resolved ordinals silently detach from the session state.
+ */
+export interface ModuleOrdinalMemo {
+    generation: number;
+    memoGeneration: number;
+    entries: Map<string, number>;
+    anchor?: RawMessageOrdinalAnchor | null;
+    storedCount?: number | null;
+    canonicalCount?: number;
+}
+
+/**
  * Resolve OpenCode message ids to the absolute ordinals used by the module.
  * The module and shadow lanes must see the same provisional suffix behavior, so
  * this is shared rather than reimplemented by the authority adapter.
@@ -870,12 +886,7 @@ function isSyntheticWireMessage(message: MessageLike): boolean {
 export async function resolveOrdinalsForModule(args: {
     sessionId: string;
     messages: MessageLike[];
-    generation: number;
-    memoGeneration: number;
-    memo: Map<string, number>;
-    memoAnchor?: RawMessageOrdinalAnchor | null;
-    memoStoredCount?: number | null;
-    memoCanonicalCount?: number;
+    memo: ModuleOrdinalMemo;
     /** Absolute ordinal immediately before a sliced unresolved tail. */
     provisionalBase?: number;
 }): Promise<
@@ -896,13 +907,13 @@ export async function resolveOrdinalsForModule(args: {
           messageRole?: string;
       }
 > {
-    const memo = args.memo;
-    const generationChanged = args.memoGeneration !== args.generation;
+    const memo = args.memo.entries;
+    const generationChanged = args.memo.memoGeneration !== args.memo.generation;
     if (generationChanged) memo.clear();
 
-    let anchor = generationChanged ? null : (args.memoAnchor ?? null);
-    let storedCount = generationChanged ? null : (args.memoStoredCount ?? null);
-    let canonicalCount = generationChanged ? 0 : (args.memoCanonicalCount ?? 0);
+    let anchor = generationChanged ? null : (args.memo.anchor ?? null);
+    let storedCount = generationChanged ? null : (args.memo.storedCount ?? null);
+    let canonicalCount = generationChanged ? 0 : (args.memo.canonicalCount ?? 0);
     const priming = storedCount === null;
     if (priming) {
         memo.clear();
@@ -1054,7 +1065,7 @@ export async function resolveOrdinalsForModule(args: {
     return {
         ok: true,
         annotatedInput: annotated,
-        memoGeneration: args.generation,
+        memoGeneration: args.memo.generation,
         memoAnchor: anchor,
         memoStoredCount: storedCount,
         memoCanonicalCount: canonicalCount,
