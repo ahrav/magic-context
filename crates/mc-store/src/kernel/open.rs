@@ -36,6 +36,46 @@ pub enum KernelError {
     Io,
     IdentityMismatch,
     FenceLost,
+    Conflict,
+    InvalidInput,
+    FutureSnapshot,
+    NotFound,
+    Fault,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelErrorKind {
+    Held,
+    EngineUnsupported,
+    Foreign,
+    Inconclusive,
+    Io,
+    IdentityMismatch,
+    FenceLost,
+    Conflict,
+    InvalidInput,
+    FutureSnapshot,
+    NotFound,
+    Fault,
+}
+
+impl KernelError {
+    pub fn kind(self) -> KernelErrorKind {
+        match self {
+            Self::Held => KernelErrorKind::Held,
+            Self::EngineUnsupported => KernelErrorKind::EngineUnsupported,
+            Self::Foreign => KernelErrorKind::Foreign,
+            Self::Inconclusive => KernelErrorKind::Inconclusive,
+            Self::Io => KernelErrorKind::Io,
+            Self::IdentityMismatch => KernelErrorKind::IdentityMismatch,
+            Self::FenceLost => KernelErrorKind::FenceLost,
+            Self::Conflict => KernelErrorKind::Conflict,
+            Self::InvalidInput => KernelErrorKind::InvalidInput,
+            Self::FutureSnapshot => KernelErrorKind::FutureSnapshot,
+            Self::NotFound => KernelErrorKind::NotFound,
+            Self::Fault => KernelErrorKind::Fault,
+        }
+    }
 }
 
 impl fmt::Display for KernelError {
@@ -48,6 +88,11 @@ impl fmt::Display for KernelError {
             Self::Io => "kernel store I/O failed",
             Self::IdentityMismatch => "kernel store identity does not match this build",
             Self::FenceLost => "kernel store writer fence was lost",
+            Self::Conflict => "kernel operation conflicts with an existing receipt",
+            Self::InvalidInput => "kernel operation input is invalid",
+            Self::FutureSnapshot => "kernel snapshot is newer than the committed tip",
+            Self::NotFound => "kernel object was not found",
+            Self::Fault => "kernel operation was interrupted",
         })
     }
 }
@@ -152,41 +197,25 @@ impl KernelStore {
         self.lease_epoch
     }
 
-    #[allow(
-        dead_code,
-        reason = "connection ownership is restricted to kernel mutation modules"
-    )]
-    pub(crate) fn with_writer<T>(
-        &self,
-        operation: impl FnOnce(&mut Connection) -> rusqlite::Result<T>,
-    ) -> Result<T, KernelError> {
-        let mut writer = self.writer.lock().map_err(|_| KernelError::Io)?;
-        // Fence validation belongs inside the `BEGIN IMMEDIATE` mutation
-        // transaction, where validation and the write are atomic.
-        let durable_epoch: i64 = writer
-            .query_row(
-                "SELECT writer_epoch FROM writer_fence WHERE id=0",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|_| KernelError::FenceLost)?;
-        if u64::try_from(durable_epoch).ok() != Some(self.lease_epoch) {
-            return Err(KernelError::FenceLost);
-        }
-        operation(&mut writer).map_err(|_| KernelError::Io)
+    pub(super) fn lock_writer(&self) -> Result<std::sync::MutexGuard<'_, Connection>, KernelError> {
+        self.writer.lock().map_err(|_| KernelError::Io)
     }
 
-    #[allow(
-        dead_code,
-        reason = "connection ownership is restricted to kernel query modules"
-    )]
-    pub(crate) fn with_reader<T>(
-        &self,
-        operation: impl FnOnce(&Connection) -> rusqlite::Result<T>,
-    ) -> Result<T, KernelError> {
+    pub(super) fn lock_reader(&self) -> Result<std::sync::MutexGuard<'_, Connection>, KernelError> {
         let index = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
-        let reader = self.readers[index].lock().map_err(|_| KernelError::Io)?;
-        operation(&reader).map_err(|_| KernelError::Io)
+        self.readers[index].lock().map_err(|_| KernelError::Io)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn invalidate_writer_fence_for_test(&self) -> Result<(), KernelError> {
+        let writer = self.lock_writer()?;
+        writer
+            .execute(
+                "UPDATE writer_fence SET writer_epoch=writer_epoch+1 WHERE id=0",
+                [],
+            )
+            .map_err(|_| KernelError::Io)?;
+        Ok(())
     }
 }
 
@@ -645,49 +674,5 @@ fn map_lease_error(error: LeaseError) -> KernelError {
     match error {
         LeaseError::Held { .. } => KernelError::Held,
         LeaseError::Io(_) => KernelError::Io,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn owned_read_connections_are_query_only() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = KernelStore::open(directory.path()).unwrap();
-        store
-            .with_reader(|connection| {
-                assert_eq!(
-                    connection.query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))?,
-                    1
-                );
-                Ok(())
-            })
-            .unwrap();
-    }
-
-    #[test]
-    fn stale_writer_fence_blocks_the_operation() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = KernelStore::open(directory.path()).unwrap();
-        store
-            .with_writer(|connection| {
-                connection.execute(
-                    "UPDATE writer_fence SET writer_epoch=writer_epoch+1 WHERE id=0",
-                    [],
-                )?;
-                Ok(())
-            })
-            .unwrap();
-        let mut called = false;
-        let error = store
-            .with_writer(|_| {
-                called = true;
-                Ok(())
-            })
-            .unwrap_err();
-        assert_eq!(error, KernelError::FenceLost);
-        assert!(!called);
     }
 }

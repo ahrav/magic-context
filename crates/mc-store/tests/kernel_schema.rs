@@ -12,6 +12,7 @@ const EXPECTED_COMPONENTS: &[&str] = &[
     "change_event",
     "outbox",
     "operation_receipts",
+    "durable_text_redactions",
     "writer_fence",
     "outbox_consumers",
     "consumer_abandonments",
@@ -131,7 +132,7 @@ fn candidate_delete_cascades_scores_but_preserves_admission_audit() {
         "INSERT INTO candidates(
              candidate_id, extraction_run_id, candidate_kind, payload, sensitivity_class,
              provenance_witness, redaction_metadata, created_at, heartbeat_at, lease_expires_at
-         ) VALUES ('candidate-1', 'run-1', 'proposition', X'02', 'internal', X'03', X'7b7d', 1, 2, 3)",
+         ) VALUES ('candidate-1', 'run-1', 'proposition', 'payload', 'internal', X'03', X'7b7d', 1, 2, 3)",
         [],
     )
     .unwrap();
@@ -310,7 +311,7 @@ fn commit_receipt_and_change_identity_shapes_are_not_overconstrained() {
             "INSERT INTO operation_receipts(
                  receipt_id, producer, operation_key, request_digest, commit_seq,
                  result_payload, created_at
-             ) VALUES (?1, ?2, 'shared-key', 'digest-1', ?3, X'01', 2)",
+             ) VALUES (?1, ?2, 'shared-key', 'digest-1', ?3, 'result', 2)",
             params![receipt_id, producer, commit_seq],
         )
         .unwrap();
@@ -356,6 +357,71 @@ fn abandonment_audit_survives_consumer_deletion() {
     .unwrap();
     assert_eq!(
         conn.query_row("SELECT COUNT(*) FROM consumer_abandonments", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn durable_text_redactions_is_digest_covered_normalized_metadata_with_restricted_parent() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, TEST_INCARNATION, 1_000).unwrap();
+    assert!(kernel_schema_inventory(&conn)
+        .unwrap()
+        .contains(&"durable_text_redactions".to_string()));
+
+    let columns = conn
+        .prepare("PRAGMA table_info(durable_text_redactions)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        columns,
+        [
+            "owner_kind",
+            "owner_id",
+            "field_name",
+            "detection_ordinal",
+            "detector_id",
+            "secret_type",
+            "utf8_offset",
+            "utf8_length",
+            "commit_seq",
+        ]
+    );
+    assert!(!columns.iter().any(|column| column.contains("match")));
+
+    let digest_with_relation = kernel_schema_digest(&conn).unwrap();
+    conn.execute_batch("DROP TABLE durable_text_redactions")
+        .unwrap();
+    assert_ne!(digest_with_relation, kernel_schema_digest(&conn).unwrap());
+
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, TEST_INCARNATION, 1_000).unwrap();
+    conn.execute(
+        "INSERT INTO commit_log(transaction_id,writer_epoch,recorded_at,actor,cause)
+         VALUES ('redaction-parent',1,1,'test','fixture')",
+        [],
+    )
+    .unwrap();
+    let commit_seq = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO durable_text_redactions(
+             owner_kind,owner_id,field_name,detection_ordinal,detector_id,secret_type,
+             utf8_offset,utf8_length,commit_seq
+         ) VALUES ('commit_log','redaction-parent','cause',0,'detector','token',0,10,?1)",
+        [commit_seq],
+    )
+    .unwrap();
+    assert!(conn
+        .execute("DELETE FROM commit_log WHERE commit_seq=?1", [commit_seq])
+        .is_err());
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM durable_text_redactions", [], |row| {
             row.get::<_, i64>(0)
         })
         .unwrap(),

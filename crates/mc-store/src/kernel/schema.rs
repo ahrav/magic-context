@@ -11,6 +11,7 @@ pub const KERNEL_SCHEMA_COMPONENT_NAMES: &[&str] = &[
     "change_event",
     "outbox",
     "operation_receipts",
+    "durable_text_redactions",
     "writer_fence",
     "outbox_consumers",
     "consumer_abandonments",
@@ -43,7 +44,7 @@ pub const KERNEL_SCHEMA_COMPONENT_NAMES: &[&str] = &[
 const COMPONENTS: &[(&str, &str)] = &[
     (
         "commit_log",
-        r#"CREATE TABLE commit_log(commit_seq INTEGER PRIMARY KEY AUTOINCREMENT,transaction_id TEXT NOT NULL UNIQUE,writer_epoch INTEGER NOT NULL,recorded_at INTEGER NOT NULL,actor TEXT NOT NULL,cause TEXT NOT NULL) STRICT;"#,
+        r#"CREATE TABLE commit_log(commit_seq INTEGER PRIMARY KEY AUTOINCREMENT,transaction_id TEXT NOT NULL UNIQUE,writer_epoch INTEGER NOT NULL,producer TEXT NOT NULL DEFAULT 'legacy',operation_key TEXT NOT NULL DEFAULT 'legacy',request_digest TEXT NOT NULL DEFAULT '',recorded_at INTEGER NOT NULL,actor TEXT NOT NULL,cause TEXT NOT NULL) STRICT; CREATE UNIQUE INDEX idx_commit_operation ON commit_log(producer,operation_key);"#,
     ),
     (
         "change_event",
@@ -55,7 +56,11 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "operation_receipts",
-        r#"CREATE TABLE operation_receipts(receipt_id TEXT PRIMARY KEY,producer TEXT NOT NULL,operation_key TEXT NOT NULL,request_digest TEXT NOT NULL,commit_seq INTEGER REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,result_payload BLOB NOT NULL,created_at INTEGER NOT NULL,UNIQUE(producer,operation_key)) STRICT; CREATE INDEX idx_receipts_commit_fk ON operation_receipts(commit_seq);"#,
+        r#"CREATE TABLE operation_receipts(receipt_id TEXT PRIMARY KEY,producer TEXT NOT NULL,operation_key TEXT NOT NULL,request_digest TEXT NOT NULL,commit_seq INTEGER REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,result_payload TEXT NOT NULL,created_at INTEGER NOT NULL,UNIQUE(producer,operation_key)) STRICT; CREATE INDEX idx_receipts_commit_fk ON operation_receipts(commit_seq);"#,
+    ),
+    (
+        "durable_text_redactions",
+        r#"CREATE TABLE durable_text_redactions(owner_kind TEXT NOT NULL,owner_id TEXT NOT NULL,field_name TEXT NOT NULL,detection_ordinal INTEGER NOT NULL,detector_id TEXT NOT NULL,secret_type TEXT NOT NULL,utf8_offset INTEGER NOT NULL,utf8_length INTEGER NOT NULL,commit_seq INTEGER REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,PRIMARY KEY(owner_kind,owner_id,field_name,detection_ordinal)) STRICT; CREATE INDEX idx_text_redactions_commit_fk ON durable_text_redactions(commit_seq);"#,
     ),
     (
         "writer_fence",
@@ -83,7 +88,7 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "domains",
-        r#"CREATE TABLE domains(domain_id TEXT PRIMARY KEY,object_id TEXT NOT NULL UNIQUE REFERENCES object_registry(object_id) DEFERRABLE INITIALLY DEFERRED,name TEXT NOT NULL UNIQUE,created_commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq),invalidated_commit_seq INTEGER REFERENCES commit_log(commit_seq),superseded_by TEXT REFERENCES object_registry(object_id),sensitivity_class TEXT NOT NULL) STRICT; CREATE INDEX idx_domains_known_as_of ON domains(created_commit_seq,invalidated_commit_seq,domain_id); CREATE INDEX idx_domains_superseded_fk ON domains(superseded_by);"#,
+        r#"CREATE TABLE domains(domain_id TEXT PRIMARY KEY,object_id TEXT NOT NULL UNIQUE REFERENCES object_registry(object_id) DEFERRABLE INITIALLY DEFERRED,name TEXT NOT NULL,created_commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq),invalidated_commit_seq INTEGER REFERENCES commit_log(commit_seq),superseded_by TEXT REFERENCES object_registry(object_id),sensitivity_class TEXT NOT NULL) STRICT; CREATE UNIQUE INDEX idx_domains_current_name ON domains(name) WHERE invalidated_commit_seq IS NULL; CREATE INDEX idx_domains_known_as_of ON domains(created_commit_seq,invalidated_commit_seq,domain_id); CREATE INDEX idx_domains_superseded_fk ON domains(superseded_by);"#,
     ),
     (
         "entities",
@@ -131,7 +136,7 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "candidates",
-        r#"CREATE TABLE candidates(candidate_id TEXT PRIMARY KEY,extraction_run_id TEXT NOT NULL REFERENCES extraction_runs(extraction_run_id) ON DELETE CASCADE,candidate_kind TEXT NOT NULL,payload BLOB NOT NULL,sensitivity_class TEXT NOT NULL,provenance_witness BLOB NOT NULL,redaction_metadata BLOB NOT NULL,detector_id TEXT,secret_type TEXT,utf8_offset INTEGER,utf8_length INTEGER,created_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,lease_expires_at INTEGER NOT NULL,terminal_state TEXT,terminal_at INTEGER) STRICT; CREATE INDEX idx_candidates_run_fk ON candidates(extraction_run_id,candidate_id); CREATE INDEX idx_candidates_ttl ON candidates(terminal_at,lease_expires_at,candidate_id);"#,
+        r#"CREATE TABLE candidates(candidate_id TEXT PRIMARY KEY,extraction_run_id TEXT NOT NULL REFERENCES extraction_runs(extraction_run_id) ON DELETE CASCADE,candidate_kind TEXT NOT NULL,payload TEXT NOT NULL,sensitivity_class TEXT NOT NULL,provenance_witness BLOB NOT NULL,redaction_metadata BLOB NOT NULL,detector_id TEXT,secret_type TEXT,utf8_offset INTEGER,utf8_length INTEGER,created_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,lease_expires_at INTEGER NOT NULL,terminal_state TEXT,terminal_at INTEGER) STRICT; CREATE INDEX idx_candidates_run_fk ON candidates(extraction_run_id,candidate_id); CREATE INDEX idx_candidates_ttl ON candidates(terminal_at,lease_expires_at,candidate_id);"#,
     ),
     (
         "candidate_scores",
@@ -159,7 +164,7 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "alignment_projection",
-        r#"CREATE TABLE alignment_projection(decision_id TEXT NOT NULL REFERENCES decisions(decision_id) ON DELETE CASCADE,observation_id TEXT NOT NULL REFERENCES observations(observation_id) ON DELETE CASCADE,alignment_kind TEXT NOT NULL,alignment_payload BLOB,built_through_commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq),PRIMARY KEY(decision_id,observation_id)) STRICT; CREATE INDEX idx_alignment_observation_fk ON alignment_projection(observation_id,decision_id); CREATE INDEX idx_alignment_built ON alignment_projection(built_through_commit_seq,decision_id);"#,
+        r#"CREATE TABLE alignment_projection(decision_id TEXT NOT NULL REFERENCES decisions(decision_id) ON DELETE CASCADE,observation_id TEXT NOT NULL REFERENCES observations(observation_id) ON DELETE CASCADE,alignment_kind TEXT NOT NULL,alignment_payload TEXT,built_through_commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq),PRIMARY KEY(decision_id,observation_id)) STRICT; CREATE INDEX idx_alignment_observation_fk ON alignment_projection(observation_id,decision_id); CREATE INDEX idx_alignment_built ON alignment_projection(built_through_commit_seq,decision_id);"#,
     ),
     (
         "mc_kernel_format_marker",
