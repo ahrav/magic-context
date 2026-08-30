@@ -310,13 +310,18 @@ describe("metamorphic transforms", () => {
             expect(normalizeContent(`${turn.user} ${turn.assistant}`)).not.toContain("legacy bridge");
         }
 
+        let applied = 0;
         for (const transform of TRANSFORMS) {
             for (let seed = 0; seed < 40; seed += 1) {
                 const result = transform.apply(scenario, seed);
                 if (!result.applicable) continue;
+                applied += 1;
                 expect(lintScenario(result.scenario), `${transform.id}/s${seed}`).toEqual([]);
             }
         }
+        // Not every transform fits this fixture, but the assertion above proves
+        // nothing unless something reached it.
+        expect(applied, "no transform applied").toBeGreaterThan(0);
     });
 
     test("duplication refuses a turn holding only half of a cross-turn rejection", () => {
@@ -395,13 +400,16 @@ describe("metamorphic transforms", () => {
         expect(lintScenario(scenario)).toEqual([]);
         const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
 
+        let applied = 0;
         for (let seed = 0; seed < 40; seed += 1) {
             const result = transform.apply(scenario, seed);
             if (!result.applicable) continue;
+            applied += 1;
             expect(result.scenario.transcript.turns[3]!.user, `seed ${seed}`).toContain(
                 "hidden_worker.ts",
             );
         }
+        expect(applied, "never applied").toBeGreaterThan(0);
     });
 
     test("rename refuses a replacement that states a probe gold answer", () => {
@@ -757,16 +765,27 @@ describe("metamorphic transforms", () => {
         // and misses the whole symbol.
         turns[2]!.user =
             "Also set the cache capacity via build<system-reminder>x</system-reminder>API.";
-        turns[3] = { user: "Background note about buildAPI handling.", assistant: "Summary recorded." };
+        // A second, reachable symbol so the transform applies and the assertion
+        // below is about the blocklist rather than about inapplicability.
+        turns[3] = {
+            user: "Background note about buildAPI and aux_worker.ts handling.",
+            assistant: "Summary recorded.",
+        };
         const scenario = parseScenario(raw);
         expect(lintScenario(scenario)).toEqual([]);
         const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
 
+        let applied = 0;
         for (let seed = 0; seed < 20; seed += 1) {
             const result = transform.apply(scenario, seed);
             if (!result.applicable) continue;
+            applied += 1;
             expect(result.scenario.transcript.turns[3]!.user, `seed ${seed}`).toContain("buildAPI");
+            expect(result.scenario.transcript.turns[3]!.user, `seed ${seed}`).not.toContain(
+                "aux_worker.ts",
+            );
         }
+        expect(applied, "never applied").toBeGreaterThan(0);
     });
 
     test("duplication refuses a rejected turn carrying another negative family", () => {
@@ -1094,14 +1113,17 @@ describe("metamorphic transforms", () => {
 
         for (const id of ["paraphrase-irrelevant", "rename-unrelated-symbols"]) {
             const transform = TRANSFORMS.find((candidate) => candidate.id === id)!;
+            let applied = 0;
             for (let seed = 0; seed < 30; seed += 1) {
                 const result = transform.apply(scenario, seed);
                 if (!result.applicable) continue;
+                applied += 1;
                 expect(result.scenario.transcript.turns[3]!.user, `${id}/s${seed}`).toBe(
                     scenario.transcript.turns[3]!.user,
                 );
                 expect(visible(result.scenario), `${id}/s${seed}`).toBe(visible(scenario));
             }
+            expect(applied, "never applied").toBeGreaterThan(0);
         }
     });
 
@@ -1193,11 +1215,14 @@ describe("metamorphic transforms", () => {
                 "background context",
             ).length - 1;
 
+        let applied = 0;
         for (let seed = 0; seed < 30; seed += 1) {
             const result = transform.apply(scenario, seed);
             if (!result.applicable) continue;
+            applied += 1;
             expect(occurrences(result.scenario), `seed ${seed}`).toBe(occurrences(scenario));
         }
+        expect(applied, "never applied").toBeGreaterThan(0);
     });
 
     test("paraphrase framing does not recase a leading identifier", () => {
@@ -1207,14 +1232,17 @@ describe("metamorphic transforms", () => {
         const scenario = parseScenario(raw);
         const transform = TRANSFORMS.find((candidate) => candidate.id === "paraphrase-irrelevant")!;
 
+        let applied = 0;
         for (let seed = 0; seed < 30; seed += 1) {
             const result = transform.apply(scenario, seed);
             if (!result.applicable) continue;
+            applied += 1;
             const rewritten = result.scenario.transcript.turns[3]!.user;
             if (rewritten === scenario.transcript.turns[3]!.user) continue;
             expect(rewritten, `seed ${seed}`).toContain("MyFile.ts");
             expect(rewritten, `seed ${seed}`).not.toContain("myFile.ts");
         }
+        expect(applied, "never applied").toBeGreaterThan(0);
     });
 
     test("duplication selects a turn whose rejection the historian receives", () => {
@@ -1303,11 +1331,14 @@ describe("metamorphic transforms", () => {
                 "background context",
             ).length - 1;
 
+        let applied = 0;
         for (let seed = 0; seed < 30; seed += 1) {
             const result = transform.apply(scenario, seed);
             if (!result.applicable) continue;
+            applied += 1;
             expect(occurrences(result.scenario), `seed ${seed}`).toBe(occurrences(scenario));
         }
+        expect(applied, "never applied").toBeGreaterThan(0);
     });
 
     test("move refuses an order the historian receives unchanged", () => {
@@ -1381,15 +1412,18 @@ describe("metamorphic transforms", () => {
         expect(lintScenario(scenario)).toEqual([]);
         const transform = TRANSFORMS.find((candidate) => candidate.id === "reorder-independent-turns")!;
 
+        let applied = 0;
         for (let seed = 0; seed < 40; seed += 1) {
             const result = transform.apply(scenario, seed);
             if (!result.applicable) continue;
+            applied += 1;
             // Turn 0 and turn 1 must not simply have traded places.
             expect(
                 result.scenario.transcript.turns[0]!.assistant,
                 `seed ${seed}`,
             ).toBe(scenario.transcript.turns[0]!.assistant);
         }
+        expect(applied, "never applied").toBeGreaterThan(0);
     });
 
     test("rename replacements avoid the segments of existing symbols", () => {
@@ -1447,15 +1481,18 @@ describe("metamorphic transforms", () => {
         expect(lintScenario(scenario)).toEqual([]);
         const transform = TRANSFORMS.find((candidate) => candidate.id === "reorder-independent-turns")!;
 
+        let applied = 0;
         for (let seed = 0; seed < 40; seed += 1) {
             const result = transform.apply(scenario, seed);
             if (!result.applicable) continue;
+            applied += 1;
             const visible = (candidate: HistorianEvalScenario) =>
                 normalizedEvidenceMessages(candidate.transcript.turns)
                     .map((message) => message.text)
                     .join("|");
             expect(visible(result.scenario), `seed ${seed}`).not.toBe(visible(scenario));
         }
+        expect(applied, "never applied").toBeGreaterThan(0);
     });
 
     test("paraphrase still applies when every unprotected message carries negative evidence", () => {
@@ -1595,11 +1632,14 @@ describe("metamorphic transforms", () => {
                 .join(" ")
                 .split("blue green").length - 1;
 
+        let applied = 0;
         for (let seed = 0; seed < 40; seed += 1) {
             const result = transform.apply(scenario, seed);
             if (!result.applicable) continue;
+            applied += 1;
             expect(answers(result.scenario), `seed ${seed}`).toBe(answers(scenario));
         }
+        expect(applied, "never applied").toBeGreaterThan(0);
     });
 
     test("paraphrase never frames a message with a probe gold answer", () => {
@@ -1628,9 +1668,11 @@ describe("metamorphic transforms", () => {
         expect(lintScenario(scenario)).toEqual([]);
         const transform = TRANSFORMS.find((candidate) => candidate.id === "paraphrase-irrelevant")!;
 
+        let applied = 0;
         for (let seed = 0; seed < 30; seed += 1) {
             const result = transform.apply(scenario, seed);
             if (!result.applicable) continue;
+            applied += 1;
             result.scenario.transcript.turns.forEach((turn, index) => {
                 for (const role of ["user", "assistant"] as const) {
                     const before = scenario.transcript.turns[index]![role];
@@ -1642,6 +1684,7 @@ describe("metamorphic transforms", () => {
                 }
             });
         }
+        expect(applied, "never applied").toBeGreaterThan(0);
     });
 
     test("duplication refuses to push the rendered transcript past single-chunk headroom", () => {
