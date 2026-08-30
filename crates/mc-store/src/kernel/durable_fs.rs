@@ -123,6 +123,38 @@ pub(super) fn create_secure_directory(parent: &File, name: &OsStr) -> Result<Fil
     secured
 }
 
+pub(super) fn open_or_create_secure_directory(
+    parent: &File,
+    name: &str,
+) -> Result<File, StorageError> {
+    match create_secure_directory(parent, OsStr::new(name)) {
+        Ok(directory) => Ok(directory),
+        Err(StorageError::Other(source)) if source.kind() == io::ErrorKind::AlreadyExists => {
+            validate_name(name)?;
+            let descriptor = rfs::openat(
+                parent,
+                name,
+                OFlags::DIRECTORY | OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(classify_errno)?;
+            let directory = File::from(descriptor);
+            let metadata = directory.metadata().map_err(classify_io)?;
+            if !metadata.is_dir()
+                || metadata.uid() != rustix::process::geteuid().as_raw()
+                || metadata.permissions().mode() & 0o777 != 0o700
+            {
+                return Err(classify_io(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "directory is not owner-only",
+                )));
+            }
+            Ok(directory)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub(super) fn create_new_file(directory: &File, name: &str) -> Result<File, StorageError> {
     validate_name(name)?;
     let descriptor = rfs::openat(
@@ -155,11 +187,37 @@ pub(super) fn sync_directory(directory: &File) -> Result<(), StorageError> {
     sync_file(directory)
 }
 
+// Callers publishing across two directories own the barrier for both, so this
+// syncs the destination first and the source only when it is a different
+// directory.
+pub(super) fn sync_publish_directories_with(
+    source_directory: &File,
+    destination_directory: &File,
+    mut sync: impl FnMut(&File) -> Result<(), StorageError>,
+) -> Result<(), StorageError> {
+    let source = source_directory.metadata().map_err(classify_io)?;
+    let destination = destination_directory.metadata().map_err(classify_io)?;
+    sync(destination_directory)?;
+    if source.dev() != destination.dev() || source.ino() != destination.ino() {
+        sync(source_directory)?;
+    }
+    Ok(())
+}
+
 // `_locked` requires callers to serialize publishers within this process.
 // Callers own the directory barrier.
 pub(super) fn publish_noreplace_locked(
     directory: &File,
     temp_name: &str,
+    final_name: &str,
+) -> Result<PublishOutcome, StorageError> {
+    publish_noreplace_between_locked(directory, temp_name, directory, final_name)
+}
+
+pub(super) fn publish_noreplace_between_locked(
+    source_directory: &File,
+    temp_name: &str,
+    destination_directory: &File,
     final_name: &str,
 ) -> Result<PublishOutcome, StorageError> {
     validate_name(temp_name)?;
@@ -168,9 +226,9 @@ pub(super) fn publish_noreplace_locked(
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         match rfs::renameat_with(
-            directory,
+            source_directory,
             temp_name,
-            directory,
+            destination_directory,
             final_name,
             rfs::RenameFlags::NOREPLACE,
         ) {
@@ -192,18 +250,20 @@ pub(super) fn publish_noreplace_locked(
     // `linkat` atomically creates `final_name` or returns `EEXIST`, preventing
     // a concurrent publisher from replacing it.
     match rfs::linkat(
-        directory,
+        source_directory,
         temp_name,
-        directory,
+        destination_directory,
         final_name,
         AtFlags::empty(),
     ) {
-        Ok(()) => match rfs::unlinkat(directory, temp_name, AtFlags::empty()) {
+        Ok(()) => match rfs::unlinkat(source_directory, temp_name, AtFlags::empty()) {
             Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(PublishOutcome::Published),
-            Err(unlink_error) => match rfs::unlinkat(directory, final_name, AtFlags::empty()) {
-                Ok(()) | Err(rustix::io::Errno::NOENT) => Err(classify_errno(unlink_error)),
-                Err(_) => Ok(PublishOutcome::PublishedTempRetained),
-            },
+            Err(unlink_error) => {
+                match rfs::unlinkat(destination_directory, final_name, AtFlags::empty()) {
+                    Ok(()) | Err(rustix::io::Errno::NOENT) => Err(classify_errno(unlink_error)),
+                    Err(_) => Ok(PublishOutcome::PublishedTempRetained),
+                }
+            }
         },
         Err(rustix::io::Errno::EXIST) => Ok(PublishOutcome::AlreadyExists),
         Err(error) => Err(classify_errno(error)),
@@ -273,6 +333,56 @@ mod tests {
             .read_to_end(&mut bytes)
             .unwrap();
         assert_eq!(bytes, b"payload");
+    }
+
+    #[test]
+    fn cross_directory_publish_syncs_destination_and_source() {
+        let root = tempfile::tempdir().unwrap();
+        let root_dir = File::open(root.path()).unwrap();
+        let source = create_secure_directory(&root_dir, OsStr::new("tmp")).unwrap();
+        let destination = create_secure_directory(&root_dir, OsStr::new("shard")).unwrap();
+        let mut temp = create_new_file(&source, "artifact.tmp").unwrap();
+        write_and_sync(&mut temp, b"payload").unwrap();
+        let mut synced = Vec::new();
+
+        sync_publish_directories_with(&source, &destination, |directory| {
+            synced.push(directory.metadata().unwrap().ino());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            synced,
+            [
+                destination.metadata().unwrap().ino(),
+                source.metadata().unwrap().ino()
+            ]
+        );
+        assert_eq!(
+            publish_noreplace_between_locked(&source, "artifact.tmp", &destination, "digest")
+                .unwrap(),
+            PublishOutcome::Published
+        );
+        assert!(!root.path().join("tmp/artifact.tmp").exists());
+        assert_eq!(
+            fs::read(root.path().join("shard/digest")).unwrap(),
+            b"payload"
+        );
+    }
+
+    #[test]
+    fn same_directory_publish_syncs_once() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = File::open(root.path()).unwrap();
+        let mut sync_count = 0;
+
+        sync_publish_directories_with(&directory, &directory, |_| {
+            sync_count += 1;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(sync_count, 1);
     }
 
     #[test]
