@@ -40,6 +40,9 @@ export interface Transform {
     id: string;
     version: number;
     alwaysApplicable: boolean;
+    /** A rewritten turn is indistinguishable from a misplaced one, so admission
+     * verifies `turnMap` against the transcript only when this is `true`. */
+    preservesTurnText: boolean;
     apply(scenario: HistorianEvalScenario, seed: number): TransformResult;
 }
 
@@ -720,6 +723,7 @@ const paraphraseIrrelevant: Transform = {
     // for a contract-valid scenario, so applicability cannot be promised for
     // every input — the frozen corpus asserts it directly instead.
     alwaysApplicable: false,
+    preservesTurnText: false,
     apply(scenario, rawSeed) {
         const seed = normalizedSeed(rawSeed);
         const rewrites = [
@@ -821,6 +825,7 @@ const reorderIndependentTurns: Transform = {
     id: "reorder-independent-turns",
     version: 1,
     alwaysApplicable: false,
+    preservesTurnText: true,
     apply(scenario, rawSeed) {
         const seed = normalizedSeed(rawSeed);
         const expectedIndexes = protectedTurnIndexes(scenario);
@@ -876,6 +881,7 @@ const moveAcceptedDecision: Transform = {
     id: "move-accepted-decision",
     version: 1,
     alwaysApplicable: false,
+    preservesTurnText: true,
     apply(scenario, rawSeed) {
         const seed = normalizedSeed(rawSeed);
         const absentIndexes = absentEvidenceTurnIndexes(scenario);
@@ -970,6 +976,7 @@ const duplicateRejectedProposal: Transform = {
     id: "duplicate-rejected-proposal",
     version: 1,
     alwaysApplicable: false,
+    preservesTurnText: true,
     apply(scenario, rawSeed) {
         const seed = normalizedSeed(rawSeed);
         if (scenario.transcript.turns.length >= MAX_TRANSCRIPT_TURNS) {
@@ -1165,6 +1172,7 @@ const renameUnrelatedSymbols: Transform = {
     id: "rename-unrelated-symbols",
     version: 1,
     alwaysApplicable: false,
+    preservesTurnText: false,
     apply(scenario, rawSeed) {
         const seed = normalizedSeed(rawSeed);
         const messages = eligibleMessages(scenario);

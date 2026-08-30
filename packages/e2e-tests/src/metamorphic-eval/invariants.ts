@@ -1,6 +1,12 @@
 import type { InjectedClaimRecord } from "../historian-eval/claim-read";
 import { normalizeContent } from "../historian-eval/contract";
-import { FAIL_REASONS, type FailReason, type ScenarioScore } from "../historian-eval/scorer";
+import {
+    FAIL_REASONS,
+    type ExpectationGoldMatchPredicates,
+    type FailReason,
+    type ScenarioScore,
+} from "../historian-eval/scorer";
+import type { MetamorphicInvariantVerdict } from "./report";
 
 export interface CanonicalInjectedClaim {
     category: string;
@@ -123,6 +129,42 @@ export function compareInvariants(
             baselineVerdict: baselineScore.verdict,
             derivativeVerdict: derivativeScore.verdict,
             introducedFailReasons,
+        },
+    ];
+}
+
+export function compareScoreInvariants(
+    baselineScore: ScenarioScore,
+    derivativeScore: ScenarioScore,
+    baselineExpectations: ExpectationGoldMatchPredicates,
+    derivativeExpectations: ExpectationGoldMatchPredicates,
+): MetamorphicInvariantVerdict[] {
+    const expectationIds = [...new Set([
+        ...Object.keys(baselineExpectations),
+        ...Object.keys(derivativeExpectations),
+    ])].sort();
+    const changedExpectationIds = expectationIds.filter(
+        (id) => baselineExpectations[id] !== derivativeExpectations[id],
+    );
+    const baselineMatches = [...new Set(baselineScore.falseAuthoritativeMatches)].sort();
+    const derivativeMatches = [...new Set(derivativeScore.falseAuthoritativeMatches)].sort();
+    return [
+        {
+            invariant: "expectation-predicate-equality",
+            holds: changedExpectationIds.length === 0,
+            changedExpectationIds,
+        },
+        {
+            invariant: "false-authoritative-set-equality",
+            holds: JSON.stringify(baselineMatches) === JSON.stringify(derivativeMatches),
+            baselineMatches,
+            derivativeMatches,
+        },
+        {
+            invariant: "scenario-verdict-equality",
+            holds: baselineScore.verdict === derivativeScore.verdict,
+            baselineVerdict: baselineScore.verdict,
+            derivativeVerdict: derivativeScore.verdict,
         },
     ];
 }
