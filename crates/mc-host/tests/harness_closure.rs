@@ -1,3 +1,9 @@
+// `src/harness_closure.rs` reaches the shared mode converter through
+// `crate::file_mode`. This target's crate root is this file, not `lib.rs`, so
+// the library's module declaration is not in scope here and the module has to
+// be declared again for the include to resolve.
+#[path = "../src/file_mode.rs"]
+mod file_mode;
 #[path = "../src/harness_closure.rs"]
 mod harness_closure;
 
