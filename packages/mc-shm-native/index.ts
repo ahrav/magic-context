@@ -75,6 +75,7 @@ interface NativeAddon {
     activeChannelCount(): number;
     attach(descriptor: NativeDescriptor): number;
     connectSetup(options: NativeSetupOptions): number;
+    peerClosed(channel: number): boolean;
     createTestPair(): {
         first: number;
         second: number;
@@ -614,6 +615,16 @@ export class NativeChannel {
                 ),
             );
         });
+    }
+
+    /**
+     * True once the host has dropped the setup socket that scopes this channel's
+     * lifetime. A ring that has simply gone quiet is indistinguishable from a
+     * dead peer without this signal. commentlint: allow(JUDGE)
+     */
+    peerClosed(): boolean {
+        if (this.closed) return true;
+        return this.native.peerClosed(this.id);
     }
 
     close(): void {

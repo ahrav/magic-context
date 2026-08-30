@@ -1052,6 +1052,23 @@ pub fn release(env: &Env, channel_id: u32, token: u32) -> Result<()> {
 }
 
 #[napi]
+pub fn peer_closed(channel_id: u32) -> Result<bool> {
+    REGISTRY.with(|registry| {
+        let registry = registry
+            .try_borrow()
+            .map_err(|_| error("native channel is busy"))?;
+        let channel = registry
+            .channels
+            .get(&channel_id)
+            .ok_or_else(|| error("native channel is closed"))?;
+        Ok(match channel.setup.as_ref() {
+            Some(stream) => setup::peer_closed(stream),
+            None => false,
+        })
+    })
+}
+
+#[napi]
 pub fn close(env: &Env, channel_id: u32) -> Result<()> {
     REGISTRY.with(|registry| {
         let mut registry = registry
