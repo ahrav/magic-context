@@ -18,14 +18,8 @@ pub mod handler;
 pub mod harness_closure;
 pub mod lifecycle;
 #[doc(hidden)]
-pub mod provider_recovery;
-#[doc(hidden)]
-pub mod shm_provider;
+pub mod ring_transport;
 pub mod synapse;
-#[doc(hidden)]
-pub mod transport_negotiation;
-#[doc(hidden)]
-pub mod transport_provider;
 
 mod connection;
 mod control;
@@ -33,17 +27,14 @@ mod dispatch;
 mod file_mode;
 #[doc(hidden)]
 pub mod frame_channel;
-mod frame_read;
 mod instance;
 mod panic_boundary;
 mod routing;
 mod runtime;
-mod tcp_frame_channel;
-// Doc-hidden rather than private because `shm_provider`'s public `send`/`recv`
-// already take and return `EnvelopeHeader`, so the type must be nameable by any
-// consumer of that module. Doc-hidden keeps it out of the documented surface:
-// the managed `client` API still yields only `Response`, `StreamItem`, and
-// `CallError`, so raw frame types never reach an ordinary caller.
+#[doc(hidden)]
+pub mod setup_socket;
+// Ring setup and tests name raw envelope types, while the managed client API
+// exposes only responses, stream items, and call errors.
 #[doc(hidden)]
 pub mod wire;
 
@@ -65,8 +56,8 @@ pub use composite::{
 };
 pub use config::{ConfigError, HostConfig, HostInit, HostLimits, HostTiming, LivenessPolicy};
 pub use connection_file::{
-    read_for_client as read_connection_file, ConnectionFileError, ConnectionInfo, Endpoint,
-    DAEMON_ID_LEN, KEY_LEN, MAX_CONNECTION_FILE_LEN, MIN_KEY_LEN, SCHEMA_VERSION,
+    read_for_client as read_connection_file, ConnectionFileError, ConnectionInfo, DAEMON_ID_LEN,
+    KEY_LEN, MAX_CONNECTION_FILE_LEN, MIN_KEY_LEN, SCHEMA_VERSION,
 };
 pub use handler::{
     BindOutcome, HealthReport, HealthStatus, InitError, ManifestSnapshot, McHostHandler,
@@ -84,7 +75,7 @@ pub use lifecycle::{
     LIFECYCLE_RECORD_NAME, LIFETIME_LOCK_NAME, PAYLOAD_MANIFEST_DIGEST_LEN, TRANSACTION_LOCK_NAME,
     UNSUPPORTED_STATE_SCHEMA_REASON,
 };
-pub use runtime::{run, HostError};
+pub use runtime::{run, run_with_publish_hook, HostError};
 /// The version-2 body cap. Published so a consumer preparing an output can
 /// gate on the same value frame admission enforces, rather than restating it.
 pub use wire::MAX_FRAME_BODY_LEN;

@@ -1,12 +1,10 @@
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
 use super::envelope::check_fence;
-use super::redaction::redact;
-use super::{KernelError, KernelStore};
+use super::redaction::{clear_owner, identity};
+use super::{map_sqlite, KernelError, KernelStore};
 
-pub(super) const HOUR_MS: i64 = 60 * 60 * 1_000;
-
-pub const STAGING_RETENTION_MS: i64 = 30 * 24 * HOUR_MS;
+pub const STAGING_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 
 const DELETE_BATCH_RUNS: i64 = 1_024;
 
@@ -54,8 +52,7 @@ impl KernelStore {
         lease_expires_at: i64,
     ) -> Result<(), KernelError> {
         validate_lease(extraction_run_id, heartbeat_at, lease_expires_at)?;
-        // `stage_candidate` stores the redacted id, so a raw argument matches no row whenever the id itself contains a detected secret.
-        let run_id = redact(extraction_run_id).text;
+        let run_id = identity(extraction_run_id)?;
         let mut writer = self.lock_writer()?;
         let tx = begin_fenced_write(&mut writer, self.lease_epoch())?;
         let run = load_run_lifecycle(&tx, &run_id)?.ok_or(KernelError::NotFound)?;
@@ -71,15 +68,15 @@ impl KernelStore {
              WHERE extraction_run_id=?3 AND terminal_state IS NULL",
             params![heartbeat_at, lease_expires_at, run_id],
         )
-        .map_err(|_| KernelError::Io)?;
+        .map_err(map_sqlite)?;
         tx.execute(
             "UPDATE candidates
              SET heartbeat_at=MAX(heartbeat_at,?1),lease_expires_at=MAX(lease_expires_at,?2)
              WHERE extraction_run_id=?3 AND terminal_state IS NULL",
             params![heartbeat_at, lease_expires_at, run_id],
         )
-        .map_err(|_| KernelError::Io)?;
-        tx.commit().map_err(|_| KernelError::Io)
+        .map_err(map_sqlite)?;
+        tx.commit().map_err(map_sqlite)
     }
 
     /// `terminal_at` starts the run's retention clock, so it is bracketed by the run's own timestamps: at or after `max(started_at, heartbeat_at)`, and inside the lease. A value below the floor lets the next sweep delete a run that just finished, and one past the lease exempts the run from the cutoff indefinitely.
@@ -98,7 +95,7 @@ impl KernelStore {
         if extraction_run_id.trim().is_empty() || terminal_at < 0 {
             return Err(KernelError::InvalidInput);
         }
-        let run_id = redact(extraction_run_id).text;
+        let run_id = identity(extraction_run_id)?;
         let mut writer = self.lock_writer()?;
         let tx = begin_fenced_write(&mut writer, self.lease_epoch())?;
         let run = load_run_lifecycle(&tx, &run_id)?.ok_or(KernelError::NotFound)?;
@@ -118,14 +115,14 @@ impl KernelStore {
              WHERE extraction_run_id=?3 AND terminal_state IS NULL",
             params![state.as_str(), terminal_at, run_id],
         )
-        .map_err(|_| KernelError::Io)?;
+        .map_err(map_sqlite)?;
         tx.execute(
             "UPDATE candidates SET terminal_state=?1,terminal_at=?2
              WHERE extraction_run_id=?3 AND terminal_state IS NULL",
             params![state.as_str(), terminal_at, run_id],
         )
-        .map_err(|_| KernelError::Io)?;
-        tx.commit().map_err(|_| KernelError::Io)
+        .map_err(map_sqlite)?;
+        tx.commit().map_err(map_sqlite)
     }
 
     /// # Errors
@@ -138,7 +135,7 @@ impl KernelStore {
         let mut writer = self.lock_writer()?;
         let tx = begin_fenced_write(&mut writer, self.lease_epoch())?;
         let abandoned = abandon_expired(&tx, now)?;
-        tx.commit().map_err(|_| KernelError::Io)?;
+        tx.commit().map_err(map_sqlite)?;
         Ok(abandoned)
     }
 
@@ -156,7 +153,7 @@ impl KernelStore {
         let mut writer = self.lock_writer()?;
         let tx = begin_fenced_write(&mut writer, self.lease_epoch())?;
         let deleted = delete_aged(&tx, now)?;
-        tx.commit().map_err(|_| KernelError::Io)?;
+        tx.commit().map_err(map_sqlite)?;
         Ok(deleted)
     }
 
@@ -174,7 +171,7 @@ impl KernelStore {
         let tx = begin_fenced_write(&mut writer, self.lease_epoch())?;
         let abandoned_runs = abandon_expired(&tx, now)?;
         let deleted_runs = delete_aged(&tx, now)?;
-        tx.commit().map_err(|_| KernelError::Io)?;
+        tx.commit().map_err(map_sqlite)?;
         Ok(StagingMaintenanceResult {
             abandoned_runs,
             deleted_runs,
@@ -207,7 +204,7 @@ fn load_run_lifecycle(
         },
     )
     .optional()
-    .map_err(|_| KernelError::Io)
+    .map_err(map_sqlite)
 }
 
 fn abandon_expired(tx: &Transaction<'_>, now: i64) -> Result<usize, KernelError> {
@@ -218,7 +215,7 @@ fn abandon_expired(tx: &Transaction<'_>, now: i64) -> Result<usize, KernelError>
              WHERE terminal_state IS NULL AND lease_expires_at<=?1",
             params![now, ABANDONED_STATE],
         )
-        .map_err(|_| KernelError::Io)?;
+        .map_err(map_sqlite)?;
     tx.execute(
         "UPDATE candidates
          SET terminal_state=?2,
@@ -230,7 +227,7 @@ fn abandon_expired(tx: &Transaction<'_>, now: i64) -> Result<usize, KernelError>
          )",
         params![now, ABANDONED_STATE],
     )
-    .map_err(|_| KernelError::Io)?;
+    .map_err(map_sqlite)?;
     Ok(abandoned)
 }
 
@@ -247,27 +244,21 @@ fn delete_aged(tx: &Transaction<'_>, now: i64) -> Result<usize, KernelError> {
             stmt.query_map(params![cutoff, DELETE_BATCH_RUNS], |row| row.get(0))?
                 .collect()
         })
-        .map_err(|_| KernelError::Io)?;
+        .map_err(map_sqlite)?;
     for run_id in &run_ids {
-        tx.execute(
-            "DELETE FROM durable_text_redactions
-             WHERE owner_kind='staging_candidate' AND owner_id IN (
-                 SELECT candidate_id FROM candidates WHERE extraction_run_id=?1
-             )",
-            [run_id],
-        )
-        .map_err(|_| KernelError::Io)?;
-        tx.execute(
-            "DELETE FROM durable_text_redactions
-             WHERE owner_kind='extraction_run' AND owner_id=?1",
-            [run_id],
-        )
-        .map_err(|_| KernelError::Io)?;
+        let candidate_ids: Vec<String> = tx
+            .prepare("SELECT candidate_id FROM candidates WHERE extraction_run_id=?1")
+            .and_then(|mut stmt| stmt.query_map([run_id], |row| row.get(0))?.collect())
+            .map_err(map_sqlite)?;
+        for candidate_id in &candidate_ids {
+            clear_owner(tx, "staging_candidate", candidate_id)?;
+        }
+        clear_owner(tx, "extraction_run", run_id)?;
         tx.execute(
             "DELETE FROM extraction_runs WHERE extraction_run_id=?1",
             [run_id],
         )
-        .map_err(|_| KernelError::Io)?;
+        .map_err(map_sqlite)?;
     }
     Ok(run_ids.len())
 }
@@ -278,7 +269,7 @@ pub(super) fn begin_fenced_write(
 ) -> Result<Transaction<'_>, KernelError> {
     let tx = writer
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|_| KernelError::Io)?;
+        .map_err(map_sqlite)?;
     check_fence(&tx, lease_epoch)?;
     Ok(tx)
 }
@@ -291,7 +282,7 @@ fn validate_lease(
     if extraction_run_id.trim().is_empty()
         || heartbeat_at < 0
         || lease_expires_at <= heartbeat_at
-        || lease_expires_at > heartbeat_at.saturating_add(HOUR_MS)
+        || lease_expires_at > heartbeat_at.saturating_add(super::envelope::MAX_STAGING_LEASE_MS)
     {
         return Err(KernelError::InvalidInput);
     }

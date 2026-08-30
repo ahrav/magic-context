@@ -1,9 +1,9 @@
 #![cfg(feature = "test-support")]
 
 use mc_store::kernel::{
-    CommitIntent, DomainSpec, KernelErrorKind, KernelStore, RemediationTarget,
-    RepositoryProvenance, Sensitivity, StagingCandidateSpec, StagingTerminalState,
-    OPERATOR_REDACTION_PLACEHOLDER, STAGING_RETENTION_MS,
+    CommitIntent, DomainSpec, KernelError, KernelStore, RemediationTarget, RepositoryProvenance,
+    Sensitivity, StagingCandidateSpec, StagingTerminalState, OPERATOR_REDACTION_PLACEHOLDER,
+    STAGING_RETENTION_MS,
 };
 use rusqlite::{Connection, OpenFlags};
 
@@ -136,9 +136,8 @@ fn completed_staging_survives_day_29_and_is_deleted_day_31() {
     assert_eq!(
         store
             .stage_candidate(candidate("run", "late-candidate", 2 * DAY_MS))
-            .unwrap_err()
-            .kind(),
-        KernelErrorKind::Conflict
+            .unwrap_err(),
+        KernelError::Conflict
     );
     // One millisecond short of the cutoff, so a retention window longer or shorter than
     // STAGING_RETENTION_MS fails one of the two assertions.
@@ -420,30 +419,27 @@ fn remediation_supports_two_live_domains_and_keeps_receipt_as_caller_result() {
             .query_row(
                 "SELECT result_payload FROM operation_receipts WHERE operation_key='remediate'",
                 [],
-                |row| row.get::<_, String>(0),
+                |row| row.get::<_, Vec<u8>>(0),
             )
             .unwrap(),
-        "remediated"
+        b"remediated"
     );
 }
 
 const AWS_KEY: &str = "AKIAFFFFFFFFFFFFFFFF";
 
 fn secret_candidate(recorded_at: i64) -> StagingCandidateSpec {
-    let mut spec = candidate(
-        &format!("run-{AWS_KEY}"),
-        &format!("cand-{AWS_KEY}"),
-        recorded_at,
-    );
+    let mut spec = candidate("run", "cand", recorded_at);
+    // Ids go through identity() and must be secret-free; the payload is still redacted.
     spec.payload = format!("payload-{AWS_KEY}");
     spec
 }
 
 #[test]
-fn renew_advances_the_lease_for_a_run_whose_id_carries_a_secret() {
+fn renew_advances_the_lease_and_never_shortens_it() {
     let directory = tempfile::tempdir().unwrap();
     let store = KernelStore::open(directory.path()).unwrap();
-    let run = format!("run-{AWS_KEY}");
+    let run = "run".to_string();
     store.stage_candidate(secret_candidate(0)).unwrap();
 
     store.renew_staging_run(&run, 10, 10 + HOUR_MS).unwrap();
@@ -479,33 +475,27 @@ fn renew_rejects_an_unknown_run_a_backwards_heartbeat_and_an_expired_lease() {
         .unwrap();
 
     assert_eq!(
-        store
-            .renew_staging_run("absent", 100, 101)
-            .unwrap_err()
-            .kind(),
-        KernelErrorKind::NotFound
+        store.renew_staging_run("absent", 100, 101).unwrap_err(),
+        KernelError::NotFound
     );
     assert_eq!(
         store
             .renew_staging_run("run", 50, 50 + HOUR_MS)
-            .unwrap_err()
-            .kind(),
-        KernelErrorKind::Conflict
+            .unwrap_err(),
+        KernelError::Conflict
     );
     assert_eq!(
         store
             .renew_staging_run("run", 2, 2 + HOUR_MS + 1)
-            .unwrap_err()
-            .kind(),
-        KernelErrorKind::InvalidInput
+            .unwrap_err(),
+        KernelError::InvalidInput
     );
     // The stored lease ends at 100 + HOUR_MS, so a heartbeat at that instant is too late.
     assert_eq!(
         store
             .renew_staging_run("run", 100 + HOUR_MS, 100 + HOUR_MS + 1)
-            .unwrap_err()
-            .kind(),
-        KernelErrorKind::Conflict
+            .unwrap_err(),
+        KernelError::Conflict
     );
 }
 
@@ -521,16 +511,14 @@ fn finish_rejects_a_terminal_time_before_the_run_lifecycle() {
     assert_eq!(
         store
             .finish_staging_run("run", StagingTerminalState::Completed, 0)
-            .unwrap_err()
-            .kind(),
-        KernelErrorKind::InvalidInput
+            .unwrap_err(),
+        KernelError::InvalidInput
     );
     assert_eq!(
         store
             .finish_staging_run("absent", StagingTerminalState::Completed, DAY_MS)
-            .unwrap_err()
-            .kind(),
-        KernelErrorKind::NotFound
+            .unwrap_err(),
+        KernelError::NotFound
     );
     store
         .finish_staging_run("run", StagingTerminalState::Failed, DAY_MS)
@@ -538,9 +526,8 @@ fn finish_rejects_a_terminal_time_before_the_run_lifecycle() {
     assert_eq!(
         store
             .finish_staging_run("run", StagingTerminalState::Canceled, DAY_MS)
-            .unwrap_err()
-            .kind(),
-        KernelErrorKind::Conflict
+            .unwrap_err(),
+        KernelError::Conflict
     );
     assert_eq!(
         inspect(directory.path())
@@ -555,16 +542,12 @@ fn finish_rejects_a_terminal_time_before_the_run_lifecycle() {
 }
 
 #[test]
-fn finish_terminates_a_run_whose_id_carries_a_secret() {
+fn finish_propagates_the_terminal_state_to_candidates() {
     let directory = tempfile::tempdir().unwrap();
     let store = KernelStore::open(directory.path()).unwrap();
     store.stage_candidate(secret_candidate(0)).unwrap();
     store
-        .finish_staging_run(
-            &format!("run-{AWS_KEY}"),
-            StagingTerminalState::Canceled,
-            TERMINAL_AT,
-        )
+        .finish_staging_run("run", StagingTerminalState::Canceled, TERMINAL_AT)
         .unwrap();
     let states: (String, String) = inspect(directory.path())
         .query_row(
@@ -583,11 +566,7 @@ fn deleting_aged_runs_removes_their_secret_location_rows() {
     let store = KernelStore::open(directory.path()).unwrap();
     store.stage_candidate(secret_candidate(0)).unwrap();
     store
-        .finish_staging_run(
-            &format!("run-{AWS_KEY}"),
-            StagingTerminalState::Completed,
-            0,
-        )
+        .finish_staging_run("run", StagingTerminalState::Completed, 0)
         .unwrap();
 
     let connection = inspect(directory.path());
@@ -623,12 +602,12 @@ fn deleting_aged_runs_removes_their_secret_location_rows() {
 fn maintenance_rejects_a_negative_clock_reading() {
     let directory = tempfile::tempdir().unwrap();
     let store = KernelStore::open(directory.path()).unwrap();
-    for kind in [
-        store.run_staging_maintenance(-1).unwrap_err().kind(),
-        store.abandon_expired_staging_runs(-1).unwrap_err().kind(),
-        store.delete_aged_staging_runs(-1).unwrap_err().kind(),
+    for error in [
+        store.run_staging_maintenance(-1).unwrap_err(),
+        store.abandon_expired_staging_runs(-1).unwrap_err(),
+        store.delete_aged_staging_runs(-1).unwrap_err(),
     ] {
-        assert_eq!(kind, KernelErrorKind::InvalidInput);
+        assert_eq!(error, KernelError::InvalidInput);
     }
 }
 
@@ -676,9 +655,8 @@ fn the_operator_placeholder_is_not_an_insertable_domain_name() {
                 envelope.insert_domain(spec(OPERATOR_REDACTION_PLACEHOLDER, 1))?;
                 Ok("inserted".to_string())
             })
-            .unwrap_err()
-            .kind(),
-        KernelErrorKind::InvalidInput
+            .unwrap_err(),
+        KernelError::InvalidInput
     );
     // The uniqueness index still binds ordinary names.
     store
@@ -785,9 +763,8 @@ fn remediation_rejects_an_unknown_object_and_a_non_domain_kind() {
                 )?;
                 Ok("remediated".to_string())
             })
-            .unwrap_err()
-            .kind(),
-        KernelErrorKind::NotFound
+            .unwrap_err(),
+        KernelError::NotFound
     );
     assert_eq!(
         store
@@ -801,9 +778,8 @@ fn remediation_rejects_an_unknown_object_and_a_non_domain_kind() {
                 )?;
                 Ok("remediated".to_string())
             })
-            .unwrap_err()
-            .kind(),
-        KernelErrorKind::InvalidInput
+            .unwrap_err(),
+        KernelError::InvalidInput
     );
 }
 
@@ -820,9 +796,8 @@ fn staging_a_candidate_cannot_revive_a_run_whose_lease_expired() {
     assert_eq!(
         store
             .stage_candidate(candidate("run", "second", 100 + HOUR_MS))
-            .unwrap_err()
-            .kind(),
-        KernelErrorKind::Conflict
+            .unwrap_err(),
+        KernelError::Conflict
     );
     let connection = inspect(directory.path());
     assert_eq!(
@@ -867,16 +842,14 @@ fn finishing_requires_the_lease_to_still_cover_the_terminal_instant() {
     assert_eq!(
         store
             .finish_staging_run("run", StagingTerminalState::Completed, i64::MAX)
-            .unwrap_err()
-            .kind(),
-        KernelErrorKind::Conflict
+            .unwrap_err(),
+        KernelError::Conflict
     );
     assert_eq!(
         store
             .finish_staging_run("run", StagingTerminalState::Completed, HOUR_MS)
-            .unwrap_err()
-            .kind(),
-        KernelErrorKind::Conflict
+            .unwrap_err(),
+        KernelError::Conflict
     );
     store
         .finish_staging_run("run", StagingTerminalState::Completed, HOUR_MS - 1)
@@ -902,8 +875,8 @@ fn staging_a_candidate_cannot_reach_back_before_the_run_heartbeat() {
     let mut stale = candidate("run", "stale", 150);
     stale.lease_expires_at = 150 + HOUR_MS;
     assert_eq!(
-        store.stage_candidate(stale).unwrap_err().kind(),
-        KernelErrorKind::Conflict
+        store.stage_candidate(stale).unwrap_err(),
+        KernelError::Conflict
     );
     let connection = inspect(directory.path());
     assert_eq!(
@@ -935,8 +908,8 @@ fn a_lease_that_expires_at_its_own_instant_is_rejected() {
     // Accepting it would insert a run already expired at its own recorded_at, which every
     // other writer then refuses.
     assert_eq!(
-        store.stage_candidate(zero_length).unwrap_err().kind(),
-        KernelErrorKind::InvalidInput
+        store.stage_candidate(zero_length).unwrap_err(),
+        KernelError::InvalidInput
     );
     assert_eq!(
         inspect(directory.path())
@@ -946,7 +919,7 @@ fn a_lease_that_expires_at_its_own_instant_is_rejected() {
         0
     );
     assert_eq!(
-        store.renew_staging_run("run", 100, 100).unwrap_err().kind(),
-        KernelErrorKind::InvalidInput
+        store.renew_staging_run("run", 100, 100).unwrap_err(),
+        KernelError::InvalidInput
     );
 }

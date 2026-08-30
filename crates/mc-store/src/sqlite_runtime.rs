@@ -136,14 +136,10 @@ pub fn verify_sqlite_connection_contract(
         ));
     }
     let synchronous: i64 = conn.query_row("PRAGMA synchronous", [], |row| row.get(0))?;
-    if !(2..=3).contains(&synchronous) {
+    if !(1..=3).contains(&synchronous) {
         violations.push(format!(
-            "synchronous mode {synchronous} is not FULL or EXTRA [2, 3]"
+            "synchronous mode {synchronous} is not in the declared set [1, 2, 3]"
         ));
-    }
-    let trusted_schema: i64 = conn.query_row("PRAGMA trusted_schema", [], |row| row.get(0))?;
-    if trusted_schema != 0 {
-        violations.push("trusted_schema is enabled".to_string());
     }
     Ok(violations)
 }

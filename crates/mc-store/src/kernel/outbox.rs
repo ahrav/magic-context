@@ -1,9 +1,9 @@
 use rusqlite::{params, OptionalExtension, Transaction};
 
 use super::envelope::{Envelope, ObjectRow, PendingChange, Sensitivity};
-use super::redaction::{redact, RedactedField};
+use super::redaction::{identity, redact, RedactedField};
 use super::retention::begin_fenced_write;
-use super::{KernelError, KernelStore};
+use super::{map_sqlite, KernelError, KernelStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutboxPruneResult {
@@ -13,7 +13,7 @@ pub struct OutboxPruneResult {
 }
 
 impl Envelope<'_> {
-    /// Every entry point screens `consumer_id` through [`stable_consumer_id`], since the id is the primary key of `outbox_consumers`.
+    /// `consumer_id` is the primary key of `outbox_consumers`, so it is stored verbatim through [`identity`], which rejects an id carrying a secret rather than collapsing distinct ids onto one row.
     ///
     /// # Errors
     ///
@@ -24,16 +24,28 @@ impl Envelope<'_> {
         consumer_id: &str,
         recorded_at: i64,
     ) -> Result<i64, KernelError> {
+        if let Some(error) = self.already_poisoned() {
+            return Err(error);
+        }
+        let outcome = self.register_outbox_consumer_inner(consumer_id, recorded_at);
+        self.poison(outcome)
+    }
+
+    fn register_outbox_consumer_inner(
+        &mut self,
+        consumer_id: &str,
+        recorded_at: i64,
+    ) -> Result<i64, KernelError> {
         if recorded_at < 0 {
             return Err(KernelError::InvalidInput);
         }
-        let consumer_id = stable_consumer_id(consumer_id)?;
+        let consumer_id = consumer_identity(consumer_id)?;
         let oldest_commit = self
             .tx
             .query_row("SELECT MIN(commit_seq) FROM outbox", [], |row| {
                 row.get::<_, Option<i64>>(0)
             })
-            .map_err(|_| KernelError::Io)?;
+            .map_err(map_sqlite)?;
         let checkpoint = match oldest_commit {
             Some(commit_seq) => commit_seq.saturating_sub(1),
             None => self.pre_operation_tip()?,
@@ -42,27 +54,15 @@ impl Envelope<'_> {
             .execute(
                 "INSERT INTO outbox_consumers(consumer_id,checkpoint_commit_seq,updated_at)
                  VALUES (?1,?2,?3)",
-                params![consumer_id.text, checkpoint, recorded_at],
+                params![consumer_id, checkpoint, recorded_at],
             )
-            .map_err(|error| match error {
-                rusqlite::Error::SqliteFailure(code, _)
-                    if code.code == rusqlite::ErrorCode::ConstraintViolation =>
-                {
-                    KernelError::Conflict
-                }
-                _ => KernelError::Io,
-            })?;
+            .map_err(map_sqlite)?;
         let audit = serde_json::json!({
-            "consumer_id": consumer_id.text.clone(),
+            "consumer_id": consumer_id.clone(),
             "checkpoint_commit_seq": checkpoint,
             "recorded_at": recorded_at,
         });
-        self.push_control_change(
-            consumer_id.text.clone(),
-            "consumer_register",
-            audit,
-            vec![("consumer_id".to_string(), consumer_id)],
-        );
+        self.push_control_change(consumer_id.clone(), "consumer_register", audit, Vec::new());
         Ok(checkpoint)
     }
 
@@ -76,6 +76,18 @@ impl Envelope<'_> {
         consumer_id: &str,
         recorded_at: i64,
     ) -> Result<(), KernelError> {
+        if let Some(error) = self.already_poisoned() {
+            return Err(error);
+        }
+        let outcome = self.deregister_outbox_consumer_inner(consumer_id, recorded_at);
+        self.poison(outcome)
+    }
+
+    fn deregister_outbox_consumer_inner(
+        &mut self,
+        consumer_id: &str,
+        recorded_at: i64,
+    ) -> Result<(), KernelError> {
         let (consumer_id, checkpoint) = self.consumer_checkpoint(consumer_id, recorded_at)?;
         if checkpoint < self.pre_operation_tip()? {
             return Err(KernelError::ConsumerPending);
@@ -83,19 +95,19 @@ impl Envelope<'_> {
         self.tx
             .execute(
                 "DELETE FROM outbox_consumers WHERE consumer_id=?1",
-                [consumer_id.text.as_str()],
+                [consumer_id.as_str()],
             )
-            .map_err(|_| KernelError::Io)?;
+            .map_err(map_sqlite)?;
         let audit = serde_json::json!({
-            "consumer_id": consumer_id.text.clone(),
+            "consumer_id": consumer_id.clone(),
             "checkpoint_commit_seq": checkpoint,
             "recorded_at": recorded_at,
         });
         self.push_control_change(
-            consumer_id.text.clone(),
+            consumer_id.clone(),
             "consumer_deregister",
             audit,
-            vec![("consumer_id".to_string(), consumer_id)],
+            Vec::new(),
         );
         Ok(())
     }
@@ -111,13 +123,28 @@ impl Envelope<'_> {
         reason: &str,
         abandoned_at: i64,
     ) -> Result<(), KernelError> {
+        if let Some(error) = self.already_poisoned() {
+            return Err(error);
+        }
+        let outcome =
+            self.abandon_outbox_consumer_inner(consumer_id, operator_id, reason, abandoned_at);
+        self.poison(outcome)
+    }
+
+    fn abandon_outbox_consumer_inner(
+        &mut self,
+        consumer_id: &str,
+        operator_id: &str,
+        reason: &str,
+        abandoned_at: i64,
+    ) -> Result<(), KernelError> {
         if operator_id.trim().is_empty() || reason.trim().is_empty() {
             return Err(KernelError::InvalidInput);
         }
         let (consumer_id, checkpoint) = self.consumer_checkpoint(consumer_id, abandoned_at)?;
         let operator_id = redact(operator_id);
         let reason = redact(reason);
-        let abandonment_id = format!("{}:{}", self.commit_seq, consumer_id.text);
+        let abandonment_id = format!("{}:{}", self.commit_seq, consumer_id);
         self.tx
             .execute(
                 "INSERT INTO consumer_abandonments(
@@ -126,7 +153,7 @@ impl Envelope<'_> {
                  ) VALUES (?1,?2,?3,?4,?5,?6,?7)",
                 params![
                     abandonment_id,
-                    consumer_id.text,
+                    consumer_id,
                     operator_id.text,
                     checkpoint,
                     reason.text,
@@ -134,26 +161,25 @@ impl Envelope<'_> {
                     self.commit_seq,
                 ],
             )
-            .map_err(|_| KernelError::Io)?;
+            .map_err(map_sqlite)?;
         self.tx
             .execute(
                 "DELETE FROM outbox_consumers WHERE consumer_id=?1",
-                [consumer_id.text.as_str()],
+                [consumer_id.as_str()],
             )
-            .map_err(|_| KernelError::Io)?;
+            .map_err(map_sqlite)?;
         let audit = serde_json::json!({
-            "consumer_id": consumer_id.text.clone(),
+            "consumer_id": consumer_id.clone(),
             "checkpoint_commit_seq": checkpoint,
             "operator_id": operator_id.text.clone(),
             "reason": reason.text.clone(),
             "abandoned_at": abandoned_at,
         });
         self.push_control_change(
-            consumer_id.text.clone(),
+            consumer_id.clone(),
             "consumer_abandon",
             audit,
             vec![
-                ("consumer_id".to_string(), consumer_id),
                 ("operator_id".to_string(), operator_id),
                 ("reason".to_string(), reason),
             ],
@@ -165,20 +191,20 @@ impl Envelope<'_> {
         &self,
         consumer_id: &str,
         recorded_at: i64,
-    ) -> Result<(RedactedField, i64), KernelError> {
+    ) -> Result<(String, i64), KernelError> {
         if recorded_at < 0 {
             return Err(KernelError::InvalidInput);
         }
-        let consumer_id = stable_consumer_id(consumer_id)?;
+        let consumer_id = consumer_identity(consumer_id)?;
         let checkpoint = self
             .tx
             .query_row(
                 "SELECT checkpoint_commit_seq FROM outbox_consumers WHERE consumer_id=?1",
-                [consumer_id.text.as_str()],
+                [consumer_id.as_str()],
                 |row| row.get::<_, i64>(0),
             )
             .optional()
-            .map_err(|_| KernelError::Io)?
+            .map_err(map_sqlite)?
             .ok_or(KernelError::NotFound)?;
         Ok((consumer_id, checkpoint))
     }
@@ -190,7 +216,7 @@ impl Envelope<'_> {
                 [self.commit_seq],
                 |row| row.get(0),
             )
-            .map_err(|_| KernelError::Io)
+            .map_err(map_sqlite)
     }
 
     fn push_control_change(
@@ -249,7 +275,7 @@ impl KernelStore {
              WHERE outbox_position<=?2 AND published_at IS NULL",
             params![published_at, outbox_position],
         )
-        .map_err(|_| KernelError::Io)?;
+        .map_err(map_sqlite)?;
         tx.execute(
             "INSERT INTO outbox_publication(id,published_through_position,published_at)
              VALUES (0,?1,?2)
@@ -258,8 +284,8 @@ impl KernelStore {
                  published_at=MAX(published_at,?2)",
             params![outbox_position, published_at],
         )
-        .map_err(|_| KernelError::Io)?;
-        tx.commit().map_err(|_| KernelError::Io)
+        .map_err(map_sqlite)?;
+        tx.commit().map_err(map_sqlite)
     }
 
     /// # Errors
@@ -276,17 +302,17 @@ impl KernelStore {
         if checkpoint_commit_seq < 0 || updated_at < 0 {
             return Err(KernelError::InvalidInput);
         }
-        let consumer_id = stable_consumer_id(consumer_id)?;
+        let consumer_id = consumer_identity(consumer_id)?;
         let mut writer = self.lock_writer()?;
         let tx = begin_fenced_write(&mut writer, self.lease_epoch())?;
         let current = tx
             .query_row(
                 "SELECT checkpoint_commit_seq FROM outbox_consumers WHERE consumer_id=?1",
-                [consumer_id.text.as_str()],
+                [consumer_id.as_str()],
                 |row| row.get::<_, i64>(0),
             )
             .optional()
-            .map_err(|_| KernelError::Io)?
+            .map_err(map_sqlite)?
             .ok_or(KernelError::NotFound)?;
         let is_existing_commit = checkpoint_commit_seq == current
             || tx
@@ -295,7 +321,7 @@ impl KernelStore {
                     [checkpoint_commit_seq],
                     |row| row.get::<_, bool>(0),
                 )
-                .map_err(|_| KernelError::Io)?;
+                .map_err(map_sqlite)?;
         if checkpoint_commit_seq < current || !is_existing_commit {
             return Err(KernelError::InvalidCheckpoint);
         }
@@ -303,10 +329,10 @@ impl KernelStore {
             "UPDATE outbox_consumers
              SET checkpoint_commit_seq=?1,updated_at=MAX(updated_at,?2)
              WHERE consumer_id=?3",
-            params![checkpoint_commit_seq, updated_at, consumer_id.text],
+            params![checkpoint_commit_seq, updated_at, consumer_id],
         )
-        .map_err(|_| KernelError::Io)?;
-        tx.commit().map_err(|_| KernelError::Io)
+        .map_err(map_sqlite)?;
+        tx.commit().map_err(map_sqlite)
     }
 
     /// Registered consumers bound the horizon; publication does not. A publisher that needs its own rows retained registers as a consumer, because `published_at` records progress without holding rows back.
@@ -323,7 +349,7 @@ impl KernelStore {
                 [],
                 |row| row.get::<_, Option<i64>>(0),
             )
-            .map_err(|_| KernelError::Io)?
+            .map_err(map_sqlite)?
             .ok_or(KernelError::NoRequiredConsumers)?;
         tx.execute(
             "DELETE FROM durable_text_redactions
@@ -332,25 +358,20 @@ impl KernelStore {
              )",
             [horizon],
         )
-        .map_err(|_| KernelError::Io)?;
+        .map_err(map_sqlite)?;
         let deleted = tx
             .execute("DELETE FROM outbox WHERE commit_seq<=?1", [horizon])
-            .map_err(|_| KernelError::Io)?;
-        tx.commit().map_err(|_| KernelError::Io)?;
+            .map_err(map_sqlite)?;
+        tx.commit().map_err(map_sqlite)?;
         Ok(OutboxPruneResult { horizon, deleted })
     }
 }
 
-/// Redaction is not injective, so an id it rewrites can alias onto a different registered consumer. Screening every entry point, not just registration, keeps one consumer's acknowledgement from advancing another's prune horizon.
-fn stable_consumer_id(consumer_id: &str) -> Result<RedactedField, KernelError> {
+fn consumer_identity(consumer_id: &str) -> Result<String, KernelError> {
     if consumer_id.trim().is_empty() {
         return Err(KernelError::InvalidInput);
     }
-    let redacted = redact(consumer_id);
-    if redacted.text != consumer_id {
-        return Err(KernelError::InvalidInput);
-    }
-    Ok(redacted)
+    identity(consumer_id)
 }
 
 fn published_watermark(tx: &Transaction<'_>) -> Result<i64, KernelError> {
@@ -361,7 +382,7 @@ fn published_watermark(tx: &Transaction<'_>) -> Result<i64, KernelError> {
     )
     .optional()
     .map(|value| value.unwrap_or(0))
-    .map_err(|_| KernelError::Io)
+    .map_err(map_sqlite)
 }
 
 fn is_outbox_commit_boundary(
@@ -379,5 +400,5 @@ fn is_outbox_commit_boundary(
     )
     .optional()
     .map(|value| value.unwrap_or(false))
-    .map_err(|_| KernelError::Io)
+    .map_err(map_sqlite)
 }

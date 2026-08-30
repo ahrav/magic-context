@@ -5,7 +5,7 @@ mod support;
 
 use support::synapse::{
     batch_params, call, constraints, items, open_synapse_route, ready_component, request_key,
-    sha256_hex, test_lane, DeterministicEngine, SynapseHost, BUDGET,
+    send_call, sha256_hex, test_lane, DeterministicEngine, SynapseHost, BUDGET,
 };
 
 use mc_host::synapse::{protocol, SynapseLimits};
@@ -23,7 +23,14 @@ async fn spawn_query(
     let mut params = constraints(lane);
     params["text"] = text.into();
     params["deadline_ms"] = deadline_ms.into();
-    tokio::spawn(async move { call(&mut client, channel, epoch, "embed.query", params).await })
+    let corr = send_call(&mut client, channel, epoch, "embed.query", params).await;
+    tokio::spawn(async move {
+        client
+            .frames_until_corr(corr, BUDGET)
+            .await
+            .expect("query terminal")
+            .1
+    })
 }
 
 async fn yield_until(predicate: impl Fn() -> bool) {
@@ -124,13 +131,42 @@ async fn expired_waiter_releases_its_slot_without_engine_work() {
 
     let first = spawn_query(&host, &lane, "running", 30_000).await;
     yield_until(|| engine.calls.load(std::sync::atomic::Ordering::SeqCst) == 1).await;
-    let expired = spawn_query(&host, &lane, "expired", 10).await;
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
+    let mut expired_client = host.client().await;
+    let (channel, epoch) = open_synapse_route(&mut expired_client).await;
+    let mut expired_params = constraints(&lane);
+    expired_params["text"] = "expired".into();
+    expired_params["deadline_ms"] = 10.into();
+    let expired_corr = send_call(
+        &mut expired_client,
+        channel,
+        epoch,
+        "embed.query",
+        expired_params,
+    )
+    .await;
+    let mut barrier_params = constraints(&lane);
+    barrier_params["text"] = "barrier".into();
+    barrier_params["deadline_ms"] = 30_000.into();
+    let barrier_corr = send_call(
+        &mut expired_client,
+        channel,
+        epoch,
+        "embed.query",
+        barrier_params,
+    )
+    .await;
+    let barrier = expired_client
+        .frames_until_corr(barrier_corr, BUDGET)
+        .await
+        .expect("waiter barrier terminal")
+        .1;
+    assert_eq!(barrier.error_code(), "queue_full");
     tokio::time::advance(std::time::Duration::from_millis(11)).await;
-    yield_until(|| expired.is_finished()).await;
-    let expired_terminal = expired.await.expect("expired query task");
+    let expired_terminal = expired_client
+        .frames_until_corr(expired_corr, BUDGET)
+        .await
+        .expect("expired query terminal")
+        .1;
     assert_eq!(expired_terminal.error_code(), "timeout");
     // The queued-waiter arm (the worker's deadline while waiting for the
     // CPU permit) and the awaiting-result arm carry distinct messages; a
@@ -222,10 +258,39 @@ async fn shutdown_cancels_waiters_but_drains_started_query() {
 
     let started = spawn_query(&host, &lane, "started", 30_000).await;
     yield_until(|| engine.calls.load(std::sync::atomic::Ordering::SeqCst) == 1).await;
-    let waiting = spawn_query(&host, &lane, "waiting", 30_000).await;
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
+    let mut waiting_client = host.client().await;
+    let (channel, epoch) = open_synapse_route(&mut waiting_client).await;
+    let mut waiting_params = constraints(&lane);
+    waiting_params["text"] = "waiting".into();
+    waiting_params["deadline_ms"] = 30_000.into();
+    let waiting_corr = send_call(
+        &mut waiting_client,
+        channel,
+        epoch,
+        "embed.query",
+        waiting_params,
+    )
+    .await;
+
+    // Same-generation FIFO makes this a barrier: the second query can report
+    // overload only after the first query occupies the sole waiter slot.
+    let mut overflow_params = constraints(&lane);
+    overflow_params["text"] = "overflow".into();
+    overflow_params["deadline_ms"] = 30_000.into();
+    let overflow_corr = send_call(
+        &mut waiting_client,
+        channel,
+        epoch,
+        "embed.query",
+        overflow_params,
+    )
+    .await;
+    let overflow = waiting_client
+        .frames_until_corr(overflow_corr, BUDGET)
+        .await
+        .expect("waiter barrier terminal")
+        .1;
+    assert_eq!(overflow.error_code(), "queue_full");
 
     let shutdown = tokio::spawn(host.shutdown());
     for _ in 0..100 {
@@ -243,7 +308,11 @@ async fn shutdown_cancels_waiters_but_drains_started_query() {
         .expect("shutdown task")
         .expect("graceful shutdown");
     let _started_terminal = started.await.expect("started query task");
-    let waiting_terminal = waiting.await.expect("waiting query task");
+    let waiting_terminal = waiting_client
+        .frames_until_corr(waiting_corr, BUDGET)
+        .await
+        .expect("waiting query terminal")
+        .1;
     assert_eq!(waiting_terminal.error_code(), "cancelled");
     // Two producers emit `cancelled`: route settlement's generation cancel
     // ("request cancelled") and the component's own shutdown arm ("the host

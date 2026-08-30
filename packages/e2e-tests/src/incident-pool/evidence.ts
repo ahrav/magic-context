@@ -44,8 +44,8 @@ import { validateCommittedMatrix } from "../../scripts/validate-shm-hardening-ma
 export const E2E_ROOT = resolve(import.meta.dir, "..", "..");
 export const REPO_ROOT = resolve(E2E_ROOT, "..", "..");
 
-export const EXPECTED_MUTATION_ARTIFACTS = 20;
-export const EXPECTED_MUTATION_RECORDS = 27;
+export const EXPECTED_MUTATION_ARTIFACTS = 13;
+export const EXPECTED_MUTATION_RECORDS = 21;
 
 export const AUDIT_SOURCE_PATH = "docs/AUDIT-KNOWN-ISSUES.md";
 export const AUDITOR_SOURCE_PATH = "AUDITOR.md";
@@ -114,27 +114,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** A deferred record is an UNPROVEN hardening claim, so tolerating it is only
- *  defensible while the failure-hardening matrix is still unresolved — the exact
- *  condition every deferral cites, and the condition under which tuple-specific
- *  execution is blocked anyway. Freezing the matrix unblocks that execution, at
- *  which point a deferral is an untested claim riding through the very gate that
- *  exists to stop it. `invalid` is not a licence either: a matrix that fails its
- *  own validation says nothing about whether the drill is inapplicable. */
-export function deferralPermittedFor(
-    outcome: ReturnType<typeof validateCommittedMatrix>["outcome"],
-): boolean {
-    return outcome === "unresolved";
-}
-
-/** Fail closed on a deferral the matrix state no longer justifies. Re-read per
- *  call rather than cached: the manifest is small, only a deferred record
- *  triggers it, and a cached verdict would go stale the moment the matrix
- *  freezes. */
+/** Fail closed because the fixed-ring matrix has no unresolved state. */
 function assertDeferralStillPermitted(label: string): void {
-    if (deferralPermittedFor(validateCommittedMatrix().outcome)) return;
+    const outcome = validateCommittedMatrix().outcome;
     throw new Error(
-        `${label} is deferred, but the failure_hardening matrix is no longer unresolved: freezing it unblocks tuple execution, so this claim needs a real mutation record instead of a deferral`,
+        `${label} is deferred, but the fixed-ring matrix is ${outcome}: this claim needs a real mutation record instead of a deferral`,
     );
 }
 

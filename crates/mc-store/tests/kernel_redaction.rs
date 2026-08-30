@@ -3,12 +3,14 @@
 use std::fs;
 
 use mc_store::kernel::{
-    CommitIntent, DomainSpec, KernelErrorKind, KernelStore, RepositoryProvenance, Sensitivity,
+    CommitIntent, DomainSpec, KernelError, KernelStore, RepositoryProvenance, Sensitivity,
     StagingCandidateSpec,
 };
 use rusqlite::{Connection, OpenFlags};
 
 const SECRET: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwxyzABCDEFGH12345678";
+const SECRET_MASK: &str = "<ANTHROPIC_API_KEY_REDACTED>";
+const CONTROL: &str = "redacted-domain";
 
 fn intent(key: &str, digest: char) -> CommitIntent {
     CommitIntent {
@@ -22,26 +24,39 @@ fn intent(key: &str, digest: char) -> CommitIntent {
 
 fn domain() -> DomainSpec {
     DomainSpec {
-        domain_id: "redacted-domain".to_string(),
+        domain_id: CONTROL.to_string(),
         object_id: "redacted-object".to_string(),
-        name: format!("name {SECRET}"),
+        name: "redacted-name".to_string(),
         source_kind: "fixture".to_string(),
-        source_id: format!("source {SECRET}"),
+        source_id: "redacted-source".to_string(),
         source_revision: 1,
         sensitivity: Sensitivity::Sensitive,
     }
 }
 
+/// A zero-byte scan would satisfy every absence assertion below, so an empty result is a test failure rather than a pass.
 fn family_bytes(root: &std::path::Path) -> Vec<u8> {
     let base = root.join("core.sqlite");
-    [
-        base.clone(),
-        std::path::PathBuf::from(format!("{}-wal", base.display())),
-    ]
-    .into_iter()
-    .filter_map(|path| fs::read(path).ok())
-    .flatten()
-    .collect()
+    let mut bytes = fs::read(&base).expect("main database is readable");
+    let wal = std::path::PathBuf::from(format!("{}-wal", base.display()));
+    if wal.exists() {
+        bytes.extend(fs::read(&wal).expect("write-ahead log is readable"));
+    }
+    assert!(!bytes.is_empty(), "scanned zero bytes");
+    bytes
+}
+
+fn assert_absent_and_scan_is_live(root: &std::path::Path) {
+    let bytes = family_bytes(root);
+    assert!(
+        bytes
+            .windows(CONTROL.len())
+            .any(|window| window == CONTROL.as_bytes()),
+        "scan did not observe stored text, so an absence check would be vacuous"
+    );
+    assert!(!bytes
+        .windows(SECRET.len())
+        .any(|window| window == SECRET.as_bytes()));
 }
 
 fn inspect_text(root: &std::path::Path, sql: &str) -> String {
@@ -62,16 +77,20 @@ fn envelope_redacts_before_bind_and_never_leaks_secret_to_storage_or_errors() {
         })
         .unwrap();
     assert!(!receipt.result.contains(SECRET));
-    assert!(inspect_text(directory.path(), "SELECT actor FROM commit_log").contains("REDACTED"));
-    assert!(inspect_text(directory.path(), "SELECT name FROM domains").contains("REDACTED"));
-    assert!(!family_bytes(directory.path())
-        .windows(SECRET.len())
-        .any(|window| window == SECRET.as_bytes()));
+    assert_eq!(
+        inspect_text(directory.path(), "SELECT actor FROM commit_log"),
+        format!("actor {SECRET_MASK}")
+    );
+    assert_eq!(
+        inspect_text(directory.path(), "SELECT cause FROM commit_log"),
+        format!("cause {SECRET_MASK}")
+    );
+    assert_absent_and_scan_is_live(directory.path());
 
     let conflict = store
         .commit(intent("secret-operation", 'b'), |_| Ok(String::new()))
         .unwrap_err();
-    assert_eq!(conflict.kind(), KernelErrorKind::Conflict);
+    assert_eq!(conflict, KernelError::Conflict);
     assert!(!conflict.to_string().contains(SECRET));
     assert!(!format!("{conflict:?}").contains(SECRET));
 
@@ -82,15 +101,20 @@ fn envelope_redacts_before_bind_and_never_leaks_secret_to_storage_or_errors() {
     .unwrap();
     let metadata: (String, String, i64, i64) = connection
         .query_row(
-            "SELECT detector_id,secret_type,utf8_offset,utf8_length
-             FROM durable_text_redactions ORDER BY owner_kind,field_name LIMIT 1",
+            "SELECT detector_id,secret_type,source_utf8_offset,source_utf8_length
+             FROM durable_text_redactions
+             WHERE owner_kind='commit_log' AND field_name='actor'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .unwrap();
     assert_eq!(metadata.0, "redaction-vocabulary-v1");
     assert_eq!(metadata.1, "anthropic_api_key");
-    assert!(metadata.2 >= 0 && metadata.3 > 0);
+    // The span indexes the pre-redaction input: "actor " is 6 bytes, then the secret.
+    assert_eq!(
+        (metadata.2, metadata.3),
+        (6, i64::try_from(SECRET.len()).unwrap())
+    );
     let owner_kinds = connection
         .prepare("SELECT DISTINCT owner_kind FROM durable_text_redactions ORDER BY owner_kind")
         .unwrap()
@@ -98,7 +122,7 @@ fn envelope_redacts_before_bind_and_never_leaks_secret_to_storage_or_errors() {
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    for expected in ["change_event", "commit_log", "operation_receipt", "outbox"] {
+    for expected in ["commit_log", "operation_receipt"] {
         assert!(
             owner_kinds.iter().any(|kind| kind == expected),
             "{expected}"
@@ -125,8 +149,33 @@ fn staging_requires_affirmative_repository_provenance_for_normal() {
             lease_expires_at: 2,
         })
         .unwrap();
-    assert_eq!(unknown.sensitivity, Sensitivity::Sensitive);
+    assert_eq!(
+        unknown.sensitivity,
+        Sensitivity::Secret,
+        "a vocabulary detection is secret, not merely sensitive"
+    );
     assert!(!unknown.payload.contains(SECRET));
+
+    let unproven_clean = store
+        .stage_candidate(StagingCandidateSpec {
+            extraction_run_id: "run-unproven-clean".to_string(),
+            candidate_id: "candidate-unproven-clean".to_string(),
+            extractor: "fixture".to_string(),
+            source_kind: "tool".to_string(),
+            source_id: "unknown-clean".to_string(),
+            source_revision: 1,
+            candidate_kind: "observation".to_string(),
+            payload: "no secret here".to_string(),
+            provenance: None,
+            recorded_at: 1,
+            lease_expires_at: 2,
+        })
+        .unwrap();
+    assert_eq!(
+        unproven_clean.sensitivity,
+        Sensitivity::Sensitive,
+        "unproven provenance defaults to sensitive"
+    );
 
     let proven = store
         .stage_candidate(StagingCandidateSpec {
@@ -147,7 +196,8 @@ fn staging_requires_affirmative_repository_provenance_for_normal() {
         })
         .unwrap();
     assert_eq!(proven.sensitivity, Sensitivity::Normal);
-    assert!(!family_bytes(directory.path())
+    let bytes = family_bytes(directory.path());
+    assert!(!bytes
         .windows(SECRET.len())
         .any(|window| window == SECRET.as_bytes()));
 }
@@ -221,7 +271,7 @@ fn staging_run_reuse_with_changed_immutable_metadata_is_a_typed_conflict() {
     let mut mismatch = shared_run_candidate("candidate-b", 5);
     mismatch.source_id = "different-source".to_string();
     let error = store.stage_candidate(mismatch).unwrap_err();
-    assert_eq!(error.kind(), KernelErrorKind::Conflict);
+    assert_eq!(error, KernelError::Conflict);
 
     let connection = Connection::open_with_flags(
         directory.path().join("core.sqlite"),
@@ -243,4 +293,239 @@ fn staging_run_reuse_with_changed_immutable_metadata_is_a_typed_conflict() {
         )
         .unwrap();
     assert_eq!(renewal, (1, 11));
+}
+
+#[test]
+fn one_run_accepts_candidates_with_different_classifications() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let mut clean = shared_run_candidate("candidate-clean", 1);
+    clean.payload = "public source".to_string();
+    let mut secret = shared_run_candidate("candidate-secret", 2);
+    secret.payload = format!("payload {SECRET}");
+
+    assert_eq!(
+        store.stage_candidate(clean).unwrap().sensitivity,
+        Sensitivity::Normal
+    );
+    assert_eq!(
+        store.stage_candidate(secret).unwrap().sensitivity,
+        Sensitivity::Secret
+    );
+
+    let connection = Connection::open_with_flags(
+        directory.path().join("core.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let run_class: String = connection
+        .query_row("SELECT sensitivity_class FROM extraction_runs", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        run_class, "normal",
+        "run classification must not follow one candidate"
+    );
+    let mut classes = connection
+        .prepare("SELECT sensitivity_class FROM candidates ORDER BY candidate_id")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    classes.sort();
+    assert_eq!(classes, ["normal", "secret"]);
+}
+
+#[test]
+fn run_identity_fields_reject_a_detected_secret() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    for mutate in [
+        |spec: &mut StagingCandidateSpec| spec.source_id = format!("src {SECRET}"),
+        |spec: &mut StagingCandidateSpec| spec.extractor = format!("tool {SECRET}"),
+    ] {
+        let mut spec = shared_run_candidate("candidate-a", 1);
+        mutate(&mut spec);
+        assert_eq!(
+            store.stage_candidate(spec).unwrap_err(),
+            KernelError::InvalidInput
+        );
+    }
+}
+
+#[test]
+fn a_terminal_or_expired_run_refuses_further_candidates() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    store
+        .stage_candidate(shared_run_candidate("candidate-a", 1))
+        .unwrap();
+
+    // recorded_at past the stored lease_expires_at of 11.
+    assert_eq!(
+        store
+            .stage_candidate(shared_run_candidate("candidate-late", 99))
+            .unwrap_err(),
+        KernelError::Conflict
+    );
+
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE extraction_runs SET terminal_state='completed',terminal_at=5",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    assert_eq!(
+        store
+            .stage_candidate(shared_run_candidate("candidate-after-terminal", 2))
+            .unwrap_err(),
+        KernelError::Conflict
+    );
+}
+
+#[test]
+fn a_run_whose_lease_expires_exactly_now_is_not_resurrected() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    // shared_run_candidate(_, 1) stores lease_expires_at = 11.
+    store
+        .stage_candidate(shared_run_candidate("candidate-a", 1))
+        .unwrap();
+    assert_eq!(
+        store
+            .stage_candidate(shared_run_candidate("candidate-boundary", 11))
+            .unwrap_err(),
+        KernelError::Conflict
+    );
+    store
+        .stage_candidate(shared_run_candidate("candidate-live", 10))
+        .unwrap();
+}
+
+#[test]
+fn a_zero_duration_lease_is_invalid_input_not_a_conflict() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let mut spec = shared_run_candidate("candidate-zero", 5);
+    spec.lease_expires_at = spec.recorded_at;
+    assert_eq!(
+        store.stage_candidate(spec).unwrap_err(),
+        KernelError::InvalidInput
+    );
+}
+
+#[test]
+fn a_lease_beyond_the_one_hour_ceiling_is_rejected() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let mut over = shared_run_candidate("candidate-over", 1_000);
+    over.lease_expires_at = over.recorded_at + 3_600_001;
+    assert_eq!(
+        store.stage_candidate(over).unwrap_err(),
+        KernelError::InvalidInput
+    );
+
+    let mut saturating = shared_run_candidate("candidate-saturating", 1_000);
+    saturating.recorded_at = i64::MAX;
+    saturating.lease_expires_at = i64::MAX;
+    assert_eq!(
+        store.stage_candidate(saturating).unwrap_err(),
+        KernelError::InvalidInput,
+        "the ceiling must use checked arithmetic"
+    );
+
+    let mut exact = shared_run_candidate("candidate-exact", 1_000);
+    exact.lease_expires_at = exact.recorded_at + 3_600_000;
+    store.stage_candidate(exact).unwrap();
+}
+
+#[test]
+fn a_blank_commit_identity_component_is_rejected() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    for (producer, operation_key) in [("", "op"), ("   ", "op"), ("prod", ""), ("prod", "\t")] {
+        let mut bad = intent("unused", 'a');
+        bad.producer = producer.to_string();
+        bad.operation_key = operation_key.to_string();
+        assert_eq!(
+            store.commit(bad, |_| Ok(String::new())).unwrap_err(),
+            KernelError::InvalidInput,
+            "producer={producer:?} operation_key={operation_key:?}"
+        );
+    }
+    assert_eq!(
+        inspect_count(directory.path(), "SELECT COUNT(*) FROM commit_log"),
+        0
+    );
+}
+
+fn inspect_count(root: &std::path::Path, sql: &str) -> i64 {
+    let connection =
+        Connection::open_with_flags(root.join("core.sqlite"), OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    connection.query_row(sql, [], |row| row.get(0)).unwrap()
+}
+
+#[test]
+fn an_identical_restage_replays_instead_of_conflicting() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let first = store
+        .stage_candidate(shared_run_candidate("candidate-a", 1))
+        .unwrap();
+    let replay = store
+        .stage_candidate(shared_run_candidate("candidate-a", 1))
+        .unwrap();
+    assert_eq!(
+        replay, first,
+        "an unchanged retry must return the stored row"
+    );
+    assert_eq!(
+        inspect_count(directory.path(), "SELECT COUNT(*) FROM candidates"),
+        1
+    );
+
+    let mut changed = shared_run_candidate("candidate-a", 1);
+    changed.payload = "different content".to_string();
+    assert_eq!(
+        store.stage_candidate(changed).unwrap_err(),
+        KernelError::Conflict,
+        "mismatched content keeps its conflict"
+    );
+}
+
+#[test]
+fn a_reused_candidate_id_does_not_collide_with_deleted_redaction_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let mut secret_candidate = shared_run_candidate("candidate-reused", 1);
+    secret_candidate.payload = format!("payload {SECRET}");
+    store.stage_candidate(secret_candidate).unwrap();
+
+    // Simulate the reaper cascade, which removes the candidate but leaves its
+    // polymorphic redaction rows behind.
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "DELETE FROM candidates WHERE candidate_id='candidate-reused'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut reused = shared_run_candidate("candidate-reused", 2);
+    reused.payload = format!("second {SECRET}");
+    store.stage_candidate(reused).unwrap();
+    assert_eq!(
+        inspect_count(
+            directory.path(),
+            "SELECT COUNT(*) FROM durable_text_redactions
+             WHERE owner_kind='staging_candidate' AND owner_id='candidate-reused'"
+        ),
+        1
+    );
 }

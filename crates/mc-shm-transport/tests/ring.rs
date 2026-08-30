@@ -1,5 +1,6 @@
+use std::os::fd::OwnedFd;
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 #[cfg(target_os = "linux")]
@@ -8,13 +9,10 @@ use std::time::Instant;
 
 use mc_shm_transport::backend::ring::{wire_v2_header, ProducerError, Ring, RingError, RingGrant};
 use mc_shm_transport::descriptor::{
-    BackendId, HardwareProfileId, Incarnation, MemoryLayout, OwnershipMode, PlatformKind,
-    ReleaseIdentity, RuntimeKind, SchedulingMode, TransportDescriptor, WorkloadClass,
+    HardwareProfileId, Incarnation, ReleaseIdentity, SchedulingMode, TransportDescriptor,
 };
 use mc_shm_transport::lease::LeaseError;
-use mc_shm_transport::profile::{
-    ring_profile, CompletionMode, ProducerTopology, ProfileConfig, TargetProfile, WorkerTopology,
-};
+use mc_shm_transport::profile::{ring_profile, ProfileConfig, TargetProfile, WorkerTopology};
 use mc_shm_transport::MAX_FRAME_BYTES;
 
 fn profile() -> TargetProfile {
@@ -28,17 +26,7 @@ fn profile() -> TargetProfile {
 fn lease_limited_profile() -> TargetProfile {
     TargetProfile::new(ProfileConfig {
         descriptor: TransportDescriptor::new(
-            BackendId::Ring,
-            MemoryLayout::TwoSpanWrap,
-            OwnershipMode::DirectLeased,
             SchedulingMode::ColdParkWake,
-            WorkloadClass::MixedDuplex,
-            if cfg!(target_os = "macos") {
-                PlatformKind::Macos
-            } else {
-                PlatformKind::Linux
-            },
-            RuntimeKind::Rust,
             HardwareProfileId::new("ring-lease-limit").unwrap(),
         ),
         descriptor_depth: 2,
@@ -47,9 +35,7 @@ fn lease_limited_profile() -> TargetProfile {
         max_leases: 1,
         mappings: 2,
         pinned_workers: 0,
-        producer_topology: ProducerTopology::CallerConfined,
         worker_topology: WorkerTopology::CallerThread,
-        completion_mode: CompletionMode::SynchronousPull,
     })
     .unwrap()
 }
@@ -306,17 +292,7 @@ fn lease_limit_reports_backpressure_then_recovers_after_release() {
 fn one_span_profile_is_rejected_at_creation() {
     let profile = TargetProfile::new(ProfileConfig {
         descriptor: TransportDescriptor::new(
-            BackendId::Ring,
-            MemoryLayout::TwoSpanWrap,
-            OwnershipMode::DirectLeased,
             SchedulingMode::ColdParkWake,
-            WorkloadClass::MixedDuplex,
-            if cfg!(target_os = "macos") {
-                PlatformKind::Macos
-            } else {
-                PlatformKind::Linux
-            },
-            RuntimeKind::Rust,
             HardwareProfileId::new("ring-one-span").unwrap(),
         ),
         descriptor_depth: 2,
@@ -325,9 +301,7 @@ fn one_span_profile_is_rejected_at_creation() {
         max_leases: 1,
         mappings: 2,
         pinned_workers: 0,
-        producer_topology: ProducerTopology::CallerConfined,
         worker_topology: WorkerTopology::CallerThread,
-        completion_mode: CompletionMode::SynchronousPull,
     })
     .unwrap();
     assert!(matches!(
@@ -388,12 +362,21 @@ fn duplicate_fd(raw: i32) -> OwnedFd {
 }
 
 #[cfg(target_os = "linux")]
+fn mapped_region_count() -> usize {
+    std::fs::read_to_string("/proc/self/maps")
+        .expect("read process mappings")
+        .lines()
+        .count()
+}
+
+#[cfg(target_os = "linux")]
 #[test]
-fn attach_rejects_unsealed_objects_and_tampered_grants() {
+fn artifact_mismatch_fails_before_mapping_and_unsealed_objects_are_rejected() {
     let ring = Ring::create(&profile(), 21).unwrap();
     let base = ring.grant().encode();
 
-    // Geometry tampering fails closed inside the pure grant decoder.
+    // Layout-identity and geometry mismatches fail in the pure decoder before
+    // an object descriptor can reach mapping or attachment.
     let mut version = base;
     version[0..2].copy_from_slice(&1u16.to_le_bytes());
     let mut zero_depth = base;
@@ -433,6 +416,7 @@ fn attach_rejects_unsealed_objects_and_tampered_grants() {
     lane[18] ^= 1;
     for bytes in [incarnation, lane] {
         let grant = RingGrant::decode(bytes).unwrap();
+        let before = mapped_region_count();
         assert!(matches!(
             Ring::attach(
                 duplicate_fd(ring.raw_fd()),
@@ -441,6 +425,10 @@ fn attach_rejects_unsealed_objects_and_tampered_grants() {
             ),
             Err(RingError::InvalidGrant)
         ));
+        assert!(
+            mapped_region_count() <= before,
+            "identity mismatch increased mapped memory"
+        );
     }
 
     let name = c"mc-shm-unsealed-test";
@@ -460,8 +448,23 @@ fn attach_rejects_unsealed_objects_and_tampered_grants() {
         0
     );
     assert_eq!(unsafe { libc::fchmod(unsealed.as_raw_fd(), 0o600) }, 0);
+    let before = mapped_region_count();
     assert!(matches!(
         Ring::attach(unsealed, ring.grant(), SchedulingMode::ColdParkWake),
+        Err(RingError::ObjectValidationFailed)
+    ));
+    assert!(
+        mapped_region_count() <= before,
+        "unsealed object increased mapped memory"
+    );
+}
+
+#[test]
+fn non_regular_attachment_object_is_rejected_before_mapping() {
+    let ring = Ring::create(&profile(), 41).unwrap();
+    let fd: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+    assert!(matches!(
+        Ring::attach(fd, ring.grant(), SchedulingMode::ColdParkWake),
         Err(RingError::ObjectValidationFailed)
     ));
 }
@@ -514,8 +517,7 @@ fn golden_grant_fixture_matches_the_frozen_ring_profile_encoding() {
     assert_eq!(
         text,
         GOLDEN_GRANT_HEX.replace(char::is_whitespace, ""),
-        "the checked-in fixture bytes moved; update the copy of this hex in \
-         packages/plugin/src/shared/mc-host-client/shm-transport-provider.test.ts too"
+        "the checked-in fixture bytes moved unexpectedly"
     );
     let grant = RingGrant::decode_slice(&bytes).expect("golden grant fixture decodes");
     assert_eq!(
@@ -530,6 +532,14 @@ fn golden_grant_fixture_matches_the_frozen_ring_profile_encoding() {
         u16::from_le_bytes([bytes[0], bytes[1]]),
         2,
         "layout version"
+    );
+    assert_eq!(
+        &bytes[2..18],
+        &[
+            0xd4, 0x89, 0xc0, 0x7e, 0xe4, 0x63, 0x33, 0xa5, 0xfe, 0x79, 0x01, 0xdf, 0x35, 0x6f,
+            0x6f, 0x46
+        ],
+        "incarnation identity"
     );
     assert_eq!(
         u32::from_le_bytes(bytes[18..22].try_into().unwrap()),

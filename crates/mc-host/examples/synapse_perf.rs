@@ -32,7 +32,7 @@ use perf_measurement::{
     LogicalRecord, ServiceSample, SynapseMethod, SynapseVariant, WindowClass,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::net::TcpStream;
+use tokio::net::UnixStream;
 use tokio::sync::{oneshot, Mutex};
 
 const ROOT: &str = "/workspace/synapse-perf";
@@ -443,7 +443,7 @@ struct WireReply {
 }
 
 struct RoutedWire {
-    writer: Mutex<WriteHalf<TcpStream>>,
+    writer: Mutex<WriteHalf<UnixStream>>,
     pending: Mutex<HashMap<u64, oneshot::Sender<(raw_client::RawFrame, u64)>>>,
     /// Correlations whose caller gave up (attempt timeout) but whose
     /// terminal may still arrive. Without this, a late terminal looks
@@ -509,9 +509,6 @@ impl RoutedWire {
             )
             .await?;
         let stream = client.into_stream();
-        stream
-            .set_nodelay(true)
-            .map_err(|error| format!("set TCP_NODELAY: {error}"))?;
         let (reader, writer) = tokio::io::split(stream);
         let wire = Arc::new(Self {
             writer: Mutex::new(writer),
@@ -670,7 +667,7 @@ impl RoutedWire {
 }
 
 async fn read_terminals(
-    mut reader: ReadHalf<TcpStream>,
+    mut reader: ReadHalf<tokio::net::UnixStream>,
     wire: Arc<RoutedWire>,
 ) -> Result<(), String> {
     loop {
@@ -2410,27 +2407,19 @@ mod tests {
         // fetch_add outside the writer lock lets two tasks write inverted
         // correlations, which this assertion catches.
         const CALLERS: usize = 256;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind loopback listener");
-        let addr = listener.local_addr().expect("listener address");
+        let (stream, mut peer) = UnixStream::pair().expect("create local stream pair");
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
             let mut corrs = Vec::with_capacity(CALLERS);
             for _ in 0..CALLERS {
                 let mut header = [0u8; raw_client::HEADER_LEN];
-                stream
-                    .read_exact(&mut header)
-                    .await
-                    .expect("request header");
+                peer.read_exact(&mut header).await.expect("request header");
                 let frame = raw_client::decode_header(&header);
                 let mut body = vec![0u8; frame.len as usize];
-                stream.read_exact(&mut body).await.expect("request body");
+                peer.read_exact(&mut body).await.expect("request body");
                 corrs.push(frame.corr);
             }
             corrs
         });
-        let stream = TcpStream::connect(addr).await.expect("connect loopback");
         let (_reader, writer) = tokio::io::split(stream);
         let wire = Arc::new(RoutedWire {
             writer: Mutex::new(writer),
