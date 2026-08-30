@@ -281,7 +281,6 @@ describe("daemon command contract", () => {
                             pinned_workers: 1,
                         },
                     },
-                    attachment: { completed: 41 },
                     activation: { completed: 37 },
                     peer_death: { observed: 31 },
                     reclamation: { completed: 29 },
@@ -294,7 +293,7 @@ describe("daemon command contract", () => {
         expect(rendered).toContain("profile=mc-host-test-ring-v1 wire=2 descriptor=2");
         expect(rendered).toContain("active_bytes=134217728");
         expect(rendered).toContain("quarantined_bytes=8388608");
-        expect(rendered).toContain("attachments=41 activations=37");
+        expect(rendered).toContain("activations=37");
         expect(rendered).toContain("peer_deaths=31 reclamations=29 exhaustions=23");
     });
 

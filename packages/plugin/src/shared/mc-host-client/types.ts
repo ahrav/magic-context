@@ -85,7 +85,6 @@ export interface SharedMemoryDiagnostics {
         active: SharedMemoryResourceCounts;
         quarantined: SharedMemoryResourceCounts;
     } | null;
-    attachment: { completed: number };
     activation: { completed: number };
     peer_death: { observed: number };
     reclamation: { completed: number };

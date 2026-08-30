@@ -842,12 +842,13 @@ export class McHostClient {
                 cached.handle = null;
             }
         }
+        const terminalClass = terminalRetirementClass(info.reason);
         this.emitDiagnostics({
             type: "retired",
             reason: info.reason,
-            ...(isPeerDeath(info.reason)
-                ? { health: "terminal" as const, errorClass: "peer_death" as const }
-                : {}),
+            ...(terminalClass === undefined
+                ? {}
+                : { health: "terminal" as const, errorClass: terminalClass }),
         });
     }
 
@@ -1667,7 +1668,6 @@ export function parseSharedMemoryDiagnostics(value: unknown): SharedMemoryDiagno
             "artifact",
             "bounds",
             "accounting",
-            "attachment",
             "activation",
             "peer_death",
             "reclamation",
@@ -1724,9 +1724,6 @@ export function parseSharedMemoryDiagnostics(value: unknown): SharedMemoryDiagno
         },
         bounds: parseResourceCounts(record.bounds, "shared_memory.bounds"),
         accounting,
-        attachment: parseCounter(record.attachment, "completed", "shared_memory.attachment") as {
-            completed: number;
-        },
         activation: parseCounter(record.activation, "completed", "shared_memory.activation") as {
             completed: number;
         },
@@ -1742,10 +1739,23 @@ export function parseSharedMemoryDiagnostics(value: unknown): SharedMemoryDiagno
     };
 }
 
-function isPeerDeath(reason: RetirementReason): boolean {
-    // A dead peer reaches this client as a channel EOF;
-    // `FrameChannelCloseReason` carries no socket-level variants.
-    return reason === "eof";
+function terminalRetirementClass(reason: RetirementReason): SharedMemoryTerminalClass | undefined {
+    switch (reason) {
+        // A dead peer reaches this client as a channel EOF;
+        // `FrameChannelCloseReason` carries no socket-level variants.
+        case "eof":
+            return "peer_death";
+        // `ShmFrameChannel` retires the generation on these when ring decoding
+        // or lease cleanup fails. The closed class vocabulary has no corruption
+        // member, so they report the generic setup class rather than leaving a
+        // terminal retirement unclassified.
+        case "protocol_violation":
+        case "role_violation":
+        case "quarantined":
+            return "setup_failure";
+        default:
+            return undefined;
+    }
 }
 
 /**

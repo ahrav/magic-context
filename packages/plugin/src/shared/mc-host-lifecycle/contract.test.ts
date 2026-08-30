@@ -67,7 +67,6 @@ function healthySharedMemory(): Record<string, unknown> {
         },
         bounds: { ...zero, arena_bytes: 134_217_728 },
         accounting: { active: zero, quarantined: zero },
-        attachment: { completed: 1 },
         activation: { completed: 1 },
         peer_death: { observed: 0 },
         reclamation: { completed: 0 },
@@ -76,6 +75,33 @@ function healthySharedMemory(): Record<string, unknown> {
 }
 
 describe("parseDaemonResult", () => {
+    test("the accepted ring-diagnostics keys are exactly what the host emits", () => {
+        expect(Object.keys(healthySharedMemory()).sort()).toEqual([
+            "accounting",
+            "activation",
+            "artifact",
+            "bounds",
+            "error_class",
+            "exhaustion",
+            "peer_death",
+            "reclamation",
+            "state",
+        ]);
+        const parsed = parseDaemonResult(
+            JSON.stringify(validResult({ shared_memory: healthySharedMemory() })),
+        );
+        expect(parsed.shared_memory?.state).toBe("healthy");
+        expect(() =>
+            parseDaemonResult(
+                JSON.stringify(
+                    validResult({
+                        shared_memory: { ...healthySharedMemory(), attachment: { completed: 1 } },
+                    }),
+                ),
+            ),
+        ).toThrow(/shared_memory/);
+    });
+
     test("accepts a fully populated conforming result", () => {
         const parsed = parseDaemonResult(JSON.stringify(validResult()));
         expect(parsed.command).toBe("status");

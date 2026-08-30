@@ -67,7 +67,7 @@ A healthy report includes only bounded, aggregate data:
 - fixed artifact identity;
 - process bounds;
 - active and quarantined accounting;
-- completed attachment and activation counts;
+- completed activation count;
 - observed peer-death count;
 - completed reclamation count;
 - observed exhaustion count.

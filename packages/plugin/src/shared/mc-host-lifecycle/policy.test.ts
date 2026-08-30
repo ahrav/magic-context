@@ -45,7 +45,6 @@ function healthySharedMemory() {
         },
         bounds: zero,
         accounting: { active: zero, quarantined: zero },
-        attachment: { completed: 1 },
         activation: { completed: 1 },
         peer_death: { observed: 0 },
         reclamation: { completed: 0 },

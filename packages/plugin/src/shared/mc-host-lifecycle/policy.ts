@@ -1047,7 +1047,6 @@ function terminalSharedMemoryDiagnostics(
         },
         bounds: ZERO_RESOURCE_COUNTS,
         accounting: null,
-        attachment: { completed: 0 },
         activation: { completed: 0 },
         peer_death: { observed: errorClass === "peer_death" ? 1 : 0 },
         reclamation: { completed: 0 },

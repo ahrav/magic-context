@@ -145,10 +145,10 @@ export function renderDaemonHuman(result: DaemonResultV1): string {
             `Ring artifact: profile=${diagnostic.artifact.profile} wire=${diagnostic.artifact.wire_version} descriptor=${diagnostic.artifact.descriptor_schema}`,
         );
         lines.push(
-            `Ring accounting: active_bytes=${diagnostic.accounting?.active.arena_bytes ?? 0} quarantined_bytes=${diagnostic.accounting?.quarantined.arena_bytes ?? 0} bound_bytes=${diagnostic.bounds.arena_bytes}`,
+            `Ring accounting: active_bytes=${diagnostic.accounting?.active.arena_bytes ?? "unknown"} quarantined_bytes=${diagnostic.accounting?.quarantined.arena_bytes ?? "unknown"} bound_bytes=${diagnostic.bounds.arena_bytes}`,
         );
         lines.push(
-            `Ring lifecycle: attachments=${diagnostic.attachment.completed} activations=${diagnostic.activation.completed} peer_deaths=${diagnostic.peer_death.observed} reclamations=${diagnostic.reclamation.completed} exhaustions=${diagnostic.exhaustion.observed}`,
+            `Ring lifecycle: activations=${diagnostic.activation.completed} peer_deaths=${diagnostic.peer_death.observed} reclamations=${diagnostic.reclamation.completed} exhaustions=${diagnostic.exhaustion.observed}`,
         );
     }
     for (const check of result.checks) {
