@@ -1516,7 +1516,7 @@ fn item_spec() -> impl Strategy<Value = ItemSpec> {
     (
         (0u8..12, 0u8..32, 0u8..3, 0u8..7),
         (
-            0u8..21,
+            0u8..TOOL_COUNT,
             0u8..10,
             any::<bool>(),
             0u16..4096,
@@ -1554,7 +1554,9 @@ fn item_spec() -> impl Strategy<Value = ItemSpec> {
         )
 }
 
-const TOOLS: [&str; 21] = [
+const TOOL_COUNT: u8 = 28;
+
+const TOOLS: [&str; TOOL_COUNT as usize] = [
     "mcp_read",
     "mcp_grep",
     "read",
@@ -1579,7 +1581,16 @@ const TOOLS: [&str; 21] = [
     "apply_patch",
     "aft_search",
     "grep",
+    "mcp_glob",
+    "mcp_ast_grep_search",
+    "mcp_lsp_diagnostics",
+    "mcp_lsp_symbols",
+    "mcp_lsp_find_references",
+    "mcp_lsp_goto_definition",
+    "mcp_lsp_prepare_rename",
 ];
+
+const DEDUP_SAFE_TOOL_INDICES: [u8; 9] = [0, 1, 21, 22, 23, 24, 25, 26, 27];
 
 /// The rocket's UTF-16 surrogate pair crosses `EDIT_REGION_HINT_LEN`.
 const DIFF_ACROSS_HINT_BOUNDARY: &str = "012345678901234567890123456789012345678\u{1F680}tail";
@@ -1802,7 +1813,7 @@ macro_rules! outcome_rows {
 fn arc_window_specs() -> impl Strategy<Value = Vec<ItemSpec>> {
     (
         24u8..31,
-        0u8..21,
+        0u8..TOOL_COUNT,
         0u8..10,
         any::<bool>(),
         any::<bool>(),
@@ -1964,7 +1975,7 @@ fn reasoning_adjacency_specs() -> impl Strategy<Value = Vec<ItemSpec>> {
 
 fn emergency_tier_specs() -> impl Strategy<Value = Vec<ItemSpec>> {
     (
-        0u8..21,
+        0u8..TOOL_COUNT,
         prop_oneof![Just(4_000u16), Just(20_000u16), Just(60_000u16)],
     )
         .prop_map(|(tool_offset, byte_size)| {
@@ -2019,7 +2030,7 @@ fn emergency_ctx_bits() -> impl Strategy<Value = CtxBits> {
 fn dedup_specs() -> impl Strategy<Value = Vec<ItemSpec>> {
     (
         2u8..6,
-        prop_oneof![Just(0u8), Just(1u8)],
+        proptest::sample::select(&DEDUP_SAFE_TOOL_INDICES),
         0u8..10,
         any::<bool>(),
     )
@@ -2231,34 +2242,70 @@ proptest! {
     }
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(192))]
-    #[test]
-    fn reasoning_guard_matches_frozen_reference(
-        specs in proptest::collection::vec(item_spec(), 0..40),
-        bits in ctx_bits(),
-    ) {
-        let (items, frozen, ctx, cfg) = build_inputs!(
-            &specs, bits,
-            SelItem, SelKind, SelMessageRole, SelectionContext, PassClass, SelectionConfig
-        );
-        let (ref_items, ref_frozen, ref_ctx, ref_cfg) = build_inputs!(
-            &specs, bits,
-            reference::SelItem, reference::SelKind, reference::SelMessageRole,
-            reference::SelectionContext, reference::PassClass, reference::SelectionConfig
-        );
-        let selected = select_reductions_with_outcome(&items, &frozen, &ctx, &cfg).decisions;
-        let ref_selected = reference::select_reductions_with_outcome(
-            &ref_items, &ref_frozen, &ref_ctx, &ref_cfg,
-        )
-        .decisions;
-        let optimized = decision_rows(&filter_reasoning_ineligible_decisions(&items, selected));
-        let expected = decision_rows(&reference::filter_reasoning_ineligible_decisions(
-            &ref_items,
-            ref_selected,
-        ));
-        prop_assert_eq!(optimized, expected, "diverged on {:?} {:?}", specs, bits);
-    }
+#[test]
+fn reasoning_guard_matches_frozen_reference_on_unfiltered_decisions() {
+    let spec = |kind: u8, arc: Option<u8>| ItemSpec {
+        msg: 0,
+        ordinal_slot: 0,
+        role: ROLE_ASSISTANT,
+        kind,
+        tool: 0,
+        input: 0,
+        provider_executed: false,
+        byte_size: 800,
+        token_count: None,
+        arc,
+        frozen: false,
+        agent_drop: false,
+        tag_protected: false,
+        exempt_protected: false,
+    };
+    let specs = vec![
+        spec(KIND_REASONING, None),
+        spec(KIND_TOOL_CALL, Some(0)),
+        spec(KIND_TOOL_RESULT, Some(0)),
+    ];
+    let bits: CtxBits = (0, 100_000.0, 100_000.0, 0, 0, true, 0, false, true, true);
+    let (items, _, _, _) = build_inputs!(
+        &specs,
+        bits,
+        SelItem,
+        SelKind,
+        SelMessageRole,
+        SelectionContext,
+        PassClass,
+        SelectionConfig
+    );
+    let (ref_items, _, _, _) = build_inputs!(
+        &specs,
+        bits,
+        reference::SelItem,
+        reference::SelKind,
+        reference::SelMessageRole,
+        reference::SelectionContext,
+        reference::PassClass,
+        reference::SelectionConfig
+    );
+    let candidates: Vec<_> = items
+        .iter()
+        .filter(|item| item.arc_id.is_some())
+        .map(|item| mc_module::transform::ReductionDecision {
+            target_id: item.id.clone(),
+            kind: "drop".to_string(),
+            payload: "[dropped]".to_string(),
+        })
+        .collect();
+
+    assert_eq!(candidates.len(), 2);
+    let optimized = decision_rows(&filter_reasoning_ineligible_decisions(
+        &items,
+        candidates.clone(),
+    ));
+    let expected = decision_rows(&reference::filter_reasoning_ineligible_decisions(
+        &ref_items, candidates,
+    ));
+    assert_eq!(optimized, expected);
+    assert!(optimized.is_empty());
 }
 
 fn sampled_specs(

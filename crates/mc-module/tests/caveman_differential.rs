@@ -853,10 +853,18 @@ fn fragment() -> impl Strategy<Value = String> {
     prop_oneof![
         Just("I just really wanted to basically explain the implementation clearly".to_string()),
         Just(
+            "actually essentially obviously quite very somewhat rather fairly sort of"
+                .to_string()
+        ),
+        Just(
             "i think it seems the results are being computed, and in order to understand"
                 .to_string()
         ),
+        Just(
+            "i believe i feel probably perhaps it appears arguably i suppose i guess".to_string()
+        ),
         Just("please review this, thanks, kind of a bit urgent".to_string()),
+        Just("thank you kindly if possible".to_string()),
         Just(
             "the historian will be summarized because of the compartment context message"
                 .to_string()
@@ -865,9 +873,14 @@ fn fragment() -> impl Strategy<Value = String> {
             "was were is are am be been being has been had been have been will be tested"
                 .to_string()
         ),
+        Just("would be could be should be might be may be tested".to_string()),
         // `in order to` -> `to` creates `due to the fact that`, which a later pass turns
         // into `because`. A single-pass or reordered implementation stops at the first.
         Just("due in order to the fact that at this point in time it failed".to_string()),
+        Just(
+            "in the event that for the purpose of with regard to in spite of the fact that on the grounds that for the reason that"
+                .to_string()
+        ),
         // Mixed-case phrase forms, matched ASCII-insensitively.
         Just("I JUST Really Basically wanted to Simply explain".to_string()),
         Just("I Think It Seems Maybe the results Are ok".to_string()),
@@ -890,6 +903,7 @@ fn fragment() -> impl Strategy<Value = String> {
         Just("https://example.com/really/long/path?query=1&flag".to_string()),
         Just("§7§ tag and msg_ABC123 plus deadbeefcafe1234 hash".to_string()),
         Just("src/some_dir/file_name.rs and ../rel/path.txt".to_string()),
+        Just("src/really/file_name.rs".to_string()),
         Just("   \t  ".to_string()),
         Just("\n\n\n\n".to_string()),
         Just("".to_string()),
@@ -897,6 +911,7 @@ fn fragment() -> impl Strategy<Value = String> {
         Just("A an a THE The tHe words".to_string()),
         Just("configuration config repository database directory session".to_string()),
         Just("and then afterwards therefore however furthermore additionally".to_string()),
+        Just("then after the first step".to_string()),
         Just("alpha as well as beta or gamma".to_string()),
         Just("\u{0}MC_PRES_0\u{0} literal placeholder collision".to_string()),
         Just("`fence with \u{0}MC_PRES_1\u{0} inside` and \u{0} stray NUL".to_string()),
