@@ -202,19 +202,52 @@ export function deriveProtectedTailTokenTarget(args: {
     return { usable, rawN, floorN, ceilingN, effectiveFloor, N, headroom, triggerBudget, reserve };
 }
 
-function nonEmergencyPerRunCap(usable: number, N: number): number {
+/**
+ * Per-run cap tiers, ordered by descending usage threshold; selection takes
+ * the first tier whose `minUsagePercentage` the snapshot meets, falling back
+ * to the last tier for out-of-domain values (negative or NaN usage). Every
+ * column increases toward the higher-pressure tiers, so rising pressure can
+ * never shrink the drain cap across a tier boundary.
+ */
+const PER_RUN_CAP_TIERS = [
+    {
+        minUsagePercentage: 95,
+        maxCap: FORCE95_MAX_CAP,
+        nMultiplier: 4,
+        usableFraction: 0.5,
+        absoluteCap: 250_000,
+    },
+    // Capacity sizing deliberately retains its historical 80% tier. For execute
+    // thresholds from 84% through 90%, this cap no longer coincides with the
+    // derived force-band transition.
+    {
+        minUsagePercentage: 80,
+        maxCap: FORCE80_MAX_CAP,
+        nMultiplier: 3,
+        usableFraction: 0.35,
+        absoluteCap: 150_000,
+    },
+    {
+        minUsagePercentage: 0,
+        maxCap: NON_EMERGENCY_MAX_CAP,
+        nMultiplier: 2,
+        usableFraction: 0.25,
+        absoluteCap: 100_000,
+    },
+] as const;
+
+function perRunCapForTier(
+    tier: (typeof PER_RUN_CAP_TIERS)[number],
+    usable: number,
+    N: number,
+): number {
     return Math.min(
-        NON_EMERGENCY_MAX_CAP,
-        Math.max(2 * N, Math.min(Math.round(0.25 * usable), 100_000)),
+        tier.maxCap,
+        Math.max(
+            tier.nMultiplier * N,
+            Math.min(Math.round(tier.usableFraction * usable), tier.absoluteCap),
+        ),
     );
-}
-
-function force80PerRunCap(usable: number, N: number): number {
-    return Math.min(FORCE80_MAX_CAP, Math.max(3 * N, Math.min(Math.round(0.35 * usable), 150_000)));
-}
-
-function force95PerRunCap(usable: number, N: number): number {
-    return Math.min(FORCE95_MAX_CAP, Math.max(4 * N, Math.min(Math.round(0.5 * usable), 250_000)));
 }
 
 export function selectPerRunCap(
@@ -227,12 +260,10 @@ export function selectPerRunCap(
         1,
         Math.round((snapshot.contextLimit * snapshot.executeThresholdPercentage) / 100),
     );
-    if (snapshot.usagePercentage >= 95) return force95PerRunCap(usable, snapshot.N);
-    // Capacity sizing deliberately retains its historical 80% tier. For execute
-    // thresholds from 84% through 90%, this cap no longer coincides with the
-    // derived force-band transition.
-    if (snapshot.usagePercentage >= 80) return force80PerRunCap(usable, snapshot.N);
-    return nonEmergencyPerRunCap(usable, snapshot.N);
+    const tier =
+        PER_RUN_CAP_TIERS.find((t) => snapshot.usagePercentage >= t.minUsagePercentage) ??
+        PER_RUN_CAP_TIERS[PER_RUN_CAP_TIERS.length - 1];
+    return perRunCapForTier(tier, usable, snapshot.N);
 }
 
 function boundaryMessageId(index: TrueRawTokenIndex, ordinal: number): string | null {
