@@ -786,6 +786,15 @@ export function validateParentManifests(
                 fail(`${where}: unknown payload optional dependency ${name}`);
             }
         }
+        // npm continues when optionalDependencies installation fails, so an addon listed in optionalDependencies overrides its required entry. commentlint: allow(JUDGE)
+        for (const addon of contract.packages.addons) {
+            if (addon in optional) {
+                fail(
+                    `${where}: optionalDependencies[${addon}] makes a required ` +
+                        `addon optional; declare it only in dependencies`,
+                );
+            }
+        }
         // Addons are non-optional, so an install fails outright when the name
         // or version is wrong. Validating only optionalDependencies let a hard
         // requirement sit entirely outside the contract.
