@@ -3,19 +3,9 @@ import {
 	cortexKitProjectConfigBasePath,
 	cortexKitUserConfigBasePath,
 } from "@magic-context/core/config/migrate-config-location";
-import {
-	type EmbeddingFeatures,
-	registerProjectEmbedding,
-	registerProjectShadowEmbedding,
-} from "@magic-context/core/features/magic-context/memory/embedding";
-import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
-import {
-	handleUntrustedLoad,
-	isConfigLoadUntrusted,
-} from "@magic-context/core/plugin/embedding-bootstrap-helpers";
-import { resolveEmbeddingRouting } from "@magic-context/core/plugin/embedding-routing";
-import { log } from "@magic-context/core/shared/logger";
+import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
+import { registerProjectEmbeddingFromDetailedLoad } from "@magic-context/core/plugin/embedding-bootstrap";
 import { loadPiConfigDetailed } from "./config";
 
 interface RegistrationFingerprint {
@@ -74,34 +64,15 @@ export async function ensureProjectRegisteredFromPiDirectory(
 	const cached = registrationFingerprints.get(projectIdentity);
 	if (cached && configFingerprint(cached.paths) === cached.fingerprint) return;
 
-	if (isConfigLoadUntrusted(detailed)) {
-		handleUntrustedLoad(db, projectIdentity, directory, detailed);
-		return;
-	}
-
-	const features: EmbeddingFeatures = {
-		memoryEnabled: detailed.config.memory.enabled,
-		gitCommitEnabled: detailed.config.memory.git_commit_indexing.enabled,
-	};
-	const routing = await resolveEmbeddingRouting({ config: detailed.config });
-	for (const warning of routing.warnings) {
-		log(`[magic-context][pi] ${warning}`);
-	}
-	registerProjectEmbedding(
+	const registered = await registerProjectEmbeddingFromDetailedLoad({
 		db,
-		projectIdentity,
-		routing.primary,
-		features,
 		directory,
-	);
-	if (routing.shadow) {
-		registerProjectShadowEmbedding(
-			db,
-			projectIdentity,
-			routing.shadow,
-			directory,
-		);
-	}
+		projectIdentity,
+		detailed,
+		logPrefix: "[magic-context][pi]",
+	});
+	if (!registered) return;
+
 	const fingerprintPaths = configCandidatePaths(
 		directory,
 		detailed.loadedFromPaths,
