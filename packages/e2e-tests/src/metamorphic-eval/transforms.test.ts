@@ -720,6 +720,34 @@ describe("metamorphic transforms", () => {
         }
     });
 
+    test("rename refuses a symbol a protected command span spells only after cleaning", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[0]!.assistant = "We could consider it.";
+        // Neither scan sees `buildAPI` on its own: the raw text spells it in
+        // fragments, and the cleaned text spells it inside a command span the
+        // rename may not edit.
+        turns[2]!.user =
+            "Also set the cache capacity via `build<system-reminder>x</system-reminder>API --watch`.";
+        turns[3] = {
+            user: "Background note about buildAPI and aux_worker.ts.",
+            assistant: "Summary recorded.",
+        };
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
+
+        let renamed = 0;
+        for (let seed = 0; seed < 30; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            const rewritten = result.scenario.transcript.turns[3]!.user;
+            expect(rewritten, `seed ${seed}`).toContain("buildAPI");
+            if (!rewritten.includes("aux_worker.ts")) renamed += 1;
+        }
+        expect(renamed).toBeGreaterThan(0);
+    });
+
     test("rename refuses a symbol a protected message spells only after cleaning", () => {
         const raw = validScenarioRaw();
         const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;

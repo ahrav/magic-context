@@ -1010,6 +1010,11 @@ const renameUnrelatedSymbols: Transform = {
             ]),
             ...probeText,
         ];
+        // Raw text, probe text, and the cleaned view together. Cleaning changes what
+        // a scan can see in both directions: it can join fragments into a symbol the
+        // raw string never spells, and it can turn a fragmented command span into a
+        // recognisable one whose contents the rename cannot reach.
+        const collisionText = [...allText, ...visibleText.values()];
         const blocked = new Set([
             ...scenario.transcript.turns.flatMap((turn, turnIndex) =>
                 (["user", "assistant"] as const).flatMap((role) =>
@@ -1027,7 +1032,7 @@ const renameUnrelatedSymbols: Transform = {
                 ),
             ),
             ...probeText.flatMap((text) => symbolsIn(text)),
-            ...allText.flatMap((text) => shadowedSymbolsIn(text)),
+            ...collisionText.flatMap((text) => shadowedSymbolsIn(text)),
         ]);
         const candidates = [
             ...new Set(
@@ -1074,9 +1079,6 @@ const renameUnrelatedSymbols: Transform = {
         // query-to-history relationship as surely as renaming one would, and one
         // aliasing a name that exists only inside a command span collides with an
         // entity the rename cannot even reach.
-        // The cleaned view too: a name the historian receives contiguously only
-        // after reminder stripping is still a name the derivative must not alias.
-        const collisionText = [...allText, ...visibleText.values()];
         const existing = new Set([
             ...collisionText.flatMap((text) => symbolsIn(text)),
             ...collisionText.flatMap((text) => shadowedSymbolsIn(text)),
