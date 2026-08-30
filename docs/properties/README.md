@@ -43,6 +43,50 @@ repos".
 | `bd list` / beads issues | Open tracked work, including `magic-context-ymc.12` (retained-tuple manifest) referenced by the dead-peer gap. |
 | Sibling repos `/local/home/ahrav/scratch/commons`, `/local/home/ahrav/scratch/subconscious` | In scope by the user's answer. Confirmed present, and confirmed **not** in the dependency graph of Part 1: `mc-shm-transport` depends only on `getrandom`, `libc`, `serde`, and `iceoryx2`. They contributed no evidence to this part and remain in scope for later parts. |
 
+## Scope decision: Rust-first
+
+Recorded 2026-08-30 by the project owner. Property discovery focuses on the Rust
+side from here, and all transforms are moving to Rust.
+
+Part 5, the TypeScript surfaces, is parked. The sub-parts already completed there
+are retained in full as a record of the transitional state. No `part-5*` material
+is deleted: the lens files, the per-record evidence files, and the
+`part-5a-storage` catalog, check inventory, and fault map all stay as written.
+
+### The fact 5c established, which stands
+
+Sub-part 5c settled what a default install runs today, and a Rust-first reader
+still needs that answer. All four references below were re-read at `e447c927` and
+are unchanged.
+
+- `transform_mode` defaults to `"ts"`. The field is declared at
+  `packages/plugin/src/config/schema/magic-context.ts:672-677` and `.default("ts")`
+  is `:674`.
+- The resolver at `packages/plugin/src/config/index.ts:605-611` decides the mode
+  once and overwrites the field at `:611`. It is the only decision point.
+- Both of that resolver's early returns demote toward `ts`:
+  `packages/plugin/src/config/transform-mode.ts:22-27` on compaction-off and
+  `:34-39` on missing user-tier consent. Only `:41` passes `rust` through.
+
+So a default install selects the TypeScript renderer, and reaching the Rust
+transform requires user-tier consent.
+
+### The inference that does not stand
+
+The commit message of `9a8a11e9` drew a further conclusion from that fact: that
+"Parts 4b and 4e cataloged a path ordinary users do not execute, and their
+reachability labels need revisiting."
+
+Under the Rust-first decision that reading is backwards. The Rust transform is
+the target architecture, so Parts 4b and 4e catalog the path that is becoming the
+default, and their records gain importance rather than losing it. The records that
+describe a transitional state are the TypeScript transform records in 5c.
+
+No record's reachability label changes as a result. What is corrected is the
+inference about what 5c's fact implies for other parts, not any record. Parts 4b
+and 4e each carry a framing note under `## Reachability under the Rust-first
+decision` in their catalog headers, and neither note relabels anything.
+
 ## Parts
 
 The system is cataloged incrementally. Each part is a separate directory with
@@ -59,12 +103,90 @@ files.
 | part-2e-subsystems | `crates/mc-host/src/{broca,synapse}/`, `harness_closure.rs` | Parked — pending ring-transport refactor |
 | part-3-store-core | `crates/mc-store`, `crates/mc-core`, `crates/mc-tokenizer`: SQLite durability, claim mirror, migrations | Not started |
 | part-4-module | `crates/mc-module`: transform, historian, selection | Not started |
-| part-5-ts-surfaces | `packages/plugin`, `packages/pi-plugin`, `packages/cli`, `packages/retina-local-fs` | Not started |
+| part-5-ts-surfaces | `packages/plugin`, `packages/pi-plugin`, `packages/cli`, `packages/retina-local-fs` | Parked — see [Scope decision: Rust-first](#scope-decision-rust-first). Holds the sub-part scope map and risk ranking under `_lenses/`; the sub-parts below carry the work. |
+| [part-5a-storage](part-5a-storage/) | `packages/plugin` storage: the newer-schema fence, the claim outbox, and write authority | Parked — retained as transitional record. 23 records; catalog, check inventory, and fault map present; no portfolio evaluation. |
+| part-5b-historian-ts | `packages/plugin` historian and compartment pipeline | Parked — retained as transitional record. 14 records, present as per-record evidence files plus two lens files; no synthesized catalog. |
+| part-5c-transform-ts | `packages/plugin` TypeScript transform and the Rust-mode adapter | Parked — retained as transitional record. 13 records, present as per-record evidence files plus two lens files; no synthesized catalog. This is the sub-part whose records describe the transitional state. |
+| part-5d-cli | `packages/cli` wizards, doctor, and the destructive database commands | Parked — retained as transitional record. 14 records, present as per-record evidence files plus two lens files; no synthesized catalog. |
+| part-5e-pi-plugin | `packages/pi-plugin` harness surface | Not started — parked. |
 
 `mc-host` is 28,026 lines of source across 29 modules, an order of magnitude
 larger than Part 1, so Part 2 is sub-partitioned. `shm_provider.rs` and
 `provider_recovery.rs` are not re-mined in Part 2: they are already cataloged as
 Part 1 boundary context.
+
+## Remaining Rust work
+
+Determined by inspecting the worktree at `0bc9c3fa`, not from the table above,
+which is stale for several Rust parts. Two directories are excluded because they
+are scope-map holders rather than cataloging units: `part-2-rescope` and
+`part-4-module` each contain only a scope map and risk ranking.
+
+### Missing artifacts per Rust part
+
+METHOD.md requires four artifacts per part: `catalog.md`, `existing-checks.md`,
+`fault-map.md`, and `portfolio-evaluation.md`. `evidence/<slug>.md` is per record
+and is not counted here.
+
+| Rust part | Missing artifacts |
+| --- | --- |
+| part-1-shm-transport | none |
+| part-2a-host-lifecycle | none |
+| part-2b-ring-datapath | `portfolio-evaluation.md` |
+| part-2b-wire-and-channels | all four: `catalog.md`, `existing-checks.md`, `fault-map.md`, `portfolio-evaluation.md` |
+| part-2c-setup-identity | `portfolio-evaluation.md` |
+| part-2d-client-peer | `portfolio-evaluation.md` |
+| part-2e-request-path | `portfolio-evaluation.md` |
+| part-2f-runtime-config | `portfolio-evaluation.md` |
+| part-3-store-core | none |
+| part-4a-historian | none |
+| part-4b-transform | none |
+| part-4c-handlers | none |
+| part-4d-facade | none |
+| part-4e-rendering | `portfolio-evaluation.md` |
+| part-4f-decisions | `existing-checks.md`, `fault-map.md`, `portfolio-evaluation.md` |
+
+So seven parts are missing a portfolio evaluation, 4f is missing its check
+inventory and fault map as well, and 2b-wire-and-channels has no synthesized
+artifacts at all: it holds four completed lens files and is parked pending the
+ring-transport refactor.
+
+### Records carrying a `Reachability:` line
+
+METHOD.md rule 4 requires a per-record reachability label. The field entered the
+record schema partway through, so the earliest parts predate it. Counts are of
+records in each part's `catalog.md`, where a record is a `###` heading whose first
+field is `Type:`.
+
+| Rust part | Records | With `Reachability:` | Without |
+| --- | --- | --- | --- |
+| part-1-shm-transport | 58 | 0 | 58 |
+| part-2a-host-lifecycle | 55 | 17 | 38 |
+| part-2b-ring-datapath | 14 | 14 | 0 |
+| part-2c-setup-identity | 14 | 14 | 0 |
+| part-2d-client-peer | 14 | 14 | 0 |
+| part-2e-request-path | 14 | 14 | 0 |
+| part-2f-runtime-config | 14 | 14 | 0 |
+| part-3-store-core | 37 | 37 | 0 |
+| part-4a-historian | 24 | 24 | 0 |
+| part-4b-transform | 24 | 24 | 0 |
+| part-4c-handlers | 25 | 25 | 0 |
+| part-4d-facade | 25 | 25 | 0 |
+| part-4e-rendering | 24 | 24 | 0 |
+| part-4f-decisions | 26 | 26 | 0 |
+| part-2b-wire-and-channels | 0 | 0 | 0 |
+| **Total** | **368** | **272** | **96** |
+
+The whole shortfall is in the two earliest parts. Part 1 has none of the labels,
+and Part 2a has them on 17 of 55 records, the 17 being later additions. Every part
+from 2b-ring-datapath onward labels every record. Backfilling those 96 labels is
+per-record work: rule 4 requires the evidence for each label at authoring time, so
+they cannot be assigned from a preamble.
+
+### Not yet opened on the Rust side
+
+No Rust part is queued that has no directory. The Rust scope named in the part-2
+and part-4 scope maps is covered by the directories above.
 
 ## Refactor in progress: the ring-transport collapse
 

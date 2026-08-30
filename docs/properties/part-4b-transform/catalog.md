@@ -67,6 +67,39 @@ clusters to three, and file order aligned with index order). R5 corrected a fals
 inventory line in `existing-checks.md` and changes no record here. The record
 count is unchanged at 24.
 
+## Reachability under the Rust-first decision
+
+Framing note, added 2026-08-30. It relabels nothing. No `Reachability:` line below
+is changed, and no record's content, type, or semantics is touched.
+
+A default install currently selects the TypeScript renderer, not this Rust
+transform. Sub-part 5c established that, and its references hold at `e447c927`:
+`transform_mode` defaults to `"ts"`
+(`packages/plugin/src/config/schema/magic-context.ts:674`, inside the field
+declared at `:672-677`); the resolver at
+`packages/plugin/src/config/index.ts:605-611` decides the mode once and overwrites
+the field at `:611`; both of that resolver's early returns demote toward `ts`
+(`packages/plugin/src/config/transform-mode.ts:22-27` on compaction-off and
+`:34-39` on missing user-tier consent), and only `:41` passes `rust` through. So
+reaching this crate's transform requires user-tier consent.
+
+The project owner's Rust-first decision makes the Rust transform the target
+architecture, and all transforms are moving to Rust. This part therefore catalogs
+the path that is becoming the default. An earlier commit message inferred the
+opposite, that 4b cataloged a path ordinary users do not execute and its
+reachability labels needed revisiting; that inference is withdrawn in
+[../README.md](../README.md).
+
+The labels below stand as written. Twenty-two records carry `default-production`,
+one of those qualified to the Claude Code leg, and two carry
+`explicit-config-only`. What changes is only what the `default-production` labels
+rest on. Each was derived from a fact internal to this crate, that the pass or the
+site executes on every compaction-enabled request once the crate is in the path,
+and no such derivation is affected. The remaining premise, that the crate is in
+the path, now rests on the target architecture rather than on today's shipped
+default. A reader who needs today's shipped behaviour reads
+[../part-5c-transform-ts/](../part-5c-transform-ts/).
+
 ## What this part is about
 
 This is the crate's reason to exist, and the place where one wrong decision either

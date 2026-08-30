@@ -220,6 +220,11 @@ charge retention and about not recycling uncertain memory depends on it holding.
 ### quarantine-authority-survives-peer-writes
 
 Type: safety
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — needs a peer that writes the lifecycle page directly; no
 harness models a peer mutating control pages.
@@ -263,6 +268,11 @@ Open questions:
 ### quarantine-gates-cover-every-storage-mutation
 
 Type: safety
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — needs a quarantine raised while a reservation is
 outstanding.
@@ -299,6 +309,12 @@ Open questions:
 ### attach-refuses-a-quarantined-object
 
 Type: safety
+Reachability: default-production — the client's default frame channel is
+`ShmFrameChannel` over this addon
+(`packages/plugin/src/shared/mc-host-client/connection.ts:393`); only a test
+`channelFactory` bypasses it (`:389-390`). The host side is unconditional too
+(`crates/mc-host/src/runtime.rs:876`), so the test-only framing above predates
+the ring-transport refactor.
 Status: active
 Exercised: not yet — needs an attach against an already-quarantined object.
 Guarantee: Attaching to a shared object whose lifecycle page is quarantined
@@ -341,6 +357,11 @@ descriptor and byte charge exactly once. This group reaches production because
 ### quarantine-charge-transition-is-atomic
 
 Type: safety
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Reaches production: no
 Status: active
 Exercised: not yet — needs `quarantined` pre-seeded near `u64::MAX` so the
@@ -384,6 +405,11 @@ Open questions: None.
 ### charge-release-never-silently-strands
 
 Type: safety
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Reaches production: yes
 Status: active
 Exercised: not yet — needs a poisoned accounting mutex and an inconsistent
@@ -415,6 +441,12 @@ Open questions:
 ### custody-terminal-transition-exactly-once
 
 Type: safety
+Reachability: test-only — when live, `CandidateCustody` and
+`ShmRecoveryBackend` sat behind the negotiated-transport provider registry,
+which shipped empty, so only tests drove custody. Superseded rather than live:
+the phase machine, the backend, and provider incarnations are all deleted, and
+`crates/mc-host/src/ring_transport.rs:291` now releases charges
+unconditionally.
 Reaches production: no
 Status: superseded-by-refactor
 Exercised: not yet — needs a release carrying a superseded provider incarnation.
@@ -467,6 +499,11 @@ Open questions:
 ### reservation-charge-visible-with-non-free-state
 
 Type: safety
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — needs a cross-process observer calling `conservation()`
 concurrently with a reservation.
@@ -515,6 +552,11 @@ has not finished writing. One release-acquire edge carries it.
 ### publication-visibility-derives-only-from-the-published-cursor
 
 Type: safety
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — needs a true cross-process race on weakly-ordered
 hardware, or a model checker. No loom, shuttle, Miri, or ThreadSanitizer
@@ -554,6 +596,11 @@ Open questions:
 ### no-frame-observable-before-commit
 
 Type: safety
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — needs an assertion that the receiver observes nothing
 mid-reservation.
@@ -582,6 +629,12 @@ Open questions: None.
 ### publish-signal-implies-committed-frame
 
 Type: safety
+Reachability: default-production — the client's default frame channel is
+`ShmFrameChannel` over this addon
+(`packages/plugin/src/shared/mc-host-client/connection.ts:393`); only a test
+`channelFactory` bypasses it (`:389-390`). The host side is unconditional too
+(`crates/mc-host/src/runtime.rs:876`), so the test-only framing above predates
+the ring-transport refactor.
 Status: active
 Exercised: not yet — needs a commit failure injected after `before_publish` has
 run.
@@ -618,6 +671,11 @@ Open questions:
 ### release-authority-bound-to-lease-ownership
 
 Type: safety
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — needs a release issued by a party other than the lease
 holder.
@@ -676,6 +734,11 @@ Open questions:
 ### release-exactly-once-per-sequence
 
 Type: safety
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — needs concurrent release attempts rather than sequential
 ones.
@@ -713,6 +776,11 @@ Open questions: None.
 ### receive-failure-leaves-no-wedged-slot
 
 Type: safety
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — needs a failpoint on lease or span construction.
 Guarantee: The error paths that follow the receive commit point are unreachable,
@@ -756,6 +824,11 @@ changed.
 ### release-failure-is-observable
 
 Type: liveness
+Reachability: default-production — the host driver is back: the ring is built
+unconditionally (`crates/mc-host/src/runtime.rs:876`) and prepared per
+connection (`crates/mc-host/src/connection.rs:148`), so the `Reaches
+production: no` line above, set when only the host driver was gone, no longer
+describes this path.
 Reaches production: no
 Status: active
 Exercised: not yet — needs an injected release failure on an otherwise clean
@@ -806,6 +879,11 @@ resets or reconciles them, so a crash is not a clean slate.
 Type: safety — revised from liveness after review. The check is evaluated at
 attach time, and attach ignores the stale cursors immediately rather than failing
 to converge later. The wedge that follows is the consequence, not the property.
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — needs a receiver killed while holding leases, then a fresh
 attach.
@@ -838,6 +916,11 @@ Open questions:
 ### crashed-producer-does-not-wedge-the-sequence
 
 Type: liveness
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — needs a producer killed between reserve and commit.
 Guarantee: A producer crash inside a reservation does not permanently prevent
@@ -864,6 +947,11 @@ Open questions: None.
 ### dead-peer-charges-are-reclaimed-or-declared
 
 Type: safety
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: yes — `crates/mc-host/tests/shm_failure_modes.rs:150`
 `killed_victim_holding_active_charges_is_never_reclaimed` constructs the fault
@@ -906,6 +994,11 @@ Open questions:
 ### cancelled-frame-disposition-is-declared
 
 Type: safety
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — needs cancellation injected exactly between a successful
 `try_receive` and the delivery of its body.
@@ -955,6 +1048,11 @@ does not address control pages.
 ### validated-spans-are-disjoint-and-inside-the-arena
 
 Type: safety
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — needs fuzzing with `arena_bytes > MAX_FRAME_BYTES`.
 Guarantee: For any accepted frame, the spans are pairwise disjoint, both lie
@@ -984,6 +1082,11 @@ Open questions: None.
 ### no-rust-reference-over-peer-writable-payload
 
 Type: safety
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — needs a peer that mutates payload bytes after publication.
 Guarantee: No lease API constructs a Rust reference or slice over arena bytes
@@ -1019,6 +1122,11 @@ Open questions:
 ### reclaim-advance-bounded-by-the-producer-reservation
 
 Type: safety
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — needs a peer rewriting the descriptor of a pending slot.
 Guarantee: The producer's `arena_reclaimed` advances by exactly the length the
@@ -1050,6 +1158,11 @@ Open questions:
 ### attach-binds-geometry-to-a-local-profile
 
 Type: safety
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — needs an attach whose grant geometry differs from the
 admitted profile.
@@ -1077,6 +1190,11 @@ Open questions: None.
 ### one-profile-name-denotes-one-geometry
 
 Type: safety
+Reachability: default-production — the host issues its grant geometry on every
+accepted connection (`crates/mc-host/src/connection.rs:148`, from
+`ring_transport.rs:32` and `:47-50`), and the client attaches through the addon
+by default (`packages/plugin/src/shared/mc-host-client/connection.ts:393`), so
+the disagreement is live on the shipped path.
 Status: active
 Exercised: not yet — needs a cross-artifact equality assertion; the
 contradiction is present today.
@@ -1115,6 +1233,12 @@ Open questions:
 ### native-boundary-not-weaker-than-its-wrapper
 
 Type: safety
+Reachability: default-production — the client's default frame channel is
+`ShmFrameChannel` over this addon
+(`packages/plugin/src/shared/mc-host-client/connection.ts:393`); only a test
+`channelFactory` bypasses it (`:389-390`). The host side is unconditional too
+(`crates/mc-host/src/runtime.rs:876`), so the test-only framing above predates
+the ring-transport refactor.
 Status: active
 Exercised: not yet — needs each wrapper-level rejection driven against the
 native boundary directly.
@@ -1159,6 +1283,13 @@ A defect here is live today, regardless of the transport being non-default.
 ### operation-counters-are-observed-not-declared
 
 Type: safety
+Reachability: test-only — the subject is bench and test material, not a runtime
+path: `OperationCounters` is referenced only by
+`crates/mc-shm-transport/src/evidence.rs:7`, `tests/contract.rs`, and
+`benches/hardware_envelope.rs`, and no production path increments a counter. It
+is the intended release gate, but `benches/manifests/v1.json:4` still reads
+`designation_status: UNSET_REQUIRES_DESIGNATED_HOST`, so it has gated no
+shipped decision yet.
 Reaches production: evidence path
 Status: active
 Exercised: not yet — needs negative controls that remove a real operation and
@@ -1205,6 +1336,11 @@ Open questions:
 ### measured-transfer-is-witnessed-by-the-data
 
 Type: safety
+Reachability: test-only — the subject is the benchmark's own reporting
+(`crates/mc-shm-transport/benches/hardware_envelope.rs`), which no host or
+addon path executes. It feeds the release gate, but
+`benches/manifests/v1.json:4` still reads `designation_status:
+UNSET_REQUIRES_DESIGNATED_HOST`, so no shipped decision has rested on it.
 Reaches production: evidence path
 Status: active
 Exercised: not yet — needs a corruption injection that the checksum must catch.
@@ -1230,6 +1366,11 @@ Open questions: None.
 ### traceability-pointers-resolve
 
 Type: safety
+Reachability: test-only — the subject is the audit artifact
+`docs/evidence/mc-shm-traceability-v1.json` and the test names it cites;
+nothing in `crates/mc-host` or `packages` reads it at run time. It is the audit
+trail for a release gate whose `designation_status` is still
+`UNSET_REQUIRES_DESIGNATED_HOST` (`benches/manifests/v1.json:4`).
 Reaches production: evidence path
 Status: active
 Exercised: yes — checked mechanically at `9c1eb4d1` and re-run independently.
@@ -1272,6 +1413,10 @@ literal substring match.
 ### negative-tests-fail-for-their-stated-reason
 
 Type: safety
+Reachability: test-only — the subject is the negative test cases themselves,
+including `crates/mc-shm-transport/tests/fuzz_corpus.rs`, and the addon
+mechanism tests. No runtime path evaluates them, and this record makes no claim
+that gates a shipped decision.
 Reaches production: evidence path
 Status: active
 Exercised: not yet — needs each negative case asserted against its specific
@@ -1313,6 +1458,11 @@ discharge it.
 ### documented-close-order-has-a-production-driver
 
 Type: reachability
+Reachability: test-only — `CloseState` and `Lifecycle` are referenced by
+exactly two files, their own module `crates/mc-shm-transport/src/lifecycle.rs`
+and `crates/mc-shm-transport/tests/contract.rs:11`; the absence of a non-test
+driver is this record's finding, so the class states it rather than
+contradicting it.
 Status: active
 Exercised: not yet.
 Guarantee: The documented close ordering is driven by production code, so the
@@ -1344,6 +1494,11 @@ Open questions:
 ### capability-probe-gates-every-advertised-mechanism
 
 Type: safety
+Reachability: test-only — `probeCapabilities`
+(`packages/mc-shm-native/index.ts:238`) is called only from
+`packages/plugin/src/shared/mc-host-client/shm-frame-channel.test.ts`; the
+default client path constructs `ShmFrameChannel` without consulting it
+(`connection.ts:393`).
 Status: active
 Exercised: not yet — needs a runtime lacking the cleanup hook.
 Guarantee: Capability is advertised only when every mechanism the documentation
@@ -1377,6 +1532,12 @@ Open questions:
 ### clean-reclamation-is-reachable
 
 Type: reachability
+Reachability: test-only — when live, the clean-reclamation branch and the
+incarnation mint were reached only through the fake recovery backend, as this
+record's own evidence states. Superseded rather than live:
+`provider_recovery.rs` and `ShmRecoveryBackend` are deleted, and
+`crates/mc-host/src/ring_transport.rs:291` releases charges unconditionally
+with no reclamation outcome.
 Status: superseded-by-refactor
 Exercised: not yet — reachable only through a fake backend today.
 Guarantee: For the shipped provider, the clean-reclamation outcome — charges
@@ -1421,6 +1582,11 @@ Open questions:
 ### test-only-surface-absent-from-the-shipped-addon
 
 Type: safety
+Reachability: default-production — the subject is the shipped addon's exported
+surface, and that addon is the default client channel
+(`packages/plugin/src/shared/mc-host-client/connection.ts:393`), loaded from
+`@cortexkit/mc-shm-native` (`packages/plugin/package.json:58`). The exports
+carry no `cfg` gate, so they ship.
 Reaches production: yes
 Status: active
 Exercised: not yet — needs an export inventory of the built artifact.
@@ -1463,6 +1629,11 @@ condition no current check pins.
 ### decoder-totality-over-arbitrary-bytes
 
 Type: safety
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — the only totality evidence sweeps ten lengths and two fill
 bytes; no exhaustive-length sweep, no structured mutation of an accepted seed,
@@ -1509,6 +1680,11 @@ Open questions:
 ### accepted-decode-consumes-its-declared-width
 
 Type: safety
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — needs a per-byte influence oracle; the one round-trip
 assertion that exists cannot fail without a source edit.
@@ -1555,6 +1731,11 @@ Open questions:
 ### identity-and-schema-rejection-is-one-contract
 
 Type: safety
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — needs one shared case table driven against every reader,
 and for the disposition half, a peer write to a slot descriptor between the
@@ -1608,6 +1789,11 @@ Open questions:
 ### grant-reserved-bytes-are-rejected-unless-zero
 
 Type: safety
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — one of the four bytes is perturbed by a test, and the corpus
 seed that encodes the case has its outcome unasserted.
@@ -1656,6 +1842,11 @@ Open questions:
 ### fuzz-harness-encoding-tracks-the-production-descriptor
 
 Type: safety
+Reachability: test-only — the subject is the fuzz harness
+(`crates/mc-shm-transport/src/harness.rs`, declared at
+`crates/mc-shm-transport/src/lib.rs:16`), which only `tests/contract.rs` and
+`tests/fuzz_corpus.rs` drive. The production descriptor it tracks is
+default-production; the harness is not.
 Reaches production: evidence path
 Status: active
 Exercised: not yet — needs a static width assertion, a per-byte influence
@@ -1719,6 +1910,12 @@ other.
 ### macos-object-creation-outcome-is-attributed
 
 Type: reachability
+Reachability: default-production — `Mapping::create` takes its macOS arm at
+`crates/mc-shm-transport/src/backend/ring.rs:217-218` and a duplex ring is
+created for every accepted connection (`crates/mc-host/src/connection.rs:148`),
+with a darwin distribution package in tree
+(`packages/mc-host-darwin-arm64/package.json`). The gap this record names is
+coverage, not reachability.
 Status: active
 Exercised: not yet — no macOS CI job reaches `Ring::create`, so
 `create_macos_shm` has never executed under observation and the documented
@@ -1761,6 +1958,12 @@ Open questions:
 ### attach-validation-is-not-platform-weakened
 
 Type: safety
+Reachability: default-production — `Mapping::create` takes its macOS arm at
+`crates/mc-shm-transport/src/backend/ring.rs:217-218` and a duplex ring is
+created for every accepted connection (`crates/mc-host/src/connection.rs:148`),
+with a darwin distribution package in tree
+(`packages/mc-host-darwin-arm64/package.json`). The gap this record names is
+coverage, not reachability.
 Status: active
 Exercised: not yet — needs a macOS execution of `Mapping::attach`; CI still runs
 no macOS job that constructs a `Ring`.
@@ -1815,6 +2018,12 @@ Open questions:
 ### macos-object-creation-leaks-no-shm-name
 
 Type: safety
+Reachability: default-production — `Mapping::create` takes its macOS arm at
+`crates/mc-shm-transport/src/backend/ring.rs:217-218` and a duplex ring is
+created for every accepted connection (`crates/mc-host/src/connection.rs:148`),
+with a darwin distribution package in tree
+(`packages/mc-host-darwin-arm64/package.json`). The gap this record names is
+coverage, not reachability.
 Status: active
 Exercised: not yet — needs a failpoint on `shm_unlink`, or a crash between open
 and unlink, on macOS, plus an oracle over the Darwin shm namespace.
@@ -1862,6 +2071,11 @@ Open questions:
 ### layout-region-offsets-are-real-page-aligned
 
 Type: safety
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — no test asserts any layout offset against the runtime page
 size, and no CI host has a non-4096 page executing this code.
@@ -1904,6 +2118,12 @@ Open questions:
 ### page-size-dependent-setup-runs-on-a-non-4096-page-host
 
 Type: reachability
+Reachability: default-production — `Mapping::create` takes its macOS arm at
+`crates/mc-shm-transport/src/backend/ring.rs:217-218` and a duplex ring is
+created for every accepted connection (`crates/mc-host/src/connection.rs:148`),
+with a darwin distribution package in tree
+(`packages/mc-host-darwin-arm64/package.json`). The gap this record names is
+coverage, not reachability.
 Status: active
 Exercised: not yet — the only page-size assertion in the tree is a pure-function
 unit test, and it runs only on a 4096-page x86-64 runner.
@@ -1979,6 +2199,13 @@ publication, and no `Result`.
 ### iceoryx-descriptor-rejection-is-terminal-or-declared
 
 Type: safety
+Reachability: test-only — when live, the `iceoryx` backend was a default Cargo
+feature at `9c1eb4d1` but was constructed only from
+`crates/mc-shm-transport/tests/iceoryx.rs` and the e2e mutation harness; no
+host or client path referenced it. Superseded rather than live: the feature and
+`src/backend/iceoryx.rs` are gone, and
+`crates/mc-shm-transport/src/backend/mod.rs:4-6` now declares only `ring` and
+`sample`.
 Status: superseded-by-refactor
 Exercised: not yet — no test makes `try_receive` return `Err`; the seven tests in
 `tests/iceoryx.rs` are same-instance and the loopback publisher always writes the
@@ -2033,6 +2260,13 @@ Open questions:
 ### iceoryx-receive-expectation-tracks-the-delivered-stream
 
 Type: safety
+Reachability: test-only — when live, the `iceoryx` backend was a default Cargo
+feature at `9c1eb4d1` but was constructed only from
+`crates/mc-shm-transport/tests/iceoryx.rs` and the e2e mutation harness; no
+host or client path referenced it. Superseded rather than live: the feature and
+`src/backend/iceoryx.rs` are gone, and
+`crates/mc-shm-transport/src/backend/mod.rs:4-6` now declares only `ring` and
+`sample`.
 Status: superseded-by-refactor
 Exercised: not yet — `sequences_progress_exactly_and_wrap_attempts_fail_closed`
 (`tests/iceoryx.rs:123`) commits and receives one frame per iteration, so both
@@ -2082,6 +2316,13 @@ Open questions:
 ### iceoryx-cross-process-pairing-is-reachable-or-declared
 
 Type: reachability
+Reachability: test-only — when live, the `iceoryx` backend was a default Cargo
+feature at `9c1eb4d1` but was constructed only from
+`crates/mc-shm-transport/tests/iceoryx.rs` and the e2e mutation harness; no
+host or client path referenced it. Superseded rather than live: the feature and
+`src/backend/iceoryx.rs` are gone, and
+`crates/mc-shm-transport/src/backend/mod.rs:4-6` now declares only `ring` and
+`sample`.
 Status: superseded-by-refactor
 Exercised: not yet, and not constructible without an API change;
 `IceoryxBackend::create(profile, lane)` accepts neither an inbound service name
@@ -2136,6 +2377,13 @@ Open questions:
 ### iceoryx-completion-is-observable-to-the-host
 
 Type: safety
+Reachability: test-only — when live, the `iceoryx` backend was a default Cargo
+feature at `9c1eb4d1` but was constructed only from
+`crates/mc-shm-transport/tests/iceoryx.rs` and the e2e mutation harness; no
+host or client path referenced it. Superseded rather than live: the feature and
+`src/backend/iceoryx.rs` are gone, and
+`crates/mc-shm-transport/src/backend/mod.rs:4-6` now declares only `ring` and
+`sample`.
 Status: superseded-by-refactor
 Exercised: not yet — needs leases disposed both ways with an assertion that some
 observation distinguishes outstanding from reclaimed; no such observation exists
@@ -2189,6 +2437,13 @@ Open questions:
 ### iceoryx-saturation-is-bounded-non-blocking-backpressure
 
 Type: liveness
+Reachability: test-only — when live, the `iceoryx` backend was a default Cargo
+feature at `9c1eb4d1` but was constructed only from
+`crates/mc-shm-transport/tests/iceoryx.rs` and the e2e mutation harness; no
+host or client path referenced it. Superseded rather than live: the feature and
+`src/backend/iceoryx.rs` are gone, and
+`crates/mc-shm-transport/src/backend/mod.rs:4-6` now declares only `ring` and
+`sample`.
 Status: superseded-by-refactor
 Exercised: not yet — every test receives and releases immediately after each
 commit, so neither configured cap is ever reached.
@@ -2264,6 +2519,11 @@ The correlation field is unvalidated by design.
 ### wire-header-fully-validated-before-any-consumer-acts
 
 Type: safety
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Reaches production: yes
 Status: active
 Exercised: partial — `crates/mc-host/tests/shm_failure_modes.rs:195` publishes one
@@ -2315,6 +2575,11 @@ Open questions:
 ### ingress-charge-matches-the-bytes-copied-from-shared-storage
 
 Type: safety
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Reaches production: yes
 Status: active
 Exercised: not yet — needs the per-frame equality assertion at admission. The
@@ -2359,6 +2624,11 @@ Open questions:
 ### every-shm-header-consumer-applies-its-role-gate
 
 Type: safety
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Reaches production: yes
 Status: active
 Exercised: partial — the host arm is exercised end to end for one illegal type.
@@ -2404,6 +2674,11 @@ Open questions:
 ### header-rejection-effect-does-not-depend-on-the-catching-layer
 
 Type: safety
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — one host-caught rejection is constructed but only the
 admission side is observed; nothing constructs a transport-caught header rejection
@@ -2462,6 +2737,11 @@ Open questions:
 ### runtime-directory-authentication-is-a-precondition-not-a-container
 
 Type: safety
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — no test references the runtime directory at all, and
 revalidation is never negative-tested.
@@ -2529,6 +2809,11 @@ an explicit interval.
 ### backpressure-converges-in-a-bounded-reclaim-window
 
 Type: liveness
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — the one convergence assertion that exists is cross-process,
 covers arena exhaustion only, and bounds nothing tighter than five seconds.
@@ -2575,6 +2860,11 @@ Open questions:
 ### receive-resumes-when-lease-capacity-clears
 
 Type: liveness
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — the existing test asserts absence without pinning that a
 frame was pending, and the shipped host cannot reach saturation at all.
@@ -2621,6 +2911,11 @@ Open questions:
 ### neither-direction-starves-the-other
 
 Type: liveness
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — no test has ever had frames in flight in both directions at
 once, so the alternation machinery is dead code under the existing traffic shape.
@@ -2668,6 +2963,11 @@ Open questions:
 ### reclamation-keeps-pace-with-completion
 
 Type: liveness
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — the existing FIFO test recovers with a one-byte request,
 which one reclaimed sequence out of two satisfies.
@@ -2708,6 +3008,13 @@ drains the whole prefix, is resolved by direct read of the loop's exits.
 ### lease-saturation-is-reached-then-drains
 
 Type: reachability
+Reachability: default-production — the lease-capacity gate is on the shipped
+path, since the ring is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and prepared per connection
+(`crates/mc-host/src/connection.rs:148`). The saturated *state* is not
+shipped-reachable: `max_leases` is 8
+(`crates/mc-host/src/ring_transport.rs:32`, `:50`) while a receive holds one
+lease at a time, which is this record's finding.
 Status: active
 Exercised: not yet — reached once, in one synthetic profile, at a cap of one,
 which cannot distinguish being at the cap from holding one lease.
@@ -2753,6 +3060,11 @@ Open questions:
 ### duplex-overlap-is-reached
 
 Type: reachability
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+shipped path. This replaces the test-only, non-default framing in the
+product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — zero coverage in the Rust suites, and the peer harness cannot
 construct the situation at all.

@@ -105,6 +105,41 @@ tree. If that leg is not live the label is closer to `test-only`. Lens B recorde
 that as an open question needing deployment knowledge, and it is not resolved
 here.
 
+## Reachability under the Rust-first decision
+
+Framing note, added 2026-08-30. It relabels nothing. No `Reachability:` line below
+is changed, and no record's content, type, or semantics is touched. It sits beside
+[Reachability provenance](#reachability-provenance) above rather than replacing it.
+
+A default install currently selects the TypeScript renderer, not this Rust
+rendering path. Sub-part 5c established that, and its references hold at
+`e447c927`: `transform_mode` defaults to `"ts"`
+(`packages/plugin/src/config/schema/magic-context.ts:674`, inside the field
+declared at `:672-677`); the resolver at
+`packages/plugin/src/config/index.ts:605-611` decides the mode once and overwrites
+the field at `:611`; both of that resolver's early returns demote toward `ts`
+(`packages/plugin/src/config/transform-mode.ts:22-27` on compaction-off and
+`:34-39` on missing user-tier consent), and only `:41` passes `rust` through. So
+reaching this crate's render requires user-tier consent.
+
+The project owner's Rust-first decision makes the Rust transform the target
+architecture, and all transforms are moving to Rust. This part therefore catalogs
+the path that is becoming the default. An earlier commit message inferred the
+opposite, that 4e cataloged a path ordinary users do not execute and its
+reachability labels needed revisiting; that inference is withdrawn in
+[../README.md](../README.md).
+
+The labels below stand as written: 22 `default-production` and 2
+`explicit-config-only`, as [Reachability provenance](#reachability-provenance)
+records. What changes is only what the `default-production` labels rest on. Each
+was derived from a fact internal to this crate, that
+`build_output_with_tags_inner` is the only byte-producing splice and carries no
+`#[cfg]`, plus the `tagging_active` and `auto_search_active` conditions and their
+shipped-producer defaults, and no such derivation is affected. The remaining
+premise, that the crate is in the path, now rests on the target architecture rather
+than on today's shipped default. A reader who needs today's shipped behaviour reads
+[../part-5c-transform-ts/](../part-5c-transform-ts/).
+
 ## What this part is about
 
 This is the code that assembles what the model finally sees. The splice

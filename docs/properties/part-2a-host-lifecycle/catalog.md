@@ -155,6 +155,9 @@ order, so no row was added, and none of the 38 surviving records was touched.
 ### generation-id-strictly-increases-and-is-never-reused
 
 Type: safety
+Reachability: default-production — the generation counter is seeded once per
+incarnation (`crates/mc-host/src/runtime.rs:922`) and every accepted connection
+mints from it (`crates/mc-host/src/connection.rs:235`).
 Status: active
 Exercised: not yet — every test hand-builds `id: 1`.
 Guarantee: Within one host incarnation every minted connection generation has a
@@ -184,6 +187,9 @@ Open questions: None.
 ### at-most-one-registered-generation-per-connection
 
 Type: safety
+Reachability: default-production — every accepted setup socket runs
+`run_connection` unconditionally (`crates/mc-host/src/runtime.rs:1043`); no
+configuration gates this path.
 Status: active
 Exercised: not yet — no test drives drain during the bootstrap-to-promoted
 transfer.
@@ -214,6 +220,9 @@ Open questions:
 ### close-disposition-is-a-total-function-of-the-read-exit-cause
 
 Type: safety
+Reachability: default-production — the `ReadExit` match runs on every
+connection teardown (`crates/mc-host/src/connection.rs:293-319`), reached
+unconditionally from `run_connection` (`crates/mc-host/src/runtime.rs:1043`).
 Status: active
 Exercised: partial — the current three-arm disposition is proven only by
 `tests/lifecycle.rs` and `tests/transport_negotiation.rs`, and the first runs in
@@ -245,6 +254,10 @@ Open questions:
 ### retirement-discards-only-through-the-discard-token
 
 Type: safety
+Reachability: default-production — `discard` and the `retired` token are the
+shipped writer's own gates (`crates/mc-host/src/frame_channel.rs:701`, `:727`),
+and retirement runs on every connection exit
+(`crates/mc-host/src/connection.rs:307`, `:317`).
 Status: active
 Exercised: not yet — nothing exercises admission after cancel.
 Guarantee: After a generation is retired with both `token.cancel()` and
@@ -270,6 +283,9 @@ Open questions: None.
 ### a-retired-generation-emits-nothing-and-mutates-nothing
 
 Type: safety
+Reachability: default-production — cancel-then-discard is the default
+retirement path (`crates/mc-host/src/connection.rs:315-318`, and `:350-354` for
+the unregistered case).
 Status: active
 Exercised: partial — one shape covered.
 Guarantee: Once a generation's token is cancelled, no *new* frame is admitted or
@@ -299,6 +315,9 @@ Open questions: None.
 ### generation-registry-entry-released-on-every-connection-exit
 
 Type: safety
+Reachability: default-production — every accepted setup socket runs
+`run_connection` unconditionally (`crates/mc-host/src/runtime.rs:1043`); no
+configuration gates this path.
 Status: active
 Exercised: not yet — needs an induced panic or abort between insert and removal.
 Guarantee: A generation inserted into the registry is removed before its
@@ -321,6 +340,11 @@ Open questions: None.
 ### disconnect-releases-every-resource-keyed-to-the-connection
 
 Type: safety
+Reachability: default-production — the draining early return is on the default
+connection path (`crates/mc-host/src/connection.rs:273-276`). Note that the
+promoted-versus-unpromoted asymmetry this record's fault angle describes is
+gone: that return now takes one arm, `discard_unregistered_generation`, which
+cancels the root (`:350-354`).
 Status: active
 Exercised: not yet — no test lands shutdown in the post-commit,
 pre-registration window.
@@ -357,6 +381,9 @@ Open questions:
 ### request-correlation-strictly-increases-per-generation
 
 Type: safety
+Reachability: default-production — the consumer watermark is evaluated in the
+read loop of every connection (`crates/mc-host/src/connection.rs:381`), reached
+unconditionally from `run_connection` (`crates/mc-host/src/runtime.rs:1043`).
 Status: active
 Exercised: partial — the watermark is covered; the pending insert is not.
 Guarantee: Within one generation no consumer request correlation is accepted
@@ -404,6 +431,12 @@ Open questions: None.
 ### ping-and-consumer-correlations-cannot-cross-settle
 
 Type: safety
+Reachability: explicit-config-only — the liveness loop is spawned only when a
+policy is configured (`crates/mc-host/src/connection.rs:279`),
+`HostConfig::default` leaves `liveness: None`
+(`crates/mc-host/src/config.rs:294`), and the production binary builds its
+config from that default without overriding it
+(`crates/mc-module/src/bin/ck_mc_host/serve.rs:582-593`).
 Status: active
 Exercised: yes — `tests/lifecycle.rs:468`
 `ping_and_consumer_correlations_do_not_cross_settle` constructs a numerically
@@ -424,6 +457,12 @@ Open questions: None.
 ### pong-preanswer-rejected-in-every-mutex-order
 
 Type: safety
+Reachability: explicit-config-only — the liveness loop is spawned only when a
+policy is configured (`crates/mc-host/src/connection.rs:279`),
+`HostConfig::default` leaves `liveness: None`
+(`crates/mc-host/src/config.rs:294`), and the production binary builds its
+config from that default without overriding it
+(`crates/mc-module/src/bin/ck_mc_host/serve.rs:582-593`).
 Status: active
 Exercised: not yet — no test drives the two mutex orderings.
 Guarantee: A pong observed strictly before its ping's bytes were written is never
@@ -462,6 +501,13 @@ Open questions:
 ### host-ping-correlation-exhaustion-retires-the-generation
 
 Type: safety
+Reachability: explicit-config-only — the egress half that carries the gap, the
+host's ping allocator, runs only under a configured policy
+(`crates/mc-host/src/connection.rs:279`), and `HostConfig::default` leaves
+`liveness: None` (`crates/mc-host/src/config.rs:294`) which the production
+binary does not override
+(`crates/mc-module/src/bin/ck_mc_host/serve.rs:582-593`). The enforced ingress
+watermark half is default-production (`crates/mc-host/src/connection.rs:381`).
 Status: active
 Exercised: not yet — practically unreachable by exhaustion.
 Guarantee: A correlation is never reused or wrapped; at exhaustion the sender
@@ -487,6 +533,9 @@ Open questions: None.
 ### no-task-outlives-the-generation-it-serves
 
 Type: safety
+Reachability: default-production — the spawn sites enumerated are on the
+default connection and dispatch path, reached from `run_connection`
+(`crates/mc-host/src/runtime.rs:1043`).
 Status: active
 Exercised: not yet.
 Guarantee: Every task holding a generation reference is a member of a set that
@@ -516,6 +565,10 @@ Open questions:
 ### the-writer-task-is-abortable-through-a-stated-owner
 
 Type: safety
+Reachability: default-production — every connection builds its writer through
+the shipped frame channel (`crates/mc-host/src/connection.rs:147-148`) and
+spawns the endpoint task into the host tracker (`:190`); the forced sweep is
+part of the ordinary shutdown path.
 Status: active
 Exercised: not yet for the forced path.
 Guarantee: Forced shutdown terminates every connection writer task.
@@ -541,6 +594,9 @@ Open questions:
 ### draining-rendezvous-is-released-or-the-loss-is-declared
 
 Type: liveness
+Reachability: default-production — the rendezvous await is on the default
+teardown path whenever draining is set
+(`crates/mc-host/src/connection.rs:328-330`).
 Status: active
 Exercised: not yet.
 Guarantee: A generation that observes draining while tearing down eventually
@@ -571,6 +627,9 @@ Open questions:
 ### no-generation-registers-after-the-drain-snapshot
 
 Type: safety
+Reachability: default-production — the draining check and the registry insert
+share the connections lock on every accepted connection
+(`crates/mc-host/src/connection.rs:267-278`).
 Status: active
 Exercised: not yet.
 Guarantee: The shutdown sequence's one-shot registry snapshot contains every
@@ -595,6 +654,8 @@ Open questions: None.
 ### read-task-quiescence-implies-no-further-registration
 
 Type: safety
+Reachability: default-production — the read-task tracker is closed and awaited
+on every connection teardown (`crates/mc-host/src/connection.rs:326-327`).
 Status: active
 Exercised: not yet — the existing fence tests hand-roll the producer.
 Guarantee: Once a generation's read-task set is closed and empty, nothing can
@@ -622,6 +683,10 @@ Open questions: None.
 ### a-cancelled-emission-releases-every-permit-it-held
 
 Type: safety
+Reachability: default-production — the pending, reject, and egress pools are
+constructed for every host incarnation
+(`crates/mc-host/src/runtime.rs:903-914`) and the per-generation reject permits
+per connection (`crates/mc-host/src/connection.rs:244`).
 Status: active
 Exercised: partial — connection permits on the candidate path only.
 Guarantee: Aborting or dropping any off-reader emission task returns its pending
@@ -645,6 +710,12 @@ Open questions: None.
 ### no-writer-hook-panic-poisons-a-generation-lock
 
 Type: safety
+Reachability: explicit-config-only — the liveness loop is spawned only when a
+policy is configured (`crates/mc-host/src/connection.rs:279`),
+`HostConfig::default` leaves `liveness: None`
+(`crates/mc-host/src/config.rs:294`), and the production binary builds its
+config from that default without overriding it
+(`crates/mc-module/src/bin/ck_mc_host/serve.rs:582-593`).
 Status: active
 Exercised: not yet — requires an injected panic.
 Guarantee: A panicking write-completion hook cannot leave any generation mutex
@@ -677,6 +748,9 @@ Open questions: None.
 ### shutdown-commits-exactly-once-on-write-ack
 
 Type: safety
+Reachability: default-production — the shutdown latch is constructed for every
+host incarnation (`crates/mc-host/src/runtime.rs:919`) and driven by the
+ordinary shutdown path; nothing gates it on configuration.
 Status: active
 Exercised: yes — four in-crate latch tests plus three integration tests, though
 the integration file runs in no CI job.
@@ -701,6 +775,9 @@ Open questions: None.
 ### admission-freeze-precedes-the-shutdown-commit
 
 Type: safety
+Reachability: default-production — the shutdown latch is constructed for every
+host incarnation (`crates/mc-host/src/runtime.rs:919`) and driven by the
+ordinary shutdown path; nothing gates it on configuration.
 Status: active
 Exercised: not yet — all four latch tests construct the hook with no registry.
 Guarantee: At the instant the commit cancels the shutdown token, registry
@@ -724,6 +801,9 @@ Open questions: None.
 ### shutdown-commit-effects-are-all-or-nothing
 
 Type: safety
+Reachability: default-production — the shutdown latch is constructed for every
+host incarnation (`crates/mc-host/src/runtime.rs:919`) and driven by the
+ordinary shutdown path; nothing gates it on configuration.
 Status: active
 Exercised: not yet.
 Guarantee: The commit point either applies all three effects — draining, frozen
@@ -753,6 +833,9 @@ Open questions: None.
 ### latch-wake-cannot-be-lost
 
 Type: liveness
+Reachability: default-production — the shutdown latch is constructed for every
+host incarnation (`crates/mc-host/src/runtime.rs:919`) and driven by the
+ordinary shutdown path; nothing gates it on configuration.
 Status: active
 Exercised: yes — one in-crate test directly pins the enable-before-check rule.
 Guarantee: A shutdown requester that observes the wait state is always woken by
@@ -782,6 +865,9 @@ Open questions: None.
 ### probe-never-reports-stopped-while-either-fence-is-held
 
 Type: safety
+Reachability: default-production — the lifecycle record is written on every
+host start (`crates/mc-host/src/runtime.rs:849`) and `probe_lifecycle` is the
+production CLI's status path (`crates/mc-module/src/bin/ck-mc-host.rs:404`).
 Status: active
 Exercised: yes — five in-crate tests, all Linux-only.
 Guarantee: The probe returns stopped only when both the lifetime fence and the
@@ -806,6 +892,9 @@ Open questions: None.
 ### stopping-precedes-unpublication-on-every-path
 
 Type: safety
+Reachability: default-production — the stopping record is written on the
+shipped teardown path (`crates/mc-host/src/lifecycle.rs:451`) and read back by
+the production CLI probe (`crates/mc-module/src/bin/ck-mc-host.rs:404`).
 Status: active
 Exercised: partial — the success path only.
 Guarantee: When an incarnation removes its publication, the on-disk record already
@@ -831,6 +920,9 @@ Open questions:
 ### phase-evidence-outlives-a-long-phase
 
 Type: liveness
+Reachability: default-production — the lifecycle record is written on every
+host start (`crates/mc-host/src/runtime.rs:849`) and `probe_lifecycle` is the
+production CLI's status path (`crates/mc-module/src/bin/ck-mc-host.rs:404`).
 Status: active — **reframed after portfolio evaluation**
 Exercised: not yet.
 Guarantee: The documented freshness window is wide enough for every phase the
@@ -872,6 +964,9 @@ Open questions:
 ### clock-anomalies-do-not-invalidate-live-evidence
 
 Type: safety
+Reachability: default-production — the lifecycle record is written on every
+host start (`crates/mc-host/src/runtime.rs:849`) and `probe_lifecycle` is the
+production CLI's status path (`crates/mc-module/src/bin/ck-mc-host.rs:404`).
 Status: active
 Exercised: not yet — both freshness tests manipulate the record, not the clock.
 Guarantee: A wall-clock step or an unrepresentable clock value does not reclassify
@@ -896,6 +991,9 @@ Open questions: None.
 ### legacy-incumbent-classification-needs-an-unforgeable-witness
 
 Type: safety
+Reachability: default-production — the lifecycle record is written on every
+host start (`crates/mc-host/src/runtime.rs:849`) and `probe_lifecycle` is the
+production CLI's status path (`crates/mc-module/src/bin/ck-mc-host.rs:404`).
 Status: active
 Exercised: partial — the regression test plants exactly the forgery by hand.
 Guarantee: A running verdict derived from a legacy record is accompanied by
@@ -924,6 +1022,9 @@ Open questions:
 ### an-observed-wedge-cause-reaches-the-operator
 
 Type: reachability
+Reachability: default-production — the lifecycle record is written on every
+host start (`crates/mc-host/src/runtime.rs:849`) and `probe_lifecycle` is the
+production CLI's status path (`crates/mc-module/src/bin/ck-mc-host.rs:404`).
 Status: active
 Exercised: not yet.
 Guarantee: When the host distinguishes a wedge cause, that distinction is
@@ -954,6 +1055,9 @@ Open questions:
 ### current-profile-never-names-an-unvalidatable-generation
 
 Type: safety
+Reachability: default-production — the production CLI reads the current profile
+and calls `stage_and_promote` on every start
+(`crates/mc-module/src/bin/ck-mc-host.rs:970`, `:992`).
 Status: active
 Exercised: partial — success and post-hoc tampering only; no fault injection and
 no crash test.
@@ -984,6 +1088,9 @@ Open questions:
 ### validation-and-enumeration-address-one-directory-object
 
 Type: safety
+Reachability: default-production — the production CLI reads the current profile
+and calls `stage_and_promote` on every start
+(`crates/mc-module/src/bin/ck-mc-host.rs:970`, `:992`).
 Status: active
 Exercised: partial.
 Guarantee: Every read, walk, and removal in a store operation resolves through the
@@ -1009,6 +1116,9 @@ Open questions:
 ### an-undecidable-quarantine-witness-fails-closed
 
 Type: safety
+Reachability: default-production — the production CLI reads the current profile
+and calls `stage_and_promote` on every start
+(`crates/mc-module/src/bin/ck-mc-host.rs:970`, `:992`).
 Status: active
 Exercised: partial — the oversize case only.
 Guarantee: For every *read-failure* mode of the lifecycle record and the generation
@@ -1043,6 +1153,9 @@ Open questions: None.
 ### persisted-state-quarantine-caps-agree
 
 Type: safety
+Reachability: default-production — the production CLI reads the current profile
+and calls `stage_and_promote` on every start
+(`crates/mc-module/src/bin/ck-mc-host.rs:970`, `:992`).
 Status: active
 Exercised: not yet — statically checkable, and currently false.
 Guarantee: The size above which persisted state is unreadable and therefore
@@ -1065,6 +1178,10 @@ Open questions: None.
 ### every-declared-cli-reason-id-has-a-producer
 
 Type: reachability
+Reachability: default-production — the reason ids are emitted by the shipped
+CLI binary `crates/mc-module/src/bin/ck-mc-host.rs` and consumed by the
+plugin's lifecycle surface
+(`packages/plugin/src/shared/mc-host-lifecycle/paths.ts`).
 Status: active — **premise corrected after portfolio evaluation**
 Exercised: not yet.
 Guarantee: Each reason id the release contract declares is emitted by the layer
@@ -1103,6 +1220,10 @@ Open questions:
 ### every-callback-invocation-is-inside-the-redaction-guard
 
 Type: safety
+Reachability: default-production — every handler callback on the default
+dispatch path goes through the guard (`crates/mc-host/src/dispatch.rs:994-995`,
+`:1148-1150`, `:1263-1264`) as does the shutdown callback
+(`crates/mc-host/src/runtime.rs:303-304`).
 Status: active
 Exercised: partial — one test pins the not-over-broad direction.
 Guarantee: Every call into untrusted handler or provider code runs with the
@@ -1131,6 +1252,8 @@ Open questions: None.
 ### the-panic-hook-cannot-itself-fail
 
 Type: safety
+Reachability: default-production — the redaction guard and its reporting run on
+the default dispatch path (`crates/mc-host/src/dispatch.rs:994-995`).
 Status: active
 Exercised: not yet.
 Guarantee: Reporting a redacted callback panic never escalates into process abort
@@ -1162,6 +1285,9 @@ Open questions: None.
 ### authentication-and-capacity-rejections-are-observable
 
 Type: reachability
+Reachability: default-production — both rejection arms are on the default
+connection path: the authentication return and the connection-permit
+`try_acquire_owned` failure (`crates/mc-host/src/connection.rs:130-138`).
 Status: active
 Exercised: not yet.
 Guarantee: A rejected connection produces some record an operator can see.
@@ -1184,6 +1310,11 @@ Open questions: None.
 ### the-largest-lifecycle-proof-runs-in-ci
 
 Type: reachability
+Reachability: test-only — the subject is the integration-test binaries and the
+CI workflow that names them; `--test client --test lifecycle` now runs on Linux
+(`.github/workflows/ci.yml:178-179`) and macOS (`:187`). This is build
+configuration, not a runtime path. The record's own `ci.yml:156` and `:164`
+citations no longer resolve to those steps.
 Status: active
 Exercised: no — this is the finding.
 Guarantee: The executed proof of shutdown ordering, lock-release ordering, latch
