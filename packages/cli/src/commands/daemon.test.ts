@@ -21,6 +21,7 @@ function result(
         remediation: null,
         effects: command === "restart" ? { stop_committed: true, start_committed: true } : null,
         readiness: null,
+        shared_memory: null,
         checks: [],
         versions: {
             release: "0.38.0",
@@ -232,6 +233,67 @@ describe("daemon command contract", () => {
 
         expect(rendered).toContain("stop_committed=true");
         expect(rendered).toContain("start_committed=false");
+    });
+
+    test("doctor renders fixed-ring identity, bounds, accounting, and lifecycle counts", () => {
+        const rendered = renderDaemonHuman(
+            result("doctor", {
+                readiness: {
+                    shared_memory: { state: "ready", reason: "healthy" },
+                },
+                shared_memory: {
+                    state: "healthy",
+                    error_class: null,
+                    artifact: {
+                        profile: "mc-host-test-ring-v1",
+                        wire_version: 2,
+                        descriptor_schema: 1,
+                    },
+                    bounds: {
+                        descriptors: 16,
+                        arena_bytes: 134_217_728,
+                        leases: 16,
+                        mappings: 2,
+                        file_descriptors: 2,
+                        workers: 1,
+                        client_instances: 1,
+                        pinned_workers: 0,
+                    },
+                    accounting: {
+                        active: {
+                            descriptors: 16,
+                            arena_bytes: 134_217_728,
+                            leases: 16,
+                            mappings: 2,
+                            file_descriptors: 2,
+                            workers: 1,
+                            client_instances: 1,
+                            pinned_workers: 0,
+                        },
+                        quarantined: {
+                            descriptors: 0,
+                            arena_bytes: 0,
+                            leases: 0,
+                            mappings: 0,
+                            file_descriptors: 0,
+                            workers: 0,
+                            client_instances: 0,
+                            pinned_workers: 0,
+                        },
+                    },
+                    attachment: { completed: 4 },
+                    activation: { completed: 3 },
+                    peer_death: { observed: 1 },
+                    reclamation: { completed: 2 },
+                    exhaustion: { observed: 1 },
+                },
+            }),
+        );
+
+        expect(rendered).toContain("Shared memory: healthy");
+        expect(rendered).toContain("profile=mc-host-test-ring-v1 wire=2 descriptor=1");
+        expect(rendered).toContain("active_bytes=134217728");
+        expect(rendered).toContain("peer_deaths=1 reclamations=2 exhaustions=1");
     });
 
     test("redacts lifecycle roots and secret-shaped native version text", async () => {

@@ -201,7 +201,7 @@ fn authenticate(
         || !bool::from(server.daemon_id.as_slice().ct_eq(expected_daemon_id))
         || server.daemon_ver != expected_daemon_ver
     {
-        return Err(invalid());
+        return Err(identity_mismatch());
     }
     write_message(
         stream,
@@ -375,6 +375,13 @@ fn nibble(byte: u8) -> io::Result<u8> {
 
 fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "shared-memory setup failed")
+}
+
+fn identity_mismatch() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "shared-memory identity mismatch",
+    )
 }
 
 fn timed_out() -> io::Error {

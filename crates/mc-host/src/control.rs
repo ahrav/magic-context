@@ -535,7 +535,10 @@ pub fn host_shutdown_response_json() -> Vec<u8> {
     br#"{"op":"host.shutdown"}"#.to_vec()
 }
 
-pub fn host_status_response_json(report: &crate::handler::HealthReport) -> Vec<u8> {
+pub fn host_status_response_json(
+    report: &crate::handler::HealthReport,
+    shared_memory: serde_json::Value,
+) -> Vec<u8> {
     let health = match report.status {
         crate::handler::HealthStatus::Ok => "ok",
         crate::handler::HealthStatus::Degraded => "degraded",
@@ -596,6 +599,7 @@ pub fn host_status_response_json(report: &crate::handler::HealthReport) -> Vec<u
         "op": OP_HOST_STATUS,
         "health": health,
         "metrics": {"components": components},
+        "shared_memory": shared_memory,
     }))
     .expect("host status serialization cannot fail")
 }
@@ -1056,8 +1060,11 @@ mod tests {
                 }
             })),
         };
-        let response: serde_json::Value =
-            serde_json::from_slice(&host_status_response_json(&report)).expect("status JSON");
+        let response: serde_json::Value = serde_json::from_slice(&host_status_response_json(
+            &report,
+            serde_json::json!({"state": "healthy"}),
+        ))
+        .expect("status JSON");
         assert_eq!(response["op"], "host.status");
         assert_eq!(response["health"], "degraded");
         assert_eq!(
@@ -1065,9 +1072,12 @@ mod tests {
             "starting"
         );
         assert!(
-            !String::from_utf8(host_status_response_json(&report))
-                .expect("UTF-8")
-                .contains("secret detail"),
+            !String::from_utf8(host_status_response_json(
+                &report,
+                serde_json::json!({"state": "healthy"}),
+            ))
+            .expect("UTF-8")
+            .contains("secret detail"),
             "handler detail is tainted and never exposed"
         );
     }

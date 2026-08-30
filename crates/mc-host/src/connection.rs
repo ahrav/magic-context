@@ -179,22 +179,29 @@ pub async fn run_connection<H: McHostHandler>(
         root.cancel();
         return;
     }
+    shared.ring.record_attachment();
+    shared.ring.record_activation();
 
     let io_task = AbortOnDropHandle::new(shared.tracker.spawn(io));
     let gen = new_generation(&shared, root.clone(), read_cancel.clone(), sender);
     let peer_gen = Arc::clone(&gen);
     let peer_read_cancel = read_cancel.clone();
+    let peer_ring = Arc::clone(&shared.ring);
     shared.spawn_tracked(gen.read_tasks.track_future(async move {
         tokio::select! {
             biased;
             () = peer_read_cancel.cancelled() => {}
-            _ = crate::setup_socket::observe_peer(&mut stream) => {
+            close = crate::setup_socket::observe_peer(&mut stream) => {
+                if close != crate::setup_socket::PeerClose::Goodbye {
+                    peer_ring.record_peer_death();
+                }
                 peer_gen.token.cancel();
                 peer_gen.read_cancel.cancel();
             }
         }
     }));
     serve_generation(&shared, gen, receiver, io_task).await;
+    shared.ring.record_reclamation();
 }
 
 fn activation_token() -> String {
@@ -672,7 +679,10 @@ async fn handle_control<H: McHostHandler>(
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone();
-                let body = crate::control::host_status_response_json(&report);
+                let body = crate::control::host_status_response_json(
+                    &report,
+                    shared_task.ring.diagnostics(),
+                );
                 if emit_catalog_response(
                     &shared_task.egress_budget,
                     &gen_task,

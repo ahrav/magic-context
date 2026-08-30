@@ -93,7 +93,12 @@ pub fn process_limits(connections: usize) -> Option<ShmHostLimits> {
 pub struct RingTransport {
     profile: Arc<TargetProfile>,
     admission: Arc<AdmissionController>,
+    limits: ShmHostLimits,
     preparations: AtomicU64,
+    activations: AtomicU64,
+    peer_deaths: AtomicU64,
+    reclamations: AtomicU64,
+    exhaustions: AtomicU64,
     publish_hook: Mutex<Option<PublishHook>>,
 }
 
@@ -126,7 +131,12 @@ impl RingTransport {
         Self {
             profile,
             admission,
+            limits,
             preparations: AtomicU64::new(0),
+            activations: AtomicU64::new(0),
+            peer_deaths: AtomicU64::new(0),
+            reclamations: AtomicU64::new(0),
+            exhaustions: AtomicU64::new(0),
             publish_hook: Mutex::new(None),
         }
     }
@@ -136,7 +146,7 @@ impl RingTransport {
         self.profile.charges()
     }
 
-    /// Number of preparations that passed side-effect-free preflight.
+    /// Number of clients that completed fixed-ring attachment.
     pub fn preparation_count(&self) -> u64 {
         self.preparations.load(Ordering::Acquire)
     }
@@ -149,6 +159,79 @@ impl RingTransport {
         mc_shm_transport::profile::AdmissionError,
     > {
         self.admission.snapshot()
+    }
+
+    /// Bounded, aggregate-only state for authenticated doctor output.
+    pub fn diagnostics(&self) -> serde_json::Value {
+        let charges = |value: ResourceCharges| {
+            serde_json::json!({
+                "descriptors": value.descriptors,
+                "arena_bytes": value.arena_bytes,
+                "leases": value.leases,
+                "mappings": value.mappings,
+                "file_descriptors": value.file_descriptors,
+                "workers": value.workers,
+                "client_instances": value.client_instances,
+                "pinned_workers": value.pinned_workers,
+            })
+        };
+        let limits = serde_json::json!({
+            "descriptors": self.limits.descriptors,
+            "arena_bytes": self.limits.arena_bytes,
+            "leases": self.limits.leases,
+            "mappings": self.limits.mappings,
+            "file_descriptors": self.limits.file_descriptors,
+            "workers": self.limits.workers,
+            "client_instances": self.limits.client_instances,
+            "pinned_workers": self.limits.pinned_workers,
+        });
+        let (state, error_class, accounting) = match self.accounting() {
+            Ok(accounting) => (
+                "healthy",
+                serde_json::Value::Null,
+                serde_json::json!({
+                    "active": charges(accounting.active),
+                    "quarantined": charges(accounting.quarantined),
+                }),
+            ),
+            Err(_) => (
+                "terminal",
+                serde_json::Value::String("setup_failure".to_owned()),
+                serde_json::Value::Null,
+            ),
+        };
+        serde_json::json!({
+            "state": state,
+            "error_class": error_class,
+            "artifact": {
+                "profile": QUALIFIED_TEST_PROFILE,
+                "wire_version": crate::wire::PROTOCOL_VERSION,
+                "descriptor_schema": mc_shm_transport::descriptor::DESCRIPTOR_SCHEMA_VERSION,
+            },
+            "bounds": limits,
+            "accounting": accounting,
+            "attachment": {"completed": self.preparations.load(Ordering::Acquire)},
+            "activation": {"completed": self.activations.load(Ordering::Acquire)},
+            "peer_death": {"observed": self.peer_deaths.load(Ordering::Acquire)},
+            "reclamation": {"completed": self.reclamations.load(Ordering::Acquire)},
+            "exhaustion": {"observed": self.exhaustions.load(Ordering::Acquire)},
+        })
+    }
+
+    pub(crate) fn record_attachment(&self) {
+        self.preparations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_activation(&self) {
+        self.activations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_peer_death(&self) {
+        self.peer_deaths.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_reclamation(&self) {
+        self.reclamations.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Test hook: install a publication observer for candidates prepared
@@ -165,11 +248,10 @@ impl RingTransport {
         queue_frames: usize,
         frame_deadline: Duration,
     ) -> Result<PreparedRing, RingUnavailable> {
-        let admission = self
-            .admission
-            .admit(&self.profile, None)
-            .map_err(|_| RingUnavailable)?;
-        self.preparations.fetch_add(1, Ordering::AcqRel);
+        let admission = self.admission.admit(&self.profile, None).map_err(|_| {
+            self.exhaustions.fetch_add(1, Ordering::Relaxed);
+            RingUnavailable
+        })?;
         let root = CancellationToken::new();
         let read_cancel = root.child_token();
         let (sender, queue) = frame_sender(queue_frames, root.clone(), frame_deadline);
@@ -677,6 +759,50 @@ mod tests {
         let accounting = transport.accounting().unwrap();
         assert_eq!(accounting.active, ResourceCharges::ZERO);
         assert_eq!(accounting.quarantined, ResourceCharges::ZERO);
+    }
+
+    #[test]
+    fn diagnostics_report_fixed_identity_bounds_accounting_and_lifecycle_counts() {
+        let limits = single_candidate_limits();
+        let transport = RingTransport::for_qualified_test_profile(limits);
+        transport.record_attachment();
+        transport.record_activation();
+        transport.record_peer_death();
+        transport.record_reclamation();
+
+        let diagnostics = transport.diagnostics();
+        assert_eq!(diagnostics["state"], "healthy");
+        assert_eq!(diagnostics["error_class"], serde_json::Value::Null);
+        assert_eq!(diagnostics["artifact"]["profile"], QUALIFIED_TEST_PROFILE);
+        assert_eq!(
+            diagnostics["artifact"]["wire_version"],
+            crate::wire::PROTOCOL_VERSION
+        );
+        assert_eq!(
+            diagnostics["artifact"]["descriptor_schema"],
+            mc_shm_transport::descriptor::DESCRIPTOR_SCHEMA_VERSION
+        );
+        assert_eq!(diagnostics["bounds"]["arena_bytes"], limits.arena_bytes);
+        assert_eq!(diagnostics["accounting"]["active"]["arena_bytes"], 0);
+        assert_eq!(diagnostics["accounting"]["quarantined"]["arena_bytes"], 0);
+        assert_eq!(diagnostics["attachment"]["completed"], 1);
+        assert_eq!(diagnostics["activation"]["completed"], 1);
+        assert_eq!(diagnostics["peer_death"]["observed"], 1);
+        assert_eq!(diagnostics["reclamation"]["completed"], 1);
+        assert_eq!(diagnostics["exhaustion"]["observed"], 0);
+
+        let encoded = diagnostics.to_string();
+        for secret_field in [
+            "socket_path",
+            "native_handle",
+            "mapping_descriptor",
+            "activation_token",
+            "authentication_key",
+            "payload",
+            "mapped_address",
+        ] {
+            assert!(!encoded.contains(secret_field));
+        }
     }
 
     #[test]

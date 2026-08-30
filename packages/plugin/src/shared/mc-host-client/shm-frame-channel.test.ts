@@ -4,6 +4,7 @@ import {
     type NativeReceiveLease,
     probeCapabilities,
 } from "@cortexkit/mc-shm-native";
+import { classifySharedMemoryFailure } from "./client";
 import { ConnectionGeneration } from "./connection";
 import { Deadline } from "./deadline";
 import { McHostCallError } from "./errors";
@@ -41,6 +42,19 @@ function responseHeader(ty: FrameType, corr: bigint, length: number, flags = 0):
         corr,
     };
 }
+
+test("shared-memory failures collapse to five terminal diagnostic classes", () => {
+    const cases = [
+        ["shared-memory native addon: addon is missing", "missing_addon"],
+        ["shared-memory identity mismatch", "identity_mismatch"],
+        ["shared-memory setup failed /private/secret?token=abc", "setup_failure"],
+        ["peer closed unexpectedly /private/secret", "peer_death"],
+        ["shared-memory resource limit exhausted handle=77", "resource_exhaustion"],
+    ] as const;
+    for (const [message, expected] of cases) {
+        expect(classifySharedMemoryFailure(new Error(message))).toBe(expected);
+    }
+});
 
 function publish(peer: NativeChannel, header: EnvelopeHeader, body: Uint8Array): void {
     peer.produce(encodeHeader(header), body.byteLength, (cursor) => cursor.write(body));

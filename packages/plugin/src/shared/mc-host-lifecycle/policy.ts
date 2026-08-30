@@ -15,7 +15,12 @@
  * path, stderr text, or native error chain rides on any result.
  */
 
-import type { AuthenticatedPeer } from "../mc-host-client/types";
+import { classifySharedMemoryFailure } from "../mc-host-client/client";
+import type {
+    AuthenticatedPeer,
+    SharedMemoryDiagnostics,
+    SharedMemoryResourceCounts,
+} from "../mc-host-client/types";
 import { checkPlatform, type LifecycleFailureReason, type PlatformReaders } from "./bootstrap";
 import { evaluateDaemonCompatibility } from "./compatibility";
 import {
@@ -72,6 +77,7 @@ export type StorageReadiness = "ready" | "starting" | "unavailable";
 
 export interface ObservationalHealth {
     readiness: DaemonReadiness;
+    sharedMemory: SharedMemoryDiagnostics;
     /**
      * The peer the probe authenticated, not just its version string. The
      * compatibility gate is applied to it here, so handing over only the version
@@ -171,6 +177,7 @@ function localResult(
                 ? { stop_committed: false, start_committed: false }
                 : null,
         readiness: null,
+        shared_memory: null,
         checks: [],
         versions: {
             release: releaseContract.release.version,
@@ -641,12 +648,35 @@ export class McHostLifecyclePolicy {
             let observed: ObservationalHealth;
             try {
                 observed = await this.readinessProbe(remaining);
-            } catch {
-                return relabeled;
+            } catch (error) {
+                const failed: DaemonCheck = {
+                    id: "readiness.shared_memory",
+                    status: "fail",
+                    reason: "native_probe_unavailable",
+                    remediation: remediationForReason("native_probe_unavailable"),
+                };
+                return {
+                    ...relabeled,
+                    ok: false,
+                    reason: failed.reason,
+                    remediation: failed.remediation,
+                    readiness: {
+                        shared_memory: {
+                            state: "unavailable",
+                            reason: failed.reason,
+                        },
+                    },
+                    shared_memory: terminalSharedMemoryDiagnostics(
+                        classifySharedMemoryFailure(error),
+                    ),
+                    checks: [...relabeled.checks, failed].sort((left, right) =>
+                        left.id.localeCompare(right.id),
+                    ),
+                };
             }
             const checks: DaemonCheck[] = [...relabeled.checks];
             const addCheck = (
-                id: "readiness.transport" | "readiness.storage" | "readiness.synapse",
+                id: "readiness.shared_memory" | "readiness.storage" | "readiness.synapse",
                 record: NonNullable<DaemonReadiness[keyof DaemonReadiness]>,
             ): void => {
                 const status =
@@ -662,8 +692,8 @@ export class McHostLifecyclePolicy {
                     remediation: remediationForReason(record.reason),
                 });
             };
-            if (observed.readiness.transport) {
-                addCheck("readiness.transport", observed.readiness.transport);
+            if (observed.readiness.shared_memory) {
+                addCheck("readiness.shared_memory", observed.readiness.shared_memory);
             }
             if (observed.readiness.storage) {
                 addCheck("readiness.storage", observed.readiness.storage);
@@ -675,8 +705,8 @@ export class McHostLifecyclePolicy {
             // client talk to this daemon at all". Without this gate an
             // observation of a running daemon whose authenticated version is
             // outside the supported half-open range reported `healthy` and then
-            // stamped that version with `proof: "current"` — a compatibility
-            // verdict inverted by omission. It joins `checks` rather than
+            // stamped that version with `proof: "current"`, producing a false
+            // compatibility verdict. It joins `checks` rather than
             // short-circuiting so the contract's failing-reason precedence still
             // decides what gets reported when readiness is also degraded.
             const compatibility = evaluateDaemonCompatibility(observed.authenticatedPeer);
@@ -693,7 +723,7 @@ export class McHostLifecyclePolicy {
             // NOT that order: the release contract ships one precedence list for
             // failing reasons, and a lower-precedence readiness failure must
             // never mask a higher-precedence one just because its check id
-            // sorts earlier (`readiness.storage` before `readiness.transport`).
+            // sorts earlier (`readiness.shared_memory` before `readiness.storage`).
             checks.sort((left, right) => left.id.localeCompare(right.id));
             const failed = checks
                 .filter((check) => check.status === "fail")
@@ -709,6 +739,7 @@ export class McHostLifecyclePolicy {
                 reason: failed?.reason ?? "healthy",
                 remediation: failed?.remediation ?? null,
                 readiness: observed.readiness,
+                shared_memory: observed.sharedMemory,
                 checks,
                 versions: {
                     ...relabeled.versions,
@@ -807,4 +838,36 @@ export class McHostLifecyclePolicy {
         }
         return localResult(command, false, state, "internal_error");
     }
+}
+
+const ZERO_RESOURCE_COUNTS: SharedMemoryResourceCounts = {
+    descriptors: 0,
+    arena_bytes: 0,
+    leases: 0,
+    mappings: 0,
+    file_descriptors: 0,
+    workers: 0,
+    client_instances: 0,
+    pinned_workers: 0,
+};
+
+function terminalSharedMemoryDiagnostics(
+    errorClass: SharedMemoryDiagnostics["error_class"],
+): SharedMemoryDiagnostics {
+    return {
+        state: "terminal",
+        error_class: errorClass,
+        artifact: {
+            profile: "mc-host-test-ring-v1",
+            wire_version: 2,
+            descriptor_schema: 1,
+        },
+        bounds: ZERO_RESOURCE_COUNTS,
+        accounting: null,
+        attachment: { completed: 0 },
+        activation: { completed: 0 },
+        peer_death: { observed: errorClass === "peer_death" ? 1 : 0 },
+        reclamation: { completed: 0 },
+        exhaustion: { observed: errorClass === "resource_exhaustion" ? 1 : 0 },
+    };
 }

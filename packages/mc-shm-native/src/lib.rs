@@ -568,7 +568,15 @@ pub fn connect_setup(env: &Env, options: NativeSetupOptions) -> Result<u32> {
         &options.daemon_ver,
         Duration::from_millis(u64::from(options.timeout_ms)),
     )
-    .map_err(|_| error("shared-memory setup failed"))?;
+    .map_err(|failure| {
+        if failure.kind() == std::io::ErrorKind::PermissionDenied
+            && failure.to_string() == "shared-memory identity mismatch"
+        {
+            error("shared-memory identity mismatch")
+        } else {
+            error("shared-memory setup failed")
+        }
+    })?;
     if connected.host_to_peer_grant == connected.peer_to_host_grant {
         return Err(descriptor_error());
     }
