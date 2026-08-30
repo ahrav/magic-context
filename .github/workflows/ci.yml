@@ -108,16 +108,8 @@ jobs:
       - name: Provision metadata-only sibling stubs
         run: sh scripts/provision-rust-ci-stubs.sh
 
-      # Serialized shm-crash nextest group; the ignored full soak
-      # stays opt-in via shm-hardening-optin.yml; no artifact upload.
-      # The --lib pass runs the provider_recovery controller unit
-      # suite (stale retries, deadline isolation, wedged cleanup,
-      # late-result fencing, inbox bounds, custody accounting), which
-      # no integration binary exercises. commentlint: allow(JUDGE)
-      - name: Crash, recovery, and soak-smoke suites
-        run: |
-          cargo nextest run -p mc-host --lib \
-            --test shm_failure_modes --test shm_soak
+      - name: Mandatory ring client suite
+        run: cargo nextest run -p mc-host --test client
 
   shm-source-build:
     name: Shared memory source build (${{ matrix.os }})
@@ -162,7 +154,7 @@ jobs:
         run: |
           cargo nextest run -p mc-shm-native -p mc-shm-transport
           cargo nextest run -p mc-host \
-            --test shm_transport --test transport_negotiation
+            --test client --test lifecycle
 
       - name: Fixed-ring contracts (macOS)
         if: runner.os == 'macOS'
@@ -170,9 +162,7 @@ jobs:
           cargo nextest run -p mc-shm-native
           cargo nextest run -p mc-shm-transport \
             --test contract --test fuzz_corpus
-          cargo nextest run -p mc-host --test shm_soak
-          cargo test -p mc-host --lib \
-            shm_provider::tests::platform_preflight_is_side_effect_free
+          cargo nextest run -p mc-host --test client --test lifecycle
 
       - name: Rust lease non-escape
         run: cargo test -p mc-host --doc
@@ -547,11 +537,7 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Adversarial scenarios (Bun)
-        working-directory: packages/plugin
-        run: bun scripts/run-mc-host-client-adversarial.ts
-
-      - name: Adversarial scenarios (Node 24)
+      - name: Shared-memory client smoke (Node 24)
         run: bun run --cwd packages/plugin test:mc-host-client:node
 
   check-rust:

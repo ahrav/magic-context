@@ -1714,62 +1714,6 @@ async fn probe_observes_running_then_stopped_across_an_incarnation() {
     );
 }
 
-/// Host shutdown while a transport candidate is mid-activation reaps both
-/// channels, removes the setup's registry membership, releases the
-/// connection permit, and leaves no tracked task — proven by the graceful
-/// shutdown result.
-#[tokio::test]
-async fn shutdown_during_candidate_setup_reaps_both_channels() {
-    use support::fake_transport::{FakeProvider, RawCandidate, FAKE_TRANSPORT};
-
-    let (provider, mut peers) = FakeProvider::install(1, serde_json::json!({}), 64 * 1024);
-    let registry = FakeProvider::registry(&provider);
-    let host = TestHost::start_with(move |config| {
-        config.transport_providers = registry;
-        // Roomy: shutdown must interrupt the setup, not the deadline.
-        config.timing.transport_setup_deadline = Duration::from_secs(30);
-    })
-    .await;
-
-    let mut client = host.setup_client().await;
-    let corr = client
-        .control(&serde_json::json!({
-            "op": "transport.negotiate",
-            "negotiation_version": 1,
-            "offers": [
-                {"transport": FAKE_TRANSPORT, "capability_version": 1},
-                {"transport": "tcp", "capability_version": 1}
-            ]
-        }))
-        .await
-        .expect("send negotiation");
-    let grant = client.frame_within(BUDGET).await.expect("grant response");
-    assert_eq!(grant.corr, corr);
-    let token = grant.json()["activation_token"]
-        .as_str()
-        .expect("token")
-        .to_owned();
-    let peer = peers.recv().await.expect("candidate peer");
-    let mut candidate = RawCandidate::new(peer);
-    let activate = format!(
-        r#"{{"op":"transport.activate","negotiation_version":1,"activation_token":"{token}"}}"#
-    );
-    candidate
-        .send_frame(TY_REQUEST, FLAGS_INTERACTIVE, 0, 0, 1, activate.as_bytes())
-        .await
-        .expect("send activate");
-    let response = candidate
-        .frame_within(BUDGET)
-        .await
-        .expect("activation response");
-    assert_eq!((response.ty, response.corr), (TY_RESPONSE, 1));
-
-    // Shutdown lands between activation and commit.
-    host.shutdown().await.expect("graceful shutdown");
-    assert!(candidate.closed_within(BUDGET).await);
-    assert!(client.closed_within(BUDGET).await);
-}
-
 // --- stable coordination fences (plan U1) ---
 
 /// Replacing the whole managed `cortexkit` subtree while a host serves leaves

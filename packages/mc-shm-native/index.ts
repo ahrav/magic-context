@@ -26,6 +26,14 @@ export interface NativeDescriptor {
     peerToHostGrant: string;
 }
 
+export interface NativeSetupOptions {
+    setupSocket: string;
+    key: Uint8Array;
+    daemonId: Uint8Array;
+    daemonVer: string;
+    timeoutMs: number;
+}
+
 export interface NativeTestPair {
     first: NativeChannel;
     second: NativeChannel;
@@ -46,6 +54,7 @@ interface NativeAddon {
     workerLimit(): number;
     activeChannelCount(): number;
     attach(descriptor: NativeDescriptor): number;
+    connectSetup(options: NativeSetupOptions): number;
     createTestPair(): {
         first: number;
         second: number;
@@ -486,6 +495,15 @@ export class NativeChannel {
             throw new Error(`shared-memory native startup failed: ${capability.reason}`);
         }
         return new NativeChannel(native, native.attach(descriptor));
+    }
+
+    static connectSetup(options: NativeSetupOptions): NativeChannel {
+        const native = requireAddon();
+        const capability = probeCapabilities();
+        if (!capability.available) {
+            throw new Error(`shared-memory native startup failed: ${capability.reason}`);
+        }
+        return new NativeChannel(native, native.connectSetup(options));
     }
 
     static createTestPair(): NativeTestPair {

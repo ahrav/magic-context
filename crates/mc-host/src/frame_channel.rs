@@ -443,10 +443,8 @@ impl LeaseTracker {
     }
 }
 
-/// Transport-owned body storage. The current TCP adapter is contiguous;
-/// candidate backends may supply two arena spans without flattening.
+/// Transport-owned body storage.
 enum ReceiveBody {
-    Contiguous(Vec<u8>),
     Segmented(Vec<u8>, Vec<u8>),
     Owned(Vec<u8>),
 }
@@ -461,20 +459,6 @@ pub struct InboundFrame {
 }
 
 impl InboundFrame {
-    pub(crate) fn contiguous(
-        header: EnvelopeHeader,
-        body: Vec<u8>,
-        charge: crate::wire::ByteCharge,
-        copies: CopyCounter,
-    ) -> Self {
-        Self {
-            header,
-            body: ReceiveBody::Contiguous(body),
-            charge,
-            copies,
-        }
-    }
-
     pub(crate) fn owned(
         header: EnvelopeHeader,
         body: Vec<u8>,
@@ -513,7 +497,7 @@ impl InboundFrame {
 
     pub fn body_len(&self) -> usize {
         match &self.body {
-            ReceiveBody::Contiguous(body) | ReceiveBody::Owned(body) => body.len(),
+            ReceiveBody::Owned(body) => body.len(),
             ReceiveBody::Segmented(first, second) => first.len().saturating_add(second.len()),
         }
     }
@@ -521,17 +505,14 @@ impl InboundFrame {
     /// Runs transport-byte decoding inside a non-escaping lexical scope.
     pub fn with_lease<T>(&self, decode: impl for<'lease> FnOnce(ReceiveLease<'lease>) -> T) -> T {
         match &self.body {
-            ReceiveBody::Contiguous(body) | ReceiveBody::Owned(body) => {
-                decode(ReceiveLease::contiguous(body))
-            }
+            ReceiveBody::Owned(body) => decode(ReceiveLease::contiguous(body)),
             ReceiveBody::Segmented(first, second) => {
                 decode(ReceiveLease::segmented(first, Some(second)))
             }
         }
     }
 
-    /// Compatibility adapter. Already-owned contiguous storage moves directly;
-    /// segmented storage is flattened synchronously before returning.
+    /// Moves owned storage directly and flattens segmented storage.
     pub fn into_owned(self) -> OwnedInboundFrame {
         let Self {
             header,
@@ -540,7 +521,7 @@ impl InboundFrame {
             copies,
         } = self;
         let body = match body {
-            ReceiveBody::Contiguous(body) | ReceiveBody::Owned(body) => body,
+            ReceiveBody::Owned(body) => body,
             ReceiveBody::Segmented(first, second) => {
                 ReceiveLease::segmented(&first, Some(&second)).to_owned(&copies)
             }
@@ -635,60 +616,6 @@ impl DirectFrame {
 
     pub(crate) fn serialize(self, writer: &mut dyn io::Write) -> io::Result<()> {
         (self.serializer)(writer)
-    }
-
-    pub(crate) fn into_owned(self) -> io::Result<Vec<u8>> {
-        let mut bytes = Vec::with_capacity(crate::wire::HEADER_LEN + self.body_len);
-        bytes.extend_from_slice(&self.header);
-        {
-            let mut writer = ExactWriter::new(&mut bytes, self.body_len);
-            self.serialize(&mut writer)?;
-            writer.finish()?;
-        }
-        Ok(bytes)
-    }
-}
-
-pub(crate) struct ExactWriter<W> {
-    inner: W,
-    remaining: usize,
-}
-
-impl<W> ExactWriter<W> {
-    pub(crate) const fn new(inner: W, len: usize) -> Self {
-        Self {
-            inner,
-            remaining: len,
-        }
-    }
-
-    pub(crate) fn finish(self) -> io::Result<()> {
-        if self.remaining == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "direct serializer underfilled reservation",
-            ))
-        }
-    }
-}
-
-impl<W: io::Write> io::Write for ExactWriter<W> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > self.remaining {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "direct serializer exceeded reservation",
-            ));
-        }
-        self.inner.write_all(bytes)?;
-        self.remaining -= bytes.len();
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
     }
 }
 
@@ -838,7 +765,6 @@ pub struct WriterGone;
 pub(crate) struct SenderQueue {
     rx: mpsc::Receiver<QueuedOutboundFrame>,
     pub retired: CancellationToken,
-    pub generation: CancellationToken,
     pub discard: CancellationToken,
     pub finish: CancellationToken,
 }
@@ -874,7 +800,6 @@ pub(crate) fn frame_sender(
     let queue = SenderQueue {
         rx,
         retired,
-        generation,
         discard,
         finish,
     };

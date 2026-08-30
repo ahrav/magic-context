@@ -23,7 +23,6 @@ pub const OP_ROUTE_OPEN: &str = "route.open";
 pub const OP_CATALOG_LIST: &str = "catalog.list";
 pub const OP_HOST_SHUTDOWN: &str = "host.shutdown";
 pub const OP_HOST_STATUS: &str = "host.status";
-pub const OP_TRANSPORT_NEGOTIATE: &str = crate::transport_negotiation::OP_TRANSPORT_NEGOTIATE;
 
 /// `TargetIndex` restricts `route.open` targets to listed `(module, kind)`
 /// pairs.
@@ -84,12 +83,6 @@ pub enum ControlAction {
     },
     HostShutdown,
     HostStatus,
-    TransportNegotiate(
-        Result<
-            crate::transport_negotiation::NegotiateRequest,
-            crate::transport_negotiation::NegotiationError,
-        >,
-    ),
     /// Semantic rejection with a trustworthy correlation; one terminal.
     Reject {
         code: &'static str,
@@ -104,104 +97,16 @@ fn invalid(message: &str) -> ControlAction {
     }
 }
 
-/// Tolerantly classifies a body that failed strict validation. A generic
-/// rejection commits the generation to TCP and leaves it usable, but a
-/// malformed negotiation-family body must reach the authoritative-terminal-
-/// and-close path (§7.7.1), so classification cannot depend on the body
-/// parsing under ANY reader — truncated JSON still names its operation.
-/// JSON permits escaped spellings of any string, so a raw miss is retried
-/// against a structure-blind unescape of the bytes. The needle omits the
-/// closing quote so a body truncated mid-token still classifies. The scan
-/// over-matches (the tag may appear as a value, or as the prefix of a
-/// longer operation name), which only retires a connection that already
-/// sent an invalid control body: fail closed.
-fn is_negotiation_family(body: &[u8]) -> bool {
-    const NEEDLE: &[u8] = b"\"transport.negotiate";
-    if body.windows(NEEDLE.len()).any(|window| window == NEEDLE) {
-        return true;
-    }
-    if !body.contains(&b'\\') {
-        return false;
-    }
-    let decoded = decode_json_escapes_lossy(body);
-    decoded.windows(NEEDLE.len()).any(|window| window == NEEDLE)
-}
-
-/// Structure-blind decode of JSON string escapes for classification only:
-/// `\uXXXX` (BMP; unpaired surrogates are dropped), the two-character
-/// escapes, and everything else copied through. Never used to build values.
-fn decode_json_escapes_lossy(body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(body.len());
-    let mut index = 0;
-    while index < body.len() {
-        if body[index] != b'\\' || index + 1 >= body.len() {
-            out.push(body[index]);
-            index += 1;
-            continue;
-        }
-        match body[index + 1] {
-            b'u' if index + 6 <= body.len() => {
-                let hex = std::str::from_utf8(&body[index + 2..index + 6]).ok();
-                let code = hex.and_then(|hex| u16::from_str_radix(hex, 16).ok());
-                if let Some(ch) = code.and_then(|code| char::from_u32(u32::from(code))) {
-                    let mut buffer = [0u8; 4];
-                    out.extend_from_slice(ch.encode_utf8(&mut buffer).as_bytes());
-                }
-                index += 6;
-            }
-            b'"' => {
-                out.push(b'"');
-                index += 2;
-            }
-            b'\\' => {
-                out.push(b'\\');
-                index += 2;
-            }
-            b'/' => {
-                out.push(b'/');
-                index += 2;
-            }
-            other => {
-                out.push(b'\\');
-                out.push(other);
-                index += 2;
-            }
-        }
-    }
-    out
-}
-
-/// The strict negotiation decode for a body already known to be invalid:
-/// yields the `NegotiationError` that routes it to retirement.
-fn malformed_negotiation(body: &[u8]) -> ControlAction {
-    ControlAction::TransportNegotiate(crate::transport_negotiation::decode_negotiate_request(body))
-}
-
 /// Validates and classifies one complete channel-0 `Request` body.
 ///
 /// `binary` is the frame's encoding bit: channel 0 accepts JSON only.
 pub fn parse_control(body: &[u8], binary: bool, targets: &TargetIndex) -> ControlAction {
     if binary {
-        if is_negotiation_family(body) {
-            // Negotiation-family frames require `binary = 0`; the strict
-            // decoder cannot express that, so the error is built directly.
-            return ControlAction::TransportNegotiate(Err(
-                crate::transport_negotiation::NegotiationError {
-                    code: crate::transport_negotiation::NegotiationErrorCode::MalformedJson,
-                    path: "flags".to_owned(),
-                },
-            ));
-        }
         return invalid("control channel accepts JSON only");
     }
     let root = match strict_json::parse(body) {
         Ok(value) => value,
-        Err(err) => {
-            if is_negotiation_family(body) {
-                return malformed_negotiation(body);
-            }
-            return invalid(err.as_str());
-        }
+        Err(err) => return invalid(err.as_str()),
     };
     let serde_json::Value::Object(fields) = root else {
         return invalid("control request must be a JSON object");
@@ -214,9 +119,6 @@ pub fn parse_control(body: &[u8], binary: bool, targets: &TargetIndex) -> Contro
         .saturating_add(1)
         > MAX_CONTROL_DEPTH
     {
-        if fields.get("op").and_then(serde_json::Value::as_str) == Some(OP_TRANSPORT_NEGOTIATE) {
-            return malformed_negotiation(body);
-        }
         return invalid("control request too deeply nested");
     }
 
@@ -235,9 +137,6 @@ pub fn parse_control(body: &[u8], binary: bool, targets: &TargetIndex) -> Contro
         OP_ROUTE_OPEN => parse_route_open(&fields, targets),
         OP_HOST_SHUTDOWN => ControlAction::HostShutdown,
         OP_HOST_STATUS => ControlAction::HostStatus,
-        OP_TRANSPORT_NEGOTIATE => ControlAction::TransportNegotiate(
-            crate::transport_negotiation::decode_negotiate_request(body),
-        ),
         _ => ControlAction::Reject {
             code: CODE_UNSUPPORTED_OPERATION,
             message: "operation is not supported by this host".to_owned(),
@@ -580,7 +479,7 @@ fn serialize_catalog_response(
         op: &'static str,
         generation: u64,
         modules: &'a [CatalogModule<'a>],
-        subc_ops: [&'static str; 5],
+        subc_ops: [&'static str; 4],
     }
 
     let modules: Vec<CatalogModule<'_>> = manifests
@@ -607,7 +506,6 @@ fn serialize_catalog_response(
                 OP_CATALOG_LIST,
                 OP_HOST_SHUTDOWN,
                 OP_HOST_STATUS,
-                OP_TRANSPORT_NEGOTIATE,
             ],
         },
     )
@@ -975,54 +873,6 @@ mod tests {
         assert_eq!(reject_code(action), CODE_INVALID_CONTROL_REQUEST);
     }
 
-    /// Strict-parse failures inside a negotiation-family body must classify
-    /// as negotiation so they reach the terminal-and-close path (§7.7.1),
-    /// not the generic rejection that commits the generation to TCP.
-    #[test]
-    fn malformed_negotiation_family_bodies_classify_as_negotiation() {
-        // Duplicate key nested inside an offer's opaque parameters.
-        let dup_nested = br#"{"op":"transport.negotiate","negotiation_version":1,"offers":[{"transport":"tcp","capability_version":1,"parameters":{"a":1,"a":2}}]}"#;
-        // Duplicate key at the root.
-        let dup_root = br#"{"op":"transport.negotiate","negotiation_version":1,"negotiation_version":1,"offers":[]}"#;
-        // Syntactically truncated body whose negotiation tag is complete.
-        let truncated = br#"{"op":"transport.negotiate","offers":"#;
-        // Escaped spelling of the tag: legal JSON, still negotiation-family.
-        let escaped = br#"{"op":"transport.\u006eegotiate","offers":"#;
-        // Truncated mid-tag, before the closing quote.
-        let mid_tag = br#"{"op":"transport.negotiate"#;
-        for body in [&dup_nested[..], dup_root, truncated, escaped, mid_tag] {
-            let action = parse_control(body, false, &two_target_index());
-            assert!(
-                matches!(action, ControlAction::TransportNegotiate(Err(_))),
-                "expected TransportNegotiate(Err), got {action:?}"
-            );
-        }
-        // A binary negotiation frame violates the JSON-only encoding rule.
-        let valid = br#"{"op":"transport.negotiate","negotiation_version":1,"offers":[{"transport":"tcp","capability_version":1}]}"#;
-        let action = parse_control(valid, true, &two_target_index());
-        assert!(
-            matches!(action, ControlAction::TransportNegotiate(Err(_))),
-            "expected TransportNegotiate(Err), got {action:?}"
-        );
-        // Deep nesting beyond the control bound stays negotiation-classified.
-        let mut params = String::from("1");
-        for _ in 0..MAX_CONTROL_DEPTH + 2 {
-            params = format!("{{\"k\":{params}}}");
-        }
-        let deep = format!(
-            "{{\"op\":\"transport.negotiate\",\"negotiation_version\":1,\"offers\":[{{\"transport\":\"tcp\",\"capability_version\":1,\"parameters\":{params}}}]}}"
-        );
-        let action = parse_control(deep.as_bytes(), false, &two_target_index());
-        assert!(
-            matches!(action, ControlAction::TransportNegotiate(Err(_))),
-            "expected TransportNegotiate(Err), got {action:?}"
-        );
-        // Non-negotiation bodies with the same defects keep the generic path.
-        let other = br#"{"op":"catalog.list","module_id":"a","module_id":"b"}"#;
-        let action = parse_control(other, false, &two_target_index());
-        assert_eq!(reject_code(action), CODE_INVALID_CONTROL_REQUEST);
-    }
-
     #[test]
     fn unknown_op_is_unsupported_operation_not_invalid() {
         let action = parse(&serde_json::json!({"op": "server.describe"}));
@@ -1349,13 +1199,7 @@ mod tests {
         );
         assert_eq!(
             unfiltered["subc_ops"],
-            serde_json::json!([
-                "route.open",
-                "catalog.list",
-                "host.shutdown",
-                "host.status",
-                "transport.negotiate"
-            ])
+            serde_json::json!(["route.open", "catalog.list", "host.shutdown", "host.status"])
         );
         assert!(!unfiltered.to_string().contains("transport.activate"));
         assert!(!unfiltered.to_string().contains("transport.commit"));

@@ -18,14 +18,8 @@ pub mod handler;
 pub mod harness_closure;
 pub mod lifecycle;
 #[doc(hidden)]
-pub mod provider_recovery;
-#[doc(hidden)]
-pub mod shm_provider;
+pub mod ring_transport;
 pub mod synapse;
-#[doc(hidden)]
-pub mod transport_negotiation;
-#[doc(hidden)]
-pub mod transport_provider;
 
 mod connection;
 mod control;
@@ -33,19 +27,14 @@ mod dispatch;
 mod file_mode;
 #[doc(hidden)]
 pub mod frame_channel;
-mod frame_read;
 mod instance;
 mod panic_boundary;
 mod routing;
 mod runtime;
 #[doc(hidden)]
 pub mod setup_socket;
-mod tcp_frame_channel;
-// Doc-hidden rather than private because `shm_provider`'s public `send`/`recv`
-// already take and return `EnvelopeHeader`, so the type must be nameable by any
-// consumer of that module. Doc-hidden keeps it out of the documented surface:
-// the managed `client` API still yields only `Response`, `StreamItem`, and
-// `CallError`, so raw frame types never reach an ordinary caller.
+// Ring setup and tests name raw envelope types, while the managed client API
+// exposes only responses, stream items, and call errors.
 #[doc(hidden)]
 pub mod wire;
 

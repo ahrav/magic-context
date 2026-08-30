@@ -280,8 +280,6 @@ pub struct HostConfig {
     pub timing: HostTiming,
     /// `None` sends no Pings at all.
     pub liveness: Option<LivenessPolicy>,
-    #[doc(hidden)]
-    pub transport_providers: crate::transport_provider::TransportProviders,
 }
 
 impl Default for HostConfig {
@@ -294,13 +292,6 @@ impl Default for HostConfig {
             limits: HostLimits::default(),
             timing: HostTiming::default(),
             liveness: None,
-            transport_providers: crate::transport_provider::TransportProviders::with_injected(
-                vec![std::sync::Arc::new(
-                    crate::shm_provider::ShmProvider::for_qualified_test_profile(
-                        crate::shm_provider::single_candidate_limits(),
-                    ),
-                )],
-            ),
         }
     }
 }

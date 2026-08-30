@@ -8,6 +8,7 @@ import {
     type CatalogEntry,
     type HostStatusSnapshot,
     McHostClient,
+    processMcHostClient,
     sameDaemonId,
 } from "../mc-host-client";
 import { BootstrapError, checkPlatform, type PlatformReaders, parseTrustIndex } from "./bootstrap";
@@ -101,9 +102,8 @@ async function probeManagedStorage(
     expectedDaemonId?: Uint8Array,
 ): Promise<"ready" | "starting" | "unavailable"> {
     const deadline = Date.now() + budgetMs;
-    let client: McHostClient | null = null;
     try {
-        client = await McHostClient.connect({
+        const client = await processMcHostClient({
             connectionFile: connectionFilePath(root),
             handshakeTimeoutMs: Math.max(1, budgetMs),
             requestTimeoutMs: Math.max(1, budgetMs),
@@ -126,8 +126,6 @@ async function probeManagedStorage(
     } catch (error) {
         if (error instanceof StorageProbeDaemonMismatchError) throw error;
         return Date.now() >= deadline ? "starting" : "unavailable";
-    } finally {
-        await client?.closeAsync().catch(() => {});
     }
 }
 
@@ -269,7 +267,7 @@ async function probeManagedCompatibility(
 
 async function probeManagedReadiness(root: string, budgetMs: number): Promise<ObservationalHealth> {
     const deadline = Date.now() + budgetMs;
-    const client = await McHostClient.connect({
+    const client = await processMcHostClient({
         connectionFile: connectionFilePath(root),
         handshakeTimeoutMs: Math.max(1, budgetMs),
         requestTimeoutMs: Math.max(1, budgetMs),
@@ -279,8 +277,7 @@ async function probeManagedReadiness(root: string, budgetMs: number): Promise<Ob
             session: "compatibility",
         },
     });
-    try {
-        const { snapshot: compatibility, status } = await readCompatibilityProbe(client, deadline);
+    const { snapshot: compatibility, status } = await readCompatibilityProbe(client, deadline);
         if (status === null) {
             // The probe short-circuited at the daemon or module stage, so
             // `host.status` never ran and storage and Synapse were never
@@ -338,9 +335,6 @@ async function probeManagedReadiness(root: string, budgetMs: number): Promise<Ob
                 synapse,
             },
         };
-    } finally {
-        await client.closeAsync().catch(() => {});
-    }
 }
 
 export interface ManagedLifecyclePolicyOptions

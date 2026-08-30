@@ -19,8 +19,9 @@ import {
     isConsumerReconnectTransient,
     isMcHostCallError,
     McHostCallError,
-    McHostClient,
+    type McHostClient,
     Priority,
+    processMcHostClient,
     type RouteHandle,
     type RouteTarget,
     SocketClosedError,
@@ -1322,7 +1323,7 @@ export class McHostModuleTransport {
         const handshakeTimeoutMs = deadline
             ? Math.max(1, deadline.stageBudgetMs(HANDSHAKE_TIMEOUT_MS))
             : HANDSHAKE_TIMEOUT_MS;
-        return McHostClient.connect({
+        return processMcHostClient({
             connectionFile: this.connectionFile,
             handshakeTimeoutMs,
             // Credentials are presented on every real connection, not only the
@@ -1491,7 +1492,6 @@ export class McHostModuleTransport {
                     );
                 }
                 if (generation !== this.connectionGeneration) {
-                    candidate.close();
                     throw this.connectionChangedError("subc connection attempt was superseded");
                 }
                 this.client = candidate;
@@ -1500,7 +1500,6 @@ export class McHostModuleTransport {
                 this.nextProbeMs = 0;
                 return { client: candidate, ...certification };
             } catch (error) {
-                candidate?.close();
                 if (generation === this.connectionGeneration) this.invalidateConnection();
                 this.nextProbeMs = Date.now() + this.backoffMs;
                 this.backoffMs = Math.min(this.backoffMs * 2, CONNECT_BACKOFF_MAX_MS);
@@ -1531,7 +1530,6 @@ export class McHostModuleTransport {
         this.client = null;
         this.routes.clear();
         this.routeOpenings.clear();
-        client?.close();
     }
 }
 

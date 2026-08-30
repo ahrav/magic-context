@@ -6,7 +6,7 @@
  * memory policy, and one idempotent retirement path. Transport mechanics —
  * the `node:net` socket, dial, auth byte I/O, incremental framing, and the
  * single bounded FIFO writer — live below the complete-frame channel
- * boundary in `TcpFrameChannel` (KTD1); the generation owns no socket. It
+ * boundary in `ShmFrameChannel`; the generation owns no setup socket. It
  * owns no route cache and no reconnect policy; the facade layer above
  * reacts to retirement but is never imported here.
  *
@@ -19,7 +19,6 @@
  * never peer receipt.
  */
 
-import { type AuthCredentials, AuthError } from "./auth";
 import { armExpiryTimer, type Deadline } from "./deadline";
 import { McHostCallError, SocketClosedError, SocketTimeoutError } from "./errors";
 import {
@@ -42,14 +41,14 @@ import {
     MAX_FRAME_BODY_LEN,
     PROTOCOL_VERSION,
 } from "./protocol";
-import { TcpFrameChannel } from "./tcp-frame-channel";
+import { ShmFrameChannel } from "./shm-frame-channel";
 import { AdmissionClass, Priority } from "./types";
 
 const DEFAULT_CLEANUP_TICKET_MS = 5_000;
 /**
  * How long setup lets a retired channel's `start()` settle before the
  * retirement cause wins the race: long enough for a rejection triggered by
- * the same event-loop turn as the retirement, short enough that a provider
+ * the same event-loop turn as the retirement, short enough that a channel
  * promise that never settles cannot meaningfully extend teardown.
  */
 const RETIREMENT_SETTLE_GRACE_MS = 50;
@@ -77,7 +76,6 @@ const EMPTY_JSON_BODY: JsonReceiveBody = Object.freeze({
 
 export type RetirementReason =
     | "setup_failed"
-    | "auth_failed"
     | "setup_deadline"
     | "socket_error"
     | "eof"
@@ -180,9 +178,13 @@ export interface PendingRequest {
     abort(): AbortHandle;
 }
 
+interface AuthCredentials {
+    key: Uint8Array;
+    daemonId: Uint8Array;
+    daemonVer: string;
+}
+
 export interface ConnectionGenerationOptions {
-    host?: string;
-    port?: number;
     setupSocket?: string;
     /**
      * Validated connection-file credentials. `daemonVer` is the file's
@@ -195,28 +197,18 @@ export interface ConnectionGenerationOptions {
     maxBodyLen?: number;
     /** One aggregate cap over reader, decoded, queued, and pending bytes. */
     memoryCapBytes?: number;
-    maxQueuedFrames?: number;
-    maxQueuedBytes?: number;
-    controlReserveFrames?: number;
     /** Bounded cleanup-ticket deadline for post-write aborts. */
     cleanupTicketMs?: number;
     /** Test seam so correlation exhaustion is reachable; defaults to 1n. */
     firstCorrelation?: bigint;
-    /** @internal Not part of the consumer contract. */
+    /** @internal Test-only complete-frame channel seam. */
     channelFactory?: (args: {
         budget: ByteBudget;
         maxBodyLen: number;
         handlers: FrameChannelHandlers;
     }) => SetupFrameChannel;
-    /**
-     * @internal Not part of the consumer contract. Identity a candidate
-     * generation adopts from the already-authenticated generation that
-     * negotiated it. A `channelFactory` channel runs no handshake and can
-     * report no identity of its own, so this is the candidate's only source.
-     */
+    /** @internal Identity inherited by a test-only pre-attached channel. */
     inheritedIdentity?: { daemonVer: string; daemonId: Uint8Array | null };
-    /** Nonce source passthrough to U2's handshake. */
-    generateNonce?: (length: number) => Uint8Array;
     onRetired?: (info: RetirementInfo) => void;
     /** Route Goodbye events; the generation owns no route cache (KTD6). */
     onRouteGoodbye?: (channel: number, epoch: number) => void;
@@ -336,7 +328,7 @@ function releaseReceiveBodies(bodies: readonly RequestReceiveBody[]): void {
 
 /**
  * The sole pending-entry, correlation, and terminal owner for one
- * connection generation (KTD6); its `TcpFrameChannel` owns the transport.
+ * connection generation; its `ShmFrameChannel` owns the transport.
  * Construct, then `start()` exactly once; every setup failure routes
  * through the same idempotent retirement.
  */
@@ -348,15 +340,15 @@ export class ConnectionGeneration {
     authenticatedDaemonId: Uint8Array | null = null;
 
     private readonly channel: SetupFrameChannel;
+    private readonly credentials: AuthCredentials;
+    private readonly inheritedIdentity: { daemonVer: string; daemonId: Uint8Array | null } | null;
     /**
      * The same channel as {@link channel} when this generation dials and
      * authenticates for itself, and the only source of a proven identity.
      * Null for a `channelFactory` channel, which runs no handshake.
      */
-    private readonly authChannel: TcpFrameChannel | null;
     private readonly budget: ByteBudget;
     private readonly cleanupTicketMs: number;
-    private readonly inheritedIdentity: { daemonVer: string; daemonId: Uint8Array | null } | null;
     private readonly onRetired?: (info: RetirementInfo) => void;
     private readonly onRouteGoodbyeHook?: (channel: number, epoch: number) => void;
     private readonly onPendingZeroHook?: () => void;
@@ -380,19 +372,22 @@ export class ConnectionGeneration {
     private pendingHeld = 0;
 
     constructor(options: ConnectionGenerationOptions) {
-        const maxBodyLen = options.maxBodyLen ?? MAX_FRAME_BODY_LEN;
-        this.budget = new ByteBudget(
-            options.memoryCapBytes ?? maxBodyLen + DEFAULT_MEMORY_OVERHEAD_BYTES,
-        );
-        this.cleanupTicketMs = options.cleanupTicketMs ?? DEFAULT_CLEANUP_TICKET_MS;
-        // Copied at construction: the retained identity that authorizes
-        // compatibility and fencing must not alias a caller-mutable array.
+        this.credentials = {
+            key: options.credentials.key.slice(),
+            daemonId: options.credentials.daemonId.slice(),
+            daemonVer: options.credentials.daemonVer,
+        };
         this.inheritedIdentity = options.inheritedIdentity
             ? {
                   daemonVer: options.inheritedIdentity.daemonVer,
                   daemonId: options.inheritedIdentity.daemonId?.slice() ?? null,
               }
             : null;
+        const maxBodyLen = options.maxBodyLen ?? MAX_FRAME_BODY_LEN;
+        this.budget = new ByteBudget(
+            options.memoryCapBytes ?? maxBodyLen + DEFAULT_MEMORY_OVERHEAD_BYTES,
+        );
+        this.cleanupTicketMs = options.cleanupTicketMs ?? DEFAULT_CLEANUP_TICKET_MS;
         this.onRetired = options.onRetired;
         this.onRouteGoodbyeHook = options.onRouteGoodbye;
         this.onPendingZeroHook = options.onPendingZero;
@@ -419,24 +414,21 @@ export class ConnectionGeneration {
             },
         };
         if (options.channelFactory) {
-            this.authChannel = null;
             this.channel = options.channelFactory({ budget: this.budget, maxBodyLen, handlers });
         } else {
-            this.authChannel = new TcpFrameChannel({
-                host: options.host,
-                port: options.port,
-                setupSocket: options.setupSocket,
-                credentials: options.credentials,
+            if (!options.setupSocket) throw new Error("shared-memory setup socket is required");
+            this.channel = new ShmFrameChannel({
+                setup: {
+                    setupSocket: options.setupSocket,
+                    key: options.credentials.key,
+                    daemonId: options.credentials.daemonId,
+                    daemonVer: options.credentials.daemonVer,
+                    timeoutMs: options.frameDeadlineMs ?? 2_000,
+                },
                 budget: this.budget,
-                frameDeadlineMs: options.frameDeadlineMs,
                 maxBodyLen,
-                maxQueuedFrames: options.maxQueuedFrames,
-                maxQueuedBytes: options.maxQueuedBytes,
-                controlReserveFrames: options.controlReserveFrames,
-                generateNonce: options.generateNonce,
                 handlers,
             });
-            this.channel = this.authChannel;
         }
     }
 
@@ -454,17 +446,7 @@ export class ConnectionGeneration {
             await this.setup(deadline);
         } catch (error) {
             if (!this.retiredInfo) {
-                // An auth-layer deadline observation is the same owner-budget
-                // exhaustion the setup timer reports: auth I/O that completes
-                // after expiry but before the timer callback runs must not
-                // masquerade as an authentication failure.
-                const reason: RetirementReason =
-                    error instanceof AuthError
-                        ? error.code === "deadline_expired"
-                            ? "setup_deadline"
-                            : "auth_failed"
-                        : "setup_failed";
-                this.retire(reason, error);
+                this.retire("setup_failed", error);
             }
             throw error;
         }
@@ -755,7 +737,7 @@ export class ConnectionGeneration {
             ),
         );
         try {
-            // Raced against retirement: a provider channel whose start()
+            // Raced against retirement: a channel whose start()
             // never settles — or ignores the close() that retirement issues
             // — must not strand setup after the timer above has already
             // retired this generation. Retirement waits one grace beat
@@ -766,16 +748,16 @@ export class ConnectionGeneration {
             // unhandled.
             await new Promise<void>((resolve, reject) => {
                 let settled = false;
-                let fallback: ReturnType<typeof setTimeout> | null = null;
+                let retirementTimer: ReturnType<typeof setTimeout> | null = null;
                 const settle = (complete: () => void): void => {
                     if (settled) return;
                     settled = true;
-                    if (fallback !== null) clearTimeout(fallback);
+                    if (retirementTimer !== null) clearTimeout(retirementTimer);
                     complete();
                 };
                 void this.retired.then((info) => {
                     if (settled) return;
-                    fallback = setTimeout(
+                    retirementTimer = setTimeout(
                         () =>
                             settle(() =>
                                 reject(
@@ -813,9 +795,9 @@ export class ConnectionGeneration {
             // channel's own handshake, or — for a candidate channel, which
             // runs none — the identity the negotiating generation
             // authenticated and passed in.
-            const identity = this.authChannel?.authenticated ?? this.inheritedIdentity;
-            this.daemonVer = identity?.daemonVer ?? null;
-            this.authenticatedDaemonId = identity?.daemonId ?? null;
+            const identity = this.inheritedIdentity ?? this.credentials;
+            this.daemonVer = identity.daemonVer;
+            this.authenticatedDaemonId = identity.daemonId?.slice() ?? null;
             this.phase = "frames";
         } finally {
             cancelSetupTimer();
