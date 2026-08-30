@@ -105,7 +105,7 @@ fn seed_object(conn: &Connection, object_id: &str, object_kind: &str, commit_seq
 #[test]
 fn kernel_schema_has_one_ordered_full_shape() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).expect("bootstrap");
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).expect("bootstrap");
 
     assert_eq!(KERNEL_SCHEMA_COMPONENT_NAMES, EXPECTED_COMPONENTS);
     assert_eq!(kernel_schema_inventory(&conn).unwrap(), EXPECTED_COMPONENTS);
@@ -129,13 +129,15 @@ fn kernel_schema_has_one_ordered_full_shape() {
         .all(|name| !name.starts_with("sqlite_")));
 }
 
+const INCARNATION: &str = "0123456789abcdef0123456789abcdef";
+
 const PINNED_SCHEMA_DIGEST: &str =
-    "d88af4fba1eb5e474586f120560781163044b1a9cc38f8e124768e3408ed51df";
+    "edd21757592088f528212faa058a1c3dd0feb122dc9fa539ecbfa17b67ab6b01";
 
 #[test]
 fn kernel_schema_digest_is_pinned_to_the_frozen_v1_shape() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).expect("bootstrap");
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).expect("bootstrap");
     assert_eq!(kernel_schema_digest(&conn).unwrap(), PINNED_SCHEMA_DIGEST);
 }
 
@@ -151,7 +153,7 @@ fn kernel_profile_is_strict_and_verified() {
 #[test]
 fn first_root_transaction_resolves_deferred_registry_cycle() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
 
     let tx = conn.transaction().unwrap();
     tx.execute(
@@ -181,7 +183,7 @@ fn first_root_transaction_resolves_deferred_registry_cycle() {
 #[test]
 fn candidate_delete_cascades_scores_but_preserves_admission_audit() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
     conn.execute(
         "INSERT INTO extraction_runs(
              extraction_run_id, extractor, sensitivity_class, provenance_witness,
@@ -241,11 +243,10 @@ fn candidate_delete_cascades_scores_but_preserves_admission_audit() {
 #[test]
 fn late_bootstrap_failure_leaves_no_partial_schema() {
     let (_dir, mut conn) = open_profiled();
-    let error =
-        apply_kernel_schema_with_fault_hook_for_test(&mut conn, "incarnation-1", 1_000, || {
-            Err(rusqlite::Error::InvalidQuery)
-        })
-        .expect_err("fault must abort bootstrap");
+    let error = apply_kernel_schema_with_fault_hook_for_test(&mut conn, INCARNATION, 1_000, || {
+        Err(rusqlite::Error::InvalidQuery)
+    })
+    .expect_err("fault must abort bootstrap");
     assert!(matches!(error, rusqlite::Error::InvalidQuery));
     assert_eq!(
         kernel_schema_inventory(&conn).unwrap(),
@@ -261,7 +262,7 @@ fn late_bootstrap_failure_leaves_no_partial_schema() {
 #[test]
 fn consumers_checkpoint_independent_outbox_positions() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
     conn.execute(
         "INSERT INTO commit_log(transaction_id, writer_epoch, recorded_at, actor, cause)
          VALUES ('tx-1', 7, 1, 'test', 'outbox')",
@@ -318,7 +319,7 @@ fn consumers_checkpoint_independent_outbox_positions() {
 #[test]
 fn every_kernel_table_is_strict_and_enforces_types_and_foreign_keys() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
 
     let mut stmt = conn
         .prepare(
@@ -378,7 +379,7 @@ fn trusted_schema_on_fails_kernel_verification() {
 #[test]
 fn commit_receipt_and_change_identity_shapes_are_not_overconstrained() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
     conn.execute(
         "INSERT INTO commit_log(
              transaction_id, writer_epoch, recorded_at, actor, cause
@@ -426,7 +427,7 @@ fn commit_receipt_and_change_identity_shapes_are_not_overconstrained() {
 #[test]
 fn abandonment_audit_survives_consumer_deletion() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
     conn.execute(
         "INSERT INTO outbox_consumers(consumer_id, checkpoint_outbox_position, updated_at)
          VALUES ('search', 9, 10)",
@@ -465,7 +466,7 @@ fn abandonment_audit_survives_consumer_deletion() {
 #[test]
 fn superseded_predicate_schema_replacement_reuses_its_name() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
     let created = seed_root_domain(&mut conn);
 
     seed_object(&conn, "object-pred-1", "predicate_schema", created);
@@ -518,7 +519,7 @@ fn superseded_predicate_schema_replacement_reuses_its_name() {
 #[test]
 fn superseded_domain_and_relation_names_are_reusable_once_invalidated() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
     let created = seed_root_domain(&mut conn);
     let corrected = next_commit(&conn, "tx-correct");
 
@@ -560,7 +561,7 @@ fn superseded_domain_and_relation_names_are_reusable_once_invalidated() {
 #[test]
 fn inverted_and_empty_validity_intervals_are_refused() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
     let created = seed_root_domain(&mut conn);
     let later = next_commit(&conn, "tx-later");
 
@@ -587,7 +588,7 @@ fn inverted_and_empty_validity_intervals_are_refused() {
 #[test]
 fn format_marker_rejects_update_and_delete() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
 
     assert!(conn
         .execute(
@@ -610,13 +611,13 @@ fn format_marker_rejects_update_and_delete() {
         )
         .unwrap();
     assert_eq!(epoch, 1);
-    assert_eq!(incarnation, "incarnation-1");
+    assert_eq!(incarnation, INCARNATION);
 }
 
 #[test]
 fn one_source_revision_admits_many_objects_of_one_kind() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
     let created = seed_root_domain(&mut conn);
 
     // One extraction over one file revision yields many propositions; object
@@ -645,7 +646,7 @@ fn one_source_revision_admits_many_objects_of_one_kind() {
 #[test]
 fn canonical_evidence_delete_is_refused_while_referenced() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
     let created = seed_root_domain(&mut conn);
 
     seed_object(&conn, "object-ev-1", "evidence", created);
@@ -688,7 +689,7 @@ fn canonical_evidence_delete_is_refused_while_referenced() {
 #[test]
 fn kernel_stamps_the_shared_direct_format_application_id() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
 
     assert_eq!(KERNEL_APPLICATION_ID, MC_APPLICATION_ID);
     assert_eq!(
@@ -705,7 +706,7 @@ fn kernel_stamps_the_shared_direct_format_application_id() {
 #[test]
 fn commit_log_rejects_update_and_delete() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
     let commit_seq = next_commit(&conn, "tx-audit");
 
     assert!(conn
@@ -737,7 +738,7 @@ fn commit_log_rejects_update_and_delete() {
 #[test]
 fn consumer_checkpoints_advance_but_never_retreat() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
     conn.execute(
         "INSERT INTO outbox_consumers(consumer_id, checkpoint_outbox_position, updated_at)
          VALUES ('search', 5, 1)",
@@ -778,7 +779,7 @@ fn consumer_checkpoints_advance_but_never_retreat() {
 #[test]
 fn staging_leases_must_outlive_their_heartbeat() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
 
     let insert_run = |lease_expires_at: i64| {
         conn.execute(
@@ -812,7 +813,7 @@ fn bootstrap_refuses_a_database_holding_foreign_objects() {
     conn.execute_batch("CREATE TABLE legacy_notes(id INTEGER PRIMARY KEY, body TEXT);")
         .unwrap();
 
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000)
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000)
         .expect_err("a non-pristine database must not be stamped as a kernel format");
 
     // Nothing stamped, nothing destroyed.
@@ -836,7 +837,7 @@ fn bootstrap_refuses_a_database_holding_foreign_objects() {
 #[test]
 fn invalidated_alias_can_be_reintroduced_for_the_same_entity() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
     let created = seed_root_domain(&mut conn);
 
     seed_object(&conn, "object-entity-1", "entity", created);
@@ -897,7 +898,7 @@ fn invalidated_alias_can_be_reintroduced_for_the_same_entity() {
 #[test]
 fn canonical_parents_refuse_deletion_instead_of_cascading() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
     let created = seed_root_domain(&mut conn);
 
     seed_object(&conn, "object-decision-1", "decision", created);
@@ -933,7 +934,7 @@ fn canonical_parents_refuse_deletion_instead_of_cascading() {
 #[test]
 fn writer_fence_singleton_cannot_be_deleted() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
 
     assert!(conn.execute("DELETE FROM writer_fence", []).is_err());
     assert_eq!(
@@ -947,7 +948,7 @@ fn writer_fence_singleton_cannot_be_deleted() {
 #[test]
 fn staging_terminal_state_and_timestamp_are_set_together() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
 
     let insert_run = |id: &str, state: Option<&str>, at: Option<i64>| {
         conn.execute(
@@ -973,7 +974,7 @@ fn bootstrap_refuses_a_header_only_database() {
     conn.pragma_update(None, "application_id", 0x4D43_5458_i64)
         .unwrap();
 
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000)
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000)
         .expect_err("a header-stamped file is not pristine");
     assert_eq!(
         conn.query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0))
@@ -988,14 +989,14 @@ fn bootstrap_refuses_a_header_only_database() {
 
     let (_dir2, mut conn2) = open_profiled();
     conn2.pragma_update(None, "user_version", 7_i64).unwrap();
-    apply_kernel_schema(&mut conn2, "incarnation-1", 1_000)
+    apply_kernel_schema(&mut conn2, INCARNATION, 1_000)
         .expect_err("a stamped user_version is not pristine");
 }
 
 #[test]
 fn commit_history_identity_is_immutable_and_undeletable() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
     let commit_seq = next_commit(&conn, "tx-events");
     conn.execute(
         "INSERT INTO change_event(
@@ -1037,7 +1038,7 @@ fn commit_history_identity_is_immutable_and_undeletable() {
 #[test]
 fn active_capture_pin_must_be_released_before_deletion() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
     let commit_seq = next_commit(&conn, "tx-pin");
     conn.execute(
         "INSERT INTO capture_pins(
@@ -1071,7 +1072,7 @@ fn active_capture_pin_must_be_released_before_deletion() {
 #[test]
 fn bootstrap_stamps_the_direct_format_epoch() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
 
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
@@ -1093,7 +1094,7 @@ fn bootstrap_stamps_the_direct_format_epoch() {
 #[test]
 fn capture_references_survive_until_released() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
     let created = seed_root_domain(&mut conn);
     seed_object(&conn, "object-ev-1", "evidence", created);
     conn.execute(
@@ -1169,7 +1170,7 @@ fn capture_references_survive_until_released() {
 #[test]
 fn audit_and_event_identity_are_immutable_and_undeletable() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
     let created = seed_root_domain(&mut conn);
     conn.execute(
         "INSERT INTO consumer_abandonments(
@@ -1213,4 +1214,111 @@ fn audit_and_event_identity_are_immutable_and_undeletable() {
         .expect("reason remediation must remain possible");
     conn.execute("UPDATE decision_events SET event_payload = X'99'", [])
         .expect("event payload remediation must remain possible");
+}
+
+#[test]
+fn replace_cannot_bypass_the_append_only_guards() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
+    let commit_seq = next_commit(&conn, "tx-replace");
+
+    // REPLACE resolves a conflict by deleting the existing row; the delete
+    // trigger only runs when recursive_triggers is on.
+    assert!(conn
+        .execute(
+            "INSERT OR REPLACE INTO mc_kernel_format_marker(
+                 singleton, format_epoch, database_incarnation_id, schema_digest, created_at
+             ) VALUES (1, 99, '99999999999999999999999999999999', ?1, 2)",
+            [PINNED_SCHEMA_DIGEST],
+        )
+        .is_err());
+    assert_eq!(
+        conn.query_row(
+            "SELECT database_incarnation_id FROM mc_kernel_format_marker",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        INCARNATION
+    );
+    assert!(conn
+        .execute(
+            "INSERT OR REPLACE INTO commit_log(
+                 commit_seq, transaction_id, writer_epoch, recorded_at, actor, cause
+             ) VALUES (?1, 'tx-hijack', 1, 1, 'attacker', 'rewrite')",
+            [commit_seq],
+        )
+        .is_err());
+    assert_eq!(
+        conn.query_row(
+            "SELECT actor FROM commit_log WHERE commit_seq = ?1",
+            [commit_seq],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        "test"
+    );
+}
+
+#[test]
+fn malformed_incarnation_ids_are_refused() {
+    for bad in [
+        "incarnation-1",
+        "",
+        "0123456789ABCDEF0123456789ABCDEF",
+        "0123456789abcdef0123456789abcde",
+        "0123456789abcdef0123456789abcdeff",
+        "0123456789abcdef0123456789abcdeg",
+    ] {
+        let (_dir, mut conn) = open_profiled();
+        assert!(
+            apply_kernel_schema(&mut conn, bad, 1_000).is_err(),
+            "must refuse incarnation {bad:?}"
+        );
+        assert_eq!(
+            kernel_schema_inventory(&conn).unwrap(),
+            Vec::<String>::new(),
+            "a refused bootstrap leaves no schema"
+        );
+    }
+}
+
+#[test]
+fn staging_timestamps_must_be_chronological() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
+
+    let insert_run = |id: &str, started: i64, heartbeat: i64, terminal: Option<i64>| {
+        conn.execute(
+            "INSERT INTO extraction_runs(
+                 extraction_run_id, extractor, sensitivity_class, provenance_witness,
+                 redaction_metadata, started_at, heartbeat_at, lease_expires_at,
+                 terminal_state, terminal_at
+             ) VALUES (?1, 'test', 'internal', X'01', X'7b7d', ?2, ?3, 9999,
+                       CASE WHEN ?4 IS NULL THEN NULL ELSE 'completed' END, ?4)",
+            params![id, started, heartbeat, terminal],
+        )
+    };
+    assert!(
+        insert_run("run-a", 100, 50, None).is_err(),
+        "heartbeat before start"
+    );
+    assert!(
+        insert_run("run-b", 10, 50, Some(40)).is_err(),
+        "terminal before last heartbeat"
+    );
+    insert_run("run-c", 10, 50, None).expect("live run in order");
+    insert_run("run-d", 10, 50, Some(50)).expect("terminal at the last heartbeat");
+
+    assert!(conn
+        .execute(
+            "INSERT INTO candidates(
+                 candidate_id, extraction_run_id, candidate_kind, payload, sensitivity_class,
+                 provenance_witness, redaction_metadata, created_at, heartbeat_at,
+                 lease_expires_at
+             ) VALUES ('candidate-1', 'run-c', 'proposition', X'02', 'internal', X'03',
+                       X'7b7d', 100, 50, 9999)",
+            [],
+        )
+        .is_err());
 }

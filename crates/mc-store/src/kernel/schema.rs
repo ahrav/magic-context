@@ -125,11 +125,11 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "extraction_runs",
-        r#"CREATE TABLE extraction_runs(extraction_run_id TEXT PRIMARY KEY,extractor TEXT NOT NULL,source_kind TEXT,source_id TEXT,source_revision INTEGER,sensitivity_class TEXT NOT NULL,provenance_witness BLOB NOT NULL,redaction_metadata BLOB NOT NULL,detector_id TEXT,secret_type TEXT,utf8_offset INTEGER,utf8_length INTEGER,started_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,lease_expires_at INTEGER NOT NULL,terminal_state TEXT,terminal_at INTEGER,CHECK(lease_expires_at>heartbeat_at),CHECK((terminal_state IS NULL)=(terminal_at IS NULL))) STRICT; CREATE INDEX idx_runs_ttl ON extraction_runs(terminal_at,lease_expires_at,extraction_run_id); CREATE INDEX idx_runs_heartbeat ON extraction_runs(terminal_at,heartbeat_at,extraction_run_id);"#,
+        r#"CREATE TABLE extraction_runs(extraction_run_id TEXT PRIMARY KEY,extractor TEXT NOT NULL,source_kind TEXT,source_id TEXT,source_revision INTEGER,sensitivity_class TEXT NOT NULL,provenance_witness BLOB NOT NULL,redaction_metadata BLOB NOT NULL,detector_id TEXT,secret_type TEXT,utf8_offset INTEGER,utf8_length INTEGER,started_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,lease_expires_at INTEGER NOT NULL,terminal_state TEXT,terminal_at INTEGER,CHECK(lease_expires_at>heartbeat_at),CHECK((terminal_state IS NULL)=(terminal_at IS NULL)),CHECK(heartbeat_at>=started_at),CHECK(terminal_at IS NULL OR terminal_at>=heartbeat_at)) STRICT; CREATE INDEX idx_runs_ttl ON extraction_runs(terminal_at,lease_expires_at,extraction_run_id); CREATE INDEX idx_runs_heartbeat ON extraction_runs(terminal_at,heartbeat_at,extraction_run_id);"#,
     ),
     (
         "candidates",
-        r#"CREATE TABLE candidates(candidate_id TEXT PRIMARY KEY,extraction_run_id TEXT NOT NULL REFERENCES extraction_runs(extraction_run_id) ON DELETE CASCADE,candidate_kind TEXT NOT NULL,payload BLOB NOT NULL,sensitivity_class TEXT NOT NULL,provenance_witness BLOB NOT NULL,redaction_metadata BLOB NOT NULL,detector_id TEXT,secret_type TEXT,utf8_offset INTEGER,utf8_length INTEGER,created_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,lease_expires_at INTEGER NOT NULL,terminal_state TEXT,terminal_at INTEGER,CHECK(lease_expires_at>heartbeat_at),CHECK((terminal_state IS NULL)=(terminal_at IS NULL))) STRICT; CREATE INDEX idx_candidates_run_fk ON candidates(extraction_run_id,candidate_id); CREATE INDEX idx_candidates_ttl ON candidates(terminal_at,lease_expires_at,candidate_id);"#,
+        r#"CREATE TABLE candidates(candidate_id TEXT PRIMARY KEY,extraction_run_id TEXT NOT NULL REFERENCES extraction_runs(extraction_run_id) ON DELETE CASCADE,candidate_kind TEXT NOT NULL,payload BLOB NOT NULL,sensitivity_class TEXT NOT NULL,provenance_witness BLOB NOT NULL,redaction_metadata BLOB NOT NULL,detector_id TEXT,secret_type TEXT,utf8_offset INTEGER,utf8_length INTEGER,created_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,lease_expires_at INTEGER NOT NULL,terminal_state TEXT,terminal_at INTEGER,CHECK(lease_expires_at>heartbeat_at),CHECK((terminal_state IS NULL)=(terminal_at IS NULL)),CHECK(heartbeat_at>=created_at),CHECK(terminal_at IS NULL OR terminal_at>=heartbeat_at)) STRICT; CREATE INDEX idx_candidates_run_fk ON candidates(extraction_run_id,candidate_id); CREATE INDEX idx_candidates_ttl ON candidates(terminal_at,lease_expires_at,candidate_id);"#,
     ),
     (
         "candidate_scores",
@@ -161,7 +161,7 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "mc_kernel_format_marker",
-        r#"CREATE TABLE mc_kernel_format_marker(singleton INTEGER PRIMARY KEY CHECK(singleton=1),format_epoch INTEGER NOT NULL,database_incarnation_id TEXT NOT NULL,schema_digest TEXT NOT NULL,created_at INTEGER NOT NULL) STRICT; CREATE TRIGGER mc_kernel_format_marker_no_update BEFORE UPDATE ON mc_kernel_format_marker BEGIN SELECT RAISE(ABORT,'mc_kernel_format_marker is immutable'); END; CREATE TRIGGER mc_kernel_format_marker_no_delete BEFORE DELETE ON mc_kernel_format_marker BEGIN SELECT RAISE(ABORT,'mc_kernel_format_marker is immutable'); END;"#,
+        r#"CREATE TABLE mc_kernel_format_marker(singleton INTEGER PRIMARY KEY CHECK(singleton=1),format_epoch INTEGER NOT NULL,database_incarnation_id TEXT NOT NULL CHECK(length(database_incarnation_id)=32),schema_digest TEXT NOT NULL CHECK(length(schema_digest)=64),created_at INTEGER NOT NULL) STRICT; CREATE TRIGGER mc_kernel_format_marker_no_update BEFORE UPDATE ON mc_kernel_format_marker BEGIN SELECT RAISE(ABORT,'mc_kernel_format_marker is immutable'); END; CREATE TRIGGER mc_kernel_format_marker_no_delete BEFORE DELETE ON mc_kernel_format_marker BEGIN SELECT RAISE(ABORT,'mc_kernel_format_marker is immutable'); END;"#,
     ),
 ];
 
@@ -203,6 +203,9 @@ pub fn apply_kernel_connection_profile(
     if !crate::sqlite_runtime::evaluate_sqlite_runtime_gate(&identity).is_empty() {
         return Err(rusqlite::Error::InvalidQuery);
     }
+    // Switching journal_mode can need the write lock, so the busy handler is
+    // installed first; the default handler gives up immediately.
+    conn.pragma_update(None, "busy_timeout", busy_timeout_ms)?;
     // `PRAGMA journal_mode` returns the resulting mode; reject a mode other than WAL.
     let journal_mode: String =
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
@@ -212,7 +215,8 @@ pub fn apply_kernel_connection_profile(
     conn.pragma_update(None, "synchronous", "FULL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "trusted_schema", "OFF")?;
-    conn.pragma_update(None, "busy_timeout", busy_timeout_ms)?;
+    // `recursive_triggers` makes REPLACE run DELETE triggers for conflicting rows.
+    conn.pragma_update(None, "recursive_triggers", "ON")?;
     Ok(())
 }
 
@@ -235,7 +239,19 @@ pub fn verify_kernel_connection_contract(
     if trusted_schema != 0 {
         violations.push("trusted_schema is enabled".to_string());
     }
+    let recursive_triggers: i64 =
+        conn.query_row("PRAGMA recursive_triggers", [], |row| row.get(0))?;
+    if recursive_triggers != 1 {
+        violations.push("recursive_triggers is disabled".to_string());
+    }
     Ok(violations)
+}
+
+fn is_well_formed_incarnation_id(incarnation: &str) -> bool {
+    incarnation.len() == 32
+        && incarnation
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
 }
 
 pub fn apply_kernel_schema(
@@ -255,6 +271,9 @@ fn apply_schema<F: FnOnce() -> rusqlite::Result<()>>(
     // `BEGIN IMMEDIATE` acquires the write lock before later statements run.
     // A DEFERRED bootstrap holds a shared read lock and fails `SQLITE_BUSY` on
     // upgrade instead of waiting out `busy_timeout`.
+    if !is_well_formed_incarnation_id(incarnation) {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let existing_objects: i64 = tx.query_row(
         "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite\\_%' ESCAPE '\\'",
