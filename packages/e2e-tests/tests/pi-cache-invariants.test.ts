@@ -12,17 +12,10 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import {
-    extractM0,
-    extractM1,
-    findBusts,
-    formatBustReport,
-    mainAgentRequests,
-} from "../src/cache-analysis";
+import { extractM0, extractM1, findBusts, formatBustReport, isHistorianRequest, mainAgentRequests } from "../src/cache-analysis";
 import type { CapturedRequest, MockUsage } from "../src/mock-provider/server";
 import { PiTestHarness } from "../src/pi-harness";
 
-const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
 const MODEL_LIMIT = 100_000;
 
 const LOW_USAGE: MockUsage = {
@@ -47,21 +40,6 @@ const HISTORIAN_TRIGGER_USAGE: MockUsage = {
     cache_creation_input_tokens: 90_000,
     cache_read_input_tokens: 0,
 };
-
-function isHistorianRequest(body: Record<string, unknown>): boolean {
-    const system = body.system;
-    if (typeof system === "string") return system.includes(HISTORIAN_SYSTEM_MARKER);
-    if (Array.isArray(system)) {
-        return system.some(
-            (b) =>
-                b &&
-                typeof b === "object" &&
-                typeof (b as { text?: unknown }).text === "string" &&
-                ((b as { text: string }).text).includes(HISTORIAN_SYSTEM_MARKER),
-        );
-    }
-    return false;
-}
 
 /** Line-anchored [N] U:/A: ordinal range, scoped to the <new_messages> block. */
 function findOrdinalRange(body: Record<string, unknown>): { start: number; end: number } | null {
@@ -370,6 +348,5 @@ describe("pi cache invariants — m[0]/m[1] taxonomy", () => {
             await h.dispose();
         }
     }, 360_000);
-
 
 });

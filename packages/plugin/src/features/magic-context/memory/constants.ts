@@ -90,9 +90,3 @@ export function getMemoryCategoryOrder(category: string): number {
         MEMORY_CATEGORY_ORDER_UNKNOWN
     );
 }
-
-// TTL in milliseconds, null = permanent
-export const CATEGORY_DEFAULT_TTL: Partial<Record<MemoryCategory, number>> = {
-    WORKFLOW_RULES: 90 * 24 * 60 * 60 * 1000, // 90 days
-    KNOWN_ISSUES: 30 * 24 * 60 * 60 * 1000, // 30 days
-};

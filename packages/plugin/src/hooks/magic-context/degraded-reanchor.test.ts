@@ -31,9 +31,12 @@ import {
     type PersistedCompactionMarkerState,
     setPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
-import { createDirectTestDatabase } from "../../features/magic-context/test-database";
+import {
+    createDirectTestDatabase,
+    createOpenCodeTestDb,
+} from "../../features/magic-context/test-database";
 import { _resetHarnessForTesting, setHarness } from "../../shared/harness";
-import { Database } from "../../shared/sqlite";
+import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     closeCompactionMarkerConnection,
@@ -58,19 +61,6 @@ function useTempDataHome(prefix: string): string {
     process.env.XDG_CACHE_HOME = dir;
     mkdirSync(join(dir, "opencode"), { recursive: true });
     return dir;
-}
-
-function createOpenCodeDb(dataHome: string): Database {
-    const dbPath = join(dataHome, "opencode", "opencode.db");
-    const ocDb = new Database(dbPath);
-    ocDb.exec("PRAGMA journal_mode=WAL");
-    ocDb.exec(
-        "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
-    );
-    ocDb.exec(
-        "CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
-    );
-    return ocDb;
 }
 
 function insertOcMessage(
@@ -144,7 +134,7 @@ function makeContextDb(): Database {
 
 beforeEach(() => {
     const dataHome = useTempDataHome("mc-degraded-reanchor-");
-    opencodeDb = createOpenCodeDb(dataHome);
+    opencodeDb = createOpenCodeTestDb(dataHome);
     db = makeContextDb();
     setHarness("opencode");
 });

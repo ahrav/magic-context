@@ -15,8 +15,8 @@ export type TransformSchedulerDecision =
 /**
  * Max transform_decisions rows kept per (session_id, harness). Pruned newest-first
  * after every insert so a long session's cache-affecting passes never grow this
- * telemetry table without bound (the dashboard loads all matching rows for cause
- * attribution).
+ * telemetry table without bound (cause-attribution readers load all
+ * matching rows).
  */
 export const TRANSFORM_DECISIONS_RETENTION = 2000;
 
@@ -240,25 +240,32 @@ export function scheduleOpenCodeTransformDecisionWrite(args: {
     return true;
 }
 
+/** The entry id when `entries[i]` is an assistant message entry with a non-empty id. */
+function assistantEntryIdAt(entries: readonly unknown[], i: number): string | null {
+    const entry = entries[i];
+    if (!entry || typeof entry !== "object") return null;
+    const row = entry as { id?: unknown; type?: unknown; message?: unknown };
+    if (row.type !== "message" || typeof row.id !== "string" || row.id.length === 0) {
+        return null;
+    }
+    const message = row.message;
+    if (
+        message &&
+        typeof message === "object" &&
+        (message as { role?: unknown }).role === "assistant"
+    ) {
+        return row.id;
+    }
+    return null;
+}
+
 export function findNewestPiAssistantEntryId(
     entries: readonly unknown[] | null | undefined,
 ): string | null {
     if (!Array.isArray(entries)) return null;
     for (let i = entries.length - 1; i >= 0; i--) {
-        const entry = entries[i];
-        if (!entry || typeof entry !== "object") continue;
-        const row = entry as { id?: unknown; type?: unknown; message?: unknown };
-        if (row.type !== "message" || typeof row.id !== "string" || row.id.length === 0) {
-            continue;
-        }
-        const message = row.message;
-        if (
-            message &&
-            typeof message === "object" &&
-            (message as { role?: unknown }).role === "assistant"
-        ) {
-            return row.id;
-        }
+        const id = assistantEntryIdAt(entries, i);
+        if (id !== null) return id;
     }
     return null;
 }
@@ -352,20 +359,8 @@ function findNewestPiAssistantEntryIdAfter(
     }
 
     for (let i = startIndex; i < entries.length; i++) {
-        const entry = entries[i];
-        if (!entry || typeof entry !== "object") continue;
-        const row = entry as { id?: unknown; type?: unknown; message?: unknown };
-        if (row.type !== "message" || typeof row.id !== "string" || row.id.length === 0) {
-            continue;
-        }
-        const message = row.message;
-        if (
-            message &&
-            typeof message === "object" &&
-            (message as { role?: unknown }).role === "assistant"
-        ) {
-            return row.id;
-        }
+        const id = assistantEntryIdAt(entries, i);
+        if (id !== null) return id;
     }
     return null;
 }
@@ -434,11 +429,11 @@ function writeTransformDecisionRowOnDatabase(
         Math.max(0, Math.floor(row.inputTokens)),
     );
     // Enforce the per-(session,harness) retention cap so a long session's
-    // cache-affecting passes can't grow this telemetry table unbounded (the
-    // dashboard loads all matching rows for cause attribution). Deleting
+    // cache-affecting passes can't grow this telemetry table unbounded
+    // (cause-attribution readers load all matching rows). Deleting
     // exactly `over` rowids in (ts_ms, rowid) order evicts the oldest entries
     // without over-deleting when many rows share the minimum timestamp; the
-    // rowid tie-breaker matches the ordering the dashboard relies on.
+    // rowid tie-breaker matches the reader's ordering.
     const cap = retentionOverrideForTests ?? TRANSFORM_DECISIONS_RETENTION;
     const probe = db
         .prepare(

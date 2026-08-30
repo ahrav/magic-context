@@ -26,7 +26,7 @@ export interface ModuleLoader {
 	load: () => Promise<unknown>;
 }
 
-export const defaultLoaders: ModuleLoader[] = [
+const defaultLoaders: ModuleLoader[] = [
 	{
 		name: "Bare import",
 		load: async () => await import(/* @vite-ignore */ PI_CODING_AGENT_MODULE),
@@ -50,7 +50,7 @@ export function clearCachedModule(): void {
 	cachedModulePromise = null;
 }
 
-export async function resolvePiCodingAgentModule(
+async function resolvePiCodingAgentModule(
 	loaders?: ModuleLoader[],
 ): Promise<unknown> {
 	if (cachedModulePromise) {

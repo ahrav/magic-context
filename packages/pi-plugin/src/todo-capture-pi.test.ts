@@ -9,7 +9,7 @@ import {
 	capturePiTodowriteArgsIfCompatible,
 	capturePiTodowriteMessageIfCompatible,
 } from "./index";
-import { assistantToolCall, createTestDb } from "./test-utils.test";
+import { assistantToolCall, createTestDb } from "./test-utils";
 import {
 	__resetTodoSnapshotsForTests,
 	getTodoSnapshot,

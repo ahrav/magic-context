@@ -1,512 +1,349 @@
-//! Barrier-driven real-process crash and isolation scenarios for the
-//! provisional ring-backed shared-memory tuple. See
-//! `support/shm_process.rs` for the harness contract, the manifest-gate
-//! note, and the Bun/Node stub category. commentlint: allow(JUDGE)
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 mod support;
 
-use std::time::Duration;
-use std::time::Instant;
+use std::io::{BufRead, Write};
+use std::os::unix::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
-use mc_host::shm_provider::{qualified_test_profile, TestShmPeer, SHM_TRANSPORT};
-use mc_host::wire::{EnvelopeHeader, Flags, FrameType, Priority, PROTOCOL_VERSION};
-use support::raw_client::{FLAGS_INTERACTIVE, TY_REQUEST, TY_RESPONSE};
-use support::shm_process::{
-    commit_shm_peer, daemon_info, daemon_role, goodbye_header, live_descendants, negotiate_grant,
-    request_header, serial_crash_lock, shm_roundtrip, spawn_victim, start_daemon,
-    start_daemon_with, victim_role, DaemonSoakStats, Observer, RoleProcess, CRASH_ROOT,
-    OBSERVATION_TIMEOUT,
-};
-use support::LINKED_MODULE_ID;
+use mc_host::{Client, RequestOptions, RouteIdentity, RouteTarget, TargetKind};
+use support::TestHost;
 
+const ROLE_ENV: &str = "MC_SHM_FAILURE_ROLE";
+const PUBLICATION_ENV: &str = "MC_SHM_FAILURE_PUBLICATION";
 const BUDGET: Duration = Duration::from_secs(10);
+const RSS_TOLERANCE_BYTES: u64 = 1024 * 1024;
 
-// ---------------------------------------------------------------------------
-// Process roles, dispatched via libtest self-reexec (the ring.rs pattern).
-// ---------------------------------------------------------------------------
-
-#[test]
-#[ignore = "daemon role for the shm crash harness"]
-fn shm_role_daemon() {
-    daemon_role();
+async fn serial_failure_test() -> tokio::sync::OwnedSemaphorePermit {
+    static SERIAL: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    SERIAL
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("failure-test semaphore remains open")
 }
 
 #[test]
-#[ignore = "victim role for the shm crash harness"]
-fn shm_role_victim() {
-    victim_role();
-}
-
-// ---------------------------------------------------------------------------
-// Parent-side helpers.
-// ---------------------------------------------------------------------------
-
-/// Bounded poll until the daemon reports exactly `expected` dispatches;
-/// exceeding it at any sample fails immediately (replay detector).
-/// commentlint: allow(JUDGE)
-fn wait_for_dispatches(daemon: &mut RoleProcess, expected: u64, budget: Duration) {
-    let deadline = Instant::now() + budget;
-    loop {
-        let count = daemon.query_dispatches();
-        assert!(
-            count <= expected,
-            "dispatch count must never exceed {expected}"
-        );
-        if count == expected {
-            return;
+#[ignore = "client role for shared-memory failure tests"]
+fn shm_role_client() {
+    let Ok(role) = std::env::var(ROLE_ENV) else {
+        return;
+    };
+    let publication = PathBuf::from(std::env::var_os(PUBLICATION_ENV).expect("publication path"));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("client runtime");
+    runtime.block_on(async move {
+        if role == "setup" {
+            let info = mc_host::read_connection_file(&publication).expect("discover host");
+            let mut stream = tokio::net::UnixStream::connect(&info.setup_socket)
+                .await
+                .expect("connect setup socket");
+            mc_host::authenticate_client(&mut stream, &info, BUDGET)
+                .await
+                .expect("authenticate setup socket");
+            let deadline = tokio::time::Instant::now() + BUDGET;
+            let (_grant, _descriptors) =
+                mc_host::setup_socket::receive_grant(&mut stream, deadline)
+                    .await
+                    .expect("receive ring grant before activation");
+            announce("READY setup");
+            std::future::pending::<()>().await;
         }
-        assert!(
-            Instant::now() < deadline,
-            "dispatch count did not reach {expected} within its bounded wait"
-        );
-        std::thread::sleep(Duration::from_millis(20));
+
+        let deadline = Instant::now() + BUDGET;
+        let client = loop {
+            match Client::connect(&publication).await {
+                Ok(client) => break client,
+                Err(_) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("activate ring: {error}"),
+            }
+        };
+        if role == "active" {
+            let route = client
+                .open_route(
+                    RouteTarget {
+                        module_id: support::LINKED_MODULE_ID.to_owned(),
+                        kind: TargetKind::ToolProvider,
+                    },
+                    RouteIdentity {
+                        project_root: PathBuf::from("/tmp/shm-failure-mode"),
+                        harness: "failure-mode".to_owned(),
+                        session: "active".to_owned(),
+                        consumer_module_id: None,
+                        consumer_launch_nonce: None,
+                        consumer_capabilities: Vec::new(),
+                        admission_facts: None,
+                        credential_fingerprints: Default::default(),
+                    },
+                )
+                .await
+                .expect("open route");
+            let request = client.request(
+                route,
+                support::mode_body(serde_json::json!({"mode": "hang"})),
+                RequestOptions {
+                    timeout: Duration::from_secs(3600),
+                    cancellation: None,
+                },
+            );
+            tokio::pin!(request);
+            tokio::select! {
+                result = &mut request => panic!("active request settled before kill: {result:?}"),
+                () = tokio::time::sleep(Duration::from_millis(100)) => announce("READY active"),
+            }
+            std::future::pending::<()>().await;
+        }
+        announce("READY idle");
+        std::future::pending::<()>().await;
+    });
+}
+
+fn announce(message: &str) {
+    println!("{message}");
+    std::io::stdout().flush().expect("flush role barrier");
+}
+
+struct Victim(Child);
+
+impl Victim {
+    fn spawn(publication: &Path, role: &str) -> Self {
+        let child = Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--ignored", "--exact", "shm_role_client", "--nocapture"])
+            .env(ROLE_ENV, role)
+            .env(PUBLICATION_ENV, publication)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn victim");
+        let mut victim = Self(child);
+        let stdout = victim.0.stdout.take().expect("victim stdout");
+        let expected = format!("READY {role}");
+        let (announced, barrier) = std::sync::mpsc::channel();
+        // `BufRead::lines()` cannot time out; a silent child would block
+        // readiness. The reader thread lets `recv_timeout(BUDGET)` bound the
+        // wait; a timeout drops `victim`, whose `Drop` kills the child.
+        std::thread::Builder::new()
+            .name("shm-victim-readiness".to_owned())
+            .spawn(move || {
+                for line in std::io::BufReader::new(stdout).lines() {
+                    let Ok(line) = line else { break };
+                    if line == expected {
+                        let _ = announced.send(true);
+                        return;
+                    }
+                }
+                let _ = announced.send(false);
+            })
+            .expect("spawn readiness reader");
+        match barrier.recv_timeout(BUDGET) {
+            Ok(true) => victim,
+            Ok(false) => panic!("victim exited before {role}"),
+            Err(_) => panic!("victim did not reach {role} within {BUDGET:?}"),
+        }
+    }
+
+    fn kill(mut self) {
+        self.0.kill().expect("SIGKILL victim");
+        let status = self.0.wait().expect("reap victim");
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
     }
 }
 
-fn one_candidate_charges() -> [u64; 4] {
-    let charges = qualified_test_profile().charges();
-    [
-        charges.descriptors,
-        charges.arena_bytes,
-        charges.leases,
-        charges.mappings,
-    ]
+impl Drop for Victim {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
 }
 
-fn wait_soak_stats(
-    daemon: &mut RoleProcess,
-    what: &str,
-    predicate: impl Fn(&DaemonSoakStats) -> bool,
-) -> DaemonSoakStats {
+async fn connect_after_reclamation(path: &Path) -> Client {
     let deadline = Instant::now() + BUDGET;
     loop {
-        let stats = daemon.query_soak_stats();
-        if predicate(&stats) {
-            return stats;
+        match Client::connect(path).await {
+            Ok(client) => return client,
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await
+            }
+            Err(error) => panic!("ring capacity was not reclaimed: {error}"),
         }
-        assert!(
-            Instant::now() < deadline,
-            "daemon accounting did not reach {what} within the bounded wait"
-        );
-        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
-// ---------------------------------------------------------------------------
-// Scenarios.
-// ---------------------------------------------------------------------------
-
-/// Idle-commit barrier with a promptly reaped victim: observer traffic
-/// succeeds immediately before the kill, during recovery, and after a fresh
-/// restart; a victim killed before request publication dispatches nothing.
-/// commentlint: allow(JUDGE)
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn promptly_reaped_idle_kill_preserves_observer_and_restarts_fresh() {
-    let _serial = serial_crash_lock().await;
-    let data_root = tempfile::tempdir().expect("data root");
-    let mut daemon = start_daemon(data_root.path());
-    let info = daemon_info(data_root.path());
-    let mut observer = Observer::connect(&info, "observer-idle").await;
-    observer.roundtrip(512, 7, BUDGET).await;
-
-    let mut victim = spawn_victim(data_root.path(), "idle", "victim-idle", None);
-    victim.expect_record("barrier idle_committed");
-    assert!(
-        live_descendants(victim.pid()).is_empty(),
-        "victim role spawns no descendants"
-    );
-    observer.roundtrip(512, 9, BUDGET).await;
-    let before_kill = daemon.query_dispatches();
-
-    victim.kill();
-    let window = victim.reap_killed();
-
-    // Killed before request publication: the victim contributed no dispatch.
-    assert_eq!(daemon.query_dispatches(), before_kill);
-    observer.roundtrip(1024, 42, window.remaining()).await;
-
-    // Fresh restart with the same external identity: fresh auth,
-    // negotiation, and candidate, ending in a successful terminal.
-    let mut fresh = spawn_victim(data_root.path(), "roundtrip", "victim-idle", None);
-    fresh.expect_record("barrier idle_committed");
-    fresh.expect_record("terminal ok");
-    fresh.wait_exit_success(BUDGET);
-    observer.roundtrip(256, 5, BUDGET).await;
-    assert_eq!(daemon.query_dispatches(), before_kill + 3);
-
-    victim.teardown();
-    fresh.teardown();
-    daemon.teardown();
-}
-
-/// Peer death is silent for the host ring endpoint: no `Goodbye` or
-/// readable close, so a victim killed WHILE holding an active committed
-/// candidate never becomes a suspect and its exact admission charges stay
-/// `active` until the daemon closes. commentlint: allow(JUDGE)
-///
-/// Known ring-backend dead-peer-reclamation gap, deferred to the `magic-context-ymc.12` retained-provider work: real reclamation must fail these exact-value assertions and force this claim to be updated. commentlint: allow(JUDGE)
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn killed_victim_holding_active_charges_is_never_reclaimed() {
-    let _serial = serial_crash_lock().await;
-    let data_root = tempfile::tempdir().expect("data root");
-    let mut daemon = start_daemon(data_root.path());
-    let info = daemon_info(data_root.path());
-    let mut observer = Observer::connect(&info, "observer-dead-peer").await;
-    observer.roundtrip(512, 7, BUDGET).await;
-
-    // The idle_committed barrier: the victim holds an active committed
-    // candidate and has NOT sent Goodbye when the kill lands.
-    let mut victim = spawn_victim(data_root.path(), "idle", "victim-dead-peer", None);
-    victim.expect_record("barrier idle_committed");
-    let held = one_candidate_charges();
-    let stats = wait_soak_stats(&mut daemon, "one active candidate", |stats| {
-        stats.active == held
-    });
-    assert_eq!(stats.quarantined, [0; 4]);
-    assert_eq!(stats.preparations, 1);
-    assert_eq!(stats.readiness, "Ready");
-
-    victim.kill();
-    let window = victim.reap_killed();
-
-    for _ in 0..10 {
-        let stats = daemon.query_soak_stats();
-        assert_eq!(stats.active, held, "dead-peer charges must stay active");
-        assert_eq!(stats.quarantined, [0; 4]);
-        assert_eq!(stats.preparations, 1);
-        assert_eq!(stats.readiness, "Ready");
-        std::thread::sleep(Duration::from_millis(50));
+/// Waits for `host` to dispatch before killing, so the `active` case cannot
+/// degrade into an idle disconnect. commentlint: allow(JUDGE)
+async fn crash_victim(host: &TestHost, role: &str) {
+    let dispatched_before = host.handler.dispatch_count();
+    let victim = Victim::spawn(&host.publication_path(), role);
+    if role == "active" {
+        let deadline = Instant::now() + BUDGET;
+        while host.handler.dispatch_count() == dispatched_before {
+            assert!(
+                Instant::now() < deadline,
+                "host never dispatched the active request"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
-    observer.roundtrip(1024, 42, window.remaining()).await;
-    let stats = daemon.query_soak_stats();
-    assert_eq!(stats.active, held);
-    assert_eq!(stats.quarantined, [0; 4]);
-
-    victim.teardown();
-    daemon.teardown();
-}
-
-/// A live peer that publishes a role-invalid frame closes unclean:
-/// `report_suspect` feeds the recovery controller, the uncertain ring
-/// cleanup isolates the record, and the provider resolves
-/// Recovering -> Ready with the candidate's exact charges quarantined.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn corrupt_peer_frame_quarantines_exact_charges_and_returns_ready() {
-    let _serial = serial_crash_lock().await;
-    let data_root = tempfile::tempdir().expect("data root");
-    let mut daemon = start_daemon(data_root.path());
-    let info = daemon_info(data_root.path());
-    let mut observer = Observer::connect(&info, "observer-corrupt").await;
-    observer.roundtrip(512, 7, BUDGET).await;
-
-    let peer = commit_shm_peer(&info).await;
-    let held = one_candidate_charges();
-    wait_soak_stats(&mut daemon, "one active candidate", |stats| {
-        stats.active == held
-    });
-
-    // A Response is role-invalid from the peer side: the endpoint's header
-    // validation classifies it Corrupt and takes the unclean-close branch.
-    let corrupt = EnvelopeHeader {
-        len: 0,
-        ver: PROTOCOL_VERSION,
-        ty: FrameType::Response,
-        flags: Flags::new(false, Priority::Interactive, false),
-        channel: 0,
-        epoch: 0,
-        corr: 99,
-    };
-    tokio::task::block_in_place(|| {
-        peer.send(corrupt, &[]).expect("publish role-invalid frame");
-    });
-
-    let stats = wait_soak_stats(&mut daemon, "quarantined suspect charges", |stats| {
-        stats.quarantined == held && stats.active == [0; 4]
-    });
-    assert_eq!(stats.preparations, 1);
-    // Capacity remains under the 8-candidate limits, so the episode
-    // resolves back to Ready instead of Quarantined.
-    wait_soak_stats(&mut daemon, "readiness Ready", |stats| {
-        stats.readiness == "Ready" && stats.quarantined == held && stats.active == [0; 4]
-    });
-    observer.roundtrip(256, 5, BUDGET).await;
-    let peer = commit_shm_peer(&info).await;
-    tokio::task::block_in_place(|| {
-        shm_roundtrip(&peer, "victim-corrupt-fresh");
-        peer.send(goodbye_header(), &[]).expect("publish goodbye");
-    });
-
-    daemon.teardown();
-}
-
-/// Request-publication barrier: a request committed before the kill
-/// dispatches exactly once and is never replayed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kill_after_request_publication_dispatches_once_without_replay() {
-    let _serial = serial_crash_lock().await;
-    let data_root = tempfile::tempdir().expect("data root");
-    let mut daemon = start_daemon(data_root.path());
-    let info = daemon_info(data_root.path());
-    let mut observer = Observer::connect(&info, "observer-publish").await;
-    observer.roundtrip(512, 7, BUDGET).await;
-
-    let mut victim = spawn_victim(data_root.path(), "publish", "victim-publish", None);
-    victim.expect_record("barrier idle_committed");
-    victim.expect_record("barrier request_published");
     victim.kill();
-    let window = victim.reap_killed();
-
-    // The dead victim never observes a terminal; the daemon-side contract is
-    // at-most-once dispatch of the committed request. commentlint: allow(JUDGE)
-    wait_for_dispatches(&mut daemon, 2, window.remaining());
-    observer.roundtrip(1024, 42, window.remaining()).await;
-
-    let mut fresh = spawn_victim(data_root.path(), "roundtrip", "victim-publish", None);
-    fresh.expect_record("barrier idle_committed");
-    fresh.expect_record("terminal ok");
-    fresh.wait_exit_success(BUDGET);
-    observer.roundtrip(256, 5, BUDGET).await;
-    // Exact accounting proves the killed victim's request never replayed.
-    assert_eq!(daemon.query_dispatches(), 5);
-
-    victim.teardown();
-    fresh.teardown();
-    daemon.teardown();
 }
 
-/// Response-publication barrier, reported by the daemon provider before the
-/// victim consumes: reclamation of the dead victim's endpoint must not
-/// corrupt the observer's own response bytes. commentlint: allow(JUDGE)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kill_before_response_consumption_leaves_observer_uncorrupted() {
-    let _serial = serial_crash_lock().await;
-    let data_root = tempfile::tempdir().expect("data root");
-    let mut daemon = start_daemon(data_root.path());
-    let info = daemon_info(data_root.path());
-    let mut observer = Observer::connect(&info, "observer-response").await;
-    observer.roundtrip(512, 7, BUDGET).await;
-
-    let mut victim = spawn_victim(data_root.path(), "publish", "victim-response", None);
-    victim.expect_record("barrier idle_committed");
-    victim.expect_record("barrier request_published");
-    // The daemon provider owns response publication; the victim parks
-    // without consuming, so the kill lands between publication and
-    // consumption. commentlint: allow(JUDGE)
-    daemon.wait_for_record("barrier response_published");
-    victim.kill();
-    let window = victim.reap_killed();
-
-    observer.roundtrip(4097, 90, window.remaining()).await;
-
-    let mut fresh = spawn_victim(data_root.path(), "roundtrip", "victim-response", None);
-    fresh.expect_record("barrier idle_committed");
-    fresh.expect_record("terminal ok");
-    fresh.wait_exit_success(BUDGET);
-    observer.roundtrip(256, 5, BUDGET).await;
-
-    victim.teardown();
-    fresh.teardown();
-    daemon.teardown();
+async fn clean_close_returns_exact_single_connection_capacity() {
+    let _serial = serial_failure_test().await;
+    let host = TestHost::start_with(|config| config.limits.max_connections = 1).await;
+    let client = Client::connect(host.publication_path()).await.unwrap();
+    client.close().await.unwrap();
+    let replacement = connect_after_reclamation(&host.publication_path()).await;
+    replacement.close().await.unwrap();
+    host.shutdown_gracefully().await;
 }
 
-/// Seeded-defect detector: a harness that starts observation timing at
-/// `kill` instead of after `wait` must fail here. commentlint: allow(JUDGE)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn held_zombie_starts_observation_timing_only_after_reap() {
-    let _serial = serial_crash_lock().await;
-    let data_root = tempfile::tempdir().expect("data root");
-    let daemon = start_daemon(data_root.path());
-    let info = daemon_info(data_root.path());
-    let mut observer = Observer::connect(&info, "observer-zombie").await;
-
-    let mut victim = spawn_victim(data_root.path(), "idle", "victim-zombie", None);
-    victim.expect_record("barrier idle_committed");
-    let evidence = victim.kill();
-    assert!(
-        victim.observation_window().is_none(),
-        "observation timing must not start at kill"
-    );
-    victim.wait_zombie(BUDGET);
-    // Real elapsed work while the zombie is deliberately held unreaped.
-    observer.roundtrip(512, 7, BUDGET).await;
-    assert!(
-        victim.observation_window().is_none(),
-        "a held zombie must not have an observation window"
-    );
-    let held = evidence.killed_at.elapsed();
-
-    let window = victim.reap_killed();
-    assert!(
-        window.started_at.duration_since(evidence.killed_at) >= held,
-        "the observation window must be anchored to the reap, not the kill"
-    );
-    assert_eq!(
-        window.deadline.duration_since(window.started_at),
-        OBSERVATION_TIMEOUT,
-        "the observation window spans exactly the post-reap timeout"
-    );
-    observer.roundtrip(512, 9, window.remaining()).await;
-
-    victim.teardown();
-    daemon.teardown();
+async fn setup_active_and_idle_sigkill_each_return_exact_capacity() {
+    let _serial = serial_failure_test().await;
+    for role in ["setup", "active", "idle"] {
+        let host = TestHost::start_with(|config| config.limits.max_connections = 1).await;
+        crash_victim(&host, role).await;
+        let replacement = connect_after_reclamation(&host.publication_path()).await;
+        replacement.close().await.unwrap();
+        host.shutdown_gracefully().await;
+    }
 }
 
-/// Restart with the same external test identity: the fresh candidate's
-/// incarnation fence rejects the killed predecessor's stale activation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn restart_with_same_identity_rejects_stale_activation() {
-    let _serial = serial_crash_lock().await;
-    let data_root = tempfile::tempdir().expect("data root");
-    let daemon = start_daemon(data_root.path());
-    let info = daemon_info(data_root.path());
-    let stale_path = data_root.path().join("stale-candidate.json");
+async fn repeated_crashes_do_not_ratchet_single_connection_capacity() {
+    let _serial = serial_failure_test().await;
+    let host = TestHost::start_with(|config| config.limits.max_connections = 1).await;
+    // The test records the baseline after one crash cycle so first-cycle setup
+    // does not affect a measured cycle. commentlint: allow(JUDGE)
+    crash_victim(&host, "active").await;
+    connect_after_reclamation(&host.publication_path())
+        .await
+        .close()
+        .await
+        .unwrap();
+    let baseline = support::process_resources::stabilize(std::process::id(), BUDGET).await;
 
-    let mut victim = spawn_victim(data_root.path(), "idle", "victim-fence", Some(&stale_path));
-    victim.expect_record("barrier idle_committed");
-    victim.kill();
-    victim.reap_killed();
+    for cycle in 0..12 {
+        crash_victim(&host, if cycle % 2 == 0 { "active" } else { "idle" }).await;
+        let probe = connect_after_reclamation(&host.publication_path()).await;
+        probe.close().await.unwrap();
+        // Readmission alone would still pass while descriptors, mappings, or
+        // threads ratchet on every kill. commentlint: allow(JUDGE)
+        support::process_resources::await_envelope(
+            std::process::id(),
+            baseline,
+            RSS_TOLERANCE_BYTES,
+            BUDGET,
+            &format!("crash cycle {cycle}"),
+        )
+        .await;
+    }
+    host.shutdown_gracefully().await;
+}
 
-    let mut fresh = spawn_victim(data_root.path(), "roundtrip", "victim-fence", None);
-    fresh.expect_record("barrier idle_committed");
-    fresh.expect_record("terminal ok");
-    fresh.wait_exit_success(BUDGET);
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_capacity_succeeds_and_plus_one_creates_no_ring_resources() {
+    let _serial = serial_failure_test().await;
+    let host = TestHost::start_with(|config| config.limits.max_connections = 2).await;
+    let first = Client::connect(host.publication_path()).await.unwrap();
+    let second = Client::connect(host.publication_path()).await.unwrap();
+    let before = support::process_resources::observe(std::process::id()).unwrap();
 
-    let stale: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&stale_path).expect("stale record"))
-            .expect("stale json");
-    std::fs::remove_file(&stale_path).expect("stale record removed");
-    let stale_token = stale["activation_token"].as_str().expect("stale token");
-
-    // A fresh negotiation mints a fresh token, candidate identity, and ring
-    // grant; values stay out of assertion output (R17). commentlint: allow(JUDGE)
-    let (mut bootstrap, grant) = negotiate_grant(&info).await;
-    assert_eq!(grant["selected"]["transport"], SHM_TRANSPORT);
-    assert!(
-        grant["activation_token"].as_str() != Some(stale_token),
-        "a fresh grant must mint a fresh activation token"
-    );
-    assert!(
-        grant["descriptor"]["candidate_id"] != stale["descriptor"]["candidate_id"],
-        "a fresh candidate must carry a fresh identity"
-    );
-    assert!(
-        grant["descriptor"]["host_to_peer_grant"] != stale["descriptor"]["host_to_peer_grant"],
-        "a fresh candidate must carry a fresh ring incarnation grant"
-    );
-
-    // Presenting the stale token on the fresh candidate retires both the
-    // candidate and the bootstrap with no activation response.
-    let peer = tokio::task::block_in_place(|| {
-        TestShmPeer::attach(&grant["descriptor"]).expect("attach fresh candidate")
-    });
-    let activate = format!(
-        r#"{{"op":"transport.activate","negotiation_version":1,"activation_token":"{stale_token}"}}"#
+    assert!(Client::connect(host.publication_path()).await.is_err());
+    support::process_resources::await_envelope(
+        std::process::id(),
+        before,
+        RSS_TOLERANCE_BYTES,
+        BUDGET,
+        "rejected +1 attempt",
     )
-    .into_bytes();
-    tokio::task::block_in_place(|| {
-        peer.send(request_header(0, 0, 1, activate.len()), &activate)
-            .expect("publish stale activate");
-    });
-    assert!(
-        bootstrap.closed_within(BUDGET).await,
-        "a stale activation must retire the bootstrap"
-    );
-    tokio::task::block_in_place(|| {
-        assert!(
-            peer.recv(Duration::from_millis(300)).is_err(),
-            "a stale activation must receive no response"
-        );
-    });
+    .await;
 
-    // Only the stale token is rejected: a correct fresh setup succeeds.
-    let peer = commit_shm_peer(&info).await;
-    tokio::task::block_in_place(|| {
-        shm_roundtrip(&peer, "victim-fence-fresh");
-        peer.send(goodbye_header(), &[]).expect("publish goodbye");
-    });
-
-    victim.teardown();
-    fresh.teardown();
-    daemon.teardown();
+    first.close().await.unwrap();
+    second.close().await.unwrap();
+    host.shutdown_gracefully().await;
 }
 
-/// Daemon restart: old pending work is classified without replay, a fresh
-/// observer serves over TCP while the provider reports exact `unavailable`,
-/// and a subsequent fresh shared-memory negotiation succeeds.
+async fn echo_route(client: &Client, session: &str) -> mc_host::RouteHandle {
+    client
+        .open_route(
+            RouteTarget {
+                module_id: support::echo_host::ECHO_MODULE_ID.to_owned(),
+                kind: TargetKind::ToolProvider,
+            },
+            RouteIdentity {
+                project_root: PathBuf::from("/tmp/shm-restart"),
+                harness: "failure-mode".to_owned(),
+                session: session.to_owned(),
+                consumer_module_id: None,
+                consumer_launch_nonce: None,
+                consumer_capabilities: Vec::new(),
+                admission_facts: None,
+                credential_fingerprints: Default::default(),
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("open {session} route: {error}"))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn daemon_restart_classifies_old_work_and_renegotiates_fresh() {
-    let _serial = serial_crash_lock().await;
+async fn daemon_restart_discards_old_rings_and_accepts_fresh_client() {
+    let _serial = serial_failure_test().await;
     let data_root = tempfile::tempdir().expect("data root");
-    let mut daemon = start_daemon_with(data_root.path(), 1);
-    let info_before = daemon_info(data_root.path());
-    let mut observer = Observer::connect(&info_before, "observer-restart").await;
-    observer.roundtrip(512, 7, BUDGET).await;
+    let body = support::mode_body(serde_json::json!({"mode": "echo"}));
+    let publication;
+    // Keep the stale client connected: connection cleanup would reclaim its
+    // ring before restart. commentlint: allow(JUDGE)
+    let (stale, stale_route) = {
+        let host = support::echo_host::InProcessHost::start(data_root.path());
+        publication = host.publication.clone();
+        let stale = Client::connect(&publication).await.unwrap();
+        let route = echo_route(&stale, "stale").await;
+        let response = stale
+            .request(route, body.clone(), RequestOptions::default())
+            .await
+            .expect("first-generation ring request");
+        assert_eq!(response.body, body, "stale ring served its own request");
+        (stale, route)
+    };
+    let stale_daemon = stale.daemon_id();
 
-    // Old pending work: a hang-mode request dispatches but never settles.
-    let mut victim = spawn_victim(data_root.path(), "pending", "victim-restart", None);
-    victim.expect_record("barrier idle_committed");
-    victim.expect_record("barrier request_published");
-    wait_for_dispatches(&mut daemon, 2, BUDGET);
-
-    daemon.kill();
-    daemon.reap_killed();
-    victim.kill();
-    victim.reap_killed();
-    victim.teardown();
-    drop(observer);
-
-    // Restart on the same publication root: a fresh daemon identity, and
-    // zero dispatches proves the old pending request never replayed.
-    let mut daemon2 = start_daemon_with(data_root.path(), 1);
-    let info_after = daemon_info(data_root.path());
+    let host = support::echo_host::InProcessHost::start(data_root.path());
     assert!(
-        info_after.daemon_id != info_before.daemon_id,
-        "a restarted daemon must publish a fresh identity"
+        stale
+            .request(stale_route, body.clone(), RequestOptions::default())
+            .await
+            .is_err(),
+        "stale generation stayed usable across the restart"
     );
-    assert_eq!(daemon2.query_dispatches(), 0);
-    let mut observer = Observer::connect(&info_after, "observer-restart-fresh").await;
-    observer.roundtrip(512, 11, BUDGET).await;
 
-    // Transient admission pressure: the provider reports exact
-    // `unavailable` while TCP service stays healthy.
-    daemon2.send_command("hold_admission");
-    daemon2.wait_for_record("held");
-    let (mut probe, selection) = negotiate_grant(&info_after).await;
-    assert_eq!(selection["selected"]["transport"], "tcp");
-    assert_eq!(selection["reason"], "unavailable");
-    let (channel, epoch) = probe
-        .route_open(LINKED_MODULE_ID, CRASH_ROOT, "shm-crash", "probe-tcp")
+    let fresh = connect_after_reclamation(&publication).await;
+    // A successor that republished the predecessor's identity would hand this
+    // client the discarded generation. commentlint: allow(JUDGE)
+    assert_ne!(
+        stale_daemon,
+        fresh.daemon_id(),
+        "successor reused the predecessor daemon identity"
+    );
+    let route = echo_route(&fresh, "fresh").await;
+    let response = fresh
+        .request(route, body.clone(), RequestOptions::default())
         .await
-        .expect("tcp route during transient unavailability");
-    let corr = probe.next_corr();
-    let body = serde_json::to_vec(&serde_json::json!({
-        "mode": "direct_fill",
-        "bytes": 64,
-        "value": 7
-    }))
-    .expect("tcp body");
-    probe
-        .send_frame(TY_REQUEST, FLAGS_INTERACTIVE, channel, epoch, corr, &body)
-        .await
-        .expect("tcp request");
-    let (_, frame) = probe
-        .frames_until_corr(corr, BUDGET)
-        .await
-        .expect("tcp terminal");
-    assert_eq!(frame.ty, TY_RESPONSE);
-    assert_eq!(frame.body, vec![7; 64]);
-    daemon2.send_command("release_admission");
-    daemon2.wait_for_record("released");
-
-    // Fresh shared-memory negotiation now succeeds end to end.
-    let peer = commit_shm_peer(&info_after).await;
-    tokio::task::block_in_place(|| {
-        shm_roundtrip(&peer, "victim-restart-fresh");
-        peer.send(goodbye_header(), &[]).expect("publish goodbye");
-    });
-    // Exactly the new observer, TCP probe, and shared-memory requests.
-    assert_eq!(daemon2.query_dispatches(), 3);
-
-    daemon2.teardown();
+        .expect("successor ring request");
+    assert_eq!(response.body, body);
+    fresh.close().await.unwrap();
+    drop(stale);
+    drop(host);
 }

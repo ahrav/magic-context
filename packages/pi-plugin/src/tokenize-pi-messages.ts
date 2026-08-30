@@ -11,7 +11,7 @@
  *     mechanical tool I/O that compaction can compress.
  *
  * The result is persisted to `session_meta.{conversation_tokens,tool_call_tokens}`
- * so `/ctx-status` and the dashboard can render an accurate breakdown
+ * so `/ctx-status` can render an accurate breakdown
  * bar that sums to the wire `inputTokens` (give or take provider
  * tokenizer drift).
  *

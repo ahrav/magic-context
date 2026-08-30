@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
+import { stripJsonComments, stripTrailingCommas } from "../shared/jsonc-parser";
 
 /**
  * Config-LOCATION migration: move Magic Context config from the per-harness
@@ -103,11 +104,68 @@ export function resolveCortexKitProjectConfigPath(directory: string): string {
     return `${cortexKitProjectConfigBasePath(directory)}.jsonc`;
 }
 
+/**
+ * The single legacy-base table every consumer derives from. `userScopeConfigPaths`
+ * is the guard that stops a project-scope migration from eating the user's own
+ * config, so the user-scope half of this table and the migration sources must
+ * stay one list: a base added to one but not the other silently escapes the
+ * guard.
+ */
+const LEGACY_BASES: ReadonlyArray<{
+    scope: "user" | "project";
+    harness: "opencode" | "pi";
+    base: (directory: string) => string;
+    label: string;
+}> = [
+    {
+        scope: "user",
+        harness: "opencode",
+        base: () => join(configHome(), "opencode", CONFIG_FILE_BASENAME),
+        label: "OpenCode user",
+    },
+    {
+        scope: "user",
+        harness: "pi",
+        base: () => join(homeDir(), ".pi", "agent", CONFIG_FILE_BASENAME),
+        label: "Pi user",
+    },
+    // The bare project-root `<root>/magic-context.*` was OpenCode-only historically.
+    {
+        scope: "project",
+        harness: "opencode",
+        base: (directory) => join(directory, CONFIG_FILE_BASENAME),
+        label: "project root",
+    },
+    {
+        scope: "project",
+        harness: "opencode",
+        base: (directory) => join(directory, ".opencode", CONFIG_FILE_BASENAME),
+        label: "OpenCode project",
+    },
+    {
+        scope: "project",
+        harness: "pi",
+        base: (directory) => join(directory, ".pi", CONFIG_FILE_BASENAME),
+        label: "Pi project",
+    },
+];
+
 function legacySourcesForBase(basePath: string, label: string): LegacyConfigSource[] {
     return [
         { path: `${basePath}.jsonc`, label: `${label} magic-context.jsonc` },
         { path: `${basePath}.json`, label: `${label} magic-context.json` },
     ];
+}
+
+/** Legacy sources from the table, filtered by scope and owning harness. */
+function legacyBaseSources(
+    scope: "user" | "project",
+    harness: ConfigHarness | "any",
+    directory: string,
+): LegacyConfigSource[] {
+    return LEGACY_BASES.filter(
+        (entry) => entry.scope === scope && (harness === "any" || entry.harness === harness),
+    ).flatMap((entry) => legacySourcesForBase(entry.base(directory), entry.label));
 }
 
 /**
@@ -122,10 +180,10 @@ function userScopeConfigPaths(): Set<string> {
         // `~/.config/cortexkit/magic-context.json` would still be eaten.
         `${cortexKitUserConfigBasePath()}.jsonc`,
         `${cortexKitUserConfigBasePath()}.json`,
-        join(configHome(), "opencode", `${CONFIG_FILE_BASENAME}.jsonc`),
-        join(configHome(), "opencode", `${CONFIG_FILE_BASENAME}.json`),
-        join(homeDir(), ".pi", "agent", `${CONFIG_FILE_BASENAME}.jsonc`),
-        join(homeDir(), ".pi", "agent", `${CONFIG_FILE_BASENAME}.json`),
+        ...LEGACY_BASES.filter((entry) => entry.scope === "user").flatMap((entry) => [
+            `${entry.base("")}.jsonc`,
+            `${entry.base("")}.json`,
+        ]),
     ]);
 }
 
@@ -149,24 +207,10 @@ export function resolveLegacyConfigSources(directory: string): {
 } {
     const userPaths = userScopeConfigPaths();
     return {
-        user: [
-            ...legacySourcesForBase(
-                join(configHome(), "opencode", CONFIG_FILE_BASENAME),
-                "OpenCode user",
-            ),
-            ...legacySourcesForBase(
-                join(homeDir(), ".pi", "agent", CONFIG_FILE_BASENAME),
-                "Pi user",
-            ),
-        ],
-        project: [
-            ...legacySourcesForBase(join(directory, CONFIG_FILE_BASENAME), "project root"),
-            ...legacySourcesForBase(
-                join(directory, ".opencode", CONFIG_FILE_BASENAME),
-                "OpenCode project",
-            ),
-            ...legacySourcesForBase(join(directory, ".pi", CONFIG_FILE_BASENAME), "Pi project"),
-        ].filter((source) => !userPaths.has(source.path)),
+        user: legacyBaseSources("user", "any", directory),
+        project: legacyBaseSources("project", "any", directory).filter(
+            (source) => !userPaths.has(source.path),
+        ),
     };
 }
 
@@ -181,35 +225,22 @@ export type ConfigHarness = "opencode" | "pi";
  * config disabled. Each harness reads only its own files, so a differing pair
  * stays correct per-harness until the user consolidates. The bare project-root
  * `<root>/magic-context.*` was OpenCode-only historically.
+ *
+ * Project sources carry the same user-scope filter as
+ * `resolveLegacyConfigSources`: when the project directory IS the user config
+ * home, the bare-root project source resolves to the USER config file, and
+ * reading it as a project config would strip user-tier fields and warn.
  */
 export function resolveLegacyConfigSourcesForHarness(
     directory: string,
     harness: ConfigHarness,
 ): { user: LegacyConfigSource[]; project: LegacyConfigSource[] } {
-    if (harness === "pi") {
-        return {
-            user: legacySourcesForBase(
-                join(homeDir(), ".pi", "agent", CONFIG_FILE_BASENAME),
-                "Pi user",
-            ),
-            project: legacySourcesForBase(
-                join(directory, ".pi", CONFIG_FILE_BASENAME),
-                "Pi project",
-            ),
-        };
-    }
+    const userPaths = userScopeConfigPaths();
     return {
-        user: legacySourcesForBase(
-            join(configHome(), "opencode", CONFIG_FILE_BASENAME),
-            "OpenCode user",
+        user: legacyBaseSources("user", harness, directory),
+        project: legacyBaseSources("project", harness, directory).filter(
+            (source) => !userPaths.has(source.path),
         ),
-        project: [
-            ...legacySourcesForBase(join(directory, CONFIG_FILE_BASENAME), "project root"),
-            ...legacySourcesForBase(
-                join(directory, ".opencode", CONFIG_FILE_BASENAME),
-                "OpenCode project",
-            ),
-        ],
     };
 }
 
@@ -218,66 +249,6 @@ export function resolveLegacyConfigSourcesForHarness(
 // (target wins); one that DIFFERS triggers refuse-and-warn (never auto-clobber).
 // We strip comments/trailing-commas and sort keys so formatting/comment/order
 // differences don't read as a conflict.
-
-function stripJsoncForParse(input: string): string {
-    let out = "";
-    let inString = false;
-    let escaped = false;
-    for (let i = 0; i < input.length; i++) {
-        const ch = input[i];
-        const next = input[i + 1];
-        if (inString) {
-            out += ch;
-            if (escaped) escaped = false;
-            else if (ch === "\\") escaped = true;
-            else if (ch === '"') inString = false;
-            continue;
-        }
-        if (ch === '"') {
-            inString = true;
-            out += ch;
-            continue;
-        }
-        if (ch === "/" && next === "/") {
-            while (i < input.length && input[i] !== "\n") i++;
-            out += "\n";
-            continue;
-        }
-        if (ch === "/" && next === "*") {
-            i += 2;
-            while (i < input.length && !(input[i] === "*" && input[i + 1] === "/")) i++;
-            i++;
-            out += " ";
-            continue;
-        }
-        out += ch;
-    }
-    let withoutTrailingCommas = "";
-    inString = false;
-    escaped = false;
-    for (let i = 0; i < out.length; i++) {
-        const ch = out[i];
-        if (inString) {
-            withoutTrailingCommas += ch;
-            if (escaped) escaped = false;
-            else if (ch === "\\") escaped = true;
-            else if (ch === '"') inString = false;
-            continue;
-        }
-        if (ch === '"') {
-            inString = true;
-            withoutTrailingCommas += ch;
-            continue;
-        }
-        if (ch === ",") {
-            let j = i + 1;
-            while (j < out.length && /\s/.test(out[j])) j++;
-            if (out[j] === "}" || out[j] === "]") continue;
-        }
-        withoutTrailingCommas += ch;
-    }
-    return withoutTrailingCommas;
-}
 
 function sortJson(value: unknown): unknown {
     if (Array.isArray(value)) return value.map(sortJson);
@@ -292,7 +263,7 @@ function sortJson(value: unknown): unknown {
 }
 
 function normalizedJsoncSemantics(content: string): string {
-    return JSON.stringify(sortJson(JSON.parse(stripJsoncForParse(content))));
+    return JSON.stringify(sortJson(JSON.parse(stripTrailingCommas(stripJsonComments(content)))));
 }
 
 function fileSemanticsMatch(a: string, b: string): boolean {

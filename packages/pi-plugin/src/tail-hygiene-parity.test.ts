@@ -342,4 +342,69 @@ describe("nudge hygiene three-leg differential corpus", () => {
 		expect(flagship.expected.u / flagship.expected.t).toBeCloseTo(0.651, 3);
 		expect(flagship.expected.band).toBe("urgent");
 	});
+
+	it("hashes tool-call arguments identically across the TypeScript and Pi legs", () => {
+		// Key set chosen so locale collation and code-point order disagree:
+		// localeCompare puts "a" before "B" and "ä" beside "a"; code-point
+		// order is B < a < z < ä. Both legs must serialize arguments with the
+		// shared code-point contract: the serialized bytes feed the tokenizer
+		// (so key order shifts measured u/t off the code-point-ordered golden
+		// on non-C locales) and collation ties would let logically identical
+		// arguments hash two ways inside one process.
+		const fixture: Fixture = {
+			id: "tool-args-key-order-parity",
+			protected_tags: 0,
+			messages: [
+				{
+					mid: "m-1",
+					ordinal: 1,
+					role: "assistant",
+					blocks: [
+						{
+							type: "tool_call",
+							id: "call-1",
+							name: "read",
+							input: { a: 1, B: 2, z: 3, ä: 4 },
+						},
+					],
+				},
+				{
+					mid: "m-2",
+					ordinal: 2,
+					role: "user",
+					blocks: [
+						{
+							type: "tool_result",
+							id: "call-1",
+							name: "read",
+							unit: "ok",
+							repeat: 1,
+						},
+					],
+				},
+			],
+			tags: [{ tag_number: 1, block_id: "m-2#0", kind: "tool" }],
+			expected: { u: 0, t: 0, band: "quiet" },
+		};
+		const core = measureTailHygiene({
+			messages: toCoreMessages(fixture),
+			tags: toTags(fixture),
+			protectedTags: fixture.protected_tags,
+		});
+		const pi = measurePiTailHygiene({
+			messages: toPiMessages(fixture),
+			tags: toTags(fixture, true),
+			protectedTags: fixture.protected_tags,
+			stableId: (message) => (message as { _mid?: string })._mid,
+		});
+		const coreToolInputs = core.parts.filter(
+			(part) => part.kind === "toolInput",
+		);
+		const piToolInputs = pi.parts.filter((part) => part.kind === "toolInput");
+		expect(coreToolInputs.length).toBe(1);
+		expect(piToolInputs.length).toBe(1);
+		expect(piToolInputs[0]?.contentHash).toBe(
+			coreToolInputs[0]?.contentHash ?? "",
+		);
+	});
 });

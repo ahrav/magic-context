@@ -131,7 +131,7 @@ export function formatBlock(block: ChunkBlock): string {
     return `${range} ${block.role}:${commitSuffix} ${block.parts.join(" / ")}`;
 }
 
-export function extractCommitHashes(text: string): string[] {
+function extractCommitHashes(text: string): string[] {
     const hashes: string[] = [];
     const seen = new Set<string>();
     for (const match of text.matchAll(createCommitHashExtractPattern())) {

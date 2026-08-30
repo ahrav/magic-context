@@ -63,7 +63,7 @@ export interface SessionFact {
     updatedAt: number;
 }
 
-interface CompartmentRow {
+interface CompartmentRowShared {
     id: number;
     session_id: string;
     sequence: number;
@@ -79,8 +79,11 @@ interface CompartmentRow {
     p4: string | null;
     importance: number | null;
     episode_type: string | null;
-    legacy: number | null;
     created_at: number;
+}
+
+interface CompartmentRow extends CompartmentRowShared {
+    legacy: number | null;
 }
 
 interface SessionFactRow {
@@ -100,7 +103,7 @@ function isNumberOrNullish(v: unknown): v is number | null | undefined {
     return v === null || v === undefined || typeof v === "number";
 }
 
-function isCompartmentRow(row: unknown): row is CompartmentRow {
+function isCompartmentRowShared(row: unknown): row is CompartmentRowShared {
     if (row === null || typeof row !== "object") return false;
     const candidate = row as Record<string, unknown>;
     return (
@@ -121,9 +124,13 @@ function isCompartmentRow(row: unknown): row is CompartmentRow {
         isStringOrNullish(candidate.p4) &&
         isNumberOrNullish(candidate.importance) &&
         isStringOrNullish(candidate.episode_type) &&
-        isNumberOrNullish(candidate.legacy) &&
         typeof candidate.created_at === "number"
     );
+}
+
+function isCompartmentRow(row: unknown): row is CompartmentRow {
+    if (!isCompartmentRowShared(row)) return false;
+    return isNumberOrNullish((row as unknown as Record<string, unknown>).legacy);
 }
 
 function isSessionFactRow(row: unknown): row is SessionFactRow {
@@ -322,24 +329,6 @@ export function appendCompartments(
     const now = Date.now();
     db.transaction(() => {
         insertCompartmentRows(db, sessionId, compartments, now);
-    })();
-}
-
-/**
- * Replace session facts without touching compartments.
- * Facts are fully re-normalized by the historian on each pass,
- * so they always need a full replacement.
- */
-export function replaceSessionFacts(
-    db: Database,
-    sessionId: string,
-    facts: Array<{ category: string; content: string }>,
-): void {
-    const now = Date.now();
-    db.transaction(() => {
-        db.prepare("DELETE FROM session_facts WHERE session_id = ?").run(sessionId);
-        insertFactRows(db, sessionId, facts, now);
-        clearCachedM0M1(db, sessionId);
     })();
 }
 
@@ -694,48 +683,13 @@ export function setRecompPartialRange(
     ).run(start, end, sessionId);
 }
 
-interface RecompCompartmentRow {
-    id: number;
-    session_id: string;
-    sequence: number;
-    start_message: number;
-    end_message: number;
-    start_message_id: string;
-    end_message_id: string;
-    title: string;
-    content: string;
-    p1: string | null;
-    p2: string | null;
-    p3: string | null;
-    p4: string | null;
-    importance: number | null;
-    episode_type: string | null;
+interface RecompCompartmentRow extends CompartmentRowShared {
     pass_number: number;
-    created_at: number;
 }
 
 function isRecompCompartmentRow(row: unknown): row is RecompCompartmentRow {
-    if (row === null || typeof row !== "object") return false;
-    const candidate = row as Record<string, unknown>;
-    return (
-        typeof candidate.id === "number" &&
-        typeof candidate.session_id === "string" &&
-        typeof candidate.sequence === "number" &&
-        typeof candidate.start_message === "number" &&
-        typeof candidate.end_message === "number" &&
-        typeof candidate.start_message_id === "string" &&
-        typeof candidate.end_message_id === "string" &&
-        typeof candidate.title === "string" &&
-        typeof candidate.content === "string" &&
-        isStringOrNullish(candidate.p1) &&
-        isStringOrNullish(candidate.p2) &&
-        isStringOrNullish(candidate.p3) &&
-        isStringOrNullish(candidate.p4) &&
-        isNumberOrNullish(candidate.importance) &&
-        isStringOrNullish(candidate.episode_type) &&
-        typeof candidate.pass_number === "number" &&
-        typeof candidate.created_at === "number"
-    );
+    if (!isCompartmentRowShared(row)) return false;
+    return typeof (row as unknown as Record<string, unknown>).pass_number === "number";
 }
 
 function isRecompFactRow(row: unknown): row is { category: string; content: string } {

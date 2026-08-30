@@ -171,62 +171,59 @@ describe("detectConflicts", () => {
             expect(result.conflicts.omoPreemptiveCompaction).toBe(true);
         });
 
-        it("respects disabled_hooks in project-level OMO config (old format)", () => {
+        // Each row writes an OMO config that disables all three hooks at one
+        // supported config location/format and asserts the conflict clears
+        // (the wrapped "[opencode]" form is the unified omo.jsonc of
+        // oh-my-openagent >= 4.19.0).
+        // Project-scoped rows avoid relying on user config-path resolution,
+        // which can be leaked across files by `spyOn(getOpenCodeConfigPaths)`
+        // mocks in sibling tests.
+        it.each([
+            [
+                "respects disabled_hooks in project-level OMO config (old format)",
+                "project",
+                "oh-my-opencode.json",
+                false,
+            ],
+            [
+                "detects disabled_hooks in new ~/.omo/omo.jsonc (user-level)",
+                "home-omo",
+                "omo.jsonc",
+                true,
+            ],
+            [
+                "detects disabled_hooks in new .omo/omo.jsonc (project-level)",
+                "project-omo",
+                "omo.jsonc",
+                true,
+            ],
+            [
+                "reads omo.json (fallback) when omo.jsonc does not exist",
+                "home-omo",
+                "omo.json",
+                true,
+            ],
+        ] as Array<
+            [string, string, string, boolean]
+        >)("%s", (_title, location, filename, wrapped) => {
             writeProjectConfig(["oh-my-opencode"]);
-            // Use project-scoped OMO config to avoid relying on user
-            // config-path resolution, which can be leaked across files
-            // by `spyOn(getOpenCodeConfigPaths)` mocks in sibling tests.
+            const disabled = {
+                disabled_hooks: [
+                    "preemptive-compaction",
+                    "context-window-monitor",
+                    "anthropic-context-window-limit-recovery",
+                ],
+            };
+            const dir =
+                location === "project"
+                    ? projectDir
+                    : location === "project-omo"
+                      ? join(projectDir, ".omo")
+                      : join(homeDir, ".omo");
+            mkdirSync(dir, { recursive: true });
             writeFileSync(
-                join(projectDir, "oh-my-opencode.json"),
-                JSON.stringify({
-                    disabled_hooks: [
-                        "preemptive-compaction",
-                        "context-window-monitor",
-                        "anthropic-context-window-limit-recovery",
-                    ],
-                }),
-            );
-            const result = detectConflicts(projectDir);
-            expect(result.hasConflict).toBe(false);
-        });
-
-        // --- New unified omo.jsonc (oh-my-openagent >= 4.19.0) ---
-
-        it("detects disabled_hooks in new ~/.omo/omo.jsonc (user-level)", () => {
-            writeProjectConfig(["oh-my-opencode"]);
-            const omoDir = join(homeDir, ".omo");
-            mkdirSync(omoDir, { recursive: true });
-            writeFileSync(
-                join(omoDir, "omo.jsonc"),
-                JSON.stringify({
-                    "[opencode]": {
-                        disabled_hooks: [
-                            "preemptive-compaction",
-                            "context-window-monitor",
-                            "anthropic-context-window-limit-recovery",
-                        ],
-                    },
-                }),
-            );
-            const result = detectConflicts(projectDir);
-            expect(result.hasConflict).toBe(false);
-        });
-
-        it("detects disabled_hooks in new .omo/omo.jsonc (project-level)", () => {
-            writeProjectConfig(["oh-my-opencode"]);
-            const omoDir = join(projectDir, ".omo");
-            mkdirSync(omoDir, { recursive: true });
-            writeFileSync(
-                join(omoDir, "omo.jsonc"),
-                JSON.stringify({
-                    "[opencode]": {
-                        disabled_hooks: [
-                            "preemptive-compaction",
-                            "context-window-monitor",
-                            "anthropic-context-window-limit-recovery",
-                        ],
-                    },
-                }),
+                join(dir, filename),
+                JSON.stringify(wrapped ? { "[opencode]": disabled } : disabled),
             );
             const result = detectConflicts(projectDir);
             expect(result.hasConflict).toBe(false);
@@ -275,26 +272,6 @@ describe("detectConflicts", () => {
             );
             const result = detectConflicts(projectDir);
             // All three are disabled across both configs
-            expect(result.hasConflict).toBe(false);
-        });
-
-        it("reads omo.json (fallback) when omo.jsonc does not exist", () => {
-            writeProjectConfig(["oh-my-opencode"]);
-            const omoDir = join(homeDir, ".omo");
-            mkdirSync(omoDir, { recursive: true });
-            writeFileSync(
-                join(omoDir, "omo.json"),
-                JSON.stringify({
-                    "[opencode]": {
-                        disabled_hooks: [
-                            "preemptive-compaction",
-                            "context-window-monitor",
-                            "anthropic-context-window-limit-recovery",
-                        ],
-                    },
-                }),
-            );
-            const result = detectConflicts(projectDir);
             expect(result.hasConflict).toBe(false);
         });
 

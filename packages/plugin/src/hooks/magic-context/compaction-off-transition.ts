@@ -1,5 +1,5 @@
 /**
- * Compaction-off mode transitions (issue #266, slice S3).
+ * Compaction-off mode transitions.
  *
  * The mode is boot-resolved and process-stable, so a transition is only ever
  * observed on a session's first transform pass after a restart that changed
@@ -70,7 +70,7 @@ let loggedUnverifiedMarkerCleanupRetry = false;
 /**
  * Flip-off unfold notice. Delivered out of band on the transition pass that
  * actually cleared something. The one-cycle warning wording is contractual
- * (spec #266): removing MC's markers exposes the history hidden solely by
+ * (per the compaction-off spec): removing MC's markers exposes the history hidden solely by
  * MC, and on a long session that expansion can exceed the model window once
  * before native compaction reacts. Docs quote this same constant.
  */

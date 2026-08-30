@@ -183,7 +183,7 @@ async fn restart_rotates_credentials_and_invalidates_old_state() {
     // The old key cannot authenticate: the server proof is minted for a
     // daemon ID the stale snapshot does not carry.
     let stale = raw_client::Discovered {
-        port: second.info.port,
+        setup_socket: second.info.setup_socket.clone(),
         ..old_info.clone()
     };
     assert!(
@@ -318,35 +318,6 @@ async fn degraded_storage_is_an_application_error_not_a_disconnect() {
         .expect("send");
     let frame = client.frame_within(BUDGET).await.expect("terminal");
     assert_eq!(frame.ty, TY_RESPONSE);
-
-    host.shutdown_gracefully().await;
-}
-
-/// A negotiated TCP connection remains live after the optional-candidate setup
-/// deadline has elapsed.
-#[tokio::test]
-async fn negotiated_connection_stays_live_beyond_setup_deadline() {
-    let host = TestHost::start_with(|config| {
-        config.timing.transport_setup_deadline = Duration::from_millis(100);
-    })
-    .await;
-    let mut client = host.client().await;
-
-    tokio::time::sleep(Duration::from_millis(400)).await;
-
-    let (channel, epoch) = client
-        .route_open(LINKED_MODULE_ID, ROOT, "opencode", "negotiated")
-        .await
-        .expect("route.open after negotiation");
-    let corr = client.next_corr();
-    let body = support::echo_body("negotiated");
-    client
-        .send_frame(TY_REQUEST, FLAGS_INTERACTIVE, channel, epoch, corr, &body)
-        .await
-        .expect("send echo");
-    let frame = client.frame_within(BUDGET).await.expect("echo terminal");
-    assert_eq!((frame.ty, frame.corr), (TY_RESPONSE, corr));
-    assert_eq!(frame.body, body);
 
     host.shutdown_gracefully().await;
 }

@@ -12,7 +12,7 @@ import {
     getOmpAgentDir,
     getOmpPluginsDir,
     getOmpPluginsLockPath,
-    getOmpUserConfigPath,
+    getSharedUserConfigPath,
 } from "../lib/paths";
 import type {
     HarnessAdapter,
@@ -44,7 +44,7 @@ export class OmpAdapter implements HarnessAdapter {
         return {
             configDir: getOmpAgentDir(),
             pluginConfigPath: getOmpPluginsLockPath(),
-            magicContextConfigPath: getOmpUserConfigPath(),
+            magicContextConfigPath: getSharedUserConfigPath(),
             secondaryConfigPath: null,
         };
     }

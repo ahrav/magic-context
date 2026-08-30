@@ -27,18 +27,18 @@ export interface PiDreamerOptions {
 	/** Resolved runnable DreamerConfig from loadPiConfig(). When disable=true, the caller does not register. */
 	config: DreamerConfig;
 	/**
-	 * Council finding #7: dreamer needs the real embedding config so it can
+	 * Dreamer needs the real embedding config so it can
 	 * (a) maintain near-duplicate/stale memories using deterministic file gates and
 	 * (b) re-embed memory content when it gets rewritten by `improve`.
-	 * Hardcoded `{provider:"off"}` previously meant dreamer skipped both
-	 * paths even when the user had a real embedding model configured.
+	 * A hardcoded `{provider:"off"}` would skip both
+	 * paths even when the user has a real embedding model configured.
 	 */
 	embeddingConfig: EmbeddingConfig;
 	/**
-	 * Council finding #7: dreamer needs the real memory.enabled gate so the
+	 * Dreamer needs the real memory.enabled gate so the
 	 * memory-promotion pipeline (consolidation + improve + archive) can
-	 * actually write to the project memory store. Hardcoded `false`
-	 * previously made dreamer's memory tasks a no-op.
+	 * actually write to the project memory store. A hardcoded `false`
+	 * would make dreamer's memory tasks a no-op.
 	 */
 	memoryEnabled: boolean;
 	retinaHandoff?: boolean;

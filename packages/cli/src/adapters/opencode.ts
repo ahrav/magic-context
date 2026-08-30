@@ -3,6 +3,7 @@ import { dirname, isAbsolute, parse as parsePath, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
 import { writeFileAtomic } from "../lib/atomic-write";
+import { ensureParentDir } from "../lib/fs-utils";
 import { detectOpenCode } from "../lib/opencode-detect";
 import {
     getOpenCodePluginPackageJsonPaths,
@@ -69,7 +70,7 @@ export class OpenCodeAdapter implements HarnessAdapter {
                     $schema: "https://opencode.ai/config.json",
                     plugin: [PLUGIN_ENTRY],
                 };
-                ensureDir(target);
+                ensureParentDir(target);
                 writeFileAtomic(target, `${JSON.stringify(initial, null, 4)}\n`);
                 return {
                     ok: true,
@@ -312,12 +313,4 @@ export function matchesPluginEntry(entry: unknown, pkgName: string): boolean {
     const at = candidate.lastIndexOf("@");
     const head = at > 0 ? candidate.slice(0, at) : candidate;
     return head === pkgName;
-}
-
-function ensureDir(filePath: string): void {
-    const dir = dirname(filePath);
-    if (!existsSync(dir)) {
-        const { mkdirSync } = require("node:fs") as typeof import("node:fs");
-        mkdirSync(dir, { recursive: true });
-    }
 }

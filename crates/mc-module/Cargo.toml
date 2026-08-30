@@ -66,8 +66,20 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 drive-fault = []
 # The `direct-host-fixture` feature enables a test-only process fixture, not a production launch surface.
 direct-host-fixture = []
+bench-internals = []
+
+[[bench]]
+name = "hot_path"
+path = "benches/hot_path.rs"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
+name = "kernels"
+harness = false
 
 [dev-dependencies]
+criterion = "=0.8.2"
 chrono-tz = "0.10"
 tokio = { workspace = true, features = ["signal"] }
 # Enable the store's seed helpers for mc-module's compose tests (populate memories +

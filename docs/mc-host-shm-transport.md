@@ -2,13 +2,15 @@
 
 ## Status
 
-Shared memory is explicit, test-only, and non-default. Host and client production registries are empty. No backend or target profile has qualified on a designated host, so no shared-memory provider ships. TCP remains the production transport.
+Shared memory is the only transport. The fixed ring is mandatory: there is no negotiation, no provider registry, and no TCP path to fall back to. A client that cannot attach a ring cannot reach the host.
 
-Current Linux integration uses profile `mc-host-test-ring-v1` only when tests inject `ShmProvider` and `createExplicitShmTestProvider`. This control proves negotiation and lifecycle behavior. It is not selectable evidence: host receive calls `lease.to_vec()` and records one transport-body copy before semantic dispatch. It must not support a zero-copy or hardware-limited claim.
+Linux and macOS integration uses profile `mc-host-test-ring-v1`, exposed as `MC_HOST_RING_PROFILE`. Host receive still calls `lease.to_vec()` and records one transport-body copy before semantic dispatch, so this path must not support a zero-copy claim.
 
 ## Architecture
 
-Authenticated TCP bootstraps negotiation. Side-effect-free preflight checks exact provider identity `("shm", 1)`, immutable profile fields, runtime capability, and process-wide admission. Preparation creates two ordered directions and returns an opaque grant. Attachment validates the exact objects and profile before activation. Correlations 1 and 2 activate and commit the new channel; application traffic starts at correlation 3.
+An authenticated Unix stream socket bootstraps the ring. The host publishes its absolute path as `setup_socket` in the connection file; the client dials it, proves identity over the shared HMAC construction, and receives the two ring descriptors over `SCM_RIGHTS`. Preparation creates two ordered directions and returns an opaque grant. Attachment validates the exact objects and profile before activation. Correlations 1 and 2 activate and commit the new channel; application traffic starts at correlation 3.
+
+Because descriptors cross the boundary as file descriptors, the setup socket cannot be proxied by a byte forwarder; any container or remote topology has to make the socket itself reachable.
 
 Each direction has a bounded descriptor ring and payload arena. A direct producer reserves bounded spans, fills through a cursor, detaches producer aliases, and commits the exact length. One descriptor carries the wire-v2 header, span metadata, incarnation, lane, and `u64` sequence. A receiver snapshots and validates descriptor metadata, then holds shared spans through a scoped Rust lease or explicit JavaScript lease.
 
@@ -56,9 +58,9 @@ Explicit test profile charges both directions before activation:
 
 Host implementation also starts one fused, unpinned owner thread per prepared candidate. Admission accounts active and quarantined descriptor, arena, lease, mapping, and pinned-worker commitments. Quarantine retains charges instead of making uncertain storage reusable.
 
-## Failure, fallback, and close
+## Failure and close
 
-TCP fallback is valid only during offer filtering, before provider preparation. After preparation starts, setup timeout, malformed data, peer loss, publication failure, cleanup uncertainty, or quarantine closes the connection without TCP replay.
+There is no fallback. Setup timeout, malformed data, peer loss, publication failure, cleanup uncertainty, and quarantine each close the connection, and a client that cannot establish a ring has no other transport to fall back to.
 
 Close stops admission, drains published data, revokes JavaScript aliases on the environment thread, waits for Rust scopes, releases samples, drops transport objects, and joins workers. Duplicate close is harmless. Unknown alias state quarantines storage, rejects successful close, and keeps its host charge.
 
@@ -66,7 +68,12 @@ Diagnostics redact descriptors, activation tokens, object names, grants, incarna
 
 ## Recovery contract
 
-This section documents the implemented behavior of `crates/mc-host/src/provider_recovery.rs`, `crates/mc-host/src/shm_provider.rs`, and the client recovery loop in `packages/plugin/src/shared/mc-host-client/client.ts` (R16). Wire-level fallback semantics are normative in `docs/mc-host-wire-protocol.md` §7.7.3.
+> **Stale.** The sections below describe the provider abstraction in
+> `crates/mc-host/src/provider_recovery.rs` and `crates/mc-host/src/shm_provider.rs`,
+> both of which were removed when the fixed ring became mandatory. Provider
+> readiness, offer filtering, typed `unavailable`, and provider incarnations no
+> longer exist, so nothing here is normative. It is retained only until the
+> replacement contract for ring establishment failure is written.
 
 ### Typed `unavailable`
 

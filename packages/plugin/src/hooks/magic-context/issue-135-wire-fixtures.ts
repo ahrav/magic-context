@@ -1,6 +1,6 @@
 /**
- * Captured openai-compat wire fixtures from issue #135 pinning harness.
- * Source: scripts/experiments/issue-135-pinning-harness.ts (case 1c).
+ * Captured openai-compat wire fixtures from the orphan-tool pinning harness
+ * (case 1c): `[dropped]` assistant between tool_calls and its tool result.
  */
 import type { OpenAiCompatWireMessage } from "./openai-compat-adjacency";
 

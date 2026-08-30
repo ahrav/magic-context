@@ -1,95 +1,21 @@
+// The consumed lifecycle surface. Leaf modules stay directly importable;
+// this barrel re-exports only the symbols production importers actually take
+// from it, so unused surface shows up as a compile error instead of hiding
+// behind a re-export line.
+export { type DaemonReason, type DaemonResultV1 } from "./contract";
+export { releaseContract } from "./generated-contract";
+export { createManagedLifecyclePolicy } from "./managed-policy";
+export type { NativeStartupEnvelope } from "./native-launcher";
+export { type ConnectionOrigin, resolveConnectionOrigin } from "./ownership";
 export {
-    availableBytesFor,
-    BootstrapError,
-    checkCapacity,
-    checkPlatform,
-    defaultPlatformReaders,
-    type LayoutResolution,
-    loadTrustIndex,
-    type PlatformGate,
-    type PlatformReaders,
-    type RetainedBootstrap,
-    resolvePayloadPackageDir,
-    revalidateRetainedBootstrap,
-    stageBootstrap,
-    type TrustIndex,
-    type TrustIndexEntry,
-} from "./bootstrap";
-export {
-    type CompatibilityVerdict,
-    evaluateCompatibility,
-    evaluateDaemonCompatibility,
-    evaluateEpochCompatibility,
-    evaluateModuleCompatibility,
-    parseSemverTriple,
-} from "./compatibility";
-export {
-    ContractViolation,
-    classifyPreNativeRoots,
-    DAEMON_RESULT_SCHEMA,
-    type DaemonCheck,
-    type DaemonCommand,
-    type DaemonReadiness,
-    type DaemonReason,
-    type DaemonResultV1,
-    type DaemonState,
-    type DaemonVersions,
-    exitAgreesWithResult,
-    harnessRemediationFor,
-    isDaemonReason,
-    type PreNativeRootsClassification,
-    parseDaemonResult,
-    preNativeState,
-    probeFallbackVerdict,
-    type RestartEffects,
-    reasonPrecedence,
-    remediationForReason,
-} from "./contract";
-export { RELEASE_CONTRACT_SHA256, releaseContract } from "./generated-contract";
-export {
-    createManagedLifecyclePolicy,
-    type ManagedLifecyclePolicyOptions,
-} from "./managed-policy";
-export {
-    LAUNCHER_CHILD_FD,
-    NativeLaunchError,
-    type NativeLaunchFailureCode,
-    type NativeLaunchOptions,
-    type NativeLaunchTarget,
-    type NativeStartupEnvelope,
-    runNativeLifecycle,
-} from "./native-launcher";
-export {
-    type ConnectionOrigin,
-    type ConnectionOriginInput,
-    mayDemandStart,
-    resolveConnectionOrigin,
-} from "./ownership";
-export {
-    type AdmissionIo,
-    admitLifecycleFilesystem,
-    CONNECTION_FILE_NAME,
     connectionFilePath,
-    coordinationDirPath,
-    type DataRootResolution,
     defaultConnectionFilePath,
-    type FilesystemAdmission,
-    managedSubtreePath,
-    parseMounts,
-    redactLifecyclePath,
     resolveLifecycleDataRoot,
-    runtimeDirPath,
     sensitiveRootsFor,
 } from "./paths";
 export {
-    type CompatibilitySnapshot,
-    type CompatibilityStage,
-    type DemandStartOutcome,
-    type DemandStartRequest,
     type LifecycleCommand,
-    type LifecyclePolicyOptions,
     McHostLifecyclePolicy,
-    type ObservationalHealth,
     OUTER_AGGREGATE_MS,
     STORAGE_HARD_BUDGET_MS,
     type StorageReadiness,

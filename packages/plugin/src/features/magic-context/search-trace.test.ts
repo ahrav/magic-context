@@ -139,6 +139,12 @@ function seedMixedCorpus(db: Database): { compartmentWindows: number } {
     return { compartmentWindows: windows.length };
 }
 
+/** Inert embedding lane for tests that only exercise lexical surfaces. */
+const noEmbedding = {
+    embedQuery: async () => null,
+    isEmbeddingRuntimeEnabled: () => true,
+};
+
 function baseSearchOptions(extra: Record<string, unknown> = {}) {
     return {
         limit: 10,
@@ -275,6 +281,7 @@ describe("candidate-depth seam", () => {
         const counter = countingDatabase(db);
         const collected = collectingSink();
         const results = await unifiedSearch(counter.db, SESSION, PROJECT, "queue drain", {
+            ...noEmbedding,
             limit: 5,
             sources: ["message"],
             embeddingEnabled: false,
@@ -326,6 +333,7 @@ describe("candidate-depth seam", () => {
                 let error: unknown = null;
                 try {
                     await unifiedSearch(counter.db, SESSION, PROJECT, "queue drain", {
+                        ...noEmbedding,
                         sources: ["message"],
                         embeddingEnabled: false,
                         measurementDisabled: true,

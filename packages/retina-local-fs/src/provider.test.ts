@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative } from "node:path";
 import { promisify } from "node:util";
 import {
     type ProviderConfig,
@@ -302,6 +302,62 @@ describe("path fence", () => {
         await writeFile(path, JSON.stringify({ key: "secret" }));
 
         process.env.XDG_DATA_HOME = dataDirectory;
+        await expect(
+            runProvider(
+                { scalar: null, config: { kind: "path_exists", path } },
+                { homeDirectory: home },
+            ),
+        ).rejects.toMatchObject({ code: "fenced_path" });
+    });
+
+    test("ignores a relative XDG_DATA_HOME and keeps fencing the home-derived root", async () => {
+        // The daemon and the lifecycle resolver both reject a relative
+        // XDG_DATA_HOME and fall back to $HOME/.local/share, so the real
+        // managed tree lives under home. A fence that resolved the relative
+        // value against cwd would compute its root elsewhere and admit the
+        // very files it exists to refuse.
+        const home = await temporaryDirectory("retina-local-fs-home-");
+        const path = join(home, ".local", "share", "cortexkit", "run", "subc-connection.json");
+        await mkdir(join(path, ".."), { recursive: true });
+        await writeFile(path, JSON.stringify({ key: "secret" }));
+
+        process.env.XDG_DATA_HOME = "./poisoned-relative-data";
+        await expect(
+            runProvider(
+                { scalar: null, config: { kind: "path_exists", path } },
+                { homeDirectory: home },
+            ),
+        ).rejects.toMatchObject({ code: "fenced_path" });
+    });
+
+    test("still fences the cwd-relative tree a relative XDG_DATA_HOME makes storage write to", async () => {
+        // The plugin's storage resolver accepts a raw XDG_DATA_HOME, so under
+        // a relative value its writes land in a cwd-relative tree. The fence
+        // covers that root too — rejecting the relative value must not trade
+        // one admitted managed tree for another.
+        const home = await temporaryDirectory("retina-local-fs-home-");
+        const dataDirectory = await temporaryDirectory("retina-local-fs-relative-xdg-");
+        const path = join(dataDirectory, "cortexkit", "magic-context", "context.db");
+        await mkdir(join(path, ".."), { recursive: true });
+        await writeFile(path, "credential-bearing data");
+
+        process.env.XDG_DATA_HOME = relative(process.cwd(), dataDirectory);
+        expect(isAbsolute(process.env.XDG_DATA_HOME)).toBe(false);
+        await expect(
+            runProvider(
+                { scalar: null, config: { kind: "path_exists", path } },
+                { homeDirectory: home },
+            ),
+        ).rejects.toMatchObject({ code: "fenced_path" });
+    });
+
+    test("ignores an empty XDG_DATA_HOME and keeps fencing the home-derived root", async () => {
+        const home = await temporaryDirectory("retina-local-fs-home-");
+        const path = join(home, ".local", "share", "cortexkit", "magic-context", "context.db");
+        await mkdir(join(path, ".."), { recursive: true });
+        await writeFile(path, "credential-bearing data");
+
+        process.env.XDG_DATA_HOME = "";
         await expect(
             runProvider(
                 { scalar: null, config: { kind: "path_exists", path } },

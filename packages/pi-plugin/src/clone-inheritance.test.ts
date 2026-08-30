@@ -22,7 +22,7 @@ import {
 	readPiSessionIdFromFile,
 } from "./clone-inheritance";
 import { mustMaterializePi } from "./inject-compartments-pi";
-import { createTestDb } from "./test-utils.test";
+import { createTestDb } from "./test-utils";
 
 const openDatabases: Database[] = [];
 const temporaryDirectories: string[] = [];

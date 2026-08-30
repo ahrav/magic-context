@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
+import { runImmediate } from "../../shared/sqlite";
 import { V2_MEMORY_CATEGORIES } from "./memory/constants";
 import { normalizeStoredProjectPath, storedPathBelongsToIdentity } from "./project-identity";
 import { collectAliasesForTargets, tableExists } from "./storage-project-identities";
@@ -235,22 +236,6 @@ export function resolveStoredPathWorkspaceIdentity(
     return null;
 }
 
-export function storedPathBelongsToWorkspace(
-    storedProjectPath: string,
-    memberIdentities: readonly string[],
-    expandedIdentities: readonly string[],
-    canonicalIdentityByStoredPath: ReadonlyMap<string, string>,
-): boolean {
-    if (expandedIdentities.includes(storedProjectPath)) return true;
-    return (
-        resolveStoredPathWorkspaceIdentity(
-            storedProjectPath,
-            memberIdentities,
-            canonicalIdentityByStoredPath,
-        ) !== null
-    );
-}
-
 export function sourceNameForMemory(
     storedProjectPath: string,
     ownIdentity: string,
@@ -354,40 +339,5 @@ export function bumpEpochsForWorkspaceMembers(
         run();
         return;
     }
-    db.exec("BEGIN IMMEDIATE");
-    try {
-        run();
-        db.exec("COMMIT");
-    } catch (error) {
-        try {
-            db.exec("ROLLBACK");
-        } catch {
-            // ignore rollback failures from an already-closed transaction
-        }
-        throw error;
-    }
-}
-
-export function bumpEpochsForWorkspaceMemberSet(
-    db: Database,
-    identities: readonly string[],
-    now = Date.now(),
-): void {
-    const run = () => bumpEpochRows(db, identities, now);
-    if (isInTransaction(db)) {
-        run();
-        return;
-    }
-    db.exec("BEGIN IMMEDIATE");
-    try {
-        run();
-        db.exec("COMMIT");
-    } catch (error) {
-        try {
-            db.exec("ROLLBACK");
-        } catch {
-            // ignore rollback failures from an already-closed transaction
-        }
-        throw error;
-    }
+    runImmediate(db, run);
 }

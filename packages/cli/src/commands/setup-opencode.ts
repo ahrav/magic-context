@@ -485,8 +485,8 @@ export async function runSetup(dryRun = false): Promise<number> {
     // ─── Step 8: Oh-My-OpenCode compatibility ───────────
     // Intentional: this branch handles the FIRST-TIME-INSTALL case only.
     // Existing users hit the same OMO conflict-fix logic via the
-    // `if (hadExistingSetup) detectConflicts/fixConflicts` block above
-    // (lines 231-257), which already covers omoPreemptiveCompaction,
+    // `if (hadExistingSetup) detectConflicts/fixConflicts` block above,
+    // which already covers omoPreemptiveCompaction,
     // omoContextWindowMonitor, and omoAnthropicRecovery. Audit tools
     // sometimes flag this `!hadExistingSetup` gate as "OMO check skipped
     // for existing users" — that's a false positive.

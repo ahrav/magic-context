@@ -20,9 +20,9 @@ pub const FORMAT_MARKER_DIGEST_PROTOCOL: &str = "mc-direct-format-marker-v1";
 
 pub const SCHEMA_MANIFEST_PROTOCOL: &str = "mc-schema-manifest-v1";
 
-/// Minimum SQLite release carrying the WAL-reset fix
+/// Minimum supported SQLite release, carrying the complete WAL-reset race fix
 /// (<https://www.sqlite.org/wal.html#walresetbug>).
-pub const SQLITE_WAL_RESET_SAFE_MIN_VERSION: [u64; 3] = [3, 47, 1];
+pub const MIN_SUPPORTED_SQLITE_VERSION: [u64; 3] = [3, 51, 3];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqliteEngineIdentity {
@@ -47,7 +47,11 @@ pub fn probe_sqlite_engine_identity_off_path() -> rusqlite::Result<SqliteEngineI
     read_sqlite_engine_identity(&conn)
 }
 
-fn parse_dotted_version(version: &str) -> Option<[u64; 3]> {
+pub fn format_dotted_version(version: [u64; 3]) -> String {
+    format!("{}.{}.{}", version[0], version[1], version[2])
+}
+
+pub fn parse_dotted_version(version: &str) -> Option<[u64; 3]> {
     let mut parts = version.trim().split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
@@ -92,10 +96,11 @@ fn is_well_formed_source_id(source_id: &str) -> bool {
 pub fn evaluate_sqlite_runtime_gate(identity: &SqliteEngineIdentity) -> Vec<String> {
     let mut reasons = Vec::new();
     match parse_dotted_version(&identity.sqlite_version) {
-        Some(version) if version >= SQLITE_WAL_RESET_SAFE_MIN_VERSION => {}
+        Some(version) if version >= MIN_SUPPORTED_SQLITE_VERSION => {}
         _ => reasons.push(format!(
-            "SQLite {} predates the WAL-reset fix in 3.47.1",
-            identity.sqlite_version
+            "SQLite {} is below the supported floor {}",
+            identity.sqlite_version,
+            format_dotted_version(MIN_SUPPORTED_SQLITE_VERSION)
         )),
     }
     if !is_well_formed_source_id(&identity.sqlite_source_id) {

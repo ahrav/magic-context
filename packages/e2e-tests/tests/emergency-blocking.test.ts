@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { TestHarness } from "../src/harness";
 import { buildMockHistorianPayload } from "../src/mock-historian";
 import { FOLD_SKIP_REASON } from "../src/rust-scenario-support";
+import { isHistorianRequest } from "../src/cache-analysis";
 
 /**
  * Emergency handling when usage climbs to or above 95%.
@@ -25,25 +26,6 @@ import { FOLD_SKIP_REASON } from "../src/rust-scenario-support";
  * or abort — both behaviors are correct and protect the user, but they have
  * very different timing characteristics.
  */
-
-const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
-
-function isHistorianRequest(body: Record<string, unknown>): boolean {
-    if (JSON.stringify(body.messages ?? "").includes("<new_messages>")) return true;
-    const system = body.system;
-    if (typeof system === "string") return system.includes(HISTORIAN_SYSTEM_MARKER);
-    if (Array.isArray(system)) {
-        for (const block of system) {
-            if (block && typeof block === "object") {
-                const text = (block as { text?: unknown }).text;
-                if (typeof text === "string" && text.includes(HISTORIAN_SYSTEM_MARKER)) {
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
-}
 
 let h: TestHarness;
 

@@ -18,6 +18,7 @@ import {
     insertUserMemoryCandidates,
 } from "../user-memory/storage-user-memory";
 import { readDreamerProjectClaims } from "./claim-manifest";
+import { assistantMessages } from "./dreamer-test-support";
 import { acquireLease, acquireLeaseWithAcquisition, releaseLease } from "./lease";
 import { applyRetrospectiveLearnings } from "./retrospective-learnings";
 import { getDreamRuns } from "./storage-dream-runs";
@@ -52,15 +53,6 @@ function mapClaim(database: Database, claim: SeededProjectMemoryClaim, paths: st
         },
     );
     expect(result.outcome).toBe("applied");
-}
-
-function assistantMessages(text: string) {
-    return [
-        {
-            info: { role: "assistant", time: { created: Date.now() } },
-            parts: [{ type: "text", text }],
-        },
-    ];
 }
 
 function providerFailureMessages(text: string) {

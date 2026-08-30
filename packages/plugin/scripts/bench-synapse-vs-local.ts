@@ -8,6 +8,8 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { storageSubtreePath } from "../src/shared/data-path";
+import { connectionFilePath } from "../src/shared/mc-host-lifecycle/paths";
 import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "../src/config/schema/magic-context";
 import { SynapseEmbeddingProvider } from "../src/features/magic-context/memory/embedding-synapse";
 import { LocalEmbeddingProvider } from "../src/features/magic-context/memory/embedding-local";
@@ -18,7 +20,7 @@ const N = nIdx >= 0 ? Number(process.argv[nIdx + 1]) : 100;
 // Real corpus: compartment P1 paraphrases (the same content class the chunk
 // embedder feeds), read-only.
 const { Database } = await import("bun:sqlite");
-const db = new Database(join(homedir(), ".local/share/cortexkit/magic-context/context.db"), {
+const db = new Database(join(storageSubtreePath(join(homedir(), ".local", "share")), "context.db"), {
     readonly: true,
 });
 const rows = db
@@ -36,7 +38,7 @@ const items = rows.map((r) => ({
 
 // Lane 1: Synapse over subc (gte-modernbert-base f16, Metal).
 {
-    const connectionFile = join(homedir(), ".local/share/cortexkit/run/subc-connection.json");
+    const connectionFile = connectionFilePath(join(homedir(), ".local", "share"));
     const metadata = await SynapseEmbeddingProvider.discover({
         connectionFile,
         projectRoot: process.cwd(),

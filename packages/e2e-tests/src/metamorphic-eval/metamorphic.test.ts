@@ -274,6 +274,7 @@ describe("deterministic metamorphic runner", () => {
         expect(entry.invariants.map((invariant) => invariant.invariant)).toEqual([
             "injection-set-equality",
             "expected-absent-empty",
+            "verdict-monotonicity",
             "expectation-predicate-equality",
             "false-authoritative-set-equality",
             "scenario-verdict-equality",
