@@ -3,7 +3,6 @@ import { shouldKeepSubagents } from "../../../plugin/src/shared/keep-subagents";
 import { dreamerScorerFixture } from "./scorer.test";
 import {
     classifyDreamerRun,
-    reconstructPoolEndState,
     type DreamerRunClassificationInput,
 } from "./runner";
 
@@ -168,13 +167,5 @@ describe("dreamer runner classification", () => {
 
     test("runner import does not mutate keep-subagents", () => {
         expect(shouldKeepSubagents()).toBe(false);
-    });
-
-    test("pool end state reconstructs from report snapshots without a database", () => {
-        const after = dreamerScorerFixture.pool.claims.map((claim, index) => ({
-            ...claim,
-            importance: index === 0 ? 91 : claim.importance,
-        }));
-        expect(reconstructPoolEndState({ poolAfter: after })).toEqual(after);
     });
 });

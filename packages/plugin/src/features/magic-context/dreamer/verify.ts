@@ -64,7 +64,8 @@ import {
     validateVerifyManifest,
 } from "./verify-prompt";
 
-const VERIFY_BATCH_SIZE = 50;
+export const VERIFY_BATCH_SIZE = 50;
+export const DREAM_VERIFY_SESSION_TITLE = "magic-context-dream-verify";
 const IDENTICAL_PROVIDER_FAILURE_BATCH_LIMIT = 2;
 
 /**
@@ -227,7 +228,7 @@ async function verifyOneBatch(
             client: args.client,
             db: args.db,
             parentSessionId: args.parentSessionId,
-            title: "magic-context-dream-verify",
+            title: DREAM_VERIFY_SESSION_TITLE,
             directory: args.sessionDirectory,
         });
         const created = shared.normalizeSDKResponse(

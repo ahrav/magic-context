@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { PluginContext } from "../../../plugin/src/plugin/types";
@@ -13,17 +13,31 @@ import {
     releaseLease,
 } from "../../../plugin/src/features/magic-context/dreamer/lease";
 import { leaseKeyFor } from "../../../plugin/src/features/magic-context/dreamer/task-registry";
-import { runVerify, type VerifyResult } from "../../../plugin/src/features/magic-context/dreamer/verify";
-import { mapMemories } from "../../../plugin/src/features/magic-context/dreamer/map-memories";
-import { runClassify } from "../../../plugin/src/features/magic-context/dreamer/classify";
+import {
+    DREAM_VERIFY_SESSION_TITLE,
+    runVerify,
+    VERIFY_BATCH_SIZE,
+    type VerifyResult,
+} from "../../../plugin/src/features/magic-context/dreamer/verify";
+import {
+    DREAM_MAP_MEMORIES_SESSION_TITLE,
+    MAP_BATCH_SIZE,
+    mapMemories,
+} from "../../../plugin/src/features/magic-context/dreamer/map-memories";
+import {
+    CLASSIFY_CHUNK_SIZE,
+    DREAM_CLASSIFY_SESSION_TITLE,
+    runClassify,
+} from "../../../plugin/src/features/magic-context/dreamer/classify";
+import { dreamerManifestIdentity } from "../../../plugin/src/features/magic-context/dreamer/claim-manifest";
 import { getSubagentInvocations } from "../../../plugin/src/features/magic-context/storage-subagent-invocations";
-import { computeClaimOperationRequestDigest } from "../../../plugin/src/features/magic-context/memory/claim-operation-contract";
-import { sha256Utf8Hex } from "../../../plugin/src/features/magic-context/memory/storage-claims";
+import { autonomousManifestRejectionRequestDigest } from "../../../plugin/src/features/magic-context/memory/storage-claim-autonomous";
 import { TestHarness } from "../harness";
 import { openTestDb } from "../test-db";
 import { liveModelSpawnOptions } from "../oracle-arms/presets";
 import {
     DREAMER_EVAL_REPORT_SCHEMA,
+    isRunFatal,
     type ClaimOperationReceiptOutcome,
     type ClaimSnapshotProjection,
     type DreamerEvalRunReport,
@@ -45,15 +59,16 @@ import {
 import {
     assertFixtureFilesCommitted,
     DreamerEvalSeederError,
+    fixtureGitEnv,
     readDreamerEvalPoolDescriptor,
     seedDreamerEvalTask,
 } from "./seeder";
 
 const TASK_TITLES: Record<DreamerTask, string> = {
-    verify: "magic-context-dream-verify",
-    "verify-broad": "magic-context-dream-verify",
-    "map-memories": "magic-context-dream-map-memories",
-    "classify-memories": "magic-context-dream-classify",
+    verify: DREAM_VERIFY_SESSION_TITLE,
+    "verify-broad": DREAM_VERIFY_SESSION_TITLE,
+    "map-memories": DREAM_MAP_MEMORIES_SESSION_TITLE,
+    "classify-memories": DREAM_CLASSIFY_SESSION_TITLE,
 };
 
 interface DreamerTaskClient {
@@ -109,7 +124,7 @@ function outcome(
     return {
         status,
         reason,
-        runFatal: status === "FAIL" && reason === "wrong-archival",
+        runFatal: isRunFatal(status, reason),
         parsedManifest,
     };
 }
@@ -182,12 +197,6 @@ export function classifyDreamerRun(input: DreamerRunClassificationInput): Dreame
     return outcome(scored.status, scored.reason, scored.parsedManifest);
 }
 
-export function reconstructPoolEndState(
-    report: Pick<DreamerEvalRunReport, "poolAfter">,
-): ClaimSnapshotProjection[] {
-    return report.poolAfter.map((claim) => ({ ...claim, files: [...claim.files] }));
-}
-
 export interface RunDreamerEvalTaskOptions {
     apiKey: string;
     model: string;
@@ -226,7 +235,12 @@ function modelProviderBlock(model: string): Record<string, unknown> {
 }
 
 function expectedBatchCount(task: DreamerTask, count: number): number {
-    const batchSize = task === "map-memories" ? 80 : 50;
+    const batchSize =
+        task === "map-memories"
+            ? MAP_BATCH_SIZE
+            : task === "classify-memories"
+              ? CLASSIFY_CHUNK_SIZE
+              : VERIFY_BATCH_SIZE;
     return count === 0 ? 0 : Math.ceil(count / batchSize);
 }
 
@@ -272,33 +286,9 @@ function assertDreamerSchedulerDisabled(harness: TestHarness): void {
     }
 }
 
-function rejectionDigest(args: {
-    task: DreamerTask;
-    parentSessionId: string;
-    leaseKey: string;
-    leaseGeneration: number;
-    publicClaimIds: readonly string[];
-    rawManifest: string;
-}): string {
-    const batchId = createHash("sha256")
-        .update([...args.publicClaimIds].sort((left, right) => left.localeCompare(right)).join("\n"))
-        .digest("hex")
-        .slice(0, 24);
-    return computeClaimOperationRequestDigest({
-        identity: {
-            batchId,
-            leaseGeneration: String(args.leaseGeneration),
-            leaseKey: args.leaseKey,
-            runId: args.parentSessionId,
-            task: args.task,
-        },
-        manifestDigest: sha256Utf8Hex(args.rawManifest),
-        operation: "reject-autonomous-project-memory-manifest",
-    });
-}
-
 function readReceipts(
     db: ReturnType<typeof openTestDb>,
+    producer: string,
     task: DreamerTask,
     logicalClaimIds: readonly string[],
 ): DreamerReceiptEvidence[] {
@@ -307,7 +297,7 @@ function readReceipts(
            FROM claim_operation_receipts
           WHERE producer = ?
           ORDER BY id`,
-    ).all(`dreamer-${task}`) as ReceiptRow[];
+    ).all(producer) as ReceiptRow[];
     return rows.flatMap((row) =>
         logicalClaimIds.map((claimId) => ({
             claimId,
@@ -325,6 +315,7 @@ function fixturePaths(scenario: DreamerEvalScenario): string[] {
 function gitOutput(workdir: string, args: readonly string[]): string | null {
     const result = Bun.spawnSync(["git", ...args], {
         cwd: workdir,
+        env: fixtureGitEnv(),
         stdout: "pipe",
         stderr: "ignore",
     });
@@ -332,8 +323,8 @@ function gitOutput(workdir: string, args: readonly string[]): string | null {
 }
 
 function systemTuple(options: RunDreamerEvalTaskOptions) {
-    const head = Bun.spawnSync(["git", "rev-parse", "HEAD"], { stdout: "pipe", stderr: "ignore" });
-    const repoCommitSha = options.repoCommitSha ?? head.stdout.toString().trim();
+    const repoCommitSha =
+        options.repoCommitSha ?? gitOutput(import.meta.dir, ["rev-parse", "HEAD"]) ?? "";
     if (!/^[0-9a-f]{40,64}$/.test(repoCommitSha)) {
         throw new Error("dreamer-eval could not resolve a concrete repository commit");
     }
@@ -386,6 +377,9 @@ export async function runDreamerEvalTask(
 ): Promise<DreamerEvalRunReport> {
     const nowMs = options.nowMs ?? Date.now();
     const runId = options.runId ?? `run-${randomUUID().replaceAll("-", "")}`;
+    // Resolve provenance before the run so a failure cannot spend model
+    // credits and then lose the report artifact to a late throw.
+    const system = systemTuple(options);
     let harness: TestHarness | null = null;
     let db: ReturnType<typeof openTestDb> | null = null;
     let parentSessionId = "";
@@ -464,15 +458,19 @@ export async function runDreamerEvalTask(
                   modelId: latest.modelId,
               }
             : null;
-        receipts = readReceipts(db, task.task, task.expectedInScopeClaimIds);
+        const manifestIdentity = dreamerManifestIdentity({
+            db,
+            holderId,
+            leaseKey,
+            parentSessionId,
+            task: task.task,
+            publicClaimIds: expectedPublicIds,
+        });
+        receipts = readReceipts(db, manifestIdentity.producer, task.task, task.expectedInScopeClaimIds);
         const rejectionRequestDigest = rawManifest === null
             ? null
-            : rejectionDigest({
-                  task: task.task,
-                  parentSessionId,
-                  leaseKey,
-                  leaseGeneration: acquired.generation,
-                  publicClaimIds: expectedPublicIds,
+            : autonomousManifestRejectionRequestDigest({
+                  identity: manifestIdentity,
                   rawManifest,
               });
         let fixtureUnchanged = true;
@@ -537,7 +535,7 @@ export async function runDreamerEvalTask(
         status: classification.status,
         reason: classification.reason,
         runFatal: classification.runFatal,
-        system: systemTuple(options),
+        system,
         poolBefore,
         poolAfter,
         rawManifest,

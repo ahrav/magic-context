@@ -87,7 +87,7 @@ function fixtureError(detail: string): never {
  * workdir. Neutralizing global and system config additionally keeps
  * `core.hooksPath` from running host scripts during the fixture commit.
  */
-function fixtureGitEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+export function fixtureGitEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     const inherited: NodeJS.ProcessEnv = {};
     for (const [key, value] of Object.entries(process.env)) {
         if (!key.startsWith("GIT_")) inherited[key] = value;
