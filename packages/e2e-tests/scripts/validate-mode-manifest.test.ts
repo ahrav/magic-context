@@ -205,6 +205,30 @@ describe("mode manifest validator", () => {
         }
     });
 
+    it("runs the metamorphic lane in the historian gate, not the host-mode suites", () => {
+        // `assertSrcTestsClassified` is satisfied by any claimant, so moving these
+        // back into `standaloneUnitFiles` would pass it while removing them from
+        // `historian-eval-contracts` — the job whose whole point is that a
+        // deterministic historian gate cannot be skipped by an unrelated failure.
+        // `--historian-eval-unit` selects no standalone files, so that move is
+        // silent non-enforcement.
+        const metamorphic = historianEvalUnitFiles().filter((file) =>
+            file.startsWith("src/metamorphic-eval/"),
+        );
+        expect(metamorphic).toContain("src/metamorphic-eval/transforms.test.ts");
+        expect(metamorphic).toContain("src/metamorphic-eval/invariants.test.ts");
+        expect(metamorphic).toContain("src/metamorphic-eval/injection-canary.test.ts");
+        for (const file of metamorphic) {
+            for (const selection of [
+                standaloneFilesForSelection("ts", "opencode"),
+                standaloneFilesForSelection("ts", "pi"),
+                standaloneFilesForSelection("rust", "all"),
+            ]) {
+                expect(selection).not.toContain(file);
+            }
+        }
+    });
+
     it("claims a historian-eval harness test in the OpenCode selection once it exists", () => {
         // `assertSrcTestsClassified` runs on every CLI path, so a harness test
         // excluded from `historianEvalUnitFiles` with no other claimant would
