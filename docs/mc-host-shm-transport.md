@@ -2,21 +2,21 @@
 
 ## Status
 
-The fixed ring is the only application transport. Linux clients use the owner-only Unix setup socket to authenticate, receive two mapping descriptors, validate the current release identity, attach, and commit activation. macOS uses the same protocol in source builds, but release qualification remains blocked by the designated-host resize test described below. Application frames never use the setup socket.
+The fixed sparse ring is the only application transport. `linux-x64-gnu` clients use the owner-only Unix setup socket to authenticate, receive two memfds and four eventfds, validate the current release identity, attach, and commit activation. Application frames never use the setup socket or eventfds. Darwin shared-memory execution is unsupported and rejected during package capability selection.
 
 There is no runtime transport selector, alternate shared-memory backend, compatibility reader, or degraded data path. A transport failure is terminal for the affected connection.
 
 The accepted identity is fixed by the release:
 
-- profile: `mc-host-test-ring-v1`
+- profile: `mc-host-eventfd-ring-v2`
 - wire version: `2`
-- descriptor schema: `2`
+- descriptor schema: `3`
 
 An install that cannot load the native addon or establish this identity fails before application traffic.
 
 ## Ring and ownership
 
-Each connection owns two bounded single-producer/single-consumer rings, one per direction. Each ring has a fixed descriptor depth and payload arena. A producer reserves capacity, writes into the shared arena, and publishes the exact body length with the wire header. A receiver validates the descriptor and header before exposing a scoped lease.
+Each connection owns two bounded single-producer/single-consumer rings, one per direction. Each ring has a fixed descriptor depth and sparse 64 MiB payload arena. Setup touches control pages only. A producer reserves capacity, writes into the shared arena, and publishes the exact body length with the wire header. A receiver validates the descriptor and header before exposing a scoped lease. FIFO reclamation removes only fully released, page-aligned interiors with `MADV_REMOVE`; partial neighboring pages remain mapped and capacity is published only after successful removal.
 
 The process-wide admission controller charges descriptors, arena bytes, receive leases, mappings, mapping file descriptors, endpoint workers, client instances, and pinned workers before creating ring resources. Active and quarantined charges are reported separately. Every configured limit is finite and validated at startup.
 
@@ -39,7 +39,7 @@ Setup proceeds through these phases:
 
 1. Authenticate the peer over the owner-only Unix socket.
 2. Admit the fixed ring charge.
-3. Transfer exactly two mapping descriptors.
+3. Transfer exactly two memfds and four eventfds.
 4. Validate the profile, wire version, descriptor schema, grants, and activation token.
 5. Attach both directions and commit activation.
 6. Keep the setup socket open as the peer-lifetime sentinel.
@@ -74,14 +74,14 @@ Reports never include setup-socket paths, native handles, mapping descriptors, g
 
 ## Resource bounds
 
-The fixed profile charges both directions. One connection uses 16 descriptors, 128 MiB of arena storage, 16 receive leases, two mappings, two mapping file descriptors, one endpoint worker, one client instance, and no pinned workers. Process bounds multiply this profile by the configured maximum connection count with checked arithmetic.
+The fixed profile charges both directions. One connection charges 64 ring descriptors, 128 MiB of sparse virtual arena capacity, 64 receive leases, two mappings, six transferred file descriptors, no endpoint or pinned worker, and one client instance. Native JS integration adds one environment watcher, not one watcher per connection. Process bounds multiply this profile by the configured maximum connection count with checked arithmetic. Resident memory grows on first touch and returns through FIFO page removal; the virtual arena charge stays fixed.
 
 Exact-capacity admission succeeds. Capacity plus one fails without creating another mapping or worker. Repeated peer crashes must not increase active charges after reclamation, and quarantined charges remain within the configured process bound.
 
 ## Platform contract
 
-Release packages include the native addon for qualified targets. The package manifest and addon checksum are verified before loading. Build profile and target identity are checked before setup. Managed Rust clients use the same setup protocol, ring profile, wire version, and descriptor schema.
+Shared-memory production support is `linux-x64-gnu` only. The package manifest and addon checksum are verified before loading. Build profile and target identity are checked before setup. Managed Rust clients use the same setup protocol, ring profile, wire version, and descriptor schema.
 
-Linux seals ring objects against size changes. macOS does not provide the same seal contract, so a same-user process that holds a shared-memory descriptor remains trusted not to resize it after validation. macOS release remains blocked until designated-host attachment tests prove the platform's resize behavior; generic builds do not establish that guarantee.
+Repository Darwin package use is inventoried. Existing Darwin host payload packages remain for unrelated host distribution, but `@cortexkit/mc-shm-native` has no Darwin selector, Darwin addon payload, or macOS shared-memory CI execution. This publishes support withdrawal for the native shared-memory path. Active-deployment absence still needs owner confirmation; any deployment that requires Darwin shared-memory transport blocks release instead of selecting another readiness or reclaim implementation.
 
-Clean-install gates must complete one cross-process application round trip. A missing package, addon, manifest, checksum, or platform capability fails the gate; unsupported or omitted results are not success states.
+Clean-install gates must complete one cross-process application round trip on Linux x64. A missing package, addon, manifest, checksum, or platform capability fails the gate; unsupported or omitted results are not success states.

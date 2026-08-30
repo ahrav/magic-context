@@ -11,7 +11,7 @@ This repository is a monorepo containing TypeScript packages (under `packages/`)
 │   ├── mc-store/           # Durable cache-state store (SQLite backed)
 │   ├── mc-tokenizer/       # Claude BPE token estimator
 │   ├── mc-host/            # Direct-linked mandatory-ring host runtime
-│   ├── mc-shm-transport/   # Fixed shared-memory ring and accounting
+│   ├── mc-shm-transport/   # Linux eventfd sparse ring, reclaim, and accounting
 │   └── mc-module/          # Current subc module and future mc-host adapter
 ├── packages/               # TypeScript packages
 │   ├── plugin/             # OpenCode plugin package (published as @cortexkit/opencode-magic-context)
@@ -115,7 +115,9 @@ All paths below are relative to `packages/plugin/` — the published OpenCode np
   - `crates/mc-store/`: Durable SQLite session database schema, metadata, and CAS transitions.
   - `crates/mc-tokenizer/`: tiktoken BPE-based token count estimator.
   - `crates/mc-host/`: Direct-linked host library. Owns secure publication, owner-only Unix setup, HMAC authentication, mandatory ring attachment, wire-v2 framing, fixed-profile control and routing, bounded request settlement, Ping/Pong, and ordered shutdown. Setup or ring failure retires the connection; no application TCP or transport-selection path exists.
-  - `crates/mc-shm-transport/`: Sole shared-memory implementation: fixed descriptor ring, payload arenas, checked grants, lexical receive leases, lifecycle state, and process-wide admission/accounting.
+  - `crates/mc-shm-transport/`: Sole shared-memory implementation: Linux-only fixed eventfd ring, sparse 64 MiB arenas, page-aligned FIFO `MADV_REMOVE` reclaim, checked six-descriptor grants, lexical receive leases, lifecycle state, and process-wide admission/accounting.
+  - `packages/mc-shm-native/`: Linux x64 addon selection, async setup, one environment watcher, and TSFN readiness delivery. Darwin is rejected before addon loading.
+  - `scripts/mc-shm-release-gate.ts`: Installed-artifact ring A/A collector contract with paired block evidence and separate local/designated-host verdicts.
   - `crates/mc-module/`: The current `subc` protocol adapter, autonomous historian coordinator, and client, including the harness-bound `HistorianProducer` that consumes the Broca route; a later task adds the one-way adapter from `mc-module` to `mc-host`.
 
 **Pi Sibling Package (`packages/pi-plugin/`):**

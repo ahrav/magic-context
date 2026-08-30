@@ -67,8 +67,9 @@ shm_run() {
   }
   shm_build
   "$SHM_BENCH" "${args[@]}" >"$evidence"
-  grep -q '"verdict": "INCONCLUSIVE"' "$evidence" || {
-    echo "shared-memory harness did not retain structured INCONCLUSIVE output" >&2
+  grep -q '"local_verdict": "MECHANISM_SMOKE_ONLY"' "$evidence" &&
+    grep -q '"designated_host_verdict": "BLOCKED"' "$evidence" || {
+    echo "shared-memory harness did not retain separate local/designated verdicts" >&2
     exit 1
   }
   cat "$evidence"

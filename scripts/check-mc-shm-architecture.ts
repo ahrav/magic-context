@@ -29,6 +29,11 @@ const FORBIDDEN_SOURCE: readonly [string, RegExp][] = [
     ["transport provider selection", /\b(?:BackendId|transport_provider|provider_recovery|provider_registry)\b/],
     ["alternate shared-memory backend", /\biceoryx2?\b/i],
     ["legacy transport compatibility branch", /\b(?:legacy|compat(?:ibility)?)_(?:transport|wire|ring|descriptor)\b/i],
+    ["shared-memory prefault", /\b(?:prefault_[A-Za-z0-9_]*|Prefault[A-Za-z0-9_]*|MAP_POPULATE|MADV_POPULATE_(?:READ|WRITE))\b/],
+    ["runtime scheduling selector", /\bSchedulingMode\b/],
+    ["50 microsecond ring polling", /(?:thread::sleep\s*\(\s*)?Duration::from_micros\s*\(\s*50\s*\)/],
+    ["production JavaScript interval polling", /\bsetInterval\s*\(/],
+    ["libuv poll integration", /\b(?:uv_poll_(?:init|start|stop)|napi_get_uv_event_loop)\b/],
 ];
 
 const FORBIDDEN_PATH = /(?:tcp[-_]frame[-_]channel|transport[-_]negotiation|transport[-_]provider|provider[-_]recovery|iceoryx)/i;

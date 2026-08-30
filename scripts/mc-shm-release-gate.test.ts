@@ -17,8 +17,14 @@ const hex = (value: string): string => createHash("sha256").update(value).digest
 function identity(role: "baseline" | "candidate", runtime: "bun" | "node") {
     return {
         source_commit: role === "baseline" ? "1".repeat(40) : "2".repeat(40),
+        platform: "linux-x64-gnu" as const,
+        profile: "mc-host-eventfd-ring-v2" as const,
+        wire_version: 2 as const,
+        descriptor_schema: 3 as const,
+        transferred_descriptors: 6 as const,
+        environment_watchers: 1 as const,
         package: {
-            name: role === "baseline" ? "mc-host-tcp-frozen" : "@cortexkit/mc-host-linux-x64-gnu",
+            name: role === "baseline" ? "mc-host-ring-frozen" : "@cortexkit/mc-host-linux-x64-gnu",
             version: role === "baseline" ? "0.37.0" : "0.38.0",
             sha256: role === "baseline" ? "3".repeat(64) : "4".repeat(64),
         },
@@ -43,7 +49,7 @@ function evidence(role: "baseline" | "candidate", runtime: "bun" | "node" = "bun
     return {
         schema: "magic-context.mc-shm-installed-performance-run/v1",
         role,
-        transport: role === "baseline" ? "tcp" : "ring",
+        transport: "ring",
         installed_artifact: true,
         state: "complete",
         identity: identity(role, runtime),
@@ -51,6 +57,9 @@ function evidence(role: "baseline" | "candidate", runtime: "bun" | "node" = "bun
             {
                 block: 1,
                 process_id: 101,
+                workload: "cold_first_frame",
+                connection_count: 1,
+                callback_budget: 64,
                 state: "complete",
                 completed_ops: 2,
                 elapsed_ns: candidate ? 800 : 1_000,
@@ -59,10 +68,35 @@ function evidence(role: "baseline" | "candidate", runtime: "bun" | "node" = "bun
                 allocations: candidate ? 3 : 4,
                 cpu_ns: candidate ? 560 : 700,
                 wakeups: candidate ? 4 : 6,
+                p99_event_loop_delay_ns: candidate ? 50 : 60,
+                rss_bytes: candidate ? 1000 : 1200,
+                pss_bytes: candidate ? 800 : 900,
+                resident_pages: candidate ? 2 : 4,
+                page_table_bytes: 4096,
+                fd_count: 7,
+                watcher_count: 1,
+                eventfd_attempts: 4,
+                eventfd_successes: 4,
+                eventfd_eagain: 0,
+                eventfd_reads: 4,
+                parks: 4,
+                spurious_wakes: 0,
+                publications: 2,
+                tsfn_callbacks: 2,
+                scheduler_handoffs: 2,
+                reclaim_scans: 1,
+                reclaim_bytes: candidate ? 4096 : 0,
+                reclaim_runs: candidate ? 1 : 0,
+                madv_remove_calls: candidate ? 1 : 0,
+                madv_remove_pages: candidate ? 1 : 0,
+                queue_hops: 0,
             },
             {
                 block: 2,
                 process_id: 102,
+                workload: "active_path",
+                connection_count: 8,
+                callback_budget: 64,
                 state: "complete",
                 completed_ops: 2,
                 elapsed_ns: candidate ? 800 : 1_000,
@@ -71,6 +105,28 @@ function evidence(role: "baseline" | "candidate", runtime: "bun" | "node" = "bun
                 allocations: candidate ? 3 : 4,
                 cpu_ns: candidate ? 560 : 700,
                 wakeups: candidate ? 4 : 6,
+                p99_event_loop_delay_ns: candidate ? 55 : 65,
+                rss_bytes: candidate ? 2000 : 2400,
+                pss_bytes: candidate ? 1600 : 1800,
+                resident_pages: candidate ? 4 : 8,
+                page_table_bytes: 8192,
+                fd_count: 49,
+                watcher_count: 1,
+                eventfd_attempts: 4,
+                eventfd_successes: 4,
+                eventfd_eagain: 0,
+                eventfd_reads: 4,
+                parks: 4,
+                spurious_wakes: 0,
+                publications: 2,
+                tsfn_callbacks: 2,
+                scheduler_handoffs: 2,
+                reclaim_scans: 1,
+                reclaim_bytes: candidate ? 4096 : 0,
+                reclaim_runs: candidate ? 1 : 0,
+                madv_remove_calls: candidate ? 1 : 0,
+                madv_remove_pages: candidate ? 1 : 0,
+                queue_hops: 0,
             },
         ],
     };
@@ -80,6 +136,7 @@ function suite(role: "baseline" | "candidate"): RunSuite {
     return {
         schema: "magic-context.mc-shm-installed-performance-suite/v1",
         runs: [evidence(role, "bun"), evidence(role, "node")],
+        blocked_runtimes: [],
     };
 }
 
@@ -101,6 +158,21 @@ function config(): GateConfig {
             package_name: "@cortexkit/mc-host-linux-x64-gnu",
             package_version: "0.38.0",
             package_sha256: "4".repeat(64),
+        },
+        designated_host: {
+            state: "blocked",
+            blockers: ["designated host unavailable"],
+        },
+        frozen_contract: {
+            equivalence_margin_ratio: 0.05,
+            callback_budget: 64,
+            max_rss_bytes: 4096,
+            max_pss_bytes: 4096,
+            max_page_table_bytes: 16384,
+            max_fd_count: 64,
+            max_watcher_count: 1,
+            tmpfs_bytes: 536870912,
+            cgroup_memory_bytes: 1073741824,
         },
         matched_identities: [
             {
@@ -128,9 +200,15 @@ function config(): GateConfig {
 describe("installed shared-memory release gate", () => {
     test("records every R12 metric without inventing a performance verdict", () => {
         const report = buildReleaseGateReport(config(), suite("baseline"), suite("candidate"));
-        expect(report.verdict).toBe("evidence_complete");
+        expect(report.local_verdict).toBe("evidence_complete");
+        expect(report.designated_host_verdict).toEqual({
+            state: "blocked",
+            blockers: ["designated host unavailable"],
+        });
         expect(report.runtime_results.map((result) => result.runtime)).toEqual(["bun", "node"]);
         for (const result of report.runtime_results) {
+            expect(result.local_verdict).toBe("evidence_complete");
+            if (result.local_verdict !== "evidence_complete") throw new Error("fixture runtime unexpectedly blocked");
             expect(result.baseline.metrics).toEqual({
                 p50_latency_ns: 200,
                 p99_latency_ns: 400,
@@ -149,6 +227,11 @@ describe("installed shared-memory release gate", () => {
                 cpu_ns: 1_120,
                 wakeups: 8,
             });
+            expect(result.paired_blocks).toHaveLength(2);
+            expect(result.paired_blocks.map((block) => [block.block, block.workload, block.connection_count])).toEqual([
+                [1, "cold_first_frame", 1],
+                [2, "active_path", 8],
+            ]);
             expect(result.comparison).toEqual({
                 p50_ratio: 1.25,
                 p99_ratio: 1.25,
@@ -177,6 +260,8 @@ describe("installed shared-memory release gate", () => {
             ["host topology", (run) => (run.identity.host.topology_sha256 = "f".repeat(64))],
             ["harness", (run) => (run.identity.harness_sha256 = "f".repeat(64))],
             ["workload", (run) => (run.identity.workload_sha256 = "f".repeat(64))],
+            ["profile", (run) => ((run.identity as { profile: string }).profile = "mc-host-test-ring-v1")],
+            ["descriptor count", (run) => ((run.identity as { transferred_descriptors: number }).transferred_descriptors = 2)],
         ];
         for (const [label, mutate] of mutations) {
             const mixed = suite("candidate");
@@ -199,8 +284,36 @@ describe("installed shared-memory release gate", () => {
         const missingRuntime = suite("candidate");
         missingRuntime.runs.pop();
         expect(() => buildReleaseGateReport(config(), suite("baseline"), missingRuntime)).toThrow(
-            /exactly ordered Bun and Node runs/,
+            /ordered Bun and eligible Node runs/,
         );
+
+        const missingCounter = suite("candidate");
+        delete (missingCounter.runs[0]!.blocks[0] as Partial<RunEvidence["blocks"][number]>).eventfd_attempts;
+        expect(() => buildReleaseGateReport(config(), suite("baseline"), missingCounter)).toThrow(
+            /fields differ.*eventfd_attempts/,
+        );
+
+        const pooledOrMismatched = suite("candidate");
+        pooledOrMismatched.runs[0]!.blocks[0]!.connection_count = 64;
+        expect(() => buildReleaseGateReport(config(), suite("baseline"), pooledOrMismatched)).toThrow(
+            /paired block workload identity mismatch/,
+        );
+    });
+
+    test("records Node baseline ineligibility as blocked without weakening Bun evidence", () => {
+        const baseline = suite("baseline");
+        baseline.runs.pop();
+        baseline.blocked_runtimes.push({ runtime: "node", reason: "pre-change artifact cannot load on supported Node" });
+        const candidate = suite("candidate");
+        candidate.runs.pop();
+        candidate.blocked_runtimes.push({ runtime: "node", reason: "paired baseline unavailable" });
+        const report = buildReleaseGateReport(config(), baseline, candidate);
+        expect(report.runtime_results[0]!.local_verdict).toBe("evidence_complete");
+        expect(report.runtime_results[1]).toEqual({
+            runtime: "node",
+            local_verdict: "blocked",
+            blocker: "pre-change artifact cannot load on supported Node",
+        });
     });
 
     test("blocked config names unavailable designated host and frozen baseline", () => {
@@ -211,11 +324,13 @@ describe("installed shared-memory release gate", () => {
             JSON.stringify({
                 schema: "magic-context.mc-shm-release-gate-config/v1",
                 state: "blocked",
-                blockers: ["designated host unavailable", "frozen TCP baseline unavailable"],
+                blockers: ["designated host unavailable", "frozen ring baseline unavailable"],
                 expected_blocks: 10,
                 required_runtimes: ["bun", "node"],
                 baseline: null,
                 candidate: null,
+                designated_host: { state: "blocked", blockers: ["designated host unavailable"] },
+                frozen_contract: null,
                 matched_identities: null,
             }),
         );
@@ -223,7 +338,7 @@ describe("installed shared-memory release gate", () => {
         expect(blocked.state).toBe("blocked");
         expect(blocked.blockers).toHaveLength(2);
         expect(() => buildReleaseGateReport(blocked, suite("baseline"), suite("candidate"))).toThrow(
-            /release gate blocked.*designated host unavailable.*frozen TCP baseline unavailable/,
+            /release gate blocked.*designated host unavailable.*frozen ring baseline unavailable/,
         );
     });
 

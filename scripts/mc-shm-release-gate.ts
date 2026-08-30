@@ -17,6 +17,12 @@ type Role = "baseline" | "candidate";
 
 export interface RunIdentity {
     source_commit: string;
+    platform: "linux-x64-gnu";
+    profile: "mc-host-eventfd-ring-v2";
+    wire_version: 2;
+    descriptor_schema: 3;
+    transferred_descriptors: 6;
+    environment_watchers: 1;
     package: { name: string; version: string; sha256: string };
     runtime: { name: "bun" | "node" | "rust"; version: string; executable_sha256: string };
     host: { id_sha256: string; kernel: string; cpu: string; topology_sha256: string };
@@ -27,6 +33,9 @@ export interface RunIdentity {
 export interface RunBlock {
     block: number;
     process_id: number;
+    workload: "setup" | "cold_first_frame" | "end_to_end" | "active_path" | "idle";
+    connection_count: 1 | 8 | 64;
+    callback_budget: number;
     state: "complete" | "interrupted" | "failed";
     completed_ops: number;
     elapsed_ns: number;
@@ -35,6 +44,28 @@ export interface RunBlock {
     allocations: number;
     cpu_ns: number;
     wakeups: number;
+    p99_event_loop_delay_ns: number;
+    rss_bytes: number;
+    pss_bytes: number;
+    resident_pages: number;
+    page_table_bytes: number;
+    fd_count: number;
+    watcher_count: number;
+    eventfd_attempts: number;
+    eventfd_successes: number;
+    eventfd_eagain: number;
+    eventfd_reads: number;
+    parks: number;
+    spurious_wakes: number;
+    publications: number;
+    tsfn_callbacks: number;
+    scheduler_handoffs: number;
+    reclaim_scans: number;
+    reclaim_bytes: number;
+    reclaim_runs: number;
+    madv_remove_calls: number;
+    madv_remove_pages: number;
+    queue_hops: number;
 }
 
 export interface RunEvidence {
@@ -50,6 +81,7 @@ export interface RunEvidence {
 export interface RunSuite {
     schema: typeof SUITE_SCHEMA;
     runs: RunEvidence[];
+    blocked_runtimes: Array<{ runtime: "node"; reason: string }>;
 }
 
 interface FrozenBaseline {
@@ -80,6 +112,23 @@ interface MatchedIdentity {
     workload_sha256: string;
 }
 
+interface FrozenContract {
+    equivalence_margin_ratio: number;
+    callback_budget: number;
+    max_rss_bytes: number;
+    max_pss_bytes: number;
+    max_page_table_bytes: number;
+    max_fd_count: number;
+    max_watcher_count: number;
+    tmpfs_bytes: number;
+    cgroup_memory_bytes: number;
+}
+
+interface DesignatedHostState {
+    state: "blocked" | "evidence_complete";
+    blockers: string[];
+}
+
 export interface GateConfig {
     schema: typeof CONFIG_SCHEMA;
     state: "ready" | "blocked";
@@ -88,6 +137,8 @@ export interface GateConfig {
     required_runtimes: Array<"bun" | "node">;
     baseline: FrozenBaseline | null;
     candidate: CandidateBinding | null;
+    designated_host: DesignatedHostState;
+    frozen_contract: FrozenContract | null;
     matched_identities: MatchedIdentity[] | null;
 }
 
@@ -103,22 +154,39 @@ interface Metrics {
 
 export interface ReleaseGateReport {
     schema: typeof REPORT_SCHEMA;
-    verdict: "evidence_complete";
-    claim: "descriptive_only_no_performance_threshold";
-    runtime_results: Array<{
-        runtime: "bun" | "node";
-        baseline: { identity: RunIdentity; metrics: Metrics };
-        candidate: { identity: RunIdentity; metrics: Metrics };
-        comparison: {
-            p50_ratio: number;
-            p99_ratio: number;
-            throughput_ratio: number;
-            copies_delta: number;
-            allocations_delta: number;
-            cpu_ratio: number;
-            wakeups_delta: number;
-        };
-    }>;
+    local_verdict: "evidence_complete";
+    designated_host_verdict: DesignatedHostState;
+    claim: "paired_measurement_against_frozen_contract";
+    frozen_contract: FrozenContract;
+    runtime_results: Array<
+        | {
+              runtime: "bun" | "node";
+              local_verdict: "evidence_complete";
+              baseline: { identity: RunIdentity; metrics: Metrics };
+              candidate: { identity: RunIdentity; metrics: Metrics };
+              paired_blocks: Array<{
+                  block: number;
+                  workload: RunBlock["workload"];
+                  connection_count: RunBlock["connection_count"];
+                  callback_budget: number;
+                  baseline: RunBlock;
+                  candidate: RunBlock;
+                  comparison: MetricComparison;
+              }>;
+              comparison: MetricComparison;
+          }
+        | { runtime: "node"; local_verdict: "blocked"; blocker: string }
+    >;
+}
+
+interface MetricComparison {
+    p50_ratio: number;
+    p99_ratio: number;
+    throughput_ratio: number;
+    copies_delta: number;
+    allocations_delta: number;
+    cpu_ratio: number;
+    wakeups_delta: number;
 }
 
 function fail(message: string): never {
@@ -160,6 +228,11 @@ function integer(value: unknown, label: string, minimum = 0): number {
     return value as number;
 }
 
+function positiveNumber(value: unknown, label: string): number {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) fail(`${label} must be a positive number`);
+    return value;
+}
+
 function stringArray(value: unknown, label: string): string[] {
     if (!Array.isArray(value)) fail(`${label} must be an array`);
     return value.map((entry, index) => string(entry, `${label}[${index}]`));
@@ -186,19 +259,25 @@ function resolveBoundPath(configPath: string, path: string): string {
 
 function parseConfig(input: unknown): GateConfig {
     const root = record(input, "config");
-    exact(root, ["schema", "state", "blockers", "expected_blocks", "required_runtimes", "baseline", "candidate", "matched_identities"], "config");
+    exact(root, ["schema", "state", "blockers", "expected_blocks", "required_runtimes", "baseline", "candidate", "designated_host", "frozen_contract", "matched_identities"], "config");
     if (root.schema !== CONFIG_SCHEMA) fail("unknown config schema");
     if (root.state !== "ready" && root.state !== "blocked") fail("config.state must be ready or blocked");
     const blockers = stringArray(root.blockers, "config.blockers");
     const expectedBlocks = integer(root.expected_blocks, "config.expected_blocks", 1);
     const requiredRuntimes = stringArray(root.required_runtimes, "config.required_runtimes");
     if (requiredRuntimes.length !== 2 || requiredRuntimes[0] !== "bun" || requiredRuntimes[1] !== "node") fail("config.required_runtimes must be exactly [bun, node]");
+    const designated = record(root.designated_host, "config.designated_host");
+    exact(designated, ["state", "blockers"], "config.designated_host");
+    if (designated.state !== "blocked" && designated.state !== "evidence_complete") fail("config.designated_host.state is invalid");
+    const designatedBlockers = stringArray(designated.blockers, "config.designated_host.blockers");
+    if ((designated.state === "blocked") !== (designatedBlockers.length > 0)) fail("designated-host blocker state mismatch");
+    const designatedHost = { state: designated.state, blockers: designatedBlockers } as DesignatedHostState;
     if (root.state === "blocked") {
         if (blockers.length === 0) fail("blocked config must name at least one blocker");
-        if (root.baseline !== null || root.candidate !== null || root.matched_identities !== null) {
+        if (root.baseline !== null || root.candidate !== null || root.frozen_contract !== null || root.matched_identities !== null) {
             fail("blocked config cannot carry partial evidence bindings");
         }
-        return { schema: CONFIG_SCHEMA, state: "blocked", blockers, expected_blocks: expectedBlocks, required_runtimes: ["bun", "node"], baseline: null, candidate: null, matched_identities: null };
+        return { schema: CONFIG_SCHEMA, state: "blocked", blockers, expected_blocks: expectedBlocks, required_runtimes: ["bun", "node"], baseline: null, candidate: null, designated_host: designatedHost, frozen_contract: null, matched_identities: null };
     }
     if (blockers.length !== 0) fail("ready config cannot carry blockers");
 
@@ -226,6 +305,19 @@ function parseConfig(input: unknown): GateConfig {
         } satisfies MatchedIdentity;
     });
     if (matchedIdentities[0]!.runtime_name !== "bun" || matchedIdentities[1]!.runtime_name !== "node") fail("matched identities must be ordered [bun, node]");
+    const frozen = record(root.frozen_contract, "config.frozen_contract");
+    exact(frozen, ["equivalence_margin_ratio", "callback_budget", "max_rss_bytes", "max_pss_bytes", "max_page_table_bytes", "max_fd_count", "max_watcher_count", "tmpfs_bytes", "cgroup_memory_bytes"], "config.frozen_contract");
+    const frozenContract: FrozenContract = {
+        equivalence_margin_ratio: positiveNumber(frozen.equivalence_margin_ratio, "config.frozen_contract.equivalence_margin_ratio"),
+        callback_budget: integer(frozen.callback_budget, "config.frozen_contract.callback_budget", 1),
+        max_rss_bytes: integer(frozen.max_rss_bytes, "config.frozen_contract.max_rss_bytes", 1),
+        max_pss_bytes: integer(frozen.max_pss_bytes, "config.frozen_contract.max_pss_bytes", 1),
+        max_page_table_bytes: integer(frozen.max_page_table_bytes, "config.frozen_contract.max_page_table_bytes", 1),
+        max_fd_count: integer(frozen.max_fd_count, "config.frozen_contract.max_fd_count", 1),
+        max_watcher_count: integer(frozen.max_watcher_count, "config.frozen_contract.max_watcher_count", 1),
+        tmpfs_bytes: integer(frozen.tmpfs_bytes, "config.frozen_contract.tmpfs_bytes", 1),
+        cgroup_memory_bytes: integer(frozen.cgroup_memory_bytes, "config.frozen_contract.cgroup_memory_bytes", 1),
+    };
     const collectorArgs = candidate.collector_args === undefined ? undefined : stringArray(candidate.collector_args, "config.candidate.collector_args");
     if ((candidate.collector_path === undefined) !== (candidate.collector_sha256 === undefined)) fail("collector_path and collector_sha256 must appear together");
     if (candidate.collector_sha256 !== undefined && matchedIdentities.some((matched) => candidate.collector_sha256 !== matched.harness_sha256)) fail("collector digest must equal every matched harness digest");
@@ -251,6 +343,8 @@ function parseConfig(input: unknown): GateConfig {
             collector_sha256: candidate.collector_sha256 === undefined ? undefined : digest(candidate.collector_sha256, "config.candidate.collector_sha256"),
             collector_args: collectorArgs,
         },
+        designated_host: designatedHost,
+        frozen_contract: frozenContract,
         matched_identities: matchedIdentities,
     };
 }
@@ -284,7 +378,8 @@ export function readGateConfig(path: string): GateConfig {
 
 function parseIdentity(input: unknown, label: string): RunIdentity {
     const value = record(input, label);
-    exact(value, ["source_commit", "package", "runtime", "host", "harness_sha256", "workload_sha256"], label);
+    exact(value, ["source_commit", "platform", "profile", "wire_version", "descriptor_schema", "transferred_descriptors", "environment_watchers", "package", "runtime", "host", "harness_sha256", "workload_sha256"], label);
+    if (value.platform !== "linux-x64-gnu" || value.profile !== "mc-host-eventfd-ring-v2" || value.wire_version !== 2 || value.descriptor_schema !== 3 || value.transferred_descriptors !== 6 || value.environment_watchers !== 1) fail(`${label} fixed release identity mismatch`);
     const pkg = record(value.package, `${label}.package`);
     exact(pkg, ["name", "version", "sha256"], `${label}.package`);
     const runtime = record(value.runtime, `${label}.runtime`);
@@ -295,6 +390,12 @@ function parseIdentity(input: unknown, label: string): RunIdentity {
     exact(host, ["id_sha256", "kernel", "cpu", "topology_sha256"], `${label}.host`);
     return {
         source_commit: commit(value.source_commit, `${label}.source_commit`),
+        platform: "linux-x64-gnu",
+        profile: "mc-host-eventfd-ring-v2",
+        wire_version: 2,
+        descriptor_schema: 3,
+        transferred_descriptors: 6,
+        environment_watchers: 1,
         package: { name: string(pkg.name, `${label}.package.name`), version: string(pkg.version, `${label}.package.version`), sha256: digest(pkg.sha256, `${label}.package.sha256`) },
         runtime: { name: runtimeName, version: string(runtime.version, `${label}.runtime.version`), executable_sha256: digest(runtime.executable_sha256, `${label}.runtime.executable_sha256`) },
         host: { id_sha256: digest(host.id_sha256, `${label}.host.id_sha256`), kernel: string(host.kernel, `${label}.host.kernel`), cpu: string(host.cpu, `${label}.host.cpu`), topology_sha256: digest(host.topology_sha256, `${label}.host.topology_sha256`) },
@@ -313,15 +414,22 @@ function parseRun(input: unknown, expectedRole: Role): RunEvidence {
     if (!Array.isArray(value.blocks)) fail(`${expectedRole} blocks must be an array`);
     const blocks = value.blocks.map((input, index) => {
         const block = record(input, `${expectedRole}.blocks[${index}]`);
-        exact(block, ["block", "process_id", "state", "completed_ops", "elapsed_ns", "latencies_ns", "body_copies", "allocations", "cpu_ns", "wakeups"], `${expectedRole}.blocks[${index}]`);
+        exact(block, ["block", "process_id", "workload", "connection_count", "callback_budget", "state", "completed_ops", "elapsed_ns", "latencies_ns", "body_copies", "allocations", "cpu_ns", "wakeups", "p99_event_loop_delay_ns", "rss_bytes", "pss_bytes", "resident_pages", "page_table_bytes", "fd_count", "watcher_count", "eventfd_attempts", "eventfd_successes", "eventfd_eagain", "eventfd_reads", "parks", "spurious_wakes", "publications", "tsfn_callbacks", "scheduler_handoffs", "reclaim_scans", "reclaim_bytes", "reclaim_runs", "madv_remove_calls", "madv_remove_pages", "queue_hops"], `${expectedRole}.blocks[${index}]`);
         if (block.state !== "complete" && block.state !== "interrupted" && block.state !== "failed") fail(`${expectedRole}.blocks[${index}].state is invalid`);
         if (!Array.isArray(block.latencies_ns)) fail(`${expectedRole}.blocks[${index}].latencies_ns must be an array`);
         const completedOps = integer(block.completed_ops, `${expectedRole}.blocks[${index}].completed_ops`, 1);
+        const workload = string(block.workload, `${expectedRole}.blocks[${index}].workload`);
+        if (!["setup", "cold_first_frame", "end_to_end", "active_path", "idle"].includes(workload)) fail(`${expectedRole}.blocks[${index}].workload is invalid`);
+        const connectionCount = integer(block.connection_count, `${expectedRole}.blocks[${index}].connection_count`, 1);
+        if (connectionCount !== 1 && connectionCount !== 8 && connectionCount !== 64) fail(`${expectedRole}.blocks[${index}].connection_count must be 1, 8, or 64`);
         const latencies = block.latencies_ns.map((entry, i) => integer(entry, `${expectedRole}.blocks[${index}].latencies_ns[${i}]`, 1));
         if (latencies.length !== completedOps) fail(`${expectedRole}.blocks[${index}] latency count must equal completed_ops`);
         return {
             block: integer(block.block, `${expectedRole}.blocks[${index}].block`, 1),
             process_id: integer(block.process_id, `${expectedRole}.blocks[${index}].process_id`, 1),
+            workload: workload as RunBlock["workload"],
+            connection_count: connectionCount as RunBlock["connection_count"],
+            callback_budget: integer(block.callback_budget, `${expectedRole}.blocks[${index}].callback_budget`, 1),
             state: block.state,
             completed_ops: completedOps,
             elapsed_ns: integer(block.elapsed_ns, `${expectedRole}.blocks[${index}].elapsed_ns`, 1),
@@ -330,6 +438,28 @@ function parseRun(input: unknown, expectedRole: Role): RunEvidence {
             allocations: integer(block.allocations, `${expectedRole}.blocks[${index}].allocations`),
             cpu_ns: integer(block.cpu_ns, `${expectedRole}.blocks[${index}].cpu_ns`, 1),
             wakeups: integer(block.wakeups, `${expectedRole}.blocks[${index}].wakeups`),
+            p99_event_loop_delay_ns: integer(block.p99_event_loop_delay_ns, `${expectedRole}.blocks[${index}].p99_event_loop_delay_ns`, 1),
+            rss_bytes: integer(block.rss_bytes, `${expectedRole}.blocks[${index}].rss_bytes`),
+            pss_bytes: integer(block.pss_bytes, `${expectedRole}.blocks[${index}].pss_bytes`),
+            resident_pages: integer(block.resident_pages, `${expectedRole}.blocks[${index}].resident_pages`),
+            page_table_bytes: integer(block.page_table_bytes, `${expectedRole}.blocks[${index}].page_table_bytes`),
+            fd_count: integer(block.fd_count, `${expectedRole}.blocks[${index}].fd_count`),
+            watcher_count: integer(block.watcher_count, `${expectedRole}.blocks[${index}].watcher_count`),
+            eventfd_attempts: integer(block.eventfd_attempts, `${expectedRole}.blocks[${index}].eventfd_attempts`),
+            eventfd_successes: integer(block.eventfd_successes, `${expectedRole}.blocks[${index}].eventfd_successes`),
+            eventfd_eagain: integer(block.eventfd_eagain, `${expectedRole}.blocks[${index}].eventfd_eagain`),
+            eventfd_reads: integer(block.eventfd_reads, `${expectedRole}.blocks[${index}].eventfd_reads`),
+            parks: integer(block.parks, `${expectedRole}.blocks[${index}].parks`),
+            spurious_wakes: integer(block.spurious_wakes, `${expectedRole}.blocks[${index}].spurious_wakes`),
+            publications: integer(block.publications, `${expectedRole}.blocks[${index}].publications`),
+            tsfn_callbacks: integer(block.tsfn_callbacks, `${expectedRole}.blocks[${index}].tsfn_callbacks`),
+            scheduler_handoffs: integer(block.scheduler_handoffs, `${expectedRole}.blocks[${index}].scheduler_handoffs`),
+            reclaim_scans: integer(block.reclaim_scans, `${expectedRole}.blocks[${index}].reclaim_scans`),
+            reclaim_bytes: integer(block.reclaim_bytes, `${expectedRole}.blocks[${index}].reclaim_bytes`),
+            reclaim_runs: integer(block.reclaim_runs, `${expectedRole}.blocks[${index}].reclaim_runs`),
+            madv_remove_calls: integer(block.madv_remove_calls, `${expectedRole}.blocks[${index}].madv_remove_calls`),
+            madv_remove_pages: integer(block.madv_remove_pages, `${expectedRole}.blocks[${index}].madv_remove_pages`),
+            queue_hops: integer(block.queue_hops, `${expectedRole}.blocks[${index}].queue_hops`),
         } as RunBlock;
     });
     return { schema: RUN_SCHEMA, role: expectedRole, transport: value.transport, installed_artifact: value.installed_artifact, state: value.state, identity: parseIdentity(value.identity, `${expectedRole}.identity`), blocks };
@@ -338,13 +468,16 @@ function parseRun(input: unknown, expectedRole: Role): RunEvidence {
 function assertRun(config: GateConfig, run: RunEvidence, role: Role): void {
     if (run.state !== "complete") fail(`${role} run is ${run.state}`);
     if (!run.installed_artifact) fail(`${role} run must exercise an installed artifact`);
-    if (role === "baseline" && run.transport !== "tcp") fail("baseline transport must be tcp");
-    if (role === "candidate" && run.transport !== "ring") fail("candidate transport must be ring");
+    if (run.transport !== "ring") fail(`${role} transport must be ring`);
     if (run.blocks.length !== config.expected_blocks || run.blocks.some((block) => block.state !== "complete")) fail(`${role} run expected ${config.expected_blocks} complete blocks`);
     const ids = run.blocks.map((block) => block.block).sort((a, b) => a - b);
     if (ids.some((block, index) => block !== index + 1)) fail(`${role} blocks must be unique and contiguous`);
     const processIds = new Set(run.blocks.map((block) => block.process_id));
     if (processIds.size !== run.blocks.length) fail(`${role} blocks must come from independent processes`);
+    for (const block of run.blocks) {
+        if (block.callback_budget !== config.frozen_contract!.callback_budget) fail(`${role} callback budget mismatch`);
+        if (block.eventfd_attempts !== block.eventfd_successes + block.eventfd_eagain) fail(`${role} eventfd accounting mismatch`);
+    }
 }
 
 function assertIdentity(config: GateConfig, matched: MatchedIdentity, baseline: RunIdentity, candidate: RunIdentity): void {
@@ -391,46 +524,93 @@ function metrics(run: RunEvidence): Metrics {
     };
 }
 
+function blockMetrics(block: RunBlock): Metrics {
+    const latencies = [...block.latencies_ns].sort((a, b) => a - b);
+    return {
+        p50_latency_ns: percentile(latencies, 0.5),
+        p99_latency_ns: percentile(latencies, 0.99),
+        throughput_ops_per_second: (block.completed_ops * 1_000_000_000) / block.elapsed_ns,
+        body_copies: block.body_copies,
+        allocations: block.allocations,
+        cpu_ns: block.cpu_ns,
+        wakeups: block.wakeups,
+    };
+}
+
+function compare(base: Metrics, next: Metrics): MetricComparison {
+    return {
+        p50_ratio: next.p50_latency_ns / base.p50_latency_ns,
+        p99_ratio: next.p99_latency_ns / base.p99_latency_ns,
+        throughput_ratio: next.throughput_ops_per_second / base.throughput_ops_per_second,
+        copies_delta: next.body_copies - base.body_copies,
+        allocations_delta: next.allocations - base.allocations,
+        cpu_ratio: next.cpu_ns / base.cpu_ns,
+        wakeups_delta: next.wakeups - base.wakeups,
+    };
+}
+
 export function buildReleaseGateReport(config: GateConfig, baselineInput: unknown, candidateInput: unknown): ReleaseGateReport {
     if (config.state === "blocked") fail(`release gate blocked: ${config.blockers.join("; ")}`);
-    const parseSuite = (input: unknown, role: Role): RunEvidence[] => {
+    const parseSuite = (input: unknown, role: Role) => {
         const suite = record(input, `${role} suite`);
-        exact(suite, ["schema", "runs"], `${role} suite`);
-        if (suite.schema !== SUITE_SCHEMA || !Array.isArray(suite.runs)) fail(`${role} suite schema or runs mismatch`);
+        exact(suite, ["schema", "runs", "blocked_runtimes"], `${role} suite`);
+        if (suite.schema !== SUITE_SCHEMA || !Array.isArray(suite.runs) || !Array.isArray(suite.blocked_runtimes)) fail(`${role} suite schema or runs mismatch`);
         const runs = suite.runs.map((run) => parseRun(run, role));
+        const blockers = suite.blocked_runtimes.map((input, index) => {
+            const blocker = record(input, `${role}.blocked_runtimes[${index}]`);
+            exact(blocker, ["runtime", "reason"], `${role}.blocked_runtimes[${index}]`);
+            if (blocker.runtime !== "node") fail(`${role} may block only Node performance evidence`);
+            return { runtime: "node" as const, reason: string(blocker.reason, `${role}.blocked_runtimes[${index}].reason`) };
+        });
+        if (blockers.length > 1) fail(`${role} has duplicate Node blockers`);
         const names = runs.map((run) => run.identity.runtime.name);
-        if (names.length !== 2 || names[0] !== "bun" || names[1] !== "node") fail(`${role} suite must contain exactly ordered Bun and Node runs`);
-        return runs;
+        const expected = blockers.length === 0 ? ["bun", "node"] : ["bun"];
+        if (names.length !== expected.length || names.some((name, index) => name !== expected[index])) fail(`${role} suite must contain ordered Bun and eligible Node runs`);
+        return { runs, blockers };
     };
-    const baselineRuns = parseSuite(baselineInput, "baseline");
-    const candidateRuns = parseSuite(candidateInput, "candidate");
+    const baselineSuite = parseSuite(baselineInput, "baseline");
+    const candidateSuite = parseSuite(candidateInput, "candidate");
     const runtimeResults = config.required_runtimes.map((runtime, index) => {
-        const baseline = baselineRuns[index]!;
-        const candidate = candidateRuns[index]!;
+        const blocker = baselineSuite.blockers[0] ?? candidateSuite.blockers[0];
+        if (runtime === "node" && blocker) return { runtime, local_verdict: "blocked" as const, blocker: blocker.reason };
+        const baseline = baselineSuite.runs[index]!;
+        const candidate = candidateSuite.runs[index]!;
         assertRun(config, baseline, "baseline");
         assertRun(config, candidate, "candidate");
         assertIdentity(config, config.matched_identities![index]!, baseline.identity, candidate.identity);
         const base = metrics(baseline);
         const next = metrics(candidate);
+        const pairedBlocks = baseline.blocks.map((baselineBlock, blockIndex) => {
+            const candidateBlock = candidate.blocks[blockIndex]!;
+            if (candidateBlock.block !== baselineBlock.block) fail("paired block identity mismatch");
+            if (candidateBlock.workload !== baselineBlock.workload || candidateBlock.connection_count !== baselineBlock.connection_count || candidateBlock.callback_budget !== baselineBlock.callback_budget) fail("paired block workload identity mismatch");
+            const baselineMetrics = blockMetrics(baselineBlock);
+            const candidateMetrics = blockMetrics(candidateBlock);
+            return {
+                block: baselineBlock.block,
+                workload: baselineBlock.workload,
+                connection_count: baselineBlock.connection_count,
+                callback_budget: baselineBlock.callback_budget,
+                baseline: baselineBlock,
+                candidate: candidateBlock,
+                comparison: compare(baselineMetrics, candidateMetrics),
+            };
+        });
         return {
             runtime,
+            local_verdict: "evidence_complete" as const,
             baseline: { identity: baseline.identity, metrics: base },
             candidate: { identity: candidate.identity, metrics: next },
-            comparison: {
-                p50_ratio: next.p50_latency_ns / base.p50_latency_ns,
-                p99_ratio: next.p99_latency_ns / base.p99_latency_ns,
-                throughput_ratio: next.throughput_ops_per_second / base.throughput_ops_per_second,
-                copies_delta: next.body_copies - base.body_copies,
-                allocations_delta: next.allocations - base.allocations,
-                cpu_ratio: next.cpu_ns / base.cpu_ns,
-                wakeups_delta: next.wakeups - base.wakeups,
-            },
+            paired_blocks: pairedBlocks,
+            comparison: compare(base, next),
         };
     });
     return {
         schema: REPORT_SCHEMA,
-        verdict: "evidence_complete",
-        claim: "descriptive_only_no_performance_threshold",
+        local_verdict: "evidence_complete",
+        designated_host_verdict: config.designated_host,
+        claim: "paired_measurement_against_frozen_contract",
+        frozen_contract: config.frozen_contract!,
         runtime_results: runtimeResults,
     };
 }
@@ -444,7 +624,15 @@ function readJson(path: string, label: string): unknown {
 }
 
 function blockedReport(config: GateConfig) {
-    return { schema: REPORT_SCHEMA, verdict: "blocked", blockers: config.blockers, baseline: null, candidate: null, comparison: null };
+    return {
+        schema: REPORT_SCHEMA,
+        local_verdict: "blocked",
+        local_blockers: config.blockers,
+        designated_host_verdict: config.designated_host,
+        baseline: null,
+        candidate: null,
+        comparison: null,
+    };
 }
 
 function complete(config: GateConfig, candidateInput: unknown, outPath: string): void {
@@ -468,7 +656,7 @@ function main(): void {
     const configPath = resolve(configArg);
     const config = readGateConfig(configPath);
     if (commandName === "status") {
-        process.stdout.write(`${JSON.stringify(config.state === "blocked" ? blockedReport(config) : { schema: REPORT_SCHEMA, verdict: "ready" }, null, 2)}\n`);
+        process.stdout.write(`${JSON.stringify(config.state === "blocked" ? blockedReport(config) : { schema: REPORT_SCHEMA, local_verdict: "ready", designated_host_verdict: config.designated_host }, null, 2)}\n`);
         return;
     }
     if (config.state === "blocked") {

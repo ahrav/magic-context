@@ -1,10 +1,16 @@
 {
   "schema": "magic-context.mc-shm-release-gate-report/v1",
-  "verdict": "blocked",
-  "blockers": [
-    "designated benchmark host is UNSET_REQUIRES_DESIGNATED_HOST",
-    "qualified frozen pre-cutover TCP artifact and evidence are unavailable"
+  "local_verdict": "blocked",
+  "local_blockers": [
+    "qualified frozen pre-change ring A/A artifact and evidence are unavailable",
+    "Darwin shared-memory deployment inventory lacks owner confirmation"
   ],
+  "designated_host_verdict": {
+    "state": "blocked",
+    "blockers": [
+      "designated benchmark host is UNSET_REQUIRES_DESIGNATED_HOST"
+    ]
+  },
   "baseline": null,
   "candidate": null,
   "comparison": null

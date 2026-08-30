@@ -1,6 +1,6 @@
 # `mc-host` Wire Protocol and Handshake
 
-Status: normative direct-linked static three-target profile
+Status: normative Linux-only eventfd sparse-ring profile
 Wire version: 2
 Connection-file schema: 1
 Task: `magic-context-c50.2`; two-target revision and Synapse application protocol: `magic-context-c50.6`; three-target revision and reserved capacity classes: `magic-context-c50.11`
@@ -187,7 +187,7 @@ sequenceDiagram
   Note over C: verify server proof, then daemon ID, then daemon version
   C->>H: ClientAuth {client_auth}
   Note over H: constant-time verify
-  H-->>C: two ring descriptors + activation data
+  H-->>C: two memfds + four eventfds + activation data
   Note over C,H: validate current identity, attach, commit; v2 ring traffic enabled
 ```
 
@@ -558,9 +558,9 @@ Commit runs inside retained host work (the connection writer task), so cancellin
 
 ### 7.7 Mandatory ring setup
 
-Transport setup is complete before the application wire becomes active. The owner-only Unix setup socket authenticates the peer, transfers exactly two ring mapping descriptors, validates the fixed release identity and one-use activation token, and commits the ring. It has no application-envelope decoder or router. The ring is the only application frame channel.
+Transport setup is complete before the application wire becomes active. The owner-only Unix setup socket authenticates the peer, transfers exactly two memfds and four nonblocking eventfds, validates profile `mc-host-eventfd-ring-v2`, wire version 2, descriptor schema 3, and one-use activation token, then commits the ring. It has no application-envelope decoder or router. Memfds carry ring metadata and application bytes. Eventfds carry only coalesced data-ready and capacity-ready notifications, one pair per direction. The ring is the only application frame channel.
 
-Setup accepts only the release's current wire version, descriptor schema, and ring profile. Missing native support, malformed ancillary data, duplicate or extra descriptors, identity mismatch, token mismatch, admission failure, attachment failure, timeout, or setup-socket loss retires the connection before application traffic. Runtime ring corruption or unexpected setup-socket EOF also retires the connection. No setup or runtime failure changes transport or replays an uncertain request.
+Setup accepts only Linux x64 and the fixed release identity. Missing native support, malformed ancillary data, duplicate or extra descriptors, identity mismatch, token mismatch, admission failure, attachment failure, timeout, or setup-socket loss retires the connection before application traffic. Runtime ring corruption or unexpected setup-socket EOF also retires the connection. No setup or runtime failure changes transport or replays an uncertain request. Producers publish before signaling data readiness. Consumers arm by generation, recheck after arming, block on eventfd only when still empty, drain the coalesced token, and recheck the ring. Capacity readiness follows the same lost-wake-safe order. There is no timed ring poll or runtime scheduling selector.
 
 ```mermaid
 stateDiagram-v2
@@ -607,7 +607,7 @@ sequenceDiagram
   H->>F: atomic owner-only publish
   C->>F: bounded validate/read
   C->>H: setup socket + three-message authentication
-  H-->>C: two descriptors + fixed identity + activation
+  H-->>C: two memfds + four eventfds + fixed identity + activation
   C->>H: commit attachment
   C->>H: application v2 frames through ring
 ```
@@ -787,7 +787,7 @@ An authenticated `host.shutdown` (Section 7.6) initiates this same graceful orde
 ### 13.1 Startup, route, call, close
 
 1. Host locks runtime state, creates fresh credentials, initializes directly linked components, binds the owner-only setup socket, and publishes schema 1 with `wire_version: 2`.
-2. Client validates one descriptor-anchored snapshot, authenticates, receives two ring descriptors, validates the fixed identity, attaches, and commits activation.
+2. Client validates one descriptor-anchored snapshot, authenticates, receives two memfds and four eventfds, validates the fixed identity, attaches, and commits activation.
 3. Client sends channel-0 `route.open` correlation 1 through the ring.
 5. Host allocates global channel 7, epoch 77, binds the component, and returns the tagged response.
 6. Client sends an opaque request on `(7,77,2)`.

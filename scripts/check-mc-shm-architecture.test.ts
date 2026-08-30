@@ -37,6 +37,13 @@ describe("mandatory ring architecture audit", () => {
         ["packages/plugin/src/shared/mc-host-client/client.ts", 'const op = "transport.negotiate";'],
         ["packages/plugin/src/shared/mc-host-client/client.ts", "const fallback_reason = true;"],
         ["crates/mc-host/src/ring_transport.rs", "let id: BackendId;"],
+        ["crates/mc-shm-transport/src/arena.rs", "fn prefault_arena() {}"],
+        ["crates/mc-shm-transport/src/arena.rs", "let error = PrefaultFailed;"],
+        ["crates/mc-shm-transport/src/descriptor.rs", "enum SchedulingMode { Poll }"],
+        ["crates/mc-shm-transport/src/backend/ring.rs", "std::thread::sleep(Duration::from_micros(50));"],
+        ["packages/plugin/src/shared/mc-host-client/client.ts", "setInterval(() => pollRing(), 1);"],
+        ["packages/mc-shm-native/src/lib.rs", "napi_get_uv_event_loop(env, &mut loop_ptr);"],
+        ["packages/mc-shm-native/src/lib.rs", "uv_poll_init(loop_ptr, &mut handle, fd);"],
         ["crates/mc-shm-transport/Cargo.toml", 'iceoryx2 = "0.9"'],
     ])("rejects %s", (path, source) => {
         const root = fixture();

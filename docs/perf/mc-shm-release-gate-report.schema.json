@@ -10,53 +10,61 @@
   "$defs": {
     "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
-    "package": {
+    "designatedVerdict": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "version", "sha256"],
+      "required": ["state", "blockers"],
       "properties": {
-        "name": { "type": "string", "minLength": 1 },
-        "version": { "type": "string", "minLength": 1 },
-        "sha256": { "$ref": "#/$defs/sha256" }
+        "state": { "enum": ["blocked", "evidence_complete"] },
+        "blockers": { "type": "array", "items": { "type": "string", "minLength": 1 } }
       }
     },
-    "runtime": {
+    "frozenContract": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "version", "executable_sha256"],
+      "required": ["equivalence_margin_ratio", "callback_budget", "max_rss_bytes", "max_pss_bytes", "max_page_table_bytes", "max_fd_count", "max_watcher_count", "tmpfs_bytes", "cgroup_memory_bytes"],
       "properties": {
-        "name": { "enum": ["bun", "node", "rust"] },
-        "version": { "type": "string", "minLength": 1 },
-        "executable_sha256": { "$ref": "#/$defs/sha256" }
-      }
-    },
-    "host": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["id_sha256", "kernel", "cpu", "topology_sha256"],
-      "properties": {
-        "id_sha256": { "$ref": "#/$defs/sha256" },
-        "kernel": { "type": "string", "minLength": 1 },
-        "cpu": { "type": "string", "minLength": 1 },
-        "topology_sha256": { "$ref": "#/$defs/sha256" }
+        "equivalence_margin_ratio": { "type": "number", "exclusiveMinimum": 0 },
+        "callback_budget": { "type": "integer", "minimum": 1 },
+        "max_rss_bytes": { "type": "integer", "minimum": 1 },
+        "max_pss_bytes": { "type": "integer", "minimum": 1 },
+        "max_page_table_bytes": { "type": "integer", "minimum": 1 },
+        "max_fd_count": { "type": "integer", "minimum": 1 },
+        "max_watcher_count": { "type": "integer", "minimum": 1 },
+        "tmpfs_bytes": { "type": "integer", "minimum": 1 },
+        "cgroup_memory_bytes": { "type": "integer", "minimum": 1 }
       }
     },
     "identity": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["source_commit", "package", "runtime", "host", "harness_sha256", "workload_sha256"],
+      "required": ["source_commit", "platform", "profile", "wire_version", "descriptor_schema", "transferred_descriptors", "environment_watchers", "package", "runtime", "host", "harness_sha256", "workload_sha256"],
       "properties": {
         "source_commit": { "$ref": "#/$defs/commit" },
-        "package": { "$ref": "#/$defs/package" },
-        "runtime": { "$ref": "#/$defs/runtime" },
-        "host": { "$ref": "#/$defs/host" },
+        "platform": { "const": "linux-x64-gnu" },
+        "profile": { "const": "mc-host-eventfd-ring-v2" },
+        "wire_version": { "const": 2 },
+        "descriptor_schema": { "const": 3 },
+        "transferred_descriptors": { "const": 6 },
+        "environment_watchers": { "const": 1 },
+        "package": {
+          "type": "object", "additionalProperties": false, "required": ["name", "version", "sha256"],
+          "properties": { "name": { "type": "string", "minLength": 1 }, "version": { "type": "string", "minLength": 1 }, "sha256": { "$ref": "#/$defs/sha256" } }
+        },
+        "runtime": {
+          "type": "object", "additionalProperties": false, "required": ["name", "version", "executable_sha256"],
+          "properties": { "name": { "enum": ["bun", "node", "rust"] }, "version": { "type": "string", "minLength": 1 }, "executable_sha256": { "$ref": "#/$defs/sha256" } }
+        },
+        "host": {
+          "type": "object", "additionalProperties": false, "required": ["id_sha256", "kernel", "cpu", "topology_sha256"],
+          "properties": { "id_sha256": { "$ref": "#/$defs/sha256" }, "kernel": { "type": "string", "minLength": 1 }, "cpu": { "type": "string", "minLength": 1 }, "topology_sha256": { "$ref": "#/$defs/sha256" } }
+        },
         "harness_sha256": { "$ref": "#/$defs/sha256" },
         "workload_sha256": { "$ref": "#/$defs/sha256" }
       }
     },
     "metrics": {
-      "type": "object",
-      "additionalProperties": false,
+      "type": "object", "additionalProperties": false,
       "required": ["p50_latency_ns", "p99_latency_ns", "throughput_ops_per_second", "body_copies", "allocations", "cpu_ns", "wakeups"],
       "properties": {
         "p50_latency_ns": { "type": "number", "exclusiveMinimum": 0 },
@@ -64,106 +72,61 @@
         "throughput_ops_per_second": { "type": "number", "exclusiveMinimum": 0 },
         "body_copies": { "type": "integer", "minimum": 0 },
         "allocations": { "type": "integer", "minimum": 0 },
-        "cpu_ns": { "type": "integer", "exclusiveMinimum": 0 },
+        "cpu_ns": { "type": "integer", "minimum": 1 },
         "wakeups": { "type": "integer", "minimum": 0 }
       }
     },
-    "arm": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["identity", "metrics"],
+    "block": {
+      "type": "object", "additionalProperties": false,
+      "required": ["block", "process_id", "workload", "connection_count", "callback_budget", "state", "completed_ops", "elapsed_ns", "latencies_ns", "body_copies", "allocations", "cpu_ns", "wakeups", "p99_event_loop_delay_ns", "rss_bytes", "pss_bytes", "resident_pages", "page_table_bytes", "fd_count", "watcher_count", "eventfd_attempts", "eventfd_successes", "eventfd_eagain", "eventfd_reads", "parks", "spurious_wakes", "publications", "tsfn_callbacks", "scheduler_handoffs", "reclaim_scans", "reclaim_bytes", "reclaim_runs", "madv_remove_calls", "madv_remove_pages", "queue_hops"],
       "properties": {
-        "identity": { "$ref": "#/$defs/identity" },
-        "metrics": { "$ref": "#/$defs/metrics" }
+        "block": { "type": "integer", "minimum": 1 }, "process_id": { "type": "integer", "minimum": 1 },
+        "workload": { "enum": ["setup", "cold_first_frame", "end_to_end", "active_path", "idle"] },
+        "connection_count": { "enum": [1, 8, 64] }, "callback_budget": { "type": "integer", "minimum": 1 },
+        "state": { "const": "complete" }, "completed_ops": { "type": "integer", "minimum": 1 }, "elapsed_ns": { "type": "integer", "minimum": 1 },
+        "latencies_ns": { "type": "array", "minItems": 1, "items": { "type": "integer", "minimum": 1 } },
+        "body_copies": { "type": "integer", "minimum": 0 }, "allocations": { "type": "integer", "minimum": 0 }, "cpu_ns": { "type": "integer", "minimum": 1 }, "wakeups": { "type": "integer", "minimum": 0 },
+        "p99_event_loop_delay_ns": { "type": "integer", "minimum": 1 }, "rss_bytes": { "type": "integer", "minimum": 0 }, "pss_bytes": { "type": "integer", "minimum": 0 }, "resident_pages": { "type": "integer", "minimum": 0 }, "page_table_bytes": { "type": "integer", "minimum": 0 }, "fd_count": { "type": "integer", "minimum": 0 }, "watcher_count": { "type": "integer", "minimum": 0 },
+        "eventfd_attempts": { "type": "integer", "minimum": 0 }, "eventfd_successes": { "type": "integer", "minimum": 0 }, "eventfd_eagain": { "type": "integer", "minimum": 0 }, "eventfd_reads": { "type": "integer", "minimum": 0 }, "parks": { "type": "integer", "minimum": 0 }, "spurious_wakes": { "type": "integer", "minimum": 0 }, "publications": { "type": "integer", "minimum": 0 }, "tsfn_callbacks": { "type": "integer", "minimum": 0 }, "scheduler_handoffs": { "type": "integer", "minimum": 0 }, "reclaim_scans": { "type": "integer", "minimum": 0 }, "reclaim_bytes": { "type": "integer", "minimum": 0 }, "reclaim_runs": { "type": "integer", "minimum": 0 }, "madv_remove_calls": { "type": "integer", "minimum": 0 }, "madv_remove_pages": { "type": "integer", "minimum": 0 }, "queue_hops": { "type": "integer", "minimum": 0 }
       }
     },
     "comparison": {
-      "type": "object",
-      "additionalProperties": false,
+      "type": "object", "additionalProperties": false,
       "required": ["p50_ratio", "p99_ratio", "throughput_ratio", "copies_delta", "allocations_delta", "cpu_ratio", "wakeups_delta"],
       "properties": {
-        "p50_ratio": { "type": "number", "exclusiveMinimum": 0 },
-        "p99_ratio": { "type": "number", "exclusiveMinimum": 0 },
-        "throughput_ratio": { "type": "number", "exclusiveMinimum": 0 },
-        "copies_delta": { "type": "integer" },
-        "allocations_delta": { "type": "integer" },
-        "cpu_ratio": { "type": "number", "exclusiveMinimum": 0 },
-        "wakeups_delta": { "type": "integer" }
+        "p50_ratio": { "type": "number", "exclusiveMinimum": 0 }, "p99_ratio": { "type": "number", "exclusiveMinimum": 0 }, "throughput_ratio": { "type": "number", "exclusiveMinimum": 0 }, "copies_delta": { "type": "integer" }, "allocations_delta": { "type": "integer" }, "cpu_ratio": { "type": "number", "exclusiveMinimum": 0 }, "wakeups_delta": { "type": "integer" }
       }
+    },
+    "arm": { "type": "object", "additionalProperties": false, "required": ["identity", "metrics"], "properties": { "identity": { "$ref": "#/$defs/identity" }, "metrics": { "$ref": "#/$defs/metrics" } } },
+    "pairedBlock": {
+      "type": "object", "additionalProperties": false, "required": ["block", "workload", "connection_count", "callback_budget", "baseline", "candidate", "comparison"],
+      "properties": { "block": { "type": "integer", "minimum": 1 }, "workload": { "enum": ["setup", "cold_first_frame", "end_to_end", "active_path", "idle"] }, "connection_count": { "enum": [1, 8, 64] }, "callback_budget": { "type": "integer", "minimum": 1 }, "baseline": { "$ref": "#/$defs/block" }, "candidate": { "$ref": "#/$defs/block" }, "comparison": { "$ref": "#/$defs/comparison" } }
     },
     "runtimeResult": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["runtime", "baseline", "candidate", "comparison"],
-      "properties": {
-        "runtime": { "enum": ["bun", "node"] },
-        "baseline": { "$ref": "#/$defs/arm" },
-        "candidate": { "$ref": "#/$defs/arm" },
-        "comparison": { "$ref": "#/$defs/comparison" }
-      }
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false, "required": ["runtime", "local_verdict", "baseline", "candidate", "paired_blocks", "comparison"],
+          "properties": { "runtime": { "enum": ["bun", "node"] }, "local_verdict": { "const": "evidence_complete" }, "baseline": { "$ref": "#/$defs/arm" }, "candidate": { "$ref": "#/$defs/arm" }, "paired_blocks": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/pairedBlock" } }, "comparison": { "$ref": "#/$defs/comparison" } }
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["runtime", "local_verdict", "blocker"],
+          "properties": { "runtime": { "const": "node" }, "local_verdict": { "const": "blocked" }, "blocker": { "type": "string", "minLength": 1 } }
+        }
+      ]
     },
     "blocked": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["schema", "verdict", "blockers", "baseline", "candidate", "comparison"],
-      "properties": {
-        "schema": { "const": "magic-context.mc-shm-release-gate-report/v1" },
-        "verdict": { "const": "blocked" },
-        "blockers": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
-        "baseline": { "type": "null" },
-        "candidate": { "type": "null" },
-        "comparison": { "type": "null" }
-      }
+      "type": "object", "additionalProperties": false, "required": ["schema", "local_verdict", "local_blockers", "designated_host_verdict", "baseline", "candidate", "comparison"],
+      "properties": { "schema": { "const": "magic-context.mc-shm-release-gate-report/v1" }, "local_verdict": { "const": "blocked" }, "local_blockers": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } }, "designated_host_verdict": { "$ref": "#/$defs/designatedVerdict" }, "baseline": { "type": "null" }, "candidate": { "type": "null" }, "comparison": { "type": "null" } }
     },
     "ready": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["schema", "verdict"],
-      "properties": {
-        "schema": { "const": "magic-context.mc-shm-release-gate-report/v1" },
-        "verdict": { "const": "ready" }
-      }
+      "type": "object", "additionalProperties": false, "required": ["schema", "local_verdict", "designated_host_verdict"],
+      "properties": { "schema": { "const": "magic-context.mc-shm-release-gate-report/v1" }, "local_verdict": { "const": "ready" }, "designated_host_verdict": { "$ref": "#/$defs/designatedVerdict" } }
     },
     "complete": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["schema", "verdict", "claim", "runtime_results"],
+      "type": "object", "additionalProperties": false, "required": ["schema", "local_verdict", "designated_host_verdict", "claim", "frozen_contract", "runtime_results"],
       "properties": {
-        "schema": { "const": "magic-context.mc-shm-release-gate-report/v1" },
-        "verdict": { "const": "evidence_complete" },
-        "claim": { "const": "descriptive_only_no_performance_threshold" },
-        "runtime_results": {
-          "type": "array",
-          "minItems": 2,
-          "maxItems": 2,
-          "prefixItems": [
-            {
-              "allOf": [
-                { "$ref": "#/$defs/runtimeResult" },
-                {
-                  "properties": {
-                    "runtime": { "const": "bun" },
-                    "baseline": { "properties": { "identity": { "properties": { "runtime": { "properties": { "name": { "const": "bun" } } } } } } },
-                    "candidate": { "properties": { "identity": { "properties": { "runtime": { "properties": { "name": { "const": "bun" } } } } } } }
-                  }
-                }
-              ]
-            },
-            {
-              "allOf": [
-                { "$ref": "#/$defs/runtimeResult" },
-                {
-                  "properties": {
-                    "runtime": { "const": "node" },
-                    "baseline": { "properties": { "identity": { "properties": { "runtime": { "properties": { "name": { "const": "node" } } } } } } },
-                    "candidate": { "properties": { "identity": { "properties": { "runtime": { "properties": { "name": { "const": "node" } } } } } } }
-                  }
-                }
-              ]
-            }
-          ],
-          "items": false
-        }
+        "schema": { "const": "magic-context.mc-shm-release-gate-report/v1" }, "local_verdict": { "const": "evidence_complete" }, "designated_host_verdict": { "$ref": "#/$defs/designatedVerdict" }, "claim": { "const": "paired_measurement_against_frozen_contract" }, "frozen_contract": { "$ref": "#/$defs/frozenContract" },
+        "runtime_results": { "type": "array", "minItems": 2, "maxItems": 2, "prefixItems": [{ "allOf": [{ "$ref": "#/$defs/runtimeResult" }, { "properties": { "runtime": { "const": "bun" } } }] }, { "allOf": [{ "$ref": "#/$defs/runtimeResult" }, { "properties": { "runtime": { "const": "node" } } }] }], "items": false }
       }
     }
   }
