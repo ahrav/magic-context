@@ -45,21 +45,17 @@ const cargoTest = (args: string[]): Detector => ({
 
 const mutations: Record<string, UnitCase> = {
     u1: {
-        name: "SHM_U1_ALLOCATION_SLACK_REACHES_DECODER",
-        source: resolve(
-            repoRoot,
-            "crates/mc-shm-transport/src/backend/iceoryx.rs",
-        ),
-        oldText:
-            "(index == 0).then_some(&self.sample.payload()[PREFIX_BYTES..PREFIX_BYTES + self.body_len])",
+        name: "SHM_U1_FIXED_RING_SCHEMA_DRIFTS",
+        source: resolve(repoRoot, "crates/mc-shm-transport/src/descriptor.rs"),
+        oldText: "            schema_version: DESCRIPTOR_SCHEMA_VERSION,",
         replacement:
-            "(index == 0).then_some(&self.sample.payload()[PREFIX_BYTES..])",
+            "            schema_version: DESCRIPTOR_SCHEMA_VERSION + 1,",
         detector: cargoTest([
             "-p",
             "mc-shm-transport",
             "--test",
-            "iceoryx",
-            "allocation_slack_never_reaches_the_frame_decoder",
+            "contract",
+            "fixed_ring_identity_survives_profile_validation",
         ]),
     },
     u2: {
@@ -149,18 +145,15 @@ const mutations: Record<string, UnitCase> = {
     u6: {
         name: "SHM_U6_MACOS_IGNORED_SOAK_INVOCATION_REMOVED",
         deferred:
-            "manifest-gated: the failure_hardening manifest is unresolved and " +
-            "retains no macOS tuple, so no dedicated macOS ignored-soak " +
-            "invocation exists to remove and no workflow-coverage validator " +
-            "is implemented yet; freezing a manifest with a retained macOS " +
-            "tuple must add both the invocation and the coverage check",
+            "the fixed ring manifest has no provider tuple matrix; dedicated " +
+            "macOS runtime execution belongs to native transport packaging",
     },
     u7: {
-        name: "SHM_U7_RETAINED_TUPLE_OMITTED_FROM_INVENTORY",
+        name: "SHM_U7_ALTERNATE_TRANSPORT_ACCEPTED",
         source: resolve(e2eRoot, "scripts/validate-shm-hardening-matrix.ts"),
-        oldText: "const categories = new Set(inventory[identity] ?? []);",
+        oldText: "        transport.length !== 1 ||",
         replacement:
-            "const categories = new Set(inventory[identity] ?? ADAPTER_CATEGORIES);",
+            "        transport.length === 0 ||",
         detector: {
             cmd: [
                 "bun",

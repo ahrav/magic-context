@@ -60,12 +60,9 @@ jobs:
         working-directory: packages/e2e-tests
         run: bun test scripts/validate-shm-hardening-matrix.test.ts
 
-      # --allow-unresolved keeps an unresolved manifest loud but
-      # non-fatal; a FROZEN manifest is validated strictly with no
-      # workflow edit. commentlint: allow(JUDGE)
-      - name: Validate hardening matrix (strict when frozen)
+      - name: Validate fixed ring manifest
         working-directory: packages/e2e-tests
-        run: bun scripts/validate-shm-hardening-matrix.ts --allow-unresolved
+        run: bun scripts/validate-shm-hardening-matrix.ts
 
   release-contract-gate:
     name: mc-host release contract drift gate
@@ -151,11 +148,10 @@ jobs:
       - name: Provision metadata-only sibling stubs
         run: sh scripts/provision-rust-ci-stubs.sh
 
-      - name: Source-build transport, host, addon, and iceoryx
+      - name: Source-build transport, host, and addon
         run: |
           cargo build -p mc-shm-transport -p mc-host -p mc-shm-native
           cargo build -p mc-module --bin ck-mc-host
-          cargo check -p mc-shm-transport --features iceoryx
 
       - name: Native lifecycle binary contract
         run: cargo test -p mc-module --test lifecycle_cli

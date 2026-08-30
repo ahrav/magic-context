@@ -5,15 +5,10 @@ edition = "2021"
 license = "MIT"
 publish = false
 
-[features]
-default = ["iceoryx"]
-iceoryx = ["dep:iceoryx2"]
-
 [dependencies]
 getrandom = "0.2"
 libc = "0.2"
 serde = { workspace = true }
-iceoryx2 = { version = "=0.9.3", optional = true, default-features = false, features = ["std"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }

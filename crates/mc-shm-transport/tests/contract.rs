@@ -3,9 +3,9 @@ use std::sync::Arc;
 use mc_shm_transport::arena::{ArenaCounts, ArenaSpan, SpanPlan, MAX_FRAME_BYTES};
 use mc_shm_transport::backend::sample::{SamplePrefix, SAMPLE_PREFIX_BYTES};
 use mc_shm_transport::descriptor::{
-    BackendId, DescriptorCounts, DescriptorError, FrameDescriptor, HardwareProfileId, Incarnation,
-    MemoryLayout, OwnershipMode, PlatformKind, ReleaseIdentity, RuntimeKind, SchedulingMode,
-    TransportDescriptor, WorkloadClass, DESCRIPTOR_SCHEMA_VERSION, WIRE_V2_HEADER_BYTES,
+    DescriptorCounts, DescriptorError, FrameDescriptor, HardwareProfileId, Incarnation,
+    ReleaseIdentity, SchedulingMode, TransportDescriptor, DESCRIPTOR_SCHEMA_VERSION,
+    WIRE_V2_HEADER_BYTES,
 };
 use mc_shm_transport::evidence::OperationCounters;
 use mc_shm_transport::lifecycle::{CloseState, Lifecycle, LifecycleError};
@@ -57,6 +57,25 @@ fn valid_descriptor() -> FrameDescriptor {
             ArenaSpan::from_untrusted(0, 4),
         ],
     )
+}
+
+#[test]
+fn fixed_ring_identity_survives_profile_validation() {
+    let profile = ring_profile(
+        HardwareProfileId::new("fixed-ring-contract").unwrap(),
+        SchedulingMode::ColdParkWake,
+    )
+    .unwrap();
+
+    assert_eq!(
+        profile.descriptor().schema_version(),
+        DESCRIPTOR_SCHEMA_VERSION
+    );
+    assert_eq!(
+        profile.descriptor().scheduling(),
+        SchedulingMode::ColdParkWake
+    );
+    assert!(profile.descriptor().hardware_matches("fixed-ring-contract"));
 }
 
 #[test]
@@ -363,13 +382,7 @@ fn host_admission_retains_quarantined_commitments() {
 fn span_profile(max_spans: usize) -> TargetProfile {
     TargetProfile::new(ProfileConfig {
         descriptor: TransportDescriptor::new(
-            BackendId::Ring,
-            MemoryLayout::TwoSpanWrap,
-            OwnershipMode::DirectLeased,
             SchedulingMode::ColdParkWake,
-            WorkloadClass::MixedDuplex,
-            PlatformKind::Linux,
-            RuntimeKind::Rust,
             HardwareProfileId::new("contract-spans").unwrap(),
         ),
         descriptor_depth: 8,
@@ -446,13 +459,7 @@ fn purity_gate_rejects_injected_copy_allocation_queue_and_wake() {
 fn debug_and_errors_redact_every_sentinel() {
     let sentinel = "SENTINEL_descriptor_token_object_incarnation_address";
     let transport = TransportDescriptor::new(
-        BackendId::Ring,
-        MemoryLayout::TwoSpanWrap,
-        OwnershipMode::DirectLeased,
         SchedulingMode::ColdParkWake,
-        WorkloadClass::MixedDuplex,
-        PlatformKind::Linux,
-        RuntimeKind::Rust,
         HardwareProfileId::new(sentinel).unwrap(),
     );
     let incarnation = Incarnation::from_bytes(*b"SENTINEL-SECRET!");

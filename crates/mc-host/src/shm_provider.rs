@@ -18,10 +18,7 @@ use crate::wire::{decode_header, EnvelopeHeader, FrameType};
 #[cfg(target_os = "linux")]
 use mc_shm_transport::backend::ring::RingGrant;
 use mc_shm_transport::backend::ring::{DuplexRing, ProducerReservation, Ring};
-use mc_shm_transport::descriptor::{
-    BackendId, HardwareProfileId, MemoryLayout, OwnershipMode, PlatformKind, RuntimeKind,
-    SchedulingMode, TransportDescriptor, WorkloadClass,
-};
+use mc_shm_transport::descriptor::{HardwareProfileId, SchedulingMode, TransportDescriptor};
 use mc_shm_transport::profile::{
     Admission, AdmissionController, CompletionMode, HostLimits as ShmHostLimits, ProducerTopology,
     ProfileConfig, ResourceCharges, TargetProfile, WorkerTopology,
@@ -75,17 +72,7 @@ pub fn qualified_test_parameters() -> serde_json::Value {
 pub fn qualified_test_profile() -> TargetProfile {
     TargetProfile::new(ProfileConfig {
         descriptor: TransportDescriptor::new(
-            BackendId::Ring,
-            MemoryLayout::TwoSpanWrap,
-            OwnershipMode::DirectLeased,
             SchedulingMode::ColdParkWake,
-            WorkloadClass::MixedDuplex,
-            if cfg!(target_os = "macos") {
-                PlatformKind::Macos
-            } else {
-                PlatformKind::Linux
-            },
-            RuntimeKind::Rust,
             HardwareProfileId::new(HARDWARE_PROFILE).expect("static hardware profile is valid"),
         ),
         descriptor_depth: DESCRIPTOR_DEPTH,
