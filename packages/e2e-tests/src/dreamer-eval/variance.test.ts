@@ -8,6 +8,7 @@ const system = {
     bunVersion: "1.3.11",
     opencodeVersion: "1.0.0",
     modelId: "anthropic/model",
+    platform: "linux",
     parserImpl: "ts" as const,
     pluginEntry: "src" as const,
     runtimeDigest: "d".repeat(64),
@@ -86,6 +87,25 @@ describe("dreamer eval variance", () => {
         );
     });
 
+    test("the same run counted twice is rejected", () => {
+        // One invocation must not read as several agreeing runs: repeatCount and
+        // every bucket would be inflated and the artifact would overstate stability.
+        expect(() => aggregateDreamerEvalVariance([report(1), report(1)])).toThrow(
+            "variance reports must have distinct run ids",
+        );
+    });
+
+    test("reports from different platforms are not one system", () => {
+        // canonicalObservedPath and production's path handling are separator-aware,
+        // and a case-insensitive filesystem changes what resolves, so the same
+        // manifest can score differently per platform.
+        const elsewhere = report(2);
+        elsewhere.system = { ...elsewhere.system, platform: "win32" };
+        expect(() => aggregateDreamerEvalVariance([report(1), elsewhere])).toThrow(
+            "variance reports must share one system tuple",
+        );
+    });
+
     test("differing plugin bytes are not one system", () => {
         // repoCommitSha describes the checkout; the digest describes what ran. A
         // dirty tree or a stale bundle makes two runs at one commit execute
@@ -111,6 +131,7 @@ describe("dreamer eval variance", () => {
             runtimeDigest: system.runtimeDigest,
             pluginEntry: system.pluginEntry,
             parserImpl: system.parserImpl,
+            platform: system.platform,
             modelId: system.modelId,
             opencodeVersion: system.opencodeVersion,
             bunVersion: system.bunVersion,

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 import type { PluginContext } from "../../../plugin/src/plugin/types";
 import { extractLatestAssistantText } from "../../../plugin/src/shared/assistant-message-extractor";
 import {
@@ -405,8 +405,17 @@ function gitOutput(workdir: string, args: readonly string[]): string | null {
  * resolves could be edited without moving the digest. The scope is the repository
  * rather than `packages/plugin` because the runner, scorers, contract, seeder, and
  * scenario corpus all decide a run's outcome too.
+ *
+ * The run's own output tree is excluded. Outputs are not inputs, and a
+ * `--output-dir` inside the repository but outside the ignored default would
+ * otherwise make each completed repeat an untracked deviation seen by the next
+ * repeat — giving every repeat a different tuple, discovered only after every
+ * model call, when variance refuses to aggregate them.
  */
-function runtimeProvenance(): { pluginEntry: PluginRuntimeSource; runtimeDigest: string } {
+function runtimeProvenance(artifactDir: string): {
+    pluginEntry: PluginRuntimeSource;
+    runtimeDigest: string;
+} {
     const pluginEntry: PluginRuntimeSource = pluginEntryPath() === PLUGIN_BUNDLE_ENTRY ? "dist" : "src";
     const head = gitOutput(PLUGIN_REPO_ROOT, ["rev-parse", "HEAD"]);
     // `-z` because a path may contain whitespace, and porcelain quotes such paths
@@ -416,9 +425,14 @@ function runtimeProvenance(): { pluginEntry: PluginRuntimeSource; runtimeDigest:
     if (head === null || status === null) {
         throw new Error("dreamer-eval could not resolve the runtime working-tree state");
     }
+    const outputRoot = resolve(artifactDir);
     const deviations = status
         .split("\0")
         .filter((entry) => entry.length > 3)
+        .filter((entry) => {
+            const absolute = resolve(PLUGIN_REPO_ROOT, entry.slice(3));
+            return absolute !== outputRoot && !absolute.startsWith(`${outputRoot}${sep}`);
+        })
         .map((entry) => {
             const path = entry.slice(3);
             const absolute = join(PLUGIN_REPO_ROOT, path);
@@ -451,8 +465,9 @@ function systemTuple(options: RunDreamerEvalTaskOptions) {
         bunVersion: Bun.version,
         opencodeVersion: options.opencodeVersion ?? "unknown",
         modelId: options.model,
+        platform: process.platform,
         parserImpl: "ts" as const,
-        ...runtimeProvenance(),
+        ...runtimeProvenance(options.artifactDir),
     };
 }
 

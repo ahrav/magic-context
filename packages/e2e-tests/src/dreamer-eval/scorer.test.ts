@@ -146,6 +146,7 @@ export function exitCodeForScore(result: ManifestScore): 0 | 1 | 2 {
             bunVersion: "test",
             opencodeVersion: "test",
             modelId: "test/model",
+            platform: "linux",
             parserImpl: "ts",
             pluginEntry: "src",
             runtimeDigest: "d".repeat(64),

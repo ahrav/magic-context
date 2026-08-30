@@ -672,6 +672,7 @@ describe("dreamer eval report contract", () => {
             bunVersion: "1.3.11",
             opencodeVersion: "1.0.0",
             modelId: "model",
+            platform: "linux",
             parserImpl: "ts",
             pluginEntry: "src",
             runtimeDigest: "d".repeat(64),

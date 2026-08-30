@@ -184,6 +184,7 @@ function systemIdentity(system: DreamerSystemTuple): string {
         system.bunVersion,
         system.opencodeVersion,
         system.modelId,
+        system.platform,
         system.parserImpl,
         system.pluginEntry,
         system.runtimeDigest,
@@ -199,6 +200,11 @@ export function aggregateDreamerEvalVariance(reports: readonly DreamerEvalRunRep
     }
     if (reports.some((report) => report.scenarioId !== first.scenarioId || report.task !== first.task)) {
         throw new Error("variance reports must share one scenario and task");
+    }
+    // One run counted twice inflates repeatCount and every bucket, so a single
+    // invocation would read as several agreeing runs and overstate stability.
+    if (new Set(reports.map((report) => report.runId)).size !== reports.length) {
+        throw new Error("variance reports must have distinct run ids");
     }
 
     const counts = new Map<string, Map<string, number>>();

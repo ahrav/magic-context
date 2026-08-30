@@ -853,6 +853,15 @@ export interface DreamerSystemTuple {
     bunVersion: string;
     opencodeVersion: string;
     modelId: string;
+    /**
+     * `process.platform`. `canonicalObservedPath` and production's own path
+     * handling are deliberately separator-aware, and a case-insensitive
+     * filesystem changes which paths production resolves, so the same manifest
+     * can score differently across platforms. Without this, reports from two
+     * platforms would read as one system and mix harness behaviour into model
+     * variance.
+     */
+    platform: string;
     parserImpl: "ts";
     /**
      * Which plugin entrypoint the harness loaded. `spawn.ts` prefers
@@ -1004,7 +1013,16 @@ function parseSystem(raw: unknown, label: string): DreamerSystemTuple {
     const value = record(raw, label);
     exact(
         value,
-        ["repoCommitSha", "bunVersion", "opencodeVersion", "modelId", "parserImpl", "pluginEntry", "runtimeDigest"],
+        [
+            "repoCommitSha",
+            "bunVersion",
+            "opencodeVersion",
+            "modelId",
+            "platform",
+            "parserImpl",
+            "pluginEntry",
+            "runtimeDigest",
+        ],
         label,
     );
     return {
@@ -1012,6 +1030,7 @@ function parseSystem(raw: unknown, label: string): DreamerSystemTuple {
         bunVersion: string(value.bunVersion, `${label}.bunVersion`),
         opencodeVersion: string(value.opencodeVersion, `${label}.opencodeVersion`),
         modelId: string(value.modelId, `${label}.modelId`),
+        platform: string(value.platform, `${label}.platform`),
         parserImpl: enumeration(value.parserImpl, ["ts"], `${label}.parserImpl`),
         pluginEntry: enumeration(value.pluginEntry, PLUGIN_RUNTIME_SOURCES, `${label}.pluginEntry`),
         runtimeDigest: staticId(value.runtimeDigest, `${label}.runtimeDigest`, DIGEST_RE),

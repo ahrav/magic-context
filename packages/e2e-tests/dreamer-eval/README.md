@@ -58,9 +58,13 @@ because the runner, scorers, contract, seeder, and corpus decide a result as muc
 as the plugin does. The harness prefers `packages/plugin/dist/index.js` when it
 exists and falls back to `packages/plugin/src/index.ts`, so the commit alone does
 not identify what ran, and without the digest two runs of different
-implementations would aggregate as repeats of one experiment. Variance refuses a
-set whose reports disagree on any part of that tuple, so a run from a dirty tree is
-comparable only against runs from the same tree.
+implementations would aggregate as repeats of one experiment. The run's own output tree is excluded, since outputs are not inputs and a report
+written between repeats would otherwise give every repeat a different tuple. The
+tuple also records `process.platform`, because path handling is separator-aware and
+a case-insensitive filesystem changes which paths resolve. Variance refuses a set
+whose reports disagree on any part of that tuple, or whose run ids repeat, so a run
+from a dirty tree is comparable only against runs from the same tree and one
+invocation cannot be counted as several agreeing repeats.
 
 Reports also record the fixture repository's tracked files, read with `git
 ls-files` after seeding. That is the universe production resolves an observed
