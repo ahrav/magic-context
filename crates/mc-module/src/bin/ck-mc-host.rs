@@ -895,10 +895,6 @@ const fn build_target() -> Option<&'static str> {
         target_env = "gnu"
     )) {
         Some("linux-x64-gnu")
-    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        Some("darwin-arm64")
-    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        Some("darwin-x64")
     } else {
         None
     }
@@ -1154,8 +1150,6 @@ fn trusted_payload_sources(
     };
     let expected_package = match target {
         "linux-x64-gnu" => "@cortexkit/mc-host-linux-x64-gnu",
-        "darwin-arm64" => "@cortexkit/mc-host-darwin-arm64",
-        "darwin-x64" => "@cortexkit/mc-host-darwin-x64",
         _ => return Err(invalid),
     };
     let _ = (&manifest.platform_floor, &manifest.synapse);
@@ -2040,8 +2034,6 @@ mod tests {
         };
         let package_name = match target {
             "linux-x64-gnu" => "@cortexkit/mc-host-linux-x64-gnu",
-            "darwin-arm64" => "@cortexkit/mc-host-darwin-arm64",
-            "darwin-x64" => "@cortexkit/mc-host-darwin-x64",
             _ => return,
         };
         let manifest = serde_json::json!({

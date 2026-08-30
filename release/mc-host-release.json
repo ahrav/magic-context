@@ -311,10 +311,7 @@
     "platforms": [
       "linux-x64-gnu"
     ],
-    "unsupported": {
-      "darwin-arm64": "synapse_unsupported",
-      "darwin-x64": "synapse_unsupported"
-    }
+    "unsupported": {}
   },
   "packages": {
     "addons": [
@@ -326,48 +323,12 @@
       "@cortexkit/pi-magic-context"
     ],
     "payloads": [
-      "@cortexkit/mc-host-darwin-arm64",
-      "@cortexkit/mc-host-darwin-x64",
       "@cortexkit/mc-host-linux-x64-gnu"
     ],
     "version": "0.38.0"
   },
   "platforms": {
     "supported": [
-      {
-        "capabilities": {
-          "dev_fd_exec": true,
-          "filesystem": [
-            "atomic_same_filesystem_replacement",
-            "cross_process_locks",
-            "file_and_directory_fsync",
-            "local_filesystem",
-            "no_follow_link_semantics",
-            "retained_object_execution"
-          ]
-        },
-        "os_min": "13.5",
-        "synapse": "unsupported",
-        "synapse_reason": "synapse_unsupported",
-        "target": "darwin-arm64"
-      },
-      {
-        "capabilities": {
-          "dev_fd_exec": true,
-          "filesystem": [
-            "atomic_same_filesystem_replacement",
-            "cross_process_locks",
-            "file_and_directory_fsync",
-            "local_filesystem",
-            "no_follow_link_semantics",
-            "retained_object_execution"
-          ]
-        },
-        "os_min": "13.5",
-        "synapse": "unsupported",
-        "synapse_reason": "synapse_unsupported",
-        "target": "darwin-x64"
-      },
       {
         "capabilities": {
           "filesystem": [

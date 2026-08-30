@@ -2,7 +2,7 @@
 
 ## Status
 
-The fixed sparse ring is the only application transport. `linux-x64-gnu` clients use the owner-only Unix setup socket to authenticate, receive two memfds and four eventfds, validate the current release identity, attach, and commit activation. Application frames never use the setup socket or eventfds. Darwin shared-memory execution is unsupported and rejected during package capability selection.
+The fixed sparse ring is the only application transport. Production support is Linux x64 with glibc only. Clients use the owner-only Unix setup socket to authenticate, receive two memfds and four eventfds, validate the current release identity, attach, and commit activation. Application frames never use the setup socket or eventfds.
 
 There is no runtime transport selector, alternate shared-memory backend, compatibility reader, or degraded data path. A transport failure is terminal for the affected connection.
 
@@ -74,14 +74,12 @@ Reports never include setup-socket paths, native handles, mapping descriptors, g
 
 ## Resource bounds
 
-The fixed profile charges both directions. One connection charges 16 ring descriptors, 128 MiB of sparse virtual arena capacity, 16 receive leases, two mappings, six transferred file descriptors, no endpoint or pinned worker, and one client instance. Native JS integration adds one environment watcher, not one watcher per connection. Process bounds multiply this profile by the configured maximum connection count with checked arithmetic. Resident memory grows on first touch and returns through FIFO page removal; the virtual arena charge stays fixed.
+The fixed profile charges both directions. One connection charges 16 ring descriptors, 128 MiB of sparse virtual arena capacity, 16 receive leases, two mappings, six transferred file descriptors, one fused endpoint worker, one client instance, and zero pinned workers. Native JS integration adds one environment watcher, not one watcher per connection. Process bounds multiply this profile by the configured maximum connection count with checked arithmetic. Resident memory grows on first touch and returns through FIFO page removal; the virtual arena charge stays fixed.
 
 Exact-capacity admission succeeds. Capacity plus one fails without creating another mapping or worker. Repeated peer crashes must not increase active charges after reclamation, and quarantined charges remain within the configured process bound.
 
 ## Platform contract
 
 Shared-memory production support is `linux-x64-gnu` only. The package manifest and addon checksum are verified before loading. Build profile and target identity are checked before setup. Managed Rust clients use the same setup protocol, ring profile, wire version, and descriptor schema.
-
-Repository Darwin package use is inventoried. Existing Darwin host payload packages remain for unrelated host distribution, but `@cortexkit/mc-shm-native` has no Darwin selector, Darwin addon payload, or macOS shared-memory CI execution. This publishes support withdrawal for the native shared-memory path. Active-deployment absence still needs owner confirmation; any deployment that requires Darwin shared-memory transport blocks release instead of selecting another readiness or reclaim implementation.
 
 Clean-install gates must complete one cross-process application round trip on Linux x64. A missing package, addon, manifest, checksum, or platform capability fails the gate; unsupported or omitted results are not success states.

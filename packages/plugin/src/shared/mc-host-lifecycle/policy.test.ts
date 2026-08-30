@@ -10,8 +10,6 @@ import {
     aggregateForTarget,
     McHostLifecyclePolicy,
     OUTER_AGGREGATE_MS,
-    OUTER_AGGREGATE_MS_DARWIN,
-    ReadinessProbeControlError,
     type WaiterDetachedError,
 } from "./policy";
 
@@ -133,21 +131,15 @@ function policyFor(
     options: ConstructorParameters<typeof McHostLifecyclePolicy>[0],
 ): McHostLifecyclePolicy {
     return new McHostLifecyclePolicy({
-        platformReaders: supportedPlatformReaders(),
+        platformReaders: {
+            platform: "linux",
+            arch: "x64",
+            kernelRelease: () => "6.1.0",
+            glibcVersion: () => "2.34",
+            procSelfFdUsable: () => true,
+        },
         ...options,
     });
-}
-
-/** A deterministic host satisfying the shipped Linux contract. */
-function supportedPlatformReaders(): PlatformReaders {
-    return {
-        platform: "linux",
-        arch: "x64",
-        kernelRelease: () => "6.12.0",
-        glibcVersion: () => "2.34",
-        procSelfFdUsable: () => true,
-        macosProductVersion: () => null,
-    };
 }
 
 function catalogEntry(moduleId: string, moduleVersion = "0.1.0"): CatalogEntry {
@@ -181,7 +173,6 @@ function unsupportedPlatformReaders(): PlatformReaders {
         kernelRelease: () => "4.17.0",
         glibcVersion: () => "2.34",
         procSelfFdUsable: () => true,
-        macosProductVersion: () => null,
     };
 }
 
@@ -231,7 +222,6 @@ describe("pre-native outcomes", () => {
                     kernelRelease: () => "4.17.0",
                     glibcVersion: () => "2.34",
                     procSelfFdUsable: () => true,
-                    macosProductVersion: () => null,
                 },
                 {
                     platform: "darwin" as const,
@@ -239,7 +229,6 @@ describe("pre-native outcomes", () => {
                     kernelRelease: () => "23.0.0",
                     glibcVersion: () => null,
                     procSelfFdUsable: () => false,
-                    macosProductVersion: () => "13.4",
                 },
                 {
                     platform: "linux" as const,
@@ -247,7 +236,6 @@ describe("pre-native outcomes", () => {
                     kernelRelease: () => "6.8.0",
                     glibcVersion: () => "2.39",
                     procSelfFdUsable: () => true,
-                    macosProductVersion: () => null,
                 },
             ]) {
                 const policy = policyFor({
@@ -957,13 +945,10 @@ describe("native invocation mapping", () => {
                 kernelRelease: () => "6.1.0",
                 glibcVersion: () => {
                     const until = Date.now() + SYNC_MS;
-                    while (Date.now() < until) {
-                        /* stand in for the darwin sw_vers fallback */
-                    }
+                    while (Date.now() < until) {}
                     return "2.34";
                 },
                 procSelfFdUsable: () => true,
-                macosProductVersion: () => null,
             };
             const policy = policyFor({
                 env: { XDG_DATA_HOME: root },
@@ -995,15 +980,7 @@ describe("native invocation mapping", () => {
     }, 20_000);
 
     test("each qualified target gets the aggregate it was qualified for", () => {
-        // release/mc-host-production-inputs.lock.json qualifies
-        // fresh_linux_transport_aggregate.hard at 60s and
-        // fresh_macos_transport_aggregate.hard at 15s. Applying the Linux
-        // aggregate on Darwin lets a hung startup run four times past its
-        // budget, so the value has to come from the gate's resolved target.
-        expect(aggregateForTarget("linux-x64-gnu")).toBe(60_000);
-        expect(aggregateForTarget("darwin-arm64")).toBe(15_000);
-        expect(aggregateForTarget("darwin-x64")).toBe(15_000);
-        expect(OUTER_AGGREGATE_MS_DARWIN).toBeLessThan(OUTER_AGGREGATE_MS);
+        expect(aggregateForTarget("linux-x64-gnu")).toBe(OUTER_AGGREGATE_MS);
     });
 
     test("an explicit aggregate still overrides the platform default", async () => {
@@ -1499,8 +1476,6 @@ describe("demand-start coalescing and detachment (U3 scenarios 15-16)", () => {
                 arch: "x64",
                 kernelRelease: () => "6.1.0",
                 glibcVersion: () => {
-                    // Synchronous, like the darwin `sw_vers` fallback this
-                    // stands in for.
                     const until = Date.now() + SYNC_MS;
                     while (Date.now() < until) {
                         /* burn the caller's budget before the waiter attaches */
@@ -1508,7 +1483,6 @@ describe("demand-start coalescing and detachment (U3 scenarios 15-16)", () => {
                     return "2.34";
                 },
                 procSelfFdUsable: () => true,
-                macosProductVersion: () => null,
             };
             const policy = policyFor({
                 env: { XDG_DATA_HOME: root },

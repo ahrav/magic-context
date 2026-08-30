@@ -12,10 +12,10 @@
   "local_verdict": "BLOCKED",
   "designated_host_verdict": "BLOCKED",
   "requirements": [
-    { "id": "R1", "status": "PASS", "evidence": ["scripts/check-mc-shm-architecture.test.ts", "docs/mc-host-wire-protocol.md#77-mandatory-ring-setup"] },
+    { "id": "R1", "status": "PASS", "evidence": ["docs/mc-host-wire-protocol.md#77-mandatory-ring-setup", "packages/plugin/src/shared/mc-host-client/shm-frame-channel.test.ts#production-shared-memory-delivery-has-no-timer-polling"] },
     { "id": "R2", "status": "PASS", "evidence": ["crates/mc-shm-transport/tests/ring.rs#sealed_sparse_object_repeated_setup_and_stress_conservation"] },
     { "id": "R3", "status": "PASS", "evidence": ["crates/mc-shm-transport/tests/ring.rs#retained_oldest_lease_enforces_fifo_reclamation_and_release_validation", "crates/mc-shm-transport/tests/ring.rs#quarantine_rejects_all_operations_and_reports_conservation"] },
-    { "id": "R4", "status": "PASS", "evidence": ["crates/mc-shm-transport/tests/ring.rs#two_process_zero_copy_exchange_uses_authenticated_grant", "packages/plugin/src/shared/mc-host-client/shm-frame-channel.test.ts#production-shared-memory-delivery-has-no-timer-polling", "scripts/check-mc-shm-architecture.test.ts"] },
+    { "id": "R4", "status": "PASS", "evidence": ["crates/mc-shm-transport/tests/ring.rs#two_process_zero_copy_exchange_uses_authenticated_grant", "packages/plugin/src/shared/mc-host-client/shm-frame-channel.test.ts#production-shared-memory-delivery-has-no-timer-polling"] },
     { "id": "R5", "status": "PASS", "evidence": ["packages/mc-shm-native/tests/runtime.ts"] },
     { "id": "R6", "status": "PASS", "evidence": ["crates/mc-shm-transport/tests/ring.rs#boundary_round_trips_include_wrap_and_exact_maximum", "packages/plugin/src/shared/mc-host-client/shm-frame-channel.test.ts#produce-and-reserve-enforce-the-configured-frame-limit-before-any-charge"] },
     { "id": "R7", "status": "PASS", "evidence": ["crates/mc-shm-transport/tests/ring.rs#probe_reads_shared_state_without_consuming_a_frame", "docs/mc-host-shm-transport.md#resource-bounds"] },
@@ -23,9 +23,9 @@
     { "id": "R9", "status": "PASS", "evidence": ["crates/mc-host/tests/shm_failure_modes.rs#setup_active_and_idle_sigkill_each_return_exact_capacity", "crates/mc-host/tests/shm_failure_modes.rs#repeated_crashes_do_not_ratchet_single_connection_capacity"] },
     { "id": "R10", "status": "PASS", "evidence": ["crates/mc-host/tests/shm_failure_modes.rs#exact_capacity_succeeds_and_plus_one_creates_no_ring_resources", "crates/mc-host/tests/shm_soak.rs#short_soak_keeps_fd_mapping_thread_and_rss_envelopes_bounded"] },
     { "id": "R11", "status": "PASS", "evidence": ["packages/mc-shm-native/tests/runtime.ts", "packages/plugin/src/shared/mc-host-client/shm-frame-channel.test.ts#close-reports-quarantine-and-rejects-alias-cleanup-failure"] },
-    { "id": "R12", "status": "PASS", "evidence": ["docs/mc-host-shm-transport.md#doctor-and-diagnostics", "scripts/mc-shm-release-gate.test.ts"] },
-    { "id": "R13", "status": "BLOCKED", "evidence": ["release/mc-shm-release-gate-report.json", "docs/perf/mc-shm-release-gate-report.schema.json", "crates/mc-shm-transport/benches/manifests/v1.json"], "note": "Collector and paired schema are executable; no frozen ring A/A, callback-budget sweep, post-change campaign, or designated-host evidence exists." },
-    { "id": "R14", "status": "BLOCKED", "evidence": ["docs/perf/mc-shm-hardware-envelope.md#platform-boundary-and-darwin-inventory", "packages/mc-shm-native/tests/capability.ts", ".github/workflows/ci.yml"], "note": "Repository use is inventoried and support withdrawal is published; active-deployment absence still needs owner confirmation." },
-    { "id": "R15", "status": "BLOCKED", "evidence": ["crates/mc-shm-transport/benches/manifests/v1.json", "release/mc-shm-release-gate-report.json"], "note": "Supported 64-connection tmpfs/cgroup envelope remains unset pending designated-host execution." }
+    { "id": "R12", "status": "BLOCKED", "evidence": ["docs/mc-host-shm-transport.md#doctor-and-diagnostics"], "note": "No executable installed-release gate evidence exists." },
+    { "id": "R13", "status": "BLOCKED", "evidence": ["crates/mc-shm-transport/benches/manifests/v1.json"], "note": "No frozen ring A/A, callback-budget sweep, post-change campaign, report schema, or designated-host evidence exists." },
+    { "id": "R14", "status": "BLOCKED", "evidence": ["docs/mc-host-shm-transport.md#production-integration", "packages/mc-shm-native/tests/capability.ts", ".github/workflows/ci.yml"], "note": "The release contract is Linux x64 only; active-deployment absence still needs owner confirmation." },
+    { "id": "R15", "status": "BLOCKED", "evidence": ["crates/mc-shm-transport/benches/manifests/v1.json"], "note": "Supported 64-connection tmpfs/cgroup envelope remains unset pending designated-host execution." }
   ]
 }
