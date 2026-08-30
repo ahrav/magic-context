@@ -47,18 +47,20 @@ fn caveman_corpus(target_bytes: usize) -> String {
 fn bench_caveman(c: &mut Criterion) {
     let mut group = c.benchmark_group("caveman");
     group.sample_size(20);
-    for (size_name, bytes) in [("small", 4 << 10), ("medium", 32 << 10), ("large", 256 << 10)] {
+    for (size_name, bytes) in [
+        ("small", 4 << 10),
+        ("medium", 32 << 10),
+        ("large", 256 << 10),
+    ] {
         let doc = caveman_corpus(bytes);
         for (level_name, level) in [
             ("lite", CavemanLevel::Lite),
             ("full", CavemanLevel::Full),
             ("ultra", CavemanLevel::Ultra),
         ] {
-            group.bench_with_input(
-                BenchmarkId::new(level_name, size_name),
-                &doc,
-                |b, doc| b.iter(|| compress(black_box(doc), level)),
-            );
+            group.bench_with_input(BenchmarkId::new(level_name, size_name), &doc, |b, doc| {
+                b.iter(|| compress(black_box(doc), level))
+            });
         }
     }
     group.finish();
@@ -81,14 +83,17 @@ fn bench_tokenizer(c: &mut Criterion) {
 fn bench_historian_truncate(c: &mut Criterion) {
     let mut group = c.benchmark_group("historian_truncate");
     group.sample_size(10);
-    for (size_name, bytes, budget) in
-        [("medium", 64 << 10, 2_000usize), ("large", 512 << 10, 8_000usize)]
-    {
+    for (size_name, bytes, budget) in [
+        ("medium", 64 << 10, 2_000usize),
+        ("large", 512 << 10, 8_000usize),
+    ] {
         let doc = caveman_corpus(bytes);
         group.bench_with_input(
             BenchmarkId::new("over_budget", size_name),
             &(doc, budget),
-            |b, (doc, budget)| b.iter(|| truncate_historian_input_if_needed(black_box(doc), *budget)),
+            |b, (doc, budget)| {
+                b.iter(|| truncate_historian_input_if_needed(black_box(doc), *budget))
+            },
         );
     }
     group.finish();
@@ -99,7 +104,7 @@ fn tool_output(i: usize) -> String {
         "file {i} contents:\nfn kernel_{i}(input: &str) -> usize {{\n    input.len() + {i}\n}}\n\
          filler so token counts vary with i: {pad}\n",
         i = i,
-        pad = "lorem ipsum dolor sit amet ".repeat(1 + i % 5),
+        pad = "lorem ipsum dolor sit amet ".repeat(260 + (i % 5) * 30),
     )
 }
 
@@ -158,42 +163,72 @@ fn arc_storm(arcs: usize) -> Vec<BoundaryMsg> {
             ordinal += 1;
         }
         let arc = format!("arc-{i}");
-        let tool = match i % 5 {
-            0..=2 => "read",
-            3 => "edit",
-            _ => "bash",
+        let dup = i % 6 == 0;
+        let tool = if dup {
+            "mcp_read"
+        } else {
+            match i % 5 {
+                0..=2 => "mcp_read",
+                3 => "edit",
+                _ => "bash",
+            }
         };
+        let path_bucket = if tool == "edit" { i % 5 } else { i % 37 };
+        let call_text = format!("{{\"filePath\":\"src/file_{path_bucket}.rs\"}}");
+        let call_kind = || SelKind::ToolCall {
+            name: tool.to_string(),
+            input: serde_json::json!({"filePath": format!("src/file_{path_bucket}.rs")}),
+        };
+        let mut call_blocks = vec![text_block(
+            format!("m-call-{i}#0"),
+            ordinal,
+            call_text.clone(),
+            Some(arc.clone()),
+            call_kind(),
+        )];
+        if dup {
+            call_blocks.push(text_block(
+                format!("m-call-{i}#1"),
+                ordinal,
+                call_text,
+                Some(format!("{arc}-dup")),
+                call_kind(),
+            ));
+        }
         messages.push(BoundaryMsg {
             message_ordinal: ordinal,
             message_id: format!("m-call-{i}"),
             role: Role::Assistant,
-            blocks: vec![text_block(
-                format!("m-call-{i}#0"),
-                ordinal,
-                format!("{{\"filePath\":\"src/file_{}.rs\"}}", i % 37),
-                Some(arc.clone()),
-                SelKind::ToolCall {
-                    name: tool.to_string(),
-                    input: serde_json::json!({"filePath": format!("src/file_{}.rs", i % 37)}),
-                },
-            )],
+            blocks: call_blocks,
         });
         ordinal += 1;
         // Every 10th arc stays open: a call with no paired result.
         if i % 10 != 9 {
+            let mut result_blocks = vec![text_block(
+                format!("m-result-{i}#0"),
+                ordinal,
+                tool_output(i),
+                Some(arc.clone()),
+                SelKind::ToolResult {
+                    tool_name: tool.to_string(),
+                },
+            )];
+            if dup {
+                result_blocks.push(text_block(
+                    format!("m-result-{i}#1"),
+                    ordinal,
+                    tool_output(i),
+                    Some(format!("{arc}-dup")),
+                    SelKind::ToolResult {
+                        tool_name: tool.to_string(),
+                    },
+                ));
+            }
             messages.push(BoundaryMsg {
                 message_ordinal: ordinal,
                 message_id: format!("m-result-{i}"),
                 role: Role::Other("tool".to_string()),
-                blocks: vec![text_block(
-                    format!("m-result-{i}#0"),
-                    ordinal,
-                    tool_output(i),
-                    Some(arc.clone()),
-                    SelKind::ToolResult {
-                        tool_name: tool.to_string(),
-                    },
-                )],
+                blocks: result_blocks,
             });
             ordinal += 1;
         }
@@ -230,6 +265,16 @@ fn bench_boundary(c: &mut Criterion) {
     for arcs in [10usize, 100, 1000] {
         let messages = arc_storm(arcs);
         let trigger_ctx = pressured_trigger_ctx();
+        let probe = resolve_protected_tail_boundary(&messages, &trigger_ctx.boundary);
+        assert!(
+            probe.eligible_head.start < probe.protected_start_ordinal,
+            "arc_storm({arcs}) leaves the eligible head empty; the trigger bench would measure the skip path"
+        );
+        assert!(
+            probe.true_raw_eligible_tokens >= 8_000.0,
+            "arc_storm({arcs}) eligible head ({} tokens) is too close to the path-flip point",
+            probe.true_raw_eligible_tokens
+        );
         group.bench_with_input(
             BenchmarkId::new("check_compartment_trigger", arcs),
             &messages,
@@ -293,13 +338,18 @@ fn bench_selection(c: &mut Criterion) {
             agent_drop_ids: Vec::new(),
             agent_drop_command_ids: HashMap::new(),
             first_applied_agent_drop_ids: HashSet::new(),
-            pass_already_busting: false,
+            pass_already_busting: true,
             supersession_ride_available: true,
             tag_window_protected_block_ids: HashSet::new(),
             exempt_message_protected_block_ids: HashSet::new(),
         };
         let cfg = SelectionConfig { smart_drops: true };
         let frozen: HashSet<String> = HashSet::new();
+        let decisions = select_reductions(&items, &frozen, &ctx, &cfg);
+        assert!(
+            !decisions.is_empty(),
+            "selection bench at {arcs} arcs selected nothing; it would measure a no-op"
+        );
         group.bench_with_input(
             BenchmarkId::new("select_reductions", arcs),
             &items,
@@ -348,18 +398,15 @@ fn bench_decay_render(c: &mut Criterion) {
     assert_eq!(compartments.len(), 388, "store-shape fixture drifted");
     let mut group = c.benchmark_group("decay_render");
     group.sample_size(10);
-    // budget below the rendered-body token count forces the demotion loop
-    for (name, budget) in [("loose_budget", 200_000.0f64), ("tight_budget", 8_000.0f64)] {
+    // Only the 8k budget sits below the rendered-body token count, so only the
+    // demotion_loop case runs demotion passes; no_demotion renders curve-only.
+    for (name, budget) in [("no_demotion", 200_000.0f64), ("demotion_loop", 8_000.0f64)] {
         group.bench_with_input(
             BenchmarkId::new("render_388", name),
             &compartments,
             |b, compartments| {
                 b.iter(|| {
-                    render_decayed_compartments(
-                        black_box(compartments),
-                        budget,
-                        estimate_tokens,
-                    )
+                    render_decayed_compartments(black_box(compartments), budget, estimate_tokens)
                 })
             },
         );
