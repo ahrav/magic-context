@@ -2171,6 +2171,36 @@ proptest! {
 }
 
 #[test]
+fn optimized_matches_frozen_reference_for_cross_owner_duplicates() {
+    let mut specs = Vec::with_capacity(4);
+    for msg in 0..2 {
+        for kind in [KIND_TOOL_CALL, KIND_TOOL_RESULT] {
+            specs.push(ItemSpec {
+                msg,
+                ordinal_slot: msg,
+                role: ROLE_ASSISTANT,
+                kind,
+                tool: 0,
+                input: 0,
+                provider_executed: false,
+                byte_size: 800,
+                token_count: None,
+                arc: Some(msg),
+                frozen: false,
+                agent_drop: false,
+                tag_protected: false,
+                exempt_protected: false,
+            });
+        }
+    }
+    let bits: CtxBits = (0, 0.0, 100_000.0, 0, 0, false, 0, false, false, true);
+
+    let (optimized, expected, _, _) = outcome_pair!(specs, bits);
+    assert_eq!(optimized, expected);
+    assert!(optimized.0.is_empty());
+}
+
+#[test]
 fn optimized_matches_frozen_reference_at_age_reclaim_threshold() {
     let spec = |msg: u8, kind: u8, token_count: Option<u16>| ItemSpec {
         msg,
