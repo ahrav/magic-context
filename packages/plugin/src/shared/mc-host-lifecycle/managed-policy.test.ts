@@ -242,7 +242,6 @@ describe("managed observational platform gate", () => {
                     kernelRelease: () => "4.17.0",
                     glibcVersion: () => "2.34",
                     procSelfFdUsable: () => true,
-                    macosProductVersion: () => null,
                 },
                 {
                     platform: "darwin" as const,
@@ -250,7 +249,6 @@ describe("managed observational platform gate", () => {
                     kernelRelease: () => "23.0.0",
                     glibcVersion: () => null,
                     procSelfFdUsable: () => false,
-                    macosProductVersion: () => "13.4",
                 },
                 {
                     platform: "linux" as const,
@@ -258,7 +256,6 @@ describe("managed observational platform gate", () => {
                     kernelRelease: () => "6.8.0",
                     glibcVersion: () => "2.39",
                     procSelfFdUsable: () => true,
-                    macosProductVersion: () => null,
                 },
             ]) {
                 const policy = createManagedLifecyclePolicy({

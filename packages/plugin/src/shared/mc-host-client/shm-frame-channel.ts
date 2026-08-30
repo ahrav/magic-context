@@ -48,12 +48,7 @@ export interface ShmFrameChannelOptions {
     handlers: FrameChannelHandlers;
 }
 
-/**
- * Longest a single publication may block the event loop waiting for ring
- * capacity. The native reservation is synchronous, and this thread is also the
- * only consumer of the inbound ring, so waiting a request deadline here stops
- * the drain that would free the capacity being waited on. commentlint: allow(JUDGE)
- */
+// Explicit reservations have no published frame and may make one bounded capacity probe.
 const MAX_RESERVATION_BLOCK_MS = 5;
 
 /** A full ring is backpressure, so callers may retry rather than fail the route. commentlint: allow(JUDGE) */
@@ -68,14 +63,6 @@ function ringFullError(cause: unknown): McHostCallError {
 
 function isRingFull(error: unknown): boolean {
     return error instanceof Error && error.message === "shared-memory ring is full";
-}
-
-/** Never waits past the caller's deadline, and never longer than the loop bound. commentlint: allow(JUDGE) */
-function reservationBlockMs(deadline?: Deadline): number {
-    const remaining = deadline?.remainingMs();
-    if (remaining === undefined) return MAX_RESERVATION_BLOCK_MS;
-    if (remaining <= 0) return 0;
-    return Math.min(MAX_RESERVATION_BLOCK_MS, Math.ceil(remaining));
 }
 
 export class ShmFrameChannel implements SetupFrameChannel {
@@ -302,7 +289,7 @@ export class ShmFrameChannel implements SetupFrameChannel {
         header: ProducerFrameHeader,
         body: DirectFrameBody,
         hooks?: FrameSendHooks,
-        deadline?: Deadline,
+        _deadline?: Deadline,
     ): FrameSendTicket {
         if (this.closed) throw new McHostCallError("not_sent", "shared-memory channel closed");
         let published = false;
@@ -319,7 +306,7 @@ export class ShmFrameChannel implements SetupFrameChannel {
                         // Send hooks cannot change publication.
                     }
                 },
-                reservationBlockMs(deadline),
+                0,
             );
         } catch (error) {
             if (isRingFull(error)) throw ringFullError(error);

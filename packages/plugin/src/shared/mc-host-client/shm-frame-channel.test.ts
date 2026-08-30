@@ -563,11 +563,44 @@ describe("mandatory shared-memory channel", () => {
             expect((caught as McHostCallError).kind).toBe("not_sent");
             expect((caught as McHostCallError).code).toBe("ring_full");
         }
-        // A publication must not hold the event loop for a request deadline;
+        // A publication must not hold the event loop for ring capacity;
         // the loop is also the only consumer draining the inbound ring.
-        expect(blockMs).toBeLessThanOrEqual(5);
+        expect(blockMs).toBe(0);
         // Every refused attempt returns its charge.
         expect(budget.used).toBe(0);
+    });
+
+    test("a saturated outbound ring cannot block inbound readiness", async () => {
+        if (!probeCapabilities().available) return;
+        const pair = NativeChannel.createTestPair();
+        const received: bigint[] = [];
+        const channel = new ShmFrameChannel({
+            nativeChannel: pair.first,
+            budget: new ByteBudget(1 << 20),
+            maxBodyLen: 1 << 20,
+            handlers: {
+                onFrame: (frame) => {
+                    received.push(frame.header.corr);
+                    frame.body.release();
+                },
+                onClosed: () => {},
+            },
+        });
+        channel.beginFrames();
+        const body = { byteLength: 0, fill: () => {} };
+        for (let index = 0; index < pair.first.descriptorDepth; index++) {
+            channel.produce(responseHeader(FrameType.Request, BigInt(index + 1), 0), body);
+        }
+        publish(pair.second, responseHeader(FrameType.Response, 99n, 0), new Uint8Array());
+
+        expect(() =>
+            channel.produce(responseHeader(FrameType.Request, 100n, 0), body),
+        ).toThrow(McHostCallError);
+        await waitUntil(() => received.length === 1);
+        expect(received).toEqual([99n]);
+
+        channel.close();
+        pair.second.close();
     });
 
     test("a dropped setup socket retires the channel as eof after draining", async () => {

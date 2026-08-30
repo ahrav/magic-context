@@ -248,6 +248,9 @@ export function probeCapabilities(): NativeCapabilities {
         transferPrevention: false,
         cleanupHooks: false,
     };
+    if (typeof (globalThis as { Bun?: unknown }).Bun === "undefined") {
+        return { available: false, ...base, reason: "node_detachment_unavailable" };
+    }
     const native = addon();
     if (!native)
         return { available: false, ...base, reason: "addon_unavailable" };
@@ -259,14 +262,6 @@ export function probeCapabilities(): NativeCapabilities {
                 ...base,
                 napiVersion,
                 reason: "napi_8_unavailable",
-            };
-        }
-        if (typeof (globalThis as { Bun?: unknown }).Bun === "undefined") {
-            return {
-                available: false,
-                ...base,
-                napiVersion,
-                reason: "detachment_unavailable",
             };
         }
         const view = native.createExternalProbe(31);

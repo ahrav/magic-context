@@ -7,7 +7,6 @@
  * lifecycle reason.
  */
 
-import { execFileSync } from "node:child_process";
 import { createHash, type Hash } from "node:crypto";
 import {
     closeSync,
@@ -78,8 +77,6 @@ export interface PlatformReaders {
     glibcVersion: () => string | null;
     /** True only when `/proc/self/fd` resolves on a real procfs. */
     procSelfFdUsable: () => boolean;
-    /** macOS product version, e.g. `14.2`, or null when unverifiable. */
-    macosProductVersion: () => string | null;
 }
 
 function detectGlibcVersion(): string | null {
@@ -132,65 +129,12 @@ export function detectProcSelfFd(): boolean {
     }
 }
 
-const MACOS_SYSTEM_VERSION_PLIST = "/System/Library/CoreServices/SystemVersion.plist";
-const MACOS_PRODUCT_VERSION_SHAPE = /^\d+(?:\.\d+)*$/;
-
-/**
- * Read the macOS `ProductVersion` (for example `14.5`) that the darwin arm of
- * {@link checkPlatform} compares against the contract's `os_min` floor.
- *
- * The system plist is tried first because it is a plain file read with no
- * subprocess; `sw_vers` is the fallback for a host whose plist is unreadable
- * or in a shape this parser does not recognize. `os.release()` is deliberately
- * not consulted: it reports the Darwin kernel version (24.x), not the product
- * version the contract floor is expressed in. Any failure returns `null`,
- * which the caller treats as unverifiable and therefore unsupported, so an
- * unreadable system fails closed instead of assuming it meets the floor.
- */
-function detectMacosProductVersion(): string | null {
-    try {
-        const plist = readFileSync(MACOS_SYSTEM_VERSION_PLIST, "utf8");
-        const match = /<key>ProductVersion<\/key>\s*<string>([^<]+)<\/string>/.exec(plist);
-        const version = match?.[1]?.trim();
-        if (version !== undefined && MACOS_PRODUCT_VERSION_SHAPE.test(version)) return version;
-    } catch {
-        // fall through to the sw_vers fallback below
-    }
-    try {
-        const reported = execFileSync("/usr/bin/sw_vers", ["-productVersion"], {
-            encoding: "utf8",
-            timeout: 2_000,
-            stdio: ["ignore", "pipe", "ignore"],
-        }).trim();
-        return MACOS_PRODUCT_VERSION_SHAPE.test(reported) ? reported : null;
-    } catch {
-        return null;
-    }
-}
-
-// The product version cannot change within a process, and checkPlatform runs
-// on every lifecycle command reached from request-driven demand-start; neither
-// the plist read nor the synchronous sw_vers spawn must repeat per demand.
-// `undefined` means "not yet detected"; a detected `null` is cached too, so a
-// host that fails detection does not retry the spawn on every command.
-let cachedMacosProductVersion: string | null | undefined;
-
-function memoizedMacosProductVersion(): string | null {
-    if (cachedMacosProductVersion === undefined) {
-        cachedMacosProductVersion = detectMacosProductVersion();
-    }
-    return cachedMacosProductVersion;
-}
-
 export const defaultPlatformReaders: PlatformReaders = {
     platform: process.platform,
     arch: process.arch,
     kernelRelease: () => os.release(),
     glibcVersion: detectGlibcVersion,
     procSelfFdUsable: detectProcSelfFd,
-    // Only the darwin arm of `checkPlatform` calls this, so no non-macOS host
-    // ever pays the plist read or the `sw_vers` fallback.
-    macosProductVersion: memoizedMacosProductVersion,
 };
 
 function parseVersionPair(value: string): [number, number] | null {
@@ -208,15 +152,13 @@ function meetsFloor(value: string, floor: string): boolean {
 }
 
 export type PlatformGate =
-    | { ok: true; target: "linux-x64-gnu" | "darwin-arm64" | "darwin-x64" }
+    | { ok: true; target: "linux-x64-gnu" }
     | { ok: false; reason: "unsupported_platform"; detail: string };
 
 /**
  * Enforce the exact release-contract target table: Linux x64 with kernel and
- * glibc at or above their floors plus usable procfs self-fd execution, or
- * macOS at or above its floor. Unknown, below-floor, and UNVERIFIABLE hosts
- * (a null glibc or macOS version) are all `unsupported_platform` — the gate
- * never guesses in favor of execution.
+ * glibc at or above their floors plus usable procfs self-fd execution.
+ * Unknown, below-floor, and unverifiable hosts are `unsupported_platform`.
  */
 export function checkPlatform(readers: PlatformReaders = defaultPlatformReaders): PlatformGate {
     const rejected = (detail: string): PlatformGate => ({
@@ -243,22 +185,6 @@ export function checkPlatform(readers: PlatformReaders = defaultPlatformReaders)
             return rejected("procfs self-fd execution is unavailable");
         }
         return { ok: true, target: "linux-x64-gnu" };
-    }
-    if (readers.platform === "darwin") {
-        const target =
-            readers.arch === "arm64"
-                ? "darwin-arm64"
-                : readers.arch === "x64"
-                  ? "darwin-x64"
-                  : null;
-        if (!target) return rejected("unsupported architecture");
-        const mac = platforms.find((entry) => entry.target === target);
-        if (!mac || !("os_min" in mac))
-            return rejected("no matching target in the release contract");
-        const version = readers.macosProductVersion();
-        if (version === null) return rejected("macOS version is unverifiable");
-        if (!meetsFloor(version, mac.os_min)) return rejected("macOS below the supported floor");
-        return { ok: true, target };
     }
     return rejected("unsupported operating system");
 }

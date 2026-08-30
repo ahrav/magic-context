@@ -128,22 +128,6 @@ export interface PayloadTarget {
 
 export const PAYLOAD_TARGETS: readonly PayloadTarget[] = [
     {
-        package: "@cortexkit/mc-host-darwin-arm64",
-        dir: "packages/mc-host-darwin-arm64",
-        target: "darwin-arm64",
-        os: ["darwin"],
-        cpu: ["arm64"],
-        synapse: "unsupported",
-    },
-    {
-        package: "@cortexkit/mc-host-darwin-x64",
-        dir: "packages/mc-host-darwin-x64",
-        target: "darwin-x64",
-        os: ["darwin"],
-        cpu: ["x64"],
-        synapse: "unsupported",
-    },
-    {
         package: "@cortexkit/mc-host-linux-x64-gnu",
         dir: "packages/mc-host-linux-x64-gnu",
         target: "linux-x64-gnu",
@@ -742,8 +726,6 @@ export function validatePayloadPackageDir(
     }
 }
 
-/** Each parent must declare all three payload packages at the exact
- *  synchronized version — no ranges, tags, or workspace specifiers (R20). */
 export function validateParentManifests(
     rootDir: string,
     contract: ReleaseContract,
@@ -1530,12 +1512,10 @@ export function verifyProductionBinaryIdentity(
     binaryPath: string,
     expectedLockSha256: string,
 ): void {
-    const executable =
-        process.platform === "linux"
-            ? "/proc/self/fd/3"
-            : process.platform === "darwin"
-              ? "/dev/fd/3"
-              : fail("production binary identity probe is unsupported");
+    if (process.platform !== "linux") {
+        fail("production binary identity probe is unsupported");
+    }
+    const executable = "/proc/self/fd/3";
     let fd: number;
     try {
         fd = openSync(
@@ -1615,14 +1595,7 @@ export function buildProductionPayload(
             binaryPath: options.binaryPath,
             nativeAddonPath:
                 options.nativeAddonPath ??
-                join(
-                    rootDir,
-                    "target",
-                    "release",
-                    process.platform === "darwin"
-                        ? "libmc_shm_native.dylib"
-                        : "libmc_shm_native.so",
-                ),
+                join(rootDir, "target", "release", "libmc_shm_native.so"),
             ...(qualifiedInputs === undefined
                 ? {}
                 : {
@@ -1865,14 +1838,7 @@ export function buildProductionPayloads(
     const payload = buildProductionPayload(rootDir, {
         target: hostTarget(),
         binaryPath: join(rootDir, "target", "release", "ck-mc-host"),
-        nativeAddonPath: join(
-            rootDir,
-            "target",
-            "release",
-            process.platform === "darwin"
-                ? "libmc_shm_native.dylib"
-                : "libmc_shm_native.so",
-        ),
+        nativeAddonPath: join(rootDir, "target", "release", "libmc_shm_native.so"),
         outDir,
     });
     return packProductionPayload(payload, outDir);
@@ -1950,9 +1916,7 @@ function main(): void {
                     rootDir,
                     "target",
                     "release",
-                    process.platform === "darwin"
-                        ? "libmc_shm_native.dylib"
-                        : "libmc_shm_native.so",
+                    "libmc_shm_native.so",
                 ),
                 outDir:
                     outDir ??

@@ -197,13 +197,9 @@ jobs:
           test ! -e packages/mc-shm-native/mc_shm_native.node
 
   mc-host-lifecycle:
-    name: mc-host lifecycle integration (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: mc-host lifecycle integration (Linux)
+    runs-on: ubuntu-latest
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
     defaults:
       run:
         working-directory: magic-context
@@ -227,8 +223,7 @@ jobs:
       - name: Store tests against real commons
         run: cargo test -p mc-store
 
-      - name: Host lifecycle and closure proofs (Linux)
-        if: runner.os == 'Linux'
+      - name: Host lifecycle and closure proofs
         run: |
           cargo test -p mc-host \
             --test broca_protocol \
@@ -238,8 +233,7 @@ jobs:
 
       # token_cache::test_cache_guard serializes the tests that share the
       # process-global cache, so this suite is correct under either runner.
-      - name: Module transform and token-cache proofs (Linux)
-        if: runner.os == 'Linux'
+      - name: Module transform and token-cache proofs
         run: |
           cargo nextest run -p mc-module --lib
           cargo nextest run -p mc-module \
@@ -247,35 +241,19 @@ jobs:
             --test caveman_differential \
             --test selection_differential
 
-      - name: Module differential contracts (Linux)
-        if: runner.os == 'Linux'
+      - name: Module differential contracts
         run: |
           cargo nextest run -p mc-module \
             --test caveman_differential \
             --test historian_truncate_differential \
             --test selection_differential
 
-      - name: Native module adapter and CLI lifecycle (Linux)
-        if: runner.os == 'Linux'
+      - name: Native module adapter and CLI lifecycle
         run: |
           cargo test -p mc-module --bin ck-mc-host
           cargo test -p mc-module \
             --test host_adapter \
             --test lifecycle_cli
-
-      # The release ships darwin payloads, so this leg proves the native
-      # lifecycle binary compiles and links for darwin and that its
-      # argument-parsing and version/release-metadata contract holds there.
-      # It asserts nothing about lifecycle state: those proofs need a
-      # published daemon, which requires Broca's `/proc` process identity,
-      # and a data root the `O_NOFOLLOW` lifecycle path walk accepts, which
-      # the darwin temporary directory's `/var` symlink is not, so they
-      # compile out here.
-      - name: Native lifecycle binary and CLI contract (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          cargo build -p mc-module --bin ck-mc-host
-          cargo test -p mc-module --test lifecycle_cli
 
   check-plugin:
     name: Check (plugin)

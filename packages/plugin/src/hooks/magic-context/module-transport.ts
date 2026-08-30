@@ -155,11 +155,7 @@ function closureCandidate(
     const platform =
         process.platform === "linux" && process.arch === "x64"
             ? "linux-x64-gnu"
-            : process.platform === "darwin" && process.arch === "arm64"
-              ? "darwin-arm64"
-              : process.platform === "darwin" && process.arch === "x64"
-                ? "darwin-x64"
-                : undefined;
+            : undefined;
     if (platform === undefined || !closure.platforms.includes(platform)) {
         return undefined;
     }
@@ -1328,6 +1324,47 @@ export class McHostModuleTransport {
         return outcome.authenticatedDaemonId;
     }
 
+    private async waitForSharedConnection(
+        shared: Promise<CertifiedConnection>,
+        deadline?: Deadline,
+        signal?: AbortSignal,
+    ): Promise<CertifiedConnection> {
+        if (signal?.aborted) {
+            throw signal.reason ?? new Error("module transport call aborted");
+        }
+        shared.catch(() => {});
+        let cancelTimer: (() => void) | undefined;
+        let onAbort: (() => void) | undefined;
+        try {
+            const stops: Promise<CertifiedConnection>[] = [shared];
+            if (deadline) {
+                if (deadline.remainingMs() <= 0) {
+                    throw this.deadlineError("waiting for the shared connection");
+                }
+                stops.push(
+                    new Promise((_resolve, reject) => {
+                        cancelTimer = armExpiryTimer(deadline, () =>
+                            reject(this.deadlineError("waiting for the shared connection")),
+                        );
+                    }),
+                );
+            }
+            if (signal) {
+                stops.push(
+                    new Promise((_resolve, reject) => {
+                        onAbort = () =>
+                            reject(signal.reason ?? new Error("module transport call aborted"));
+                        signal.addEventListener("abort", onAbort, { once: true });
+                    }),
+                );
+            }
+            return await Promise.race(stops);
+        } finally {
+            cancelTimer?.();
+            if (onAbort) signal?.removeEventListener("abort", onAbort);
+        }
+    }
+
     private async ensureConnected(
         deadline?: Deadline,
         signal?: AbortSignal,
@@ -1369,10 +1406,7 @@ export class McHostModuleTransport {
         // from contending for the lifecycle lock the first caller already holds.
         const joinable = this.connectionPromise;
         if (joinable) {
-            if (signal?.aborted) {
-                throw signal.reason ?? new Error("module transport call aborted");
-            }
-            return await joinable;
+            return await this.waitForSharedConnection(joinable, deadline, signal);
         }
         // Backoff gates the lifecycle demand as well as the dial: a rotated or
         // unreachable daemon must not be re-probed at full request rate.
@@ -1414,7 +1448,7 @@ export class McHostModuleTransport {
         // dialing a second time, and hold it to this demand's own certification.
         const raced = this.connectionPromise;
         if (raced) {
-            const joined = await raced;
+            const joined = await this.waitForSharedConnection(raced, deadline, signal);
             if (
                 expectedDaemonId !== undefined &&
                 !sameDaemonId(joined.client.authenticated?.daemonId, expectedDaemonId)
@@ -1463,11 +1497,12 @@ export class McHostModuleTransport {
             }
         })();
         this.connectionPromise = connecting;
-        try {
-            return await connecting;
-        } finally {
-            if (this.connectionPromise === connecting) this.connectionPromise = null;
-        }
+        void connecting
+            .catch(() => {})
+            .finally(() => {
+                if (this.connectionPromise === connecting) this.connectionPromise = null;
+            });
+        return await this.waitForSharedConnection(connecting, deadline, signal);
     }
 
     private connectionBackoffError(): Error & { code?: string } {

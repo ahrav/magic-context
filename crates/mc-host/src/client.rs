@@ -1957,7 +1957,6 @@ fn start_ring_bridge(
                         if failed {
                             break;
                         }
-                        continue;
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                     Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -4159,6 +4158,73 @@ mod tests {
         assert_eq!(SendOutcome::NotSent.as_str(), "not_sent");
         assert_eq!(SendOutcome::OutcomeUnknown.as_str(), "outcome_unknown");
         assert_eq!(SendOutcome::Terminal.as_str(), "terminal");
+    }
+
+    #[tokio::test]
+    async fn ring_bridge_drains_inbound_between_sustained_writes() {
+        let rings = mc_shm_transport::backend::ring::DuplexRing::create(
+            &crate::ring_transport::ring_profile(),
+        )
+        .expect("duplex ring");
+        let (descriptor, descriptors) =
+            crate::ring_transport::worker_descriptor(&rings).expect("descriptor");
+        let (client_end, _host_end) = StdUnixStream::pair().expect("socket pair");
+        let (write, mut read_rx) = start_ring_bridge(
+            descriptor,
+            descriptors,
+            client_end,
+            CancellationToken::new(),
+            Arc::new(ByteCounter::new(CLIENT_INBOUND_FRAME_BYTES)),
+        )
+        .expect("bridge");
+
+        let outbound = EnvelopeHeader {
+            len: 0,
+            ver: PROTOCOL_VERSION,
+            ty: FrameType::Request,
+            flags: pure_header_flags(),
+            channel: 1,
+            epoch: 1,
+            corr: 1,
+        }
+        .encode()
+        .to_vec();
+        for _ in 0..9 {
+            let (completed, _rx) = oneshot::channel();
+            write
+                .tx
+                .try_send(RingWrite {
+                    bytes: outbound.clone(),
+                    completed,
+                    deadline: StdInstant::now() + Duration::from_secs(1),
+                })
+                .expect("queue write without waking worker");
+        }
+        rings
+            .first
+            .try_reserve(
+                0,
+                EnvelopeHeader {
+                    len: 0,
+                    ver: PROTOCOL_VERSION,
+                    ty: FrameType::Response,
+                    flags: response_flags(false, true),
+                    channel: 1,
+                    epoch: 1,
+                    corr: 1,
+                }
+                .encode(),
+            )
+            .expect("reserve inbound")
+            .commit(0)
+            .expect("publish inbound");
+        signal_eventfd(&write.wake);
+
+        let frame = tokio::time::timeout(Duration::from_millis(250), read_rx.recv())
+            .await
+            .expect("inbound frame starved behind queued writes")
+            .expect("bridge closed");
+        assert_eq!(frame.0.ty, FrameType::Response);
     }
 
     #[test]
