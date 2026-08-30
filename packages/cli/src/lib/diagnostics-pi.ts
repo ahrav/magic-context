@@ -26,8 +26,8 @@ import {
     getMagicContextLogPath,
     getPiAgentDir,
     getPiSessionsRoot,
-    getSharedUserConfigPath,
     getPiUserExtensionsPath,
+    getSharedUserConfigPath,
 } from "./paths";
 import { detectPiBinary, getPiVersion } from "./pi-helpers";
 import {

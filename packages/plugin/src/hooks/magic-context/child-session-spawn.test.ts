@@ -132,7 +132,7 @@ describe("createChildSessionWithFence", () => {
 
 describe("childSessionMessagesFetcher", () => {
     it("reads the child session messages with the bound id, directory, and limit", async () => {
-        const messages = mock(async (input: unknown) => [{ info: { role: "assistant" } }]);
+        const messages = mock(async (_input: unknown) => [{ info: { role: "assistant" } }]);
         const fetcher = childSessionMessagesFetcher(
             { session: { messages } } as never,
             "ses_child",

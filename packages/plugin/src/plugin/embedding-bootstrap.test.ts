@@ -2,13 +2,13 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { loadPluginConfigDetailed } from "../config";
 import {
     _resetProjectEmbeddingRegistryForTests,
     getProjectEmbeddingSnapshot,
 } from "../features/magic-context/memory/embedding";
 import { resolveProjectIdentity } from "../features/magic-context/memory/project-identity";
 import { closeDatabase, openDatabase } from "../features/magic-context/storage";
-import { loadPluginConfigDetailed } from "../config";
 import {
     ensureProjectRegisteredFromOpenCodeDirectory,
     registerProjectEmbeddingFromDetailedLoad,

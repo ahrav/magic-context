@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
 
 import { SMART_NOTE_COMPILER_AGENT } from "../../../agents/smart-note-compiler";
-import { childSessionMessagesFetcher, createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
+import {
+    childSessionMessagesFetcher,
+    createChildSessionWithFence,
+} from "../../../hooks/magic-context/child-session-spawn";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import { extractLatestAssistantText } from "../../../shared/assistant-message-extractor";

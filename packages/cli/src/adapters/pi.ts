@@ -7,8 +7,8 @@ import { readJsoncConfig, readJsoncConfigForUpdate } from "../lib/jsonc-config";
 import {
     getMagicContextLogPath,
     getPiAgentDir,
-    getSharedUserConfigPath,
     getPiUserExtensionsPath,
+    getSharedUserConfigPath,
 } from "../lib/paths";
 import { detectPiBinary, PI_PACKAGE_SOURCE, runPiCommand } from "../lib/pi-helpers";
 import { isPiMagicContextPackageEntry } from "../lib/pi-package-entry";

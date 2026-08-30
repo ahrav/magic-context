@@ -3,8 +3,8 @@ import {
 	cortexKitProjectConfigBasePath,
 	cortexKitUserConfigBasePath,
 } from "@magic-context/core/config/migrate-config-location";
-import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
+import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { registerProjectEmbeddingFromDetailedLoad } from "@magic-context/core/plugin/embedding-bootstrap";
 import { loadPiConfigDetailed } from "./config";
 

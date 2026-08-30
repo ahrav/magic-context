@@ -1,5 +1,8 @@
 import { DREAMER_MEMORY_MAPPER_AGENT } from "../../../agents/dreamer";
-import { childSessionMessagesFetcher, createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
+import {
+    childSessionMessagesFetcher,
+    createChildSessionWithFence,
+} from "../../../hooks/magic-context/child-session-spawn";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import {

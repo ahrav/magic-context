@@ -8,7 +8,10 @@ import {
 } from "../../../agents/dreamer";
 import { withContentLanguageDirective } from "../../../agents/language-directive";
 import type { DreamingTask } from "../../../config/schema/magic-context";
-import { childSessionMessagesFetcher, createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
+import {
+    childSessionMessagesFetcher,
+    createChildSessionWithFence,
+} from "../../../hooks/magic-context/child-session-spawn";
 import type { RawMessageProvider } from "../../../hooks/magic-context/read-session-chunk";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
@@ -1144,11 +1147,11 @@ async function runRetrospectiveTask(
                     fallbackModels: config.fallbackModels,
                     callContext: "dreamer:retrospective",
                     fetchOutput: childSessionMessagesFetcher(
-                    deps.client,
-                    sessionId,
-                    deps.sessionDirectory,
-                    50,
-                ),
+                        deps.client,
+                        sessionId,
+                        deps.sessionDirectory,
+                        50,
+                    ),
                     validateOutput: (outputMessages) => {
                         const text = extractLatestAssistantText(outputMessages);
                         if (!text) throw new Error("Retrospective child returned no output.");
@@ -1429,12 +1432,7 @@ async function runAgenticTask(
                 signal: abortController.signal,
                 fallbackModels: config.fallbackModels,
                 callContext: `dreamer:${task}`,
-                fetchOutput: childSessionMessagesFetcher(
-                    deps.client,
-                    sessionId,
-                    docsDir,
-                    50,
-                ),
+                fetchOutput: childSessionMessagesFetcher(deps.client, sessionId, docsDir, 50),
                 validateOutput: (messages) => {
                     const text = extractLatestAssistantText(messages);
                     if (!text) throw new Error("Dreamer returned no assistant output.");

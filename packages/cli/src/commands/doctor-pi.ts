@@ -43,8 +43,8 @@ import {
     getMagicContextLogPath,
     getPiAgentDir,
     getPiCacheRoot,
-    getSharedUserConfigPath,
     getPiUserExtensionsPath,
+    getSharedUserConfigPath,
 } from "../lib/paths";
 import {
     detectPiBinary,

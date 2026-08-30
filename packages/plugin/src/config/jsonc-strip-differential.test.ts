@@ -82,7 +82,7 @@ const CORPUS: string[] = [
     '{"a":1}',
     '{"a": 1, "b": [1, 2, 3],}',
     '{"a": {"b": {"c": true,},},}',
-    '[1, 2, 3,]',
+    "[1, 2, 3,]",
     `{
         // line comment
         "memory": { "enabled": true }, // trailing line comment
@@ -103,7 +103,7 @@ const CORPUS: string[] = [
     "",
     "not json at all",
     '{"a": 1,, }',
-    '// only a comment',
+    "// only a comment",
 ];
 
 describe("migration comparator strip pipeline", () => {

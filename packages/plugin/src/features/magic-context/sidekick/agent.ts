@@ -1,7 +1,10 @@
 import { withContentLanguageDirective } from "../../../agents/language-directive";
 import { SIDEKICK_AGENT } from "../../../agents/sidekick";
 import type { SidekickConfig } from "../../../config/schema/magic-context";
-import { childSessionMessagesFetcher, createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
+import {
+    childSessionMessagesFetcher,
+    createChildSessionWithFence,
+} from "../../../hooks/magic-context/child-session-spawn";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import { extractLatestAssistantText } from "../../../shared/assistant-message-extractor";

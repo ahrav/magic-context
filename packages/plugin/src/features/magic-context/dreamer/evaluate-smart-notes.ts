@@ -1,5 +1,8 @@
 import { SMART_NOTE_COMPILER_AGENT } from "../../../agents/smart-note-compiler";
-import { childSessionMessagesFetcher, createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
+import {
+    childSessionMessagesFetcher,
+    createChildSessionWithFence,
+} from "../../../hooks/magic-context/child-session-spawn";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import { extractLatestAssistantText } from "../../../shared/assistant-message-extractor";
@@ -496,11 +499,11 @@ Output exactly JSON: {"met": false}`;
                     fallbackModels: args.fallbackModels,
                     callContext: "dreamer:smart-note-read-only-confirm",
                     fetchOutput: childSessionMessagesFetcher(
-                    args.client,
-                    childSessionId as string,
-                    args.sessionDirectory ?? args.projectIdentity,
-                    20,
-                ),
+                        args.client,
+                        childSessionId as string,
+                        args.sessionDirectory ?? args.projectIdentity,
+                        20,
+                    ),
                     validateOutput: (messages) => {
                         const text = extractLatestAssistantText(messages) ?? "";
                         const match = text.match(/\{[\s\S]*\}/);
