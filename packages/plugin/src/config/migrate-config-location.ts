@@ -225,14 +225,22 @@ export type ConfigHarness = "opencode" | "pi";
  * config disabled. Each harness reads only its own files, so a differing pair
  * stays correct per-harness until the user consolidates. The bare project-root
  * `<root>/magic-context.*` was OpenCode-only historically.
+ *
+ * Project sources carry the same user-scope filter as
+ * `resolveLegacyConfigSources`: when the project directory IS the user config
+ * home, the bare-root project source resolves to the USER config file, and
+ * reading it as a project config would strip user-tier fields and warn.
  */
 export function resolveLegacyConfigSourcesForHarness(
     directory: string,
     harness: ConfigHarness,
 ): { user: LegacyConfigSource[]; project: LegacyConfigSource[] } {
+    const userPaths = userScopeConfigPaths();
     return {
         user: legacyBaseSources("user", harness, directory),
-        project: legacyBaseSources("project", harness, directory),
+        project: legacyBaseSources("project", harness, directory).filter(
+            (source) => !userPaths.has(source.path),
+        ),
     };
 }
 

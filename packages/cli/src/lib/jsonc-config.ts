@@ -84,21 +84,17 @@ export function assertJsoncConfigsParseable(paths: readonly string[]): void {
 
 /**
  * Lenient JSONC read for diagnostics surfaces: a missing file is an empty
- * config, and a parse failure is reported as a string instead of thrown.
+ * config, and a parse failure — including a non-object document root — is
+ * reported as a string instead of thrown.
  */
 export function readJsoncLenient(path: string): {
     value: Record<string, unknown>;
     parseError?: string;
 } {
-    if (!existsSync(path)) return { value: {} };
-    try {
-        return {
-            value: parseConfigJsonc<Record<string, unknown>>(readFileSync(path, "utf-8")),
-        };
-    } catch (error) {
-        return {
-            value: {},
-            parseError: error instanceof Error ? error.message : String(error),
-        };
+    const result = readJsoncConfig(path);
+    if (result.kind === "missing") return { value: {} };
+    if (result.kind === "parse-error") {
+        return { value: {}, parseError: result.error.message };
     }
+    return { value: result.value };
 }
