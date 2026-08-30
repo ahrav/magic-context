@@ -1,6 +1,6 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { join, resolve, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import type { PluginContext } from "../../../plugin/src/plugin/types";
 import { extractLatestAssistantText } from "../../../plugin/src/shared/assistant-message-extractor";
 import {
@@ -30,7 +30,6 @@ import {
     runClassify,
 } from "../../../plugin/src/features/magic-context/dreamer/classify";
 import { dreamerManifestIdentity } from "../../../plugin/src/features/magic-context/dreamer/claim-manifest";
-import { sha256Utf8Hex } from "../../../plugin/src/features/magic-context/memory/storage-claims";
 import { getSubagentInvocations } from "../../../plugin/src/features/magic-context/storage-subagent-invocations";
 import { autonomousManifestRejectionRequestDigest } from "../../../plugin/src/features/magic-context/memory/storage-claim-autonomous";
 import { TestHarness } from "../harness";
@@ -474,6 +473,11 @@ function runtimeProvenance(artifactDir: string): {
         "--porcelain=v1",
         "-z",
         "--untracked-files=all",
+        // A detected rename emits `R  <new>\0<old>\0`, whose second field is a bare
+        // path with no XY prefix — parsed as a record it loses its first bytes and
+        // hashes as unreadable. Disabling detection makes every field one record with
+        // a prefix, and reports the same change as a delete plus an add.
+        "--no-renames",
     ]);
     if (head === null || status === null) {
         throw new Error("dreamer-eval could not resolve the runtime working-tree state");
@@ -506,27 +510,39 @@ function runtimeProvenance(artifactDir: string): {
         .split("\0")
         .filter((entry) => entry.length > 3)
         .filter((entry) => {
+            // Only the files this lane writes are excluded — a report and the
+            // group's variance artifact, both `.json` directly in the output
+            // directory — rather than the whole tree. Trusting the tree would hide
+            // an untracked module a caller happened to place under it, and an
+            // untracked module is invisible to the tracked-file guard above.
             const absolute = resolve(PLUGIN_REPO_ROOT, entry.slice(3));
-            return absolute !== outputRoot && !absolute.startsWith(`${outputRoot}${sep}`);
+            return !(dirname(absolute) === outputRoot && absolute.endsWith(".json"));
         })
         .map((entry) => {
             const path = entry.slice(3);
             const absolute = join(PLUGIN_REPO_ROOT, path);
-            let content = "";
+            // Raw bytes, not a UTF-8 decode: decoding replaces every malformed
+            // sequence with one character, so two different binary inputs — a WASM
+            // asset, a native fixture — would hash alike and read as the same runtime.
+            let content = createHash("sha256").update("").digest("hex");
             try {
-                content = statSync(absolute).isFile() ? readFileSync(absolute, "utf8") : "";
+                if (statSync(absolute).isFile()) {
+                    content = createHash("sha256").update(readFileSync(absolute)).digest("hex");
+                }
             } catch {
                 // Deleted, or unreadable: the status code below still records the
                 // deviation, and an unreadable path cannot be an evaluator input.
-                content = "";
             }
-            return `${entry.slice(0, 2)}\u0000${path}\u0000${sha256Utf8Hex(content)}`;
+            return `${entry.slice(0, 2)}\u0000${path}\u0000${content}`;
         })
         .sort();
-    const bundle = pluginEntry === "dist" ? sha256Utf8Hex(readFileSync(PLUGIN_BUNDLE_ENTRY, "utf8")) : "";
+    const bundle =
+        pluginEntry === "dist"
+            ? createHash("sha256").update(readFileSync(PLUGIN_BUNDLE_ENTRY)).digest("hex")
+            : "";
     return {
         pluginEntry,
-        runtimeDigest: sha256Utf8Hex([head, bundle, ...deviations].join("\u0001")),
+        runtimeDigest: createHash("sha256").update([head, bundle, ...deviations].join("\u0001")).digest("hex"),
     };
 }
 
