@@ -356,6 +356,10 @@ fn close_channel(env: &Env, channel: &mut Channel) -> Result<()> {
 
 fn quarantine_channel(env: &Env, channel: &mut Channel) -> Result<()> {
     channel.closed = true;
+    // The quarantine retains the mapping, not the peer. Holding `setup` keeps the host's connection permit and both rings for the process lifetime. commentlint: allow(JUDGE)
+    if let Some(mut setup) = channel.setup.take() {
+        setup::goodbye(&mut setup);
+    }
     channel.to_host.enter_quarantine();
     channel.from_host.enter_quarantine();
     let producer_tokens: Vec<u32> = channel.producers.keys().copied().collect();

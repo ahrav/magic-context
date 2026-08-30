@@ -63,13 +63,13 @@ flowchart TB
 
 ### 4.1 Canonical path and schema
 
-Clients MUST read `${dataDir}/cortexkit/run/subc-connection.json`. Host and client configuration MAY supply an explicit equivalent path. The host MUST publish schema 1:
+Clients MUST read `${dataDir}/cortexkit/run/subc-connection.json`. Host and client configuration MAY supply an explicit equivalent path. The host MUST publish schema 2:
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
   "wire_version": 2,
-  "endpoints": [{ "host": "127.0.0.1", "port": 43123 }],
+  "setup_socket": "/home/user/.local/share/cortexkit/run/setup.sock",
   "key": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],
   "daemon_id": [96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111],
   "pid": 4242,
@@ -79,19 +79,19 @@ Clients MUST read `${dataDir}/cortexkit/run/subc-connection.json`. Host and clie
 
 Example bytes are deterministic and non-secret. Real key and daemon-ID bytes MUST come from the OS CSPRNG.
 
-Writers MUST include numeric `wire_version: 2`. Clients MUST reject an absent, null, string, fractional, or non-2 value before endpoint selection or TCP dial. There is no omission default and no version downgrade.
+Writers MUST include numeric `wire_version: 2`. Clients MUST reject an absent, null, string, fractional, or non-2 value before dialing the setup socket. There is no omission default and no version downgrade.
 
 A client MUST:
 
 1. open the parent and connection file without following links, then take one descriptor-anchored regular-file snapshot capped at 65,536 bytes;
 2. reject a larger file before JSON parsing;
-3. require schema 1, numeric wire version 2, at least one endpoint, exactly 32 key bytes, exactly 16 daemon-ID bytes, a numeric PID, and a nonempty daemon version;
+3. require schema 2, numeric wire version 2, a nonempty absolute `setup_socket` path, exactly 32 key bytes, exactly 16 daemon-ID bytes, a numeric PID, and a nonempty daemon version;
 4. verify owner-only regular-file metadata before and after the read and verify the directory entry still names the same file;
-5. select `endpoints[0]` only;
-6. require host exactly `127.0.0.1` and port `1..=65535`;
-7. reject wildcard addresses, IPv6, hostnames, malformed arrays, replacement, and insecure ownership or permissions.
+5. dial `setup_socket` as a Unix stream socket;
+6. reject a relative `setup_socket`, since the host resolves it from its own data directory and a relative path names a different socket for a client with another working directory;
+7. reject replacement and insecure ownership or permissions.
 
-The validated descriptor snapshot is the sole source of credentials and endpoint authority. A client MUST NOT validate by pathname and then reopen that pathname for the key, daemon ID, or endpoint.
+The validated descriptor snapshot is the sole source of credentials and setup-socket authority. A client MUST NOT validate by pathname and then reopen that pathname for the key, daemon ID, or setup socket.
 
 Publication and acceptance require exactly 32 key bytes so all direct implementations use one credential shape.
 
@@ -932,9 +932,9 @@ An authenticated `host.shutdown` (Section 7.6) initiates this same graceful orde
 
 ### 13.1 Startup, route, call, close
 
-1. Host locks runtime state, creates fresh credentials, initializes directly linked components, binds loopback, and publishes schema 1 with `wire_version: 2`.
+1. Host locks runtime state, creates fresh credentials, initializes directly linked components, binds the owner-only setup socket, and publishes schema 2 with `wire_version: 2`.
 2. Client validates one descriptor-anchored snapshot and completes all three auth messages.
-3. Client sends `transport.negotiate` version 1 as correlation 1 and validates the selected transport.
+3. Client receives the two ring descriptors, attaches both directions, and activates as correlation 1.
 4. Client sends channel-0 `route.open` correlation 2.
 5. Host allocates global channel 7, epoch 77, binds the component, and returns the tagged response.
 6. Client sends an opaque request on `(7,77,3)`.
