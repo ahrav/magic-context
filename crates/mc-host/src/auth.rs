@@ -17,7 +17,6 @@ pub use mc_shm_transport::setup_auth::{
 
 pub const MAX_AUTH_MESSAGE_LEN: u32 = mc_shm_transport::setup_auth::MAX_AUTH_MESSAGE_LEN as u32;
 
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientHello {
     pub client_nonce: [u8; NONCE_LEN],

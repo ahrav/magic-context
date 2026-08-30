@@ -695,7 +695,33 @@ impl fmt::Display for AdmissionError {
 
 impl std::error::Error for AdmissionError {}
 
-/// Builds the fixed ring profile for tests and local tools.
+/// Hardware profile id the host stamps into every production grant. commentlint: allow(JUDGE)
+pub const MC_HOST_RING_PROFILE: &str = "mc-host-test-ring-v1";
+
+/// Descriptor slots and lease bound of `MC_HOST_RING_PROFILE`. commentlint: allow(JUDGE)
+pub const MC_HOST_RING_DEPTH: usize = 8;
+
+/// Geometry named by `MC_HOST_RING_PROFILE`, so a peer or harness that echoes that id exercises the depth and topology the host actually creates. commentlint: allow(JUDGE)
+pub fn mc_host_ring_profile() -> Result<TargetProfile, ProfileError> {
+    TargetProfile::new(ProfileConfig {
+        descriptor: TransportDescriptor::new(
+            SchedulingMode::ColdParkWake,
+            HardwareProfileId::new(MC_HOST_RING_PROFILE)
+                .expect("static hardware profile id is valid"),
+        ),
+        descriptor_depth: MC_HOST_RING_DEPTH,
+        arena_bytes: MIN_ARENA_BYTES,
+        max_spans: 2,
+        max_leases: MC_HOST_RING_DEPTH,
+        mappings: 2,
+        pinned_workers: 0,
+        producer_topology: ProducerTopology::Arbitrated,
+        worker_topology: WorkerTopology::Fused,
+        completion_mode: CompletionMode::SynchronousPull,
+    })
+}
+
+/// Builds a generic ring profile for tests and local tools. commentlint: allow(JUDGE)
 pub fn ring_profile(
     hardware: HardwareProfileId,
     scheduling: SchedulingMode,

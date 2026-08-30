@@ -15,16 +15,16 @@ use std::time::{Duration, Instant};
 
 use mc_shm_transport::backend::ring::RingGrant;
 use mc_shm_transport::backend::ring::{ProducerReservation, Ring};
-use mc_shm_transport::descriptor::{HardwareProfileId, SchedulingMode};
+use mc_shm_transport::descriptor::SchedulingMode;
 use mc_shm_transport::descriptor::{ReleaseIdentity, WIRE_V2_HEADER_BYTES};
-use mc_shm_transport::profile::ring_profile;
+use mc_shm_transport::profile::mc_host_ring_profile;
 use napi::bindgen_prelude::{Buffer, FnArgs, Function, Object};
 use napi::{sys, Env, Error, JsValue, Result, Status, Unknown, ValueType};
 use napi_derive::napi;
 
 use napi_buffers::ExternalRef;
 
-const PROFILE: &str = "mc-host-test-ring-v1";
+const PROFILE: &str = mc_shm_transport::profile::MC_HOST_RING_PROFILE;
 
 /// The one bounded, redacted failure every malformed raw descriptor maps
 /// to. Grant bytes, pids, fds, and key names never reach error messages.
@@ -630,11 +630,7 @@ pub fn connect_setup(env: &Env, options: NativeSetupOptions) -> Result<u32> {
 #[napi]
 pub fn create_test_pair(env: &Env) -> Result<NativeTestPair> {
     {
-        let profile = ring_profile(
-            HardwareProfileId::new(PROFILE).map_err(|_| error("test profile unavailable"))?,
-            SchedulingMode::ColdParkWake,
-        )
-        .map_err(|_| error("test profile unavailable"))?;
+        let profile = mc_host_ring_profile().map_err(|_| error("test profile unavailable"))?;
         let first_to_second = Ring::create(&profile, 1)
             .map_err(|_| error("shared-memory test pair creation failed"))?;
         let second_from_first = first_to_second
@@ -909,11 +905,7 @@ mod tests {
 
     #[test]
     fn channel_drops_borrowing_reservations_before_the_ring() {
-        let profile = ring_profile(
-            HardwareProfileId::new(PROFILE).expect("static profile"),
-            SchedulingMode::ColdParkWake,
-        )
-        .expect("profile");
+        let profile = mc_host_ring_profile().expect("profile");
         let to_host = Box::new(Ring::create(&profile, 1).expect("producer ring"));
         let from_host = Ring::create(&profile, 2).expect("consumer ring");
         let ring_ptr: *const Ring = to_host.as_ref();

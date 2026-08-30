@@ -12,10 +12,9 @@ use std::{fmt, io};
 use crate::wire::{decode_header, EnvelopeHeader, FrameType};
 use mc_shm_transport::backend::ring::RingGrant;
 use mc_shm_transport::backend::ring::{DuplexRing, ProducerReservation, Ring};
-use mc_shm_transport::descriptor::{HardwareProfileId, SchedulingMode, TransportDescriptor};
+use mc_shm_transport::descriptor::SchedulingMode;
 use mc_shm_transport::profile::{
-    AdmissionController, CompletionMode, HostLimits as ShmHostLimits, ProducerTopology,
-    ProfileConfig, ResourceCharges, TargetProfile, WorkerTopology,
+    AdmissionController, HostLimits as ShmHostLimits, ResourceCharges, TargetProfile,
 };
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -28,8 +27,7 @@ use crate::frame_channel::{
 use crate::wire::{ByteBudget, MAX_CONTROL_BODY_LEN};
 
 /// Current ring profile accepted by every process in one release.
-pub const RING_PROFILE: &str = "mc-host-test-ring-v1";
-const DESCRIPTOR_DEPTH: usize = 8;
+pub const RING_PROFILE: &str = mc_shm_transport::profile::MC_HOST_RING_PROFILE;
 const POLL_INTERVAL: Duration = Duration::from_micros(50);
 
 /// Test-only observer invoked after each successful frame publication with
@@ -39,22 +37,8 @@ const POLL_INTERVAL: Duration = Duration::from_micros(50);
 pub type PublishHook = Arc<dyn Fn(FrameType, u16) + Send + Sync>;
 
 pub fn ring_profile() -> TargetProfile {
-    TargetProfile::new(ProfileConfig {
-        descriptor: TransportDescriptor::new(
-            SchedulingMode::ColdParkWake,
-            HardwareProfileId::new(RING_PROFILE).expect("static hardware profile is valid"),
-        ),
-        descriptor_depth: DESCRIPTOR_DEPTH,
-        arena_bytes: mc_shm_transport::MIN_ARENA_BYTES,
-        max_spans: 2,
-        max_leases: DESCRIPTOR_DEPTH,
-        mappings: 2,
-        pinned_workers: 0,
-        producer_topology: ProducerTopology::Arbitrated,
-        worker_topology: WorkerTopology::Fused,
-        completion_mode: CompletionMode::SynchronousPull,
-    })
-    .expect("static shared-memory profile is valid")
+    mc_shm_transport::profile::mc_host_ring_profile()
+        .expect("static shared-memory profile is valid")
 }
 
 /// Admission limits sufficient for one connection.

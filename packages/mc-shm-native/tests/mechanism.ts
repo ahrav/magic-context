@@ -77,11 +77,11 @@ function loadRawAddon(): RawAttachAddon | null {
     return createRequire(import.meta.url)(path) as RawAttachAddon;
 }
 
-/** Geometry of the `mc-host-test-ring-v1` profile (`ring_profile`). */
-const GRANT_DESCRIPTOR_DEPTH = 32n;
+/** Geometry of the `mc-host-test-ring-v1` profile (`mc_host_ring_profile`). */
+const GRANT_DESCRIPTOR_DEPTH = 8n;
 /** `MIN_ARENA_BYTES` == `MAX_FRAME_BYTES` == 64 MiB. */
 const GRANT_ARENA_BYTES = 67_108_864n;
-const GRANT_MAX_LEASES = 32n;
+const GRANT_MAX_LEASES = 8n;
 /**
  * Bytes the ring layout adds around a page-aligned arena: the control
  * region that precedes it (producer, consumer, and reclaim cache lines
@@ -96,7 +96,7 @@ const GRANT_MAX_LEASES = 32n;
  * test needs the grant to be *valid* — see the unresolvable-descriptor
  * test below, which is the only case that gets past decoding.
  */
-const GRANT_LAYOUT_OVERHEAD_BYTES = 16_384n;
+const GRANT_LAYOUT_OVERHEAD_BYTES = 8_192n;
 
 /**
  * Encodes one RingGrant wire image (layout version 2) as lowercase hex:

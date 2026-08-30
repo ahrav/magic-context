@@ -239,7 +239,14 @@ fn proof(
     daemon_ver: &str,
     daemon_id: &[u8],
 ) -> [u8; PROOF_LEN] {
-    setup_auth::compute_proof(key, domain, client_nonce, server_nonce, daemon_ver, daemon_id)
+    setup_auth::compute_proof(
+        key,
+        domain,
+        client_nonce,
+        server_nonce,
+        daemon_ver,
+        daemon_id,
+    )
 }
 
 fn receive_grant(stream: &mut UnixStream, deadline: Instant) -> io::Result<(Grant, [OwnedFd; 2])> {
