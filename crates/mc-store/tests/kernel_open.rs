@@ -168,10 +168,15 @@ fn every_conclusive_kernel_mismatch_is_quarantined_and_rebuilt() {
 
 #[test]
 fn foreign_family_is_refused_before_sqlite_can_touch_it() {
+    // `FOREIGN_APPLICATION_ID` must differ from `KERNEL_APPLICATION_ID` so the
+    // fixture exercises foreign-header classification.
+    const FOREIGN_APPLICATION_ID: u32 = 0x5A5A_5A5A;
+    assert_ne!(FOREIGN_APPLICATION_ID, KERNEL_APPLICATION_ID);
+
     let dir = tempfile::tempdir().unwrap();
     let path = core_path(dir.path());
     let conn = Connection::open(&path).unwrap();
-    conn.pragma_update(None, "application_id", 0x4D43_5458_u32)
+    conn.pragma_update(None, "application_id", FOREIGN_APPLICATION_ID)
         .unwrap();
     conn.execute_batch("CREATE TABLE legacy(value TEXT);")
         .unwrap();
@@ -189,6 +194,28 @@ fn foreign_family_is_refused_before_sqlite_can_touch_it() {
         fs::read(format!("{}-wal", path.display())).unwrap(),
         before_wal
     );
+    assert!(quarantine_dirs(dir.path()).is_empty());
+}
+
+#[test]
+fn a_sibling_mc_family_is_refused_and_left_untouched() {
+    // `KERNEL_APPLICATION_ID` is shared across mc families; schema inspection
+    // distinguishes them.
+    let dir = tempfile::tempdir().unwrap();
+    let path = core_path(dir.path());
+    let conn = Connection::open(&path).unwrap();
+    conn.pragma_update(None, "application_id", KERNEL_APPLICATION_ID)
+        .unwrap();
+    conn.execute_batch("CREATE TABLE legacy(value TEXT);")
+        .unwrap();
+    drop(conn);
+    let before_main = fs::read(&path).unwrap();
+
+    assert_eq!(
+        KernelStore::open(dir.path()).unwrap_err(),
+        KernelError::Inconclusive
+    );
+    assert_eq!(fs::read(&path).unwrap(), before_main);
     assert!(quarantine_dirs(dir.path()).is_empty());
 }
 

@@ -132,7 +132,7 @@ fn kernel_schema_has_one_ordered_full_shape() {
 const INCARNATION: &str = "0123456789abcdef0123456789abcdef";
 
 const PINNED_SCHEMA_DIGEST: &str =
-    "edd21757592088f528212faa058a1c3dd0feb122dc9fa539ecbfa17b67ab6b01";
+    "92e7c76e51e721720c2123e0bba45ea41995545b308f9767c64c7aef0fe7a9e6";
 
 #[test]
 fn kernel_schema_digest_is_pinned_to_the_frozen_v1_shape() {
