@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
-import { probeCapabilities } from "../index.ts";
+import { NativeChannel, probeCapabilities } from "../index.ts";
 
 const scratch = mkdtempSync(join(tmpdir(), "mc-shm-native-"));
 afterAll(() => rmSync(scratch, { recursive: true, force: true }));
@@ -158,6 +158,47 @@ function validRawDescriptor(): Record<string, unknown> {
         peerToHostGrant: testGrantHex(1, 0xcd),
     };
 }
+
+describe("readiness dispatch", () => {
+    test("one channel handler failure does not starve later channels", async () => {
+        if (!probeCapabilities().available) return;
+        const first = NativeChannel.createTestPair();
+        const second = NativeChannel.createTestPair();
+        let firstCalls = 0;
+        let delivered = false;
+        first.first.startReadiness(() => {
+            firstCalls += 1;
+            throw new Error("first handler failed");
+        });
+        second.first.startReadiness(() => {
+            while (second.first.drainOne((lease) => {
+                delivered = true;
+                lease.release();
+            })) {}
+        });
+        try {
+            const header = new Uint8Array(21);
+            const view = new DataView(header.buffer);
+            view.setUint32(0, 0, true);
+            view.setUint8(4, 2);
+            view.setUint8(5, 3);
+            view.setUint16(7, 1, true);
+            view.setUint32(9, 1, true);
+            second.second.produce(header, 0, () => {});
+            const deadline = Date.now() + 1_000;
+            while (!delivered && Date.now() < deadline) {
+                await new Promise((resolve) => setTimeout(resolve, 1));
+            }
+            expect(firstCalls).toBeGreaterThan(0);
+            expect(delivered).toBe(true);
+        } finally {
+            first.first.close();
+            first.second.close();
+            second.first.close();
+            second.second.close();
+        }
+    });
+});
 
 describe("raw N-API descriptor boundary", () => {
     const DESCRIPTOR_ERROR = /invalid shared-memory descriptor/;

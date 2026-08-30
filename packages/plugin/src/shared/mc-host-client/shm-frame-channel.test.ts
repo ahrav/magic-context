@@ -675,6 +675,48 @@ describe("mandatory shared-memory channel", () => {
         expect(channel.isClosed()).toBe(true);
     });
 
+    test("setup EOF waits for every frame beyond one drain budget", async () => {
+        const closes: FrameChannelCloseReason[] = [];
+        const received: bigint[] = [];
+        const leases = Array.from({ length: 65 }, (_, index) => ({
+            header: encodeHeader(responseHeader(FrameType.Response, BigInt(index + 1), 0)),
+            byteLength: 0,
+            segmentCount: 1,
+            segment: () => new Uint8Array(),
+            release: () => {},
+        })) as unknown as NativeReceiveLease[];
+        const native = {
+            drainOne: (deliver: (lease: NativeReceiveLease) => void) => {
+                const lease = leases.shift();
+                if (!lease) return false;
+                deliver(lease);
+                return true;
+            },
+            startReadiness: (callback: () => void) => callback(),
+            close: () => {},
+            peerClosed: () => true,
+        } as unknown as NativeChannel;
+        const channel = new ShmFrameChannel({
+            nativeChannel: native,
+            budget: new ByteBudget(1024),
+            maxBodyLen: 1 << 20,
+            handlers: {
+                onFrame: (frame) => {
+                    received.push(frame.header.corr);
+                    frame.body.release();
+                },
+                onClosed: (reason) => closes.push(reason),
+            },
+        });
+
+        channel.beginFrames();
+        expect(received).toHaveLength(64);
+        expect(closes).toEqual([]);
+        await waitUntil(() => closes.length === 1);
+        expect(received).toHaveLength(65);
+        expect(closes).toEqual(["eof"]);
+    });
+
     test("handler throw releases JSON lease before fail-close", async () => {
         if (!probeCapabilities().available) return;
         const pair = NativeChannel.createTestPair();

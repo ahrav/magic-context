@@ -1123,10 +1123,11 @@ pub fn watch(channel_id: u32, callback: Function<(), ()>) -> Result<()> {
         let channel = channels
             .get(&channel_id)
             .ok_or_else(|| error("native channel is closed"))?;
-        reactor
-            .as_mut()
-            .expect("reactor initialized")
-            .register(channel_id, &channel.from_host)
+        reactor.as_mut().expect("reactor initialized").register(
+            channel_id,
+            &channel.from_host,
+            channel.setup.as_ref(),
+        )
     })
 }
 
@@ -1151,6 +1152,9 @@ pub fn poll(
         let mut registry = registry
             .try_borrow_mut()
             .map_err(|_| error("native channel is busy"))?;
+        if let Some(reactor) = registry.reactor.as_ref() {
+            reactor.ensure_healthy()?;
+        }
         let channel = registry
             .channels
             .get_mut(&channel_id)
@@ -1206,10 +1210,15 @@ pub fn poll(
                 .channels
                 .get(&channel_id)
                 .ok_or_else(|| error("native channel is closed"))?;
-            channel
+            let should_block = channel
                 .from_host
                 .arm_data_wait()
                 .map_err(|_| error("shared-memory receive failed"))?;
+            if !should_block {
+                if let Some(reactor) = registry.reactor.as_ref() {
+                    reactor.kick();
+                }
+            }
             Ok::<(), Error>(())
         })?;
         return Ok(false);

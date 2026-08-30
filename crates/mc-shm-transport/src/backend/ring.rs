@@ -980,19 +980,47 @@ impl Ring {
                     .parked
                     .store(generation.wrapping_add(1), Ordering::Release)
             };
+            match self.try_reserve(bound, wire_header) {
+                Err(ProducerError::Exhausted) if Instant::now() < deadline => {}
+                Err(ProducerError::Exhausted) => {
+                    unsafe { (*wake).parked.store(0, Ordering::Release) };
+                    return Err(ProducerError::Deadline);
+                }
+                result => {
+                    unsafe { (*wake).parked.store(0, Ordering::Release) };
+                    return result;
+                }
+            }
             if unsafe { (*wake).generation.load(Ordering::Acquire) } != generation {
                 unsafe { (*wake).parked.store(0, Ordering::Release) };
                 continue;
             }
-            self.capacity_ready.drain().map_err(ProducerError::Ring)?;
+            if let Err(error) = self.capacity_ready.drain() {
+                unsafe { (*wake).parked.store(0, Ordering::Release) };
+                return Err(ProducerError::Ring(error));
+            }
+            match self.try_reserve(bound, wire_header) {
+                Err(ProducerError::Exhausted) if Instant::now() < deadline => {}
+                Err(ProducerError::Exhausted) => {
+                    unsafe { (*wake).parked.store(0, Ordering::Release) };
+                    return Err(ProducerError::Deadline);
+                }
+                result => {
+                    unsafe { (*wake).parked.store(0, Ordering::Release) };
+                    return result;
+                }
+            }
             if unsafe { (*wake).generation.load(Ordering::Acquire) } != generation {
                 unsafe { (*wake).parked.store(0, Ordering::Release) };
                 continue;
             }
-            let ready = self
-                .capacity_ready
-                .wait_until(deadline)
-                .map_err(ProducerError::Ring)?;
+            let ready = match self.capacity_ready.wait_until(deadline) {
+                Ok(ready) => ready,
+                Err(error) => {
+                    unsafe { (*wake).parked.store(0, Ordering::Release) };
+                    return Err(ProducerError::Ring(error));
+                }
+            };
             unsafe { (*wake).parked.store(0, Ordering::Release) };
             if !ready && Instant::now() >= deadline {
                 return Err(ProducerError::Deadline);

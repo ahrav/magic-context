@@ -526,7 +526,13 @@ const readinessHandlers = new Map<number, () => void>();
 
 function dispatchReadiness(): void {
     try {
-        for (const handler of [...readinessHandlers.values()]) handler();
+        for (const handler of [...readinessHandlers.values()]) {
+            try {
+                handler();
+            } catch {
+                // One failed channel cannot starve readiness for other channels.
+            }
+        }
     } finally {
         loaded?.readinessHandled();
     }

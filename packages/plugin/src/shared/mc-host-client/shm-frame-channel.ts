@@ -69,6 +69,7 @@ export class ShmFrameChannel implements SetupFrameChannel {
     private native: NativeChannel | null;
     private readonly copies = new CopyCounter();
     private readinessStarted = false;
+    private drainScheduled = false;
     private closed = false;
     private readonly receiveLeases = new Set<ReceiveLease>();
     private quarantinedBytes = 0;
@@ -383,17 +384,27 @@ export class ShmFrameChannel implements SetupFrameChannel {
                         lease.release();
                         throw error;
                     }
-                })) break;
-            }
-            // Readiness includes setup-socket closure. Check after draining so graceful Goodbye reaches dispatcher first. commentlint: allow(JUDGE)
-            if (this.attached().peerClosed()) {
-                this.options.handlers.onClosed("eof", undefined);
-                try {
-                    this.close();
-                } catch {
-                    // close() rethrows on quarantined leases; readiness callback has no caller.
+                })) {
+                    // Readiness includes setup-socket closure. Check only after an empty drain so graceful Goodbye reaches dispatcher first. commentlint: allow(JUDGE)
+                    if (this.attached().peerClosed()) {
+                        this.options.handlers.onClosed("eof", undefined);
+                        try {
+                            this.close();
+                        } catch {
+                            // close() rethrows on quarantined leases; readiness callback has no caller.
+                        }
+                    }
+                    return;
                 }
             }
+            if (!this.drainScheduled) {
+                this.drainScheduled = true;
+                queueMicrotask(() => {
+                    this.drainScheduled = false;
+                    if (!this.closed) this.drainReady();
+                });
+            }
+            return;
         } catch (error) {
             this.options.handlers.onClosed(
                 error instanceof InboundFrameError ? error.reason : "protocol_violation",
