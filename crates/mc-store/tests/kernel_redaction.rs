@@ -269,3 +269,95 @@ fn staging_run_reuse_with_changed_immutable_metadata_is_a_typed_conflict() {
         .unwrap();
     assert_eq!(renewal, (1, 11));
 }
+
+#[test]
+fn one_run_accepts_candidates_with_different_classifications() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let mut clean = shared_run_candidate("candidate-clean", 1);
+    clean.payload = "public source".to_string();
+    let mut secret = shared_run_candidate("candidate-secret", 2);
+    secret.payload = format!("payload {SECRET}");
+
+    assert_eq!(
+        store.stage_candidate(clean).unwrap().sensitivity,
+        Sensitivity::Normal
+    );
+    assert_eq!(
+        store.stage_candidate(secret).unwrap().sensitivity,
+        Sensitivity::Sensitive
+    );
+
+    let connection = Connection::open_with_flags(
+        directory.path().join("core.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let run_class: String = connection
+        .query_row("SELECT sensitivity_class FROM extraction_runs", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        run_class, "normal",
+        "run classification must not follow one candidate"
+    );
+    let mut classes = connection
+        .prepare("SELECT sensitivity_class FROM candidates ORDER BY candidate_id")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    classes.sort();
+    assert_eq!(classes, ["normal", "sensitive"]);
+}
+
+#[test]
+fn run_identity_fields_reject_a_detected_secret() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    for mutate in [
+        |spec: &mut StagingCandidateSpec| spec.source_id = format!("src {SECRET}"),
+        |spec: &mut StagingCandidateSpec| spec.extractor = format!("tool {SECRET}"),
+    ] {
+        let mut spec = shared_run_candidate("candidate-a", 1);
+        mutate(&mut spec);
+        assert_eq!(
+            store.stage_candidate(spec).unwrap_err(),
+            KernelError::InvalidInput
+        );
+    }
+}
+
+#[test]
+fn a_terminal_or_expired_run_refuses_further_candidates() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    store
+        .stage_candidate(shared_run_candidate("candidate-a", 1))
+        .unwrap();
+
+    // recorded_at past the stored lease_expires_at of 11.
+    assert_eq!(
+        store
+            .stage_candidate(shared_run_candidate("candidate-late", 99))
+            .unwrap_err(),
+        KernelError::Conflict
+    );
+
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE extraction_runs SET terminal_state='completed',terminal_at=5",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    assert_eq!(
+        store
+            .stage_candidate(shared_run_candidate("candidate-after-terminal", 2))
+            .unwrap_err(),
+        KernelError::Conflict
+    );
+}

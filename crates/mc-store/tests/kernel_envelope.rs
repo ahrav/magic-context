@@ -681,3 +681,54 @@ fn a_constraint_violation_is_a_conflict_rather_than_an_io_failure() {
     assert!(!error.is_retryable());
     assert!(KernelError::Busy.is_retryable());
 }
+
+#[test]
+fn a_swallowed_mutation_error_cannot_commit_a_partial_correction() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    store
+        .commit(intent("seed-a", 'a'), |envelope| {
+            envelope.insert_domain(domain(1))?;
+            Ok(String::new())
+        })
+        .unwrap();
+    let mut taken = domain(2);
+    taken.name = "occupied".to_string();
+    store
+        .commit(intent("seed-b", 'b'), |envelope| {
+            envelope.insert_domain(taken)?;
+            Ok(String::new())
+        })
+        .unwrap();
+
+    // The replacement collides with the live name held by object-2, so
+    // correct_domain fails after it has already invalidated object-1.
+    let mut colliding = domain(3);
+    colliding.name = "occupied".to_string();
+    let error = store
+        .commit(intent("swallow", 'c'), |envelope| {
+            let _ = envelope.correct_domain("object-1", colliding);
+            Ok("swallowed".to_string())
+        })
+        .unwrap_err();
+    assert_eq!(error, KernelError::Conflict);
+
+    let live = store
+        .known_as_of(store.known_as_of(0).unwrap().tip)
+        .unwrap();
+    let mut ids = live
+        .objects
+        .iter()
+        .map(|row| row.object_id.as_str())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        ["object-1", "object-2"],
+        "invalidation must not survive"
+    );
+    assert_eq!(
+        inspect(directory.path(), "SELECT COUNT(*) FROM commit_log"),
+        2
+    );
+}

@@ -136,10 +136,27 @@ pub struct Envelope<'tx> {
     tx: &'tx Transaction<'tx>,
     commit_seq: i64,
     changes: Vec<PendingChange>,
+    poisoned: Option<KernelError>,
 }
 
 impl Envelope<'_> {
+    /// A mutation can fail after writing part of its rows, and a caller may discard that `Err`. Recording it here lets `commit` refuse a transaction whose change set no longer describes its writes.
+    fn poison<T>(&mut self, result: Result<T, KernelError>) -> Result<T, KernelError> {
+        if let Err(error) = &result {
+            self.poisoned = Some(*error);
+        }
+        result
+    }
+
     pub fn insert_domain(&mut self, spec: DomainSpec) -> Result<(), KernelError> {
+        if let Some(error) = self.poisoned {
+            return Err(error);
+        }
+        let outcome = self.insert_domain_inner(spec);
+        self.poison(outcome)
+    }
+
+    fn insert_domain_inner(&mut self, spec: DomainSpec) -> Result<(), KernelError> {
         let spec = RedactedDomain::new(spec)?;
         insert_domain(self.tx, self.commit_seq, &spec)?;
         self.changes.push(PendingChange {
@@ -153,6 +170,18 @@ impl Envelope<'_> {
 
     /// `replaced_object_id` selects the row to supersede, so redacting it could resolve a different object.
     pub fn correct_domain(
+        &mut self,
+        replaced_object_id: &str,
+        replacement: DomainSpec,
+    ) -> Result<(), KernelError> {
+        if let Some(error) = self.poisoned {
+            return Err(error);
+        }
+        let outcome = self.correct_domain_inner(replaced_object_id, replacement);
+        self.poison(outcome)
+    }
+
+    fn correct_domain_inner(
         &mut self,
         replaced_object_id: &str,
         replacement: DomainSpec,
@@ -173,6 +202,14 @@ impl Envelope<'_> {
 
     /// `object_id` selects the row to retire, so redacting it could resolve a different object.
     pub fn retire_domain(&mut self, object_id: &str) -> Result<(), KernelError> {
+        if let Some(error) = self.poisoned {
+            return Err(error);
+        }
+        let outcome = self.retire_domain_inner(object_id);
+        self.poison(outcome)
+    }
+
+    fn retire_domain_inner(&mut self, object_id: &str) -> Result<(), KernelError> {
         let object_id = identity(object_id)?;
         let mut object = self.invalidate_domain(&object_id)?;
         object.invalidated_commit_seq = Some(self.commit_seq);
@@ -324,8 +361,12 @@ impl KernelStore {
             tx: &tx,
             commit_seq,
             changes: Vec::new(),
+            poisoned: None,
         };
         let result = operation(&mut envelope)?;
+        if let Some(error) = envelope.poisoned {
+            return Err(error);
+        }
         let result = redact(&result);
 
         let payloads = envelope
@@ -500,43 +541,50 @@ impl KernelStore {
         spec: StagingCandidateSpec,
     ) -> Result<StagingCandidateRow, KernelError> {
         let spec = RedactedCandidate::new(spec)?;
-        let sensitivity = spec.sensitivity();
+        let run_sensitivity = spec.run_sensitivity();
+        let candidate_sensitivity = spec.candidate_sensitivity();
         let mut writer = self.lock_writer()?;
         let tx = writer
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite)?;
         check_fence(&tx, self.lease_epoch())?;
         let provenance = spec.provenance_json()?;
-        let run_metadata = spec.run_detection_json()?;
         let existing = tx
             .query_row(
                 "SELECT extractor,source_kind,source_id,source_revision,sensitivity_class,
-                        provenance_witness
+                        provenance_witness,terminal_state,lease_expires_at
                  FROM extraction_runs WHERE extraction_run_id=?1",
                 [spec.extraction_run_id.as_str()],
                 |row| {
                     Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<i64>>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Vec<u8>>(5)?,
+                        (
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<i64>>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, Vec<u8>>(5)?,
+                        ),
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, i64>(7)?,
                     ))
                 },
             )
             .optional()
             .map_err(map_sqlite)?;
-        if let Some(existing) = existing {
+        if let Some((stored_identity, terminal_state, lease_expires_at)) = existing {
             let expected = (
-                spec.extractor.text.clone(),
-                Some(spec.source_kind.text.clone()),
-                Some(spec.source_id.text.clone()),
+                spec.extractor.clone(),
+                Some(spec.source_kind.clone()),
+                Some(spec.source_id.clone()),
                 Some(spec.source_revision),
-                sensitivity.as_str().to_string(),
+                run_sensitivity.as_str().to_string(),
                 provenance.clone(),
             );
-            if existing != expected {
+            if stored_identity != expected
+                || terminal_state.is_some()
+                || lease_expires_at < spec.recorded_at
+            {
                 return Err(KernelError::Conflict);
             }
             tx.execute(
@@ -559,19 +607,18 @@ impl KernelStore {
                  ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10)",
                 params![
                     spec.extraction_run_id,
-                    spec.extractor.text,
-                    spec.source_kind.text,
-                    spec.source_id.text,
+                    spec.extractor,
+                    spec.source_kind,
+                    spec.source_id,
                     spec.source_revision,
-                    sensitivity.as_str(),
+                    run_sensitivity.as_str(),
                     provenance,
-                    run_metadata,
+                    b"[]".to_vec(),
                     spec.recorded_at,
                     spec.lease_expires_at,
                 ],
             )
             .map_err(map_sqlite)?;
-            spec.record_run(&tx)?;
         }
         let candidate_metadata = spec.candidate_detection_json()?;
         tx.execute(
@@ -584,7 +631,7 @@ impl KernelStore {
                 spec.extraction_run_id,
                 spec.candidate_kind.text,
                 spec.payload.text,
-                sensitivity.as_str(),
+                candidate_sensitivity.as_str(),
                 provenance,
                 candidate_metadata,
                 spec.recorded_at,
@@ -597,7 +644,7 @@ impl KernelStore {
         Ok(StagingCandidateRow {
             candidate_id: spec.candidate_id,
             payload: spec.payload.text,
-            sensitivity,
+            sensitivity: candidate_sensitivity,
         })
     }
 
@@ -817,13 +864,13 @@ fn load_object(tx: &Transaction<'_>, object_id: &str) -> Result<Option<ObjectRow
 struct RedactedCandidate {
     extraction_run_id: String,
     candidate_id: String,
-    extractor: RedactedField,
-    source_kind: RedactedField,
-    source_id: RedactedField,
+    extractor: String,
+    source_kind: String,
+    source_id: String,
     source_revision: i64,
     candidate_kind: RedactedField,
     payload: RedactedField,
-    provenance: Option<(RedactedField, RedactedField)>,
+    provenance: Option<(String, String)>,
     recorded_at: i64,
     lease_expires_at: i64,
 }
@@ -841,9 +888,9 @@ impl RedactedCandidate {
         Ok(Self {
             extraction_run_id: identity(&spec.extraction_run_id)?,
             candidate_id: identity(&spec.candidate_id)?,
-            extractor: redact(&spec.extractor),
-            source_kind: redact(&spec.source_kind),
-            source_id: redact(&spec.source_id),
+            extractor: identity(&spec.extractor)?,
+            source_kind: identity(&spec.source_kind)?,
+            source_id: identity(&spec.source_id)?,
             source_revision: spec.source_revision,
             candidate_kind: redact(&spec.candidate_kind),
             payload: redact(&spec.payload),
@@ -852,23 +899,36 @@ impl RedactedCandidate {
                 .filter(|value| {
                     !value.repository_id.trim().is_empty() && !value.revision.trim().is_empty()
                 })
-                .map(|value| (redact(&value.repository_id), redact(&value.revision))),
+                .map(|value| {
+                    Ok::<_, KernelError>((
+                        identity(&value.repository_id)?,
+                        identity(&value.revision)?,
+                    ))
+                })
+                .transpose()?,
             recorded_at: spec.recorded_at,
             lease_expires_at: spec.lease_expires_at,
         })
     }
 
-    /// Repository provenance does not by itself make a payload shareable.
-    fn sensitivity(&self) -> Sensitivity {
-        let detected = self
-            .candidate_fields()
-            .into_iter()
-            .chain(self.run_fields())
-            .any(|(_, field)| !field.detections.is_empty());
-        if self.provenance.is_some() && !detected {
+    fn run_sensitivity(&self) -> Sensitivity {
+        if self.provenance.is_some() {
             Sensitivity::Normal
         } else {
             Sensitivity::Sensitive
+        }
+    }
+
+    /// Repository provenance does not by itself make a payload shareable.
+    fn candidate_sensitivity(&self) -> Sensitivity {
+        let detected = self
+            .candidate_fields()
+            .into_iter()
+            .any(|(_, field)| !field.detections.is_empty());
+        if detected {
+            Sensitivity::Sensitive
+        } else {
+            self.run_sensitivity()
         }
     }
 
@@ -876,25 +936,12 @@ impl RedactedCandidate {
         match &self.provenance {
             Some((repository_id, revision)) => serde_json::to_vec(&serde_json::json!({
                 "kind": "repository",
-                "repository_id": repository_id.text,
-                "revision": revision.text,
+                "repository_id": repository_id,
+                "revision": revision,
             })),
             None => serde_json::to_vec(&serde_json::json!({"kind": "unclassified"})),
         }
         .map_err(|_| KernelError::InvalidInput)
-    }
-
-    fn run_fields(&self) -> Vec<(&'static str, &RedactedField)> {
-        let mut fields = vec![
-            ("extractor", &self.extractor),
-            ("source_kind", &self.source_kind),
-            ("source_id", &self.source_id),
-        ];
-        if let Some((repository_id, revision)) = &self.provenance {
-            fields.push(("repository_id", repository_id));
-            fields.push(("revision", revision));
-        }
-        fields
     }
 
     fn candidate_fields(&self) -> Vec<(&'static str, &RedactedField)> {
@@ -931,26 +978,8 @@ impl RedactedCandidate {
         serde_json::to_vec(&metadata).map_err(|_| KernelError::InvalidInput)
     }
 
-    fn run_detection_json(&self) -> Result<Vec<u8>, KernelError> {
-        self.detection_json(self.run_fields())
-    }
-
     fn candidate_detection_json(&self) -> Result<Vec<u8>, KernelError> {
         self.detection_json(self.candidate_fields())
-    }
-
-    fn record_run(&self, tx: &Transaction<'_>) -> Result<(), KernelError> {
-        for (name, field) in self.run_fields() {
-            record(
-                tx,
-                "extraction_run",
-                &self.extraction_run_id,
-                name,
-                field,
-                None,
-            )?;
-        }
-        Ok(())
     }
 
     fn record(&self, tx: &Transaction<'_>) -> Result<(), KernelError> {

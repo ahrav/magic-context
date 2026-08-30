@@ -49,7 +49,7 @@ pub enum KernelError {
 impl KernelError {
     /// Returns true only when retrying the unchanged request is valid.
     pub fn is_retryable(self) -> bool {
-        matches!(self, Self::Busy)
+        matches!(self, Self::Busy | Self::Held)
     }
 }
 
