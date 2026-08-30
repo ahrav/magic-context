@@ -313,10 +313,19 @@ pub fn render_decayed_compartments(
     }
     let mut tiers = compute_tiers(compartments, history_budget_tokens);
 
-    let render = |tiers: &[u8]| -> String {
-        let mut parts = Vec::new();
+    // `render_one_compartment` depends only on compartment and tier, so each
+    // cache slot is reusable across the demotion loop's re-renders.
+    let mut rendered_cache: Vec<std::collections::HashMap<u8, String>> =
+        vec![std::collections::HashMap::new(); compartments.len()];
+    let mut render = |tiers: &[u8]| -> String {
         for (i, c) in compartments.iter().enumerate() {
-            let rendered = render_one_compartment(c, tiers[i]);
+            rendered_cache[i]
+                .entry(tiers[i])
+                .or_insert_with(|| render_one_compartment(c, tiers[i]));
+        }
+        let mut parts: Vec<&str> = Vec::with_capacity(compartments.len());
+        for (i, _) in compartments.iter().enumerate() {
+            let rendered = &rendered_cache[i][&tiers[i]];
             if !rendered.is_empty() {
                 parts.push(rendered);
             }

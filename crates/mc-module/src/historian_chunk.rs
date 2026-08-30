@@ -793,17 +793,34 @@ pub fn truncate_historian_input_if_needed(input: &str, token_budget: usize) -> S
     // TypeScript slices by UTF-16 code units. Keep the same search space rather than
     // treating an astral character as one scalar; a cut through a surrogate pair is
     // represented by the replacement scalar Rust can safely emit for that lone unit.
-    let input_units: Vec<u16> = input.encode_utf16().collect();
+    const MID_PAIR: usize = usize::MAX;
+    let mut byte_at_unit = Vec::with_capacity(input.len() + 1);
+    for (byte_offset, ch) in input.char_indices() {
+        byte_at_unit.push(byte_offset);
+        if ch.len_utf16() == 2 {
+            byte_at_unit.push(MID_PAIR);
+        }
+    }
+    byte_at_unit.push(input.len());
+    let unit_len = byte_at_unit.len() - 1;
+
+    let byte_end_for = |requested: usize| -> usize {
+        let mut end = requested.min(unit_len);
+        if byte_at_unit[end] == MID_PAIR {
+            end -= 1;
+        }
+        byte_at_unit[end]
+    };
+
+    let mut candidate = String::with_capacity(input.len() + HISTORIAN_TRUNCATION_MARKER.len());
     let mut lo = 0usize;
-    let mut hi = input_units.len();
+    let mut hi = unit_len;
     let mut best = 0usize;
     while lo <= hi {
         let mid = (lo + hi) >> 1;
-        let candidate = format!(
-            "{}{}",
-            utf16_prefix(&input_units, mid),
-            HISTORIAN_TRUNCATION_MARKER
-        );
+        candidate.clear();
+        candidate.push_str(&input[..byte_end_for(mid)]);
+        candidate.push_str(HISTORIAN_TRUNCATION_MARKER);
         if estimate_tokens(&candidate) <= token_budget {
             best = mid;
             lo = mid + 1;
@@ -814,19 +831,11 @@ pub fn truncate_historian_input_if_needed(input: &str, token_budget: usize) -> S
         }
     }
 
-    format!(
-        "{}{}",
-        utf16_prefix(&input_units, best),
-        HISTORIAN_TRUNCATION_MARKER
-    )
-}
-
-fn utf16_prefix(units: &[u16], requested: usize) -> String {
-    let mut end = requested.min(units.len());
-    if end > 0 && (0xD800..=0xDBFF).contains(&units[end - 1]) {
-        end -= 1;
-    }
-    String::from_utf16_lossy(&units[..end])
+    candidate.clear();
+    candidate.push_str(&input[..byte_end_for(best)]);
+    candidate.push_str(HISTORIAN_TRUNCATION_MARKER);
+    candidate.shrink_to_fit();
+    candidate
 }
 
 fn end_placeholder(start: u64) -> u64 {
