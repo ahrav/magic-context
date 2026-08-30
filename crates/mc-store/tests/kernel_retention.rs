@@ -459,7 +459,7 @@ fn renew_advances_the_lease_for_a_run_whose_id_carries_a_secret() {
     assert_eq!(leases, (10, 10 + HOUR_MS, 10, 10 + HOUR_MS));
 
     // A shorter lease must not pull the expiry back into the sweep's reach.
-    store.renew_staging_run(&run, 20, 20).unwrap();
+    store.renew_staging_run(&run, 20, 21).unwrap();
     let after: (i64, i64) = connection
         .query_row(
             "SELECT heartbeat_at,lease_expires_at FROM extraction_runs",
@@ -480,7 +480,7 @@ fn renew_rejects_an_unknown_run_a_backwards_heartbeat_and_an_expired_lease() {
 
     assert_eq!(
         store
-            .renew_staging_run("absent", 100, 100)
+            .renew_staging_run("absent", 100, 101)
             .unwrap_err()
             .kind(),
         KernelErrorKind::NotFound
@@ -502,7 +502,7 @@ fn renew_rejects_an_unknown_run_a_backwards_heartbeat_and_an_expired_lease() {
     // The stored lease ends at 100 + HOUR_MS, so a heartbeat at that instant is too late.
     assert_eq!(
         store
-            .renew_staging_run("run", 100 + HOUR_MS, 100 + HOUR_MS)
+            .renew_staging_run("run", 100 + HOUR_MS, 100 + HOUR_MS + 1)
             .unwrap_err()
             .kind(),
         KernelErrorKind::Conflict
@@ -922,5 +922,31 @@ fn staging_a_candidate_cannot_reach_back_before_the_run_heartbeat() {
             )
             .unwrap(),
         (200, 250)
+    );
+}
+
+#[test]
+fn a_lease_that_expires_at_its_own_instant_is_rejected() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let mut zero_length = candidate("run", "candidate", 100);
+    zero_length.lease_expires_at = 100;
+
+    // Accepting it would insert a run already expired at its own recorded_at, which every
+    // other writer then refuses.
+    assert_eq!(
+        store.stage_candidate(zero_length).unwrap_err().kind(),
+        KernelErrorKind::InvalidInput
+    );
+    assert_eq!(
+        inspect(directory.path())
+            .query_row("SELECT COUNT(*) FROM extraction_runs", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store.renew_staging_run("run", 100, 100).unwrap_err().kind(),
+        KernelErrorKind::InvalidInput
     );
 }

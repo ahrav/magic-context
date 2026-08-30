@@ -44,7 +44,7 @@ impl KernelStore {
     ///
     /// # Errors
     ///
-    /// - Returns [`KernelError::InvalidInput`] when the id is empty, a timestamp is negative, or the lease falls outside `heartbeat_at ..= heartbeat_at + 1h`.
+    /// - Returns [`KernelError::InvalidInput`] when the id is empty, a timestamp is negative, or the lease falls outside `heartbeat_at+1 ..= heartbeat_at + 1h`.
     /// - Returns [`KernelError::NotFound`] when no run has the id.
     /// - Returns [`KernelError::Conflict`] when the run is terminal, its lease has expired, or `heartbeat_at` moves the heartbeat backwards.
     pub fn renew_staging_run(
@@ -290,7 +290,7 @@ fn validate_lease(
 ) -> Result<(), KernelError> {
     if extraction_run_id.trim().is_empty()
         || heartbeat_at < 0
-        || lease_expires_at < heartbeat_at
+        || lease_expires_at <= heartbeat_at
         || lease_expires_at > heartbeat_at.saturating_add(HOUR_MS)
     {
         return Err(KernelError::InvalidInput);

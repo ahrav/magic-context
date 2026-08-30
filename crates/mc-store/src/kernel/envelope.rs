@@ -1027,7 +1027,7 @@ impl RedactedCandidate {
     fn new(spec: StagingCandidateSpec) -> Result<Self, KernelError> {
         if spec.source_revision < 0
             || spec.recorded_at < 0
-            || spec.lease_expires_at < spec.recorded_at
+            || spec.lease_expires_at <= spec.recorded_at
             || spec.lease_expires_at > spec.recorded_at.saturating_add(super::retention::HOUR_MS)
         {
             return Err(KernelError::InvalidInput);
