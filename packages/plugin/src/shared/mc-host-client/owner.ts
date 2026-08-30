@@ -29,11 +29,10 @@ export function processMcHostClient(options: ProcessMcHostClientOptions): Promis
         (client) => {
             if (clients.get(key) === entry) entry.client = client;
         },
-        () => {},
+        () => {
+            if (clients.get(key) === entry) clients.delete(key);
+        },
     );
-    void created.catch(() => {
-        if (clients.get(key) === entry) clients.delete(key);
-    });
     return created;
 }
 

@@ -139,16 +139,6 @@ impl RingTransport {
         }
     }
 
-    /// Aggregate profile charge used by admission tests.
-    pub fn profile_charges(&self) -> ResourceCharges {
-        self.profile.charges()
-    }
-
-    /// Number of clients that completed fixed-ring attachment.
-    pub fn preparation_count(&self) -> u64 {
-        self.preparations.load(Ordering::Acquire)
-    }
-
     /// Returns redacted aggregate admission accounting.
     pub fn accounting(
         &self,
@@ -779,7 +769,6 @@ mod tests {
     #[test]
     fn construction_has_no_ring_side_effects() {
         let transport = RingTransport::for_ring_profile(per_connection_limits());
-        assert_eq!(transport.preparation_count(), 0);
         let accounting = transport.accounting().unwrap();
         assert_eq!(accounting.active, ResourceCharges::ZERO);
         assert_eq!(accounting.quarantined, ResourceCharges::ZERO);
