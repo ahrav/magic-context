@@ -1378,6 +1378,7 @@ dependencies = [
  "cortexkit-lease",
  "cortexkit-store",
  "cortexkit-store-types",
+ "criterion",
  "filetime",
  "libc",
  "mc-core",
