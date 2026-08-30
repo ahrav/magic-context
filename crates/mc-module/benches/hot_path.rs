@@ -207,7 +207,8 @@ fn bench_e2e_first_hard(c: &mut Criterion) {
                         let ctx = producer_ctx(dir.path().to_str().expect("utf8 dir"));
                         let out = transform(&store, &req, &ctx).expect("hard pass");
                         black_box(out.status);
-                        dir
+                        // Return owned inputs so cleanup occurs after Criterion stops timing.
+                        (dir, store, req)
                     },
                     criterion::BatchSize::PerIteration,
                 )
