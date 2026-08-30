@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { McHostCallError } from "../../../shared/mc-host-client";
+import { WaiterDetachedError } from "../../../shared/mc-host-lifecycle";
 import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import {
@@ -30,7 +31,11 @@ import {
 } from "./embedding-synapse";
 
 class MockSynapseClient implements SynapseClientLike {
-    readonly requests: Array<{ method: string; params: unknown }> = [];
+    readonly requests: Array<{
+        method: string;
+        params: unknown;
+        expectedDaemonId?: Uint8Array;
+    }> = [];
     private batchAttempts = 0;
     constructor(private readonly batchSize = 2) {}
 
@@ -38,8 +43,20 @@ class MockSynapseClient implements SynapseClientLike {
         _module: string,
         method: string,
         params?: unknown,
+        options?: {
+            timeoutMs?: number;
+            identity?: { project_root: string; harness: string; session: string };
+            targetKind?: "management_surface" | "tool_provider";
+            expectedDaemonId?: Uint8Array;
+        },
     ): Promise<Response> {
-        this.requests.push({ method, params });
+        this.requests.push({
+            method,
+            params,
+            ...(options?.expectedDaemonId === undefined
+                ? {}
+                : { expectedDaemonId: options.expectedDaemonId }),
+        });
         if (method === "models.list") {
             return {
                 models: [
@@ -208,6 +225,27 @@ describe("SynapseEmbeddingProvider", () => {
         expect(demands).toBe(1);
     });
 
+    it("does not re-demand when a managed demand succeeds without a daemon identity", async () => {
+        // A success that omits the identity certifies no incarnation, so the
+        // lane cannot dial. That is a failed demand and must arm the same
+        // backoff; otherwise each later call spawns another native lifecycle
+        // start and storage probe at request rate.
+        let demands = 0;
+        const provider = new SynapseEmbeddingProvider({
+            projectRoot: "/repo",
+            session: "managed-demand-no-identity",
+            demandStart: async () => {
+                demands += 1;
+                return { ok: true, reason: "started", storage: "ready" };
+            },
+            connectionOrigin: "managed-default",
+        });
+
+        expect(await provider.initialize()).toBe(false);
+        expect(await provider.initialize()).toBe(false);
+        expect(demands).toBe(1);
+    });
+
     it("discovers a certified model and sends the required artifact constraints", async () => {
         const client = new MockSynapseClient();
         const provider = new SynapseEmbeddingProvider({
@@ -232,6 +270,214 @@ describe("SynapseEmbeddingProvider", () => {
             allow_equivalent: false,
             accept_declared: false,
         });
+    });
+
+    it("binds Synapse calls to the lifecycle-compatible daemon identity", async () => {
+        const client = new MockSynapseClient();
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "daemon-bound",
+            clientFactory: async () => client,
+        });
+        const expectedDaemonId = new Uint8Array([1, 2, 3, 4]);
+        (
+            provider as unknown as {
+                compatibleDaemonId: Uint8Array | null;
+            }
+        ).compatibleDaemonId = expectedDaemonId;
+
+        expect(await provider.initialize()).toBe(true);
+        expect(client.requests[0]?.expectedDaemonId).toEqual(expectedDaemonId);
+    });
+
+    it("refuses to publish on the managed lane without a certified daemon identity", async () => {
+        const client = new MockSynapseClient();
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "fence-required",
+            clientFactory: async () => client,
+            // A lifecycle owner is part of the scenario, not scaffolding: it is
+            // the only writer of a certified identity, so a cleared identity is
+            // reachable only on a lane that has one. The injected factory keeps
+            // the origin non-managed until the state below is installed, so this
+            // owner is never invoked.
+            demandStart: async () => ({
+                ok: true,
+                reason: "started",
+                storage: "ready",
+                authenticatedDaemonId: new Uint8Array([4, 2]),
+            }),
+        });
+        expect(await provider.initialize()).toBe(true);
+
+        // Reproduce the post-rotation state the failure handler installs: the
+        // lane is managed and its certified identity has been cleared. An
+        // omitted expectation would publish unfenced onto the rotated daemon.
+        const internals = provider as unknown as {
+            connectionOrigin: string;
+            compatibleDaemonId: Uint8Array | null;
+        };
+        internals.connectionOrigin = "managed-default";
+        internals.compatibleDaemonId = null;
+        const published = client.requests.length;
+
+        // `embed` reports a failed lane as null; the load-bearing assertion is
+        // that no request reached the wire without an expectation.
+        expect(await provider.embed("hello")).toBeNull();
+        expect(client.requests.length).toBe(published);
+    });
+
+    it("dials a managed-default lane that has no lifecycle owner to certify it", async () => {
+        // With no owner configured the lane is dial-only, and no identity is
+        // ever certified, so requiring one would refuse the very first
+        // discovery call against an already-running daemon.
+        const client = new MockSynapseClient();
+        const provider = new SynapseEmbeddingProvider({
+            projectRoot: "/repo",
+            session: "passive-dial",
+            clientFactory: async () => client,
+        });
+        const internals = provider as unknown as {
+            connectionOrigin: string;
+            demandStart: unknown;
+            compatibleDaemonId: Uint8Array | null;
+        };
+        internals.connectionOrigin = "managed-default";
+        expect(internals.demandStart).toBeUndefined();
+
+        expect(await provider.initialize()).toBe(true);
+        expect(internals.compatibleDaemonId).toBeNull();
+        const discovery = client.requests.find((entry) => entry.method === "models.list");
+        expect(discovery).toBeDefined();
+        // Nothing certified an incarnation, so the call carries no expectation
+        // and the daemon's own handshake is the only fence available.
+        expect(discovery?.expectedDaemonId).toBeUndefined();
+    });
+
+    it("re-certification leaves an identity a sibling already certified in place", async () => {
+        const client = new MockSynapseClient();
+        const certified = new Uint8Array([9, 1]);
+        const recertified = new Uint8Array([9, 2]);
+        let release = (): void => {};
+        const gate = new Promise<void>((resolve) => {
+            release = () => resolve();
+        });
+        let demands = 0;
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "recertify-sibling",
+            clientFactory: async () => client,
+            demandStart: async () => {
+                demands += 1;
+                await gate;
+                return {
+                    ok: true,
+                    reason: "started",
+                    storage: "ready",
+                    authenticatedDaemonId: recertified,
+                };
+            },
+        });
+        expect(await provider.initialize()).toBe(true);
+
+        const internals = provider as unknown as {
+            connectionOrigin: string;
+            compatibleDaemonId: Uint8Array | null;
+            initialized: boolean;
+            rebindAfterModuleRestart(deadlineAt: number, signal?: AbortSignal): Promise<void>;
+        };
+        internals.connectionOrigin = "managed-default";
+        internals.compatibleDaemonId = certified;
+
+        const flight = internals.rebindAfterModuleRestart(Date.now() + 60_000);
+        await Promise.resolve();
+        await Promise.resolve();
+
+        // A sibling that already re-established the fence and is dispatching
+        // against it keeps that identity while this demand is in flight. Erasing
+        // it here would fail the sibling's resubmission on a fence it had already
+        // proved, and its one restart budget is already spent.
+        expect(demands).toBe(1);
+        expect(internals.initialized).toBe(false);
+        expect(internals.compatibleDaemonId).toEqual(certified);
+
+        release();
+        await expect(flight).resolves.toBeUndefined();
+        expect(internals.compatibleDaemonId).toEqual(recertified);
+    });
+
+    it("does not clear a newer identity when a stale attempt fails after it is installed", async () => {
+        const client = new MockSynapseClient();
+        const rotated = new Uint8Array([8, 1]);
+        const replacement = new Uint8Array([8, 2]);
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "stale-failure-sibling",
+            clientFactory: async () => client,
+        });
+        expect(await provider.initialize()).toBe(true);
+
+        const internals = provider as unknown as {
+            connectionOrigin: string;
+            compatibleDaemonId: Uint8Array | null;
+            initialized: boolean;
+        };
+        internals.connectionOrigin = "managed-default";
+        internals.compatibleDaemonId = rotated;
+
+        // Two operations straddle one rotation: a sibling finishes
+        // re-certifying and installs the replacement identity while this
+        // attempt's request against the rotated generation is still failing.
+        client.call = async <Response = unknown>(
+            _module: string,
+            method: string,
+            params?: unknown,
+        ): Promise<Response> => {
+            client.requests.push({ method, params });
+            internals.compatibleDaemonId = replacement;
+            internals.initialized = true;
+            const error = new Error("module_restarted") as Error & { code: string };
+            error.code = "module_restarted";
+            throw error;
+        };
+
+        // The late failure is evidence about the rotated identity alone.
+        // Clearing the replacement would make the sibling's next call refuse
+        // for want of a certified identity after its restart budget is spent.
+        expect(await provider.embed("hello")).toBeNull();
+        expect(internals.compatibleDaemonId).toEqual(replacement);
+        expect(internals.initialized).toBe(true);
+    });
+
+    it("does not arm managed-demand backoff for caller detachment", async () => {
+        const client = new MockSynapseClient();
+        let demands = 0;
+        const provider = new SynapseEmbeddingProvider({
+            projectRoot: "/repo",
+            session: "managed-detachment",
+            connectionOrigin: "managed-default",
+            clientFactory: async () => client,
+            demandStart: async () => {
+                demands += 1;
+                if (demands === 1) throw new WaiterDetachedError("aborted");
+                return {
+                    ok: true,
+                    reason: "started",
+                    storage: "ready",
+                    authenticatedDaemonId: new Uint8Array([1]),
+                };
+            },
+        });
+        const internals = provider as unknown as { connectionOrigin: string };
+        internals.connectionOrigin = "managed-default";
+
+        expect(await provider.initialize()).toBe(false);
+        expect(await provider.initialize()).toBe(true);
+        expect(demands).toBe(2);
     });
 
     it("adopts the catalog's advertised input limits", async () => {
@@ -1199,6 +1445,8 @@ describe("embedItemsDetailed", () => {
     interface RecordedCall {
         method: string;
         params: Record<string, unknown>;
+        expectedDaemonId?: Uint8Array;
+        timeoutMs?: number;
     }
 
     /** Deterministic host double: embed.batch answers with a job descriptor
@@ -1232,8 +1480,16 @@ describe("embedItemsDetailed", () => {
             _module: string,
             method: string,
             params?: unknown,
+            options?: { expectedDaemonId?: Uint8Array; timeoutMs?: number },
         ): Promise<Response> {
-            const record = { method, params: (params ?? {}) as Record<string, unknown> };
+            const record = {
+                method,
+                params: (params ?? {}) as Record<string, unknown>,
+                ...(options?.expectedDaemonId === undefined
+                    ? {}
+                    : { expectedDaemonId: options.expectedDaemonId }),
+                ...(options?.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+            };
             this.calls.push(record);
             if (method === "embed.batch") {
                 const scripted = this.batchError?.(this.batchCalls().length - 1);
@@ -1285,6 +1541,17 @@ describe("embedItemsDetailed", () => {
     function moduleRestartedError(): Error {
         const error = new Error("module restarted") as Error & { code: string };
         error.code = "module_restarted";
+        return error;
+    }
+
+    /** The client's own pre-publication fence: the authenticated daemon no
+     *  longer matches the certified incarnation, refused before any byte is
+     *  enqueued, so the request never reached the daemon. */
+    function daemonGenerationChangedError(): Error {
+        const error = new Error(
+            "authenticated daemon changed after lifecycle compatibility validation",
+        ) as Error & { code: string };
+        error.code = "daemon_generation_changed";
         return error;
     }
 
@@ -1940,6 +2207,132 @@ describe("embedItemsDetailed", () => {
         }
     });
 
+    it("rebinds a restarted page to the compatible replacement daemon", async () => {
+        const db = ledgerDb();
+        try {
+            const host = new DetailedHost();
+            const daemonIds = [new Uint8Array([1]), new Uint8Array([2])];
+            // One rotation, observed when the retained job's reply reports the
+            // restart. Identity is a function of that generation, not of the
+            // demand count: the lifecycle owner coalesces demands and reports
+            // whichever daemon is live, so every demand raised while recovering
+            // from the same restart must observe the same replacement.
+            let rotated = false;
+            host.resultPages = (jobId, items) => {
+                if (jobId === "job-1") {
+                    rotated = true;
+                    return moduleRestartedError();
+                }
+                return {
+                    result: {
+                        ...ENVELOPE,
+                        done: true,
+                        vectors: items.map((item) => ({
+                            id: item.id,
+                            content_sha256: item.content_sha256,
+                            vector: [1, 2, 3],
+                        })),
+                    },
+                };
+            };
+            const provider = detailedProvider(host);
+            let demands = 0;
+            const mutable = provider as unknown as {
+                connectionOrigin: "managed-default";
+                demandStart: () => Promise<{
+                    ok: true;
+                    reason: "started";
+                    storage: null;
+                    authenticatedDaemonId: Uint8Array;
+                }>;
+            };
+            mutable.connectionOrigin = "managed-default";
+            mutable.demandStart = async () => {
+                demands += 1;
+                return {
+                    ok: true,
+                    reason: "started",
+                    storage: null,
+                    authenticatedDaemonId: (rotated ? daemonIds[1] : daemonIds[0]) as Uint8Array,
+                };
+            };
+
+            const result = await provider.embedItemsDetailed(
+                detailedItems([{ id: "memory:1", group: "g1" }]),
+                detailedContext(db),
+            );
+
+            expect(result.failures).toEqual([]);
+            expect(result.receipts).toHaveLength(1);
+            // Initial certification plus one bounded rebind for the restart.
+            expect(demands).toBe(2);
+            const batches = host.batchCalls();
+            expect(batches).toHaveLength(2);
+            expect(batches[0].expectedDaemonId).toEqual(daemonIds[0]);
+            expect(batches[1].expectedDaemonId).toEqual(daemonIds[1]);
+            expect(batches[0].params.request_key).toBe(batches[1].params.request_key);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("rebinds a page refused by the pre-publication daemon fence without spending the restart budget", async () => {
+        const db = ledgerDb();
+        try {
+            const host = new DetailedHost();
+            const daemonIds = [new Uint8Array([1]), new Uint8Array([2])];
+            let rotated = false;
+            // The client fence refuses the first submission before publishing.
+            // It is `not_sent`, so nothing reached the daemon and the same
+            // request key may be resubmitted against the replacement.
+            host.batchError = (index) => {
+                if (index !== 0) return null;
+                rotated = true;
+                return daemonGenerationChangedError();
+            };
+            const provider = detailedProvider(host);
+            const mutable = provider as unknown as {
+                connectionOrigin: "managed-default";
+                demandStart: () => Promise<{
+                    ok: true;
+                    reason: "started";
+                    storage: null;
+                    authenticatedDaemonId: Uint8Array;
+                }>;
+            };
+            mutable.connectionOrigin = "managed-default";
+            mutable.demandStart = async () => ({
+                ok: true,
+                reason: "started",
+                storage: null,
+                authenticatedDaemonId: (rotated ? daemonIds[1] : daemonIds[0]) as Uint8Array,
+            });
+
+            const result = await provider.embedItemsDetailed(
+                detailedItems([{ id: "memory:1", group: "g1" }]),
+                detailedContext(db),
+            );
+
+            // The fence is absorbed in-page: the page succeeds rather than
+            // being reported as a failure the caller must retry.
+            expect(result.failures).toEqual([]);
+            expect(result.receipts).toHaveLength(1);
+            const batches = host.batchCalls();
+            expect(batches).toHaveLength(2);
+            // Same key, so the replacement daemon dedupes rather than
+            // double-embedding, and the retry rides the replacement identity.
+            expect(batches[0].params.request_key).toBe(batches[1].params.request_key);
+            expect(batches[1].expectedDaemonId).toEqual(daemonIds[1]);
+            // The durable restart budget belongs to observed daemon restarts.
+            // A pre-publication refusal must not consume it, so a genuine
+            // restart afterwards is still absorbable.
+            const row = getSynapseLedgerPage(db, result.receipts[0].rowId);
+            expect(row?.restartCount ?? 0).toBe(0);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     it("fails the page when the single restart budget is spent instead of resubmitting again", async () => {
         const db = ledgerDb();
         try {
@@ -2072,8 +2465,10 @@ describe("embedItemsDetailed", () => {
         const db = ledgerDb();
         try {
             const host = new DetailedHost();
-            // The submit itself restarts, so the durable restart CAS never
-            // runs and the page's single restart stays unspent.
+            // Every submit restarts: the first restart consumes the one
+            // submission-time rebind and resubmits the same request key; the
+            // second propagates. The durable restart CAS never runs, so the
+            // page's single durable restart stays unspent.
             host.batchError = () => moduleRestartedError();
             const provider = detailedProvider(host);
             const result = await provider.embedItemsDetailed(
@@ -2085,11 +2480,109 @@ describe("embedItemsDetailed", () => {
             expect(result.failures).toHaveLength(1);
             expect(result.failures[0].code).toBe("module_restarted");
             expect(result.failures[0].disposition).toBe("retryable");
-            expect(host.batchCalls()).toHaveLength(1);
+            const batchCalls = host.batchCalls();
+            expect(batchCalls).toHaveLength(2);
+            expect(batchCalls[1].params.request_key).toBe(batchCalls[0].params.request_key);
             const row = ledgerRows(db)[0];
             expect(row.state).toBe("failed");
             expect(row.failure_disposition).toBe("retryable");
             expect(row.restart_count).toBe(0);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("reports a page cancelled when the abort lands inside its re-validation", async () => {
+        const db = ledgerDb();
+        try {
+            const host = new DetailedHost();
+            const controller = new AbortController();
+            let demands = 0;
+            const provider = new SynapseEmbeddingProvider({
+                connectionFile: "fixture",
+                projectRoot: "/repo",
+                session: "ses-1",
+                model: MODEL,
+                fingerprint: FP,
+                tableEpoch: 0,
+                dims: 3,
+                recommendedBatch: 2,
+                batchTimeoutMs: 5_000,
+                clientFactory: async () => host,
+                demandStart: async () => {
+                    demands += 1;
+                    // The abort lands while the managed demand is in flight, so
+                    // `initialize` observes it on its own await and reports the
+                    // plain `false` a rejected `raceSignal` is folded into.
+                    controller.abort();
+                    await new Promise((resolve) => setTimeout(resolve, 0));
+                    return {
+                        ok: true,
+                        reason: "started",
+                        storage: "ready",
+                        authenticatedDaemonId: new Uint8Array([7, 7]),
+                    };
+                },
+            });
+            // Certify the lane before installing the managed origin: `initialize`
+            // is the only writer of the identity, and the pre-loop initialize
+            // must return from the already-certified state so the first page
+            // dispatches instead of demanding.
+            expect(await provider.initialize()).toBe(true);
+            const internals = provider as unknown as {
+                connectionOrigin: string;
+                compatibleDaemonId: Uint8Array | null;
+                initialized: boolean;
+            };
+            internals.connectionOrigin = "managed-default";
+            internals.compatibleDaemonId = new Uint8Array([7, 7]);
+
+            // Reproduce the state a rotation on an earlier page installs: the
+            // lane is managed and no longer certified, which is precisely the
+            // precondition the per-page re-validation exists to answer. Doing it
+            // from the first page's own response keeps the second page's
+            // `signal.aborted` check ahead of the abort, so the abort can only
+            // be observed inside the re-validation itself.
+            host.resultPages = (_jobId, items) => {
+                if (items.some((item) => item.id === "memory:1")) internals.initialized = false;
+                return {
+                    result: {
+                        ...ENVELOPE,
+                        done: true,
+                        vectors: items.map((item) => ({
+                            id: item.id,
+                            content_sha256: item.content_sha256,
+                            vector: [1, 2, 3],
+                        })),
+                    },
+                };
+            };
+
+            const result = await provider.embedItemsDetailed(
+                detailedItems([
+                    { id: "memory:1", group: "g1" },
+                    { id: "memory:2", group: "g2" },
+                ]),
+                detailedContext(db),
+                controller.signal,
+            );
+
+            // The first page completed before the identity was invalidated.
+            expect(result.receipts).toHaveLength(1);
+            expect(result.receipts[0].applicationGroup).toBe("g1");
+            // Exactly one demand: the second page's re-validation.
+            expect(demands).toBe(1);
+            expect(result.failures).toHaveLength(1);
+            const g2 = result.failures[0];
+            expect(g2.applicationGroup).toBe("g2");
+            // This read `transport`/`retryable` before the signal was re-checked
+            // after initialization, which invites a retry of a request the caller
+            // withdrew and disagrees with the `cancelled` every later page reports.
+            expect(g2.code).toBe("cancelled");
+            expect(g2.message).toBe("Synapse request aborted");
+            expect(g2.disposition).toBe("retryable");
+            // The cancelled page must never have reached the wire.
+            expect(host.batchCalls()).toHaveLength(1);
         } finally {
             closeQuietly(db);
         }
@@ -2611,6 +3104,78 @@ describe("embedItemsDetailed", () => {
             expect(ledgerRows(db)).toEqual([]);
         } finally {
             closeQuietly(db);
+        }
+    });
+
+    it("keeps the original legacy page deadline across daemon rebind and polling", async () => {
+        let now = 1_000;
+        try {
+            const host = new DetailedHost();
+            host.resultPages = (jobId, items) => {
+                if (jobId === "job-1") return moduleRestartedError();
+                return {
+                    result: {
+                        ...ENVELOPE,
+                        done: true,
+                        vectors: items.map((item) => ({
+                            id: item.id,
+                            content_sha256: item.content_sha256,
+                            vector: [1, 2, 3],
+                        })),
+                    },
+                };
+            };
+            const provider = new SynapseEmbeddingProvider({
+                connectionFile: "fixture",
+                projectRoot: "/repo",
+                session: "legacy-deadline",
+                model: MODEL,
+                fingerprint: FP,
+                tableEpoch: 0,
+                dims: 3,
+                recommendedBatch: 2,
+                batchTimeoutMs: 100,
+                now: () => now,
+                clientFactory: async () => host,
+            });
+            const daemonIds = [new Uint8Array([1]), new Uint8Array([2])];
+            let demands = 0;
+            const mutable = provider as unknown as {
+                connectionOrigin: "managed-default";
+                demandStart: () => Promise<{
+                    ok: true;
+                    reason: "started";
+                    storage: null;
+                    authenticatedDaemonId: Uint8Array;
+                }>;
+            };
+            mutable.connectionOrigin = "managed-default";
+            mutable.demandStart = async () => {
+                if (demands === 1) now += 40;
+                return {
+                    ok: true,
+                    reason: "started",
+                    storage: null,
+                    authenticatedDaemonId: daemonIds[demands++] as Uint8Array,
+                };
+            };
+
+            const vectors = await provider.embedItems([
+                { id: "memory:1", text: "one", contentSha256: "a" },
+            ]);
+
+            expect(vectors.get("memory:1")).toEqual(new Float32Array([1, 2, 3]));
+            expect(demands).toBe(2);
+            const batches = host.batchCalls();
+            expect(batches[0].expectedDaemonId).toEqual(daemonIds[0]);
+            expect(batches[1].expectedDaemonId).toEqual(daemonIds[1]);
+            expect(batches[0].params.request_key).toBe(batches[1].params.request_key);
+            const replacementPoll = host
+                .resultCalls()
+                .find((call) => call.params.job_id === "job-2");
+            expect(replacementPoll?.timeoutMs).toBe(60);
+        } finally {
+            _resetSynapseClientForTests();
         }
     });
 

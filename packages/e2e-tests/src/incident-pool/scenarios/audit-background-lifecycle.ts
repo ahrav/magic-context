@@ -554,7 +554,7 @@ export async function driveLeaseLossResidualWrite(
         await runScriptedToolCall(h, parentSessionId, {
             tool: "ctx_memory",
             input: {
-                action: "write",
+                action: "create",
                 content: seedContent,
                 category: "CONSTRAINTS",
             },

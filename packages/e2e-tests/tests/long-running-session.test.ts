@@ -604,7 +604,7 @@ describe("long-running OpenCode Magic Context session", () => {
             // f5a0f403 routed Rust memory writes through the module backend. Use
             // the public tool, then verify the local read-model mirror caught up.
             emitToolOnce(/^ctx_memory$/, {
-                action: "write",
+                action: "create",
                 category: "PROJECT_RULES",
                 content: autoSearchMemory,
             });

@@ -18,12 +18,14 @@
 
 use std::collections::BTreeSet;
 use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use rustix::fd::OwnedFd;
 use rustix::fs::{fsync, mkdirat, openat, renameat, unlinkat, AtFlags, Mode, OFlags};
 use sha2::Digest;
 
+use crate::file_mode::raw_mode;
 use crate::instance::{
     hex, io_err, is_safe_ancestor, is_secure_regular, mode_bits, open_secure_dir_existing,
     owner_uid, read_all_fd, secure_runtime_dir, write_all_fd, InstanceError, S_IFDIR, S_IFLNK,
@@ -304,15 +306,16 @@ pub struct ValidatedGeneration {
     pub digest: String,
     pub manifest: GenerationManifest,
     dir: OwnedFd,
-    path: PathBuf,
 }
 
 impl ValidatedGeneration {
-    /// Stable managed path for libraries that require pathname-based loading.
-    /// Every consumer must still perform its own no-follow/hash validation;
-    /// the retained directory descriptor remains the generation identity.
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// Stable descriptor-rooted path for in-process loaders. The generation
+    /// object must remain alive while the path is used.
+    ///
+    /// Directory traversal through this path is Linux-only; see
+    /// [`crate::harness_closure::descriptor_path`] for the platform contract.
+    pub fn descriptor_root_path(&self) -> PathBuf {
+        crate::harness_closure::descriptor_path(self.dir.as_raw_fd())
     }
 
     /// Opens one manifest-listed file through the retained validated
@@ -394,20 +397,6 @@ fn open_rel_walk(dir: &OwnedFd, rel: &str, final_is_dir: bool) -> Option<OwnedFd
         }
     }
     current
-}
-
-/// Permission bits as rustix's platform-width `RawMode`.
-///
-/// `RawMode` is `u32` on Linux and `u16` on the Darwin targets, while the
-/// manifest commits `mode` as `u32`, so the two cannot meet without an explicit
-/// conversion — leaving it implicit compiles on Linux and fails on Darwin. Only
-/// the permission and set-id bits are meaningful to any caller here, and every
-/// value passed is already within them (0o600 or 0o700 for staged output, and a
-/// manifest mode that validation requires to equal `mode & 0o777`), so the mask
-/// documents that range rather than narrowing a value that could exceed it.
-#[allow(clippy::unnecessary_cast)]
-fn raw_mode(mode: u32) -> rustix::fs::RawMode {
-    (mode & 0o7777) as rustix::fs::RawMode
 }
 
 fn verify_file_against_entry(fd: &OwnedFd, entry: &ManifestFile) -> Result<(), GenerationError> {
@@ -612,7 +601,6 @@ impl GenerationStore {
             digest: digest.to_owned(),
             manifest,
             dir,
-            path: self.generation_path(digest),
         })
     }
 
@@ -685,13 +673,6 @@ impl GenerationStore {
             }
         }
         Ok(manifest)
-    }
-
-    /// Managed pathname of one generation directory, derived from the store
-    /// root rather than resolved, so it names the same location whether or not
-    /// the directory exists yet.
-    fn generation_path(&self, name: &str) -> PathBuf {
-        self.root.join(GENERATIONS_DIR_NAME).join(name)
     }
 
     /// Available bytes for this store's destination filesystem, as seen by
@@ -1487,6 +1468,35 @@ mod tests {
         // Restaging the identical sources converges on the same digest.
         let again = stage_default(&store, src.path());
         assert_eq!(again, digest);
+    }
+
+    #[test]
+    fn descriptor_root_survives_generation_path_replacement() {
+        let root = tempfile::tempdir().expect("root");
+        let src = tempfile::tempdir().expect("src");
+        let store = store_at(root.path());
+        let digest = stage_default(&store, src.path());
+        let validated = store.validate(&digest).expect("validate");
+        let descriptor_path = validated.descriptor_root_path().join("bin/ck-mc-host");
+        let expected = std::fs::read(&descriptor_path).expect("descriptor bytes");
+
+        let generation_path = store.root().join(GENERATIONS_DIR_NAME).join(&digest);
+        let moved = store
+            .root()
+            .join(GENERATIONS_DIR_NAME)
+            .join("moved-generation");
+        std::fs::rename(&generation_path, moved).expect("rename generation");
+        std::fs::create_dir_all(generation_path.join("bin")).expect("replacement tree");
+        std::fs::write(
+            generation_path.join("bin/ck-mc-host"),
+            b"malicious replacement",
+        )
+        .expect("replacement bytes");
+
+        assert_eq!(
+            std::fs::read(descriptor_path).expect("retained descriptor bytes"),
+            expected
+        );
     }
 
     #[test]

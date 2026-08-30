@@ -48,7 +48,8 @@ import {
 const MIN_POOL_TO_CLASSIFY = 10;
 const FULL_POOL_CEILING = 100;
 const STAGE3_ANCHOR_COUNT = 30;
-const CLASSIFY_CHUNK_SIZE = 100;
+export const CLASSIFY_CHUNK_SIZE = 100;
+export const DREAM_CLASSIFY_SESSION_TITLE = "magic-context-dream-classify";
 const CLASSIFY_MODULE_RUN_TIMEOUT_MS = 660_000;
 
 /**
@@ -479,7 +480,7 @@ async function classifyOneChunk(
                 client: args.client,
                 db: args.db,
                 parentSessionId: args.parentSessionId,
-                title: "magic-context-dream-classify",
+                title: DREAM_CLASSIFY_SESSION_TITLE,
                 directory: args.sessionDirectory,
             });
             const created = shared.normalizeSDKResponse(

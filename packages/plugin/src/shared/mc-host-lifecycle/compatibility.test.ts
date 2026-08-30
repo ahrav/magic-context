@@ -5,6 +5,7 @@ import {
     evaluateDaemonCompatibility,
     evaluateEpochCompatibility,
     evaluateModuleCompatibility,
+    observedEpochsFromMagicContextMetrics,
     parseSemverTriple,
 } from "./compatibility";
 import { releaseContract } from "./generated-contract";
@@ -14,7 +15,7 @@ function entry(id: string, version: string): CatalogEntry {
 }
 
 function peer(daemonVer: string): AuthenticatedPeer {
-    return { daemonVer, daemonId: null, proof: "current" };
+    return { daemonVer, daemonId: new Uint8Array(16), proof: "current" };
 }
 
 const healthyCatalog = [
@@ -92,6 +93,31 @@ describe("module version ranges", () => {
 });
 
 describe("exact epoch comparison", () => {
+    test("maps the five Magic Context wire epoch names to the release contract", () => {
+        expect(
+            observedEpochsFromMagicContextMetrics({
+                epochs: {
+                    memory_render_epoch: 2,
+                    compartment_render_epoch: 2,
+                    profile_epoch: 2,
+                    tagger_epoch: 3,
+                    state_sync_epoch: 1,
+                    state_sync_deltas: true,
+                },
+            }),
+        ).toEqual(healthyEpochs);
+    });
+
+    test("missing or malformed status fields remain absent and fail closed", () => {
+        expect(observedEpochsFromMagicContextMetrics(null)).toEqual({});
+        expect(observedEpochsFromMagicContextMetrics({ epochs: [] })).toEqual({});
+        expect(
+            observedEpochsFromMagicContextMetrics({
+                epochs: { state_sync_epoch: "1" },
+            }),
+        ).toEqual({ state_sync: "1" });
+    });
+
     test("missing, nonnumeric, stale, and future epochs each name the epoch", () => {
         const stale = { ...healthyEpochs, tagger: healthyEpochs.tagger - 1 };
         const future = { ...healthyEpochs, tagger: healthyEpochs.tagger + 1 };
@@ -143,6 +169,25 @@ describe("semver parsing", () => {
         expect(parseSemverTriple("1.2.3")).toEqual([1, 2, 3]);
         for (const bad of ["1.2", "1.2.3.4", "v1.2.3", "1.2.x", ""]) {
             expect(parseSemverTriple(bad)).toBeNull();
+        }
+    });
+    test("leading zeroes are rejected rather than normalized", () => {
+        expect(parseSemverTriple("0.1.0")).toEqual([0, 1, 0]);
+        // Each of these would parse to an in-range triple under `\d+`, so the
+        // range gate would accept a non-canonical version.
+        for (const bad of ["00.1.0", "0.01.0", "0.1.00", "00.01.000", "01.2.3"]) {
+            expect(parseSemverTriple(bad)).toBeNull();
+        }
+    });
+
+    test("a non-canonical daemon version fails the compatibility gate", () => {
+        // `00.01.000` normalizes to `[0, 1, 0]`, which is inside the supported
+        // half-open range, so only canonical-form rejection keeps this closed.
+        const verdict = evaluateDaemonCompatibility(peer("mc-host/00.01.000"));
+        expect(verdict.ok).toBe(false);
+        if (!verdict.ok) {
+            expect(verdict.reason).toBe("incompatible_daemon");
+            expect(verdict.detail).toBe("daemon version is not a canonical mc-host/X.Y.Z value");
         }
     });
 

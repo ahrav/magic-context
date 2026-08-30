@@ -8,7 +8,8 @@
  *
  * Each message is a `u32` little-endian byte length followed by at most
  * 4,096 UTF-8 JSON bytes. Proofs are
- * `HMAC-SHA256(key, ASCII(domain) || client_nonce || server_nonce || daemon_id)`.
+ * `HMAC-SHA256(key, ASCII(domain) || client_nonce || server_nonce ||
+ * u32be(len(daemon_ver)) || UTF8(daemon_ver) || daemon_id)`.
  * The client compares the server proof in constant time, then requires the
  * server's daemon ID to equal the connection-file daemon ID and its daemon
  * version to equal the connection-file `daemon_ver`, and emits no ClientAuth
@@ -93,7 +94,8 @@ export interface AuthResult {
 }
 
 /**
- * `HMAC-SHA256(key, ASCII(domain) || client_nonce || server_nonce || daemon_id)`
+ * `HMAC-SHA256(key, ASCII(domain) || client_nonce || server_nonce ||
+ * u32be(len(daemon_ver)) || UTF8(daemon_ver) || daemon_id)`
  * per wire doc Section 5.2. Exported so tests can reproduce the committed
  * literal vectors independently of the transcript path.
  */
@@ -102,12 +104,18 @@ export function computeProof(
     domain: string,
     clientNonce: Uint8Array,
     serverNonce: Uint8Array,
+    daemonVer: string,
     daemonId: Uint8Array,
 ): Uint8Array {
+    const daemonVerBytes = Buffer.from(daemonVer, "utf8");
+    const daemonVerLen = Buffer.allocUnsafe(4);
+    daemonVerLen.writeUInt32BE(daemonVerBytes.length);
     const mac = createHmac("sha256", key);
     mac.update(Buffer.from(domain, "ascii"));
     mac.update(clientNonce);
     mac.update(serverNonce);
+    mac.update(daemonVerLen);
+    mac.update(daemonVerBytes);
     mac.update(daemonId);
     return new Uint8Array(mac.digest());
 }
@@ -276,6 +284,7 @@ export async function authenticateClient(
         SERVER_PROOF_DOMAIN,
         clientNonce,
         server.serverNonce,
+        server.daemonVer,
         server.daemonId,
     );
     if (!constantTimeEqual(expectedServerProof, server.serverProof)) {
@@ -287,15 +296,8 @@ export async function authenticateClient(
             "daemon_id_mismatch",
         );
     }
-    // `daemon_ver` is outside the proof input, so the HMAC binds the key and
-    // the daemon ID but not the reported version. Requiring equality with
-    // the connection file's `daemon_ver` binds the version to the same
-    // snapshot the proof already authenticates, which is what makes it
-    // usable for compatibility and fencing. Residual: an attacker who can
-    // rewrite BOTH the owner-only connection file and this JSON consistently
-    // is not excluded, but that requires the same write access that would let
-    // them replace the key outright. The version is snapshot-bound, not
-    // cryptographically authenticated.
+    // The proof authenticates `daemon_ver`; equality with the connection file
+    // also binds it to the discovery snapshot used to dial this peer.
     if (server.daemonVer !== credentials.daemonVer) {
         throw new AuthError(
             "server daemon version does not match the connection file",
@@ -307,6 +309,7 @@ export async function authenticateClient(
         CLIENT_AUTH_DOMAIN,
         clientNonce,
         server.serverNonce,
+        server.daemonVer,
         server.daemonId,
     );
     await writeMessage(io, { client_auth: Array.from(clientAuth) }, deadline);

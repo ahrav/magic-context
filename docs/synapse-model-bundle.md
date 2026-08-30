@@ -63,9 +63,10 @@ Validation rules (`crates/mc-host/src/synapse/bundle.rs` is authoritative):
   escape its directory.
 - Hashes are 64 lowercase hex and may not be placeholders (a repeated
   single character, e.g. all zeros, is refused).
-- `max_tokens` must equal the tokenizer_config's `model_max_length`, so the
-  truncation boundary has one owner, and `tokenizer_config` must declare a
-  string `pad_token`.
+- `max_tokens` must not exceed the tokenizer_config's `model_max_length`, so
+  the manifest remains the one effective truncation boundary. Hugging Face's
+  large "unlimited" sentinel is accepted as a ceiling. `tokenizer_config`
+  must declare a string `pad_token`.
 - The corpus must parse, match `dims`, and carry a finite tolerance in
   `(0, 0.1]`.
 
@@ -141,6 +142,26 @@ version, target triple, CPU-only build provenance, and the SHA-256 the host
 configuration pins. A nominally matching library with a different hash is
 refused by design.
 
+The pinned Linux lane uses the
+`keisuke-miyako/gte-modernbert-base-onnx-f16` commit
+`3d5fc87c1790e6846bad06013655b0703da47be9`, rooted in Apache-2.0
+`Alibaba-NLP/gte-modernbert-base`, with CLS pooling, 768 dimensions, and an
+8192-token manifest limit. It loads Microsoft CPU ONNX Runtime 1.24.2
+`libonnxruntime.so.1.24.2` with SHA-256
+`ffc84d48e845cf0b562ba4ea5ca32aaafc0d4069019fef4f63095b307d0270ad`.
+The semantic corpus tolerance is `0.005`, which covers measured FP16
+single-item versus batch-shape drift while still rejecting pooling,
+normalization, tokenizer, model, and runtime substitutions. The offline
+oracle runs with networking disabled on glibc 2.28.
+
+These pins define the candidate the release gate evaluates; they do not
+assert that the candidate is production-qualified. That verdict lives in
+`release/mc-host-production-inputs.lock.json` (`production_qualified`, with
+any blocking reasons under `unqualified`) together with the target's
+`qualified` and `published` entries in `release/mc-host-payload-index.json`.
+Read the gate for the lane's qualification state; this document only fixes
+the identities the gate checks.
+
 ## 4. Startup, readiness, and degraded mode
 
 Initialization order: hash and confine every bundle artifact, verify and
@@ -187,3 +208,16 @@ is unset; every pre-ORT rejection path runs hermetically without it.
   configuration at it. The host never watches, reloads, or mutates a bundle.
 - The lane serves exactly one model; there is no registry, no download path,
   and no per-request model selection.
+- The Linux native payload stages the pinned manifest, corpus,
+  model/tokenizer files, and exact CPU ONNX Runtime together in one
+  content-addressed generation. `ck-mc-host serve` derives `SynapseConfig`
+  only from that revalidated generation.
+- On macOS the Synapse component is built in its host-only form and carries
+  exact readiness `unsupported` / `synapse_unsupported`. No client observes
+  that value from a macOS daemon, because the daemon does not reach
+  publication: `ck-mc-host serve` composes Synapse alongside Broca, Broca
+  refuses to initialize off Linux (its crash-ownership records and sweeps
+  depend on `/proc` process identity), and the composite requires every
+  child initializer to succeed. Serving this lane on macOS therefore
+  requires a Broca component that initializes off Linux as unavailable
+  rather than failing.

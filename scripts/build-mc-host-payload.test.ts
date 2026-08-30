@@ -5,6 +5,7 @@ import {
     mkdirSync,
     mkdtempSync,
     readFileSync,
+    renameSync,
     rmSync,
     symlinkSync,
     writeFileSync,
@@ -13,20 +14,26 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { completeRegistryGate } from "./__fixtures__/registry-gate";
 import {
     buildContract,
     canonicalJson,
     sha256Hex,
+    validateRegistryGate,
 } from "./generate-mc-host-release-manifest";
 import {
+    assembleProductionPayload,
     buildDevPayload,
     buildTrustArtifacts,
     hostTarget,
     LAUNCHER_PATH,
+    LINUX_PRODUCTION_PAYLOAD_SLOTS,
     loadReleaseContext,
     OUTPUT_PATHS,
     PAYLOAD_TARGETS,
     type PayloadManifest,
+    packProductionPayload,
+    type ReleaseContext,
     payloadManifestDigest,
     runCheck,
     validateParentManifests,
@@ -34,6 +41,7 @@ import {
     validatePayloadPackageDir,
     validateStopRecord,
     validateTrustIndex,
+    verifyProductionBinaryIdentity,
     verifyPayloadDir,
 } from "./build-mc-host-payload";
 
@@ -44,7 +52,6 @@ const CONTEXT_FILES = [
     "release/mc-host-production-inputs.lock.json",
     "release/mc-host-provider-credentials.json",
     "release/mc-host-registry-gate.json",
-    "docs/evidence/mc-host-release-qualification.json",
 ];
 const PACKAGE_DIRS = [
     "packages/mc-host-darwin-arm64",
@@ -84,6 +91,43 @@ function freshRoot(): string {
     return root;
 }
 
+function writeFailClosedQualification(root: string): void {
+    const contract = buildContract();
+    const releaseContractSha256 = sha256Hex(canonicalJson(contract));
+    const lockPath = "release/mc-host-production-inputs.lock.json";
+    const credentialsPath = "release/mc-host-provider-credentials.json";
+    const lockText = readFileSync(join(root, lockPath), "utf8");
+    const credentialsText = readFileSync(join(root, credentialsPath), "utf8");
+    const lock = JSON.parse(lockText) as {
+        production_qualified: boolean;
+        unqualified: string[];
+    };
+    const evidence = {
+        schema: "magic-context.mc-host-release-qualification/v1",
+        release: {
+            id: contract.release.id,
+            version: contract.release.version,
+        },
+        release_contract_sha256: releaseContractSha256,
+        artifacts: {
+            production_inputs_lock: {
+                path: lockPath,
+                sha256: sha256Hex(lockText),
+            },
+            provider_credentials: {
+                path: credentialsPath,
+                sha256: sha256Hex(credentialsText),
+            },
+        },
+        production_qualified: lock.production_qualified,
+        test_only: false,
+        unqualified: lock.unqualified,
+    };
+    const path = join(root, "tmp/mc-host-release-qualification.json");
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, `${canonicalJson(evidence)}\n`);
+}
+
 // biome-ignore lint/suspicious/noExplicitAny: tests mutate deep copies
 function readMutable(root: string, relative: string): any {
     return JSON.parse(readFileSync(join(root, relative), "utf8"));
@@ -93,8 +137,68 @@ function writeJson(root: string, relative: string, value: unknown): void {
     writeFileSync(join(root, relative), `${JSON.stringify(value, null, 2)}\n`);
 }
 
+function markRegistryGatePassing(root: string): void {
+    writeJson(
+        root,
+        "release/mc-host-registry-gate.json",
+        completeRegistryGate(readMutable(root, "release/mc-host-registry-gate.json")),
+    );
+}
+
 function context() {
-    return loadReleaseContext(repoRoot);
+    return loadReleaseContext(freshRoot());
+}
+
+describe("release context qualification evidence", () => {
+    test("an unqualified lock is usable without local evidence", () => {
+        const root = freshRoot();
+        expect(loadReleaseContext(root).productionQualified).toBe(false);
+    });
+
+    test("local evidence is validated when present", () => {
+        const root = freshRoot();
+        writeFailClosedQualification(root);
+        expect(loadReleaseContext(root).productionQualified).toBe(false);
+
+        const evidencePath = join(
+            root,
+            "tmp/mc-host-release-qualification.json",
+        );
+        const evidence = JSON.parse(readFileSync(evidencePath, "utf8"));
+        evidence.artifacts.production_inputs_lock.sha256 = "f".repeat(64);
+        writeFileSync(evidencePath, `${canonicalJson(evidence)}\n`);
+        expect(() => loadReleaseContext(root)).toThrow(
+            /stale U9 artifact digest/,
+        );
+    });
+
+    test("a production-qualified lock requires local evidence", () => {
+        const root = freshRoot();
+        const lockPath = join(
+            root,
+            "release/mc-host-production-inputs.lock.json",
+        );
+        const lock = JSON.parse(readFileSync(lockPath, "utf8"));
+        lock.production_qualified = true;
+        writeFileSync(lockPath, `${canonicalJson(lock)}\n`);
+        expect(() => loadReleaseContext(root)).toThrow(
+            /production-qualified U9 lock requires local qualification evidence/,
+        );
+    });
+});
+
+function unqualifiedContext(): ReleaseContext {
+    const unqualified = structuredClone(context());
+    unqualified.productionQualified = false;
+    unqualified.lock.production_qualified = false;
+    return unqualified;
+}
+
+function qualifiedContext(): ReleaseContext {
+    const qualified = structuredClone(context());
+    qualified.productionQualified = true;
+    qualified.lock.production_qualified = true;
+    return qualified;
 }
 
 function successorContext() {
@@ -140,9 +244,30 @@ function devManifest(): PayloadManifest {
 }
 
 describe("payload package metadata", () => {
-    test("committed package dirs pass and full check passes", () => {
-        const result = runCheck(repoRoot, { write: false });
-        expect(result.drift).toEqual([]);
+    test("committed fail-closed registry gate passes artifact drift checks", () => {
+        const root = freshRoot();
+        expect(() => runCheck(root, { write: false })).not.toThrow();
+    });
+
+    test("the committed fail-closed gate passes drift but blocks publication", () => {
+        // `runCheck` is the drift lane (`release:payload:check`), which runs on
+        // every change. The committed gate records a live npm audit that is
+        // honestly fail-closed between releases, so asserting readiness here
+        // would leave the drift signal permanently red and unable to catch a
+        // hand-edited gate. Readiness is asserted where bytes get published.
+        const root = freshRoot();
+        expect(() => runCheck(root, { write: false })).not.toThrow();
+        expect(() =>
+            validateRegistryGate(
+                JSON.parse(
+                    readFileSync(
+                        join(root, "release/mc-host-registry-gate.json"),
+                        "utf8",
+                    ),
+                ),
+                buildContract(),
+            ),
+        ).toThrow(/synchronized version 0\.38\.0 is not unpublished/);
     });
 
     test("version drift from the contract fails", () => {
@@ -200,7 +325,12 @@ describe("payload package metadata", () => {
     });
 
     test("any lifecycle script fails the no-lifecycle scan", () => {
-        for (const script of ["preinstall", "install", "postinstall", "build"]) {
+        for (const script of [
+            "preinstall",
+            "install",
+            "postinstall",
+            "build",
+        ]) {
             const root = freshRoot();
             const relative = "packages/mc-host-darwin-x64/package.json";
             const pkg = readMutable(root, relative);
@@ -258,9 +388,12 @@ describe("parent optional dependencies", () => {
             const relative = "packages/cli/package.json";
             const pkg = readMutable(root, relative);
             if (spec === undefined) {
-                delete pkg.optionalDependencies["@cortexkit/mc-host-darwin-x64"];
+                delete pkg.optionalDependencies[
+                    "@cortexkit/mc-host-darwin-x64"
+                ];
             } else {
-                pkg.optionalDependencies["@cortexkit/mc-host-darwin-x64"] = spec;
+                pkg.optionalDependencies["@cortexkit/mc-host-darwin-x64"] =
+                    spec;
             }
             writeJson(root, relative, pkg);
             expect(() =>
@@ -334,9 +467,17 @@ describe("payload manifest schema", () => {
             "payload/./bin",
         ]) {
             const manifest = structuredClone(devManifest());
-            manifest.files[0].path = path;
-            manifest.launcher = path;
-            expect(() => validatePayloadManifest(manifest, ctx)).toThrow();
+            manifest.files.push({
+                path,
+                type: "file",
+                size: 1,
+                mode: "644",
+                sha256: "b".repeat(64),
+            });
+            manifest.files.sort((left, right) => left.path.localeCompare(right.path));
+            expect(() => validatePayloadManifest(manifest, ctx)).toThrow(
+                /safe relative path|payload path|payload\//,
+            );
         }
     });
 
@@ -385,7 +526,7 @@ describe("payload manifest schema", () => {
     });
 
     test("production manifest fails closed while inputs are unqualified", () => {
-        const ctx = context();
+        const ctx = unqualifiedContext();
         const manifest = structuredClone(devManifest());
         manifest.mode = "production";
         expect(() => validatePayloadManifest(manifest, ctx)).toThrow(
@@ -521,13 +662,14 @@ describe("stop-provenance record", () => {
         expect(() =>
             validateStopRecord(predecessorRecord(), ctx, "0.38.0"),
         ).not.toThrow();
-        expect(() => validateStopRecord(predecessorRecord(), ctx, null)).toThrow(
-            /genesis is required/,
-        );
+        expect(() =>
+            validateStopRecord(predecessorRecord(), ctx, null),
+        ).toThrow(/genesis is required/);
     });
 
     test("reservation versions can never be ancestry", () => {
         const ctx = successorContext();
+        ctx.reservationVersions.push("0.0.1-reserved.0");
         const record = predecessorRecord();
         record.predecessor_release_version = "0.0.1-reserved.0";
         expect(() =>
@@ -578,19 +720,15 @@ describe("stop-provenance record", () => {
 });
 
 describe("trust index", () => {
-    test("committed index matches regeneration byte-for-byte", () => {
-        const ctx = context();
-        const { indexText, stopText } = buildTrustArtifacts(ctx);
-        expect(readFileSync(join(repoRoot, OUTPUT_PATHS.index), "utf8")).toBe(
-            indexText,
-        );
-        expect(readFileSync(join(repoRoot, OUTPUT_PATHS.stop), "utf8")).toBe(
-            stopText,
+    test("qualified trust generation requires a complete three-target payload root", () => {
+        const ctx = qualifiedContext();
+        expect(() => buildTrustArtifacts(ctx)).toThrow(
+            /requires the complete payload root/,
         );
     });
 
     test("unqualified entries must fail closed", () => {
-        const ctx = context();
+        const ctx = unqualifiedContext();
         const { index } = buildTrustArtifacts(ctx);
         // biome-ignore lint/suspicious/noExplicitAny: test mutates a deep copy
         const qualified: any = structuredClone(index);
@@ -619,7 +757,7 @@ describe("trust index", () => {
     });
 
     test("publication order must put payloads before parents", () => {
-        const ctx = context();
+        const ctx = unqualifiedContext();
         const { index } = buildTrustArtifacts(ctx);
         // biome-ignore lint/suspicious/noExplicitAny: test mutates a deep copy
         const reordered: any = structuredClone(index);
@@ -630,7 +768,7 @@ describe("trust index", () => {
     });
 
     test("drift in entries, floors, budgets, or citations fails", () => {
-        const ctx = context();
+        const ctx = unqualifiedContext();
         const { index } = buildTrustArtifacts(ctx);
         // biome-ignore lint/suspicious/noExplicitAny: test mutates deep copies
         const cases: [string, (copy: any) => void, RegExp][] = [
@@ -678,8 +816,9 @@ describe("trust index", () => {
         }
     });
 
-    test("runCheck reports drift when a committed artifact is edited", () => {
+    test("runCheck reports drift while release inputs remain unqualified", () => {
         const root = freshRoot();
+        markRegistryGatePassing(root);
         const record = readMutable(root, OUTPUT_PATHS.stop);
         record.release_version = "0.39.0";
         writeFileSync(
@@ -690,6 +829,274 @@ describe("trust index", () => {
         expect(result.drift).toEqual([
             expect.stringContaining("mc-host-n-minus-one-stop.json"),
         ]);
+    });
+});
+
+describe("production payload assembly", () => {
+    test("production binary must embed the current input-lock digest", () => {
+        const root = mkdtempSync(join(tmpdir(), "mc-host-binary-identity-"));
+        tempRoots.push(root);
+        const binary = join(root, "ck-mc-host");
+        const digest = "a".repeat(64);
+        writeFileSync(binary, `#!/bin/sh\nprintf '%s\\n' '${digest}'\n`);
+        chmodSync(binary, 0o700);
+        expect(() =>
+            verifyProductionBinaryIdentity(binary, digest),
+        ).not.toThrow();
+        expect(() =>
+            verifyProductionBinaryIdentity(binary, "b".repeat(64)),
+        ).toThrow(/does not embed the current U9 input-lock digest/);
+    });
+
+    test("Linux copies the launcher and exact locked runtime/model slots", () => {
+        const root = mkdtempSync(join(tmpdir(), "mc-host-production-"));
+        tempRoots.push(root);
+        const binary = join(root, "ck-mc-host");
+        writeFileSync(binary, "\x7fELF production launcher\n");
+        const qualifiedInputs: Record<string, string> = {};
+        const qualifiedInputExpectations: Record<
+            string,
+            { size_bytes: number; sha256: string }
+        > = {};
+        for (const input of Object.keys(LINUX_PRODUCTION_PAYLOAD_SLOTS)) {
+            const source = join(root, `source-${input}`);
+            const bytes = `qualified ${input} bytes\n`;
+            writeFileSync(source, bytes);
+            qualifiedInputs[input] = source;
+            qualifiedInputExpectations[input] = {
+                size_bytes: Buffer.byteLength(bytes),
+                sha256: sha256Hex(bytes),
+            };
+        }
+
+        const result = assembleProductionPayload(
+            qualifiedContext(),
+            targetFor("linux-x64-gnu"),
+            {
+                outDir: join(root, "out"),
+                sources: {
+                    binaryPath: binary,
+                    qualifiedInputs,
+                    qualifiedInputExpectations,
+                },
+            },
+        );
+
+        expect(result.manifest.mode).toBe("production");
+        expect(result.manifest.files.map((entry) => entry.path)).toEqual(
+            [
+                LAUNCHER_PATH,
+                ...Object.values(LINUX_PRODUCTION_PAYLOAD_SLOTS),
+            ].sort(),
+        );
+        expect(() => verifyPayloadDir(result.outDir, result.manifest)).not.toThrow();
+        expect(payloadManifestDigest(result.manifest)).toBe(result.digest);
+        for (const [input, relative] of Object.entries(
+            LINUX_PRODUCTION_PAYLOAD_SLOTS,
+        )) {
+            expect(
+                result.manifest.files.find((entry) => entry.path === relative)
+                    ?.sha256,
+            ).toBe(qualifiedInputExpectations[input]?.sha256);
+        }
+
+        writeFileSync(
+            qualifiedInputs.model_onnx,
+            "mutated model bytes after qualification\n",
+        );
+        expect(() =>
+            assembleProductionPayload(
+                qualifiedContext(),
+                targetFor("linux-x64-gnu"),
+                {
+                    outDir: join(root, "mutated"),
+                    sources: {
+                        binaryPath: binary,
+                        qualifiedInputs,
+                        qualifiedInputExpectations,
+                    },
+                },
+            ),
+        ).toThrow(/differs from the U9 lock/);
+    });
+
+    test("macOS host-only payload carries no Linux model bytes", () => {
+        const root = mkdtempSync(join(tmpdir(), "mc-host-production-"));
+        tempRoots.push(root);
+        const binary = join(root, "ck-mc-host");
+        writeFileSync(binary, "Mach-O production launcher\n");
+
+        const result = assembleProductionPayload(
+            qualifiedContext(),
+            targetFor("darwin-arm64"),
+            {
+                outDir: join(root, "out"),
+                sources: { binaryPath: binary },
+            },
+        );
+
+        expect(result.manifest.files.map((entry) => entry.path)).toEqual([
+            LAUNCHER_PATH,
+        ]);
+        expect(result.manifest.synapse).toBe("unsupported");
+    });
+
+    test("source pathname replacement after open cannot change copied bytes", () => {
+        const root = mkdtempSync(join(tmpdir(), "mc-host-source-swap-"));
+        tempRoots.push(root);
+        const binary = join(root, "ck-mc-host");
+        writeFileSync(binary, "\x7fELF production launcher\n");
+        const qualifiedInputs: Record<string, string> = {};
+        const qualifiedInputExpectations: Record<
+            string,
+            { size_bytes: number; sha256: string }
+        > = {};
+        for (const input of Object.keys(LINUX_PRODUCTION_PAYLOAD_SLOTS)) {
+            const source = join(root, `source-${input}`);
+            const bytes = `qualified ${input} bytes\n`;
+            writeFileSync(source, bytes);
+            qualifiedInputs[input] = source;
+            qualifiedInputExpectations[input] = {
+                size_bytes: Buffer.byteLength(bytes),
+                sha256: sha256Hex(bytes),
+            };
+        }
+        const modelPath = qualifiedInputs.model_onnx;
+        let swapped = false;
+        const result = assembleProductionPayload(
+            qualifiedContext(),
+            targetFor("linux-x64-gnu"),
+            {
+                outDir: join(root, "out"),
+                sources: {
+                    binaryPath: binary,
+                    qualifiedInputs,
+                    qualifiedInputExpectations,
+                    afterSourceOpenForTest(relative, sourcePath) {
+                        if (
+                            relative ===
+                            LINUX_PRODUCTION_PAYLOAD_SLOTS.model_onnx
+                        ) {
+                            renameSync(sourcePath, `${sourcePath}.opened`);
+                            writeFileSync(sourcePath, "attacker replacement");
+                            swapped = true;
+                        }
+                    },
+                },
+            },
+        );
+        expect(swapped).toBeTrue();
+        expect(
+            result.manifest.files.find(
+                (entry) =>
+                    entry.path ===
+                    LINUX_PRODUCTION_PAYLOAD_SLOTS.model_onnx,
+            )?.sha256,
+        ).toBe(qualifiedInputExpectations.model_onnx?.sha256);
+        expect(readFileSync(modelPath, "utf8")).toBe("attacker replacement");
+    });
+
+    test("npm 11 packs the manifest and payload from the staged package root", () => {
+        const root = mkdtempSync(join(tmpdir(), "mc-host-production-"));
+        tempRoots.push(root);
+        const binary = join(root, "ck-mc-host");
+        writeFileSync(binary, "Mach-O production launcher\n");
+        const result = assembleProductionPayload(
+            qualifiedContext(),
+            targetFor("darwin-x64"),
+            {
+                outDir: join(root, "out"),
+                packageMetadataDir: join(
+                    repoRoot,
+                    "packages",
+                    "mc-host-darwin-x64",
+                ),
+                sources: { binaryPath: binary },
+            },
+        );
+
+        const packed = packProductionPayload(result, join(root, "tarballs"));
+        const listing = Bun.spawnSync(["tar", "-tf", packed.tarballPath]);
+
+        expect(listing.exitCode).toBe(0);
+        const names = listing.stdout.toString("utf8");
+        expect(names).toContain("package/payload-manifest.json");
+        expect(names).toContain("package/payload/bin/ck-mc-host");
+        expect(() =>
+            packProductionPayload(
+                { ...result, releaseQualified: false },
+                join(root, "blocked-tarballs"),
+            ),
+        ).toThrow(/gate-bypassed payloads cannot be packed/);
+    });
+
+    test("unqualified context and missing Linux inputs fail before a manifest exists", () => {
+        const root = mkdtempSync(join(tmpdir(), "mc-host-production-"));
+        tempRoots.push(root);
+        const binary = join(root, "ck-mc-host");
+        writeFileSync(binary, "\x7fELF production launcher\n");
+
+        expect(() =>
+            assembleProductionPayload(
+                unqualifiedContext(),
+                targetFor("darwin-x64"),
+                {
+                outDir: join(root, "unqualified"),
+                sources: { binaryPath: binary },
+                },
+            ),
+        ).toThrow(/production-qualified/);
+        expect(() =>
+            assembleProductionPayload(
+                qualifiedContext(),
+                targetFor("linux-x64-gnu"),
+                {
+                    outDir: join(root, "missing"),
+                    sources: { binaryPath: binary },
+                },
+            ),
+        ).toThrow(/missing qualified/);
+    });
+
+    test("complete target outputs become a qualified unpublished parent trust index", () => {
+        const root = mkdtempSync(join(tmpdir(), "mc-host-production-"));
+        tempRoots.push(root);
+        const outDir = join(root, "out");
+        const binary = join(root, "ck-mc-host");
+        writeFileSync(binary, "qualified launcher bytes\n");
+        const qualifiedInputs: Record<string, string> = {};
+        for (const input of Object.keys(LINUX_PRODUCTION_PAYLOAD_SLOTS)) {
+            const source = join(root, `source-${input}`);
+            writeFileSync(source, `qualified ${input} bytes\n`);
+            qualifiedInputs[input] = source;
+        }
+        const ctx = qualifiedContext();
+        for (const target of PAYLOAD_TARGETS) {
+            assembleProductionPayload(ctx, target, {
+                outDir,
+                sources: {
+                    binaryPath: binary,
+                    ...(target.synapse === "certified_cpu"
+                        ? { qualifiedInputs }
+                        : {}),
+                },
+            });
+        }
+
+        const artifacts = buildTrustArtifacts(ctx, outDir);
+
+        expect(() => validateTrustIndex(artifacts.index, ctx)).not.toThrow();
+        const entries = (artifacts.index.entries as Record<string, unknown>[]);
+        expect(entries).toHaveLength(3);
+        expect(entries.every((entry) => entry.qualified === true)).toBe(true);
+        expect(entries.every((entry) => entry.published === false)).toBe(true);
+        expect(
+            entries.every(
+                (entry) =>
+                    typeof entry.payload_manifest_digest === "string" &&
+                    typeof entry.bootstrap_launcher_digest === "string",
+            ),
+        ).toBe(true);
     });
 });
 
@@ -727,14 +1134,15 @@ describe("dev payload build", () => {
     test("dev payload manifest recomputes to the same digest from disk", () => {
         const root = mkdtempSync(join(tmpdir(), "mc-host-dev-"));
         tempRoots.push(root);
+        const releaseRoot = freshRoot();
         const fakeBinary = join(root, "ck-mc-host-src");
         writeFileSync(fakeBinary, "\x7fELF fake dev binary bytes\n");
-        const result = buildDevPayload(repoRoot, {
+        const result = buildDevPayload(releaseRoot, {
             outDir: join(root, "out"),
             binaryPath: fakeBinary,
             target: targetFor("darwin-x64"),
         });
-        const ctx = context();
+        const ctx = loadReleaseContext(releaseRoot);
         const reloaded = JSON.parse(readFileSync(result.manifestPath, "utf8"));
         validatePayloadManifest(reloaded, ctx);
         expect(payloadManifestDigest(reloaded)).toBe(result.digest);
@@ -747,16 +1155,17 @@ describe("dev payload build", () => {
     test("staged dev bytes are mutation-detected", () => {
         const root = mkdtempSync(join(tmpdir(), "mc-host-dev-"));
         tempRoots.push(root);
+        const releaseRoot = freshRoot();
         const fakeBinary = join(root, "ck-mc-host-src");
         writeFileSync(fakeBinary, "dev binary");
-        const result = buildDevPayload(repoRoot, {
+        const result = buildDevPayload(releaseRoot, {
             outDir: join(root, "out"),
             binaryPath: fakeBinary,
             target: targetFor("darwin-arm64"),
         });
         writeFileSync(join(result.outDir, LAUNCHER_PATH), "dev binarY");
-        expect(() =>
-            verifyPayloadDir(result.outDir, result.manifest),
-        ).toThrow(/digest drift/);
+        expect(() => verifyPayloadDir(result.outDir, result.manifest)).toThrow(
+            /digest drift/,
+        );
     });
 });

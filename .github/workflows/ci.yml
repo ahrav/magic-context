@@ -151,6 +151,12 @@ jobs:
       - name: Provision metadata-only sibling stubs
         run: sh scripts/provision-rust-ci-stubs.sh
 
+      # mc-module is absent here on purpose. It depends on mc-core and
+      # mc-store, which import real types from the ../commons cortexkit
+      # crates; the stubs above are metadata-only, so anything that COMPILES
+      # mc-module fails to resolve those imports. The ck-mc-host binary build
+      # and the lifecycle_cli contract run in the mc-host-lifecycle job, which
+      # checks out the sibling sources instead of stubbing them.
       - name: Source-build transport, host, addon, and iceoryx
         run: |
           cargo build -p mc-shm-transport -p mc-host -p mc-shm-native
@@ -207,6 +213,63 @@ jobs:
           rm -f packages/mc-shm-native/mc_shm_native.node
           test ! -e packages/mc-shm-native/mc_shm_native.node
 
+  mc-host-lifecycle:
+    name: mc-host lifecycle integration (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    defaults:
+      run:
+        working-directory: magic-context
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: magic-context
+          persist-credentials: false
+
+      - uses: actions/checkout@v5
+        with:
+          repository: ahrav/commons
+          ref: d2208eda95d845193d84199dbfd0781a1f479291
+          path: commons
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Host lifecycle and closure proofs (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo test -p mc-host \
+            --test broca_protocol \
+            --test broca_subprocess \
+            --test harness_closure \
+            --test protocol_vectors
+
+      - name: Native module adapter and CLI lifecycle (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo test -p mc-module --bin ck-mc-host
+          cargo test -p mc-module \
+            --test host_adapter \
+            --test lifecycle_cli
+
+      # The release ships darwin payloads, so this leg proves the native
+      # lifecycle binary compiles and links for darwin and that its
+      # argument-parsing and version/release-metadata contract holds there.
+      # It asserts nothing about lifecycle state: those proofs need a
+      # published daemon, which requires Broca's `/proc` process identity,
+      # and a data root the `O_NOFOLLOW` lifecycle path walk accepts, which
+      # the darwin temporary directory's `/var` symlink is not, so they
+      # compile out here.
+      - name: Native lifecycle binary and CLI contract (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cargo build -p mc-module --bin ck-mc-host
+          cargo test -p mc-module --test lifecycle_cli
+
   check-plugin:
     name: Check (plugin)
     runs-on: ubuntu-latest
@@ -237,6 +300,23 @@ jobs:
 
       - name: Check compiled TUI freshness
         run: bun run --cwd packages/plugin check:tui-compiled
+
+      # `bun run test` ends in test:release, whose dependency-boundary check
+      # shells out to `cargo tree -p mc-host`. cargo refuses to load the
+      # workspace until every path-dep manifest exists, including the
+      # ../commons cortexkit crates. Metadata-only stubs satisfy the manifest
+      # graph; nothing in this job compiles them.
+      - name: Provision metadata-only sibling stubs
+        run: sh scripts/provision-rust-ci-stubs.sh
+
+      # Pins the cargo used by the warm-up below and by the same `cargo tree`
+      # inside test:release, matching every other cargo-invoking job. Without
+      # it both resolve to whatever rustc the runner image ships, so an image
+      # change surfaces as a cargo failure inside a TypeScript job.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Warm mc-host dependency graph
+        run: cargo tree -p mc-host -e normal >/dev/null
 
       - name: Test
         run: bun run test
@@ -347,6 +427,13 @@ jobs:
       # boundary through `cargo tree`, which needs a resolvable workspace.
       - uses: dtolnay/rust-toolchain@stable
 
+      # Production payload packing refuses any npm outside the certified 11.x
+      # line, and this job otherwise inherits whichever npm the runner image
+      # ships. Node 24 carries npm 11.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.18.0"
+
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
@@ -416,6 +503,38 @@ jobs:
 
       - name: Run the invalid-state mutation battery
         run: bun packages/e2e-tests/scripts/run-historian-eval.ts --mutations
+
+  # Its own job with no `needs`, for the reasons spelled out above the historian
+  # lane: a gate placed as a step in another job is skipped whenever an earlier
+  # step fails, and a gate placed downstream of check-plugin is skipped whenever
+  # check-plugin fails — both reproduce silent non-enforcement one hop away.
+  #
+  # Nothing invoked test:dreamer-eval-unit before: test:e2e selects --mode ts
+  # and test:opencode-e2e runs the harness manifests, and neither reaches
+  # dreamerEvalUnitFiles(), so the scenario contract, seeder, scorer, and
+  # mutation battery could regress with every other lane green. The suites are
+  # credential-free and make no live model calls; live scenario runs stay out of
+  # per-PR CI.
+  dreamer-eval-contracts:
+    name: Dreamer eval lane contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Dreamer eval unit contracts
+        run: bun run test:dreamer-eval-unit
 
   mc-host-client-interop:
     name: mc-host client interop (Bun + Node 24)
@@ -681,6 +800,12 @@ jobs:
         # specifier pointing at packages/plugin/, so dist must exist.
         run: bun run --cwd packages/plugin build
 
+      - name: Build Pi plugin
+        # The OpenCode selection carries cross-harness parity tests that spawn a
+        # Pi runner alongside opencode, and that spawn asserts
+        # packages/pi-plugin/dist/index.js exists before booting.
+        run: bun run --cwd packages/pi-plugin build
+
       # Strip inherited NODE_ENV=test so the spawned opencode subprocess
       # gets the same logging + runtime behavior as a normal local run
       # (documented in CONTRIBUTING / project memory).
@@ -698,9 +823,9 @@ jobs:
         # manifest, carries the standalone oracles that live outside the
         # manifest's tests/**/*.test.ts inventory (see standaloneUnitFiles),
         # and runs the incident-pool green wrapper alone in a second phase
-        # with --max-concurrency 1. Rust is intentionally absent from public
-        # CI because its private ../commons and ../subconscious path-deps are
-        # not provisioned here; the local release gate runs that host group.
+        # with --max-concurrency 1. Rust is intentionally absent from this job
+        # because its ../commons and ../subconscious path-deps are not checked
+        # out here; the local release gate runs that host group.
         run: bun run --cwd packages/e2e-tests test:opencode-e2e
 
   e2e-host-pi:

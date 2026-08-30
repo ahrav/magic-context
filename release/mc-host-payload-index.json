@@ -16,7 +16,7 @@
       },
       "synapse": "unsupported",
       "target": "darwin-arm64",
-      "unqualified_reason": "production payload not built: release inputs are not production-qualified (docs/evidence/mc-host-release-qualification.json production_qualified: false)",
+      "unqualified_reason": "production payload not built: release inputs are not production-qualified (tmp/mc-host-release-qualification.json production_qualified: false)",
       "version": "0.38.0"
     },
     {
@@ -35,7 +35,7 @@
       },
       "synapse": "unsupported",
       "target": "darwin-x64",
-      "unqualified_reason": "production payload not built: release inputs are not production-qualified (docs/evidence/mc-host-release-qualification.json production_qualified: false)",
+      "unqualified_reason": "production payload not built: release inputs are not production-qualified (tmp/mc-host-release-qualification.json production_qualified: false)",
       "version": "0.38.0"
     },
     {
@@ -55,7 +55,7 @@
       },
       "synapse": "certified_cpu",
       "target": "linux-x64-gnu",
-      "unqualified_reason": "production payload not built: release inputs are not production-qualified (docs/evidence/mc-host-release-qualification.json production_qualified: false)",
+      "unqualified_reason": "production payload not built: release inputs are not production-qualified (tmp/mc-host-release-qualification.json production_qualified: false)",
       "version": "0.38.0"
     }
   ],

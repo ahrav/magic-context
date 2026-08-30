@@ -501,7 +501,7 @@ export async function driveArchivedReobservation(
         const write = await runScriptedToolCall(h, sessionId, {
             tool: "ctx_memory",
             input: {
-                action: "write",
+                action: "create",
                 category: fixture.category,
                 content: fixture.fact,
             },
@@ -524,7 +524,7 @@ export async function driveArchivedReobservation(
         const reobserve = await runScriptedToolCall(h, sessionId, {
             tool: "ctx_memory",
             input: {
-                action: "write",
+                action: "create",
                 category: fixture.category,
                 content: `  ${fixture.fact.toUpperCase()}  `,
             },
@@ -534,7 +534,7 @@ export async function driveArchivedReobservation(
         const activeControl = await runScriptedToolCall(h, sessionId, {
             tool: "ctx_memory",
             input: {
-                action: "write",
+                action: "create",
                 category: fixture.category,
                 content: fixture.activeControl,
             },
@@ -738,7 +738,7 @@ export async function driveSupersedeReconciliation(
         const write = await runScriptedToolCall(h, sessionId, {
             tool: "ctx_memory",
             input: {
-                action: "write",
+                action: "create",
                 category: fixture.category,
                 content: fixture.original,
             },
@@ -1038,7 +1038,7 @@ export async function driveEmbeddingFreshness(
         const write = await runScriptedToolCall(h, sessionId, {
             tool: "ctx_memory",
             input: {
-                action: "write",
+                action: "create",
                 category: fixture.category,
                 content: fixture.oldContent,
             },
@@ -1389,7 +1389,7 @@ export async function driveCrossSourceRank(
         const write = await runScriptedToolCall(h, sessionId, {
             tool: "ctx_memory",
             input: {
-                action: "write",
+                action: "create",
                 category: fixture.category,
                 content: fixture.memoryContent,
             },
@@ -1592,7 +1592,7 @@ export async function drivePendingNoteRecall(
         const activeControl = await runScriptedToolCall(h, writerSessionId, {
             tool: "ctx_memory",
             input: {
-                action: "write",
+                action: "create",
                 category: "PROJECT_RULES",
                 content: fixture.activeControl,
             },

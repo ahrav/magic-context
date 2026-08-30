@@ -6,6 +6,7 @@ import {
 import { ShmFrameChannel } from "./shm-frame-channel";
 import { decodeShmGrant } from "./shm-grant";
 import type { ClientTransportProvider } from "./transport-provider";
+import { sameDaemonId } from "./types";
 
 const PARAMETERS = Object.freeze({
     backend: "ring",
@@ -13,14 +14,6 @@ const PARAMETERS = Object.freeze({
     scheduling: "cold_park_wake",
     topology: "fused",
 });
-
-function sameDaemonId(a: Uint8Array, b: Uint8Array): boolean {
-    if (a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i++) {
-        if (a[i] !== b[i]) return false;
-    }
-    return true;
-}
 
 /** Explicit test-only provider. commentlint: allow(JUDGE) */
 export function createExplicitShmTestProvider(

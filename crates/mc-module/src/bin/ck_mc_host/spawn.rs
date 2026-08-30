@@ -153,12 +153,14 @@ pub fn spawn_detached(
     // and execution uses only this open file description.
     let exe_fd = match generation_launcher {
         Some(fd) => relocate_above_stderr(fd)?,
-        None => {
-            // `/proc/self/exe` names the running image's inode directly. Resolving
-            // the path first and reopening it would let another principal swap the
-            // path's target between the readlink and the open.
-            let exe = std::fs::File::open("/proc/self/exe")
-                .map_err(|_| SpawnError("executable self-descriptor open failed"))?;
+        None if test_self_exec_allowed() => {
+            #[cfg(target_os = "linux")]
+            let path = Path::new("/proc/self/exe").to_path_buf();
+            #[cfg(target_os = "macos")]
+            let path = std::env::current_exe()
+                .map_err(|_| SpawnError("test executable path unavailable"))?;
+            let exe =
+                std::fs::File::open(path).map_err(|_| SpawnError("test executable open failed"))?;
             let exe_meta = exe
                 .metadata()
                 .map_err(|_| SpawnError("executable stat failed"))?;
@@ -173,21 +175,46 @@ pub fn spawn_detached(
             }
             relocate_above_stderr(OwnedFd::from(exe))?
         }
+        None => return Err(SpawnError("verified generation launcher is required")),
     };
 
     let mut pipe_fds = [0 as libc::c_int; 2];
+    // Linux creates the pipe already close-on-exec. Darwin has no `pipe2`, so
+    // there the flag is applied in a second step below.
+    #[cfg(target_os = "linux")]
     // SAFETY: pipe2 writes exactly two descriptors into the array.
     cvt(
         unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) },
         "envelope pipe creation failed",
     )?;
-    // SAFETY: the descriptors were just returned by pipe2 and are owned here.
+    #[cfg(target_os = "macos")]
+    // SAFETY: pipe writes exactly two descriptors into the array.
+    cvt(
+        unsafe { libc::pipe(pipe_fds.as_mut_ptr()) },
+        "envelope pipe creation failed",
+    )?;
+    // SAFETY: the descriptors were just returned by pipe2/pipe and are owned here.
     let (pipe_r, pipe_w) = unsafe {
         (
             OwnedFd::from_raw_fd(pipe_fds[0]),
             OwnedFd::from_raw_fd(pipe_fds[1]),
         )
     };
+    // Both ends are owned before the flag is set, so a failure here closes them
+    // instead of leaking a descriptor pair. Unlike `pipe2` this is not atomic
+    // with creation: a concurrent exec in another thread could inherit the ends
+    // in that window. The child below is the only exec this binary performs, it
+    // happens after this point, and it keeps the read end deliberately by
+    // dup2-ing it onto stdin (which clears close-on-exec) while closing every
+    // descriptor above 3.
+    #[cfg(target_os = "macos")]
+    for fd in [pipe_r.as_raw_fd(), pipe_w.as_raw_fd()] {
+        // SAFETY: fd is owned by pipe_r/pipe_w and open for this call.
+        cvt(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+            "envelope pipe cloexec failed",
+        )?;
+    }
     // The read end is a `dup2` source in the child, so it must not sit in a
     // slot the sequence assigns. A same-fd `dup2(0, 0)` would also leave the
     // pipe's `O_CLOEXEC` set, closing the daemon's stdin across the exec.
@@ -219,7 +246,13 @@ pub fn spawn_detached(
     }
     // Highest signal number to reset, resolved before fork so the child makes
     // no library call that could consult allocator or lock state.
+    #[cfg(target_os = "linux")]
     let max_signal = libc::SIGRTMAX();
+    // Darwin defines no realtime signals and `libc` exposes no `NSIG` for it, so
+    // the highest signal the platform names is the ceiling. Resetting past it
+    // would only collect `EINVAL`.
+    #[cfg(not(target_os = "linux"))]
+    let max_signal = libc::SIGUSR2;
 
     // SAFETY: fork with a multithreaded parent; the child performs only
     // async-signal-safe operations (setsid/umask/chdir/signal/sigprocmask/
@@ -292,6 +325,17 @@ pub fn spawn_detached(
         .and_then(|()| writer.flush())
         .map_err(|_| SpawnError("startup envelope delivery failed"))?;
     Ok(())
+}
+
+pub(super) fn test_self_exec_allowed() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var_os("CK_MC_HOST_TEST_ALLOW_SELF_EXEC").is_some_and(|value| value == "1")
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
 }
 
 /// Ignores SIGPIPE in the launcher process so a child that dies before

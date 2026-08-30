@@ -1371,6 +1371,7 @@ dependencies = [
 name = "mc-module"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "async-trait",
  "chrono",
  "chrono-tz",
@@ -1383,6 +1384,7 @@ dependencies = [
  "mc-host",
  "mc-store",
  "mc-tokenizer",
+ "memchr",
  "regex",
  "serde",
  "serde_json",

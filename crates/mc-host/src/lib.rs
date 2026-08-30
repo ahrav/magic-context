@@ -30,6 +30,7 @@ pub mod transport_provider;
 mod connection;
 mod control;
 mod dispatch;
+mod file_mode;
 #[doc(hidden)]
 pub mod frame_channel;
 mod frame_read;
