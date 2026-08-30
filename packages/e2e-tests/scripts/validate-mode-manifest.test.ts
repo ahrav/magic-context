@@ -242,6 +242,16 @@ describe("mode manifest validator", () => {
         );
     });
 
+    it("requires the metamorphic unit selection script", () => {
+        const pkg = JSON.parse(
+            readFileSync(resolve(E2E_ROOT, "package.json"), "utf8"),
+        ) as { scripts: Record<string, string> };
+        delete pkg.scripts["test:metamorphic-unit"];
+        expect(() => validateGreenPackageScripts(pkg)).toThrow(
+            /test:metamorphic-unit/,
+        );
+    });
+
     it("rejects invalid tiers and a both-modes entry missing an invocation", () => {
         const entries = validation.manifest.entries;
         expect(() =>

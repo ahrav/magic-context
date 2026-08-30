@@ -21,6 +21,20 @@ on:
         options:
           - dev
         default: dev
+      metamorphic_scenario:
+        description: Scenario for the bounded live metamorphic pair
+        type: string
+        default: hse-webhook-docs-injection
+      metamorphic_transform:
+        description: Transform for the bounded live metamorphic pair
+        type: choice
+        options:
+          - reorder-independent-turns
+          - paraphrase-irrelevant
+          - move-accepted-decision
+          - duplicate-rejected-proposal
+          - rename-unrelated-symbols
+        default: paraphrase-irrelevant
   schedule:
     # Weekly, offset from the retrieval-benchmark schedule.
     - cron: "41 4 * * 2"
@@ -146,5 +160,72 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: historian-eval-report
+          path: packages/e2e-tests/artifacts/
+          if-no-files-found: warn
+
+  live-metamorphic:
+    if: >-
+      github.event_name == 'schedule' ||
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    concurrency:
+      group: historian-eval-live
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0"
+
+      - name: Install workspace deps
+        run: bun install --frozen-lockfile
+
+      - name: Install opencode
+        run: |
+          curl -fsSL https://opencode.ai/install | bash
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve the corpus selection
+        env:
+          CORPUS_INPUT: ${{ inputs.scenarios }}
+        run: |
+          case "${CORPUS_INPUT:-dev}" in
+            dev) SELECT_PATH=packages/e2e-tests/historian-eval/dev ;;
+            *) echo "unknown corpus: $CORPUS_INPUT" >&2; exit 1 ;;
+          esac
+          echo "SELECT_PATH=$SELECT_PATH" >> "$GITHUB_ENV"
+
+      - name: Gate the base corpus without credentials
+        run: |
+          bun packages/e2e-tests/scripts/run-historian-eval.ts --lint --scenarios "$SELECT_PATH"
+          bun packages/e2e-tests/scripts/run-historian-eval.ts --mutations --scenarios "$SELECT_PATH"
+
+      - name: Run the live metamorphic pair
+        timeout-minutes: 300
+        env:
+          NODE_ENV: ""
+          ANTHROPIC_API_KEY: ${{ secrets.HISTORIAN_EVAL_ANTHROPIC_API_KEY }}
+          HISTORIAN_EVAL_MODEL: anthropic/claude-sonnet-4-5
+          HISTORIAN_EVAL_PROBE_MODEL: anthropic/claude-haiku-4-5
+          METAMORPHIC_SCENARIO: ${{ inputs.metamorphic_scenario }}
+          METAMORPHIC_TRANSFORM: ${{ inputs.metamorphic_transform }}
+        run: |
+          bun packages/e2e-tests/scripts/run-metamorphic-eval.ts --live \
+            --scenarios "$SELECT_PATH" \
+            --scenario "${METAMORPHIC_SCENARIO:-hse-webhook-docs-injection}" \
+            --transform "${METAMORPHIC_TRANSFORM:-paraphrase-irrelevant}" \
+            --deadline-minutes 290 \
+            --report packages/e2e-tests/artifacts/metamorphic-eval-live-report.json
+
+      - name: Archive the metamorphic report and run records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: historian-eval-metamorphic-report
           path: packages/e2e-tests/artifacts/
           if-no-files-found: warn
