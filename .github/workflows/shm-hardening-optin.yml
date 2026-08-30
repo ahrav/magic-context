@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       soak_hours:
-        description: Installed ring soak duration in hours
+        description: Measured ring soak duration in hours (hosted runners cap the job at 6h)
         required: false
-        default: "8"
+        default: "5"
       fuzz_seconds:
         description: Per-target libFuzzer -max_total_time seconds
         required: false
@@ -17,9 +17,13 @@ permissions:
 
 jobs:
   full-soak:
-    name: Eight-hour installed ring resource soak (Linux)
+    name: Long-running ring resource soak (Linux)
     runs-on: ubuntu-latest
-    timeout-minutes: 540
+    # GitHub terminates a hosted-runner job at six hours of execution time and
+    # timeout-minutes cannot raise that ceiling, so the measured soak plus
+    # checkout and compilation has to fit inside it. This timeout fires first so
+    # an overrun fails with our logs instead of an opaque platform kill.
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v5
         with:
@@ -32,9 +36,18 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
 
-      - name: Installed fixed-ring soak
+      - name: Measured fixed-ring soak
         working-directory: packages/e2e-tests
-        run: bun scripts/run-shm-soak.ts --hours '${{ inputs.soak_hours }}'
+        env:
+          SOAK_HOURS: ${{ inputs.soak_hours }}
+        run: |
+          # This job is pinned to a hosted runner, so a request the platform
+          # cannot honour is a configuration error rather than a soak failure.
+          if ! awk -v h="$SOAK_HOURS" 'BEGIN { exit !(h + 0 > 0 && h + 0 <= 5) }' </dev/null; then
+            echo "soak_hours must be >0 and <=5 to fit the six-hour hosted-runner limit, got: $SOAK_HOURS" >&2
+            exit 1
+          fi
+          bun scripts/run-shm-soak.ts --hours "$SOAK_HOURS"
 
   bounded-fuzz:
     name: Bounded libFuzzer campaign (nested fuzz workspace)
