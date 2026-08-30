@@ -5,14 +5,14 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use mc_shm_transport::backend::ring::RingGrant;
+use mc_shm_transport::descriptor::SETUP_DESCRIPTOR_COUNT;
 use rustix::net::{recvmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use mc_shm_transport::setup_auth::{
     self, CLIENT_AUTH_DOMAIN, DAEMON_ID_LEN, DEFAULT_CLIENT_ROLE, MAX_AUTH_MESSAGE_LEN,
-    MAX_SETUP_MESSAGE_LEN, NONCE_LEN, PROOF_LEN, PROTOCOL_VERSION, RING_DESCRIPTOR_COUNT,
-    SERVER_PROOF_DOMAIN,
+    MAX_SETUP_MESSAGE_LEN, NONCE_LEN, PROOF_LEN, PROTOCOL_VERSION, SERVER_PROOF_DOMAIN,
 };
 
 #[derive(Serialize)]
@@ -290,7 +290,7 @@ fn receive_grant(
             _ => return Err(invalid()),
         }
     }
-    if descriptors.len() != RING_DESCRIPTOR_COUNT {
+    if descriptors.len() != SETUP_DESCRIPTOR_COUNT {
         return Err(invalid());
     }
     let descriptors = descriptors.try_into().map_err(|_| invalid())?;

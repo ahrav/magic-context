@@ -1753,6 +1753,7 @@ impl Correlations {
 struct ByteCounter {
     cap: usize,
     used: Mutex<usize>,
+    wake: Mutex<Option<Weak<OwnedFd>>>,
 }
 
 impl ByteCounter {
@@ -1760,6 +1761,7 @@ impl ByteCounter {
         Self {
             cap,
             used: Mutex::new(0),
+            wake: Mutex::new(None),
         }
     }
 
@@ -1778,6 +1780,10 @@ impl ByteCounter {
 
     const fn capacity(&self) -> usize {
         self.cap
+    }
+
+    fn set_wake(&self, wake: &Arc<OwnedFd>) {
+        *lock_unpoisoned(&self.wake) = Some(Arc::downgrade(wake));
     }
 
     #[cfg(test)]
@@ -1807,8 +1813,16 @@ impl ByteCharge {
 impl Drop for ByteCharge {
     fn drop(&mut self) {
         if let Some(owner) = self.owner.upgrade() {
-            let mut used = lock_unpoisoned(&owner.used);
-            *used = used.saturating_sub(self.bytes);
+            {
+                let mut used = lock_unpoisoned(&owner.used);
+                *used = used.saturating_sub(self.bytes);
+            }
+            if let Some(wake) = lock_unpoisoned(&owner.wake)
+                .as_ref()
+                .and_then(Weak::upgrade)
+            {
+                signal_eventfd(&wake);
+            }
         }
     }
 }
@@ -1907,6 +1921,7 @@ fn start_ring_bridge(
         .map_err(|_| ClientError::new("setup_failed", "shared-memory setup failed"))?,
     );
     let worker_wake = Arc::clone(&wake_fd);
+    read_budget.set_wake(&wake_fd);
     let (read_tx, read_rx) = mpsc::channel(CLIENT_DATA_QUEUE_FRAMES);
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
@@ -1963,7 +1978,23 @@ fn start_ring_bridge(
                     if cancel.is_cancelled() {
                         return None;
                     }
-                    std::thread::sleep(Duration::from_micros(50));
+                    let mut fds = [
+                        rustix::event::PollFd::new(&*worker_wake, rustix::event::PollFlags::IN),
+                        rustix::event::PollFd::new(
+                            &setup,
+                            rustix::event::PollFlags::HUP | rustix::event::PollFlags::ERR,
+                        ),
+                    ];
+                    if rustix::event::poll(&mut fds, None).is_err()
+                        || fds[1].revents().intersects(
+                            rustix::event::PollFlags::HUP | rustix::event::PollFlags::ERR,
+                        )
+                    {
+                        return None;
+                    }
+                    if fds[0].revents().contains(rustix::event::PollFlags::IN) {
+                        drain_eventfd(&worker_wake);
+                    }
                 };
                 match endpoint.try_recv_with(charge) {
                     Ok(Some(frame)) => {

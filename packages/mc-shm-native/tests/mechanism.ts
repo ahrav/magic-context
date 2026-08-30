@@ -94,6 +94,10 @@ function loadRawAddon(): RawAttachAddon | null {
     return createRequire(import.meta.url)(path) as RawAttachAddon;
 }
 
+function supportsMechanismTests(addon: RawAttachAddon | null): addon is RawAttachAddon {
+    return addon !== null && process.platform === "linux";
+}
+
 /** Geometry of the `mc-host-test-ring-v1` profile (`mc_host_ring_profile`). */
 const GRANT_DESCRIPTOR_DEPTH = 8n;
 /** `MIN_ARENA_BYTES` == `MAX_FRAME_BYTES` == 64 MiB. */
