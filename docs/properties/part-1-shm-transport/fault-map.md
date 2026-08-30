@@ -25,7 +25,7 @@ nothing. That is the failure mode this file exists to prevent.
 
 | Class | Description | Available today |
 | --- | --- | --- |
-| F1 process kill | `SIGKILL` at a chosen point, signal-9 wait status required, observation window anchored to reap | **Was yes at `9c1eb4d1`** — `crates/mc-host/tests/support/shm_process.rs` implemented exactly this; `ed487e11` deleted that harness with the provider it drove, so F1 has no implementation at `e447c927` |
+| F1 process kill | `SIGKILL` at a chosen point, signal-9 wait status required, observation window anchored to reap | **Partial, and weaker than this map assumed** — `ed487e11` deleted `crates/mc-host/tests/support/shm_process.rs`, the reusable harness that implemented the full class, along with the provider it drove. What survives at `e447c927` is an inline primitive in one test file: `Victim::kill` at `crates/mc-host/tests/shm_failure_modes.rs:141-145` sends `SIGKILL`, reaps, and asserts `status.signal() == SIGKILL`. It has no reap-anchored observation window, and its only injection points are the connection roles `setup`, `active`, and `idle` (`:233-240`). None of the transport-level kill points this map depends on — a receiver holding leases, a producer between reserve and commit, a peer committed without a goodbye — has an implementation any more |
 | F2 hostile peer writes | A peer that writes shared control pages: the quarantine byte, cursors, slot fields, a pending descriptor | **No** — all three fuzz targets model immutable byte decoders; nothing models a mutating peer |
 | F3 deterministic failpoints | Forced failure at a named internal point: lease construction, span materialization, accounting overflow, alias detach, charge release | **Partial** — an external-view creation failpoint exists in the addon; no failpoint exists for lease or span construction, accounting arithmetic, or charge release |
 | F4 true concurrency | Producer and receiver progressing independently, not in lockstep | **No** — the only cross-process test is lockstep with a sleep |
@@ -53,9 +53,9 @@ nothing. That is the failure mode this file exists to prevent.
 | release-exactly-once-per-sequence | Two or more release attempts for one sequence, ideally concurrent (F4) | Partial — sequential duplicate and stale-lap cases are covered well |
 | receive-failure-leaves-no-wedged-slot | F3 at lease or span construction, after the receive compare-exchange succeeds | No — and physical faults alone will not construct it |
 | release-failure-is-observable | F3: a release that fails while the surrounding operation is otherwise clean | No |
-| attach-reconciles-or-refuses-stale-shared-cursors | F1 killing a receiver holding leases, then an attach | Partial — F1 exists; no test performs the post-kill attach |
-| crashed-producer-does-not-wedge-the-sequence | F1 between reserve and commit | Partial — F1 exists; this injection point is unused |
-| dead-peer-charges-are-reclaimed-or-declared | F1 on a committed peer without a goodbye | **Yes** — pinned by an existing test |
+| attach-reconciles-or-refuses-stale-shared-cursors | F1 killing a receiver holding leases, then an attach | No — was "Partial, F1 exists"; the kill harness that made it partial was deleted by `ed487e11` and the surviving inline primitive cannot kill a lease-holding receiver |
+| crashed-producer-does-not-wedge-the-sequence | F1 between reserve and commit | No — was "Partial, F1 exists"; same cause, and this injection point was already unused |
+| dead-peer-charges-are-reclaimed-or-declared | F1 on a committed peer without a goodbye | No — was "**Yes**, pinned by an existing test"; the pinning test `killed_victim_holding_active_charges_is_never_reclaimed` was deleted across `ed487e11` and `dde0c051`, and nothing in `shm_failure_modes.rs` at `e447c927` replaces it. This row was the only **Yes** in the F1 column |
 | cancelled-frame-disposition-is-declared | Cancellation or overload arriving between a successful receive and the ingress charge (F3 for determinism) | No |
 | validated-spans-are-disjoint-and-inside-the-arena | Attacker-controlled descriptor fields **and** an arena larger than the minimum | Partial — fuzzing covers fields but pins the arena at the minimum |
 | no-rust-reference-over-peer-writable-payload | Audit form needs no fault; the impact demonstration needs F2 mutating leased bytes | Audit yes, demonstration no |
@@ -199,8 +199,9 @@ Ranked by how many catalog records it unblocks:
    the transport's core publication guarantee.
 4. **F8, cross-artifact assertions** — unblocks 3 properties and would have
    caught the one defect in this area that already shipped.
-5. **F1 at new injection points** — the harness exists; only two new kill points
-   are needed.
+5. **F1 at new injection points** — no longer the cheap option it was. The
+   reusable harness is gone, so this now means rebuilding a kill fixture with a
+   reap-anchored observation window before adding the two kill points.
 
 ## Citation sweep, 2026-08-30
 
@@ -215,3 +216,21 @@ this file assumed no longer exists. F13 and the five iceoryx property rows are
 marked moot, because `0f336d3c` deleted the iceoryx backend, its tests, and its
 Cargo feature. Everything else, including the transport-side fault classes and
 the leverage ranking, is unchanged.
+
+## F1 consequence pass, 2026-08-30
+
+The earlier sweep corrected F1's class row but left the map's own rows still
+asserting that F1 was available, so the file contradicted itself. **Five rows
+changed** in this pass, all of them consequences of the same deletion and none of
+them a re-derived fault requirement:
+
+- The F1 class row, refined from "no implementation" to "partial": a `SIGKILL`
+  plus reap plus signal-9 assertion still exists inline at
+  `crates/mc-host/tests/shm_failure_modes.rs:141-145`, but with no reap-anchored
+  observation window and only connection-level injection points.
+- `attach-reconciles-or-refuses-stale-shared-cursors`: Partial to No.
+- `crashed-producer-does-not-wedge-the-sequence`: Partial to No.
+- `dead-peer-charges-are-reclaimed-or-declared`: **Yes** to No. This was the only
+  **Yes** in the F1 column, so no property in this catalog now has a non-vacuous
+  process-kill oracle.
+- Leverage item 5, which claimed the harness already existed.

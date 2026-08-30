@@ -65,12 +65,66 @@ declared in [../METHOD.md](../METHOD.md). It is used deliberately here and
 `part-2a-host-lifecycle` already uses it, but the schema question is open and
 belongs to a human.
 
-Not audited by this pass, and reported rather than fixed: citations into
-`crates/mc-shm-transport` have also drifted a small number of lines
-(`ring.rs:847` for `Ring::release` is now `:849`, `ring.rs:1352` for
-`ProducerReservation::commit` is now `:1354`, and `profile.rs:492-511` for the
-quarantine ordering is now `:522-542`). Those paths are live, so this refresh
-left them alone.
+Not audited by that pass, and now closed by the sweep below: citations into
+`crates/mc-shm-transport` and `packages/mc-shm-native` had also drifted, far more
+widely than the three examples that pass reported.
+
+## Transport-crate citation sweep, 2026-08-30
+
+The refactor commits `0f336d3c`, `d8bde128`, `793a973e`, `ed487e11`, `d21cde26`,
+`dde0c051`, `76cd6f41`, and `b5dc778e` edited the transport crate and the addon
+themselves, so this catalog's own line numbers disagreed with the evidence files,
+which were swept first. This pass re-anchored them.
+
+Method: every citation into `crates/mc-shm-transport` or `packages/mc-shm-native`
+was resolved to a file, the cited lines were read at `9c1eb4d1` (the commit this
+catalog was authored against), and the same byte-identical block was located at
+`e447c927`. A citation was re-pathed only when its construct exists
+byte-identically at the new location; every other case was escalated rather than
+re-numbered. Eight cited files are unchanged upstream and their citations cannot
+have drifted:
+`arena.rs`, `lease.rs`, `harness.rs`, `lifecycle.rs`, `evidence.rs`,
+`napi_buffers.rs`, `crates/mc-shm-transport/src/lib.rs`, and
+`tests/fuzz_corpus.rs`; `backend/sample.rs` is also unchanged.
+
+Counts: **263 line references checked.** 204 had drifted purely by line movement
+and were re-anchored, each verified byte-identical at its new line. 2 named a test
+the refactor renamed and were re-anchored with the new name and line. 21 point
+into files the refactor deleted; 2 of those moved to `tests/contract.rs`, where
+the coverage actually went, and 19 are kept as historical references inside Group
+K. 4 name constructs the refactor deleted outright, and those drove the
+record-level decisions recorded below rather than a new number. The remaining 32
+were already
+correct. Every re-anchored citation was cross-checked against the evidence file
+for its record: where both name a line for the same construct they now agree, and
+no re-anchored citation contradicts one.
+
+`DESCRIPTOR_SCHEMA_VERSION` moved from 1 to 2 in this window
+(`crates/mc-shm-transport/src/descriptor.rs:8`), and the descriptor lost its
+`platform` field along with `OwnershipMode`, `BackendId`, `MemoryLayout`,
+`RuntimeKind`, and `WorkloadClass`; `TransportDescriptor` now carries only
+`schema_version`, `scheduling`, and `hardware` (`descriptor.rs:58-62`). No record
+here asserted the literal version number or any of the removed fields — every
+record names `DESCRIPTOR_SCHEMA_VERSION` symbolically — so the bump invalidated no
+claim. Two consequences were checked rather than assumed.
+`FrameDescriptor::validate` is byte-identical across the change and only moved,
+from `descriptor.rs:348-362` at `9c1eb4d1` to `:223-237`, so
+`identity-and-schema-rejection-is-one-contract`'s five-condition claim stands as
+written. And the `.quarantine()` call sites cited by
+`quarantine-charge-transition-is-atomic` are still `tests/contract.rs:368` and
+`:479`, even though the `OwnershipMode::DirectLeased` line that used to sit at
+`contract.rs:368` is gone; that citation needed no change.
+
+Two citation targets outside the two named trees also drifted and are **reported,
+not repaired**, because repairing them is a re-derivation rather than a sweep.
+`docs/mc-host-shm-transport.md` was rewritten from 126 lines to 88, and 17 of the
+19 line references this catalog makes into it no longer resolve to their cited
+text. Those references carry documented guarantees, which METHOD.md rule 3 treats
+as claims under test, so re-anchoring them means re-reading the rewritten spec
+against 19 claims. That needs its own pass. The one exception handled here is
+`packages/plugin/src/shared/mc-host-client/shm-grant.ts`, deleted outright: it was
+one of the four artifacts in `one-profile-name-denotes-one-geometry`, so its
+removal changes that record's subject and is recorded there.
 
 ## Product context, and what it does to priority
 
@@ -138,11 +192,11 @@ decide whether to ship the transport. A defect there is live today.
 | [macos-object-creation-leaks-no-shm-name](#macos-object-creation-leaks-no-shm-name) | safety | medium | no |
 | [layout-region-offsets-are-real-page-aligned](#layout-region-offsets-are-real-page-aligned) | safety | high | no |
 | [page-size-dependent-setup-runs-on-a-non-4096-page-host](#page-size-dependent-setup-runs-on-a-non-4096-page-host) | reachability | high | no |
-| [iceoryx-descriptor-rejection-is-terminal-or-declared](#iceoryx-descriptor-rejection-is-terminal-or-declared) | safety | high | no |
-| [iceoryx-receive-expectation-tracks-the-delivered-stream](#iceoryx-receive-expectation-tracks-the-delivered-stream) | safety | high | no |
-| [iceoryx-cross-process-pairing-is-reachable-or-declared](#iceoryx-cross-process-pairing-is-reachable-or-declared) | reachability | high | no |
-| [iceoryx-completion-is-observable-to-the-host](#iceoryx-completion-is-observable-to-the-host) | safety | high | no |
-| [iceoryx-saturation-is-bounded-non-blocking-backpressure](#iceoryx-saturation-is-bounded-non-blocking-backpressure) | liveness | high | no |
+| [iceoryx-descriptor-rejection-is-terminal-or-declared](#iceoryx-descriptor-rejection-is-terminal-or-declared) | safety | high | n/a — superseded-by-refactor |
+| [iceoryx-receive-expectation-tracks-the-delivered-stream](#iceoryx-receive-expectation-tracks-the-delivered-stream) | safety | high | n/a — superseded-by-refactor |
+| [iceoryx-cross-process-pairing-is-reachable-or-declared](#iceoryx-cross-process-pairing-is-reachable-or-declared) | reachability | high | n/a — superseded-by-refactor |
+| [iceoryx-completion-is-observable-to-the-host](#iceoryx-completion-is-observable-to-the-host) | safety | high | n/a — superseded-by-refactor |
+| [iceoryx-saturation-is-bounded-non-blocking-backpressure](#iceoryx-saturation-is-bounded-non-blocking-backpressure) | liveness | high | n/a — superseded-by-refactor |
 | [wire-header-fully-validated-before-any-consumer-acts](#wire-header-fully-validated-before-any-consumer-acts) | safety | high | yes |
 | [ingress-charge-matches-the-bytes-copied-from-shared-storage](#ingress-charge-matches-the-bytes-copied-from-shared-storage) | safety | high | yes |
 | [every-shm-header-consumer-applies-its-role-gate](#every-shm-header-consumer-applies-its-role-gate) | safety | medium | yes |
@@ -185,12 +239,12 @@ a failed alias detach) **and** a peer that writes the shared lifecycle page
 after it. Without the second, the check passes without testing anything.
 Confidence: high — [evidence](evidence/quarantine-authority-survives-peer-writes.md).
 Verified by inspection: the only store is to `LifecyclePage.quarantined` in the
-shared mapping (`ring.rs:1033`), every gate re-reads it (`ring.rs:670`, `:765`,
-`:848`, `:913`, `:999`), the `Ring` struct carries no local mirror, and both
+shared mapping (`ring.rs:1035`), every gate re-reads it (`ring.rs:672`, `:767`,
+`:850`, `:915`, `:1001`), the `Ring` struct carries no local mirror, and both
 `Mapping::create` and `Mapping::attach` map the whole object
-`PROT_READ|PROT_WRITE` (`ring.rs:229`, `:258`) with required seals of
-`F_SEAL_GROW|SHRINK|SEAL` only and no `F_SEAL_WRITE` (`ring.rs:1709`).
-Existing check: `crates/mc-shm-transport/tests/ring.rs:256`
+`PROT_READ|PROT_WRITE` (`ring.rs:227`, `:249`) with required seals of
+`F_SEAL_GROW|SHRINK|SEAL` only and no `F_SEAL_WRITE` (`ring.rs:1704`).
+Existing check: `crates/mc-shm-transport/tests/ring.rs:246`
 `quarantine_rejects_all_operations_and_reports_conservation` — covers
 self-quarantine only, never a peer clearing the flag. Status unaudited.
 Impact: a one-byte write by the peer un-terminates a channel the local side
@@ -219,24 +273,24 @@ Check: `always` — hold a reservation, quarantine the ring, then assert
 an earlier draft also required that an abort not restore `SLOT_FREE`. That
 clause is dropped, because restoring a slot to free does not by itself permit
 reuse while `try_reserve` remains gated on the quarantine flag
-(`ring.rs:670-671`), so no independent harm from the abort path was established.
+(`ring.rs:672-673`), so no independent harm from the abort path was established.
 Fault/timing angle: the exact interleaving is producer-holds-reservation → peer
 publishes a corrupt frame → the receiver's `try_receive` quarantines
-(`ring.rs:807`) → producer commits. Also reachable in the addon when
+(`ring.rs:809`) → producer commits. Also reachable in the addon when
 `quarantine_channel` fails partway and leaves producers registered.
 Required faults and enabling state: an outstanding `ProducerReservation`
 **and** a quarantine trigger from the other side during its lifetime.
 Confidence: high — [evidence](evidence/quarantine-gates-cover-every-storage-mutation.md).
-Verified by inspection: `try_reserve` (`ring.rs:670`), `try_receive`
-(`ring.rs:765`), `release` (`ring.rs:848`), and `probe` (`ring.rs:999`) gate on
-`is_quarantined()`; `commit_reservation` (`ring.rs:1164-1215`) and
-`abort_reservation` (`ring.rs:1150-1165`) have no gate.
+Verified by inspection: `try_reserve` (`ring.rs:672`), `try_receive`
+(`ring.rs:767`), `release` (`ring.rs:850`), and `probe` (`ring.rs:1001`) gate on
+`is_quarantined()`; `commit_reservation` (`ring.rs:1166-1217`) and
+`abort_reservation` (`ring.rs:1152-1167`) have no gate.
 Existing check: none.
 Impact: publication into a ring whose storage is already considered
 unrecyclable, and an abort that hands quarantined storage back to the free pool.
 The abort path matters most where quarantine was raised *because* a JavaScript
 alias may still be attached to the aborted range
-(`packages/mc-shm-native/src/lib.rs:259-263`).
+(`packages/mc-shm-native/src/lib.rs:265-269`).
 Open questions:
 - Is "a reservation admitted before quarantine may still publish" the intended
   contract? If so it belongs in the documented close ordering, which currently
@@ -259,16 +313,16 @@ Required faults and enabling state: a quarantine trigger, then a fresh attach
 using the same grant.
 Confidence: high — [evidence](evidence/attach-refuses-a-quarantined-object.md).
 Raised from medium after direct verification: `validate_lifecycle`
-(`ring.rs:1637-1668`) reads exactly eight fields at `:1646-1653` — magic, layout
+(`ring.rs:1639-1670`) reads exactly eight fields at `:1648-1655` — magic, layout
 version, depth, arena, leases, total, incarnation, and lane — and compares them
-at `:1656-1665`. It never reads `quarantined`. The per-operation gates are the
+at `:1658-1667`. It never reads `quarantined`. The per-operation gates are the
 only readers of that flag.
 Existing check: per-operation `is_quarantined()` guards only.
 Impact: a caller receives a channel id and a usable-looking channel that fails at
 first reserve or receive. The grant claim is held until the registry entry is
 removed; `close` and `force_close` do remove it once producers, active leases,
-and stranded aliases are all empty (`packages/mc-shm-native/src/lib.rs:949-952`,
-`:970-973`), so the claim is pinned indefinitely only when a detach has already
+and stranded aliases are all empty (`packages/mc-shm-native/src/lib.rs:1070-1073`,
+`:1070-1073`), so the claim is pinned indefinitely only when a detach has already
 stranded an alias. An earlier draft of this record overstated that as "for the
 process lifetime".
 Open questions: None. The question that opened this record — whether
@@ -298,7 +352,7 @@ Check: `always-or-unreached` — force the `quarantined.checked_add` to overflow
 and assert `active + quarantined` is unchanged from before the call. Semantics
 revised from `always`: review established that a valid public execution cannot
 reach the overflow, because admission checks `active + requested + quarantined`
-against the host limits under the same mutex (`profile.rs:413-447`), so the sum
+against the host limits under the same mutex (`profile.rs:434-468`), so the sum
 cannot approach the bound. The ordering defect is real and worth pinning, but it
 is reachable only through a synthetic seam, and the record says so rather than
 implying a live path.
@@ -307,9 +361,9 @@ first and then performs a fallible add, with an early return between them.
 Required faults and enabling state: an accounting state where
 `quarantined + retained` overflows, or an injected failure at that point.
 Confidence: high — [evidence](evidence/quarantine-charge-transition-is-atomic.md).
-Verified by direct read of `crates/mc-shm-transport/src/profile.rs:492-511`:
-line 497-500 sets `accounting.active = active.checked_sub(charges)?`, then line
-506-509 sets `accounting.quarantined = quarantined.checked_add(retained)?` with
+Verified by direct read of `crates/mc-shm-transport/src/profile.rs:522-542`:
+line 527-530 sets `accounting.active = active.checked_sub(charges)?`, then line
+537-540 sets `accounting.quarantined = quarantined.checked_add(retained)?` with
 `.ok_or(AdmissionError::ChargeOverflow)?`. On that error path `active` has
 already been reduced and `quarantined` is never raised. The host caller that
 discarded the error, `provider_recovery.rs:187`'s `admission.quarantine().ok()`,
@@ -318,7 +372,7 @@ non-test caller anywhere in the tree; the only two call sites are
 `crates/mc-shm-transport/tests/contract.rs:368` and `:479`. The ordering defect
 is unchanged, so the record stays active, but it moved from
 `Reaches production: yes` to `no`.
-Existing check: `crates/mc-shm-transport/tests/contract.rs:330`
+Existing check: `crates/mc-shm-transport/tests/contract.rs:349`
 `host_admission_retains_quarantined_commitments` — asserts the success path
 only. Status unaudited.
 Impact: charges vanish from both counters, so the operator-visible snapshot
@@ -344,10 +398,10 @@ mismatched or double release makes `checked_sub` fail.
 Required faults and enabling state: lock poisoning, or an arithmetic
 inconsistency in `active`.
 Confidence: medium — [evidence](evidence/charge-release-never-silently-strands.md).
-Reported basis: `profile.rs:481-491` returns early on a poisoned lock and
+Reported basis: `profile.rs:511-521` returns early on a poisoned lock and
 performs the subtraction inside `if let Some(active) = ...checked_sub(charges)`,
 so both failures are silent, while `Drop` still marks the state `Released`
-(`profile.rs:550-557`). I verified the analogous pattern in `quarantine()` by
+(`profile.rs:581-588`). I verified the analogous pattern in `quarantine()` by
 direct read, but not the `release()` body itself.
 Existing check: none.
 Impact: `active` diverges permanently from the live set, so admission refuses
@@ -430,15 +484,15 @@ construct it.
 Confidence: high — [evidence](evidence/reservation-charge-visible-with-non-free-state.md).
 Verified by direct read. `try_reserve` performs the
 `SLOT_FREE → SLOT_PRODUCER_RESERVED` compare-exchange at
-`ring.rs:691-701`, then plans the arena at `:706-718` (which returns early at
-`:710` and `:715`), and only then stores `reservation_len` at `:720-724`. The
-SAFETY comment at `ring.rs:932` states the opposite: "reservation length is
+`ring.rs:693-703`, then plans the arena at `:708-720` (which returns early at
+`:712` and `:717`), and only then stores `reservation_len` at `:722-726`. The
+SAFETY comment at `ring.rs:934` states the opposite: "reservation length is
 atomic and assigned before non-free state is observed." The comment and the code
 disagree.
 Existing check: the `conservation` byte assertions in
-`crates/mc-shm-transport/tests/ring.rs:141-143`, `:207-211`, `:241-244`. They
+`crates/mc-shm-transport/tests/ring.rs:131-133`, `:197-201`, `:231-234`. They
 run single-threaded between operations, and `bytes.free` is computed as
-`arena_bytes - charged` (`ring.rs:989-993`), which makes
+`arena_bytes - charged` (`ring.rs:991-995`), which makes
 `ArenaCounts::conserves` arithmetically self-satisfying. Status unaudited, and
 the oracle is structurally weak.
 Impact: byte accounting only, not memory safety. A concurrent observer
@@ -480,13 +534,13 @@ observable rather than merely permitted.
 Confidence: high — [evidence](evidence/publication-visibility-derives-only-from-the-published-cursor.md).
 `commit_reservation` publishes in the order descriptor `write_volatile`, then
 `state.store(SLOT_PUBLISHED, Relaxed)`, then `arena_write.store(Relaxed)`, then
-`published.store(Release)` (`ring.rs:1202-1208`). A relaxed store forms no
-release sequence, so the acquire load of `state` at `ring.rs:931` synchronizes
+`published.store(Release)` (`ring.rs:1204-1210`). A relaxed store forms no
+release sequence, so the acquire load of `state` at `ring.rs:933` synchronizes
 with nothing. `reclaim_completed` does it correctly, gating on an acquire load of
-`completion_sequence` (`ring.rs:1116`) before reading state (`:1121`) and the
-descriptor (`:1125`).
+`completion_sequence` (`ring.rs:1118`) before reading state (`:1123`) and the
+descriptor (`:1127`).
 Existing check: none. `two_process_zero_copy_exchange_uses_authenticated_grant`
-(`tests/ring.rs:565`) is lockstep with a sleep and one frame; it cannot observe
+(`tests/ring.rs:581`) is lockstep with a sleep and one frame; it cannot observe
 a reordering window.
 Impact: today `conservation()` never reads the descriptor, so this is a latent
 hazard plus an accounting-accuracy bug rather than undefined behaviour. It
@@ -494,7 +548,7 @@ becomes unsoundness the moment any reader reaches descriptor or arena bytes from
 slot state.
 Open questions:
 - Is the relaxed state store intentional, given `abort_reservation` and
-  `reclaim_completed` use `Release` for the same field (`ring.rs:1146`, `:1159`)?
+  `reclaim_completed` use `Release` for the same field (`ring.rs:1148`, `:1161`)?
   If intentional, the reasoning belongs in the code.
 
 ### no-frame-observable-before-commit
@@ -515,9 +569,9 @@ Required faults and enabling state: an open reservation with bytes written and a
 receiver polling concurrently.
 Confidence: high — [evidence](evidence/no-frame-observable-before-commit.md).
 The only receive gate is `consumed != published` with `published` loaded acquire
-(`ring.rs:781-784`), and `published.store(Release)` is the last write of commit.
+(`ring.rs:783-786`), and `published.store(Release)` is the last write of commit.
 A reserved-but-uncommitted slot is in `PRODUCER_RESERVED`, so the receive CAS
-fails (`ring.rs:790-800`).
+fails (`ring.rs:792-802`).
 Existing check: partial — round-trip tests cover the positive direction; no test
 asserts the negative.
 Impact: this is the property the whole zero-copy design rests on. It looks sound
@@ -543,7 +597,7 @@ exactly on commit failure.
 Required faults and enabling state: a commit that fails after the hook fires.
 Confidence: medium — [evidence](evidence/publish-signal-implies-committed-frame.md).
 The ordering is confirmed by the reported line references
-(`packages/mc-shm-native/src/lib.rs:697-700`, `:809-812`;
+(`packages/mc-shm-native/src/lib.rs:769-772`, `:883-886`;
 `packages/plugin/src/shared/mc-host-client/shm-frame-channel.ts:255-276`;
 `crates/mc-host/src/ring_transport.rs:560-567`). What "published" is contractually
 supposed to mean to a client is not settled, which is why this is medium.
@@ -584,9 +638,9 @@ Confidence: high on the API shape, and the reachability question is now settled
 as latent — [evidence](evidence/release-authority-bound-to-lease-ownership.md).
 Verified by direct read of both signatures:
 `pub fn release(&self, identity: ReleaseIdentity) -> Result<(), LeaseError>`
-(`ring.rs:847`) validates identity and slot state only, and
+(`ring.rs:849`) validates identity and slot state only, and
 `pub fn commit(mut self, body_len: usize) -> Result<ReleaseIdentity, ProducerError>`
-(`ring.rs:1352`) hands that identity to the producer. No role, owner, or
+(`ring.rs:1354`) hands that identity to the producer. No role, owner, or
 lease-token check exists on the release path.
 Reachability verdict: **not reachable in the shipped two-process topology.**
 Re-verified against `ring_transport.rs` at `e447c927` after the refactor rewrote
@@ -595,17 +649,17 @@ the refactor could have changed. It did not. Every non-test `commit` caller stil
 discards the returned identity: all three host call sites put `commit` in
 statement position under `?` (`ring_transport.rs:591` in `publish_direct`, `:604`
 in `publish_owned`, `:670` in `RingClientEndpoint::send`), and the addon's two
-call sites do the same (`packages/mc-shm-native/src/lib.rs:699-700`, `:811-812`).
+call sites do the same (`packages/mc-shm-native/src/lib.rs:771-772`, `:885-886`).
 The only non-test direct `Ring::release` is a receiver completing its own lease
 (`lib.rs:303-307`, on the receive ring with an identity from `lease.identity()`
 held in the addon's table because `poll` forgets the lease). And the two
 directions are separate objects with independent random incarnations
-(`DuplexRing::create`, `ring.rs:559`), so a cross-ring release fails the
-incarnation check at `:851-856`. The violating composition is reachable only in
+(`DuplexRing::create`, `ring.rs:564`), so a cross-ring release fails the
+incarnation check at `:853-858`. The violating composition is reachable only in
 a same-process, single-`Ring` arrangement, which today means the transport's own
 tests.
 Existing check: none. The identity-validation tests
-(`tests/ring.rs:173-197`, `:222`) all issue releases from the legitimate holder.
+(`tests/ring.rs:163-187`, `:212`) all issue releases from the legitimate holder.
 Impact: a latent API-shape hazard rather than a live defect. What keeps it worth
 a record is that the composition is available rather than prevented, and in
 `tests/ring.rs` the violating call sits one unmutated argument away from an
@@ -632,7 +686,7 @@ Check: `always` — for any multiset of release calls carrying one identity, at
 most one returns `Ok`, and `active_leases` is decremented at most once. The
 preconditions are stated in the guarantee because "exactly one succeeds" is
 false without them: zero succeed if the ring is quarantined, if the identity is
-wrong, or if no lease was ever taken (`ring.rs:848-900`). The at-most-once half
+wrong, or if no lease was ever taken (`ring.rs:850-902`). The at-most-once half
 is the invariant; the exactly-once half holds only under those preconditions.
 Fault/timing angle: interleave `ReceiveLease::release()`, a direct
 `Ring::release()`, and `Drop`. The compare-exchange
@@ -642,18 +696,18 @@ descriptor bytes.
 Required faults and enabling state: at least two release attempts for one
 sequence, ideally concurrent.
 Confidence: high — [evidence](evidence/release-exactly-once-per-sequence.md).
-The CAS at `ring.rs:884-891` is the single mutation point, and
+The CAS at `ring.rs:886-893` is the single mutation point, and
 `DuplicateRelease` is mapped from observing `RELEASE_PENDING` or `FREE`
-(`:892-900`).
+(`:894-902`).
 Existing check: good coverage of the sequential cases —
-`tests/ring.rs:174-199` (wrong incarnation, wrong lane, wrong sequence,
-duplicate) and `tests/ring.rs:222`
+`tests/ring.rs:164-189` (wrong incarnation, wrong lane, wrong sequence,
+duplicate) and `tests/ring.rs:212`
 `stale_lap_release_cannot_complete_recycled_slot`, a genuine full-lap test.
 Status unaudited for the read-then-CAS window.
 Impact: this is the load-bearing exactly-once guarantee for storage reuse. It is
 cataloged as well-covered so that the *gap* — concurrency and the descriptor
-re-read at `:873` not being atomic with the CAS at `:884` — is explicit rather
-than assumed.
+re-read at `ring.rs:875` not being atomic with the CAS at `:886` — is explicit
+rather than assumed.
 Open questions: None.
 
 ### receive-failure-leaves-no-wedged-slot
@@ -674,7 +728,7 @@ point.
 Fault/timing angle: `try_receive` compare-exchanges
 `PUBLISHED → RECEIVER_HELD` before validating. Descriptor-validation failure
 quarantines; three later paths propagate with `?` and do not — span
-materialization, the `body_len` usize conversion (`ring.rs:828-829`), and
+materialization, the `body_len` usize conversion (`ring.rs:830-831`), and
 `ReceiveLease::new`. Were the first reachable, it would leave the slot in
 `RECEIVER_HELD` with `consumed` un-advanced, so every later `try_receive` would
 fail its CAS with `InvalidSharedState` forever, un-quarantined. Were the third
@@ -685,7 +739,7 @@ branches are not entered. A synthetic failpoint would prove nothing about
 production, since it would construct a state `validate` excludes.
 Confidence: high — [evidence](evidence/receive-failure-leaves-no-wedged-slot.md).
 Verified by inspection: `enter_quarantine` is called exactly once inside
-`try_receive`, at `ring.rs:807`, on the validation path only. Two independent
+`try_receive`, at `ring.rs:809`, on the validation path only. Two independent
 analyses then agreed that an accepted descriptor guarantees the span count and
 bounds that both constructors check, so all three branches are dead given
 `validate` on a 64-bit target.
@@ -767,11 +821,11 @@ Required faults and enabling state: an actual process termination while leases
 are held — not a clean shutdown — followed by an attach.
 Confidence: high — [evidence](evidence/attach-reconciles-or-refuses-stale-shared-cursors.md).
 `Ring::attach` validates identity and geometry and prefaults
-(`ring.rs:593-611`, `:1637-1667`); it never inspects `published`, `consumed`,
+(`ring.rs:598-616`, `:1639-1669`); it never inspects `published`, `consumed`,
 `completed`, `arena_write`, `arena_reclaimed`, or `quarantined`. Reclamation
-head-of-line blocks at the lowest stale sequence (`ring.rs:1116-1119`),
-`try_receive` returns `Ok(None)` (`:771-776`), and `try_reserve` eventually
-returns `Exhausted` (`:683-685`). None of these is an error, so no quarantine
+head-of-line blocks at the lowest stale sequence (`ring.rs:1118-1121`),
+`try_receive` returns `Ok(None)` (`:773-778`), and `try_reserve` eventually
+returns `Exhausted` (`:685-687`). None of these is an error, so no quarantine
 and no recovery episode occurs.
 Existing check: none.
 Impact: permanent, silent loss of lease and descriptor capacity, reported as
@@ -798,8 +852,8 @@ replacement producer re-derives the same sequence, and its
 followed by `Deadline` — both backpressure codes.
 Required faults and enabling state: termination during an open reservation.
 Confidence: high — [evidence](evidence/crashed-producer-does-not-wedge-the-sequence.md).
-`ring.rs:687-701` derives the sequence and performs the CAS; `abort_reservation`
-(`:1154-1162`) is the only path that restores `SLOT_FREE` and it runs in `Drop`,
+`ring.rs:689-703` derives the sequence and performs the CAS; `abort_reservation`
+(`:1156-1164`) is the only path that restores `SLOT_FREE` and it runs in `Drop`,
 which a killed process never executes. `conservation()` still reports
 `producer_reserved == 1` and conserves, so the accounting looks healthy.
 Existing check: none.
@@ -870,7 +924,7 @@ classified clean.
 Required faults and enabling state: cancellation or overload arriving in that
 exact window, with a frame already acquired.
 Confidence: high — [evidence](evidence/cancelled-frame-disposition-is-declared.md).
-`ring.rs:824-826` advances `consumed` before the lease is returned;
+`ring.rs:826-828` advances `consumed` before the lease is returned;
 `lease.rs:215-221` releases on drop; `crates/mc-host/src/ring_transport.rs:492-494`
 maps read cancellation inside the ingress-charge wait to `ReadClose::Cancelled`.
 The former `shm_provider.rs:498` clean-versus-unclean classification is gone:
@@ -916,12 +970,12 @@ Confidence: high — [evidence](evidence/validated-spans-are-disjoint-and-inside
 Disjointness follows only from three separate conditions holding together:
 `spans[0]` ending exactly at `arena_bytes`, `spans[1].offset == 0`, and
 `len0 + len1 == body_len <= allocation_len <= arena_bytes`
-(`descriptor.rs:367`, `:387-393`, `:401-409`). Relaxing any one re-opens
+(`descriptor.rs:242`, `:262-268`, `:276-284`). Relaxing any one re-opens
 overlap. The fuzz harness asserts per-span bounds and the sum but never pairwise
 disjointness, and it only ever passes `arena_bytes == MAX_FRAME_BYTES`
 (`harness.rs:76-89`).
 Existing check: partial — `descriptor_rejects_every_untrusted_identity_and_span_failure`
-(`tests/contract.rs:63`) and the `frame_descriptor` fuzz target. Status
+(`tests/contract.rs:82`) and the `frame_descriptor` fuzz target. Status
 unaudited; neither asserts disjointness.
 Impact: two spans over the same bytes would pass validation, so a frame could
 alias itself. Currently prevented by the conjunction, with nothing pinning it.
@@ -978,8 +1032,8 @@ which pins *where* the advance starts but not *how far* it goes.
 Required faults and enabling state: a peer write to a `RELEASE_PENDING` slot's
 descriptor between release and reclaim.
 Confidence: medium — [evidence](evidence/reclaim-advance-bounded-by-the-producer-reservation.md).
-Reclaim consumes the re-read `allocation_len` (`ring.rs:1136-1143`) with only
-the FIFO start check (`:1133`). Both candidate records — the descriptor and the
+Reclaim consumes the re-read `allocation_len` (`ring.rs:1138-1145`) with only
+the FIFO start check (`:1135`). Both candidate records — the descriptor and the
 atomic `reservation_len` — live in peer-writable memory, so neither is
 trustworthy. Exploitability past the start check was not established, hence
 medium.
@@ -988,7 +1042,7 @@ Impact: the reclaim cursor can be pushed past bytes still under a live lease.
 Later underflow is caught (`arena.rs:104-108`), so this is corruption and
 denial of service rather than an out-of-bounds access.
 Open questions:
-- Was the atomic `reservation_len` (`ring.rs:113`) intended to be the producer's
+- Was the atomic `reservation_len` (`ring.rs:112`) intended to be the producer's
   trusted record? It is written but never read by `reclaim_completed`. A
   producer-local table would be trustworthy; is that feasible given `Ring` is
   thread-confined?
@@ -1010,8 +1064,8 @@ page — never against what admission charged.
 Required faults and enabling state: a grant declaring a geometry the local
 profile did not charge for.
 Confidence: high — [evidence](evidence/attach-binds-geometry-to-a-local-profile.md).
-`Ring::attach` (`ring.rs:593`) has no profile parameter, and `checked_layout`
-(`:465`) bounds depth only by `!= 0` plus layout arithmetic.
+`Ring::attach` (`ring.rs:598`) has no profile parameter, and `checked_layout`
+(`:461`) bounds depth only by `!= 0` plus layout arithmetic.
 Existing check: `crates/mc-host/src/ring_transport.rs:822`
 `ring_profile_pins_per_connection_grant_geometry` pins the *host*
 profile's geometry; nothing pins the attaching side's. Status unaudited.
@@ -1037,12 +1091,17 @@ the addon enforces no geometry (see the previous property) and because the
 total-bytes cap is loose enough to admit both overheads.
 Required faults and enabling state: none; this is a static consistency property.
 Confidence: high — [evidence](evidence/one-profile-name-denotes-one-geometry.md).
-Four artifacts name one profile with two geometries: the host issues depth 8 and
-8 leases (`ring_transport.rs:47-50`), the addon's own `ring_profile` is depth 32
-and 32 leases (`profile.rs:682`, `:685`), the TypeScript validator hard-rejects
-anything but 8 (`shm-grant.ts:66-69`), and the addon test fixture encodes 32
-(`packages/mc-shm-native/tests/mechanism.ts:80-84`). Each is internally
-consistent; together they contradict.
+Three artifacts name one profile with two geometries: the host issues depth 8 and
+8 leases (`ring_transport.rs:47-50`, from `DESCRIPTOR_DEPTH` at `:32`), the
+transport's own `ring_profile` is depth 32
+and 32 leases (`profile.rs:706`, `:709`), and the addon test fixture encodes 32
+(`packages/mc-shm-native/tests/mechanism.ts:91-95`). Each is internally
+consistent; together they contradict. A fourth artifact used to participate: the
+TypeScript validator at `packages/plugin/src/shared/mc-host-client/shm-grant.ts:66-69`
+hard-rejected anything but 8. That file was deleted by the ring-transport refactor
+and no replacement validator pins a geometry, so the contradiction now has one
+fewer witness but is unchanged in kind, and the client-side guard that would have
+caught a depth-32 grant is gone.
 Existing check: `ring_profile_pins_per_connection_grant_geometry`
 (`ring_transport.rs:822`) pins Rust only. Status unaudited.
 Impact: this is the mechanism behind defect `daf6e244`, where a stale hardcoded
@@ -1075,8 +1134,8 @@ Required faults and enabling state: a direct native call with a descriptor the
 wrapper would reject.
 Confidence: high — [evidence](evidence/native-boundary-not-weaker-than-its-wrapper.md).
 The native field reads are enumerable at
-`packages/mc-shm-native/src/lib.rs:491-512` and contain none of these checks;
-`NativeDescriptor` (`packages/mc-shm-native/index.ts:17-24`) structurally omits
+`packages/mc-shm-native/src/lib.rs:503-530` and contain none of these checks;
+`NativeDescriptor` (`packages/mc-shm-native/index.ts:41-47`) structurally omits
 `candidateId`, so the replay fence is dropped by the type contract.
 Existing check: none at the native boundary; the TypeScript tests exercise the
 wrapper.
@@ -1116,8 +1175,8 @@ Required faults and enabling state: none. This is a static property of the
 harness, and it currently fails.
 Confidence: high — [evidence](evidence/operation-counters-are-observed-not-declared.md).
 Verified by repository-wide search: `body_copies` is written only in a test
-fixture (`tests/contract.rs:422`), in the bench where it is derived rather than
-observed (`benches/hardware_envelope.rs:183`, `:191`, `:212`, `:249`), and as a
+fixture (`tests/contract.rs:488`), in the bench where it is derived rather than
+observed (`benches/hardware_envelope.rs:162`, `:170`, `:191`, `:226`), and as a
 field declaration plus a read in `evidence.rs:9`, `:30`. `OperationCounters` is
 referenced by exactly three files — `evidence.rs`, `tests/contract.rs`, and the
 bench — none of them production. No production path increments any counter. The
@@ -1125,11 +1184,15 @@ receiver's copy happens in a forked child while the count is added in the parent
 after `waitpid`; `syscalls` and `allocations` are hardcoded per arm; and the gate
 control overwrites all six counters after running the *same* body as the
 selectable arm.
-Existing check: `injected_gate_control_must_be_disqualified`
-(`benches/manifests/v1.json:155`) and
-`purity_gate_rejects_injected_copy_allocation_queue_and_wake`
-(`tests/contract.rs:420`). Both test the gate's arithmetic over values they
-supply themselves. Status unaudited, and circular as an oracle.
+Existing check: `purity_gate_rejects_injected_copy_allocation_queue_and_wake`
+(`tests/contract.rs:486`), which tests the gate's arithmetic over values it
+supplies itself. Status unaudited, and circular as an oracle. The second anchor is
+gone: the manifest key `injected_gate_control_must_be_disqualified`, formerly
+`benches/manifests/v1.json:155` at `9c1eb4d1`, no longer appears anywhere in the
+tree at
+`e447c927`. The manifest now names the injected arm only as a `gate_controls`
+entry (`benches/manifests/v1.json:104-106`) with no disqualification rule stated
+beside it, so the manifest half of this check was removed rather than moved.
 Impact: the zero-copy selection gate cannot detect a copy. A body copy added to
 a nominally zero-copy arm would report `body_copies == 0` and pass. This is the
 gate that decides whether a shared-memory provider may ship.
@@ -1155,9 +1218,9 @@ Required faults and enabling state: none to demonstrate the gap; a byte
 corruption to demonstrate the impact.
 Confidence: high — [evidence](evidence/measured-transfer-is-witnessed-by-the-data.md).
 The ring arm's checksum is a closed form over the *parameters*
-(`benches/hardware_envelope.rs:401-403`), while the consumer's real
-`span.checksum()` is computed into a black box and discarded (`:444`). The
-stream arms do checksum real bytes (`:516`), so the field is not even comparable
+(`benches/hardware_envelope.rs:363-365`), while the consumer's real
+`span.checksum()` is computed into a black box and discarded (`:406`). The
+stream arms do checksum real bytes (`:478`), so the field is not even comparable
 across arms.
 Existing check: none.
 Impact: a fully corrupted ring transfer yields a bit-identical checksum, so the
@@ -1186,7 +1249,7 @@ defect:
 - **Definitively stale, 2 distinct across 5 citation instances.** The record
   cites `tests/ring.rs#lease_limit_rejects_then_recovers_after_release` where the
   test is `lease_limit_reports_backpressure_then_recovers_after_release`
-  (`ring.rs:289`), and
+  (`ring.rs:272`), and
   `tests/shm_transport.rs#omitted_and_unqualified_profiles_fall_back_without_side_effects`
   where the test is
   `omitted_and_unqualified_profiles_fall_back_reasonless_without_side_effects`
@@ -1266,7 +1329,7 @@ their own module `crates/mc-shm-transport/src/lifecycle.rs` and
 `crates/mc-shm-transport/tests/contract.rs`. The host close path and the addon
 close path each implement their own ordering, and neither advances this machine.
 Existing check: `lifecycle_accepts_only_diagram_edges_and_quarantine_is_terminal`
-(`tests/contract.rs:262`) proves the model's edges. Status unaudited as evidence
+(`tests/contract.rs:281`) proves the model's edges. Status unaudited as evidence
 for the shipping paths.
 Impact: `docs/mc-host-shm-transport.md:63` describes the close ordering as the
 implemented contract and the traceability record marks the corresponding
@@ -1374,7 +1437,9 @@ The addon source contains no `cfg(test)`, `cfg(feature)`, or
 `cfg(debug_assertions)` gates at all, and exports the failpoint setter, an
 arbitrary `ArrayBuffer` detach, the external probe, an arbitrary-path cleanup
 probe, the test-pair constructor, and a forced close
-(`packages/mc-shm-native/src/lib.rs:409-454`, `:553`, `:958`). The fuzz harness
+(`packages/mc-shm-native/src/lib.rs:415-474`, `:631`, `:1079`). The ungated block
+grew rather than shrank: `d8bde128` added `build_profile` (`:427-434`) and
+`build_target` (`:436-439`) to it. The fuzz harness
 module is likewise ungated in the library (`crates/mc-shm-transport/src/lib.rs:16`).
 Existing check: none.
 Impact: the external-view failpoint can drive both directions into quarantine
@@ -1412,28 +1477,28 @@ forbidden state with no dedicated detection point, so it is expressed as
 execute.
 Fault/timing angle: none. All three decoders are pure functions over one
 immutable slice. The exposure is structural: panic-freedom rests on
-`GRANT_BYTES` being the literal `58` (`ring.rs:30`) with no static tie to its 54
+`GRANT_BYTES` being the literal `58` (`ring.rs:29`) with no static tie to its 54
 bytes of fields, and on the harness's last `read_u64` ending at exactly the
 length gate with zero margin.
 Required faults and enabling state: none. Arbitrary bytes are the whole enabling
 state. The property holds at HEAD and is under-evidenced rather than violated.
 Confidence: high — [evidence](evidence/decoder-totality-over-arbitrary-bytes.md).
-Accept types are constructed once, after every guard (`descriptor.rs:424-432`,
+Accept types are constructed once, after every guard (`descriptor.rs:299-307`,
 `sample.rs:122-125`), both with private fields and no other constructor.
-`RingGrant` materializes at `ring.rs:438-454` before `checked_layout()?` at
-`:455` but cannot escape it. Panic sites enumerated: three `.expect()` calls
-(`ring.rs:436`, `:443`, `:448`) plus constant range indexes, all infallible on a
+`RingGrant` materializes at `ring.rs:434-450` before `checked_layout()?` at
+`:451` but cannot escape it. Panic sites enumerated: three `.expect()` calls
+(`ring.rs:432`, `:439`, `:444`) plus constant range indexes, all infallible on a
 58-byte array; and `harness.rs:19-23` `read_u64`, whose last read ends at index
 107 against a gate admitting exactly 108. No decoder allocates; the first
 length-driven allocation is `lease.rs:178-179`, bounded solely by the decoder's
 `body_len > MAX_FRAME_BYTES` rejection against 64 MiB.
-Existing check: `tests/contract.rs:683-706`
+Existing check: `tests/contract.rs:743-766`
 `harness_replays_terminate_on_arbitrary_lengths` (ten lengths, fills `0x00` and
 `0xff`) and `tests/fuzz_corpus.rs:44-57` (five seeds each, panic-freedom only).
 Status unaudited, and both are smoke tests for the claim they are taken to
 support: neither fill reaches any arithmetic guard.
 Impact: none today. The value is that the reasoning keeping totality true lives
-nowhere in the tree. Narrowing `GRANT_BYTES` turns `ring.rs:430` into an
+nowhere in the tree. Narrowing `GRANT_BYTES` turns `ring.rs:426` into an
 unconditional panic on every call, and a harness offset edit does the same to
 `read_u64`; no property currently forbids either.
 Open questions:
@@ -1456,7 +1521,7 @@ the declared width changes the decoded value or causes rejection, and the
 consumed width equals the declared width. The per-decoder slack policy is part
 of the condition rather than an exception to it.
 Fault/timing angle: none. The interesting axis is that the three decoders do not
-share a policy: `RingGrant::decode_slice` (`ring.rs:460-463`) and
+share a policy: `RingGrant::decode_slice` (`ring.rs:456-459`) and
 `harness::frame_descriptor` (`harness.rs:31-33`) demand an exact width, while
 `SamplePrefix::snapshot` (`sample.rs:41-45`) accepts a prefix plus declared body
 and deliberately ignores documented capacity slack.
@@ -1465,7 +1530,7 @@ missing is the oracle.
 Confidence: high — [evidence](evidence/accepted-decode-consumes-its-declared-width.md).
 What the `provider_grant` round-trip at `harness.rs:112-116` actually proves:
 `decode` maps all 54 non-reserved bytes into seven fields with no lossy
-transform, and `encode` (`ring.rs:410-421`) writes exactly those back plus four
+transform, and `encode` (`ring.rs:406-417`) writes exactly those back plus four
 zero bytes, so no byte is read-and-discarded or defaulted, and acceptance cannot
 silently widen. It does not cover value legality, never evaluates a short input,
 cannot detect a reordering of two same-width fields, and has no counterpart for
@@ -1473,9 +1538,10 @@ the other two decoders: `FrameDescriptor` has no encoder anywhere in the library
 and `SamplePrefix` cannot have a byte-exact oracle because its contract permits
 slack. On this commit the assertion is a tautology over accepted inputs, so it is
 a regression tripwire rather than a campaign-time detector.
-Existing check: partial. `tests/ring.rs:470-497` sweeps every cut in `0..58`, a
-one-byte suffix, and empty; `:503` re-asserts the round-trip on one fixture.
-`tests/iceoryx.rs:164` covers the sample slack policy properly. Nothing asserts
+Existing check: partial. `tests/ring.rs:479-506` sweeps every cut in `0..58`, a
+one-byte suffix, and empty; `:512` re-asserts the round-trip on one fixture.
+`tests/contract.rs:581-593` covers the sample slack policy properly, having moved
+there from the deleted `tests/iceoryx.rs`. Nothing asserts
 the frame-descriptor encoding consumes its declared width. Status unaudited.
 Impact: the 108-byte frame-descriptor encoding is the one with no consumption
 oracle and the one whose offsets are hand-written literals. A change making a
@@ -1503,25 +1569,26 @@ produces the declared disposition. The divergence is a live state of the code,
 not a code point, so `unreachable` does not apply.
 Fault/timing angle: the enforcement half is static. The disposition half has an
 unbounded window, because the descriptor is read twice from peer-writable memory
-— `ring.rs:802` on receive and `:1125` on reclaim — with the whole lease lifetime
+— `ring.rs:804` on receive and `:1127` on reclaim — with the whole lease lifetime
 between, so "validated at receive" does not imply "valid at reclaim".
 Required faults and enabling state: none for enforcement. For disposition, a live
 lease plus a peer write to that slot's `schema_version`, then a release followed
 by a `try_reserve`.
 Confidence: high on enforcement; the second failure shape's reachability is
 unresolved — [evidence](evidence/identity-and-schema-rejection-is-one-contract.md).
-The five conditions appear in identical order at `descriptor.rs:348-362` and
-`sample.rs:88-102`. `Ring::release` (`ring.rs:847-909`) enforces three: it checks
-incarnation and lane against the grant (`:851-856`), non-zero sequence
-(`:858-860`), and `sequence > consumed` (`:866-868`), then compares only
-incarnation, lane, and sequence against the raw struct (`:874-882`). It never
+The five conditions appear in identical order at `descriptor.rs:223-237` and
+`sample.rs:88-102`. `Ring::release` (`ring.rs:849-911`) enforces three: it checks
+incarnation and lane against the grant (`:853-858`), non-zero sequence
+(`:860-862`), and `sequence > consumed` (`:868-870`), then compares only
+incarnation, lane, and sequence against the raw struct (`:876-884`). It never
 calls `snapshot()` or `validate`, so `schema_version` is not read. Dispositions
-diverge for the same `validate` call: `try_receive` quarantines at `:807`, while
-`reclaim_completed` maps the error through at `:1127-1130` to `try_reserve`; both
+diverge for the same `validate` call: `try_receive` quarantines at `:809`, while
+`reclaim_completed` maps the error through at `:1129-1132` to `try_reserve`; both
 consumers of that error were searched and neither quarantines.
-Existing check: partial, and none cross-cutting. `tests/contract.rs:63` tables
-the descriptor cases; `tests/iceoryx.rs:208-229` and `tests/contract.rs:538`
-cover the sample prefix; `tests/ring.rs:173-197` covers release identity. Each
+Existing check: partial, and none cross-cutting. `tests/contract.rs:82` tables
+the descriptor cases; `tests/contract.rs:598-700` covers the sample prefix,
+including the incarnation, lane, and sequence cases that used to live in the
+deleted `tests/iceoryx.rs`; `tests/ring.rs:163-187` covers release identity. Each
 table is written against its own reader. Status unaudited.
 Impact: two shapes. Adding a condition to one decoder and not the other leaves
 both tables green while the backends admit different identity classes. And a
@@ -1557,18 +1624,20 @@ Required faults and enabling state: none. A nonzero reserved byte is the whole
 input. For the re-encode direction, a component that decodes and re-encodes a
 grant, which does not exist in-tree today.
 Confidence: high — [evidence](evidence/grant-reserved-bytes-are-rejected-unless-zero.md).
-`GRANT_BYTES` is the literal `58` (`ring.rs:30`); the seven fields occupy 54
+`GRANT_BYTES` is the literal `58` (`ring.rs:29`); the seven fields occupy 54
 bytes; `encode` writes `0u32.to_le_bytes()` into `54..58` unconditionally at
-`:419`; `decode` rejects a nonzero region at `:430-432`. The corpus seeds
+`:415`; `decode` rejects a nonzero region at `:426-428`. The corpus seeds
 `provider_grant/valid` and `near-valid` were compared byte by byte: they differ
 only at index 54 (`0x00` versus `0x01`), so `near-valid` is the reserved-byte
 case. The descriptor-side contrast was also measured: `SharedDescriptor` is 120
 bytes with 12 of padding, written whole by `write_volatile` and read only by name
 in `snapshot()`, so the shared descriptor has an unconstrained equivalent region
 while the grant's four bytes are enforced.
-Existing check: `tests/ring.rs:392`
-`attach_rejects_unsealed_objects_and_tampered_grants` sets `reserved[54] = 1` and
-asserts `Err(RingError::InvalidGrant)`. A genuine pin, but it covers one byte of
+Existing check: `tests/ring.rs:380`
+`artifact_mismatch_fails_before_mapping_and_unsealed_objects_are_rejected`, which
+the refactor renamed from `attach_rejects_unsealed_objects_and_tampered_grants`,
+sets `reserved[54] = 1` (`:403`) and asserts `Err(RingError::InvalidGrant)`
+(`:432`). A genuine pin, but it covers one byte of
 four and asserts a category eight other tampered cases share. The corpus
 `near-valid` seed runs with its outcome unchecked. Status unaudited.
 Impact: the guard makes a version-2 reader fail closed against a version-3 grant,
@@ -1607,8 +1676,8 @@ accept path satisfies the three identity comparisons by construction, and the
 reject path at `:98-102` differs only in `lane ^ 1`.
 Required faults and enabling state: none for the static half. For coverage, an
 `expected` identity differing from the decoded one in incarnation or sequence,
-which neither fuzz target supplies, so the guards at `descriptor.rs:354-356` and
-`:360-362` are reached by no campaign execution.
+which neither fuzz target supplies, so the guards at `descriptor.rs:229-231` and
+`:235-237` are reached by no campaign execution.
 Confidence: high — [evidence](evidence/fuzz-harness-encoding-tracks-the-production-descriptor.md).
 Measured: `FRAME_DESCRIPTOR_BYTES` is 108 (`harness.rs:16-17`) while
 `size_of::<SharedDescriptor>()` is 120 with 12 bytes of padding; every field from
@@ -1623,7 +1692,7 @@ which requires the 120-byte descriptor, and that seed is accepted by a passing
 test.
 Existing check: partial and type-level only. `MAX_SPANS` is coupled by a
 two-element array literal, and `from_untrusted`'s argument list makes an added
-field a compile error. `tests/contract.rs:683-706` sweeps the constant and the
+field a compile error. `tests/contract.rs:743-766` sweeps the constant and the
 constant plus one. Nothing asserts the read regions sum to the constant, and
 nothing asserts the incarnation and sequence guards are reachable from fuzzing.
 Status unaudited.
@@ -1665,10 +1734,10 @@ actually runs the file.
 Required faults and enabling state: none. A macOS runner executing
 `tests/ring.rs` suffices.
 Confidence: medium — [evidence](evidence/macos-object-creation-outcome-is-attributed.md).
-`create_macos_shm` (`ring.rs:1753-1788`) has three `ObjectSetupFailed` exits and
+`create_macos_shm` (`ring.rs:1748-1783`) has three `ObjectSetupFailed` exits and
 `validate_object` returns a different variant, so the documented error originates
 inside the create function. The shm name is 40 characters, computed by
-replicating the fold at `:1755-1764` rather than assumed. Medium because nothing
+replicating the fold at `:1750-1759` rather than assumed. Medium because nothing
 could be executed on macOS and Darwin's `PSHMNAMLEN` is external to the
 repository and unverified.
 Existing check: none, and the former partial one is gone.
@@ -1693,44 +1762,55 @@ Open questions:
 
 Type: safety
 Status: active
-Exercised: not yet — needs a macOS execution of `Mapping::attach`, which no
-in-tree macOS path can currently produce a descriptor for.
+Exercised: not yet — needs a macOS execution of `Mapping::attach`; CI still runs
+no macOS job that constructs a `Ring`.
 Guarantee: On every platform where attach is reachable, an admitted descriptor's
 object type is established and its size is immutable for the mapping's lifetime.
 Check: `always` — at every attach, the descriptor is refused unless its object
 type is established and its size cannot subsequently shrink. `always` rather than
-`unreachable` because this is a per-operation admission predicate; today macOS
-satisfies it only vacuously, so the check must also assert the premise that no
-macOS path yields a ring descriptor.
+`unreachable` because this is a per-operation admission predicate. The earlier
+form of this check also required asserting the premise that no macOS path yields
+a ring descriptor; that clause is withdrawn, because `d8bde128` made a macOS
+`Ring` retain and export its descriptor, so the vacuity the clause encoded no
+longer holds.
 Fault/timing angle: the shrink half has a window spanning the whole mapping
-lifetime, from `validate_object`'s `fstat` (`ring.rs:1681`) to any later access,
+lifetime, from `validate_object`'s `fstat` (`ring.rs:1683`) to any later access,
 because nothing re-checks. The type half has no window.
-Required faults and enabling state: a macOS descriptor source such as
-`SCM_RIGHTS`, plus either a wrong-type descriptor of exact size, uid, and mode,
-or a retained second descriptor used to `ftruncate` after validation.
+Required faults and enabling state: a macOS descriptor source — `attachment()`
+plus `SCM_RIGHTS` is now one — plus a retained second descriptor used to
+`ftruncate` after validation.
 Confidence: high — [evidence](evidence/attach-validation-is-not-platform-weakened.md).
-Verified from `cfg` attributes: `validate_seals` (`:1705-1714`) and `seal_object`
-(`:1743-1751`) are both Linux-gated, the attach-side call is gated at `:251-252`,
-the create-side pair at `:573-577`, and `validate_object` sets
-`type_valid = true` on non-Linux at `:1689-1693`. Also verified that macOS
-retains no descriptor: `Mapping` has no `fd` field there, both constructors
-`drop(fd)`, and `raw_fd`, `attachment`, `set_inheritable`, `RingAttachment`, and
-both `attach_ring` helpers are Linux-gated.
-Existing check: `attach_rejects_unsealed_objects_and_tampered_grants`
-(`tests/ring.rs:392`) covers the Linux seal path only and is itself Linux-gated,
-with no macOS counterpart. Status unaudited as evidence for the type check.
+The refactor changed this record's premise in both directions, verified from `cfg`
+attributes at `e447c927`. Closed: `validate_object` no longer weakens the
+object-type clause off Linux. `b5dc778e` deleted the `cfg!(target_os = "linux")`
+carve-out that set `type_valid = true` on Darwin, and the check is now the
+unconditional `stat.st_mode & S_IFMT == S_IFREG` at `ring.rs:1688`, so the type
+half of this guarantee holds on both platforms by construction. Still open, and
+now reachable: shrink immunity remains Linux-only. `validate_seals`
+(`:1700-1709`) and `seal_object` (`:1738-1746`) are both still Linux-gated, as are
+the attach-side call (`:242-243`) and the create-side pair (`:578-582`). Opened:
+the vacuity argument is gone. `d8bde128` removed the macOS `drop(fd)` and the
+`#[cfg(target_os = "linux")]` on `Mapping`'s `fd` field, so macOS now retains the
+descriptor (`ring.rs:207-211`), and it removed the Linux gates from `raw_fd`
+(`:624`), `attachment` (`:629`), and `set_inheritable` (`:645`); `RingAttachment`
+(`:503`) is ungated and gained `into_parts` (`:521`), which hands out the raw
+`OwnedFd`. A macOS host therefore has an in-tree descriptor source today, and
+`Ring::attach` on macOS is unreachable only because no macOS job runs this code.
+Existing check: `artifact_mismatch_fails_before_mapping_and_unsealed_objects_are_rejected`
+(`tests/ring.rs:380`) covers the Linux seal path only and is itself Linux-gated,
+with no macOS counterpart. Status unaudited as evidence for the shrink check.
 Impact: `docs/mc-host-shm-transport.md:117` rests the trusted-peer boundary on
-owner-only attachment. On macOS that boundary is uid plus exact size plus mode
-bits, with no object-type check and no shrink immunity, and the compensating
-property is that attach is unreachable rather than that it is safe. A regular
-file of matching size, mode `0600`, owned by the euid would be mapped
-`MAP_SHARED | PROT_READ | PROT_WRITE`.
+owner-only attachment. On macOS that boundary is now uid plus exact size plus mode
+bits plus the regular-file check, with no shrink immunity, and the compensating
+property is no longer that attach is structurally unreachable — only that no CI
+job executes it. A descriptor whose size is reduced after `fstat` is mapped
+`MAP_SHARED | PROT_READ | PROT_WRITE` at its validated length.
 Open questions:
-- Is the Darwin `st_mode` premise at `ring.rs:1686-1688` correct? If not, an
-  `S_IFMT == 0 || S_IFMT == S_IFREG` form would have covered both platforms and
-  the carve-out discarded a working check. (needs human input)
-- If a macOS descriptor-passing path is added, what substitutes for
-  `F_SEAL_SHRINK`? Darwin has no seals. (needs human input)
+- The former question about the Darwin `st_mode` premise is resolved by deletion:
+  `b5dc778e` removed the carve-out and took the `S_IFREG` branch on both
+  platforms, so whatever the Darwin premise was, the code no longer relies on it.
+- If a macOS descriptor-passing path is wired to the now-ungated `attachment()`,
+  what substitutes for `F_SEAL_SHRINK`? Darwin has no seals. (needs human input)
 
 ### macos-object-creation-leaks-no-shm-name
 
@@ -1744,20 +1824,25 @@ Check: `always` — after any `create_macos_shm` invocation that does not return
 `Ok`, the generated name is absent from the shm namespace. The forbidden state is
 residue after an operation with a defined completion point, and there is no
 dedicated detector, so `unreachable` does not apply.
-Fault/timing angle: a one-statement error window at `ring.rs:1779`, between a
+Fault/timing angle: a one-statement error window at `ring.rs:1774`, between a
 successful `shm_open` and a successful `shm_unlink`. No concurrency needed. The
-crash variant is wider, spanning `OwnedFd::from_raw_fd` at `:1777`.
+crash variant is wider, spanning `OwnedFd::from_raw_fd` at `:1772`.
 Required faults and enabling state: an `shm_unlink` failure after a successful
 `O_EXCL` `shm_open`, or a process kill in that window. Both require macOS and a
 seam into `create_macos_shm`.
 Confidence: medium — [evidence](evidence/macos-object-creation-leaks-no-shm-name.md).
 Verified from the `a5568707` diff and HEAD that the step order is `shm_open`
-(`:1766-1772`), `shm_unlink` (`:1779`), `ftruncate` (`:1784`), so the pre-fix
+(`:1761-1767`), `shm_unlink` (`:1774`), `ftruncate` (`:1779`), so the pre-fix
 `ftruncate` leak window is closed and the `shm_unlink` exit is now the one
 returning with the name present and no retained handle. `shm_unlink` appears
 exactly once in the crate. Medium because whether Darwin names survive the last
 descriptor close, and whether `shm_unlink` can fail after `O_EXCL` success, are
-external facts that could not be tested.
+external facts that could not be tested. Re-checked at `e447c927`:
+`create_macos_shm` is byte-identical to its form at `9c1eb4d1` and only moved
+five lines up, so the refactor did not touch this record's premise. The macOS
+descriptor-lifetime change in `d8bde128` applies to `Mapping` after a successful
+return; on every early-return path inside `create_macos_shm` the local `OwnedFd`
+still drops, so "no retained handle" continues to describe the leak path.
 Existing check: none. `RuntimeDir` has the analogous cleanup — `Drop` plus unwind
 on two early returns — and the shm object has no equivalent.
 Impact: each occurrence permanently consumes one Darwin shm namespace slot and
@@ -1792,14 +1877,14 @@ Required faults and enabling state: none beyond a host whose
 `sysconf(_SC_PAGESIZE)` is not 4096, or an injectable page size in the layout
 computation.
 Confidence: high — [evidence](evidence/layout-region-offsets-are-real-page-aligned.md).
-`Layout::new` (`ring.rs:142-183`) uses the 4096 constant at `:159-164`,
-`:165-170`, and `:171-173`, while `system_page_size()` (`:195-201`) has exactly
-one caller, `verify_prefaulted` (`:1007`). The divergence was computed, not
+`Layout::new` (`ring.rs:141-182`) uses the 4096 constant at `:158-163`,
+`:164-169`, and `:170-172`, while `system_page_size()` (`:194-200`) has exactly
+one caller, `verify_prefaulted` (`:1009`). The divergence was computed, not
 estimated: at depth 8 under a 16384-byte page, `arena % 16384 = 4096`,
 `lifecycle % 16384 = 4096`, and `total % 16384 = 8192`; at depth 32 the figures
 are 12288, 12288, and 0. Depth 32 passes the total condition only because
 67,125,248 is 4097 x 16384.
-Existing check: `residency_vector_tracks_runtime_page_size` (`ring.rs:1790-1800`)
+Existing check: `residency_vector_tracks_runtime_page_size` (`ring.rs:1785-1795`)
 asserts the pure `residency_vector_len` helper at 16 KiB and 64 KiB. It touches
 no layout offset and no mapping.
 Impact: on a 16 KiB-page host the lifecycle page — magic, layout version,
@@ -1841,7 +1926,7 @@ constant. CI was read directly: Linux runs all targets while macOS runs
 `--test contract --test fuzz_corpus`, which excludes both `ring.rs` and the lib
 target. The `mincore` mismatch the fix repaired reproduces exactly in arithmetic:
 16386 entries sized against 4097 written, leaving 12289 zero.
-Existing check: `residency_vector_tracks_runtime_page_size` (`ring.rs:1790-1800`),
+Existing check: `residency_vector_tracks_runtime_page_size` (`ring.rs:1785-1795`),
 a pure-function assertion with no mapping. On macOS it does not run at all, since
 `--test` excludes the lib target.
 Impact: the configuration in which the previous defect lived has never been
@@ -1862,22 +1947,39 @@ Open questions:
 
 ## Group K: the second backend
 
-The iceoryx backend is a second implementation of the same contract. All 32
-original records were derived from the ring backend, so this group exists to
-state which guarantees iceoryx also owes and which it structurally cannot
+**The second backend no longer exists.** `0f336d3c` deleted
+`crates/mc-shm-transport/src/backend/iceoryx.rs`,
+`crates/mc-shm-transport/tests/iceoryx.rs`, and the `iceoryx` Cargo feature, and
+collapsed the crate to the fixed ring transport. Every parity question this group
+asked — which guarantees the second implementation also owes, and where it
+diverges from the ring — is therefore moot, and all five records below carry
+`Status: superseded-by-refactor`. Their citations into `iceoryx.rs` and
+`tests/iceoryx.rs` resolve against `9c1eb4d1`, not against the current tree, and
+are kept as the record of what the removed backend did and did not guarantee.
+
+One finding transfers, and is the reason to keep the group rather than delete it:
+a same-instance test structurally cannot prove a property whose predicate ranges
+over two address spaces or two incarnations. That is a statement about test
+topology, not about iceoryx, so it applies to any future second backend, and to
+any single-process harness offered as evidence for a cross-process guarantee. It
+is stated at length in `iceoryx-cross-process-pairing-is-reachable-or-declared`.
+
+The iceoryx backend was a second implementation of the same contract. All 32
+original records were derived from the ring backend, so this group existed to
+state which guarantees iceoryx also owed and which it structurally could not
 provide. The distinction between untested and unprovable is the point.
 
 One correction carried into this group: an earlier pass called the iceoryx
-release a no-op. It is not. `release(self)` takes `self` by value, so the closing
-brace runs drop glue that returns the chunk to the publisher's retrieve channel.
-The reclamation is real and exactly-once by move semantics. What it does not do
+release a no-op. It was not. `release(self)` took `self` by value, so the closing
+brace ran drop glue that returned the chunk to the publisher's retrieve channel.
+The reclamation was real and exactly-once by move semantics. What it did not do
 is anything else: no identity argument, no validation, no counter, no completion
 publication, and no `Result`.
 
 ### iceoryx-descriptor-rejection-is-terminal-or-declared
 
 Type: safety
-Status: active
+Status: superseded-by-refactor
 Exercised: not yet — no test makes `try_receive` return `Err`; the seven tests in
 `tests/iceoryx.rs` are same-instance and the loopback publisher always writes the
 sequence the receiver expects, so the rejection at `iceoryx.rs:167` never fires.
@@ -1904,8 +2006,8 @@ Confidence: high — [evidence](evidence/iceoryx-descriptor-rejection-is-termina
 `backend/mod.rs` was read in full: nine lines, and no trait, which is why none of
 the missing parity is a compile error. `backend/iceoryx.rs` was searched for
 `quarantine`, `conservation`, `completion`, `active_leases`, and `Drop`; all zero
-hits, against the ring's gate set at `ring.rs:670-672`, `:765-767`, `:848-850`,
-`:999-1001`, and `:913-924`, and its quarantine raise at `:807`.
+hits, against the ring's gate set at `ring.rs:672-674`, `:767-769`, `:850-852`,
+`:1001-1003`, and `:915-926`, and its quarantine raise at `:809`.
 Existing check: none. No test drives a rejection through the backend and then
 probes what it accepts.
 Impact: the ring's terminal state is what converts storage of unknown state into
@@ -1917,6 +2019,11 @@ pages; release identity validation is absent and soundly so, because the move
 makes a wrong or duplicate identity unpresentable; incarnation fencing compares
 against a locally minted value that is never exchanged, so it discriminates
 nothing; quarantine and conservation reporting are absent with no substitute.
+Superseded: `0f336d3c` deleted the backend, so there is no code left to hold or
+violate this property. What the record established is that the removed backend
+had no terminal state after a rejected descriptor — the ring's quarantine had no
+counterpart — and that the absence was invisible because `backend/mod.rs`
+declared no trait, so no parity gap was a compile error.
 Open questions:
 - Is the loopback shape intended to be permanent? The ledger reads differently
   under each answer and no repository file states one. (needs human input)
@@ -1926,7 +2033,7 @@ Open questions:
 ### iceoryx-receive-expectation-tracks-the-delivered-stream
 
 Type: safety
-Status: active
+Status: superseded-by-refactor
 Exercised: not yet — `sequences_progress_exactly_and_wrap_attempts_fail_closed`
 (`tests/iceoryx.rs:123`) commits and receives one frame per iteration, so both
 cursors advance in lockstep and never diverge.
@@ -1961,7 +2068,12 @@ Impact: a permanently unreadable stream on which the producer keeps consuming
 loan capacity for frames the receiver will never accept, with no shared cursor to
 reconcile against, no terminal state, and one opaque error variant. This record
 and the previous one share a code point from two sides: this one owns the cursor
-obligation, that one owns the fail-closed obligation.
+obligation, that one owns the fail-closed obligation. Superseded: `0f336d3c`
+deleted the backend. What the record established is that the removed backend's
+receive cursor was an unconditionally-advanced dequeue paired with a conditional
+expectation advance, over process-local `Cell<u64>` rather than shared pages, so
+one rejected sample stranded the expectation permanently with no shared cursor to
+reconcile against.
 Open questions:
 - Was the `Cell<u64>` pair intended as a same-instance smoke-test device rather
   than a transport cursor? If so the record scopes down to a documentation
@@ -1970,7 +2082,7 @@ Open questions:
 ### iceoryx-cross-process-pairing-is-reachable-or-declared
 
 Type: reachability
-Status: active
+Status: superseded-by-refactor
 Exercised: not yet, and not constructible without an API change;
 `IceoryxBackend::create(profile, lane)` accepts neither an inbound service name
 nor an inbound incarnation.
@@ -1998,26 +2110,33 @@ locally and read from `self.incarnation` at `:163`, with `sample.rs:94-96`
 rejecting any other. All seven tests and the bench arm construct exactly one
 backend used as both producer and receiver.
 Existing check: none for pairing. `tests/iceoryx.rs` is same-instance throughout.
-Impact: nothing authenticates the peer because the design admits no peer. The
-consequence is evidential: the arm is `selectable` in the release-gate manifest
-(`benches/manifests/v1.json:107-110`) as one of two candidate providers for a
+Impact: nothing authenticated the peer because the design admitted no peer. The
+consequence was evidential: the arm was `selectable` in the release-gate manifest
+(`benches/manifests/v1.json:107-110` at `9c1eb4d1`) as one of two candidate
+providers for a
 transport whose purpose is moving frames between processes, while the same bench
-report classifies it as a loopback smoke arm against nine paired-process arms. A
+report classified it as a loopback smoke arm against nine paired-process arms. A
 same-instance test structurally cannot prove any property whose predicate ranges
 over two address spaces or two incarnations: publication visibility across a real
 release-acquire edge, peer authentication at attach, geometry binding, restart
 reconciliation, stale-cursor handling. Those are not untested; they are
-unprovable on this backend as constructed.
+unprovable on such a backend as constructed. Superseded: `0f336d3c` deleted the
+backend, and the manifest's `selectable` list with it — the arms block now reads
+`"transport": ["ring"]` (`benches/manifests/v1.json:107`) with no second candidate
+to declare. What the record established, and the part that outlives the backend,
+is the topology argument in the preceding paragraph: it is a statement about
+same-instance harnesses, so it binds any future second backend.
 Open questions:
-- Is `selectable: true` for this arm deliberate, given the same report calls it a
-  loopback smoke arm? (needs human input)
-- Should the gate require that the loopback-smoke list and the `selectable` list
-  be disjoint? They overlap on this arm today. (needs human input)
+- The two questions about `selectable: true` and about disjoint loopback-smoke and
+  `selectable` lists are moot: `0f336d3c` left one transport arm and removed the
+  `selectable` key. The general form survives and belongs to whichever gate
+  reintroduces a second arm: must a same-instance arm be barred from the
+  candidate list? (needs human input)
 
 ### iceoryx-completion-is-observable-to-the-host
 
 Type: safety
-Status: active
+Status: superseded-by-refactor
 Exercised: not yet — needs leases disposed both ways with an assertion that some
 observation distinguishes outstanding from reclaimed; no such observation exists
 to assert against.
@@ -2039,9 +2158,9 @@ public surface.
 Confidence: high — [evidence](evidence/iceoryx-completion-is-observable-to-the-host.md).
 `iceoryx.rs:319-355` was read in full and searched for `impl Drop`,
 `conservation`, `probe`, `quarantine`, `completion`, and `active_leases`; all zero
-hits, against the ring's `release` (`ring.rs:847-909`, whose successful path
-stores `completion_sequence` and decrements `active_leases` at `:902-906`),
-`conservation` (`:912-995`), and `probe` (`:998-1003`). The iceoryx lease meets
+hits, against the ring's `release` (`ring.rs:849-911`, whose successful path
+stores `completion_sequence` and decrements `active_leases` at `:904-908`),
+`conservation` (`:914-997`), and `probe` (`:1000-1005`). The iceoryx lease meets
 exactly-once completion by move semantics rather than by a check: sound, but
 silent. The host-side comparator is gone: the former `provider_recovery.rs:530`
 decided readiness from `backend.probe() && backend.admission_fits()` and had no
@@ -2056,7 +2175,12 @@ indistinguishable from one leaked into a long-lived collection, up to the borrow
 cap, where the symptom surfaces on the other side as `ReceiveFailed` attributed
 to the receive mechanism rather than to retained leases. Combined with the
 constant counters, a body copy added anywhere in `run_iceoryx` would change none
-of the six fields the gate names as required.
+of the six fields the gate names as required. Superseded: `0f336d3c` deleted the
+backend, and `ed487e11` had already deleted the host-side readiness consumer. What
+the record established is that the removed backend met exactly-once completion by
+move semantics rather than by a check — sound, but silent — so it exposed no
+observation from which outstanding samples could be counted, and an explicitly
+released lease was indistinguishable from an abandoned one.
 Open questions:
 - Is `stale_node_observed` (`iceoryx.rs:178-189`) intended as the readiness
   surface? It is an associated function over global dead-node entries, keyed to
@@ -2065,7 +2189,7 @@ Open questions:
 ### iceoryx-saturation-is-bounded-non-blocking-backpressure
 
 Type: liveness
-Status: active
+Status: superseded-by-refactor
 Exercised: not yet — every test receives and releases immediately after each
 commit, so neither configured cap is ever reached.
 Guarantee: When a configured capacity limit binds, the backend returns control to
@@ -2097,7 +2221,7 @@ an exceeds-max-borrows error when every channel with data sits at the borrow cap
 and `iceoryx.rs:151-157` collapses every receive error into
 `IceoryxError::ReceiveFailed`, indistinguishable from a connection failure.
 Existing check: none on iceoryx. The ring's counterpart is pinned at
-`tests/ring.rs:289`. Status unaudited.
+`tests/ring.rs:279`. Status unaudited.
 Impact: the ring answers a full descriptor set with `Exhausted`, which
 `reserve_until` converts to `Deadline`, and a full lease set with `Ok(None)` under
 the stated rule that a full lease set is backpressure and errors are reserved for
@@ -2105,6 +2229,12 @@ channel-ending faults. The iceoryx path violates both halves: the publisher can
 hang forever with no deadline parameter, and normal receive backpressure is
 reported as a fault. Both caps are handed to the provider and never consulted
 locally, so the backend cannot report saturation in its own vocabulary.
+Superseded: `0f336d3c` deleted the backend. What the record established is that the
+removed backend inherited its backpressure strategy from an external
+`iceoryx2.toml` rather than pinning it, so a full publish queue blocked
+indefinitely on the one thread that could have drained it, and ordinary receive
+backpressure was reported as a channel-ending fault — the opposite of the ring's
+`Exhausted`-plus-`Ok(None)` split, which survives.
 Open questions:
 - Does any designated host's global config override the backpressure strategy? No
   repository file sets it and no test asserts it, and the two possible values give
@@ -2149,7 +2279,7 @@ Check: `always` — on every receive that yields a lease, `decode_header` and
 (`:478`, `:527`). An ordering invariant evaluated at every receive, with no
 optional path and no convergence to wait for.
 Fault/timing angle: none required. The descriptor is snapshotted by one
-`read_volatile` (`ring.rs:802`), so the 21 header bytes are frozen locally before
+`read_volatile` (`ring.rs:804`), so the 21 header bytes are frozen locally before
 either layer inspects them, and there is no time-of-check window between the two
 layers. The window that makes the ordering load-bearing is the ingress wait loop
 (`ring_transport.rs:487-518`), bounded by `frame_deadline`: that is the resource
@@ -2157,7 +2287,7 @@ an out-of-order gate would let an illegal frame hold.
 Required faults and enabling state: a peer-authored header satisfying exactly the
 transport's two checks and violating one host rule. No concurrency, no timing.
 Confidence: high — [evidence](evidence/wire-header-fully-validated-before-any-consumer-acts.md).
-`descriptor.rs:414-422` is the transport's only header inspection; `receive_one`
+`descriptor.rs:289-297` is the transport's only header inspection; `receive_one`
 runs its seven steps in the order above with `?` on each, and nothing between
 `ring_transport.rs:464` and `:473` reads a header field or a payload byte.
 `WIRE_V2_HEADER_BYTES`
@@ -2178,7 +2308,7 @@ Open questions:
   answers `Rejected` rather than closing, a fourth disposition. Is a per-channel
   body cap a header rule or an admission rule? (needs human input)
 - A version 3 relocating `len` or `ver` is permitted by the extension point at
-  `wire.rs:292-297` and would leave `descriptor.rs:414-419` silently validating
+  `wire.rs:292-297` and would leave `descriptor.rs:289-294` silently validating
   offsets 0..5 of a different layout. Should the transport's two checks be
   versioned, or replaced by a host-supplied predicate? (needs human input)
 
@@ -2203,8 +2333,8 @@ the descriptor's `body_len` (`lease.rs:178-196`), and the host never compares th
 Required faults and enabling state: none to pin the property. To demonstrate the
 impact, a peer writing the descriptor page directly, which the mapping permits.
 Confidence: high — [evidence](evidence/ingress-charge-matches-the-bytes-copied-from-shared-storage.md).
-The sole enforcement point is `descriptor.rs:414-422`, called from
-`Ring::try_receive` at `ring.rs:804`, which refuses a lease otherwise.
+The sole enforcement point is `descriptor.rs:289-297`, called from
+`Ring::try_receive` at `ring.rs:806`, which refuses a lease otherwise.
 Downstream, nothing re-derives it: `InboundFrame::owned`
 (`frame_channel.rs:478-490`) stores header, body, and byte charge side by side
 without comparing them. The bounding constants are independently defined 64 MiB
@@ -2212,9 +2342,9 @@ values, `MAX_FRAME_BYTES` (`arena.rs:4`) and `MAX_FRAME_BODY_LEN` (`wire.rs:35`)
 and the dependency edge runs host-to-transport, so the transport can import
 neither the constant nor the header type it validates.
 Existing check: none for the composition. The transport's two checks are covered
-alone at `tests/contract.rs:163`, `:604`, and `:613`; the wire-header setter has
+alone at `tests/contract.rs:182`, `:664`, and `:664`; the wire-header setter has
 no test at all. Status unaudited.
-Impact: `descriptor.rs:420` is the only thing making the host's ingress accounting
+Impact: `descriptor.rs:295` is the only thing making the host's ingress accounting
 mean anything. Relax it, weaken it to a bound, or feature-gate it, and a peer sets
 host admission accounting from a field unrelated to the bytes moved. The
 balanced-but-wrong case, charge 64 MiB and copy 64 bytes, is a cheap
@@ -2292,12 +2422,12 @@ host's, and that byte is peer-writable, so the signal the transport path emits i
 one a peer can erase.
 Required faults and enabling state: two rejections of the same class caught at
 different layers. The transport-caught one requires a direct descriptor-page
-write, because `commit_reservation` re-checks both fields (`ring.rs:1172-1180`),
+write, because `commit_reservation` re-checks both fields (`ring.rs:1174-1182`),
 so the producer API cannot express it.
 Confidence: high — [evidence](evidence/header-rejection-effect-does-not-depend-on-the-catching-layer.md).
 `enter_quarantine` has exactly one caller, the descriptor-validation arm at
-`ring.rs:807`; no host path reaches it. There `consumed` is never advanced, since
-the advance is at `:825` past the error, so the slot stays `RECEIVER_HELD`. On the
+`ring.rs:809`; no host path reaches it. There `consumed` is never advanced, since
+the advance is at `:827` past the error, so the slot stays `RECEIVER_HELD`. On the
 host paths the dropped lease releases and `consumed` has already advanced. The
 convergence point changed: both used to meet the clean-close classification at the
 former `shm_provider.rs:498` and fall into `report_suspect`, where cleanup answered
@@ -2343,8 +2473,8 @@ symlink, by a different real directory, by a non-directory; mode widened; owner
 changed), both `create_in` and `validate` return `ObjectValidationFailed`
 specifically, and `Ring::create_in` refuses. A per-call invariant over
 adversary-chosen filesystem state.
-Fault/timing angle: two narrow windows. From `mkdir` (`ring.rs:330`) to the open
-(`:333-337`), closed after the fact by the inode equality check at `:351`, which
+Fault/timing angle: two narrow windows. From `mkdir` (`ring.rs:313`) to the open
+(`:316-320`), closed after the fact by the inode equality check at `:334`, which
 detects a swap rather than preventing it; and between any `validate()` and the
 operation that follows, which is object creation that does not use the directory.
 `O_NOFOLLOW` covers only the final component, and the root is the process
@@ -2354,8 +2484,8 @@ Four of the five cases are constructible unprivileged in a temporary root; the
 owner-change case needs a second user or a container and may have to be recorded
 as unconstructible in CI rather than skipped silently.
 Confidence: high — [evidence](evidence/runtime-directory-authentication-is-a-precondition-not-a-container.md).
-A repository-wide search returns only the definition (`ring.rs:308-394`), the two
-creation sites (`:537`, `:1418`), and two struct fields, with nothing in the test
+A repository-wide search returns only the definition (`ring.rs:291-377`), the two
+creation sites (`:545`, `:1420`), and two struct fields, with nothing in the test
 directory. `create_in` and `validate` each evaluate the same five clauses. The
 directory holds nothing on either platform: `Mapping::create` takes a length and
 no path; Linux uses an anonymous memfd; macOS uses `shm_open` in the global POSIX
@@ -2367,7 +2497,7 @@ path runs on every `Ring::create` in the ring tests.
 Impact: low, for a specific reason: defeating the checks gains nothing, because no
 object is inside the directory on any supported platform. The reachable
 consequence of tampering is a refusal, so the candidate fails to prepare and the
-host falls back to TCP. The residual is teardown: `Drop` (`:390-394`) calls
+host falls back to TCP. The residual is teardown: `Drop` (`:373-377`) calls
 `remove_dir` by path with no `validate()` first, so with the temporary root naming
 an attacker-writable directory lacking the sticky bit, they can substitute their
 own directory under our name and have our `Drop` remove theirs, a narrow same-user
@@ -2376,7 +2506,7 @@ storing something real here would inherit an authentication covering only the
 container.
 Open questions:
 - Is the directory a remnant of an earlier file-backed design, or a deliberate
-  environment sanity check? The doc comment at `ring.rs:535` implies the object is
+  environment sanity check? The doc comment at `ring.rs:543` implies the object is
   under it; it is not. Git archaeology was not performed. (needs human input)
 - Should `Drop` revalidate before removing, that being the one unauthenticated use
   of the path? (needs human input)
@@ -2409,11 +2539,11 @@ lease, then require the next single `try_reserve` to succeed, and require
 `reserve_until` with a deadline set beyond the release to return `Ok` strictly
 inside it. The bounded fault-free window is one `try_reserve` after the release
 becomes visible, because `reclaim_completed` drains the whole contiguous completed
-prefix per call and is invoked at the head of `try_reserve` (`ring.rs:673`).
+prefix per call and is invoked at the head of `try_reserve` (`ring.rs:675`).
 Fault/timing angle: three independent conditions all surface as
-`ProducerError::Exhausted` — depth full (`:683-684`), a lost reservation
-compare-exchange (`:700`), and arena exhaustion (`:708-712`) — and only that
-variant is retried (`:745-754`). Under the cold park-wake mode the host selects,
+`ProducerError::Exhausted` — depth full (`:685-686`), a lost reservation
+compare-exchange (`:702`), and arena exhaustion (`:710-714`) — and only that
+variant is retried (`:747-756`). Under the cold park-wake mode the host selects,
 retries are 50 microseconds apart, so one quantum is the floor on any asserted
 bound.
 Required faults and enabling state: genuine exhaustion of either capacity, then
@@ -2424,14 +2554,14 @@ Confidence: high — [evidence](evidence/backpressure-converges-in-a-bounded-rec
 `reclaim_completed`'s sole call site in the repository is `try_reserve`, so
 reclamation is producer-driven and a retry is the act that recovers capacity; the
 reclaim loop exits only at the first gap, an error, or an exhausted prefix; and
-the compare-exchange at `:700` cannot lose fault-free, because `slot_ptr` maps
+the compare-exchange at `:702` cannot lose fault-free, because `slot_ptr` maps
 sequence to `(sequence - 1) % descriptor_depth` and the depth gate already puts
 that slot's previous user at or below `completed`, hence freed.
 Existing check: partial —
 `two_process_zero_copy_exchange_uses_authenticated_grant`
-(`tests/ring.rs:565-602`). A `reserve_until` with a five-second deadline converges
+(`tests/ring.rs:581-618`). A `reserve_until` with a five-second deadline converges
 after the child releases, and an elapsed-time assertion keeps it from passing
-vacuously. Status unaudited. The give-up path is pinned separately at `:202-206`.
+vacuously. Status unaudited. The give-up path is pinned separately at `:192-196`.
 Impact: this is the only statement in the catalog that the transport makes forward
 progress in normal operation. A recovery-chain defect presents as
 `ProducerError::Deadline`, which the host converts into a failed publish, a
@@ -2461,8 +2591,8 @@ host: `receive_one` holds at most one of eight leases and releases it on every
 path.
 Fault/timing angle: no race — the counter is incremented and decremented by the
 same thread-confined receiver. The hazard is representational: the declining
-return is used both for saturation (`ring.rs:772-776`) and for an empty ring
-(`:782-783`), and the saturation gate is taken before `consumed` or `published` is
+return is used both for saturation (`ring.rs:774-778`) and for an empty ring
+(`:784-785`), and the saturation gate is taken before `consumed` or `published` is
 read at all, so the value carries no reason.
 Required faults and enabling state: a profile whose `max_leases` is reachable and
 strictly greater than one, plus at least one frame published beyond the leased
@@ -2473,7 +2603,7 @@ Confidence: high — [evidence](evidence/receive-resumes-when-lease-capacity-cle
 Both gates and the single decrement site were read directly, and every
 `receive_one` return path in the host was traced to confirm one lease per call.
 Existing check: `lease_limit_reports_backpressure_then_recovers_after_release`
-(`tests/ring.rs:288-303`) against a profile with depth 2 and one lease. The
+(`tests/ring.rs:278-293`) against a profile with depth 2 and one lease. The
 recovery half is real; the saturation half asserts only absence. Status unaudited,
 and the oracle cannot distinguish saturation from an empty ring, which is the gap
 this record closes.
@@ -2560,11 +2690,11 @@ pass, so the check must use a bare `try_reserve`.
 Required faults and enabling state: a retained lease with at least two released
 sequences behind it, situation `shm_arena_wrap_with_live_lease`, then the release.
 Confidence: high — [evidence](evidence/reclamation-keeps-pace-with-completion.md).
-The loop at `ring.rs:1110-1150` has exactly three exits, so one call drains the
+The loop at `ring.rs:1112-1152` has exactly three exits, so one call drains the
 whole contiguous prefix; both refusal gates it feeds are the outstanding-versus-depth
 comparison and insufficient contiguous arena capacity.
 Existing check: `retained_oldest_lease_enforces_fifo_reclamation_and_release_validation`
-(`tests/ring.rs:148-219`). The blocking half is good. The recovery half releases
+(`tests/ring.rs:138-209`). The blocking half is good. The recovery half releases
 the retained lease and asserts a one-byte reserve succeeds; with a 64 MiB arena
 fully charged, a reclaimer advancing only the first sequence leaves 40 MiB, where
 one byte fits just as well. Status unaudited.
