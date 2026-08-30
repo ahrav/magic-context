@@ -171,8 +171,10 @@ fn sqlite_runtime_source() {
 fn sqlite_runtime_source_connection_contract() {
     let dir = tempfile::tempdir().expect("tempdir");
     let conn = Connection::open(dir.path().join("contract.db")).expect("open");
-    conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;")
-        .expect("pragmas");
+    conn.execute_batch(
+        "PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF;",
+    )
+    .expect("pragmas");
     let journal_mode: String = conn
         .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
         .expect("journal mode");
@@ -194,7 +196,7 @@ fn sqlite_runtime_source_connection_contract() {
         violations,
         vec![
             "busy_timeout 0ms is below the required 5000ms".to_string(),
-            "synchronous mode 0 is not in the declared set [1, 2, 3]".to_string(),
+            "synchronous mode 0 is not FULL or EXTRA [2, 3]".to_string(),
         ]
     );
 }
