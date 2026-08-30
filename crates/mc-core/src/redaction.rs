@@ -27,6 +27,10 @@ pub struct Redaction {
     pub detections: Vec<Detection>,
 }
 
+/// Character class matching JavaScript's non-`u` `\s`, which covers U+FEFF and omits U+0085.
+const JS_SPACE: &str =
+    r"\t\n\x0B\f\r \x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}\x{feff}";
+
 /// Secret-key names mark `name=value` and `"name": "value"` pairs for redaction.
 ///
 /// The shared list keeps secret-name matching terms consistent across keyed rules.
@@ -124,7 +128,9 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
         ),
         // The named `value` group narrows replacement to the token, so the `Authorization: Bearer ` prefix stays readable.
         fixed(
-            r"(?-u:\b)(?i-u:authorization)\s*:\s*(?i-u:bearer)\s+(?P<value>[A-Za-z0-9._~+/=-]{8,})",
+            &format!(
+                r"(?-u:\b)(?i-u:authorization)[{JS_SPACE}]*:[{JS_SPACE}]*(?i-u:bearer)[{JS_SPACE}]+(?P<value>[A-Za-z0-9._~+/=-]{{8,}})"
+            ),
             "bearer",
             "<REDACTED:bearer>",
         ),
@@ -139,19 +145,20 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
         .into_iter()
         .map(|(key_quote, value_quote)| {
             format!(
-                r#"{key_quote}(?P<key>[^"']*(?i-u:{SECRET_WORDS})[^"']*){key_quote}\s*:\s*{value_quote}(?P<value>[^"']*){value_quote}"#
+                r#"{key_quote}(?P<key>[^"']*(?i-u:{SECRET_WORDS})[^"']*){key_quote}[{JS_SPACE}]*:[{JS_SPACE}]*{value_quote}(?P<value>[^"']*){value_quote}"#
             )
         })
         .collect();
     rules.push(keyed_value(&quoted));
     rules.push(keyed_assignment(&format!(
-        r#"(?-u:\b)(?P<key>[A-Za-z0-9_.-]*(?i-u:{SECRET_WORDS})[A-Za-z0-9_.-]*)\s*=\s*(?P<value>[^\s'"`]+)"#
+        r#"(?-u:\b)(?P<key>[A-Za-z0-9_.-]*(?i-u:{SECRET_WORDS})[A-Za-z0-9_.-]*)[{JS_SPACE}]*=[{JS_SPACE}]*(?P<value>[^{JS_SPACE}'"`]+)"#
     )));
     rules
 });
 
 static SCALAR_VALUE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$").expect("scalar diagnostic regex is valid")
+    Regex::new(r"^[+-]?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$")
+        .expect("scalar diagnostic regex is valid")
 });
 
 static KEY_SEPARATOR: LazyLock<Regex> =
@@ -469,13 +476,36 @@ fn piece_at(starts: &[usize], pieces: &[Piece], position: usize) -> Option<usize
         .map(|(index, _)| index)
 }
 
+/// Same set as [`JS_SPACE`], for trimming; `str::trim` would use Unicode rules instead.
+fn is_js_space(character: char) -> bool {
+    matches!(
+        character,
+        '\u{9}'
+            | '\u{a}'
+            | '\u{b}'
+            | '\u{c}'
+            | '\u{d}'
+            | '\u{20}'
+            | '\u{a0}'
+            | '\u{1680}'
+            | '\u{2000}'
+            ..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\u{feff}'
+    )
+}
+
 /// A bare number, boolean, or null is never a credential.
 ///
 /// A keyed rule can match because the KEY holds a word like `token` while the VALUE is a count or flag, as in `tokens.input=45000`.
 /// Value-shaped rules still catch high-entropy secrets regardless of key name.
 /// The exemption costs coverage: `password=123456` survives.
 fn is_non_secret_scalar_value(value: &str) -> bool {
-    let value = value.trim();
+    let value = value.trim_matches(is_js_space);
     matches!(value, "true" | "false" | "null" | "undefined") || SCALAR_VALUE.is_match(value)
 }
 
@@ -634,6 +664,52 @@ mod tests {
         assert_eq!(result.text, "secret=<REDACTED:secret>");
         assert_eq!(result.detections[0].offset, 9);
         assert_eq!(result.detections[0].length, "spaced-value".len());
+    }
+
+    #[test]
+    fn js_space_class_and_predicate_agree() {
+        let class = Regex::new(&format!("^[{JS_SPACE}]$")).expect("class compiles");
+        for code in (0..=0x3100u32).chain([0xfeff]) {
+            let Some(character) = char::from_u32(code) else {
+                continue;
+            };
+            assert_eq!(
+                class.is_match(&character.to_string()),
+                is_js_space(character),
+                "disagreement on U+{code:04X}"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_exemption_uses_ascii_digits_and_javascript_trimming() {
+        // Arabic-Indic digits are not an exempt scalar, so the value stays redacted.
+        assert_eq!(
+            redact_secret_text("api_key=\u{664}\u{669}\u{660}\u{666}").text,
+            "api_key=<REDACTED:api_key>"
+        );
+        // U+FEFF is whitespace to JavaScript, so trimming leaves an exempt count.
+        assert_eq!(
+            redact_secret_text("\"api_key\": \"4096\u{feff}\"").text,
+            "\"api_key\": \"4096\u{feff}\""
+        );
+        // U+0085 is not whitespace to JavaScript, so the value is not a bare number.
+        assert_eq!(
+            redact_secret_text("\"api_key\": \"4096\u{85}\"").text,
+            "\"api_key\": \"<REDACTED:api_key>\""
+        );
+    }
+
+    #[test]
+    fn separators_accept_javascript_whitespace() {
+        assert_eq!(
+            redact_secret_text("Authorization:\u{feff}Bearer abcdef123456").text,
+            "Authorization:\u{feff}Bearer <REDACTED:bearer>"
+        );
+        assert_eq!(
+            redact_secret_text("secret\u{feff}=\u{feff}value1234").text,
+            "secret=<REDACTED:secret>"
+        );
     }
 
     #[test]
