@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use mc_shm_transport::backend::ring::RingGrant;
-use mc_shm_transport::backend::ring::{ProducerReservation, Ring};
+use mc_shm_transport::backend::ring::{ProducerError, ProducerReservation, Ring};
 use mc_shm_transport::descriptor::SchedulingMode;
 use mc_shm_transport::descriptor::{ReleaseIdentity, WIRE_V2_HEADER_BYTES};
 use mc_shm_transport::profile::mc_host_ring_profile;
@@ -724,7 +724,7 @@ pub fn produce(
                 header,
                 Instant::now() + Duration::from_millis(u64::from(timeout_ms)),
             )
-            .map_err(|_| error("shared-memory reservation failed"))?;
+            .map_err(reservation_error)?;
         let mut views = Vec::with_capacity(reservation.segment_count());
         let mut refs = Vec::with_capacity(reservation.segment_count());
         let built = (|| -> Result<()> {
@@ -800,7 +800,7 @@ pub fn reserve(
                 [0; WIRE_V2_HEADER_BYTES],
                 Instant::now() + Duration::from_millis(u64::from(timeout_ms)),
             )
-            .map_err(|_| error("shared-memory reservation failed"))?;
+            .map_err(reservation_error)?;
         let mut views = Vec::with_capacity(reservation.segment_count());
         let mut refs = Vec::with_capacity(reservation.segment_count());
         let built = (|| -> Result<()> {
@@ -1041,6 +1041,14 @@ pub fn release(env: &Env, channel_id: u32, token: u32) -> Result<()> {
             .ok_or_else(|| error("native channel is closed"))?;
         detach_active(env, channel, token, true)
     })
+}
+
+/// A full ring is ordinary backpressure, so it carries a distinct message the caller can classify as retryable instead of terminal. commentlint: allow(JUDGE)
+fn reservation_error(failure: ProducerError) -> Error {
+    match failure {
+        ProducerError::Exhausted | ProducerError::Deadline => error("shared-memory ring is full"),
+        _ => error("shared-memory reservation failed"),
+    }
 }
 
 #[napi]

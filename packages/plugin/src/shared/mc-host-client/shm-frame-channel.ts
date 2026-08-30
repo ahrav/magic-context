@@ -48,6 +48,36 @@ export interface ShmFrameChannelOptions {
     handlers: FrameChannelHandlers;
 }
 
+/**
+ * Longest a single publication may block the event loop waiting for ring
+ * capacity. The native reservation is synchronous, and this thread is also the
+ * only consumer of the inbound ring, so waiting a request deadline here stops
+ * the drain that would free the capacity being waited on. commentlint: allow(JUDGE)
+ */
+const MAX_RESERVATION_BLOCK_MS = 5;
+
+/** A full ring is backpressure, so callers may retry rather than fail the route. commentlint: allow(JUDGE) */
+function ringFullError(cause: unknown): McHostCallError {
+    return new McHostCallError(
+        "not_sent",
+        "shared-memory ring has no capacity for this frame",
+        "ring_full",
+        cause,
+    );
+}
+
+function isRingFull(error: unknown): boolean {
+    return error instanceof Error && error.message === "shared-memory ring is full";
+}
+
+/** Never waits past the caller's deadline, and never longer than the loop bound. commentlint: allow(JUDGE) */
+function reservationBlockMs(deadline?: Deadline): number {
+    const remaining = deadline?.remainingMs();
+    if (remaining === undefined) return MAX_RESERVATION_BLOCK_MS;
+    if (remaining <= 0) return 0;
+    return Math.min(MAX_RESERVATION_BLOCK_MS, Math.ceil(remaining));
+}
+
 export class ShmFrameChannel implements SetupFrameChannel {
     private native: NativeChannel | null;
     private readonly copies = new CopyCounter();
@@ -121,9 +151,10 @@ export class ShmFrameChannel implements SetupFrameChannel {
         this.admitPublication(reservedBytes);
         let reservation: NativeProducerReservation;
         try {
-            reservation = this.attached().reserve(capacity);
+            reservation = this.attached().reserve(capacity, MAX_RESERVATION_BLOCK_MS);
         } catch (error) {
             this.releasePublication(reservedBytes);
+            if (isRingFull(error)) throw ringFullError(error);
             throw error;
         }
         let held = true;
@@ -271,20 +302,25 @@ export class ShmFrameChannel implements SetupFrameChannel {
     ): FrameSendTicket {
         if (this.closed) throw new McHostCallError("not_sent", "shared-memory channel closed");
         let published = false;
-        this.attached().produce(
-            encodeHeader({ ...header, len: body.byteLength }),
-            body.byteLength,
-            (cursor: ProducerCursor) => body.fill(cursor),
-            () => {
-                published = true;
-                try {
-                    hooks?.onPublish?.();
-                } catch {
-                    // Send hooks cannot change publication.
-                }
-            },
-            deadline?.remainingMs() ?? 0,
-        );
+        try {
+            this.attached().produce(
+                encodeHeader({ ...header, len: body.byteLength }),
+                body.byteLength,
+                (cursor: ProducerCursor) => body.fill(cursor),
+                () => {
+                    published = true;
+                    try {
+                        hooks?.onPublish?.();
+                    } catch {
+                        // Send hooks cannot change publication.
+                    }
+                },
+                reservationBlockMs(deadline),
+            );
+        } catch (error) {
+            if (isRingFull(error)) throw ringFullError(error);
+            throw error;
+        }
         try {
             hooks?.onComplete?.();
         } catch {

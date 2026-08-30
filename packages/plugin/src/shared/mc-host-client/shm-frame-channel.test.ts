@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
     NativeChannel,
     type NativeReceiveLease,
+    type ProducerCursor,
     probeCapabilities,
 } from "@cortexkit/mc-shm-native";
 import { ConnectionGeneration } from "./connection";
@@ -517,6 +518,59 @@ describe("mandatory shared-memory channel", () => {
         channel.close();
         expect(() => channel.sendControl(responseHeader(FrameType.Pong, 1n, 0))).not.toThrow();
         expect(produceCalls).toBe(0);
+    });
+
+    test("a full ring is retryable backpressure, not a terminal failure", () => {
+        const budget = new ByteBudget(1 << 20);
+        let blockMs: number | undefined;
+        const native = {
+            produce: (
+                _header: Uint8Array,
+                _capacity: number,
+                _fill: unknown,
+                _beforePublish: unknown,
+                timeoutMs: number,
+            ) => {
+                blockMs = timeoutMs;
+                throw new Error("shared-memory ring is full");
+            },
+            reserve: () => {
+                throw new Error("shared-memory ring is full");
+            },
+            close: () => {},
+            peerClosed: () => false,
+        } as unknown as NativeChannel;
+        const channel = new ShmFrameChannel({
+            nativeChannel: native,
+            budget,
+            maxBodyLen: 1 << 20,
+            handlers: { onFrame: () => {}, onClosed: () => {} },
+        });
+        const header = responseHeader(FrameType.Request, 1n, 4);
+        const body = {
+            byteLength: 4,
+            fill: (cursor: ProducerCursor) => cursor.write(new Uint8Array(4)),
+        };
+
+        for (const attempt of [
+            () => channel.produce(header, body),
+            () => channel.reserve(header, 4),
+        ]) {
+            let caught: unknown;
+            try {
+                attempt();
+            } catch (error) {
+                caught = error;
+            }
+            expect(caught).toBeInstanceOf(McHostCallError);
+            expect((caught as McHostCallError).kind).toBe("not_sent");
+            expect((caught as McHostCallError).code).toBe("ring_full");
+        }
+        // A publication must not hold the event loop for a request deadline;
+        // the loop is also the only consumer draining the inbound ring.
+        expect(blockMs).toBeLessThanOrEqual(5);
+        // Every refused attempt returns its charge.
+        expect(budget.used).toBe(0);
     });
 
     test("a dropped setup socket retires the channel as eof after draining", async () => {
