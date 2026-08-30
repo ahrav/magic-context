@@ -1,6 +1,9 @@
 //! Token counts are not monotonic in prefix length, so preserve this binary
 //! search's probe sequence.
 //!
+//! `reference` mirrors `truncate_historian_input_if_needed` and `utf16_prefix` in
+//! `crates/mc-module/src/historian_chunk.rs`.
+//!
 //! `reference` defines expected behavior; optimized output must match it.
 
 mod reference {

@@ -1,7 +1,8 @@
 //! The optimized selection module must produce decision-for-decision
 //! identical output to this frozen copy on every generated input.
 //!
-//! `reference` defines expected behavior; optimized output must match it.
+//! `reference` mirrors `crates/mc-module/src/selection.rs` plus the two `utf16_*` helpers in
+//! `crates/mc-module/src/transform.rs`.
 
 #[allow(clippy::all, dead_code)]
 mod reference {
@@ -1439,15 +1440,16 @@ mod reference {
 use std::collections::{HashMap, HashSet};
 
 use mc_module::selection::{
-    select_reductions_with_outcome, PassClass, SelItem, SelKind, SelMessageRole, SelectionConfig,
-    SelectionContext,
+    filter_reasoning_ineligible_decisions, select_reductions_with_outcome, PassClass, SelItem,
+    SelKind, SelMessageRole, SelectionConfig, SelectionContext,
 };
 use proptest::prelude::*;
+use proptest::strategy::ValueTree;
+use proptest::test_runner::TestRunner;
 
 #[derive(Debug, Clone)]
 struct ItemSpec {
     msg: u8,
-    block: u8,
     ordinal_slot: u8,
     role: u8,
     kind: u8,
@@ -1463,9 +1465,56 @@ struct ItemSpec {
     exempt_protected: bool,
 }
 
+const KIND_TOOL_CALL: u8 = 0;
+const KIND_TOOL_RESULT: u8 = 1;
+const KIND_REASONING: u8 = 2;
+const KIND_REDACTED_REASONING: u8 = 3;
+const KIND_MEDIA: u8 = 4;
+const KIND_OPAQUE: u8 = 5;
+const KIND_TEXT: u8 = 6;
+
+const ROLE_ASSISTANT: u8 = 0;
+const ROLE_SYSTEM: u8 = 1;
+const ROLE_NON_ASSISTANT: u8 = 2;
+
+const PASS_EXECUTE: u8 = 0;
+const PASS_EMERGENCY_FORCE: u8 = 1;
+const PASS_DEFER: u8 = 2;
+
+/// This match has no `_` arm so new `SelKind` variants fail to compile.
+fn kind_index(kind: &SelKind) -> u8 {
+    match kind {
+        SelKind::ToolCall { .. } => KIND_TOOL_CALL,
+        SelKind::ToolResult { .. } => KIND_TOOL_RESULT,
+        SelKind::Reasoning => KIND_REASONING,
+        SelKind::RedactedReasoning => KIND_REDACTED_REASONING,
+        SelKind::Media => KIND_MEDIA,
+        SelKind::Opaque => KIND_OPAQUE,
+        SelKind::Text => KIND_TEXT,
+    }
+}
+
+/// This match has no `_` arm so new `SelMessageRole` variants fail to compile.
+fn role_index(role: &SelMessageRole) -> u8 {
+    match role {
+        SelMessageRole::Assistant => ROLE_ASSISTANT,
+        SelMessageRole::System => ROLE_SYSTEM,
+        SelMessageRole::NonAssistant => ROLE_NON_ASSISTANT,
+    }
+}
+
+/// This match has no `_` arm so new `PassClass` variants fail to compile.
+fn pass_class_index(pass_class: &PassClass) -> u8 {
+    match pass_class {
+        PassClass::Execute => PASS_EXECUTE,
+        PassClass::EmergencyForce => PASS_EMERGENCY_FORCE,
+        PassClass::Defer => PASS_DEFER,
+    }
+}
+
 fn item_spec() -> impl Strategy<Value = ItemSpec> {
     (
-        (0u8..12, 0u8..3, 0u8..32, 0u8..3, 0u8..7),
+        (0u8..12, 0u8..32, 0u8..3, 0u8..7),
         (
             0u8..15,
             0u8..10,
@@ -1483,12 +1532,11 @@ fn item_spec() -> impl Strategy<Value = ItemSpec> {
     )
         .prop_map(
             |(
-                (msg, block, ordinal_slot, role, kind),
+                (msg, ordinal_slot, role, kind),
                 (tool, input, provider_executed, byte_size, token_count),
                 (arc, frozen, agent_drop, tag_protected, exempt_protected),
             )| ItemSpec {
                 msg,
-                block,
                 ordinal_slot,
                 role,
                 kind,
@@ -1562,8 +1610,8 @@ fn input_value(variant: u8) -> serde_json::Value {
     }
 }
 
-fn id_of(spec: &ItemSpec) -> String {
-    format!("m{}#{}", spec.msg, spec.block)
+fn id_of(index: usize, spec: &ItemSpec) -> String {
+    format!("m{}#{}", spec.msg, index)
 }
 
 macro_rules! build_inputs {
@@ -1590,28 +1638,31 @@ macro_rules! build_inputs {
         ) = $ctx_bits;
         let items: Vec<Item> = specs
             .iter()
-            .map(|s| {
+            .enumerate()
+            .map(|(i, s)| {
                 let kind = match s.kind {
-                    0 => K::ToolCall {
+                    KIND_TOOL_CALL => K::ToolCall {
                         name: TOOLS[usize::from(s.tool)].to_string(),
                         input: input_value(s.input),
                     },
-                    1 => K::ToolResult {
+                    KIND_TOOL_RESULT => K::ToolResult {
                         tool_name: TOOLS[usize::from(s.tool)].to_string(),
                     },
-                    2 => K::Reasoning,
-                    3 => K::RedactedReasoning,
-                    4 => K::Media,
-                    5 => K::Opaque,
-                    _ => K::Text,
+                    KIND_REASONING => K::Reasoning,
+                    KIND_REDACTED_REASONING => K::RedactedReasoning,
+                    KIND_MEDIA => K::Media,
+                    KIND_OPAQUE => K::Opaque,
+                    KIND_TEXT => K::Text,
+                    other => unreachable!("unmapped kind index {other}"),
                 };
                 let role = match s.role {
-                    0 => R::Assistant,
-                    1 => R::System,
-                    _ => R::NonAssistant,
+                    ROLE_ASSISTANT => R::Assistant,
+                    ROLE_SYSTEM => R::System,
+                    ROLE_NON_ASSISTANT => R::NonAssistant,
+                    other => unreachable!("unmapped role index {other}"),
                 };
                 Item {
-                    id: id_of(s),
+                    id: id_of(i, s),
                     ordinal: u64::from(s.ordinal_slot),
                     message_role: role,
                     kind,
@@ -1624,13 +1675,15 @@ macro_rules! build_inputs {
             .collect();
         let frozen: HashSet<String> = specs
             .iter()
-            .filter(|s| s.frozen)
-            .map(|s| id_of(s))
+            .enumerate()
+            .filter(|(_, s)| s.frozen)
+            .map(|(i, s)| id_of(i, s))
             .collect();
         let agent_drop_ids: Vec<String> = specs
             .iter()
-            .filter(|s| s.agent_drop)
-            .map(|s| id_of(s))
+            .enumerate()
+            .filter(|(_, s)| s.agent_drop)
+            .map(|(i, s)| id_of(i, s))
             .collect();
         let agent_drop_command_ids: HashMap<String, String> = agent_drop_ids
             .iter()
@@ -1647,9 +1700,10 @@ macro_rules! build_inputs {
         let max_ordinal = items.iter().map(|i| i.ordinal).max().unwrap_or(0);
         let ctx = Ctx {
             pass_class: match pass_class {
-                0u8 => P::Execute,
-                1 => P::EmergencyForce,
-                _ => P::Defer,
+                PASS_EXECUTE => P::Execute,
+                PASS_EMERGENCY_FORCE => P::EmergencyForce,
+                PASS_DEFER => P::Defer,
+                other => unreachable!("unmapped pass class index {other}"),
             },
             current_total_input_tokens: tokens,
             ceiling_tokens: ceiling,
@@ -1672,13 +1726,15 @@ macro_rules! build_inputs {
             supersession_ride_available: ride,
             tag_window_protected_block_ids: specs
                 .iter()
-                .filter(|s| s.tag_protected)
-                .map(|s| id_of(s))
+                .enumerate()
+                .filter(|(_, s)| s.tag_protected)
+                .map(|(i, s)| id_of(i, s))
                 .collect(),
             exempt_message_protected_block_ids: specs
                 .iter()
-                .filter(|s| s.exempt_protected)
-                .map(|s| id_of(s))
+                .enumerate()
+                .filter(|(_, s)| s.exempt_protected)
+                .map(|(i, s)| id_of(i, s))
                 .collect(),
         };
         let cfg = Cfg { smart_drops: smart };
@@ -1743,10 +1799,9 @@ fn arc_window_specs() -> impl Strategy<Value = Vec<ItemSpec>> {
             |(arc_count, tool, input, provider_executed, agent_drop, frozen_tail)| {
                 let mut specs = Vec::with_capacity(usize::from(arc_count) * 2);
                 for arc in 0..arc_count {
-                    let mut push = |block: u8, kind: u8, byte_size: u16, agent_drop: bool| {
+                    let mut push = |kind: u8, byte_size: u16, agent_drop: bool| {
                         specs.push(ItemSpec {
                             msg: arc,
-                            block,
                             ordinal_slot: arc,
                             role: 0,
                             kind,
@@ -1762,8 +1817,8 @@ fn arc_window_specs() -> impl Strategy<Value = Vec<ItemSpec>> {
                             exempt_protected: false,
                         });
                     };
-                    push(0, 0, 1200, agent_drop);
-                    push(1, 1, 600, false);
+                    push(0, 1200, agent_drop);
+                    push(1, 600, false);
                 }
                 specs
             },
@@ -1823,10 +1878,9 @@ fn payload_clamp_specs() -> impl Strategy<Value = Vec<ItemSpec>> {
             let mut specs = Vec::with_capacity(usize::from(arc_count) * 2);
             for arc in 0..arc_count {
                 let input = inputs[usize::from(arc) % inputs.len()];
-                let mut push = |block: u8, kind: u8, byte_size: u16, agent_drop: bool| {
+                let mut push = |kind: u8, byte_size: u16, agent_drop: bool| {
                     specs.push(ItemSpec {
                         msg: arc,
-                        block,
                         ordinal_slot: arc,
                         role: 0,
                         kind,
@@ -1842,8 +1896,8 @@ fn payload_clamp_specs() -> impl Strategy<Value = Vec<ItemSpec>> {
                         exempt_protected: false,
                     });
                 };
-                push(0, 0, 1400, agent_drop && arc == 0);
-                push(1, 1, 700, false);
+                push(0, 1400, agent_drop && arc == 0);
+                push(1, 700, false);
             }
             specs
         })
@@ -1859,10 +1913,9 @@ fn dedup_specs() -> impl Strategy<Value = Vec<ItemSpec>> {
         .prop_map(|(arc_count, tool, input, tag_protected)| {
             let mut specs = Vec::with_capacity(usize::from(arc_count) * 2);
             for arc in 0..arc_count {
-                let mut push = |block: u8, kind: u8, byte_size: u16, tag_protected: bool| {
+                let mut push = |kind: u8, byte_size: u16, tag_protected: bool| {
                     specs.push(ItemSpec {
                         msg: 0,
-                        block,
                         ordinal_slot: arc,
                         role: 0,
                         kind,
@@ -1878,8 +1931,44 @@ fn dedup_specs() -> impl Strategy<Value = Vec<ItemSpec>> {
                         exempt_protected: false,
                     });
                 };
-                push(arc * 2, 0, 900, tag_protected && arc == 0);
-                push(arc * 2 + 1, 1, 400, false);
+                push(0, 900, tag_protected && arc == 0);
+                push(1, 400, false);
+            }
+            specs
+        })
+}
+
+fn supersession_withheld_specs() -> impl Strategy<Value = Vec<ItemSpec>> {
+    (
+        3u8..7,
+        prop_oneof![Just(3u8), Just(4u8)],
+        prop_oneof![Just(0u8), Just(1u8)],
+        any::<bool>(),
+    )
+        .prop_map(|(arc_count, tool, input, exempt_instead)| {
+            let mut specs = Vec::with_capacity(usize::from(arc_count) * 2);
+            for arc in 0..arc_count {
+                let protect = arc == 0;
+                let mut push = |kind: u8, byte_size: u16| {
+                    specs.push(ItemSpec {
+                        msg: arc,
+                        ordinal_slot: arc,
+                        role: 0,
+                        kind,
+                        tool,
+                        input,
+                        provider_executed: false,
+                        byte_size,
+                        token_count: None,
+                        arc: Some(arc),
+                        frozen: false,
+                        agent_drop: false,
+                        tag_protected: protect && !exempt_instead,
+                        exempt_protected: protect && exempt_instead,
+                    });
+                };
+                push(0, 1200);
+                push(1, 600);
             }
             specs
         })
@@ -1949,5 +2038,207 @@ proptest! {
     ) {
         let (optimized, expected, specs, bits) = outcome_pair!(specs, bits);
         prop_assert_eq!(optimized, expected, "diverged on {:?} {:?}", specs, bits);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(192))]
+    #[test]
+    fn optimized_matches_frozen_reference_on_withheld_supersession(
+        specs in supersession_withheld_specs(),
+        bits in pressured_ctx_bits(),
+    ) {
+        let (optimized, expected, specs, bits) = outcome_pair!(specs, bits);
+        prop_assert_eq!(optimized, expected, "diverged on {:?} {:?}", specs, bits);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(192))]
+    #[test]
+    fn reasoning_guard_matches_frozen_reference(
+        specs in proptest::collection::vec(item_spec(), 0..40),
+        bits in ctx_bits(),
+    ) {
+        let (items, frozen, ctx, cfg) = build_inputs!(
+            &specs, bits,
+            SelItem, SelKind, SelMessageRole, SelectionContext, PassClass, SelectionConfig
+        );
+        let (ref_items, ref_frozen, ref_ctx, ref_cfg) = build_inputs!(
+            &specs, bits,
+            reference::SelItem, reference::SelKind, reference::SelMessageRole,
+            reference::SelectionContext, reference::PassClass, reference::SelectionConfig
+        );
+        let selected = select_reductions_with_outcome(&items, &frozen, &ctx, &cfg).decisions;
+        let ref_selected = reference::select_reductions_with_outcome(
+            &ref_items, &ref_frozen, &ref_ctx, &ref_cfg,
+        )
+        .decisions;
+        let optimized = decision_rows(&filter_reasoning_ineligible_decisions(&items, selected));
+        let expected = decision_rows(&reference::filter_reasoning_ineligible_decisions(
+            &ref_items,
+            ref_selected,
+        ));
+        prop_assert_eq!(optimized, expected, "diverged on {:?} {:?}", specs, bits);
+    }
+}
+
+fn sampled_specs(
+    strategy: impl Strategy<Value = Vec<ItemSpec>>,
+    draws: usize,
+) -> Vec<Vec<ItemSpec>> {
+    let mut runner = TestRunner::deterministic();
+    (0..draws)
+        .map(|_| {
+            strategy
+                .new_tree(&mut runner)
+                .expect("strategy produces a value tree")
+                .current()
+        })
+        .collect()
+}
+
+/// A green differential run says nothing about paths the generator never reaches.
+#[test]
+fn generators_reach_every_decision_class() {
+    const DRAWS: usize = 600;
+
+    let mut drops = 0usize;
+    let mut skeletons = 0usize;
+    let mut edit_markers = 0usize;
+    let mut supersession_runs = 0usize;
+    let mut withheld = 0usize;
+
+    let mut bit_runner = TestRunner::deterministic();
+    for strategy in [
+        proptest::collection::vec(item_spec(), 0..40).boxed(),
+        arc_window_specs().boxed(),
+        dedup_specs().boxed(),
+        payload_clamp_specs().boxed(),
+        supersession_withheld_specs().boxed(),
+    ] {
+        for specs in sampled_specs(strategy, DRAWS) {
+            let bits = ctx_bits()
+                .new_tree(&mut bit_runner)
+                .expect("strategy produces a value tree")
+                .current();
+            let (items, frozen, ctx, cfg) = build_inputs!(
+                &specs,
+                bits,
+                SelItem,
+                SelKind,
+                SelMessageRole,
+                SelectionContext,
+                PassClass,
+                SelectionConfig
+            );
+            let outcome = select_reductions_with_outcome(&items, &frozen, &ctx, &cfg);
+            for decision in &outcome.decisions {
+                match decision.kind.as_str() {
+                    "drop" => drops += 1,
+                    "skeleton" => skeletons += 1,
+                    "edit_marker" => edit_markers += 1,
+                    other => panic!("unexpected decision kind {other}"),
+                }
+            }
+            if outcome.eligible_supersession_count.is_some() {
+                supersession_runs += 1;
+            }
+            if outcome
+                .supersession_withheld_by_tag_window_count
+                .is_some_and(|n| n > 0)
+                || outcome
+                    .supersession_withheld_by_exempt_message_count
+                    .is_some_and(|n| n > 0)
+            {
+                withheld += 1;
+            }
+        }
+    }
+
+    assert!(drops > 0, "no drop decisions were generated");
+    assert!(skeletons > 0, "no skeleton decisions were generated");
+    assert!(edit_markers > 0, "no edit_marker decisions were generated");
+    assert!(supersession_runs > 0, "the supersession selector never ran");
+    assert!(withheld > 0, "no supersession arc was ever withheld");
+}
+
+/// These assertions fail when a variant exists but no generator produces it.
+#[test]
+fn every_production_variant_is_generated() {
+    const DRAWS: usize = 600;
+
+    let drawn = sampled_specs(proptest::collection::vec(item_spec(), 0..40).boxed(), DRAWS);
+    let field = |project: &dyn Fn(&ItemSpec) -> u8| -> HashSet<u8> {
+        drawn
+            .iter()
+            .flat_map(|specs| specs.iter().map(project))
+            .collect()
+    };
+
+    let generated_kinds = field(&|spec: &ItemSpec| spec.kind);
+    for kind in [
+        SelKind::ToolCall {
+            name: "edit".to_string(),
+            input: serde_json::json!({}),
+        },
+        SelKind::ToolResult {
+            tool_name: "edit".to_string(),
+        },
+        SelKind::Reasoning,
+        SelKind::RedactedReasoning,
+        SelKind::Media,
+        SelKind::Opaque,
+        SelKind::Text,
+    ] {
+        let index = kind_index(&kind);
+        assert!(
+            generated_kinds.contains(&index),
+            "kind index {index} is never generated"
+        );
+    }
+
+    let generated_roles = field(&|spec: &ItemSpec| spec.role);
+    for role in [
+        SelMessageRole::Assistant,
+        SelMessageRole::System,
+        SelMessageRole::NonAssistant,
+    ] {
+        let index = role_index(&role);
+        assert!(
+            generated_roles.contains(&index),
+            "role index {index} is never generated"
+        );
+    }
+
+    let generated_tools = field(&|spec: &ItemSpec| spec.tool);
+    for index in 0..TOOLS.len() {
+        let index = u8::try_from(index).expect("tool count fits u8");
+        assert!(
+            generated_tools.contains(&index),
+            "tool index {index} is never generated"
+        );
+    }
+
+    let mut runner = TestRunner::deterministic();
+    let generated_passes: HashSet<u8> = (0..DRAWS)
+        .map(|_| {
+            ctx_bits()
+                .new_tree(&mut runner)
+                .expect("strategy produces a value tree")
+                .current()
+                .0
+        })
+        .collect();
+    for pass in [
+        PassClass::Execute,
+        PassClass::EmergencyForce,
+        PassClass::Defer,
+    ] {
+        let index = pass_class_index(&pass);
+        assert!(
+            generated_passes.contains(&index),
+            "pass class index {index} is never generated"
+        );
     }
 }

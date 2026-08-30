@@ -1,6 +1,8 @@
 //! Token counts stay comparable only if compression output is stable;
 //! `reference` is a frozen copy of the current implementation and defines
 //! expected behavior. Optimized output must match it byte for byte.
+//!
+//! `reference` mirrors `crates/mc-module/src/caveman.rs`.
 
 #[allow(clippy::all, dead_code)]
 mod reference {

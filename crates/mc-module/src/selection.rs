@@ -516,7 +516,8 @@ pub(crate) fn reasoning_ineligible_arc_ids(items: &[SelItem]) -> HashSet<String>
         .collect()
 }
 
-pub(crate) fn filter_reasoning_ineligible_decisions(
+#[doc(hidden)]
+pub fn filter_reasoning_ineligible_decisions(
     items: &[SelItem],
     decisions: Vec<ReductionDecision>,
 ) -> Vec<ReductionDecision> {
