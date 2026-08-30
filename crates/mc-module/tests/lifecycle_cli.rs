@@ -11,8 +11,15 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+// A published daemon requires Broca, whose crash-ownership records and sweeps
+// depend on `/proc` process identity, so Broca refuses to initialize anywhere
+// else and no spawned daemon can publish there. Every item carrying this gate
+// serves a proof that needs a published daemon; the CLI-contract tests fail
+// before any spawn and stay portable.
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
 use mc_module::{
     COMPARTMENT_RENDER_FORMAT_EPOCH, MEMORY_RENDER_FORMAT_EPOCH,
     PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC, STATE_SYNC_EPOCH, TAGGER_FEATURE_EPOCH,
@@ -131,6 +138,7 @@ fn coordination_dir(root: &Path) -> PathBuf {
     root.join(".mc-host-coordination")
 }
 
+#[cfg(target_os = "linux")]
 fn daemon_id(root: &Path) -> [u8; 16] {
     let publication = mc_host::runtime_dir_path(Some(root))
         .expect("runtime dir")
@@ -140,6 +148,7 @@ fn daemon_id(root: &Path) -> [u8; 16] {
         .daemon_id
 }
 
+#[cfg(target_os = "linux")]
 fn try_flock_exclusive(path: &Path) -> bool {
     use std::os::fd::AsRawFd;
     let file = std::fs::File::open(path).expect("lock file opens");
@@ -153,11 +162,13 @@ fn try_flock_exclusive(path: &Path) -> bool {
 }
 
 /// Best-effort stop on drop so a failed assertion cannot leak a daemon.
+#[cfg(target_os = "linux")]
 struct DaemonJanitor {
     root: PathBuf,
     active: bool,
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for DaemonJanitor {
     fn drop(&mut self) {
         if self.active {
@@ -422,6 +433,7 @@ fn quarantined_record_is_classified_alike_by_every_command() {
 /// on disk must never be discovered after the daemon is down: that yields
 /// `stop_committed:true`, `start_committed:false`, and an outage with no
 /// takeover. The running daemon must still be serving afterwards.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restart_preflights_the_successor_before_committing_the_stop() {
     let root = tempfile::tempdir().expect("root");
@@ -482,6 +494,7 @@ async fn restart_preflights_the_successor_before_committing_the_stop() {
     janitor.active = false;
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn full_dev_mode_lifecycle_roundtrip() {
     let root = tempfile::tempdir().expect("root");
@@ -616,6 +629,7 @@ async fn full_dev_mode_lifecycle_roundtrip() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn credentialed_restart_is_explicit_exact_and_clears_stale_selection() {
     let root = tempfile::tempdir().expect("root");
@@ -957,6 +971,7 @@ fn credentialed_restart_is_explicit_exact_and_clears_stale_selection() {
     std::fs::remove_file(&selection).expect("committed-stop cleanup fixture removal");
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sigint_runs_ordered_daemon_teardown() {
     let root = tempfile::tempdir().expect("root");
@@ -1013,6 +1028,7 @@ async fn sigint_runs_ordered_daemon_teardown() {
     assert!(probe.lifetime_lock_free);
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retained_generation_restarts_after_source_payload_deletion() {
     let root = tempfile::tempdir().expect("root");
