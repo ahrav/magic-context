@@ -119,12 +119,23 @@ fn bench_m0_trim_claims(c: &mut Criterion) {
                 public_claim_id: format!("mcm_{index:032}"),
                 revision_locator: format!("mcm_{index:032}/r1/deadbeef"),
                 project_id: 1,
-                category: "decision".to_string(),
+                category: "ARCHITECTURE_DECISIONS".to_string(),
                 content: corpus::text(ContentClass::Prose, 300, &mut rng),
                 importance: (rng.next() % 100) as i64,
                 provenance_label: None,
             })
             .collect();
+        // A category outside POSITIVE_MEMORY_CATEGORIES is filtered before any
+        // tokenization, so the cell would time an empty eligible set. commentlint: allow(JUDGE)
+        let retained = bench_internals::trim_claims_to_budget(&claims, 8_000.0);
+        assert!(
+            retained > 0,
+            "m0 fixture filtered out entirely at {count} claims: check the claim category"
+        );
+        assert!(
+            count < 256 || retained < count,
+            "the {count}-claim cell must exceed the budget and trim, retained {retained}"
+        );
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{count}claims_8k_budget")),
             &claims,

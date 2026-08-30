@@ -179,9 +179,7 @@ All numbers are Criterion means with 95% CIs, from the retained
 | `tail_hygiene/measure/2500msgs` | 281.1 ms [280.4, 281.9] | 4.555 ms [4.551, 4.562] | −98.4% |
 | `e2e/steady/1400msgs_2KiB_mixed` | 195.8 ms [194.9, 196.4] | 45.06 ms [44.92, 45.20] | −77.0% |
 | `e2e/first_hard/1400msgs_2KiB_mixed` | 210.5 ms [208.6, 213.3] | 203.8 ms [203.0, 204.7] | −3.2% |
-| `m0/trim_claims_to_budget/8claims` | 2.546 µs [2.542, 2.550] | 2.649 µs [2.643, 2.655] | +4.0% |
-| `m0/trim_claims_to_budget/64claims` | 2.693 µs [2.680, 2.705] | 2.788 µs [2.783, 2.793] | +3.5% |
-| `m0/trim_claims_to_budget/256claims` | 3.315 µs [3.309, 3.322] | 3.306 µs [3.300, 3.312] | −0.3% |
+| `m0/trim_claims_to_budget/*` | **void — see below** | **void** | **void** |
 
 Reading the marginal cells against the design's own limits:
 
@@ -197,31 +195,25 @@ Reading the marginal cells against the design's own limits:
   the −3.2% comparison stands, but the absolute `first_hard` times above are
   inflated by that teardown and are not comparable to a rerun of the current
   harness, which returns the response as batch output.
-- `m0/trim_claims` +3.5–4.0% on the 8/64 cells: also below resolution, and
-  these cells underflow the budget and tokenize only sub-64-byte wrapper
-  strings, which bypass the cache entirely — they exercise the counter
-  overhead, not the cache. The 256claims cell — the only one that actually
-  trims — is flat (−0.3%).
+- `m0/trim_claims` — **all three cells are void.** The fixture built every
+  claim with `category: "decision"`, and `trim_claims_to_budget` drops claims
+  outside `POSITIVE_MEMORY_CATEGORIES` (12 exact uppercase names) *before* it
+  tokenizes anything. The whole fixture was filtered out, so each cell timed a
+  filter and sort over an empty eligible set — never claim trimming, and never
+  the token cache. The earlier +4.0% / +3.5% / −0.3% readings, and the
+  slope-versus-mean replication argument built on them, measured nothing about
+  this change and are withdrawn.
 
-  The mean is the comparison estimator everywhere, including the table above.
-  For this group alone a second estimator is also available, because all
-  three m0 cells sampled in linear mode in both arms and so carry a Criterion
-  `slope` (the three cells that crossed the flat/linear boundary do not).
-  Read as a one-way cross-check, it does not agree with the mean on the
-  64claims cell, so the group is flagged for replication rather than
-  dismissed as sub-resolution. Slope point estimates with 95% CIs, in ns,
-  from the same retained `estimates.json` files:
+  The scale of the error is what confirms it. With a recognized category the
+  same cells cost 15.75 µs / 90.9 µs / 371 µs against the recorded
+  2.5–3.3 µs, and only the 256-claim cell exceeds the 8k budget (retains 157
+  of 256, trimming 99), which is what that cell was meant to demonstrate.
+  Those figures are one arm at short warm-up, so they are a sanity check, not
+  a comparison; the m0 cells need a fresh two-arm run before any claim.
 
-  | Cell | Before (slope) | After (slope) | Slope change | Mean change |
-  | --- | --- | --- | --- | --- |
-  | `8claims` | 2556.39 [2552.66, 2559.45] | 2652.31 [2646.19, 2657.88] | +3.8% | +4.0% |
-  | `64claims` | 2642.86 [2636.07, 2651.49] | 2790.20 [2784.82, 2795.32] | +5.6% | +3.5% |
-  | `256claims` | 3338.24 [3332.66, 3342.91] | 3298.62 [3292.28, 3304.85] | −1.2% | −0.3% |
-
-  The 64claims slope reads +5.6% against the ~5% threshold while its mean
-  reads +3.5% below it. Escalating on the less favorable of the two is a
-  deliberately conservative choice, not a switch of declared estimator; the
-  disagreement is itself the reason the cell needs replication.
+  The fixture now asserts a non-empty eligible set, and that the 256-claim
+  cell actually trims, before the timed loop — so a category that fails the
+  filter fails the benchmark instead of quietly measuring an empty scan.
 
 The tail_hygiene and steady headline cells are hit-rate-1.0 upper bounds
 (see Known gaps). Their mechanism coherence check: the steady-pass delta
