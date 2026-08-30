@@ -5,7 +5,7 @@ use mc_store::kernel::schema::{
     kernel_schema_inventory, verify_kernel_connection_contract, KERNEL_APPLICATION_ID,
     KERNEL_SCHEMA_COMPONENT_NAMES,
 };
-use mc_store::sqlite_runtime::MC_APPLICATION_ID;
+use mc_store::sqlite_runtime::{DIRECT_FORMAT_EPOCH, MC_APPLICATION_ID};
 use rusqlite::{params, Connection};
 
 const EXPECTED_COMPONENTS: &[&str] = &[
@@ -130,7 +130,7 @@ fn kernel_schema_has_one_ordered_full_shape() {
 }
 
 const PINNED_SCHEMA_DIGEST: &str =
-    "ba6f6f4276a691d91e1b087c147d92cb8a8b7977b712871f93645fa0a3804170";
+    "d88af4fba1eb5e474586f120560781163044b1a9cc38f8e124768e3408ed51df";
 
 #[test]
 fn kernel_schema_digest_is_pinned_to_the_frozen_v1_shape() {
@@ -1066,4 +1066,151 @@ fn active_capture_pin_must_be_released_before_deletion() {
         [],
     )
     .expect("a released pin is deletable");
+}
+
+#[test]
+fn bootstrap_stamps_the_direct_format_epoch() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        DIRECT_FORMAT_EPOCH
+    );
+    // The header epoch and the marker epoch describe the same format.
+    assert_eq!(
+        conn.query_row(
+            "SELECT format_epoch FROM mc_kernel_format_marker",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        DIRECT_FORMAT_EPOCH
+    );
+}
+
+#[test]
+fn capture_references_survive_until_released() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    let created = seed_root_domain(&mut conn);
+    seed_object(&conn, "object-ev-1", "evidence", created);
+    conn.execute(
+        "INSERT INTO evidence_meta(
+             evidence_id, object_id, artifact_reference, artifact_digest, byte_length,
+             media_type, retention_class, provider_egress_class, redaction_metadata,
+             created_commit_seq, sensitivity_class
+         ) VALUES ('ev-1', 'object-ev-1', 'cas://a', 'digest-a', 3, 'text/plain', 'standard',
+                   'internal', X'7b7d', ?1, 'internal')",
+        [created],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO capture_pins(
+             capture_pin_id, pin_kind, owner_id, commit_seq, lease_epoch, writer_epoch, created_at
+         ) VALUES ('pin-1', 'backup', 'operator-1', ?1, 1, 1, 5)",
+        [created],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO capture_pin_refs(capture_pin_id, evidence_id) VALUES ('pin-1', 'ev-1')",
+        [],
+    )
+    .unwrap();
+
+    // A direct delete would let GC reclaim an artifact the backup still holds.
+    assert!(conn
+        .execute(
+            "DELETE FROM capture_pin_refs WHERE evidence_id = 'ev-1'",
+            []
+        )
+        .is_err());
+    assert!(conn
+        .execute(
+            "UPDATE capture_pin_refs SET capture_pin_id = 'pin-2' WHERE evidence_id = 'ev-1'",
+            [],
+        )
+        .is_err());
+
+    // A BEFORE DELETE trigger fires for FK cascade rows too, so releasing the
+    // reference is part of the pin teardown rather than optional.
+    conn.execute(
+        "UPDATE capture_pins SET released_at = 6 WHERE capture_pin_id = 'pin-1'",
+        [],
+    )
+    .unwrap();
+    assert!(
+        conn.execute(
+            "DELETE FROM capture_pins WHERE capture_pin_id = 'pin-1'",
+            []
+        )
+        .is_err(),
+        "an unreleased reference blocks the cascade"
+    );
+    conn.execute(
+        "UPDATE capture_pin_refs SET released_at = 6 WHERE evidence_id = 'ev-1'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "DELETE FROM capture_pins WHERE capture_pin_id = 'pin-1'",
+        [],
+    )
+    .expect("a fully released pin tears down with its references");
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM capture_pin_refs", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn audit_and_event_identity_are_immutable_and_undeletable() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    let created = seed_root_domain(&mut conn);
+    conn.execute(
+        "INSERT INTO consumer_abandonments(
+             abandonment_id, consumer_id, operator_id, last_checkpoint_outbox_position,
+             reason, commit_seq, abandoned_at
+         ) VALUES ('abandon-1', 'search', 'operator-1', 9, 'retired', ?1, 11)",
+        [created],
+    )
+    .unwrap();
+    seed_object(&conn, "object-decision-1", "decision", created);
+    conn.execute(
+        "INSERT INTO decisions(
+             decision_id, object_id, decision_kind, decision_payload, created_commit_seq,
+             sensitivity_class
+         ) VALUES ('decision-1', 'object-decision-1', 'accept', X'01', ?1, 'internal')",
+        [created],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO decision_events(
+             decision_id, event_ordinal, commit_seq, event_kind, event_payload, recorded_at
+         ) VALUES ('decision-1', 0, ?1, 'opened', X'02', 5)",
+        [created],
+    )
+    .unwrap();
+
+    for sql in [
+        "UPDATE consumer_abandonments SET consumer_id = 'other'",
+        "UPDATE consumer_abandonments SET last_checkpoint_outbox_position = 0",
+        "UPDATE consumer_abandonments SET commit_seq = NULL",
+        "DELETE FROM consumer_abandonments",
+        "UPDATE decision_events SET event_kind = 'closed'",
+        "UPDATE decision_events SET event_ordinal = 1",
+        "DELETE FROM decision_events",
+    ] {
+        assert!(conn.execute(sql, []).is_err(), "must be refused: {sql}");
+    }
+
+    // Detector-scanned columns stay writable for R8 remediation.
+    conn.execute("UPDATE consumer_abandonments SET reason = '[redacted]'", [])
+        .expect("reason remediation must remain possible");
+    conn.execute("UPDATE decision_events SET event_payload = X'99'", [])
+        .expect("event payload remediation must remain possible");
 }

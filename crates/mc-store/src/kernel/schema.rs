@@ -1,4 +1,4 @@
-use crate::sqlite_runtime::MC_APPLICATION_ID;
+use crate::sqlite_runtime::{DIRECT_FORMAT_EPOCH, MC_APPLICATION_ID};
 use rusqlite::{params, Connection, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -65,7 +65,7 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "consumer_abandonments",
-        r#"CREATE TABLE consumer_abandonments(abandonment_id TEXT PRIMARY KEY,consumer_id TEXT NOT NULL,operator_id TEXT NOT NULL,last_checkpoint_outbox_position INTEGER NOT NULL,reason TEXT NOT NULL,commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,abandoned_at INTEGER NOT NULL) STRICT; CREATE INDEX idx_abandonments_consumer ON consumer_abandonments(consumer_id,abandoned_at); CREATE INDEX idx_abandonments_commit_fk ON consumer_abandonments(commit_seq);"#,
+        r#"CREATE TABLE consumer_abandonments(abandonment_id TEXT PRIMARY KEY,consumer_id TEXT NOT NULL,operator_id TEXT NOT NULL,last_checkpoint_outbox_position INTEGER NOT NULL,reason TEXT NOT NULL,commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,abandoned_at INTEGER NOT NULL) STRICT; CREATE INDEX idx_abandonments_consumer ON consumer_abandonments(consumer_id,abandoned_at); CREATE INDEX idx_abandonments_commit_fk ON consumer_abandonments(commit_seq); CREATE TRIGGER consumer_abandonments_identity_immutable BEFORE UPDATE OF abandonment_id,consumer_id,operator_id,last_checkpoint_outbox_position,commit_seq,abandoned_at ON consumer_abandonments BEGIN SELECT RAISE(ABORT,'consumer_abandonments identity is immutable'); END; CREATE TRIGGER consumer_abandonments_no_delete BEFORE DELETE ON consumer_abandonments BEGIN SELECT RAISE(ABORT,'consumer_abandonments are retained audit facts'); END;"#,
     ),
     (
         "capture_pins",
@@ -73,7 +73,7 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "capture_pin_refs",
-        r#"CREATE TABLE capture_pin_refs(capture_pin_id TEXT NOT NULL REFERENCES capture_pins(capture_pin_id) ON DELETE CASCADE,evidence_id TEXT NOT NULL REFERENCES evidence_meta(evidence_id) ON DELETE RESTRICT,expires_at INTEGER,released_at INTEGER,PRIMARY KEY(capture_pin_id,evidence_id)) STRICT; CREATE INDEX idx_capture_pin_refs_evidence_fk ON capture_pin_refs(evidence_id,capture_pin_id);"#,
+        r#"CREATE TABLE capture_pin_refs(capture_pin_id TEXT NOT NULL REFERENCES capture_pins(capture_pin_id) ON DELETE CASCADE,evidence_id TEXT NOT NULL REFERENCES evidence_meta(evidence_id) ON DELETE RESTRICT,expires_at INTEGER,released_at INTEGER,PRIMARY KEY(capture_pin_id,evidence_id)) STRICT; CREATE INDEX idx_capture_pin_refs_evidence_fk ON capture_pin_refs(evidence_id,capture_pin_id); CREATE TRIGGER capture_pin_refs_release_before_delete BEFORE DELETE ON capture_pin_refs WHEN OLD.released_at IS NULL BEGIN SELECT RAISE(ABORT,'an active capture reference must be released before deletion'); END; CREATE TRIGGER capture_pin_refs_no_reparent BEFORE UPDATE OF capture_pin_id,evidence_id ON capture_pin_refs WHEN OLD.released_at IS NULL BEGIN SELECT RAISE(ABORT,'an active capture reference cannot be re-parented'); END;"#,
     ),
     (
         "object_registry",
@@ -145,7 +145,7 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "decision_events",
-        r#"CREATE TABLE decision_events(decision_id TEXT NOT NULL REFERENCES decisions(decision_id) ON DELETE RESTRICT,event_ordinal INTEGER NOT NULL,commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq),event_kind TEXT NOT NULL,event_payload BLOB NOT NULL,evidence_id TEXT REFERENCES evidence_meta(evidence_id) ON DELETE RESTRICT,recorded_at INTEGER NOT NULL,PRIMARY KEY(decision_id,event_ordinal)) STRICT; CREATE INDEX idx_decision_events_commit ON decision_events(commit_seq,decision_id,event_ordinal); CREATE INDEX idx_decision_events_evidence_fk ON decision_events(evidence_id);"#,
+        r#"CREATE TABLE decision_events(decision_id TEXT NOT NULL REFERENCES decisions(decision_id) ON DELETE RESTRICT,event_ordinal INTEGER NOT NULL,commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq),event_kind TEXT NOT NULL,event_payload BLOB NOT NULL,evidence_id TEXT REFERENCES evidence_meta(evidence_id) ON DELETE RESTRICT,recorded_at INTEGER NOT NULL,PRIMARY KEY(decision_id,event_ordinal)) STRICT; CREATE INDEX idx_decision_events_commit ON decision_events(commit_seq,decision_id,event_ordinal); CREATE INDEX idx_decision_events_evidence_fk ON decision_events(evidence_id); CREATE TRIGGER decision_events_identity_immutable BEFORE UPDATE OF decision_id,event_ordinal,commit_seq,event_kind,evidence_id ON decision_events BEGIN SELECT RAISE(ABORT,'decision_events identity is immutable'); END; CREATE TRIGGER decision_events_no_delete BEFORE DELETE ON decision_events BEGIN SELECT RAISE(ABORT,'decision_events are append-only'); END;"#,
     ),
     (
         "observations",
@@ -272,6 +272,7 @@ fn apply_schema<F: FnOnce() -> rusqlite::Result<()>>(
         return Err(rusqlite::Error::InvalidQuery);
     }
     tx.pragma_update(None, "application_id", KERNEL_APPLICATION_ID)?;
+    tx.pragma_update(None, "user_version", DIRECT_FORMAT_EPOCH)?;
     for (_, sql) in COMPONENTS {
         tx.execute_batch(sql)?;
     }
