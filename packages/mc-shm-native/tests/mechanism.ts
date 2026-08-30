@@ -80,7 +80,7 @@ function loadRawAddon(): RawAttachAddon | null {
 }
 
 function supportsMechanismTests(addon: RawAttachAddon | null): addon is RawAttachAddon {
-    const supportedPlatform = ["linux", "darwin"].includes(process.platform);
+    const supportedPlatform = process.platform === "linux";
     if (addon && supportedPlatform) return true;
     if (claimedTarget) {
         throw new Error(`claimed native target is unsupported: ${process.platform}`);
@@ -88,7 +88,6 @@ function supportsMechanismTests(addon: RawAttachAddon | null): addon is RawAttac
     return false;
 }
 
-/** Geometry of the `mc-host-test-ring-v1` profile (`ring_profile`). */
 const GRANT_DESCRIPTOR_DEPTH = 32n;
 /** `MIN_ARENA_BYTES` == `MAX_FRAME_BYTES` == 64 MiB. */
 const GRANT_ARENA_BYTES = 67_108_864n;
@@ -137,10 +136,14 @@ function testGrantHex(lane: number, incarnation: number): string {
 
 function validRawDescriptor(): Record<string, unknown> {
     return {
-        profile: "mc-host-test-ring-v1",
+        profile: "mc-host-eventfd-ring-v2",
         hostToPeerFd: 10,
+        hostToPeerDataReadyFd: 11,
+        hostToPeerCapacityReadyFd: 12,
         hostToPeerGrant: testGrantHex(0, 0xab),
-        peerToHostFd: 11,
+        peerToHostFd: 13,
+        peerToHostDataReadyFd: 14,
+        peerToHostCapacityReadyFd: 15,
         peerToHostGrant: testGrantHex(1, 0xcd),
     };
 }
@@ -189,15 +192,21 @@ describe("raw N-API descriptor boundary", () => {
         const addon = loadRawAddon();
         if (!supportsMechanismTests(addon)) return;
         const hostileFds = [-1, -0, 2 ** 31, 3.5, Number.NaN, "10"];
+        const fields = [
+            "hostToPeerFd",
+            "hostToPeerDataReadyFd",
+            "hostToPeerCapacityReadyFd",
+            "peerToHostFd",
+            "peerToHostDataReadyFd",
+            "peerToHostCapacityReadyFd",
+        ];
         for (const fd of hostileFds) {
-            expectRejectedWithoutEffects(addon, {
-                ...validRawDescriptor(),
-                hostToPeerFd: fd,
-            });
-            expectRejectedWithoutEffects(addon, {
-                ...validRawDescriptor(),
-                peerToHostFd: fd,
-            });
+            for (const field of fields) {
+                expectRejectedWithoutEffects(addon, {
+                    ...validRawDescriptor(),
+                    [field]: fd,
+                });
+            }
         }
     });
 
@@ -221,10 +230,9 @@ describe("raw N-API descriptor boundary", () => {
                 hostToPeerGrant: grant,
             });
         }
-        // One fd or one grant backing both lanes aliases the duplex pair.
         expectRejectedWithoutEffects(addon, {
             ...validRawDescriptor(),
-            peerToHostFd: 10,
+            peerToHostCapacityReadyFd: 10,
         });
         expectRejectedWithoutEffects(addon, {
             ...validRawDescriptor(),

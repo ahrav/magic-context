@@ -5,8 +5,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { markAsUntransferable } from "node:worker_threads";
 
-export const QUALIFIED_TEST_PROFILE = "mc-host-test-ring-v1";
-export const DESCRIPTOR_SCHEMA_VERSION = 2;
+export const QUALIFIED_TEST_PROFILE = "mc-host-eventfd-ring-v2";
+export const DESCRIPTOR_SCHEMA_VERSION = 3;
 
 export interface NativeCapabilities {
     available: boolean;
@@ -41,8 +41,12 @@ export class NativeStartupError extends Error {
 export interface NativeDescriptor {
     profile: string;
     hostToPeerFd: number;
+    hostToPeerDataReadyFd: number;
+    hostToPeerCapacityReadyFd: number;
     hostToPeerGrant: string;
     peerToHostFd: number;
+    peerToHostDataReadyFd: number;
+    peerToHostCapacityReadyFd: number;
     peerToHostGrant: string;
 }
 
@@ -121,16 +125,6 @@ let loadError: Error | undefined;
 let constructorCapability: NativeCapabilities | undefined;
 
 const PLATFORM_PACKAGES = {
-    "darwin-arm64": {
-        package: "@cortexkit/mc-host-darwin-arm64",
-        target: "darwin-arm64",
-        nativeTarget: "macos-aarch64",
-    },
-    "darwin-x64": {
-        package: "@cortexkit/mc-host-darwin-x64",
-        target: "darwin-x64",
-        nativeTarget: "macos-x86_64",
-    },
     "linux-x64": {
         package: "@cortexkit/mc-host-linux-x64-gnu",
         target: "linux-x64-gnu",

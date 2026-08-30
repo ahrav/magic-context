@@ -4,7 +4,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use crate::arena::MIN_ARENA_BYTES;
-use crate::descriptor::{HardwareProfileId, SchedulingMode, TransportDescriptor, MAX_SPANS};
+use crate::descriptor::{HardwareProfileId, TransportDescriptor, MAX_SPANS};
 
 /// Producer arbitration topology.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,14 +165,8 @@ impl TargetProfile {
         if config.mappings < 2 {
             return Err(ProfileError::InvalidMappingCharge);
         }
-        match config.descriptor.scheduling() {
-            SchedulingMode::HotPinnedPoll if config.pinned_workers == 0 => {
-                return Err(ProfileError::InvalidWorkerCharge)
-            }
-            SchedulingMode::ColdParkWake if config.pinned_workers != 0 => {
-                return Err(ProfileError::InvalidWorkerCharge)
-            }
-            _ => {}
+        if config.pinned_workers != 0 {
+            return Err(ProfileError::InvalidWorkerCharge);
         }
         let descriptors = u64::try_from(config.descriptor_depth)
             .ok()
@@ -192,7 +186,9 @@ impl TargetProfile {
             spans_per_frame: config.max_spans as u64,
             leases,
             mappings: config.mappings as u64,
-            file_descriptors: config.mappings as u64,
+            file_descriptors: (config.mappings as u64)
+                .checked_add(4)
+                .ok_or(ProfileError::ChargeOverflow)?,
             workers: match config.worker_topology {
                 WorkerTopology::CallerThread => 0,
                 WorkerTopology::SplitDirection => 2,
@@ -453,12 +449,6 @@ impl AdmissionController {
         physical_cores: Option<VerifiedPhysicalCores>,
     ) -> Result<ResourceCharges, AdmissionError> {
         let requested = profile.charges();
-        if profile.descriptor().scheduling() == SchedulingMode::HotPinnedPoll {
-            let verified = physical_cores.ok_or(AdmissionError::PhysicalCoresUnverified)?;
-            if requested.pinned_workers > verified.get() {
-                return Err(AdmissionError::PhysicalCoreBudgetExceeded);
-            }
-        }
         let active = accounting
             .active
             .checked_add(requested)
@@ -696,25 +686,17 @@ impl fmt::Display for AdmissionError {
 impl std::error::Error for AdmissionError {}
 
 /// Builds the fixed ring profile for tests and local tools.
-pub fn ring_profile(
-    hardware: HardwareProfileId,
-    scheduling: SchedulingMode,
-) -> Result<TargetProfile, ProfileError> {
-    let pinned_workers = usize::from(scheduling == SchedulingMode::HotPinnedPoll) * 2;
+pub fn ring_profile(hardware: HardwareProfileId) -> Result<TargetProfile, ProfileError> {
     TargetProfile::new(ProfileConfig {
-        descriptor: TransportDescriptor::new(scheduling, hardware),
+        descriptor: TransportDescriptor::new(hardware),
         descriptor_depth: 32,
         arena_bytes: MIN_ARENA_BYTES,
         max_spans: 2,
         max_leases: 32,
         mappings: 2,
-        pinned_workers,
+        pinned_workers: 0,
         producer_topology: ProducerTopology::CallerConfined,
-        worker_topology: if scheduling == SchedulingMode::HotPinnedPoll {
-            WorkerTopology::SplitDirection
-        } else {
-            WorkerTopology::CallerThread
-        },
+        worker_topology: WorkerTopology::CallerThread,
         completion_mode: CompletionMode::SynchronousPull,
     })
 }

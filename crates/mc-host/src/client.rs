@@ -1841,7 +1841,7 @@ type RingFrameReceiver = mpsc::Receiver<(EnvelopeHeader, Vec<u8>, ByteCharge)>;
 
 fn start_ring_bridge(
     descriptor: serde_json::Value,
-    descriptors: [OwnedFd; 2],
+    descriptors: [OwnedFd; crate::setup_socket::RING_DESCRIPTOR_COUNT],
     mut setup: StdUnixStream,
     cancel: CancellationToken,
     read_budget: Arc<ByteCounter>,
