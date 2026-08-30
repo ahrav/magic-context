@@ -100,6 +100,7 @@ export function standaloneUnitFiles(root: string = E2E_ROOT): string[] {
         "src/cache-analysis.test.ts",
         "src/metamorphic-eval/injection-canary.test.ts",
         "src/metamorphic-eval/invariants.test.ts",
+        "src/metamorphic-eval/metamorphic.test.ts",
         "src/metamorphic-eval/transforms.test.ts",
         "src/oracle-arms/seed-gold-memories.test.ts",
         "src/opencode-runner/spawn.test.ts",
