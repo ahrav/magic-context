@@ -1,19 +1,22 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use rusqlite::backup::{Backup, StepResult};
 use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use rustix::fs::RenameFlags;
-use rustix::fs::{self as rfs, AtFlags, Mode, OFlags};
+use rustix::fs::{self as rfs, Mode, OFlags};
 use serde::Serialize;
 
+use super::durable_fs::{
+    create_new_file, create_secure_directory, durable_unlink, next_unique_id,
+    publish_noreplace_locked, sync_directory as sync_directory_fd, temp_name as durable_temp_name,
+    write_and_sync, PublishOutcome,
+};
 use super::envelope::check_fence;
 use super::open::{
     activate_wal, apply_preclassification_profile, current_time_ms, family_sidecars, harden_family,
@@ -43,7 +46,6 @@ const LOCAL_FILESYSTEMS: &[i64] = &[
     0x5265_4973, // ReiserFS
     0x0000_3434, // NILFS
 ];
-static UNIQUE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct BackupRequest {
@@ -138,16 +140,16 @@ impl KernelStore {
             self.lease_epoch(),
             request.capture_pin_expires_at,
         )?;
-        let unique = next_unique();
+        let unique = next_unique_id();
         let final_name = final_name_override
             .map(str::to_owned)
             .unwrap_or_else(|| format!("{BACKUP_PREFIX}{}-{unique}.sqlite", capture.commit_seq));
-        let temp_name = format!(".{BACKUP_PREFIX}{}-{unique}.tmp", capture.commit_seq);
+        let temp_name = durable_temp_name(&format!("{BACKUP_PREFIX}{}", capture.commit_seq));
         let final_path = request.destination_directory.join(&final_name);
 
         let mut published = false;
         let result = (|| {
-            create_private_file_at(&destination, &temp_name)?;
+            drop(create_new_file(&destination, &temp_name).map_err(|_| KernelError::Io)?);
             if let Some(callback) = hook.as_mut() {
                 callback();
             }
@@ -198,13 +200,18 @@ impl KernelStore {
             if fault_before_rename {
                 return Err(KernelError::Fault);
             }
-            publish_noreplace(&destination, &temp_name, &final_name)?;
+            if publish_noreplace_locked(&destination, &temp_name, &final_name)
+                .map_err(|_| KernelError::Io)?
+                == PublishOutcome::AlreadyExists
+            {
+                return Err(KernelError::Io);
+            }
             published = true;
             cleanup_backup_sidecars(&destination, &temp_name)?;
             if Instant::now() >= request.deadline {
                 return Err(KernelError::Deadline);
             }
-            destination.sync_all().map_err(|_| KernelError::Io)?;
+            sync_directory_fd(&destination).map_err(|_| KernelError::Io)?;
             if Instant::now() >= request.deadline {
                 return Err(KernelError::Deadline);
             }
@@ -531,43 +538,6 @@ pub fn owner_is_current_for_test(uid: u32) -> bool {
     owner_is_current(uid)
 }
 
-fn create_private_file_at(directory: &File, name: &str) -> Result<(), KernelError> {
-    let file = rfs::openat(
-        directory,
-        name,
-        OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_raw_mode(0o600),
-    )
-    .map_err(|_| KernelError::Io)?;
-    drop(file);
-    Ok(())
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn publish_noreplace(
-    directory: &File,
-    temp_name: &str,
-    final_name: &str,
-) -> Result<(), KernelError> {
-    rfs::renameat_with(
-        directory,
-        temp_name,
-        directory,
-        final_name,
-        RenameFlags::NOREPLACE,
-    )
-    .map_err(|_| KernelError::Io)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn publish_noreplace(
-    _directory: &File,
-    _temp_name: &str,
-    _final_name: &str,
-) -> Result<(), KernelError> {
-    Err(KernelError::UnsafeDestination)
-}
-
 fn capture_state(
     writer: &mut Connection,
     lease_epoch: u64,
@@ -696,7 +666,7 @@ fn cleanup_backup_family(directory: &File, name: &str) {
         format!("{name}-wal"),
         format!("{name}-shm"),
     ] {
-        let _ = rfs::unlinkat(directory, candidate, AtFlags::empty());
+        let _ = durable_unlink(directory, &candidate);
     }
 }
 
@@ -706,10 +676,7 @@ fn cleanup_backup_sidecars(directory: &File, name: &str) -> Result<(), KernelErr
         format!("{name}-wal"),
         format!("{name}-shm"),
     ] {
-        match rfs::unlinkat(directory, candidate, AtFlags::empty()) {
-            Ok(()) | Err(rustix::io::Errno::NOENT) => {}
-            Err(_) => return Err(KernelError::Io),
-        }
+        durable_unlink(directory, &candidate).map_err(|_| KernelError::Io)?;
     }
     Ok(())
 }
@@ -789,7 +756,11 @@ struct RestoreMarker<'a> {
 
 fn publish_restore_marker(path: &Path, recovery_dir: &Path) -> Result<(), KernelError> {
     let marker_path = restore_marker_path(path);
-    let temp_path = PathBuf::from(format!("{}.{}.tmp", marker_path.display(), next_unique()));
+    let temp_path = PathBuf::from(format!(
+        "{}.{}.tmp",
+        marker_path.display(),
+        next_unique_id()
+    ));
     let bytes = serde_json::to_vec(&RestoreMarker {
         protocol: RESTORE_MARKER_PROTOCOL,
         database_path: path,
@@ -799,10 +770,7 @@ fn publish_restore_marker(path: &Path, recovery_dir: &Path) -> Result<(), Kernel
     let mut options = OpenOptions::new();
     options.write(true).create_new(true).mode(0o600);
     let mut file = options.open(&temp_path).map_err(|_| KernelError::Io)?;
-    if std::io::Write::write_all(&mut file, &bytes)
-        .and_then(|()| file.sync_all())
-        .is_err()
-    {
+    if write_and_sync(&mut file, &bytes).is_err() {
         drop(file);
         let _ = fs::remove_file(&temp_path);
         return Err(KernelError::Io);
@@ -871,20 +839,24 @@ fn open_live_family(
 }
 
 fn allocate_recovery_dir(path: &Path) -> Result<PathBuf, KernelError> {
+    let parent_path = path.parent().ok_or(KernelError::Io)?;
+    let parent = File::open(parent_path).map_err(|_| KernelError::Io)?;
     for _ in 0..10_000 {
         let candidate = PathBuf::from(format!(
             "{}{}{unique}",
             path.display(),
             RESTORE_INFIX,
-            unique = next_unique()
+            unique = next_unique_id()
         ));
-        match fs::create_dir(&candidate) {
-            Ok(()) => {
-                fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700))
-                    .map_err(|_| KernelError::Io)?;
-                return Ok(candidate);
+        let name = candidate
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or(KernelError::Io)?;
+        match create_secure_directory(&parent, name) {
+            Ok(_) => return Ok(candidate),
+            Err(error) if error.raw_os_error() == Some(rustix::io::Errno::EXIST.raw_os_error()) => {
+                continue;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(_) => return Err(KernelError::Io),
         }
     }
@@ -938,7 +910,11 @@ fn remove_family(path: &Path) -> Result<(), KernelError> {
 }
 
 fn restore_temp_path(path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.restore-{}.tmp", path.display(), next_unique()))
+    PathBuf::from(format!(
+        "{}.restore-{}.tmp",
+        path.display(),
+        next_unique_id()
+    ))
 }
 
 fn copy_to_private_temp(source: &mut File, destination: &Path) -> Result<(), KernelError> {
@@ -984,9 +960,4 @@ fn fd_directory() -> &'static str {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn fd_directory() -> &'static str {
     "/unsupported-fd-path"
-}
-
-fn next_unique() -> u64 {
-    let counter = UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
-    (u64::from(std::process::id()) << 32) | counter
 }
