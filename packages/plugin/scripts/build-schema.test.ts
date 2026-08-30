@@ -61,4 +61,13 @@ describe("magic-context JSON schema", () => {
         expect(schema.properties.auto_update.type).toBe("boolean");
         expect(typeof schema.properties.auto_update.description).toBe("string");
     });
+
+    test("experimental is not a published schema property", () => {
+        // The in-memory migration relocates `experimental.*` keys, so the
+        // published schema must not document the legacy container.
+        const schema = JSON.parse(fs.readFileSync(schemaPath, "utf-8")) as {
+            properties: Record<string, unknown>;
+        };
+        expect(schema.properties.experimental).toBeUndefined();
+    });
 });

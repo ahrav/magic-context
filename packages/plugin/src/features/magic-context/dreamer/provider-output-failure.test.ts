@@ -3,6 +3,7 @@ import { describe, expect, it } from "bun:test";
 import {
     DreamerProviderOutputFailureError,
     providerOutputFailureFromInvalidManifest,
+    rethrowInvalidManifestAsProviderFailure,
 } from "./provider-output-failure";
 
 function assistantCompletion(args: {
@@ -79,5 +80,32 @@ describe("providerOutputFailureFromInvalidManifest", () => {
                 responseText,
             ),
         ).toBeNull();
+    });
+});
+
+describe("rethrowInvalidManifestAsProviderFailure", () => {
+    const outageMessages = [assistantCompletion({ created: 1, output: 8, reasoning: 0 })];
+
+    it("returns silently when the validator accepts", () => {
+        expect(() =>
+            rethrowInvalidManifestAsProviderFailure(outageMessages, "provider text", () => {}),
+        ).not.toThrow();
+    });
+
+    it("reclassifies a validator rejection as a provider failure on the outage token shape", () => {
+        expect(() =>
+            rethrowInvalidManifestAsProviderFailure(outageMessages, "provider text", () => {
+                throw new Error("manifest missing <memories> root");
+            }),
+        ).toThrow(DreamerProviderOutputFailureError);
+    });
+
+    it("propagates the validator error when the transcript is not an outage shape", () => {
+        const messages = [assistantCompletion({ created: 1, output: 400, reasoning: 12 })];
+        expect(() =>
+            rethrowInvalidManifestAsProviderFailure(messages, "long real reply", () => {
+                throw new Error("manifest missing <memories> root");
+            }),
+        ).toThrow("manifest missing <memories> root");
     });
 });

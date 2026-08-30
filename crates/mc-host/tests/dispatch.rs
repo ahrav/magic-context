@@ -1064,6 +1064,7 @@ async fn saturated_broca_reserve_cannot_consume_a_general_slot() {
     assert_eq!(frame.ty, TY_RESPONSE);
     assert_eq!(frame.json()["served_by"], "magic-context");
 
+    drop(client);
     host.shutdown().await.expect("graceful shutdown");
 }
 

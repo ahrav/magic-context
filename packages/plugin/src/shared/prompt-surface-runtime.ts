@@ -37,9 +37,6 @@ export const ACTIVE_TOOL_IDS = [
     "ctx_search",
 ] as const;
 
-/** @deprecated Use ACTIVE_TOOL_IDS. Kept as an alias for existing consumers. */
-export const PROMPT_SURFACE_TOOL_IDS = ACTIVE_TOOL_IDS;
-
 export type PromptSurfaceToolId = (typeof ACTIVE_TOOL_IDS)[number];
 
 export const LIGHT_TOOL_DESCRIPTIONS = {

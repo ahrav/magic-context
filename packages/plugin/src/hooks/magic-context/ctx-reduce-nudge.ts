@@ -44,7 +44,7 @@ export function channel1RefireTokens(tailTokens: number): number {
     return Math.max(CHANNEL1_REFIRE_FLOOR_TOKENS, scaled);
 }
 
-export function isDroppedToolOutput(output: string): boolean {
+function isDroppedToolOutput(output: string): boolean {
     const head = output
         .trimStart()
         .replace(/^§\d+§\s*/, "")

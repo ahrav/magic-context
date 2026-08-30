@@ -108,7 +108,7 @@ export function getTaskScheduleStatesForProject(
  * meaning the V1 `dream_state['last_dream_at:<project>']` field carried before
  * Dreamer V2 retired it. Used by the OpenCode sidebar RPC and Pi's /ctx-status
  * so the displayed "last run" reflects V2 per-task execution instead of a frozen
- * V1 migration-seed timestamp (issue #194).
+ * V1 migration-seed timestamp.
  */
 export function getMostRecentTaskRunAt(db: Database, projectPath: string): number | null {
     const row = db

@@ -5,17 +5,16 @@
  */
 
 import type { EmbeddingConfig } from "../../config/schema/magic-context";
-import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
 import {
     getSynapseLaneIdentity,
     type SynapseClientLike,
     SynapseEmbeddingProvider,
 } from "./memory/embedding-synapse";
 
-export const SYNAPSE_TEST_MODEL = "gte-modernbert-base-f16";
-export const SYNAPSE_TEST_FINGERPRINT = "fp-test";
-export const SYNAPSE_TEST_EPOCH = 0;
-export const SYNAPSE_TEST_DIMS = 3;
+const SYNAPSE_TEST_MODEL = "gte-modernbert-base-f16";
+const SYNAPSE_TEST_FINGERPRINT = "fp-test";
+const SYNAPSE_TEST_EPOCH = 0;
+const SYNAPSE_TEST_DIMS = 3;
 
 export const SYNAPSE_TEST_LANE_IDENTITY = getSynapseLaneIdentity(
     SYNAPSE_TEST_MODEL,
@@ -154,62 +153,4 @@ export function synapseTestConfig(): EmbeddingConfig {
         synapse_table_epoch: SYNAPSE_TEST_EPOCH,
         synapse_dims: SYNAPSE_TEST_DIMS,
     } as unknown as EmbeddingConfig;
-}
-
-export interface CrashInjection {
-    /** SQL matcher for statements whose execution should throw. */
-    matcher: RegExp;
-    /** How many MATCHING executions to let through before throwing. */
-    skip?: number;
-    /** How many injected throws to perform before passing through again. */
-    times?: number;
-}
-
-/**
- * Wrap a Database so chosen statements throw on execution, simulating a
- * process crash at that exact write. Delegates everything else unchanged;
- * transactions opened through the wrapper roll back on the injected throw,
- * matching what SQLite does when a process dies before COMMIT.
- */
-export function crashingDatabase(db: Database, injection: CrashInjection): Database {
-    let remainingSkips = injection.skip ?? 0;
-    let remainingThrows = injection.times ?? 1;
-    const proxyStatement = (sql: string, stmt: PreparedStatement): PreparedStatement => {
-        return new Proxy(stmt, {
-            get(target, prop, receiver) {
-                if (prop === "run" || prop === "get" || prop === "all") {
-                    return (...args: unknown[]) => {
-                        if (remainingSkips > 0) {
-                            remainingSkips -= 1;
-                        } else if (remainingThrows > 0) {
-                            remainingThrows -= 1;
-                            throw new Error(`injected crash at: ${sql.slice(0, 80)}`);
-                        }
-                        const method = Reflect.get(target, prop) as (...a: unknown[]) => unknown;
-                        return method.apply(target, args);
-                    };
-                }
-                const value = Reflect.get(target, prop, receiver);
-                return typeof value === "function"
-                    ? (value as (...a: unknown[]) => unknown).bind(target)
-                    : value;
-            },
-        });
-    };
-    const wrapper = {
-        prepare(sql: string) {
-            const stmt = db.prepare(sql);
-            return injection.matcher.test(sql) ? proxyStatement(sql, stmt) : stmt;
-        },
-        exec(sql: string) {
-            return db.exec(sql);
-        },
-        transaction<F extends (...args: never[]) => unknown>(fn: F) {
-            return db.transaction(fn);
-        },
-        close() {
-            db.close();
-        },
-    };
-    return wrapper as unknown as Database;
 }

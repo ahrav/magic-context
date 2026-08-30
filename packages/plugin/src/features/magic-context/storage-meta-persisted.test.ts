@@ -1,7 +1,7 @@
 /// <reference types="bun-types" />
 
 import { beforeEach, describe, expect, it } from "bun:test";
-import { Database } from "../../shared/sqlite";
+import type { Database } from "../../shared/sqlite";
 import {
     clearDeferredExecutePendingIfMatches,
     type DeferredExecutePayload,
@@ -9,36 +9,10 @@ import {
     setDeferredExecutePendingIfAbsent,
 } from "./storage-meta-persisted";
 import { ensureSessionMetaRow } from "./storage-meta-shared";
+import { createDirectTestDatabase } from "./test-database";
 
 function createTestDb(): Database {
-    const db = new Database(":memory:");
-    db.exec(`
-        CREATE TABLE session_meta (
-            session_id TEXT PRIMARY KEY,
-            harness TEXT NOT NULL DEFAULT 'opencode',
-            last_response_time INTEGER NOT NULL DEFAULT 0,
-            cache_ttl TEXT NOT NULL DEFAULT '5m',
-            counter INTEGER NOT NULL DEFAULT 0,
-            last_nudge_tokens INTEGER NOT NULL DEFAULT 0,
-            last_nudge_band TEXT NOT NULL DEFAULT '',
-            last_transform_error TEXT NOT NULL DEFAULT '',
-            is_subagent INTEGER NOT NULL DEFAULT 0,
-            last_context_percentage REAL NOT NULL DEFAULT 0,
-            last_input_tokens INTEGER NOT NULL DEFAULT 0,
-            observed_safe_input_tokens INTEGER NOT NULL DEFAULT 0,
-            cache_alert_sent INTEGER NOT NULL DEFAULT 0,
-            times_execute_threshold_reached INTEGER NOT NULL DEFAULT 0,
-            compartment_in_progress INTEGER NOT NULL DEFAULT 0,
-            system_prompt_hash TEXT NOT NULL DEFAULT '',
-            system_prompt_tokens INTEGER NOT NULL DEFAULT 0,
-            conversation_tokens INTEGER NOT NULL DEFAULT 0,
-            tool_call_tokens INTEGER NOT NULL DEFAULT 0,
-            cleared_reasoning_through_tag INTEGER NOT NULL DEFAULT 0,
-            last_todo_state TEXT NOT NULL DEFAULT '',
-            deferred_execute_state TEXT
-        )
-    `);
-    return db;
+    return createDirectTestDatabase().db;
 }
 
 const payload: DeferredExecutePayload = {

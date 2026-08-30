@@ -16,6 +16,7 @@
  * Reads the live context.db (identities) and opencode.db (session directories)
  * read-only; writes to stdout when no path is given.
  */
+import { storageSubtreePath } from "../src/shared/data-path";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
@@ -35,7 +36,7 @@ function isCanonicalHomeRoot(root: string): boolean {
 
 const dbPath =
     process.env.MAGIC_CONTEXT_DB ??
-    join(homedir(), ".local", "share", "cortexkit", "magic-context", "context.db");
+    join(storageSubtreePath(join(homedir(), ".local", "share")), "context.db");
 // Plain path + options object, not a file: URI — bun:sqlite on Linux rejects
 // file: URIs (the CLI database-access fix established this pattern).
 const db = new Database(dbPath, { readonly: true });

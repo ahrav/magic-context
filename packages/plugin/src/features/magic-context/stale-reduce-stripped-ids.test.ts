@@ -52,4 +52,15 @@ describe("stale_reduce_stripped_ids (frozen replay watermark)", () => {
         expect(getStaleReduceStrippedIds(db, "ses-a")).toEqual(new Set(["a-1"]));
         expect(getStaleReduceStrippedIds(db, "ses-b")).toEqual(new Set(["b-1"]));
     });
+
+    it("stores an insertion-ordered JSON array, appending new ids after existing ones", () => {
+        addStaleReduceStrippedIds(db, ses, ["m2", "m1"]);
+        addStaleReduceStrippedIds(db, ses, ["m3", "m1"]);
+        const row = db
+            .prepare(
+                "SELECT stale_reduce_stripped_ids AS blob FROM session_meta WHERE session_id = ?",
+            )
+            .get(ses) as { blob: string };
+        expect(row.blob).toBe('["m2","m1","m3"]');
+    });
 });

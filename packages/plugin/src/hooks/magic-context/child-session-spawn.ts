@@ -5,6 +5,7 @@ import {
 } from "../../features/magic-context/schema-fence-probe";
 import { updateSessionMeta } from "../../features/magic-context/storage";
 import { sessionLog } from "../../shared/logger";
+import { normalizeSDKResponse } from "../../shared/normalize-sdk-response";
 import { pushNotification } from "../../shared/rpc-notifications";
 import type { Database } from "../../shared/sqlite";
 import { type NotificationParams, sendIgnoredMessage } from "./send-session-notification";
@@ -61,7 +62,7 @@ async function surfaceSchemaFenceFailure(
         // The toast's companion action makes the persisted sidebar error visible
         // immediately instead of waiting for the next session event or poll.
         pushNotification("action", { action: "refresh-sidebar" }, args.parentSessionId);
-        // This is the same out-of-band boot-warning surface used for #266 mode
+        // This is the same out-of-band boot-warning surface used for compaction-off mode
         // transitions. It never joins the transform message array or nudge path.
         await sendIgnoredMessage(
             args.client,
@@ -107,4 +108,31 @@ export async function createChildSessionWithFence(
         },
         query: { directory: args.directory },
     } as never);
+}
+
+interface ChildSessionMessagesClient {
+    session: { messages(input: never): unknown | Promise<unknown> };
+}
+
+/**
+ * Builds the `fetchOutput` closure a child-session prompt run hands to
+ * `promptSyncWithValidatedOutputRetry`: read the child session's transcript and
+ * normalize the SDK envelope, preferring response data over a bare wrapper.
+ * The session id is bound at construction; callers create the child session first.
+ */
+export function childSessionMessagesFetcher(
+    client: ChildSessionMessagesClient,
+    sessionId: string,
+    directory: string | undefined,
+    limit: number,
+): () => Promise<unknown[]> {
+    return async () => {
+        const messagesResponse = await client.session.messages({
+            path: { id: sessionId },
+            query: { directory, limit },
+        } as never);
+        return normalizeSDKResponse(messagesResponse, [] as unknown[], {
+            preferResponseOnMissingData: true,
+        });
+    };
 }

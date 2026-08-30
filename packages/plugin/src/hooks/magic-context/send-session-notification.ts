@@ -191,7 +191,7 @@ async function sendIgnoredMessageNow(
     // model/agent for the NEXT real turn. Passing nothing makes OpenCode record
     // the DEFAULT agent/model — which then switches the model on the user's
     // next turn and busts the provider prefix cache the prior turn warmed.
-    // Mirrors AFT's notifications.ts (issue #62).
+    // Mirrors AFT's notifications.ts.
     //
     // Caller-supplied params win; otherwise resolve from the last assistant
     // turn. We only pin values actually resolved from real messages (never a

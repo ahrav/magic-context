@@ -1,4 +1,5 @@
 import {
+    escapeRegex,
     hasShareabilitySensitiveText,
     isSecretKey,
     redactSecretText,
@@ -8,6 +9,7 @@ import {
 } from "@magic-context/core/shared/redaction";
 
 export {
+    escapeRegex,
     hasShareabilitySensitiveText,
     isSecretKey,
     redactSecretText,

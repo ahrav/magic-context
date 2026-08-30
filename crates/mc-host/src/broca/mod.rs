@@ -110,11 +110,6 @@ impl BrocaComponent {
         Arc::clone(&self.supervisor)
     }
 
-    /// Shared route-map handle for teardown observation, cloned before the component moves into its composite like [`BrocaComponent::supervisor`]; metrics carry no route-mapping count. commentlint: allow(JUDGE)
-    pub fn route_index(&self) -> Arc<Mutex<HashMap<RouteHandle, SessionKey>>> {
-        Arc::clone(&self.routes)
-    }
-
     fn key_of_route(&self, route: RouteHandle) -> Option<SessionKey> {
         self.routes
             .lock()

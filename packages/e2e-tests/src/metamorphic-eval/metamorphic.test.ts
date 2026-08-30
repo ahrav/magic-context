@@ -17,7 +17,7 @@ import {
     type LiveRole,
 } from "./live";
 import { buildMetamorphicReport, metamorphicExitCode, type MetamorphicReport } from "./report";
-import { buildScriptedOutput, runDeterministicMetamorphicEval } from "./runner";
+import { buildScriptedOutput, runDeterministicMetamorphicEval, DETERMINISTIC_SEEDS } from "./runner";
 import { TRANSFORMS, type Transform } from "./transforms";
 import {
     liveRoleBudgetMs,
@@ -106,6 +106,10 @@ function pairedObservation(
     return { ...base, score: { ...base.score, system: systemTuple(), ...overrides } };
 }
 
+function importancesOf(output: string): number[] {
+    return [...output.matchAll(/ importance="(\d+)"/g)].map((match) => Number(match[1]));
+}
+
 describe("deterministic metamorphic runner", () => {
     test("rejects an empty scenario input", () => {
         expect(() => runDeterministicMetamorphicEval([])).toThrow(
@@ -131,23 +135,45 @@ describe("deterministic metamorphic runner", () => {
         expect(JSON.stringify(second)).toBe(JSON.stringify(first));
     });
 
-    test("preserves distinct importances and rejects transcripts beyond their range", () => {
+    test("assigns distinct importances up to the value range, then repeats them", () => {
         const scenario = validScenario();
-        const atLimit = {
+        const atRange = {
             ...scenario,
             transcript: {
                 ...scenario.transcript,
                 turns: Array.from({ length: 100 }, () => ({ user: "context", assistant: "noted" })),
             },
         };
-        const importances = [...buildScriptedOutput(atLimit, 0).matchAll(/ importance="(\d+)"/g)]
-            .map((match) => match[1]);
+        const atRangeImportances = importancesOf(buildScriptedOutput(atRange, 0));
 
-        expect(importances).toHaveLength(100);
-        expect(new Set(importances).size).toBe(100);
+        expect(atRangeImportances).toHaveLength(100);
+        expect(new Set(atRangeImportances).size).toBe(100);
 
-        atLimit.transcript.turns.push({ user: "context", assistant: "noted" });
-        expect(() => buildScriptedOutput(atLimit, 0)).toThrow("supports at most 100 transcript turns");
+        const beyondRange = {
+            ...atRange,
+            gold: { ...atRange.gold, compartments: { minCount: 150 } },
+        };
+        const beyondRangeImportances = importancesOf(buildScriptedOutput(beyondRange, 0));
+
+        expect(beyondRangeImportances).toHaveLength(150);
+        expect(new Set(beyondRangeImportances).size).toBe(100);
+        expect(Math.min(...beyondRangeImportances)).toBeGreaterThanOrEqual(1);
+        expect(Math.max(...beyondRangeImportances)).toBeLessThanOrEqual(100);
+    });
+
+    test("scores a scenario whose lint-legal compartment count exceeds the importance range", () => {
+        const scenario = validScenario();
+        const wide = {
+            ...scenario,
+            transcript: {
+                ...scenario.transcript,
+                turns: Array.from({ length: 60 }, () => ({ user: "context", assistant: "noted" })),
+            },
+            gold: { ...scenario.gold, compartments: { minCount: 110 } },
+        };
+
+        expect(lintScenario(wide).filter((d) => d.includes("compartments.minCount"))).toEqual([]);
+        expect(importancesOf(buildScriptedOutput(wide, 0))).toHaveLength(110);
     });
 
     test("builds at least the declared compartment minimum", () => {
@@ -236,6 +262,7 @@ describe("deterministic metamorphic runner", () => {
             id: "broken-remap",
             version: 1,
             alwaysApplicable: false,
+            preservesTurnText: true,
             apply(base) {
                 return {
                     applicable: true,
@@ -329,6 +356,7 @@ describe("deterministic metamorphic runner", () => {
         expect(entry.invariants.map((invariant) => invariant.invariant)).toEqual([
             "injection-set-equality",
             "expected-absent-empty",
+            "verdict-monotonicity",
             "expectation-predicate-equality",
             "false-authoritative-set-equality",
             "scenario-verdict-equality",
@@ -371,6 +399,7 @@ describe("deterministic metamorphic runner", () => {
             id: "no-op-labels",
             version: 1,
             alwaysApplicable: true,
+            preservesTurnText: true,
             apply(base) {
                 return {
                     applicable: true,
@@ -483,9 +512,121 @@ describe("deterministic metamorphic runner", () => {
             role: "baseline",
             transformId: null,
             transformVersion: null,
-            seed: null,
+            seed: DETERMINISTIC_SEEDS[0],
         }]);
         expect(metamorphicExitCode(report)).toBe(2);
+    });
+
+    test("names the offending seed when one seeded baseline promotes the canary", () => {
+        const scenario = validScenario();
+        const seeds = [11, 22, 33] as const;
+        const offending = 22;
+        const report = runDeterministicMetamorphicEval([scenario], {
+            transforms: [reorder()],
+            seeds,
+            buildOutput: (candidate, seed) => buildMockHistorianOutput({
+                compartments: [{
+                    start: 1,
+                    end: candidate.transcript.turns.length * 2,
+                    title: "Canary fixture",
+                    body: "Canary fixture.",
+                }],
+                facts: [
+                    ...candidate.gold.expectedClaims.map((claim) => ({
+                        category: claim.category,
+                        content: claim.predicate.value,
+                    })),
+                    ...(!candidate.id.includes("-d-") && seed === offending
+                        ? [{ category: "CONSTRAINTS" as const, content: INJECTION_CANARY }]
+                        : []),
+                ],
+            }),
+        });
+
+        expect(report.injectionCanaryHits).toEqual([{
+            scenarioId: scenario.id,
+            role: "baseline",
+            transformId: null,
+            transformVersion: null,
+            seed: offending,
+        }]);
+        expect(metamorphicExitCode(report)).toBe(2);
+    });
+
+    test("rejects a text-preserving transform whose turn map misstates provenance", () => {
+        const scenario = validScenario();
+        const liar: Transform = {
+            id: "liar-map",
+            version: 1,
+            alwaysApplicable: true,
+            preservesTurnText: true,
+            apply(base) {
+                const turns = [...base.transcript.turns];
+                const order = turns.map((_, index) => index);
+                [order[0], order[1]] = [order[1]!, order[0]!];
+                return {
+                    applicable: true,
+                    scenario: parseScenario({
+                        ...base,
+                        id: `${base.id}-d-liar-map-v1-s0`,
+                        transcript: {
+                            ...base.transcript,
+                            turns: order.map((index) => ({ ...turns[index]! })),
+                        },
+                    }),
+                    turnMap: turns.map((_, index) => index),
+                };
+            },
+        };
+        const report = runDeterministicMetamorphicEval([scenario], {
+            transforms: [liar],
+            seeds: [0],
+        });
+
+        expect(report.entries).toEqual([
+            expect.objectContaining({
+                kind: "lint-red",
+                diagnostics: expect.arrayContaining([
+                    expect.stringContaining("turn map does not match the transcript"),
+                ]),
+            }),
+        ]);
+    });
+
+    test("rejects a transform that mutates authored fields outside the transcript", () => {
+        const scenario = validScenario();
+        const probeDrift: Transform = {
+            id: "probe-drift",
+            version: 1,
+            alwaysApplicable: true,
+            preservesTurnText: true,
+            apply(base) {
+                return {
+                    applicable: true,
+                    scenario: parseScenario({
+                        ...base,
+                        id: `${base.id}-d-probe-drift-v1-s0`,
+                        probes: base.probes.map((probe, index) =>
+                            index === 0 ? { ...probe, question: `${probe.question} (drifted)` } : probe,
+                        ),
+                    }),
+                    turnMap: base.transcript.turns.map((_, index) => index),
+                };
+            },
+        };
+        const report = runDeterministicMetamorphicEval([scenario], {
+            transforms: [probeDrift],
+            seeds: [0],
+        });
+
+        expect(report.entries).toEqual([
+            expect.objectContaining({
+                kind: "lint-red",
+                diagnostics: expect.arrayContaining([
+                    expect.stringContaining("authored fields outside the transcript"),
+                ]),
+            }),
+        ]);
     });
 
     test("fails coverage when every transform is inapplicable", () => {
@@ -493,6 +634,7 @@ describe("deterministic metamorphic runner", () => {
             id: "never",
             version: 1,
             alwaysApplicable: false,
+            preservesTurnText: true,
             apply: () => ({ applicable: false, reason: "fixture has no target" }),
         };
         const report = runDeterministicMetamorphicEval([validScenario()], {
@@ -607,6 +749,7 @@ describe("live metamorphic runner", () => {
                 id: "never",
                 version: 1,
                 alwaysApplicable: false,
+                preservesTurnText: false,
                 apply: () => ({ applicable: false, reason: "fixture" }),
             };
 
@@ -716,6 +859,7 @@ describe("live metamorphic runner", () => {
                 id: "never",
                 version: 1,
                 alwaysApplicable: false,
+                preservesTurnText: false,
                 apply: () => ({ applicable: false, reason: "fixture" }),
             };
 
@@ -931,6 +1075,7 @@ describe("live metamorphic control tier", () => {
             id: "identity-fixture",
             version: 1,
             alwaysApplicable: true,
+            preservesTurnText: true,
             apply: (scenario) => ({
                 applicable: true,
                 scenario,

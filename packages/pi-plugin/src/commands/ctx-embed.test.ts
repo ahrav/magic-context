@@ -14,7 +14,7 @@ import {
 import { recordSessionProjectIdentity } from "@magic-context/core/features/magic-context/session-project-storage";
 import { autoEmbedAttemptedBySession } from "@magic-context/core/hooks/magic-context/embed-session-state";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
-import { createTestDb } from "../test-utils.test";
+import { createTestDb } from "../test-utils";
 import {
 	clearPiEmbedSessionState,
 	maybeAutoEmbedPiSession,

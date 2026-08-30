@@ -53,12 +53,24 @@ export function prospectiveUnitFiles(root: string = E2E_ROOT): string[] {
 
 /**
  * Pure-data historian-eval lane tests (contract, scorer, mutation battery,
- * promote). Harness-booting lane tests live in the OpenCode standalone list
- * instead, so they never run under rust or pi modes.
+ * promote) and the metamorphic lane built on them. Harness-booting lane tests
+ * live in the OpenCode standalone list instead, so they never run under rust or
+ * pi modes.
+ *
+ * The metamorphic directory belongs here rather than in `standaloneUnitFiles`:
+ * its transforms, invariants, and canary are credential-free and boot nothing,
+ * and `historian-eval-contracts` is the job that exists so a deterministic
+ * historian gate cannot be skipped by an unrelated failure. Classified as a
+ * standalone unit, it ran only inside the host-mode suites and never in that job,
+ * because `--historian-eval-unit` selects no standalone files at all.
  */
 export function historianEvalUnitFiles(root: string = E2E_ROOT): string[] {
     const files = [
         ...new Glob("src/historian-eval/**/*.test.ts").scanSync({
+            cwd: root,
+            onlyFiles: true,
+        }),
+        ...new Glob("src/metamorphic-eval/**/*.test.ts").scanSync({
             cwd: root,
             onlyFiles: true,
         }),
@@ -98,10 +110,6 @@ export const HISTORIAN_EVAL_HARNESS_TESTS = ["src/historian-eval/runner.test.ts"
 export function standaloneUnitFiles(root: string = E2E_ROOT): string[] {
     const files = [
         "src/cache-analysis.test.ts",
-        "src/metamorphic-eval/injection-canary.test.ts",
-        "src/metamorphic-eval/invariants.test.ts",
-        "src/metamorphic-eval/metamorphic.test.ts",
-        "src/metamorphic-eval/transforms.test.ts",
         "src/oracle-arms/seed-gold-memories.test.ts",
         "src/opencode-runner/spawn.test.ts",
         "src/pi-runner/rpc-client.test.ts",

@@ -48,6 +48,14 @@ const PAYLOAD_PACKAGES = [
     "@cortexkit/mc-host-linux-x64-gnu",
 ] as const;
 
+/**
+ * The shared-memory addon is a non-optional dependency of every parent, so an
+ * unpublished or unowned name breaks `npm install` outright rather than
+ * degrading one capability. It is not a payload: it carries the loader, not a
+ * daemon binary.
+ */
+const ADDON_PACKAGES = ["@cortexkit/mc-shm-native"] as const;
+
 const CONTRACT = {
     schema: "magic-context.mc-host-release/v1",
     release: {
@@ -57,6 +65,7 @@ const CONTRACT = {
     packages: {
         parents: [...PARENT_PACKAGES],
         payloads: [...PAYLOAD_PACKAGES],
+        addons: [...ADDON_PACKAGES],
         version: RELEASE_VERSION,
     },
     versions: {
@@ -218,6 +227,16 @@ const CONTRACT = {
         directory: ".mc-host-coordination",
         transaction_lock: "transaction.lock",
         lifetime_lock: "lifetime.lock",
+    },
+    // Managed data-root layout segments. The Rust daemon and every
+    // TypeScript resolver derive `${dataRoot}/cortexkit/...` path names from
+    // this one definition, so a rename regenerates every side at once
+    // instead of leaving a stale hand-written copy pointing at the old tree.
+    layout: {
+        managed_subtree: "cortexkit",
+        runtime_directory: "run",
+        connection_file: "subc-connection.json",
+        storage_subdirectory: "magic-context",
     },
     cli: {
         result_schema: "magic-context.daemon/v1",
@@ -629,6 +648,7 @@ export function validateContractSchema(contract: any): void {
             "epochs",
             "harness_unavailable",
             "install_layouts",
+            "layout",
             "model_lane",
             "packages",
             "platforms",
@@ -652,7 +672,7 @@ export function validateContractSchema(contract: any): void {
     // Packages: three parents, three payloads, one synchronized version.
     assertExactKeys(
         contract.packages,
-        ["parents", "payloads", "version"],
+        ["addons", "parents", "payloads", "version"],
         "packages",
     );
     if (contract.packages.version !== contract.release.version) {
@@ -660,12 +680,19 @@ export function validateContractSchema(contract: any): void {
     }
     if (
         contract.packages.parents.length !== 3 ||
-        contract.packages.payloads.length !== 3
+        contract.packages.payloads.length !== 3 ||
+        contract.packages.addons.length !== 1
     ) {
-        fail("exactly three parent and three payload packages are required");
+        fail(
+            "exactly three parent, three payload, and one addon package are required",
+        );
     }
     assertUnique(
-        [...contract.packages.parents, ...contract.packages.payloads],
+        [
+            ...contract.packages.parents,
+            ...contract.packages.payloads,
+            ...contract.packages.addons,
+        ],
         "package names",
     );
 
@@ -936,6 +963,26 @@ export function validateContractSchema(contract: any): void {
         fail("coordination names are fixed and version-neutral");
     }
 
+    // Managed data-root layout segments.
+    assertExactKeys(
+        contract.layout,
+        [
+            "connection_file",
+            "managed_subtree",
+            "runtime_directory",
+            "storage_subdirectory",
+        ],
+        "layout",
+    );
+    if (
+        contract.layout.managed_subtree !== "cortexkit" ||
+        contract.layout.runtime_directory !== "run" ||
+        contract.layout.connection_file !== "subc-connection.json" ||
+        contract.layout.storage_subdirectory !== "magic-context"
+    ) {
+        fail("managed layout segments are fixed and version-neutral");
+    }
+
     // Closed CLI unions (KTD12).
     const cli = contract.cli;
     assertExactKeys(
@@ -1179,10 +1226,11 @@ export function validateRegistryGateShape(
         );
     }
     if (!Array.isArray(g.packages)) gateFail("gate packages must be an array");
-    const expected = new Map<string, "parent" | "payload">();
+    const expected = new Map<string, "parent" | "payload" | "addon">();
     for (const name of contract.packages.parents) expected.set(name, "parent");
     for (const name of contract.packages.payloads)
         expected.set(name, "payload");
+    for (const name of contract.packages.addons) expected.set(name, "addon");
     const seen = new Set<string>();
     for (const pkg of g.packages) {
         const kind = expected.get(pkg.name);
@@ -1663,6 +1711,36 @@ pub const STATE_SYNC_EPOCH: u32 = ${contract.epochs.state_sync};
 pub const COORDINATION_DIRECTORY: &str = "${contract.coordination.directory}";
 pub const TRANSACTION_LOCK_NAME: &str = "${contract.coordination.transaction_lock}";
 pub const LIFETIME_LOCK_NAME: &str = "${contract.coordination.lifetime_lock}";
+
+/// Managed data-root layout segments (\`\${dataRoot}/cortexkit/...\`).
+pub const MANAGED_SUBTREE_DIRECTORY: &str = "${contract.layout.managed_subtree}";
+pub const RUNTIME_DIRECTORY_NAME: &str = "${contract.layout.runtime_directory}";
+pub const CONNECTION_FILE_NAME: &str = "${contract.layout.connection_file}";
+pub const STORAGE_SUBDIRECTORY: &str = "${contract.layout.storage_subdirectory}";
+`;
+}
+
+export function renderRetinaLayoutTsOutput(
+    contract: ReturnType<typeof buildContract>,
+): string {
+    const banner = GENERATED_BANNER.split("\n")
+        .map((line) => ` * ${line}`)
+        .join("\n");
+    return `/**
+${banner}
+ *
+ * Managed data-root layout segments from the release contract.
+ * \`retina-local-fs\` is a dependency of the plugin packages, so it cannot
+ * import their generated contract module; this standalone copy is emitted
+ * and drift-checked by the same generator instead.
+ */
+
+export const managedLayout = {
+    managedSubtree: ${JSON.stringify(contract.layout.managed_subtree)},
+    runtimeDirectory: ${JSON.stringify(contract.layout.runtime_directory)},
+    connectionFile: ${JSON.stringify(contract.layout.connection_file)},
+    storageSubdirectory: ${JSON.stringify(contract.layout.storage_subdirectory)},
+} as const;
 `;
 }
 
@@ -1700,6 +1778,7 @@ export const OUTPUT_PATHS = {
     rust: "release/generated/mc-host-release-contract.rs",
     typescript:
         "packages/plugin/src/shared/mc-host-lifecycle/generated-contract.ts",
+    retinaLayout: "packages/retina-local-fs/src/generated-layout.ts",
 } as const;
 
 export const REGISTRY_GATE_PATH = "release/mc-host-registry-gate.json";
@@ -1743,6 +1822,7 @@ export function generate(
         contractJson: `${canonical}\n`,
         rust: renderRustOutput(canonical, digest),
         typescript: renderTsOutput(canonical, digest),
+        retinaLayout: renderRetinaLayoutTsOutput(contract),
     };
 
     const drift: string[] = [];

@@ -33,17 +33,6 @@ export const CLAIMS_AND_EVIDENCE_TABLES = [
     "verification_events",
 ] as const;
 
-/** Tables whose rows are immutable at the database boundary (KTD34). */
-export const APPEND_ONLY_CLAIMS_TABLES = [
-    "episodes",
-    "source_spans",
-    "observations",
-    "claim_revisions",
-    "claim_evidence",
-    "claim_conflicts",
-    "verification_events",
-] as const;
-
 /** Full v82 object graph: tables from the dependency roots outward, then indexes and guards. */
 export function createClaimsAndEvidenceSchema(db: Database): void {
     db.exec(`
@@ -337,20 +326,4 @@ export function createClaimsAndEvidenceSchema(db: Database): void {
     )
     BEGIN SELECT RAISE(ABORT, 'verification_events observation must belong to the revision project'); END;
     `);
-}
-
-/**
- * Targeted per-new-table foreign-key validation. Full `PRAGMA integrity_check`
- * is reserved for tests so unrelated legacy corruption cannot turn this
- * migration into a whole-database repair gate (U1 approach step 6).
- */
-export function assertClaimsSchemaForeignKeys(db: Database): void {
-    const violations: string[] = [];
-    for (const table of CLAIMS_AND_EVIDENCE_TABLES) {
-        const rows = db.prepare(`PRAGMA foreign_key_check(${table})`).all() as unknown[];
-        if (rows.length > 0) violations.push(`${table}: ${rows.length} violation(s)`);
-    }
-    if (violations.length > 0) {
-        throw new Error(`v82 foreign_key_check failed: ${violations.join("; ")}`);
-    }
 }

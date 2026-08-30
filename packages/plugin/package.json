@@ -35,13 +35,12 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc -p ../retina-local-fs/tsconfig.build.json && bun run build:tui && rm -f dist/index.js dist/*-*.js && bun build src/index.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --external @huggingface/transformers --external onnxruntime-web --external bun:sqlite --external node:sqlite && tsc --emitDeclarationOnly",
+    "build": "tsc -p ../retina-local-fs/tsconfig.build.json && bun run build:tui && rm -f dist/index.js dist/*-*.js && bun build src/index.ts --outdir dist --target node --format esm --splitting --external @cortexkit/mc-shm-native --external @opencode-ai/plugin --external @huggingface/transformers --external onnxruntime-web --external bun:sqlite --external node:sqlite && tsc --emitDeclarationOnly",
     "build:tui": "bun scripts/build-tui.ts",
     "check:tui-compiled": "tmp=$(mktemp -d) && cp -R src/tui-compiled/. \"$tmp\" && bun run build:tui && diff -ru \"$tmp\" src/tui-compiled; status=$?; rm -rf \"$tmp\"; exit $status",
     "typecheck": "tsc -p ../retina-local-fs/tsconfig.build.json && tsc --noEmit && tsc -p tsconfig.scripts.json",
     "test": "bun test",
-    "test:mc-host-client:node": "bun scripts/run-mc-host-client-node.ts adversarial",
-    "test:mc-shm:node": "bun scripts/run-mc-shm-node.ts",
+    "test:mc-host-client:node": "bun scripts/run-mc-host-client-node.ts smoke",
     "smoke:mc-host-client:bun": "bun scripts/smoke-mc-host-client.ts",
     "smoke:mc-host-client:node": "bun scripts/run-mc-host-client-node.ts smoke",
     "smoke:mc-host-synapse:bun": "bun scripts/smoke-mc-host-synapse.ts",
@@ -56,6 +55,7 @@
     "prepublishOnly": "bun run build && bun run build:tui"
   },
   "dependencies": {
+    "@cortexkit/mc-shm-native": "0.38.0",
     "@huggingface/transformers": "^4.1.0",
     "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",
     "@opencode-ai/plugin": "^1.17.11",
@@ -73,7 +73,6 @@
     "@ai-sdk/anthropic": "3.0.82",
     "@ai-sdk/openai-compatible": "2.0.41",
     "@biomejs/biome": "^2.5.1",
-    "@magic-context/mc-shm-native": "workspace:*",
     "@types/better-sqlite3": "^7.6.13",
     "@types/bun": "^1.3.10",
     "@types/node": "^22.20.0",
