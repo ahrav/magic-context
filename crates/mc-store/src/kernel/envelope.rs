@@ -21,7 +21,7 @@ impl Sensitivity {
         }
     }
 
-    /// Any stored class other than `normal` reads back as `Sensitive`, so an unknown or legacy vocabulary fails closed. commentlint: allow(JUDGE)
+    /// An unrecognized or legacy stored class resolves to `Sensitive` rather than to `Normal`.
     fn from_stored(value: &str) -> Self {
         match value {
             "normal" => Self::Normal,
@@ -30,7 +30,7 @@ impl Sensitivity {
     }
 }
 
-/// `producer` and `operation_key` form the dedup key, so `commit` rejects either one carrying a detected secret. commentlint: allow(JUDGE)
+/// `producer` and `operation_key` form the dedup key, so `commit` rejects either one carrying a detected secret.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitIntent {
     pub producer: String,
@@ -47,7 +47,6 @@ pub struct CommitReceipt {
     pub replayed: bool,
 }
 
-/// `domain_id` and `object_id` are stored verbatim and rejected when they carry a detected secret; remaining text fields are redacted. commentlint: allow(JUDGE)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainSpec {
     pub domain_id: String,
@@ -152,7 +151,7 @@ impl Envelope<'_> {
         Ok(())
     }
 
-    /// `replaced_object_id` addresses a row, so a detected secret in it is rejected rather than redacted. commentlint: allow(JUDGE)
+    /// `replaced_object_id` selects the row to supersede, so redacting it could resolve a different object.
     pub fn correct_domain(
         &mut self,
         replaced_object_id: &str,
@@ -172,7 +171,7 @@ impl Envelope<'_> {
         Ok(())
     }
 
-    /// `object_id` addresses a row, so a detected secret in it is rejected rather than redacted. commentlint: allow(JUDGE)
+    /// `object_id` selects the row to retire, so redacting it could resolve a different object.
     pub fn retire_domain(&mut self, object_id: &str) -> Result<(), KernelError> {
         let object_id = identity(object_id)?;
         let mut object = self.invalidate_domain(&object_id)?;
@@ -186,7 +185,6 @@ impl Envelope<'_> {
         Ok(())
     }
 
-    /// Both updates require exactly one affected row, so `object_registry` and `domains` cannot diverge on a non-domain object. commentlint: allow(JUDGE)
     fn invalidate_domain(&self, object_id: &str) -> Result<ObjectRow, KernelError> {
         let object = load_object(self.tx, object_id)?.ok_or(KernelError::NotFound)?;
         if object.object_kind != DOMAIN_OBJECT_KIND {
@@ -242,7 +240,7 @@ impl Envelope<'_> {
 }
 
 impl KernelStore {
-    /// `operation` runs while this thread holds the writer mutex inside an `IMMEDIATE` transaction: calling back into this store deadlocks, blocking work extends the single-writer window, and a reader opened inside it cannot see the in-flight write. commentlint: allow(JUDGE)
+    /// `operation` holds the writer mutex for an `IMMEDIATE` transaction. Re-entering the store deadlocks; blocking work extends the single-writer window; readers opened within `operation` cannot observe uncommitted writes.
     pub fn commit(
         &self,
         intent: CommitIntent,
@@ -436,7 +434,7 @@ impl KernelStore {
         })
     }
 
-    /// `invalidated_commit_seq` and `superseded_by` are always `None` here, because a row this snapshot returns is by definition not yet invalidated. commentlint: allow(JUDGE)
+    /// `invalidated_commit_seq` and `superseded_by` are `None` for every returned row; `object_history_as_of` reads those columns.
     pub fn known_as_of(&self, requested: i64) -> Result<KnownAsOf, KernelError> {
         self.snapshot(
             requested,
@@ -449,7 +447,7 @@ impl KernelStore {
         )
     }
 
-    /// Every object created by `requested`, exposing only the invalidation metadata `requested` already knew. commentlint: allow(JUDGE)
+    /// Invalidation columns are masked past `requested`, so a later correction stays invisible to an earlier snapshot.
     pub fn object_history_as_of(&self, requested: i64) -> Result<KnownAsOf, KernelError> {
         self.snapshot(
             requested,
@@ -603,7 +601,7 @@ impl KernelStore {
         })
     }
 
-    /// A truncate-then-insert rebuild, not an upsert; an empty `rows` is rejected so erasing the projection is always deliberate. commentlint: allow(JUDGE)
+    /// A truncate-then-insert rebuild rather than an upsert. An empty `rows` is rejected, so erasing the projection stays deliberate.
     pub fn replace_alignment_projection(
         &self,
         rows: &[AlignmentProjectionSpec],
@@ -860,7 +858,7 @@ impl RedactedCandidate {
         })
     }
 
-    /// Repository provenance alone does not clear a payload, so a detected secret in any field escalates the class. commentlint: allow(JUDGE)
+    /// Repository provenance does not by itself make a payload shareable.
     fn sensitivity(&self) -> Sensitivity {
         let detected = self
             .candidate_fields()
@@ -992,7 +990,7 @@ impl RedactedProjection {
         })
     }
 
-    /// Length-prefixing keeps distinct id pairs from sharing one owner_id when an id contains the separator. commentlint: allow(JUDGE)
+    /// A bare `decision:observation` join would alias distinct pairs when an id contains the separator.
     fn owner_id(&self) -> String {
         format!(
             "{}:{}:{}",
@@ -1040,7 +1038,7 @@ fn check_fence(tx: &Transaction<'_>, expected: u64) -> Result<(), KernelError> {
     Ok(())
 }
 
-/// Length-prefixing each component keeps two distinct field splits from sharing one preimage. commentlint: allow(JUDGE)
+/// Without a length prefix, two different field splits would produce the same preimage.
 fn operation_identity(intent: &RedactedIntent) -> String {
     let mut hash = Sha256::new();
     hash.update(b"mc-kernel-operation-v2\0");

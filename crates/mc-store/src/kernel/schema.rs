@@ -5,7 +5,6 @@ use std::collections::BTreeSet;
 use crate::sqlite_runtime::compute_marker_digest_for_application_id;
 
 pub const KERNEL_APPLICATION_ID: u32 = 0x4D43_4B52;
-/// Epoch changes quarantine prior databases instead of migrating them; `every_conclusive_kernel_mismatch_is_quarantined_and_rebuilt` pins that contract. commentlint: allow(JUDGE)
 pub const KERNEL_FORMAT_EPOCH: i64 = 2;
 pub const KERNEL_SCHEMA_COMPONENT_NAMES: &[&str] = &[
     "commit_log",

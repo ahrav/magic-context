@@ -17,7 +17,7 @@ pub(super) fn redact(value: &str) -> RedactedField {
     }
 }
 
-/// Lookup keys, primary keys, and dedup identities must not contain detected secrets because redaction can alias distinct values. commentlint: allow(JUDGE)
+/// Lookup keys, primary keys, and dedup identities must not contain detected secrets because redaction can alias distinct values.
 pub(super) fn identity(value: &str) -> Result<String, KernelError> {
     let redaction = redact_secret_text(value);
     if redaction.detections.is_empty() {
@@ -58,7 +58,7 @@ pub(super) fn record(
     Ok(())
 }
 
-/// Clears an owner_kind so a rewrite cannot collide with the `(owner_kind,owner_id,field_name,detection_ordinal)` primary key. commentlint: allow(JUDGE)
+/// A rewrite under a reused owner id collides with `(owner_kind,owner_id,field_name,detection_ordinal)` unless prior rows are cleared first.
 pub(super) fn clear_owner_kind(tx: &Transaction<'_>, owner_kind: &str) -> Result<(), KernelError> {
     tx.execute(
         "DELETE FROM durable_text_redactions WHERE owner_kind=?1",

@@ -34,7 +34,7 @@ fn domain() -> DomainSpec {
     }
 }
 
-/// Reads the on-disk family, failing when a member is unreadable so a scan of zero bytes cannot pass a "secret is absent" assertion. commentlint: allow(JUDGE)
+/// A zero-byte scan would satisfy every absence assertion below, so an empty result is a test failure rather than a pass.
 fn family_bytes(root: &std::path::Path) -> Vec<u8> {
     let base = root.join("core.sqlite");
     let mut bytes = fs::read(&base).expect("main database is readable");

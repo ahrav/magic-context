@@ -9,7 +9,7 @@ pub use envelope::{
 };
 pub use open::{KernelError, KernelStore};
 
-/// Separates a constraint violation a caller can act on, a lock wait a caller may retry, and genuine I/O failure. commentlint: allow(JUDGE)
+/// A constraint violation is permanent and a lock wait is retryable, so collapsing both into `Io` would make either untreatable.
 pub(crate) fn map_sqlite(error: rusqlite::Error) -> KernelError {
     let rusqlite::Error::SqliteFailure(failure, _) = &error else {
         return KernelError::Io;
