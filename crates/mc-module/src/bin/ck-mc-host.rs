@@ -1543,19 +1543,20 @@ fn cmd_stop() -> DaemonResult {
         return DaemonResult::new(command, false, state, reason);
     }
     match observed.state {
-        // No lock-held incarnation exists. Selector cleanup is best-effort
-        // stale-state removal under the transaction ownership boundary, so a
-        // cleanup failure is reported (`ok:false`) without restating the
-        // lifecycle state: the host really is stopped, and `wedged` would
-        // route remediation at a daemon process that is not there. Only an
-        // unsupported schema stays `wedged`, because that state is owned by a
-        // newer binary and needs `align_versions`.
+        // No lock-held incarnation exists, so the state the caller asked for
+        // holds before any cleanup runs. Selector cleanup is best-effort
+        // stale-state removal under the transaction ownership boundary: a
+        // removal or fsync fault leaves behind a stale selector the next start
+        // rewrites, which cannot unmake the stopped state, so it is swallowed
+        // rather than reported as a failed `stop`. An unsupported schema is not
+        // that: the file is owned by a newer binary, is preserved as evidence
+        // for it, and blocks the next start until `align_versions`, so it stays
+        // a `wedged` failure.
         LifecycleState::Stopped => match serve::clear_active_selection() {
-            Ok(()) => DaemonResult::new(command, true, "stopped", "already_stopped"),
             Err("unsupported active harness selection schema") => {
                 DaemonResult::new(command, false, "wedged", "unsupported_state_schema")
             }
-            Err(_) => DaemonResult::new(command, false, "stopped", "internal_error"),
+            Ok(()) | Err(_) => DaemonResult::new(command, true, "stopped", "already_stopped"),
         },
         LifecycleState::Wedged => {
             let reason = if observed.reason == "unsupported_state_schema" {
@@ -1573,18 +1574,18 @@ fn cmd_stop() -> DaemonResult {
         ),
         LifecycleState::Running => match stop_phase(&runtime, outer) {
             // The stop transaction committed: the incarnation was signalled,
-            // acknowledged, and observed stopped. A best-effort selector
-            // cleanup failure after that point cannot un-commit it, so the
-            // reported state stays `stopped` and only `ok`/`reason` carry the
-            // cleanup fault. Reporting `wedged` here contradicted the
-            // committed stop and sent callers into wedged recovery against an
-            // already-stopped host.
+            // acknowledged, and observed stopped. Nothing after that point can
+            // un-commit it, so a best-effort selector-cleanup fault — stale
+            // bookkeeping the next start rewrites — must not turn a stop that
+            // already happened into a failed command. An unsupported schema
+            // still fails `wedged`: that file is owned by a newer binary, is
+            // preserved as evidence for it, and blocks the next start until
+            // `align_versions`.
             (_, Ok(())) => match serve::clear_active_selection() {
-                Ok(()) => DaemonResult::new(command, true, "stopped", "stopped"),
                 Err("unsupported active harness selection schema") => {
                     DaemonResult::new(command, false, "wedged", "unsupported_state_schema")
                 }
-                Err(_) => DaemonResult::new(command, false, "stopped", "internal_error"),
+                Ok(()) | Err(_) => DaemonResult::new(command, true, "stopped", "stopped"),
             },
             (_, Err((state, reason))) => DaemonResult::new(command, false, state, reason),
         },

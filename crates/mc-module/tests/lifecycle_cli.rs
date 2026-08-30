@@ -888,28 +888,73 @@ fn credentialed_restart_is_explicit_exact_and_clears_stale_selection() {
         "stop must clear a stale selection citing an unqualified closure"
     );
 
-    // Selector cleanup is best-effort stale-state removal, so its failure must
-    // not restate the lifecycle state. The host is stopped; reporting `wedged`
-    // sent callers into wedged recovery against a daemon that is not running
-    // and contradicted the next probe. Only `ok`/`reason` carry the fault.
-    std::fs::write(&selection, b"{\"schema\":1}").expect("cleanup-failure fixture");
+    // Selector cleanup is best-effort stale-state removal, so a cleanup fault
+    // cannot unmake a stop that already holds. The residue is stale bookkeeping
+    // the next start rewrites; failing the command would send callers into
+    // recovery for a host that is exactly where they asked it to be. Only an
+    // unsupported schema still fails, and `unknown_stop` above pins that.
+    std::fs::write(&selection, b"{\"schema\":1}").expect("cleanup-fault fixture");
     std::fs::set_permissions(&selection, std::fs::Permissions::from_mode(0o600))
-        .expect("cleanup-failure mode");
-    let cleanup_failed = run_with_envelope_and_env(
+        .expect("cleanup-fault mode");
+    let already_stopped_cleanup_fault = run_with_envelope_and_env(
         &data,
         &["stop"],
         None,
         &[("CK_MC_HOST_TEST_FAIL_SELECTION_REMOVAL", "1")],
     );
-    assert_eq!(cleanup_failed.code, 1);
+    assert_eq!(already_stopped_cleanup_fault.code, 0);
     assert_result(
-        &cleanup_failed.json(),
+        &already_stopped_cleanup_fault.json(),
         "stop",
-        false,
+        true,
         "stopped",
-        "internal_error",
+        "already_stopped",
     );
-    std::fs::remove_file(&selection).expect("cleanup-failure fixture removal");
+    assert!(
+        selection.exists(),
+        "the injected fault must leave the selector unremoved"
+    );
+    std::fs::remove_file(&selection).expect("cleanup-fault fixture removal");
+
+    // The same rule once the stop transaction has committed: the incarnation
+    // was signalled, acknowledged, and observed stopped before cleanup ran, so
+    // the command reports the stop it performed and the probe agrees.
+    let cleanup_fault_start = run_with_envelope(&data, &["start"], Some(&merged_envelope));
+    assert_eq!(
+        cleanup_fault_start.code, 0,
+        "start before the committed-stop cleanup fault failed: {} {}",
+        cleanup_fault_start.stdout, cleanup_fault_start.stderr
+    );
+    janitor.active = true;
+    assert!(
+        selection.exists(),
+        "a credentialed start publishes the selector the cleanup fault targets"
+    );
+    let committed_stop_cleanup_fault = run_with_envelope_and_env(
+        &data,
+        &["stop"],
+        None,
+        &[("CK_MC_HOST_TEST_FAIL_SELECTION_REMOVAL", "1")],
+    );
+    janitor.active = false;
+    assert_eq!(committed_stop_cleanup_fault.code, 0);
+    assert_result(
+        &committed_stop_cleanup_fault.json(),
+        "stop",
+        true,
+        "stopped",
+        "stopped",
+    );
+    assert_eq!(
+        run(&data, &["probe"]).json()["state"],
+        "stopped",
+        "a cleanup fault must not hide a committed stop from the next probe"
+    );
+    assert!(
+        selection.exists(),
+        "the injected fault must leave the selector unremoved"
+    );
+    std::fs::remove_file(&selection).expect("committed-stop cleanup fixture removal");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
