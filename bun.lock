@@ -15,6 +15,7 @@
       },
       "dependencies": {
         "@clack/prompts": "^1.6.0",
+        "@cortexkit/mc-shm-native": "0.38.0",
         "comment-json": "^5.0.0",
         "jsonc-parser": "^3.3.1",
       },

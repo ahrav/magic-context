@@ -257,6 +257,7 @@ pub struct Response {
 pub struct HostStatusSnapshot {
     pub health: String,
     pub metrics: serde_json::Value,
+    pub shared_memory: serde_json::Value,
 }
 
 /// One ordered streaming response item.
@@ -623,6 +624,7 @@ impl Client {
             op: String,
             health: String,
             metrics: serde_json::Value,
+            shared_memory: serde_json::Value,
         }
 
         if self.inner.closed.load(Ordering::Acquire) {
@@ -664,6 +666,7 @@ impl Client {
         Ok(HostStatusSnapshot {
             health: decoded.health,
             metrics: decoded.metrics,
+            shared_memory: decoded.shared_memory,
         })
     }
 

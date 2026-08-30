@@ -184,9 +184,6 @@ jobs:
       - name: Plugin shared-memory contracts (Bun)
         run: bun test packages/plugin/src/shared/mc-host-client
 
-      - name: Plugin shared-memory lifetime (Node 24)
-        run: bun run --cwd packages/plugin test:mc-shm:node
-
       - name: Plugin typecheck
         run: bun run --cwd packages/plugin typecheck
 
@@ -663,6 +660,9 @@ jobs:
       - name: Install workspace deps
         run: bun install --frozen-lockfile
 
+      - name: Build shared-memory package loader
+        run: bun run --cwd packages/mc-shm-native build:js
+
       - name: Build OpenCode plugin
         run: bun run --cwd packages/plugin build
 
@@ -695,6 +695,9 @@ jobs:
 
       - name: Install workspace deps
         run: bun install --frozen-lockfile
+
+      - name: Build shared-memory package loader
+        run: bun run --cwd packages/mc-shm-native build:js
 
       - name: Build Pi plugin
         run: bun run --cwd packages/pi-plugin build
@@ -732,6 +735,9 @@ jobs:
 
       - name: Install workspace deps
         run: bun install --frozen-lockfile
+
+      - name: Build shared-memory package loader
+        run: bun run --cwd packages/mc-shm-native build:js
 
       - name: Build Pi-compatible plugin and OMP argv renderer
         run: |

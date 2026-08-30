@@ -1685,7 +1685,13 @@ fn validate_object(fd: &OwnedFd, expected_len: usize) -> Result<(), RingError> {
     }
     // SAFETY: geteuid has no preconditions.
     let current_uid = unsafe { libc::geteuid() };
+    #[cfg(target_os = "linux")]
     let type_valid = stat.st_mode & libc::S_IFMT == libc::S_IFREG;
+    // Darwin POSIX shared-memory descriptors do not provide a portable
+    // regular-file type bit. Size, owner, permissions, and ring identity
+    // validate the unlinked object instead.
+    #[cfg(target_os = "macos")]
+    let type_valid = true;
     if stat.st_uid != current_uid
         || stat.st_size < 0
         || stat.st_size as usize != expected_len
