@@ -52,6 +52,12 @@ pub struct ResourceCharges {
     pub leases: u64,
     /// Shared mappings.
     pub mappings: u64,
+    /// File descriptors retaining shared mappings.
+    pub file_descriptors: u64,
+    /// Dedicated endpoint workers.
+    pub workers: u64,
+    /// Process-level client instances.
+    pub client_instances: u64,
     /// Dedicated workers for hot-active scheduling.
     pub pinned_workers: u64,
 }
@@ -64,6 +70,9 @@ impl ResourceCharges {
         spans_per_frame: 0,
         leases: 0,
         mappings: 0,
+        file_descriptors: 0,
+        workers: 0,
+        client_instances: 0,
         pinned_workers: 0,
     };
 
@@ -74,6 +83,9 @@ impl ResourceCharges {
             spans_per_frame: self.spans_per_frame.max(other.spans_per_frame),
             leases: self.leases.checked_add(other.leases)?,
             mappings: self.mappings.checked_add(other.mappings)?,
+            file_descriptors: self.file_descriptors.checked_add(other.file_descriptors)?,
+            workers: self.workers.checked_add(other.workers)?,
+            client_instances: self.client_instances.checked_add(other.client_instances)?,
             pinned_workers: self.pinned_workers.checked_add(other.pinned_workers)?,
         })
     }
@@ -87,6 +99,9 @@ impl ResourceCharges {
             spans_per_frame: self.spans_per_frame,
             leases: self.leases.checked_sub(other.leases)?,
             mappings: self.mappings.checked_sub(other.mappings)?,
+            file_descriptors: self.file_descriptors.checked_sub(other.file_descriptors)?,
+            workers: self.workers.checked_sub(other.workers)?,
+            client_instances: self.client_instances.checked_sub(other.client_instances)?,
             pinned_workers: self.pinned_workers.checked_sub(other.pinned_workers)?,
         })
     }
@@ -177,6 +192,13 @@ impl TargetProfile {
             spans_per_frame: config.max_spans as u64,
             leases,
             mappings: config.mappings as u64,
+            file_descriptors: config.mappings as u64,
+            workers: match config.worker_topology {
+                WorkerTopology::CallerThread => 0,
+                WorkerTopology::SplitDirection => 2,
+                WorkerTopology::Fused => 1,
+            },
+            client_instances: 1,
             pinned_workers: config.pinned_workers as u64,
         };
 
@@ -256,6 +278,12 @@ pub struct HostLimits {
     pub leases: u64,
     /// Active plus quarantined mappings.
     pub mappings: u64,
+    /// Active plus quarantined mapping descriptors.
+    pub file_descriptors: u64,
+    /// Active endpoint workers.
+    pub workers: u64,
+    /// Active plus quarantined process-level clients.
+    pub client_instances: u64,
     /// Active pinned workers.
     pub pinned_workers: u64,
 }
@@ -450,6 +478,15 @@ impl AdmissionController {
         if committed.mappings > self.limits.mappings {
             return Err(AdmissionError::MappingLimit);
         }
+        if committed.file_descriptors > self.limits.file_descriptors {
+            return Err(AdmissionError::FileDescriptorLimit);
+        }
+        if active.workers > self.limits.workers {
+            return Err(AdmissionError::WorkerLimit);
+        }
+        if committed.client_instances > self.limits.client_instances {
+            return Err(AdmissionError::ClientInstanceLimit);
+        }
         let core_limit = physical_cores
             .map(VerifiedPhysicalCores::get)
             .unwrap_or(self.limits.pinned_workers)
@@ -493,6 +530,7 @@ impl AdmissionController {
             .ok_or(AdmissionError::AccountingUnavailable)?;
         accounting.release_spans(charges.spans_per_frame);
         let retained = ResourceCharges {
+            workers: 0,
             pinned_workers: 0,
             ..charges
         };
@@ -619,6 +657,12 @@ pub enum AdmissionError {
     LeaseLimit,
     /// Mapping commitment exceeds host limit.
     MappingLimit,
+    /// Mapping descriptor commitment exceeds host limit.
+    FileDescriptorLimit,
+    /// Active endpoint workers exceed host limit.
+    WorkerLimit,
+    /// Client instances exceed host limit.
+    ClientInstanceLimit,
     /// Resource charge arithmetic overflowed.
     ChargeOverflow,
     /// Accounting lock was poisoned.
@@ -640,6 +684,9 @@ impl fmt::Display for AdmissionError {
             Self::ArenaByteLimit => "host arena-byte limit exceeded",
             Self::LeaseLimit => "host lease limit exceeded",
             Self::MappingLimit => "host mapping limit exceeded",
+            Self::FileDescriptorLimit => "host file-descriptor limit exceeded",
+            Self::WorkerLimit => "host worker limit exceeded",
+            Self::ClientInstanceLimit => "host client-instance limit exceeded",
             Self::ChargeOverflow => "host admission arithmetic overflow",
             Self::AccountingUnavailable => "host admission accounting unavailable",
         })

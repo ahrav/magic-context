@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 pub mod broca;
+pub mod echo_host;
 pub mod process_resources;
 pub mod raw_client;
 #[cfg(target_os = "linux")]

@@ -16,7 +16,7 @@ slow-timeout = { period = "120s", terminate-after = 5 }
 #   cargo nextest run -P shm-soak --run-ignored ignored-only
 # commentlint: allow(JUDGE)
 [profile.shm-soak]
-default-filter = 'package(mc-host) and binary(shm_soak) and test(full_soak_cycles_conserve_resources)'
+default-filter = 'package(mc-host) and binary(shm_soak) and test(installed_eight_hour_soak)'
 
 [[profile.shm-soak.overrides]]
 filter = 'package(mc-host) and binary(shm_soak)'

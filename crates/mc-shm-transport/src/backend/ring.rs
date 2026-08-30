@@ -388,6 +388,19 @@ pub struct RingGrant {
     total_bytes: u64,
 }
 
+/// Mapping geometry carried by an authenticated ring grant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RingGeometry {
+    /// Descriptor slots in one direction.
+    pub descriptor_depth: u64,
+    /// Payload arena bytes in one direction.
+    pub arena_bytes: u64,
+    /// Concurrent receive leases in one direction.
+    pub max_leases: u64,
+    /// Complete mapping length, including control pages and alignment.
+    pub mapping_bytes: u64,
+}
+
 impl RingGrant {
     /// Encodes grant for authenticated bootstrap transport.
     pub fn encode(self) -> [u8; GRANT_BYTES] {
@@ -467,6 +480,16 @@ impl RingGrant {
     /// Fixed encoded grant length.
     pub const fn encoded_len() -> usize {
         GRANT_BYTES
+    }
+
+    /// Returns validated mapping geometry from the grant itself.
+    pub const fn geometry(self) -> RingGeometry {
+        RingGeometry {
+            descriptor_depth: self.descriptor_depth,
+            arena_bytes: self.arena_bytes,
+            max_leases: self.max_leases,
+            mapping_bytes: self.total_bytes,
+        }
     }
 }
 

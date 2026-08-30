@@ -358,6 +358,9 @@ fn host_admission_retains_quarantined_commitments() {
         arena_bytes: charges.arena_bytes,
         leases: charges.leases,
         mappings: charges.mappings,
+        file_descriptors: charges.file_descriptors,
+        workers: charges.workers,
+        client_instances: charges.client_instances,
         pinned_workers: 0,
     }));
     let admission = controller.admit(&profile, None).unwrap();
@@ -376,7 +379,54 @@ fn host_admission_retains_quarantined_commitments() {
             | Err(AdmissionError::ArenaByteLimit)
             | Err(AdmissionError::LeaseLimit)
             | Err(AdmissionError::MappingLimit)
+            | Err(AdmissionError::FileDescriptorLimit)
+            | Err(AdmissionError::ClientInstanceLimit)
     ));
+}
+
+#[test]
+fn exact_aggregate_capacity_admits_n_and_rejects_n_plus_one_without_charging() {
+    let profile = ring_profile(
+        HardwareProfileId::new("contract-capacity").unwrap(),
+        SchedulingMode::ColdParkWake,
+    )
+    .unwrap();
+    let one = profile.charges();
+    let count = 3;
+    let controller = Arc::new(AdmissionController::new(HostLimits {
+        descriptors: one.descriptors * count,
+        arena_bytes: one.arena_bytes * count,
+        leases: one.leases * count,
+        mappings: one.mappings * count,
+        file_descriptors: one.file_descriptors * count,
+        workers: one.workers * count,
+        client_instances: one.client_instances * count,
+        pinned_workers: one.pinned_workers * count,
+    }));
+    let admissions: Vec<_> = (0..count)
+        .map(|_| {
+            controller
+                .admit(&profile, None)
+                .expect("capacity admission")
+        })
+        .collect();
+    let full = controller.snapshot().unwrap();
+    assert_eq!(full.active.client_instances, count);
+    assert!(matches!(
+        controller.admit(&profile, None),
+        Err(AdmissionError::DescriptorLimit)
+            | Err(AdmissionError::ArenaByteLimit)
+            | Err(AdmissionError::LeaseLimit)
+            | Err(AdmissionError::MappingLimit)
+            | Err(AdmissionError::FileDescriptorLimit)
+            | Err(AdmissionError::WorkerLimit)
+            | Err(AdmissionError::ClientInstanceLimit)
+    ));
+    assert_eq!(controller.snapshot().unwrap(), full);
+    drop(admissions);
+    let reclaimed = controller.snapshot().unwrap();
+    assert_eq!(reclaimed.active, ResourceCharges::ZERO);
+    assert_eq!(reclaimed.quarantined, ResourceCharges::ZERO);
 }
 
 fn span_profile(max_spans: usize) -> TargetProfile {
@@ -407,6 +457,9 @@ fn released_admissions_recompute_active_span_charge() {
         arena_bytes: 1 << 30,
         leases: 1024,
         mappings: 1024,
+        file_descriptors: 1024,
+        workers: 1024,
+        client_instances: 1024,
         pinned_workers: 0,
     }));
 

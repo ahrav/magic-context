@@ -67,6 +67,9 @@ pub fn single_candidate_limits() -> ShmHostLimits {
         arena_bytes: charges.arena_bytes,
         leases: charges.leases,
         mappings: charges.mappings,
+        file_descriptors: charges.file_descriptors,
+        workers: charges.workers,
+        client_instances: charges.client_instances,
         pinned_workers: charges.pinned_workers,
     }
 }
@@ -79,6 +82,9 @@ pub fn process_limits(connections: usize) -> Option<ShmHostLimits> {
         arena_bytes: one.arena_bytes.checked_mul(count)?,
         leases: one.leases.checked_mul(count)?,
         mappings: one.mappings.checked_mul(count)?,
+        file_descriptors: one.file_descriptors.checked_mul(count)?,
+        workers: one.workers.checked_mul(count)?,
+        client_instances: one.client_instances.checked_mul(count)?,
         pinned_workers: one.pinned_workers.checked_mul(count)?,
     })
 }
@@ -568,8 +574,15 @@ impl RingClientEndpoint {
             return Err(RingClientError);
         }
         let [from_host_fd, to_host_fd] = descriptors;
-        let from_host = attach_ring(from_host_fd, &descriptor.host_to_peer_grant)?;
-        let to_host = attach_ring(to_host_fd, &descriptor.peer_to_host_grant)?;
+        let from_host_grant = decode_grant(&descriptor.host_to_peer_grant)?;
+        let to_host_grant = decode_grant(&descriptor.peer_to_host_grant)?;
+        if from_host_grant.geometry() != to_host_grant.geometry() {
+            return Err(RingClientError);
+        }
+        let from_host = Ring::attach(from_host_fd, from_host_grant, SchedulingMode::ColdParkWake)
+            .map_err(|_| RingClientError)?;
+        let to_host = Ring::attach(to_host_fd, to_host_grant, SchedulingMode::ColdParkWake)
+            .map_err(|_| RingClientError)?;
         Ok(Self { to_host, from_host })
     }
 
@@ -618,9 +631,8 @@ impl RingClientEndpoint {
     }
 }
 
-fn attach_ring(fd: OwnedFd, grant: &str) -> Result<Ring, RingClientError> {
-    let grant = RingGrant::decode(decode_hex(grant)?).map_err(|_| RingClientError)?;
-    Ring::attach(fd, grant, SchedulingMode::ColdParkWake).map_err(|_| RingClientError)
+fn decode_grant(grant: &str) -> Result<RingGrant, RingClientError> {
+    RingGrant::decode(decode_hex(grant)?).map_err(|_| RingClientError)
 }
 
 fn decode_hex<const N: usize>(text: &str) -> Result<[u8; N], RingClientError> {
@@ -678,11 +690,11 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn copied_control_frame_records_one_host_adapter_copy() {
         let rings = DuplexRing::create(&qualified_test_profile()).unwrap();
-        let encoded = rings.first.grant().encode();
-        assert_eq!(u64::from_le_bytes(encoded[22..30].try_into().unwrap()), 8);
-        assert_eq!(u64::from_le_bytes(encoded[38..46].try_into().unwrap()), 8);
+        let geometry = rings.first.grant().geometry();
+        assert_eq!(geometry.descriptor_depth, 8);
+        assert_eq!(geometry.max_leases, 8);
         assert_eq!(
-            u64::from_le_bytes(encoded[46..54].try_into().unwrap()),
+            geometry.mapping_bytes,
             (mc_shm_transport::MIN_ARENA_BYTES + 8_192) as u64
         );
         let body = b"copy";
