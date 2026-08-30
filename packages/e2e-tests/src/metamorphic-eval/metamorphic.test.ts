@@ -894,6 +894,36 @@ describe("live metamorphic control tier", () => {
         }
     });
 
+    test("accepts a live rerun once the artifact namespace exists", () => {
+        const root = mkdtempSync(join(tmpdir(), "metamorphic-rerun-"));
+        try {
+            const corpusDirectory = join(root, "corpus");
+            mkdirSync(corpusDirectory);
+            const report = join(root, "out", "report.json");
+            mkdirSync(join(root, "out"));
+
+            const first = prepareLiveOutputPaths(report, corpusDirectory);
+            /** A control run creates `first.artifactNamespace`; later runs must tolerate it. commentlint: allow(JUDGE) */
+            mkdirSync(first.artifactNamespace);
+            expect(() => prepareLiveOutputPaths(report, corpusDirectory)).not.toThrow();
+            expect(() => prepareLiveOutputPaths(join(root, "out", "sibling.json"), corpusDirectory)).not.toThrow();
+
+            mkdirSync(join(root, "out2"));
+            writeFileSync(join(root, "out2", "metamorphic-eval-artifacts"), "not a directory");
+            expect(() => prepareLiveOutputPaths(join(root, "out2", "report.json"), corpusDirectory)).toThrow(
+                "artifact namespace exists and is not a directory",
+            );
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("derives distinct partials for extensionless and JSON reports", () => {
+        expect(partialReportPath("/x/foo")).not.toBe(partialReportPath("/x/foo.json"));
+        expect(partialReportPath("/x/foo.json")).toBe("/x/foo.json.partial.json");
+        expect(stagingReportPath("/x/foo")).not.toBe(stagingReportPath("/x/foo.json"));
+    });
+
     test("counts only admitted derivatives as applied coverage", async () => {
         /** An identity derivative lints red on its fingerprint, which is the `rejected` branch that must not count as applied. commentlint: allow(JUDGE) */
         const identity: Transform = {

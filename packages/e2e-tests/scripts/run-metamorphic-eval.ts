@@ -177,9 +177,8 @@ function writeReportFile(destination: string, report: MetamorphicReport): void {
 }
 
 export function partialReportPath(destination: string): string {
-    return destination.endsWith(".json")
-        ? `${destination.slice(0, -".json".length)}.partial.json`
-        : `${destination}.partial.json`;
+    /** Appended rather than substituted for `.json`, because substituting maps `foo` and `foo.json` onto one partial. commentlint: allow(JUDGE) */
+    return `${destination}.partial.json`;
 }
 
 /** Walks to the nearest existing ancestor and realpaths it, because a lexical resolve treats a symlinked corpus and its target as unrelated. commentlint: allow(JUDGE) */
@@ -249,26 +248,36 @@ function requireReplaceableReportPath(label: string, path: string): void {
     }
 }
 
+/** The namespace is a directory every live run reuses, so it takes a directory rule rather than the report-file shape check. commentlint: allow(JUDGE) */
+function requireUsableArtifactNamespace(path: string): void {
+    const occupant = lstatSync(path, { throwIfNoEntry: false });
+    if (occupant === undefined) return;
+    if (!occupant.isDirectory()) {
+        throw new Error(`artifact namespace exists and is not a directory: ${path}`);
+    }
+}
+
 function validateReportDestinations(
     label: string,
     reportPath: string,
     corpusDirectory: string,
-    outputs: readonly string[],
+    overlapPaths: readonly string[],
+    reportFilePaths: readonly string[],
 ): void {
     requireOwnableReportPath(reportPath);
-    if (outputs.some((path) => containsPath(corpusDirectory, path))) {
+    if (overlapPaths.some((path) => containsPath(corpusDirectory, path))) {
         throw new Error(`${label} must not overlap the scenario corpus`);
     }
     const corpusTargets = corpusFileTargets(corpusDirectory);
-    if (outputs.some((path) => corpusTargets.has(canonicalPath(path)))) {
+    if (overlapPaths.some((path) => corpusTargets.has(canonicalPath(path)))) {
         throw new Error(`${label} must not resolve onto a scenario file in the corpus`);
     }
-    for (const path of outputs) requireReplaceableReportPath(label, path);
+    for (const path of reportFilePaths) requireReplaceableReportPath(label, path);
 }
 
 export function prepareDeterministicOutputPaths(reportPath: string, corpusDirectory: string): void {
     const outputs = reportDestinations(reportPath);
-    validateReportDestinations("report and staging paths", reportPath, corpusDirectory, outputs);
+    validateReportDestinations("report and staging paths", reportPath, corpusDirectory, outputs, outputs);
     for (const path of outputs) removeRegularFile(path);
 }
 
@@ -283,7 +292,8 @@ export function prepareLiveOutputPaths(
     if (containsPath(artifactNamespace, corpusDirectory)) {
         throw new Error(`${label} must not overlap the scenario corpus`);
     }
-    validateReportDestinations(label, reportPath, corpusDirectory, [...outputs, artifactNamespace]);
+    validateReportDestinations(label, reportPath, corpusDirectory, [...outputs, artifactNamespace], outputs);
+    requireUsableArtifactNamespace(artifactNamespace);
     /** The control run creates the namespace as a directory, so renameSync could never publish a report that lives inside it. commentlint: allow(JUDGE) */
     if (outputs.some((path) => containsPath(artifactNamespace, path))) {
         throw new Error(`live report paths must stay outside the artifact namespace: ${artifactNamespace}`);
