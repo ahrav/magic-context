@@ -164,7 +164,7 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "mc_kernel_format_marker",
-        r#"CREATE TABLE mc_kernel_format_marker(singleton INTEGER PRIMARY KEY CHECK(singleton=1),format_epoch INTEGER NOT NULL,database_incarnation_id TEXT NOT NULL CHECK(length(database_incarnation_id)=32),schema_digest TEXT NOT NULL CHECK(length(schema_digest)=64),created_at INTEGER NOT NULL,marker_digest TEXT NOT NULL CHECK(length(marker_digest)=64)) STRICT; CREATE TRIGGER mc_kernel_format_marker_no_update BEFORE UPDATE ON mc_kernel_format_marker BEGIN SELECT RAISE(ABORT, 'mc_kernel_format_marker is immutable'); END; CREATE TRIGGER mc_kernel_format_marker_no_delete BEFORE DELETE ON mc_kernel_format_marker BEGIN SELECT RAISE(ABORT, 'mc_kernel_format_marker is immutable'); END;"#,
+        r#"CREATE TABLE mc_kernel_format_marker(singleton INTEGER PRIMARY KEY CHECK(singleton=1),format_epoch INTEGER NOT NULL,database_incarnation_id TEXT NOT NULL CHECK(length(database_incarnation_id)=32),schema_digest TEXT NOT NULL CHECK(length(schema_digest)=64),created_at INTEGER NOT NULL,marker_digest TEXT NOT NULL CHECK(length(marker_digest)=64)) STRICT; CREATE TRIGGER mc_kernel_format_marker_no_update BEFORE UPDATE ON mc_kernel_format_marker BEGIN SELECT RAISE(ABORT, 'mc_kernel_format_marker is immutable'); END; CREATE TRIGGER mc_kernel_format_marker_no_delete BEFORE DELETE ON mc_kernel_format_marker BEGIN SELECT RAISE(ABORT, 'mc_kernel_format_marker is immutable'); END; CREATE TRIGGER mc_kernel_format_marker_no_replace BEFORE INSERT ON mc_kernel_format_marker WHEN EXISTS(SELECT 1 FROM mc_kernel_format_marker) BEGIN SELECT RAISE(ABORT, 'mc_kernel_format_marker is immutable'); END;"#,
     ),
 ];
 

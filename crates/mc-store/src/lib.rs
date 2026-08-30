@@ -423,7 +423,7 @@ pub const PASS_SCHEDULER_TELEMETRY_MAX_BYTES: usize = 1
     + PASS_SCHEDULER_INTERESTING_HISTORY_CAP
         * (MAX_INTERESTING_PASS_SCHEDULER_OBSERVATION_JSON_BYTES + 1);
 
-fn current_time_ms() -> i64 {
+pub(crate) fn current_time_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
