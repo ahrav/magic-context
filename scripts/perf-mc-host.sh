@@ -138,14 +138,14 @@ budget_collect() {
 budget_block() {
   local block="$1"
   shift
-  local arms=(atomic-floor tcp-serial tcp-open tcp-throughput)
+  local arms=(atomic-floor ring-serial ring-open ring-throughput)
   if (((block - 1) % 2 == 1)); then
-    arms=(tcp-throughput tcp-open tcp-serial atomic-floor)
+    arms=(ring-throughput ring-open ring-serial atomic-floor)
   fi
   for arm in "${arms[@]}"; do
-    if [[ "$arm" == tcp-open ]]; then
+    if [[ "$arm" == ring-open ]]; then
       for rate in $BUDGET_RATES; do
-        budget_collect tcp-open same-l3 "$block" "$@" "MC_IPC_BUDGET_RATE=$rate"
+        budget_collect ring-open same-l3 "$block" "$@" "MC_IPC_BUDGET_RATE=$rate"
       done
     else
       budget_collect "$arm" same-l3 "$block" "$@"
@@ -156,9 +156,9 @@ budget_block() {
   # reverses on even blocks exactly like the same-L3 arms, so
   # time-dependent drift cancels for the cross-NUMA paired comparison
   # too.
-  local cross=(atomic-floor tcp-serial)
+  local cross=(atomic-floor ring-serial)
   if (((block - 1) % 2 == 1)); then
-    cross=(tcp-serial atomic-floor)
+    cross=(ring-serial atomic-floor)
   fi
   for arm in "${cross[@]}"; do
     BUDGET_PAIR="${BUDGET_CROSS_PAIR:-}" budget_collect "$arm" cross-numa "$block" "$@"
@@ -206,7 +206,7 @@ budget-preflight)
   budget_trap
   budget_collect atomic-floor same-l3 1 \
     MC_IPC_BUDGET_WARMUP_BATCHES=2 MC_IPC_BUDGET_BATCHES=5 MC_IPC_BUDGET_EXCHANGES=1000
-  budget_collect tcp-serial same-l3 1 \
+  budget_collect ring-serial same-l3 1 \
     MC_IPC_BUDGET_WARMUP_OPS=200 MC_IPC_BUDGET_MEASURED_OPS=1000
   if [[ -n "${BUDGET_CROSS_PAIR:-}" ]]; then
     # An explicit cross pair must fail preflight, not the final run: an

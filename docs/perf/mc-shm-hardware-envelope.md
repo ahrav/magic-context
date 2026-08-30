@@ -1,5 +1,68 @@
 # Shared-memory hardware envelope
 
+## Installed release gate
+
+`scripts/mc-shm-release-gate.ts` compares an installed shared-memory ring
+package with a frozen pre-cutover TCP run. It does not run a TCP implementation
+from the current source tree. The baseline is immutable JSON whose file digest,
+source commit, and package digest are pinned by
+`release/mc-shm-release-gate.json`.
+
+The candidate collector must run the installed package under Bun and Node and
+emit `magic-context.mc-shm-installed-performance-suite/v1` JSON containing one
+ordered `magic-context.mc-shm-installed-performance-run/v1` run for each
+runtime. Missing either runtime blocks the gate. `run` executes only a
+digest-bound collector without a shell and passes the package path in
+`MC_SHM_PERF_PACKAGE`. `verify` accepts an already collected candidate file.
+Both paths reject source-tree evidence, candidate TCP transport, interrupted or
+missing blocks, malformed fields, and mixed host, runtime, harness, or workload
+identity.
+
+Each block records a unique process ID, raw latency observations, elapsed time,
+completed operations, body-copy count, allocation count, CPU time, and wakeups.
+Duplicate process IDs are rejected. The report derives p50 and p99 latency,
+throughput, and totals for the remaining metrics. Its schema is frozen in
+`docs/perf/mc-shm-release-gate-report.schema.json`.
+
+The report can say only `blocked`, `ready`, or `evidence_complete`. It cannot say
+that either arm passes, wins, or regresses because no performance threshold is
+part of this task's contract. A policy decision must consume the descriptive
+comparison separately.
+
+Check current readiness without collecting data:
+
+```bash
+bun scripts/mc-shm-release-gate.ts status release/mc-shm-release-gate.json
+```
+
+Run the release-gate script tests from the repository root:
+
+```bash
+bun test scripts/mc-shm-release-gate.test.ts
+```
+
+Run a configured installed-path collector on the designated host:
+
+```bash
+bun scripts/mc-shm-release-gate.ts run \
+  release/mc-shm-release-gate.json \
+  artifacts/mc-shm-release-gate-report.json
+```
+
+Validate an existing candidate run against the frozen baseline:
+
+```bash
+bun scripts/mc-shm-release-gate.ts verify \
+  release/mc-shm-release-gate.json \
+  artifacts/candidate-run.json \
+  artifacts/mc-shm-release-gate-report.json
+```
+
+The checked-in configuration is blocked. No designated benchmark host or
+qualified frozen TCP artifact is available. This is an explicit failed release
+gate, not a synthetic benchmark result. The machine-readable evidence is
+`release/mc-shm-release-gate-report.json`.
+
 ## Current verdict
 
 **INCONCLUSIVE / NO QUALIFYING ARM**
