@@ -82,13 +82,13 @@ impl KernelStore {
         tx.commit().map_err(|_| KernelError::Io)
     }
 
-    /// `terminal_at` starts the run's retention clock. A value before the run's own `started_at` or `heartbeat_at` would let the next sweep delete a run that just finished.
+    /// `terminal_at` starts the run's retention clock, so it is bracketed by the run's own timestamps: at or after `max(started_at, heartbeat_at)`, and inside the lease. A value below the floor lets the next sweep delete a run that just finished, and one past the lease exempts the run from the cutoff indefinitely.
     ///
     /// # Errors
     ///
     /// - Returns [`KernelError::InvalidInput`] when the id is empty, `terminal_at` is negative, or `terminal_at` precedes the run's `started_at` or `heartbeat_at`.
     /// - Returns [`KernelError::NotFound`] when no run has the id.
-    /// - Returns [`KernelError::Conflict`] when the run is already terminal.
+    /// - Returns [`KernelError::Conflict`] when the run is already terminal, or its lease has expired at `terminal_at`.
     pub fn finish_staging_run(
         &self,
         extraction_run_id: &str,
@@ -107,6 +107,11 @@ impl KernelStore {
         }
         if terminal_at < run.started_at.max(run.heartbeat_at) {
             return Err(KernelError::InvalidInput);
+        }
+        // The lease also caps terminal_at from above, so a clock error cannot park a run
+        // beyond the deletion cutoff forever.
+        if terminal_at >= run.lease_expires_at {
+            return Err(KernelError::Conflict);
         }
         tx.execute(
             "UPDATE extraction_runs SET terminal_state=?1,terminal_at=?2

@@ -9,6 +9,8 @@ use rusqlite::{Connection, OpenFlags};
 
 const HOUR_MS: i64 = 60 * 60 * 1_000;
 const DAY_MS: i64 = 24 * HOUR_MS;
+/// The last instant a run staged at 0 still holds its lease.
+const TERMINAL_AT: i64 = HOUR_MS - 1;
 
 fn intent(key: &str) -> CommitIntent {
     CommitIntent {
@@ -129,7 +131,7 @@ fn completed_staging_survives_day_29_and_is_deleted_day_31() {
         .stage_candidate(candidate("run", "candidate", 0))
         .unwrap();
     store
-        .finish_staging_run("run", StagingTerminalState::Completed, DAY_MS)
+        .finish_staging_run("run", StagingTerminalState::Completed, TERMINAL_AT)
         .unwrap();
     assert_eq!(
         store
@@ -142,7 +144,7 @@ fn completed_staging_survives_day_29_and_is_deleted_day_31() {
     // STAGING_RETENTION_MS fails one of the two assertions.
     assert_eq!(
         store
-            .run_staging_maintenance(DAY_MS + STAGING_RETENTION_MS - 1)
+            .run_staging_maintenance(TERMINAL_AT + STAGING_RETENTION_MS - 1)
             .unwrap()
             .deleted_runs,
         0
@@ -157,7 +159,7 @@ fn completed_staging_survives_day_29_and_is_deleted_day_31() {
     );
     assert_eq!(
         store
-            .run_staging_maintenance(DAY_MS + STAGING_RETENTION_MS)
+            .run_staging_maintenance(TERMINAL_AT + STAGING_RETENTION_MS)
             .unwrap()
             .deleted_runs,
         1
@@ -189,7 +191,7 @@ fn staging_cleanup_preserves_exact_denormalized_admission_facts() {
         .stage_candidate(candidate("run", "candidate", 0))
         .unwrap();
     store
-        .finish_staging_run("run", StagingTerminalState::Completed, DAY_MS)
+        .finish_staging_run("run", StagingTerminalState::Completed, TERMINAL_AT)
         .unwrap();
     drop(store);
     let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
@@ -210,7 +212,7 @@ fn staging_cleanup_preserves_exact_denormalized_admission_facts() {
     let store = KernelStore::open(directory.path()).unwrap();
     assert_eq!(
         store
-            .delete_aged_staging_runs(DAY_MS + STAGING_RETENTION_MS)
+            .delete_aged_staging_runs(TERMINAL_AT + STAGING_RETENTION_MS)
             .unwrap(),
         1
     );
@@ -314,7 +316,7 @@ fn halted_consumer_does_not_block_staging_cleanup_or_lose_unacked_outbox_rows() 
         .stage_candidate(candidate("run", "candidate", 0))
         .unwrap();
     store
-        .finish_staging_run("run", StagingTerminalState::Completed, DAY_MS)
+        .finish_staging_run("run", StagingTerminalState::Completed, TERMINAL_AT)
         .unwrap();
     assert_eq!(
         store
@@ -561,7 +563,7 @@ fn finish_terminates_a_run_whose_id_carries_a_secret() {
         .finish_staging_run(
             &format!("run-{AWS_KEY}"),
             StagingTerminalState::Canceled,
-            DAY_MS,
+            TERMINAL_AT,
         )
         .unwrap();
     let states: (String, String) = inspect(directory.path())
@@ -849,5 +851,76 @@ fn staging_a_candidate_cannot_revive_a_run_whose_lease_expired() {
                 .get::<_, i64>(0))
             .unwrap(),
         2
+    );
+}
+
+#[test]
+fn finishing_requires_the_lease_to_still_cover_the_terminal_instant() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    store
+        .stage_candidate(candidate("run", "candidate", 0))
+        .unwrap();
+
+    // A far-future terminal_at would sit past every later cutoff and exempt the run and its
+    // candidate payloads from deletion for good, so the lease caps it.
+    assert_eq!(
+        store
+            .finish_staging_run("run", StagingTerminalState::Completed, i64::MAX)
+            .unwrap_err()
+            .kind(),
+        KernelErrorKind::Conflict
+    );
+    assert_eq!(
+        store
+            .finish_staging_run("run", StagingTerminalState::Completed, HOUR_MS)
+            .unwrap_err()
+            .kind(),
+        KernelErrorKind::Conflict
+    );
+    store
+        .finish_staging_run("run", StagingTerminalState::Completed, HOUR_MS - 1)
+        .unwrap();
+    assert_eq!(
+        store
+            .delete_aged_staging_runs(HOUR_MS - 1 + STAGING_RETENTION_MS)
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn staging_a_candidate_cannot_reach_back_before_the_run_heartbeat() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let mut first = candidate("run", "first", 200);
+    first.lease_expires_at = 250;
+    store.stage_candidate(first).unwrap();
+
+    // An out-of-order producer at 150 sits inside the stored lease of 250 but behind the
+    // heartbeat of 200, and its own long lease would otherwise extend the run.
+    let mut stale = candidate("run", "stale", 150);
+    stale.lease_expires_at = 150 + HOUR_MS;
+    assert_eq!(
+        store.stage_candidate(stale).unwrap_err().kind(),
+        KernelErrorKind::Conflict
+    );
+    let connection = inspect(directory.path());
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM candidates", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT heartbeat_at,lease_expires_at FROM extraction_runs",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap(),
+        (200, 250)
     );
 }

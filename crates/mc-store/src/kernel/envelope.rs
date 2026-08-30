@@ -692,7 +692,8 @@ impl KernelStore {
                 .execute(
                     "UPDATE extraction_runs
                  SET heartbeat_at=MAX(heartbeat_at,?1),lease_expires_at=MAX(lease_expires_at,?2)
-                 WHERE extraction_run_id=?3 AND terminal_state IS NULL AND lease_expires_at>?1",
+                 WHERE extraction_run_id=?3 AND terminal_state IS NULL
+                 AND lease_expires_at>?1 AND heartbeat_at<=?1",
                     params![
                         spec.recorded_at,
                         spec.lease_expires_at,
