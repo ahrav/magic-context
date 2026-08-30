@@ -1849,6 +1849,42 @@ fn payload_clamp_specs() -> impl Strategy<Value = Vec<ItemSpec>> {
         })
 }
 
+fn dedup_specs() -> impl Strategy<Value = Vec<ItemSpec>> {
+    (
+        2u8..6,
+        prop_oneof![Just(0u8), Just(1u8)],
+        0u8..10,
+        any::<bool>(),
+    )
+        .prop_map(|(arc_count, tool, input, tag_protected)| {
+            let mut specs = Vec::with_capacity(usize::from(arc_count) * 2);
+            for arc in 0..arc_count {
+                let mut push = |block: u8, kind: u8, byte_size: u16, tag_protected: bool| {
+                    specs.push(ItemSpec {
+                        msg: 0,
+                        block,
+                        ordinal_slot: arc,
+                        role: 0,
+                        kind,
+                        tool,
+                        input,
+                        provider_executed: false,
+                        byte_size,
+                        token_count: None,
+                        arc: Some(arc),
+                        frozen: false,
+                        agent_drop: false,
+                        tag_protected,
+                        exempt_protected: false,
+                    });
+                };
+                push(arc * 2, 0, 900, tag_protected && arc == 0);
+                push(arc * 2 + 1, 1, 400, false);
+            }
+            specs
+        })
+}
+
 fn pressured_ctx_bits() -> impl Strategy<Value = CtxBits> {
     (0u8..5, 0u8..5, 0u8..4, any::<bool>()).prop_map(
         |(cutoff_slot, execute_slot, prior, busting)| {
@@ -1885,6 +1921,18 @@ proptest! {
     #[test]
     fn optimized_matches_frozen_reference_across_skeleton_window(
         specs in arc_window_specs(),
+        bits in ctx_bits(),
+    ) {
+        let (optimized, expected, specs, bits) = outcome_pair!(specs, bits);
+        prop_assert_eq!(optimized, expected, "diverged on {:?} {:?}", specs, bits);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(192))]
+    #[test]
+    fn optimized_matches_frozen_reference_on_duplicate_calls(
+        specs in dedup_specs(),
         bits in ctx_bits(),
     ) {
         let (optimized, expected, specs, bits) = outcome_pair!(specs, bits);

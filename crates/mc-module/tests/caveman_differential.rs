@@ -872,6 +872,10 @@ fn fragment() -> impl Strategy<Value = String> {
         Just("Please review, Thanks, Kind Of A Bit urgent".to_string()),
         Just("In Order To understand At The Moment, Due To The Fact That".to_string()),
         Just("Was Were Has Been Have Been Will Be tested".to_string()),
+        // Each term is repeated three times to trigger `ULTRA_ABBREVIATIONS`.
+        Just("compression compression compression compressor compressor compressor".to_string(),),
+        Just("compartments compartments compartments messages messages messages".to_string(),),
+        Just("implemented implemented implemented".to_string()),
         Just("U: keep this user line untouched".to_string()),
         Just("`inline code with  spaces`".to_string()),
         Just("```rust\nfn nested() { let a = 1; }\n```".to_string()),
