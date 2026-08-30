@@ -129,6 +129,18 @@ pub fn clear() {
     *guard = Some(Generations::default());
 }
 
+/// Serializes tests whose assertions depend on shared cache contents. commentlint: allow(JUDGE)
+///
+/// Parallel test threads can clear a seeded cache hit before its assertion;
+/// counter deltas remain thread-local. commentlint: allow(JUDGE)
+#[cfg(test)]
+pub(crate) fn test_cache_guard() -> std::sync::MutexGuard<'static, ()> {
+    static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    CACHE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Drop-in replacement for `mc_tokenizer::estimate_tokens` that hashes and
 /// caches contents long enough to be worth it.
 pub(crate) fn cached_estimate_tokens(content: &str) -> usize {
@@ -176,6 +188,7 @@ mod tests {
 
     #[test]
     fn digest_keyed_hits_skip_retokenization() {
+        let _guard = test_cache_guard();
         let content = "x".repeat(200);
         let digest: [u8; 32] = Sha256::digest(content.as_bytes()).into();
         let expected = mc_tokenizer::estimate_tokens(&content);
@@ -215,6 +228,7 @@ mod tests {
 
     #[test]
     fn stats_partition_calls_into_hits_misses_and_bypassed() {
+        let _guard = test_cache_guard();
         let long =
             "stats partition fixture: unique sentence long enough to clear the cache threshold";
         assert!(long.len() >= MIN_CACHED_LEN);

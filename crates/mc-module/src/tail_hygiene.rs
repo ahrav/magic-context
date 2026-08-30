@@ -824,6 +824,7 @@ mod tests {
                 &HashSet::new(),
             )
         };
+        let _cache_guard = crate::token_cache::test_cache_guard();
         crate::token_cache::clear();
         let cold = measure();
         let warm = measure();

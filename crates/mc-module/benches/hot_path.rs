@@ -206,9 +206,9 @@ fn bench_e2e_first_hard(c: &mut Criterion) {
                     |(dir, store, req)| {
                         let ctx = producer_ctx(dir.path().to_str().expect("utf8 dir"));
                         let out = transform(&store, &req, &ctx).expect("hard pass");
-                        black_box(out.status);
-                        // Return owned inputs so cleanup occurs after Criterion stops timing.
-                        (dir, store, req)
+                        // `out` carries message buffers; return `out` so Criterion drops it after timing. commentlint: allow(JUDGE)
+                        // Reading a Copy field off it would drop the buffers inside the timed section. commentlint: allow(JUDGE)
+                        (dir, store, req, out)
                     },
                     criterion::BatchSize::PerIteration,
                 )

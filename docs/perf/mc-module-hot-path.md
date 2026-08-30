@@ -182,6 +182,14 @@ Reading the marginal cells against the design's own limits:
   single-replication resolution; unresolved until replicated across ≥3
   fresh process invocations with an A/A floor. The load-bearing result of
   this cell is directional: the all-miss pass did **not** regress.
+
+  These numbers predate a harness correction: at bench time the routine
+  returned only the owned setup values, so the `TransformResponse` — whose
+  `ck_messages`/`native_messages` drop scales with the message count — was
+  deallocated inside the timed section. Both arms carried it identically, so
+  the −3.2% comparison stands, but the absolute `first_hard` times above are
+  inflated by that teardown and are not comparable to a rerun of the current
+  harness, which returns the response as batch output.
 - `m0/trim_claims` +3.5–4.0% on the 8/64 cells: also below resolution, and
   these cells underflow the budget and tokenize only sub-64-byte wrapper
   strings, which bypass the cache entirely — they exercise the counter

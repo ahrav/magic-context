@@ -250,8 +250,8 @@ jobs:
             --test harness_closure \
             --test protocol_vectors
 
-      # Tail-hygiene tests clear the process-global token cache, so they need
-      # the process-per-test isolation nextest provides.
+      # token_cache::test_cache_guard serializes the tests that share the
+      # process-global cache, so this suite is correct under either runner.
       - name: Module transform and token-cache proofs (Linux)
         if: runner.os == 'Linux'
         run: cargo nextest run -p mc-module --lib
