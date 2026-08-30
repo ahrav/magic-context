@@ -179,6 +179,9 @@ describe("dreamer eval variance", () => {
     test("verify repeats sharing a verdict but not a payload disagree", () => {
         const verifyReport = (index: number, files: string[]): DreamerEvalRunReport => {
             const entry = report(index);
+            // Both paths are tracked, so both are part of what the host would
+            // apply — the universe comes from the capture's projected files.
+            entry.poolBefore = [{ ...entry.poolBefore[0]!, files: ["src/cache.ts", "src/config.ts"] }];
             entry.parsedManifest = {
                 verified: [{ publicClaimId: "mcm_claim", files }],
                 updated: [],
@@ -192,14 +195,23 @@ describe("dreamer eval variance", () => {
         // reported both as unanimous.
         const artifact = aggregateDreamerEvalVariance([
             verifyReport(1, ["src/cache.ts"]),
-            verifyReport(2, ["src/cache.ts", "src/other.ts"]),
+            verifyReport(2, ["src/cache.ts", "src/config.ts"]),
         ]);
 
         expect(artifact.claimHistograms[0]).toMatchObject({ disagreement: true });
         expect(Object.keys(artifact.claimHistograms[0]!.counts).sort()).toEqual([
             "verified;files:src/cache.ts",
-            "verified;files:src/cache.ts,src/other.ts",
+            "verified;files:src/cache.ts,src/config.ts",
         ]);
+
+        // An untracked extra is not part of the applied mapping: production drops
+        // it, so it must not read as disagreement.
+        expect(
+            aggregateDreamerEvalVariance([
+                verifyReport(1, ["src/cache.ts"]),
+                verifyReport(2, ["src/cache.ts", "src/untracked.ts"]),
+            ]).claimHistograms[0],
+        ).toMatchObject({ disagreement: false });
     });
 
     test("update repeats differ by replacement body, not by surrounding whitespace", () => {

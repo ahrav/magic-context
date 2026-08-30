@@ -531,9 +531,26 @@ function scoreMutation(
     manifest: string,
     fixture: DreamerMutationFixture,
 ): ManifestScore {
-    if (task === "verify") return scoreVerifyManifest(manifest, fixture.pool, fixture.verifyGold);
-    if (task === "map") return scoreMapManifest(manifest, fixture.pool, fixture.mapGold);
+    if (task === "verify") return scoreVerifyManifest(manifest, fixture.pool, fixture.verifyGold, trackedFixtureUniverse(fixture));
+    if (task === "map") return scoreMapManifest(manifest, fixture.pool, fixture.mapGold, trackedFixtureUniverse(fixture));
     return scoreClassifyManifest(manifest, fixture.pool, fixture.classifyGold);
+}
+
+/**
+ * The paths a synthetic fixture treats as committed. A gold path is tracked by
+ * construction — gold describes what the host would apply, and the host only
+ * applies a tracked file — so the universe spans the pool's mapped files and every
+ * path a gold layer names, which a pool-derived set would miss whenever a gold
+ * file is not also a seeded mapping.
+ */
+export function trackedFixtureUniverse(fixture: DreamerMutationFixture): string[] {
+    return [
+        ...new Set([
+            ...fixture.pool.claims.flatMap((claim) => claim.files),
+            ...fixture.verifyGold.claims.flatMap((claim) => claim.expectedFiles),
+            ...fixture.mapGold.claims.flatMap((claim) => claim.files),
+        ]),
+    ];
 }
 
 export function runMutationBattery(
@@ -544,8 +561,8 @@ export function runMutationBattery(
     const map = correctMapManifest(fixture);
     const classify = correctClassifyManifest(fixture);
     const baselines = [
-        scoreVerifyManifest(verify, fixture.pool, fixture.verifyGold),
-        scoreMapManifest(map, fixture.pool, fixture.mapGold),
+        scoreVerifyManifest(verify, fixture.pool, fixture.verifyGold, trackedFixtureUniverse(fixture)),
+        scoreMapManifest(map, fixture.pool, fixture.mapGold, trackedFixtureUniverse(fixture)),
         scoreClassifyManifest(classify, fixture.pool, fixture.classifyGold),
     ];
     if (baselines.some((baseline) => baseline.status !== "PASS")) {

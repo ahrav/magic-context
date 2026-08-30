@@ -103,6 +103,9 @@ export interface DreamerRunClassificationInput {
     invocation: DreamerInvocationEvidence | null;
     receipts: readonly DreamerReceiptEvidence[];
     rejectionRequestDigest: string | null;
+    /** Every path the scenario's fixture commits — the universe production's
+     *  `git ls-files` lookup resolves an observed mapping path against. */
+    trackedFiles: readonly string[];
     fixtureUnchanged: boolean;
     leaseLost: boolean;
     expectedResultMode: string | null;
@@ -133,10 +136,10 @@ function scoreManifest(input: DreamerRunClassificationInput): ManifestScore {
     const text = input.rawManifest ?? "";
     const evidence = { messages: input.childMessages };
     if ((input.task === "verify" || input.task === "verify-broad") && input.gold.kind === "verify") {
-        return scoreVerifyManifest(text, input.pool, input.gold, evidence);
+        return scoreVerifyManifest(text, input.pool, input.gold, input.trackedFiles, evidence);
     }
     if (input.task === "map-memories" && input.gold.kind === "map") {
-        return scoreMapManifest(text, input.pool, input.gold, evidence);
+        return scoreMapManifest(text, input.pool, input.gold, input.trackedFiles, evidence);
     }
     if (input.task === "classify-memories" && input.gold.kind === "classify") {
         return scoreClassifyManifest(text, input.pool, input.gold, evidence);
@@ -533,6 +536,7 @@ export async function runDreamerEvalTask(
             invocation,
             receipts,
             rejectionRequestDigest,
+            trackedFiles: fixturePaths(scenario),
             fixtureUnchanged,
             leaseLost,
             expectedResultMode: task.expectedResultMode,

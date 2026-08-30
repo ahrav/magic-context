@@ -11,7 +11,7 @@ import type {
 } from "./contract";
 import { parseRunReport } from "./contract";
 import { sha256Utf8Hex } from "../../../plugin/src/features/magic-context/memory/storage-claims";
-import { canonicalTrackedPaths } from "./scorer";
+import { appliedTrackedPaths, canonicalObservedPaths } from "./scorer";
 
 export interface DreamerClaimVerdictHistogram {
     claimId: string;
@@ -57,10 +57,27 @@ function publicClaimId(value: unknown): string | null {
 }
 
 /**
- * Encode a mapping entry the way `scoreMapManifest` compares one: it canonicalizes
- * the observed paths, then tests them against gold with set equality, so
- * duplicate entries and equivalent spellings such as `src/./cache.ts` are already
- * immaterial to PASS/FAIL and must not read as a different verdict.
+ * The path universe a report carries, or none.
+ *
+ * A claim's projected files come from its seeded mapping, so a task with no
+ * mapping preconditions — map and classify — reports an empty set. Dropping every
+ * observed path against an empty universe would collapse each claim into one
+ * bucket and report agreement between repeats that mapped different files, so an
+ * empty universe falls back to canonicalization alone. That still compares
+ * repeats consistently, which is what this artifact measures; only the scorer
+ * compares against gold, and it is handed the scenario's committed fixture paths.
+ */
+function appliedFiles(observed: readonly string[], tracked: readonly string[]): string[] {
+    const files = tracked.length === 0 ? canonicalObservedPaths(observed) : appliedTrackedPaths(observed, tracked);
+    return [...new Set(files)].sort();
+}
+
+/**
+ * Encode a mapping entry the way `scoreMapManifest` compares one: it resolves the
+ * observed paths to what the host would apply, then tests them against gold with
+ * set equality, so duplicate entries, equivalent spellings such as
+ * `src/./cache.ts`, and case variants of a tracked path are already immaterial to
+ * PASS/FAIL and must not read as a different verdict.
  *
  * Independence and the path set are encoded together because the scorer checks
  * both — independence first, then files — so a claim's bucket has to carry
@@ -70,8 +87,7 @@ function mapVerdict(entry: Record<string, unknown>, tracked: readonly string[]):
     const observed = Array.isArray(entry.files)
         ? entry.files.filter((file): file is string => typeof file === "string")
         : [];
-    const files = [...new Set(canonicalTrackedPaths(observed, tracked))].sort();
-    return `independent:${String(entry.independent === true)};files:${files.join(",")}`;
+    return `independent:${String(entry.independent === true)};files:${appliedFiles(observed, tracked).join(",")}`;
 }
 
 /**
@@ -120,7 +136,7 @@ function verifyVerdict(
     const observed = Array.isArray(entry.files)
         ? entry.files.filter((file): file is string => typeof file === "string")
         : [];
-    const files = [...new Set(canonicalTrackedPaths(observed, tracked))].sort().join(",");
+    const files = appliedFiles(observed, tracked).join(",");
     if (verdict === "verified") return `verified;files:${files}`;
     const content = typeof entry.content === "string" ? entry.content.trim() : "";
     return `update;files:${files};content:${sha256Utf8Hex(content).slice(0, 12)}`;
