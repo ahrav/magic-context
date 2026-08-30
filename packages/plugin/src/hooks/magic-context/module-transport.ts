@@ -475,6 +475,7 @@ export class McHostModuleTransport {
     private readonly requestTimeoutMs: number;
     private readonly routeSessionPrefix: string;
     private client: McHostClient | null = null;
+    private clientCacheOptions: McHostClientOptions | null = null;
     private routes = new Map<string, CachedRoute>();
     private routeOpenings = new Map<string, OpeningRoute>();
     private canonicalRootCache = new Map<string, string>();
@@ -1446,6 +1447,7 @@ export class McHostModuleTransport {
                     throw this.connectionChangedError("subc connection attempt was superseded");
                 }
                 this.client = candidate;
+                this.clientCacheOptions = options;
                 this.routes.clear();
                 this.backoffMs = CONNECT_BACKOFF_INITIAL_MS;
                 this.nextProbeMs = 0;
@@ -1478,9 +1480,19 @@ export class McHostModuleTransport {
         this.connectionGeneration += 1;
         this.connectionCertification = null;
         this.invalidateStateSyncCapabilities();
+        const superseded = this.client;
+        const supersededOptions = this.clientCacheOptions;
         this.client = null;
+        this.clientCacheOptions = null;
         this.routes.clear();
         this.routeOpenings.clear();
+        // A retained entry holds a resolved client whose channel owns a polling interval and two ring mappings, and `handshakeTimeoutMs` is deadline-derived, so reconnects do not reuse one entry. commentlint: allow(JUDGE)
+        if (superseded && supersededOptions) {
+            void evictProcessMcHostClient(supersededOptions, superseded).then(
+                () => superseded.closeAsync().catch(() => undefined),
+                () => undefined,
+            );
+        }
     }
 }
 
