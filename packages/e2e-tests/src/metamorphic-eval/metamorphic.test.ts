@@ -8,7 +8,7 @@ import { scoreRawOutputWithInjectedClaims } from "../historian-eval/scorer";
 import { validScenario } from "../historian-eval/test-support";
 import { INJECTION_CANARY } from "./injection-canary";
 import { buildMetamorphicReport, metamorphicExitCode } from "./report";
-import { buildScriptedOutput, runDeterministicMetamorphicEval } from "./runner";
+import { buildScriptedOutput, runDeterministicMetamorphicEval, DETERMINISTIC_SEEDS } from "./runner";
 import { TRANSFORMS, type Transform } from "./transforms";
 
 const CORPUS_DIR = join(import.meta.dir, "../../historian-eval/dev");
@@ -22,6 +22,10 @@ function corpus(): HistorianEvalScenario[] {
 
 function reorder(): Transform {
     return TRANSFORMS.find((transform) => transform.id === "reorder-independent-turns")!;
+}
+
+function importancesOf(output: string): number[] {
+    return [...output.matchAll(/ importance="(\d+)"/g)].map((match) => Number(match[1]));
 }
 
 describe("deterministic metamorphic runner", () => {
@@ -49,23 +53,45 @@ describe("deterministic metamorphic runner", () => {
         expect(JSON.stringify(second)).toBe(JSON.stringify(first));
     });
 
-    test("preserves distinct importances and rejects transcripts beyond their range", () => {
+    test("assigns distinct importances up to the value range, then repeats them", () => {
         const scenario = validScenario();
-        const atLimit = {
+        const atRange = {
             ...scenario,
             transcript: {
                 ...scenario.transcript,
                 turns: Array.from({ length: 100 }, () => ({ user: "context", assistant: "noted" })),
             },
         };
-        const importances = [...buildScriptedOutput(atLimit, 0).matchAll(/ importance="(\d+)"/g)]
-            .map((match) => match[1]);
+        const atRangeImportances = importancesOf(buildScriptedOutput(atRange, 0));
 
-        expect(importances).toHaveLength(100);
-        expect(new Set(importances).size).toBe(100);
+        expect(atRangeImportances).toHaveLength(100);
+        expect(new Set(atRangeImportances).size).toBe(100);
 
-        atLimit.transcript.turns.push({ user: "context", assistant: "noted" });
-        expect(() => buildScriptedOutput(atLimit, 0)).toThrow("supports at most 100 transcript turns");
+        const beyondRange = {
+            ...atRange,
+            gold: { ...atRange.gold, compartments: { minCount: 150 } },
+        };
+        const beyondRangeImportances = importancesOf(buildScriptedOutput(beyondRange, 0));
+
+        expect(beyondRangeImportances).toHaveLength(150);
+        expect(new Set(beyondRangeImportances).size).toBe(100);
+        expect(Math.min(...beyondRangeImportances)).toBeGreaterThanOrEqual(1);
+        expect(Math.max(...beyondRangeImportances)).toBeLessThanOrEqual(100);
+    });
+
+    test("scores a scenario whose lint-legal compartment count exceeds the importance range", () => {
+        const scenario = validScenario();
+        const wide = {
+            ...scenario,
+            transcript: {
+                ...scenario.transcript,
+                turns: Array.from({ length: 60 }, () => ({ user: "context", assistant: "noted" })),
+            },
+            gold: { ...scenario.gold, compartments: { minCount: 110 } },
+        };
+
+        expect(lintScenario(wide).filter((d) => d.includes("compartments.minCount"))).toEqual([]);
+        expect(importancesOf(buildScriptedOutput(wide, 0))).toHaveLength(110);
     });
 
     test("builds at least the declared compartment minimum", () => {
@@ -401,7 +427,43 @@ describe("deterministic metamorphic runner", () => {
             role: "baseline",
             transformId: null,
             transformVersion: null,
-            seed: null,
+            seed: DETERMINISTIC_SEEDS[0],
+        }]);
+        expect(metamorphicExitCode(report)).toBe(2);
+    });
+
+    test("names the offending seed when one seeded baseline promotes the canary", () => {
+        const scenario = validScenario();
+        const seeds = [11, 22, 33] as const;
+        const offending = 22;
+        const report = runDeterministicMetamorphicEval([scenario], {
+            transforms: [reorder()],
+            seeds,
+            buildOutput: (candidate, seed) => buildMockHistorianOutput({
+                compartments: [{
+                    start: 1,
+                    end: candidate.transcript.turns.length * 2,
+                    title: "Canary fixture",
+                    body: "Canary fixture.",
+                }],
+                facts: [
+                    ...candidate.gold.expectedClaims.map((claim) => ({
+                        category: claim.category,
+                        content: claim.predicate.value,
+                    })),
+                    ...(!candidate.id.includes("-d-") && seed === offending
+                        ? [{ category: "CONSTRAINTS" as const, content: INJECTION_CANARY }]
+                        : []),
+                ],
+            }),
+        });
+
+        expect(report.injectionCanaryHits).toEqual([{
+            scenarioId: scenario.id,
+            role: "baseline",
+            transformId: null,
+            transformVersion: null,
+            seed: offending,
         }]);
         expect(metamorphicExitCode(report)).toBe(2);
     });
