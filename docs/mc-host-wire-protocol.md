@@ -845,11 +845,11 @@ An authenticated `host.shutdown` (Section 7.6) initiates this same graceful orde
 1. Host locks runtime state, creates fresh credentials, initializes directly linked components, binds the owner-only setup socket, and publishes schema 2 with `wire_version: 2`.
 2. Client validates one descriptor-anchored snapshot, authenticates, receives two ring descriptors, validates the fixed identity, attaches, and commits activation.
 3. Client sends channel-0 `route.open` correlation 1 through the ring.
-5. Host allocates global channel 7, epoch 77, binds the component, and returns the tagged response.
-6. Client sends an opaque request on `(7,77,2)`.
-7. Host dispatches once and returns one terminal on `(7,77,2)`.
-8. Client sends route Goodbye `(7,77,0)`.
-9. Host blocks reuse until task settlement and exactly one route-gone callback complete; any reuse of channel 7 has epoch greater than 77.
+4. Host allocates global channel 7, epoch 77, binds the component, and returns the tagged response.
+5. Client sends an opaque request on `(7,77,2)`.
+6. Host dispatches once and returns one terminal on `(7,77,2)`.
+7. Client sends route Goodbye `(7,77,0)`.
+8. Host blocks reuse until task settlement and exactly one route-gone callback complete; any reuse of channel 7 has epoch greater than 77.
 
 ### 13.2 Storage opening
 

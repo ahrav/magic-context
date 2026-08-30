@@ -82,6 +82,10 @@ The fixed profile charges both directions. One connection uses 16 descriptors, 1
 
 Exact-capacity admission succeeds. Capacity plus one fails without creating another mapping or worker. Repeated peer crashes must not increase active charges after reclamation, and quarantined charges remain within the configured process bound.
 
+## Trusted-peer boundary
+
+Owner-only attachment establishes same-user authentication. The ring still trusts the peer and any in-process consumer to honor lane ownership, no-transfer, no resizing, and post-publication immutability. Scoped leases guarantee lifetime and ownership discipline; they do not protect against a malicious authenticated peer mutating mapped payload after publication, and tests and documents must not claim such immutability.
+
 ## Platform contract
 
 Release packages include the native addon for supported targets. The package manifest and addon checksum are verified before loading. Build profile and target identity are checked before setup. Managed Rust clients use the same setup protocol, ring profile, wire version, and descriptor schema.
