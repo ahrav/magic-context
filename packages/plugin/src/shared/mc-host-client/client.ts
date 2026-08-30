@@ -373,6 +373,7 @@ export class McHostClient {
     /** In-flight route.open attempts, drained bounded during owner close. */
     private readonly pendingRouteOpens = new Set<Promise<void>>();
     private closeStarted = false;
+    private retirementEmitted = false;
     private closePromise: Promise<void> | null = null;
 
     private diagWindowStartMs = 0;
@@ -406,11 +407,13 @@ export class McHostClient {
             await client.ensureConnection(Deadline.start(client.handshakeTimeoutMs, client.clock));
             return client;
         } catch (error) {
-            client.emitDiagnostics({
-                type: "retired",
-                health: "terminal",
-                errorClass: classifySharedMemoryFailure(error),
-            });
+            if (!client.retirementEmitted) {
+                client.emitDiagnostics({
+                    type: "retired",
+                    health: "terminal",
+                    errorClass: classifySharedMemoryFailure(error),
+                });
+            }
             throw error;
         }
     }
@@ -842,7 +845,11 @@ export class McHostClient {
                 cached.handle = null;
             }
         }
-        const terminalClass = terminalRetirementClass(info.reason);
+        const terminalClass =
+            info.reason === "setup_failed" || info.reason === "setup_deadline"
+                ? classifySharedMemoryFailure(info.error)
+                : terminalRetirementClass(info.reason);
+        this.retirementEmitted = true;
         this.emitDiagnostics({
             type: "retired",
             reason: info.reason,

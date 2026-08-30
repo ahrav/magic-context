@@ -284,8 +284,7 @@ async function probeManagedReadiness(root: string, budgetMs: number): Promise<Ob
     try {
         probe = await readCompatibilityProbe(client, deadline);
     } catch (error) {
-        // Only a failure over a still-live client is control-only.
-        if (client.isClosed) throw error;
+        if (client.isClosed || client.authenticated === null) throw error;
         throw new ReadinessProbeControlError(error);
     }
     const { snapshot: compatibility, status } = probe;
