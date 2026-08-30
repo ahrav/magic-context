@@ -252,6 +252,14 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo nextest run -p mc-module --lib
 
+      - name: Module differential contracts (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo nextest run -p mc-module \
+            --test caveman_differential \
+            --test historian_truncate_differential \
+            --test selection_differential
+
       - name: Native module adapter and CLI lifecycle (Linux)
         if: runner.os == 'Linux'
         run: |

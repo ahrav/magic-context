@@ -12,7 +12,7 @@ use crate::chunk_text::{
     clean_user_text, compact_role, compact_text_for_summary, extract_key_arg, format_block_line,
     is_system_directive, merge_commit_hashes, normalize_text,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -997,7 +997,6 @@ struct TokenIndex {
     terminal_ordinal: u64,
     ordinals: Vec<u64>,
     prefix: Vec<f64>,
-    tokens_by_ordinal: HashMap<u64, f64>,
 }
 
 impl TokenIndex {
@@ -1014,7 +1013,7 @@ impl TokenIndex {
         messages: &[BoundaryMsg],
         mut block_tokens: impl FnMut(&BoundaryBlock) -> usize,
     ) -> Self {
-        let mut totals_by_ordinal = BTreeMap::new();
+        let mut message_totals = Vec::with_capacity(messages.len());
         for message in messages {
             let total = message
                 .blocks
@@ -1022,27 +1021,32 @@ impl TokenIndex {
                 .map(&mut block_tokens)
                 .map(|tokens| tokens as f64)
                 .sum::<f64>();
-            *totals_by_ordinal
-                .entry(message.message_ordinal)
-                .or_insert(0.0) += total;
+            message_totals.push((message.message_ordinal, total));
+        }
+        if !message_totals.is_sorted_by_key(|(ordinal, _)| *ordinal) {
+            message_totals.sort_by_key(|(ordinal, _)| *ordinal);
         }
 
-        let ordinals: Vec<u64> = totals_by_ordinal.keys().copied().collect();
+        let mut ordinals: Vec<u64> = Vec::with_capacity(message_totals.len());
+        let mut prefix = Vec::with_capacity(message_totals.len() + 1);
+        prefix.push(0.0);
+        for (ordinal, total) in message_totals {
+            if ordinals.last() == Some(&ordinal) {
+                let last = prefix.len() - 1;
+                prefix[last] += total;
+            } else {
+                ordinals.push(ordinal);
+                let previous = prefix.last().copied().unwrap_or(0.0);
+                prefix.push(previous + total);
+            }
+        }
+
         let first_ordinal = ordinals.first().copied().unwrap_or(1);
         let last_ordinal = ordinals.last().copied().unwrap_or(0);
         let terminal_ordinal = ordinals
             .last()
             .map(|ordinal| ordinal.saturating_add(1))
             .unwrap_or(1);
-        let mut prefix = Vec::with_capacity(ordinals.len() + 1);
-        prefix.push(0.0);
-        let mut tokens_by_ordinal = HashMap::new();
-        for ordinal in &ordinals {
-            let total = totals_by_ordinal.get(ordinal).copied().unwrap_or(0.0);
-            tokens_by_ordinal.insert(*ordinal, total);
-            let previous = prefix.last().copied().unwrap_or(0.0);
-            prefix.push(previous + total);
-        }
 
         Self {
             raw_message_count: ordinals.len() as u64,
@@ -1051,12 +1055,16 @@ impl TokenIndex {
             terminal_ordinal,
             ordinals,
             prefix,
-            tokens_by_ordinal,
         }
     }
 
+    /// Per-message totals are integer-valued, so adjacent prefix sums differ
+    /// by the exact stored total.
     fn token_for_ordinal(&self, ordinal: u64) -> f64 {
-        self.tokens_by_ordinal.get(&ordinal).copied().unwrap_or(0.0)
+        match self.ordinals.binary_search(&ordinal) {
+            Ok(index) => self.prefix[index + 1] - self.prefix[index],
+            Err(_) => 0.0,
+        }
     }
 
     fn total_tokens(&self) -> f64 {
@@ -1215,16 +1223,16 @@ fn build_tool_arcs(messages: &[BoundaryMsg]) -> Vec<ToolArc> {
         res: Vec<u64>,
     }
 
-    let mut partial: BTreeMap<String, PartialArc> = BTreeMap::new();
+    let mut partial: BTreeMap<&str, PartialArc> = BTreeMap::new();
     for message in messages {
         for block in &message.blocks {
             if block.provider_executed {
                 continue;
             }
-            let Some(arc_id) = &block.arc_id else {
+            let Some(arc_id) = block.arc_id.as_deref() else {
                 continue;
             };
-            let entry = partial.entry(arc_id.clone()).or_default();
+            let entry = partial.entry(arc_id).or_default();
             match &block.kind {
                 SelKind::ToolCall { .. } => entry.inv.push(message.message_ordinal),
                 SelKind::ToolResult { .. } => entry.res.push(message.message_ordinal),
