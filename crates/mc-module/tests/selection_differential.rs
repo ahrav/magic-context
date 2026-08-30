@@ -1516,7 +1516,7 @@ fn item_spec() -> impl Strategy<Value = ItemSpec> {
     (
         (0u8..12, 0u8..32, 0u8..3, 0u8..7),
         (
-            0u8..15,
+            0u8..21,
             0u8..10,
             any::<bool>(),
             0u16..4096,
@@ -1554,7 +1554,7 @@ fn item_spec() -> impl Strategy<Value = ItemSpec> {
         )
 }
 
-const TOOLS: [&str; 15] = [
+const TOOLS: [&str; 21] = [
     "mcp_read",
     "mcp_grep",
     "read",
@@ -1572,6 +1572,13 @@ const TOOLS: [&str; 15] = [
     "MCP_READ",
     "Edit",
     "TodoWrite",
+    // `T1_TOOLS` and `T2_TOOLS` members absent from the names above.
+    "task",
+    "aft_outline",
+    "aft_zoom",
+    "apply_patch",
+    "aft_search",
+    "grep",
 ];
 
 /// The rocket's UTF-16 surrogate pair crosses `EDIT_REGION_HINT_LEN`.
@@ -1605,6 +1612,12 @@ fn input_value(variant: u8) -> serde_json::Value {
             "filePath": "src/a.rs",
             "oldString": DIFF_ACROSS_HINT_BOUNDARY,
             "newString": "short",
+        }),
+        9 => serde_json::json!({
+            "file_path": "src/a.rs",
+            "content": DIFF_ACROSS_HINT_BOUNDARY,
+            "old_string": DIFF_ACROSS_HINT_BOUNDARY,
+            "new_string": DIFF_ACROSS_HINT_BOUNDARY,
         }),
         _ => serde_json::json!({}),
     }
@@ -1789,7 +1802,7 @@ macro_rules! outcome_rows {
 fn arc_window_specs() -> impl Strategy<Value = Vec<ItemSpec>> {
     (
         24u8..31,
-        0u8..15,
+        0u8..21,
         0u8..10,
         any::<bool>(),
         any::<bool>(),
@@ -1871,10 +1884,11 @@ fn payload_clamp_specs() -> impl Strategy<Value = Vec<ItemSpec>> {
             Just(2u8),
             Just(12u8)
         ],
-        proptest::collection::vec(prop_oneof![Just(7u8), Just(8u8)], 8),
         any::<bool>(),
     )
-        .prop_map(|(arc_count, tool, inputs, agent_drop)| {
+        .prop_map(|(arc_count, tool, agent_drop)| {
+            // Every case includes the camelCase and snake_case edit-marker keys.
+            let inputs = [7u8, 8u8, 9u8];
             let mut specs = Vec::with_capacity(usize::from(arc_count) * 2);
             for arc in 0..arc_count {
                 let input = inputs[usize::from(arc) % inputs.len()];
@@ -1901,6 +1915,105 @@ fn payload_clamp_specs() -> impl Strategy<Value = Vec<ItemSpec>> {
             }
             specs
         })
+}
+
+/// `filler_arcs` are newer than tool-result arc 1, so the skeleton window no longer holds it.
+/// Each filler carries a non-arc block, which makes `fully_removed_by_arc` skip it.
+fn reasoning_adjacency_specs() -> impl Strategy<Value = Vec<ItemSpec>> {
+    (
+        prop_oneof![Just(10u8), Just(11u8), Just(7u8), Just(0u8)],
+        0u8..10,
+        any::<bool>(),
+        any::<bool>(),
+        22u8..27,
+    )
+        .prop_map(|(tool, input, right_reasoning, redacted, filler_arcs)| {
+            let reasoning = if redacted { 3u8 } else { 2u8 };
+            let mk = |msg: u8, ordinal: u8, role: u8, kind: u8, arc: Option<u8>| ItemSpec {
+                msg,
+                ordinal_slot: ordinal,
+                role,
+                kind,
+                tool,
+                input,
+                provider_executed: false,
+                byte_size: 800,
+                token_count: None,
+                arc,
+                frozen: false,
+                agent_drop: false,
+                tag_protected: false,
+                exempt_protected: false,
+            };
+            let mut specs = vec![
+                mk(0, 0, 0, reasoning, None),
+                mk(0, 0, 0, 6, None),
+                mk(1, 1, 2, 0, Some(1)),
+                mk(1, 1, 2, 1, Some(1)),
+                mk(2, 2, 0, if right_reasoning { reasoning } else { 6 }, None),
+            ];
+            for n in 0..filler_arcs {
+                let msg = 10 + n;
+                specs.push(mk(msg, 10 + n, 0, 0, Some(msg)));
+                specs.push(mk(msg, 10 + n, 0, 1, Some(msg)));
+                specs.push(mk(msg, 10 + n, 0, 6, None));
+            }
+            specs
+        })
+}
+
+fn emergency_tier_specs() -> impl Strategy<Value = Vec<ItemSpec>> {
+    (
+        0u8..21,
+        prop_oneof![Just(4_000u16), Just(20_000u16), Just(60_000u16)],
+    )
+        .prop_map(|(tool_offset, byte_size)| {
+            let tool_count = u8::try_from(TOOLS.len()).expect("tool count fits u8");
+            let mut specs = Vec::with_capacity(TOOLS.len() * 2);
+            for arc in 0..tool_count {
+                let tool = (arc + tool_offset) % tool_count;
+                let mut push = |kind: u8| {
+                    specs.push(ItemSpec {
+                        msg: arc,
+                        ordinal_slot: arc,
+                        role: 0,
+                        kind,
+                        tool,
+                        input: 0,
+                        provider_executed: false,
+                        byte_size,
+                        token_count: None,
+                        arc: Some(arc),
+                        frozen: false,
+                        agent_drop: false,
+                        tag_protected: false,
+                        exempt_protected: false,
+                    });
+                };
+                push(0);
+                push(1);
+            }
+            specs
+        })
+}
+
+fn emergency_ctx_bits() -> impl Strategy<Value = CtxBits> {
+    (0u8..5, 0u8..5, any::<bool>(), any::<bool>()).prop_map(
+        |(cutoff_slot, execute_slot, busting, smart)| {
+            (
+                1,
+                180_000.0,
+                100_000.0,
+                cutoff_slot,
+                execute_slot,
+                true,
+                0,
+                busting,
+                true,
+                smart,
+            )
+        },
+    )
 }
 
 fn dedup_specs() -> impl Strategy<Value = Vec<ItemSpec>> {
@@ -2010,6 +2123,30 @@ proptest! {
     #[test]
     fn optimized_matches_frozen_reference_across_skeleton_window(
         specs in arc_window_specs(),
+        bits in ctx_bits(),
+    ) {
+        let (optimized, expected, specs, bits) = outcome_pair!(specs, bits);
+        prop_assert_eq!(optimized, expected, "diverged on {:?} {:?}", specs, bits);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(192))]
+    #[test]
+    fn optimized_matches_frozen_reference_across_emergency_tiers(
+        specs in emergency_tier_specs(),
+        bits in emergency_ctx_bits(),
+    ) {
+        let (optimized, expected, specs, bits) = outcome_pair!(specs, bits);
+        prop_assert_eq!(optimized, expected, "diverged on {:?} {:?}", specs, bits);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(192))]
+    #[test]
+    fn optimized_matches_frozen_reference_on_reasoning_adjacency(
+        specs in reasoning_adjacency_specs(),
         bits in ctx_bits(),
     ) {
         let (optimized, expected, specs, bits) = outcome_pair!(specs, bits);

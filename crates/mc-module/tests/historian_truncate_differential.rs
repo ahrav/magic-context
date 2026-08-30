@@ -64,6 +64,12 @@ fn fragment() -> impl Strategy<Value = String> {
         Just("unicode: ünïcödé — 中文 🚀🧪 𝕊𝕦𝕣𝕣𝕠𝕘𝕒𝕥𝕖 pairs\n".to_string()),
         Just("   \t whitespace   runs \n\n\n".to_string()),
         Just("U: user line\nA: assistant line\nTC: tool call\n".to_string()),
+        Just("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+        Just("        \t\t\t        \n        ".to_string()),
+        Just(
+            "\u{1F680}\u{1F680}\u{1F680}\u{1F680}\u{1F680}\u{1F680}\u{1F680}\u{1F680}".to_string()
+        ),
+        Just("...............................".to_string()),
         "[ -~]{0,60}".prop_map(|s| s),
         "\\PC{0,24}".prop_map(|s| s),
     ]
@@ -71,6 +77,32 @@ fn fragment() -> impl Strategy<Value = String> {
 
 fn document() -> impl Strategy<Value = String> {
     proptest::collection::vec(fragment(), 0..24).prop_map(|frags| frags.concat())
+}
+
+/// Repeat fragments to exercise truncation on larger documents.
+fn large_document() -> impl Strategy<Value = String> {
+    (proptest::collection::vec(fragment(), 8..24), 12usize..64).prop_map(|(frags, repeats)| {
+        let unit = frags.concat();
+        if unit.is_empty() {
+            return unit;
+        }
+        unit.repeat(repeats)
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(24))]
+    #[test]
+    fn optimized_matches_frozen_reference_at_production_windows(
+        doc in large_document(),
+        budget in 1usize..32_001,
+    ) {
+        prop_assert_eq!(
+            truncate_historian_input_if_needed(&doc, budget),
+            reference::truncate_historian_input_if_needed(&doc, budget),
+            "diverged on budget {} doc len {}", budget, doc.len()
+        );
+    }
 }
 
 proptest! {
