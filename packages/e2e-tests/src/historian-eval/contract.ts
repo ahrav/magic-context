@@ -1019,7 +1019,30 @@ export function countCompleteValues(content: string, value: string): number {
 }
 
 /** A letter or digit, the adjacency that makes a match part of a larger value. */
-const VALUE_CHARACTER_RE = /[\p{L}\p{N}]/u;
+const VALUE_CHARACTER_RE = /^[\p{L}\p{N}]/u;
+
+/**
+ * The code point ending just before `index`, or `""` at the start.
+ *
+ * Read as a code point, not a code unit: a single `charAt` on an astral letter
+ * returns one surrogate half, which is not a letter under `\p{L}`, so a match sitting
+ * against such a letter would have looked boundary-clean.
+ */
+function codePointBefore(text: string, index: number): string {
+    if (index <= 0) return "";
+    const low = text.charCodeAt(index - 1);
+    if (index >= 2 && low >= 0xdc00 && low <= 0xdfff) {
+        const high = text.charCodeAt(index - 2);
+        if (high >= 0xd800 && high <= 0xdbff) return text.slice(index - 2, index);
+    }
+    return text.charAt(index - 1);
+}
+
+/** The code point starting at `index`, or `""` at the end. */
+function codePointAt(text: string, index: number): string {
+    const point = text.codePointAt(index);
+    return point === undefined ? "" : String.fromCodePoint(point);
+}
 
 /**
  * Occurrences of `value` in `content`, by starting position, stopping at the first
@@ -1044,8 +1067,8 @@ function findCompleteValues(content: string, value: string, firstOnly: boolean):
     const haystack = normalizeContent(decodeXmlEntities(content));
     let count = 0;
     for (let at = haystack.indexOf(needle); at !== -1; at = haystack.indexOf(needle, at + 1)) {
-        const before = at === 0 ? "" : haystack.charAt(at - 1);
-        const after = haystack.charAt(at + needle.length);
+        const before = codePointBefore(haystack, at);
+        const after = codePointAt(haystack, at + needle.length);
         if (VALUE_CHARACTER_RE.test(before) || VALUE_CHARACTER_RE.test(after)) continue;
         count += 1;
         if (firstOnly) return count;

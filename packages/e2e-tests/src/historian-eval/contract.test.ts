@@ -1274,6 +1274,15 @@ describe("complete-value counting", () => {
         expect(containsCompleteValue("blue blue blue", "blue blue")).toBe(true);
     });
 
+    test("boundaries are code points, not code units", () => {
+        // A single `charAt` on an astral letter returns one surrogate half, which is
+        // not a letter under the boundary rule, so the match would have looked clean.
+        expect(containsCompleteValue("\u{10400}foo", "foo")).toBe(false);
+        expect(containsCompleteValue("foo\u{10400}", "foo")).toBe(false);
+        expect(countCompleteValues("\u{10400}foo foo", "foo")).toBe(1);
+        expect(containsCompleteValue("a foo b", "foo")).toBe(true);
+    });
+
     test("stays linear against a repetitive haystack", () => {
         // A regex advanced one character at a time re-derives every overlapping
         // match, which turned a long answer against a megabyte of repetition into

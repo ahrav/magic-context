@@ -1957,6 +1957,45 @@ describe("metamorphic transforms", () => {
         expect(applied, "never applied").toBeGreaterThan(0);
     });
 
+    test("duplication copies a turn whose rejection spans its two messages", () => {
+        const raw = validScenarioRaw();
+        const transcript = raw.transcript as {
+            turns: Array<{ user: string; assistant: string }>;
+            epilogueStartIndex: number;
+        };
+        const gold = raw.gold as {
+            expectedClaims: Array<{ sourceTurnRange: [number, number] }>;
+            expectedAbsent: Array<Record<string, unknown>>;
+        };
+        // The rejection runs from the user message into the assistant message of one
+        // turn, so the occurrence names that turn twice.
+        transcript.turns.unshift({
+            user: "Should we adopt the batch",
+            assistant: "pipeline? Rejected for now.",
+        });
+        transcript.epilogueStartIndex += 1;
+        for (const claim of gold.expectedClaims) {
+            claim.sourceTurnRange = [claim.sourceTurnRange[0] + 1, claim.sourceTurnRange[1] + 1];
+        }
+        gold.expectedAbsent = [
+            {
+                id: "abs-batch-pipeline",
+                family: "proposed-but-rejected",
+                predicate: { kind: "normalized-substring", value: "batch pipeline" },
+            },
+        ];
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "duplicate-rejected-proposal")!;
+
+        const result = transform.apply(scenario, 0);
+        expect(result.applicable).toBe(true);
+        if (!result.applicable) return;
+        expect(
+            result.scenario.transcript.turns.filter((turn) => turn.user === "Should we adopt the batch"),
+        ).toHaveLength(2);
+    });
+
     test("duplication refuses a copy boundary that authors a second rejection", () => {
         const raw = validScenarioRaw();
         const transcript = raw.transcript as {

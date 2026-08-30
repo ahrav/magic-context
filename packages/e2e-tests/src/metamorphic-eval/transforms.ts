@@ -158,6 +158,19 @@ function diagnosticKey(diagnostic: string, scenarioID: string): string {
 }
 
 /**
+ * The lint diagnostics a scenario already carries, keyed for comparison.
+ *
+ * Enumerated once per application and handed to every `derivative()` call: linting
+ * the unchanged source runs the whole freeze battery, token budget included, and an
+ * exhaustive candidate probe would otherwise repeat it for every candidate.
+ */
+function inheritedDiagnostics(scenario: HistorianEvalScenario): ReadonlySet<string> {
+    return new Set(
+        lintScenario(scenario).map((diagnostic) => diagnosticKey(diagnostic, scenario.id)),
+    );
+}
+
+/**
  * Builds the derivative, or declines the candidate when the perturbation is what
  * breaks the contract.
  *
@@ -180,6 +193,7 @@ function diagnosticKey(diagnostic: string, scenarioID: string): string {
  */
 function derivative(
     base: HistorianEvalScenario,
+    inherited: ReadonlySet<string>,
     transform: Pick<Transform, "id" | "version">,
     seed: number,
     turns: TranscriptTurn[],
@@ -200,11 +214,6 @@ function derivative(
             reason: `${CONTRACT_VIOLATION_REASON}: ${error instanceof Error ? error.message : String(error)}`,
         };
     }
-    const inherited = new Set(
-        lintScenario(base).map((diagnostic) =>
-            diagnosticKey(diagnostic, base.id),
-        ),
-    );
     const introduced = lintScenario(scenario).filter(
         (diagnostic) => !inherited.has(diagnosticKey(diagnostic, scenario.id)),
     );
@@ -641,8 +650,11 @@ function preservesEvidenceForDuplication(
     for (const match of baselines.rejected.matches) {
         add(remapMatch(match, turnMap));
         // An occurrence wholly inside the copied turn appears once more, at the copy.
-        const turns_ = matchTurns(match);
-        if (turns_.length === 1 && turns_[0] === source) {
+        // Wholly, not singly: a formation spanning the turn's user and assistant
+        // names that turn twice, and requiring a single index would drop the expected
+        // copy and reject the very candidate the transform exists to make.
+        const crossedTurns = matchTurns(match);
+        if (crossedTurns.every((turnIndex) => turnIndex === source)) {
             add(remapMatch(match, turnMap.map((_, index) => (index === source ? insertion : -1))));
         }
     }
@@ -728,6 +740,7 @@ const paraphraseIrrelevant: Transform = {
         // transcript and expectation limits has hundreds of pairs, so proving all
         // of them to use one made a single application cost over a second.
         const baselines = evidenceBaselines(scenario);
+        const inherited = inheritedDiagnostics(scenario);
         return firstDerivative(
             pairs,
             splitmix32(seed),
@@ -741,6 +754,7 @@ const paraphraseIrrelevant: Transform = {
                 }
                 return derivative(
                     scenario,
+                    inherited,
                     this,
                     seed,
                     replaceMessage(scenario.transcript.turns, message, text),
@@ -801,6 +815,7 @@ const reorderIndependentTurns: Transform = {
         const expectedIndexes = protectedTurnIndexes(scenario);
         const absentIndexes = absentEvidenceTurnIndexes(scenario);
         const baselines = evidenceBaselines(scenario);
+        const inherited = inheritedDiagnostics(scenario);
         const answers = probeAnswers(scenario);
         const candidates = Array.from(
             { length: scenario.transcript.epilogueStartIndex - 1 },
@@ -835,6 +850,7 @@ const reorderIndependentTurns: Transform = {
             }
             return derivative(
                 scenario,
+                inherited,
                 this,
                 seed,
                 reordered,
@@ -853,6 +869,7 @@ const moveAcceptedDecision: Transform = {
         const seed = normalizedSeed(rawSeed);
         const absentIndexes = absentEvidenceTurnIndexes(scenario);
         const baselines = evidenceBaselines(scenario);
+        const inherited = inheritedDiagnostics(scenario);
         const answers = probeAnswers(scenario);
         // A multi-turn claim range declares an evidence chronology. Sorting the
         // mapped indices lets a rotation of that range look contiguous, so the
@@ -927,6 +944,7 @@ const moveAcceptedDecision: Transform = {
             }
             return derivative(
                 scenario,
+                inherited,
                 this,
                 seed,
                 reordered,
@@ -950,6 +968,7 @@ const duplicateRejectedProposal: Transform = {
             };
         }
         const baselines = evidenceBaselines(scenario);
+        const inherited = inheritedDiagnostics(scenario);
         const rejected = baselines.rejected.entries;
         const answers = probeAnswers(scenario);
         // Turns the rejection evidence actually runs through in the text the
@@ -1013,6 +1032,7 @@ const duplicateRejectedProposal: Transform = {
                 }
                 return derivative(
                     scenario,
+                    inherited,
                     this,
                     seed,
                     turns,
@@ -1308,6 +1328,7 @@ const renameUnrelatedSymbols: Transform = {
         // exhaustive probe would otherwise rescan the whole transcript for every
         // claim and absent predicate on each failed candidate.
         const baselines = evidenceBaselines(scenario);
+        const inherited = inheritedDiagnostics(scenario);
         // A replacement that aliases a probe-only entity changes the
         // query-to-history relationship as surely as renaming one would, and one
         // aliasing a name that exists only inside a command span collides with an
@@ -1439,6 +1460,7 @@ const renameUnrelatedSymbols: Transform = {
             }
             return derivative(
                     scenario,
+                    inherited,
                     this,
                     seed,
                     turns,
