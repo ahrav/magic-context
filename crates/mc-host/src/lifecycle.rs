@@ -1920,49 +1920,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_discarded_writer_drops_the_hook_unrun_and_reopens_the_latch() {
-        let latch = std::sync::Arc::new(ShutdownLatch::new());
-        let shutdown = tokio_util::sync::CancellationToken::new();
-        assert_eq!(latch.try_own(), LatchDecision::Owner);
-        let commit = CommitOnAck::new(std::sync::Arc::clone(&latch), shutdown.clone());
-
-        let (server, client) = tokio::io::duplex(64);
-        let generation = tokio_util::sync::CancellationToken::new();
-        let (handle, task) = crate::tcp_frame_channel::spawn_writer(
-            server,
-            2,
-            generation.clone(),
-            std::time::Duration::from_secs(5),
-        );
-        handle
-            .send(crate::frame_channel::OutboundFrame {
-                bytes: vec![0u8; 8],
-                tail: Vec::new(),
-                direct: None,
-                charge: crate::wire::ByteCharge::none(),
-                written: Some(Box::new(move |_at| commit.acknowledge())),
-            })
-            .await
-            .expect("queued");
-        // Discarding the writer before it writes a queued frame drops that
-        // frame's hook unrun.
-        handle.discard();
-        drop(handle);
-        task.await.expect("writer task");
-        drop(client);
-
-        assert!(!shutdown.is_cancelled(), "an unwritten frame cannot commit");
-        assert_eq!(
-            latch.try_own(),
-            LatchDecision::Owner,
-            "ownership reopened for a later requester"
-        );
-        CommitOnAck::new(std::sync::Arc::clone(&latch), shutdown.clone()).acknowledge();
-        assert!(shutdown.is_cancelled());
-        assert_eq!(latch.try_own(), LatchDecision::Committed);
-    }
-
-    #[tokio::test]
     async fn latch_waiters_wake_on_reopen_and_commit() {
         for (finish, expected) in [("reopen", "owner"), ("commit", "committed")] {
             let latch = std::sync::Arc::new(ShutdownLatch::new());

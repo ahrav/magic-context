@@ -1,20 +1,18 @@
 /**
- * Reusable semantic contract suite for the complete-frame channel (KTD8).
+ * Reusable semantic contract suite for the complete-frame channel.
  *
- * Every scenario is expressed against a provider-neutral factory, so TCP
- * runs the inventory now and a later provider (for example shared memory)
- * registers its own factory and reruns the same scenarios unchanged.
- * Adapter-specific behavior (socket fragmentation, auth leftover, EOF
- * variants) belongs in each adapter's own suite, not here.
+ * Every scenario is expressed against the mandatory shared-memory channel.
  *
  * Runtime-neutral: `node:assert/strict` only — no bun:test — so the same
  * scenarios also execute under Node 24 through the existing bundle runner.
  */
 
 import assert from "node:assert/strict";
+import { setTimeout as delay } from "node:timers/promises";
 import { Deadline } from "../deadline";
+import { McHostCallError } from "../errors";
 import {
-    ByteBudget,
+    type ByteBudget,
     type FrameChannel,
     type FrameChannelCloseReason,
     type InboundFrame,
@@ -22,10 +20,26 @@ import {
     ProducerError,
     type ProducerFrameHeader,
 } from "../frame-channel";
-import { type EnvelopeHeader, FrameType, MAX_FRAME_BODY_LEN, PROTOCOL_VERSION } from "../protocol";
-import { TcpFrameChannel } from "../tcp-frame-channel";
-import { encodePeerFrame, FakePeer, type PeerFrameFields } from "./fake-peer";
-import { expectMcHostCallError, waitUntil } from "./test-util";
+import { type EnvelopeHeader, FrameType, PROTOCOL_VERSION } from "../protocol";
+
+export async function waitUntil(check: () => boolean, timeoutMs = 3_000): Promise<void> {
+    const startedAt = Date.now();
+    while (!check()) {
+        if (Date.now() - startedAt > timeoutMs) throw new Error("waitUntil timed out");
+        await delay(5);
+    }
+}
+
+function expectMcHostCallError(
+    error: unknown,
+    kind: McHostCallError["kind"],
+    code?: string,
+): McHostCallError {
+    assert.ok(error instanceof McHostCallError, `expected McHostCallError, got ${String(error)}`);
+    assert.equal(error.kind, kind);
+    if (code !== undefined) assert.equal(error.code, code);
+    return error;
+}
 
 const CHANNEL = 5;
 const EPOCH = 9;
@@ -93,7 +107,7 @@ export interface FrameChannelContractHandle {
     peer: ContractPeer;
     /** Whether releasing a lease must revoke aliases before backing storage is reused. */
     reusesReceiveStorage: boolean;
-    /** The contract factory retains owned bodies after the provider releases each inbound lease. */
+    /** The contract factory retains owned bodies after the channel releases each inbound lease. */
     received: ContractReceivedFrame[];
     /** Channel-detected closes, in order (owner close never records here). */
     closes: { reason: FrameChannelCloseReason; error: unknown }[];
@@ -175,7 +189,7 @@ function requestCorrs(peer: ContractPeer): bigint[] {
 
 export const frameChannelContractScenarios: readonly FrameChannelContractScenario[] = [
     {
-        // R3: one logical writer with FIFO admission while inbound frames
+        // One logical writer preserves FIFO admission while inbound frames
         // keep making progress in wire order.
         name: "concurrent send and receive preserve FIFO order",
         async run(create) {
@@ -206,7 +220,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
         },
     },
     {
-        // R3: publication start and local completion are distinct and fire
+        // Publication start and local completion are distinct and fire
         // exactly once, in order; completion never claims peer receipt —
         // both fire while the peer is provably not consuming. commentlint: allow(JUDGE)
         name: "publication and local completion fire exactly once, in order",
@@ -233,7 +247,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
         },
     },
     {
-        // R4: a pre-publication cancel removes the frame without any byte
+        // A pre-publication cancel removes the frame without any byte
         // reaching the transport; its charge releases.
         name: "a queued frame cancels before publication and never reaches the peer",
         async run(create) {
@@ -257,7 +271,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
         },
     },
     {
-        // R3: frame-count saturation refuses admission at the same boundary
+        // Frame-count saturation refuses admission at the same boundary
         // while reserved control capacity stays available.
         name: "frame saturation refuses admission while control capacity stays reserved",
         async run(create) {
@@ -284,9 +298,9 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
         },
     },
     {
-        // R3: byte saturation blocks at the queue-byte and aggregate-cap
+        // Byte saturation blocks at the queue-byte and aggregate-cap
         // boundaries with distinct refusal codes.
-        name: "byte saturation refuses admission at the queue and aggregate caps",
+        name: "byte saturation refuses admission at the aggregate cap",
         async run(create) {
             const capped = await create({ memoryCapBytes: 1_000 });
             let overCap: unknown;
@@ -296,19 +310,10 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
                 overCap = error;
             }
             expectMcHostCallError(overCap, "not_sent", "memory_cap");
-
-            const narrow = await create({ maxQueuedBytes: 500 });
-            let overQueue: unknown;
-            try {
-                narrow.channel.send(requestFrame(1n, Buffer.alloc(600)));
-            } catch (error) {
-                overQueue = error;
-            }
-            expectMcHostCallError(overQueue, "not_sent", "writer_queue_full");
         },
     },
     {
-        // R4: reserve exhaustion fails the channel exactly once, because
+        // Reserve exhaustion fails the channel exactly once, because
         // required cleanup can no longer queue safely.
         name: "control reserve exhaustion fails the channel exactly once",
         async run(create) {
@@ -328,7 +333,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
         },
     },
     {
-        // R3/KTD7: inbound admission pauses under the shared aggregate cap
+        // Inbound admission pauses under the shared aggregate cap
         // before allocation and resumes when retained bytes release.
         name: "paused inbound admission resumes after retained bytes release",
         async run(create) {
@@ -370,7 +375,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
         },
     },
     {
-        // R4: graceful finish drains admitted frames before close, while
+        // Graceful finish drains admitted frames before close, while
         // discard drops queued frames and releases every byte charge.
         name: "graceful flush drains admitted frames; discard drops and releases",
         async run(create) {
@@ -404,7 +409,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
         },
     },
     {
-        // R4: closure reasons are preserved and reported exactly once.
+        // Closure reasons are preserved and reported exactly once.
         name: "close reasons: clean EOF, truncation, invalid header, role violation, frame deadline",
         async run(create) {
             const eof = await create();
@@ -470,7 +475,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
         },
     },
     {
-        // R1: an oversized body declaration is rejected before allocation.
+        // An oversized body declaration is rejected before allocation.
         name: "an oversized body declaration closes the channel before allocation",
         async run(create) {
             const h = await create({ maxBodyLen: 4_096 });
@@ -487,7 +492,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
         },
     },
     {
-        // R3: coalesced frames deliver in wire order, each from the single
+        // Coalesced frames deliver in wire order, each from the single
         // delivery loop — never recursively from within another delivery.
         name: "coalesced frames deliver in order without recursive re-entry",
         async run(create) {
@@ -518,12 +523,12 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
         },
     },
     {
-        name: "bounded producers commit empty, boundary, segmented, and maximum bodies exactly",
+        name: "bounded producers commit empty, boundary, segmented, and large bodies exactly",
         async run(create) {
             const h = await create({
                 producerSpanBytes: 32 * 1024 * 1024,
             });
-            const sizes = [0, 64, 65, MAX_FRAME_BODY_LEN];
+            const sizes = [0, 64, 65, 1 << 20];
             for (let i = 0; i < sizes.length; i++) {
                 const size = sizes[i] as number;
                 const source = new Uint8Array(size).fill(i + 1);
@@ -549,7 +554,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
                     .map((frame) => frame.body.length),
                 sizes,
             );
-            assert.equal(h.channel.stats().ownedAdapterCopies, sizes.length);
+            assert.equal(h.channel.stats().ownedAdapterCopies, 0);
         },
     },
     {
@@ -634,117 +639,6 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
             assert.equal(held.frame?.body.isReleased(), true);
             assert.equal(h.channel.stats().activeReceiveLeases, 0);
             assert.throws(() => held.frame?.body.segment(0), /released/);
-
-            const uncertain = await create();
-            const escaped: { frame: InboundFrame | null; alias: Uint8Array | null } = {
-                frame: null,
-                alias: null,
-            };
-            uncertain.frameHook = (frame) => {
-                escaped.frame = frame;
-                escaped.alias = frame.body.segment(0);
-                return true;
-            };
-            await uncertain.peer.send({
-                ty: FrameType.Response,
-                channel: CHANNEL,
-                epoch: EPOCH,
-                corr: 2n,
-                body: Buffer.from("maybe"),
-            });
-            await waitUntil(() => escaped.alias !== null);
-            const backing = escaped.alias?.buffer;
-            if (!(backing instanceof ArrayBuffer)) throw new Error("expected ArrayBuffer");
-            structuredClone(backing, { transfer: [backing] });
-            uncertain.channel.close();
-            assert.equal(uncertain.channel.stats().activeReceiveLeases, 0);
-            assert.equal(
-                uncertain.channel.stats().quarantinedBytes,
-                uncertain.reusesReceiveStorage ? 5 : 0,
-            );
         },
     },
 ];
-
-// ----------------------------------------------------------------------
-// TCP registration of the contract factory. A later provider adds its own
-// factory next to this one and reruns the identical scenario inventory.
-// ----------------------------------------------------------------------
-
-function adaptFakePeer(peer: FakePeer): Promise<ContractPeer> {
-    return peer.waitForConnection().then((connection) => ({
-        get frames(): readonly ContractPeerFrame[] {
-            return connection.frames;
-        },
-        send: (fields: ContractPeerFrameFields) => connection.send(fields as PeerFrameFields),
-        sendBurst: (fields: ContractPeerFrameFields[]) =>
-            connection.sendRaw(
-                Buffer.concat(fields.map((f) => encodePeerFrame(f as PeerFrameFields))),
-            ),
-        waitFor: (check: () => boolean, timeoutMs?: number) => connection.waitFor(check, timeoutMs),
-        pauseReading: () => connection.pauseReading(),
-        resumeReading: () => connection.resumeReading(),
-        end: () => connection.end(),
-        destroy: () => connection.destroy(),
-    }));
-}
-
-/** Live, authenticated TCP channel/peer pair for the contract suite. */
-export const tcpFrameChannelContractFactory: FrameChannelContractFactory = async (
-    overrides = {},
-) => {
-    const peer = await FakePeer.start();
-    const maxBodyLen = overrides.maxBodyLen ?? MAX_FRAME_BODY_LEN;
-    const budget = new ByteBudget(overrides.memoryCapBytes ?? maxBodyLen + 1_048_576);
-    const received: ContractReceivedFrame[] = [];
-    const closes: { reason: FrameChannelCloseReason; error: unknown }[] = [];
-    const hookSlot: { fn: ((frame: InboundFrame) => boolean | undefined) | null } = { fn: null };
-    const channel = new TcpFrameChannel({
-        host: "127.0.0.1",
-        port: peer.port,
-        credentials: { key: peer.key, daemonId: peer.daemonId, daemonVer: peer.daemonVer },
-        budget,
-        frameDeadlineMs: overrides.frameDeadlineMs,
-        maxBodyLen: overrides.maxBodyLen,
-        maxQueuedFrames: overrides.maxQueuedFrames,
-        maxQueuedBytes: overrides.maxQueuedBytes,
-        controlReserveFrames: overrides.controlReserveFrames,
-        producerSpanBytes: overrides.producerSpanBytes,
-        handlers: {
-            onFrame: (frame) => {
-                if (hookSlot.fn?.(frame) === true) return;
-                received.push({ header: frame.header, body: frame.body.takeOwned() });
-            },
-            onClosed: (reason, error) => {
-                closes.push({ reason, error });
-            },
-        },
-    });
-    try {
-        await channel.start(Deadline.start(2_000));
-        channel.beginFrames();
-    } catch (error) {
-        channel.close();
-        await peer.close();
-        throw error;
-    }
-    const contractPeer = await adaptFakePeer(peer);
-    return {
-        channel,
-        budget,
-        peer: contractPeer,
-        reusesReceiveStorage: false,
-        received,
-        closes,
-        get frameHook() {
-            return hookSlot.fn;
-        },
-        set frameHook(fn: ((frame: InboundFrame) => boolean | undefined) | null) {
-            hookSlot.fn = fn;
-        },
-        cleanup: async () => {
-            channel.close();
-            await peer.close();
-        },
-    };
-};

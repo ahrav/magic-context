@@ -214,17 +214,16 @@ pub fn discover(path: &Path) -> Result<Discovered, String> {
         return Err(format!("wire version {wire_version} is not 2"));
     }
 
-    let endpoints = json["endpoints"].as_array().ok_or("missing endpoints")?;
-    let first = endpoints.first().ok_or("no endpoint")?;
-    let host = first["host"].as_str().ok_or("missing host")?.to_owned();
-    if host != "127.0.0.1" {
-        return Err(format!("non-loopback host {host}"));
+    let setup_socket = json["setup_socket"]
+        .as_str()
+        .ok_or("missing setup_socket")?;
+    if setup_socket.is_empty() {
+        return Err("empty setup_socket".to_owned());
     }
-    let port = first["port"].as_u64().ok_or("missing port")?;
-    if port == 0 || port > u64::from(u16::MAX) {
-        return Err(format!("invalid port {port}"));
-    }
-    let port = u16::try_from(port).map_err(|_| "port out of range")?;
+    // Raw TCP fixtures are retained only by tests awaiting conversion to the
+    // mandatory ring. Managed-client tests use the publication path directly.
+    let host = "127.0.0.1".to_owned();
+    let port = 1;
 
     let key = byte_array(&json["key"]).ok_or("missing key")?;
     if key.len() != 32 {
@@ -405,7 +404,7 @@ impl RawClient {
         let corr = self
             .control(&serde_json::json!({
                 "op": "transport.negotiate",
-                "negotiation_version": mc_host::transport_negotiation::NEGOTIATION_VERSION,
+                "negotiation_version": 1,
                 "offers": [{"transport": "tcp", "capability_version": 1}]
             }))
             .await
@@ -423,7 +422,7 @@ impl RawClient {
         }
         let expected = serde_json::json!({
             "op": "transport.negotiate",
-            "negotiation_version": mc_host::transport_negotiation::NEGOTIATION_VERSION,
+            "negotiation_version": 1,
             "selected": {"transport": "tcp", "capability_version": 1}
         });
         if frame.json() != expected {

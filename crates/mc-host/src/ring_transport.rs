@@ -1,21 +1,20 @@
-//! Shared-memory ring transport provider.
+//! Mandatory shared-memory ring transport.
 //!
 //! One dedicated OS thread creates and owns both `!Send` ring endpoints. Host
 //! tasks exchange frame tickets and completion notifications with that thread.
 
-use std::fmt;
-use std::io;
 use std::os::fd::OwnedFd;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant as StdInstant};
+use std::{fmt, io};
 
 use crate::wire::{decode_header, EnvelopeHeader, FrameType};
 use mc_shm_transport::backend::ring::RingGrant;
 use mc_shm_transport::backend::ring::{DuplexRing, ProducerReservation, Ring};
 use mc_shm_transport::descriptor::{HardwareProfileId, SchedulingMode, TransportDescriptor};
 use mc_shm_transport::profile::{
-    Admission, AdmissionController, CompletionMode, HostLimits as ShmHostLimits, ProducerTopology,
+    AdmissionController, CompletionMode, HostLimits as ShmHostLimits, ProducerTopology,
     ProfileConfig, ResourceCharges, TargetProfile, WorkerTopology,
 };
 use tokio::sync::mpsc;
@@ -26,43 +25,20 @@ use crate::frame_channel::{
     frame_sender, validate_inbound_header, BoxedReceiver, CopyCounter, DirectFrame, FrameReceiver,
     InboundEvent, InboundFrame, OutboundFrame, ReadClose, RejectedFrame, SenderQueue, COMPLETE,
 };
-use crate::provider_recovery::{
-    CleanupOutcome, ProviderReadiness, ProviderRecovery, RecoveryBackend, SystemClock,
-};
-use crate::transport_provider::{
-    Candidate, InjectedProvider, PreflightEligibility, PreparedCandidate, ProviderContext,
-    ProviderFailure,
-};
 use crate::wire::{ByteBudget, MAX_CONTROL_BODY_LEN};
 
-/// Explicit transport name used by the qualified provider.
-pub const SHM_TRANSPORT: &str = "shm";
-/// Capability version implemented by the qualified provider.
-pub const SHM_CAPABILITY_VERSION: u32 = 1;
-/// Only profile accepted by this pre-production provider.
+/// Current ring profile accepted by every process in one release.
 pub const QUALIFIED_TEST_PROFILE: &str = "mc-host-test-ring-v1";
 
 const HARDWARE_PROFILE: &str = "mc-host-test-ring-v1";
 const DESCRIPTOR_DEPTH: usize = 8;
 const POLL_INTERVAL: Duration = Duration::from_micros(50);
 
-static NEXT_CANDIDATE_ID: AtomicU64 = AtomicU64::new(1);
-
 /// Test-only observer invoked after each successful frame publication with
 /// the published frame's type and channel. It receives no descriptors,
 /// payloads, or provider data.
 #[doc(hidden)]
 pub type PublishHook = Arc<dyn Fn(FrameType, u16) + Send + Sync>;
-
-/// Exact offer parameters required to select the test-only provider.
-pub fn qualified_test_parameters() -> serde_json::Value {
-    serde_json::json!({
-        "backend": "ring",
-        "profile": QUALIFIED_TEST_PROFILE,
-        "scheduling": "cold_park_wake",
-        "topology": "fused"
-    })
-}
 
 pub fn qualified_test_profile() -> TargetProfile {
     TargetProfile::new(ProfileConfig {
@@ -95,65 +71,57 @@ pub fn single_candidate_limits() -> ShmHostLimits {
     }
 }
 
-/// Explicit provider. Callers must install it through `TransportProviders`.
-pub struct ShmProvider {
+pub fn process_limits(connections: usize) -> Option<ShmHostLimits> {
+    let count = u64::try_from(connections).ok()?;
+    let one = single_candidate_limits();
+    Some(ShmHostLimits {
+        descriptors: one.descriptors.checked_mul(count)?,
+        arena_bytes: one.arena_bytes.checked_mul(count)?,
+        leases: one.leases.checked_mul(count)?,
+        mappings: one.mappings.checked_mul(count)?,
+        pinned_workers: one.pinned_workers.checked_mul(count)?,
+    })
+}
+
+/// Process-wide owner of ring admission and endpoint creation.
+pub struct RingTransport {
     profile: Arc<TargetProfile>,
     admission: Arc<AdmissionController>,
     preparations: AtomicU64,
-    quarantine_next_close: Arc<AtomicBool>,
-    recovery: ProviderRecovery,
-    recovery_cleanups: Arc<AtomicU64>,
     publish_hook: Mutex<Option<PublishHook>>,
-    held_admission: Mutex<Option<Admission>>,
 }
 
-/// Recovery primitives for the thread-confined ring endpoint. The rings die
-/// with their endpoint thread, so a suspect close leaves alias state
-/// uncertain: cleanup isolates instead of reclaiming. commentlint: allow(JUDGE)
-struct ShmRecoveryBackend {
-    profile: Arc<TargetProfile>,
-    admission: Arc<AdmissionController>,
-    cleanups: Arc<AtomicU64>,
+pub(crate) struct PreparedRing {
+    pub(crate) descriptor: serde_json::Value,
+    pub(crate) descriptors: [OwnedFd; 2],
+    pub(crate) sender: crate::frame_channel::FrameSender,
+    pub(crate) receiver: BoxedReceiver,
+    pub(crate) io: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    pub(crate) root: CancellationToken,
+    pub(crate) read_cancel: CancellationToken,
 }
 
-impl RecoveryBackend for ShmRecoveryBackend {
-    fn cleanup(&self, _candidate_id: u64) -> CleanupOutcome {
-        self.cleanups.fetch_add(1, Ordering::AcqRel);
-        CleanupOutcome::Uncertain
-    }
+#[derive(Debug, Clone, Copy)]
+pub struct RingUnavailable;
 
-    fn probe(&self) -> bool {
-        // No shared state outlives the endpoint thread, so isolation alone
-        // proves the provider side is clean.
-        true
-    }
-
-    fn admission_fits(&self) -> bool {
-        self.admission.can_admit(&self.profile, None).is_ok()
+impl std::fmt::Display for RingUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("shared-memory ring is unavailable")
     }
 }
 
-impl ShmProvider {
-    /// Builds provider with explicit process-wide admission limits.
+impl std::error::Error for RingUnavailable {}
+
+impl RingTransport {
+    /// Builds the process-wide transport with finite admission limits.
     pub fn for_qualified_test_profile(limits: ShmHostLimits) -> Self {
         let profile = Arc::new(qualified_test_profile());
         let admission = Arc::new(AdmissionController::new(limits));
-        let recovery_cleanups = Arc::new(AtomicU64::new(0));
-        let backend = Arc::new(ShmRecoveryBackend {
-            profile: Arc::clone(&profile),
-            admission: Arc::clone(&admission),
-            cleanups: Arc::clone(&recovery_cleanups),
-        });
-        let recovery = ProviderRecovery::new(backend, Arc::new(SystemClock::new()));
         Self {
             profile,
             admission,
             preparations: AtomicU64::new(0),
-            quarantine_next_close: Arc::new(AtomicBool::new(false)),
-            recovery,
-            recovery_cleanups,
             publish_hook: Mutex::new(None),
-            held_admission: Mutex::new(None),
         }
     }
 
@@ -177,11 +145,6 @@ impl ShmProvider {
         self.admission.snapshot()
     }
 
-    /// Test hook: next endpoint close retains non-worker commitments.
-    pub fn quarantine_next_close(&self) {
-        self.quarantine_next_close.store(true, Ordering::Release);
-    }
-
     /// Test hook: install a publication observer for candidates prepared
     /// after this call. The hook runs on the endpoint thread after the ring
     /// commit. commentlint: allow(JUDGE)
@@ -190,112 +153,26 @@ impl ShmProvider {
         *self.publish_hook.lock().expect("publish hook lock") = Some(hook);
     }
 
-    /// Test hook: hold one profile's admission charges so preflight reports
-    /// exact dynamic unavailability. commentlint: allow(JUDGE)
-    #[doc(hidden)]
-    pub fn hold_admission(&self) -> bool {
-        let mut held = self.held_admission.lock().expect("held admission lock");
-        if held.is_some() {
-            return false;
-        }
-        match self.admission.admit(&self.profile, None) {
-            Ok(admission) => {
-                *held = Some(admission);
-                true
-            }
-            Err(_) => false,
-        }
-    }
-
-    /// Test hook: end the admission hold. commentlint: allow(JUDGE)
-    #[doc(hidden)]
-    pub fn release_admission(&self) {
-        if let Some(admission) = self
-            .held_admission
-            .lock()
-            .expect("held admission lock")
-            .take()
-        {
-            admission.release();
-        }
-    }
-
-    /// Provider offer readiness (R6): governs new offers only.
-    pub fn readiness(&self) -> ProviderReadiness {
-        self.recovery.readiness()
-    }
-
-    /// Number of recovery cleanup calls the controller dispatched. Preflight
-    /// must never move this counter (R6, seeded-defect detector).
-    pub fn recovery_cleanup_count(&self) -> u64 {
-        self.recovery_cleanups.load(Ordering::Acquire)
-    }
-
-    fn offer_is_exact(parameters: Option<&serde_json::Value>) -> bool {
-        parameters == Some(&qualified_test_parameters())
-    }
-}
-
-impl fmt::Debug for ShmProvider {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ShmProvider")
-            .field("profile", &"<redacted>")
-            .finish_non_exhaustive()
-    }
-}
-
-impl InjectedProvider for ShmProvider {
-    fn transport(&self) -> &str {
-        SHM_TRANSPORT
-    }
-
-    fn capability_version(&self) -> u32 {
-        SHM_CAPABILITY_VERSION
-    }
-
-    fn preflight(&self, parameters: Option<&serde_json::Value>) -> PreflightEligibility {
-        if !Self::offer_is_exact(parameters) {
-            return PreflightEligibility::StaticallyOmitted;
-        }
-        if self.recovery.readiness() != ProviderReadiness::Ready
-            || self.admission.can_admit(&self.profile, None).is_err()
-        {
-            return PreflightEligibility::DynamicallyUnavailable;
-        }
-        PreflightEligibility::Serveable
-    }
-
-    fn prepare(&self, ctx: &ProviderContext) -> Result<PreparedCandidate, ProviderFailure> {
-        if !Self::offer_is_exact(ctx.offer_parameters()) {
-            return Err(ProviderFailure::Unavailable);
-        }
-        let candidate_id = NEXT_CANDIDATE_ID.fetch_add(1, Ordering::Relaxed);
-        // Readiness and admission are one atomic decision under the
-        // recovery lock: a suspect reported between a separate readiness
-        // check and the admission would otherwise let this preparation
-        // admit resources, create rings, and publish a grant into a
-        // recovery episode (KTD6: `Recovering` is unoffered). Custody of
-        // the exact admission charges moves into one lifecycle record
-        // before the candidate is exposed (KTD4).
-        let custody = self
-            .recovery
-            .admit_candidate_while_ready(candidate_id, &self.admission, &self.profile)
-            .ok_or(ProviderFailure::Unavailable)?;
+    pub(crate) fn prepare(
+        &self,
+        ingress: ByteBudget,
+        queue_frames: usize,
+        frame_deadline: Duration,
+    ) -> Result<PreparedRing, RingUnavailable> {
+        let admission = self
+            .admission
+            .admit(&self.profile, None)
+            .map_err(|_| RingUnavailable)?;
         self.preparations.fetch_add(1, Ordering::AcqRel);
-        let recovery = self.recovery.clone();
         let root = CancellationToken::new();
         let read_cancel = root.child_token();
-        let (sender, queue) = frame_sender(ctx.queue_frames, root.clone(), ctx.frame_deadline);
-        let (inbound_tx, inbound_rx) = mpsc::channel(ctx.queue_frames);
+        let (sender, queue) = frame_sender(queue_frames, root.clone(), frame_deadline);
+        let (inbound_tx, inbound_rx) = mpsc::channel(queue_frames);
         let (initialized_tx, initialized_rx) = std::sync::mpsc::sync_channel(1);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let profile = Arc::clone(&self.profile);
-        let ingress = ctx.ingress.clone();
-        let frame_deadline = ctx.frame_deadline;
         let worker_root = root.clone();
         let worker_read_cancel = read_cancel.clone();
-        let quarantine_next_close = Arc::clone(&self.quarantine_next_close);
         let publish_hook = self.publish_hook.lock().expect("publish hook lock").clone();
 
         let spawned = std::thread::Builder::new()
@@ -306,31 +183,24 @@ impl InjectedProvider for ShmProvider {
                     .build();
                 let rings = runtime
                     .as_ref()
-                    .map_err(|_| ProviderFailure::Unavailable)
-                    .and_then(|_| {
-                        DuplexRing::create(&profile).map_err(|_| ProviderFailure::Unavailable)
-                    });
+                    .map_err(|_| RingUnavailable)
+                    .and_then(|_| DuplexRing::create(&profile).map_err(|_| RingUnavailable));
                 let (runtime, rings) = match (runtime, rings) {
                     (Ok(runtime), Ok(rings)) => (runtime, rings),
                     _ => {
-                        let _ = initialized_tx.send(Err(ProviderFailure::Unavailable));
+                        let _ = initialized_tx.send(Err(RingUnavailable));
                         return;
                     }
                 };
-                let transfer = worker_descriptor(candidate_id, &rings);
+                let transfer = worker_descriptor(&rings);
                 let Ok((descriptor, descriptors)) = transfer else {
-                    let _ = initialized_tx.send(Err(ProviderFailure::Unavailable));
+                    let _ = initialized_tx.send(Err(RingUnavailable));
                     return;
                 };
                 if initialized_tx.send(Ok((descriptor, descriptors))).is_err() {
                     return;
                 }
-                // An endpoint panic is an unclean close: catching it here
-                // keeps this thread alive to take the quarantine branch
-                // below instead of letting `Admission`'s drop return the
-                // charges as clean capacity while ring mappings may still
-                // exist.
-                let clean = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     runtime.block_on(run_endpoint(
                         rings,
                         queue,
@@ -341,41 +211,28 @@ impl InjectedProvider for ShmProvider {
                         worker_read_cancel,
                         publish_hook,
                     ))
-                }))
-                .unwrap_or(false);
-                if clean && !quarantine_next_close.swap(false, Ordering::AcqRel) {
-                    let _ = custody.release();
-                } else {
-                    // Unclean close (or the forced test hook): the record
-                    // becomes a suspect and the recovery controller decides
-                    // between reclamation and isolation (KTD4).
-                    recovery.report_suspect(custody);
-                }
+                }));
+                admission.release();
                 let _ = done_tx.send(());
             });
         if spawned.is_err() {
-            return Err(ProviderFailure::Unavailable);
+            return Err(RingUnavailable);
         }
-        let (descriptor, descriptors) = initialized_rx
-            .recv()
-            .map_err(|_| ProviderFailure::Unavailable)??;
+        let (descriptor, descriptors) = initialized_rx.recv().map_err(|_| RingUnavailable)??;
         let receiver = BoxedReceiver::new(ShmReceiver {
             inbound: inbound_rx,
         });
         let io = Box::pin(async move {
             let _ = done_rx.await;
         });
-        Ok(PreparedCandidate {
+        Ok(PreparedRing {
             descriptor,
-            descriptors: Some(descriptors),
-            candidate_id,
-            candidate: Candidate {
-                sender,
-                receiver,
-                io,
-                root,
-                read_cancel,
-            },
+            descriptors,
+            sender,
+            receiver,
+            io,
+            root,
+            read_cancel,
         })
     }
 }
@@ -388,10 +245,7 @@ struct WireDescriptor {
     peer_to_host_grant: String,
 }
 
-fn worker_descriptor(
-    candidate_id: u64,
-    rings: &DuplexRing,
-) -> Result<(serde_json::Value, [OwnedFd; 2]), ()> {
+fn worker_descriptor(rings: &DuplexRing) -> Result<(serde_json::Value, [OwnedFd; 2]), ()> {
     let descriptor = WireDescriptor {
         profile: QUALIFIED_TEST_PROFILE.to_owned(),
         host_to_peer_grant: encode_hex(&rings.first.grant().encode()),
@@ -401,12 +255,10 @@ fn worker_descriptor(
         rings.first.attachment().map_err(|_| ())?.into_parts().0,
         rings.second.attachment().map_err(|_| ())?.into_parts().0,
     ];
-    let mut value = serde_json::to_value(descriptor).map_err(|_| ())?;
-    value
-        .as_object_mut()
-        .ok_or(())?
-        .insert("candidate_id".to_owned(), candidate_id.into());
-    Ok((value, descriptors))
+    Ok((
+        serde_json::to_value(descriptor).map_err(|_| ())?,
+        descriptors,
+    ))
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -685,35 +537,35 @@ impl io::Write for ReservationWriter<'_, '_> {
 }
 
 /// Thread-confined peer endpoint for integration tests.
-pub struct TestShmPeer {
+pub struct RingClientEndpoint {
     /// Peer-to-host producer direction.
     pub to_host: Ring,
     /// Host-to-peer consumer direction.
     pub from_host: Ring,
 }
 
-impl TestShmPeer {
+impl RingClientEndpoint {
     /// Rejects descriptor-only attachment because setup transfers ring
     /// ownership through `SCM_RIGHTS` rather than process-local descriptor
     /// numbers embedded in JSON.
-    pub fn attach(_descriptor: &serde_json::Value) -> Result<Self, TestPeerError> {
-        Err(TestPeerError)
+    pub fn attach(_descriptor: &serde_json::Value) -> Result<Self, RingClientError> {
+        Err(RingClientError)
     }
 
     /// Attaches a descriptor and its setup-socket file descriptors.
     pub fn attach_with_descriptors(
         descriptor: &serde_json::Value,
         descriptors: [OwnedFd; 2],
-    ) -> Result<Self, TestPeerError> {
+    ) -> Result<Self, RingClientError> {
         let mut descriptor = descriptor.clone();
         descriptor
             .as_object_mut()
-            .ok_or(TestPeerError)?
+            .ok_or(RingClientError)?
             .remove("candidate_id");
         let descriptor: WireDescriptor =
-            serde_json::from_value(descriptor).map_err(|_| TestPeerError)?;
+            serde_json::from_value(descriptor).map_err(|_| RingClientError)?;
         if descriptor.profile != QUALIFIED_TEST_PROFILE {
-            return Err(TestPeerError);
+            return Err(RingClientError);
         }
         let [from_host_fd, to_host_fd] = descriptors;
         let from_host = attach_ring(from_host_fd, &descriptor.host_to_peer_grant)?;
@@ -722,7 +574,7 @@ impl TestShmPeer {
     }
 
     /// Publishes one complete consumer frame.
-    pub fn send(&self, header: EnvelopeHeader, body: &[u8]) -> Result<(), TestPeerError> {
+    pub fn send(&self, header: EnvelopeHeader, body: &[u8]) -> Result<(), RingClientError> {
         let mut reservation = self
             .to_host
             .reserve_until(
@@ -730,64 +582,76 @@ impl TestShmPeer {
                 header.encode(),
                 StdInstant::now() + Duration::from_secs(2),
             )
-            .map_err(|_| TestPeerError)?;
-        reservation.write(body).map_err(|_| TestPeerError)?;
-        reservation.commit(body.len()).map_err(|_| TestPeerError)?;
+            .map_err(|_| RingClientError)?;
+        reservation.write(body).map_err(|_| RingClientError)?;
+        reservation
+            .commit(body.len())
+            .map_err(|_| RingClientError)?;
         Ok(())
     }
 
     /// Waits for one complete host frame and records its completion.
-    pub fn recv(&self, timeout: Duration) -> Result<(EnvelopeHeader, Vec<u8>), TestPeerError> {
+    pub fn recv(&self, timeout: Duration) -> Result<(EnvelopeHeader, Vec<u8>), RingClientError> {
         let deadline = StdInstant::now() + timeout;
         loop {
-            if let Some(lease) = self.from_host.try_receive().map_err(|_| TestPeerError)? {
-                let header = decode_header(&lease.wire_header()).map_err(|_| TestPeerError)?;
-                let body = lease.to_vec().map_err(|_| TestPeerError)?;
-                lease.release().map_err(|_| TestPeerError)?;
+            if let Some(lease) = self.from_host.try_receive().map_err(|_| RingClientError)? {
+                let header = decode_header(&lease.wire_header()).map_err(|_| RingClientError)?;
+                let body = lease.to_vec().map_err(|_| RingClientError)?;
+                lease.release().map_err(|_| RingClientError)?;
                 return Ok((header, body));
             }
             if StdInstant::now() >= deadline {
-                return Err(TestPeerError);
+                return Err(RingClientError);
             }
             std::thread::sleep(POLL_INTERVAL);
         }
     }
+
+    pub fn try_recv(&self) -> Result<Option<(EnvelopeHeader, Vec<u8>)>, RingClientError> {
+        let Some(lease) = self.from_host.try_receive().map_err(|_| RingClientError)? else {
+            return Ok(None);
+        };
+        let header = decode_header(&lease.wire_header()).map_err(|_| RingClientError)?;
+        let body = lease.to_vec().map_err(|_| RingClientError)?;
+        lease.release().map_err(|_| RingClientError)?;
+        Ok(Some((header, body)))
+    }
 }
 
-fn attach_ring(fd: OwnedFd, grant: &str) -> Result<Ring, TestPeerError> {
-    let grant = RingGrant::decode(decode_hex(grant)?).map_err(|_| TestPeerError)?;
-    Ring::attach(fd, grant, SchedulingMode::ColdParkWake).map_err(|_| TestPeerError)
+fn attach_ring(fd: OwnedFd, grant: &str) -> Result<Ring, RingClientError> {
+    let grant = RingGrant::decode(decode_hex(grant)?).map_err(|_| RingClientError)?;
+    Ring::attach(fd, grant, SchedulingMode::ColdParkWake).map_err(|_| RingClientError)
 }
 
-fn decode_hex<const N: usize>(text: &str) -> Result<[u8; N], TestPeerError> {
+fn decode_hex<const N: usize>(text: &str) -> Result<[u8; N], RingClientError> {
     if text.len() != N * 2 {
-        return Err(TestPeerError);
+        return Err(RingClientError);
     }
     let mut bytes = [0u8; N];
     for (index, byte) in bytes.iter_mut().enumerate() {
         *byte =
-            u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).map_err(|_| TestPeerError)?;
+            u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).map_err(|_| RingClientError)?;
     }
     Ok(bytes)
 }
 
 /// Redacted test-peer attachment or I/O failure.
 #[derive(Clone, Copy)]
-pub struct TestPeerError;
+pub struct RingClientError;
 
-impl fmt::Debug for TestPeerError {
+impl fmt::Debug for RingClientError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("TestPeerError(<redacted>)")
+        formatter.write_str("RingClientError(<redacted>)")
     }
 }
 
-impl fmt::Display for TestPeerError {
+impl fmt::Display for RingClientError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("shared-memory peer operation failed")
     }
 }
 
-impl std::error::Error for TestPeerError {}
+impl std::error::Error for RingClientError {}
 
 #[cfg(test)]
 mod tests {
@@ -795,25 +659,10 @@ mod tests {
     use crate::wire::{Flags, Priority, PROTOCOL_VERSION};
 
     #[test]
-    fn platform_preflight_is_side_effect_free() {
-        let provider = ShmProvider::for_qualified_test_profile(single_candidate_limits());
-        let expected = if cfg!(target_os = "linux") {
-            PreflightEligibility::Serveable
-        } else {
-            PreflightEligibility::StaticallyOmitted
-        };
-        assert_eq!(
-            provider.preflight(Some(&qualified_test_parameters())),
-            expected
-        );
-        assert_eq!(
-            provider.preflight(Some(&serde_json::json!({}))),
-            PreflightEligibility::StaticallyOmitted
-        );
-        assert_eq!(provider.readiness(), ProviderReadiness::Ready);
-        assert_eq!(provider.preparation_count(), 0);
-        assert_eq!(provider.recovery_cleanup_count(), 0);
-        let accounting = provider.accounting().unwrap();
+    fn construction_has_no_ring_side_effects() {
+        let transport = RingTransport::for_qualified_test_profile(single_candidate_limits());
+        assert_eq!(transport.preparation_count(), 0);
+        let accounting = transport.accounting().unwrap();
         assert_eq!(accounting.active, ResourceCharges::ZERO);
         assert_eq!(accounting.quarantined, ResourceCharges::ZERO);
     }

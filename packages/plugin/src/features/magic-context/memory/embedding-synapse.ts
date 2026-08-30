@@ -2,7 +2,11 @@ import { createHash, randomUUID } from "node:crypto";
 import { getDataDir } from "../../../shared/data-path";
 import { getHarness } from "../../../shared/harness";
 import { log } from "../../../shared/logger";
-import { isMcHostCallError, McHostClient } from "../../../shared/mc-host-client";
+import {
+    isMcHostCallError,
+    processMcHostClient,
+    resetProcessMcHostClientsForTest,
+} from "../../../shared/mc-host-client";
 import {
     type ConnectionOrigin,
     defaultConnectionFilePath,
@@ -548,11 +552,10 @@ function extractBatchItems(value: unknown): Array<Record<string, unknown>> {
     });
 }
 
+const factoryClients = new WeakMap<() => Promise<SynapseClientLike>, Promise<SynapseClientLike>>();
 let sharedClient: SynapseClientLike | null = null;
 let sharedClientFile: string | null = null;
 let sharedClientPromise: Promise<SynapseClientLike> | null = null;
-
-const factoryClients = new WeakMap<() => Promise<SynapseClientLike>, Promise<SynapseClientLike>>();
 
 async function getSharedClient(
     options: SynapseEmbeddingProviderOptions,
@@ -576,32 +579,23 @@ async function getSharedClient(
         return promise;
     }
     const file = options.connectionFile ?? defaultConnectionFile();
-    if (sharedClient && sharedClientFile === file) return sharedClient;
-    if (sharedClientPromise && sharedClientFile === file) return sharedClientPromise;
-    const promise = McHostClient.connect({
+    const promise = processMcHostClient({
         connectionFile: file,
         handshakeTimeoutMs: SYNAPSE_HANDSHAKE_TIMEOUT_MS,
-    }).then((client) => {
-        if (sharedClientPromise === promise && sharedClientFile === file) {
-            sharedClient = client;
-        } else {
-            // A connect for a different connection file superseded this one
-            // while it was in flight; close the orphan instead of leaking it
-            // or publishing it under the newer file's cache slot.
-            client.close();
-        }
-        return client;
-    });
-    promise.catch(() => {
-        // Evict only our own rejected promise so a later call can
-        // reconnect instead of reusing the poisoned one.
-        if (sharedClientPromise === promise) {
-            sharedClientPromise = null;
-            sharedClientFile = null;
-        }
     });
     sharedClientFile = file;
     sharedClientPromise = promise;
+    void promise.then(
+        (client) => {
+            if (sharedClientPromise === promise) sharedClient = client;
+        },
+        () => {
+            if (sharedClientPromise !== promise) return;
+            sharedClient = null;
+            sharedClientFile = null;
+            sharedClientPromise = null;
+        },
+    );
     return promise;
 }
 
@@ -1875,7 +1869,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
 }
 
 export function _resetSynapseClientForTests(): void {
-    sharedClient?.close();
+    resetProcessMcHostClientsForTest();
     sharedClient = null;
     sharedClientFile = null;
     sharedClientPromise = null;

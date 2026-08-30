@@ -8,6 +8,9 @@ use std::{
     collections::{HashMap, HashSet},
     error::Error,
     fmt,
+    io::Write as _,
+    os::fd::OwnedFd,
+    os::unix::net::UnixStream as StdUnixStream,
     path::Path,
     sync::{
         atomic::{AtomicBool, AtomicU8, Ordering},
@@ -18,8 +21,7 @@ use std::{
 
 use serde_json::Value;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    net::{unix::OwnedWriteHalf, UnixStream},
+    net::UnixStream,
     sync::{mpsc, oneshot},
     task::JoinHandle,
     time::{timeout_at, Instant},
@@ -30,14 +32,10 @@ use crate::{
     auth::authenticate_client,
     connection_file::{read_for_client, ConnectionInfo, DAEMON_ID_LEN},
     handler::{RouteHandle, RouteIdentity, RouteTarget, TargetKind},
-    transport_negotiation::{
-        decode_negotiate_response, encode_negotiate_request, NegotiateRequest, NegotiateResponse,
-        TransportOffer, NEGOTIATION_VERSION, TRANSPORT_TCP,
-    },
     wire::{
         decode_header, encode_owned_frame, pure_header_flags, AdmissionClass, EnvelopeHeader,
-        Flags, FrameId, FrameType, Priority, FROZEN_PREFIX_LEN, HEADER_LEN, MAX_BODY_LEN,
-        MAX_CONTROL_BODY_LEN, PROTOCOL_VERSION,
+        Flags, FrameId, FrameType, Priority, HEADER_LEN, MAX_BODY_LEN, MAX_CONTROL_BODY_LEN,
+        PROTOCOL_VERSION,
     },
 };
 
@@ -110,15 +108,9 @@ const CLIENT_DISCOVERY_SLOTS: usize = 64;
 static DISCOVERY_SLOTS: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(CLIENT_DISCOVERY_SLOTS)));
 
-const NEGOTIATION_CORRELATION: u64 = 1;
-const FIRST_APPLICATION_CORRELATION: u64 = 2;
+const FIRST_APPLICATION_CORRELATION: u64 = 1;
 const MAX_ERROR_CODE_BYTES: usize = 128;
 const MAX_ERROR_MESSAGE_BYTES: usize = 512;
-/// Read-side socket buffer for the wire read path. Matches the framing
-/// layer's `tcp_frame_channel` read buffer so the per-frame header-then-body
-/// reads coalesce into large socket reads instead of one syscall per field.
-const READ_BUFFER_BYTES: usize = 64 * 1024;
-
 /// Exact send-outcome classifications used by recovery policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendOutcome {
@@ -370,9 +362,20 @@ impl Client {
                 .map_err(|_| {
                     ClientError::new("authentication_failed", "daemon authentication failed")
                 })?;
-        negotiate_tcp(&mut stream, deadline).await?;
-
-        let (read, write) = stream.into_split();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let (descriptor, descriptors) =
+            crate::setup_socket::activate_client(&mut stream, remaining)
+                .await
+                .map_err(|_| ClientError::new("setup_failed", "shared-memory setup failed"))?;
+        let setup_stream = stream
+            .into_std()
+            .map_err(|_| ClientError::new("setup_failed", "shared-memory setup failed"))?;
+        setup_stream
+            .set_nonblocking(false)
+            .map_err(|_| ClientError::new("setup_failed", "shared-memory setup failed"))?;
+        let cancel = CancellationToken::new();
+        let (ring_tx, ring_rx) =
+            start_ring_bridge(descriptor, descriptors, setup_stream, cancel.clone())?;
         let (data_tx, data_rx) = mpsc::channel(CLIENT_DATA_QUEUE_FRAMES);
         let (control_tx, control_rx) = mpsc::channel(CLIENT_CONTROL_QUEUE_FRAMES);
         let inner = Arc::new(Inner {
@@ -380,7 +383,7 @@ impl Client {
             daemon_ver: authenticated.daemon_ver,
             closed: AtomicBool::new(false),
             retired: AtomicBool::new(false),
-            cancel: CancellationToken::new(),
+            cancel,
             correlations: Mutex::new(Correlations::new(FIRST_APPLICATION_CORRELATION)),
             admission: Mutex::new(()),
             pending: Mutex::new(HashMap::new()),
@@ -398,15 +401,11 @@ impl Client {
         });
         let writer_inner = Arc::clone(&inner);
         let writer = tokio::spawn(async move {
-            writer_loop(writer_inner, write, data_rx, control_rx).await;
+            writer_loop(writer_inner, ring_tx, data_rx, control_rx).await;
         });
         let reader_inner = Arc::clone(&inner);
         let reader = tokio::spawn(async move {
-            reader_loop(
-                reader_inner,
-                tokio::io::BufReader::with_capacity(READ_BUFFER_BYTES, read),
-            )
-            .await;
+            ring_reader_loop(reader_inner, ring_rx).await;
         });
         *inner.writer.lock().await = Some(writer);
         *inner.reader.lock().await = Some(reader);
@@ -1783,6 +1782,7 @@ impl ByteCharge {
     /// A zero-byte charge for bodiless frames. Holding one keeps every
     /// inbound frame's accounting uniform: an absent charge never reaches
     /// `dispatch`, so "no charge" cannot be misread as an exhausted budget.
+    #[cfg(test)]
     const fn none() -> Self {
         Self {
             owner: Weak::new(),
@@ -1825,9 +1825,90 @@ struct QueuedFrame {
     deadline: Instant,
 }
 
+struct RingWrite {
+    bytes: Vec<u8>,
+    completed: oneshot::Sender<Result<(), ()>>,
+}
+
+type RingWriteSender = std::sync::mpsc::SyncSender<RingWrite>;
+type RingFrameReceiver = mpsc::Receiver<(EnvelopeHeader, Vec<u8>)>;
+
+fn start_ring_bridge(
+    descriptor: serde_json::Value,
+    descriptors: [OwnedFd; 2],
+    mut setup: StdUnixStream,
+    cancel: CancellationToken,
+) -> Result<(RingWriteSender, RingFrameReceiver), ClientError> {
+    let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<RingWrite>(CLIENT_DATA_QUEUE_FRAMES);
+    let (read_tx, read_rx) = mpsc::channel(CLIENT_DATA_QUEUE_FRAMES);
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("mc-host-ring-client".to_owned())
+        .spawn(move || {
+            let endpoint = crate::ring_transport::RingClientEndpoint::attach_with_descriptors(
+                &descriptor,
+                descriptors,
+            );
+            let Ok(endpoint) = endpoint else {
+                let _ = ready_tx.send(Err(()));
+                return;
+            };
+            if ready_tx.send(Ok(())).is_err() {
+                return;
+            }
+            while !cancel.is_cancelled() {
+                match write_rx.try_recv() {
+                    Ok(write) => {
+                        let result = decode_outbound(&write.bytes)
+                            .and_then(|(header, body)| endpoint.send(header, body).map_err(|_| ()));
+                        let failed = result.is_err();
+                        let _ = write.completed.send(result);
+                        if failed {
+                            break;
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+                match endpoint.try_recv() {
+                    Ok(Some(frame)) => {
+                        if read_tx.blocking_send(frame).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => std::thread::sleep(Duration::from_micros(50)),
+                    Err(_) => break,
+                }
+            }
+            let body = br#"{"type":"goodbye"}"#;
+            let _ = setup.write_all(&(body.len() as u32).to_le_bytes());
+            let _ = setup.write_all(body);
+            let _ = setup.shutdown(std::net::Shutdown::Both);
+        })
+        .map_err(|_| ClientError::new("setup_failed", "shared-memory setup failed"))?;
+    ready_rx
+        .recv()
+        .map_err(|_| ClientError::new("setup_failed", "shared-memory setup failed"))?
+        .map_err(|_| ClientError::new("setup_failed", "shared-memory setup failed"))?;
+    Ok((write_tx, read_rx))
+}
+
+fn decode_outbound(bytes: &[u8]) -> Result<(EnvelopeHeader, &[u8]), ()> {
+    if bytes.len() < HEADER_LEN {
+        return Err(());
+    }
+    let header_bytes: &[u8; HEADER_LEN] = bytes[..HEADER_LEN].try_into().map_err(|_| ())?;
+    let header = decode_header(header_bytes).map_err(|_| ())?;
+    let body = &bytes[HEADER_LEN..];
+    if body.len() != header.len as usize {
+        return Err(());
+    }
+    Ok((header, body))
+}
+
 async fn writer_loop(
     inner: Arc<Inner>,
-    mut write: OwnedWriteHalf,
+    write: std::sync::mpsc::SyncSender<RingWrite>,
     mut data_rx: mpsc::Receiver<QueuedFrame>,
     mut control_rx: mpsc::Receiver<QueuedFrame>,
 ) {
@@ -1855,12 +1936,23 @@ async fn writer_loop(
         {
             continue;
         }
+        let (completed_tx, completed_rx) = oneshot::channel();
+        if write
+            .try_send(RingWrite {
+                bytes: frame.bytes,
+                completed: completed_tx,
+            })
+            .is_err()
+        {
+            inner.retire("write_failed");
+            break;
+        }
         let written = tokio::select! {
             biased;
             () = inner.cancel.cancelled() => break,
-            result = timeout_at(frame.deadline, write.write_all(&frame.bytes)) => result,
+            result = timeout_at(frame.deadline, completed_rx) => result,
         };
-        if !matches!(written, Ok(Ok(()))) {
+        if !matches!(written, Ok(Ok(Ok(())))) {
             inner.retire("write_failed");
             break;
         }
@@ -1872,140 +1964,24 @@ async fn writer_loop(
         }
         drop(frame.charge);
     }
-    let _ = write.shutdown().await;
 }
 
-async fn reader_loop<R: AsyncRead + Unpin>(inner: Arc<Inner>, mut read: R) {
-    loop {
-        let frame = match read_active_frame(&mut read, &inner).await {
-            Ok(Some(frame)) => frame,
-            Ok(None) => {
-                inner.retire("eof");
-                break;
-            }
-            Err(()) => {
-                inner.retire("protocol_violation");
-                break;
-            }
+async fn ring_reader_loop(inner: Arc<Inner>, mut read: mpsc::Receiver<(EnvelopeHeader, Vec<u8>)>) {
+    while let Some((header, body)) = read.recv().await {
+        if validate_inbound(&header).is_err() || body.len() != header.len as usize {
+            inner.retire("protocol_violation");
+            return;
+        }
+        let Some(charge) = inner.read_budget.charge(body.len()) else {
+            inner.retire("protocol_violation");
+            return;
         };
-        inner.dispatch(frame.header, frame.body, frame.charge);
+        inner.dispatch(header, body, charge);
         if inner.retired.load(Ordering::Acquire) {
-            break;
+            return;
         }
     }
-}
-
-struct InboundFrame {
-    header: EnvelopeHeader,
-    body: Vec<u8>,
-    /// Retained-budget accounting for `body`. A bodiless frame carries
-    /// `ByteCharge::none()`; a refused charge never constructs a frame at all
-    /// (`read_active_frame` drains and fails the connection instead).
-    charge: ByteCharge,
-}
-
-async fn read_active_frame<R: AsyncRead + Unpin>(
-    read: &mut R,
-    inner: &Arc<Inner>,
-) -> Result<Option<InboundFrame>, ()> {
-    let mut header_bytes = [0u8; HEADER_LEN];
-    let first = tokio::select! {
-        biased;
-        () = inner.cancel.cancelled() => return Err(()),
-        result = read.read(&mut header_bytes[..1]) => result.map_err(|_| ())?,
-    };
-    if first == 0 {
-        return Ok(None);
-    }
-    let deadline = Instant::now() + CLIENT_FRAME_TIMEOUT;
-    // Frozen-prefix discipline (§5): `len` and `ver` live in bytes 0..5, and an
-    // incompatible version is provable from them alone. Waiting for all 21 bytes
-    // first lets a peer that sends only the prefix hold this connection — and one
-    // of the owner's active slots — until the frame deadline, even though byte 4
-    // already proved the generation unusable. The host's reader splits the read
-    // for the same reason; see `tcp_frame_channel::read_frame`.
-    read_exact_until(
-        read,
-        &mut header_bytes[1..FROZEN_PREFIX_LEN],
-        deadline,
-        &inner.cancel,
-    )
-    .await?;
-    if header_bytes[4] != PROTOCOL_VERSION {
-        return Err(());
-    }
-    read_exact_until(
-        read,
-        &mut header_bytes[FROZEN_PREFIX_LEN..],
-        deadline,
-        &inner.cancel,
-    )
-    .await?;
-    let header = decode_header(&header_bytes).map_err(|_| ())?;
-    validate_inbound(&header)?;
-    if header.len == 0 {
-        return Ok(Some(InboundFrame {
-            header,
-            body: Vec::new(),
-            charge: ByteCharge::none(),
-        }));
-    }
-    // The reservation covers the framing maximum and belongs to the reader
-    // alone, so a valid frame is never refused because a consumer is holding
-    // queued bytes. A refusal here therefore means the header declared more than
-    // the framing maximum, which `validate_inbound` has already rejected — it
-    // survives only as the structural guard for that invariant.
-    let Some(charge) = inner.read_budget.charge(header.len as usize) else {
-        drain_until(read, header.len as usize, deadline, &inner.cancel).await?;
-        return Err(());
-    };
-    let body = read_body_until(read, header.len as usize, deadline, &inner.cancel).await?;
-    Ok(Some(InboundFrame {
-        header,
-        body,
-        charge,
-    }))
-}
-
-/// Fills `buf` under the frame deadline. Every stop is fatal to this generation:
-/// the client resynchronizes by reconnecting, never by guessing where the next
-/// header begins.
-async fn read_exact_until<R: AsyncRead + Unpin>(
-    read: &mut R,
-    buf: &mut [u8],
-    deadline: Instant,
-    cancel: &CancellationToken,
-) -> Result<(), ()> {
-    crate::frame_read::read_exact(read, buf, deadline, cancel)
-        .await
-        .map_err(|_| ())
-}
-
-/// Reads exactly `len` body bytes under one frame deadline.
-async fn read_body_until<R: AsyncRead + Unpin>(
-    read: &mut R,
-    len: usize,
-    deadline: Instant,
-    cancel: &CancellationToken,
-) -> Result<Vec<u8>, ()> {
-    let mut body = Vec::with_capacity(len);
-    crate::frame_read::read_body(read, &mut body, len, deadline, cancel)
-        .await
-        .map_err(|_| ())?;
-    Ok(body)
-}
-
-/// Discards a body this client refused to retain, so the failure is reported
-/// against a stream still aligned on a header boundary.
-async fn drain_until<R: AsyncRead + Unpin>(
-    read: &mut R,
-    remaining: usize,
-    deadline: Instant,
-    cancel: &CancellationToken,
-) -> Result<(), ()> {
-    crate::frame_read::drain(read, remaining, deadline, cancel)
-        .await
-        .map_err(|_| ())
+    inner.retire("eof");
 }
 
 /// Turns a caller-supplied timeout into an absolute deadline.
@@ -2089,7 +2065,7 @@ fn validate_inbound(header: &EnvelopeHeader) -> Result<(), ()> {
     }
     // Pure-header frames must set binary 0, last 0, and admission Normal, but
     // §6.1 permits any valid priority — matching the framing layer's own check
-    // in `tcp_frame_channel`. Comparing the whole flag byte would retire the
+    // in the host frame reader. Comparing the whole flag byte would retire the
     // generation over a conforming Ping that merely chose Interactive.
     if header.ty.is_pure_header()
         && (header.len != 0
@@ -2137,108 +2113,6 @@ fn encode_data_frame(
         ack: None,
         deadline,
     })
-}
-
-async fn negotiate_tcp(stream: &mut UnixStream, deadline: Instant) -> Result<(), ClientError> {
-    // One offers value feeds both the encoded request and response
-    // validation, so the selection is checked against exactly what was sent.
-    let request = NegotiateRequest {
-        negotiation_version: NEGOTIATION_VERSION,
-        offers: vec![TransportOffer {
-            transport: TRANSPORT_TCP.to_owned(),
-            capability_version: 1,
-            parameters: None,
-        }],
-    };
-    let body = encode_negotiate_request(&request)
-        .map_err(|_| ClientError::new("negotiation_failed", "transport negotiation failed"))?;
-    let bytes = encode_owned_frame(
-        FrameType::Request,
-        Flags::new(false, Priority::Interactive, false),
-        FrameId::control(NEGOTIATION_CORRELATION),
-        body,
-    )
-    .map_err(|_| ClientError::new("negotiation_failed", "transport negotiation failed"))?;
-    timeout_at(deadline, stream.write_all(&bytes))
-        .await
-        .map_err(|_| ClientError::new("handshake_timeout", "client handshake timed out"))?
-        .map_err(|_| ClientError::new("negotiation_failed", "transport negotiation failed"))?;
-    let frame = read_setup_frame(stream, deadline).await?;
-    // Channel 0 accepts UTF-8 JSON only (§7.1), so a binary setup response is a
-    // nonconforming generation even when its body happens to parse.
-    if frame.header.ty != FrameType::Response
-        || frame.header.channel != 0
-        || frame.header.epoch != 0
-        || frame.header.corr != NEGOTIATION_CORRELATION
-        || frame.header.flags.is_binary()
-    {
-        return Err(ClientError::new(
-            "negotiation_failed",
-            "transport negotiation failed closed",
-        ));
-    }
-    let selection = decode_negotiate_response(&frame.body, &request.offers).map_err(|_| {
-        ClientError::new("negotiation_failed", "transport negotiation failed closed")
-    })?;
-    if !matches!(selection, NegotiateResponse::Tcp { reason: None }) {
-        return Err(ClientError::new(
-            "negotiation_failed",
-            "transport negotiation failed closed",
-        ));
-    }
-    Ok(())
-}
-
-async fn read_setup_frame(
-    stream: &mut UnixStream,
-    deadline: Instant,
-) -> Result<InboundFrame, ClientError> {
-    let mut header_bytes = [0u8; HEADER_LEN];
-    // Frozen-prefix discipline: bytes 0..5 carry `len` and `ver`, and an
-    // incompatible version is provable from them alone. Reading all 21 bytes
-    // first lets a peer that sends 5 bytes and stops hold the handshake open to
-    // its whole deadline before the version is even inspected.
-    read_setup_exact(stream, &mut header_bytes[..FROZEN_PREFIX_LEN], deadline).await?;
-    if header_bytes[4] != PROTOCOL_VERSION {
-        return Err(ClientError::new(
-            "negotiation_failed",
-            "transport negotiation failed",
-        ));
-    }
-    read_setup_exact(stream, &mut header_bytes[FROZEN_PREFIX_LEN..], deadline).await?;
-    let header = decode_header(&header_bytes)
-        .map_err(|_| ClientError::new("negotiation_failed", "transport negotiation failed"))?;
-    // Negotiation is channel-zero control traffic, so §7.1's 65,536-byte cap
-    // applies — not the 64 MiB framing maximum. This path never reaches
-    // `validate_inbound`, so without the tighter check a malformed peer can make
-    // every connect attempt allocate roughly 64 MiB before the response is
-    // rejected.
-    if header.channel != 0 || header.len > MAX_CONTROL_BODY_LEN {
-        return Err(ClientError::new(
-            "negotiation_failed",
-            "transport negotiation failed",
-        ));
-    }
-    let mut body = vec![0u8; header.len as usize];
-    read_setup_exact(stream, &mut body, deadline).await?;
-    Ok(InboundFrame {
-        header,
-        body,
-        charge: ByteCharge::none(),
-    })
-}
-
-/// Reads exactly `buf.len()` setup bytes under the shared handshake deadline.
-async fn read_setup_exact(
-    stream: &mut UnixStream,
-    buf: &mut [u8],
-    deadline: Instant,
-) -> Result<(), ClientError> {
-    timeout_at(deadline, stream.read_exact(buf))
-        .await
-        .map_err(|_| ClientError::new("handshake_timeout", "client handshake timed out"))?
-        .map_err(|_| ClientError::new("negotiation_failed", "transport negotiation failed"))?;
-    Ok(())
 }
 
 fn route_open_body(target: &RouteTarget, identity: &RouteIdentity) -> Result<Vec<u8>, CallError> {
@@ -2389,7 +2263,6 @@ fn bounded_text(text: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::wire::response_flags;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn test_inner(
         queued_bytes: usize,
@@ -2613,18 +2486,15 @@ mod tests {
         assert!(!claim_for_write(&publish));
         assert!(control_rx.try_recv().is_err(), "not-sent needs no Cancel");
 
-        let (mut peer, socket) = UnixStream::pair().unwrap();
-        let (_read, write) = socket.into_split();
+        let (write, writes) = std::sync::mpsc::sync_channel(1);
         let writer_inner = Arc::clone(&inner);
         let writer = tokio::spawn(async move {
             writer_loop(writer_inner, write, data_rx, control_rx).await;
         });
-        let mut byte = [0u8; 1];
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), peer.read(&mut byte))
-                .await
-                .is_err(),
-            "cancel-winning queued request must write no frame bytes"
+            matches!(writes.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+            "cancel-winning queued request must publish no ring frame"
         );
         assert_eq!(inner.queue_budget.used(), 0);
         inner.cancel.cancel();
@@ -3624,90 +3494,6 @@ mod tests {
         assert_eq!(cancel.bytes[5], FrameType::Cancel as u8);
         inner.retire("test_done");
         drop(stream);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn idle_header_is_unbounded_then_partial_frame_has_one_deadline() {
-        let (inner, _data_rx, _control_rx) = test_inner(CLIENT_QUEUED_BYTES);
-        let (mut peer, mut reader) = tokio::io::duplex(64);
-        let task_inner = Arc::clone(&inner);
-        let task = tokio::spawn(async move { read_active_frame(&mut reader, &task_inner).await });
-
-        tokio::time::advance(Duration::from_secs(3_600)).await;
-        tokio::task::yield_now().await;
-        assert!(
-            !task.is_finished(),
-            "idle first-header wait must be unbounded"
-        );
-
-        peer.write_all(&[0]).await.expect("first header byte");
-        tokio::time::advance(CLIENT_FRAME_TIMEOUT - Duration::from_millis(1)).await;
-        tokio::task::yield_now().await;
-        assert!(!task.is_finished(), "partial frame keeps original deadline");
-        tokio::time::advance(Duration::from_millis(1)).await;
-        tokio::task::yield_now().await;
-        assert!(task.await.expect("reader task").is_err());
-    }
-
-    #[tokio::test]
-    async fn an_unsupported_version_fails_at_the_frozen_prefix() {
-        // Byte 4 of the frozen prefix already proves the generation unusable.
-        // Waiting for the remaining 16 header bytes lets a peer that sends five
-        // and stops hold this connection for the whole frame deadline, so the
-        // outer bound below is far shorter than `CLIENT_FRAME_TIMEOUT`: only a
-        // prefix-first rejection can satisfy it.
-        let (inner, _data_rx, _control_rx) = test_inner(CLIENT_QUEUED_BYTES);
-        let (mut peer, mut reader) = tokio::io::duplex(64);
-        let mut prefix = [0u8; FROZEN_PREFIX_LEN];
-        prefix[4] = PROTOCOL_VERSION.wrapping_add(1);
-        peer.write_all(&prefix).await.expect("frozen prefix");
-
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            read_active_frame(&mut reader, &inner),
-        )
-        .await
-        .expect("an unsupported version must be rejected on the prefix alone");
-        assert!(
-            result.is_err(),
-            "an unsupported envelope version is not a readable frame"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_oversize_negotiation_response_is_rejected_on_the_header() {
-        // Negotiation is channel-zero control traffic, so §7.1's 65,536-byte cap
-        // applies. This path never reaches `validate_inbound`, so without its own
-        // check the client accepts the header and allocates the declared body —
-        // roughly 64 MiB on every connect attempt. The peer below sends no body
-        // at all, so only a header-only rejection completes inside the bound.
-        let (mut stream, mut socket) = UnixStream::pair().unwrap();
-        let peer = tokio::spawn(async move {
-            let header = EnvelopeHeader {
-                len: MAX_CONTROL_BODY_LEN + 1,
-                ver: PROTOCOL_VERSION,
-                ty: FrameType::Response,
-                flags: response_flags(false, true),
-                channel: 0,
-                epoch: 0,
-                corr: NEGOTIATION_CORRELATION,
-            }
-            .encode();
-            socket.write_all(&header).await.unwrap();
-            socket
-        });
-
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(1),
-            read_setup_frame(&mut stream, Instant::now() + CLIENT_HANDSHAKE_TIMEOUT),
-        )
-        .await
-        .expect("the header alone proves the violation; no body wait");
-        let Err(error) = outcome else {
-            panic!("an oversize control body is rejected");
-        };
-        assert_eq!(error.code(), "negotiation_failed");
-        drop(peer.await);
     }
 
     #[tokio::test]

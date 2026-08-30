@@ -30,7 +30,7 @@ export function isMcHostCallError(error: unknown): error is McHostCallError {
  *
  * - `not_sent`: the request bytes provably never reached `socket.write()`.
  *   Policy may issue one fresh RPC.
- * - `outcome_unknown`: any byte may have reached the socket and no matching
+ * - `outcome_unknown`: a frame may have been published and no matching
  *   terminal was observed. Never safe to replay generically.
  * - `terminal`: a matching terminal Error (or non-retryable setup failure)
  *   was observed; it applies only to that correlation.
@@ -41,13 +41,6 @@ export type McHostCallErrorKind = "not_sent" | "outcome_unknown" | "terminal";
 export class McHostCallError extends Error {
     /** The facade attaches `cleanup` when a caller abort produces this error. */
     cleanup?: Promise<void>;
-
-    /**
-     * Captured only during transport negotiation, which replaces
-     * peer-controlled Error terminals with a bounded failure before
-     * exposing them to callers.
-     */
-    errorTerminal?: { bodyText: string | null; flags: number; streamed: boolean };
 
     /** Host-advised delay before retrying this operation. */
     retry_after_ms?: number;

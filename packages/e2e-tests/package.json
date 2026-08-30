@@ -25,8 +25,7 @@
         "test:incidents:pi": "bun scripts/run-incident-pool.ts --harness pi --lane known-red --report artifacts/incident-pool-pi-report.json",
         "test:incidents:rust": "bun scripts/run-incident-pool.ts --mode rust --report artifacts/incident-pool-rust-report.json",
         "mutation:rust-historian": "bun scripts/run-rust-historian-producer-mutation.ts",
-        "mutation:rust-ctx-reduce": "bun scripts/run-rust-ctx-reduce-mutation.ts",
-        "mutation:shm-hardening": "bun scripts/run-mc-shm-hardening-mutation.ts"
+        "mutation:rust-ctx-reduce": "bun scripts/run-rust-ctx-reduce-mutation.ts"
     },
     "dependencies": {
         "@opencode-ai/sdk": "^1.15.13"

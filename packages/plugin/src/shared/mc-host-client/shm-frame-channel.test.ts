@@ -3,10 +3,10 @@ import {
     NativeChannel,
     type NativeReceiveLease,
     probeCapabilities,
-    QUALIFIED_TEST_PROFILE,
 } from "@cortexkit/mc-shm-native";
 import { ConnectionGeneration } from "./connection";
 import { Deadline } from "./deadline";
+import { McHostCallError } from "./errors";
 import {
     ByteBudget,
     type FrameChannelCloseReason,
@@ -18,17 +18,17 @@ import {
     type EnvelopeHeader,
     encodeHeader,
     FrameType,
+    MAX_FRAME_BODY_LEN,
     PROTOCOL_VERSION,
 } from "./protocol";
 import { ShmFrameChannel } from "./shm-frame-channel";
-import { createExplicitShmTestProvider } from "./shm-transport-provider";
 import {
     type ContractPeerFrame,
     type FrameChannelContractFactory,
     frameChannelContractScenarios,
     runFrameChannelContractScenario,
+    waitUntil,
 } from "./test-support/frame-channel-contract";
-import { waitUntil } from "./test-support/test-util";
 
 function responseHeader(ty: FrameType, corr: bigint, length: number, flags = 0): EnvelopeHeader {
     return {
@@ -61,8 +61,6 @@ async function generationHarness(): Promise<{
     const pair = NativeChannel.createTestPair();
     let channel: ShmFrameChannel | undefined;
     const generation = new ConnectionGeneration({
-        host: "127.0.0.1",
-        port: 1,
         credentials: { key: new Uint8Array(32), daemonId: new Uint8Array(16), daemonVer: "test" },
         channelFactory: ({ budget, handlers }) => {
             channel = new ShmFrameChannel({
@@ -79,9 +77,9 @@ async function generationHarness(): Promise<{
     return { generation, channel, peer: pair.second };
 }
 
-const shmContractFactory: FrameChannelContractFactory = async () => {
+const shmContractFactory: FrameChannelContractFactory = async (overrides = {}) => {
     const pair = NativeChannel.createTestPair();
-    const budget = new ByteBudget(128 * 1024 * 1024);
+    const budget = new ByteBudget(overrides.memoryCapBytes ?? 128 * 1024 * 1024);
     const frames: ContractPeerFrame[] = [];
     const received: { header: EnvelopeHeader; body: Uint8Array }[] = [];
     const closes: { reason: FrameChannelCloseReason; error: unknown }[] = [];
@@ -93,7 +91,7 @@ const shmContractFactory: FrameChannelContractFactory = async () => {
     const channel = new ShmFrameChannel({
         nativeChannel: pair.first,
         budget,
-        maxBodyLen: 1 << 20,
+        maxBodyLen: overrides.maxBodyLen ?? MAX_FRAME_BODY_LEN,
         handlers: {
             onFrame: (frame) => {
                 if (hook.current?.(frame)) return;
@@ -193,16 +191,19 @@ const shmContractFactory: FrameChannelContractFactory = async () => {
     };
 };
 
-const SHM_CONTRACT_SCENARIOS = new Set([
-    "concurrent send and receive preserve FIFO order",
-    "publication and local completion fire exactly once, in order",
-    "underfill, overflow, and abort return reservations without publication",
-    "owned receive adapter copies once after transport lease release",
-]);
-
 describe("frame channel semantic contract (shared-memory factory)", () => {
+    const scenarios = new Set([
+        "concurrent send and receive preserve FIFO order",
+        "publication and local completion fire exactly once, in order",
+        "byte saturation refuses admission at the aggregate cap",
+        "coalesced frames deliver in order without recursive re-entry",
+        "bounded producers commit empty, boundary, segmented, and large bodies exactly",
+        "underfill, overflow, and abort return reservations without publication",
+        "owned receive adapter copies once after transport lease release",
+        "close revokes active receive aliases before storage reuse",
+    ]);
     for (const scenario of frameChannelContractScenarios) {
-        if (!SHM_CONTRACT_SCENARIOS.has(scenario.name)) continue;
+        if (!scenarios.has(scenario.name)) continue;
         test(scenario.name, async () => {
             if (!probeCapabilities().available) return;
             await runFrameChannelContractScenario(scenario, shmContractFactory);
@@ -210,17 +211,7 @@ describe("frame channel semantic contract (shared-memory factory)", () => {
     }
 });
 
-describe("explicit shared-memory provider", () => {
-    test("omits unsupported and non-qualified profiles without registration", () => {
-        expect(createExplicitShmTestProvider("production-default")).toBeUndefined();
-        const provider = createExplicitShmTestProvider(QUALIFIED_TEST_PROFILE);
-        expect(provider === undefined).toBe(!probeCapabilities().available);
-        if (provider) {
-            expect(provider.transport).toBe("shm");
-            expect(provider.capabilityVersion).toBe(1);
-        }
-    });
-
+describe("mandatory shared-memory channel", () => {
     test("propagates JSON and binary leases without owned-adapter copies", async () => {
         if (!probeCapabilities().available) return;
         const { generation, channel, peer } = await generationHarness();
@@ -429,6 +420,7 @@ describe("explicit shared-memory provider", () => {
         let nativeCloseCalls = 0;
         const nativeLease = {
             header: encodeHeader(responseHeader(FrameType.Response, 1n, 5)),
+            byteLength: 5,
             segmentCount: 1,
             segment: () => new Uint8Array(Buffer.from("maybe")),
             release: () => {
@@ -546,5 +538,179 @@ describe("explicit shared-memory provider", () => {
         expect(channel.isClosed()).toBe(true);
         expect(alias?.byteLength).toBe(0);
         pair.second.close();
+    });
+
+    test("wrong version is rejected before publication and role-invalid input closes", async () => {
+        if (!probeCapabilities().available) return;
+        const pair = NativeChannel.createTestPair();
+        const encoded = encodeHeader(responseHeader(FrameType.Response, 1n, 0));
+        encoded[4] = PROTOCOL_VERSION + 1;
+        expect(() => pair.second.produce(encoded, 0, () => {})).toThrow();
+        expect(pair.first.poll(() => {})).toBe(false);
+        pair.first.close();
+        pair.second.close();
+
+        const rolePair = NativeChannel.createTestPair();
+        const closes: FrameChannelCloseReason[] = [];
+        const channel = new ShmFrameChannel({
+            nativeChannel: rolePair.first,
+            budget: new ByteBudget(1024),
+            maxBodyLen: 1 << 20,
+            handlers: {
+                onFrame: () => {},
+                onClosed: (reason) => closes.push(reason),
+            },
+        });
+        channel.beginFrames();
+        publish(rolePair.second, responseHeader(FrameType.Request, 1n, 0), new Uint8Array());
+        await waitUntil(() => closes.length === 1);
+        expect(closes).toEqual(["role_violation"]);
+        expect(channel.isClosed()).toBe(true);
+        rolePair.second.close();
+    });
+
+    test("correlations settle out of order without crossing requests", async () => {
+        if (!probeCapabilities().available) return;
+        const { generation, peer } = await generationHarness();
+        try {
+            const first = generation.request({
+                channel: 7,
+                epoch: 1,
+                body: Buffer.from("{}"),
+                deadline: Deadline.start(2_000),
+            });
+            const firstSent = take(peer);
+            firstSent.release();
+            const second = generation.request({
+                channel: 7,
+                epoch: 1,
+                body: Buffer.from("{}"),
+                deadline: Deadline.start(2_000),
+            });
+            const secondSent = take(peer);
+            secondSent.release();
+            expect(second.correlation).toBe(first.correlation + 1n);
+
+            publish(
+                peer,
+                responseHeader(FrameType.Response, second.correlation, 12),
+                Buffer.from('{"id":"two"}'),
+            );
+            publish(
+                peer,
+                responseHeader(FrameType.Response, first.correlation, 12),
+                Buffer.from('{"id":"one"}'),
+            );
+            expect((await first.result).body).toMatchObject({ value: { id: "one" } });
+            expect((await second.result).body).toMatchObject({ value: { id: "two" } });
+        } finally {
+            generation.retire("owner_close");
+            peer.close();
+        }
+    });
+
+    test("deadline after ring publication is outcome_unknown and late terminal is dropped", async () => {
+        if (!probeCapabilities().available) return;
+        const { generation, peer } = await generationHarness();
+        try {
+            const request = generation.request({
+                channel: 7,
+                epoch: 1,
+                body: Buffer.from("{}"),
+                deadline: Deadline.start(20),
+            });
+            take(peer).release();
+            await expect(request.result).rejects.toMatchObject({
+                kind: "outcome_unknown",
+                code: "deadline_expired",
+            });
+
+            publish(
+                peer,
+                responseHeader(FrameType.Response, request.correlation, 2),
+                Buffer.from("{}"),
+            );
+            await waitUntil(() => generation.stats().droppedFrames === 1);
+            expect(generation.isRetired()).toBe(false);
+        } finally {
+            generation.retire("owner_close");
+            peer.close();
+        }
+    });
+
+    test("abort after ring publication is outcome_unknown and cleanup waits for terminal", async () => {
+        if (!probeCapabilities().available) return;
+        const { generation, peer } = await generationHarness();
+        try {
+            const request = generation.request({
+                channel: 7,
+                epoch: 1,
+                body: Buffer.from("{}"),
+                deadline: Deadline.start(2_000),
+            });
+            take(peer).release();
+            const cleanup = request.abort().cleanup;
+            await expect(request.result).rejects.toMatchObject({ kind: "outcome_unknown" });
+            publish(
+                peer,
+                responseHeader(FrameType.Response, request.correlation, 2),
+                Buffer.from("{}"),
+            );
+            await cleanup;
+            expect(generation.stats().pendingRequests).toBe(0);
+        } finally {
+            generation.retire("owner_close");
+            peer.close();
+        }
+    });
+
+    test("connection Goodbye makes possible sends unknown and later sends not_sent", async () => {
+        if (!probeCapabilities().available) return;
+        const { generation, peer } = await generationHarness();
+        try {
+            const request = generation.request({
+                channel: 7,
+                epoch: 1,
+                body: Buffer.from("{}"),
+                deadline: Deadline.start(2_000),
+            });
+            take(peer).release();
+            publish(
+                peer,
+                {
+                    len: 0,
+                    ver: PROTOCOL_VERSION,
+                    ty: FrameType.Goodbye,
+                    flags: 0,
+                    channel: 0,
+                    epoch: 0,
+                    corr: 0n,
+                },
+                new Uint8Array(),
+            );
+            await expect(request.result).rejects.toMatchObject({ kind: "outcome_unknown" });
+            const info = await generation.retired;
+            expect(info.reason).toBe("connection_goodbye");
+            expect(() =>
+                generation.request({
+                    channel: 7,
+                    epoch: 1,
+                    body: Buffer.from("{}"),
+                    deadline: Deadline.start(2_000),
+                }),
+            ).toThrow(McHostCallError);
+            try {
+                generation.request({
+                    channel: 7,
+                    epoch: 1,
+                    body: Buffer.from("{}"),
+                    deadline: Deadline.start(2_000),
+                });
+            } catch (error) {
+                expect(error).toMatchObject({ kind: "not_sent", code: "connection_retired" });
+            }
+        } finally {
+            peer.close();
+        }
     });
 });

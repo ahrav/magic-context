@@ -3,10 +3,12 @@
 mod lifecycle;
 mod napi_buffers;
 mod scheduling;
+mod setup;
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -36,6 +38,15 @@ pub struct NativeTestPair {
     pub arena_bytes: u32,
 }
 
+#[napi(object)]
+pub struct NativeSetupOptions {
+    pub setup_socket: String,
+    pub key: Buffer,
+    pub daemon_id: Buffer,
+    pub daemon_ver: String,
+    pub timeout_ms: u32,
+}
+
 struct ActiveLease {
     identity: ReleaseIdentity,
     buffers: Vec<ExternalRef>,
@@ -57,6 +68,7 @@ struct Channel {
     next_producer: u32,
     next_lease: u32,
     closed: bool,
+    setup: Option<UnixStream>,
     // Held for its Drop: releasing the process-wide claim exactly when the
     // channel entry is removed keeps quarantined and alias-holding entries
     // reserved for as long as their mapping lives.
@@ -325,6 +337,9 @@ fn detach_producer(
 
 fn close_channel(env: &Env, channel: &mut Channel) -> Result<()> {
     channel.closed = true;
+    if let Some(mut setup) = channel.setup.take() {
+        setup::goodbye(&mut setup);
+    }
     let producer_tokens: Vec<u32> = channel.producers.keys().copied().collect();
     for token in producer_tokens {
         detach_producer(env, channel, token)?.abort();
@@ -536,11 +551,64 @@ pub fn attach(env: &Env, descriptor: Unknown<'_>) -> Result<u32> {
                     next_producer: 0,
                     next_lease: 0,
                     closed: false,
+                    setup: None,
                     _reservation: Some(reservation),
                 },
             )
         })
     }
+}
+
+#[napi]
+pub fn connect_setup(env: &Env, options: NativeSetupOptions) -> Result<u32> {
+    let connected = setup::connect(
+        std::path::Path::new(&options.setup_socket),
+        options.key.as_ref(),
+        options.daemon_id.as_ref(),
+        &options.daemon_ver,
+        Duration::from_millis(u64::from(options.timeout_ms)),
+    )
+    .map_err(|_| error("shared-memory setup failed"))?;
+    if connected.host_to_peer_grant == connected.peer_to_host_grant {
+        return Err(descriptor_error());
+    }
+    let reservation = GrantReservation::claim(
+        connected.host_to_peer_grant.encode().to_vec(),
+        connected.peer_to_host_grant.encode().to_vec(),
+    )?;
+    let from_host = Ring::attach(
+        connected.host_to_peer_fd,
+        connected.host_to_peer_grant,
+        SchedulingMode::ColdParkWake,
+    )
+    .map_err(|_| error("shared-memory attachment failed"))?;
+    let to_host = Ring::attach(
+        connected.peer_to_host_fd,
+        connected.peer_to_host_grant,
+        SchedulingMode::ColdParkWake,
+    )
+    .map_err(|_| error("shared-memory attachment failed"))?;
+    REGISTRY.with(|registry| {
+        let mut registry = registry
+            .try_borrow_mut()
+            .map_err(|_| error("native channel is busy"))?;
+        ensure_cleanup(env, &mut registry)?;
+        insert_channel(
+            &mut registry,
+            Channel {
+                producers: HashMap::new(),
+                active: HashMap::new(),
+                stranded: Vec::new(),
+                to_host: Box::new(to_host),
+                from_host,
+                next_producer: 0,
+                next_lease: 0,
+                closed: false,
+                setup: Some(connected.stream),
+                _reservation: Some(reservation),
+            },
+        )
+    })
 }
 
 #[napi]
@@ -579,6 +647,7 @@ pub fn create_test_pair(env: &Env) -> Result<NativeTestPair> {
                     next_producer: 0,
                     next_lease: 0,
                     closed: false,
+                    setup: None,
                     // Test pairs attach freshly created local rings, never a
                     // host descriptor, so no process-wide grant is claimed.
                     _reservation: None,
@@ -595,6 +664,7 @@ pub fn create_test_pair(env: &Env) -> Result<NativeTestPair> {
                     next_producer: 0,
                     next_lease: 0,
                     closed: false,
+                    setup: None,
                     _reservation: None,
                 },
             )?;

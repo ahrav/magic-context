@@ -1,8 +1,8 @@
 import {
     NativeChannel,
-    type NativeDescriptor,
     type NativeProducerReservation,
     type NativeReceiveLease,
+    type NativeSetupOptions,
     type ProducerCursor,
 } from "@cortexkit/mc-shm-native";
 import type { Deadline } from "./deadline";
@@ -16,16 +16,33 @@ import {
     type FrameChannelStats,
     type FrameSendHooks,
     type FrameSendTicket,
+    headerViolation,
     type OutboundFrame,
     type ProducerFrameHeader,
     ReceiveLease,
     type SetupFrameChannel,
 } from "./frame-channel";
-import { decodeHeader, type EnvelopeHeader, encodeHeader, HEADER_LEN } from "./protocol";
+import {
+    decodeHeader,
+    type EnvelopeHeader,
+    encodeHeader,
+    HEADER_LEN,
+    PROTOCOL_VERSION,
+} from "./protocol";
+
+class InboundFrameError extends Error {
+    constructor(
+        readonly reason: "protocol_violation" | "role_violation",
+        message: string,
+    ) {
+        super(message);
+    }
+}
 
 export interface ShmFrameChannelOptions {
-    descriptor?: NativeDescriptor;
+    /** Injected only by unit tests; production attaches through `setup`. */
     nativeChannel?: NativeChannel;
+    setup?: NativeSetupOptions;
     budget: ByteBudget;
     maxBodyLen: number;
     handlers: FrameChannelHandlers;
@@ -41,13 +58,9 @@ export class ShmFrameChannel implements SetupFrameChannel {
     private heldBytes = 0;
 
     constructor(private readonly options: ShmFrameChannelOptions) {
-        if (!options.nativeChannel && !options.descriptor) {
+        if (!options.nativeChannel && !options.setup) {
             throw new Error("shared-memory channel requires an attachment");
         }
-        // Attachment I/O (fd opens, grant validation, mappings) belongs in
-        // the deadline-raced start() phase per the provider contract, so a
-        // descriptor is only recorded here; a pre-attached channel carries
-        // no attachment I/O and is adopted directly.
         this.native = options.nativeChannel ?? null;
     }
 
@@ -56,10 +69,15 @@ export class ShmFrameChannel implements SetupFrameChannel {
             throw new McHostCallError("not_sent", "shared-memory channel closed");
         }
         if (!this.native) {
+            const setup = this.options.setup;
+            if (!setup) throw new Error("shared-memory setup is missing");
             if (deadline.remainingMs() <= 0) {
                 throw new McHostCallError("not_sent", "shared-memory setup deadline expired");
             }
-            this.native = NativeChannel.attach(this.options.descriptor as NativeDescriptor);
+            this.native = NativeChannel.connectSetup({
+                ...setup,
+                timeoutMs: Math.max(1, Math.ceil(deadline.remainingMs())),
+            });
         }
     }
 
@@ -78,7 +96,7 @@ export class ShmFrameChannel implements SetupFrameChannel {
         this.assertBodyBounds(body.byteLength);
         // The native ring's fixed capacity is not the configured aggregate
         // cap: admission consults the shared budget so an over-cap body is
-        // refused with `memory_cap`, exactly like the TCP channel. The
+        // refused with `memory_cap`. The
         // charge covers the synchronous publication window and is returned
         // once the ring owns the bytes.
         const reservedBytes = HEADER_LEN + body.byteLength;
@@ -303,6 +321,22 @@ export class ShmFrameChannel implements SetupFrameChannel {
             while (
                 this.attached().poll((nativeLease: NativeReceiveLease) => {
                     const header = decodeHeader(nativeLease.header);
+                    const violation = headerViolation(header);
+                    const structuralError =
+                        header.ver !== PROTOCOL_VERSION
+                            ? "unsupported protocol version"
+                            : header.len !== nativeLease.byteLength
+                              ? "ring frame length mismatch"
+                              : header.len > this.options.maxBodyLen
+                                ? "ring frame exceeds configured body limit"
+                                : null;
+                    if (structuralError !== null || violation !== null) {
+                        nativeLease.release();
+                        throw new InboundFrameError(
+                            violation?.reason ?? "protocol_violation",
+                            structuralError ?? violation?.detail ?? "invalid ring frame",
+                        );
+                    }
                     const segments = Array.from({ length: nativeLease.segmentCount }, (_, index) =>
                         nativeLease.segment(index),
                     );
@@ -330,7 +364,10 @@ export class ShmFrameChannel implements SetupFrameChannel {
                 })
             ) {}
         } catch (error) {
-            this.options.handlers.onClosed("protocol_violation", error);
+            this.options.handlers.onClosed(
+                error instanceof InboundFrameError ? error.reason : "protocol_violation",
+                error,
+            );
             try {
                 this.close();
             } catch {

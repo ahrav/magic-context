@@ -58,6 +58,17 @@ pub struct GrantMessage<'a> {
     pub descriptor: &'a serde_json::Value,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum OwnedGrantMessage {
+    Grant {
+        wire_version: u8,
+        descriptor_schema: u16,
+        activation_token: String,
+        descriptor: serde_json::Value,
+    },
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ClientMessage {
@@ -282,6 +293,59 @@ pub async fn activate_server(
         ClientMessage::Commit => write_message(stream, &ServerMessage::Committed, deadline).await,
         _ => Err(SetupError::InvalidMessage),
     }
+}
+
+/// Receives, validates, and commits the sole current ring on a client setup socket.
+pub async fn activate_client(
+    stream: &mut UnixStream,
+    timeout: Duration,
+) -> Result<(serde_json::Value, [OwnedFd; RING_DESCRIPTOR_COUNT]), SetupError> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or(SetupError::Timeout)?;
+    let (value, descriptors) = receive_grant(stream, deadline).await?;
+    let OwnedGrantMessage::Grant {
+        wire_version,
+        descriptor_schema,
+        activation_token,
+        descriptor,
+    } = serde_json::from_value(value).map_err(|_| SetupError::InvalidMessage)?;
+    if wire_version != crate::wire::PROTOCOL_VERSION
+        || descriptor_schema != mc_shm_transport::descriptor::DESCRIPTOR_SCHEMA_VERSION
+    {
+        return Err(SetupError::InvalidIdentity);
+    }
+    write_message(
+        stream,
+        &ClientMessage::Activate {
+            wire_version,
+            descriptor_schema,
+            activation_token,
+        },
+        deadline,
+    )
+    .await?;
+    if !matches!(
+        read_message(stream, deadline).await?,
+        ServerMessage::Activated
+    ) {
+        return Err(SetupError::InvalidMessage);
+    }
+    write_message(stream, &ClientMessage::Commit, deadline).await?;
+    if !matches!(
+        read_message(stream, deadline).await?,
+        ServerMessage::Committed
+    ) {
+        return Err(SetupError::InvalidMessage);
+    }
+    Ok((descriptor, descriptors))
+}
+
+/// Sends the only legal post-commit setup message.
+pub async fn goodbye_client(stream: &mut UnixStream) {
+    let deadline = Instant::now() + Duration::from_millis(100);
+    let _ = write_message(stream, &ClientMessage::Goodbye, deadline).await;
+    let _ = stream.shutdown().await;
 }
 
 /// Waits for the only legal post-commit setup message or peer EOF.

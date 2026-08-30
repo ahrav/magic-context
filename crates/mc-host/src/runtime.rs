@@ -101,7 +101,7 @@ pub struct HostShared<H> {
     /// Last completed sanitized component health snapshot. Authenticated
     /// `host.status` reads this without invoking a lifecycle callback.
     pub health_snapshot: RwLock<HealthReport>,
-    pub providers: crate::transport_provider::TransportProviders,
+    pub ring: Arc<crate::ring_transport::RingTransport>,
     pub registry: RouteRegistry,
     /// Admits inbound frame bodies. The only budget with a blocking
     /// consumer, so nothing whose lifetime outlives a request may draw on it.
@@ -857,6 +857,10 @@ pub async fn run<H: McHostHandler>(
 
     drop(manifests);
 
+    let ring_limits = crate::ring_transport::process_limits(config.limits.max_connections)
+        .ok_or_else(|| {
+            HostError::InitFailed("shared-memory resource limits overflow".to_owned())
+        })?;
     let shared = Arc::new(HostShared {
         handler,
         limits: config.limits.clone(),
@@ -869,7 +873,9 @@ pub async fn run<H: McHostHandler>(
             detail: None,
             metrics: Some(serde_json::json!({"components": {}})),
         }),
-        providers: config.transport_providers.clone(),
+        ring: Arc::new(
+            crate::ring_transport::RingTransport::for_qualified_test_profile(ring_limits),
+        ),
         registry: RouteRegistry::new(config.limits.max_routes),
         ingress_budget: ByteBudget::new(
             config.limits.max_resident_bytes

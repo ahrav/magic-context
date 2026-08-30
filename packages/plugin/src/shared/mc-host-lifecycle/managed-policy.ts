@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import payloadIndex from "../../../../../release/mc-host-payload-index.json";
-import { McHostClient } from "../mc-host-client";
+import { processMcHostClient } from "../mc-host-client";
 import { BootstrapError, checkPlatform, type PlatformReaders, parseTrustIndex } from "./bootstrap";
 import {
     type PayloadTrustIndex,
@@ -38,9 +38,8 @@ async function probeManagedStorage(
     budgetMs: number,
 ): Promise<"ready" | "starting" | "unavailable"> {
     const deadline = Date.now() + budgetMs;
-    let client: McHostClient | null = null;
     try {
-        client = await McHostClient.connect({
+        const client = await processMcHostClient({
             connectionFile: connectionFilePath(root),
             handshakeTimeoutMs: Math.max(1, budgetMs),
             requestTimeoutMs: Math.max(1, budgetMs),
@@ -63,73 +62,67 @@ async function probeManagedStorage(
         }
     } catch {
         return Date.now() >= deadline ? "starting" : "unavailable";
-    } finally {
-        await client?.closeAsync().catch(() => {});
     }
 }
 
 async function probeManagedReadiness(root: string, budgetMs: number): Promise<ObservationalHealth> {
     const deadline = Date.now() + budgetMs;
-    const client = await McHostClient.connect({
+    const client = await processMcHostClient({
         connectionFile: connectionFilePath(root),
         handshakeTimeoutMs: Math.max(1, budgetMs),
         requestTimeoutMs: Math.max(1, budgetMs),
     });
-    try {
-        const authenticated = client.authenticated;
-        if (authenticated === null) throw new Error("authenticated peer disappeared");
-        const status = await client.hostStatus({
-            timeoutMs: Math.max(1, deadline - Date.now()),
-        });
-        const components = asRecord(status.metrics.components);
-        const storage = storageState(status.metrics);
-        const synapseMetrics = asRecord(asRecord(components?.synapse)?.metrics);
-        const synapseState = synapseMetrics?.synapse_state;
-        const synapse =
-            synapseState === "ready"
-                ? { state: "ready" as const, reason: "healthy" as const }
-                : synapseState === "unsupported"
-                  ? {
+    const authenticated = client.authenticated;
+    if (authenticated === null) throw new Error("authenticated peer disappeared");
+    const status = await client.hostStatus({
+        timeoutMs: Math.max(1, deadline - Date.now()),
+    });
+    const components = asRecord(status.metrics.components);
+    const storage = storageState(status.metrics);
+    const synapseMetrics = asRecord(asRecord(components?.synapse)?.metrics);
+    const synapseState = synapseMetrics?.synapse_state;
+    const synapse =
+        synapseState === "ready"
+            ? { state: "ready" as const, reason: "healthy" as const }
+            : synapseState === "unsupported"
+              ? {
+                    state: "unsupported" as const,
+                    reason: "synapse_unsupported" as const,
+                }
+              : synapseState === "starting"
+                ? { state: "starting" as const, reason: "synapse_starting" as const }
+                : synapseState === undefined
+                  ? // The status payload omits a component whose state it
+                    // cannot report: the daemon skips any module missing from
+                    // `components`, missing a usable `status`, or missing its
+                    // state key. Absence means the lane is not offered, so it
+                    // reports `unsupported` — the one non-failing readiness
+                    // state, which `addCheck` maps to a skipped check. Calling
+                    // it `degraded` would make `status` and `doctor` answer
+                    // `ok: false` for a daemon that is serving correctly and
+                    // simply has no Synapse lane, which is the normal shape on
+                    // every platform the model lane does not cover.
+                    {
                         state: "unsupported" as const,
                         reason: "synapse_unsupported" as const,
                     }
-                  : synapseState === "starting"
-                    ? { state: "starting" as const, reason: "synapse_starting" as const }
-                    : synapseState === undefined
-                      ? // The status payload omits a component whose state it
-                        // cannot report: the daemon skips any module missing from
-                        // `components`, missing a usable `status`, or missing its
-                        // state key. Absence means the lane is not offered, so it
-                        // reports `unsupported` — the one non-failing readiness
-                        // state, which `addCheck` maps to a skipped check. Calling
-                        // it `degraded` would make `status` and `doctor` answer
-                        // `ok: false` for a daemon that is serving correctly and
-                        // simply has no Synapse lane, which is the normal shape on
-                        // every platform the model lane does not cover.
-                        {
-                            state: "unsupported" as const,
-                            reason: "synapse_unsupported" as const,
-                        }
-                      : { state: "degraded" as const, reason: "synapse_degraded" as const };
-        return {
-            authenticatedPeer: authenticated,
-            readiness: {
-                transport: { state: "ready", reason: "healthy" },
-                storage: {
-                    state: storage,
-                    reason:
-                        storage === "ready"
-                            ? "healthy"
-                            : storage === "starting"
-                              ? "storage_starting"
-                              : "storage_unavailable",
-                },
-                synapse,
+                  : { state: "degraded" as const, reason: "synapse_degraded" as const };
+    return {
+        authenticatedPeer: authenticated,
+        readiness: {
+            transport: { state: "ready", reason: "healthy" },
+            storage: {
+                state: storage,
+                reason:
+                    storage === "ready"
+                        ? "healthy"
+                        : storage === "starting"
+                          ? "storage_starting"
+                          : "storage_unavailable",
             },
-        };
-    } finally {
-        await client.closeAsync().catch(() => {});
-    }
+            synapse,
+        },
+    };
 }
 
 export interface ManagedLifecyclePolicyOptions

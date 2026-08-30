@@ -494,8 +494,7 @@ fn golden_grant_fixture_matches_the_frozen_ring_profile_encoding() {
     assert_eq!(
         text,
         GOLDEN_GRANT_HEX.replace(char::is_whitespace, ""),
-        "the checked-in fixture bytes moved; update the copy of this hex in \
-         packages/plugin/src/shared/mc-host-client/shm-transport-provider.test.ts too"
+        "the checked-in fixture bytes moved unexpectedly"
     );
     let grant = RingGrant::decode_slice(&bytes).expect("golden grant fixture decodes");
     assert_eq!(
