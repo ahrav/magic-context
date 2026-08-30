@@ -347,3 +347,145 @@ U7 (Wave 3 correctness items) is now complete.
   exclusions unchanged), then U10 (Wave 5 anchors, awe-bead fixture
   excluded), then U11 (ledger finalization, full final-HEAD gate,
   comment-policy sweep over the branch diff).
+
+## Fourth execution run (resume #3, interrupted) + final run (resume #4)
+
+The fourth run landed five U8 commits, then was cancelled mid-C13. The final
+run recovered C13 and closed out the branch.
+
+### Completed — U8 (both runs)
+
+- features CC-1(b/d) (`c63bc0c7`): shared child-session fetch
+  (`child-session-spawn.ts`) and provider-failure rethrow
+  (`provider-output-failure.ts`) helpers across 11 dreamer/mural/sidekick/
+  smart-notes/user-memory callers.
+- features T2-3 (`9c21acdf`): frozen-set CAS writers merged through a widened
+  `casUpdateJsonArrayColumn` (`IS ?` retained).
+- pi F-8 (`6fbb64c0`): CLI pure-forwarding path aliases collapsed onto their
+  implementations.
+- M10 (`b10513a0`): project embedding registration control flow
+  single-sourced; pi-plugin bootstrap delegates to the plugin implementation.
+- shared T2-2 (`47865008`): migration comparator backed by the shared JSONC
+  strip pipeline, with a 120-line differential test before the swap.
+- hooks C13 (`c7b10e99`, recovery): the module wire `method` union declared
+  once (`ModuleAuthorityMethod` / `ModuleMethod` / `ModuleStateSyncMethod` in
+  `module-wire.ts`); transport `call`, `authorityRequest`, and the state-sync
+  client interface all point at it. Recovery review caught two defects in the
+  interrupted edit: (1) `"authority.drain_flip"` had been dropped from the
+  union (live method — Rust dispatcher `mc-module/src/lib.rs:12276`); restored
+  as a direct `ModuleMethod` member since the authority helper never carried
+  it. (2) The type-level subset test lived in a `*.test.ts` file that tsc
+  excludes and `bun test` type-strips (inert); the compile-time guards moved
+  into `module-wire.ts` source where `tsc --noEmit` checks them.
+- Lint restoration (`0f03c42d`): the five interrupted-run commits had landed
+  with format/import-order lint failures in 17 files; mechanical fix, no
+  behavior change.
+- features T2-5 (`1d4bd4cb`): fork resolved empirically to the
+  absorbed-into-args reading — `hasExplicitUserEvidence` enforces the
+  origin-revision-only rule from closed bead `m3t` (regression test at
+  `storage-claim-policy.test.ts:592-612` observed), every production mint
+  passes `sourceTrustClass` explicitly or defaults `model_inference`, and no
+  rewrite path retains a row's `source_type`. `source-trust.ts` + test
+  deleted; the conditional lost-call bug bead was not needed.
+- hooks C16 (`768e98f5`): per-run drain-cap trio folded into
+  `PER_RUN_CAP_TIERS`; five boundary tests (tier edges at 80/95, per-term
+  regimes, monotone no-shrink property, out-of-domain fallback) written and
+  observed green against the old implementation first.
+- hooks C17+C18 (`e5333a59`): `resolveOrdinalsForModule` takes a
+  `ModuleOrdinalMemo` bundle projected once by `ordinalMemoOf(state)` (call
+  sites collapse 4×9 fields); the two `buildTransformBody` calls share a
+  hoisted `transformBodyBase` with `fullArrayFingerprint` deliberately
+  per-site (the retry rebuilds `pendingWireCache` first). Reviewer verified no
+  hoisted source mutates between the two builds.
+- tests CC-4 (`de7c731d`): the five drifted fake-peer frame helpers (incl.
+  `bodyJson`, added on review) consolidated into
+  `test-support/fake-peer.ts`; `sendErrorBody` standardized on the
+  extra-field superset (default `{}` keeps the transport suite's error frames
+  byte-identical). No assertion removed (TRACKED shb honored).
+
+### Wire-sensitivity evidence
+
+`bun run test:rust-e2e` on this host fails a fixed 15-test environment set
+(mc-host native lifecycle / historian / failure-drill classes; recorded in
+run logs). Three full runs — after C13, after C17/C18, after CC-4 — produced
+byte-identical failure sets (diff-verified), and the C13 diff is type-only
+(erased at runtime), so no wire regression is attributable to this branch.
+
+### Final-HEAD full gate (U11)
+
+- `bun run typecheck`: green. `bun run lint`: green. `bun run lint:rust`:
+  green.
+- `scripts/test-rust.sh`: 1391/1393 pass; 2 failures
+  (`mc-host::lifecycle delayed_lifecycle_callback_runs_shutdown_once_…`,
+  `mc-host::shm_transport unavailable_outranks_capability_mismatch_…`) are
+  load-dependent timeout flakes in the recorded mc-host environment class —
+  both pass in isolation (verified this run); no Rust code changed on this
+  branch since the recorded baseline.
+- `sh scripts/test-shard.sh packages/plugin`: 31 failures = the recorded
+  31-failure baseline (isolation re-check: `policy.test.ts` 28,
+  `module-transport.test.ts` 2, `storage-claim-operations-crash.test.ts` 1;
+  the shard run redistributes 9 policy-class environment failures into
+  `paths.test.ts` via the known directory-run interference — `paths.test.ts`
+  is fully green in isolation).
+- pi-plugin (793), cli (387), retina-local-fs (26): all green.
+- Comment-policy sweep over `git diff main...HEAD` code paths: no tracking,
+  temporal, or review-narration comments added by this branch.
+
+### Dropped-stale — these runs
+
+None. (The two C13 recovery defects were errors in the in-flight edit, not
+stale audit findings.)
+
+### Residuals — cut under the final-resume budget rule (complete list)
+
+U8 items not executed, still open audit work:
+
+- tests CC-3: `useTempDataHome`/teardown factory consolidation (31 + 17
+  copies, est. −410 LOC) into `shared/test-support/temp-data-home.ts`.
+- tests CC-5: e2e mock-provider body/session helpers (~15 copies, est. −120
+  LOC) into `cache-analysis.ts` / `pi-harness.ts` / `scripted-tool-call.ts`.
+- pi F-7: `logs-opencode.ts`/`logs-pi.ts` issue-bundling consolidation with
+  the asymmetric-redaction decision; logs-pi test first per plan.
+- mc-module T2-2: the two publication fences (predicate + string delta).
+- mc-module T2-4: historian producer-failure handling in the drive loop
+  (preserve the `cancellation_confirmed_stopped` asymmetry).
+
+U10 (Wave 5 drift anchors) skipped entirely per the final-resume provision:
+all §7 anchors remain open (v2 envelope vectors fixture, `max_frame_body_len`
+contract entry ×3, auth handshake/`computeProof` vectors, handshake deadline
+budget pin, `epochs.claim_mirror` entry + Rust assert, X7 `ctx_memory`
+schema spec, X6 parity tests; claim-payload round-trip fixture stays
+bead-gated per KTD8). New sibling from C13 review: nothing pins the TS
+`ModuleMethod` union against the mc-module Rust dispatch arms — the
+`drain_flip` drop would have been caught by exactly such an anchor; fold into
+the U10 work when it runs.
+
+Carried residuals from earlier runs (unchanged): X1 orchestration
+unification (parity gate landed); T2-1 `SessionLruCache<E>` consolidation
+(7 members incl. `TransformSnapshotCache`); CC-2 sibling drift
+(`notes`/`source_contents`/`pending_ops` copies); shared T2-3
+`CONFLICT_WARNING_MARKER` single-sourcing; X2 residual literals; features
+T2-2 review observations. KTD10/KTD7/KTD11/KTD8 exclusions unchanged; tests
+T2-1 deletion still awaits human sign-off.
+
+Workspace notes: the two stale top-level strays named in the resume brief
+(`docs/research/.beads-guard.txt`, `docs/research/MERGED.md`) were deleted;
+the other untracked top-level `docs/research/*.md` duplicates and the
+`undefined/` test-artifact directory predate this run and were left
+untouched (not offered for cleanup).
+
+### Review dispositions — final run
+
+- C13 recovery: 2 HIGH (drain_flip drop; inert type test), 1 MEDIUM
+  (comment citing a nonexistent test), 2 LOW (import order; dead constraint
+  prose) — all applied.
+- T2-5: verification-detail review, no findings; deletion confirmed safe on
+  all three trace questions.
+- C16: 1 LOW (fallback tests) + 2 nits (comment wording, catch-all
+  duplication) — tests and wording applied; the `?? last-tier` fallback kept
+  alongside `minUsagePercentage: 0` because `find` still types as
+  `T | undefined` and NaN fails every `>=`.
+- C17/C18: 1 LOW applied (ModuleOrdinalMemo aliasing sentence: the resolver
+  mutates `entries` in place — pass the live Map, never a copy).
+- CC-4: 1 MEDIUM applied (`bodyJson` moved too), 1 LOW applied
+  (`routeChannel`/`routeEpoch` rename + header-vs-body doc).
