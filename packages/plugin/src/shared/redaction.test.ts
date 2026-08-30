@@ -2,8 +2,8 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { hasShareabilitySensitiveText, redactSecretText } from "./redaction";
 import vocabulary from "./fixtures/redaction-vocabulary-v1.json";
+import { hasShareabilitySensitiveText, redactSecretText } from "./redaction";
 
 describe("redaction vocabulary fixture", () => {
     test("matches the cross-runtime redacted output", () => {
@@ -18,11 +18,8 @@ describe("redaction vocabulary fixture", () => {
     });
 
     test("preserves scalar exemptions and documents known misses", () => {
-        for (const exemption of vocabulary.exemptions) {
-            expect(redactSecretText(exemption)).toBe(exemption);
-        }
-        for (const knownMiss of vocabulary.known_misses) {
-            expect(redactSecretText(knownMiss)).toBe(knownMiss);
+        for (const unchanged of [...vocabulary.exemptions, ...vocabulary.known_misses]) {
+            expect(redactSecretText(unchanged)).toBe(unchanged);
         }
     });
 });
