@@ -2,9 +2,9 @@
 use mc_store::kernel::schema::apply_kernel_schema_with_fault_hook_for_test;
 use mc_store::kernel::schema::{
     apply_kernel_connection_profile, apply_kernel_schema, kernel_schema_digest,
-    kernel_schema_inventory, KERNEL_APPLICATION_ID, KERNEL_SCHEMA_COMPONENT_NAMES,
+    kernel_schema_inventory, verify_kernel_connection_contract, KERNEL_APPLICATION_ID,
+    KERNEL_SCHEMA_COMPONENT_NAMES,
 };
-use mc_store::sqlite_runtime::verify_sqlite_connection_contract;
 use rusqlite::{params, Connection};
 
 const EXPECTED_COMPONENTS: &[&str] = &[
@@ -75,11 +75,21 @@ fn kernel_schema_has_one_ordered_full_shape() {
         .all(|name| !name.starts_with("sqlite_")));
 }
 
+const PINNED_SCHEMA_DIGEST: &str =
+    "bc9a2b9d8a63fa552e117a420bdd7a7e362da09064fc24919c5c5f777b8b4f53";
+
+#[test]
+fn kernel_schema_digest_is_pinned_to_the_frozen_v1_shape() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).expect("bootstrap");
+    assert_eq!(kernel_schema_digest(&conn).unwrap(), PINNED_SCHEMA_DIGEST);
+}
+
 #[test]
 fn kernel_profile_is_strict_and_verified() {
     let (_dir, conn) = open_profiled();
     assert_eq!(
-        verify_sqlite_connection_contract(&conn, true, 5_000).unwrap(),
+        verify_kernel_connection_contract(&conn, 5_000).unwrap(),
         Vec::<String>::new()
     );
 }
@@ -205,30 +215,49 @@ fn consumers_checkpoint_independent_outbox_positions() {
     )
     .unwrap();
     let commit_seq = conn.last_insert_rowid();
+    for ordinal in 0..2 {
+        conn.execute(
+            "INSERT INTO outbox(
+                 commit_seq, ordinal, object_id, object_kind, source_kind, source_id,
+                 source_revision, sensitivity_class, payload, created_at
+             ) VALUES (?1, ?2, 'object-1', 'test', 'test', 'root', 1, 'internal', X'01', 2)",
+            params![commit_seq, ordinal],
+        )
+        .unwrap();
+    }
+    let latest_position = conn.last_insert_rowid();
     conn.execute(
-        "INSERT INTO outbox(
-             commit_seq, ordinal, object_id, object_kind, source_kind, source_id,
-             source_revision, sensitivity_class, payload, created_at
-         ) VALUES (?1, 0, 'object-1', 'test', 'test', 'root', 1, 'internal', X'01', 2)",
-        [commit_seq],
+        "INSERT INTO outbox_consumers(consumer_id, checkpoint_outbox_position, updated_at)
+         VALUES ('search', ?1, 3), ('mirror', 0, 3)",
+        params![latest_position - 1],
     )
     .unwrap();
-    let outbox_position = conn.last_insert_rowid();
+
     conn.execute(
-        "INSERT INTO outbox_consumers(
-             consumer_id, checkpoint_outbox_position, updated_at
-         ) VALUES ('search', ?1, 3)",
-        params![outbox_position],
+        "UPDATE outbox_consumers SET checkpoint_outbox_position = ?1
+         WHERE consumer_id = 'search'",
+        params![latest_position],
     )
     .unwrap();
+
+    let checkpoint = |conn: &Connection, consumer: &str| -> i64 {
+        conn.query_row(
+            "SELECT checkpoint_outbox_position FROM outbox_consumers WHERE consumer_id = ?1",
+            [consumer],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(checkpoint(&conn, "search"), latest_position);
+    assert_eq!(checkpoint(&conn, "mirror"), 0);
     assert_eq!(
         conn.query_row(
-            "SELECT checkpoint_outbox_position FROM outbox_consumers WHERE consumer_id = 'search'",
+            "SELECT MIN(checkpoint_outbox_position) FROM outbox_consumers",
             [],
             |row| row.get::<_, i64>(0),
         )
         .unwrap(),
-        outbox_position
+        0
     );
 }
 
@@ -277,8 +306,18 @@ fn normal_synchronous_mode_fails_kernel_verification() {
     let (_dir, conn) = open_profiled();
     conn.pragma_update(None, "synchronous", "NORMAL").unwrap();
     assert_eq!(
-        verify_sqlite_connection_contract(&conn, true, 5_000).unwrap(),
+        verify_kernel_connection_contract(&conn, 5_000).unwrap(),
         vec!["synchronous mode 1 is not FULL or EXTRA [2, 3]".to_string()]
+    );
+}
+
+#[test]
+fn trusted_schema_on_fails_kernel_verification() {
+    let (_dir, conn) = open_profiled();
+    conn.pragma_update(None, "trusted_schema", "ON").unwrap();
+    assert_eq!(
+        verify_kernel_connection_contract(&conn, 5_000).unwrap(),
+        vec!["trusted_schema is enabled".to_string()]
     );
 }
 

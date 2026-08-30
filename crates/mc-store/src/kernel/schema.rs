@@ -164,7 +164,30 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
 ];
 
-const _: () = assert!(COMPONENTS.len() == KERNEL_SCHEMA_COMPONENT_NAMES.len());
+const fn component_names_match() -> bool {
+    if COMPONENTS.len() != KERNEL_SCHEMA_COMPONENT_NAMES.len() {
+        return false;
+    }
+    let mut index = 0;
+    while index < COMPONENTS.len() {
+        let a = COMPONENTS[index].0.as_bytes();
+        let b = KERNEL_SCHEMA_COMPONENT_NAMES[index].as_bytes();
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut byte = 0;
+        while byte < a.len() {
+            if a[byte] != b[byte] {
+                return false;
+            }
+            byte += 1;
+        }
+        index += 1;
+    }
+    true
+}
+
+const _: () = assert!(component_names_match());
 
 pub fn apply_kernel_connection_profile(
     conn: &mut Connection,
@@ -173,12 +196,39 @@ pub fn apply_kernel_connection_profile(
     if !conn.is_autocommit() {
         return Err(rusqlite::Error::InvalidQuery);
     }
-    conn.pragma_update(None, "journal_mode", "WAL")?;
+    // `PRAGMA journal_mode` returns the resulting mode; reject a mode other than WAL.
+    let journal_mode: String =
+        conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
     conn.pragma_update(None, "synchronous", "FULL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "trusted_schema", "OFF")?;
     conn.pragma_update(None, "busy_timeout", busy_timeout_ms)?;
     Ok(())
+}
+
+/// Enforce kernel-only synchronous (FULL or EXTRA) and trusted_schema (off)
+/// requirements in addition to the shared SQLite contract. Returns every
+/// violation (empty = pass).
+pub fn verify_kernel_connection_contract(
+    conn: &Connection,
+    min_busy_timeout_ms: i64,
+) -> rusqlite::Result<Vec<String>> {
+    let mut violations =
+        crate::sqlite_runtime::verify_sqlite_connection_contract(conn, true, min_busy_timeout_ms)?;
+    let synchronous: i64 = conn.query_row("PRAGMA synchronous", [], |row| row.get(0))?;
+    if !(2..=3).contains(&synchronous) {
+        violations.push(format!(
+            "synchronous mode {synchronous} is not FULL or EXTRA [2, 3]"
+        ));
+    }
+    let trusted_schema: i64 = conn.query_row("PRAGMA trusted_schema", [], |row| row.get(0))?;
+    if trusted_schema != 0 {
+        violations.push("trusted_schema is enabled".to_string());
+    }
+    Ok(violations)
 }
 
 pub fn apply_kernel_schema(
@@ -197,8 +247,7 @@ fn apply_schema<F: FnOnce() -> rusqlite::Result<()>>(
 ) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
     tx.pragma_update(None, "application_id", KERNEL_APPLICATION_ID)?;
-    for ((name, sql), expected) in COMPONENTS.iter().zip(KERNEL_SCHEMA_COMPONENT_NAMES) {
-        debug_assert_eq!(name, expected);
+    for (_, sql) in COMPONENTS {
         tx.execute_batch(sql)?;
     }
     tx.execute("INSERT INTO writer_fence(id) VALUES(0)", [])?;
