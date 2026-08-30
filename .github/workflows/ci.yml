@@ -233,7 +233,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: ahrav/commons
-          ref: 34b0cae2d2ea7e181222c3d8b1957e394eb1dc2c
+          ref: 77cd36b9cb8bde762d2b39d4807bb1c0338ed927
           path: commons
           persist-credentials: false
 

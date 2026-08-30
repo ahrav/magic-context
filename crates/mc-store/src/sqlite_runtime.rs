@@ -47,7 +47,11 @@ pub fn probe_sqlite_engine_identity_off_path() -> rusqlite::Result<SqliteEngineI
     read_sqlite_engine_identity(&conn)
 }
 
-fn parse_dotted_version(version: &str) -> Option<[u64; 3]> {
+pub fn format_dotted_version(version: [u64; 3]) -> String {
+    format!("{}.{}.{}", version[0], version[1], version[2])
+}
+
+pub fn parse_dotted_version(version: &str) -> Option<[u64; 3]> {
     let mut parts = version.trim().split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
@@ -94,8 +98,9 @@ pub fn evaluate_sqlite_runtime_gate(identity: &SqliteEngineIdentity) -> Vec<Stri
     match parse_dotted_version(&identity.sqlite_version) {
         Some(version) if version >= MIN_SUPPORTED_SQLITE_VERSION => {}
         _ => reasons.push(format!(
-            "SQLite {} is below the supported floor 3.51.3",
-            identity.sqlite_version
+            "SQLite {} is below the supported floor {}",
+            identity.sqlite_version,
+            format_dotted_version(MIN_SUPPORTED_SQLITE_VERSION)
         )),
     }
     if !is_well_formed_source_id(&identity.sqlite_source_id) {

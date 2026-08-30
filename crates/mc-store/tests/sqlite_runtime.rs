@@ -4,9 +4,10 @@
 
 use mc_store::sqlite_runtime::{
     compute_marker_digest, compute_schema_manifest_digest, evaluate_sqlite_runtime_gate,
-    probe_sqlite_engine_identity_off_path, verify_sqlite_connection_contract, SqliteEngineIdentity,
-    DIRECT_FORMAT_EPOCH, DIRECT_FORMAT_MARKER_TABLE, FORMAT_MARKER_DIGEST_PROTOCOL,
-    MC_APPLICATION_ID, MIN_SUPPORTED_SQLITE_VERSION, SCHEMA_MANIFEST_PROTOCOL,
+    format_dotted_version, parse_dotted_version, probe_sqlite_engine_identity_off_path,
+    verify_sqlite_connection_contract, SqliteEngineIdentity, DIRECT_FORMAT_EPOCH,
+    DIRECT_FORMAT_MARKER_TABLE, FORMAT_MARKER_DIGEST_PROTOCOL, MC_APPLICATION_ID,
+    MIN_SUPPORTED_SQLITE_VERSION, SCHEMA_MANIFEST_PROTOCOL,
 };
 use rusqlite::Connection;
 use serde_json::Value;
@@ -69,12 +70,7 @@ fn sqlite_runtime_source() {
     );
     assert_eq!(
         fixture["minSqliteVersion"].as_str().unwrap(),
-        format!(
-            "{}.{}.{}",
-            MIN_SUPPORTED_SQLITE_VERSION[0],
-            MIN_SUPPORTED_SQLITE_VERSION[1],
-            MIN_SUPPORTED_SQLITE_VERSION[2]
-        )
+        format_dotted_version(MIN_SUPPORTED_SQLITE_VERSION)
     );
 
     // Manifest shape and digest parity through the canonical line encoding.
@@ -115,6 +111,16 @@ fn sqlite_runtime_source() {
             .to_string(),
     };
     assert!(evaluate_sqlite_runtime_gate(&safe).is_empty());
+    for above_floor in ["3.51.10", "3.52.0"] {
+        let newer = SqliteEngineIdentity {
+            sqlite_version: above_floor.to_string(),
+            ..safe.clone()
+        };
+        assert!(
+            evaluate_sqlite_runtime_gate(&newer).is_empty(),
+            "{above_floor} is above the floor and must pass"
+        );
+    }
     let unsafe_bundled = SqliteEngineIdentity {
         sqlite_version: "3.46.0".to_string(),
         sqlite_source_id:
@@ -123,7 +129,10 @@ fn sqlite_runtime_source() {
     };
     assert_eq!(
         evaluate_sqlite_runtime_gate(&unsafe_bundled),
-        vec!["SQLite 3.46.0 is below the supported floor 3.51.3".to_string()]
+        vec![format!(
+            "SQLite 3.46.0 is below the supported floor {}",
+            format_dotted_version(MIN_SUPPORTED_SQLITE_VERSION)
+        )]
     );
     let unknown_source = SqliteEngineIdentity {
         sqlite_version: "3.51.3".to_string(),
@@ -137,13 +146,20 @@ fn sqlite_runtime_source() {
         ]
     );
 
-    // The dependency pin and runtime gate must agree on SQLite 3.51.3.
+    // The bundled engine is checked against the floor the gate enforces, not
+    // against one pinned release, so a newer amalgamation still passes.
     let live = probe_sqlite_engine_identity_off_path().expect("off-path probe");
     println!(
         "live bundled engine: sqlite_version={} sqlite_source_id={}",
         live.sqlite_version, live.sqlite_source_id
     );
-    assert_eq!(live.sqlite_version, "3.51.3");
+    let live_version = parse_dotted_version(&live.sqlite_version).expect("live version parses");
+    assert!(
+        live_version >= MIN_SUPPORTED_SQLITE_VERSION,
+        "bundled engine {} is below the floor {}",
+        live.sqlite_version,
+        format_dotted_version(MIN_SUPPORTED_SQLITE_VERSION)
+    );
     let live_reasons = evaluate_sqlite_runtime_gate(&live);
     assert!(
         live_reasons.is_empty(),
