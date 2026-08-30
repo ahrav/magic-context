@@ -239,6 +239,8 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: taiki-e/install-action@nextest
+
       - name: Store tests against real commons
         run: cargo test -p mc-store
 
@@ -250,6 +252,12 @@ jobs:
             --test broca_subprocess \
             --test harness_closure \
             --test protocol_vectors
+
+      # token_cache::test_cache_guard serializes the tests that share the
+      # process-global cache, so this suite is correct under either runner.
+      - name: Module transform and token-cache proofs (Linux)
+        if: runner.os == 'Linux'
+        run: cargo nextest run -p mc-module --lib
 
       - name: Native module adapter and CLI lifecycle (Linux)
         if: runner.os == 'Linux'

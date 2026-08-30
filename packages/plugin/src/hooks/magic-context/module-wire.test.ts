@@ -115,12 +115,14 @@ describe("resolveOrdinalsForModule provisional tails", () => {
             const first = await resolveOrdinalsForModule({
                 sessionId,
                 messages,
-                generation: 1,
-                memoGeneration: 1,
-                memo,
-                memoAnchor: { timeCreated: 500, id: "m-500" },
-                memoStoredCount: 500,
-                memoCanonicalCount: 500,
+                memo: {
+                    generation: 1,
+                    memoGeneration: 1,
+                    entries: memo,
+                    anchor: { timeCreated: 500, id: "m-500" },
+                    storedCount: 500,
+                    canonicalCount: 500,
+                },
                 provisionalBase: 500,
             });
             expect(first.ok).toBe(true);
@@ -153,12 +155,14 @@ describe("resolveOrdinalsForModule provisional tails", () => {
             const resolved = await resolveOrdinalsForModule({
                 sessionId,
                 messages,
-                generation: 1,
-                memoGeneration: 1,
-                memo: new Map(),
-                memoAnchor: null,
-                memoStoredCount: 0,
-                memoCanonicalCount: 0,
+                memo: {
+                    generation: 1,
+                    memoGeneration: 1,
+                    entries: new Map(),
+                    anchor: null,
+                    storedCount: 0,
+                    canonicalCount: 0,
+                },
                 provisionalBase: 97,
             });
             expect(resolved.ok).toBe(true);
@@ -216,12 +220,14 @@ describe("resolveOrdinalsForModule provisional tails", () => {
             const reconciled = await resolveOrdinalsForModule({
                 sessionId: result.sessionId,
                 messages: result.messages,
-                generation: 1,
-                memoGeneration: result.first.memoGeneration,
-                memo: result.memo,
-                memoAnchor: result.first.memoAnchor,
-                memoStoredCount: result.first.memoStoredCount,
-                memoCanonicalCount: result.first.memoCanonicalCount,
+                memo: {
+                    generation: 1,
+                    memoGeneration: result.first.memoGeneration,
+                    entries: result.memo,
+                    anchor: result.first.memoAnchor,
+                    storedCount: result.first.memoStoredCount,
+                    canonicalCount: result.first.memoCanonicalCount,
+                },
             });
             expect(reconciled.ok).toBe(true);
             if (reconciled.ok) {

@@ -3,106 +3,65 @@ import { stripTagPrefixFromAssistantMessage } from "./strip-tag-prefix";
 
 describe("stripTagPrefixFromAssistantMessage", () => {
 	describe("leading tag prefix (canonical MC tagger mimicry)", () => {
-		it("strips a single §N§ prefix from assistant text", () => {
-			const msg = {
-				role: "assistant",
-				content: [
-					{ type: "text", text: "§4§ Yes. I can see the magic context." },
-				],
-			};
-			const mutated = stripTagPrefixFromAssistantMessage(msg);
-			expect(mutated).toBe(true);
-			expect((msg.content[0] as { text: string }).text).toBe(
+		// Each row is one single-text-part assistant message: the leading-tag
+		// scrub must report a mutation and leave exactly the expected text.
+		it.each([
+			[
+				"strips a single §N§ prefix from assistant text",
+				"§4§ Yes. I can see the magic context.",
 				"Yes. I can see the magic context.",
-			);
-		});
-
-		it("strips consecutive §N§ prefixes (model-mimicked sequence)", () => {
-			const msg = {
-				role: "assistant",
-				content: [{ type: "text", text: "§3§ §4§ §5§ Hello world" }],
-			};
-			expect(stripTagPrefixFromAssistantMessage(msg)).toBe(true);
-			expect((msg.content[0] as { type: string; text: string }).text).toBe(
+			],
+			[
+				"strips consecutive §N§ prefixes (model-mimicked sequence)",
+				"§3§ §4§ §5§ Hello world",
 				"Hello world",
-			);
-		});
-
-		it("strips trailing whitespace after the prefix", () => {
+			],
+			["strips trailing whitespace after the prefix", "§4§   \n\nYes", "Yes"],
+			["strips multi-digit tag IDs", "§38773§ Found it.", "Found it."],
+		] as Array<[string, string, string]>)("%s", (_title, input, expected) => {
 			const msg = {
 				role: "assistant",
-				content: [{ type: "text", text: "§4§   \n\nYes" }],
+				content: [{ type: "text", text: input }],
 			};
 			expect(stripTagPrefixFromAssistantMessage(msg)).toBe(true);
 			expect((msg.content[0] as { type: string; text: string }).text).toBe(
-				"Yes",
-			);
-		});
-
-		it("strips multi-digit tag IDs", () => {
-			const msg = {
-				role: "assistant",
-				content: [{ type: "text", text: "§38773§ Found it." }],
-			};
-			expect(stripTagPrefixFromAssistantMessage(msg)).toBe(true);
-			expect((msg.content[0] as { type: string; text: string }).text).toBe(
-				"Found it.",
+				expected,
 			);
 		});
 	});
 
 	describe("cargo-culted § mid-text (models mimicking MC notation)", () => {
-		it("removes mid-text §N§ pair entirely (cargo-cult defense)", () => {
-			const msg = {
-				role: "assistant",
-				content: [
-					{
-						type: "text",
-						text: "Looking at §5§ which references the earlier discussion",
-					},
-				],
-			};
-			expect(stripTagPrefixFromAssistantMessage(msg)).toBe(true);
-			expect((msg.content[0] as { type: string; text: string }).text).toBe(
+		// Cargo-cult defense rows: § notation appearing mid-text (not as a
+		// leading tag) must be scrubbed wherever it appears.
+		it.each([
+			[
+				"removes mid-text §N§ pair entirely (cargo-cult defense)",
+				"Looking at §5§ which references the earlier discussion",
 				"Looking at  which references the earlier discussion",
-			);
-		});
-
-		it('removes malformed §N"> hybrid mid-text', () => {
-			const msg = {
-				role: "assistant",
-				content: [{ type: "text", text: `Hello §40827">Oracle confirmed` }],
-			};
-			expect(stripTagPrefixFromAssistantMessage(msg)).toBe(true);
-			expect((msg.content[0] as { type: string; text: string }).text).toBe(
+			],
+			[
+				'removes malformed §N"> hybrid mid-text',
+				'Hello §40827">Oracle confirmed',
 				"Hello Oracle confirmed",
-			);
-		});
-
-		it("strips stray § character anywhere", () => {
-			const msg = {
-				role: "assistant",
-				content: [{ type: "text", text: "See § marker for details" }],
-			};
-			expect(stripTagPrefixFromAssistantMessage(msg)).toBe(true);
-			expect((msg.content[0] as { type: string; text: string }).text).toBe(
+			],
+			[
+				"strips stray § character anywhere",
+				"See § marker for details",
 				"See  marker for details",
-			);
-		});
-
-		it("strips both leading prefix and mid-text § in same message", () => {
+			],
+			[
+				"strips both leading prefix and mid-text § in same message",
+				"§42§ The pattern §40827§ appeared.",
+				"The pattern  appeared.",
+			],
+		] as Array<[string, string, string]>)("%s", (_title, input, expected) => {
 			const msg = {
 				role: "assistant",
-				content: [
-					{
-						type: "text",
-						text: "§42§ The pattern §40827§ appeared.",
-					},
-				],
+				content: [{ type: "text", text: input }],
 			};
 			expect(stripTagPrefixFromAssistantMessage(msg)).toBe(true);
 			expect((msg.content[0] as { type: string; text: string }).text).toBe(
-				"The pattern  appeared.",
+				expected,
 			);
 		});
 	});

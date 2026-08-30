@@ -15,6 +15,7 @@ import {
     SESSION_META_SELECT_COLUMNS,
     toSessionMeta,
 } from "./storage-meta-shared";
+import { tableColumnSet } from "./storage-schema-helpers";
 import type { SessionMeta } from "./types";
 
 const SESSION_META_FALLBACK_SELECTS: Partial<
@@ -79,11 +80,7 @@ function getSessionMetaSelectStatement(db: Database): ReturnType<Database["prepa
 function getSessionMetaSelectColumns(db: Database): string {
     const cached = sessionMetaSelectColumnsCache.get(db);
     if (cached !== undefined) return cached;
-    const existingColumns = new Set(
-        (db.prepare("PRAGMA table_info(session_meta)").all() as Array<{ name?: string }>).map(
-            (column) => column.name,
-        ),
-    );
+    const existingColumns = tableColumnSet(db, "session_meta");
     const projection = SESSION_META_SELECT_COLUMNS.map((column) => {
         if (existingColumns.has(column)) return column;
         return SESSION_META_FALLBACK_SELECTS[column] ?? `0 AS ${column}`;

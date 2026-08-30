@@ -71,6 +71,7 @@ import {
     decodeClaimMirrorReceiptResponse,
     decodeClaimMirrorSnapshotResponse,
     MODULE_PAGE_MAX_BYTES,
+    type ModuleStateSyncMethod,
     moduleRawBlockMappings,
     moduleWireBodyBytes,
 } from "./module-wire";
@@ -647,10 +648,7 @@ export function loadModuleWatermarks(args: {
     };
 }
 
-export function moduleWatermarksEqual(
-    left: ModuleWatermarks | null,
-    right: ModuleWatermarks,
-): boolean {
+function moduleWatermarksEqual(left: ModuleWatermarks | null, right: ModuleWatermarks): boolean {
     return (
         left !== null &&
         left.compartment_sequence === right.compartment_sequence &&
@@ -678,7 +676,7 @@ function flatBlockIdForRawMessage(
  * synthetic summary rows. Resolve module boundaries from the summary-excluding
  * basis so the shared memo compares one canonical value everywhere.
  */
-export function canonicalOrdinalForMessageId(args: {
+function canonicalOrdinalForMessageId(args: {
     sessionId: string;
     raw: RawMessageParts | null;
     messageId: string;
@@ -2382,21 +2380,7 @@ export interface ModuleStateSyncClient {
     call(args: {
         sessionId: string;
         projectRoot: string;
-        method:
-            | "state_sync"
-            | "transform"
-            | "session.status"
-            | "session.delete"
-            | "session.flush"
-            | "session.recomp"
-            | "session.wrapup"
-            | "todo_state.set"
-            | "agent_drops.append"
-            | "ctx_note"
-            | "ctx_memory"
-            | "note.evaluate"
-            | "transform.ack"
-            | "transform.nack";
+        method: ModuleStateSyncMethod;
         body: unknown;
         signal?: AbortSignal;
         generationSensitive?: boolean;

@@ -1000,9 +1000,9 @@ export interface PiHeuristicsOptions {
 	/**
 	 * Number of tags before the most recent tag whose typed reasoning is
 	 * cleared on cache-busting passes. Mirrors OpenCode's
-	 * `clear_reasoning_age` config (`packages/plugin/src/config/schema/magic-context.ts:303`).
-	 * Default `50` matches OpenCode. Pi previously hardcoded `30`, which
-	 * cleared reasoning more aggressively than the user configured.
+	 * `clear_reasoning_age` config (`packages/plugin/src/config/schema/magic-context.ts`).
+	 * Default `50` matches OpenCode and respects the user's configured
+	 * clearing aggressiveness.
 	 */
 	clearReasoningAge?: number;
 }
@@ -5618,10 +5618,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 
 	const outputMessages = transcript.getOutputMessages();
 
-	// 7. Persist conversation/tool-call token totals for /ctx-status and
-	// the dashboard. Walks the post-everything message array (tagged,
+	// 7. Persist conversation/tool-call token totals for /ctx-status.
+	// Walks the post-everything message array (tagged,
 	// injected, stripped) so the numbers reflect what the LLM actually
-	// receives. Mirrors OpenCode's transform.ts:996-1127. Best-effort —
+	// receives. Mirrors OpenCode's transform.ts token accounting. Best-effort —
 	// never fail the pipeline on a stats write error.
 	try {
 		const tTokenAccounting = performance.now();
@@ -5702,7 +5702,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
  */
 /**
  * Apply note-nudge replay + delivery. Mirrors OpenCode's
- * `transform-postprocess-phase.ts` (around lines 611-650).
+ * `transform-postprocess-phase.ts` note-nudge pass.
  *
  * Two paths:
  *   1. Sticky replay: a previously-delivered nudge anchored to a user

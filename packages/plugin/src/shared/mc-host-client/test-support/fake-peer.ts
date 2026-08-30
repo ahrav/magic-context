@@ -14,7 +14,7 @@ import { createHmac, randomBytes } from "node:crypto";
 import { createServer, type Server, type Socket } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 
-export const PEER_HEADER_LEN = 21;
+const PEER_HEADER_LEN = 21;
 export const PEER_PROTOCOL_VERSION = 2;
 
 /** Frame type bytes duplicated from the wire doc, not from protocol.ts. */
@@ -73,7 +73,7 @@ export function encodePeerFrame(fields: PeerFrameFields): Buffer {
 }
 
 /** `u32 LE length || UTF-8 JSON` auth message framing (wire doc 5.1). */
-export function encodePeerAuthMessage(value: unknown): Buffer {
+function encodePeerAuthMessage(value: unknown): Buffer {
     const body = Buffer.from(JSON.stringify(value), "utf8");
     const framed = Buffer.alloc(4 + body.length);
     framed.writeUInt32LE(body.length, 0);
@@ -605,4 +605,92 @@ export class FakePeer {
             this.server.close(() => resolve());
         });
     }
+}
+
+// ---------------------------------------------------------------------------
+// Frame-level test helpers shared by the transport and client suites.
+// ---------------------------------------------------------------------------
+
+export interface FrameCursor {
+    next(predicate: (frame: PeerFrame) => boolean, timeoutMs?: number): Promise<PeerFrame>;
+}
+
+/** Ordered frame consumption: each `next` scans forward from the last hit. */
+export function frameCursor(conn: FakePeerConnection): FrameCursor {
+    let index = 0;
+    return {
+        async next(predicate, timeoutMs = 4_000) {
+            let found: PeerFrame | null = null;
+            await conn.waitFor(() => {
+                for (let i = index; i < conn.frames.length; i++) {
+                    const frame = conn.frames[i] as PeerFrame;
+                    if (predicate(frame)) {
+                        index = i + 1;
+                        found = frame;
+                        return true;
+                    }
+                }
+                return false;
+            }, timeoutMs);
+            return found as unknown as PeerFrame;
+        },
+    };
+}
+
+export function jsonBody(value: unknown): Buffer {
+    return Buffer.from(JSON.stringify(value), "utf8");
+}
+
+/** Inverse of {@link jsonBody}; `undefined` for a non-JSON frame body. */
+export function bodyJson(frame: PeerFrame): unknown {
+    try {
+        return JSON.parse(frame.body.toString("utf8"));
+    } catch {
+        return undefined;
+    }
+}
+
+export function sendResponse(
+    conn: FakePeerConnection,
+    corr: bigint,
+    value: unknown,
+    channel = 0,
+    epoch = 0,
+): Promise<void> {
+    return conn.send({ ty: PeerFrameType.Response, channel, epoch, corr, body: jsonBody(value) });
+}
+
+export function sendErrorBody(
+    conn: FakePeerConnection,
+    corr: bigint,
+    code: string,
+    channel = 0,
+    epoch = 0,
+    extra: Record<string, unknown> = {},
+): Promise<void> {
+    return conn.send({
+        ty: PeerFrameType.Error,
+        channel,
+        epoch,
+        corr,
+        body: jsonBody({ code, message: `error ${code}`, ...extra }),
+    });
+}
+
+/**
+ * Route-open acknowledgement. `routeChannel`/`routeEpoch` land in the JSON
+ * body; the frame header itself goes out on channel 0, epoch 0, unlike
+ * {@link sendResponse}'s trailing params, which set the header fields.
+ */
+export function sendRouteOpenOk(
+    conn: FakePeerConnection,
+    corr: bigint,
+    routeChannel: number,
+    routeEpoch: number,
+): Promise<void> {
+    return sendResponse(conn, corr, {
+        op: "route.open",
+        route_channel: routeChannel,
+        route_epoch: routeEpoch,
+    });
 }

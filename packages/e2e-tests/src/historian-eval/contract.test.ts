@@ -948,80 +948,53 @@ describe("lintScenario", () => {
         );
     });
 
-    test("rejects a probe gold answer the harness's own ballast emits", () => {
-        const raw = validScenarioRaw();
+    // Each row swaps in one gold answer for the FIRST probe (probe-capacity,
+    // which runs before any prompt suffix has rendered) and checks whether the
+    // harness-owned-text lint rejects it. Rejected rows prove the surface covers
+    // a given harness text source; accepted rows pin the deliberate holes.
+    test.each([
         // "boundary" is in `ballastProse`'s word bank, so every filler, authored,
         // padding, and spike turn states it. The post-epilogue padding sits in the
         // protected tail, which is never compartment-covered and so never spliced
         // out — the probe model can read the answer off raw history and PASS with
         // the injected payload contributing nothing. Both runtime gates are scoped
         // to the authored gold range and cannot see it.
-        (raw.probes as Record<string, unknown>[])[0].goldAnswer = "boundary";
-        const diagnostics = lintScenario(parseScenario(raw));
-        expect(diagnostics).toContain(
-            "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: occurs-in-harness-owned-text",
-        );
-    });
-
-    test("rejects a probe gold answer the harness's own turn text states", () => {
-        const raw = validScenarioRaw();
+        ["rejects a probe gold answer the harness's own ballast emits", "boundary", true],
         // Not only ballast: the runner's padding turns say "Housekeeping
         // acknowledged." verbatim, and those turns are the protected tail.
-        (raw.probes as Record<string, unknown>[])[0].goldAnswer = "housekeeping";
-        const diagnostics = lintScenario(parseScenario(raw));
-        expect(diagnostics).toContain(
-            "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: occurs-in-harness-owned-text",
-        );
-    });
-
-    test("rejects a probe gold answer that collides with a generated padding index", () => {
-        const raw = validScenarioRaw();
+        ["rejects a probe gold answer the harness's own turn text states", "housekeeping", true],
         // The runner numbers every padding turn — `Wrap-up housekeeping note 3.` —
         // and those turns are the protected tail. A bare "3" is therefore stated in
         // raw history the probe can read, and a surface that rendered index 1 alone
         // would not see it.
-        (raw.probes as Record<string, unknown>[])[0].goldAnswer = "3";
-        const diagnostics = lintScenario(parseScenario(raw));
-        expect(diagnostics).toContain(
-            "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: occurs-in-harness-owned-text",
-        );
-    });
-
-    test("the generated-index surface spans every padding turn the runner sends", () => {
-        const raw = validScenarioRaw();
+        ["rejects a probe gold answer that collides with a generated padding index", "3", true],
         // The canonical recipe needs ten padding turns, so the last one says
         // "Wrap-up housekeeping note 10." A surface built from a fixed sample of
         // indices rather than from `paddingTurnCount()`'s own arithmetic would stop
         // short and miss it. Run indices are rendered the same way ("step 1",
         // "step 2"), but the canonical recipe's two runs fall inside the padding
         // range, so no value separates the two sources here.
-        (raw.probes as Record<string, unknown>[])[0].goldAnswer = "10";
-        const diagnostics = lintScenario(parseScenario(raw));
-        expect(diagnostics).toContain(
-            "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: occurs-in-harness-owned-text",
-        );
-    });
-
-    test("rejects a probe gold answer the prompt's question label states", () => {
-        const raw = validScenarioRaw();
+        ["the generated-index surface spans every padding turn the runner sends", "10", true],
         // `buildProbePrompt` writes "Question: <authored question>", so a gold answer of
         // "question" is supplied by the very prompt being answered. The label was the one
         // piece of the wrapper still written as a literal rather than a linted constant.
-        (raw.probes as Record<string, unknown>[])[0].goldAnswer = "question";
-        const diagnostics = lintScenario(parseScenario(raw));
-        expect(diagnostics).toContain(
-            "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: occurs-in-harness-owned-text",
-        );
-    });
-
-    test("an exact probe is not rejected for a suffix no EARLIER prompt rendered", () => {
-        const raw = validScenarioRaw();
+        ["rejects a probe gold answer the prompt's question label states", "question", true],
         // probe-capacity runs FIRST, so no `Choose exactly one of:` has been sent when it
         // is asked and "choose" is in nothing its history carries. Refusing here would
         // keep a valid scenario out of the corpus on text the session never held.
-        (raw.probes as Record<string, unknown>[])[0].goldAnswer = "choose";
+        ["an exact probe is not rejected for a suffix no EARLIER prompt rendered", "choose", false],
+        // "memory" is in the shared boilerplate every probe's prompt carries, so the
+        // per-probe-type surface split must not narrow it out.
+        ["shared prompt wording is still checked for every probe type", "memory", true],
+        // The bank emits "session", never "sessio". Bare containment would refuse a
+        // legitimate answer here; the check matches complete values.
+        ["a gold answer merely contained in a harness word is not a collision", "sessio", false],
+    ] as Array<[string, string, boolean]>)("%s", (_title, goldAnswer, rejected) => {
+        const raw = validScenarioRaw();
+        (raw.probes as Record<string, unknown>[])[0].goldAnswer = goldAnswer;
         const diagnostics = lintScenario(parseScenario(raw));
-        expect(diagnostics).not.toContain(
+        const expectation = expect(diagnostics);
+        (rejected ? expectation : expectation.not).toContain(
             "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: occurs-in-harness-owned-text",
         );
     });
@@ -1079,17 +1052,6 @@ describe("lintScenario", () => {
         );
     });
 
-    test("shared prompt wording is still checked for every probe type", () => {
-        const raw = validScenarioRaw();
-        // "memory" is in the shared boilerplate every probe's prompt carries, so the
-        // split must not have narrowed it out.
-        (raw.probes as Record<string, unknown>[])[0].goldAnswer = "memory";
-        const diagnostics = lintScenario(parseScenario(raw));
-        expect(diagnostics).toContain(
-            "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: occurs-in-harness-owned-text",
-        );
-    });
-
     test("an oversized probe question is a named diagnostic, not a regex blow-up", () => {
         const raw = validScenarioRaw();
         (raw.probes as Record<string, unknown>[])[0].question = "x".repeat(20_001);
@@ -1102,17 +1064,6 @@ describe("lintScenario", () => {
         // all-pairs, so an unbounded value has to be refused before any scan reads it.
         (raw.probes as Record<string, unknown>[])[0].goldAnswer = "y".repeat(2_001);
         expect(() => parseScenario(raw)).toThrow(/goldAnswer: above-operational-maximum/);
-    });
-
-    test("a gold answer merely contained in a harness word is not a collision", () => {
-        const raw = validScenarioRaw();
-        // The bank emits "session", never "sessio". Bare containment would refuse a
-        // legitimate answer here; the check matches complete values.
-        (raw.probes as Record<string, unknown>[])[0].goldAnswer = "sessio";
-        const diagnostics = lintScenario(parseScenario(raw));
-        expect(diagnostics).not.toContain(
-            "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: occurs-in-harness-owned-text",
-        );
     });
 
     test("rejects a probe gold answer absent from its claim's source range", () => {

@@ -18,7 +18,7 @@ import {
 	processSystemPromptForCache,
 	SYSTEM_PROMPT_DATA_MARKERS,
 } from "./system-prompt";
-import { createTestDb } from "./test-utils.test";
+import { createTestDb } from "./test-utils";
 
 function tempDir(prefix: string): string {
 	return mkdtempSync(join(tmpdir(), prefix));

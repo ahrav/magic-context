@@ -2,6 +2,8 @@ pub mod opencode;
 pub mod pi;
 pub mod sidecar;
 
+mod json;
+
 pub use opencode::{
     decode_opencode, decode_opencode_with_sidecar, decode_opencode_with_sidecar_and_base,
     encode_opencode, encode_opencode_with_session, encode_opencode_with_session_exemptions,

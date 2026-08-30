@@ -1,0 +1,9 @@
+Linux dev-dsk-ahrav-2c-a9191cb6.us-west-2.amazon.com 6.12.100-125.179.amzn2023.x86_64 #1 SMP PREEMPT_DYNAMIC Mon Aug 10 22:42:54 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+cargo 1.97.1 (c980f4866 2026-06-30)
+
+model name	: AMD EPYC 9R14
+128
+
+MemTotal:       258514068 kB

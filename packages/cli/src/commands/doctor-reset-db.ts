@@ -38,6 +38,7 @@ import {
     inspectDirectDatabaseFamilyState,
 } from "../lib/database-access";
 import { DATABASE_RESET_COMMAND } from "../lib/database-repair-guidance";
+import { reportDatabaseHolderRefusal, timestamp } from "../lib/db-maintenance";
 import { type PromptIO, promptIO } from "../lib/prompts";
 import { type DatabaseHolderInspection, defaultInspectHolders } from "./doctor-repair-db";
 
@@ -75,10 +76,6 @@ const DEFAULT_DEPS: ResetDbDeps = {
 
 const RETENTION_NOTE =
     "Quarantine is logical abandonment, not secure erasure; the quarantined files are retained at that path until you delete them yourself.";
-
-function timestamp(date: Date): string {
-    return date.toISOString().replaceAll("-", "").replaceAll(":", "").replace(".", "");
-}
 
 function pathEntryExists(path: string): boolean {
     try {
@@ -197,12 +194,11 @@ function reportSafetyRefusal(
     dbPath: string,
     inspection: DatabaseHolderInspection,
 ): void {
-    prompts.log.error(`Refusing to reset the database family: ${dbPath}`);
-    if (inspection.blockers.length > 0) {
-        prompts.log.error(`Active database holder(s): ${inspection.blockers.join(", ")}`);
-    }
-    if (inspection.uncertainty) prompts.log.error(inspection.uncertainty);
-    prompts.log.info("Close every OpenCode, Pi, and OMP process, then run the command again.");
+    reportDatabaseHolderRefusal(
+        prompts,
+        `Refusing to reset the database family: ${dbPath}`,
+        inspection,
+    );
 }
 
 function refuseQuarantine(

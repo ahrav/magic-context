@@ -5,10 +5,10 @@ import { modelRefLookupOrder } from "./harness-provider-map";
 import { sessionLog } from "./logger";
 import type { ModelLimit } from "./models-dev-cache";
 
-export const WINDOW_OVERLAY_SCHEMA = "fusiform-window-overlay/v1";
-export const PROMPT_WALL_MARGIN = 4_096;
-export const PI_OUTPUT_FLOOR = 4_096;
-export const OPENCODE_OUTPUT_CAP = 32_000;
+const WINDOW_OVERLAY_SCHEMA = "fusiform-window-overlay/v1";
+const PROMPT_WALL_MARGIN = 4_096;
+const PI_OUTPUT_FLOOR = 4_096;
+const OPENCODE_OUTPUT_CAP = 32_000;
 
 const MIN_PLAUSIBLE_CONTEXT_LIMIT = 1_024;
 const OUTPUT_RESERVE_CAP_RATIO = 0.25;
@@ -290,7 +290,7 @@ export function parseWindowOverlay(value: unknown): {
     };
 }
 
-export function defaultWindowOverlayPath(): string {
+function defaultWindowOverlayPath(): string {
     return join(getDataDir(), "fusiform", "window-overlay.json");
 }
 
@@ -329,12 +329,6 @@ export function setWindowOverlayPath(path: string | undefined): void {
     configuredOverlayPath = path;
     loadedOverlayPath = undefined;
     loadedOverlay = undefined;
-}
-
-export function clearWindowOverlayCacheForTest(): void {
-    loadedOverlayPath = undefined;
-    loadedOverlay = undefined;
-    geometryClampLogSeen.clear();
 }
 
 export function getWindowOverlay(): WindowOverlay | undefined {
@@ -615,7 +609,7 @@ export function formatWindowDerivationLine(
     return `Context: ${formatCompactTokens(inputTokens)} / ${formatCompactTokens(result.usableSoft)} usable (${percentage.toFixed(1)}%) — window ${formatCompactTokens(result.derivation.window)} − ${formatCompactTokens(result.derivation.reserve)} ${reserveLabel} [${result.geometry}]`;
 }
 
-export function formatCompactTokens(value: number): string {
+function formatCompactTokens(value: number): string {
     if (Math.abs(value) >= 1_000_000) {
         return `${(value / 1_000_000).toFixed(1).replace(/\.0$/, "")}m`;
     }

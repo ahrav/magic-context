@@ -23,7 +23,7 @@ export interface DreamRunMemoryChanges {
     deleted: number;
     archived: number;
     merged: number;
-    // Exact ids of the memories changed in each bucket (#221). Persisted in the
+    // Exact ids of the memories changed in each bucket. Persisted in the
     // same `memory_changes_json` blob (no schema migration) so a drill-down
     // consumer can show EXACTLY which memories a run touched instead of
     // reconstructing them with an approximate created_at/updated_at time-window

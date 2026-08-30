@@ -2,6 +2,7 @@
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { TestHarness } from "../src/harness";
+import { isHistorianRequest } from "../src/cache-analysis";
 
 /**
  * Subagent-specific behavior.
@@ -39,24 +40,6 @@ import { TestHarness } from "../src/harness";
  *
  * Scenarios below target each invariant directly.
  */
-
-const HISTORIAN_MARKER = "the hippocampus of a long-running coding agent";
-
-function isHistorianRequest(body: Record<string, unknown>): boolean {
-    const sys = body.system;
-    if (typeof sys === "string") return sys.includes(HISTORIAN_MARKER);
-    if (Array.isArray(sys)) {
-        for (const block of sys) {
-            if (block && typeof block === "object") {
-                const text = (block as { text?: unknown }).text;
-                if (typeof text === "string" && text.includes(HISTORIAN_MARKER)) {
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
-}
 
 /**
  * Detects whether an outgoing provider request carries a §N§ tag prefix on any

@@ -28,13 +28,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import {
-    extractM0,
-    extractM1,
-    findBusts,
-    formatBustReport,
-    mainAgentRequests,
-} from "../src/cache-analysis";
+import { extractM0, extractM1, findBusts, formatBustReport, isHistorianRequest, mainAgentRequests } from "../src/cache-analysis";
 import { TestHarness } from "../src/harness";
 import {
     driveAgedCtxReduceSurvival,
@@ -46,26 +40,9 @@ import {
 import type { MockUsage } from "../src/mock-provider/server";
 
 const RUST_MODE = process.env.MC_E2E_MODE === "rust";
-const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
 
 function wireValueText(value: unknown): string {
     return typeof value === "string" ? value : JSON.stringify(value);
-}
-
-function isHistorianRequest(body: Record<string, unknown>): boolean {
-    if (JSON.stringify(body.messages ?? "").includes("<new_messages>")) return true;
-    const system = body.system;
-    if (typeof system === "string") return system.includes(HISTORIAN_SYSTEM_MARKER);
-    if (Array.isArray(system)) {
-        return system.some(
-            (b) =>
-                b &&
-                typeof b === "object" &&
-                typeof (b as { text?: unknown }).text === "string" &&
-                ((b as { text: string }).text).includes(HISTORIAN_SYSTEM_MARKER),
-        );
-    }
-    return false;
 }
 
 /**
@@ -421,6 +398,5 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
             );
         });
     });
-
 
 });

@@ -41,17 +41,14 @@ import { copyFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { storageSubtreePath } from "../src/shared/data-path";
 type DB = Database;
 type Stmt = Statement;
 
 const LIVE_DB_PATH =
     process.env.MAGIC_CONTEXT_DB ??
     join(
-        process.env.HOME ?? "",
-        ".local",
-        "share",
-        "cortexkit",
-        "magic-context",
+        storageSubtreePath(join(process.env.HOME ?? "", ".local", "share")),
         "context.db",
     );
 
