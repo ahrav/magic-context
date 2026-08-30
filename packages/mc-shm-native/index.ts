@@ -159,9 +159,6 @@ function packageAddonPath(platform: PlatformPackage): string {
     }
     const packageDir = dirname(packageJsonPath);
     const manifestPath = join(packageDir, "payload-manifest.json");
-    if (!existsSync(manifestPath)) {
-        throw new NativeStartupError("missing_manifest");
-    }
     let manifest: {
         package?: { name?: string; target?: string };
         files?: { path?: string; sha256?: string }[];
