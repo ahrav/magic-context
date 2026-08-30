@@ -257,6 +257,14 @@ export function probeCapabilities(): NativeCapabilities {
                 reason: "napi_8_unavailable",
             };
         }
+        if (typeof (globalThis as { Bun?: unknown }).Bun === "undefined") {
+            return {
+                available: false,
+                ...base,
+                napiVersion,
+                reason: "detachment_unavailable",
+            };
+        }
         const view = native.createExternalProbe(31);
         const externalArrayBuffer =
             view instanceof Uint8Array && view.byteLength === 31;

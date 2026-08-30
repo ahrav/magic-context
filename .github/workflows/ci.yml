@@ -545,11 +545,17 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Provision metadata-only sibling stubs
+        run: sh scripts/provision-rust-ci-stubs.sh
+
       - name: Build shared-memory addon from source
         run: bun run --cwd packages/mc-shm-native build:source
 
-      - name: Shared-memory client smoke (Node 24)
-        run: bun run --cwd packages/plugin test:mc-host-client:node
+      - name: Shared-memory client smoke (Bun)
+        run: bun run --cwd packages/plugin smoke:mc-host-client:bun
+
+      - name: Shared-memory capability preflight (Node 24)
+        run: bun run --cwd packages/mc-shm-native test:capability:node
 
   check-rust:
     name: Check (Rust fmt + mc-core features)

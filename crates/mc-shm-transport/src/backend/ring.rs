@@ -1747,7 +1747,9 @@ fn seal_object(fd: &OwnedFd) -> Result<(), RingError> {
 
 #[cfg(target_os = "macos")]
 fn create_macos_shm(len: usize) -> Result<OwnedFd, RingError> {
-    let mut random = [0u8; 16];
+    // Darwin limits POSIX shared-memory names to 31 bytes. Prefix plus 80 bits
+    // of random identity remains below that limit; O_EXCL rejects collisions.
+    let mut random = [0u8; 10];
     getrandom::getrandom(&mut random).map_err(|_| RingError::ObjectSetupFailed)?;
     let name = random
         .iter()
