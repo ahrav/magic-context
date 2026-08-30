@@ -583,7 +583,7 @@ impl KernelStore {
             );
             if stored_identity != expected
                 || terminal_state.is_some()
-                || lease_expires_at < spec.recorded_at
+                || lease_expires_at <= spec.recorded_at
             {
                 return Err(KernelError::Conflict);
             }
@@ -730,9 +730,9 @@ impl RedactedIntent {
 struct RedactedDomain {
     domain_id: String,
     object_id: String,
-    name: RedactedField,
-    source_kind: RedactedField,
-    source_id: RedactedField,
+    name: String,
+    source_kind: String,
+    source_id: String,
     source_revision: i64,
     sensitivity: Sensitivity,
 }
@@ -751,9 +751,9 @@ impl RedactedDomain {
         Ok(Self {
             domain_id: identity(&spec.domain_id)?,
             object_id: identity(&spec.object_id)?,
-            name: redact(&spec.name),
-            source_kind: redact(&spec.source_kind),
-            source_id: redact(&spec.source_id),
+            name: identity(&spec.name)?,
+            source_kind: identity(&spec.source_kind)?,
+            source_id: identity(&spec.source_id)?,
             source_revision: spec.source_revision,
             sensitivity: spec.sensitivity,
         })
@@ -764,8 +764,8 @@ impl RedactedDomain {
             object_id: self.object_id.clone(),
             object_kind: DOMAIN_OBJECT_KIND.to_string(),
             domain_id: self.domain_id.clone(),
-            source_kind: self.source_kind.text.clone(),
-            source_id: self.source_id.text.clone(),
+            source_kind: self.source_kind.clone(),
+            source_id: self.source_id.clone(),
             source_revision: self.source_revision,
             created_commit_seq: commit_seq,
             invalidated_commit_seq: None,
@@ -775,11 +775,7 @@ impl RedactedDomain {
     }
 
     fn text_fields(&self) -> Vec<(String, RedactedField)> {
-        vec![
-            ("name".to_string(), self.name.clone()),
-            ("source_kind".to_string(), self.source_kind.clone()),
-            ("source_id".to_string(), self.source_id.clone()),
-        ]
+        Vec::new()
     }
 }
 
@@ -795,7 +791,7 @@ fn insert_domain(
         params![
             spec.domain_id,
             spec.object_id,
-            spec.name.text,
+            spec.name,
             commit_seq,
             spec.sensitivity.as_str(),
         ],
@@ -810,28 +806,14 @@ fn insert_domain(
             spec.object_id,
             DOMAIN_OBJECT_KIND,
             spec.domain_id,
-            spec.source_kind.text,
-            spec.source_id.text,
+            spec.source_kind,
+            spec.source_id,
             spec.source_revision,
             commit_seq,
             spec.sensitivity.as_str(),
         ],
     )
     .map_err(map_sqlite)?;
-    for (name, field) in [
-        ("name", &spec.name),
-        ("source_kind", &spec.source_kind),
-        ("source_id", &spec.source_id),
-    ] {
-        record(
-            tx,
-            "object_registry",
-            &spec.object_id,
-            name,
-            field,
-            Some(commit_seq),
-        )?;
-    }
     Ok(())
 }
 

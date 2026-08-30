@@ -735,3 +735,54 @@ fn a_swallowed_mutation_error_cannot_commit_a_partial_correction() {
         2
     );
 }
+
+#[test]
+fn two_distinct_secret_bearing_names_are_rejected_not_collapsed() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    for (index, key, digest) in [(1_usize, "n1", 'a'), (2, "n2", 'b')] {
+        let mut spec = domain(index);
+        spec.name = format!("name {SECRET}");
+        assert_eq!(
+            store
+                .commit(intent(key, digest), |envelope| {
+                    envelope.insert_domain(spec)?;
+                    Ok(String::new())
+                })
+                .unwrap_err(),
+            KernelError::InvalidInput,
+            "name {index}"
+        );
+    }
+    // A rejected name must not consume the live-name index either.
+    let mut clean = domain(3);
+    clean.name = "plain".to_string();
+    store
+        .commit(intent("n3", 'c'), |envelope| {
+            envelope.insert_domain(clean)?;
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(inspect(directory.path(), "SELECT COUNT(*) FROM domains"), 1);
+}
+
+#[test]
+fn a_caught_callback_panic_leaves_the_store_usable() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = store.commit(intent("panic", 'a'), |_| {
+            panic!("callback panics while holding the writer");
+        });
+    }));
+    assert!(panicked.is_err(), "the panic must reach this caller");
+
+    // A poisoned writer mutex would make every later write fail with Io.
+    store
+        .commit(intent("after-panic", 'b'), |envelope| {
+            envelope.insert_domain(domain(1))?;
+            Ok("recovered".to_string())
+        })
+        .unwrap();
+    assert_eq!(store.known_as_of(1).unwrap().objects.len(), 1);
+}

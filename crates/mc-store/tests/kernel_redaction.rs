@@ -26,9 +26,9 @@ fn domain() -> DomainSpec {
     DomainSpec {
         domain_id: CONTROL.to_string(),
         object_id: "redacted-object".to_string(),
-        name: format!("name {SECRET}"),
+        name: "redacted-name".to_string(),
         source_kind: "fixture".to_string(),
-        source_id: format!("source {SECRET}"),
+        source_id: "redacted-source".to_string(),
         source_revision: 1,
         sensitivity: Sensitivity::Sensitive,
     }
@@ -82,8 +82,8 @@ fn envelope_redacts_before_bind_and_never_leaks_secret_to_storage_or_errors() {
         format!("actor {SECRET_MASK}")
     );
     assert_eq!(
-        inspect_text(directory.path(), "SELECT name FROM domains"),
-        format!("name {SECRET_MASK}")
+        inspect_text(directory.path(), "SELECT cause FROM commit_log"),
+        format!("cause {SECRET_MASK}")
     );
     assert_absent_and_scan_is_live(directory.path());
 
@@ -122,7 +122,7 @@ fn envelope_redacts_before_bind_and_never_leaks_secret_to_storage_or_errors() {
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    for expected in ["change_event", "commit_log", "operation_receipt", "outbox"] {
+    for expected in ["commit_log", "operation_receipt"] {
         assert!(
             owner_kinds.iter().any(|kind| kind == expected),
             "{expected}"
@@ -360,4 +360,23 @@ fn a_terminal_or_expired_run_refuses_further_candidates() {
             .unwrap_err(),
         KernelError::Conflict
     );
+}
+
+#[test]
+fn a_run_whose_lease_expires_exactly_now_is_not_resurrected() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    // shared_run_candidate(_, 1) stores lease_expires_at = 11.
+    store
+        .stage_candidate(shared_run_candidate("candidate-a", 1))
+        .unwrap();
+    assert_eq!(
+        store
+            .stage_candidate(shared_run_candidate("candidate-boundary", 11))
+            .unwrap_err(),
+        KernelError::Conflict
+    );
+    store
+        .stage_candidate(shared_run_candidate("candidate-live", 10))
+        .unwrap();
 }

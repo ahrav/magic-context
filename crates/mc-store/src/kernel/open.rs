@@ -181,13 +181,19 @@ impl KernelStore {
         self.lease_epoch
     }
 
+    /// A panic in a caller's closure drops the guard mid-unwind and poisons the
+    /// mutex, so recovering the guard keeps one caught panic from disabling every
+    /// later write. Dropping a rusqlite `Transaction` rolls it back, so the
+    /// recovered connection has no in-flight statement.
     pub(super) fn lock_writer(&self) -> Result<std::sync::MutexGuard<'_, Connection>, KernelError> {
-        self.writer.lock().map_err(|_| KernelError::Io)
+        Ok(self.writer.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     pub(super) fn lock_reader(&self) -> Result<std::sync::MutexGuard<'_, Connection>, KernelError> {
         let index = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
-        self.readers[index].lock().map_err(|_| KernelError::Io)
+        Ok(self.readers[index]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner))
     }
 
     #[cfg(feature = "test-support")]
