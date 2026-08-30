@@ -1,5 +1,5 @@
 import { DREAMER_MEMORY_MAPPER_AGENT } from "../../../agents/dreamer";
-import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
+import { childSessionMessagesFetcher, createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import {
@@ -38,7 +38,7 @@ import {
 import type { DreamerModuleRoute } from "./module-apply";
 import {
     DreamerProviderOutputFailureError,
-    providerOutputFailureFromInvalidManifest,
+    rethrowInvalidManifestAsProviderFailure,
 } from "./provider-output-failure";
 
 const MAP_BATCH_SIZE = 80;
@@ -252,15 +252,12 @@ async function mapOneBatch(
                 signal,
                 fallbackModels: args.fallbackModels,
                 callContext: "dreamer:map-memories",
-                fetchOutput: async () => {
-                    const messagesResponse = await args.client.session.messages({
-                        path: { id: agentSessionId as string },
-                        query: { directory: args.sessionDirectory, limit: 100 },
-                    });
-                    return shared.normalizeSDKResponse(messagesResponse, [] as unknown[], {
-                        preferResponseOnMissingData: true,
-                    });
-                },
+                fetchOutput: childSessionMessagesFetcher(
+                    args.client,
+                    agentSessionId as string,
+                    args.sessionDirectory,
+                    100,
+                ),
                 validateOutput: (messages) => {
                     if (hasLengthCappedOutput(messages)) {
                         throw new Error("map-memories returned length-capped output");
@@ -268,19 +265,12 @@ async function mapOneBatch(
                     const text = extractLatestAssistantText(messages);
                     if (!text) throw new Error("map-memories returned no output");
                     rawManifest = text;
-                    try {
+                    rethrowInvalidManifestAsProviderFailure(messages, text, () => {
                         validateMapMemoriesManifest(
                             text,
                             new Set(batch.map((input) => input.publicClaimId)),
                         );
-                    } catch (error) {
-                        const providerFailure = providerOutputFailureFromInvalidManifest(
-                            messages,
-                            text,
-                        );
-                        if (providerFailure) throw providerFailure;
-                        throw error;
-                    }
+                    });
                     return text;
                 },
             },

@@ -1,6 +1,6 @@
 import { DREAMER_MEMORY_MAPPER_AGENT } from "../../../agents/dreamer";
 import { withContentLanguageDirective } from "../../../agents/language-directive";
-import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
+import { childSessionMessagesFetcher, createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import {
@@ -52,7 +52,7 @@ import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from
 import type { DreamerModuleRoute } from "./module-apply";
 import {
     DreamerProviderOutputFailureError,
-    providerOutputFailureFromInvalidManifest,
+    rethrowInvalidManifestAsProviderFailure,
 } from "./provider-output-failure";
 import { getTaskScheduleState, writeTaskScheduleState } from "./storage-task-schedule";
 import { partitionVerifyScope } from "./verify-gate";
@@ -280,15 +280,12 @@ async function verifyOneBatch(
                 signal,
                 fallbackModels: args.fallbackModels,
                 callContext: "dreamer:verify",
-                fetchOutput: async () => {
-                    const messagesResponse = await args.client.session.messages({
-                        path: { id: agentSessionId as string },
-                        query: { directory: args.sessionDirectory, limit: 100 },
-                    });
-                    return shared.normalizeSDKResponse(messagesResponse, [] as unknown[], {
-                        preferResponseOnMissingData: true,
-                    });
-                },
+                fetchOutput: childSessionMessagesFetcher(
+                    args.client,
+                    agentSessionId as string,
+                    args.sessionDirectory,
+                    100,
+                ),
                 validateOutput: (messages) => {
                     if (hasLengthCappedOutput(messages)) {
                         throw new Error("verify returned length-capped output");
@@ -296,16 +293,9 @@ async function verifyOneBatch(
                     const text = extractLatestAssistantText(messages);
                     if (!text) throw new Error("verify returned no output");
                     rawManifest = text;
-                    try {
+                    rethrowInvalidManifestAsProviderFailure(messages, text, () => {
                         validateVerifyBatch(text, batch);
-                    } catch (error) {
-                        const providerFailure = providerOutputFailureFromInvalidManifest(
-                            messages,
-                            text,
-                        );
-                        if (providerFailure) throw providerFailure;
-                        throw error;
-                    }
+                    });
                     return text;
                 },
             },

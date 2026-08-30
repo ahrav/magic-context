@@ -13,6 +13,7 @@ import {
 } from "../../shared/rpc-notifications";
 import { Database } from "../../shared/sqlite";
 import {
+    childSessionMessagesFetcher,
     createChildSessionWithFence,
     SCHEMA_PROBE_FAILURE_NOTICE,
     STALE_PLUGIN_RESTART_NOTICE,
@@ -126,5 +127,52 @@ describe("createChildSessionWithFence", () => {
                 .prepare("SELECT last_transform_error FROM session_meta WHERE session_id = ?")
                 .get("ses_parent"),
         ).toEqual({ last_transform_error: STALE_PLUGIN_RESTART_NOTICE });
+    });
+});
+
+describe("childSessionMessagesFetcher", () => {
+    it("reads the child session messages with the bound id, directory, and limit", async () => {
+        const messages = mock(async (input: unknown) => [{ info: { role: "assistant" } }]);
+        const fetcher = childSessionMessagesFetcher(
+            { session: { messages } } as never,
+            "ses_child",
+            "/work/dir",
+            50,
+        );
+        const output = await fetcher();
+        expect(messages).toHaveBeenCalledTimes(1);
+        expect(messages.mock.calls[0]?.[0]).toEqual({
+            path: { id: "ses_child" },
+            query: { directory: "/work/dir", limit: 50 },
+        });
+        expect(output).toEqual([{ info: { role: "assistant" } }]);
+    });
+
+    it("unwraps a data-envelope response and falls back to an empty array", async () => {
+        const enveloped = childSessionMessagesFetcher(
+            { session: { messages: async () => ({ data: [{ id: 1 }] }) } } as never,
+            "ses_child",
+            undefined,
+            20,
+        );
+        expect(await enveloped()).toEqual([{ id: 1 }]);
+
+        // preferResponseOnMissingData keeps the bare wrapper when `data` is null,
+        // matching every prompt-run call site this helper replaced.
+        const bareWrapper = childSessionMessagesFetcher(
+            { session: { messages: async () => ({ data: null }) } } as never,
+            "ses_child",
+            undefined,
+            20,
+        );
+        expect(await bareWrapper()).toEqual({ data: null } as never);
+
+        const missing = childSessionMessagesFetcher(
+            { session: { messages: async () => null } } as never,
+            "ses_child",
+            undefined,
+            20,
+        );
+        expect(await missing()).toEqual([]);
     });
 });

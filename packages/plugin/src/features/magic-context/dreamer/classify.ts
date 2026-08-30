@@ -1,5 +1,5 @@
 import { DREAMER_CLASSIFIER_AGENT } from "../../../agents/dreamer";
-import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
+import { childSessionMessagesFetcher, createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import {
@@ -39,7 +39,7 @@ import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from
 import { DreamerModuleFailureError } from "./module-apply";
 import {
     DreamerProviderOutputFailureError,
-    providerOutputFailureFromInvalidManifest,
+    rethrowInvalidManifestAsProviderFailure,
 } from "./provider-output-failure";
 
 const MIN_POOL_TO_CLASSIFY = 10;
@@ -545,15 +545,12 @@ async function classifyOneChunk(
                 signal,
                 fallbackModels: args.fallbackModels,
                 callContext: "dreamer:classify-memories",
-                fetchOutput: async () => {
-                    const messagesResponse = await args.client.session.messages({
-                        path: { id: agentSessionId as string },
-                        query: { directory: args.sessionDirectory, limit: 50 },
-                    });
-                    return shared.normalizeSDKResponse(messagesResponse, [] as unknown[], {
-                        preferResponseOnMissingData: true,
-                    });
-                },
+                fetchOutput: childSessionMessagesFetcher(
+                    args.client,
+                    agentSessionId as string,
+                    args.sessionDirectory,
+                    50,
+                ),
                 validateOutput: (messages) => {
                     if (hasLengthCappedOutput(messages)) {
                         throw new Error("classify returned length-capped output");
@@ -561,19 +558,12 @@ async function classifyOneChunk(
                     const text = extractLatestAssistantText(messages);
                     if (!text) throw new Error("classify returned no output");
                     rawManifest = text;
-                    try {
+                    rethrowInvalidManifestAsProviderFailure(messages, text, () => {
                         validateClassifyManifest(
                             text,
                             new Set(chunk.map((claim) => claim.publicClaimId)),
                         );
-                    } catch (error) {
-                        const providerFailure = providerOutputFailureFromInvalidManifest(
-                            messages,
-                            text,
-                        );
-                        if (providerFailure) throw providerFailure;
-                        throw error;
-                    }
+                    });
                     return text;
                 },
             },

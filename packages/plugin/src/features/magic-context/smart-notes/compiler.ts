@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 import { SMART_NOTE_COMPILER_AGENT } from "../../../agents/smart-note-compiler";
-import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
+import { childSessionMessagesFetcher, createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import { extractLatestAssistantText } from "../../../shared/assistant-message-extractor";
@@ -142,18 +142,12 @@ Remember: output only the JSON object described by the system prompt.`;
                 signal: args.signal,
                 fallbackModels: args.fallbackModels,
                 callContext: "dreamer:smart-note-compiler",
-                fetchOutput: async () => {
-                    const messagesResponse = await args.client.session.messages({
-                        path: { id: childSessionId as string },
-                        query: {
-                            directory: args.sessionDirectory ?? args.projectIdentity,
-                            limit: 20,
-                        },
-                    });
-                    return shared.normalizeSDKResponse(messagesResponse, [] as unknown[], {
-                        preferResponseOnMissingData: true,
-                    });
-                },
+                fetchOutput: childSessionMessagesFetcher(
+                    args.client,
+                    childSessionId as string,
+                    args.sessionDirectory ?? args.projectIdentity,
+                    20,
+                ),
                 validateOutput: (messages) =>
                     parseCompilerOutput(extractLatestAssistantText(messages)),
             },

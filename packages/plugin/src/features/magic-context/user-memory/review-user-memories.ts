@@ -1,6 +1,6 @@
 import { DREAMER_REVIEWER_AGENT } from "../../../agents/dreamer";
 import { withContentLanguageDirective } from "../../../agents/language-directive";
-import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
+import { childSessionMessagesFetcher, createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import { extractLatestAssistantText } from "../../../shared/assistant-message-extractor";
@@ -795,15 +795,12 @@ If no promotions are warranted, return empty arrays. Consume reviewed candidates
                 signal: abortController.signal,
                 fallbackModels: args.fallbackModels,
                 callContext: "dreamer:user-memories",
-                fetchOutput: async () => {
-                    const messagesResponse = await args.client.session.messages({
-                        path: { id: childSessionId },
-                        query: { directory: args.sessionDirectory, limit: 50 },
-                    });
-                    return shared.normalizeSDKResponse(messagesResponse, [] as unknown[], {
-                        preferResponseOnMissingData: true,
-                    });
-                },
+                fetchOutput: childSessionMessagesFetcher(
+                    args.client,
+                    childSessionId,
+                    args.sessionDirectory,
+                    50,
+                ),
                 validateOutput: (messages) => {
                     const responseText = extractLatestAssistantText(messages);
                     if (!responseText) throw new Error("User memory review returned no output.");

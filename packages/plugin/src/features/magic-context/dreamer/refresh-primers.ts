@@ -1,6 +1,6 @@
 import { DREAMER_PRIMER_INVESTIGATOR_AGENT } from "../../../agents/dreamer";
 import { withContentLanguageDirective } from "../../../agents/language-directive";
-import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
+import { childSessionMessagesFetcher, createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
 import {
     type RawMessageProvider,
     setRawMessageProvider,
@@ -273,15 +273,12 @@ async function refreshOnePrimer(
                 signal,
                 fallbackModels: args.fallbackModels,
                 callContext: "dreamer:refresh-primers",
-                fetchOutput: async () => {
-                    const messagesResponse = await args.client.session.messages({
-                        path: { id: agentSessionId as string },
-                        query: { directory: args.sessionDirectory, limit: 100 },
-                    });
-                    return shared.normalizeSDKResponse(messagesResponse, [] as unknown[], {
-                        preferResponseOnMissingData: true,
-                    });
-                },
+                fetchOutput: childSessionMessagesFetcher(
+                    args.client,
+                    agentSessionId as string,
+                    args.sessionDirectory,
+                    100,
+                ),
                 validateOutput: (messages) => parseAnswer(messages, primer.answer),
             },
         );
