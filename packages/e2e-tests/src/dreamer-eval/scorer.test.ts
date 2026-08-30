@@ -159,6 +159,36 @@ describe("dreamer manifest scorers", () => {
         expect(scoreClassifyManifest(correctClassify, pool, classifyGold)).toMatchObject({ stage: "scored", status: "PASS" });
     });
 
+    test("a case variant of a tracked path scores as the tracked path", () => {
+        // gitTrackedPath falls back to a case-insensitive match and
+        // normalizeVerificationFiles stores the tracked spelling, so production
+        // applies exactly the gold mapping for this manifest.
+        expect(
+            scoreMapManifest(
+                correctMap.replace('files="src/cache.ts,src/config.ts"', 'files="SRC/CACHE.ts,src/config.ts"'),
+                pool,
+                mapGold,
+            ),
+        ).toMatchObject({ stage: "scored", status: "PASS" });
+        expect(
+            scoreVerifyManifest(
+                correctVerify.replace('<verified claim="mcm_true" files="src/cache.ts,src/config.ts"/>', '<verified claim="mcm_true" files="SRC/CACHE.ts,src/config.ts"/>'),
+                pool,
+                verifyGold,
+            ),
+        ).toMatchObject({ stage: "scored", status: "PASS" });
+    });
+
+    test("a case variant matching no tracked path still fails", () => {
+        expect(
+            scoreMapManifest(
+                correctMap.replace('files="src/cache.ts,src/config.ts"', 'files="SRC/MISSING.ts,src/config.ts"'),
+                pool,
+                mapGold,
+            ),
+        ).toMatchObject({ stage: "scored", status: "FAIL", reason: "wrong-mapping" });
+    });
+
     test("wrong archival of a gold-true claim is run-fatal", () => {
         const result = scoreVerifyManifest(
             correctVerify.replace('<verified claim="mcm_true" files="src/cache.ts,src/config.ts"/>', '<archive claim="mcm_true" reason="wrong"/>'),

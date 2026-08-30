@@ -47,7 +47,14 @@ function input(overrides: Partial<DreamerRunClassificationInput> = {}): DreamerR
             providerId: "anthropic",
             modelId: "claude-test",
         },
-        receipts: [],
+        receipts: [
+            {
+                claimId: "claim-true",
+                operation: "classify-memories",
+                outcome: "applied",
+                requestDigest: "c".repeat(64),
+            },
+        ],
         rejectionRequestDigest: "b".repeat(64),
         fixtureUnchanged: true,
         leaseLost: false,
@@ -58,6 +65,16 @@ function input(overrides: Partial<DreamerRunClassificationInput> = {}): DreamerR
 }
 
 describe("dreamer runner classification", () => {
+    test("a scored PASS with no receipt is ERROR:apply-not-applied", () => {
+        // Receipt and mutation share one transaction, so no receipt means the
+        // pool never took the manifest — reporting PASS would file a successful
+        // experiment for a change that was never committed.
+        expect(classifyDreamerRun(input({ receipts: [] }))).toMatchObject({
+            status: "ERROR",
+            reason: "apply-not-applied",
+        });
+    });
+
     test("a gold-matching manifest on the pinned model is PASS", () => {
         const result = classifyDreamerRun(input());
 

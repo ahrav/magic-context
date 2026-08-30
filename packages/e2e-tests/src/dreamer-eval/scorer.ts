@@ -129,8 +129,41 @@ function canonicalObservedPath(value: string): string {
     return /^[\\/]/.test(value) ? `/${joined}` : joined;
 }
 
-export function canonicalObservedPaths(values: readonly string[]): string[] {
+function canonicalObservedPaths(values: readonly string[]): string[] {
     return values.map(canonicalObservedPath);
+}
+
+/**
+ * Canonicalize an observed path, then resolve its casing against the paths the
+ * fixture actually tracks.
+ *
+ * The casing step mirrors `gitTrackedPath`, which looks for an exact `git
+ * ls-files` match, falls back to a case-insensitive one, and applies the tracked
+ * spelling it finds. `normalizeVerificationFiles` then stores that spelling, so a
+ * manifest naming `SRC/CACHE.ts` applies `src/cache.ts` — even on a
+ * case-sensitive filesystem, where the variant does not exist and therefore skips
+ * the `existsSync` branch entirely and reaches the git lookup with
+ * `safeRealpath` null.
+ *
+ * Ambiguity is resolved the way production resolves it: only a unique
+ * case-insensitive match is adopted. Anything else keeps the observed spelling,
+ * which then compares unequal — the same outcome production reaches by dropping a
+ * path it cannot bind to one tracked file.
+ */
+export function canonicalTrackedPaths(values: readonly string[], tracked: readonly string[]): string[] {
+    const trackedSet = new Set(tracked.map(canonicalObservedPath));
+    return canonicalObservedPaths(values).map((value) => {
+        if (trackedSet.has(value)) return value;
+        const folded = value.toLowerCase();
+        const matches = [...trackedSet].filter((candidate) => candidate.toLowerCase() === folded);
+        return matches.length === 1 ? matches[0]! : value;
+    });
+}
+
+/** Every path the scenario's fixture tracks, which is the universe production's
+ *  `git ls-files` lookup resolves an observed path against. */
+function trackedPoolPaths(pool: PoolDescriptor): string[] {
+    return [...new Set(pool.claims.flatMap((claim) => claim.files))];
 }
 
 export function scoreVerifyManifest(
@@ -143,6 +176,8 @@ export function scoreVerifyManifest(
     if (rejected !== null) return rejected;
     const context = scoringContext(pool, gold.claims);
     if (isScore(context)) return context;
+
+    const tracked = trackedPoolPaths(pool);
 
     let parsed: ReturnType<typeof validateVerifyManifest>;
     try {
@@ -191,7 +226,10 @@ export function scoreVerifyManifest(
         }
         // Verification applies this attribute as the claim's new exact mapping,
         // so a narrowed set silently shrinks future incremental verify scope.
-        if (expected.verdict !== "archive" && !sameSet(canonicalObservedPaths(observed.files), expected.expectedFiles)) {
+        if (
+            expected.verdict !== "archive" &&
+            !sameSet(canonicalTrackedPaths(observed.files, tracked), expected.expectedFiles)
+        ) {
             return score("FAIL", "wrong-mapping", "scored", parsed);
         }
         if (expected.verdict === "update") {
@@ -289,6 +327,8 @@ export function scoreMapManifest(
     const context = scoringContext(pool, gold.claims);
     if (isScore(context)) return context;
 
+    const tracked = trackedPoolPaths(pool);
+
     let parsed: ReturnType<typeof validateMapMemoriesManifest>;
     try {
         parsed = validateMapMemoriesManifest(manifestText, context.expectedIds);
@@ -305,7 +345,7 @@ export function scoreMapManifest(
     for (const expected of gold.claims) {
         const publicClaimId = context.byClaimId.get(expected.claimId)?.publicClaimId;
         const observed = publicClaimId === undefined ? undefined : actual.get(publicClaimId);
-        if (observed === undefined || !sameSet(canonicalObservedPaths(observed.files), expected.files)) {
+        if (observed === undefined || !sameSet(canonicalTrackedPaths(observed.files, tracked), expected.files)) {
             return score("FAIL", "wrong-mapping", "scored", parsed);
         }
     }

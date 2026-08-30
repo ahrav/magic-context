@@ -204,6 +204,18 @@ export function classifyDreamerRun(input: DreamerRunClassificationInput): Dreame
     if (scored.status === "FAIL" && scored.reason === "invalid-output") {
         return outcome("ERROR", "harness-failure", scored.parsedManifest);
     }
+    // A receipt and the mutations it covers are written in one transaction, so a
+    // committed apply always leaves one behind — `runClaimOperationInCurrentTransaction`
+    // records the receipt inside the same transaction that stages the items, and
+    // records a `noop` outcome when nothing changed. No receipt therefore means
+    // nothing was applied, and a PASS would report a successful experiment for a
+    // manifest the pool never took. Reachable because the task records the
+    // invocation as completed before applying and its rejection-receipt write is
+    // itself best-effort, so an apply-time database fault can leave a captured,
+    // gold-matching manifest with no receipt of any kind.
+    if (scored.status === "PASS" && input.receipts.length === 0) {
+        return outcome("ERROR", "apply-not-applied", scored.parsedManifest);
+    }
     return outcome(scored.status, scored.reason, scored.parsedManifest);
 }
 

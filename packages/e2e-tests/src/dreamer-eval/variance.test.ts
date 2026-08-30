@@ -56,7 +56,7 @@ describe("dreamer eval variance", () => {
         expect(artifact.claimHistograms).toEqual([
             {
                 claimId: "claim-cache",
-                counts: { verified: 3 },
+                counts: { "verified;files:src/cache.ts": 3 },
                 disagreement: false,
             },
         ]);
@@ -69,7 +69,7 @@ describe("dreamer eval variance", () => {
 
         expect(artifact.claimHistograms[0]).toEqual({
             claimId: "claim-cache",
-            counts: { archive: 1, verified: 2 },
+            counts: { archive: 1, "verified;files:src/cache.ts": 2 },
             disagreement: true,
         });
     });
@@ -109,7 +109,7 @@ describe("dreamer eval variance", () => {
 
         expect(artifact.repeatCount).toBe(3);
         expect(artifact.claimHistograms).toEqual([
-            { claimId: "claim-cache", counts: { missing: 1, verified: 2 }, disagreement: true },
+            { claimId: "claim-cache", counts: { missing: 1, "verified;files:src/cache.ts": 2 }, disagreement: true },
         ]);
     });
 
@@ -174,6 +174,61 @@ describe("dreamer eval variance", () => {
                 disagreement: false,
             },
         ]);
+    });
+
+    test("verify repeats sharing a verdict but not a payload disagree", () => {
+        const verifyReport = (index: number, files: string[]): DreamerEvalRunReport => {
+            const entry = report(index);
+            entry.parsedManifest = {
+                verified: [{ publicClaimId: "mcm_claim", files }],
+                updated: [],
+                archived: [],
+            };
+            return entry;
+        };
+
+        // scoreVerifyManifest judges a retained claim's file set, so one repeat
+        // can pass while the other fails wrong-mapping. The verdict word alone
+        // reported both as unanimous.
+        const artifact = aggregateDreamerEvalVariance([
+            verifyReport(1, ["src/cache.ts"]),
+            verifyReport(2, ["src/cache.ts", "src/other.ts"]),
+        ]);
+
+        expect(artifact.claimHistograms[0]).toMatchObject({ disagreement: true });
+        expect(Object.keys(artifact.claimHistograms[0]!.counts).sort()).toEqual([
+            "verified;files:src/cache.ts",
+            "verified;files:src/cache.ts,src/other.ts",
+        ]);
+    });
+
+    test("update repeats differ by replacement body, not by whitespace or case", () => {
+        const updateReport = (index: number, content: string): DreamerEvalRunReport => {
+            const entry = report(index);
+            entry.parsedManifest = {
+                verified: [],
+                updated: [{ publicClaimId: "mcm_claim", files: ["src/cache.ts"], content }],
+                archived: [],
+            };
+            return entry;
+        };
+
+        // The scorer matches anchors against the trimmed, lowercased body, so
+        // these two are one applied state.
+        expect(
+            aggregateDreamerEvalVariance([
+                updateReport(1, "Cache holds 4096 entries."),
+                updateReport(2, "  cache holds 4096 entries.  "),
+            ]).claimHistograms[0],
+        ).toMatchObject({ disagreement: false });
+
+        // A different body is a different stored content, which is real variance.
+        expect(
+            aggregateDreamerEvalVariance([
+                updateReport(1, "Cache holds 4096 entries."),
+                updateReport(2, "Cache holds 2048 entries."),
+            ]).claimHistograms[0],
+        ).toMatchObject({ disagreement: true });
     });
 
     test("a partial classification resolves omitted fields like the scorer does", () => {

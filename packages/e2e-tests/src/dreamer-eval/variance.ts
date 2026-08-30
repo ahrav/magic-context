@@ -10,7 +10,8 @@ import type {
     FailReason,
 } from "./contract";
 import { parseRunReport } from "./contract";
-import { canonicalObservedPaths } from "./scorer";
+import { sha256Utf8Hex } from "../../../plugin/src/features/magic-context/memory/storage-claims";
+import { canonicalTrackedPaths } from "./scorer";
 
 export interface DreamerClaimVerdictHistogram {
     claimId: string;
@@ -65,11 +66,11 @@ function publicClaimId(value: unknown): string | null {
  * both — independence first, then files — so a claim's bucket has to carry
  * whatever could have made those two checks disagree between repeats.
  */
-function mapVerdict(entry: Record<string, unknown>): string {
+function mapVerdict(entry: Record<string, unknown>, tracked: readonly string[]): string {
     const observed = Array.isArray(entry.files)
         ? entry.files.filter((file): file is string => typeof file === "string")
         : [];
-    const files = [...new Set(canonicalObservedPaths(observed))].sort();
+    const files = [...new Set(canonicalTrackedPaths(observed, tracked))].sort();
     return `independent:${String(entry.independent === true)};files:${files.join(",")}`;
 }
 
@@ -93,9 +94,41 @@ function classifyVerdict(entry: Record<string, unknown>, current: ClaimSnapshotP
     return `importance:${String(importance)};scope:${String(scope)};shareable:${String(shareable)}`;
 }
 
+/**
+ * Encode a verify entry the way `scoreVerifyManifest` judges one. The verdict
+ * alone is not the scored unit: a retained claim's canonical file set decides
+ * `wrong-mapping`, and an update's replacement body decides
+ * `wrong-update-content`, so two repeats can share a verdict while one passes and
+ * the other fails.
+ *
+ * The body is recorded as a digest of its trimmed, lowercased form — the shape
+ * the scorer's anchor matching sees — so whitespace and case differences do not
+ * register, while a genuinely different replacement body does. That is real
+ * variance: the body becomes the claim's stored content, so two repeats writing
+ * different text left the pool in different states.
+ *
+ * Archived entries carry neither: the parser forces their file set empty and the
+ * scorer skips both checks for them.
+ */
+function verifyVerdict(
+    verdict: "verified" | "update" | "archive",
+    entry: Record<string, unknown>,
+    tracked: readonly string[],
+): string {
+    if (verdict === "archive") return "archive";
+    const observed = Array.isArray(entry.files)
+        ? entry.files.filter((file): file is string => typeof file === "string")
+        : [];
+    const files = [...new Set(canonicalTrackedPaths(observed, tracked))].sort().join(",");
+    if (verdict === "verified") return `verified;files:${files}`;
+    const content = typeof entry.content === "string" ? entry.content.trim().toLowerCase() : "";
+    return `update;files:${files};content:${sha256Utf8Hex(content).slice(0, 12)}`;
+}
+
 function observedVerdicts(report: DreamerEvalRunReport): Map<string, string> {
     const observed = new Map<string, string>();
     if (report.parsedManifest === null) return observed;
+    const tracked = [...new Set(report.poolBefore.flatMap((claim) => claim.files))];
     if (report.task === "verify" || report.task === "verify-broad") {
         const manifest = object(report.parsedManifest);
         for (const [field, verdict] of [
@@ -105,9 +138,11 @@ function observedVerdicts(report: DreamerEvalRunReport): Map<string, string> {
         ] as const) {
             const entries = manifest?.[field];
             if (!Array.isArray(entries)) continue;
-            for (const entry of entries) {
+            for (const value of entries) {
+                const entry = object(value);
                 const id = publicClaimId(entry);
-                if (id !== null) observed.set(id, verdict);
+                if (entry === null || id === null) continue;
+                observed.set(id, verifyVerdict(verdict, entry, tracked));
             }
         }
         return observed;
@@ -120,7 +155,9 @@ function observedVerdicts(report: DreamerEvalRunReport): Map<string, string> {
         if (entry === null || id === null) continue;
         observed.set(
             id,
-            report.task === "map-memories" ? mapVerdict(entry) : classifyVerdict(entry, currentByPublicId.get(id)),
+            report.task === "map-memories"
+                ? mapVerdict(entry, tracked)
+                : classifyVerdict(entry, currentByPublicId.get(id)),
         );
     }
     return observed;
