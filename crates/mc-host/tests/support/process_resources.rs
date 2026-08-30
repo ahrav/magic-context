@@ -12,7 +12,7 @@
 //!
 //! Observing a process's own fd table on Linux includes the enumeration
 //! descriptor itself; the bias is constant across samples, so deltas and
-//! envelope comparisons are unaffected. commentlint: allow(JUDGE)
+//! envelope comparisons are unaffected.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -231,7 +231,7 @@ fn count_threads(pid: u32) -> Result<u64, ObserveError> {
 // ---------------------------------------------------------------------------
 // macOS backend: public libproc (R13). Compiled and self-testable on macOS
 // CI; this crate's provisional soak tuple itself is Linux-only until the
-// frozen `.12` manifest retains a macOS provider. commentlint: allow(JUDGE)
+// frozen `.12` manifest retains a macOS provider.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "macos")]

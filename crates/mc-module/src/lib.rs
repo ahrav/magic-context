@@ -2813,7 +2813,7 @@ impl ProjectionCache {
     }
 
     fn snapshot(&mut self, session_id: &str, revert_epoch: u64) -> Option<ProjectionCacheSnapshot> {
-        // TODO(memory-accounting): add an active-clone budget for this `Arc`, as identified by
+        // TODO: add an active-clone budget for this `Arc`, as identified by
         // the module-memory audit. A running transform can retain it after LRU eviction, so the
         // cache-only charge cannot bound that in-flight allocation.
         if self
@@ -2873,7 +2873,7 @@ impl ProjectionCache {
 pub struct McHandler {
     store: Arc<Mutex<Option<Arc<McStore>>>>,
     store_open: Arc<StoreOpenCoordinator>,
-    /// Storage descriptor decoded by `initialize` and consumed by `activate`, so storage opening begins only after transport publication while a malformed descriptor still fails startup before anything publishes. commentlint: allow(JUDGE)
+    /// Storage descriptor decoded by `initialize` and consumed by `activate`, so storage opening begins only after transport publication while a malformed descriptor still fails startup before anything publishes.
     pending_storage: Mutex<Option<StorageDescriptor>>,
     /// Serializes "is the module still accepting tasks?" against shutdown.
     ///
@@ -17297,7 +17297,7 @@ mod tests {
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            // The previous pass's synthetic tail anchors (e.g. todo pair) may relocate
+            // The previous pass's synthetic tail anchors (e.g. task-list pair) may relocate
             // relative to NEW tail messages; compare the non-synthetic sequence.
             let strip = |arr: &[Value]| -> Vec<String> {
                 arr.iter()

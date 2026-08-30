@@ -1,8 +1,7 @@
 /// <reference types="bun-types" />
 
 /**
- * Regression suite for the three-set cache-busting refactor (Oracle review
- * 2026-04-26). Replaces the old monolithic `flushedSessions` set with three
+ * Regression suite for the three-set cache-busting refactor. Replaces the old monolithic `flushedSessions` set with three
  * single-purpose sets:
  *
  *   - `historyRefreshSessions`     one-shot, drained after `prepareCompartmentInjection`
@@ -174,7 +173,6 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
     it("Test 2: two subsequent defer passes after one historian publish — history is rebuilt exactly once", async () => {
         // Scenario from Oracle: a single historian publish should NOT
         // cause two cache busts (one per defer pass). The pre-refactor
-        // bug: flushedSessions stayed set across multiple passes when
         // heuristics couldn't run, so each defer pass re-rebuilt the
         // injection block.
         //

@@ -614,7 +614,7 @@ describe("detectConflicts", () => {
             // state (server version drift, a fetch racing boot) — NOT that the
             // host resolved its defaults. Reading absence as auto=true disabled
             // the plugin for real users whose auto=false lived in the file layer
-            // (issue #309, second arm: the 2026-08-14 desktop incident where
+            // (issue #309, second arm: the desktop incident where
             // every session overflowed with nothing managing the window).
             const client = {
                 config: {

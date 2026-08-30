@@ -1507,7 +1507,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         // E3 (recomp) + /ctx-session-upgrade: both run through the SHARED
         // orchestrator (runManagedRecomp / runManagedUpgrade) so the command
         // paths get identical model fallback + live progress + terminal state as
-        // the RPC dialog paths. Dogfood 2026-05-30: previously the command path
+        // the RPC dialog paths. Previously the command path
         // had fallback but no progress (sidebar stuck on stale "failed") while
         // the RPC dialog had progress but no fallback (failed on empty primary
         // model). One runner closes both gaps.

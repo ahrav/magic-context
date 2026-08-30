@@ -277,7 +277,7 @@ type CreateEmbeddingPipeline = (
 const DEFAULT_LOCAL_DTYPE: LocalEmbeddingDtype = "fp32";
 
 /**
- * Temporarily redirects console.warn and console.error to the file logger
+ * Redirects console.warn and console.error to the file logger
  * so that @huggingface/transformers and ONNX runtime never leak to the TUI.
  */
 async function withQuietConsole<T>(fn: () => Promise<T>): Promise<T> {

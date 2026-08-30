@@ -190,7 +190,7 @@ interface ActiveConnection {
 }
 
 /**
- * One client-wide re-upgrade episode: fenced to the exact source primary, bounded by one immutable deadline, and cancellable so owner close and primary retirement release every shadow connection permit (KTD5-KTD7). commentlint: allow(JUDGE)
+ * One client-wide re-upgrade episode: fenced to the exact source primary, bounded by one immutable deadline, and cancellable so owner close and primary retirement release every shadow connection permit (KTD5-KTD7).
  */
 interface RecoveryEpisode {
     readonly source: ActiveConnection;
@@ -445,11 +445,11 @@ export class McHostClient {
 
     private active: ActiveConnection | null = null;
     private connecting: SetupFlight<ActiveConnection> | null = null;
-    /** Draining generation slot; occupied from promotion until drain completes (KTD7). commentlint: allow(JUDGE) */
+    /** Draining generation slot; occupied from promotion until drain completes (KTD7). */
     private predecessor: ActiveConnection | null = null;
-    /** At most one client-wide recovery episode (KTD5). commentlint: allow(JUDGE) */
+    /** At most one client-wide recovery episode (KTD5). */
     private recovery: RecoveryEpisode | null = null;
-    /** RouteHandles opened by the managed-route cache, not caller-owned raw handles; the drain closes orphaned managed handles at pending-zero while raw handles wait for their caller's explicit close (R10). commentlint: allow(JUDGE) */
+    /** RouteHandles opened by the managed-route cache, not caller-owned raw handles; the drain closes orphaned managed handles at pending-zero while raw handles wait for their caller's explicit close (R10). */
     private readonly managedHandles = new WeakSet<RouteHandle>();
     private readonly routes = new Map<string, CachedManagedRoute>();
     /** In-flight route.open attempts, drained bounded during owner close. */
@@ -963,7 +963,7 @@ export class McHostClient {
         conn.fallbackReason = selection.reason;
         this.active = conn;
         this.emitConnected(conn, conn.fallbackReason);
-        // R11: exact `unavailable` is the only fallback that starts an automatic shared-memory recovery probe; every other reason and reasonless TCP stay sticky. commentlint: allow(JUDGE)
+        // R11: exact `unavailable` is the only fallback that starts an automatic shared-memory recovery probe; every other reason and reasonless TCP stay sticky.
         if (conn.fallbackReason === "unavailable") this.startRecovery(conn);
         return conn;
     }
@@ -1325,13 +1325,13 @@ export class McHostClient {
     }
 
     // ------------------------------------------------------------------
-    // Fresh-generation TCP-to-shared-memory re-upgrade (R9-R11). commentlint: allow(JUDGE)
+    // Fresh-generation TCP-to-shared-memory re-upgrade (R9-R11).
     // ------------------------------------------------------------------
 
     /**
      * Begin one client-wide recovery episode fenced to `source`. Only an
      * exact `unavailable` TCP fallback reaches this point; the deadline is
-     * created once here and never reset by any retry (KTD5). commentlint: allow(JUDGE)
+     * created once here and never reset by any retry (KTD5).
      */
     private startRecovery(source: ActiveConnection): void {
         if (this.closeStarted) return;
@@ -1399,7 +1399,7 @@ export class McHostClient {
      * authenticate, negotiate, and — on a grant — activate and commit,
      * all bounded by the episode deadline. Retries only discovery/dial
      * transients and repeated exact `unavailable`; every other outcome
-     * stops the episode permanently (KTD6). commentlint: allow(JUDGE)
+     * stops the episode permanently (KTD6).
      */
     private async shadowAttempt(episode: RecoveryEpisode): Promise<ShadowOutcome> {
         const stage = episode.deadline.stage(this.handshakeTimeoutMs);
@@ -1499,7 +1499,7 @@ export class McHostClient {
     /**
      * Source-fenced publication: the shadow commit becomes the primary only
      * while the exact source primary is still published and the predecessor
-     * slot is free; any other state retires the candidate instead (KTD6). commentlint: allow(JUDGE)
+     * slot is free; any other state retires the candidate instead (KTD6).
      */
     private finishPromotion(episode: RecoveryEpisode, conn: ActiveConnection): void {
         episode.shadowGenerations.delete(conn.generation);
@@ -1526,7 +1526,7 @@ export class McHostClient {
      * Retire the draining predecessor once no pending work AND no live
      * route handles remain on it. Orphaned managed-cache routes close at
      * pending-zero; caller-owned raw handles keep the drain open until
-     * their explicit close (R10). commentlint: allow(JUDGE)
+     * their explicit close (R10).
      */
     private maybeRetirePredecessor(): void {
         const pred = this.predecessor;
@@ -1809,7 +1809,7 @@ export class McHostClient {
                 };
                 this.routes.set(key, cached);
             }
-            // Only the primary serves cached managed handles: a handle left on a draining predecessor is stale for NEW managed acquisitions even while raw callers still use it (R10). commentlint: allow(JUDGE)
+            // Only the primary serves cached managed handles: a handle left on a draining predecessor is stale for NEW managed acquisitions even while raw callers still use it (R10).
             if (cached.handle && this.isPrimaryLiveHandle(cached.handle)) {
                 const active = this.active;
                 // Without a live connection the identity cannot be refreshed;
@@ -1996,7 +1996,7 @@ export class McHostClient {
 
     private async runClose(): Promise<void> {
         const deadline = Deadline.start(this.shutdownDeadlineMs, this.clock);
-        // Cancel shadow publication FIRST: a commit racing owner close must not publish, and every shadow connection permit is released (R11). commentlint: allow(JUDGE)
+        // Cancel shadow publication FIRST: a commit racing owner close must not publish, and every shadow connection permit is released (R11).
         if (this.recovery !== null) this.cancelRecovery(this.recovery);
         if (this.connecting) {
             try {

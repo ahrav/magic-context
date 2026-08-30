@@ -52,7 +52,7 @@ export function buildDreamTaskRuntimeConfigs(
  */
 export const MAX_CLASSIFY_MODEL_CHAIN = 8;
 
-/** Built from dreamer-level inputs only so historian model settings cannot select a classify model. commentlint: allow(JUDGE) */
+/** Built from dreamer-level inputs only so historian model settings cannot select a classify model. */
 export function buildClassifyModelChain(
     taskModel: string | undefined,
     dreamerModel: string | undefined,

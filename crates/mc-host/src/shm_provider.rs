@@ -127,7 +127,7 @@ pub struct ShmProvider {
 
 /// Recovery primitives for the thread-confined ring endpoint. The rings die
 /// with their endpoint thread, so a suspect close leaves alias state
-/// uncertain: cleanup isolates instead of reclaiming. commentlint: allow(JUDGE)
+/// uncertain: cleanup isolates instead of reclaiming.
 struct ShmRecoveryBackend {
     profile: Arc<TargetProfile>,
     admission: Arc<AdmissionController>,
@@ -202,14 +202,14 @@ impl ShmProvider {
 
     /// Test hook: install a publication observer for candidates prepared
     /// after this call. The hook runs on the endpoint thread after the ring
-    /// commit. commentlint: allow(JUDGE)
+    /// commit.
     #[doc(hidden)]
     pub fn set_publish_hook(&self, hook: PublishHook) {
         *self.publish_hook.lock().expect("publish hook lock") = Some(hook);
     }
 
     /// Test hook: hold one profile's admission charges so preflight reports
-    /// exact dynamic unavailability. commentlint: allow(JUDGE)
+    /// exact dynamic unavailability.
     #[doc(hidden)]
     pub fn hold_admission(&self) -> bool {
         let mut held = self.held_admission.lock().expect("held admission lock");
@@ -225,7 +225,7 @@ impl ShmProvider {
         }
     }
 
-    /// Test hook: end the admission hold. commentlint: allow(JUDGE)
+    /// Test hook: end the admission hold.
     #[doc(hidden)]
     pub fn release_admission(&self) {
         if let Some(admission) = self

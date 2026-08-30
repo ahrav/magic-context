@@ -312,7 +312,7 @@ export function renderTodowriteResult(
 				const parsed = parseTodos(JSON.parse(text));
 				if (parsed !== null) todos = parsed;
 			} catch {
-				// Leave the renderer empty if the tool result is not a todo list.
+				// Leave the renderer empty if the tool result is not a task list.
 			}
 		}
 	}

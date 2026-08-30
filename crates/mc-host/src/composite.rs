@@ -76,7 +76,7 @@ pub trait CompositeComponent: Send + Sync + 'static {
 pub trait PrimaryComponent: CompositeComponent {
     fn initialize(&self, init: HostInit) -> impl Future<Output = Result<(), InitError>> + Send;
 
-    /// Post-publication activation with [`McHostHandler::activate`]'s contract; the default does nothing so components without deferred work stay unchanged. commentlint: allow(JUDGE)
+    /// Post-publication activation with [`McHostHandler::activate`]'s contract; the default does nothing so components without deferred work stay unchanged.
     fn activate(&self) -> impl Future<Output = Result<(), InitError>> + Send {
         async { Ok(()) }
     }
@@ -89,7 +89,7 @@ pub trait PrimaryComponent: CompositeComponent {
 pub trait SecondaryComponent: CompositeComponent {
     fn initialize(&self) -> impl Future<Output = Result<(), InitError>> + Send;
 
-    /// Post-publication activation with [`McHostHandler::activate`]'s contract; the default does nothing so components without deferred work stay unchanged. commentlint: allow(JUDGE)
+    /// Post-publication activation with [`McHostHandler::activate`]'s contract; the default does nothing so components without deferred work stay unchanged.
     fn activate(&self) -> impl Future<Output = Result<(), InitError>> + Send {
         async { Ok(()) }
     }

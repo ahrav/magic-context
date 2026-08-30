@@ -601,7 +601,7 @@ mod fixture {
     /// Leader that forks a grandchild into the same process group and then
     /// hangs; group termination must take both (AE6).
     fn spawn_grandchild_then_hang(out: PathBuf) -> ! {
-        // The leader outlives the grandchild's exit so the SIGKILL sweep cannot race the grandchild's marker write. commentlint: allow(JUDGE)
+        // The leader outlives the grandchild's exit so the SIGKILL sweep cannot race the grandchild's marker write.
         let rt = tokio_rt();
         rt.block_on(async move {
             let mut term =
@@ -1637,7 +1637,7 @@ fn pi_broca_hook_owns_generation_controls() {
     let hook_path = scratch.path().join(PI_BROCA_EXTENSION_FILE);
     fs::write(&hook_path, PI_BROCA_EXTENSION_BYTES).expect("materialize hook");
     let driver_path = scratch.path().join("driver.mjs");
-    // The apply() chain below models the docs-specified handler semantics (returned value replaces the payload, undefined keeps it) from packages/pi-plugin/node_modules/@earendil-works/pi-coding-agent/docs/extensions.md#before_provider_request. commentlint: allow(JUDGE)
+    // The apply() chain below models the docs-specified handler semantics (returned value replaces the payload, undefined keeps it) from packages/pi-plugin/node_modules/@earendil-works/pi-coding-agent/docs/extensions.md#before_provider_request.
     let driver = format!(
         r#"import hook from "file://{hook}";
 const handlers = [];

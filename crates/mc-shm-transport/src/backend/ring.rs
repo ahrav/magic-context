@@ -456,7 +456,7 @@ impl RingGrant {
         Ok(grant)
     }
 
-    /// Decodes one exact-length grant slice. commentlint: allow(JUDGE)
+    /// Decodes one exact-length grant slice.
     pub fn decode_slice(bytes: &[u8]) -> Result<Self, RingError> {
         let bytes: [u8; GRANT_BYTES] = bytes.try_into().map_err(|_| RingError::InvalidGrant)?;
         Self::decode(bytes)
@@ -493,7 +493,7 @@ impl fmt::Debug for RingGrant {
     }
 }
 
-/// Ring attachment handle. commentlint: allow(JUDGE)
+/// Ring attachment handle.
 #[cfg(target_os = "linux")]
 pub struct RingAttachment {
     fd: OwnedFd,
@@ -503,12 +503,12 @@ pub struct RingAttachment {
 
 #[cfg(target_os = "linux")]
 impl RingAttachment {
-    /// Attaches ring. commentlint: allow(JUDGE)
+    /// Attaches ring.
     pub fn attach(self) -> Result<Ring, RingError> {
         Ring::attach(self.fd, self.grant, self.scheduling)
     }
 
-    /// Grant. commentlint: allow(JUDGE)
+    /// Grant.
     pub const fn grant(&self) -> RingGrant {
         self.grant
     }
@@ -621,7 +621,7 @@ impl Ring {
         self.mapping.fd.as_raw_fd()
     }
 
-    /// Duplicates attachment handle. commentlint: allow(JUDGE)
+    /// Duplicates attachment handle.
     #[cfg(target_os = "linux")]
     pub fn attachment(&self) -> Result<RingAttachment, RingError> {
         // SAFETY: F_DUPFD_CLOEXEC duplicates owned valid descriptor.
@@ -994,7 +994,7 @@ impl Ring {
         Ok((descriptors, bytes))
     }
 
-    /// Readiness probe that only reads shared state. commentlint: allow(JUDGE)
+    /// Readiness probe that only reads shared state.
     pub fn probe(&self) -> Result<(), RingError> {
         if self.is_quarantined() {
             return Err(RingError::Quarantined);
@@ -1287,12 +1287,12 @@ impl ProducerReservation<'_> {
         self.capacity() - self.cursor
     }
 
-    /// Number of reserved spans. commentlint: allow(JUDGE)
+    /// Number of reserved spans.
     pub const fn segment_count(&self) -> usize {
         self.plan.span_count() as usize
     }
 
-    /// Returns one reserved span. commentlint: allow(JUDGE)
+    /// Returns one reserved span.
     pub fn segment(&self, index: usize) -> Result<Option<LeaseSpan<'_>>, ProducerError> {
         let Some(span) = self.plan.span(index) else {
             return Ok(None);
@@ -1303,7 +1303,7 @@ impl ProducerReservation<'_> {
             .map_err(ProducerError::Ring)
     }
 
-    /// Advances cursor after writes into reserved spans. commentlint: allow(JUDGE)
+    /// Advances cursor after writes into reserved spans.
     pub fn advance(&mut self, bytes: usize) -> Result<(), ProducerError> {
         if self.finished {
             return Err(ProducerError::Aborted);
@@ -1322,7 +1322,7 @@ impl ProducerReservation<'_> {
         Ok(())
     }
 
-    /// Sets the wire header that commit validates against exact body length. commentlint: allow(JUDGE)
+    /// Sets the wire header that commit validates against exact body length.
     pub fn set_wire_header(
         &mut self,
         wire_header: [u8; WIRE_V2_HEADER_BYTES],

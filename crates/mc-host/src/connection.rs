@@ -903,7 +903,7 @@ async fn handle_negotiate<H: McHostHandler>(
             .find(&offer.transport, offer.capability_version)
         {
             Some(provider) => {
-                // A panicking preflight fails toward static omission: reasonless TCP and no client probe (KTD6). commentlint: allow(JUDGE)
+                // A panicking preflight fails toward static omission: reasonless TCP and no client probe (KTD6).
                 let eligibility = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     crate::panic_boundary::redact_sync(|| {
                         provider.preflight(offer.parameters.as_ref())
@@ -928,7 +928,7 @@ async fn handle_negotiate<H: McHostHandler>(
                         )
                         .await;
                     }
-                    // Exact `unavailable` is reserved for an installed, statically eligible provider's dynamic readiness or admission pressure (KTD6). commentlint: allow(JUDGE)
+                    // Exact `unavailable` is reserved for an installed, statically eligible provider's dynamic readiness or admission pressure (KTD6).
                     PreflightEligibility::DynamicallyUnavailable => {
                         dynamically_unavailable = true;
                     }
@@ -940,7 +940,7 @@ async fn handle_negotiate<H: McHostHandler>(
             None if shared.providers.serves_transport(&offer.transport) => {
                 capability_mismatch = true;
             }
-            // Permanent absence selects reasonless TCP, never `unavailable`, so a client cannot probe for a provider that cannot appear (KTD6). commentlint: allow(JUDGE)
+            // Permanent absence selects reasonless TCP, never `unavailable`, so a client cannot probe for a provider that cannot appear (KTD6).
             None => {}
         }
     }

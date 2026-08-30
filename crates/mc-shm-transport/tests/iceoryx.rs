@@ -107,8 +107,8 @@ fn allocation_slack_never_reaches_the_frame_decoder() {
 #[test]
 fn stale_node_observation_lists_without_disturbing_a_live_backend() {
     let backend = IceoryxBackend::create(&iceoryx_profile(), 7).unwrap();
-    // The observed value depends on host state left by other processes. commentlint: allow(JUDGE)
-    // The contract under test: observation succeeds and the live backend still round-trips afterwards. commentlint: allow(JUDGE)
+    // The observed value depends on host state left by other processes.
+    // The contract under test: observation succeeds and the live backend still round-trips afterwards.
     let _ = IceoryxBackend::stale_node_observed().unwrap();
     let body = [0x5Au8; 4];
     let mut reservation = backend.try_reserve(64, wire(body.len())).unwrap();

@@ -3413,7 +3413,7 @@ const TODO_ACTIVE_STATE = JSON.stringify([
 ]);
 
 /**
- * Drive the REAL runPostTransformPhase todo-synthesis block (B7) with an
+ * Drive the REAL runPostTransformPhase task-list synthesis block (B7) with an
  * explicit todowrite-availability verdict and scheduler decision, so the
  * disabled-tool gate is exercised against production code rather than a mirror.
  * `schedulerDecision: "execute"` is a cache-busting pass; `"defer"` replays.

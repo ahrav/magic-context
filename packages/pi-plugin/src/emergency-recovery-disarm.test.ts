@@ -5,7 +5,7 @@ import { join } from "node:path";
 /**
  * Regression guard for the emergency-recovery disarm predicate.
  *
- * BUG: a session whose overflow armed `needs_emergency_recovery=1`, then was
+ * Regression: a session whose overflow armed `needs_emergency_recovery=1`, then was
  * rescued by `/ctx-recomp` (covering all but a tiny in-progress tail), looped
  * forever — every transform pass force-bumped pressure to 95% because the flag
  * never cleared. Two clearing paths exist:

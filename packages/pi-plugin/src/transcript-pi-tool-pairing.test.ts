@@ -2,7 +2,7 @@
  * Regression test for the assistant `toolCall` ↔ `toolResult` pairing
  * preservation through `replaceWithSentinel`.
  *
- * Bug history: an earlier version of `createPiAssistantPart.replaceWithSentinel`
+ * Regression history: an earlier version of `createPiAssistantPart.replaceWithSentinel`
  * replaced the entire toolCall part with `{ type: "text", text: "[dropped §N§]" }`,
  * destroying the `id` field. The corresponding `toolResult` message
  * (separate role, separate `toolCallId`) then became orphaned, and Codex

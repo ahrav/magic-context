@@ -1662,11 +1662,6 @@ function pumpShadowBackfill(): void {
             const signature = ids.join(",");
             if (shadowBackfillLastIds.get(stallKey) === signature) {
                 // No progress since the last pump for this scope; stop retrying.
-                // Record WHY so status surfaces can distinguish "honest backlog,
-                // provider was failing" from "nothing left" — a bare remaining
-                // count after a silent stop reads as an unembeddable-item bug and
-                // costs a diagnosis cycle (2026-07-24: 437 chunks, transient
-                // provider timeouts under load, zero recorded reason).
                 shadowBackfillStopReasons.set(stallKey, "stalled_no_progress");
                 log(
                     `[shadow] backfill scope ${scope} for ${projectIdentity} retired without progress — ` +

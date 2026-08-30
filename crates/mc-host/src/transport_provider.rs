@@ -96,13 +96,13 @@ impl fmt::Debug for PreparedCandidate {
     }
 }
 
-/// Preflight verdict for one offer (KTD6). commentlint: allow(JUDGE)
+/// Preflight verdict for one offer (KTD6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreflightEligibility {
     Serveable,
-    /// Permanent absence or static ineligibility. commentlint: allow(JUDGE)
+    /// Permanent absence or static ineligibility.
     StaticallyOmitted,
-    /// Transient readiness or admission pressure. commentlint: allow(JUDGE)
+    /// Transient readiness or admission pressure.
     DynamicallyUnavailable,
 }
 
@@ -113,8 +113,8 @@ pub trait InjectedProvider: Send + Sync + 'static {
     fn transport(&self) -> &str;
     fn capability_version(&self) -> u32;
 
-    /// Implementations must not create resources, run cleanup, or touch workers here (R6). commentlint: allow(JUDGE)
-    /// Readiness changes govern new offers only, never existing candidates. commentlint: allow(JUDGE)
+    /// Implementations must not create resources, run cleanup, or touch workers here (R6).
+    /// Readiness changes govern new offers only, never existing candidates.
     fn preflight(&self, _parameters: Option<&serde_json::Value>) -> PreflightEligibility {
         PreflightEligibility::Serveable
     }

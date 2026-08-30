@@ -62,7 +62,7 @@ export function compareCodePoints(left: string, right: string): number {
     return leftPoints.length - rightPoints.length;
 }
 
-// The repo's TS lib target lacks String.prototype.isWellFormed, so isWellFormedUnicode scans UTF-16 code units directly. commentlint: allow(JUDGE)
+// The repo's TS lib target lacks String.prototype.isWellFormed, so isWellFormedUnicode scans UTF-16 code units directly.
 function isWellFormedUnicode(value: string): boolean {
     for (let index = 0; index < value.length; index++) {
         const unit = value.charCodeAt(index);

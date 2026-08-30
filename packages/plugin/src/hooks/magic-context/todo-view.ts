@@ -1,5 +1,5 @@
 /**
- * Todo state synthesis — synthetic todowrite injection.
+ * Task-list state synthesis — synthetic todowrite injection.
  *
  * Instead of inventing a custom `<current-todos>` block (which agents would
  * need to learn to parse), we synthesize a realistic `todowrite` tool part
@@ -19,7 +19,7 @@
  *     re-inject the same part at the same anchor, idempotent via callID match.
  *
  * Wire shape verified against:
- *   - OpenCode source: ~/Work/OSS/opencode/packages/opencode/src/tool/todo.ts
+ *   - OpenCode planning-tool output contract
  *   - Production OpenCode DB sample: part where data LIKE '%"tool":"todowrite"%'
  */
 
@@ -75,7 +75,7 @@ export const TERMINAL_STATUSES = new Set<TodoStatus>([
  * tool-part `title` (e.g. "3 todos"). OpenCode counts only `completed` as
  * "done"; cancelled todos still appear in the title's active count.
  *
- * Source: ~/Work/OSS/opencode/packages/opencode/src/tool/todo.ts:47-52.
+ * Matches OpenCode's planning-tool output contract.
  */
 export const TITLE_DONE_STATUSES = new Set<TodoStatus>([TODO_STATUS_COMPLETED]);
 
@@ -83,11 +83,11 @@ const SYNTHETIC_CALL_ID_PREFIX = "mc_synthetic_todo_";
 
 /**
  * Normalize a `todowrite` args.todos array into a stable JSON string.
- * Returns `null` if the input is not a valid todo array.
+ * Returns `null` if the input is not a valid work-item array.
  *
  * Some Pi users disable Magic Context's built-in `todowrite` and install a
  * third-party tool with the same name. Capture stays interoperable when that
- * tool emits Magic Context's exact todo shape, but it must fail closed for any
+ * tool emits Magic Context's exact work-item shape, but it must fail closed for any
  * other status or priority values so bad state never reaches synthetic replay.
  *
  * Used by the snapshot capture path (`hook-handlers.ts`) to produce a
@@ -150,16 +150,16 @@ export function buildSyntheticTodoPart(stateJson: string): SyntheticTodoPart | n
     const todos = parseTodoState(stateJson);
     if (todos === null || todos.length === 0) return null;
 
-    // Skip if every todo is terminal — agent has nothing in flight, no point reminding.
+    // Skip if every work item is terminal — agent has nothing in flight, no point reminding.
     if (todos.every((t) => TERMINAL_STATUSES.has(t.status))) return null;
 
     const callID = computeSyntheticCallId(stateJson);
     // Match OpenCode's `${todos.length - completed.length} todos` exactly:
-    // exclude only `completed`, NOT `cancelled`. See todo.ts:47-52.
+    // exclude only `completed`, NOT `cancelled`, per the planning-tool contract.
     const activeCount = todos.filter((t) => !TITLE_DONE_STATUSES.has(t.status)).length;
 
     // Match OpenCode's todowrite output exactly: pretty-printed JSON of the full todos array.
-    // See ~/Work/OSS/opencode/packages/opencode/src/tool/todo.ts:46-52.
+    // See the planning-tool implementation.
     const output = JSON.stringify(todos, null, 2);
 
     // `time.start === time.end` is a deliberate signal that this is synthetic.
@@ -187,7 +187,7 @@ export function buildSyntheticTodoPart(stateJson: string): SyntheticTodoPart | n
  * state; identical state across passes produces identical callID, which
  * gives byte-identical wire shape on both cache-busting and defer passes.
  *
- * Format chosen to clearly distinguish from real provider-generated IDs:
+ * Format chosen to distinguish from real provider-generated IDs:
  *   - Anthropic: `toolu_<24 base62 chars>`
  *   - OpenAI:    `call_<random>`
  *   - Synthetic: `mc_synthetic_todo_<16 hex chars>`
@@ -201,7 +201,7 @@ export function computeSyntheticCallId(stateJson: string): string {
 }
 
 /**
- * Detect whether a part is a synthetic todo part this module produced.
+ * Detect whether a part is a synthetic task-list part this module produced.
  * Used to skip synthetic parts during tagging and other tool-walk passes.
  */
 export function isSyntheticTodoPart(part: unknown): boolean {

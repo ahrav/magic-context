@@ -354,7 +354,7 @@ class CaseCacheController {
                 `case ${profileCase.id}: connectionStatement and sqlitePage states must agree in-process`,
             ]);
         }
-        // With concurrency > 1, another worker can repopulate the shared processVector cache between invalidation and measurement, so cold samples require one worker (KTD9). commentlint: allow(JUDGE)
+        // With concurrency > 1, another worker can repopulate the shared processVector cache between invalidation and measurement, so cold samples require one worker (KTD9).
         // The guard applies only when the memory lane can touch that cache;
         // a case whose lanes exclude memory never reads it, so the race it
         // prevents cannot occur.

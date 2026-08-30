@@ -309,7 +309,7 @@ async function executeSessionUpgrade(
          *  memory migration) via the shared orchestrator. Optional: unavailable
          *  when no historian model is configured. The orchestrator gives the
          *  command path identical model fallback + live progress + terminal
-         *  state as the RPC dialog path (dogfood 2026-05-30 unification). */
+         *  state as the RPC dialog path through one shared implementation. */
         runUpgrade?: (sessionId: string) => Promise<string>;
     },
     sessionId: string,
@@ -944,7 +944,7 @@ export function createMagicContextCommandHandler(deps: {
                     }
                 } else if (isTuiConnected(sessionId)) {
                     // In TUI, push an RPC action so the TUI poller shows a confirmation dialog.
-                    // Partial-range args fall through to the full-recomp dialog for now — TUI
+                    // Partial-range args fall through to the full-recomp dialog — TUI
                     // range UI is tracked as a phase-2 enhancement; typed args are ignored here.
                     pushNotification("action", { action: "show-recomp-dialog" }, sessionId);
                     sessionLog(sessionId, "command ctx-recomp: pushed show-recomp-dialog to TUI");

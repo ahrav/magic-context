@@ -2,7 +2,7 @@
 # recursively discovers every package's *.test.ts). Without this, a root-CWD
 # `bun test` runs all suites with NO preload and a bare openDatabase() would hit
 # the user's REAL shared DB — exactly how a worktree at a newer LATEST migrated
-# the live DB (2026-06-01 v26 incident, recurred at v41). resolveDatabasePath()
+# the live DB during the v26 incident; the failure recurred at v41. resolveDatabasePath()
 # also has a NODE_ENV=test backstop, but this keeps the redirect canonical.
 [test]
 preload = ["./packages/plugin/test-preload.ts"]

@@ -106,7 +106,7 @@ export function peekNoteNudgeText(
     }
 
     // Suppress if we delivered a nudge recently (within 15 minutes).
-    // Prevents the same notes from being re-surfaced on every commit/todo boundary
+    // Prevents the same notes from being re-surfaced on every commit/task-list boundary
     // in quick succession during active work.
     // Check unconditionally — a new trigger clears sticky fields, so gating on
     // stickyText presence would let triggers bypass the cooldown window.

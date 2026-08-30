@@ -9,7 +9,7 @@
  * retry.
  *
  * These tests are source-pinning rather than runtime mocks because the
- * bug shape is structural — the difference between "delete-before-work"
+ * failure shape is structural — the difference between "delete-before-work"
  * and "delete-after-success" is what matters and that's stable across
  * runtime mocking.
  */

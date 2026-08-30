@@ -8,8 +8,7 @@ import type { AgentBySession, LiveModelBySession, VariantBySession } from "./hoo
  * every component that needs to share signals with the others (the magic-
  * context hook, RPC handlers, command handlers, etc).
  *
- * The `*Sessions` sets are the cache-busting signal channels added in
- * the Oracle 2026-04-26 review (replaces the old single `flushedSessions`).
+ * The `*Sessions` sets give each cache-busting signal one consumer and lifetime.
  * See `hook-handlers.ts` for the full lifetime/semantics doc-comment on
  * each set, and `system-prompt-hash.ts` / `transform.ts` /
  * `transform-postprocess-phase.ts` for the consumer drain points.

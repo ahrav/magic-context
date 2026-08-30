@@ -34,7 +34,7 @@ impl<'lease> LeaseSpan<'lease> {
         self.len
     }
 
-    /// Raw span address, valid for this span's lifetime. commentlint: allow(JUDGE)
+    /// Raw span address, valid for this span's lifetime.
     pub const fn as_mut_ptr(self) -> *mut u8 {
         self.base.as_ptr()
     }
@@ -58,7 +58,7 @@ impl<'lease> LeaseSpan<'lease> {
         if destination.len() != self.len {
             return Err(LeaseError::LengthMismatch);
         }
-        // SAFETY: LeaseSpan::new guarantees readable storage for the lease; R19 forbids peer writes before release; destination is distinct and no shared-memory reference escapes. commentlint: allow(JUDGE)
+        // SAFETY: LeaseSpan::new guarantees readable storage for the lease; R19 forbids peer writes before release; destination is distinct and no shared-memory reference escapes.
         unsafe {
             std::ptr::copy_nonoverlapping(self.base.as_ptr(), destination.as_mut_ptr(), self.len)
         };
@@ -67,7 +67,7 @@ impl<'lease> LeaseSpan<'lease> {
 
     /// Touches every byte without materializing a body copy.
     pub fn checksum(self) -> u64 {
-        // SAFETY: LeaseSpan::new guarantees readable storage for the lease; R19 forbids peer writes before release; slice stays inside this call. commentlint: allow(JUDGE)
+        // SAFETY: LeaseSpan::new guarantees readable storage for the lease; R19 forbids peer writes before release; slice stays inside this call.
         let bytes = unsafe { std::slice::from_raw_parts(self.base.as_ptr(), self.len) };
         bytes
             .iter()

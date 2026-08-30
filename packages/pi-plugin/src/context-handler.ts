@@ -1245,7 +1245,7 @@ function collectMessageEntryIds(
 
 	// Helper: is this entry type one that produces an AgentMessage in
 	// buildSessionContext? Same three types: message, custom_message,
-	// branch_summary (the latter only when summary is set). Note that
+	// branch_summary (the latter only when summary is set). The
 	// branch_summary entries with `summary === undefined` are skipped
 	// by buildSessionContext but we accept all branch_summary entries
 	// here for robustness — the worst case is we emit an extra id that
@@ -2452,7 +2452,7 @@ export function registerPiContextHandler(
 			//
 			//   1. If the error reported a real context limit, prefer
 			//      that limit over Pi's reported contextWindow (which
-			//      was clearly wrong if we just overflowed).
+			//      was wrong if we just overflowed).
 			//   2. Bump effective percentage to 95% so the existing
 			//      emergency path (await historian + drop-all-tools)
 			//      fires regardless of pressure math.

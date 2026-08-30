@@ -94,7 +94,7 @@ afterEach(() => {
 
 describe("runCompartmentPhase - 95% emergency notification idempotency", () => {
     /**
-     * Regression guard for the CI-only infinite-loop bug discovered on 2026-05-19:
+     * Regression guard for the CI-only infinite-loop failure:
      *
      * When pressure stays >=95% across multiple transform passes (e.g. force-cleanup
      * usage that keeps reporting 85k tokens), the same compartment run stays active

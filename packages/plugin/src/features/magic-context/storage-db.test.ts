@@ -753,7 +753,7 @@ describe("storage-db direct format", () => {
         });
     });
 
-    // Regression guard for the 2026-06-01 (v26) / 2026-06-19 (v41) incidents:
+    // Regression guard for the v26 and v41 migration incidents:
     // a `bun test` run from a CWD whose bunfig lacks `[test] preload` ran the
     // package suites with NO isolation, so a bare openDatabase() migrated the
     // user's REAL shared DB. The NODE_ENV=test backstop in resolveDatabasePath

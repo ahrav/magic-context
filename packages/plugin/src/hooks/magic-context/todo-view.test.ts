@@ -116,7 +116,7 @@ describe("buildSyntheticTodoPart", () => {
     it("title reflects active count only", () => {
         const part = buildSyntheticTodoPart(validState);
         if (!part) throw new Error("part null");
-        // 1 active todo (in_progress); the completed one doesn't count
+        // 1 active work item (in_progress); the completed one doesn't count
         expect(part.state.title).toBe("1 todos");
     });
 

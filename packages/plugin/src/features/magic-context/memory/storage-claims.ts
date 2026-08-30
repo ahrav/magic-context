@@ -80,7 +80,7 @@ export function resolveProjectId(db: Database, identity: string): number | null 
 }
 
 // The prefix predicate mirrors `isCanonicalProjectIdentity` in
-// storage-project-identities.ts; keep the two in sync. commentlint: allow(JUDGE)
+// storage-project-identities.ts; keep the two in sync.
 function assertCanonicalProjectIdentity(canonicalIdentity: string): void {
     if (
         !(canonicalIdentity.startsWith("git:") || canonicalIdentity.startsWith("dir:")) ||

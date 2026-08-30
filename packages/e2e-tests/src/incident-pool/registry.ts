@@ -360,7 +360,7 @@ function executesBoundSymbol(executed: unknown, bound: unknown): boolean {
     if (typeof executed !== "function" || typeof bound !== "function")
         return false;
     if (executed === bound) return true;
-    // SAFETY: function objects support symbol-keyed properties set by adaptBoundSymbol. commentlint: allow(JUDGE)
+    // SAFETY: function objects support symbol-keyed properties set by adaptBoundSymbol.
     return (executed as unknown as Record<symbol, unknown>)[ADAPTED_FROM] ===
         bound;
 }

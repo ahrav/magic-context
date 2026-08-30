@@ -63,7 +63,7 @@ export class UnsupportedSchemaVersionError extends Error {
 export const CLI_SCHEMA_FLOOR_VERSION = LATEST_SUPPORTED_VERSION;
 
 function configureWriteConnection(db: DatabaseType): void {
-    // Total lock budget: 25.9s = five 5s waits + 900ms backoff. commentlint: allow(JUDGE)
+    // Total lock budget: 25.9s = five 5s waits + 900ms backoff.
     db.exec("PRAGMA busy_timeout=5000");
     db.exec("PRAGMA foreign_keys=ON");
     const row = db.prepare("PRAGMA foreign_keys").get() as Record<string, unknown>;

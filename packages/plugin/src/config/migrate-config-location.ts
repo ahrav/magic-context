@@ -141,7 +141,7 @@ function userScopeConfigPaths(): Set<string> {
  * resolves to the USER config path. Without this guard the project migration
  * would "migrate" the user's own config into `<root>/.cortexkit/` and rename the
  * original aside, leaving the user on schema defaults (the config-eats-itself
- * bug). A project migration must never touch a user-scope file.
+ * failure mode). A project migration must never touch a user-scope file.
  */
 export function resolveLegacyConfigSources(directory: string): {
     user: LegacyConfigSource[];

@@ -52,7 +52,7 @@ const UPGRADE_REMINDER_TEXT = [
  *  `p1` tier (e.g. from an interrupted/crashed recomp, or an older partial-v2
  *  build). The `legacy=0 ⟹ has tiers` invariant can break from any partial state,
  *  which would otherwise TRAP the session — the old gate said "already upgraded"
- *  and refused to re-run (dogfood 2026-05-30, AFT session with 541 tierless rows).
+ *  and refused to re-run on a session with 541 tierless rows.
  *  Single source of truth shared with the upgrade gate in recomp-orchestrator. */
 export const NEEDS_UPGRADE_SQL = "(legacy = 1 OR p1 IS NULL OR p1 = '')";
 

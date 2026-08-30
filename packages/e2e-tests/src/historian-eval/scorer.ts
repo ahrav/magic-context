@@ -625,7 +625,7 @@ export function freshScoringDatabase(): Database {
     if (scoringDbTemplate === null) {
         const template = createClaimReaderTestDatabase();
         // SAFETY: E2E executes in Bun, so the plugin Database is bun:sqlite,
-        // which carries serialize/deserialize. commentlint: allow(JUDGE)
+        // which carries serialize/deserialize.
         scoringDbTemplate = (template as unknown as BunDatabase).serialize();
         template.close();
     }

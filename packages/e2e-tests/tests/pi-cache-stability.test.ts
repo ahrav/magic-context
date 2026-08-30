@@ -848,46 +848,46 @@ describe("pi cache stability", () => {
         });
     }, 180_000);
 
-    // FIXME(pi-cache-stability): expected to fail until Pi gets OpenCode v10-style
+    // TODO: expected to fail until Pi gets OpenCode v10-style
     // history injection cache parity for background publication during defer passes.
     it.skip("does not rebuild <session-history> after historian publishes during a defer pass", () => {});
 
-    // FIXME(pi-cache-stability): pi --print exits immediately after the parent turn;
+    // TODO: pi --print exits immediately after the parent turn;
     // existing Pi smoke tests document that async historian completion is out of scope
     // for print-mode until Pi exposes a durable single-shot drain surface.
     it.skip("fires historian on commit cluster trigger and publishes harness='pi' compartments", () => {});
 
-    // FIXME(pi-cache-stability): depends on the same print-mode historian child drain;
+    // TODO: depends on the same print-mode historian child drain;
     // keep as durable coverage target for fallback model retry once that lands.
     it.skip("publishes historian output through fallback_models after primary 503", () => {});
 
-    // FIXME(pi-cache-stability): Pi --print reloads the extension between user turns,
+    // TODO: Pi --print reloads the extension between user turns,
     // so in-memory adjunct caches do not currently preserve the design invariant that
     // ctx_memory writes wait for an explicit /ctx-flush before refreshing the system prompt.
     it.skip("refreshes system-prompt memory adjuncts only after explicit /ctx-flush", () => {});
 
-    // FIXME(pi-cache-stability): sticky reminder anchor persistence is wired through
+    // TODO: sticky reminder anchor persistence is wired through
     // session_meta, but Pi --print cannot yet synthesize the exact multi-turn nudge
     // anchor/restart sequence without interactive process control.
     it.skip("keeps sticky reminder anchored at the same message across defer passes and restart", () => {});
 
-    // FIXME(pi-cache-stability): native compaction is cancelled by session_before_compact,
+    // TODO: native compaction is cancelled by session_before_compact,
     // but the current e2e harness has no hook to force Pi's native compact event in print mode.
     it.skip("cancels native Pi compaction and lets Magic Context own compaction", () => {});
 
-    // FIXME(pi-cache-stability): requires reliable print-mode historian publication and
+    // TODO: requires reliable print-mode historian publication and
     // inspection of Pi's JSONL compaction entry after appendCompaction(...).
     it.skip("writes a Pi compaction marker at the historian boundary and resumes after it", () => {});
 
-    // FIXME(pi-cache-stability): /ctx-aug subagent runs need a print-mode command/tool
+    // TODO: /ctx-aug subagent runs need a print-mode command/tool
     // harness that can wait for the child Pi process and inspect its session rows.
     it.skip("marks Pi subagents isolated and skips historian/project-docs/user-profile/key-files", () => {});
 
-    // FIXME(pi-cache-stability): same subagent command harness gap as above; target is
+    // TODO: same subagent command harness gap as above; target is
     // cross-session memory visibility via ctx_search from a Pi subagent.
     it.skip("allows Pi subagents to search parent-written project memory", () => {});
 
-    // FIXME(pi-cache-stability): simulating SIGKILL mid-historian in print mode currently
+    // TODO: simulating SIGKILL mid-historian in print mode currently
     // races Pi process shutdown; keep as the restart-recovery target for stale state cleanup.
     it.skip("clears stale compartment_in_progress after Pi restart", () => {});
 });

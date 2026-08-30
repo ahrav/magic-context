@@ -62,7 +62,7 @@ jobs:
 
       # --allow-unresolved keeps an unresolved manifest loud but
       # non-fatal; a FROZEN manifest is validated strictly with no
-      # workflow edit. commentlint: allow(JUDGE)
+      # workflow edit.
       - name: Validate hardening matrix (strict when frozen)
         working-directory: packages/e2e-tests
         run: bun scripts/validate-shm-hardening-matrix.ts --allow-unresolved
@@ -116,7 +116,7 @@ jobs:
       # The --lib pass runs the provider_recovery controller unit
       # suite (stale retries, deadline isolation, wedged cleanup,
       # late-result fencing, inbox bounds, custody accounting), which
-      # no integration binary exercises. commentlint: allow(JUDGE)
+      # no integration binary exercises.
       - name: Crash, recovery, and soak-smoke suites
         run: |
           cargo nextest run -p mc-host --lib \
@@ -171,7 +171,7 @@ jobs:
 
       # No retained macOS provider: Linux-gated crash/soak harnesses
       # are absent by cfg, so this proves side-effect-free omission
-      # (R15), not active parity. commentlint: allow(JUDGE)
+      # (R15), not active parity.
       - name: Contracts, observer self-tests, and omission proof (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -786,7 +786,7 @@ jobs:
         # post-overflow change, commit 7e09660c3, until release; the
         # overflow-recovery host test is now version-agnostic.) Trade-off: a
         # known-bad upstream release can turn CI red for unrelated PRs — if that
-        # happens, temporarily re-pin with `--version X.Y.Z` here until it's
+        # happens, re-pin with `--version X.Y.Z` here until it's
         # resolved upstream.
         run: |
           curl -fsSL https://opencode.ai/install | bash

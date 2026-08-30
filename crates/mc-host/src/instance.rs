@@ -640,7 +640,6 @@ pub(crate) fn write_atomic_owner_only(
 /// reinstates the replacement-overlap hazard unless the daemon is fully
 /// stopped first, and an external rename of `.mc-host-coordination` itself
 /// (out of contract) splits the fence the same way.
-/// commentlint: allow(JUDGE)
 fn lock_instance(dir: &OwnedFd, dir_path: &Path) -> Result<(), InstanceError> {
     match flock(dir, FlockOperation::NonBlockingLockExclusive) {
         Ok(()) => Ok(()),

@@ -1,6 +1,6 @@
 # Test isolation: force XDG_DATA_HOME to a throwaway temp dir for the whole test
 # process so NO test can read or migrate the user's real shared cortexkit
 # database (shared with OpenCode). See test-preload.ts for the rationale
-# (2026-06-01 incident). Structural guard; do not remove.
+# This structural guard prevents live-DB migration; do not remove.
 [test]
 preload = ["./test-preload.ts"]

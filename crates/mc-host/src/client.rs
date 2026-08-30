@@ -579,7 +579,7 @@ impl Client {
             .await
     }
 
-    /// The host commits the stop only after the complete `host.shutdown` response frame reaches the socket, so `Ok` here is the stop linearization point the native lifecycle owner waits on; the connection itself stays open. commentlint: allow(JUDGE)
+    /// The host commits the stop only after the complete `host.shutdown` response frame reaches the socket, so `Ok` here is the stop linearization point the native lifecycle owner waits on; the connection itself stays open.
     pub async fn host_shutdown(&self) -> Result<(), CallError> {
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(CallError::local(

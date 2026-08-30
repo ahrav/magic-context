@@ -231,7 +231,7 @@ export async function executeContextRecompWithResult(
         return {
             // "— Skipped" suffix so isRecompFailure() (string-based callers) treats
             // this as a non-success and never proceeds to migration / "complete"
-            // on it (dogfood 2026-05-30). The `published:false` flag is the robust
+            // on it. The `published:false` flag is the robust
             // primary signal; this heading is defense-in-depth.
             message:
                 "## Magic Recomp — Skipped\n\nHistorian is already running for this session. Wait for it to finish, then try `/ctx-recomp` again.",
@@ -275,7 +275,7 @@ export async function executeContextRecompWithResult(
     activeRuns.set(sessionId, { promise: wrappedPromise, published: false, kind: "recomp" });
     try {
         const message = await promise;
-        // B1 (dogfood 2026-05-30): log EVERY recomp outcome here — this wraps all
+        // Log EVERY recomp outcome here — this wraps all
         // ~12 return paths in the runner, so a silently-non-publishing recomp is
         // now always diagnosable from the log. The returned message carries the
         // reason inline (e.g. "## Magic Recomp — Failed\n\n<reason>").

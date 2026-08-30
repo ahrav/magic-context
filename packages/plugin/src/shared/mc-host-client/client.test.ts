@@ -2331,7 +2331,7 @@ describe("facade helpers", () => {
         expect(isMcHostCallError(new SecondCopyCallError("terminal", "x"))).toBe(true);
 
         const oldName = new SecondCopyCallError("terminal", "x", "c");
-        // Assembled from parts; boundary tests reject the joined spelling. commentlint: allow(JUDGE)
+        // Assembled from parts; boundary tests reject the joined spelling.
         oldName.name = ["Subc", "CallError"].join("");
         expect(isMcHostCallError(oldName)).toBe(false);
 

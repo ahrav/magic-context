@@ -98,7 +98,7 @@ export function variantChangeBustsProviderCache(providerID?: string): boolean {
  *
  * `cache_control` inheritance: if the original part carried provider-side
  * cache-breakpoint metadata (`cache_control` / `cacheControl`), the
- * sentinel inherits it. OpenCode currently only sets cache markers on the
+ * sentinel inherits it. OpenCode only sets cache markers on the
  * last two system+non-system messages (never on mid-history parts we
  * strip), so this is defensive, but cheap.
  */

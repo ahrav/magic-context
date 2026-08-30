@@ -1820,7 +1820,7 @@ pub enum TransformError {
     DuplicateBlockId(String),
     /// A live message's block-kind/fingerprint vector changed after first sight.
     IdentityDrift(String),
-    /// A frozen synthetic todo pair could not be replayed at its stored tail anchor.
+    /// A frozen synthetic task-list pair could not be replayed at its stored tail anchor.
     SyntheticTodoAnchorMissing(String),
     /// A frozen reduction still names a live message, but that exact block disappeared.
     FrozenRedTargetVanish(String),
@@ -2513,7 +2513,7 @@ fn validate_lineage_anchor(
     }
     // Locate the anchor at the first NON-synthetic message, matching the seam
     // check's boundary rule. A synthetic-marked head (e.g. a normalized
-    // synthetic-todo message) would otherwise pass the seam gate and fail here
+    // synthetic-task-list message) would otherwise pass the seam gate and fail here
     // on every pass, turning a benign head into a per-pass defer.
     let first = req
         .messages
@@ -3236,7 +3236,7 @@ fn apply_once(
     let total_started_at = Instant::now();
     let mut timings = TransformTimings::default();
     let mut m1_revision_read_timings = M1RevisionReadTimings::default();
-    // OpenCode transports the frozen todo pair as one marked tool part. Older adapters did not
+    // OpenCode transports the frozen task-list pair as one marked tool part. Older adapters did not
     // copy that marker into CK metadata, so recognize the reserved call-id namespace here too.
     // Normalizing before projection keeps the replayed pair out of selection, coverage, and output.
     let projection_started_at = Instant::now();
@@ -4143,7 +4143,7 @@ fn apply_once(
         .collect();
     let tail_for_selection =
         tail_sel_items(&live, loaded.meta.coverage_ordinal, &tag_tokens_by_block);
-    // Todo state is deferred work just like an m1 or reduction delta: it may ride an
+    // Task-list state is deferred work just like an m1 or reduction delta: it may ride an
     // independently scheduled bust, but it never authorizes provider-visible bytes by itself.
     // Compute only the call-id transition here; the complete pair is built after classification.
     let todo_injection_pending = tail_reclaim_enabled
@@ -4312,7 +4312,7 @@ fn apply_once(
         // hard/force/emergency arms bypass it.
         bust_opportunity,
     });
-    // A todo-only delta does not need a coverage anchor: it inserts a frozen pair between the
+    // A task-list-only delta does not need a coverage anchor: it inserts a frozen pair between the
     // existing prefix and tail without moving the m0/m1 boundary. The generic classifier blocks
     // boundaryless m1 deltas because they cannot splice safely, so promote only its ordinary
     // defer result when an independent bust opportunity already exists. Reconcile defers remain
@@ -5175,8 +5175,8 @@ fn apply_once(
             estimate_tokens,
         ));
     }
-    // A todo-only SOFT splice changes neither the m0/m1 divider nor the covered tail. Keep
-    // divergence evidence across that bust so repeated todo churn cannot postpone repair. A
+    // A task-list-only SOFT splice changes neither the m0/m1 divider nor the covered tail. Keep
+    // divergence evidence across that bust so repeated task-list churn cannot postpone repair. A
     // structural boundary/coverage move, or a converged observation, still closes the episode.
     if boundary_divergence_reset_allowed(
         is_bust_pass,
@@ -5536,7 +5536,7 @@ fn apply_once(
         &mut meta,
     );
 
-    // Build the output before committing so a missing synthetic-todo anchor cannot
+    // Build the output before committing so a missing synthetic-task-list anchor cannot
     // persist an unusable frozen pair. Pending rows are classified from the final plan:
     // live unfrozen targets remain durable, while applied or retired targets are consumed.
     let consumed_drop_ids = consumed_pending_drop_ids(
@@ -7071,7 +7071,7 @@ fn tail_sel_items(
 }
 
 fn tail_end_mid(req: &TransformRequest, coverage: Option<u64>) -> Option<String> {
-    // Synthetic todo state is attached to the latest non-synthetic assistant message,
+    // Synthetic task-list state is attached to the latest non-synthetic assistant message,
     // never to a trailing user or tool message. If no eligible assistant exists, return
     // None so build_output can place the stable anchor after the initial metadata blocks.
     req.messages
@@ -7501,7 +7501,7 @@ fn reanchor_kept_synthetic_todo_if_folded_or_shrunk(
 
     // A coverage-moving bust already changes the rendered bytes: advance folds the old
     // anchor into history, while shrink means the old anchor was in reverted-away tail. In
-    // both cases an unchanged synthetic todo can move to the new tail end without turning
+    // both cases an unchanged synthetic task list can move to the new tail end without turning
     // into an always-last floater on ordinary tail growth or defer passes.
     debug_assert!(folded_by_advance || coverage_shrunk_on_bust);
     pair.anchor_mid = tail_end_mid(req, meta.coverage_ordinal);
@@ -7750,7 +7750,7 @@ fn tag_mint_frozen_key(frozen: &HashSet<String>) -> [u8; 32] {
 
 /// A block is resolved for frontier purposes when it will not receive a new mint
 /// under the current frozen set: already tagged, frozen-reduced, or not taggable.
-/// Mutation-exempt mids are temporary and do not advance the frontier past them.
+/// Mutation-exempt mids do not advance the frontier past them.
 fn tag_mint_block_resolved(
     block: &FlatBlock,
     frozen: &HashSet<String>,
@@ -14019,10 +14019,6 @@ pub(crate) mod tests {
         meta.coverage_start_ordinal = Some(1);
         meta.coverage_compartment_seq = Some(1);
         meta.folded_compartment_seq = 1;
-        // Production row read for ses_08df2045… on 2026-08-08: initialized=1,
-        // coverage_ordinal=425, m1_revision=1644131851866052375,
-        // publication_floor_ordinal=2417 (present, not rewound), and max compartment sequence 47
-        // ending near ordinal 2400. The fixture's 2401 floor is intentionally close to that row.
         meta.publication_floor_ordinal = Some(2_401);
         store
             .commit(&request.session_id, loaded.row_version, &core, &meta)
@@ -20647,7 +20643,7 @@ pub(crate) mod tests {
             &before_meta,
         ));
 
-        // A todo-promoted bust on a still-damaged row must retain the evidence that drives
+        // A task-list-promoted bust on a still-damaged row must retain the evidence that drives
         // bounded repair escalation. The synthetic splice itself moves no cache boundary.
         assert!(!boundary_divergence_reset_allowed(
             true, false, false, false, false, false,
@@ -29207,7 +29203,7 @@ pub(crate) mod tests {
 
     #[test]
     fn continued_lineage_survives_post_descent_folds_advancing_past_the_seam() {
-        // Prod wedge f6a4ca71 (2026-08-11): the continuation base is frozen at
+        // Production wedge f6a4ca71: the continuation base is frozen at
         // the descent seam, but the successor's historian keeps folding. The
         // old equality check fenced every pass after the first successor fold
         // (+2 / +5 compartment-end overhangs); coverage PAST the seam must be
@@ -29334,7 +29330,7 @@ pub(crate) mod tests {
     fn continued_lineage_tolerates_a_synthetic_head_like_the_seam_check() {
         // The seam check finds the boundary at the first non-synthetic message;
         // the anchor check must use the same rule or a synthetic-marked head
-        // (normalized synthetic todo) passes one gate and defers forever on the
+        // (normalized synthetic task list) passes one gate and defers forever on the
         // other.
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());

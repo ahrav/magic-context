@@ -137,7 +137,7 @@ describe("effectiveEndMs", () => {
 
 describe("formatDate", () => {
     test("formats a date as YYYY-MM-DD", () => {
-        // 2026-04-21 00:00:00 local time. Test with a known date.
+        // The fixture instant is midnight local time on a known date.
         const ms = new Date(2026, 3, 21, 12, 0, 0).getTime(); // Apr 21 2026 noon local
         expect(formatDate(ms)).toBe("2026-04-21");
     });

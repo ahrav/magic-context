@@ -87,7 +87,7 @@ describe("pi session lifecycle", () => {
   }, 120_000);
 
   it.skip("session deletion clears tags and session_meta (FIXME: Pi exposes no deletion RPC/event)", () => {
-    // FIXME(v0.20 parity): OpenCode emits `session.deleted` from
+    // TODO: OpenCode emits `session.deleted` from
     // client.session.delete(), and the OpenCode e2e verifies durable tags +
     // session_meta rows are removed. Pi currently exposes `new_session`
     // (session_before_switch) and process teardown (session_shutdown), but no

@@ -1389,7 +1389,7 @@ async function driveDependent(
                     bytes1 === bytes0 &&
                     // Each defer wire must carry exactly one injected pair. The
                     // byte comparison resolves `root.callId`, so a second pair
-                    // beside the frozen one is invisible to it, and Todo 1's
+                    // beside the frozen one is invisible to it, and the initial scenario's
                     // single-pair check covers only the initial bust.
                     [t0, t1].every(
                         (body) =>
@@ -1498,7 +1498,7 @@ async function driveDependent(
                 // between the two passes says nothing about WHAT was rebuilt:
                 // healing reconstructs the pair after synthetic_todo is deleted,
                 // so incorrect input or result bytes replayed consistently would
-                // pass. Todo 1's payload check covers the original injection,
+                // pass. The initial scenario's payload check covers the original injection,
                 // not this rebuild.
                 providerTransitionCorrect:
                     bustBytes !== null &&

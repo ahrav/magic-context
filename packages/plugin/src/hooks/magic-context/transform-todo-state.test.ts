@@ -2,7 +2,7 @@
 
 /**
  * Synthetic-todowrite injection tests covering all 7 branches of the
- * todo state placement logic in transform-postprocess-phase.ts.
+ * task-list state placement logic in transform-postprocess-phase.ts.
  *
  * Cache-safety invariant under test: defer-pass replays produce
  * byte-identical message shape to the previous defer pass on the same

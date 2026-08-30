@@ -143,7 +143,7 @@ function codecProxy(value: unknown, samples: number): {
         try {
             JSON.parse(serialized);
         } catch {
-            // Benchmark round-trip of freshly stringified data. commentlint: allow(JUDGE)
+            // Benchmark round-trip of freshly stringified data.
         }
         parseSamples.push(performance.now() - startedAt);
     }

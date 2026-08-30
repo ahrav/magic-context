@@ -61,8 +61,7 @@ export type AgentBySession = Map<string, string>;
  *
  * The old `Set<string>` conflated three independent lifetimes into one flag,
  * which caused defer passes blocked by an in-progress historian to keep
- * re-firing the same flush signal across multiple turns (Oracle review,
- * 2026-04-26). Each set now has exactly one consumer and one lifetime.
+ * re-firing the same flush signal across multiple turns. Each set now has exactly one consumer and one lifetime.
  *
  * Design rule: every producer that wants to refresh state should `add` to
  * EVERY set whose consumer needs to react. Consumers are responsible for
@@ -564,7 +563,7 @@ export function createToolExecuteAfterHook(args: {
             }
         }
         if (typedInput.tool === "todowrite") {
-            // Persist todo state only for the exact native `todowrite` tool
+            // Persist task-list state only for the exact native `todowrite` tool
             // after checking its availability and live permission. MCP-shaped
             // lookalikes such as `mcp_Todowrite` do not enter this branch and
             // remain refused.
@@ -595,7 +594,7 @@ export function createToolExecuteAfterHook(args: {
                     );
                 }
             }
-            // Only trigger note nudge when ALL todo items are terminal (completed/cancelled).
+            // Only trigger note nudge when ALL work items are terminal (completed/cancelled).
             // Firing on every todowrite is too eager — agents call it repeatedly while working.
             const todoArgs = typedInput.args as { todos?: unknown } | undefined;
             const todos = todoArgs?.todos;

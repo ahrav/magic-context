@@ -219,7 +219,7 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
         // `protectedTailStart`; `emitProgress` drives the TUI progress bar.
         // (Outcome LOGGING is done once in executeContextRecompWithResult, which
         // wraps every return path — previously only lease-loss logged, making a
-        // silently-non-publishing recomp undiagnosable; see dogfood 2026-05-30.)
+        // silently-non-publishing recomp undiagnosable.)
         const totalMessages = Math.max(0, protectedTailStart - 1);
         const progressStartedAt = Date.now();
         const emitProgress = (note?: string): void => {

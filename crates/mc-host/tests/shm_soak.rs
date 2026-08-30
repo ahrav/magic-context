@@ -8,7 +8,7 @@
 //! `ShmProvider` tuple on Linux as the provisional tuple, exactly like
 //! `shm_failure_modes.rs`. The observer backends themselves are
 //! cross-platform: macOS `libproc` support compiles and self-tests on macOS
-//! CI. commentlint: allow(JUDGE)
+//! CI.
 //!
 //! # Conservation mechanism (R12)
 //! The ring provider has no dead-peer reclamation: a candidate whose peer
@@ -20,9 +20,8 @@
 //! subsequent `SIGKILL` still terminates a live process holding both ring
 //! mappings, and the parent then proves exact logical conservation, zero
 //! quarantined charges, and no surviving descendants before the next cycle.
-//! commentlint: allow(JUDGE)
 //!
-//! Clean cycles therefore prove clean-close charge conservation plus crash-side OS hygiene — NOT dead-peer charge reclamation, which remains a provider gap pending the frozen `.12` manifest and is pinned exactly by `killed_victim_holding_active_charges_is_never_reclaimed` in `shm_failure_modes.rs`. commentlint: allow(JUDGE)
+//! Clean cycles therefore prove clean-close charge conservation plus crash-side OS hygiene — NOT dead-peer charge reclamation, which remains a provider gap pending the frozen `.12` manifest and is pinned exactly by `killed_victim_holding_active_charges_is_never_reclaimed` in `shm_failure_modes.rs`.
 //!
 //! # Envelope (KTD10)
 //! Twenty unmeasured warmup cycles run first. After logical quiescence,
@@ -30,7 +29,7 @@
 //! harness parent, which also holds the observer route) freeze the
 //! envelope. Measurement checks logical counters every cycle and OS
 //! counters every ten cycles plus the final cycle, and never updates the
-//! envelope. commentlint: allow(JUDGE)
+//! envelope.
 //!
 //! # Full soak
 //! `full_soak_cycles_conserve_resources` is `#[ignore]`d and opt-in. Run it
@@ -39,7 +38,6 @@
 //! `cargo test -p mc-host --test shm_soak -- --ignored --exact
 //! full_soak_cycles_conserve_resources`. The `MC_SHM_SOAK_CYCLES`
 //! environment variable overrides the measured cycle count (default 1000).
-//! commentlint: allow(JUDGE)
 //!
 //! # Redaction (R17)
 //! Failure output names only role, cycle number, counter kind, and
@@ -56,7 +54,6 @@ use support::process_resources::{observe, ResourceCounts};
 /// Serializes every test in this binary under plain `cargo test`, where
 /// tests share one process and would otherwise race the fd, mapping, and
 /// thread counters. Taken before any runtime is built.
-/// commentlint: allow(JUDGE)
 fn serial_soak_lock() -> MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -122,7 +119,7 @@ fn observer_reports_fd_delta_and_return_to_baseline() {
 
 /// One shared file-backed (Linux memfd) or shared anonymous (macOS)
 /// mapping: both kinds occupy exactly one region that never merges into a
-/// neighbor. commentlint: allow(JUDGE)
+/// neighbor.
 struct TestMapping {
     address: *mut libc::c_void,
     length: usize,
@@ -248,7 +245,7 @@ fn observer_fails_on_an_unobservable_pid() {
 // ---------------------------------------------------------------------------
 
 // Role tests live at the crate top level so `spawn_role`'s `--exact`
-// libtest filter matches their names. commentlint: allow(JUDGE)
+// libtest filter matches their names.
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "daemon role for the shm soak harness"]
@@ -276,7 +273,7 @@ fn shm_soak_role_leaky() {
         .spawn()
         .expect("spawn the leaked descendant");
     // The child handle is dropped without wait: the descendant outlives
-    // this role's own lifetime checks. commentlint: allow(JUDGE)
+    // this role's own lifetime checks.
     drop(child);
     support::shm_process::emit_record("child_leaked");
     loop {
@@ -436,7 +433,6 @@ mod soak {
         pub os_check_interval: u64,
         /// Test fault: the daemon leaks one duplicated fd every N measured
         /// cycles (the seeded-defect detector fixture).
-        /// commentlint: allow(JUDGE)
         pub leak_fd_every: Option<u64>,
     }
 
@@ -492,7 +488,7 @@ mod soak {
             .await;
         }
         // Freeze the envelope after warmup quiescence; measurement never
-        // updates it. commentlint: allow(JUDGE)
+        // updates it.
         let daemon_envelope = stable_counts(daemon_pid);
         let parent_envelope = stable_counts(parent_pid);
 
@@ -536,7 +532,6 @@ mod soak {
 
     /// A fixture process that leaks one descendant must FAIL the role and
     /// descendant check, instead of a daemon-only snapshot passing.
-    /// commentlint: allow(JUDGE)
     #[test]
     fn role_liveness_check_detects_a_leaked_descendant() {
         let _serial = serial_soak_lock();
@@ -578,7 +573,6 @@ mod soak {
 
     /// Seeded-defect detector: one duplicated fd leaked per measured cycle
     /// must breach the frozen daemon fd envelope within ten cycles.
-    /// commentlint: allow(JUDGE)
     #[test]
     fn injected_fd_leak_breaches_the_frozen_envelope() {
         let _serial = serial_soak_lock();

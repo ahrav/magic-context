@@ -1,7 +1,7 @@
 //! Barrier-driven real-process crash and isolation scenarios for the
 //! provisional ring-backed shared-memory tuple. See
 //! `support/shm_process.rs` for the harness contract, the manifest-gate
-//! note, and the Bun/Node stub category. commentlint: allow(JUDGE)
+//! note, and the Bun/Node stub category.
 #![cfg(target_os = "linux")]
 
 mod support;
@@ -44,7 +44,6 @@ fn shm_role_victim() {
 
 /// Bounded poll until the daemon reports exactly `expected` dispatches;
 /// exceeding it at any sample fails immediately (replay detector).
-/// commentlint: allow(JUDGE)
 fn wait_for_dispatches(daemon: &mut RoleProcess, expected: u64, budget: Duration) {
     let deadline = Instant::now() + budget;
     loop {
@@ -100,7 +99,6 @@ fn wait_soak_stats(
 /// Idle-commit barrier with a promptly reaped victim: observer traffic
 /// succeeds immediately before the kill, during recovery, and after a fresh
 /// restart; a victim killed before request publication dispatches nothing.
-/// commentlint: allow(JUDGE)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn promptly_reaped_idle_kill_preserves_observer_and_restarts_fresh() {
     let _serial = serial_crash_lock().await;
@@ -143,9 +141,9 @@ async fn promptly_reaped_idle_kill_preserves_observer_and_restarts_fresh() {
 /// Peer death is silent for the host ring endpoint: no `Goodbye` or
 /// readable close, so a victim killed WHILE holding an active committed
 /// candidate never becomes a suspect and its exact admission charges stay
-/// `active` until the daemon closes. commentlint: allow(JUDGE)
+/// `active` until the daemon closes.
 ///
-/// Known ring-backend dead-peer-reclamation gap, deferred to the `magic-context-ymc.12` retained-provider work: real reclamation must fail these exact-value assertions and force this claim to be updated. commentlint: allow(JUDGE)
+/// Known ring-backend dead-peer-reclamation gap, deferred to the `magic-context-ymc.12` retained-provider work: real reclamation must fail these exact-value assertions and force this claim to be updated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn killed_victim_holding_active_charges_is_never_reclaimed() {
     let _serial = serial_crash_lock().await;
@@ -258,7 +256,7 @@ async fn kill_after_request_publication_dispatches_once_without_replay() {
     let window = victim.reap_killed();
 
     // The dead victim never observes a terminal; the daemon-side contract is
-    // at-most-once dispatch of the committed request. commentlint: allow(JUDGE)
+    // at-most-once dispatch of the committed request.
     wait_for_dispatches(&mut daemon, 2, window.remaining());
     observer.roundtrip(1024, 42, window.remaining()).await;
 
@@ -277,7 +275,7 @@ async fn kill_after_request_publication_dispatches_once_without_replay() {
 
 /// Response-publication barrier, reported by the daemon provider before the
 /// victim consumes: reclamation of the dead victim's endpoint must not
-/// corrupt the observer's own response bytes. commentlint: allow(JUDGE)
+/// corrupt the observer's own response bytes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kill_before_response_consumption_leaves_observer_uncorrupted() {
     let _serial = serial_crash_lock().await;
@@ -292,7 +290,7 @@ async fn kill_before_response_consumption_leaves_observer_uncorrupted() {
     victim.expect_record("barrier request_published");
     // The daemon provider owns response publication; the victim parks
     // without consuming, so the kill lands between publication and
-    // consumption. commentlint: allow(JUDGE)
+    // consumption.
     daemon.wait_for_record("barrier response_published");
     victim.kill();
     let window = victim.reap_killed();
@@ -311,7 +309,7 @@ async fn kill_before_response_consumption_leaves_observer_uncorrupted() {
 }
 
 /// Seeded-defect detector: a harness that starts observation timing at
-/// `kill` instead of after `wait` must fail here. commentlint: allow(JUDGE)
+/// `kill` instead of after `wait` must fail here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn held_zombie_starts_observation_timing_only_after_reap() {
     let _serial = serial_crash_lock().await;
@@ -379,7 +377,7 @@ async fn restart_with_same_identity_rejects_stale_activation() {
     let stale_token = stale["activation_token"].as_str().expect("stale token");
 
     // A fresh negotiation mints a fresh token, candidate identity, and ring
-    // grant; values stay out of assertion output (R17). commentlint: allow(JUDGE)
+    // grant; values stay out of assertion output (R17).
     let (mut bootstrap, grant) = negotiate_grant(&info).await;
     assert_eq!(grant["selected"]["transport"], SHM_TRANSPORT);
     assert!(

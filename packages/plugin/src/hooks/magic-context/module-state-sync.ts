@@ -544,12 +544,12 @@ function stableHash(value: string): string {
 }
 
 /**
- * The todo state we report to the Rust module for a session.
+ * The task-list state we report to the Rust module for a session.
  *
  * When the session's tools map filters the native todowrite tool out (frozen
  * "unavailable" verdict), we report an EMPTY state instead of the persisted
  * one. The module's existing content-change handling then drops the synthetic
- * todo pair on its next cache-busting render. Reporting empty here (rather than
+ * task-list pair on its next cache-busting render. Reporting empty here (rather than
  * the stale persisted state) keeps a disabled tool from being replayed into the
  * module's wire content. The watermark hash is computed from this same value so
  * the flip to empty registers as a content change and actually triggers a
@@ -1236,7 +1236,7 @@ export function buildPagedModuleStateSyncPayloads(args: {
     });
 
     // The envelope is fixed for all pages; use the largest safe sequence numbers so
-    // page estimates cannot undercount metadata. Empty arrays are intentionally left
+    // page estimates cannot undercount metadata. Empty arrays are left
     // in this margin, making the estimate conservative by a few bytes per field.
     const sizingEnvelope = makePayload({
         index: Number.MAX_SAFE_INTEGER,

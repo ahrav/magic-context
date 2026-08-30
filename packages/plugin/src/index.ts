@@ -155,7 +155,7 @@ const server: Plugin = async (ctx) => {
                 type SessionListFn = () => Promise<
                     { data?: Array<{ id?: string }> } | Array<{ id?: string }>
                 >;
-                // SAFETY: probe guards every access at runtime. commentlint: allow(JUDGE)
+                // SAFETY: probe guards every access at runtime.
                 const clientWithSessions = ctx.client as unknown as {
                     session?: { list?: SessionListFn };
                 };
@@ -401,7 +401,7 @@ const server: Plugin = async (ctx) => {
         // importantly, issue #77 showed that a later refresh can regress to a
         // smaller/wrong limit and silently break an in-progress session. The
         // event handler may still retry this refresh once when it detects an
-        // obviously bad cache value, but normal operation is one-shot.
+        // bad cache value, but normal operation is one-shot.
         void refreshModelLimitsFromApi(ctx.client, { retries: 3, retryDelayMs: 1000 });
     }
 
@@ -415,7 +415,7 @@ const server: Plugin = async (ctx) => {
         if (fence) {
             void import("./plugin/conflict-warning-hook").then(({ sendSchemaFenceWarning }) =>
                 sendSchemaFenceWarning(
-                    // SAFETY: helper duck-types the client at runtime. commentlint: allow(JUDGE)
+                    // SAFETY: helper duck-types the client at runtime.
                     ctx.client as unknown as Record<string, unknown>,
                     ctx.directory,
                     fence,
@@ -429,7 +429,7 @@ const server: Plugin = async (ctx) => {
     if (conflictResult?.hasConflict) {
         // Fire-and-forget: send warning to the last active session for this project
         void sendConflictWarning(
-            // SAFETY: helper duck-types the client at runtime. commentlint: allow(JUDGE)
+            // SAFETY: helper duck-types the client at runtime.
             ctx.client as unknown as Record<string, unknown>,
             ctx.directory,
             conflictResult,
@@ -440,7 +440,7 @@ const server: Plugin = async (ctx) => {
         const serverUrlStr =
             serverUrl instanceof URL ? serverUrl.toString().replace(/\/$/, "") : undefined;
         void cleanupConflictWarnings(
-            // SAFETY: helper duck-types the client at runtime. commentlint: allow(JUDGE)
+            // SAFETY: helper duck-types the client at runtime.
             ctx.client as unknown as Record<string, unknown>,
             ctx.directory,
             serverUrlStr,
@@ -476,7 +476,7 @@ const server: Plugin = async (ctx) => {
                     void import("./plugin/conflict-warning-hook")
                         .then(({ sendStartupAnnouncement }) =>
                             sendStartupAnnouncement(
-                                // SAFETY: helper duck-types the client at runtime. commentlint: allow(JUDGE)
+                                // SAFETY: helper duck-types the client at runtime.
                                 ctx.client as unknown as Record<string, unknown>,
                                 ctx.directory,
                                 ANNOUNCEMENT_VERSION,
@@ -562,7 +562,7 @@ const server: Plugin = async (ctx) => {
                 );
             },
         }),
-        // SAFETY: wrapper matches the hook's runtime call shape. commentlint: allow(JUDGE)
+        // SAFETY: wrapper matches the hook's runtime call shape.
         "experimental.chat.messages.transform": createMessagesTransformHandler({
             magicContext: magicContextRuntime.magicContext,
             getMagicContext: () => magicContextRuntime.magicContext,
@@ -574,7 +574,7 @@ const server: Plugin = async (ctx) => {
             compactionOff: !isCompactionEnabled(pluginConfig),
             internalChildSessions: liveSessionState.internalChildSessions,
             tryReopenStorage,
-            // SAFETY: wrapper matches the hook's runtime call shape. commentlint: allow(JUDGE)
+            // SAFETY: wrapper matches the hook's runtime call shape.
         }) as unknown as NonNullable<Hooks["experimental.chat.messages.transform"]>,
         "experimental.chat.system.transform": async (input, output) => {
             await magicContextRuntime.magicContext?.["experimental.chat.system.transform"]?.(

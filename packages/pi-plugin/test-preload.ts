@@ -4,7 +4,7 @@
 // shared cortexkit DB (~/.local/share/cortexkit/magic-context/context.db),
 // which pi-plugin shares with OpenCode via @magic-context/core's
 // `getDataDir()` = `XDG_DATA_HOME ?? ~/.local/share`. See the OpenCode plugin's
-// test-preload.ts for the full rationale (2026-06-01 incident: a dormant
+// test-preload.ts for the full rationale (a dormant
 // unisolated test migrated the production DB to v26 and fail-closed every
 // running v25 binary). Tests that set their own XDG_DATA_HOME still override
 // per-test. Do not remove.

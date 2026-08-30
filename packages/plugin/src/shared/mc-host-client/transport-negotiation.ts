@@ -731,7 +731,7 @@ function plainDepth(value: unknown): number {
  * `undefined` members, and other JavaScript-only shapes all differ from
  * their pre-serialization value — and the returned parsed snapshot is what
  * callers MUST encode: a stateful `toJSON` could otherwise pass validation
- * and emit a different shape on the second serialization. Note that
+ * and emit a different shape on the second serialization. The
  * `JSON.stringify` may run provider-authored `toJSON`; callers holding a
  * provider-owned value contain that call and pass the string to
  * {@link checkOpaqueSerialized} instead.

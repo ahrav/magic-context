@@ -172,7 +172,7 @@ export type SubagentProgressEvent =
  *       JSON malformed or unexpected event ordering)
  * - `error`: human-readable detail; safe to log, may include stack info.
  * - `durationMs`: wall-clock time from runner-call to runner-return.
- * - `meta`: optional harness-specific debug payload. Currently unused; left
+ * - `meta`: optional harness-specific debug payload. Unused; kept
  *   here so the OpenCode runner can surface the child session ID for log
  *   correlation when Step 5b lands.
  */

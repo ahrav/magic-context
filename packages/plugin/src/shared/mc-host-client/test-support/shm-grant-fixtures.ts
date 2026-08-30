@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import { ShmGrantError, type ShmGrantErrorCode } from "../shm-grant";
 
-// Field offsets mirror RingGrant::encode in backend/ring.rs. commentlint: allow(JUDGE)
+// Field offsets mirror RingGrant::encode in backend/ring.rs.
 export function grantHex(
     overrides: Partial<{
         layoutVersion: number;

@@ -158,7 +158,7 @@ export class PiTestHarness {
   private static mockBaseURL(mock: MockProvider): string {
     const last = mock.requests()[0];
     if (last) return `http://${last.headers.host}`;
-    // SAFETY: MockProvider.start stores Bun server under this stable test-only field. commentlint: allow(JUDGE)
+    // SAFETY: MockProvider.start stores Bun server under this stable test-only field.
     const server = (mock as unknown as { server?: { port?: number } }).server;
     const port = server?.port;
     if (!port) throw new Error("mock provider is not running");

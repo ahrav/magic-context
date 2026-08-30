@@ -15,7 +15,7 @@ const PARAMETERS = Object.freeze({
     topology: "fused",
 });
 
-/** Explicit test-only provider. commentlint: allow(JUDGE) */
+/** Explicit test-only provider. */
 export function createExplicitShmTestProvider(
     profile: string,
 ): ClientTransportProvider | undefined {
@@ -32,7 +32,7 @@ export function createExplicitShmTestProvider(
         capabilityVersion: 1,
         parameters: PARAMETERS,
         connect: (grant, args) => {
-            // Attachment I/O runs in start(), after this decode. commentlint: allow(JUDGE)
+            // Attachment I/O runs in start(), after this decode.
             const watermark =
                 previousCandidate !== undefined &&
                 sameDaemonId(previousCandidate.daemonId, args.daemonId)

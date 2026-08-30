@@ -211,7 +211,7 @@ export interface AgeReclaimToolTag extends ToolReclaimHintTag {
 /**
  * Tools whose output is task / plan STATE, never appropriate to surface as a
  * "you could drop this" hint regardless of size. `todowrite` is the agent's
- * working plan: the canonical todo state is the synthetic todowrite we inject
+ * working plan: the canonical task-list state is the synthetic todowrite we inject
  * (and protect from dropping), so suggesting the agent drop a todowrite output
  * is both pointless and confusing. Name-excluded (not just floor-excluded)
  * because a todowrite output can be several hundred tokens, above the floor.

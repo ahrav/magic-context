@@ -23,7 +23,7 @@ import { join } from "node:path";
  *
  * These tests guard against regressions by reading the source
  * verbatim — string assertions on `agent_end` body shape — because the
- * bug is structural (the handler signature and what it awaits) and is
+ * failure mode is structural (the handler signature and what it awaits) and is
  * cheaper to pin via source inspection than a Pi runtime mock.
  */
 

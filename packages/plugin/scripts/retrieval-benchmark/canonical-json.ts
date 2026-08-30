@@ -23,7 +23,7 @@ export type CanonicalJsonFileFailure = "unreadable" | "invalid-json" | "non-cano
 
 /**
  * `JSON.parse` retains only the last duplicate member; the byte comparison
- * rejects input containing duplicate members. commentlint: allow(JUDGE)
+ * rejects input containing duplicate members.
  * Use `onFailure` to preserve caller-specific errors.
  */
 export function readCanonicalJsonFile(

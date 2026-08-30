@@ -181,7 +181,7 @@ describe("recomp message helpers", () => {
 
     it("treats the lease/activeRuns skip messages as failures (— Skipped suffix)", () => {
         // These no-op messages must NOT let the upgrade proceed to migration /
-        // declare "complete" — the recomp wrote nothing (dogfood 2026-05-30).
+        // declare "complete" — the recomp wrote nothing.
         // Belt: the message heading now carries "— Skipped"; suspenders: the
         // orchestrator also gates on the `published:false` flag.
         expect(
@@ -227,9 +227,8 @@ describe("recomp message helpers", () => {
     });
 
     it("contextualizeUpgradeReason rewrites /ctx-recomp -> /ctx-session-upgrade", () => {
-        // Bug (dogfood 2026-05-31): the upgrade flow surfaced the shared recomp
-        // skip text verbatim, telling the user to run `/ctx-recomp` — the wrong
-        // command for the upgrade flow.
+        // Upgrade flow must not surface shared recomp skip text verbatim because
+        // it directs the user to `/ctx-recomp`, the wrong command for this flow.
         const out = contextualizeUpgradeReason(
             "Historian returned no usable compartments. Try `/ctx-recomp` again.",
         );

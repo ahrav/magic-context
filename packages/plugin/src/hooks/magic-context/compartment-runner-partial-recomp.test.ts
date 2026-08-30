@@ -192,7 +192,7 @@ describe("snapRangeToCompartments", () => {
 /**
  * Regression test for "UNIQUE constraint failed: compartments.session_id, compartments.sequence"
  *
- * Bug: partial recomp assigned 1-indexed sequences to prior compartments (`idx + 1`)
+ * Regression: partial recomp assigned 1-indexed sequences to prior compartments (`idx + 1`)
  * and to tail compartments (`candidateCompartments.length + idx + 1`). This created
  * a gap between the "prior + new" block and the "tail" block, breaking the invariant
  * `MAX(sequence) = count - 1`. Next incremental historian then computed

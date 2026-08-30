@@ -1,24 +1,24 @@
 #![warn(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//! Transport storage stays charged until publication-ordered completion. commentlint: allow(JUDGE)
-//! Cross-process metadata carries checked offsets and lengths, never pointers. commentlint: allow(JUDGE)
+//! Transport storage stays charged until publication-ordered completion.
+//! Cross-process metadata carries checked offsets and lengths, never pointers.
 
-/// FIFO arena planning and byte-state accounting. commentlint: allow(JUDGE)
+/// FIFO arena planning and byte-state accounting.
 pub mod arena;
-/// Shared-memory backend implementations. commentlint: allow(JUDGE)
+/// Shared-memory backend implementations.
 pub mod backend;
-/// Immutable grant and complete-frame metadata. commentlint: allow(JUDGE)
+/// Immutable grant and complete-frame metadata.
 pub mod descriptor;
-/// Operation-counter evidence gates. commentlint: allow(JUDGE)
+/// Operation-counter evidence gates.
 pub mod evidence;
-/// Fuzz and corpus-replay decoder entry points. commentlint: allow(JUDGE)
+/// Fuzz and corpus-replay decoder entry points.
 pub mod harness;
-/// Scoped raw-span receive leases. commentlint: allow(JUDGE)
+/// Scoped raw-span receive leases.
 pub mod lease;
-/// Checked close state machine. commentlint: allow(JUDGE)
+/// Checked close state machine.
 pub mod lifecycle;
-/// Target profiles and host-wide resource admission. commentlint: allow(JUDGE)
+/// Target profiles and host-wide resource admission.
 pub mod profile;
 
 pub use arena::{MAX_FRAME_BYTES, MIN_ARENA_BYTES};

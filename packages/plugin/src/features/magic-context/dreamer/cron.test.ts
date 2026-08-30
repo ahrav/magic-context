@@ -89,14 +89,14 @@ describe("matchesCron — dom/dow OR semantics", () => {
         expect(matchesCron(c, local(2026, 6, 16, 0, 0))).toBe(false);
     });
     it("only dow restricted → only that weekday", () => {
-        // 2026-06-07 is a Sunday.
+        // The first fixture date is a Sunday.
         const c = parsed("0 0 * * 0");
         expect(local(2026, 6, 7).getDay()).toBe(0);
         expect(matchesCron(c, local(2026, 6, 7, 0, 0))).toBe(true);
         expect(matchesCron(c, local(2026, 6, 8, 0, 0))).toBe(false);
     });
     it("both restricted → OR (either matches)", () => {
-        // dom=15 OR dow=0(Sun). 2026-06-15 is a Monday (dom hit, dow miss).
+        // dom=15 OR dow=0(Sun). The day-15 fixture is a Monday (dom hit, dow miss).
         const c = parsed("0 0 15 * 0");
         expect(local(2026, 6, 15).getDay()).toBe(1); // Monday
         expect(matchesCron(c, local(2026, 6, 15, 0, 0))).toBe(true); // dom matches
@@ -125,7 +125,7 @@ describe("nextOccurrence", () => {
     });
     it("weekly Sunday 03:00", () => {
         const c = parsed("0 3 * * 0");
-        // From Mon 2026-06-08, next Sunday is 2026-06-14.
+        // From the Monday fixture, the next match is the following Sunday.
         const next = nextOccurrence(c, local(2026, 6, 8, 12, 0));
         expect(next?.getDay()).toBe(0);
         expect(next?.getTime()).toBe(local(2026, 6, 14, 3, 0).getTime());

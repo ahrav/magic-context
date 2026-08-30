@@ -93,11 +93,11 @@ jobs:
             rm -rf "$RUNNER_TEMP/retrieval-benchmark/run-$run"
           done
 
-      # Baselines bind one profile fingerprint. commentlint: allow(JUDGE)
-      # baselines/v1/quality.json is ci-profile. commentlint: allow(JUDGE)
-      # An arm-neon comparison is non-comparable. commentlint: allow(JUDGE)
-      # Publish host baselines via baseline-create. commentlint: allow(JUDGE)
-      # Then this step can gate. commentlint: allow(JUDGE)
+      # Baselines bind one profile fingerprint.
+      # baselines/v1/quality.json is ci-profile.
+      # An arm-neon comparison is non-comparable.
+      # Publish host baselines via baseline-create.
+      # Then this step can gate.
       - name: Apply regression policy (informational)
         continue-on-error: true
         run: |
@@ -192,11 +192,11 @@ jobs:
             rm -rf "$RUNNER_TEMP/retrieval-benchmark/run-$run"
           done
 
-      # Baselines bind one profile fingerprint. commentlint: allow(JUDGE)
-      # baselines/v1/quality.json is ci-profile. commentlint: allow(JUDGE)
-      # An x86-avx2 comparison is non-comparable. commentlint: allow(JUDGE)
-      # Publish host baselines via baseline-create. commentlint: allow(JUDGE)
-      # Then this step can gate. commentlint: allow(JUDGE)
+      # Baselines bind one profile fingerprint.
+      # baselines/v1/quality.json is ci-profile.
+      # An x86-avx2 comparison is non-comparable.
+      # Publish host baselines via baseline-create.
+      # Then this step can gate.
       - name: Apply regression policy (informational)
         continue-on-error: true
         run: |

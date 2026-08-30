@@ -6,7 +6,7 @@ export const embedPauseBySession = new Set<string>();
 /** AbortController for the active embed drain per session. */
 export const embedRunStateBySession = new Map<string, AbortController>();
 
-/** Completed auto-drains, plus temporary in-flight claims, per session and process. */
+/** Completed auto-drains, plus in-flight claims, per session and process. */
 export const autoEmbedAttemptedBySession = new Set<string>();
 
 export type EmbedDrainUiStatus = "idle" | "running" | "paused" | "stopped";

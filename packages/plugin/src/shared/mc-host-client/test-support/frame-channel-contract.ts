@@ -208,7 +208,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
     {
         // R3: publication start and local completion are distinct and fire
         // exactly once, in order; completion never claims peer receipt —
-        // both fire while the peer is provably not consuming. commentlint: allow(JUDGE)
+        // both fire while the peer is provably not consuming.
         name: "publication and local completion fire exactly once, in order",
         async run(create) {
             const h = await create();
@@ -382,7 +382,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
             const flushed = graceful.channel.flush(Deadline.start(15_000));
             graceful.peer.resumeReading();
             await flushed;
-            // Flush confirms local completion, not receipt. commentlint: allow(JUDGE)
+            // Flush confirms local completion, not receipt.
             await graceful.peer.waitFor(() => requestCorrs(graceful.peer).length >= 3, 15_000);
             assert.deepEqual(requestCorrs(graceful.peer), [1n, 2n, 3n]);
             assert.equal(graceful.budget.used, 0);

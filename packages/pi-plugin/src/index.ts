@@ -359,7 +359,7 @@ function applyCompatiblePiTodoCapture(args: {
 
 /**
  * Capture a `todowrite` args.todos payload only when it matches Magic Context's
- * exact todo enum contract. Third-party Pi extensions can reuse the same tool
+ * exact task list enum contract. Third-party Pi extensions can reuse the same tool
  * name, so incompatible shapes must not update `last_todo_state` or the
  * transcript render cache.
  */
@@ -381,7 +381,7 @@ export function capturePiTodowriteArgsIfCompatible(args: {
 /**
  * Scan an assistant `message_end` payload for the first compatible `todowrite`
  * call. This keeps interop with third-party tools that share the name but only
- * captures state when their payload matches Magic Context's todo enums exactly.
+ * captures state when their payload matches Magic Context's work-item enums exactly.
  */
 export function capturePiTodowriteMessageIfCompatible(args: {
 	db: ContextDatabase;
@@ -1942,7 +1942,7 @@ async function startPiMagicContextRuntime(
 				// session state and the local tool-call cache; it does not
 				// mutate Pi messages. Subagents skip — they do not get synthetic
 				// todowrite injection. Foreign Pi extensions can share the
-				// `todowrite` name, so only the exact Magic Context todo
+				// `todowrite` name, so only the exact Magic Context task list
 				// shape updates the stored snapshot.
 				capturePiTodowriteArgsIfCompatible({
 					db,

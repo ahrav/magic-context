@@ -159,7 +159,7 @@ function isTaskRoutingCaller(agentId: string, config: Record<string, unknown>): 
     const mode = config.mode;
     // OpenCode compatibility:
     // Only strictly-primary callers receive explicit Task routing rules.
-    // Agents that may execute as Task children are intentionally left untouched,
+    // Agents that may execute as Task children are left untouched,
     // because explicit task permissions can alter OpenCode's default anti-nesting
     // behavior in the currently supported permission model.
     if (mode === "primary") return true;

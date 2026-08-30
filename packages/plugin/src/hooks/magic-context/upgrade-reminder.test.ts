@@ -128,7 +128,7 @@ describe("E5 upgrade reminder", () => {
         // The TUI path does NOT durably stamp on mere display — the stamp is set
         // only on an explicit Confirm/Cancel (via the dismiss-upgrade-reminder
         // RPC). Stamping on display would trap a session the user closed before
-        // acting (dogfood 2026-05-30). The per-process guard prevents same-process
+        // acting. The per-process guard prevents same-process
         // spam; a new process re-shows until the user decides.
         expect(getOrCreateSessionMeta(db, "ses-tui").upgradeRemindedAt).toBeNull();
     });
@@ -335,7 +335,7 @@ describe("E5 upgrade reminder", () => {
     });
 
     it("does NOT show a resume prompt for a fully-upgraded session with orphan staging, and clears it", async () => {
-        // Regression (dogfood 2026-05-31, AFT): a session whose compartments are
+        // Regression: a session whose compartments are
         // ALL v2 (legacy=0, tiers present) but which still carries leftover
         // recomp_compartments staging from a superseded run must NOT trigger the
         // "Resume the interrupted upgrade?" dialog. The master gate is "has legacy

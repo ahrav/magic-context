@@ -325,7 +325,7 @@ export function resolveProjectIdentityStrict(directory: string): string {
  * Returns a stable string suitable for use as a database key:
  *   - `"git:<sha>"` for git repositories with at least one commit
  *   - `"dir:<md5-12>"` for accessible non-git directories, empty repos, or cold-start git-backed
- *     directories whose git probe is temporarily unavailable before any `git:` identity is known
+ *     directories while initial git identity resolution is unavailable
  *
  * A cold-start `dir:` fallback can split project-scoped rows until git recovers, but that split is
  * bounded and self-heals through the backfill/reconciliation paths. After a successful git resolve,

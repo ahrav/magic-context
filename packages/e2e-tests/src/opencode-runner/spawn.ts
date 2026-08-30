@@ -277,7 +277,7 @@ function writeConfigs(
         );
     }
 
-    // tui.json: not needed for headless serve, but harmless to emit nothing for now.
+    // tui.json: not needed for headless serve, but harmless to emit nothing.
 }
 
 /**

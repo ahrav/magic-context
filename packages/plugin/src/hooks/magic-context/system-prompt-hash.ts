@@ -515,7 +515,6 @@ export function createSystemPromptHashHandler(deps: {
         // any pre-existing flag set by `/ctx-flush` or variant change so
         // the next valid pass can consume it.
         //
-        // See Oracle review 2026-04-26 Finding A1 for the bug this fixes.
         if (isCacheBusting) {
             deps.systemPromptRefreshSessions.delete(sessionId);
         }

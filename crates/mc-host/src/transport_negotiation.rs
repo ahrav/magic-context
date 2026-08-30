@@ -140,7 +140,7 @@ impl FallbackReason {
 #[derive(Clone)]
 pub struct ActivationToken(String);
 
-// Constant-time equality: XOR-fold every byte pair instead of early-exiting on the first mismatch. commentlint: allow(JUDGE)
+// Constant-time equality: XOR-fold every byte pair instead of early-exiting on the first mismatch.
 impl PartialEq for ActivationToken {
     fn eq(&self, other: &Self) -> bool {
         // The length guard keeps `zip` from truncating the comparison: without

@@ -3,7 +3,7 @@
 /**
  * Regression suite for `createSystemPromptHashHandler`'s drain semantics.
  *
- * Oracle review 2026-04-26 Finding A1 caught a real bug: the handler's
+ * The handler's
  * unconditional drain of `systemPromptRefreshSessions` at the end of the
  * handler was silently dropping the flag added by hash-change detection
  * earlier in the same handler call. That meant a real prompt-content

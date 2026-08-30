@@ -1937,7 +1937,7 @@ export function createRustModeTransform(
             }
         }
         const reduceAvailability = resolveCtxReduceAvailability(sessionId);
-        // Freeze the native todo-tool map verdict before state sync reads it, then combine it
+        // Freeze the native task-list-tool map verdict before state sync reads it, then combine it
         // with OpenCode's live permission decision. The module receives one authoritative bool;
         // provisional or missing host evidence fails closed for synthesis.
         resolveTodowriteAvailabilityFromMessages(sessionId, messages);

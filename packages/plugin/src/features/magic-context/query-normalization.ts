@@ -1,7 +1,7 @@
 /**
  * Keep this module free of storage/database imports: the retrieval-benchmark
  * facade consumes it, and any SQLite import here would leak into that
- * facade's transitive import graph. commentlint: allow(JUDGE)
+ * facade's transitive import graph.
  */
 
 import { createHash } from "node:crypto";

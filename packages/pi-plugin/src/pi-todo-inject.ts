@@ -4,7 +4,11 @@
  * # Why this is separate from OpenCode's path
  *
  * OpenCode synthesizes a single `tool` part on the latest assistant message
- * (`buildSyntheticTodoPart` in `packages/plugin/src/hooks/magic-context/todo-view.ts`);
+ * (`buildSyntheticTodoPart` in the shared planning-tool implementation):
+ *
+ * ```text
+ * packages/plugin/src/hooks/magic-context/todo-view.ts
+ * ```
  * OpenCode's wire serializer (`MessageV2.toModelMessagesEffect`) splits that
  * combined part into provider-shape `tool_use` (assistant) and `tool_result`
  * (next user) at wire-emit time.
@@ -272,7 +276,7 @@ export function injectSyntheticTodowriteForPi(args: {
 			// Snapshot unchanged AND persisted anchor still present —
 			// idempotent re-inject; backfill stateJson if it was empty
 			// (legacy row from a build that persisted callID without state).
-			// Mirrors the same self-heal in the OpenCode todo-injection path.
+			// Mirrors the same self-heal in the OpenCode task-list injection path.
 			if (persistedAnchor.stateJson.length === 0) {
 				setPersistedTodoSyntheticAnchor(
 					args.db,

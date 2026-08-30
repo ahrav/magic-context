@@ -396,7 +396,7 @@ const StatusDialog = props => {
       return () => _c$5() && (() => {
         const p = s().recompProgress;
         // Label follows the flow that started the run, so a plain
-        // /ctx-recomp never reads as an "Upgrade" (dogfood 2026-06-04).
+        // /ctx-recomp never reads as an "Upgrade".
         const verb = p.kind === "upgrade" ? "Upgrade" : p.kind === "embed" ? "Embed" : "Recomp";
         return (() => {
           var _el$40 = _$createElement("box"),
@@ -1091,7 +1091,7 @@ function showUpgradeDialog(api, resume, targetSessionId = getSessionId(api)) {
     onCancel: () => {
       // Explicit decline → set the durable stamp so we don't re-prompt
       // on every restart. The fix for stamp-on-display trapping a
-      // never-upgraded session (dogfood 2026-05-30) relies on THIS
+      // never-upgraded session relies on THIS
       // being the only place the TUI path stamps.
       void dismissUpgradeReminder(sessionId);
       showToast(api, {

@@ -15,16 +15,16 @@ import { openTestDb } from "../src/test-db";
  * request inspection are shared with OpenCode, so the assertions below inspect
  * the exact Anthropic wire payload Pi sends.
  *
- * Bug A — Pi nudges are inserted by `nudge-injector.ts` as a separate synthetic
+ * Failure mode A: Pi nudges are inserted by `nudge-injector.ts` as a separate synthetic
  * assistant message before the latest user, instead of mutating/re-anchoring an
  * existing assistant. A thinking-bearing assistant must stay byte-identical.
  *
- * Bug B — Pi uses the shared `apply-operations.ts` drop/truncate path plus
+ * Failure mode B: Pi uses the shared `apply-operations.ts` drop/truncate path plus
  * Pi-specific `strip-placeholders-pi.ts`. User turn boundaries between signed
  * assistant messages must survive as a `[dropped §N§]` user shell so provider
  * adapters cannot merge adjacent assistants or change thinking block layout.
  *
- * Bug C — Pi image prompts arrive as typed `image` parts. Dropping the companion
+ * Failure mode C: Pi image prompts arrive as typed `image` parts. Dropping the companion
  * text tag must not delete the image part or remove the user message carrying it.
  */
 

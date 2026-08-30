@@ -358,7 +358,7 @@ function buildPluginBundle(): number {
  * would read as a complete result for a smaller corpus: the aggregate rates are
  * micro-averaged over whatever it contains. The workflow archives the whole
  * artifacts directory with `if: always()`, so a killed job now uploads the
- * scenarios that finished, clearly labelled as partial, and a completed run
+ * scenarios that finished, labelled as partial, and a completed run
  * removes it.
  */
 /**

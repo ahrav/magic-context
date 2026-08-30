@@ -104,7 +104,7 @@ describe("shouldShowAnnouncement gating", () => {
             shouldShowAnnouncement,
         } = mod;
 
-        // Skip the test if announcements are currently disabled (empty constants)
+        // Skip the test if announcements are disabled (empty constants)
         // — the gate's empty-input behavior is covered separately below.
         if (!ANNOUNCEMENT_VERSION || ANNOUNCEMENT_FEATURES.length === 0) {
             return;

@@ -10,7 +10,7 @@ import { join } from "node:path";
  * spawnPiRecompRun so the single-process Pi REPL stays responsive — parity with
  * OpenCode's `void runManagedUpgrade`. A previous build awaited the recomp
  * inline in the command handler, which froze ALL input (prompts and even
- * /ctx-status) for the whole upgrade (dogfood 2026-06-01: a 1105-message
+ * /ctx-status) for the whole upgrade (a 1105-message
  * upgrade locked the REPL across several ~4-min historian passes).
  *
  * Because it runs in the background, the post-publish signals MUST be the

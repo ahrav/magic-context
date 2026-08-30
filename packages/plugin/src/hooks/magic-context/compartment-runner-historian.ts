@@ -41,7 +41,7 @@ import {
 // (<project>/.opencode/magic-context/historian/) so they sit inside the
 // project boundary OpenCode's permission system already trusts AND so users
 // debugging a failed run can find dumps next to the project they belong to.
-// The user has explicitly requested keeping these dumps for now (see audit
+// The user has explicitly requested keeping these dumps (see audit
 // #21); they survive until manual cleanup.
 function historianResponseDumpDir(directory: string): string {
     return getProjectMagicContextHistorianDir(directory);

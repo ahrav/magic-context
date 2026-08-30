@@ -363,7 +363,7 @@ const SectionHeader = (props: { theme: TuiThemeCurrent; title: string }) => (
 
 // Live recomp / session-upgrade progress. Renders while an upgrade runs (and
 // briefly after it finishes) so a multi-minute rebuild is visible instead of a
-// single missed toast (dogfood 2026-05-30).
+// single missed toast.
 const RecompProgressSection = (props: {
     theme: TuiThemeCurrent
     progress: NonNullable<SidebarSnapshot["recompProgress"]>
@@ -375,7 +375,7 @@ const RecompProgressSection = (props: {
     // creation-time phase forever — the sidebar stuck on "upgrading / Running
     // historian (pass 1)…" even though the upgrade finished. Each accessor below
     // tracks the parent signal so the label/bar/note update live (root cause of
-    // the dogfood 2026-05-30 "recomp upgrading stays" freeze).
+    // the "recomp upgrading stays" freeze).
     const phase = () => props.progress.phase
     const fraction = () =>
         props.progress.totalMessages > 0
@@ -384,7 +384,7 @@ const RecompProgressSection = (props: {
     const pct = () => Math.round(fraction() * 100)
 
     // "Recomp" vs "Upgrade" vs "Embed" wording follows the flow that started this
-    // run, so a plain /ctx-recomp never renders as an "Upgrade" (dogfood 2026-06-04).
+    // run, so a plain /ctx-recomp never renders as an "Upgrade".
     const verb = () =>
         props.progress.kind === "upgrade"
             ? "Upgrade"
@@ -489,14 +489,14 @@ const SidebarContent = (props: {
     // happens in CHILD sessions whose message events are filtered out of the
     // subscription below, so without this the progress bar would freeze until
     // the next parent-session message. Active only during recomp/migration;
-    // stops itself once the phase goes terminal/absent (dogfood 2026-05-30).
+    // stops itself once the phase goes terminal/absent.
     let recompPollTimer: ReturnType<typeof setTimeout> | undefined
     const RECOMP_POLL_MS = 1200
     // Robust recomp poll state. The loop MUST survive a failed/slow snapshot
     // fetch — the server is busy doing the historian LLM call during a recomp,
     // so a poll can reject or return a stale (pre-recomp) cached snapshot. The
     // OLD loop reattached the next timer only inside `.then()`, so any rejection
-    // killed it and the bar froze mid-pass (dogfood 2026-05-30). This version
+    // killed it and the bar froze mid-pass. This version
     // reschedules on BOTH success and failure, keyed on `recompActive`, and only
     // stops on a terminal phase, a bounded "never started" probe window, or the
     // entry vanishing after we'd seen it active.
@@ -514,7 +514,7 @@ const SidebarContent = (props: {
     // entry is held until terminal + a 30s grace, so we keep polling through many
     // absents and only give up after a long run of them (entry truly gone but we
     // somehow missed "done"). This was the freeze: the old logic stopped on the
-    // FIRST absent-after-active (dogfood 2026-05-30).
+    // FIRST absent-after-active.
     const RECOMP_ABSENT_GIVEUP = 40 // ~48s of continuous absence → stop
     const RECOMP_MAX_POLLS = 1500 // ~30min absolute safety cap
 

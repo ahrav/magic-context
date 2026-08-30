@@ -141,7 +141,7 @@ export function setRawMessageProvider(sessionId: string, provider: RawMessagePro
 }
 
 /**
- * Run `fn` with a temporary per-session provider override. Cleans up
+ * Run `fn` with a scoped per-session provider override. Cleans up
  * on return regardless of throw — preferred over manual
  * `setRawMessageProvider` / `cleanup()` pairs.
  *

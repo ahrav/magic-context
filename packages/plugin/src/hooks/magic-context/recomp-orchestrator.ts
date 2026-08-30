@@ -35,7 +35,7 @@ function resolveLiveModelKey(
  * `recomp` handler, the RPC `upgrade` handler, and the hook-side `executeRecomp`
  * closure (used by `/ctx-recomp` and `/ctx-session-upgrade`). They drifted: the
  * RPC handlers had live progress but no model fallback, while the hook path had
- * fallback but no progress. The dogfood failure on 2026-05-30 was exactly this —
+ * fallback but no progress. Without shared orchestration,
  * the dialog "Run upgrade now" button (RPC, no fallback) failed when the primary
  * historian model returned empty, while `/ctx-session-upgrade` (hook, with
  * fallback) succeeded via the kimi fallback, leaving the sidebar stuck on a
@@ -103,9 +103,8 @@ export function isRecompComplete(message: string): boolean {
 }
 
 /** Strip markdown headings + blank lines from a runner outcome message, leaving
- *  the human reason for compact sidebar/status display. Fixes the dogfood
- *  2026-05-30 cosmetic bug where a raw "## Magic Recomp — Failed" heading leaked
- *  into the sidebar line. */
+ *  the human reason for compact sidebar/status display. Prevents a raw
+ *  "## Magic Recomp — Failed" heading from leaking into the sidebar line. */
 export function extractRecompReason(raw: string): string {
     const meaningful = raw
         .split("\n")
@@ -140,7 +139,7 @@ const RECOMP_DONE_GRACE_MS = 30_000;
  *  requested — before any async work (session-dir resolution, child-session
  *  creation, the first slow historian attempt + fallback). Without this the
  *  sidebar stays blank until the first per-pass emit, which can be 60-90s into a
- *  fallback-heavy run (dogfood 2026-05-30). `totalMessages: 0` renders an
+ *  fallback-heavy run. `totalMessages: 0` renders an
  *  indeterminate "Starting…" state until the loop knows the real range. */
 export function setRecompStarting(
     liveSessionState: LiveSessionState,
@@ -340,7 +339,7 @@ export async function runManagedUpgrade(
         // malformed `legacy=0` row with no `p1` (interrupted recomp / older
         // partial-v2 build). Matching ONLY `legacy=1` would trap a session whose
         // rows are tierless-but-not-flagged-legacy — the gate would say "already
-        // upgraded" and refuse to rebuild (dogfood 2026-05-30, AFT session).
+        // upgraded" and refuse to rebuild.
         const compartments = getCompartments(ctx.db, sessionId);
         const legacyCount = compartments.filter(
             (c) => c.legacy === 1 || !c.p1 || c.p1.trim() === "",
@@ -375,7 +374,7 @@ export async function runManagedUpgrade(
         // already running…" (no status suffix), which `isRecompFailure` misses.
         // The old code then ran the migration and declared the upgrade COMPLETE
         // even though zero compartments were rebuilt — leaving tierless rows but
-        // migrated memories + a false "Complete" (dogfood 2026-05-30, AFT: a
+        // migrated memories + a false "Complete" (a
         // concurrent opencode process for the same project still held the lease,
         // so the resume's recomp was skipped while migration ran anyway).
         const recompResult = await executeContextRecompWithResult(buildRecompDeps(ctx, sessionId));

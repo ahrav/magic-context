@@ -32,7 +32,7 @@ use crate::transform::{utf16_len, utf16_prefix, ReductionDecision};
 
 // --- ported TS constants (exact; the differential golden is the arbiter) ---
 
-/// `todowrite`: keep the newest 1 (the live plan is the newest todo state).
+/// `todowrite`: keep the newest 1 (the live plan is the newest task-list state).
 const TODOWRITE_KEEP: usize = 1;
 /// Recent `ctx_reduce` arcs retained as visible housekeeping exemplars.
 const CTX_REDUCE_KEEP: usize = 3;

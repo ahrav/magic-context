@@ -863,7 +863,7 @@ export async function driveThinkingImageSurvival(
     // helper is text-only, so call the raw client to include a file part.
     const sdk = await import("@opencode-ai/sdk");
     // SAFETY: widen the client so the prompt body can include a file part;
-    // the server accepts it even though the published type omits it. commentlint: allow(JUDGE)
+    // the server accepts it even though the published type omits it.
     const rawClient = sdk.createOpencodeClient({
         baseUrl: h.opencode.url,
     }) as unknown as {

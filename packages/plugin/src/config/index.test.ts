@@ -810,7 +810,7 @@ describe("loadPluginConfig — project compaction trust boundary", () => {
 });
 
 describe("loadPluginConfig — raw merge preserves user fields not set in project", () => {
-    // Regression for the 2026-05-12 embedding-wipe bug. Project configs that
+    // Regression for the embedding-wipe bug. Project configs that
     // don't mention `embedding` (or any other defaulted field) must inherit
     // the user's explicit value instead of getting clobbered by the Zod
     // default. Previously each source was parsed separately and Zod-filled

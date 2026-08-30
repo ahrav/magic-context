@@ -170,7 +170,6 @@ describe("restart history omission", () => {
 
         // The invariant: B must NOT silently vanish. Either its summary is present
         // (in m[1] or m[0]) OR its raw messages are still in the live tail. The
-        // bug is when BOTH are false.
         const bInSummary =
             post.m1.includes("Bravo just-published") || post.m0.includes("Bravo just-published");
         // B's boundary is m1, so its raw slice is messages with id m1 (and the

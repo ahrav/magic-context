@@ -142,7 +142,7 @@ function readCompartmentCount(h: PiTestHarness, sessionId: string): number {
 }
 
 describe("pi compaction marker", () => {
-    // FIXME(post-v0.21.5): Despite the Oracle-guided rewrite below (which
+    // TODO: Despite the Oracle-guided rewrite below (which
     // waits for the durable compartment row + uses ~90% pressure instead
     // of the original ~180% over-spike that routed through emergency
     // recovery), this test still fails in our e2e environment. Two

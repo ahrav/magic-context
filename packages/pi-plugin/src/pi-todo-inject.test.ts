@@ -138,7 +138,7 @@ describe("injectSyntheticTodowriteForPi", () => {
 		}
 	});
 
-	// Reproduction of the live Codex 400 on session 019de471 (2026-07-03): the
+	// Reproduction of the live Codex 400 on session 019de471: the
 	// persisted anchor pointed at an ABORTED assistant (stopReason "aborted",
 	// empty content). Pi's transform-messages skips errored/aborted assistants
 	// wholesale at wire build but forwards toolResult messages unconditionally,

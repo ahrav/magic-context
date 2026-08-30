@@ -55,7 +55,7 @@ describe("processSystemPromptForCache", () => {
 			const sessionId = "ses-freeze";
 			getOrCreateSessionMeta(db, sessionId);
 
-			// Turn 1: live date is 2026-05-01.
+			// Turn 1: live date is the baseline fixture date.
 			const turn1 = processSystemPromptForCache({
 				db,
 				sessionId,
@@ -64,7 +64,7 @@ describe("processSystemPromptForCache", () => {
 			});
 			expect(turn1.systemPrompt).toContain("2026-05-01");
 
-			// Turn 2: live date flipped to 2026-05-02 BUT cache is not
+			// Turn 2: live date flipped to the next-day fixture date BUT cache is not
 			// busting for any other reason. We should freeze to the
 			// first-observed date so the prefix cache survives.
 			const turn2 = processSystemPromptForCache({
@@ -90,7 +90,7 @@ describe("processSystemPromptForCache", () => {
 			const sessionId = "ses-adopt";
 			getOrCreateSessionMeta(db, sessionId);
 
-			// Turn 1: prime sticky to 2026-05-01.
+			// Turn 1: prime sticky to the baseline fixture date.
 			processSystemPromptForCache({
 				db,
 				sessionId,
@@ -98,7 +98,7 @@ describe("processSystemPromptForCache", () => {
 				isCacheBusting: false,
 			});
 
-			// Turn 2: live is 2026-05-02 AND we're cache-busting (e.g.
+			// Turn 2: live is the next-day fixture date AND we're cache-busting (e.g.
 			// dreamer just published new docs). We should adopt the
 			// live date so future stable turns freeze on it.
 			const turn2 = processSystemPromptForCache({
@@ -111,9 +111,9 @@ describe("processSystemPromptForCache", () => {
 			// Hash is over the new live date.
 			expect(turn2.hashChanged).toBe(true);
 
-			// Turn 3: live is still 2026-05-02, not cache-busting. We
+			// Turn 3: live is still the next-day fixture date, not cache-busting. We
 			// should keep using the new sticky (no re-freeze to
-			// 2026-05-01).
+			// the baseline fixture date).
 			const turn3 = processSystemPromptForCache({
 				db,
 				sessionId,
@@ -178,8 +178,8 @@ describe("processSystemPromptForCache", () => {
 				isCacheBusting: false,
 			});
 
-			// Date flipped to 2026-05-02 — sticky-date freeze should
-			// rewrite the prompt back to 2026-05-01 BEFORE hashing, so
+			// Date flipped to the next-day fixture date — sticky-date freeze should
+			// rewrite the prompt back to the baseline fixture date BEFORE hashing, so
 			// hash stays identical.
 			const turn2 = processSystemPromptForCache({
 				db,

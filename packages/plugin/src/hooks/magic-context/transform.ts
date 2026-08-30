@@ -531,7 +531,7 @@ export interface TransformDeps {
      * One-shot signal that `<session-history>` injection cache is stale and
      * `prepareCompartmentInjection` should rebuild on this pass. Drained
      * after the rebuild so subsequent defer passes hit the fresh cache.
-     * See Oracle review 2026-04-26 for the three-set split rationale.
+     * Each cache-busting signal has one consumer and lifetime.
      */
     historyRefreshSessions: Set<string>;
     deferredHistoryRefreshSessions?: Set<string>;
@@ -882,7 +882,7 @@ export function createTransform(deps: TransformDeps) {
         const ctxReduceCallable = ctxReduceAvailability.callable;
 
         // Same frozen-per-session verdict for the native `todowrite` tool. When
-        // a session's tools map filters todowrite out, the synthetic todo-pair
+        // a session's tools map filters todowrite out, the synthetic task-list pair
         // injection (postprocess B7 block) must not replay a pair for a tool the
         // model cannot call. Resolved here from the same first-user-message map
         // so the verdict is frozen identically and never flaps mid-session.
@@ -1770,7 +1770,7 @@ export function createTransform(deps: TransformDeps) {
             // gating, so this drain doesn't affect later behavior in this
             // pass — only future passes.
             //
-            // This is the core of the Oracle 2026-04-26 fix: the previous
+            // This preserves one-shot signal consumption: the previous
             // single-set design left the flush flag alive whenever
             // compartmentRunning blocked heuristics, so every defer pass
             // re-fired prepareCompartmentInjection with isCacheBusting=true

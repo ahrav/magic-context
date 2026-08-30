@@ -25,8 +25,8 @@ export interface RecompProgress {
      *  compartments and is labeled "Recomp"; `/ctx-session-upgrade` (legacy→v2 +
      *  memory migration) is labeled "Upgrade". Without this the sidebar/status
      *  hardcoded "Upgrade" wording for BOTH, so a plain recomp showed
-     *  "Recomp / ✗ Upgrade failed" — a self-contradiction (dogfood 2026-06-04,
-     *  a 0-compartment session in a project whose other sessions had them).
+     *  "Recomp / ✗ Upgrade failed" — a self-contradiction observed on
+     *  a 0-compartment session in a project whose other sessions had them.
      *  Optional + defaults to "recomp" so runner-emitted per-pass entries (which
      *  don't know the flow) inherit the kind set by setRecompStarting. */
     kind?: "recomp" | "upgrade" | "embed" | "wrapup";

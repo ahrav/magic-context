@@ -126,7 +126,7 @@ export function shouldShowAnnouncement(): boolean {
         return false;
     }
     if (state.status === "error") {
-        // A corrupt or temporarily unreadable existing state file is not first-run.
+        // A corrupt or unreadable existing state file is not first-run.
         // Do not advance the version; a later successful boot can still show it.
         return false;
     }

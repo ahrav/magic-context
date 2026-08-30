@@ -4,7 +4,7 @@ import { resolveHistoryBudgetTokens } from "./transform";
 /**
  * Regression coverage for the history-budget resolver.
  *
- * The bug (AFT 2026-06-01, wire-confirmed): on the FIRST transform pass after a
+ * The failure mode is wire-confirmed: on the FIRST transform pass after a
  * restart, live usage is percentage=0 / inputTokens=0. The resolver used to
  * back-derive the context limit as inputTokens/(percentage/100) → 0/0 → bail
  * (undefined), and the caller fell through to the hard-coded 60K default. When

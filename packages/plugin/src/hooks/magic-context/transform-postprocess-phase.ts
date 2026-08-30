@@ -565,7 +565,7 @@ interface RunPostTransformPhaseArgs {
     /** Final-array counts of reclaimable tagged mass (U) and total eligible mass (T). */
     channel1StateBySession?: Map<string, Channel1State>;
     /** Frozen-per-session verdict for the native `todowrite` tool. Gates the
-     *  synthetic todo-pair injection below: a session whose tools map filters
+     *  synthetic task-list pair injection below: a session whose tools map filters
      *  todowrite out must not get a synthetic pair for a tool it cannot call. */
     todowriteAvailability: ToolAvailabilityVerdict;
     /** OpenCode SDK for live permission checks on cache-busting passes. */
@@ -601,7 +601,7 @@ interface RunPostTransformPhaseArgs {
      * Survives across defer passes when `compartmentRunning` blocks the
      * heuristic pass. Drained ONLY after `shouldRunHeuristics` succeeds —
      * preserving `/ctx-flush` intent across blocked passes is the entire
-     * reason for the three-set split (see Oracle review 2026-04-26).
+     * reason for the three-set split.
      */
     pendingMaterializationSessions: Set<string>;
     deferredHistoryRefreshSessions: Set<string>;
@@ -825,7 +825,7 @@ export async function runPostTransformPhase(
     args: RunPostTransformPhaseArgs,
 ): Promise<PostTransformPhaseResult> {
     const compactionOff = args.compactionOff === true;
-    // Capture before todo/history synthesis can add assistant messages. Anthropic
+    // Capture before task-list/history synthesis can add assistant messages. Anthropic
     // requires the signed reasoning blocks from the newest assistant to be replayed
     // unchanged, and OpenCode serializes these same in-memory message objects.
     let reasoningMutationExemptMessage: MessageLike | undefined;
@@ -1040,7 +1040,7 @@ export async function runPostTransformPhase(
     //
     // Definition: TRUE only when this pass actually mutates message state —
     // either by applying pending ops or by running heuristic cleanup. This
-    // is the Oracle 2026-04-26 fix: the previous `isExplicitFlush ||
+    // preserves the required one-shot signal: the previous `isExplicitFlush ||
     // shouldApplyPendingOps` definition was unsafe because `isExplicitFlush`
     // could be true even on a defer pass where compartmentRunning blocked
     // both materialization and heuristics, causing cache-busting-only
@@ -1753,7 +1753,7 @@ export async function runPostTransformPhase(
             explicitRebuildHappened) &&
         materializationSatisfied;
 
-    // Drain the persisted marker before todo synthesis so the todo anchor sees
+    // Drain the persisted marker before task-list synthesis so the task list anchor sees
     // the same summary representation that this pass will emit.
     let suppressV12HistoryDrain = false;
     if (historyWasConsumedThisPass && args.deferredHistoryWasPendingAtPassStart) {
@@ -1865,7 +1865,7 @@ export async function runPostTransformPhase(
         }
     }
 
-    // Todo state synthesis is deliberately isolated so its live permission
+    // Task-list state synthesis is deliberately isolated so its live permission
     // refresh and cache-boundary behavior can be tested independently.
     if (args.fullFeatureMode && !compactionOff) {
         prependedMessageCount += await applyTodoSynthesis({
@@ -2036,7 +2036,7 @@ export async function runPostTransformPhase(
 
     // The original corpus was already cleared in transform.ts. After that point,
     // only explicit injection results add messages, while flushed/pending tool or
-    // text drops can rewrite an owning assistant's reasoning to `[cleared]`. Todo synthesis,
+    // text drops can rewrite an owning assistant's reasoning to `[cleared]`. Task-list synthesis,
     // notes, marker reconciliation, and auto-search add only tool/text parts, so
     // they cannot create a cleared reasoning shell. Keeping the exact injected
     // head count plus owning mutation targets preserves the old full-array result

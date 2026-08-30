@@ -78,8 +78,7 @@ export interface HarnessAdapter {
     /**
      * Remove the plugin entry from the harness's config.
      *
-     * Used by `doctor --uninstall`-style flows in the future. Returns
-     * the same result shape as ensurePluginEntry.
+     * Returns the same result shape as ensurePluginEntry.
      */
     removePluginEntry(): Promise<PluginEntryResult>;
 

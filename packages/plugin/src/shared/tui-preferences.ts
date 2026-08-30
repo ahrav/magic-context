@@ -291,7 +291,7 @@ export function watchTuiPreferences(onChange: () => void): () => void {
     try {
         lastSeen = readFileSync(file, "utf8");
     } catch {
-        // A missing or temporarily unreadable baseline is retried after registration.
+        // A missing or unreadable baseline is retried after registration.
     }
     const reconcile = (): void => {
         void watchReadFile(file)

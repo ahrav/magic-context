@@ -16,7 +16,7 @@ path = "examples/direct_host_fixture.rs"
 required-features = ["direct-host-fixture"]
 
 # `ck-mc-host` is the production lifecycle/serve executable; it depends on
-# mc-module + mc-host, never the reverse. commentlint: allow(JUDGE)
+# mc-module + mc-host, never the reverse.
 [[bin]]
 name = "ck-mc-host"
 path = "src/bin/ck-mc-host.rs"
@@ -40,7 +40,7 @@ tokio = { workspace = true, features = ["signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 sha2 = { workspace = true }
 # Only the detached-exec module in `src/bin/ck-mc-host.rs` uses libc
-# (fork/setsid/fexecve); library code never does. commentlint: allow(JUDGE)
+# (fork/setsid/fexecve); library code never does.
 libc = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 

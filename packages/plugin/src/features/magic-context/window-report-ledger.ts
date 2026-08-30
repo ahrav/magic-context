@@ -11,7 +11,7 @@ const ROTATED_WINDOW_REPORTS_FILE = `${WINDOW_REPORTS_FILE}.1`;
 export const WINDOW_REPORTS_ROTATION_BYTES = 16 * 1024 * 1024;
 
 /**
- * Fusiform's full-catalog dual-detector admit sweep (pm_d3e23fcd, 2026-08-13:
+ * Fusiform's full-catalog dual-detector admit sweep (pm_d3e23fcd:
  * 125 providers / 5,680 models whose catalogs carry other vendors' models).
  * An ADMIT list, not a classification — membership warrants
  * `path_may_forward: true` at capture; absence clears nobody (a provider

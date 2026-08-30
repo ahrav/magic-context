@@ -974,7 +974,7 @@ export function registerRpcHandlers(
     // The RPC dialog paths ("/ctx-recomp" + "Run upgrade now") run through the
     // SAME runManagedRecomp/runManagedUpgrade as the /ctx-* command paths, so
     // they get identical model fallback, live progress, terminal state, and
-    // clean messaging. Dogfood 2026-05-30: the old RPC upgrade handler lacked
+    // clean messaging. The old RPC upgrade handler lacked
     // model fallback (failed when the primary historian model returned empty,
     // while /ctx-session-upgrade succeeded via fallback) and the command path
     // lacked progress (left the sidebar stuck on a stale "failed"). One runner
@@ -1067,8 +1067,7 @@ export function registerRpcHandlers(
     // The user made an explicit choice on the upgrade dialog (Confirm or Cancel).
     // Set the durable stamp so the FRESH reminder won't re-show. We deliberately
     // do NOT stamp when the dialog is merely displayed — a display that the user
-    // closed/ctrl-c'd before acting must re-show on the next process (dogfood
-    // 2026-05-30). Resume prompts are staging-driven and unaffected by this stamp.
+    // closed/ctrl-c'd before acting must re-show on the next process. Resume prompts are staging-driven and unaffected by this stamp.
     rpcServer.handle("dismiss-upgrade-reminder", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         if (!sessionId) return { ok: false, error: "no session" };

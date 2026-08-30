@@ -169,8 +169,7 @@ export function getOpenCodeStorageDir(): string {
  * Layout: <XDG_DATA_HOME>/cortexkit/magic-context/
  *
  * TEST-ISOLATION GUARD. `openDatabase()` has been guarded in
- * `resolveDatabasePath()` since the 2026-06-01 (v26) and 2026-06-19 (v41)
- * incidents, in which unisolated tests migrated the user's REAL shared DB.
+ * `resolveDatabasePath()` after the v26 and v41 migration incidents, in which unisolated tests migrated the user's REAL shared DB.
  * Every OTHER caller bypassed that guard — notably the CLI doctors, which
  * build `join(getMagicContextStorageDir(), "context.db")` themselves and run
  * `PRAGMA integrity_check` against it. A test that deletes XDG_DATA_HOME to

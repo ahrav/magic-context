@@ -310,7 +310,7 @@ describe("long-running Pi Magic Context session", () => {
             const phase2Tail = mainRequests().slice(-2);
             expect(serialize(phase2Tail[1]!.body.messages?.[0])).toBe(serialize(phase2Tail[0]!.body.messages?.[0]));
 
-            // Phase 3: ctx_note write plus terminal todo trigger. The nudge is delayed to a fresh user turn and then replayed.
+            // Phase 3: ctx_note write plus terminal task-list trigger. The nudge is delayed to a fresh user turn and then replayed.
             emitToolOnce(h, /^ctx_note$/, { action: "write", content: "Revisit the long-running Pi assertions after verification." });
             await send("turn 7: write a deferred Pi session note with ctx_note", "pi phase 3 after note write");
             expect(

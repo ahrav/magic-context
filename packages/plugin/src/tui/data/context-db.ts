@@ -98,7 +98,7 @@ const EMPTY_SNAPSHOT: SidebarSnapshot = {
  * next successful refresh. With this cache, the client returns the most
  * recent good snapshot for the same session so the UI stays stable through
  * transient RPC blips. 5-minute staleness ceiling keeps it from showing
- * obviously old data after long disconnects.
+ * old data after long disconnects.
  */
 interface CachedSnapshot {
     snapshot: SidebarSnapshot;

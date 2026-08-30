@@ -9,7 +9,7 @@
 // (~/.local/share/cortexkit/magic-context/context.db). That is harmless only
 // while the DB's schema version already equals LATEST_SUPPORTED_VERSION — the
 // moment LATEST advances, that test runs the new migration on the user's LIVE
-// DB. 2026-06-01 incident: a long-dormant unisolated test migrated the
+// DB. A long-dormant unisolated test migrated the
 // production DB to v26 the instant LATEST hit 26, tripping the schema fence and
 // fail-closing every running v25 binary.
 //

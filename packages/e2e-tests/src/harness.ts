@@ -7,12 +7,14 @@
  *
  * Usage:
  *
- *   const h = await TestHarness.create({ magicContextConfig: { execute_threshold_percentage: 40 } });
- *   h.mock.script([{ text: "ok", usage: { input_tokens: 100, output_tokens: 10 } }]);
- *   const sessionId = await h.createSession();
- *   await h.sendPrompt(sessionId, "hello");
- *   expect(h.mock.requests().length).toBe(1);
- *   await h.dispose();
+ * ```ts
+ * const h = await TestHarness.create({ magicContextConfig: { execute_threshold_percentage: 40 } });
+ * h.mock.script([{ text: "ok", usage: { input_tokens: 100, output_tokens: 10 } }]);
+ * const sessionId = await h.createSession();
+ * await h.sendPrompt(sessionId, "hello");
+ * expect(h.mock.requests().length).toBe(1);
+ * await h.dispose();
+ * ```
  */
 
 import { Database } from "bun:sqlite";

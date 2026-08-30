@@ -1,7 +1,7 @@
 /**
  * Keep TCP fragmentation, authentication leftovers, and FIN/RST cases
  * separate from provider-neutral contract scenarios: only the socket
- * transport has byte-split or EOF variants. commentlint: allow(JUDGE)
+ * transport has byte-split or EOF variants.
  */
 
 import { afterEach, describe, expect, test } from "bun:test";

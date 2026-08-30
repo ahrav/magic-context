@@ -375,12 +375,12 @@ async function send(sessionId: string, prompt: string, text: string, usage: Mock
 }
 
 describe("long-running OpenCode Magic Context session", () => {
-    // TODO(ci-hang): on Linux GitHub-hosted runners, OpenCode 1.15.x
+    // TODO: on Linux GitHub-hosted runners, OpenCode 1.15.x
     // sometimes binds its server port and prints "Database migration
     // complete" but then never responds to HTTP requests, so the harness
     // sits waiting until the per-test budget expires. Same OpenCode
     // version on macOS local runs the same 23 turns in ~6 seconds. The
-    // bug is in OpenCode's HTTP server bring-up under Linux+Bun-compiled
+    // Failure originates in OpenCode's HTTP server bring-up under Linux+Bun-compiled
     // binary, not in Magic Context, but it blocks our CI gate.
     // Skip on CI until OpenCode either ships a fix or we can pin to a
     // verified-good build (1.15.4 was tried; the symptom returned).
@@ -454,7 +454,7 @@ describe("long-running OpenCode Magic Context session", () => {
         // byte-identical cache recovery asserted above — NOT a drop count
         // (routine need-blind age-drops are gone; these are need-driven).
 
-        // Phase 3: ctx_note write plus terminal todo trigger. The nudge is delayed to a fresh user turn and then replayed.
+        // Phase 3: ctx_note write plus terminal task-list trigger. The nudge is delayed to a fresh user turn and then replayed.
         emitToolOnce(/^ctx_note$/, { action: "write", content: "Revisit the long-running OpenCode assertions after verification." });
         await send(sessionId, "turn 7: write a deferred session note with ctx_note", "phase 3 after note write");
         expect(

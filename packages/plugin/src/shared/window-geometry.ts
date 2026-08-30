@@ -30,7 +30,7 @@ export type WindowOverlayUnknownWhy =
     // Asserts the KEY cannot hold one fact (e.g. a router samples heterogeneous
     // backends per request), so measurement cannot settle it and measured
     // reports must not be promoted into stated/bracket cells at this key.
-    // Ratified terminal at fusiform 080e70208aad713d (2026-08-13), added without a schema bump: an
+    // Ratified terminal at fusiform 080e70208aad713d, added without a schema bump: an
     // additive vocabulary value degrades per-cell for ignorant consumers,
     // whereas a version bump would trigger the file-level refusal rule.
     | "not_single_valued_at_key"

@@ -160,7 +160,7 @@ export function applyHeuristicCleanup(
     }
 
     db.transaction(() => {
-        // Strip or drop system injections (todo continuation, skill reminders, etc.)
+        // Strip or drop system injections (task-list continuation, skill reminders, etc.)
         for (const tag of tags) {
             if (tag.status !== "active") continue;
             if (tag.tagNumber > protectedCutoff) continue;

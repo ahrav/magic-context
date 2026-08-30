@@ -162,7 +162,7 @@ describe("git sweep coordinator", () => {
 
         expect(parkGitSweepNonIndexable(db, PROJECT, holder)).toBe(true);
 
-        // Immediately after parking: cooldown blocks, far in the future.
+        // Immediately after parking: cooldown blocks.
         const blocked = acquireGitSweepLease(db, PROJECT, "holder-2");
         expect(blocked.acquired).toBe(false);
         if (!blocked.acquired) {

@@ -119,7 +119,7 @@ export function registerCtxSessionUpgradeCommand(
 			// malformed `legacy=0` row with no `p1` (interrupted recomp / older
 			// partial-v2 build). Matching ONLY `legacy=1` would trap a session
 			// whose rows are tierless-but-not-flagged-legacy (parity with
-			// OpenCode runManagedUpgrade; dogfood 2026-05-30 AFT).
+			// OpenCode runManagedUpgrade).
 			const compartments = getCompartments(currentDeps.db, sessionId);
 			const upgradableCount = compartments.filter(
 				(c) => c.legacy === 1 || !c.p1 || c.p1.trim() === "",
@@ -227,7 +227,7 @@ export function registerCtxSessionUpgradeCommand(
 					// running…"), which isRecompFailure misses. Running migration +
 					// declaring Complete on a skipped recomp leaves tierless rows but
 					// migrated memories + a project-wide cache-bust from the epoch bump
-					// (dogfood 2026-05-30, AFT false-complete under concurrent processes).
+					// (a false-complete under concurrent processes).
 					// Require a POSITIVE full-success ("— Complete"), not merely the
 					// absence of a Failed/Skipped heading: a published "— Partial"
 					// rebuilt only a prefix (published===true, not a failure heading),

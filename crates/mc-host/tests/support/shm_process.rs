@@ -6,7 +6,7 @@
 //! unresolved fields, so this harness runs against the in-repo ring-backed
 //! `ShmProvider` tuple on Linux as the provisional tuple. Once `.12` freezes
 //! the retained matrix, these roles must be pointed at each retained tuple's
-//! adapter instead. commentlint: allow(JUDGE)
+//! adapter instead.
 //!
 //! # Roles
 //! The parent (an ordinary libtest test in `shm_failure_modes.rs`) spawns
@@ -23,19 +23,18 @@
 //! `request_published` after its ring commit, and the daemon provider
 //! reports `response_published` through the provider publish hook. No
 //! wall-clock sleep decides whether a crash point was reached.
-//! commentlint: allow(JUDGE)
 //!
 //! # Kill-and-reap discipline
 //! [`RoleProcess::kill`] sends `SIGKILL` and records only the kill instant.
 //! The bounded post-reap observation window starts only in
 //! [`RoleProcess::reap_killed`], after `wait` returned signal-9 status. The
 //! harness never resets the provider or client recovery episode deadlines,
-//! which keep their original start times. commentlint: allow(JUDGE)
+//! which keep their original start times.
 //!
 //! # Redaction
 //! Records and failure output carry only redacted seed, tuple, and state
 //! names — never descriptors, grants, tokens, object names, addresses, or
-//! payloads. commentlint: allow(JUDGE)
+//! payloads.
 //!
 //! # JavaScript victim runtimes (stub category)
 //! [`VictimRuntime`] currently offers only `Rust`. Bun/Node victims need a
@@ -47,7 +46,6 @@
 //! `run-mc-shm-failure-child` script, then extend [`VictimRuntime`] with
 //! `Bun`/`Node` variants that spawn those runtimes directly so the signaled
 //! PID is the runtime under test. This is a stub category, not coverage.
-//! commentlint: allow(JUDGE)
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -72,7 +70,6 @@ pub const RECORD_PREFIX: &str = "MC_SHM_REC";
 
 /// Bounded post-reap observation window. Starts only after `wait` reaped the
 /// killed child; provider and client episode deadlines are independent.
-/// commentlint: allow(JUDGE)
 pub const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Bound on every wait for one role record.
@@ -101,7 +98,6 @@ pub const ENV_VICTIM_STALE_FILE: &str = "MC_SHM_VICTIM_STALE_FILE";
 
 /// Victim runtimes the harness can spawn. Only `Rust` is implemented; see
 /// the module documentation's stub-category note for the Bun/Node gap.
-/// commentlint: allow(JUDGE)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VictimRuntime {
     Rust,
@@ -109,7 +105,7 @@ pub enum VictimRuntime {
 
 /// Serializes the crash scenarios inside one test binary so plain
 /// `cargo test` stays safe; nextest-level serialization comes from the
-/// `shm-crash` test group in `.config/nextest.toml`. commentlint: allow(JUDGE)
+/// `shm-crash` test group in `.config/nextest.toml`.
 pub async fn serial_crash_lock() -> tokio::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -123,7 +119,7 @@ pub fn emit_record(record: &str) {
 }
 
 /// Instant `SIGKILL` was sent. Deliberately not an observation window: the
-/// window may start only after the child is reaped. commentlint: allow(JUDGE)
+/// window may start only after the child is reaped.
 #[derive(Clone, Copy, Debug)]
 pub struct KillEvidence {
     pub killed_at: Instant,
@@ -563,7 +559,7 @@ pub fn daemon_role() {
     }));
     // The daemon provider owns the response-publication transition, so it
     // reports that barrier itself. Control replies (channel 0) are not
-    // route responses and stay silent. commentlint: allow(JUDGE)
+    // route responses and stay silent.
     provider.set_publish_hook(Arc::new(|ty, channel| {
         if ty == FrameType::Response && channel != 0 {
             emit_record("barrier response_published");
@@ -630,7 +626,7 @@ pub fn daemon_role() {
                     emit_record("quarantine_armed");
                 }
                 "leak_fd" => {
-                    // A duplicated fd remains open. commentlint: allow(JUDGE)
+                    // A duplicated fd remains open.
                     assert!(unsafe { libc::dup(0) } >= 0, "duplicated fd fixture");
                     emit_record("leaked");
                 }
@@ -681,7 +677,6 @@ pub fn victim_role() {
     if let Some(path) = stale_file {
         // Private scratch handoff consumed by the parent's incarnation-fence
         // scenario; never written to any record or diagnostic surface.
-        // commentlint: allow(JUDGE)
         let record = serde_json::json!({
             "activation_token": token,
             "descriptor": grant["descriptor"],
@@ -721,7 +716,7 @@ pub fn victim_role() {
             peer.send(request_header(channel, epoch, 4, body.len()), &body)
                 .expect("publish request");
             // The victim's client provider side owns this transition: the
-            // ring commit above completed publication. commentlint: allow(JUDGE)
+            // ring commit above completed publication.
             emit_record("barrier request_published");
             park();
         }
@@ -740,7 +735,7 @@ pub fn victim_role() {
             emit_record("terminal ok");
             peer.send(goodbye_header(), &[]).expect("publish goodbye");
             if scenario == "roundtrip_park" {
-                // Logical close precedes termination. commentlint: allow(JUDGE)
+                // Logical close precedes termination.
                 emit_record("closed");
                 park();
             }
@@ -797,7 +792,7 @@ pub fn spawn_victim(
     spawn_role("victim", "shm_role_victim", &envs)
 }
 
-/// Independently authenticated observer route. commentlint: allow(JUDGE)
+/// Independently authenticated observer route.
 pub struct Observer {
     client: RawClient,
     channel: u16,

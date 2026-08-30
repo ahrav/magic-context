@@ -1111,7 +1111,7 @@ setInterval(() => {}, 1000);`;
         expect(result.baseline_comparison).toBe("unscored");
         expect(result.reason_code).toBe("deadline_exceeded");
         expect(diagnostics.workspaceDeleted).toBe(true);
-        // The descendant writes after 2500 ms; the marker must remain absent after that delay. commentlint: allow(JUDGE)
+        // The descendant writes after 2500 ms; the marker must remain absent after that delay.
         await new Promise((resolveWait) =>
             setTimeout(
                 resolveWait,
@@ -1255,7 +1255,7 @@ describe("catalog-bound report", () => {
         const report = buildIncidentReport(reportInput(snapshot, [result]));
         const target = join(testRoot, "reports", "incident-report.json");
         publishIncidentReport(report, join(testRoot, "reports", "warmup.json"));
-        // The test simulates interruption after writing the temporary file and before renaming it. commentlint: allow(JUDGE)
+        // The test simulates interruption after writing the temporary file and before renaming it.
         writeFileSync(`${target}.tmp-dead`, JSON.stringify(report), {
             flag: "w",
         });
