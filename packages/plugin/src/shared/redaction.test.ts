@@ -4,29 +4,6 @@ import { describe, expect, test } from "bun:test";
 
 import vocabulary from "./fixtures/redaction-vocabulary-v1.json";
 import { hasShareabilitySensitiveText, redactSecretText } from "./redaction";
-import vocabulary from "./fixtures/redaction-vocabulary-v1.json";
-
-describe("redaction vocabulary fixture", () => {
-    test("matches the cross-runtime redacted output", () => {
-        for (const fixture of vocabulary.cases) {
-            expect(redactSecretText(fixture.input)).toBe(fixture.expected_redacted);
-            for (const detection of fixture.detections) {
-                const bytes = Buffer.from(fixture.input, "utf8");
-                expect(detection.offset + detection.length).toBeLessThanOrEqual(bytes.length);
-                expect(detection.secret_type.length).toBeGreaterThan(0);
-            }
-        }
-    });
-
-    test("preserves scalar exemptions and documents known misses", () => {
-        for (const exemption of vocabulary.exemptions) {
-            expect(redactSecretText(exemption)).toBe(exemption);
-        }
-        for (const knownMiss of vocabulary.known_misses) {
-            expect(redactSecretText(knownMiss)).toBe(knownMiss);
-        }
-    });
-});
 
 describe("redaction vocabulary fixture", () => {
     test("matches the cross-runtime redacted output", () => {

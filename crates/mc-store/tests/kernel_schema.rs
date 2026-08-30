@@ -1340,3 +1340,53 @@ fn staging_timestamps_must_be_chronological() {
         )
         .is_err());
 }
+
+#[test]
+fn commit_log_requires_an_explicit_operation_identity() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
+
+    let omitted = conn.execute(
+        "INSERT INTO commit_log(transaction_id,writer_epoch,recorded_at,actor,cause)
+         VALUES ('tx-omitted',1,1,'test','omitted')",
+        [],
+    );
+    assert!(
+        omitted.is_err(),
+        "producer and operation_key must have no default that two writers can share"
+    );
+
+    for (transaction_id, operation_key) in [("tx-a", "op-a"), ("tx-b", "op-b")] {
+        conn.execute(
+            "INSERT INTO commit_log(
+                 transaction_id,writer_epoch,producer,operation_key,request_digest,
+                 recorded_at,actor,cause
+             ) VALUES (?1,1,'fixture',?2,'',1,'test','explicit')",
+            params![transaction_id, operation_key],
+        )
+        .unwrap();
+    }
+    let repeated = conn.execute(
+        "INSERT INTO commit_log(
+             transaction_id,writer_epoch,producer,operation_key,request_digest,
+             recorded_at,actor,cause
+         ) VALUES ('tx-c',1,'fixture','op-a','',1,'test','repeat')",
+        [],
+    );
+    assert!(repeated.is_err(), "idx_commit_operation must stay unique");
+}
+
+#[test]
+fn an_unstamped_writer_fence_reads_as_a_typed_epoch() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
+
+    let epoch: i64 = conn
+        .query_row(
+            "SELECT writer_epoch FROM writer_fence WHERE id=0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(epoch, -1, "bootstrap must seed a sentinel, not NULL");
+}
