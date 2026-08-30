@@ -499,6 +499,38 @@ jobs:
       - name: Run the invalid-state mutation battery
         run: bun packages/e2e-tests/scripts/run-historian-eval.ts --mutations
 
+  # Its own job with no `needs`, for the reasons spelled out above the historian
+  # lane: a gate placed as a step in another job is skipped whenever an earlier
+  # step fails, and a gate placed downstream of check-plugin is skipped whenever
+  # check-plugin fails — both reproduce silent non-enforcement one hop away.
+  #
+  # Nothing invoked test:dreamer-eval-unit before: test:e2e selects --mode ts
+  # and test:opencode-e2e runs the harness manifests, and neither reaches
+  # dreamerEvalUnitFiles(), so the scenario contract, seeder, scorer, and
+  # mutation battery could regress with every other lane green. The suites are
+  # credential-free and make no live model calls; live scenario runs stay out of
+  # per-PR CI.
+  dreamer-eval-contracts:
+    name: Dreamer eval lane contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Dreamer eval unit contracts
+        run: bun run test:dreamer-eval-unit
+
   mc-host-client-interop:
     name: mc-host client interop (Bun + Node 24)
     runs-on: ubuntu-latest
@@ -762,6 +794,12 @@ jobs:
         # Host tests spawn `opencode serve` with a file:// plugin
         # specifier pointing at packages/plugin/, so dist must exist.
         run: bun run --cwd packages/plugin build
+
+      - name: Build Pi plugin
+        # The OpenCode selection carries cross-harness parity tests that spawn a
+        # Pi runner alongside opencode, and that spawn asserts
+        # packages/pi-plugin/dist/index.js exists before booting.
+        run: bun run --cwd packages/pi-plugin build
 
       # Strip inherited NODE_ENV=test so the spawned opencode subprocess
       # gets the same logging + runtime behavior as a normal local run

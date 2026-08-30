@@ -35,7 +35,7 @@ function emitMemoryWriteOnce(mock: TestHarness["mock"], content: string): void {
                     type: "tool_use",
                     id: `toolu_cross_memory_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`,
                     name: memoryTool.name,
-                    input: { action: "write", category: "PROJECT_RULES", content },
+                    input: { action: "create", category: "PROJECT_RULES", content },
                 },
             ],
             stop_reason: "tool_use",
