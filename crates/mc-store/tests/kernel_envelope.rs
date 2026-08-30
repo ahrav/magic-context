@@ -834,3 +834,85 @@ fn an_empty_rebuild_is_publishable_through_the_clear_path() {
     );
     assert_eq!(store.clear_alignment_projection().unwrap(), 0);
 }
+
+#[test]
+fn a_stale_projection_rebuild_cannot_regress_a_newer_one() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_projection_inputs(directory.path());
+    // built_through_commit_seq references commit_log, so generations 2 and 3
+    // must exist before a rebuild can name them.
+    let seeder = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    for transaction_id in ["gen-2", "gen-3"] {
+        seeder
+            .execute(
+                "INSERT INTO commit_log(
+                     transaction_id,writer_epoch,producer,operation_key,request_digest,
+                     recorded_at,actor,cause
+                 ) VALUES (?1,1,'fixture',?1,'',1,'test','generation')",
+                [transaction_id],
+            )
+            .unwrap();
+    }
+    drop(seeder);
+    let store = KernelStore::open(directory.path()).unwrap();
+    let at = |generation: i64, kind: &str| AlignmentProjectionSpec {
+        decision_id: "decision".to_string(),
+        observation_id: "observation".to_string(),
+        alignment_kind: kind.to_string(),
+        alignment_payload: None,
+        built_through_commit_seq: generation,
+    };
+
+    store
+        .replace_alignment_projection(&[at(2, "newer")])
+        .unwrap();
+    assert_eq!(
+        store
+            .replace_alignment_projection(&[at(1, "older")])
+            .unwrap_err(),
+        KernelError::Conflict
+    );
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT built_through_commit_seq FROM alignment_projection"
+        ),
+        2,
+        "the newer rows must survive a stale rebuild"
+    );
+    // Re-publishing the same generation stays allowed.
+    store
+        .replace_alignment_projection(&[at(2, "same")])
+        .unwrap();
+
+    let mixed = [at(2, "a"), at(3, "b")];
+    assert_eq!(
+        store.replace_alignment_projection(&mixed).unwrap_err(),
+        KernelError::InvalidInput,
+        "one batch must carry one generation"
+    );
+}
+
+#[test]
+fn change_event_identity_distinguishes_two_producers_sharing_an_operation_key() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    for (index, producer) in [(1_usize, "producer-a"), (2, "producer-b")] {
+        let mut spec = intent("shared-key", 'a');
+        spec.producer = producer.to_string();
+        store
+            .commit(spec, |envelope| {
+                envelope.insert_domain(domain(index))?;
+                Ok(String::new())
+            })
+            .unwrap();
+    }
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(DISTINCT idempotency_key) FROM change_event"
+        ),
+        2,
+        "two producers sharing an operation key must not share a change-event identity"
+    );
+}

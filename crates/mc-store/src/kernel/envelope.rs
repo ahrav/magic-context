@@ -2,7 +2,7 @@ use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::redaction::{clear_owner_kind, identity, record, redact, RedactedField};
+use super::redaction::{clear_owner, clear_owner_kind, identity, record, redact, RedactedField};
 use super::{map_sqlite, KernelError, KernelStore};
 use crate::current_time_ms;
 
@@ -399,7 +399,7 @@ impl KernelStore {
                     ordinal,
                     change.object.object_id,
                     change.kind,
-                    intent.operation_key,
+                    transaction_id,
                     payloads[index],
                 ],
             )
@@ -625,6 +625,42 @@ impl KernelStore {
             )
             .map_err(map_sqlite)?;
         }
+        let existing_candidate = tx
+            .query_row(
+                "SELECT extraction_run_id,candidate_kind,payload,sensitivity_class,
+                        provenance_witness
+                 FROM candidates WHERE candidate_id=?1",
+                [spec.candidate_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_sqlite)?;
+        if let Some(existing_candidate) = existing_candidate {
+            let expected = (
+                spec.extraction_run_id.clone(),
+                spec.candidate_kind.text.clone(),
+                spec.payload.text.as_bytes().to_vec(),
+                candidate_sensitivity.as_str().to_string(),
+                provenance.clone(),
+            );
+            if existing_candidate != expected {
+                return Err(KernelError::Conflict);
+            }
+            tx.commit().map_err(map_sqlite)?;
+            return Ok(StagingCandidateRow {
+                candidate_id: spec.candidate_id,
+                payload: spec.payload.text,
+                sensitivity: candidate_sensitivity,
+            });
+        }
         let candidate_metadata = spec.candidate_detection_json()?;
         tx.execute(
             "INSERT INTO candidates(
@@ -670,6 +706,23 @@ impl KernelStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite)?;
         check_fence(&tx, self.lease_epoch())?;
+        let generation = rows[0].built_through_commit_seq;
+        if rows
+            .iter()
+            .any(|row| row.built_through_commit_seq != generation)
+        {
+            return Err(KernelError::InvalidInput);
+        }
+        let stored: Option<i64> = tx
+            .query_row(
+                "SELECT MAX(built_through_commit_seq) FROM alignment_projection",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite)?;
+        if stored.is_some_and(|stored| generation < stored) {
+            return Err(KernelError::Conflict);
+        }
         truncate_alignment_projection(&tx)?;
         for row in &rows {
             tx.execute(
@@ -999,6 +1052,7 @@ impl RedactedCandidate {
     }
 
     fn record(&self, tx: &Transaction<'_>) -> Result<(), KernelError> {
+        clear_owner(tx, "staging_candidate", &self.candidate_id)?;
         for (name, field) in self.candidate_fields() {
             record(
                 tx,

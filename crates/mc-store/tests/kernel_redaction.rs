@@ -469,3 +469,63 @@ fn inspect_count(root: &std::path::Path, sql: &str) -> i64 {
             .unwrap();
     connection.query_row(sql, [], |row| row.get(0)).unwrap()
 }
+
+#[test]
+fn an_identical_restage_replays_instead_of_conflicting() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let first = store
+        .stage_candidate(shared_run_candidate("candidate-a", 1))
+        .unwrap();
+    let replay = store
+        .stage_candidate(shared_run_candidate("candidate-a", 1))
+        .unwrap();
+    assert_eq!(
+        replay, first,
+        "an unchanged retry must return the stored row"
+    );
+    assert_eq!(
+        inspect_count(directory.path(), "SELECT COUNT(*) FROM candidates"),
+        1
+    );
+
+    let mut changed = shared_run_candidate("candidate-a", 1);
+    changed.payload = "different content".to_string();
+    assert_eq!(
+        store.stage_candidate(changed).unwrap_err(),
+        KernelError::Conflict,
+        "mismatched content keeps its conflict"
+    );
+}
+
+#[test]
+fn a_reused_candidate_id_does_not_collide_with_deleted_redaction_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let mut secret_candidate = shared_run_candidate("candidate-reused", 1);
+    secret_candidate.payload = format!("payload {SECRET}");
+    store.stage_candidate(secret_candidate).unwrap();
+
+    // Simulate the reaper cascade, which removes the candidate but leaves its
+    // polymorphic redaction rows behind.
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "DELETE FROM candidates WHERE candidate_id='candidate-reused'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut reused = shared_run_candidate("candidate-reused", 2);
+    reused.payload = format!("second {SECRET}");
+    store.stage_candidate(reused).unwrap();
+    assert_eq!(
+        inspect_count(
+            directory.path(),
+            "SELECT COUNT(*) FROM durable_text_redactions
+             WHERE owner_kind='staging_candidate' AND owner_id='candidate-reused'"
+        ),
+        1
+    );
+}

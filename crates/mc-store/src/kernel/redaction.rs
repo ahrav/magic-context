@@ -67,3 +67,17 @@ pub(super) fn clear_owner_kind(tx: &Transaction<'_>, owner_kind: &str) -> Result
     .map_err(map_sqlite)?;
     Ok(())
 }
+
+/// Clears one owner's rows so a reused owner id cannot collide with metadata left by a deleted predecessor.
+pub(super) fn clear_owner(
+    tx: &Transaction<'_>,
+    owner_kind: &str,
+    owner_id: &str,
+) -> Result<(), KernelError> {
+    tx.execute(
+        "DELETE FROM durable_text_redactions WHERE owner_kind=?1 AND owner_id=?2",
+        [owner_kind, owner_id],
+    )
+    .map_err(map_sqlite)?;
+    Ok(())
+}
