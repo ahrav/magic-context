@@ -350,6 +350,50 @@ describe("SynapseEmbeddingProvider", () => {
         expect(internals.compatibleDaemonId).toEqual(recertified);
     });
 
+    it("does not clear a newer identity when a stale attempt fails after it is installed", async () => {
+        const client = new MockSynapseClient();
+        const rotated = new Uint8Array([8, 1]);
+        const replacement = new Uint8Array([8, 2]);
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "stale-failure-sibling",
+            clientFactory: async () => client,
+        });
+        expect(await provider.initialize()).toBe(true);
+
+        const internals = provider as unknown as {
+            connectionOrigin: string;
+            compatibleDaemonId: Uint8Array | null;
+            initialized: boolean;
+        };
+        internals.connectionOrigin = "managed-default";
+        internals.compatibleDaemonId = rotated;
+
+        // Two operations straddle one rotation: a sibling finishes
+        // re-certifying and installs the replacement identity while this
+        // attempt's request against the rotated generation is still failing.
+        client.call = async <Response = unknown>(
+            _module: string,
+            method: string,
+            params?: unknown,
+        ): Promise<Response> => {
+            client.requests.push({ method, params });
+            internals.compatibleDaemonId = replacement;
+            internals.initialized = true;
+            const error = new Error("module_restarted") as Error & { code: string };
+            error.code = "module_restarted";
+            throw error;
+        };
+
+        // The late failure is evidence about the rotated identity alone.
+        // Clearing the replacement would make the sibling's next call refuse
+        // for want of a certified identity after its restart budget is spent.
+        expect(await provider.embed("hello")).toBeNull();
+        expect(internals.compatibleDaemonId).toEqual(replacement);
+        expect(internals.initialized).toBe(true);
+    });
+
     it("does not arm managed-demand backoff for caller detachment", async () => {
         const client = new MockSynapseClient();
         let demands = 0;

@@ -2071,7 +2071,21 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
 
     private logCallFailure(error: unknown, operation: string): void {
         const classified = classifyError(error);
-        if (classified.code === "module_restarted") {
+        // A rotation condemns the identity the failed attempt published
+        // against, not whatever is installed now: overlapping operations can
+        // straddle one rotation, with a sibling installing the re-certified
+        // identity before this attempt's failure against the old generation
+        // arrives. `initialize` is the identity's only writer and installs a
+        // fresh array per certification, so a mismatch here means the binding
+        // has already been replaced, and clearing it would strand the sibling
+        // without the fence it just proved — its own restart budget is spent,
+        // so its next call would refuse for want of an identity. A failure
+        // that records no identity carries no such evidence and clears.
+        if (
+            classified.code === "module_restarted" &&
+            (classified.attemptDaemonId === undefined ||
+                classified.attemptDaemonId === this.compatibleDaemonId)
+        ) {
             this.initialized = false;
             this.compatibleDaemonId = null;
         }
