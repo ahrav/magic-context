@@ -1,8 +1,9 @@
+use crate::sqlite_runtime::MC_APPLICATION_ID;
 use rusqlite::{params, Connection, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
-pub const KERNEL_APPLICATION_ID: u32 = 0x4D43_4B52;
+pub const KERNEL_APPLICATION_ID: u32 = MC_APPLICATION_ID;
 pub const KERNEL_SCHEMA_COMPONENT_NAMES: &[&str] = &[
     "commit_log",
     "change_event",
@@ -40,7 +41,7 @@ pub const KERNEL_SCHEMA_COMPONENT_NAMES: &[&str] = &[
 const COMPONENTS: &[(&str, &str)] = &[
     (
         "commit_log",
-        r#"CREATE TABLE commit_log(commit_seq INTEGER PRIMARY KEY AUTOINCREMENT,transaction_id TEXT NOT NULL UNIQUE,writer_epoch INTEGER NOT NULL,recorded_at INTEGER NOT NULL,actor TEXT NOT NULL,cause TEXT NOT NULL) STRICT;"#,
+        r#"CREATE TABLE commit_log(commit_seq INTEGER PRIMARY KEY AUTOINCREMENT,transaction_id TEXT NOT NULL UNIQUE,writer_epoch INTEGER NOT NULL,recorded_at INTEGER NOT NULL,actor TEXT NOT NULL,cause TEXT NOT NULL) STRICT; CREATE TRIGGER commit_log_no_update BEFORE UPDATE ON commit_log BEGIN SELECT RAISE(ABORT,'commit_log is append-only'); END; CREATE TRIGGER commit_log_no_delete BEFORE DELETE ON commit_log BEGIN SELECT RAISE(ABORT,'commit_log is append-only'); END;"#,
     ),
     (
         "change_event",
@@ -60,7 +61,7 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "outbox_consumers",
-        r#"CREATE TABLE outbox_consumers(consumer_id TEXT PRIMARY KEY,checkpoint_outbox_position INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL) STRICT; CREATE INDEX idx_consumers_checkpoint ON outbox_consumers(checkpoint_outbox_position,consumer_id);"#,
+        r#"CREATE TABLE outbox_consumers(consumer_id TEXT PRIMARY KEY,checkpoint_outbox_position INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL) STRICT; CREATE INDEX idx_consumers_checkpoint ON outbox_consumers(checkpoint_outbox_position,consumer_id); CREATE TRIGGER outbox_consumers_checkpoint_monotonic BEFORE UPDATE OF checkpoint_outbox_position ON outbox_consumers WHEN NEW.checkpoint_outbox_position<OLD.checkpoint_outbox_position BEGIN SELECT RAISE(ABORT,'checkpoint_outbox_position must not move backward'); END;"#,
     ),
     (
         "consumer_abandonments",
@@ -124,11 +125,11 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "extraction_runs",
-        r#"CREATE TABLE extraction_runs(extraction_run_id TEXT PRIMARY KEY,extractor TEXT NOT NULL,source_kind TEXT,source_id TEXT,source_revision INTEGER,sensitivity_class TEXT NOT NULL,provenance_witness BLOB NOT NULL,redaction_metadata BLOB NOT NULL,detector_id TEXT,secret_type TEXT,utf8_offset INTEGER,utf8_length INTEGER,started_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,lease_expires_at INTEGER NOT NULL,terminal_state TEXT,terminal_at INTEGER) STRICT; CREATE INDEX idx_runs_ttl ON extraction_runs(terminal_at,lease_expires_at,extraction_run_id); CREATE INDEX idx_runs_heartbeat ON extraction_runs(terminal_at,heartbeat_at,extraction_run_id);"#,
+        r#"CREATE TABLE extraction_runs(extraction_run_id TEXT PRIMARY KEY,extractor TEXT NOT NULL,source_kind TEXT,source_id TEXT,source_revision INTEGER,sensitivity_class TEXT NOT NULL,provenance_witness BLOB NOT NULL,redaction_metadata BLOB NOT NULL,detector_id TEXT,secret_type TEXT,utf8_offset INTEGER,utf8_length INTEGER,started_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,lease_expires_at INTEGER NOT NULL,terminal_state TEXT,terminal_at INTEGER,CHECK(lease_expires_at>heartbeat_at)) STRICT; CREATE INDEX idx_runs_ttl ON extraction_runs(terminal_at,lease_expires_at,extraction_run_id); CREATE INDEX idx_runs_heartbeat ON extraction_runs(terminal_at,heartbeat_at,extraction_run_id);"#,
     ),
     (
         "candidates",
-        r#"CREATE TABLE candidates(candidate_id TEXT PRIMARY KEY,extraction_run_id TEXT NOT NULL REFERENCES extraction_runs(extraction_run_id) ON DELETE CASCADE,candidate_kind TEXT NOT NULL,payload BLOB NOT NULL,sensitivity_class TEXT NOT NULL,provenance_witness BLOB NOT NULL,redaction_metadata BLOB NOT NULL,detector_id TEXT,secret_type TEXT,utf8_offset INTEGER,utf8_length INTEGER,created_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,lease_expires_at INTEGER NOT NULL,terminal_state TEXT,terminal_at INTEGER) STRICT; CREATE INDEX idx_candidates_run_fk ON candidates(extraction_run_id,candidate_id); CREATE INDEX idx_candidates_ttl ON candidates(terminal_at,lease_expires_at,candidate_id);"#,
+        r#"CREATE TABLE candidates(candidate_id TEXT PRIMARY KEY,extraction_run_id TEXT NOT NULL REFERENCES extraction_runs(extraction_run_id) ON DELETE CASCADE,candidate_kind TEXT NOT NULL,payload BLOB NOT NULL,sensitivity_class TEXT NOT NULL,provenance_witness BLOB NOT NULL,redaction_metadata BLOB NOT NULL,detector_id TEXT,secret_type TEXT,utf8_offset INTEGER,utf8_length INTEGER,created_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,lease_expires_at INTEGER NOT NULL,terminal_state TEXT,terminal_at INTEGER,CHECK(lease_expires_at>heartbeat_at)) STRICT; CREATE INDEX idx_candidates_run_fk ON candidates(extraction_run_id,candidate_id); CREATE INDEX idx_candidates_ttl ON candidates(terminal_at,lease_expires_at,candidate_id);"#,
     ),
     (
         "candidate_scores",
@@ -249,6 +250,14 @@ fn apply_schema<F: FnOnce() -> rusqlite::Result<()>>(
     // A DEFERRED bootstrap holds a shared read lock and fails `SQLITE_BUSY` on
     // upgrade instead of waiting out `busy_timeout`.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let existing_objects: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite\\_%' ESCAPE '\\'",
+        [],
+        |row| row.get(0),
+    )?;
+    if existing_objects != 0 {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
     tx.pragma_update(None, "application_id", KERNEL_APPLICATION_ID)?;
     for (_, sql) in COMPONENTS {
         tx.execute_batch(sql)?;

@@ -5,6 +5,7 @@ use mc_store::kernel::schema::{
     kernel_schema_inventory, verify_kernel_connection_contract, KERNEL_APPLICATION_ID,
     KERNEL_SCHEMA_COMPONENT_NAMES,
 };
+use mc_store::sqlite_runtime::MC_APPLICATION_ID;
 use rusqlite::{params, Connection};
 
 const EXPECTED_COMPONENTS: &[&str] = &[
@@ -129,7 +130,7 @@ fn kernel_schema_has_one_ordered_full_shape() {
 }
 
 const PINNED_SCHEMA_DIGEST: &str =
-    "ca1ee7fb16048d86186ed2e36fed6a05b170094e4fab8ec3ec9566cff57f50a6";
+    "13668a809c0453a7551afd59a341695a731f681bdda368e5c8c256a30d2f5110";
 
 #[test]
 fn kernel_schema_digest_is_pinned_to_the_frozen_v1_shape() {
@@ -681,5 +682,153 @@ fn canonical_evidence_delete_is_refused_while_referenced() {
         )
         .unwrap(),
         Some("ev-1".to_string())
+    );
+}
+
+#[test]
+fn kernel_stamps_the_shared_direct_format_application_id() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+
+    assert_eq!(KERNEL_APPLICATION_ID, MC_APPLICATION_ID);
+    assert_eq!(
+        conn.query_row("PRAGMA application_id", [], |row| row.get::<_, u32>(0))
+            .unwrap(),
+        MC_APPLICATION_ID
+    );
+    // The marker table, not the application id, decides the family.
+    assert!(kernel_schema_inventory(&conn)
+        .unwrap()
+        .contains(&"mc_kernel_format_marker".to_string()));
+}
+
+#[test]
+fn commit_log_rejects_update_and_delete() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    let commit_seq = next_commit(&conn, "tx-audit");
+
+    assert!(conn
+        .execute(
+            "UPDATE commit_log SET actor = 'someone-else' WHERE commit_seq = ?1",
+            [commit_seq],
+        )
+        .is_err());
+    assert!(conn
+        .execute(
+            "UPDATE commit_log SET writer_epoch = 99 WHERE commit_seq = ?1",
+            [commit_seq],
+        )
+        .is_err());
+    assert!(conn
+        .execute("DELETE FROM commit_log WHERE commit_seq = ?1", [commit_seq])
+        .is_err());
+    assert_eq!(
+        conn.query_row(
+            "SELECT actor FROM commit_log WHERE commit_seq = ?1",
+            [commit_seq],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        "test"
+    );
+}
+
+#[test]
+fn consumer_checkpoints_advance_but_never_retreat() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    conn.execute(
+        "INSERT INTO outbox_consumers(consumer_id, checkpoint_outbox_position, updated_at)
+         VALUES ('search', 5, 1)",
+        [],
+    )
+    .unwrap();
+
+    conn.execute(
+        "UPDATE outbox_consumers SET checkpoint_outbox_position = 9 WHERE consumer_id = 'search'",
+        [],
+    )
+    .expect("forward advance is legal");
+    assert!(conn
+        .execute(
+            "UPDATE outbox_consumers SET checkpoint_outbox_position = 4
+              WHERE consumer_id = 'search'",
+            [],
+        )
+        .is_err());
+    // Re-acknowledging the same position stays legal.
+    conn.execute(
+        "UPDATE outbox_consumers SET checkpoint_outbox_position = 9, updated_at = 2
+          WHERE consumer_id = 'search'",
+        [],
+    )
+    .expect("idempotent re-acknowledgement is legal");
+    assert_eq!(
+        conn.query_row(
+            "SELECT checkpoint_outbox_position FROM outbox_consumers WHERE consumer_id = 'search'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        9
+    );
+}
+
+#[test]
+fn staging_leases_must_outlive_their_heartbeat() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+
+    let insert_run = |lease_expires_at: i64| {
+        conn.execute(
+            "INSERT INTO extraction_runs(
+                 extraction_run_id, extractor, sensitivity_class, provenance_witness,
+                 redaction_metadata, started_at, heartbeat_at, lease_expires_at
+             ) VALUES ('run-1', 'test', 'internal', X'01', X'7b7d', 1, 10, ?1)",
+            [lease_expires_at],
+        )
+    };
+    assert!(insert_run(9).is_err(), "expired-on-write lease is refused");
+    assert!(insert_run(10).is_err(), "zero-length lease is refused");
+    insert_run(11).expect("a lease outliving its heartbeat is legal");
+
+    assert!(conn
+        .execute(
+            "INSERT INTO candidates(
+                 candidate_id, extraction_run_id, candidate_kind, payload, sensitivity_class,
+                 provenance_witness, redaction_metadata, created_at, heartbeat_at,
+                 lease_expires_at
+             ) VALUES ('candidate-1', 'run-1', 'proposition', X'02', 'internal', X'03',
+                       X'7b7d', 1, 10, 10)",
+            [],
+        )
+        .is_err());
+}
+
+#[test]
+fn bootstrap_refuses_a_database_holding_foreign_objects() {
+    let (_dir, mut conn) = open_profiled();
+    conn.execute_batch("CREATE TABLE legacy_notes(id INTEGER PRIMARY KEY, body TEXT);")
+        .unwrap();
+
+    apply_kernel_schema(&mut conn, "incarnation-1", 1_000)
+        .expect_err("a non-pristine database must not be stamped as a kernel format");
+
+    // Nothing stamped, nothing destroyed.
+    assert_eq!(
+        conn.query_row("PRAGMA application_id", [], |row| row.get::<_, u32>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        kernel_schema_inventory(&conn).unwrap(),
+        vec!["legacy_notes".to_string()]
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM legacy_notes", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
     );
 }
