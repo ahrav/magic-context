@@ -37,6 +37,7 @@ use mc_host::broca::subprocess::{
 use mc_host::broca::supervisor::{SessionKey, Supervisor};
 use mc_host::harness_closure::{
     ClosureCandidate, ClosureManifest, ClosureNode, HarnessClosureStore, NodeKind,
+    DESCRIPTOR_PATHS_ARE_FILE_LIKE,
 };
 use mc_host::CancellationToken;
 use sha2::{Digest, Sha256};
@@ -1428,12 +1429,26 @@ fn pi_argv_privacy_contract() {
             "--no-approve",
         ]
     );
-    let descriptor_root = if cfg!(target_os = "macos") {
-        "/dev/fd/"
-    } else {
-        "/proc/self/fd/"
+    // The entrypoint and provider extensions are modules Node reads as data and
+    // resolves siblings against, so they travel as `module_path`: the
+    // descriptor path only where opening it reopens the named object and a
+    // loader can walk back to its directory, and the closure pathname
+    // otherwise. macOS `/dev/fd/N` is a `dup`, not a symlink, so it satisfies
+    // neither property and the closure tree supplies the name instead.
+    let assert_module_arg = |arg: &str, node: &str| {
+        if DESCRIPTOR_PATHS_ARE_FILE_LIKE {
+            assert!(
+                arg.starts_with("/proc/self/fd/"),
+                "{node} must travel as a descriptor path, got {arg}"
+            );
+        } else {
+            assert!(
+                arg.ends_with(&format!("/files/{node}")),
+                "{node} must travel as its closure pathname, got {arg}"
+            );
+        }
     };
-    assert!(args[0].starts_with(descriptor_root));
+    assert_module_arg(&args[0], "node_modules/pi/entry.mjs");
     assert_eq!(args[10], "--no-extensions");
     // Descriptor extensions in order, bundled hook LAST (R16, KTD8).
     let extensions: Vec<&String> = args
@@ -1443,8 +1458,8 @@ fn pi_argv_privacy_contract() {
         .filter_map(|(index, _)| args.get(index + 1))
         .collect();
     assert_eq!(extensions.len(), 3);
-    assert!(extensions[0].starts_with(descriptor_root));
-    assert!(extensions[1].starts_with(descriptor_root));
+    assert_module_arg(extensions[0], "node_modules/provider/0.mjs");
+    assert_module_arg(extensions[1], "node_modules/provider/1.mjs");
     assert_ne!(extensions[0], extensions[1]);
     assert!(extensions[2].ends_with(PI_BROCA_EXTENSION_FILE));
     // Known provider alias translation happens at the argv edge (openai ->
