@@ -3,6 +3,10 @@ name: SHM hardening opt-in
 on:
   workflow_dispatch:
     inputs:
+      soak_hours:
+        description: Installed ring soak duration in hours
+        required: false
+        default: "8"
       fuzz_seconds:
         description: Per-target libFuzzer -max_total_time seconds
         required: false
@@ -12,6 +16,26 @@ permissions:
   contents: read
 
 jobs:
+  full-soak:
+    name: Eight-hour installed ring resource soak (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 540
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Provision metadata-only sibling stubs
+        run: sh scripts/provision-rust-ci-stubs.sh
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Installed fixed-ring soak
+        working-directory: packages/e2e-tests
+        run: bun scripts/run-shm-soak.ts --hours '${{ inputs.soak_hours }}'
+
   bounded-fuzz:
     name: Bounded libFuzzer campaign (nested fuzz workspace)
     runs-on: ubuntu-latest
