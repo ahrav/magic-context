@@ -96,6 +96,90 @@
       "input": "api_key=sk-proj-IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII",
       "expected_redacted": "api_key=<REDACTED:api_key>",
       "detections": [{ "secret_type": "api_key", "offset": 8, "length": 40 }]
+    },
+    {
+      "name": "overlapping provider values keep the higher-priority key whole",
+      "input": "AIzaAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-sk-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      "expected_redacted": "AIzaAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-<OPENAI_API_KEY_REDACTED>",
+      "detections": [{ "secret_type": "openai_api_key", "offset": 36, "length": 43 }]
+    },
+    {
+      "name": "openai api key immediately after multibyte text",
+      "input": "ésk-proj-CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "expected_redacted": "é<OPENAI_API_KEY_REDACTED>",
+      "detections": [{ "secret_type": "openai_api_key", "offset": 2, "length": 40 }]
+    },
+    {
+      "name": "one rule matching twice in a single input",
+      "input": "password=first-value and api_key=second-value",
+      "expected_redacted": "password=<REDACTED:password> and api_key=<REDACTED:api_key>",
+      "detections": [
+        { "secret_type": "password", "offset": 9, "length": 11 },
+        { "secret_type": "api_key", "offset": 33, "length": 12 }
+      ]
+    },
+    {
+      "name": "empty keyed value",
+      "input": "\"api_key\":\"\"",
+      "expected_redacted": "\"api_key\":\"<REDACTED:api_key>\"",
+      "detections": [{ "secret_type": "api_key", "offset": 11, "length": 0 }]
+    },
+    {
+      "name": "keyed rule supersedes an aws value match",
+      "input": "token=AKIADDDDDDDDDDDDDDDD",
+      "expected_redacted": "token=<REDACTED:token>",
+      "detections": [{ "secret_type": "token", "offset": 6, "length": 20 }]
+    },
+    {
+      "name": "assignment drops whitespace around the equals sign",
+      "input": "secret = spaced-value",
+      "expected_redacted": "secret=<REDACTED:secret>",
+      "detections": [{ "secret_type": "secret", "offset": 9, "length": 12 }]
+    },
+    {
+      "name": "a later quote pairing does not rematch an earlier replacement",
+      "input": "\"api_key\":\"\":'auth_token':'t'",
+      "expected_redacted": "\"api_key\":\"<REDACTED:api_key>\":'auth_token':'<REDACTED:auth_token>'",
+      "detections": [
+        { "secret_type": "api_key", "offset": 11, "length": 0 },
+        { "secret_type": "auth_token", "offset": 27, "length": 1 }
+      ]
+    },
+    {
+      "name": "unquoted assignment consumes a trailing delimiter",
+      "input": "connect(password=hunter2, retries=3)",
+      "expected_redacted": "connect(password=<REDACTED:password> retries=3)",
+      "detections": [{ "secret_type": "password", "offset": 17, "length": 8 }]
+    },
+    {
+      "name": "non-ascii digits are not an exempt scalar",
+      "input": "api_key=\u0664\u0669\u0660\u0666",
+      "expected_redacted": "api_key=<REDACTED:api_key>",
+      "detections": [{ "secret_type": "api_key", "offset": 8, "length": 8 }]
+    },
+    {
+      "name": "separator accepts javascript-only whitespace",
+      "input": "Authorization:\ufeffBearer abcdef123456",
+      "expected_redacted": "Authorization:\ufeffBearer <REDACTED:bearer>",
+      "detections": [{ "secret_type": "bearer", "offset": 24, "length": 12 }]
+    },
+    {
+      "name": "next-line is not javascript whitespace, so the value is not a bare number",
+      "input": "\"api_key\": \"4096\u0085\"",
+      "expected_redacted": "\"api_key\": \"<REDACTED:api_key>\"",
+      "detections": [{ "secret_type": "api_key", "offset": 12, "length": 6 }]
+    },
+    {
+      "name": "key trimming keeps javascript-only whitespace out of the secret type",
+      "input": "\"api_key\u0085\":\"v\"",
+      "expected_redacted": "\"api_key\u0085\":\"<REDACTED:api_key_>\"",
+      "detections": [{ "secret_type": "api_key_", "offset": 13, "length": 1 }]
+    },
+    {
+      "name": "key trimming removes javascript whitespace before naming the secret type",
+      "input": "\"api_key\ufeff\":\"v\"",
+      "expected_redacted": "\"api_key\ufeff\":\"<REDACTED:api_key>\"",
+      "detections": [{ "secret_type": "api_key", "offset": 14, "length": 1 }]
     }
   ],
   "exemptions": [
@@ -104,11 +188,14 @@
     "totalInputTokens=132000",
     "max_tokens=4096",
     "\"max_tokens\": \"4096\"",
-    "api_key=null"
+    "api_key=null",
+    "\"api_key\": \"4096\ufeff\""
   ],
   "known_misses": [
     "opaque high entropy value abcdefghijklmnopqrstuvwxyz012345",
     "Bearer abc123def456",
-    "short provider prefix sk-short"
+    "short provider prefix sk-short",
+    "\u212aey=abcdefghijklmnop",
+    "xapp-1-A0123456789-1234567890123-abcdef"
   ]
 }

@@ -23,7 +23,7 @@ export interface SyntheticDocument {
     body: string;
 }
 
-function splitmix32(seed: number): () => number {
+export function splitmix32(seed: number): () => number {
     let state = seed >>> 0;
     return () => {
         state = (state + 0x9e3779b9) >>> 0;

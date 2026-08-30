@@ -138,6 +138,19 @@ export type RawOutputStageResult =
     | { stage: "authored-evidence-unprocessed"; error: string }
     | { stage: "scored"; score: ScenarioScore };
 
+export interface RawOutputScoringOptions {
+    nowMs?: number;
+    chunkStartOrdinal?: number;
+    chunkEndOrdinal?: number;
+    authoredStartOrdinal?: number;
+    authoredEndOrdinal?: number;
+}
+
+export interface RawOutputScoringRead {
+    result: RawOutputStageResult;
+    injectedClaims: InjectedClaimRecord[];
+}
+
 interface FactsScore {
     precision: number | null;
     recall: number | null;
@@ -146,6 +159,20 @@ interface FactsScore {
     visibleClaimsMatched: number;
     visibleClaimsTotal: number;
     falseAuthoritativeMatches: string[];
+}
+
+export type ExpectationGoldMatchPredicates = Record<string, boolean>;
+
+/** Independent match predicate per gold expectation; no matching assignment is consulted. */
+export function expectationGoldMatchPredicates(
+    scenario: HistorianEvalScenario,
+    visible: ReadonlyArray<{ category: string; content: string }>,
+): ExpectationGoldMatchPredicates {
+    return Object.fromEntries(
+        scenario.gold.expectedClaims
+            .map((expected) => [expected.id, visible.some((claim) => matchesGold(expected, claim))] as const)
+            .sort(([left], [right]) => left.localeCompare(right)),
+    );
 }
 
 /**
@@ -299,18 +326,6 @@ function structuralFindingsFromRows(
 }
 
 /**
- * Boundary-healing evidence (R9/KTD3), scored from recorded per-run numbers.
- *
- * A discarded provisional compartment is healed only by a LATER SUCCESSFUL run
- * re-deriving the dropped range, so every run is inspected rather than the last
- * row alone: run 1 discarding and run 2 then failing validation leaves the
- * dropped range's facts never re-derived while the final row itself reports no
- * discard, and the record is not all-attempts-invalid either. A kept
- * multi-compartment boundary whose lookahead margin is inside the healing slack
- * means the forced-keep escape hatch (forbidden for facts-scored scenarios) or
- * equivalent skipped healing.
- */
-/**
  * Runs whose discarded provisional compartment no later successful run healed.
  *
  * Extracted because two callers need exactly this subset: `healingFindings`
@@ -396,8 +411,6 @@ function goldAnswerStatedInCompartments(probe: Probe, exchange: ProbeExchange): 
         probe.goldAnswer,
     );
 }
-
-
 
 /** Resolve a gold expected-claim reference to concrete injected claims. */
 function claimsMatchingGold(claim: ExpectedClaim, items: readonly InjectedClaimRecord[]): InjectedClaimRecord[] {
@@ -642,7 +655,7 @@ export function freshScoringDatabase(): Database {
 }
 
 /**
- * Primary scorer entry point (KTD5): raw historian output artifact →
+ * Primary scorer entry point: raw historian output artifact →
  * parse → validate → publish into a fresh temp DB → score. Validation
  * rejection is a stage outcome the mutation battery asserts on; it never
  * appears as a live scenario verdict (live all-attempts-invalid is
@@ -660,17 +673,11 @@ export function freshScoringDatabase(): Database {
  * differently through the two entry points. The authored-transcript default
  * needs no span because there the chunk IS the authored space.
  */
-export function scoreRawOutput(
+export function scoreRawOutputWithInjectedClaims(
     rawOutput: string,
     scenario: HistorianEvalScenario,
-    options: {
-        nowMs?: number;
-        chunkStartOrdinal?: number;
-        chunkEndOrdinal?: number;
-        authoredStartOrdinal?: number;
-        authoredEndOrdinal?: number;
-    } = {},
-): RawOutputStageResult {
+    options: RawOutputScoringOptions = {},
+): RawOutputScoringRead {
     const nowMs = options.nowMs ?? Date.now();
     const hasRange = options.chunkStartOrdinal !== undefined || options.chunkEndOrdinal !== undefined;
     if (hasRange && (options.chunkStartOrdinal === undefined || options.chunkEndOrdinal === undefined)) {
@@ -714,7 +721,7 @@ export function scoreRawOutput(
         : { startMessage: chunk.startIndex, endMessage: chunk.endIndex };
     const validated = validateHistorianOutput(rawOutput, RAW_OUTPUT_SESSION_ID, chunk, [], 1);
     if (!validated.ok) {
-        return { stage: "validation-rejected", error: validated.error };
+        return { result: { stage: "validation-rejected", error: validated.error }, injectedClaims: [] };
     }
 
     // Stopping early is LEGAL in a valid output — `<unprocessed_from>` is how the
@@ -741,14 +748,6 @@ export function scoreRawOutput(
         (earliest, compartment) => Math.min(earliest, compartment.startMessage),
         Number.POSITIVE_INFINITY,
     );
-    if (emittedReach < authoredSpan.endMessage || emittedStart > authoredSpan.startMessage) {
-        const covered = Number.isFinite(emittedStart) ? `${emittedStart}-${emittedReach}` : "nothing";
-        return {
-            stage: "authored-evidence-unprocessed",
-            error: `output covers ${covered}, which does not span the authored ordinals ${authoredSpan.startMessage}-${authoredSpan.endMessage}; gold and absence checks over the uncovered part would pass vacuously`,
-        };
-    }
-
     // Mirror production's publish gating (compartment-runner-incremental):
     // a provisional last compartment inside the healing slack is discarded
     // and unanchored promotion is skipped for the whole pass, so this seam
@@ -776,30 +775,51 @@ export function scoreRawOutput(
             // A fresh single-writer temp DB cannot legitimately be stale.
             throw new Error("historian-eval scorer: temp-DB claim snapshot unexpectedly stale");
         }
+        if (emittedReach < authoredSpan.endMessage || emittedStart > authoredSpan.startMessage) {
+            const covered = Number.isFinite(emittedStart) ? `${emittedStart}-${emittedReach}` : "nothing";
+            return {
+                result: {
+                    stage: "authored-evidence-unprocessed",
+                    error: `output covers ${covered}, which does not span the authored ordinals ${authoredSpan.startMessage}-${authoredSpan.endMessage}; gold and absence checks over the uncovered part would pass vacuously`,
+                },
+                injectedClaims: visible,
+            };
+        }
         const rows = persisted.map((compartment) => ({
             startMessage: compartment.startMessage,
             endMessage: compartment.endMessage,
         }));
         return {
-            stage: "scored",
-            score: assembleScore({
-                scenarioId: scenario.id,
-                facts: scoreFacts(scenario, visible),
-                structuralFindings: structuralFindingsFromRows(
-                    rows,
-                    scenario.gold.compartments.minCount,
-                    chunk.startIndex > 1 ? { startMessage: 1, endMessage: chunk.startIndex - 1 } : null,
-                    authoredSpan,
-                ),
-                probeVerdicts: [],
-                anyRunInvalid: false,
-                system: null,
-                source: "raw-output",
-            }),
+            result: {
+                stage: "scored",
+                score: assembleScore({
+                    scenarioId: scenario.id,
+                    facts: scoreFacts(scenario, visible),
+                    structuralFindings: structuralFindingsFromRows(
+                        rows,
+                        scenario.gold.compartments.minCount,
+                        chunk.startIndex > 1 ? { startMessage: 1, endMessage: chunk.startIndex - 1 } : null,
+                        authoredSpan,
+                    ),
+                    probeVerdicts: [],
+                    anyRunInvalid: false,
+                    system: null,
+                    source: "raw-output",
+                }),
+            },
+            injectedClaims: visible,
         };
     } finally {
         db.close();
     }
+}
+
+export function scoreRawOutput(
+    rawOutput: string,
+    scenario: HistorianEvalScenario,
+    options: RawOutputScoringOptions = {},
+): RawOutputStageResult {
+    return scoreRawOutputWithInjectedClaims(rawOutput, scenario, options).result;
 }
 
 function errorScore(

@@ -1003,17 +1003,77 @@ export function matchesGold(
  * inside a sentence while `"4"` no longer matches inside `"4096"`.
  */
 export function containsCompleteValue(content: string, value: string): boolean {
+    return findCompleteValues(content, value, true) > 0;
+}
+
+/**
+ * How many times `content` states `value` as a complete value.
+ *
+ * A caller comparing a transcript with a perturbation of it needs the count, not
+ * just presence: a rewrite that adds or removes one occurrence of a probe's answer
+ * changes what the probe can copy from raw history even when another occurrence
+ * keeps presence unchanged.
+ */
+export function countCompleteValues(content: string, value: string): number {
+    return findCompleteValues(content, value, false);
+}
+
+/** A letter or digit, the adjacency that makes a match part of a larger value. */
+const VALUE_CHARACTER_RE = /^[\p{L}\p{N}]/u;
+
+/**
+ * The code point ending just before `index`, or `""` at the start.
+ *
+ * Read as a code point, not a code unit: a single `charAt` on an astral letter
+ * returns one surrogate half, which is not a letter under `\p{L}`, so a match sitting
+ * against such a letter would have looked boundary-clean.
+ */
+function codePointBefore(text: string, index: number): string {
+    if (index <= 0) return "";
+    const low = text.charCodeAt(index - 1);
+    if (index >= 2 && low >= 0xdc00 && low <= 0xdfff) {
+        const high = text.charCodeAt(index - 2);
+        if (high >= 0xd800 && high <= 0xdbff) return text.slice(index - 2, index);
+    }
+    return text.charAt(index - 1);
+}
+
+/** The code point starting at `index`, or `""` at the end. */
+function codePointAt(text: string, index: number): string {
+    const point = text.codePointAt(index);
+    return point === undefined ? "" : String.fromCodePoint(point);
+}
+
+/**
+ * Occurrences of `value` in `content`, by starting position, stopping at the first
+ * when `firstOnly`.
+ *
+ * Substring search plus a boundary test on the two adjacent characters, rather than
+ * a regex advanced one character at a time: a repeated-substring haystack makes the
+ * regex re-derive each overlapping match, which turned a two-thousand-character
+ * answer against a megabyte of repetitive text into seconds of work. Counted by
+ * starting position, so `blue blue` occurs twice in `blue blue blue` — a caller
+ * comparing counts across a perturbation would otherwise miss the loss of one
+ * overlapping occurrence.
+ */
+function findCompleteValues(content: string, value: string, firstOnly: boolean): number {
     // Both sides decoded first, so every collision guard uses the SAME equality
     // `compareProbeAnswer` accepts on. Without it a gold of `A&B` was accepted when a
     // model answered `A&amp;B`, while a question or an earlier reply containing
     // `A&amp;B` passed these guards — so the escaped form could be copied out of the
     // prompt or the shared history and still score.
-    content = decodeXmlEntities(content);
-    value = decodeXmlEntities(value);
-    const needle = normalizeContent(value);
-    if (needle.length === 0) return false;
-    const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, "u").test(normalizeContent(content));
+    const needle = normalizeContent(decodeXmlEntities(value));
+    if (needle.length === 0) return 0;
+    const haystack = normalizeContent(decodeXmlEntities(content));
+    let count = 0;
+    for (let at = haystack.indexOf(needle); at !== -1; at = haystack.indexOf(needle, at + 1)) {
+        const before = codePointBefore(haystack, at);
+        const after = codePointAt(haystack, at + needle.length);
+        if (VALUE_CHARACTER_RE.test(before) || VALUE_CHARACTER_RE.test(after)) continue;
+        count += 1;
+        if (firstOnly) return count;
+    }
+    return count;
 }
 
 /**
@@ -1041,19 +1101,67 @@ function messageAsHistorianSeesIt(role: "user" | "assistant", text: string): str
 }
 
 /**
- * Authored evidence text for a half-open turn range: both messages of every
- * turn as the historian receives them, ballast excluded. Ballast is
- * harness-owned filler that never carries authored evidence, so including it
- * could only let a predicate match by accident against generated prose.
+ * Authored evidence text for a turn list: both messages of every turn as the
+ * historian receives them, ballast excluded. Ballast is harness-owned filler
+ * that never carries authored evidence, so including it could only let a
+ * predicate match by accident against generated prose.
  */
-function evidenceText(scenario: HistorianEvalScenario, startTurn: number, endTurnExclusive: number): string {
-    return scenario.transcript.turns
-        .slice(startTurn, endTurnExclusive)
+export function authoredEvidenceText(turns: readonly TranscriptTurn[]): string {
+    return turns
         .map(
             (turn) =>
                 `${messageAsHistorianSeesIt("user", turn.user)} ${messageAsHistorianSeesIt("assistant", turn.assistant)}`,
         )
         .join(" ");
+}
+
+export interface NormalizedEvidenceMessage {
+    turnIndex: number;
+    role: "user" | "assistant";
+    text: string;
+}
+
+/**
+ * The messages of `turns` the historian actually receives, in evidence order,
+ * with the ones production discards omitted.
+ *
+ * Case and spacing are as authored, so a caller that needs the exact spelling of
+ * something — a case-sensitive identifier, say — can read it here rather than
+ * from the raw message, whose discarded parts the historian never sees.
+ */
+export function visibleEvidenceMessages(
+    turns: readonly TranscriptTurn[],
+): NormalizedEvidenceMessage[] {
+    return turns.flatMap((turn, turnIndex) =>
+        (["user", "assistant"] as const).flatMap((role) => {
+            const text = messageAsHistorianSeesIt(role, turn[role]);
+            return normalizeContent(text).length === 0 ? [] : [{ turnIndex, role, text }];
+        }),
+    );
+}
+
+/**
+ * The same messages, each normalized the way `predicateMatches` compares.
+ *
+ * Joining these with a single space reproduces
+ * `normalizeContent(authoredEvidenceText(turns))`, so a caller can map a
+ * predicate match back to the exact messages it spans. Evidence rules that
+ * search the whole range — the expected-absent authorship check, for one —
+ * accept matches no single message contains, and a per-turn or per-role
+ * approximation of this view silently misses them.
+ */
+export function normalizedEvidenceMessages(
+    turns: readonly TranscriptTurn[],
+): NormalizedEvidenceMessage[] {
+    return visibleEvidenceMessages(turns).map((message) => ({
+        ...message,
+        text: normalizeContent(message.text),
+    }));
+}
+
+/** Authored evidence text for a half-open turn range. */
+function evidenceText(scenario: HistorianEvalScenario, startTurn: number, endTurnExclusive: number): string {
+    return authoredEvidenceText(scenario.transcript.turns.slice(startTurn, endTurnExclusive));
 }
 
 /**
@@ -1135,6 +1243,32 @@ export function renderedFillerBlocks(scenario: HistorianEvalScenario): string[] 
     // Ballast comes from the scenario's own trigger inside the renderer, so the
     // filler turns carry exactly what the runner attaches to them.
     return renderedTranscriptBlocks(filler);
+}
+
+/**
+ * The messages of `turns` as the chunk builder renders their content: production
+ * cleaning, then `compactTextForSummary`, with the messages production drops
+ * omitted and the commit metadata compaction extracts carried alongside the text.
+ *
+ * Positional ordinals are deliberately excluded, so two callers can ask whether a
+ * reordering changes what the historian receives at all. Compaction matters for
+ * that question: it lifts a commit hash out of assistant prose and lowercases it
+ * into metadata, so `Committed ABCDEF1` and `Committed abcdef1` reach the model
+ * identically even though the authored strings differ.
+ */
+export function compactedEvidenceMessages(
+    turns: readonly TranscriptTurn[],
+): NormalizedEvidenceMessage[] {
+    return visibleEvidenceMessages(turns).flatMap((message) => {
+        const compacted = compactTextForSummary(message.text, message.role);
+        if (!compacted.text) return [];
+        return [
+            {
+                ...message,
+                text: [compacted.text, ...compacted.commitHashes].join(" "),
+            },
+        ];
+    });
 }
 
 export function renderedTranscriptBlocks(scenario: HistorianEvalScenario): string[] {

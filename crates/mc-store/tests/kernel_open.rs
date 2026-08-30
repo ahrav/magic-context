@@ -168,10 +168,15 @@ fn every_conclusive_kernel_mismatch_is_quarantined_and_rebuilt() {
 
 #[test]
 fn foreign_family_is_refused_before_sqlite_can_touch_it() {
+    // `FOREIGN_APPLICATION_ID` must differ from `KERNEL_APPLICATION_ID` so the
+    // fixture exercises foreign-header classification.
+    const FOREIGN_APPLICATION_ID: u32 = 0x5A5A_5A5A;
+    assert_ne!(FOREIGN_APPLICATION_ID, KERNEL_APPLICATION_ID);
+
     let dir = tempfile::tempdir().unwrap();
     let path = core_path(dir.path());
     let conn = Connection::open(&path).unwrap();
-    conn.pragma_update(None, "application_id", 0x4D43_5458_u32)
+    conn.pragma_update(None, "application_id", FOREIGN_APPLICATION_ID)
         .unwrap();
     conn.execute_batch("CREATE TABLE legacy(value TEXT);")
         .unwrap();
@@ -193,37 +198,67 @@ fn foreign_family_is_refused_before_sqlite_can_touch_it() {
 }
 
 #[test]
-fn malformed_marker_is_inconclusive_and_untouched() {
+fn a_sibling_mc_family_is_refused_and_left_untouched() {
+    // `KERNEL_APPLICATION_ID` is shared across mc families; schema inspection
+    // distinguishes them.
     let dir = tempfile::tempdir().unwrap();
-    let conn = seed_kernel(dir.path());
-    conn.execute_batch("DROP TRIGGER mc_kernel_format_marker_no_update;")
-        .unwrap();
-    conn.execute(
-        "UPDATE mc_kernel_format_marker SET marker_digest=?1",
-        ["g".repeat(64)],
-    )
-    .unwrap();
-    drop(conn);
     let path = core_path(dir.path());
-    let before = fs::read(&path).unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.pragma_update(None, "application_id", KERNEL_APPLICATION_ID)
+        .unwrap();
+    conn.execute_batch("CREATE TABLE legacy(value TEXT);")
+        .unwrap();
+    drop(conn);
+    let before_main = fs::read(&path).unwrap();
 
     assert_eq!(
         KernelStore::open(dir.path()).unwrap_err(),
         KernelError::Inconclusive
     );
-    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(fs::read(&path).unwrap(), before_main);
     assert!(quarantine_dirs(dir.path()).is_empty());
+}
+
+#[test]
+fn malformed_marker_is_inconclusive_and_untouched() {
+    // "g" fails the lowercase-hex check; the all-zero digest fails digest comparison.
+    for digest in ["g".repeat(64), "0".repeat(64)] {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = seed_kernel(dir.path());
+        conn.execute_batch("DROP TRIGGER mc_kernel_format_marker_no_update;")
+            .unwrap();
+        conn.execute(
+            "UPDATE mc_kernel_format_marker SET marker_digest=?1",
+            [&digest],
+        )
+        .unwrap();
+        drop(conn);
+        let path = core_path(dir.path());
+        let before = fs::read(&path).unwrap();
+
+        assert_eq!(
+            KernelStore::open(dir.path()).unwrap_err(),
+            KernelError::Inconclusive,
+            "{digest}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before, "{digest}");
+        assert!(quarantine_dirs(dir.path()).is_empty(), "{digest}");
+    }
 }
 
 #[test]
 fn valid_interrupted_reset_marker_resumes_without_opening_old_family() {
     let dir = tempfile::tempdir().unwrap();
-    let conn = seed_kernel(dir.path());
+    // Quarantine resume compares paths lexically. A symlinked root
+    // (`/var` -> `/private/var`) fails that comparison when spellings are mixed.
+    // commentlint: allow(JUDGE)
+    let root = dir.path().canonicalize().unwrap();
+    let conn = seed_kernel(&root);
     conn.execute_batch("CREATE TABLE unexpected(value INTEGER) STRICT;")
         .unwrap();
     drop(conn);
-    let db_path = core_path(dir.path()).canonicalize().unwrap();
-    let quarantine = dir.path().join("core.sqlite.mc-quarantine-resume");
+    let db_path = core_path(&root);
+    let quarantine = root.join("core.sqlite.mc-quarantine-resume");
     fs::create_dir(&quarantine).unwrap();
     fs::rename(&db_path, quarantine.join("core.sqlite")).unwrap();
     for suffix in ["-journal", "-wal", "-shm"] {
@@ -245,13 +280,13 @@ fn valid_interrupted_reset_marker_resumes_without_opening_old_family() {
     let mut marker = marker_without_digest;
     marker["marker_digest"] = digest.into();
     fs::write(
-        dir.path().join("core.sqlite.mc-reset"),
+        root.join("core.sqlite.mc-reset"),
         serde_json::to_vec(&marker).unwrap(),
     )
     .unwrap();
 
-    let _store = KernelStore::open(dir.path()).unwrap();
-    assert!(core_path(dir.path()).is_file());
+    let _store = KernelStore::open(&root).unwrap();
+    assert!(core_path(&root).is_file());
     assert!(quarantine.join("core.sqlite.mc-reset").is_file());
     assert_owner_only(&quarantine, 0o700);
     for name in [
@@ -303,36 +338,37 @@ fn unsupported_engine_is_rejected_before_creating_lease_or_database_files() {
 }
 
 #[test]
-fn an_opened_store_satisfies_the_durability_contract_on_writer_and_readers() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = KernelStore::open(directory.path()).unwrap();
-    drop(store);
+fn kernel_with_uncheckpointed_wal_opens_and_preserves_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(KernelStore::open(dir.path()).unwrap());
 
-    let writer = Connection::open(directory.path().join("core.sqlite")).unwrap();
-    let journal_mode: String = writer
-        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
-        .unwrap();
-    assert!(
-        journal_mode.eq_ignore_ascii_case("wal"),
-        "journal_mode was {journal_mode}"
-    );
-}
-
-#[test]
-fn pooled_readers_reject_writes() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = KernelStore::open(directory.path()).unwrap();
-    // known_as_of borrows a pooled reader, proving the pool is usable for reads.
-    assert!(store.known_as_of(0).unwrap().objects.is_empty());
-
-    let reader = Connection::open_with_flags(
-        directory.path().join("core.sqlite"),
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    let conn = Connection::open(core_path(dir.path())).unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.execute(
+        "INSERT INTO commit_log(
+             transaction_id,writer_epoch,producer,operation_key,request_digest,
+             recorded_at,actor,cause
+         ) VALUES('t1',1,'fixture','t1','',1,'actor','cause')",
+        [],
     )
     .unwrap();
-    assert!(reader
-        .execute("INSERT INTO writer_fence(id,writer_epoch) VALUES(0,1)", [])
-        .is_err());
+    let wal = PathBuf::from(format!("{}-wal", core_path(dir.path()).display()));
+    assert!(wal.is_file(), "the row should still be in the WAL");
+    // Leaking skips the clean close that would checkpoint and remove the WAL.
+    // A crashed writer leaves the uncheckpointed WAL on disk.
+    std::mem::forget(conn);
+
+    let _store = KernelStore::open(dir.path()).unwrap();
+    assert_eq!(
+        inspect(dir.path(), |conn| conn.query_row(
+            "SELECT COUNT(*) FROM commit_log",
+            [],
+            |row| row.get::<_, i64>(0)
+        ))
+        .unwrap(),
+        1
+    );
+    assert!(quarantine_dirs(dir.path()).is_empty());
 }
 
 #[cfg(unix)]

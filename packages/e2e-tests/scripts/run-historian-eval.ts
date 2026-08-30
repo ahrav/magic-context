@@ -203,7 +203,7 @@ function runMutations(scenarios: readonly HistorianEvalScenario[]): number {
     return 0;
 }
 
-function liveModeFromEnv(): LiveHistorianMode {
+export function liveModeFromEnv(): LiveHistorianMode {
     const apiKey = process.env.ANTHROPIC_API_KEY;
     const historianModel = process.env.HISTORIAN_EVAL_MODEL;
     const probeModel = process.env.HISTORIAN_EVAL_PROBE_MODEL;
@@ -236,7 +236,7 @@ function liveModeFromEnv(): LiveHistorianMode {
  * harness runtimes. Without this, their system identity would match and the
  * reports would look longitudinally comparable when they are not.
  */
-function opencodeVersion(): string | null {
+export function opencodeVersion(): string | null {
     try {
         const version = execSync("opencode --version", { encoding: "utf8" }).trim();
         return version.length > 0 ? version : null;
@@ -259,7 +259,7 @@ function opencodeVersion(): string | null {
  * too: the release's own evidence proves the battery was green when it froze, not
  * that it is green under the scorer in this checkout.
  */
-function liveAdmissionGate(scenarios: readonly HistorianEvalScenario[]): number {
+export function liveAdmissionGate(scenarios: readonly HistorianEvalScenario[]): number {
     const diagnostics = corpusDiagnostics(scenarios);
     if (diagnostics.length > 0) {
         for (const diagnostic of diagnostics) console.error(`live admission: ${diagnostic}`);
@@ -300,7 +300,7 @@ function liveAdmissionGate(scenarios: readonly HistorianEvalScenario[]): number 
  * whole process and made a direct run exercise a different plugin entrypoint than
  * a prebuilt scheduled run under the same recorded identity.
  */
-function buildPluginBundle(): number {
+export function buildPluginBundle(): number {
     const repoRoot = resolve(E2E_ROOT, "..", "..");
     console.log("building the plugin bundle the harness loads...");
     // The live credential is already in this process's environment by the time

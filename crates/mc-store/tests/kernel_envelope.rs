@@ -456,14 +456,17 @@ fn projection_full_replace_is_coordinator_side_and_creates_no_commit_or_events()
         OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .unwrap();
-    let row: (String, String) = connection
+    let row: (String, Vec<u8>) = connection
         .query_row(
             "SELECT alignment_kind,alignment_payload FROM alignment_projection",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(row, ("implemented".to_string(), "second".to_string()));
+    assert_eq!(
+        (row.0, String::from_utf8(row.1).unwrap()),
+        ("implemented".to_string(), "second".to_string())
+    );
 }
 
 const SECRET: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwxyzABCDEFGH12345678";

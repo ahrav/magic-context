@@ -318,7 +318,7 @@ impl KernelStore {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
+                        row.get::<_, Vec<u8>>(2)?,
                     ))
                 },
             )
@@ -331,7 +331,7 @@ impl KernelStore {
             tx.commit().map_err(map_sqlite)?;
             return Ok(CommitReceipt {
                 commit_seq,
-                result,
+                result: String::from_utf8(result).map_err(|_| KernelError::Io)?,
                 replayed: true,
             });
         }
@@ -454,7 +454,7 @@ impl KernelStore {
                 intent.operation_key,
                 intent.request_digest,
                 commit_seq,
-                result.text,
+                result.text.as_bytes(),
                 recorded_at,
             ],
         )
@@ -630,7 +630,7 @@ impl KernelStore {
                 spec.candidate_id,
                 spec.extraction_run_id,
                 spec.candidate_kind.text,
-                spec.payload.text,
+                spec.payload.text.as_bytes(),
                 candidate_sensitivity.as_str(),
                 provenance,
                 candidate_metadata,
@@ -678,7 +678,9 @@ impl KernelStore {
                     row.decision_id,
                     row.observation_id,
                     row.alignment_kind.text,
-                    row.alignment_payload.as_ref().map(|field| &field.text),
+                    row.alignment_payload
+                        .as_ref()
+                        .map(|field| field.text.as_bytes()),
                     row.built_through_commit_seq,
                 ],
             )
