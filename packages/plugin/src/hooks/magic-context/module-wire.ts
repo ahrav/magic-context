@@ -1538,3 +1538,109 @@ export function encodeOpenCodeMessagesToCk(messages: unknown[]): Array<{
         };
     });
 }
+
+/**
+ * Authority + mirror wire methods the transport routes through its serialized
+ * authority lane. `authority.drain_flip` is deliberately absent: the drain
+ * flip is issued through the general `call` path, not the authority helper.
+ */
+export type ModuleAuthorityMethod =
+    | "authority.status"
+    | "authority.prepare"
+    | "authority.seed"
+    | "authority.drain.begin"
+    | "authority.drain.finish"
+    | "authority.drain_seed"
+    | "authority.drain_memories"
+    | "authority.drain_notes"
+    | "authority.drain_compartments"
+    | "authority.drain_reconcile"
+    | "authority.drain_verify"
+    | "authority.drain_finish"
+    | "mirror.pull";
+
+/** Every method name the module transport can carry on the wire. */
+export type ModuleMethod =
+    | ModuleAuthorityMethod
+    | "authority.drain_flip"
+    | "state_sync"
+    | "transform"
+    | "session.status"
+    | "session.delete"
+    | "session.flush"
+    | "session.recomp"
+    | "session.wrapup"
+    | "todo_state.set"
+    | "agent_drops.append"
+    | "ctx_note"
+    | "ctx_memory"
+    | "claim.intent.stage"
+    | "claim.intent.inspect"
+    | "claim.intent.ack"
+    | "claim.effects.apply"
+    | "claim.mirror.replace"
+    | "claim.mirror.apply"
+    | "note.evaluate"
+    | "note.evaluation.register"
+    | "note.evaluation.heartbeat"
+    | "note.evaluation.unregister"
+    | "note.evaluation.next"
+    | "note.evaluation.renew"
+    | "note.evaluation.complete"
+    | "note.evaluation.abandon"
+    | "transform.ack"
+    | "transform.nack"
+    | "dreamer.run_task"
+    | "memory.set_classification";
+
+/**
+ * Subset a state-sync client may issue. `Extract` ties each member to
+ * {@link ModuleMethod}: a name that leaves the transport union silently drops
+ * out of this subset, so client code issuing it fails typecheck instead of
+ * the client accepting a method the transport cannot carry.
+ */
+export type ModuleStateSyncMethod = Extract<
+    ModuleMethod,
+    | "state_sync"
+    | "transform"
+    | "session.status"
+    | "session.delete"
+    | "session.flush"
+    | "session.recomp"
+    | "session.wrapup"
+    | "todo_state.set"
+    | "agent_drops.append"
+    | "ctx_note"
+    | "ctx_memory"
+    | "note.evaluate"
+    | "transform.ack"
+    | "transform.nack"
+>;
+
+// Compile-time guards, checked by `tsc --noEmit` because this is a source
+// file (test files are excluded from the typecheck project). Erased at
+// runtime.
+type _MethodUnionAssertTrue<T extends true> = T;
+// The state-sync subset admits no authority-lane method.
+type _StateSyncExcludesAuthority = _MethodUnionAssertTrue<
+    Extract<ModuleStateSyncMethod, ModuleAuthorityMethod> extends never ? true : false
+>;
+// No expected state-sync member silently dropped out of the `Extract`.
+type _StateSyncMembersCarried = _MethodUnionAssertTrue<
+        | "state_sync"
+        | "transform"
+        | "session.status"
+        | "session.delete"
+        | "session.flush"
+        | "session.recomp"
+        | "session.wrapup"
+        | "todo_state.set"
+        | "agent_drops.append"
+        | "ctx_note"
+        | "ctx_memory"
+        | "note.evaluate"
+        | "transform.ack"
+        | "transform.nack" extends ModuleStateSyncMethod
+        ? true
+        : false
+>;
