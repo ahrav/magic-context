@@ -266,6 +266,21 @@ export function classifyDreamerRun(input: DreamerRunClassificationInput): Dreame
     return outcome(scored.status, scored.reason, scored.parsedManifest);
 }
 
+/**
+ * Thrown when a run's report could not be persisted. Carries the report so a
+ * caller can still account for its outcome — an artifact failure must not erase a
+ * classification the run already established.
+ */
+export class DreamerEvalArtifactError extends Error {
+    constructor(
+        readonly report: DreamerEvalRunReport,
+        readonly cause: unknown,
+    ) {
+        super(`dreamer-eval could not write the report for ${report.runId}`);
+        this.name = "DreamerEvalArtifactError";
+    }
+}
+
 export interface RunDreamerEvalTaskOptions {
     apiKey: string;
     model: string;
@@ -395,7 +410,7 @@ function trackedFixtureFiles(workdir: string): string[] {
     // backslash, or a newline, which would record the displayed spelling instead of
     // the tracked path production resolves — and a quoted form can itself violate
     // the report's path rules.
-    const listed = gitOutput(workdir, ["ls-files", "-z"]);
+    const listed = gitRawOutput(workdir, ["ls-files", "-z"]);
     if (listed === null) throw new Error("dreamer-eval could not list the fixture's tracked files");
     return listed.split("\0").filter((path) => path.length > 0);
 }
@@ -406,14 +421,18 @@ function reportCleanupFailure(step: string, error: unknown): void {
     );
 }
 
-function gitOutput(workdir: string, args: readonly string[]): string | null {
+function gitRawOutput(workdir: string, args: readonly string[]): string | null {
     const result = Bun.spawnSync(["git", ...args], {
         cwd: workdir,
         env: fixtureGitEnv(),
         stdout: "pipe",
         stderr: "ignore",
     });
-    return result.success ? result.stdout.toString().trim() : null;
+    return result.success ? result.stdout.toString() : null;
+}
+
+function gitOutput(workdir: string, args: readonly string[]): string | null {
+    return gitRawOutput(workdir, args)?.trim() ?? null;
 }
 
 /**
@@ -446,7 +465,16 @@ function runtimeProvenance(artifactDir: string): {
     // `-z` because a path may contain whitespace, and porcelain quotes such paths
     // otherwise. Ignored files stay out, which is what keeps artifact directories
     // from entering the digest.
-    const status = gitOutput(PLUGIN_REPO_ROOT, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+    // Raw, not trimmed: porcelain's XY prefix begins with a space for an
+    // unstaged-only edit (` M file.ts`), and trimming that byte shifts every field
+    // of the first record — the path slice then names a file that cannot be read, so
+    // its content hashes as empty and further edits to it leave the digest still.
+    const status = gitRawOutput(PLUGIN_REPO_ROOT, [
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+    ]);
     if (head === null || status === null) {
         throw new Error("dreamer-eval could not resolve the runtime working-tree state");
     }
@@ -461,7 +489,12 @@ function runtimeProvenance(artifactDir: string): {
     // ls-files` refuses a pathspec outside the repository outright, so an external
     // output root is answered by path arithmetic rather than by asking git.
     if (outputRoot === PLUGIN_REPO_ROOT || outputRoot.startsWith(`${PLUGIN_REPO_ROOT}${sep}`)) {
-        const trackedUnderOutput = gitOutput(PLUGIN_REPO_ROOT, ["ls-files", "-z", "--", outputRoot]);
+        const trackedUnderOutput = gitRawOutput(PLUGIN_REPO_ROOT, [
+            "ls-files",
+            "-z",
+            "--",
+            outputRoot,
+        ]);
         if (trackedUnderOutput === null) {
             throw new Error("dreamer-eval could not inspect the artifact directory");
         }
@@ -778,7 +811,15 @@ export async function runDreamerEvalTask(
             outcome: receiptOutcome,
         })),
     };
-    mkdirSync(options.artifactDir, { recursive: true });
-    writeFileSync(join(options.artifactDir, `${runId}.json`), `${JSON.stringify(report, null, 2)}\n`);
+    try {
+        mkdirSync(options.artifactDir, { recursive: true });
+        writeFileSync(join(options.artifactDir, `${runId}.json`), `${JSON.stringify(report, null, 2)}\n`);
+    } catch (error) {
+        // The classification is already decided, and it may record an irreversible
+        // mutation. Rejecting with only the I/O error would lose it: the caller
+        // never sees this run's report, so an applied wrong archival would exit 1.
+        // The report travels with the error so the caller can still count it.
+        throw new DreamerEvalArtifactError(report, error);
+    }
     return report;
 }

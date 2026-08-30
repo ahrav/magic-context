@@ -11,7 +11,7 @@ import {
     type DreamerEvalScenario,
     type DreamerTask,
 } from "../src/dreamer-eval/contract";
-import { runDreamerEvalTask } from "../src/dreamer-eval/runner";
+import { DreamerEvalArtifactError, runDreamerEvalTask } from "../src/dreamer-eval/runner";
 import { aggregateDreamerEvalVarianceFiles } from "../src/dreamer-eval/variance";
 
 const E2E_ROOT = resolve(import.meta.dir, "..");
@@ -144,6 +144,11 @@ async function main(): Promise<0 | 1 | 2> {
                 });
             } catch (error) {
                 runFailed = true;
+                // An artifact failure still carries the run's report: count it, so a
+                // classification the run established — including an irreversible
+                // archival — reaches the exit code. Its path is not recorded, since
+                // the file is what failed to be written.
+                if (error instanceof DreamerEvalArtifactError) reports.push(error.report);
                 console.error(
                     `${scenario.id}/${task.task}: run ${repeat} failed: ${error instanceof Error ? error.message : String(error)}`,
                 );
