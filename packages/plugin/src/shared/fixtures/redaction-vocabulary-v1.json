@@ -168,6 +168,18 @@
       "input": "\"api_key\": \"4096\u0085\"",
       "expected_redacted": "\"api_key\": \"<REDACTED:api_key>\"",
       "detections": [{ "secret_type": "api_key", "offset": 12, "length": 6 }]
+    },
+    {
+      "name": "key trimming keeps javascript-only whitespace out of the secret type",
+      "input": "\"api_key\u0085\":\"v\"",
+      "expected_redacted": "\"api_key\u0085\":\"<REDACTED:api_key_>\"",
+      "detections": [{ "secret_type": "api_key_", "offset": 13, "length": 1 }]
+    },
+    {
+      "name": "key trimming removes javascript whitespace before naming the secret type",
+      "input": "\"api_key\ufeff\":\"v\"",
+      "expected_redacted": "\"api_key\ufeff\":\"<REDACTED:api_key>\"",
+      "detections": [{ "secret_type": "api_key", "offset": 14, "length": 1 }]
     }
   ],
   "exemptions": [

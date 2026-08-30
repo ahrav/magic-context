@@ -210,25 +210,41 @@ struct Edit {
 }
 
 // Scan all alternatives before applying edits so each match is selected from unmodified text.
-fn scan(rule: &Rule, text: &str) -> Vec<Edit> {
+//
+// Each alternative keeps its last match, and an alternative that reports no match from some
+// position reports none from any later one, so it is retired after a single scan. Re-querying every
+// alternative at every position would instead rescan the whole remaining suffix per match.
+fn scan<'t>(rule: &Rule, text: &'t str) -> Vec<Edit> {
     let mut edits = Vec::new();
+    let mut pending: Vec<Option<Option<regex::Captures<'t>>>> =
+        (0..rule.regexes.len()).map(|_| None).collect();
     let mut position = 0;
     while position <= text.len() {
-        let Some(captures) = rule
-            .regexes
-            .iter()
-            .filter_map(|regex| regex.captures_at(text, position))
-            .min_by_key(|captures| {
-                captures
-                    .get(0)
-                    .expect("every capture has a whole match")
-                    .start()
-            })
-        else {
-            break;
-        };
-        let whole = captures.get(0).expect("every capture has a whole match");
-        if let Some(edit) = build_edit(&rule.kind, &captures, whole) {
+        let mut best: Option<(usize, usize)> = None;
+        for (index, (slot, regex)) in pending.iter_mut().zip(rule.regexes.iter()).enumerate() {
+            let stale = match &*slot {
+                // Retired: no match remains anywhere at or after `position`.
+                Some(None) => continue,
+                Some(Some(captures)) => whole_of(captures).start() < position,
+                None => true,
+            };
+            if stale {
+                *slot = Some(regex.captures_at(text, position));
+            }
+            if let Some(Some(captures)) = &*slot {
+                let start = whole_of(captures).start();
+                if best.is_none_or(|(chosen, _)| start < chosen) {
+                    best = Some((start, index));
+                }
+            }
+        }
+        let Some((_, index)) = best else { break };
+        let captures = pending[index]
+            .as_ref()
+            .and_then(Option::as_ref)
+            .expect("chosen alternative holds a match");
+        let whole = whole_of(captures);
+        if let Some(edit) = build_edit(&rule.kind, captures, whole) {
             edits.push(edit);
         }
         position = if whole.end() > whole.start() {
@@ -238,6 +254,10 @@ fn scan(rule: &Rule, text: &str) -> Vec<Edit> {
         };
     }
     edits
+}
+
+fn whole_of<'t>(captures: &regex::Captures<'t>) -> regex::Match<'t> {
+    captures.get(0).expect("every capture has a whole match")
 }
 
 fn build_edit(
@@ -387,6 +407,11 @@ fn apply(input_len: usize, pieces: &[Piece], starts: &[usize], edits: Vec<Edit>)
         })
         .collect();
 
+    spans.sort_by_key(|span| (span.start, span.end));
+
+    // Sorting first lets a single forward cursor replace a search over every span per piece.
+    let mut survivors: Vec<Span> = Vec::new();
+    let mut cursor = 0;
     for piece in pieces {
         if let Piece::Redacted {
             start,
@@ -397,11 +422,12 @@ fn apply(input_len: usize, pieces: &[Piece], starts: &[usize], edits: Vec<Edit>)
             replacement,
         } = piece
         {
-            let superseded = spans
-                .iter()
-                .any(|span| span.start < *end && *start < span.end);
+            while cursor < spans.len() && spans[cursor].end <= *start {
+                cursor += 1;
+            }
+            let superseded = cursor < spans.len() && spans[cursor].start < *end;
             if !superseded {
-                spans.push(Span {
+                survivors.push(Span {
                     start: *start,
                     end: *end,
                     detect_start: *detect_start,
@@ -412,8 +438,10 @@ fn apply(input_len: usize, pieces: &[Piece], starts: &[usize], edits: Vec<Edit>)
             }
         }
     }
-
-    spans.sort_by_key(|span| (span.start, span.end));
+    if !survivors.is_empty() {
+        spans.extend(survivors);
+        spans.sort_by_key(|span| (span.start, span.end));
+    }
 
     let mut out: Vec<Piece> = Vec::with_capacity(spans.len() * 2 + 1);
     let mut cursor = 0;
@@ -466,14 +494,13 @@ fn map_end(starts: &[usize], pieces: &[Piece], position: usize) -> usize {
     }
 }
 
+// `starts` is ascending, so the owning piece is the last one beginning at or before `position`.
+// Binary search keeps piece lookup logarithmic.
 fn piece_at(starts: &[usize], pieces: &[Piece], position: usize) -> Option<usize> {
-    pieces
-        .iter()
-        .enumerate()
-        .find(|(index, piece)| {
-            position >= starts[*index] && position < starts[*index] + piece.rendered_len()
-        })
-        .map(|(index, _)| index)
+    let index = starts
+        .partition_point(|start| *start <= position)
+        .checked_sub(1)?;
+    (position < starts[index] + pieces[index].rendered_len()).then_some(index)
 }
 
 /// Same set as [`JS_SPACE`], for trimming; `str::trim` would use Unicode rules instead.
@@ -510,7 +537,7 @@ fn is_non_secret_scalar_value(value: &str) -> bool {
 }
 
 fn redaction_type_for_key(key: &str) -> String {
-    let lowered = key.trim().to_lowercase();
+    let lowered = key.trim_matches(is_js_space).to_lowercase();
     let normalized = KEY_SEPARATOR.replace_all(&lowered, "_");
     normalized
         .split('.')
@@ -710,6 +737,28 @@ mod tests {
             redact_secret_text("secret\u{feff}=\u{feff}value1234").text,
             "secret=<REDACTED:secret>"
         );
+    }
+
+    #[test]
+    fn key_trimming_uses_javascript_whitespace() {
+        // U+0085 is not whitespace to JavaScript, so it normalizes into the type name.
+        assert_eq!(
+            redact_secret_text("\"api_key\u{85}\":\"v\"").text,
+            "\"api_key\u{85}\":\"<REDACTED:api_key_>\""
+        );
+        // U+FEFF is whitespace to JavaScript, so trimming removes it first.
+        assert_eq!(
+            redact_secret_text("\"api_key\u{feff}\":\"v\"").text,
+            "\"api_key\u{feff}\":\"<REDACTED:api_key>\""
+        );
+    }
+
+    #[test]
+    fn many_secrets_stay_linear() {
+        let input = r#"{"api_key":"abcdefghij"},"#.repeat(4000);
+        let result = redact_secret_text(&input);
+        assert_eq!(result.detections.len(), 4000);
+        assert!(!result.text.contains("abcdefghij"));
     }
 
     #[test]
