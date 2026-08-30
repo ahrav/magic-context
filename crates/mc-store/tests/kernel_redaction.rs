@@ -380,3 +380,15 @@ fn a_run_whose_lease_expires_exactly_now_is_not_resurrected() {
         .stage_candidate(shared_run_candidate("candidate-live", 10))
         .unwrap();
 }
+
+#[test]
+fn a_zero_duration_lease_is_invalid_input_not_a_conflict() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let mut spec = shared_run_candidate("candidate-zero", 5);
+    spec.lease_expires_at = spec.recorded_at;
+    assert_eq!(
+        store.stage_candidate(spec).unwrap_err(),
+        KernelError::InvalidInput
+    );
+}

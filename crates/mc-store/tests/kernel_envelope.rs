@@ -786,3 +786,51 @@ fn a_caught_callback_panic_leaves_the_store_usable() {
         .unwrap();
     assert_eq!(store.known_as_of(1).unwrap().objects.len(), 1);
 }
+
+#[test]
+fn an_empty_rebuild_is_publishable_through_the_clear_path() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_projection_inputs(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    store
+        .replace_alignment_projection(&[AlignmentProjectionSpec {
+            decision_id: "decision".to_string(),
+            observation_id: "observation".to_string(),
+            alignment_kind: "intended".to_string(),
+            alignment_payload: Some(format!("payload {SECRET}")),
+            built_through_commit_seq: 1,
+        }])
+        .unwrap();
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM alignment_projection"
+        ),
+        1
+    );
+
+    // An accidental empty vector is still refused.
+    assert_eq!(
+        store.replace_alignment_projection(&[]).unwrap_err(),
+        KernelError::InvalidInput
+    );
+
+    assert_eq!(store.clear_alignment_projection().unwrap(), 1);
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM alignment_projection"
+        ),
+        0
+    );
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM durable_text_redactions
+             WHERE owner_kind='alignment_projection'"
+        ),
+        0,
+        "clearing must retire the projection's redaction rows too"
+    );
+    assert_eq!(store.clear_alignment_projection().unwrap(), 0);
+}

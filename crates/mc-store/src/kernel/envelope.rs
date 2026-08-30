@@ -648,7 +648,7 @@ impl KernelStore {
         })
     }
 
-    /// A truncate-then-insert rebuild rather than an upsert. An empty `rows` is rejected, so erasing the projection stays deliberate.
+    /// A truncate-then-insert rebuild rather than an upsert. An empty `rows` is rejected so an accidental empty vector cannot erase the projection; `clear_alignment_projection` publishes an intentionally empty rebuild.
     pub fn replace_alignment_projection(
         &self,
         rows: &[AlignmentProjectionSpec],
@@ -665,9 +665,7 @@ impl KernelStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite)?;
         check_fence(&tx, self.lease_epoch())?;
-        tx.execute("DELETE FROM alignment_projection", [])
-            .map_err(map_sqlite)?;
-        clear_owner_kind(&tx, "alignment_projection")?;
+        truncate_alignment_projection(&tx)?;
         for row in &rows {
             tx.execute(
                 "INSERT INTO alignment_projection(
@@ -690,6 +688,26 @@ impl KernelStore {
         tx.commit().map_err(map_sqlite)?;
         Ok(rows.len())
     }
+
+    /// Publishes an empty rebuild, so a rebuild that produced no alignments can retire the previous rows instead of leaving them queryable.
+    pub fn clear_alignment_projection(&self) -> Result<usize, KernelError> {
+        let mut writer = self.lock_writer()?;
+        let tx = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite)?;
+        check_fence(&tx, self.lease_epoch())?;
+        let removed = truncate_alignment_projection(&tx)?;
+        tx.commit().map_err(map_sqlite)?;
+        Ok(removed)
+    }
+}
+
+fn truncate_alignment_projection(tx: &Transaction<'_>) -> Result<usize, KernelError> {
+    let removed = tx
+        .execute("DELETE FROM alignment_projection", [])
+        .map_err(map_sqlite)?;
+    clear_owner_kind(tx, "alignment_projection")?;
+    Ok(removed)
 }
 
 struct RedactedIntent {
@@ -863,7 +881,7 @@ impl RedactedCandidate {
     fn new(spec: StagingCandidateSpec) -> Result<Self, KernelError> {
         if spec.source_revision < 0
             || spec.recorded_at < 0
-            || spec.lease_expires_at < spec.recorded_at
+            || spec.lease_expires_at <= spec.recorded_at
             || spec.extraction_run_id.trim().is_empty()
             || spec.candidate_id.trim().is_empty()
         {
