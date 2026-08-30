@@ -8,6 +8,7 @@ import {
     assertSrcTestsClassified,
     historianEvalUnitFiles,
     incidentUnitFiles,
+    parseArgs,
     prospectiveUnitFiles,
     standaloneFilesForSelection,
     tsOpenCodeStandaloneFiles,
@@ -303,5 +304,38 @@ describe("mode manifest validator", () => {
                 validation.files,
             ),
         ).toThrow(/invocation disagrees with both-modes/);
+    });
+});
+
+describe("test selection arguments", () => {
+    it("accepts exactly one mode", () => {
+        expect(parseArgs(["--mode", "ts"]).selection).toEqual({ kind: "mode", mode: "ts" });
+    });
+
+    it("rejects two different modes", () => {
+        // Previously only a preceding UNIT selection counted as a conflict, so the
+        // second --mode silently overwrote the first and the run proceeded as rust.
+        expect(() => parseArgs(["--mode", "ts", "--mode", "rust"])).toThrow(
+            /select exactly one/,
+        );
+    });
+
+    it("accepts a repeated identical mode", () => {
+        // Symmetric with the unit branch, which only conflicts on a DIFFERENT flag.
+        expect(parseArgs(["--mode", "ts", "--mode", "ts"]).selection).toEqual({
+            kind: "mode",
+            mode: "ts",
+        });
+    });
+
+    it("rejects a mode combined with a unit selection, in either order", () => {
+        expect(() => parseArgs(["--incident-unit", "--mode", "ts"])).toThrow(/select exactly one/);
+        expect(() => parseArgs(["--mode", "ts", "--incident-unit"])).toThrow(/select exactly one/);
+    });
+
+    it("rejects two different unit selections", () => {
+        expect(() => parseArgs(["--incident-unit", "--prospective-unit"])).toThrow(
+            /select exactly one/,
+        );
     });
 });

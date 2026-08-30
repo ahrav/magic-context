@@ -253,7 +253,7 @@ interface CliArgs {
     maxConcurrency: number | null;
 }
 
-function parseArgs(args: string[]): CliArgs {
+export function parseArgs(args: string[]): CliArgs {
     let selection: TestSelection | null = null;
     let selectionConflict = false;
     let harness: GreenHarness = "all";
@@ -271,7 +271,8 @@ function parseArgs(args: string[]): CliArgs {
             if (value !== "ts" && value !== "rust") {
                 throw new Error("--mode requires ts or rust");
             }
-            selectionConflict ||= selection?.kind === "unit";
+            selectionConflict ||= selection !== null &&
+                (selection.kind !== "mode" || selection.mode !== value);
             if (selection === null || selection.kind === "mode") {
                 selection = { kind: "mode", mode: value };
             }
