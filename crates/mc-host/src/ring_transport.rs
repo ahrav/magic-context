@@ -55,10 +55,10 @@ pub fn per_connection_limits() -> ShmHostLimits {
     }
 }
 
-/// Ceiling on ring arena bytes this process admits at once. An admitted arena is prefaulted before activation, so it is resident memory, and `max_resident_bytes` does not bound the product of `max_connections` and the per-connection arena. commentlint: allow(JUDGE)
+/// Ceiling on sparse ring virtual arena bytes this process admits at once. commentlint: allow(JUDGE)
 pub const MAX_RING_RESIDENT_BYTES: u64 = 1 << 30;
 
-/// Admission limits for `connections` concurrent rings, reduced to the count whose arenas fit `MAX_RING_RESIDENT_BYTES`. One connection stays admissible, so a profile wider than the ceiling still serves. commentlint: allow(JUDGE)
+/// Admission limits for `connections` concurrent sparse rings, bounded by aggregate virtual arena bytes. One connection stays admissible. commentlint: allow(JUDGE)
 pub fn process_limits(connections: usize) -> Option<ShmHostLimits> {
     let one = per_connection_limits();
     let affordable = MAX_RING_RESIDENT_BYTES

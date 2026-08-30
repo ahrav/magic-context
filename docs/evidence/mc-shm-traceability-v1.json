@@ -3,7 +3,7 @@
   "plan": "docs/plans/2026-08-30-2018-perf-sparse-eventfd-rings-plan.md",
   "release_identity": {
     "platform": "linux-x64-gnu",
-    "profile": "mc-host-eventfd-ring-v2",
+    "profile": "mc-host-test-ring-v1",
     "wire_version": 2,
     "descriptor_schema": 3,
     "transferred_descriptors": 6,

@@ -30,8 +30,8 @@ console.log(JSON.stringify({ runtime: process.release.name, ...result }));
 function runAttachBoundary(): void {
     // Invalid descriptors create no native channels or external views.
     const hostile: unknown[] = [
-        { profile: "mc-host-eventfd-ring-v2", hostToPeerFd: Number.NaN },
-        { profile: "mc-host-eventfd-ring-v2", hostToPeerFd: 2.5 },
+        { profile: "mc-host-test-ring-v1", hostToPeerFd: Number.NaN },
+        { profile: "mc-host-test-ring-v1", hostToPeerFd: 2.5 },
     ];
     for (const descriptor of hostile) {
         const refs = activeExternalRefs();

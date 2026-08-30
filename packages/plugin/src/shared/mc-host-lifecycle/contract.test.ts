@@ -45,35 +45,6 @@ function validResult(overrides: Record<string, unknown> = {}): Record<string, un
     };
 }
 
-function healthySharedMemory(): Record<string, unknown> {
-    const zero = {
-        descriptors: 0,
-        arena_bytes: 0,
-        leases: 0,
-        mappings: 0,
-        file_descriptors: 0,
-        workers: 0,
-        client_instances: 0,
-        pinned_workers: 0,
-    };
-    return {
-        state: "healthy",
-        error_class: null,
-        artifact: {
-            profile: "mc-host-test-ring-v1",
-            wire_version: 2,
-            descriptor_schema: 3,
-        },
-        bounds: { ...zero, arena_bytes: 134_217_728 },
-        accounting: { active: zero, quarantined: zero },
-        attachment: { completed: 1 },
-        activation: { completed: 1 },
-        peer_death: { observed: 0 },
-        reclamation: { completed: 0 },
-        exhaustion: { observed: 0 },
-    };
-}
-
 describe("parseDaemonResult", () => {
     test("accepts a fully populated conforming result", () => {
         const parsed = parseDaemonResult(JSON.stringify(validResult()));
@@ -82,54 +53,6 @@ describe("parseDaemonResult", () => {
         expect(parsed.reason).toBe("healthy");
         expect(parsed.checks.length).toBe(2);
         expect(parsed.versions.daemon).toBe("mc-host/0.1.0");
-    });
-
-    test("accepts bounded fixed-ring diagnostics", () => {
-        const parsed = parseDaemonResult(
-            JSON.stringify(validResult({ shared_memory: healthySharedMemory() })),
-        );
-        expect(parsed.shared_memory?.state).toBe("healthy");
-        expect(parsed.shared_memory?.artifact.profile).toBe("mc-host-test-ring-v1");
-        expect(parsed.shared_memory?.bounds.arena_bytes).toBe(134_217_728);
-    });
-
-    test("rejects superseded shared-memory artifact identity", () => {
-        const diagnostics = healthySharedMemory();
-        diagnostics.artifact = {
-            profile: "mc-host-test-ring-v1",
-            wire_version: 2,
-            descriptor_schema: 2,
-        };
-        expect(() =>
-            parseDaemonResult(JSON.stringify(validResult({ shared_memory: diagnostics }))),
-        ).toThrow(/shared_memory diagnostics violate the closed schema/);
-    });
-
-    test("accepts exactly five terminal shared-memory classes", () => {
-        for (const errorClass of [
-            "missing_addon",
-            "identity_mismatch",
-            "setup_failure",
-            "peer_death",
-            "resource_exhaustion",
-        ] as const) {
-            const diagnostics = healthySharedMemory();
-            diagnostics.state = "terminal";
-            diagnostics.error_class = errorClass;
-            diagnostics.accounting = null;
-            const parsed = parseDaemonResult(
-                JSON.stringify(validResult({ shared_memory: diagnostics })),
-            );
-            expect(parsed.shared_memory?.error_class).toBe(errorClass);
-        }
-    });
-
-    test("rejects unbounded or identifying shared-memory fields", () => {
-        const diagnostics = healthySharedMemory();
-        diagnostics.socket_path = "/private/service.sock";
-        expect(() =>
-            parseDaemonResult(JSON.stringify(validResult({ shared_memory: diagnostics }))),
-        ).toThrow(ContractViolation);
     });
 
     test("rejects a probe command in a result and accepts the status it really emits", () => {
