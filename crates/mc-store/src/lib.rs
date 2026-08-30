@@ -4408,23 +4408,7 @@ impl<'a> FacadeMutationTxn<'a> {
         if content.is_empty() {
             return Err("note content must not be empty".to_string());
         }
-        self.tx
-            .execute(
-                "INSERT INTO mc_notes
-                 (type, project_path, session_id, content, status, surface_condition,
-                  anchor_block_id, harness, created_at_ms, updated_at_ms)
-                 VALUES ('session', ?1, ?2, ?3, 'active', ?4, ?5, 'module', ?6, ?6)",
-                params![
-                    input.project_path,
-                    input.session_id,
-                    content,
-                    input.surface_condition,
-                    input.anchor_block_id,
-                    input.now_ms,
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-        load_note_tx(self.tx, self.tx.last_insert_rowid()).map_err(|error| error.to_string())
+        insert_note_tx(self.tx, &input, content).map_err(|error| error.to_string())
     }
 
     pub fn insert_project_note(&self, input: NoteWriteInput<'_>) -> Result<StoredNote, String> {
@@ -4432,41 +4416,7 @@ impl<'a> FacadeMutationTxn<'a> {
         if content.is_empty() {
             return Err("note content must not be empty".to_string());
         }
-        let status = if input
-            .surface_condition
-            .is_some_and(|condition| !condition.trim().is_empty())
-        {
-            "pending"
-        } else {
-            "active"
-        };
-        self.tx
-            .execute(
-                "INSERT INTO mc_notes
-                 (type, project_path, session_id, content, status, surface_condition,
-                  anchor_block_id, anchor_ordinal, harness, compiled_provider, compiled_config,
-                  compiled_at, compile_status, created_at_ms, updated_at_ms)
-                 VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'module', ?8, ?9, ?10, ?11, ?12, ?12)",
-                params![
-                    input.project_path,
-                    input.session_id,
-                    content,
-                    status,
-                    input
-                        .surface_condition
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty()),
-                    input.anchor_block_id,
-                    input.anchor_ordinal,
-                    input.compiled_provider,
-                    input.compiled_config,
-                    input.compiled_at,
-                    input.compile_status,
-                    input.now_ms,
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-        load_note_tx(self.tx, self.tx.last_insert_rowid()).map_err(|error| error.to_string())
+        insert_project_note_tx(self.tx, &input, content).map_err(|error| error.to_string())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4481,84 +4431,18 @@ impl<'a> FacadeMutationTxn<'a> {
         condition_compile: Option<NoteConditionCompile<'_>>,
         now_ms: i64,
     ) -> Result<NoteCasOutcome, String> {
-        let current = load_note_tx(self.tx, note_id)
-            .optional()
-            .map_err(|error| error.to_string())?;
-        let Some(current) = current else {
-            return Ok(NoteCasOutcome::Conflict { current: None });
-        };
-        if current.project_path != project_path
-            || current.status != expected_status
-            || current.status_version != expected_version
-        {
-            return Ok(NoteCasOutcome::Conflict {
-                current: Some(current),
-            });
-        }
-        let next_content = content.map(str::trim).unwrap_or(&current.content);
-        if next_content.is_empty() {
-            return Ok(NoteCasOutcome::Conflict {
-                current: Some(current),
-            });
-        }
-        let condition_changed = surface_condition.is_some();
-        let next_condition = surface_condition
-            .flatten()
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        let content_changed = next_content != current.content;
-        let compiler_edit = condition_changed || content_changed;
-        let remaining_condition = if condition_changed {
-            next_condition
-        } else {
-            current
-                .surface_condition
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-        };
-        let next_status = if compiler_edit && remaining_condition.is_some() {
-            "pending"
-        } else {
-            current.status.as_str()
-        };
-        let compile = condition_compile.unwrap_or_default();
-        let changed = self
-            .tx
-            .execute(
-                NOTE_CAS_UPDATE_SQL,
-                params![
-                    next_content,
-                    condition_changed,
-                    next_condition,
-                    next_status,
-                    compiler_edit,
-                    now_ms,
-                    compile.compiled_provider,
-                    compile.compiled_config,
-                    compile.compiled_at,
-                    compile.compile_status,
-                    note_id,
-                    project_path,
-                    expected_status,
-                    expected_version,
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-        if changed == 0 {
-            return Ok(NoteCasOutcome::Conflict {
-                current: load_note_tx(self.tx, note_id)
-                    .optional()
-                    .map_err(|error| error.to_string())?,
-            });
-        }
-        if compiler_edit {
-            fence_active_note_claims_tx(self.tx, project_path, Some(note_id), "stale", now_ms)
-                .map_err(|error| error.to_string())?;
-        }
-        Ok(NoteCasOutcome::Applied(
-            load_note_tx(self.tx, note_id).map_err(|error| error.to_string())?,
-        ))
+        update_note_cas_tx(
+            self.tx,
+            project_path,
+            note_id,
+            expected_status,
+            expected_version,
+            content,
+            surface_condition,
+            condition_compile,
+            now_ms,
+        )
+        .map_err(|error| error.to_string())
     }
 
     pub fn dismiss_note(
@@ -4569,54 +4453,15 @@ impl<'a> FacadeMutationTxn<'a> {
         resolution: Option<&str>,
         now_ms: i64,
     ) -> Result<Option<StoredNote>, String> {
-        let Some(current) = load_note_tx(self.tx, note_id)
-            .optional()
-            .map_err(|error| error.to_string())?
-        else {
-            return Ok(None);
-        };
-        if current.project_path != project_path
-            || current.session_id != session_id
-            || !matches!(
-                current.status.as_str(),
-                "active" | "pending" | "ready" | "surfacing" | "surfaced"
-            )
-        {
-            return Ok(None);
-        }
-        let resolution = resolution.map(str::trim).filter(|value| !value.is_empty());
-        let content = resolution
-            .map(|value| format!("{}\n\nResolution: {value}", current.content))
-            .unwrap_or_else(|| current.content.clone());
-        let changed = self
-            .tx
-            .execute(
-                "UPDATE mc_notes
-                    SET status = 'dismissed', content = ?1,
-                        status_version = status_version + 1, state_version = state_version + 1,
-                        updated_at_ms = ?2,
-                        dismissed_at = ?2, dismissal_resolution = ?3
-                  WHERE id = ?4 AND project_path = ?5
-                    AND status = ?6 AND status_version = ?7",
-                params![
-                    content,
-                    now_ms,
-                    resolution,
-                    note_id,
-                    project_path,
-                    current.status,
-                    current.status_version,
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-        if changed == 0 {
-            return Ok(None);
-        }
-        fence_active_note_claims_tx(self.tx, project_path, Some(note_id), "stale", now_ms)
-            .map_err(|error| error.to_string())?;
-        Ok(Some(
-            load_note_tx(self.tx, note_id).map_err(|error| error.to_string())?,
-        ))
+        dismiss_note_tx(
+            self.tx,
+            project_path,
+            Some(session_id),
+            note_id,
+            resolution,
+            now_ms,
+        )
+        .map_err(|error| error.to_string())
     }
 }
 
@@ -10083,23 +9928,7 @@ impl McStore {
         // This compatibility entry point keeps legacy callers on the active-status path
         // used by the previous context-note surface; the full project smart-note writer
         // below deliberately uses pending instead while still recording condition text.
-        self.with_note_conn_fenced(input.project_path, |tx| {
-            tx.execute(
-                "INSERT INTO mc_notes
-                 (type, project_path, session_id, content, status, surface_condition,
-                  anchor_block_id, harness, created_at_ms, updated_at_ms)
-                 VALUES ('session', ?1, ?2, ?3, 'active', ?4, ?5, 'module', ?6, ?6)",
-                params![
-                    input.project_path,
-                    input.session_id,
-                    content,
-                    input.surface_condition,
-                    input.anchor_block_id,
-                    input.now_ms,
-                ],
-            )?;
-            load_note_tx(tx, tx.last_insert_rowid())
-        })
+        self.with_note_conn_fenced(input.project_path, |tx| insert_note_tx(tx, &input, content))
     }
 
     pub fn insert_project_note(
@@ -10119,40 +9948,8 @@ impl McStore {
                 "note content must not be empty".to_string(),
             ));
         }
-        let status = if input
-            .surface_condition
-            .is_some_and(|condition| !condition.trim().is_empty())
-        {
-            "pending"
-        } else {
-            "active"
-        };
         self.with_note_conn_fenced(input.project_path, |tx| {
-            tx.execute(
-                "INSERT INTO mc_notes
-                 (type, project_path, session_id, content, status, surface_condition,
-                  anchor_block_id, anchor_ordinal, harness, compiled_provider, compiled_config,
-                  compiled_at, compile_status, created_at_ms, updated_at_ms)
-                 VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'module', ?8, ?9, ?10, ?11, ?12, ?12)",
-                params![
-                    input.project_path,
-                    input.session_id,
-                    content,
-                    status,
-                    input
-                        .surface_condition
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty()),
-                    input.anchor_block_id,
-                    input.anchor_ordinal,
-                    input.compiled_provider,
-                    input.compiled_config,
-                    input.compiled_at,
-                    input.compile_status,
-                    input.now_ms,
-                ],
-            )?;
-            load_note_tx(tx, tx.last_insert_rowid())
+            insert_project_note_tx(tx, &input, content)
         })
     }
 
@@ -10358,87 +10155,17 @@ impl McStore {
     ) -> Result<NoteCasOutcome, McStoreError> {
         self.require_note_project(project_path, note_id)?;
         let result = self.with_note_conn_fenced(project_path, |tx| {
-            let current = load_note_tx(tx, note_id).optional()?;
-            let Some(current) = current else {
-                return Ok(NoteCasOutcome::Conflict { current: None });
-            };
-            if current.project_path != project_path {
-                return Ok(NoteCasOutcome::Conflict {
-                    current: Some(current),
-                });
-            }
-            if current.status != expected_status || current.status_version != expected_version {
-                return Ok(NoteCasOutcome::Conflict {
-                    current: Some(current),
-                });
-            }
-            let next_content = content.map(str::trim).unwrap_or(&current.content);
-            if next_content.is_empty() {
-                return Ok(NoteCasOutcome::Conflict {
-                    current: Some(current),
-                });
-            }
-            let next_condition = surface_condition
-                .flatten()
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            let current_condition = current
-                .surface_condition
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            // Presence alone is not an edit: an update that re-supplies the
-            // existing condition unchanged must not invalidate the compiled
-            // artifact, reset a ready note to pending, or fence active claims.
-            let condition_changed =
-                surface_condition.is_some() && next_condition != current_condition;
-            let content_changed = next_content != current.content;
-            let compiler_edit = condition_changed || content_changed;
-            if !compiler_edit {
-                // A fully unchanged update is mutation-neutral: bumping the
-                // versions would fence an active evaluation claim and re-run
-                // billable work for compiler inputs that did not change.
-                return Ok(NoteCasOutcome::Applied(current));
-            }
-            let remaining_condition = if condition_changed {
-                next_condition
-            } else {
-                current_condition
-            };
-            let next_status = if compiler_edit && remaining_condition.is_some() {
-                "pending"
-            } else {
-                current.status.as_str()
-            };
-            let compile = condition_compile.unwrap_or_default();
-            let changed = tx.execute(
-                NOTE_CAS_UPDATE_SQL,
-                params![
-                    next_content,
-                    condition_changed,
-                    next_condition,
-                    next_status,
-                    compiler_edit,
-                    now_ms,
-                    compile.compiled_provider,
-                    compile.compiled_config,
-                    compile.compiled_at,
-                    compile.compile_status,
-                    note_id,
-                    project_path,
-                    expected_status,
-                    expected_version,
-                ],
-            )?;
-            if changed == 0 {
-                return Ok(NoteCasOutcome::Conflict {
-                    current: load_note_tx(tx, note_id).optional()?,
-                });
-            }
-            if compiler_edit {
-                fence_active_note_claims_tx(tx, project_path, Some(note_id), "stale", now_ms)?;
-            }
-            Ok(NoteCasOutcome::Applied(load_note_tx(tx, note_id)?))
+            update_note_cas_tx(
+                tx,
+                project_path,
+                note_id,
+                expected_status,
+                expected_version,
+                content,
+                surface_condition,
+                condition_compile,
+                now_ms,
+            )
         })?;
         Ok(result)
     }
@@ -10457,45 +10184,8 @@ impl McStore {
         {
             return Ok(None);
         }
-        let resolution = resolution.map(str::trim).filter(|value| !value.is_empty());
         self.with_note_conn_fenced(project_path, |tx| {
-            let Some(current) = load_note_tx(tx, note_id).optional()? else {
-                return Ok(None);
-            };
-            if current.project_path != project_path
-                || !matches!(
-                    current.status.as_str(),
-                    "active" | "pending" | "ready" | "surfacing" | "surfaced"
-                )
-            {
-                return Ok(None);
-            }
-            let content = resolution
-                .map(|value| format!("{}\n\nResolution: {value}", current.content))
-                .unwrap_or_else(|| current.content.clone());
-            let changed = tx.execute(
-                "UPDATE mc_notes
-                    SET status = 'dismissed', content = ?1,
-                        status_version = status_version + 1, state_version = state_version + 1,
-                        updated_at_ms = ?2,
-                        dismissed_at = ?2, dismissal_resolution = ?3
-                  WHERE id = ?4 AND project_path = ?5
-                    AND status = ?6 AND status_version = ?7",
-                params![
-                    content,
-                    now_ms,
-                    resolution,
-                    note_id,
-                    project_path,
-                    current.status,
-                    current.status_version,
-                ],
-            )?;
-            if changed == 0 {
-                return Ok(None);
-            }
-            fence_active_note_claims_tx(tx, project_path, Some(note_id), "stale", now_ms)?;
-            Ok(Some(load_note_tx(tx, note_id)?))
+            dismiss_note_tx(tx, project_path, None, note_id, resolution, now_ms)
         })
     }
 
@@ -12869,6 +12559,224 @@ fn load_note_tx(tx: &rusqlite::Transaction<'_>, id: i64) -> rusqlite::Result<Sto
         params![id],
         stored_note_from_row,
     )
+}
+
+/// Single definition of the session-note insert executed by both the
+/// `McStore` method and the facade command path. `content` is the
+/// already-trimmed, non-empty note text (each caller validates it against
+/// its own error type).
+fn insert_note_tx(
+    tx: &rusqlite::Transaction<'_>,
+    input: &NoteInput<'_>,
+    content: &str,
+) -> rusqlite::Result<StoredNote> {
+    tx.execute(
+        "INSERT INTO mc_notes
+         (type, project_path, session_id, content, status, surface_condition,
+          anchor_block_id, harness, created_at_ms, updated_at_ms)
+         VALUES ('session', ?1, ?2, ?3, 'active', ?4, ?5, 'module', ?6, ?6)",
+        params![
+            input.project_path,
+            input.session_id,
+            content,
+            input.surface_condition,
+            input.anchor_block_id,
+            input.now_ms,
+        ],
+    )?;
+    load_note_tx(tx, tx.last_insert_rowid())
+}
+
+/// Single definition of the project smart-note insert executed by both the
+/// `McStore` method and the facade command path. A non-empty surface
+/// condition starts the note `pending` (awaiting compile); otherwise it is
+/// immediately `active`.
+fn insert_project_note_tx(
+    tx: &rusqlite::Transaction<'_>,
+    input: &NoteWriteInput<'_>,
+    content: &str,
+) -> rusqlite::Result<StoredNote> {
+    let status = if input
+        .surface_condition
+        .is_some_and(|condition| !condition.trim().is_empty())
+    {
+        "pending"
+    } else {
+        "active"
+    };
+    tx.execute(
+        "INSERT INTO mc_notes
+         (type, project_path, session_id, content, status, surface_condition,
+          anchor_block_id, anchor_ordinal, harness, compiled_provider, compiled_config,
+          compiled_at, compile_status, created_at_ms, updated_at_ms)
+         VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'module', ?8, ?9, ?10, ?11, ?12, ?12)",
+        params![
+            input.project_path,
+            input.session_id,
+            content,
+            status,
+            input
+                .surface_condition
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+            input.anchor_block_id,
+            input.anchor_ordinal,
+            input.compiled_provider,
+            input.compiled_config,
+            input.compiled_at,
+            input.compile_status,
+            input.now_ms,
+        ],
+    )?;
+    load_note_tx(tx, tx.last_insert_rowid())
+}
+
+/// Single definition of the note CAS update executed by both the `McStore`
+/// method and the facade command path.
+#[allow(clippy::too_many_arguments)]
+fn update_note_cas_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project_path: &str,
+    note_id: i64,
+    expected_status: &str,
+    expected_version: i64,
+    content: Option<&str>,
+    surface_condition: Option<Option<&str>>,
+    condition_compile: Option<NoteConditionCompile<'_>>,
+    now_ms: i64,
+) -> rusqlite::Result<NoteCasOutcome> {
+    let current = load_note_tx(tx, note_id).optional()?;
+    let Some(current) = current else {
+        return Ok(NoteCasOutcome::Conflict { current: None });
+    };
+    if current.project_path != project_path
+        || current.status != expected_status
+        || current.status_version != expected_version
+    {
+        return Ok(NoteCasOutcome::Conflict {
+            current: Some(current),
+        });
+    }
+    let next_content = content.map(str::trim).unwrap_or(&current.content);
+    if next_content.is_empty() {
+        return Ok(NoteCasOutcome::Conflict {
+            current: Some(current),
+        });
+    }
+    let next_condition = surface_condition
+        .flatten()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let current_condition = current
+        .surface_condition
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    // Presence alone is not an edit: an update that re-supplies the
+    // existing condition unchanged must not invalidate the compiled
+    // artifact, reset a ready note to pending, or fence active claims.
+    let condition_changed = surface_condition.is_some() && next_condition != current_condition;
+    let content_changed = next_content != current.content;
+    let compiler_edit = condition_changed || content_changed;
+    if !compiler_edit {
+        // A fully unchanged update is mutation-neutral: bumping the
+        // versions would fence an active evaluation claim and re-run
+        // billable work for compiler inputs that did not change.
+        return Ok(NoteCasOutcome::Applied(current));
+    }
+    let remaining_condition = if condition_changed {
+        next_condition
+    } else {
+        current_condition
+    };
+    let next_status = if remaining_condition.is_some() {
+        "pending"
+    } else {
+        current.status.as_str()
+    };
+    let compile = condition_compile.unwrap_or_default();
+    let changed = tx.execute(
+        NOTE_CAS_UPDATE_SQL,
+        params![
+            next_content,
+            condition_changed,
+            next_condition,
+            next_status,
+            compiler_edit,
+            now_ms,
+            compile.compiled_provider,
+            compile.compiled_config,
+            compile.compiled_at,
+            compile.compile_status,
+            note_id,
+            project_path,
+            expected_status,
+            expected_version,
+        ],
+    )?;
+    if changed == 0 {
+        return Ok(NoteCasOutcome::Conflict {
+            current: load_note_tx(tx, note_id).optional()?,
+        });
+    }
+    if compiler_edit {
+        fence_active_note_claims_tx(tx, project_path, Some(note_id), "stale", now_ms)?;
+    }
+    Ok(NoteCasOutcome::Applied(load_note_tx(tx, note_id)?))
+}
+
+/// Single definition of the note dismissal executed by both the `McStore`
+/// method and the facade command path. `session_id` is an extra ownership
+/// gate: `Some` requires the note's writer session to match (the facade
+/// carries the caller's session), `None` relies on the caller's own
+/// session-scoped precheck.
+fn dismiss_note_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project_path: &str,
+    session_id: Option<&str>,
+    note_id: i64,
+    resolution: Option<&str>,
+    now_ms: i64,
+) -> rusqlite::Result<Option<StoredNote>> {
+    let Some(current) = load_note_tx(tx, note_id).optional()? else {
+        return Ok(None);
+    };
+    if current.project_path != project_path
+        || session_id.is_some_and(|session| current.session_id != session)
+        || !matches!(
+            current.status.as_str(),
+            "active" | "pending" | "ready" | "surfacing" | "surfaced"
+        )
+    {
+        return Ok(None);
+    }
+    let resolution = resolution.map(str::trim).filter(|value| !value.is_empty());
+    let content = resolution
+        .map(|value| format!("{}\n\nResolution: {value}", current.content))
+        .unwrap_or_else(|| current.content.clone());
+    let changed = tx.execute(
+        "UPDATE mc_notes
+            SET status = 'dismissed', content = ?1,
+                status_version = status_version + 1, state_version = state_version + 1,
+                updated_at_ms = ?2,
+                dismissed_at = ?2, dismissal_resolution = ?3
+          WHERE id = ?4 AND project_path = ?5
+            AND status = ?6 AND status_version = ?7",
+        params![
+            content,
+            now_ms,
+            resolution,
+            note_id,
+            project_path,
+            current.status,
+            current.status_version,
+        ],
+    )?;
+    if changed == 0 {
+        return Ok(None);
+    }
+    fence_active_note_claims_tx(tx, project_path, Some(note_id), "stale", now_ms)?;
+    Ok(Some(load_note_tx(tx, note_id)?))
 }
 
 const NOTE_EVAL_CLAIM_COLUMNS: &str = "claim_id, note_id, phase, acquisition_id, \
@@ -17293,6 +17201,119 @@ mod tests {
             )
             .unwrap()
         {
+            NoteCasOutcome::Applied(note) => note,
+            other => panic!("unexpected changed-condition outcome: {other:?}"),
+        };
+        assert_eq!(changed.status, "pending");
+        assert_eq!(changed.source_revision, unchanged.source_revision + 1);
+        assert!(changed.compiled_check.is_none());
+    }
+
+    #[test]
+    fn facade_note_update_with_unchanged_condition_is_not_a_compiler_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let note = store
+            .insert_project_note(NoteWriteInput {
+                project_path: "git:proj",
+                route_project_root: None,
+                session_id: Some("writer-session"),
+                content: "wait for the release",
+                surface_condition: Some("release exists"),
+                anchor_block_id: None,
+                anchor_ordinal: None,
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
+                now_ms: 10,
+            })
+            .unwrap();
+        let claimed = store.claim_due_note("git:proj", 20).unwrap().unwrap();
+        let ready = match store
+            .write_note_evaluation(NoteEvaluationInput {
+                project_path: "git:proj",
+                note_id: note.id,
+                source_revision: claimed.status_version,
+                verdict: true,
+                compiled_check: Some("release exists"),
+                manifest_json: Some("{}"),
+                check_hash: Some("hash"),
+                next_due_at: None,
+                now_ms: 30,
+            })
+            .unwrap()
+        {
+            NoteCasOutcome::Applied(note) => note,
+            other => panic!("unexpected evaluation outcome: {other:?}"),
+        };
+
+        // The same unchanged-condition update the McStore path treats as
+        // mutation-neutral, driven through the facade command path.
+        let mut outcome = None;
+        store
+            .with_facade_command(
+                "git:proj",
+                "git:proj",
+                "notes",
+                "writer-session",
+                "ctx_note",
+                "update",
+                None,
+                |txn| {
+                    outcome = Some(txn.update_note_cas(
+                        "git:proj",
+                        note.id,
+                        &ready.status,
+                        ready.status_version,
+                        None,
+                        Some(Some("  release exists  ")),
+                        None,
+                        40,
+                    )?);
+                    Ok(Vec::new())
+                },
+            )
+            .unwrap();
+        let unchanged = match outcome.unwrap() {
+            NoteCasOutcome::Applied(note) => note,
+            other => panic!("unexpected unchanged-condition outcome: {other:?}"),
+        };
+        // Mutation-neutral on the facade path too: no status reset, no version
+        // bump, no compiled-artifact invalidation.
+        assert_eq!(unchanged.status, ready.status);
+        assert_eq!(unchanged.status_version, ready.status_version);
+        assert_eq!(unchanged.state_version, ready.state_version);
+        assert_eq!(unchanged.compiled_check, ready.compiled_check);
+        assert_eq!(unchanged.source_revision, ready.source_revision);
+
+        // A genuinely changed condition through the facade still recompiles.
+        let mut changed_outcome = None;
+        store
+            .with_facade_command(
+                "git:proj",
+                "git:proj",
+                "notes",
+                "writer-session",
+                "ctx_note",
+                "update",
+                None,
+                |txn| {
+                    changed_outcome = Some(txn.update_note_cas(
+                        "git:proj",
+                        note.id,
+                        &unchanged.status,
+                        unchanged.status_version,
+                        None,
+                        Some(Some("release tagged")),
+                        None,
+                        50,
+                    )?);
+                    Ok(Vec::new())
+                },
+            )
+            .unwrap();
+        let changed = match changed_outcome.unwrap() {
             NoteCasOutcome::Applied(note) => note,
             other => panic!("unexpected changed-condition outcome: {other:?}"),
         };

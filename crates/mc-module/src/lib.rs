@@ -11824,9 +11824,18 @@ impl McHandler {
                 // already-conditioned note resets the compiled artifact, which the
                 // evaluator recompiles once it is available again; refusing it here
                 // would make every conditioned note uneditable for as long as the
-                // evaluator is down.
-                let condition_changed = condition
-                    .is_some_and(|value| current.surface_condition.as_deref() != Some(value));
+                // evaluator is down. The trimmed comparison mirrors the store's
+                // own change predicate, so a whitespace-only re-supply is not
+                // refused for an update the store would treat as a no-op.
+                let current_condition = current
+                    .surface_condition
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let condition_changed = condition.is_some_and(|value| {
+                    let next_condition = Some(value.trim()).filter(|value| !value.is_empty());
+                    next_condition != current_condition
+                });
                 if condition_changed && !self.has_live_note_evaluator(project, now) {
                     return refuse_conditioned_note_without_evaluator(
                         &store,
