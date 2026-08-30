@@ -185,10 +185,28 @@ Reading the marginal cells against the design's own limits:
 - `m0/trim_claims` +3.5–4.0% on the 8/64 cells: also below resolution, and
   these cells underflow the budget and tokenize only sub-64-byte wrapper
   strings, which bypass the cache entirely — they exercise the counter
-  overhead, not the cache. The 64claims slope estimator reads +5.6%, above
-  the ~5% threshold, so this group is flagged for replication rather than
-  dismissed. The 256claims cell — the only one that actually trims — is
-  flat (−0.3%).
+  overhead, not the cache. The 256claims cell — the only one that actually
+  trims — is flat (−0.3%).
+
+  The mean is the comparison estimator everywhere, including the table above.
+  For this group alone a second estimator is also available, because all
+  three m0 cells sampled in linear mode in both arms and so carry a Criterion
+  `slope` (the three cells that crossed the flat/linear boundary do not).
+  Read as a one-way cross-check, it does not agree with the mean on the
+  64claims cell, so the group is flagged for replication rather than
+  dismissed as sub-resolution. Slope point estimates with 95% CIs, in ns,
+  from the same retained `estimates.json` files:
+
+  | Cell | Before (slope) | After (slope) | Slope change | Mean change |
+  | --- | --- | --- | --- | --- |
+  | `8claims` | 2556.39 [2552.66, 2559.45] | 2652.31 [2646.19, 2657.88] | +3.8% | +4.0% |
+  | `64claims` | 2642.86 [2636.07, 2651.49] | 2790.20 [2784.82, 2795.32] | +5.6% | +3.5% |
+  | `256claims` | 3338.24 [3332.66, 3342.91] | 3298.62 [3292.28, 3304.85] | −1.2% | −0.3% |
+
+  The 64claims slope reads +5.6% against the ~5% threshold while its mean
+  reads +3.5% below it. Escalating on the less favorable of the two is a
+  deliberately conservative choice, not a switch of declared estimator; the
+  disagreement is itself the reason the cell needs replication.
 
 The tail_hygiene and steady headline cells are hit-rate-1.0 upper bounds
 (see Known gaps). Their mechanism coherence check: the steady-pass delta
