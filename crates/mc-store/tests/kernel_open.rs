@@ -249,12 +249,16 @@ fn malformed_marker_is_inconclusive_and_untouched() {
 #[test]
 fn valid_interrupted_reset_marker_resumes_without_opening_old_family() {
     let dir = tempfile::tempdir().unwrap();
-    let conn = seed_kernel(dir.path());
+    // Quarantine resume compares paths lexically. A symlinked root
+    // (`/var` -> `/private/var`) fails that comparison when spellings are mixed.
+    // commentlint: allow(JUDGE)
+    let root = dir.path().canonicalize().unwrap();
+    let conn = seed_kernel(&root);
     conn.execute_batch("CREATE TABLE unexpected(value INTEGER) STRICT;")
         .unwrap();
     drop(conn);
-    let db_path = core_path(dir.path()).canonicalize().unwrap();
-    let quarantine = dir.path().join("core.sqlite.mc-quarantine-resume");
+    let db_path = core_path(&root);
+    let quarantine = root.join("core.sqlite.mc-quarantine-resume");
     fs::create_dir(&quarantine).unwrap();
     fs::rename(&db_path, quarantine.join("core.sqlite")).unwrap();
     for suffix in ["-journal", "-wal", "-shm"] {
@@ -276,13 +280,13 @@ fn valid_interrupted_reset_marker_resumes_without_opening_old_family() {
     let mut marker = marker_without_digest;
     marker["marker_digest"] = digest.into();
     fs::write(
-        dir.path().join("core.sqlite.mc-reset"),
+        root.join("core.sqlite.mc-reset"),
         serde_json::to_vec(&marker).unwrap(),
     )
     .unwrap();
 
-    let _store = KernelStore::open(dir.path()).unwrap();
-    assert!(core_path(dir.path()).is_file());
+    let _store = KernelStore::open(&root).unwrap();
+    assert!(core_path(&root).is_file());
     assert!(quarantine.join("core.sqlite.mc-reset").is_file());
     assert_owner_only(&quarantine, 0o700);
     for name in [
