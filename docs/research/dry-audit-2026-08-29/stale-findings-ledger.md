@@ -226,3 +226,124 @@ Resumed at `2c9e8db9`; this section records the U6-remainder and U7 work.
   system-marker-first hardening (recorded as unit-test comment instead).
 - T2-1: fixed charge derivation, duplicate eviction pin, import placement,
   Arc qualification; seventh-member note carried to the residual above.
+
+## Third execution run (resume #2)
+
+Resumed at `0dce37bf`; this section records the U7 items 6–10 work.
+U7 (Wave 3 correctness items) is now complete.
+
+### Completed
+
+- U7 item 6 — features T2-2/CC-3 (`e59eb07f`): deleted the dead
+  module-global embedding lane (memory/embedding.ts singleton, incl. the
+  hardcoded synapse 8192 that bypassed `normalizeSynapseTokenBudget`);
+  `embedQuery`/`isEmbeddingRuntimeEnabled` are now required on
+  `UnifiedSearchOptions`. Red evidence: tsc enumerated every defaulting
+  site (a test-including tsc probe verified the error set returned to
+  baseline modulo line shifts). Unique provider-identity tests moved to
+  embedding-openai.test.ts; cosine tests to cosine-similarity.test.ts.
+- U7 item 7 — X4 + X2 (`9b2031fe`): path-fence honors XDG_DATA_HOME and
+  HOME only when absolute AND still fences the cwd-relative tree the
+  permissive storage resolver would write to (union of candidate roots;
+  three fence tests observed red first). Release contract gained a fixed
+  `layout` section (managed_subtree/runtime_directory/connection_file/
+  storage_subdirectory) with generator validation (mutation tests
+  observed red first), Rust consts, a generated retina-local-fs module,
+  and an mc-module conformance test binding contract values to
+  mc_host::MANAGED_DIR_NAME / RUNTIME_DIR_NAME (new) /
+  CONNECTION_FILE_NAME and DEFAULT_MODULE_ID. TS resolvers, e2e
+  harnesses, and plugin scripts now compose managed paths through
+  contract-derived helpers (`storageSubtreePath` added to data-path.ts).
+- U7 item 8 — X3 (`2b28e149`): CLI doctor wraps the shared
+  `migrateDreamerV2` with a recursive comment-preserving graft.
+  16-fixture cross-copy parity test observed green before the swap
+  (characterization gate); canonical-coverage test pins every
+  `CANONICAL_DREAMER_TASKS` member in doctor output; comment-preservation
+  test pins JSONC comments at three depths.
+- U7 item 9 — shared T2-3 (`e078bbce`): the four hand-rolled
+  conflict-warning senders route through `sendIgnoredMessage`. Blocker
+  check passed: `isMidTurn` fails open to not-mid-turn on an unreadable
+  DB, so the primary path was taken — the T1-2 fallback and its
+  conditional model-pinning bug bead were not needed. Three tests
+  observed red first (mid-turn deferral, prompt-context pinning,
+  markSeen deferral); toast-direction mapping and positive markSeen also
+  pinned.
+- U7 item 10 — tests CC-2 (`b4a0be33`): 13 fixtures adopted
+  `createDirectTestDatabase` (incl. the pi-plugin site and the cas-race
+  first-composes/second-plain two-handle pattern); command-handler's
+  dead IF-NOT-EXISTS blocks deleted. Deferred as deliberate fixtures:
+  cli migrate-session (legacy-schema migration source), clone-session
+  (OpenCode session-DB half + narrow context columns are the point of
+  its assertions), recover-benchmark-candidates (pre-existing-failing
+  ledgered file; its context half is adoptable once that baseline is
+  fixed).
+
+### Pre-existing failures newly verified at baseline (not caused by this branch)
+
+- `bun run test:release` / `release:qualify:check` / `release:payload:check`
+  fail identically at the pre-change baseline: `Cannot find package
+  'typescript'` from `scripts/qualify-mc-host-production-inputs.ts`
+  (environment; the generate-manifest suite and
+  `release:contract:check` are green).
+- `bun test src/shared/` directory-run interference: 28 failures at both
+  baseline and post-change HEAD (already ledgered); the touched lifecycle
+  files pass in isolation.
+
+### Narrowings and residuals (this run)
+
+- X2 residual literals (deliberate, outside the data-layout contract):
+  config-home `cortexkit` segments (migrate-config-location.ts, hermetic
+  fixtureConfigRoot), drive-preseed's rig-specific `ckdev-rig/runtime`
+  segments (its managed prefix + connection filename now derive from the
+  contract), and the fence-local `plexus`/`claustrum`/`staging` segments.
+- CC-2 sibling drift outside the finding's member list (same defect
+  class, keyed on other tables): `tools/ctx-note/tools.test.ts` `notes`
+  copy, `storage-source.test.ts` `source_contents` NOT NULL drift,
+  `storage-ops.test.ts` exact `pending_ops` duplicate.
+- features T2-2 review observations recorded, not applied (would change
+  the audit-approved contract): a registry-backed `embedQuery` default
+  and folding `isEmbeddingRuntimeEnabled` into `embeddingEnabled`;
+  memory/embedding.ts barrel remains as the audit's scope fence (two
+  import paths to the registry surface).
+- shared T2-3 review residual: `CONFLICT_WARNING_MARKER` duplicates the
+  first line of `formatConflictShort` (pre-existing; single-sourcing it
+  is a follow-up).
+- X1 orchestration unification and the T2-1 `SessionLruCache<E>`
+  consolidation remain open as previously ledgered.
+
+### Review dispositions — this run
+
+- Item 6: 8 findings; applied test rehoming (incl. unique secret-identity
+  tests), stub consistency, pure-indirection removal, barrel comment
+  reword; declined the two contract-shape alternatives and the barrel
+  deletion (scope fence), and the shared test-stub hoist (independent
+  test oracles).
+- Item 7: 10 findings; applied the union-of-roots fence fix (MAJOR) with
+  its new red test, HOME absolute-only, owner.ts helper reuse, retina
+  biome exclusion for the generated file, STORAGE_SUBDIRECTORY ↔
+  DEFAULT_MODULE_ID bind, drive-preseed partial derivation, generator
+  contract passing, annotation drop; declined moving the conformance
+  test file (kept beside the coordination sibling) and the
+  benchmark-tag-queries HOME fallback change (behavior preservation).
+- Item 8: 5 findings; applied recursive comment-preserving graft (MAJOR)
+  with a JSONC comment test (MAJOR), dead-branch removal + Object.hasOwn,
+  changed-flag assertion tightening, comment rewording.
+- Item 9: 9 findings; applied disposition-gated auto-remove, TUI-gate
+  comment reword, duplicate-bound correction, two toast-direction tests,
+  positive markSeen test, afterEach cleanup, fence pre-send log;
+  declined the marker single-sourcing (pre-existing, ledgered above)
+  and the flush-path guard cap (pre-existing helper behavior).
+- Item 10: 8 findings; applied docblock fix, retrospective context-half
+  adoption, cas-race busy_timeout + mechanism comment, local-variable
+  cleanup, and ledger-reason corrections for the deferred sites;
+  recorded the sibling-drift residual above.
+
+### Exact resume point
+
+- U8 (plan): remaining ungated non-correctness T2s in `MERGED.md` §6
+  item 11 dependency order (features CC-1(b/d) → features T2-3 → tests
+  CC-3/CC-4/CC-5 → pi F-7/F-8 → M10 → shared T2-2 → hooks C13 → C16 →
+  C17/C18 → mc-module T2-2/T2-4; T2-5 fork resolution; KTD10/KTD7/KTD11
+  exclusions unchanged), then U10 (Wave 5 anchors, awe-bead fixture
+  excluded), then U11 (ledger finalization, full final-HEAD gate,
+  comment-policy sweep over the branch diff).
