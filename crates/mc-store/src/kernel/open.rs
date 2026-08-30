@@ -136,6 +136,7 @@ impl std::error::Error for KernelError {}
 
 pub struct KernelStore {
     writer: Mutex<Connection>,
+    pub(super) purge_intent_log: Mutex<File>,
     pub(super) readers: Vec<Mutex<Connection>>,
     next_reader: AtomicUsize,
     poisoned: AtomicBool,
@@ -240,9 +241,14 @@ impl KernelStore {
         harden_family(&db_path)?;
         let readers = open_read_pool(&db_path)?;
         harden_family(&db_path)?;
+        let root_directory = File::open(&root).map_err(|_| KernelError::Io)?;
+        let purge_intent_log =
+            super::durable_fs::open_or_create_append_file(&root_directory, "purge-intent.jsonl")
+                .map_err(|_| KernelError::Io)?;
 
         let store = Self {
             writer: Mutex::new(writer),
+            purge_intent_log: Mutex::new(purge_intent_log),
             readers,
             next_reader: AtomicUsize::new(0),
             poisoned: AtomicBool::new(false),

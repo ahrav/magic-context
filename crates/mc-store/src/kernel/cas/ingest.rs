@@ -13,7 +13,7 @@ use super::{
 };
 use crate::kernel::durable_fs::{
     create_new_file, durable_unlink, open_or_create_secure_directory,
-    publish_noreplace_between_locked, temp_name, write_and_sync, PublishOutcome, StorageError,
+    publish_noreplace_between_locked, temp_name, write_and_sync, PublishOutcome,
 };
 use crate::kernel::envelope::{check_fence, commit_with_writer, ObjectRow, PendingChange};
 use crate::kernel::open::current_time_ms;
@@ -102,7 +102,7 @@ impl KernelStore {
         &self,
         request: ArtifactIngestRequest,
     ) -> Result<ArtifactHandle, ArtifactError> {
-        self.ingest_artifact_inner(request, false, false)
+        self.ingest_artifact_inner(request, false, false, None)
     }
 
     #[cfg(feature = "test-support")]
@@ -115,7 +115,17 @@ impl KernelStore {
             request,
             fault == ArtifactIngestFault::AfterDirectorySync,
             fault == ArtifactIngestFault::AfterEvents,
+            None,
         )
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn ingest_artifact_with_temp_hook_for_test(
+        &self,
+        request: ArtifactIngestRequest,
+        mut hook: impl FnMut(&str),
+    ) -> Result<ArtifactHandle, ArtifactError> {
+        self.ingest_artifact_inner(request, false, false, Some(&mut hook))
     }
 
     fn ingest_artifact_inner(
@@ -123,6 +133,7 @@ impl KernelStore {
         request: ArtifactIngestRequest,
         fault_after_directory_sync: bool,
         fault_after_events: bool,
+        temp_written_hook: Option<&mut dyn FnMut(&str)>,
     ) -> Result<ArtifactHandle, ArtifactError> {
         if self.cas_is_failed() {
             return Err(ArtifactError::new(ArtifactErrorKind::IngestionFailClosed));
@@ -134,32 +145,42 @@ impl KernelStore {
         self.check_budget(&prepared.digest, byte_length)?;
 
         let artifacts = File::open(&self.artifacts_path)
-            .map_err(|_| self.fail_storage(ArtifactErrorKind::IngestionFailClosed))?;
-        let tmp = open_or_create_secure_directory(&artifacts, "tmp")
-            .map_err(|error| self.map_storage_error(error))?;
-        let objects = open_or_create_secure_directory(&artifacts, "objects")
-            .map_err(|error| self.map_storage_error(error))?;
-        let temp_name = temp_name("artifact");
-        let mut temp =
-            create_new_file(&tmp, &temp_name).map_err(|error| self.map_storage_error(error))?;
+            .map_err(|_| self.fail_cas_storage(ArtifactErrorKind::IngestionFailClosed))?;
+        let tmp = open_or_create_secure_directory(&artifacts, "tmp").map_err(|error| {
+            self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed)
+        })?;
+        let objects = open_or_create_secure_directory(&artifacts, "objects").map_err(|error| {
+            self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed)
+        })?;
+        let temp_name = temp_name(&format!("artifact-{}", prepared.digest));
+        let mut temp = create_new_file(&tmp, &temp_name).map_err(|error| {
+            self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed)
+        })?;
         if let Err(error) = write_and_sync(&mut temp, &prepared.bytes) {
-            let mapped = self.map_storage_error(error);
-            let _ =
-                durable_unlink(&tmp, &temp_name).map_err(|cleanup| self.map_storage_error(cleanup));
+            let mapped = self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed);
+            let _ = durable_unlink(&tmp, &temp_name).map_err(|cleanup| {
+                self.map_cas_storage_error(cleanup, ArtifactErrorKind::IngestionFailClosed)
+            });
             return Err(mapped);
         }
         drop(temp);
+        if let Some(hook) = temp_written_hook {
+            hook(&temp_name);
+        }
 
         let mut writer = self
             .lock_writer()
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
         if let Err(error) = self.check_budget(&prepared.digest, byte_length) {
-            let _ =
-                durable_unlink(&tmp, &temp_name).map_err(|cleanup| self.map_storage_error(cleanup));
+            let _ = durable_unlink(&tmp, &temp_name).map_err(|cleanup| {
+                self.map_cas_storage_error(cleanup, ArtifactErrorKind::IngestionFailClosed)
+            });
             return Err(error);
         }
-        let shard = open_or_create_secure_directory(&objects, &prepared.digest[..2])
-            .map_err(|error| self.map_storage_error(error))?;
+        let shard =
+            open_or_create_secure_directory(&objects, &prepared.digest[..2]).map_err(|error| {
+                self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed)
+            })?;
         let now = current_time_ms();
         let reservation_id = format!(
             "{}-{}",
@@ -176,8 +197,9 @@ impl KernelStore {
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?
         {
             drop(reservation);
-            let _ =
-                durable_unlink(&tmp, &temp_name).map_err(|cleanup| self.map_storage_error(cleanup));
+            let _ = durable_unlink(&tmp, &temp_name).map_err(|cleanup| {
+                self.map_cas_storage_error(cleanup, ArtifactErrorKind::IngestionFailClosed)
+            });
             return Err(ArtifactError::for_digest(
                 ArtifactErrorKind::ReclaimInProgress,
                 &prepared.digest,
@@ -187,8 +209,9 @@ impl KernelStore {
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?
         {
             drop(reservation);
-            let _ =
-                durable_unlink(&tmp, &temp_name).map_err(|cleanup| self.map_storage_error(cleanup));
+            let _ = durable_unlink(&tmp, &temp_name).map_err(|cleanup| {
+                self.map_cas_storage_error(cleanup, ArtifactErrorKind::IngestionFailClosed)
+            });
             return Err(ArtifactError::for_digest(
                 ArtifactErrorKind::ReAdmissionBlocked,
                 &prepared.digest,
@@ -221,17 +244,20 @@ impl KernelStore {
             Ok(PublishOutcome::Published) => true,
             Ok(PublishOutcome::AlreadyExists) => {
                 if let Err(error) = durable_unlink(&tmp, &temp_name) {
-                    let mapped = self.map_storage_error(error);
+                    let mapped =
+                        self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed);
                     self.release_reservation(&mut writer, &reservation_id);
                     return Err(mapped);
                 }
                 false
             }
             Err(error) => {
-                let mapped = self.map_storage_error(error);
+                let mapped =
+                    self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed);
                 self.release_reservation(&mut writer, &reservation_id);
-                let _ = durable_unlink(&tmp, &temp_name)
-                    .map_err(|cleanup| self.map_storage_error(cleanup));
+                let _ = durable_unlink(&tmp, &temp_name).map_err(|cleanup| {
+                    self.map_cas_storage_error(cleanup, ArtifactErrorKind::IngestionFailClosed)
+                });
                 return Err(mapped);
             }
         };
@@ -306,18 +332,6 @@ impl KernelStore {
             return Err(ArtifactError::capacity(usage, self.artifact_cap));
         }
         Ok(())
-    }
-
-    fn map_storage_error(&self, error: StorageError) -> ArtifactError {
-        match error {
-            StorageError::Exhausted(_) => ArtifactError::new(ArtifactErrorKind::StorageExhausted),
-            StorageError::Other(_) => self.fail_storage(ArtifactErrorKind::IngestionFailClosed),
-        }
-    }
-
-    fn fail_storage(&self, kind: ArtifactErrorKind) -> ArtifactError {
-        self.latch_cas_failure();
-        ArtifactError::new(kind)
     }
 
     fn release_reservation(&self, writer: &mut Connection, reservation_id: &str) {

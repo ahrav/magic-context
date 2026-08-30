@@ -1,6 +1,7 @@
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Write};
+use std::os::unix::fs::FileExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -113,29 +114,33 @@ pub(super) fn open_or_create_secure_directory(
     match create_secure_directory(parent, name) {
         Ok(directory) => Ok(directory),
         Err(StorageError::Other(source)) if source.kind() == io::ErrorKind::AlreadyExists => {
-            validate_name(name)?;
-            let descriptor = rfs::openat(
-                parent,
-                name,
-                OFlags::DIRECTORY | OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(classify_errno)?;
-            let directory = File::from(descriptor);
-            let metadata = directory.metadata().map_err(classify_io)?;
-            if !metadata.is_dir()
-                || metadata.uid() != rustix::process::geteuid().as_raw()
-                || metadata.permissions().mode() & 0o777 != 0o700
-            {
-                return Err(classify_io(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "directory is not owner-only",
-                )));
-            }
-            Ok(directory)
+            open_secure_directory(parent, name)
         }
         Err(error) => Err(error),
     }
+}
+
+pub(super) fn open_secure_directory(parent: &File, name: &str) -> Result<File, StorageError> {
+    validate_name(name)?;
+    let descriptor = rfs::openat(
+        parent,
+        name,
+        OFlags::DIRECTORY | OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(classify_errno)?;
+    let directory = File::from(descriptor);
+    let metadata = directory.metadata().map_err(classify_io)?;
+    if !metadata.is_dir()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.permissions().mode() & 0o777 != 0o700
+    {
+        return Err(classify_io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "directory is not owner-only",
+        )));
+    }
+    Ok(directory)
 }
 
 pub(super) fn create_new_file(directory: &File, name: &str) -> Result<File, StorageError> {
@@ -149,6 +154,56 @@ pub(super) fn create_new_file(directory: &File, name: &str) -> Result<File, Stor
     .map_err(classify_errno)?;
     rfs::fchmod(&descriptor, Mode::from_raw_mode(0o600)).map_err(classify_errno)?;
     Ok(File::from(descriptor))
+}
+
+pub(super) fn open_or_create_append_file(
+    directory: &File,
+    name: &str,
+) -> Result<File, StorageError> {
+    match create_new_file(directory, name) {
+        Ok(file) => {
+            sync_directory(directory)?;
+            drop(file);
+            open_or_create_append_file(directory, name)
+        }
+        Err(StorageError::Other(source)) if source.kind() == io::ErrorKind::AlreadyExists => {
+            validate_name(name)?;
+            let descriptor = rfs::openat(
+                directory,
+                name,
+                OFlags::APPEND | OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(classify_errno)?;
+            let file = File::from(descriptor);
+            let metadata = file.metadata().map_err(classify_io)?;
+            if !metadata.is_file()
+                || metadata.uid() != rustix::process::geteuid().as_raw()
+                || metadata.permissions().mode() & 0o777 != 0o600
+            {
+                return Err(classify_io(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "append file is not owner-only",
+                )));
+            }
+            Ok(file)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub(super) fn append_and_sync(file: &mut File, bytes: &[u8]) -> Result<(), StorageError> {
+    let length = file.metadata().map_err(classify_io)?.len();
+    if length > 0 {
+        let mut last = [0_u8; 1];
+        file.read_exact_at(&mut last, length - 1)
+            .map_err(classify_io)?;
+        if last[0] != b'\n' {
+            file.write_all(b"\n").map_err(classify_io)?;
+        }
+    }
+    file.write_all(bytes).map_err(classify_io)?;
+    sync_file(file)
 }
 
 pub(super) fn write_and_sync(file: &mut File, bytes: &[u8]) -> Result<(), StorageError> {
@@ -378,6 +433,29 @@ mod tests {
         durable_unlink(&directory, "present").unwrap();
 
         assert!(!root.path().join("present").exists());
+    }
+
+    #[test]
+    fn append_log_is_owner_only_and_isolates_an_unterminated_tail() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = File::open(root.path()).unwrap();
+        let mut log = open_or_create_append_file(&directory, "intent.jsonl").unwrap();
+
+        append_and_sync(&mut log, b"partial").unwrap();
+        append_and_sync(&mut log, b"{\"next\":true}\n").unwrap();
+
+        assert_eq!(
+            fs::read(root.path().join("intent.jsonl")).unwrap(),
+            b"partial\n{\"next\":true}\n"
+        );
+        assert_eq!(
+            fs::metadata(root.path().join("intent.jsonl"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 
     #[test]

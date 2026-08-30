@@ -1,3 +1,4 @@
+mod deletion;
 pub(super) mod gc;
 mod ingest;
 mod read;
@@ -110,6 +111,8 @@ pub enum ArtifactErrorKind {
     ReferenceCommit,
     ReclaimInProgress,
     InvalidInput,
+    PurgeIntent,
+    PurgeUnlinkPending,
 }
 
 pub struct ArtifactError {
@@ -139,7 +142,9 @@ impl ArtifactError {
     pub fn is_retriable(&self) -> bool {
         matches!(
             self.kind,
-            ArtifactErrorKind::StorageExhausted | ArtifactErrorKind::ReclaimInProgress
+            ArtifactErrorKind::StorageExhausted
+                | ArtifactErrorKind::ReclaimInProgress
+                | ArtifactErrorKind::PurgeUnlinkPending
         )
     }
 
@@ -214,10 +219,22 @@ impl fmt::Display for ArtifactError {
                 formatter.write_str("artifact reclamation is in progress; retry ingestion")
             }
             ArtifactErrorKind::InvalidInput => formatter.write_str("artifact input is invalid"),
+            ArtifactErrorKind::PurgeIntent => {
+                formatter.write_str("artifact purge intent could not be made durable")
+            }
+            ArtifactErrorKind::PurgeUnlinkPending => {
+                formatter.write_str("artifact purge committed with durable unlink pending")
+            }
         }
     }
 }
 
+#[cfg(feature = "test-support")]
+pub use deletion::ArtifactDeletionFault;
+pub use deletion::{
+    ArtifactDeletionIdentity, ArtifactDeletionKind, ArtifactDeletionRequest,
+    ArtifactDeletionResult, BarrierConsumerStatus, DeletionBarrierStatus,
+};
 #[cfg(feature = "test-support")]
 pub use gc::ArtifactGcFault;
 pub use gc::ArtifactGcResult;
@@ -264,6 +281,27 @@ impl KernelStore {
 
     pub(super) fn latch_cas_failure(&self) {
         self.cas_failed.store(true, Ordering::Release);
+    }
+
+    pub(super) fn map_cas_storage_error(
+        &self,
+        error: crate::kernel::durable_fs::StorageError,
+        non_capacity_kind: ArtifactErrorKind,
+    ) -> ArtifactError {
+        match error {
+            crate::kernel::durable_fs::StorageError::Exhausted(_) => {
+                ArtifactError::new(ArtifactErrorKind::StorageExhausted)
+            }
+            crate::kernel::durable_fs::StorageError::Other(_) => {
+                self.latch_cas_failure();
+                ArtifactError::new(non_capacity_kind)
+            }
+        }
+    }
+
+    pub(super) fn fail_cas_storage(&self, kind: ArtifactErrorKind) -> ArtifactError {
+        self.latch_cas_failure();
+        ArtifactError::new(kind)
     }
 }
 

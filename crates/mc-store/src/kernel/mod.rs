@@ -15,12 +15,14 @@ pub use backup::{
     verify_backup_with_deadline_for_test, BackupFault, RestoreFault,
 };
 pub use backup::{BackupManifest, BackupRequest, BackupResult};
-pub use cas::{
-    ArtifactDestination, ArtifactEligibility, ArtifactError, ArtifactErrorKind, ArtifactGcResult,
-    ArtifactHandle, ArtifactIngestRequest, EligibilityDeniedReason, ProviderEgress,
-};
 #[cfg(feature = "test-support")]
-pub use cas::{ArtifactGcFault, ArtifactIngestFault};
+pub use cas::{ArtifactDeletionFault, ArtifactGcFault, ArtifactIngestFault};
+pub use cas::{
+    ArtifactDeletionIdentity, ArtifactDeletionKind, ArtifactDeletionRequest,
+    ArtifactDeletionResult, ArtifactDestination, ArtifactEligibility, ArtifactError,
+    ArtifactErrorKind, ArtifactGcResult, ArtifactHandle, ArtifactIngestRequest,
+    BarrierConsumerStatus, DeletionBarrierStatus, EligibilityDeniedReason, ProviderEgress,
+};
 #[cfg(feature = "test-support")]
 pub use envelope::CommitFault;
 pub use envelope::{
@@ -30,5 +32,5 @@ pub use envelope::{
 };
 pub use facts::{ArtifactBudgetFacts, KernelFacts, MAIN_FILE_WARN_BYTES};
 pub use open::{KernelError, KernelErrorKind, KernelStore};
-pub use outbox::OutboxPruneResult;
+pub use outbox::{ConsumerAbandonment, OutboxPruneResult};
 pub use retention::{StagingMaintenanceResult, StagingTerminalState};
