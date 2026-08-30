@@ -404,6 +404,68 @@ describe("metamorphic transforms", () => {
         }
     });
 
+    test("rename refuses a replacement that states a probe gold answer", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[0]!.assistant = "We could consider it.";
+        turns[2]!.assistant = "Done: cache capacity is 4096 entries, tracked per symbol.";
+        turns[3] = { user: "Background note about aux_worker.ts.", assistant: "Summary recorded." };
+        // Every generated name contains `symbol` as a complete value, so any
+        // rename would put this probe's answer into surviving raw history.
+        (raw.probes as Array<Record<string, unknown>>)[0] = {
+            id: "probe-capacity",
+            question: "What does the capacity record track per unit?",
+            answerType: "exact",
+            goldAnswer: "symbol",
+            sourceClaimRef: "exp-cache-capacity",
+        };
+        const gold = raw.gold as { expectedClaims: Array<{ predicate: { value: string } }> };
+        gold.expectedClaims[1]!.predicate.value = "4096 entries, tracked per symbol";
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
+
+        for (let seed = 0; seed < 20; seed += 1) {
+            expect(transform.apply(scenario, seed), `seed ${seed}`).toEqual({
+                applicable: false,
+                reason: "no unused replacement symbol",
+            });
+        }
+    });
+
+    test("rename replacements avoid names hidden inside inline code", () => {
+        // The generator scans forward from a seed-chosen index, so reserving the
+        // name that index lands on makes the collision deterministic.
+        for (let seed = 0; seed < 6; seed += 1) {
+            const next = splitmix32(seed);
+            next();
+            const reserved = `aux_symbol_${Math.floor(next() * 10_000)}`;
+            const raw = validScenarioRaw();
+            const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> })
+                .turns;
+            turns[0]!.assistant = "We could consider it.";
+            turns[3] = {
+                user: `Background note about aux_worker.ts; run \`${reserved} --watch\` afterwards.`,
+                assistant: "Summary recorded.",
+            };
+            const scenario = parseScenario(raw);
+            expect(lintScenario(scenario)).toEqual([]);
+            const transform = TRANSFORMS.find(
+                (candidate) => candidate.id === "rename-unrelated-symbols",
+            )!;
+
+            const result = transform.apply(scenario, seed);
+            expect(result.applicable, `seed ${seed}`).toBe(true);
+            if (!result.applicable) continue;
+            const rewritten = result.scenario.transcript.turns[3]!.user;
+            expect(rewritten, `seed ${seed}`).not.toContain("aux_worker.ts");
+            expect(
+                rewritten.split(reserved).length - 1,
+                `seed ${seed} reserved ${reserved}`,
+            ).toBe(1);
+        }
+    });
+
     test("rename replacements avoid names only a probe uses", () => {
         // The seed decides which `aux_symbol_N` the generator reaches for first:
         // one draw picks the symbol, the next picks the starting index. Reserving

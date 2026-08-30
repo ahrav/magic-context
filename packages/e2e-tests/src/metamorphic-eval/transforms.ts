@@ -839,12 +839,24 @@ const renameUnrelatedSymbols: Transform = {
         const next = splitmix32(seed);
         const original = pick(candidates, next);
         // A replacement that aliases a probe-only entity changes the
-        // query-to-history relationship as surely as renaming one would.
-        const existing = new Set(allText.flatMap((text) => symbolsIn(text)));
+        // query-to-history relationship as surely as renaming one would, and one
+        // aliasing a name that exists only inside a command span collides with an
+        // entity the rename cannot even reach.
+        const existing = new Set([
+            ...allText.flatMap((text) => symbolsIn(text)),
+            ...allText.flatMap((text) => shadowedSymbolsIn(text)),
+        ]);
+        // A generated name contains its own parts as complete values, so a probe
+        // whose gold answer is one of them — `aux`, `symbol` — would find the
+        // answer copyable from raw history the moment any rename lands.
+        const probeAnswers = scenario.probes.flatMap((probe) =>
+            probe.answerType === "claim-id" ? [] : [probe.goldAnswer],
+        );
         const replacementStart = Math.floor(next() * 10_000);
         let replacement: string | undefined;
         for (let offset = 0; offset < 10_000; offset += 1) {
             const candidate = `aux_symbol_${(replacementStart + offset) % 10_000}`;
+            if (probeAnswers.some((answer) => containsCompleteValue(candidate, answer))) continue;
             if (candidate !== original && !existing.has(candidate)) {
                 replacement = candidate;
                 break;
