@@ -12,12 +12,7 @@ import { isValidPublicClaimId, parseRevisionLocator } from "./memory/claim-opera
 import { CLAIM_POLICY_VERSION } from "./memory/claim-visibility-policy";
 import { ANTI_MEMORY_CATEGORY } from "./memory/constants";
 import { cosineSimilarity } from "./memory/cosine-similarity";
-import {
-    embedBatchForProject,
-    embedText,
-    getProjectEmbeddingSnapshot,
-    isEmbeddingEnabled,
-} from "./memory/embedding";
+import { embedBatchForProject, getProjectEmbeddingSnapshot } from "./memory/embedding";
 import type { EmbeddingPurpose } from "./memory/embedding-provider";
 import {
     listActiveAntiMemoryPublicIds,
@@ -161,7 +156,11 @@ export interface UnifiedSearchOptions {
     embeddingEnabled?: boolean;
     /** Deprecated: message search no longer reads raw messages on the hot path. */
     readMessages?: (sessionId: string) => unknown[];
-    embedQuery?: (
+    /** Required — there is deliberately no default embedder. Production
+     *  callers route through the project embedding registry
+     *  (`embedTextForProject`), which owns provider normalization; a
+     *  default here would bypass that lane. */
+    embedQuery: (
         text: string,
         signal?: AbortSignal,
         purpose?: EmbeddingPurpose,
@@ -171,7 +170,9 @@ export interface UnifiedSearchOptions {
         signal?: AbortSignal,
         purpose?: EmbeddingPurpose,
     ) => Promise<(Float32Array | null)[]>;
-    isEmbeddingRuntimeEnabled?: () => boolean;
+    /** Required for the same reason as `embedQuery`: runtime availability
+     *  is a property of the caller's embedding lane, not module state. */
+    isEmbeddingRuntimeEnabled: () => boolean;
     /** Only return message-history hits with ordinal ≤ this value (e.g. last compartment end). -1 or omit to search all. */
     maxMessageOrdinal?: number;
     /** Include indexed git commits in the result set. Default false — the
@@ -1960,7 +1961,7 @@ export async function unifiedSearch(
     sessionId: string,
     projectPath: string,
     query: string,
-    options: UnifiedSearchOptions = {},
+    options: UnifiedSearchOptions,
 ): Promise<UnifiedSearchResult[]> {
     const prepared = prepareExplicitQuery(query);
     if (!prepared.ok) {
@@ -2032,8 +2033,6 @@ async function executeUnifiedSearch(args: {
 
     const filterSpan = trace?.begin("filter_construction", "unified", { parent: rootId }) ?? null;
     const embeddingEnabled = options.embeddingEnabled ?? true;
-    const embedQuery = options.embedQuery ?? embedText;
-    const isEmbeddingRuntimeEnabled = options.isEmbeddingRuntimeEnabled ?? isEmbeddingEnabled;
     const gitCommitsEnabled = options.gitCommitsEnabled ?? false;
     const activeSources = resolveSources(options.sources);
 
@@ -2072,7 +2071,7 @@ async function executeUnifiedSearch(args: {
     const needsEmbedding =
         (runGitCommits || runCompartmentChunks || runPrimers || antiMemorySemanticEnabled) &&
         embeddingEnabled &&
-        isEmbeddingRuntimeEnabled();
+        options.isEmbeddingRuntimeEnabled();
 
     const embedSpan =
         trace && needsEmbedding
@@ -2083,7 +2082,7 @@ async function executeUnifiedSearch(args: {
     }
     const queryEmbeddingPromise: Promise<CapturedQueryEmbedding | Float32Array | null> =
         needsEmbedding
-            ? embedQuery(trimmedQuery, options.signal, "query").then(
+            ? options.embedQuery(trimmedQuery, options.signal, "query").then(
                   (captured) => {
                       embedSpan?.end("ok");
                       return captured;

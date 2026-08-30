@@ -747,7 +747,11 @@ describe("executeAutoSearchDelivery", () => {
         sessionId: "s-delivery",
         projectPath: "git:test",
         prompt: "please explain how the historian decides when to run",
-        searchOptions: { limit: 3 },
+        searchOptions: {
+            limit: 3,
+            embedQuery: async () => null,
+            isEmbeddingRuntimeEnabled: () => true,
+        },
         scoreThreshold: 0.6,
         ...overrides,
     });
