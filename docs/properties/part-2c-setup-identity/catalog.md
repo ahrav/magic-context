@@ -63,28 +63,51 @@ because it touches record text this synthesis may not edit.
   comparisons, and **nine** `let _ =`. The corrections and their sites are in
   [existing-checks.md](existing-checks.md); none of them changes a record.
 
-**A fourth refinement, on the native addon's line numbers.** Two records cite
-`packages/mc-shm-native/src/lib.rs` a few lines off, and the records are carried
-verbatim from lens A, so the correction is stated here rather than applied to the
-record text. Re-derived at `HEAD`: in `attach` the aliased-fd-or-grant rejection is
-`:533-535` (lens A: `:534-537`) and the `GrantReservation::claim` is `:540-543`
-(lens A: `:539-549`); in `connect_setup` the equal-grant rejection is `:588-590`
-(lens A: `:582-584`) and the claim is `:591-594` (lens A: `:585-588`). The two
-registry insertion sites are the `insert_channel` calls at `:551` and `:612`, not
-the `:550-556` and `:589-596` ranges the records name; `:655` and `:672` are two
-further calls inside `create_test_pair` (`:631`), which is a separate surface.
-Every finding the two records state is unaffected: both predicates, both claims,
-and both insertion sites exist where the records say they do in structure, and the
-counts are unchanged.
+**A fourth refinement, on the native addon's line numbers, now applied to the
+record text.** Two records cited `packages/mc-shm-native/src/lib.rs` a few lines
+off. The earlier revision of this catalog recorded the corrections here and left
+the record text alone, on the reasoning that the records were carried verbatim
+from lens A. That was the wrong call: METHOD.md rule 1 requires the reference to
+be corrected where it is written, and leaving a known-wrong number in a `Check:`
+line sends a later reader to the wrong predicate. **The corrections are applied in
+the records now, and this paragraph records what moved.** Re-derived at `HEAD` and
+re-verified by grep for this disposition: in `attach` (`:491`) the
+aliased-fd-or-grant rejection is `:533-535` (lens A: `:534-537`) and the
+`GrantReservation::claim` is `:540-543` (lens A: `:539-549`); in `connect_setup`
+(`:571`) the equal-grant rejection is `:588-590` (lens A: `:582-584`) and the
+claim is `:591-594` (lens A: `:585-588`). The two registry insertion sites are the
+`insert_channel` calls at `:551` and `:612`, not the `:550-556` and `:589-596`
+ranges the records named; `:655` and `:672` are two further calls inside
+`create_test_pair` (`:631`), which is a separate surface. Every finding the two
+records state is unaffected: both predicates, both claims, and both insertion
+sites exist where the records say they do in structure, and the counts are
+unchanged.
 
 ## What this part is about
 
-Seven facts frame every record below. They are stated with evidence because five
-of them read as design decisions until the line is opened, and then read as
-consequences nobody wrote down.
+Seven facts frame every record below. They are stated with evidence because
+several of them read as design decisions until the line is opened. One caution
+about that framing, applied throughout after an independent evaluation refuted its
+earlier form: **"undocumented" is a claim under test like any other, and the first
+of the seven turned out to be documented.** Where a fact below is documented
+design, the doc is cited and the record is a regression property rather than a
+finding.
 
 **Authority to map shared memory is possession of a 32-byte key and nothing
-else.** The only gate on the accept path is the `if auth.is_err() { return; }` at
+else, and this is documented design rather than a gap.** State the second half
+first, because an earlier revision of this catalog did not and the framing was
+refuted. `docs/mc-host-wire-protocol.md:27` says it outright: "The 32-byte
+connection key is a bearer capability. Possession grants every direct-profile
+operation ... Client `role`, `consumer_identity`, `project_root`, `harness`, and
+`session` are claims or scoping metadata; none grants authority." The code says the
+same thing in the same words. `Authenticated`'s doc comment (`auth.rs:70-81`) is a
+deliberately empty struct explaining that "WHAT THIS PROVES: the peer possesses the
+connection key ... Nothing more", and that `ClientHello.role` "is parsed and then
+discarded — any peer holding the key can claim any role, so it must never decide
+admission, capacity, or privilege". So there is **no second factor to bypass**, and
+nothing below should be read as reporting one. What follows is the mechanism, which
+is worth pinning against regression precisely because it is intended. The only gate
+on the accept path is the `if auth.is_err() { return; }` at
 `connection.rs:130-133`, immediately after `authenticate_server`. Everything past
 it is unconditional from the peer's point of view. `connection.rs:146-164` builds
 the ring, and `activate_server`'s first peer-facing statement is the `send_grant`
@@ -144,7 +167,8 @@ inverted.** The refactor added `packages/mc-shm-native/src/setup.rs`, and the
 native peer now validates wire version and schema (`:115-118`), decodes both
 grants (`:120-121`), and rejects a wrong profile or an aliased grant pair in one
 expression (`:122-124`), while `lib.rs:533-535` rejects an aliased fd or grant and
-`:540-543` and `:591-594` take a process-wide `GrantReservation::claim`. The
+`:540-543` and `:591-594` take a process-wide `GrantReservation::claim`. Those four
+native line ranges are the corrected ones. The
 managed Rust peer has none of that at the same layer: `activate_client`
 (`setup_socket.rs:302-306`) checks wire version and schema only and returns the
 descriptor as an unvalidated `serde_json::Value`, and `ring_transport.rs:642-650`
@@ -214,8 +238,9 @@ the normative startup order. Nothing else covers any of them.
 
 ## Index
 
-14 records, listed in the order lens A discovered them. The group sections below
-re-present the same 14 by shared mechanism, so section order and index order
+16 records, listed in the order lens A discovered them, with the two records the
+portfolio disposition added placed beside their siblings. The group sections below
+re-present the same 16 by shared mechanism, so section order and index order
 differ deliberately; every record appears exactly once in each.
 
 | Slug | Type | Confidence |
@@ -229,17 +254,32 @@ differ deliberately; every record appears exactly once in each.
 | [setup-a-a-hostile-occupant-of-the-socket-path-fails-closed](#setup-a-a-hostile-occupant-of-the-socket-path-fails-closed) | safety | high |
 | [setup-a-a-rogue-listener-at-the-published-path-obtains-no-client-proof](#setup-a-a-rogue-listener-at-the-published-path-obtains-no-client-proof) | safety | high |
 | [setup-a-unauthenticated-setup-work-is-bounded-and-every-slot-is-released](#setup-a-unauthenticated-setup-work-is-bounded-and-every-slot-is-released) | safety | high |
-| [setup-a-an-abandoned-setup-strands-no-ring-charge](#setup-a-an-abandoned-setup-strands-no-ring-charge) | safety | medium |
-| [setup-a-the-peer-lifetime-sentinel-allocates-under-a-cap-and-stays-cancellable](#setup-a-the-peer-lifetime-sentinel-allocates-under-a-cap-and-stays-cancellable) | safety | high |
+| [setup-a-an-abandoned-setup-strands-no-ring-charge](#setup-a-an-abandoned-setup-strands-no-ring-charge) | safety | high |
+| [setup-a-a-stalled-setup-is-torn-down-within-the-transport-setup-deadline](#setup-a-a-stalled-setup-is-torn-down-within-the-transport-setup-deadline) | liveness | high |
+| [setup-a-the-peer-lifetime-sentinel-allocates-under-a-cap](#setup-a-the-peer-lifetime-sentinel-allocates-under-a-cap) | safety | high |
+| [setup-a-the-peer-lifetime-sentinel-exits-on-cancellation-without-further-peer-input](#setup-a-the-peer-lifetime-sentinel-exits-on-cancellation-without-further-peer-input) | liveness | high |
 | [setup-a-the-managed-rust-peer-repeats-every-native-peer-rejection](#setup-a-the-managed-rust-peer-repeats-every-native-peer-rejection) | safety | high |
 | [setup-a-only-an-authenticated-grant-enters-the-native-channel-registry](#setup-a-only-an-authenticated-grant-enters-the-native-channel-registry) | safety | high |
 | [setup-a-concurrent-setup-saturation-is-reached](#setup-a-concurrent-setup-saturation-is-reached) | reachability | high |
 
-Distribution: 13 `safety` and 1 `reachability`; 13 `always` and 1 `sometimes`; all
-14 `default-production`; 13 high confidence and 1 medium. There is no `liveness`
-record and no `unreachable` record, which lens A surfaced as a bias against its
-own output rather than as a property of the subject. The absence is carried
-forward for the portfolio evaluation and is discussed in the relationship map.
+Distribution after the portfolio disposition in
+[portfolio-evaluation.md](portfolio-evaluation.md): **13 `safety`, 2 `liveness`, 1
+`reachability`**; **15 `always` and 1 `sometimes`**; 16 high confidence and 0
+medium. Reachability classes are 15 `default-production` plus one record whose
+subject is a published export **compiled with no shipped-plugin caller**
+(`setup-a-only-an-authenticated-grant-enters-the-native-channel-registry`); each
+label carries its own evidence on the record, per METHOD.md rule 4.
+
+Before the disposition this read 13 `safety` and 1 `reachability`, 13 `always` and
+1 `sometimes`, all 14 `default-production`, with 1 medium confidence, **and no
+`liveness` record at all**. That absence was defended in the relationship map on a
+misreading of METHOD.md's liveness rule and has been corrected: the rule admits a
+deadline as a bound, so the rejected candidate is now
+[setup-a-a-stalled-setup-is-torn-down-within-the-transport-setup-deadline](#setup-a-a-stalled-setup-is-torn-down-within-the-transport-setup-deadline),
+and the cancellation clause that had been smuggled into the sentinel safety record
+is now [its own liveness record](#setup-a-the-peer-lifetime-sentinel-exits-on-cancellation-without-further-peer-input)
+with an explicit bound. There is still no `unreachable` record, and that remains
+correct rather than a gap: no record here is about a forbidden code location.
 
 **Group names below are this synthesis's, not the lens's.** Lens A produced 14
 numbered records with no grouping. The five groups are chosen by the mechanism
@@ -251,11 +291,12 @@ that would break, because that is what decides which oracle subsumes which.
 
 Three records on the single `if auth.is_err()` at `connection.rs:130-133` and on
 what the code does immediately after it. The first is the ordering invariant that
-no descriptor precedes a verified proof. The second is the consequence nobody
-wrote down, that once the proof lands the descriptors are unconditional, so the
-activation token gates the host's acknowledgement and not the peer's capability.
-The third is what the token does still buy: it distinguishes the peer that
-received a grant from any other authenticated peer, one connection at a time.
+no descriptor precedes a verified proof. The second is the documented consequence
+of a bearer-capability model, that once the proof lands the descriptors are
+unconditional, so the activation token gates the host's acknowledgement and not the
+peer's capability. The third is what the token does still buy: it distinguishes the
+peer that received a grant from any other authenticated peer, one connection at a
+time.
 
 They are grouped because they are three readings of one straight-line sequence,
 `connection.rs:120-170` into `setup_socket.rs:249-284`, and because the second and
@@ -311,13 +352,24 @@ Status: active
 Exercised: partial — `shm_failure_modes.rs:44-58` constructs the peer that takes
 the descriptors and never activates, but it asserts capacity return, not the
 authority question.
-Guarantee: The activation token is not a mapping gate. A peer that has proved key
-possession can map the ring whether or not it ever presents a correct token, and
-no host-side check between message 3 and message 4 can refuse it.
+Guarantee: The activation token is not a mapping gate, and is not intended to be
+one. A peer that has proved key possession can map the ring whether or not it ever
+presents a correct token, and no host-side check between message 3 and message 4
+can refuse it.
 Check: `always` — for a peer that authenticates and then sends nothing, a wrong
 token, or a truncated `Activate`, the two descriptors it already holds still map
 successfully. Stated as `always` because it is a standing property of the message
 order at `setup_socket.rs:249-276` rather than an occasional outcome.
+**This is a regression property over documented design, not a report of a
+second-factor bypass**, and an earlier revision of this record read as the latter.
+The bearer-capability model is stated in `docs/mc-host-wire-protocol.md:27` and
+restated in `auth.rs:70-81`, which says the handshake proves key possession and
+"Nothing more". So the check is not "the token fails to gate mapping" — nothing
+claims it does — but "the relationship between key possession and mapping
+authority is still exactly one-to-one", which a future refactor could silently
+break in either direction: by making a token check appear to gate mapping when it
+runs after the descriptors are gone, or by admitting a peer that never proved key
+possession at all.
 Fault/timing angle: the window is from the host's `sendmsg` at
 `setup_socket.rs:151-159` to its token compare at `:267-272`, which is at least
 one peer round trip wide and is bounded only by `transport_setup_deadline`,
@@ -333,10 +385,15 @@ Existing check: none for the authority claim. `setup_socket.rs:768-808`
 `client_rejects_stale_identity_without_activate_write_or_returned_descriptors`
 proves the well-behaved client does not *return* descriptors it rejected; it does
 not and cannot prove a hostile peer lacks them.
-Impact: the security argument for the setup socket rests entirely on the
-connection file's `0600` mode and the runtime directory's `0700` mode. Any future
-design that treats the token as a second factor, for example to fence a
-compromised key, would be relying on a check that runs after the asset is gone.
+Impact: the security argument for the setup socket rests on the connection file's
+`0600` mode and the runtime directory's `0700` mode, which is what a bearer-key
+model implies and what `docs/mc-host-wire-protocol.md:27` says: a key reader "MUST
+therefore be trusted as the same local security principal as the host". The
+consequence worth guarding is forward-looking rather than current. Any future
+design that treats the token as a second factor — to fence a compromised key, for
+example — would be relying on a check that runs after the asset is gone, and the
+message order makes that mistake easy to make and hard to see. That is what this
+record protects against, and it is the whole of its claim.
 Open questions:
 - Was descriptor-before-validation chosen so the host need not hold the ring
   while waiting on a peer round trip, or is it incidental? Reordering to
@@ -623,20 +680,27 @@ Open questions:
 
 ## Group S4: bounded unauthenticated work, abandoned setups, and the sentinel
 
-Four records on resource accounting across the boundary, plus the coverage marker
-that keeps three of them from passing vacuously.
+Six records on resource accounting across the boundary, plus the coverage marker
+that keeps three of them from passing vacuously. This group grew by two under the
+portfolio disposition: it gained the deadline record the earlier revision rejected,
+and it gained the sentinel's cancellation clause as a record of its own.
 
-The three substantive records follow one connection's charge from accept to death.
+The five substantive records follow one connection's charge from accept to death.
 `runtime.rs:1035-1040` takes an unauthenticated handshake permit before spawning
 anything, bounded at `max_handshakes` = 32 (`config.rs:128`). The swap at
 `connection.rs:137-141` acquires the *connection* permit before releasing the
 handshake permit, bounded at `max_connections` = 64 (`config.rs:129`), which is why
 the post-auth descriptor transfer and its 2-second `transport_setup_deadline`
 (`config.rs:227`) are charged to 64 rather than to 32. Then the prepared ring's own
-charge must come back on every abandoned exit, and finally the post-commit
-sentinel must stay cheap for the whole life of an idle connection.
+charge must come back on every abandoned exit, and the same deadline bounds how
+long a stalled peer can hold that ring at all — those two are the group's pair on
+the same window, one about whether the charge returns and one about when. Finally
+the post-commit sentinel must stay cheap for the whole life of an idle connection,
+which splits into a length cap that is a safety invariant and an exit-on-cancellation
+obligation that is a liveness one; the earlier revision carried both in one record
+and the liveness half therefore carried no bound.
 
-The fourth record is the reason the other three are here as a group rather than
+The last record is the reason the others are here as a group rather than
 scattered. It is the part's only `reachability` record and its only `sometimes`
 check, and it exists because the two existing saturation tests pin
 `max_handshakes` to 1 (`tests/lifecycle.rs:239`) and 4 (`:339`) and use squatters
@@ -691,10 +755,14 @@ Open questions:
 ### setup-a-an-abandoned-setup-strands-no-ring-charge
 
 Type: safety
-Reachability: default-production.
+Reachability: default-production — `ring.prepare` runs on every authenticated
+connection (`connection.rs:148`) and all four post-prepare exits are on that
+ungated path; `transport_setup_deadline` ships with a 2-second default
+(`config.rs:227`).
 Status: active
 Exercised: partial — SIGKILL after `receive_grant` is covered; the `prepare`
-timeout path is not.
+timeout path is not, and reaching it is a race rather than a configuration (see
+`Required faults`).
 Guarantee: Every exit from `run_connection` that occurs after `ring.prepare`
 succeeds and before activation completes releases the prepared ring's charge, so
 repeated abandoned setups do not ratchet capacity.
@@ -706,18 +774,35 @@ Fault/timing angle: one exit is not covered by the discard pattern. The
 `timeout_at` at `connection.rs:157-164` abandons a `spawn_blocking` task that
 tokio cannot abort, so the `PreparedRing` is dropped inside the detached task and
 the surrounding code has no `sender` to `discard()` or `root` to `cancel()`.
-Whether `Drop` alone releases the charge is a Part 1 and 2b question; this record
-names the exit and requires the balance to be shown.
-Required faults and enabling state: a `transport_setup_deadline` short enough for
-`ring.prepare` to miss it, which needs either a configured near-zero deadline or
-injected slowness in `prepare`. The other three exits need a peer that stalls
-after `receive_grant`, which `shm_failure_modes.rs:44-58` already builds.
-Confidence: medium — [evidence](evidence/setup-a-an-abandoned-setup-strands-no-ring-charge.md).
+**That exit does release the charge, and the mechanism is now established rather
+than deferred to 2b.** Dropping the `PreparedRing` drops the `FrameSender` it
+carries (`frame_channel.rs:685-694`), which is the sole holder of the queue's
+`mpsc::Sender`, so the endpoint thread's `queue.recv()` returns `None` and
+`run_endpoint` returns (`ring_transport.rs:437-440`). Control then reaches
+`admission.release()` at `ring_transport.rs:291`, which sits outside the
+`catch_unwind` at `:279-290` and runs on every exit. The `Admission` guard's own
+`Drop` (`profile.rs:581-586`) is the backstop rather than the mechanism. So the
+obligation this record states is met on all four exits, and the record is a
+regression property rather than an open question about one of them.
+Required faults and enabling state: three exits need a peer that stalls after
+`receive_grant`, which `shm_failure_modes.rs:44-58` already builds. The fourth
+needs `ring.prepare` to miss `transport_setup_deadline`, and **a near-zero
+deadline does not deterministically force it.** `timeout_at(Instant::now() +
+deadline, prepared)` races a timer against a `spawn_blocking` task that may
+already have completed, so a fast `prepare` wins and the connection proceeds
+normally; the test would pass having exercised the wrong path and would flake in
+both directions. Reaching it deterministically needs either injected slowness
+inside `prepare` — which is 2b's R1 and has no seam — or a barrier that holds the
+blocking task past the deadline. That is why this record stays `partial`.
+Confidence: high — [evidence](evidence/setup-a-an-abandoned-setup-strands-no-ring-charge.md).
 Verified by inspection: the discard-and-cancel pairs at `connection.rs:166-169`
-and `:180-185`, and their absence at `:157-164`. Not verified: whether dropping a
-`PreparedRing` releases the charge. Part 1's
-`charge-release-never-silently-strands` is the neighbouring obligation and should
-be cited rather than restated.
+and `:180-185`, and their absence at `:157-164`. Verified for this disposition and
+previously recorded as unverified: `FrameSender` holds the queue's only
+`mpsc::Sender` (`frame_channel.rs:685-694`), `run_endpoint` returns when
+`queue.recv()` yields `None` (`ring_transport.rs:437-440`), and
+`admission.release()` at `:291` is unconditional and outside the `catch_unwind`.
+Part 1's `charge-release-never-silently-strands` remains the neighbouring
+obligation.
 Existing check: `crates/mc-host/tests/shm_failure_modes.rs:232-245`
 `setup_active_and_idle_sigkill_each_return_exact_capacity` and `:247-263`
 `repeated_crashes_do_not_ratchet_single_connection_capacity` cover a killed peer
@@ -725,53 +810,202 @@ in the `setup` role, which is the post-grant pre-activation state. Neither
 reaches the `prepare` timeout. Status unaudited.
 Impact: with `max_connections = 1` a single stranded charge is a permanent
 denial. The existing tests were written for exactly that reason, so the
-uncovered exit is a gap in an otherwise deliberate campaign.
+uncovered exit is a gap in an otherwise deliberate campaign. What the mechanism
+above changes is the shape of the gap: the risk is not that the charge is
+stranded today, it is that the only thing returning it on that exit is a
+channel-closure side effect three files away, which a refactor that gave the
+endpoint thread another sender clone would silently remove.
 Open questions:
-- Does dropping a `PreparedRing` inside a detached `spawn_blocking` release the
-  admission charge, or does that require `sender.discard()`? Answering it needs
-  `ring_transport.rs` and the transport crate. (unresolved, needs 2b)
+- Should the `prepare`-timeout exit cancel the ring it abandoned explicitly,
+  rather than relying on sender-drop closing the queue? The behaviour is correct
+  today and the coupling is implicit. 2b records the same question from the
+  transport side under
+  `ring-a-ring-unavailability-fails-closed-without-a-classified-reason`.
 
 
-### setup-a-the-peer-lifetime-sentinel-allocates-under-a-cap-and-stays-cancellable
+### setup-a-a-stalled-setup-is-torn-down-within-the-transport-setup-deadline
+
+Type: liveness
+Reachability: default-production — `activate_server` is called at
+`connection.rs:170-179` on every authenticated connection and is passed
+`shared.timing.transport_setup_deadline` (`:177`), which ships at 2 seconds
+(`config.rs:227`). No opt-in and no alternative branch.
+Status: active
+Exercised: not yet — the existing stalling peer (`shm_failure_modes.rs:44-58`)
+parks on `std::future::pending()` forever and the test asserts capacity return, so
+nothing asserts that the host tore the setup down or when.
+Guarantee: A peer that authenticates and then stalls anywhere in the post-grant
+setup exchange has its connection torn down, and its handshake and connection
+permits and ring charge released, within one `transport_setup_deadline` of the
+grant send.
+Check: `always` — evaluated at the close of an explicit bounded window. Drive a
+peer that authenticates, calls `receive_grant`, and then sends nothing; **stop all
+peer activity**, which is what makes the window fault-free; then poll until the
+host has released the connection and assert it happened within
+`transport_setup_deadline` measured from the deadline anchor. The bound is stated
+in the unit the code bounds, a **single absolute deadline**:
+`activate_server` computes `deadline = Instant::now() + timeout` **once**
+(`setup_socket.rs:246-248`) and threads that same `Instant` through every
+subsequent I/O — `send_grant` (`:249-260`), the `Activate` read (`:261`), the
+`Activated` write (`:273`), the `Commit` read (`:281`), and the `Committed` write
+(`:282`) — and `read_message` enforces it with `timeout_at` on **both** its
+`read_exact` calls (`:374-376`, `:382-384`). So there is no accumulation across
+messages: a peer that stalls at any of the four message positions, or at three of
+four length bytes, is refused at the same wall-clock instant. `always` because the
+bound must hold every time the window closes.
+Fault/timing angle: the interesting property is that the deadline is *absolute
+and shared*, not per-message. A per-message timeout would let a peer that
+dribbles one byte per interval hold the setup open indefinitely; this construction
+forbids that by design, and the property is that the single-anchor construction
+does not regress into a per-read one. The teardown that follows is
+`connection.rs:180-185`: `activate_server` returning `Err` runs `sender.discard()`
+and `root.cancel()` and returns, which drops the permits and releases the ring
+charge through the mechanism recorded in
+[setup-a-an-abandoned-setup-strands-no-ring-charge](#setup-a-an-abandoned-setup-strands-no-ring-charge).
+Required faults and enabling state: a peer that authenticates and then stalls in
+the setup exchange. `tests/shm_failure_modes.rs:44-58` already builds exactly this
+peer against a real host and runs in CI (`ci.yml:133`); the missing part is an
+assertion on *when* the host gave up, not a new fixture. A shortened
+`transport_setup_deadline` through `TestHost::start_with` makes the window cheap to
+observe, and unlike the `prepare`-timeout exit this needs no race: the peer's
+silence, not a scheduling outcome, is what makes the deadline fire.
+Confidence: high — [evidence](evidence/setup-a-a-stalled-setup-is-torn-down-within-the-transport-setup-deadline.md).
+**That evidence file does not exist yet**: this record was added by the portfolio
+disposition, which was scoped to `catalog.md`, `fault-map.md`, and
+`portfolio-evaluation.md` and forbidden from writing under `evidence/`. The link is
+written to the schema's target so it resolves once the file lands, and the gap is
+recorded in the process caveat of
+[portfolio-evaluation.md](portfolio-evaluation.md). Everything the file would hold
+is verified and stated here.
+Verified: the single `deadline` computation at `setup_socket.rs:246-248` and its
+reuse at `:249-260`, `:261`, `:273`, `:281`, and `:282`; `read_message`
+(`:369-386`) wrapping both reads in `timeout_at(deadline, ..)` and mapping expiry
+to `SetupError::Timeout`; `activate_server` being called with
+`shared.timing.transport_setup_deadline` at `connection.rs:177`; the default of 2
+seconds at `config.rs:227`; and the discard-and-cancel teardown at
+`connection.rs:180-185`.
+Existing check: none. `tests/shm_failure_modes.rs:232-245`
+`setup_active_and_idle_sigkill_each_return_exact_capacity` asserts capacity returns
+after a killed peer, which is a different exit and carries no timing claim.
+Status unaudited.
+Impact: **this is the part's only bound on how long an authenticated peer can hold
+a prepared ring without completing setup**, and the resource it holds is the
+expensive one. `setup-a-unauthenticated-setup-work-is-bounded-and-every-slot-is-released`
+records that the post-auth setup window is charged to `max_connections` (64) rather
+than to `max_handshakes` (32), and its own open question observes that 64
+concurrent stalled setups each hold a prepared ring. Whether that is 2 seconds of
+exposure or unbounded exposure is exactly this record, and nothing else in the
+catalog states it.
+Open questions:
+- Should the post-grant exchange have a tighter deadline than the pre-grant one?
+  Both halves currently share `transport_setup_deadline`, but only the post-grant
+  half holds a prepared ring. (needs human input)
+
+
+### setup-a-the-peer-lifetime-sentinel-allocates-under-a-cap
 
 Type: safety
 Reachability: default-production — `observe_peer` runs for the whole life of
-every activated connection (`connection.rs:196-206`).
+every activated connection (`connection.rs:196-206`), reached unconditionally
+after commit; `MAX_SETUP_MESSAGE_LEN` is a compile-time constant
+(`setup_socket.rs:24`) with no configuration behind it.
 Status: active
-Exercised: partial — the two `PeerClose` outcomes are tested; the cap and the
-cancellation are not.
+Exercised: partial — the two `PeerClose` outcomes are tested; the cap is not.
 Guarantee: The post-commit sentinel read never allocates more than
-`MAX_SETUP_MESSAGE_LEN`, whatever length the peer declares, and it always yields
-to `read_cancel`.
+`MAX_SETUP_MESSAGE_LEN`, whatever length the peer declares.
 Check: `always` — declare a length of `u32::MAX` and assert
-`SetupError::MessageTooLarge` with no allocation of that size; separately, cancel
-`read_cancel` while the sentinel is parked and assert the task exits. `always`
-because both must hold on every sentinel read.
-Fault/timing angle: `read_message_unbounded` (`setup_socket.rs:355-367`) has no
-deadline, so a peer that sends three of four length bytes and stops parks the read
-forever. That is intentional: the sentinel's purpose is to notice the peer, and
-its bound is cancellation rather than time. The name is the hazard, not the
-behaviour, and it resolves the re-scope open question at
-`part-2-rescope/scope-map-and-risk-ranking.md:744-746`.
+`SetupError::MessageTooLarge` with no allocation of that size. `always` because it
+must hold on every sentinel read.
+**This record was split under the portfolio disposition.** It previously carried a
+second clause, "and it always yields to `read_cancel`", which is a liveness
+obligation about eventual task exit rather than a safety invariant about
+allocation, and METHOD.md's schema gives each record exactly one `Type`. That
+clause is now
+[setup-a-the-peer-lifetime-sentinel-exits-on-cancellation-without-further-peer-input](#setup-a-the-peer-lifetime-sentinel-exits-on-cancellation-without-further-peer-input),
+with an explicit bound, because smuggled into a safety record it had no bound at
+all.
+Fault/timing angle: none for the cap itself; the check at
+`setup_socket.rs:361-363` precedes the allocation at `:364`, so the ordering is
+straight-line and the property is that the ordering does not regress.
 Required faults and enabling state: a peer that completes commit and then sends a
-huge length prefix, and separately one that sends a partial prefix and stalls
-while the connection is cancelled.
+huge length prefix.
 Confidence: high — [evidence](evidence/setup-a-the-peer-lifetime-sentinel-allocates-under-a-cap-and-stays-cancellable.md).
 Verified: the cap at `setup_socket.rs:361-363` precedes the `vec![0u8; len]` at
-`:364`, and the `select!` at `connection.rs:196-206` is `biased` with
-`read_cancel` first.
+`:364`, and `MAX_SETUP_MESSAGE_LEN` is `16 * 1024` (`:24`).
 Existing check: `setup_socket.rs:810-825`
 `goodbye_and_eof_have_distinct_outcomes` covers the `Goodbye` and EOF
 classifications. `:599-651` `activation_and_commit_complete_on_setup_socket`
-covers the `ProtocolError` classification. None covers the cap or the
-cancellation. Status unaudited.
+covers the `ProtocolError` classification. None covers the cap. Status unaudited.
 Impact: the cap is the only thing between a post-commit peer and a 4 GiB
-allocation, and the sentinel is the one read on this socket with no deadline, so
-the two properties are what keep an idle authenticated connection cheap.
+allocation, on a read that has no deadline at all, so it is what keeps an idle
+authenticated connection cheap.
 Open questions:
 - Should `read_message_unbounded` be renamed to say what it actually is,
   time-unbounded and length-capped? The current name invites the exact wrong
   conclusion, and the re-scope document drew it. (needs human input)
+
+
+### setup-a-the-peer-lifetime-sentinel-exits-on-cancellation-without-further-peer-input
+
+Type: liveness
+Reachability: default-production — the sentinel task is spawned for every
+activated connection (`connection.rs:195-207`) and `read_cancel` is the
+generation's own child token, cancelled on every close path including peer death
+(`:203-204`) and generation teardown.
+Status: active
+Exercised: not yet — no test parks the sentinel and then cancels it. The two
+`PeerClose` outcomes that are tested (`setup_socket.rs:810-825`) both arrive
+through the peer rather than through cancellation.
+Guarantee: Once `read_cancel` fires, the sentinel task completes without requiring
+any further byte from the peer, even when it is parked mid-message.
+Check: `always` — evaluated at the close of an explicit bounded window. Park the
+sentinel by sending three of the four length-prefix bytes and stopping, cancel
+`read_cancel`, **send nothing further**, then poll the generation's tracked task
+set until it is empty and assert it emptied. The bound is stated in the unit the
+code bounds, which is a **cancellation edge and one poll of a `biased` select**,
+not a duration: `connection.rs:196-206` is `tokio::select!` with `biased` and
+`peer_read_cancel.cancelled()` as its **first** arm (`:198`), so the cancellation
+branch is chosen the next time the task is polled and the `observe_peer` future is
+dropped where it stands. The polling cap is a test parameter and must be stated as
+an explicit attempt count in the test, not as a generous timeout.
+**This record exists because an earlier revision rejected it on a misreading of
+METHOD.md, and the misreading is corrected here.** That revision argued no liveness
+record could be written for this part because the available bounds are wall-clock
+durations, "not an attempt count or an explicit interval the code reasons about".
+METHOD.md's liveness rule says the opposite in its own words: "State the bound in
+the units the code actually bounds: attempts, deadlines, or an explicit interval."
+A deadline is an admissible bound. What the rule forbids is an unbounded
+"eventually" and a generous timeout standing in for a bound, neither of which this
+check or its sibling below uses.
+Fault/timing angle: the whole property. `read_message_unbounded`
+(`setup_socket.rs:355-367`) has no deadline, so a peer that sends a partial length
+prefix and stops parks the read forever. That is intentional: the sentinel's
+purpose is to notice the peer, and its bound is cancellation rather than time. The
+name is the hazard, not the behaviour, and it resolves the re-scope open question at
+`part-2-rescope/scope-map-and-risk-ranking.md:744-746`. The consequence is that
+cancellation is the **only** exit from a parked sentinel, so if the `biased`
+ordering were lost or the first arm removed, an idle connection would hold a task
+and a socket until the peer chose to release them.
+Required faults and enabling state: a peer that sends a partial length prefix and
+then stalls, plus a cancellation of `read_cancel` while it is parked. Both halves
+are in-process over a `UnixStream::pair`, the shape `setup_socket.rs:810-825`
+already uses.
+Confidence: high — [evidence](evidence/setup-a-the-peer-lifetime-sentinel-allocates-under-a-cap-and-stays-cancellable.md).
+Verified: `read_message_unbounded` (`:355-367`) applies no `timeout_at`, unlike
+`read_message` (`:369-386`) which wraps both `read_exact` calls; the `select!` at
+`connection.rs:196-206` is `biased` with `peer_read_cancel.cancelled()` first
+(`:198`); `observe_peer` is `setup_socket.rs:345-353`. **Note the shared evidence
+file:** this record and its safety sibling both link
+`evidence/setup-a-the-peer-lifetime-sentinel-allocates-under-a-cap-and-stays-cancellable.md`
+so no link breaks, and that file needs splitting into two.
+Existing check: none. `setup_socket.rs:810-825`
+`goodbye_and_eof_have_distinct_outcomes` reaches `observe_peer` but always through
+a peer-driven outcome, never through cancellation. Status unaudited.
+Impact: this is the exit that makes an idle authenticated connection releasable on
+the host's own schedule. Without it, teardown of a connection whose peer has gone
+quiet mid-message depends on the peer, which is the one party a teardown path must
+not depend on.
+Open questions: None.
 
 
 ### setup-a-concurrent-setup-saturation-is-reached
@@ -847,8 +1081,8 @@ Check: `always` — for each native rejection reason, construct the grant that
 triggers it and assert the managed Rust path also refuses. Enumerated from the
 native side: wire version (`setup.rs:115`), descriptor schema (`:116`), grant hex
 and decode (`:120-121`), profile (`:122`), grant distinctness (`:122`), and the
-process-wide claim (`lib.rs:585-588`). `always` because it is a per-descriptor
-invariant, the same shape as Part 1's
+process-wide claim (`lib.rs:591-594` in `connect_setup`, `:540-543` in `attach`).
+`always` because it is a per-descriptor invariant, the same shape as Part 1's
 `native-boundary-not-weaker-than-its-wrapper`.
 Fault/timing angle: none temporal. The exposure is a divergence in two
 independently maintained validation lists.
@@ -856,13 +1090,14 @@ Required faults and enabling state: a host, or a stand-in, that emits a grant
 naming two identical grant strings, or a second concurrent attach of the same
 grant in one process.
 Confidence: high — [evidence](evidence/setup-a-the-managed-rust-peer-repeats-every-native-peer-rejection.md).
-Verified: two divergences. First, `ring_transport.rs:646-650` compares
+Verified: two divergences, with the native-side line numbers corrected from lens A
+per the provenance note above. First, `ring_transport.rs:646-650` compares
 `from_host_grant.geometry() != to_host_grant.geometry()` and rejects on
-*inequality*, whereas native `setup.rs:122` and `lib.rs:582-584` reject on grant
+*inequality*, whereas native `setup.rs:122` and `lib.rs:588-590` reject on grant
 *equality*; the two checks are not the same predicate and the managed path admits
-the aliased pair the native path refuses. Second, native `lib.rs:539-549` and
-`:585-588` take a process-wide `GrantReservation::claim`; the managed Rust path
-takes no claim at all. `setup_socket.rs:302-306`, the managed peer's setup step,
+the aliased pair the native path refuses. Second, native `lib.rs:540-543`
+(`attach`) and `:591-594` (`connect_setup`) take a process-wide
+`GrantReservation::claim`; the managed Rust path takes no claim at all. `setup_socket.rs:302-306`, the managed peer's setup step,
 checks only wire version and schema and returns the descriptor as an
 unvalidated `serde_json::Value`.
 Existing check: none on the managed Rust peer. Part 1's
@@ -883,44 +1118,76 @@ Open questions:
 ### setup-a-only-an-authenticated-grant-enters-the-native-channel-registry
 
 Type: safety
-Reachability: default-production for `connect_setup`; `attach` is the surface
-under test and is exported without a cfg gate.
+Reachability: default-production for `connect_setup` (`lib.rs:571`), which the
+shipped plugin reaches through `NativeChannel.connectSetup`
+(`packages/mc-shm-native/index.ts:531-534`) from `shm-frame-channel.ts:77`.
+**`attach` is compiled and exported with no shipped-plugin caller**, and that is
+stated rather than defaulted: `attach` (`lib.rs:490-491`) carries no
+`#[cfg(test)]` and no `#[doc(hidden)]`, `NativeChannel.attach` exports it at
+`index.ts:526-529`, and a grep of `packages/plugin/src` at `HEAD` for
+`NativeChannel.attach` and `.attach(` returns **no non-test caller**. So the
+export is production surface by visibility and unreached by the shipped path,
+which is neither `default-production` nor `test-only` and is the reason the
+guarantee below is scoped the way it is.
 Status: active
 Exercised: not yet — no test asserts the shipped wrapper never reaches `attach`.
-Guarantee: In a shipped configuration every channel inserted into the native
+Guarantee: **In the shipped plugin path**, every channel inserted into the native
 registry originates from `connect_setup`, which authenticated over the setup
 socket, and never from `attach`, which takes caller-supplied descriptors and
 authenticates nothing.
-Check: `always` — instrument both insertion sites (`lib.rs:550-556` and
-`:589-596`) and assert that a full shipped-wrapper run inserts only through
-`connect_setup`. `always` rather than `unreachable` because `attach` is a
-published export that tests and embedders may legitimately call; the forbidden
-thing is a *state*, a registry entry with no authenticated provenance, and
-METHOD's rule for a forbidden state with no dedicated detection point is
-`always(!X)`.
+Check: `always` — instrument both insertion sites, the `insert_channel` calls at
+`lib.rs:551` (from `attach`) and `:612` (from `connect_setup`), and assert that a
+full shipped-plugin run inserts only through `connect_setup`. `always` rather than
+`unreachable` because `attach` is a published export that tests and embedders may
+legitimately call; the forbidden thing is a *state*, a registry entry with no
+authenticated provenance, and METHOD's rule for a forbidden state with no
+dedicated detection point is `always(!X)`.
+**The scope of this guarantee is narrowed, and the narrowing matters.** An earlier
+form of this record read as a claim over the addon as a whole. It cannot be one.
+`attach` is a `#[napi]` export (`lib.rs:490-491`) reachable from any JavaScript in
+the process, so no campaign can establish that *no* caller reaches it — a claim
+universally quantified over the callers of a published API is not falsifiable by
+running the shipped wrapper, and it is **false** as stated for an arbitrary
+embedder, who may call `NativeChannel.attach` deliberately and correctly. What is
+provable, and what this record now claims, is the narrower call-graph fact about
+the **shipped plugin**: the only `NativeChannel` construction on the plugin's
+frame-channel path is `connectSetup` (`shm-frame-channel.ts:77`), and a census
+over `packages/plugin/src` finds no other. Stated plainly, so a later reader does
+not recover the stronger claim: **an unauthenticated registry entry is reachable
+in-process by design, and this property only says the shipped plugin does not
+create one.**
 Fault/timing angle: none. This is a call-graph property.
-Required faults and enabling state: none beyond running the shipped wrapper with
+Required faults and enabling state: none beyond running the shipped plugin with
 both sites instrumented.
 Confidence: high — [evidence](evidence/setup-a-only-an-authenticated-grant-enters-the-native-channel-registry.md).
 Verified: `attach` at `lib.rs:491` reads `hostToPeerFd` and `peerToHostFd` as
 caller-supplied integers (`:510-513`) and never touches a socket;
 `connect_setup` at `:571` calls `setup::connect` which performs the three-message
 handshake (`setup.rs:107-113`). Both end in `insert_channel` on the same
-`REGISTRY`. `index.ts:526-529` and `:531-534` expose both;
-`shm-frame-channel.ts:77` uses only `connectSetup`.
+`REGISTRY`, at `:551` and `:612`. `index.ts:526-529` and `:531-534` expose both;
+`shm-frame-channel.ts:77` uses only `connectSetup`, and grepping
+`packages/plugin/src` for any other `.attach(` call site returns nothing outside
+tests.
 Existing check: Part 1's `test-only-surface-absent-from-the-shipped-addon` is the
 neighbouring property and should be checked for whether it already covers
 `attach`. `attach` carries no `#[cfg(test)]` and no `#[doc(hidden)]`, so on the
 face of it that record does not reach it. Status unaudited.
-Impact: `attach` is a fully authenticated-path bypass reachable from JavaScript
-in the same process. Under the same-uid trust model that is not a privilege
-escalation, but it does mean the setup socket is not the only way into the ring,
-and any reasoning that starts "the peer must have authenticated" is unsound for
-in-process callers.
+Impact: `attach` is an authenticated-path bypass reachable from JavaScript in the
+same process. Under the same-uid trust model that is not a privilege escalation,
+and it may well be intended surface — `create_test_pair` at `lib.rs:631` suggests
+a test reading and a worker-thread re-attach reading is equally consistent with
+the code. What it does mean, regardless of intent, is that **the setup socket is
+not the only way into the ring**, so any reasoning of the form "the peer must have
+authenticated to hold this ring" is unsound for in-process callers. That is the
+consequence worth protecting against regression, and it is why this record stays
+in the catalog after the narrowing.
 Open questions:
 - Is `attach` intended as production surface, test surface, or a
   worker-thread re-attach path? `create_test_pair` at `lib.rs:631` suggests the
-  test reading. (needs human input)
+  test reading. If it is test surface, the check strengthens to a build-time
+  assertion that the shipped addon does not export it, which is Part 1's
+  neighbouring record; if it is production surface, the narrowed guarantee above
+  is the strongest form available. (needs human input)
 
 
 ## Relationship map
@@ -928,7 +1195,7 @@ Open questions:
 Grouped by shared mechanism rather than by the section headings above, because the
 sharpest relationships cross groups. **Every dominance statement below is a
 hypothesis** about which oracle subsumes which, offered to order the work, not a
-verified claim. None has been tested, and for 12 of the 14 records no check
+verified claim. None has been tested, and for 14 of the 16 records no check
 executes anywhere, so nothing here has been measured.
 
 - **The gate, and the fact that nothing after it is a gate.**
@@ -998,22 +1265,33 @@ executes anywhere, so nothing here has been measured.
   records. That makes this the cheapest cluster in the part by leverage, and the
   fixture it needs is a small variation on one that already exists.
 
-- **The one exit with no discard, and a question this part cannot answer.**
-  [setup-a-an-abandoned-setup-strands-no-ring-charge](#setup-a-an-abandoned-setup-strands-no-ring-charge).
-  Called out separately because it is the part's only medium-confidence record and
-  the reason is a scope boundary, not a weak reading. Three of the four post-prepare
-  exits pair `sender.discard()` with `root.cancel()` (`connection.rs:166-169`,
-  `:180-185`). The fourth, the `prepare` timeout at `:157-164`, has no handle to
-  discard, because the `PreparedRing` is dropped inside a detached `spawn_blocking`
-  task tokio cannot abort. **Whether `Drop` alone releases the admission charge is
-  a 2b question and is preserved as one here.** Part 1's
-  `charge-release-never-silently-strands` is the neighbouring obligation. This
-  catalog names the exit, requires the balance to be shown, and does not assert a
-  verdict either way. One construction refinement over the lens: the exit needs no
-  injected slowness, because `config.timing.transport_setup_deadline` is an
-  ordinary config field that integration tests already set for its siblings
-  (`tests/lifecycle.rs:165`, `tests/activation.rs:127-128`), so a near-zero
-  deadline reaches it directly.
+- **The one exit with no discard, and the question 2b has now answered.**
+  [setup-a-an-abandoned-setup-strands-no-ring-charge](#setup-a-an-abandoned-setup-strands-no-ring-charge),
+  [setup-a-a-stalled-setup-is-torn-down-within-the-transport-setup-deadline](#setup-a-a-stalled-setup-is-torn-down-within-the-transport-setup-deadline).
+  Called out separately because it **was** the part's only medium-confidence record
+  and the reason was a scope boundary rather than a weak reading. Three of the four
+  post-prepare exits pair `sender.discard()` with `root.cancel()`
+  (`connection.rs:166-169`, `:180-185`). The fourth, the `prepare` timeout at
+  `:157-164`, has no handle to discard, because the `PreparedRing` is dropped inside
+  a detached `spawn_blocking` task tokio cannot abort. **The 2b dependency is now
+  closed and the record is `high`.** Dropping the `PreparedRing` drops the
+  `FrameSender` it carries (`frame_channel.rs:685-694`), the sole holder of the
+  queue's `mpsc::Sender`, so the endpoint thread's `queue.recv()` returns `None`,
+  `run_endpoint` returns (`ring_transport.rs:437-440`), and `admission.release()`
+  runs at `ring_transport.rs:291` outside the `catch_unwind`. Part 1's
+  `charge-release-never-silently-strands` remains the neighbouring obligation.
+  **What keeps the record partial is a different fact, and the lens's construction
+  refinement was wrong about it.** That refinement said the exit "needs no injected
+  slowness, because `config.timing.transport_setup_deadline` is an ordinary config
+  field" (`tests/lifecycle.rs:165`, `tests/activation.rs:127-128`). Setting the
+  field is indeed easy, but it does not *force* the timeout:
+  `timeout_at(Instant::now() + deadline, prepared)` races a timer against a
+  `spawn_blocking` task that may already have finished, so a fast `prepare` wins,
+  the connection proceeds normally, and the test exercises the wrong path. The exit
+  is reachable and not deterministically reachable, which are different claims.
+  Hypothesis: the deadline record beside it *dominates nothing* here, because it
+  bounds the post-grant exchange and this exit happens before the grant; the two
+  are adjacent on the same config field rather than on the same window.
 
 - **Two validation lists maintained independently, and one bypass around both.**
   [setup-a-the-managed-rust-peer-repeats-every-native-peer-rejection](#setup-a-the-managed-rust-peer-repeats-every-native-peer-rejection),
@@ -1033,20 +1311,34 @@ executes anywhere, so nothing here has been measured.
   `native-boundary-not-weaker-than-its-wrapper`, whose method transfers directly
   even though its polarity no longer does.
 
-- **The absence worth naming: no liveness record.**
-  Lens A surfaced this against its own output and left it for synthesis, so it is
-  answered here rather than silently inherited. This synthesis is **not** adding a
-  liveness record, and the reason is that the candidate does not survive
-  METHOD.md's liveness rule. "A stalled setup is torn down within
-  `transport_setup_deadline`" is bounded by a wall-clock duration
+- **The absence that was not an absence: the two liveness records.**
+  Lens A surfaced "no liveness record" against its own output and left it for
+  synthesis. The earlier revision of this section answered it by declining to add
+  one, on the reasoning that "a stalled setup is torn down within
+  `transport_setup_deadline`" is "bounded by a wall-clock duration
   (`config.rs:227`), not by an attempt count or an explicit interval the code
-  reasons about, and the part's one genuinely unbounded wait,
-  `read_message_unbounded` (`setup_socket.rs:355-367`), is deliberately
-  time-unbounded and bounded by cancellation instead, which is already the second
-  clause of
-  [setup-a-the-peer-lifetime-sentinel-allocates-under-a-cap-and-stays-cancellable](#setup-a-the-peer-lifetime-sentinel-allocates-under-a-cap-and-stays-cancellable).
-  Writing "the sentinel task exits after `read_cancel` fires" as a separate
-  liveness record would restate that clause with a generous timeout standing in
-  for a bound, which the rule forbids. The distribution stays 13 `always` and one
-  `sometimes`, and the bias is surfaced for the portfolio evaluation rather than
-  papered over with a record that could not be refuted.
+  reasons about". **That reasoning was refuted by an independent evaluation and the
+  refutation is correct.** METHOD.md's liveness rule names three admissible units
+  and a deadline is the second of them: "State the bound in the units the code
+  actually bounds: attempts, deadlines, or an explicit interval." What the rule
+  forbids is an unbounded "eventually" and a generous timeout standing in for a
+  bound. `transport_setup_deadline` is neither: it is a single absolute `Instant`
+  the code computes once (`setup_socket.rs:246-248`) and enforces on every
+  subsequent read and write, so it is a bound the code reasons about explicitly and
+  in one place.
+  So the part now has two liveness records, and they partition the two ways a
+  stalled peer is released.
+  [setup-a-a-stalled-setup-is-torn-down-within-the-transport-setup-deadline](#setup-a-a-stalled-setup-is-torn-down-within-the-transport-setup-deadline)
+  is the deadline half, covering everything from the grant send to `Committed`.
+  [setup-a-the-peer-lifetime-sentinel-exits-on-cancellation-without-further-peer-input](#setup-a-the-peer-lifetime-sentinel-exits-on-cancellation-without-further-peer-input)
+  is the cancellation half, covering the one read that deliberately has no deadline
+  (`read_message_unbounded`, `setup_socket.rs:355-367`), and its bound is a
+  cancellation edge plus one poll of a `biased` select rather than any duration.
+  Hypothesis: **no dominance in either direction**, and the reason is the reason
+  they are two records. They bound different phases with different mechanisms, and
+  the second was previously the trailing clause of a safety record where it had no
+  bound at all — which is how a liveness obligation hides. Note what that means for
+  the earlier revision's argument: it was right that restating the clause "with a
+  generous timeout standing in for a bound" would violate the rule, and wrong to
+  conclude that no bound existed. The bound is cancellation, and cancellation is
+  observable.

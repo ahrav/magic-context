@@ -4,9 +4,15 @@ For each property, what must actually occur for a test to be non-vacuous, and
 whether the harness can produce it today.
 
 Same rules as the earlier parts: safety checks must hold *while* their faults are
-active; liveness checks need a bounded fault-free window; a rare branch needs
+active; liveness checks need a bounded fault-free window, **stated in a unit the
+code bounds — attempts, deadlines, or an explicit interval**; a rare branch needs
 deterministic injection to be reachable at all; and coverage checks assert
 independent preconditions, never the violation.
+
+The liveness clause is spelled out because an earlier revision of this part read it
+as excluding deadlines and therefore carried no liveness record at all. It admits
+them, and the part now has two: the deadline record and the sentinel's
+cancellation record, both in Group S4 below.
 
 Three framing points specific to this part.
 
@@ -63,22 +69,31 @@ while S0 is open.
 
 ## Map
 
-All 14 records. **"Non-vacuous today" means a developer can construct the required
-state with the current harness.** It does not mean the check runs anywhere; for 12
-of the 14 the only checks that exist are in unexecuted modules or unnamed binaries.
+All 16 records, after the portfolio disposition added two: the deadline liveness
+record, and the sentinel's cancellation clause split out of its safety sibling.
+**"Non-vacuous today" means a developer can construct the required state with the
+current harness.** It does not mean the check runs anywhere; for 14 of the 16 the
+only checks that exist are in unexecuted modules or unnamed binaries.
 
-Every record is `default-production`. The label was verified per record at
-authoring time rather than asserted in a preamble: the accept path
-(`runtime.rs:1042-1044` into `connection.rs`) is the only accept-path body, the
-ring is mandatory after `ed487e11`, and every bound and deadline the records depend
-on ships with a default (`config.rs:128-129`, `:223`, `:227`). Two records carry a
-qualified label from the lens and both resolve to `default-production`:
-`setup-a-the-managed-rust-peer-repeats-every-native-peer-rejection` is production
-for the native path through `shm-frame-channel.ts:77` and for the managed Rust path
-for embedders, and
+Reachability is recorded per record in `catalog.md`, with its own evidence clause,
+and is not asserted in a blanket claim here. Fifteen records are
+`default-production`: the accept path (`runtime.rs:1042-1044` into `connection.rs`)
+is the only accept-path body, the ring is mandatory after `ed487e11`, and every
+bound and deadline the records depend on ships with a default
+(`config.rs:128-129`, `:223`, `:227`). One record is **not** uniform and this map
+previously flattened it.
 `setup-a-only-an-authenticated-grant-enters-the-native-channel-registry` is
-production for `connect_setup` while `attach` is a published export with no cfg
-gate.
+`default-production` for `connect_setup`, reached from `shm-frame-channel.ts:77`,
+while its actual subject `attach` is a published napi export
+(`packages/mc-shm-native/src/lib.rs:490-491`, exported at `index.ts:526-529`)
+**compiled with no shipped-plugin caller** — a grep of `packages/plugin/src` at
+`HEAD` finds no non-test `.attach(` call. That is stated rather than resolved to
+`default-production`, because it is exactly the fact that makes the record's
+guarantee provable only over the shipped plugin path and false as a universal
+claim.
+`setup-a-the-managed-rust-peer-repeats-every-native-peer-rejection` is genuinely
+production on both halves: the native path through `shm-frame-channel.ts:77` and
+the managed Rust path for embedders through `client.rs:346`.
 
 ### Group S1: the one authorization gate
 
@@ -108,8 +123,10 @@ gate.
 | Property | Required faults and enabling state | Non-vacuous today |
 | --- | --- | --- |
 | setup-a-unauthenticated-setup-work-is-bounded-and-every-slot-is-released | With `max_handshakes = 1`, a squatter that never speaks holding the slot, a second accept asserted to close with no bytes read, then release and re-acquisition. Plus an enumeration of every exit before `drop(handshake_permit)`: the auth error at `connection.rs:130-133` and the connection-permit exhaustion at `:137-139` | **Yes** — both squatter shapes exist in the test support (`tests/support/raw_client.rs:878`) and two lifecycle tests already drive saturation and non-starvation (`tests/lifecycle.rs:237`, `:337`) |
-| setup-a-an-abandoned-setup-strands-no-ring-charge | N abandoned setups through each of four exits, asserting the accounting at `ring_transport.rs:199-203` returns to its pre-attempt value. Three exits need S1's stalling peer, already built. The fourth needs `config.timing.transport_setup_deadline` set near zero so `ring.prepare` misses it (S5) | **Partial** — the construction is available on all four exits, including the one lens A recorded as blocked. **The oracle is not: whether dropping a `PreparedRing` inside a detached `spawn_blocking` releases the charge is unresolved and needs 2b.** Part 1's `charge-release-never-silently-strands` is the neighbouring obligation. This row states the dependency and asserts no verdict |
-| setup-a-the-peer-lifetime-sentinel-allocates-under-a-cap-and-stays-cancellable | A peer that completes commit and then declares a length of `u32::MAX`, asserting `SetupError::MessageTooLarge` with no allocation of that size (the cap is at `setup_socket.rs:361-363`, before the `vec![0u8; len]` at `:364`). Separately, a peer that sends a partial prefix and stalls while `read_cancel` fires, asserting the task exits | **Yes** — both are in-process over a socket pair, the shape `goodbye_and_eof_have_distinct_outcomes` (`:810-825`) already uses, and the `select!` under test is `biased` with `read_cancel` first (`connection.rs:196-206`) |
+| setup-a-an-abandoned-setup-strands-no-ring-charge | N abandoned setups through each of four exits, asserting the accounting at `ring_transport.rs:199-203` returns to its pre-attempt value. Three exits need S1's stalling peer, already built. The fourth needs `ring.prepare` to miss `config.timing.transport_setup_deadline` (S5) | **Partial, and for a different reason than this row previously gave.** The oracle is no longer blocked: dropping the `PreparedRing` drops the sole `mpsc::Sender` (`frame_channel.rs:685-694`), `run_endpoint` returns on `queue.recv() == None` (`ring_transport.rs:437-440`), and `admission.release()` runs at `:291`. **The 2b dependency is closed and the record is now `high` confidence.** What keeps it partial is construction of the fourth exit: a near-zero deadline does **not** deterministically force the `prepare` timeout, because `timeout_at(Instant::now() + deadline, prepared)` races the timer against a `spawn_blocking` task that may already have completed, so a fast `prepare` wins and the test silently exercises the normal path. Deterministic reach needs injected slowness inside `prepare` (2b's R1, no seam) or a barrier holding the blocking task |
+| setup-a-a-stalled-setup-is-torn-down-within-the-transport-setup-deadline | A peer that authenticates, calls `receive_grant`, and then stalls anywhere in the post-grant exchange, with **all peer activity stopped** so the window is fault-free, then a poll until the host releases the connection and an assertion on the elapsed bound measured from the deadline anchor at `setup_socket.rs:246-248` (S1). A shortened `transport_setup_deadline` through `TestHost::start_with` makes the window cheap to observe | **Yes** — `tests/shm_failure_modes.rs:44-58` is this peer, against a real host, in CI (`ci.yml:133`). Only the timing assertion is new. Note the contrast with the `prepare`-timeout exit two rows up: that one races a timer against `spawn_blocking` and is not deterministic, while this one fires on the peer's silence and is |
+| setup-a-the-peer-lifetime-sentinel-allocates-under-a-cap | A peer that completes commit and then declares a length of `u32::MAX`, asserting `SetupError::MessageTooLarge` with no allocation of that size (the cap is at `setup_socket.rs:361-363`, before the `vec![0u8; len]` at `:364`) | **Yes** — in-process over a socket pair, the shape `goodbye_and_eof_have_distinct_outcomes` (`:810-825`) already uses |
+| setup-a-the-peer-lifetime-sentinel-exits-on-cancellation-without-further-peer-input | A peer that sends a partial length prefix and stalls, then a cancellation of `read_cancel` while the sentinel is parked, then **no further peer byte** and a poll of the generation's tracked task set until empty, with the poll cap stated as an explicit attempt count. The bound is a cancellation edge plus one poll of the `biased` select (`connection.rs:196-206`, `read_cancel` first at `:198`), not a duration | **Yes** — same socket-pair shape, and the cancellation token is already reachable from the test side. This row is new: the obligation was previously the trailing clause of the row above, where it had no bound and no separate construction |
 | setup-a-concurrent-setup-saturation-is-reached | `max_handshakes` and `max_connections` both above 1, more concurrent dialers than `max_handshakes`, and at least one dialer that authenticates and then delays its `Activate` inside the setup deadline (S4) | **Yes** for the state; the marker's second clause needs an observation point inside `activate_server` between `setup_socket.rs:260` and `:273`, which is a host-source change |
 
 ### Group S5: the two peer halves
@@ -117,14 +134,24 @@ gate.
 | Property | Required faults and enabling state | Non-vacuous today |
 | --- | --- | --- |
 | setup-a-the-managed-rust-peer-repeats-every-native-peer-rejection | A host, or a stand-in, emitting a grant that names two identical grant strings, plus a second concurrent attach of the same grant in one process. Enumerated from the native side: wire version (`packages/mc-shm-native/src/setup.rs:115`), schema (`:116`), grant hex and decode (`:120-121`), profile and distinctness (`:122`), and the process-wide claim (`lib.rs:591-594`) | **Yes** — `mc_host::setup_socket::activate_client` is `pub` and already driven by `tests/support/raw_client.rs:329`, so a hand-built `GrantMessage` reaches the managed path directly with no host at all |
-| setup-a-only-an-authenticated-grant-enters-the-native-channel-registry | A full shipped-wrapper run with both registry insertion sites instrumented, the `insert_channel` calls at `packages/mc-shm-native/src/lib.rs:551` (from `attach`) and `:612` (from `connect_setup`), asserting every insert originated from `connect_setup`. **No fault of any kind is required** | **Partial** — the shipped-wrapper run already happens in CI (`ci.yml:206-208`, `:214`) and the static call-graph half is settled by reading, but the campaign observation needs a marker inside the addon that does not exist. Part 1's `test-only-surface-absent-from-the-shipped-addon` should be checked for whether it already reaches `attach`; `attach` carries no `#[cfg(test)]` and no `#[doc(hidden)]`, so on the face of it that record does not |
+| setup-a-only-an-authenticated-grant-enters-the-native-channel-registry | A full **shipped-plugin** run with both registry insertion sites instrumented, the `insert_channel` calls at `packages/mc-shm-native/src/lib.rs:551` (from `attach`) and `:612` (from `connect_setup`), asserting every insert originated from `connect_setup`. **No fault of any kind is required.** Note the scope: the guarantee is now explicitly over the shipped plugin path, because a claim quantified over the callers of a published napi export is not falsifiable by any campaign and is false for an arbitrary embedder | **Partial** — the shipped-plugin run already happens in CI (`ci.yml:206-208`, `:214`) and the call-graph half is settled by reading: `grep` over `packages/plugin/src` finds no non-test `.attach(` caller, and `shm-frame-channel.ts:77` uses only `connectSetup`. The campaign observation still needs a marker inside the addon that does not exist. Part 1's `test-only-surface-absent-from-the-shipped-addon` should be checked for whether it already reaches `attach`; `attach` carries no `#[cfg(test)]` and no `#[doc(hidden)]`, so on the face of it that record does not |
 
-**Totals: 10 of 14 are non-vacuous today, 4 are partial, and none is unreachable.**
+**Totals: 12 of 16 are non-vacuous today, 4 are partial, and none is unreachable.**
+Two records were added by the portfolio disposition and both are non-vacuous, which
+is why the numerator moved by two and the partial count did not: the deadline
+liveness record is an assertion on a fixture that already runs in CI, and the
+sentinel's cancellation record is an in-process socket-pair exchange.
+
 The four partials fail for three different reasons, and the distinction matters for
 sequencing: two need a second uid (a CI environment limit), one needs a marker seam
-inside the native addon (a code change), and one needs 2b to answer a charge-release
-question (a scope dependency). Nothing here is blocked on a fault-injection
-capability the repository lacks.
+inside the native addon (a code change), and one needs a deterministic way to force
+the `prepare` timeout (a race, not a missing capability). **The last of those four
+changed reason under the disposition.**
+`setup-a-an-abandoned-setup-strands-no-ring-charge` was partial because its oracle
+was blocked on a 2b charge-release question; that question is now answered and the
+record is `high`, so it stays partial only because setting a near-zero deadline
+races the timer against `spawn_blocking` rather than forcing the exit. Nothing here
+is blocked on a fault-injection capability the repository lacks.
 
 ## Coverage checks
 
@@ -250,7 +277,12 @@ already runs in CI.
    `setup-a-mapping-authority-derives-only-from-the-key-never-from-the-token`,
    inside a binary CI already names (`ci.yml:133`). **One record, no new harness,
    no new fault, and it lands in an executing job.** This is the single highest
-   leverage item in the part per line of test code.
+   leverage item in the part per line of test code. The same fixture carries a
+   second record for one more assertion: timing how long the host tolerates the
+   stall discharges
+   `setup-a-a-stalled-setup-is-torn-down-within-the-transport-setup-deadline`,
+   which needs the peer to stop rather than any fault. Two records, one fixture,
+   both in CI.
 
 3. **One new fixture: a dialer that authenticates then delays `Activate`.** A
    bounded sleep where `tests/shm_failure_modes.rs:58` has `pending()`. It supplies
@@ -267,10 +299,12 @@ already runs in CI.
    `setup_socket.rs:810-825` already use:
    `setup-a-a-captured-client-proof-never-authenticates-twice` (record and resend),
    `setup-a-a-rogue-listener-at-the-published-path-obtains-no-client-proof` (add
-   the missing `daemon_ver` case to an existing driver), and
-   `setup-a-the-peer-lifetime-sentinel-allocates-under-a-cap-and-stays-cancellable`
-   (declare `u32::MAX`, then cancel a parked read). No process, no timing, no
-   filesystem.
+   the missing `daemon_ver` case to an existing driver), and the two sentinel
+   records, `setup-a-the-peer-lifetime-sentinel-allocates-under-a-cap` (declare
+   `u32::MAX`) and
+   `setup-a-the-peer-lifetime-sentinel-exits-on-cancellation-without-further-peer-input`
+   (park a partial prefix, then cancel). No process, no timing, no filesystem. That
+   is four records, not three, after the sentinel split.
 
 5. **Parameterizing one existing occupant test.** `insecure_stale_occupant_is_not_replaced`
    (`setup_socket.rs:494-501`) already plants an object and asserts survival.

@@ -97,7 +97,7 @@ files.
 | --- | --- | --- |
 | [part-1-shm-transport](part-1-shm-transport/) | `crates/mc-shm-transport`, `packages/mc-shm-native`; boundary context from `crates/mc-host/src/{shm_provider,transport_negotiation,transport_provider,provider_recovery}.rs` | 58 records; portfolio evaluated; all 7 queued gaps closed |
 | [part-2a-host-lifecycle](part-2a-host-lifecycle/) | `crates/mc-host/src/{lifecycle,generation,connection,frame_read,panic_boundary}.rs` (~6.5k lines) | 55 records; portfolio evaluated; all 5 queued gaps mined and merged; 6 records superseded by the ring-transport refactor |
-| part-2b-wire-and-channels | `crates/mc-host/src/{wire,frame_channel,tcp_frame_channel,transport_negotiation,transport_provider,composite}.rs` (~4.9k) | Parked — pending ring-transport refactor. No catalog; four completed lens files retained under `_lenses/` (A wire format, B channel egress, C negotiation and provider, D claims and existing checks), of which A, B, and C propose records and D is the claims-and-history inventory. All four describe the pre-refactor surface. |
+| [part-2b-wire-and-channels](part-2b-wire-and-channels/) | `crates/mc-host/src/{wire,frame_channel,tcp_frame_channel,transport_negotiation,transport_provider,composite}.rs` (~4.9k) | **Superseded by the ring-transport refactor. Retained as salvage, not as a plan.** No catalog and none owed; synthesis never ran. Four completed lens files under `_lenses/` (A wire format, B channel egress, C negotiation and provider, D claims and existing checks) describe the pre-refactor surface; A, B and C propose 36 records between them and D is the claims-and-history inventory. Triage of those 36: 6 still valid, 9 invalid because their subject was deleted, 21 needing re-verification. **None of the 6 still-valid records has been absorbed by a successor part yet.** See [part-2b-wire-and-channels/README.md](part-2b-wire-and-channels/README.md) for the disposition and [Two directories share the number 2b](#two-directories-share-the-number-2b) below. |
 | part-2c-auth-and-control | `crates/mc-host/src/{auth,instance,control,config,connection_file}.rs` (~5k) | Parked — pending ring-transport refactor |
 | part-2d-dispatch-and-client | `crates/mc-host/src/{client,dispatch,routing,handler,runtime}.rs` (~8.4k) | Parked — pending ring-transport refactor |
 | part-2e-subsystems | `crates/mc-host/src/{broca,synapse}/`, `harness_closure.rs` | Parked — pending ring-transport refactor |
@@ -114,6 +114,37 @@ files.
 larger than Part 1, so Part 2 is sub-partitioned. `shm_provider.rs` and
 `provider_recovery.rs` are not re-mined in Part 2: they are already cataloged as
 Part 1 boundary context.
+
+The Part 2 rows above are the **original** sub-partition. The ring-transport
+refactor forced a re-partition, recorded in
+[part-2-rescope/scope-map-and-risk-ranking.md](part-2-rescope/scope-map-and-risk-ranking.md),
+and the directories that exist today are `part-2a-host-lifecycle`,
+`part-2b-ring-datapath`, `part-2c-setup-identity`, `part-2d-client-peer`,
+`part-2e-request-path` and `part-2f-runtime-config`. Their record counts are in
+[Records carrying a `Reachability:` line](#records-carrying-a-reachability-line).
+The `part-2c`, `part-2d` and `part-2e` rows above name the **pre-refactor** scope
+for those numbers and are superseded by the re-partition; do not read a row above
+as the scope of the same-numbered directory in the tree.
+
+### Two directories share the number 2b
+
+`part-2b-wire-and-channels` and `part-2b-ring-datapath` are **not two versions of
+one sub-part, and neither supersedes the other's records.** The re-scope retired
+the `wire-and-channels` label and reused the number.
+
+| Directory | Surface | State |
+| --- | --- | --- |
+| `part-2b-wire-and-channels` | pre-refactor: the frame codec, both channel implementations, transport negotiation and provider selection | Superseded. Lens files only, no catalog, none owed. |
+| `part-2b-ring-datapath` | post-refactor: `ring_transport.rs`, `wire.rs`, `frame_channel.rs`, `frame_channel/contract_tests.rs` | Active. 14 records; missing `portfolio-evaluation.md`. |
+
+The two overlap on exactly one file. `wire.rs` is in both scopes and is
+byte-identical across the refactor, and the four still-valid wire records the old
+directory holds are **not** among `part-2b-ring-datapath`'s 14, all of which are
+about the ring transport rather than the codec. So the number is shared, the
+records are disjoint, and one file's properties are owed by the active directory
+and not yet written there. `composite.rs` left 2b entirely and belongs to
+`part-2e-request-path`. Details in
+[part-2b-wire-and-channels/README.md](part-2b-wire-and-channels/README.md).
 
 ## Remaining Rust work
 
@@ -133,7 +164,7 @@ and is not counted here.
 | part-1-shm-transport | none |
 | part-2a-host-lifecycle | none |
 | part-2b-ring-datapath | `portfolio-evaluation.md` |
-| part-2b-wire-and-channels | all four: `catalog.md`, `existing-checks.md`, `fault-map.md`, `portfolio-evaluation.md` |
+| part-2b-wire-and-channels | **none owed — superseded**, see [its note](part-2b-wire-and-channels/README.md) |
 | part-2c-setup-identity | `portfolio-evaluation.md` |
 | part-2d-client-peer | `portfolio-evaluation.md` |
 | part-2e-request-path | `portfolio-evaluation.md` |
@@ -143,13 +174,22 @@ and is not counted here.
 | part-4b-transform | none |
 | part-4c-handlers | none |
 | part-4d-facade | none |
-| part-4e-rendering | `portfolio-evaluation.md` |
+| part-4e-rendering | none — **reconstructed from a report, with 7 of its 9 refinements outstanding** |
 | part-4f-decisions | `existing-checks.md`, `fault-map.md`, `portfolio-evaluation.md` |
 
-So seven parts are missing a portfolio evaluation, 4f is missing its check
-inventory and fault map as well, and 2b-wire-and-channels has no synthesized
-artifacts at all: it holds four completed lens files and is parked pending the
-ring-transport refactor.
+So six parts are missing a portfolio evaluation and 4f is missing its check
+inventory and fault map as well. Two rows need reading with their footnote.
+
+- **2b-wire-and-channels owes nothing.** It is superseded rather than parked, and
+  no catalog will be synthesized against a surface the refactor deleted. It holds
+  four completed lens files as salvage.
+- **4e's `portfolio-evaluation.md` is present but is a reconstruction.** The
+  evaluation ran and its file was destroyed before it reached disk. The file in
+  the directory is written from a report of its findings, marks itself as such,
+  and records that **7 of its 9 refinements were never applied**, as actionable
+  work. Two were applied and are named in `catalog.md`. Treat the part as
+  evaluated and not dispositioned.
+
 
 ### Records carrying a `Reachability:` line
 
@@ -179,7 +219,10 @@ field is `Type:`.
 
 The whole shortfall is in the two earliest parts. Part 1 has none of the labels,
 and Part 2a has them on 17 of 55 records, the 17 being later additions. Every part
-from 2b-ring-datapath onward labels every record. Backfilling those 96 labels is
+from 2b-ring-datapath onward labels every record. `part-2b-wire-and-channels`
+scores zero because it has no catalog and is owed none; its 36 unlabelled lens
+records are working material, not records, and are not counted in the 368.
+Backfilling those 96 labels is
 per-record work: rule 4 requires the evidence for each label at authoring time, so
 they cannot be assigned from a preamble.
 

@@ -85,41 +85,56 @@ arbiter is sound: `Settlement` (`dispatch.rs:34-59`) is three fields, `won` is
 mutated only by the `swap(true)` at `:408`, that swap happens under the async
 `order` mutex (`:407-410`), and every emission site takes the same lock, so a
 stream item can never follow a terminal and exactly one claimant wins among
-handler completion, cancellation, route close, and generation teardown. What is
-missing is the other half of exactly-once. **Five exits leave admitted work with
-no terminal at all**, and each was verified individually.
+handler completion, cancellation, route close, and generation teardown. The whole
+arbiter is `settle` at `:399-500`, and its first two statements are the lock and
+the swap. What is missing is the other half of exactly-once. **Five exits leave
+work with no terminal at all.** Each was verified individually, and **this
+disposition classified them, because they are not all about the same thing and the
+original list read as though they were.** Exactly one concerns an admitted routed
+request's settlement; one is pre-dispatch, before any settlement exists; and three
+are control-channel `route.open` exits.
 
-1. `dispatch.rs:1058` — the non-panic join-error arm. `:1053` catches
+1. `dispatch.rs:1058` — the non-panic join-error arm, and **the only one of the
+   five about admitted routed settlement**. `:1053` catches
    `join_err.is_panic()` and emits `internal_error`; the `Err(_)` arm at `:1058`
-   removes the pending entry and returns. An aborted handler task settles
-   nothing. Printed and confirmed as `Err(_) => { remove_pending(&gen_task,
-   key); return; }`.
-2. `dispatch.rs:637-638` — busy-reject exhaustion. Past the per-generation
-   `MAX_INFLIGHT_BUSY_REJECTS` of 32 (`connection.rs:42`, used at `:244`) the
-   code cancels the token and calls `gen.writer.discard()`, which drops **other
-   correlations' already queued terminals**, not just the rejection that could
-   not be emitted. This is the worst of the five by blast radius. The comment at
-   `:630-636` argues the trade honestly and names the outcome, so it is a
+   removes the pending entry and returns *before* the `settle` call at `:1063`,
+   so an aborted handler task settles nothing. Printed and confirmed as
+   `Err(_) => { remove_pending(&gen_task, key); return; }`. **No record in this
+   catalog asserts the silence here.** The pending-entry record covers the
+   `remove_pending` at `:1059`, which is the entry's removal, not the missing
+   terminal; see the gaps queued in
+   [portfolio-evaluation.md](portfolio-evaluation.md).
+2. `dispatch.rs:637-638` — busy-reject exhaustion, which is **pre-dispatch**: the
+   rejection never became an admitted request and no `Settlement` exists for it.
+   Past the per-generation `MAX_INFLIGHT_BUSY_REJECTS` of 32
+   (`connection.rs:42`, used at `:244`) the code cancels the token and calls
+   `gen.writer.discard()`, which drops **other correlations' already queued
+   terminals**, not just the rejection that could not be emitted. This is the
+   worst of the five by blast radius, and its blast radius is precisely the reason
+   it is not confined to the pre-dispatch request that triggered it. The comment
+   at `:630-636` argues the trade honestly and names the outcome, so it is a
    declared cost; nothing checks that the declared cost is the one that occurs.
-3. `dispatch.rs:1164` — a bind callback that stopped, by panic, abort, or its
-   own inner deadline. Route-gone still runs exactly once; no `Error` is
-   emitted.
-4. `dispatch.rs:1174` — a bind callback still executing at the lifecycle
-   deadline. The fatal latch is already tripped, so the incarnation terminates
-   and a terminal would be pointless.
-5. `dispatch.rs:1199` — `BindInstall::CloseWins`, a close that raced the bind.
-   Route-gone runs; no terminal.
+3. `dispatch.rs:1164` — **a control `route.open` exit**: a bind callback that
+   stopped, by panic, abort, or its own inner deadline. Route-gone still runs
+   exactly once; no `Error` is emitted.
+4. `dispatch.rs:1174` — **a control `route.open` exit**: a bind callback still
+   executing at the lifecycle deadline. The fatal latch is already tripped, so
+   the incarnation terminates and a terminal would be pointless.
+5. `dispatch.rs:1199` — **a control `route.open` exit**: `BindInstall::CloseWins`,
+   a close that raced the bind. Route-gone runs; no terminal.
 
-Three of those five are `open_route` exits, out of seven total
-(`dispatch.rs:1103-1239`), which makes the control path's worst case worse than
-the routed path's. Protocol `:692` covers the retirement cases: "Any published
-request lacking an observed terminal at close is `outcome_unknown`". It does not
-cover `:1164`, `:1174`, or `:1199`, where the connection stays live and the
-`route.open` correlation simply never settles until the caller's own 30-second
-route deadline expires.
+So the at-most-one guarantee is satisfied by all five, each by emitting zero, but
+they do not share a subject. Three of the five are `open_route` exits, out of
+seven total (`dispatch.rs:1103-1239`), which makes the control path's worst case
+worse than the routed path's. Protocol `:692` covers the retirement cases: "Any
+published request lacking an observed terminal at close is `outcome_unknown`". It
+does not cover `:1164`, `:1174`, or `:1199`, where the connection stays live and
+the `route.open` correlation simply never settles until the caller's own
+30-second route deadline expires.
 
-**A handler failure can reach the client as a success.** The whole success gate
-for a unary response is `dispatch.rs:1031-1033`, printed and confirmed:
+**An empty success is accepted end to end, and nothing below dispatch can reject
+it.** The whole success gate for a unary response is `dispatch.rs:1031-1033`,
+printed and confirmed:
 
 ```
 Ok(RequestOutcome::Response { body, binary })
@@ -129,31 +144,53 @@ Ok(RequestOutcome::Response { body, binary })
 ```
 
 The predicate is an upper bound only, and `0 <= MAX_BODY_LEN` holds. A handler
-that reserves output through `reserve_output` (`handler.rs:466`), fails partway,
-and returns the buffer it never wrote into emits a **zero-length `Response`
-terminal**. `OutputBuffer::len()` (`handler.rs:362-366`) returns the *declared*
-`exact_len` for a direct output and the *written* length for an owned one, and
-`extend_from_slice` and `resize` (`:381-396`) both refuse to grow past
-`max_len` and both refuse outright when `direct.is_some()`, so a reserved and
-unwritten buffer is a supported, silent state. The wire layer accepts the
+that reserves **owned** output through `reserve_output` (`handler.rs:466`), fails
+partway, and returns the buffer it never wrote into emits a **zero-length
+`Response` terminal**. `OutputBuffer::len()` (`handler.rs:361-366`) returns the
+*written* `body.len()` for an owned buffer and the *declared* `direct.len` for a
+direct one, and `extend_from_slice` and `resize` (`:381-396`) both refuse to grow
+past `max_len` and both refuse outright when `direct.is_some()`, so a reserved and
+unwritten owned buffer is a supported, silent state. The wire layer accepts the
 result: `wire.rs:340` rejects a body only on a pure-header type
 (`if ty.is_pure_header() && len != 0`, printed and confirmed), and `Response` is
-not pure-header, so no lower bound on a declared `Response` length exists
-anywhere in decode. The adjacent arms show the author reasoning carefully about
-other shapes in the same match — `:1020` catches a unary response after
-streaming, `:1035` catches an oversize body. Emptiness is the gap.
+not pure-header (`:86-88`), so no lower bound on a declared `Response` length
+exists anywhere in decode. Neither does the Rust client impose one:
+`validate_inbound`'s `Response | Error` arm (`client.rs:2022-2031`) checks
+`corr != 0` and the binary-flag-on-channel-0 rule and nothing about length. The
+adjacent arms show the author reasoning carefully about other shapes in the same
+match — `:1020` catches a unary response after streaming, `:1035` catches an
+oversize body. Emptiness is the gap.
 
-**This is the fourth part in this catalog to find an error path presenting to
-its caller as a success, and it is worth saying plainly because the pattern is
-now the catalog's most repeated finding.** Lens A records the ordinal and names
-the two handler-side occurrences, Parts 4c and 4d, which found handlers
-returning success without writing on the other side of this exact boundary; 2d
-found the third shape, `host_shutdown` returning `Ok` on a JSON echo of its own
-operation name. This synthesis verified the citation lens A makes for 4c and 4d
-but did **not** re-derive the count across all parts, so the ordinal is
-inherited and unconfirmed in the same way the lenses treat the
-"fourth misleading comment" ordinal in `runtime.rs`. What is confirmed is the
-mechanism at `:1031` and the wire layer's acceptance at `wire.rs:340`.
+**Two scope corrections, both applied during disposition.** First, this is
+*empty-response acceptance*, not a handler failure presenting as a success. The
+handler that returns `RequestOutcome::Response` has explicitly selected the
+variant `handler.rs:220-225` documents as "Unary success"; nothing in the
+observable state says a failure occurred, so calling it an error path is not
+established, and whether an empty `Response` is a defect at all is an open
+question this catalog cannot settle. Second, the *direct*-output form is not part
+of this gap: a declared `exact_len` that the serializer never satisfies is caught,
+at publication rather than at the gate, with `ProducerError::Underfill` — which is
+[req-a-a-response-publication-failure-never-reaches-the-settling-path](#req-a-a-response-publication-failure-never-reaches-the-settling-path)'s
+subject. The owned path is the one where declared and written are the same field
+and zero is legal.
+
+**Cross-part note, replacing an unverified ordinal.** The original text called
+this "the fourth part in this catalog to find an error path presenting to its
+caller as a success" and conceded in the same paragraph that the count was
+inherited and never re-derived. The ordinal is **removed** rather than confirmed,
+for three reasons. METHOD rule 2 forbids clearing an open question by assertion,
+and the catalog had already marked this one unverified. After the narrowing above,
+the 2e instance is not an error path at all, so it cannot be the fourth of
+anything. And the sites the ordinal grouped do not share an oracle: Part 4c's and
+4d's are write paths that report success without persisting, whose oracle is to
+re-read the store after a successful response; 2d's `host_shutdown` accepts a JSON
+echo of its own operation name, whose oracle is to keep serving after answering
+and show the caller's next call succeeds; and this one is an empty body that every
+layer accepts, whose oracle is a census of the gate. Part 4c's own disposition
+made exactly this correction one layer up, removing a third site from an
+equivalence for having a different oracle. Three mechanisms with three oracles are
+worth a reader's attention as a recurring *shape*; they are not worth a count, and
+a count is what made the claim unverifiable.
 
 **Routed terminals carry no delivery acknowledgement, so acknowledged effects
 are identically zero and only attempted are observable.** `settle` returns
@@ -258,6 +295,21 @@ this sub-part — `tests/dispatch.rs` (20), `tests/composite_routing.rs` (16),
 `tests/routing.rs` (12), `tests/broca_protocol.rs` (9) — and CI names none of
 them. So the sub-part is *well tested* and *barely gated*: 121 claim-bearing
 tests, zero executed by CI.
+
+**One correction to that framing, applied during disposition, and it is the only
+CI-executed check on any record in this catalog.** "Zero executed by CI" is true
+of the 121 tests in the five source files and six subject binaries. It is not true
+of this sub-part's *record coverage*, because one record is asserted exactly by a
+test in a binary CI does name.
+`tests/lifecycle.rs:576-657` `shutdown_refuses_new_routes_and_new_routed_work`
+drives a `route.open` and a routed request into one draining host and asserts
+`target_unavailable` and `server_busy` respectively, which is
+[req-a-shutdown-rejects-routed-and-control-work-under-divergent-codes](#req-a-shutdown-rejects-routed-and-control-work-under-divergent-codes)
+in full; `lifecycle` runs at `ci.yml:178-179` on Linux and `:187` on macOS. The
+binary was excluded from the six because its *subject* is the host lifecycle
+rather than the request path, which is a defensible scope call and is exactly how
+the check went uncredited. Counting by binary subject rather than by assertion is
+what produced the error.
 
 The four doctests are the exception and they matter. All four are
 `compile_fail`, all four are in `handler.rs`, and all four execute because
@@ -582,15 +634,14 @@ Open questions:
 Type: safety
 Reachability: default-production
 Status: active
-Exercised: not yet — no test inspects `gen.pending` after a forced close, and
-the map is private to the crate.
+Exercised: not yet — no test inspects `gen.pending` after a forced close.
 Guarantee: Every entry inserted into `gen.pending` is removed either by the
 outer dispatch task on each of its exits, or by the route close that aborted
 that task.
 Check: `always` — after a generation quiesces, assert `gen.pending` is empty.
 `always` on an emptiness postcondition rather than `unreachable` on a leak site,
-because a stranded entry is a forbidden *state* with no dedicated detection
-point, which METHOD's first coverage rule assigns to `always(!X)`.
+because a stranded entry is a forbidden *state* with no dedicated detection point,
+which METHOD's first coverage rule assigns to `always(!X)`.
 Fault/timing angle: `remove_pending` is called on all five outer-task exits
 (`dispatch.rs:935`, `:958`, `:1059`, `:1066`). The abort case is covered by
 `settle_route_work`'s explicit sweep of the keys it collected
@@ -599,13 +650,28 @@ never removed their own pending entries". `force_close_all_routes`
 (`:1421-1452`) aborts the same tasks and performs **no** equivalent sweep.
 Required faults and enabling state: A forced shutdown past the drain deadline
 with requests in flight, so `force_close_all_routes` aborts outer tasks whose
-keys no `settle_route_work` collected.
+keys no `settle_route_work` collected. **Placement constraint, established during
+disposition:** the oracle must live in-crate. `mod connection` is private
+(`lib.rs:24`), so no integration test can name `GenerationCore`, but `pending` is
+`pub` on it (`connection.rs:95`) and therefore directly readable and insertable
+from any in-crate test.
 Confidence: medium — [evidence](evidence/req-a-every-pending-entry-is-removed-by-its-owner-or-its-route-close.md).
 The sweep asymmetry is verified by reading both functions. What I could not
 verify is whether the forced path is always followed by the whole
 `GenerationCore` being dropped, which would make the leak unobservable; that
-depends on `harness_closure.rs`, which is sub-part 2f.
-Existing check: none.
+depends on `runtime.rs:1144-1244`, which is sub-part 2f. **One premise of the
+original record was wrong and is corrected here: the map is not unobservable.**
+The claim that "the map is private to the crate" and that "no in-crate test
+constructs a `GenerationCore`" is false on the second half.
+`connection.rs:946-963` (`shutdown_registration_rejection_leaves_no_graceful_drain_work`)
+constructs a complete `GenerationCore` today, all eleven fields, using
+`frame_sender` for the writer, and asserts against it. So the postcondition is
+assertable; what it costs is placing the oracle in a lane CI does not run, which
+is a trade rather than a block.
+Existing check: none for this record's postcondition.
+`connection.rs:946-963` is not a check of it — it constructs a `GenerationCore`
+for an unrelated claim — but it is the construction proof this record's oracle
+needs. Status `unaudited`.
 Impact: Bounded by the pending-permit pool in the worst case, so this is not
 unbounded growth. The consequence is a stale `PendingEntry` holding a
 `CancellationToken` and an `Arc<Settlement>` for the remaining life of the
@@ -615,6 +681,10 @@ Open questions:
 - Does the forced path always drop the `GenerationCore` immediately afterwards?
   `close_generation` removes the connection at `dispatch.rs:1409-1413`, but
   `force_close_all_routes` does not call it. (unresolved, needs sub-part 2f)
+- Should the oracle be an in-crate test that reads `pending` directly, or should
+  a test-only accessor expose it so the integration binaries CI might one day run
+  can assert it? The first is free and runs nowhere; the second is a production
+  edit. (needs human input)
 
 > Synthesis note on this record's open question, carried here rather than edited
 > into it. Sub-part 2f's construction conditionality map answers the adjacent
@@ -636,10 +706,13 @@ is that it carries no delivery acknowledgement at all, so the host's
 acknowledged effect count is identically zero. The second is that a publication
 failure lands after the settling path has already returned success, so the host
 believes the request was answered while the client believes nothing was. The
-third is that the success gate checks only that the body fits, so a handler
-failure can arrive as an empty success. Grouped because all three are about the
-distance between "settled" and "answered", and because together they mean the
-host's own record of a request's outcome cannot be reconciled with the client's.
+third is that the success gate checks only that the body fits, so a zero-length
+`Response` is accepted by every layer from the gate to the client. Grouped
+because all three are about the distance between "settled" and "answered", and
+because together they mean the host's own record of a request's outcome cannot be
+reconciled with the client's. The third record's original framing — a handler
+*failure* arriving as a success — was narrowed during disposition to
+empty-response acceptance; see its `Confidence:` line.
 
 ### req-a-a-routed-terminal-carries-no-delivery-acknowledgement
 
@@ -724,34 +797,61 @@ Reachability: default-production
 Status: active
 Exercised: partial — `tests/dispatch.rs:665`
 `oversized_handler_output_cannot_corrupt_framing` covers the upper bound only.
-No test constructs a handler that reserves output and returns `Response`
+No test constructs a handler that reserves owned output and returns `Response`
 without writing.
 Guarantee: The dispatch layer validates a handler `Response` against the frame
-size ceiling and nothing else, so a handler that reserved output and wrote
-nothing produces a successful zero-length `Response` terminal.
+size ceiling and nothing else, so a handler that reserved owned output and wrote
+nothing produces a well-formed zero-length `Response` terminal that every layer
+below accepts.
 Check: `always` — for every `RequestOutcome::Response` accepted at
 `dispatch.rs:1031`, the only predicate applied is
 `body.len() <= MAX_BODY_LEN`; assert there is no lower-bound, emptiness, or
 declared-versus-written comparison anywhere on the path to
 `emit_reserved_frame`. `always` because the check runs on every unary success.
 Fault/timing angle: None. This is a static gap in the guard, not a race.
-Required faults and enabling state: A handler that reserves an `OutputBuffer`,
-takes an early error return without writing, and still returns
-`RequestOutcome::Response`. Parts 4c and 4d found handlers returning success
-without writing, on the other side of this boundary.
+Required faults and enabling state: A handler that reserves an **owned**
+`OutputBuffer` through `reserve_output`, takes an early return without writing,
+and still returns `RequestOutcome::Response`. The owned path is the whole record:
+`OutputBuffer::len()` (`handler.rs:361-366`) returns the *written* `body.len()`
+for an owned buffer and the *declared* `direct.len` for a direct one, so only the
+owned shape reaches `:1031` reporting zero.
 Confidence: high — [evidence](evidence/req-a-a-handler-response-is-length-checked-and-never-content-checked.md).
-Confirmed `encode_owned_frame` (`wire.rs:571-602`) accepts an empty body and
-that `decode`'s pure-header rule (`wire.rs:340`) covers only Cancel, Ping,
-Pong, and Goodbye, so a zero-length `Response` is a well-formed frame.
+**Narrowed during disposition, and the narrowing changed what the record claims.**
+What is verified is that an **empty success is accepted end to end**, at five
+independent points: an owned reservation starts empty
+(`dispatch.rs:537-542`, `Vec::with_capacity` with no writes), `len()` reports the
+written length for it (`handler.rs:361-366`), the gate accepts zero
+(`dispatch.rs:1031-1034`), `Response` is not a pure-header type so decode rejects
+a body only for `Cancel`/`Ping`/`Pong`/`Goodbye` (`wire.rs:48-88`, rule at
+`:340-342`), and the Rust client's `validate_inbound` imposes no minimum on a
+`Response` (`client.rs:2022-2031`, which checks only `corr != 0` and the
+binary-flag-on-channel-0 rule). What is **not** established is that this is a
+handler *failure* surfacing as a success: the handler explicitly returned the
+variant `handler.rs:220-225` documents as "Unary success", so nothing in the
+observable state distinguishes a failed reservation from a deliberate empty
+result. That question is upstream of the record and is referred to a human.
 Existing check: `tests/dispatch.rs:665` for the ceiling. Status unaudited. Not
 in CI.
-Impact: This is the success-shaped-error-path pattern in this layer, and it is
-the fourth part of the catalog to find it. A handler failure reaches the client
-as a terminal success with an empty body. The client cannot distinguish it from
-a legitimately empty result, so it will not retry and will not surface an error.
+Impact: An empty `Response` is indistinguishable from a legitimately empty result
+at every layer that could reject it, so a handler that abandons its output
+mid-request and still reports success is invisible. The severity depends entirely
+on whether an empty `Response` is a supported outcome, which nothing states.
+Note what this record does **not** cover after narrowing: the *direct*-output
+underfill, where a declared `exact_len` is never satisfied, is caught — it fails
+at publication with `ProducerError::Underfill` rather than at this gate, which is
+[req-a-a-response-publication-failure-never-reaches-the-settling-path](#req-a-a-response-publication-failure-never-reaches-the-settling-path)'s
+territory. The gap here is specifically the owned path, where declared and written
+are the same field and zero is legal.
 Open questions:
-- Does any client treat an empty-body `Response` as a protocol violation? That
-  is Part 2d's and Part 5's surface. (unresolved, needs a client-side check)
+- Is a zero-length `Response` a defect or a supported outcome?
+  `handler.rs:220-235` does not state the intent, and
+  `OutputBuffer::is_empty()` (`:368-370`) exists as public API, which weakly
+  suggests emptiness is a state callers are expected to reason about rather than
+  an error. Settling this decides whether this record is a missing guard or a
+  documentation gap. (needs human input)
+- Does any client treat an empty-body `Response` as a protocol violation? The
+  Rust client does not (`client.rs:2022-2031`, verified). The TypeScript peer is
+  Part 5's surface. (unresolved, needs a Part 5 check)
 
 ---
 
@@ -921,8 +1021,10 @@ no, which the routed and control chains do differently at every level.
 Type: safety
 Reachability: default-production
 Status: active
-Exercised: not yet — no test sends a `route.open` and a routed request into the
-same draining host and compares the two codes.
+Exercised: yes — `tests/lifecycle.rs:576`
+`shutdown_refuses_new_routes_and_new_routed_work` asserts both codes against one
+draining host, and `lifecycle` is CI-executed on Linux (`ci.yml:178-179`) and
+macOS (`:187`)
 Guarantee: The shutdown admission fence is one condition evaluated at two call
 sites, and the two sites answer with different error codes carrying different
 client retry rules.
@@ -940,11 +1042,23 @@ external shutdown signal, with a client pipelining both a routed request and a
 `route.open` behind it.
 Confidence: high — [evidence](evidence/req-a-shutdown-rejects-routed-and-control-work-under-divergent-codes.md).
 Both call sites read; protocol §10.2's two retry rows compared.
-Existing check: none.
+Existing check: **corrected during disposition from "none".**
+`tests/lifecycle.rs:576-657` `shutdown_refuses_new_routes_and_new_routed_work`
+asserts this property exactly and in the record's own shape: it holds a drain open
+with a parked handler (`:590-606`), spawns the shutdown (`:611`), waits for the
+publication to be unlinked (`:614-621`), then sends a `route.open` and asserts
+`open_error.error_code() == "target_unavailable"` (`:626-638`) and sends a routed
+request on the still-live route and asserts
+`request_error.error_code() == "server_busy"` (`:640-657`). Both codes, one
+draining host, one test. Status `unaudited`. **In CI**, unlike every other check
+this catalog cites: `ci.yml:178-179` runs `--test client --test lifecycle` on
+Linux and `:187` runs the same pair on macOS.
 Impact: Protocol §10.2 tells a client to retry `target_unavailable` "with new
 correlation under bounded route deadline" and `server_busy` "with backoff". A
 draining host therefore invites un-backed-off `route.open` retries from exactly
-the clients it is trying to shed, while backing off their routed traffic.
+the clients it is trying to shed, while backing off their routed traffic. The
+divergence is not merely unchecked, it is **pinned by a CI-executed test**, so it
+is current intended behaviour unless someone changes both the code and that test.
 Open questions:
 - Which code does the protocol intend for a `route.open` during shutdown? §12
   step 1 names `server_busy` for routed requests and is silent on `route.open`;
@@ -1035,9 +1149,13 @@ Open questions: None.
 Grouped by shared mechanism rather than by the headings above, because the
 sharpest relationships cross groups. **Every dominance statement below is a
 hypothesis** about which oracle subsumes which, offered to order the work, not a
-verified claim. None has been tested, and none can be tested by anything CI runs
-today: the four `compile_fail` doctests are this sub-part's only CI-executed
-checks, and they bear on the handler API surface rather than on any record here.
+verified claim. None has been tested. **Corrected during disposition: one record
+is CI-tested, though no dominance statement is.** The four `compile_fail` doctests
+bear on the handler API surface rather than on any record here, but
+`tests/lifecycle.rs:576-657` asserts the divergent-codes record exactly and runs
+at `ci.yml:178-179` and `:187`. That record appears in the fourth cluster below,
+and its presence there is the only place a hypothesis could be checked against
+something CI executes today.
 
 - **One settlement primitive, read from four sides.**
   [req-a-an-admitted-routed-request-emits-at-most-one-terminal-frame](#req-a-an-admitted-routed-request-emits-at-most-one-terminal-frame),
@@ -1059,16 +1177,21 @@ checks, and they bear on the handler API surface rather than on any record here.
   [req-a-a-route-open-is-answered-unless-the-host-is-failing-or-draining](#req-a-a-route-open-is-answered-unless-the-host-is-failing-or-draining),
   [req-a-every-pending-entry-is-removed-by-its-owner-or-its-route-close](#req-a-every-pending-entry-is-removed-by-its-owner-or-its-route-close).
   These three cover four of the five exits between them: `:637-638` for the
-  first, `:1164`, `:1174`, and `:1199` for the second, and the abort that
-  produces `:1058` for the third. Hypothesis: a per-exit counter or marker,
-  incremented at each of the five sites, *dominates* the reachability half of
-  all three, because every one of their oracles begins with "observe that this
-  exit was taken". It dominates none of their safety halves: a counter at
-  `:637-638` does not tell you which other correlations' frames the `discard()`
-  dropped, a counter at `:1199` does not tell you whether the connection stayed
-  live afterwards, and a counter at `:1058` does not tell you whether the
-  pending entry was swept. Those three questions need three different oracles,
-  which is why the pending-entry record is the only `medium` in the catalog.
+  first, and `:1164`, `:1174`, and `:1199` for the second. **The third does not
+  cover `:1058`, and the original text said it did.** It cites `:1059`, the
+  `remove_pending` on the same match arm, which is the pending entry's removal
+  rather than the absent terminal; `:1058` returns before `settle` at `:1063`, and
+  it is the only one of the five silent exits that concerns an admitted routed
+  request's settlement. Nothing here asserts that silence, which is a queued gap.
+  Hypothesis: a per-exit counter or marker, incremented at each of the five sites,
+  *dominates* the reachability half of all three, because every one of their
+  oracles begins with "observe that this exit was taken". It dominates none of
+  their safety halves: a counter at `:637-638` does not tell you which other
+  correlations' frames the `discard()` dropped, a counter at `:1199` does not tell
+  you whether the connection stayed live afterwards, and a counter at `:1058` does
+  not tell you whether the pending entry was swept. Those three questions need
+  three different oracles, which is why the pending-entry record is the only
+  `medium` in the catalog.
 - **Two hand-written copies of one policy.**
   [req-a-handler-authored-diagnostics-are-capped-before-any-egress-wait](#req-a-handler-authored-diagnostics-are-capped-before-any-egress-wait),
   [req-a-a-handler-response-is-length-checked-and-never-content-checked](#req-a-a-handler-response-is-length-checked-and-never-content-checked).

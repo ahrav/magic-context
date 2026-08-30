@@ -31,11 +31,20 @@ error message (`:1045`), or hold its permits past every host deadline. Six of
 the fourteen records need nothing but a hostile handler. No injection seam, no
 production edit, no new infrastructure.
 
-**Third, the one thing this sub-part cannot observe is its own private state.**
-`gen.pending` is private to the crate, no in-crate test constructs a
-`GenerationCore`, and no integration test can reach the map. That single absence
-is what blocks the pending-entry record outright and is why it is the catalog's
-only `medium` confidence record.
+**Third, the one thing this sub-part cannot observe from an integration test is
+its own private state, and "cannot observe" was originally overstated.**
+`gen.pending` lives on `GenerationCore`, `mod connection` is private
+(`lib.rs:24`), and no integration test can name the type, so no integration
+oracle can read the map. **Disposition correction: an in-crate oracle can.**
+`pending` is a `pub` field (`connection.rs:95`) and
+`connection.rs:946-963`
+(`shutdown_registration_rejection_leaves_no_graceful_drain_work`) already
+constructs a complete `GenerationCore` — all eleven fields, `frame_sender` for the
+writer — and asserts against it. So the pending-entry record is not blocked; its
+oracle is merely confined to a lane CI does not run, which is a placement trade
+rather than an absent capability. The record keeps its `medium` confidence for a
+different reason: its open question about whether the forced path drops the
+`GenerationCore` is still unresolved and is answerable only from sub-part 2f.
 
 **Fourth, six of the fourteen records are discharged wholly or partly by
 enumeration, and that is a property of the findings rather than a shortcut.**
@@ -62,23 +71,29 @@ and both are handler-authored.
 | **C6** a non-panic join error on the request task | The handler task aborted rather than panicked, so `dispatch.rs:1053`'s `is_panic()` guard fails and the `Err(_)` arm at `:1058` removes the pending entry and returns with no terminal | **Partial.** The producer is `force_close_all_routes` (`:1421-1452`), which aborts before waiting, so the state is reachable through a forced shutdown past the drain deadline. What is not available is the *observation*: the arm emits nothing, records nothing, and increments nothing, so a test can only infer it from a correlation that never settles, which is indistinguishable from a slow handler. This is the same shape as `C4`: the state is producible, the exit is unobservable |
 | **C7** permit saturation in all five states | General pending, general task, reserved pending, reserved task, and per-generation `busy_rejects` exhaustion | **Yes, and the pieces all exist.** `tests/dispatch.rs:295` shrinks `max_pending_requests` and parks a handler; `:976` and `:1074` saturate both classes' pending pools; Broca's live 96/96 reserved declaration (`broca/config.rs:185`, `:188`) makes the reserved class real. Task-permit exhaustion needs more than `max_handler_tasks` concurrent *executing* handlers, which is why a shrunk limit plus parked handlers is the route rather than volume. The fifth state is `C5` |
 | **C8** a draining host with both request kinds pipelined | `shared.draining` set or `shared.shutdown` cancelled, with a routed request and a `route.open` arriving behind it, so `dispatch.rs:844` answers `server_busy` and `:1112` answers `target_unavailable` | **Yes.** An authenticated `host.shutdown` or an external shutdown signal reaches both fences, and `handle_host_shutdown`'s write hook sets `draining` and `freeze_admission` inside the writer task (`:752-753`) so the commit point and the fence coincide, which makes the ordering deterministic rather than racy. The harness already stops hosts gracefully |
-| **C9** a forced shutdown past the drain deadline | `force_close_all_routes` (`dispatch.rs:1421-1452`) aborting outer tasks whose pending keys no `settle_route_work` sweep collected | **Producible, not observable.** Sub-part 2f establishes that `shutdown_sequence` calls `force_close_all_routes` twice (`runtime.rs:1206`, `:1216`) with no enclosing timeout, and `tests/lifecycle.rs:678` and `:714` already build the non-yielding-callback shape that reaches the forced path. The blocker is that `gen.pending` is private to the crate and no in-crate test constructs a `GenerationCore`, so nothing can assert the map's emptiness. This is the single blocking capability in the sub-part |
+| **C9** a forced shutdown past the drain deadline | `force_close_all_routes` (`dispatch.rs:1421-1452`) aborting outer tasks whose pending keys no `settle_route_work` sweep collected | **Producible and observable, the latter corrected during disposition.** Sub-part 2f establishes that `shutdown_sequence` calls `force_close_all_routes` twice (`runtime.rs:1206`, `:1216`) with no enclosing timeout, and `tests/lifecycle.rs:678` and `:714` already build the non-yielding-callback shape that reaches the forced path. The original blocker was that "`gen.pending` is private to the crate and no in-crate test constructs a `GenerationCore`, so nothing can assert the map's emptiness". The first clause is true and the second is false: `pending` is `pub` (`connection.rs:95`) and `connection.rs:946-963` constructs the whole struct today. So the postcondition is assertable from an in-crate test, which is where the oracle must live because `mod connection` is private (`lib.rs:24`). This is no longer the sub-part's single blocking capability; the cost is that the in-crate lane runs in no CI job |
 
 Three availability caveats cut across the classes.
 
-**C4, C6, and C9 share an observability problem, not an injection problem.** All
-three land on an exit that emits no frame, records no cause, and increments no
-counter. So an oracle for any of them must observe either the *client's*
-disposition, which cannot distinguish an abandoned correlation from a slow
-handler, or *host-private state*, which is unreachable. That is the finding
-rather than an obstacle to measuring it, and it is the same shape 2d recorded for
-the detached bridge thread.
+**C4 and C6 share an observability problem, not an injection problem, and C9 no
+longer does.** Both land on an exit that emits no frame, records no cause, and
+increments no counter. So an oracle for either must observe the *client's*
+disposition, which cannot distinguish an abandoned correlation from a slow handler.
+That is the finding rather than an obstacle to measuring it, and it is the same
+shape 2d recorded for the detached bridge thread. `C9` was originally grouped with
+them; it does not belong, because its postcondition is a readable field on a
+constructible struct (see the correction in `C9`). Its constraint is placement, not
+observability.
 
 **C0's split is favourable and should not be over-read.** Four CI-executed
 doctests is genuinely more than either sibling has, but all four bear on the
 handler API *surface* — they forbid a `Vec<u8>` body and three field accesses —
-and none of them touches a record in this catalog. The sub-part's CI-executed
-coverage of its own findings is zero.
+and none of them touches a record in this catalog. The original conclusion, "the
+sub-part's CI-executed coverage of its own findings is zero", was **wrong for one
+record** and is corrected: `tests/lifecycle.rs:576-657` asserts the divergent
+shutdown codes exactly and runs at `ci.yml:178-179` and `:187`. One of fourteen,
+in a binary this file's own CI-name list already contained. The correct statement
+is that CI executes a check on one record and on none of the other thirteen.
 
 **C3's cost is a configuration choice, not a capability.** Both bind exits are
 constructible today, but the `:1174` form waits out
@@ -113,7 +128,7 @@ is `crates/mc-module/src/bin/ck_mc_host/serve.rs` (composite at `:575`,
 | --- | --- | --- |
 | req-a-a-pre-dispatch-rejection-is-emitted-or-the-generation-is-retired | **`C5`.** A saturated egress byte budget plus a client pipelining more than 32 requests that fail admission. Both halves exist separately — `tests/dispatch.rs:788` saturates the budget, `:271` and `:295` produce admission failure — and the composition adds a slow-reading peer so the 32 in-flight rejections do not drain | **Yes** for the disjunction the check states: either a terminal is queued, or `gen.token.is_cancelled()` and the writer is discarding, both observable. The **blast radius** in the record's `Impact:` — which *other* correlations' queued frames the `discard()` dropped — needs a per-correlation egress trace the harness does not have |
 | req-a-a-route-open-is-answered-unless-the-host-is-failing-or-draining | Three exits, two costs. `C3` gives both bind-stop forms: a panicking `bind` reaches `:1164` immediately, and a blocking `bind` reaches `:1174` after `lifecycle_callback_deadline`, so a shrunk `HostTiming` keeps it fast. `C4` gives `CloseWins` at `:1199` and has no seam | **Partial** — two of three exits are constructible from a hostile `bind` today, and `tests/handler_contract.rs:229` already drives a rejecting bind so the fixture shape exists. The third needs the close to be marked between `reserve` (`:1127`) and `install_bound` (`:1178`), which is racy rather than deterministic |
-| req-a-every-pending-entry-is-removed-by-its-owner-or-its-route-close | **`C9`.** A forced shutdown past the drain deadline with requests in flight, so `force_close_all_routes` (`:1421-1452`) aborts outer tasks whose keys no `settle_route_work` sweep collected (`:1332-1342`, removal at `:1374-1380`). The state is producible: `tests/lifecycle.rs:678` and `:714` build the non-yielding-callback shape | **No** — the state is producible and the postcondition is not observable. `gen.pending` is private to the crate, no in-crate test constructs a `GenerationCore`, and no integration test can reach the map. This is the only fully blocked record in the sub-part and the only `medium` confidence one |
+| req-a-every-pending-entry-is-removed-by-its-owner-or-its-route-close | **`C9`.** A forced shutdown past the drain deadline with requests in flight, so `force_close_all_routes` (`:1421-1452`) aborts outer tasks whose keys no `settle_route_work` sweep collected (`:1332-1342`, removal at `:1374-1380`). The state is producible: `tests/lifecycle.rs:678` and `:714` build the non-yielding-callback shape. The postcondition is readable from an in-crate test: `pending` is `pub` (`connection.rs:95`) and `connection.rs:946-963` already constructs a complete `GenerationCore` | **Yes** — moved from `No` during disposition. The earlier verdict rested on "no in-crate test constructs a `GenerationCore`", which is false. What survives is a placement constraint, not a blocker: `mod connection` is private (`lib.rs:24`), so the oracle cannot live in an integration binary, and the in-crate lane runs in no CI job |
 
 ### A terminal that proves nothing
 
@@ -121,7 +136,7 @@ is `crates/mc-module/src/bin/ck_mc_host/serve.rs` (composite at `:575`,
 | --- | --- | --- |
 | req-a-a-routed-terminal-carries-no-delivery-acknowledgement | **No fault.** The check is a census of every `written:` construction in the sub-part: three hooks exist — `handle_host_shutdown` (`:678-680`, `:743-756`), `emit_authoritative_rejection` (`:814-816`), `send_connection_goodbye` (`:1474-1476`) — and every routed terminal passes `written: None` (`:358`, `:300`). Per METHOD's effect accounting the derived assertion is that acknowledged effects are identically zero | **Yes** — enumeration only, and the oracle proves an **absence**, so it is discharged by a census over the emission paths rather than by a test that passes. A census check in CI would catch the reintroduction case |
 | req-a-a-response-publication-failure-never-reaches-the-settling-path | **`C2`.** A handler calling `output_from_writer` with an `exact_len` its serializer does not match, so `commit` returns `ProducerError::Underfill` inside the writer at `ring_transport.rs:580-593`, after `settle` already returned `true` at `dispatch.rs:460` | **Yes** — the fault is authored in the handler and needs no seam. What the test observes is the *asymmetry*: the host records a settlement, the client sees a clean close, and no `Error` terminal follows. Part 2b's `ring-a-publish-failure-is-reported-as-a-clean-peer-close` already establishes the close half |
-| req-a-a-handler-response-is-length-checked-and-never-content-checked | **`C1`, plus enumeration.** The census half is that the only predicate at `:1031` is `body.len() <= MAX_BODY_LEN`, with no lower-bound, emptiness, or declared-versus-written comparison anywhere on the path to `emit_reserved_frame`. The construction half is a handler that reserves an `OutputBuffer`, takes an early error return without writing, and still returns `Response` | **Yes** — both halves. `tests/dispatch.rs:665` already covers the ceiling from the other direction, and the wire layer's acceptance is settled by reading `wire.rs:340`, which rejects a body only on a pure-header type |
+| req-a-a-handler-response-is-length-checked-and-never-content-checked | **`C1`, plus enumeration.** The census half is that the only predicate at `:1031` is `body.len() <= MAX_BODY_LEN`, with no lower-bound, emptiness, or declared-versus-written comparison anywhere on the path to `emit_reserved_frame`. The construction half is a handler that reserves an **owned** `OutputBuffer`, takes an early return without writing, and still returns `Response`. Narrowed during disposition: the owned shape is the whole record, because `OutputBuffer::len()` (`handler.rs:361-366`) reports the *written* length for an owned buffer and the *declared* `direct.len` for a direct one, so only the owned shape reaches the gate reporting zero. A direct reservation that is never satisfied fails later, at `commit`, which is `C2`'s record | **Yes** — both halves. `tests/dispatch.rs:665` already covers the ceiling from the other direction, and the acceptance chain below the gate is settled by reading `wire.rs:86-88` and `:340-342` (`Response` is not pure-header, so decode imposes no minimum) plus `client.rs:2022-2031` (the Rust client imposes none either) |
 
 ### Admission bounds and the missing deadline
 
@@ -135,21 +150,28 @@ is `crates/mc-module/src/bin/ck_mc_host/serve.rs` (composite at `:575`,
 
 | Property | Required faults and enabling state | Non-vacuous today |
 | --- | --- | --- |
-| req-a-shutdown-rejects-routed-and-control-work-under-divergent-codes | **`C8`.** An authenticated `host.shutdown` or an external shutdown signal, with a client pipelining both a routed request and a `route.open` behind it. The ordering is deterministic rather than racy, because `handle_host_shutdown`'s write hook sets `draining` and `freeze_admission` inside the writer task (`:752-753`), so the commit point and the fence coincide | **Yes** — and the oracle is two codes read from one client, which is the cheapest end-to-end assertion in the sub-part. Currently unasserted: the record's `Existing check:` is `none` |
+| req-a-shutdown-rejects-routed-and-control-work-under-divergent-codes | **`C8`.** An authenticated `host.shutdown` or an external shutdown signal, with a client pipelining both a routed request and a `route.open` behind it. The ordering is deterministic rather than racy, because `handle_host_shutdown`'s write hook sets `draining` and `freeze_admission` inside the writer task (`:752-753`), so the commit point and the fence coincide | **Yes, and already done.** Corrected during disposition: the row said "Currently unasserted: the record's `Existing check:` is `none`", and `tests/lifecycle.rs:576-657` asserts both codes against one draining host (`:638`, `:657`) and runs in CI at `ci.yml:178-179` and `:187`. This is the only record in the sub-part with a CI-executed check, and the cheapest end-to-end assertion here was already written |
 | req-a-three-control-rejection-paths-carry-three-different-bounds | Split. The **classification half** — semantic rejections through `emit_error_terminal` inside a pending-permit-holding task (`connection.rs:638-655`), capacity rejections through `emit_rejection`, oversize rejections through `emit_authoritative_rejection` (`connection.rs:430-450`), and only the third carrying `written_tx` — is enumeration over three call sites. The **bound half** needs concurrent floods of malformed control bodies, oversize control bodies, and requests past the pending bound, one of which is `C5` | **Partial** — the classification and the `written`-hook asymmetry are discharged by reading today, and `tests/routing.rs:98` and `:212` already exercise the semantic path. Asserting that each of the three counters actually binds needs the three floods composed on one generation, which no fixture builds |
 | req-a-handler-authored-diagnostics-are-capped-before-any-egress-wait | **`C1` plus `C3`.** A handler returning a multi-megabyte error message, at pending-pool or route-pool saturation, with a slow-reading peer so the terminals queue; and a `BindOutcome::Reject` carrying the same oversize pair, to reach the second capping site at `:1206-1218`. `tests/handler_contract.rs:229` already carries a handler code to the client through a rejected bind | **Yes** — both sites are reachable from handler-authored values, and the record's second assertion, that the two capping sites use identical limits, is enumeration. The bind copy currently has no test at all |
 
-**Totals: 10 fully non-vacuous today, 3 partial, 1 not constructible.** The ten
-are the arbiter's at-most-one record, all three of Group C, the pre-dispatch
-rejection disjunction, both admission-bound records plus the saturation
-reachability record, the divergent-codes record, and the diagnostics cap. The
+**Totals: 11 fully non-vacuous today, 3 partial, 0 not constructible.** Revised
+during disposition from 10 / 3 / 1: the pending-entry sweep moved from `No` to
+`Yes` once its observability premise was refuted. The eleven are the arbiter's
+at-most-one record, all three of Group C, the pre-dispatch rejection disjunction,
+both admission-bound records plus the saturation reachability record, the
+divergent-codes record, the diagnostics cap, and the pending-entry sweep. The
 three partial ones are the no-emission-after-retirement record (enumeration yes,
 charge-straddling interleaving no), the `route.open` record (two exits of three),
 and the three-control-bounds record (classification yes, joint saturation no).
-The one blocked record is the pending-entry sweep, blocked on observability
-rather than on producibility.
+**No record in this sub-part is blocked outright.** The remaining costs are
+placement, wall-clock, and one deterministic seam.
 
-Note the shape of that ten: **six of them are discharged wholly or partly by
+One row is worth separating from the totals because its status is different in
+kind: the divergent-codes record is not merely constructible, it is **already
+asserted and CI-executed** by `tests/lifecycle.rs:576-657` at `ci.yml:178-179`
+and `:187`. It is the only such row in the sub-part.
+
+Note the shape of that eleven: **six of them are discharged wholly or partly by
 enumeration**, because six of the fourteen records are statements about code that
 is missing — no lower bound at `:1031`, no `written` hook on a routed terminal,
 no request field in `HostTiming`, no capacity predicate distinguishing the two
@@ -200,7 +222,7 @@ accident.
 | `req_control_terminal_enqueued_with_a_written_hook` | One of the three control or teardown emissions attached a `written` hook (`:678-680`, `:814-816`, `:1474-1476`) | The complementary legal case, and the one that shows the crate knows how to condition an effect on delivery. Together the pair is the finding |
 | `req_publication_failed_after_a_recorded_settlement` | `publish_one` returned `Err` (`ring_transport.rs:564-566`) for a correlation whose `won` was already `true` | Legal: the two events are unordered by construction, and the record's whole point is that nothing relates them. Does **not** assert what the client then observed |
 | `req_response_accepted_at_the_length_gate` | A `RequestOutcome::Response` satisfied `body.len() <= MAX_BODY_LEN` at `:1031` and became a `Terminal::Response` | The ordinary success path. Recording that the length predicate is the whole gate is the finding; asserting the handler failed is not something dispatch can observe |
-| `req_output_buffer_was_reserved_and_unwritten` | An `OutputBuffer` reached `:1031` with a declared `exact_len` and nothing written into it | A legal state by construction (`handler.rs:381-396`). The independent companion to the check above, and what makes its silence meaningful |
+| `req_owned_output_buffer_was_reserved_and_unwritten` | An **owned** `OutputBuffer` reached `:1031` with `direct: None` and nothing written into it, so `len()` reports zero | A legal state by construction: the reservation starts empty (`dispatch.rs:537-542`) and `extend_from_slice`/`resize` are the only writers (`handler.rs:381-396`). The independent companion to the check above, and what makes its silence meaningful. Renamed and narrowed during disposition to exclude the direct shape, whose unwritten form declares a nonzero length and fails at `commit` instead |
 | `req_emit_rejection_acquired_a_busy_permit` | `emit_rejection` took one of the 32 `busy_rejects` permits (`connection.rs:244`) | The ordinary rejection path on a healthy generation. The precondition of the exhaustion arm |
 | `req_emit_rejection_found_the_busy_bound_exhausted` | `emit_rejection` reached `dispatch.rs:637-638` and cancelled the token then discarded the queue | A declared outcome the comment at `:630-636` argues for explicitly. Records the blast radius' precondition without asserting which other correlations lost frames |
 | `req_open_route_returned_without_a_terminal` | `open_route` returned through `:1164`, `:1174`, or `:1199` | Legal on all three: two are gated on the fatal latch, and the third is the specified `CloseWins` ordering. This is the counter the quiet-area section says does not exist |
@@ -223,15 +245,23 @@ defect is easier to name than its precondition.
   the guarantee is at-most-one, not exactly-one — so the pairing would encode the
   wrong contract and its marker could only fire by observing one of five
   deliberate exits. Assert `req_open_route_returned_without_a_terminal` and
-  `req_open_route_answered_its_correlation` as two independent legal facts, and
-  `req_request_join_error_was_not_a_panic` for the fifth exit.
+  `req_open_route_answered_its_correlation` as two independent legal facts for the
+  three control `route.open` exits (`:1164`, `:1174`, `:1199`),
+  `req_emit_rejection_found_the_busy_bound_exhausted` for the pre-dispatch exit
+  (`:637-638`), and `req_request_join_error_was_not_a_panic` for the one exit that
+  concerns an admitted routed request's settlement (`:1058`). **Note that the last
+  of those markers is owned by no record**: the classification added during
+  disposition established that `:1058` is the only silent exit about routed
+  settlement and that nothing in the catalog asserts its silence. Placing the
+  marker without a record behind it is legal and useful; it is also a gap, queued
+  in [portfolio-evaluation.md](portfolio-evaluation.md).
 - Do not pair `always(response_body_is_non_empty)` with
   `sometimes(empty_response_terminal)`. There is no such lower bound at `:1031`,
   so the `always` half is vacuous and the `sometimes` half would report the
   ordinary success path as a defect. Assert
   `req_response_accepted_at_the_length_gate` and
-  `req_output_buffer_was_reserved_and_unwritten` instead: two legal facts whose
-  conjunction is the finding.
+  `req_owned_output_buffer_was_reserved_and_unwritten` instead: two legal facts
+  whose conjunction is the finding.
 - Do not pair `always(settled_implies_delivered)` with
   `sometimes(settled_but_not_delivered)`. The host has no delivery signal at all
   on the routed path, so the second marker cannot be placed anywhere that could
@@ -314,13 +344,15 @@ zero CI execution of it.
    the writer at `ring_transport.rs:580-593`. Ranked here because it needs a
    handler shape the suite does not currently have, unlike tier 3's four.
 
-5. **`C8`, a draining host with both request kinds.** Two codes read from one
-   client discharges
-   `req-a-shutdown-rejects-routed-and-control-work-under-divergent-codes`, which
-   currently has no check at any level. Deterministic rather than racy, because
-   the write hook sets the fence inside the writer task (`:752-753`). Cheap, and
-   ranked below tier 4 only because it needs a two-request pipeline rather than a
-   single handler.
+5. **`C8`, a draining host with both request kinds. Already built.** Two codes
+   read from one client discharges
+   `req-a-shutdown-rejects-routed-and-control-work-under-divergent-codes`, and
+   `tests/lifecycle.rs:576-657` does exactly that and runs in CI
+   (`ci.yml:178-179`, `:187`). The original text said the record "currently has no
+   check at any level"; it has the sub-part's only CI-executed one. Deterministic
+   rather than racy, because the write hook sets the fence inside the writer task
+   (`:752-753`). This tier now costs nothing, and what it leaves open is an audit
+   of the existing check rather than the writing of a new one.
 
 6. **`C3`, a hostile `bind`.** A panicking `bind` reaches `dispatch.rs:1164`
    immediately and a blocking one reaches `:1174` under a shrunk
@@ -358,12 +390,15 @@ zero CI execution of it.
    race, so what is missing is the dispatch-level composition rather than the
    registry mechanics.
 
-10. **Observability of `gen.pending`.** Last, because it is the only fully
-    blocked record and it needs either a crate-internal test that constructs a
-    `GenerationCore` or a test-only accessor.
+10. **Observability of `gen.pending` from an integration binary.** Last, and
+    **demoted during disposition from a blocking capability to a convenience.**
     `req-a-every-pending-entry-is-removed-by-its-owner-or-its-route-close` is
     producible today through `tests/lifecycle.rs:678` and `:714` and assertable
-    nowhere. Note that its own open question — whether the forced path drops the
+    today from an in-crate test, because `pending` is `pub`
+    (`connection.rs:95`) and `connection.rs:946-963` already constructs a complete
+    `GenerationCore`. What a test-only accessor would buy is the ability to put the
+    oracle in an integration binary, which matters only if CI ever names one.
+    Note that its own open question — whether the forced path drops the
     `GenerationCore` immediately, making the leak unobservable and therefore
-    harmless — is answerable from sub-part 2f's `runtime.rs:1144-1244` without
-    any new capability, and that is the cheaper thing to do first.
+    harmless — is answerable from sub-part 2f's `runtime.rs:1144-1244` without any
+    new capability, and that is still the cheaper thing to do first.

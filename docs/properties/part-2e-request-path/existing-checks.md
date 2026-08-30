@@ -21,10 +21,11 @@ property from the catalog. Test adequacy belongs to
 
 ## The coverage fact that frames this inventory
 
-**37 in-crate tests and 84 integration tests reach this sub-part. CI names none
-of the binaries that carry them. But four `compile_fail` doctests do run, so 2e
-owns four of the six CI-executed source-resident checks in the whole `mc-host`
-library.**
+**37 in-crate tests and 84 integration tests reach this sub-part. Of the binaries
+that carry them CI names none, and four `compile_fail` doctests do run, so 2e owns
+four of the six CI-executed source-resident checks in the whole `mc-host`
+library. One catalog record additionally has a CI-executed check in a binary
+outside the six; see the correction under "Integration tests".**
 
 | Unit | Where | Lines | Tests | Executed in CI |
 | --- | --- | --- | --- | --- |
@@ -116,6 +117,23 @@ This is the load-bearing coverage observation. The sub-part is *well tested* and
 *barely gated*: 84 integration tests plus 37 in-crate tests is 121 claim-bearing
 checks, and the number CI executes is zero.
 
+> **Correction applied during disposition: one catalog record does have a
+> CI-executed check, and this inventory's own table above contains the evidence.**
+> The sentence "the number CI executes is zero" is true of the 121 checks counted
+> here. It is false as a statement about record coverage, which is how it was read
+> by the catalog and the fault map. `tests/lifecycle.rs:576-657`
+> `shutdown_refuses_new_routes_and_new_routed_work` sends a `route.open` and a
+> routed request into one draining host and asserts `target_unavailable` at `:638`
+> and `server_busy` at `:657` — which is
+> [req-a-shutdown-rejects-routed-and-control-work-under-divergent-codes](catalog.md#req-a-shutdown-rejects-routed-and-control-work-under-divergent-codes)
+> in full, in the record's own shape, including the parked handler that holds the
+> drain open (`:582`, `:590-606`). `lifecycle` is named at `ci.yml:178-179`
+> (Linux) and `:187` (macOS), so the check runs on two platforms. It is not in the
+> six-binary count because that count is by binary *subject*, and `lifecycle`'s
+> subject is the host lifecycle; the record it happens to assert belongs to 2e.
+> Counting by subject rather than by assertion is the mechanism of the error.
+> Status `unaudited`.
+
 The integration tests named by catalog records:
 
 | Site | Test | Record it serves |
@@ -138,6 +156,7 @@ The integration tests named by catalog records:
 | `tests/handler_contract.rs:229` | `a_rejected_bind_carries_the_handler_code_to_the_client` | route.open answering exits |
 | `:323` | `reservations_must_leave_one_general_slot_in_each_pool` | permit-pair bound |
 | `:636` | `zero_reservation_handlers_keep_single_pool_admission` | permit-pair bound |
+| `tests/lifecycle.rs:576` | `shutdown_refuses_new_routes_and_new_routed_work` | the divergent shutdown codes, in full and **in CI** (`ci.yml:178-179`, `:187`). Added during disposition; the record's `Existing check:` read `none` |
 
 One inventory note carried forward from lens B for a later pass:
 `tests/broca_subprocess.rs` is 3,220 lines and a grep for `#[test]` or
@@ -390,6 +409,16 @@ proves. The framing point that applies to all three: this is not thin coverage.
    [req-a-a-route-open-is-answered-unless-the-host-is-failing-or-draining](catalog.md#req-a-a-route-open-is-answered-unless-the-host-is-failing-or-draining),
    and
    [req-a-every-pending-entry-is-removed-by-its-owner-or-its-route-close](catalog.md#req-a-every-pending-entry-is-removed-by-its-owner-or-its-route-close).
+
+   **Ownership correction applied during disposition: one of the four exits is
+   owned by nothing.** The three records above cover `:637-638` (pre-dispatch),
+   `:1164`, `:1174`, and `:1199` (all three control `route.open` exits). The
+   fourth, `:1058`, is the *only* one of the five that concerns an admitted routed
+   request's settlement — it returns before the `settle` call at `:1063` — and no
+   record asserts its silence. The pending-entry record cites `:1059`, which is the
+   `remove_pending` on the same arm, so it covers the entry's removal and not the
+   missing terminal. Queued as a gap in
+   [portfolio-evaluation.md](portfolio-evaluation.md).
 
 3. **`routing.rs` holds 3 unconditional production panics in a process-global
    structure, and no check drives any of them.** `:184`, `:446`, and `:447-450`

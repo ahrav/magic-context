@@ -30,14 +30,21 @@ direct calls into `retire`, `settle_all`, `admit`, `validate_inbound`, or
 `dispatch` on a hand-built `Inner`. That is why the leverage ranking below puts
 direct-call oracles above every fault.
 
-**Third, one capability this sub-part needs does not exist anywhere in the tree,
-and it blocks three records.** There is no fake-host fixture that can hand the
-client a chosen inbound frame over the ring. `tests/support/echo_host.rs` (121
-lines) is a **real** in-process host with an echoing handler, and
-`tests/support/raw_client.rs` drives the **peer** side against a real host, which
-is the mirror image of what 2d needs. Verified by reading both. Any record whose
-required state is "a host, or a fake peer, that answers X" is therefore blocked at
-the fixture layer rather than at a fault seam.
+**Third, one capability this sub-part lacks does not exist anywhere in the tree,
+but it blocks less than this file originally claimed.** There is no fake-host
+fixture that can hand the client a chosen inbound frame over the ring.
+`tests/support/echo_host.rs` (121 lines) is a **real** in-process host with an
+echoing handler, and `tests/support/raw_client.rs` drives the **peer** side against
+a real host, which is the mirror image of what 2d needs. Verified by reading both.
+The original claim was that this blocks three records. **Disposition correction:
+it blocks none of them outright.** Two of the three are constructible by *forging*
+the frame instead of soliciting it: `inner.dispatch` takes an
+`(EnvelopeHeader, Vec<u8>, ByteCharge)` triple directly and
+`an_abandoned_control_open_releases_a_late_bound_route` (`client.rs:3503-3565`)
+already hand-builds a `route.open` control `Response` and feeds it in. The third
+was blocked on a premise that turned out to have no producer in the current host.
+What the missing fixture still costs is *end-to-end confirmation* against a real
+ring, which is a different and much weaker claim than first-time constructability.
 
 **Fourth, the correlation-exhaustion state needs a seeded allocator, not a
 fault.** This matters because it reads like the hardest thing on the list and is
@@ -62,7 +69,7 @@ parts, but neither is really a fault either, and each row says so.
 | **C2** a ring fault behind the bridge | `RingClientEndpoint::send` (`ring_transport.rs:659`) or `try_recv_with` (`:694`) returning `Err`, so the bridge thread breaks at `client.rs:1874` or `:1887` | **No.** There is no seam. The endpoint is constructed inside the thread closure by `attach_with_descriptors` (`:1855`) and is not injectable from outside, the thread's `JoinHandle` is discarded at `:1895` so nothing can even observe which break fired, and no in-crate test constructs the bridge at all (zero hits for `start_ring_bridge` in `mod tests`). Corrupting a real ring from the host side would work in principle but is 2b's `R4`, which that fault map records as having no host-side producer either. This is the single blocking capability for the comparison half of one record and the runtime half of another |
 | **C3** a host-originated `Cancel` | A well-formed pure-header `Cancel` frame arriving inbound, so `validate_inbound` falls to `_ => return Err(())` (`client.rs:2067`) | **Yes for the oracle, and no fault is needed.** `validate_inbound` (`:2006`) is a free function taking `&EnvelopeHeader`, and the test module already calls it directly at 41 sites, including `inbound_validation_enforces_the_direct_profile_table` (`:2658-2751`). A `Cancel` header is a value, so the classification claim is a one-line assertion. Only the *end-to-end* form — a real host emitting `Cancel` over the ring and the client retiring — needs the fake host this tree lacks, and that form is optional colour rather than the oracle |
 | **C4** correlation exhaustion | `Correlations::allocate` (`client.rs:1735-1739`) returning `None` after `u64::MAX`, so `admit` maps it to `correlations_exhausted` (`:1177-1183`) and `restore`'s `u64::MAX` clause (`:1742-1744`) becomes live | **Yes, and it is a seeded allocator rather than a fault.** Two existing tests already build the state: `max_correlation_is_used_once_then_exhausted` (`:2328`) and `real_admission_exhausts_after_max_without_second_charge_or_frame` (`:2338`), which drives a real `admit` from a seeded `Correlations`. Reaching the state through real traffic needs 2^64 admissions and is not the route. Note that neither existing test asserts anything about `retired`, which is the half the normative document requires (`docs/mc-host-wire-protocol.md:654`) and the half the code does not do |
-| **C5** route-map growth driven by a host | A host that binds every `route.open`, so `routes.insert(handle)` (`client.rs:507`) runs repeatedly, and a host that answers two distinct `route.open` correlations with one identical `(channel, epoch)` | **Partial, and the two halves differ.** *Growth: yes but pointless as an oracle.* `echo_host.rs` and `TestHost` bind real routes, so a loop can grow the set — but there is no ceiling to drive it toward, so the oracle is the **absent capacity predicate at `:507`**, which is an enumeration, not a growth test. *Duplicate bind: no through `open_route`.* A duplicate requires a host answering two correlations with one handle, which needs the fake host this tree lacks. The `HashSet` merge semantics and the already-cached early return (`:1576-1578`) are separately reachable on the synthetic inner, and `a_duplicate_bind_terminal_never_closes_an_owned_route` (`:3587`) already reaches the second |
+| **C5** route-map growth driven by a host | A host that binds every `route.open`, so `routes.insert(handle)` (`client.rs:507`) runs repeatedly, and two distinct `route.open` correlations answered with one identical `(channel, epoch)` | **Partial, and the two halves differ.** *Growth: yes but pointless as an oracle.* `echo_host.rs` and `TestHost` bind real routes, so a loop can grow the set — but there is no ceiling to drive it toward, so the oracle is the **absent capacity predicate at `:507`**, which is an enumeration, not a growth test. *Duplicate bind: yes, by forging rather than by soliciting.* Corrected during disposition: the duplicate does **not** need a host that answers two correlations with one handle, because `inner.dispatch` accepts a hand-built control `Response` and `client.rs:3503-3565` already does exactly that for a `route.open` body. Two `open_route` futures over a `Client` built on a synthetic `Inner` plus two forged responses carrying one `(channel, epoch)` produce the state. The `HashSet` merge semantics and the already-cached early return (`:1576-1578`) are separately reachable, and `a_duplicate_bind_terminal_never_closes_an_owned_route` (`:3587`) already reaches the second |
 | **C6** a bridge-thread panic | A panic escaping the closure spawned at `client.rs:1854`, so the thread dies without reaching `:1890-1893` | **No, and it is unobservable as well as uninjectable.** There is no `catch_unwind` anywhere in `1-2264`, the thread's handle is discarded at `:1895`, and the thread is the sole producer of write completions (`:1872`), so a panic there is silent: every outbound frame then waits out its own `frame.deadline` at `:1960` and the setup socket closes by process teardown rather than by the goodbye at `:1891`. Contrast the reader task, where a panic **is** reachable in principle through the two `unreachable!()` arms (`:1440`, `:1457`) but is swallowed by `join_tasks_until`'s `let _ = task.await` (`:1691`) with no `retire`. Both need an injectable panic point that does not exist |
 
 Two availability caveats cut across the classes.
@@ -106,8 +113,8 @@ resolution in `catalog.md` for the full argument.
 
 | Property | Required faults and enabling state | Non-vacuous today |
 | --- | --- | --- |
-| client-a-a-ring-failure-departs-the-setup-socket-as-a-clean-goodbye | **No fault for the check as written.** The claim is that the post-loop block at `:1890-1893` is outside every `break` and branches on nothing, which is a structural read of the closure spawned at `:1854`, plus the host-side gate at `connection.rs:200` calling `record_peer_death()` only when `close != PeerClose::Goodbye`. Both were printed and confirmed. The **runtime confirmation** — force a ring failure, then observe whether the host's counter fired — needs `C2` | **Yes** for the primary oracle; **No** for the runtime confirmation. This is the record where enumeration proves the finding and a fault would only illustrate it |
-| client-a-a-close-completes-before-its-setup-goodbye-is-written | Two independent preconditions, per the coverage rule: (a) `close()` returned with `within_deadline == true`, which `close_rejects_new_sends` (`tests/client.rs:228`) already produces against a real host in CI; and (b) the bridge thread still inside its loop body or its 50 µs sleep (`:1886`) at that instant. (a) is free. (b) has **no observation point**: the handle is discarded at `:1895` and the thread exposes no status channel | **Partial** — the ordering occurs on essentially every close today, and precondition (a) is already CI-protected, but (b) cannot be witnessed without retaining the `JoinHandle` or adding a test-only status hook. The record is the sub-part's one `sometimes` and it is unwitnessable rather than unreachable |
+| client-a-a-ring-failure-departs-the-setup-socket-as-a-clean-goodbye | **No fault for the attempt; the consequence needs more.** The structural claim — that the post-loop block at `:1890-1893` is outside every `break` and branches on nothing — is a read of the closure spawned at `:1854` and is discharged today. The *consequence* is not: `:1890` is `if let Ok(goodbye)` and `:1891` is `let _ = setup.write_all(..)`, so delivery is unproven, and the host's watcher is a `biased` select whose first arm is `peer_read_cancel.cancelled()` (`connection.rs:196-198`), so a generation already retired from ring evidence never evaluates `close != PeerClose::Goodbye` at all. Asserting the under-count needs the write to have landed *and* the watcher to have been armed, plus `C2` to force the fault | **Partial** — moved from `Yes` during disposition, and the only pessimistic movement in this pass. The `Check:` as written is discharged by enumeration; the `Impact:` is conditional on two facts this sub-part cannot establish |
+| client-a-a-close-completes-before-its-setup-goodbye-is-written | Two independent preconditions, per the coverage rule: (a) `close()` returned with `within_deadline == true`, which `close_rejects_new_sends` (`tests/client.rs:228`) already produces against a real host in CI; and (b) the bridge thread still inside its loop body or its 50 µs sleep (`:1886`) at that instant. (a) is free. (b) has **no observation point** for the *ordering*: the handle is discarded at `:1895` and the thread exposes no status channel. Partial credit added during disposition for the thread's *termination*, which `tests/shm_soak.rs:35-52` and `tests/shm_failure_modes.rs:193-210` observe through the process thread count after real close cycles, in CI at `ci.yml:130-135` | **Partial** — unchanged verdict, better characterised. The ordering occurs on essentially every close, (a) is CI-protected, and the thread's exit is now known to be CI-observed; what remains unwitnessable is the instant of (b), which needs the `JoinHandle` retained or a test-only status hook |
 
 ### In-flight work
 
@@ -120,7 +127,7 @@ resolution in `catalog.md` for the full argument.
 
 | Property | Required faults and enabling state | Non-vacuous today |
 | --- | --- | --- |
-| client-a-a-dropped-pong-is-never-observable-to-the-client | An `encode_owned_frame` failure for a pure-header `Pong` whose flags `validate_inbound` already accepted, so `send_control` returns `Err` from its encode branch (`:1329-1335`) — the one `send_control` path that does not retire — while called from the `Ping` arm's `let _ = self.send_control(...)` (`:1390`). Lens A could not construct such a failure and recorded the reachability as unresolved, which is why the record is `medium` and not `high` | **No** — and the blocker is not a seam but an open question: whether that branch is reachable at all. If `encode_owned_frame` cannot reject a flag byte `validate_inbound:2073-2080` accepted, the record downgrades. Resolving it needs the `wire.rs` read that 2b owns |
+| client-a-a-failed-pong-enqueue-retires-the-generation-as-a-local-fault | **No fault seam, and the original recipe was impossible.** The encode branch (`:1329-1335`) cannot be entered for a `Pong`: `encode_owned_frame` (`wire.rs:571-601`) fails only on `body.len() > MAX_BODY_LEN` and the call passes `Vec::new()`. The record now targets the two branches that *do* run, both of which retire: exhaust `control_budget` (`:399`, funded by `CLIENT_CONTROL_QUEUED_BYTES` at `:76`) to reach `:1340-1347`, or fill `control_tx` to reach `:1355-1361`. Then deliver a `Ping` so the failure arrives through the `let _ =` at `:1390`. `control_exhaustion_retires_and_releases_all_queued_bytes` (`:3196`) already drives the charge branch from another caller | **Yes** — moved from `No` during disposition. The blocker was an unresolved reachability question about a branch that is provably unreachable; removing it leaves two constructible branches with an existing fixture for one of them |
 | client-a-pong-egress-is-not-bounded-by-any-client-side-liveness-budget | The bridge parked in `read_tx.blocking_send` (`:1882`) with the 256-slot inbound channel full — `CLIENT_DATA_QUEUE_FRAMES = 256` (`:59`) was printed and confirmed as the capacity at `:1850` — plus one control frame enqueued at `:1355`. Filling that channel requires `ring_reader_loop` to stop draining it, and the reader is spawned internally with no stall seam. Then a bounded fault-free window per METHOD's liveness rule: release the stall and poll until the write completes within one `frame.deadline` (`:1353`, 30 s per `:45`) | **No** — the precondition needs a way to stall the client's own reader task, which does not exist. `data_saturation_never_starves_a_control_frame` (`:3225`) covers queue-slot starvation, a different mechanism, and reaches admission rather than egress |
 
 ### The route cache
@@ -128,14 +135,14 @@ resolution in `catalog.md` for the full argument.
 | Property | Required faults and enabling state | Non-vacuous today |
 | --- | --- | --- |
 | client-a-live-route-handles-are-bounded-only-by-the-host | **No fault.** The check is the absence of a capacity predicate on the insert path: `routes.insert(handle)` (`:507`) tests only `closed` (`:501`), a grep for `CLIENT_MAX_LIVE_ROUTES` returns zero hits, and the two `CLIENT_MAX_*` constants that exist (`:53`, `:55`) are consulted at `:1169` and `:1058` instead. All three facts were re-verified here. Driving real growth through `C5` is possible and proves nothing extra, because there is no ceiling to compare against | **Yes** — enumeration only. Note that the oracle proves an **absence**, so it is discharged by a census over the insert path rather than by a test that passes |
-| client-a-a-duplicate-host-bind-collapses-two-routes-into-one-handle | Three clauses with different costs. The **set semantics** — a repeated insert returns `false` and leaves the set unchanged, so `settle_route` (`:1623`) can remove it at most once — is a property of `HashSet<RouteHandle>` (`:944`) and provable on a synthetic inner. The **cleanup block** — `release_stranded_route` returning early at `:1576-1578` when the route is already cached — is already reached by `a_duplicate_bind_terminal_never_closes_an_owned_route` (`:3587`). The **two-successful-opens** clause needs `C5`'s duplicate half, which needs a host answering two correlations with one `(channel, epoch)` | **Partial** — two of three clauses are constructible on the existing harness today; the clause that makes the record's guarantee concrete needs the fake host this tree lacks |
+| client-a-a-duplicate-host-bind-collapses-two-routes-into-one-handle | Three clauses, and **all three are constructible on the synthetic inner** once the duplicate is forged rather than solicited. The **set semantics** — a repeated insert returns `false` and leaves the set unchanged, so `settle_route` (`:1623`) can remove it at most once — is a property of `HashSet<RouteHandle>` (`:944`). The **cleanup block** — `release_stranded_route` returning early at `:1576-1578` when the route is already cached — is already reached by `a_duplicate_bind_terminal_never_closes_an_owned_route` (`:3587`). The **two-successful-opens** clause needs two `open_route` futures over a `Client` built on a synthetic `Inner` (the struct literal at `:431` is reachable from `mod tests`) plus two forged control `route.open` `Response` bodies carrying one `(channel, epoch)`, fed through `inner.dispatch`. That exact forging already exists: `an_abandoned_control_open_releases_a_late_bound_route` (`:3503-3565`) hand-builds `{"op":"route.open","route_channel":..,"route_epoch":..}` at `:3547-3552` and dispatches it at `:3553-3565` | **Yes** — moved from `Partial` during disposition. The earlier `Partial` said this clause "needs the fake host this tree lacks", which contradicted leverage item 5 of this same file (`:326-331`), which proposes the forging route. Leverage item 5 was right |
 
 ### Host answers taken as proof
 
 | Property | Required faults and enabling state | Non-vacuous today |
 | --- | --- | --- |
 | client-a-host-shutdown-success-rests-only-on-a-json-echo | **No fault for the check as written.** The acceptance predicate is total over responses: `host_shutdown` (`:576-615`) returns `Ok(())` if and only if the body parses as JSON with `op == "host.shutdown"` (`:598-606`), else `invalid_shutdown_response` (`:607-613`). Feeding it a chosen control `Response` body on a synthetic inner exercises both arms. The **"the stop was not real"** demonstration — answer the echo, keep serving, show the caller's next operation succeeds — needs a fake host | **Yes** for the predicate. Worth flagging that nothing exercises `host_shutdown` at any level today: no in-crate test calls it, and the six integration tests stop the host through `host.shutdown_gracefully()`, a harness path. So this is a `Yes` with zero existing coverage behind it |
-| client-a-route-open-retries-treat-four-host-terminals-as-proof-of-no-bind | A fake peer that answers `route.open` with `Error{code:"module_timeout"}` and then **also** binds a route and emits a late `Response` on `0/0`, so host-side binds can be counted against client-side handles and `release_stranded_route` (`:1572`) can be checked for reclamation. Needs the fake host. And the record's premise — whether `module_timeout` is authoritative that no bind occurred — is a host-side question its own open question leaves unresolved | **No** — blocked twice over, at the fixture layer and at an unresolved contract question. The retry predicate itself (`:511-525`, four codes, 25 ms doubling backoff capped at 500 ms inside a 30 s absolute deadline) is verifiable by reading, but that is not the record's claim |
+| client-a-route-open-retries-treat-four-host-terminals-as-proof-of-no-bind | **Restated during disposition; no fault, and the original recipe has no producer.** The check as restated is an enumeration over the host's bind exits at `dispatch.rs:1177-1238`: `Installed` emits success (`:1178-1193`), `CloseWins` emits nothing (`:1195-1202`), `Reject` calls `take_rejected_bind` (`:1219`, cancelling and marking `Closing` per `routing.rs:191-205`) *before* `emit_error_terminal` (`:1229-1236`), and the stopped-callback arm emits nothing (`:1164-1170`). So no exit both installs a bind and answers with an error. `module_timeout` has no producer anywhere outside the client's own allowlist (`client.rs:518`), by grep. The **original** recipe — a peer that answers a retried code *and* binds — therefore requires a non-conforming peer, which is a fake host plus a framing decision | **Yes** for the restated check, by enumeration; moved from `No`. The blocked half is now explicitly a test of the client against a host protocol violation, which the biases section refers to a human rather than to a fixture |
 
 ### Inbound classification
 
@@ -144,22 +151,27 @@ resolution in `catalog.md` for the full argument.
 | client-a-a-host-originated-cancel-retires-the-generation | **No fault**, per `C3`. `validate_inbound` (`:2006`) is a free function and the test module calls it directly at 41 sites, so asserting that a `Cancel` header falls to `_ => return Err(())` (`:2067`) is one line, and asserting that `ring_reader_loop:1979` turns that into `retire("protocol_violation")` is a second read of an already-enumerated path. The end-to-end form needs the fake host and is optional | **Yes** — and it is currently unasserted. This synthesis verified that `inbound_validation_enforces_the_direct_profile_table` (`:2658-2751`) mentions exactly one of the five residue types, `FrameType::Request` at `:2750`, and says nothing about `Cancel` |
 | client-a-the-unmatched-inbound-frame-arm-is-never-entered-in-production | **No fault.** Two things asserted together: a marker at `:1557` that must not fire during any production-path campaign, and the independent observation that `validate_inbound` returned `Err` for the same five frame types (`Request`, `Cancel`, `Pong`, `Hello`, `HelloAck`, per `wire.rs:52-63`). `dispatch`'s only non-test caller is `:1982`, so the production path is a single edge to check | **Yes** — enumeration plus a never-firing marker. Note the marker's placement constraint below: it belongs at the classification point, not after it |
 
-**Totals: 8 fully non-vacuous today, 3 partial, 3 not constructible.** The eight
-are both retirement-cause records' static halves — specifically
-`client-a-a-retired-generation-forgets-why-it-retired` in full — plus the
-ring-failure departure record, both in-flight-work records, the route-bound
-record, the `host_shutdown` predicate, and both inbound-classification records.
-The three partial ones are the `eof` comparison, the close-ordering `sometimes`,
-and the duplicate-bind record. The three blocked ones are the dropped `Pong`
-(blocked on an unresolved reachability question), the `Pong` egress bound (no
-reader stall seam), and the route-open retry record (no fake host, plus an
-unresolved host-side premise).
+**Totals: 10 fully non-vacuous today, 3 partial, 1 not constructible.** Revised
+during disposition from 8 / 3 / 3; see
+[portfolio-evaluation.md](portfolio-evaluation.md) for the four row moves. The ten
+are `client-a-a-retired-generation-forgets-why-it-retired` in full, both
+in-flight-work records, the route-bound record, the `host_shutdown` predicate,
+both inbound-classification records, the reframed failed-`Pong`-enqueue record,
+the duplicate-bind record, and the restated route-open retry record. The three
+partial ones are the `eof` comparison, the close-ordering `sometimes`, and the
+ring-failure departure record, whose consequence was demoted from proved to
+conditional. The one blocked record is the `Pong` egress bound, which still has no
+reader-stall seam.
 
-Note the shape of that eight: **six of them need no fault at all**, because six of
-the fourteen records are statements about code that is missing or about a total
-classification function, not about code that misbehaves under stress. That is
-what cataloging a post-refactor client surface for the first time produces, and it
-is the same shape 2b reported.
+Note the shape of that ten: **eight of them need no fault at all.** The earlier
+text said six, which undercounted by two: every one of the eight rows that carried
+a `Yes` before this disposition opens with "No fault", and the two rows that moved
+to `Yes` need no fault either. Counting the rows that prescribe no fault or a pure
+enumeration over the whole table gives ten of fourteen. That is what cataloging a
+post-refactor client surface for the first time produces — most of these records
+are statements about code that is missing, about a total classification function,
+or about an ordering readable in another file — and it is the same shape 2b
+reported.
 
 ## Coverage checks to add
 
@@ -192,7 +204,8 @@ rather than a new check.
 | `client_settle_all_took_a_non_empty_pending_map` | `settle_all` executed `std::mem::take` (`:1651-1652`) over a non-empty map under the `admission` mutex | The designed bulk-settlement path. The precondition of the per-identity exactly-once oracle |
 | `client_cancel_classification_lost_the_queued_cas` | `cancel_classification`'s `QUEUED -> CANCELLED` compare-exchange (`:2225`) failed, so `classify` (`:2215`) ran instead | Legal and the expected outcome whenever the writer's `claim_for_write` (`:1939-1945`) won the race. It is the precondition of `OutcomeUnknown` being correct, not of anything being wrong |
 | `client_correlations_restore_rewound_the_last_allocation` | `restore` (`:1741-1747`) matched its guard and rewound `self.next` | Legal by design on both call sites (`:1196`, `:1209`), each of which precedes any delivery to `data_tx`. Records the rewind without asserting that a rewound value reached the wire |
-| `client_send_control_returned_err_from_its_encode_branch` | `send_control` returned `Err` from `:1329-1335`, the one path that does not retire | Legal if reachable at all, which is the record's own open question. A marker here answers that question as a side effect, which is why it is worth placing even though it may never fire |
+| `client_send_control_returned_err_from_a_retiring_branch` | `send_control` returned `Err` from the charge branch (`:1340-1347`) or the try-send branch (`:1355-1361`), both of which retire | Legal: both are the specified behaviour on reserved-control exhaustion, and the comment at `:1336-1339` argues for exactly this pool choice. Renamed and retargeted during disposition: the original marker named the encode branch (`:1329-1335`) as "the one path that does not retire", and that branch is unreachable for a pure-header frame, so a marker there could never fire and its silence would have proved nothing |
+| `client_ping_arm_discarded_a_send_control_error` | The `let _ = self.send_control(FrameType::Pong, ..)` at `:1390` received an `Err` | Legal by construction, since the call site binds the result to `_`. The independent companion to the marker above: together they witness that a probe went unanswered and that nothing at the probe's own call site recorded it |
 | `client_bridge_thread_parked_in_blocking_send` | The bridge entered `read_tx.blocking_send` (`:1882`) on a full 256-slot channel | Ordinary backpressure, and exactly the design the reserved control pool exists to survive on the admission side. The precondition of the egress bound, not a claim that the bound was exceeded |
 | `client_route_insert_returned_false` | `routes.insert(handle)` (`:507`) returned `false`, so the handle was already present | A legal `HashSet` outcome. Records the merge without asserting cross-caller interference |
 | `client_route_open_inserted_without_a_capacity_test` | A successful `open_route` reached `:507` having consulted `closed` (`:501`) and no length predicate | True of every insert today and legal, since no cap exists. This is the honest form of the unbounded-routes finding: a fact about the code path, not an outcome |
@@ -329,6 +342,13 @@ has a CI-protected integration binary to put new oracles into.
    control `Response` bodies carrying one `(channel, epoch)`. Ranked below tier 3
    because it needs a body-construction helper the suite does not have, and
    `parse_route_open` (`:2167-2206`) validates only shape so the helper is small.
+   **Disposition note: the helper largely exists.**
+   `an_abandoned_control_open_releases_a_late_bound_route` (`:3503-3565`) already
+   builds a `route.open` response body by hand at `:3547-3552` and dispatches it
+   at `:3553-3565`, so this tier is a copy plus a second `open_route` future over
+   a `Client` built on the synthetic `Inner`. This item is also what corrected the
+   map row above, which had claimed the same clause needed a fake host. Two places
+   in one file disagreed and the ranking was right.
 
 6. **A bridge-thread observation point.** Retaining the `JoinHandle` in `Inner`,
    or exposing a test-only thread-state signal, supplies precondition (b) of
@@ -355,15 +375,20 @@ has a CI-protected integration binary to put new oracles into.
 
 9. **A fake host that answers chosen frames.** The expensive item, and the one
    this tree has no starting point for: `echo_host.rs` is a real host and
-   `raw_client.rs` is the peer side. Building it would unblock
-   `client-a-route-open-retries-treat-four-host-terminals-as-proof-of-no-bind`
-   outright and give the duplicate-bind, `host_shutdown`, and `Cancel` records
-   their end-to-end forms. Two cautions before anyone starts. First, three of
-   those four records already have a cheaper valid oracle in tiers 3 and 5, so the
-   fake host buys end-to-end confirmation rather than first-time constructability.
-   Second, the retry record additionally depends on an unresolved host-side
-   question — whether `module_timeout` proves no bind occurred — so a fake host
-   alone does not make it decidable; the 2e control-handler pass does.
+   `raw_client.rs` is the peer side. It would give the retry, duplicate-bind,
+   `host_shutdown`, and `Cancel` records their end-to-end forms. Three cautions
+   before anyone starts, the third added during disposition. First, all four of
+   those records already have a cheaper valid oracle in tiers 2, 3, and 5, so the
+   fake host buys end-to-end confirmation rather than first-time constructability;
+   the original text said "three of those four", and after the retry record was
+   restated it is four of four. Second, the retry record's remaining half needs a
+   peer that answers a retried terminal *after* installing a bind, which no
+   conforming host does — `take_rejected_bind` runs before `emit_error_terminal`
+   at `dispatch.rs:1219` and `:1229` — so the fixture would be simulating a host
+   protocol violation. Third, and consequently, building it is downstream of a
+   framing decision a human owns: whether defending this client against a lying
+   host is in scope at all. See the biases section of
+   [portfolio-evaluation.md](portfolio-evaluation.md).
 
 10. **An injectable panic point.** Last, because it serves the two records this
     catalog does **not** contain: a bridge-thread panic (`C6`) and a reader-task

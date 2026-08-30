@@ -44,8 +44,11 @@ That matters because `cargo test -p mc-host --doc` **does** run, at `ci.yml:190`
 under the step name "Rust lease non-escape", and it builds the lib target's
 doctests. Sub-part 2b has exactly two, both `compile_fail`
 (`frame_channel.rs:296-301` and `:303-308`), and they are its only CI-executed
-source-resident checks. 2d has no equivalent. The sub-part's entire CI-executed
-coverage is the six integration tests in `crates/mc-host/tests/client.rs`.
+source-resident checks. 2d has no equivalent. The sub-part's CI-executed coverage
+is the six integration tests in `crates/mc-host/tests/client.rs`, plus the two
+thread-count assertions in `tests/shm_soak.rs` and `tests/shm_failure_modes.rs`
+recorded below. The original text said "entire ... is the six", which omitted the
+latter two.
 
 One count correction so a later pass does not repeat it. An initial pass of this
 synthesis counted 38 in-crate tests by grepping `#[test]` and `#[tokio::test]`
@@ -167,6 +170,23 @@ subject, and three of the seven are CI-named.** Counted by grepping each of the
 The shared harness also constructs the client: `tests/support/mod.rs` at 3 sites
 and `tests/support/synapse.rs` at 1. So **8 of the 24 integration binaries touch
 `client.rs` at all**, and 4 of those 8 are CI-named.
+
+> **Two fixture binaries carry a claim-bearing assertion about this sub-part, and
+> this inventory originally credited neither.** Added during disposition.
+> `shm_soak.rs` and `shm_failure_modes.rs` were counted above by their
+> `Client::connect` occurrences and classified as fixture users, which is how a
+> real check went unrecorded. Both assert that the process **thread count returns
+> to a post-close baseline** after real connect-and-close cycles:
+> `shm_soak.rs:35-52` (`wait_for_envelope`, called after each `cycle` at
+> `:54-92`) and `shm_failure_modes.rs:193-210` (`assert_resources_return_to`,
+> called twice by `clean_close_returns_exact_single_connection_capacity` at
+> `:218-230`). The client's detached bridge thread (`client.rs:1852-1895`) is one
+> of those threads, so a thread that never exited would fail both assertions
+> inside their budgets. Both are CI-executed at `ci.yml:130-135`. This is the only
+> CI-executed evidence in the sub-part about the bridge thread, and it covers
+> termination only: not which `break` fired, not the goodbye write, not the spin.
+> Status `unaudited` for both. See quiet area 1 below and
+> [portfolio-evaluation.md](portfolio-evaluation.md).
 
 Two support fixtures bear on constructability and are recorded here because a
 later pass will look for them. `tests/support/echo_host.rs` (121 lines) is an
@@ -383,22 +403,44 @@ coverage. The 40 in-crate tests are dense and well built, and the six integratio
 tests are real end-to-end peer exercises. What is quiet is a specific seam in each
 case.
 
-1. **The bridge OS thread is unjoined, unobserved, and untested by anything.**
-   `client.rs:1852-1895` spawns it, discards the handle (the only combinator
-   applied to `spawn`'s result is `.map_err` at `:1895`), and the file has no
-   other reference to it. It owns three things nothing else can reach: the ring
-   attach (`:1855`), the completion signal every outbound frame waits on
-   (`:1872`), and the setup-socket departure the host reads as its peer-death
-   discriminator (`:1890-1893`). No in-crate test constructs it — zero hits for
-   `start_ring_bridge` in `mod tests` — and no integration test observes it,
-   because the six `tests/client.rs` tests exercise it only transitively and none
-   inspects the setup socket or thread state. Three separate normative claims
-   depend on it: that a clean `Goodbye` and an unexpected setup-socket loss are
-   distinct (`:296`, `:691`), that connection close is a bounded joined teardown
-   (`:691`, `:741`), and that Ping/Pong is owned independently of application
-   waits (`:683`). All three are unchecked at that seam. It also busy-polls at 50
-   microseconds (`:1886`) for the life of every connection, spinning an OS thread
-   at roughly 20 kHz, which nothing measures. Owned by
+1. **The bridge OS thread is unjoined, and everything about it except its
+   termination is unobserved.** `client.rs:1852-1895` spawns it, discards the
+   handle (the only combinator applied to `spawn`'s result is `.map_err` at
+   `:1895`), and the file has no other reference to it. It owns three things
+   nothing else can reach: the ring attach (`:1855`), the completion signal every
+   outbound frame waits on (`:1872`), and the setup-socket departure the host reads
+   as its peer-death discriminator (`:1890-1893`). No in-crate test constructs it —
+   zero hits for `start_ring_bridge` in `mod tests` — and none of the six
+   `tests/client.rs` tests inspects the setup socket or thread state.
+
+   **Correction applied during disposition: the original claim that it is
+   "untested by anything" was false, and the counter-evidence was already in this
+   file's own fixture table.** Two CI-executed integration tests observe the
+   thread's **exit** through the process thread count. `tests/shm_soak.rs` drives a
+   real `Client::connect` / `open_route` / `request` / `close_route` / `close`
+   cycle (`:54-92`) and then polls `wait_for_envelope` (`:35-52`) until `threads`
+   equals a post-close baseline; `tests/shm_failure_modes.rs` does the same through
+   `assert_resources_return_to` (`:193-210`), called twice by
+   `clean_close_returns_exact_single_connection_capacity` (`:218-230`) around a
+   real connect and close. A bridge thread that never left its loop at `:1866`
+   would hold the count above baseline until the budget expired and fail both. Both
+   run in CI: `ci.yml:130-135` is one "Mandatory ring client suite" step whose
+   three commands are `--test client`, `--test shm_failure_modes` (unfiltered, so
+   `:218` runs), and `--test shm_soak` filtered to
+   `short_soak_keeps_fd_mapping_thread_and_rss_envelopes_bounded`, which is the
+   test that calls `run_soak` and therefore `cycle`.
+
+   So the seam is narrower than recorded and still real. What no check reaches:
+   which of the five `break`s fired, whether `:1891` wrote anything, whether the
+   goodbye's content distinguished the cause, and the 50-microsecond busy-poll
+   (`:1886`, roughly 20 kHz per idle connection). Of the three normative claims
+   that depend on this thread, one now has partial evidence — connection close as a
+   bounded joined teardown (`:691`, `:741`) is contradicted rather than unchecked,
+   since `join_tasks_until` demonstrably does not join this thread while the tests
+   above show it does eventually exit — and two remain unchecked at that seam: that
+   a clean `Goodbye` and an unexpected setup-socket loss are distinct (`:296`,
+   `:691`), and that Ping/Pong is owned independently of application waits
+   (`:683`). Owned by
    [client-a-a-close-completes-before-its-setup-goodbye-is-written](catalog.md#client-a-a-close-completes-before-its-setup-goodbye-is-written),
    [client-a-a-ring-failure-departs-the-setup-socket-as-a-clean-goodbye](catalog.md#client-a-a-ring-failure-departs-the-setup-socket-as-a-clean-goodbye),
    and
@@ -454,8 +496,13 @@ Stated so a later pass knows what was and was not looked at.
   well covered and merely well tested. Carried forward unresolved from
   `../part-2-rescope/scope-map-and-risk-ranking.md:750-752`.
 - The seven fixture binaries were counted by `Client::connect` occurrences, not
-  read. Their tests may contain checks relevant to catalog records; this inventory
-  establishes only that they construct a client and which of them CI names.
+  read. **That sampling choice produced a false claim, and the correction is
+  recorded above rather than hidden here:** `shm_soak.rs` and
+  `shm_failure_modes.rs` each carry a thread-count assertion that bears directly
+  on the bridge-thread quiet area, and counting occurrences instead of reading the
+  bodies is exactly why quiet area 1 originally said the thread was "untested by
+  anything". The remaining five fixture binaries are still unread, so the same
+  class of omission may survive in them.
 - `tests/support/echo_host.rs` was read only far enough to establish that it runs
   a real host with an echoing handler and cannot forge an inbound frame. Its
   remaining 100 lines were not examined.

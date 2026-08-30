@@ -92,23 +92,35 @@ Eight cause categories, spelled with ten distinct literals — `connection_goodb
 `owner_drop` (`:744`), `owner_close_dropped` (`:766`), and `shutdown_timeout`
 (`:676`) — collapse to two constants.
 
-**The peer-death counter is uncorrelated with reality in both directions.** The
-bridge thread writes a setup-socket goodbye unconditionally after every exit.
-`:1890-1893` runs `encoded_goodbye` then `shutdown(Both)` outside the `while`
-loop that closes at `:1889`, with no branch on why the loop ended, so a client
-whose ring collapsed departs looking clean. On the host side
+**The peer-death counter can under-report, and the over-report direction does not
+hold.** The bridge thread attempts a setup-socket goodbye unconditionally after
+every exit. `:1890-1893` runs `encoded_goodbye` then `shutdown(Both)` outside the
+`while` loop that closes at `:1889`, with no branch on why the loop ended, so a
+client whose ring collapsed attempts to depart looking clean. On the host side
 `connection.rs:199-206` observes that socket and calls `record_peer_death()`
-**only** when `close != PeerClose::Goodbye` (`:200`), which this synthesis
-printed and confirmed. So the host skips its peer-death record even on a real
-ring fault. The inverse also holds: `close()` cancels at `:711` and then joins
-only the two Tokio tasks (`join_tasks_until`, `:1677-1695`, iterating
-`[&self.writer, &self.reader]` at `:1682`), while the detached bridge thread
-observes cancellation only at the top of its next iteration, so a clean owner
-close can outrun its own goodbye and present to the host as an abrupt EOF. And
-sub-part 2b established the other end of the same blind spot: a host that cannot
-create shared-memory objects reports `state: "healthy"` with `error_class: null`
-while refusing every connection. Neither side of this connection retains the
-diagnosis.
+**only** when `close != PeerClose::Goodbye` (`:200`), which this synthesis printed
+and confirmed. So the host can skip its peer-death record even on a real ring
+fault. Two qualifications were added during disposition and both narrow the claim.
+The write is best-effort with its result discarded (`:1890` is `if let Ok(..)`,
+`:1891` is `let _ = setup.write_all(..)`), so an *attempt* is not a delivery. And
+the host's watcher is a `biased` select whose first arm is
+`peer_read_cancel.cancelled()` (`connection.rs:196-198`), so a generation already
+retired from ring evidence stops watching the socket regardless of what arrives on
+it.
+
+**The inverse does not hold, and the original catalog claimed it did.** A clean
+owner close does not present to the host as an abrupt EOF. `close` sends a ring
+channel-0 `Goodbye` through `send_control_wait` (`:702`) and returns from it only
+after the writer's completion channel resolved and the ack fired (`:1957-1971`),
+so the goodbye reaches the ring *before* `cancel.cancel()` at `:711`; and the
+setup socket is moved into the bridge closure at `:1854`, so `close` returning
+closes nothing the host is reading. What survives is an unjoined teardown:
+`close` returns while a detached OS thread still owns the socket, the ring attach,
+and the write-completion channel, which is a gap against protocol `:691`'s
+"followed by joined ring teardown and setup-socket close" rather than a
+misattribution. Sub-part 2b established a genuinely adjacent blind spot on the
+other end: a host that cannot create shared-memory objects reports
+`state: "healthy"` with `error_class: null` while refusing every connection.
 
 **In-flight requests are handled correctly.** This is the strong part and it is
 worth stating plainly, because the rest of this section is failure attribution.
@@ -156,10 +168,24 @@ correlations, handler tasks, queued requests, and aggregate buffered bodies."
 idle connection spins an OS thread at roughly 20 kHz for its whole lifetime. It
 owns three things nothing else can reach — the ring attach (`:1855`), the
 completion signal every outbound frame waits on (`:1872`), and the setup-socket
-departure the host reads as its peer-death discriminator (`:1890-1893`) — and it
-is tested at no level. A grep of `mod tests` for `start_ring_bridge`,
-`RingClientEndpoint`, `Client::connect`, or `TestHost` returns zero hits, and none
-of the six integration tests observes the thread or the socket.
+departure the host reads as its peer-death discriminator (`:1890-1893`).
+
+**Correction applied during disposition: the thread is not untested at every
+level, and the original text said it was.** The in-crate half of that claim holds:
+a grep of `mod tests` for `start_ring_bridge`, `RingClientEndpoint`,
+`Client::connect`, or `TestHost` returns zero hits, and none of the six
+`tests/client.rs` integration tests observes the thread or the socket. But two
+CI-executed integration tests do observe its **exit**, indirectly and genuinely.
+`tests/shm_soak.rs` runs a real `Client::connect`/`open_route`/`request`/`close`
+cycle (`:54-92`) and then polls `wait_for_envelope` (`:35-52`) until the process
+thread count equals a post-close baseline; `tests/shm_failure_modes.rs` does the
+same through `assert_resources_return_to` (`:193-210`) in
+`clean_close_returns_exact_single_connection_capacity` (`:218-230`). A bridge
+thread that never left its loop would hold the count above baseline and fail both
+assertions inside their budgets. Both run in CI at `ci.yml:130-135`
+("Mandatory ring client suite"). What remains genuinely unobserved is everything
+except termination: which `break` fired, whether `:1891` wrote anything, and the
+50-microsecond spin, none of which any check reaches.
 
 **Coverage: 40 in-crate tests, none in CI, all driving a synthetic inner.** The
 count was re-derived here by grepping `#[test]` and `tokio::test` from `:2266`
@@ -192,7 +218,11 @@ and asserts on the client's own observable behaviour.
 "Rust lease non-escape", and it builds the lib target's doctests. Sub-part 2b has
 two `compile_fail` doctests (`frame_channel.rs:296-301`, `:303-308`) and they are
 its only CI-executed source-resident checks. 2d has no equivalent. The sub-part's
-entire CI-executed coverage is the six integration tests.
+entire CI-executed coverage is the six integration tests in
+`crates/mc-host/tests/client.rs`, plus — corrected during disposition — the
+thread-count assertions in `tests/shm_soak.rs` and
+`tests/shm_failure_modes.rs`, which are CI-executed at `ci.yml:130-135` and are
+the only CI evidence in the sub-part that the bridge thread terminates.
 
 **Five normative doc statements describe a byte-stream reader the refactor
 deleted.** One is in the code, four are in the normative document, and all five
@@ -288,18 +318,21 @@ design; it built the 20-claim register and the check inventory.
 | [client-a-a-close-completes-before-its-setup-goodbye-is-written](#client-a-a-close-completes-before-its-setup-goodbye-is-written) | reachability | high |
 | [client-a-every-in-flight-request-is-settled-with-a-classified-send-outcome](#client-a-every-in-flight-request-is-settled-with-a-classified-send-outcome) | safety | high |
 | [client-a-no-request-frame-carries-a-non-increasing-correlation](#client-a-no-request-frame-carries-a-non-increasing-correlation) | safety | high |
-| [client-a-a-dropped-pong-is-never-observable-to-the-client](#client-a-a-dropped-pong-is-never-observable-to-the-client) | safety | medium |
+| [client-a-a-failed-pong-enqueue-retires-the-generation-as-a-local-fault](#client-a-a-failed-pong-enqueue-retires-the-generation-as-a-local-fault) | safety | high |
 | [client-a-pong-egress-is-not-bounded-by-any-client-side-liveness-budget](#client-a-pong-egress-is-not-bounded-by-any-client-side-liveness-budget) | liveness | high |
 | [client-a-live-route-handles-are-bounded-only-by-the-host](#client-a-live-route-handles-are-bounded-only-by-the-host) | safety | high |
 | [client-a-a-duplicate-host-bind-collapses-two-routes-into-one-handle](#client-a-a-duplicate-host-bind-collapses-two-routes-into-one-handle) | safety | high |
 | [client-a-host-shutdown-success-rests-only-on-a-json-echo](#client-a-host-shutdown-success-rests-only-on-a-json-echo) | safety | high |
-| [client-a-route-open-retries-treat-four-host-terminals-as-proof-of-no-bind](#client-a-route-open-retries-treat-four-host-terminals-as-proof-of-no-bind) | safety | medium |
+| [client-a-route-open-retries-treat-four-host-terminals-as-proof-of-no-bind](#client-a-route-open-retries-treat-four-host-terminals-as-proof-of-no-bind) | safety | high |
 | [client-a-a-host-originated-cancel-retires-the-generation](#client-a-a-host-originated-cancel-retires-the-generation) | safety | high |
 | [client-a-the-unmatched-inbound-frame-arm-is-never-entered-in-production](#client-a-the-unmatched-inbound-frame-arm-is-never-entered-in-production) | reachability | high |
 
-Semantics distribution: eleven `always`, one `always-or-unreached`, one
-`sometimes`, one `unreachable`. Type distribution: eleven safety, two
-reachability, one liveness.
+Semantics distribution: twelve `always`, one `sometimes`, one `unreachable`. No
+`always-or-unreached` and no `reachable`. Type distribution: eleven safety, two
+reachability, one liveness. The distribution moved during disposition: the
+`always-or-unreached` record became `always` once its optional branch was proved
+impossible rather than merely unreached. See
+[portfolio-evaluation.md](portfolio-evaluation.md).
 
 **The seven group headings below are this synthesis's own**, chosen by shared
 mechanism rather than by the order records were proposed. Grouping reorders the
@@ -401,14 +434,19 @@ Open questions:
 
 ---
 
-## Group B: the departure signal, wrong in both directions
+## Group B: the departure signal, one direction not two
 
-Two records that are exact inverses. A client whose ring collapsed still writes a
-clean goodbye, so the host under-counts peer deaths. A client that closes cleanly
-can outrun that same goodbye, so the host over-counts them. Grouped because one
-design decision resolves both, and because both turn on the same unconditional
-post-loop block at `client.rs:1890-1893` being read by the same host gate at
-`connection.rs:200`.
+Two records on the same unconditional post-loop block at `client.rs:1890-1893`
+read by the same host gate at `connection.rs:200`. **This disposition removed the
+symmetry the group was originally built on.** The claim that a clean close
+over-counts peer deaths does not hold, for two independent reasons verified
+below: `close` sends and *waits for* a ring channel-0 `Goodbye` before it cancels
+(`:699-711`), and the bridge thread still owns the setup socket after `close`
+returns, so nothing produces an abrupt EOF at that moment. What survives on that
+side is an unjoined-thread window, which is a real gap against protocol `:691`'s
+joined-teardown requirement but is not a misattribution. The under-count
+direction survives and is itself narrowed: the goodbye write is *attempted*
+unconditionally, which is not the same as delivered.
 
 ### client-a-a-ring-failure-departs-the-setup-socket-as-a-clean-goodbye
 
@@ -417,41 +455,71 @@ Reachability: default-production
 Status: active
 Exercised: not yet — no test observes the setup socket after a forced ring failure
 Guarantee: The client's setup-socket departure signal does not distinguish a
-clean exit from a transport failure, so the host's peer-death accounting
-under-reports ring faults.
+clean exit from a transport failure: the bridge thread *attempts* the same
+goodbye write on every exit, so whenever that write lands the host's peer-death
+accounting under-reports ring faults.
 Check: `always` — whenever the bridge thread leaves its `while` loop at
 `client.rs:1866`, it reaches `:1890-1893` and attempts `encoded_goodbye` followed
 by `shutdown(Both)`, with no branch on why the loop ended. `always` because the
-post-loop block is unconditional and evaluable on every thread exit.
+post-loop block is unconditional and evaluable on every thread exit. **Scope
+correction applied during disposition: the check is over the attempt, not over
+the host's resulting classification.** `:1890` is `if let Ok(goodbye)` and `:1891`
+is `let _ = setup.write_all(&goodbye)`, so both the encode and the write can fail
+with the result discarded; and the host's watcher (`connection.rs:195-207`) is a
+`biased` select whose first arm is `peer_read_cancel.cancelled()`, so a
+generation already retired by ring evidence stops observing the socket before
+`observe_peer` resolves. Asserting that `record_peer_death` did not fire therefore
+requires establishing both that the write landed and that the watcher was still
+armed, neither of which follows from this client's code.
 Fault/timing angle: None for the write itself. The consequence lands on the host,
 whose watcher at `connection.rs:199-206` calls `record_peer_death()` only for a
-non-`Goodbye` close (`:200`).
+non-`Goodbye` close (`:200`), and only if that arm of the select wins.
 Required faults and enabling state: Force the ring endpoint to fail after
 activation, so the bridge breaks at `:1874` or `:1887`. Observe the host's setup
-socket and assert whether `record_peer_death` fired.
+socket and assert whether `record_peer_death` fired. Per the scope correction,
+record separately whether `:1891` returned `Ok` and whether the host's
+`peer_read_cancel` was still uncancelled when `observe_peer` returned; without
+both, a negative result is unattributable.
 Confidence: high — [evidence](evidence/client-a-a-ring-failure-departs-the-setup-socket-as-a-clean-goodbye.md).
 Verified the post-loop block is outside every `break` and that
-`connection.rs:200` gates the peer-death counter on the message.
+`connection.rs:200` gates the peer-death counter on the message. This disposition
+additionally verified that the write result is discarded at `:1891` and that the
+host's watcher is a biased select against `peer_read_cancel` (`:196-198`), which
+is what demotes the consequence from proved to conditional.
 Existing check: `setup_socket.rs:820` and `:824` assert `observe_peer` returns
 `Goodbye` and `UnexpectedEof` respectively, but nothing ties either to a client
 transport state.
-Impact: The host metric intended to count dead peers counts only peers that
-failed to complete a socket write. A fleet losing rings would look like a fleet
-of well-behaved clients.
+Impact: Partial rather than established. If the write lands and the host's
+watcher is still armed, the metric intended to count dead peers counts only peers
+that failed to complete a socket write, and a fleet losing rings would look like
+a fleet of well-behaved clients. Whether both conditions hold on a ring fault is
+a 2b question about which side observes the collapse first, and it is the
+difference between a metric that is wrong and a metric that is merely unproven.
 Open questions:
 - Should the bridge thread suppress the goodbye on its failure `break`s so the
   host classifies correctly? That makes a transport fault look like an abrupt
   EOF, which is the honest signal. (needs human input)
+- On a ring fault, does the host retire its generation from ring evidence before
+  `observe_peer` resolves? If it always does, the counter is unreachable on this
+  path for a reason unrelated to the goodbye, and this record's consequence
+  collapses entirely while its `Check:` stands. (unresolved, needs 2b's
+  ring-collapse ordering)
 
 ### client-a-a-close-completes-before-its-setup-goodbye-is-written
 
 Type: reachability
 Reachability: default-production
 Status: active
-Exercised: not yet — nothing constructs the ordering
+Exercised: partial — nothing constructs the ordering, but the thread's *exit* is
+observed in CI: `tests/shm_soak.rs:54-110` and
+`tests/shm_failure_modes.rs:193-228` poll until the process thread count returns
+to a post-close baseline after real `Client::connect`/`close` cycles, so a bridge
+thread that never left its loop would fail those assertions
 Guarantee: The window in which `close()` has returned `Ok` while the detached
 bridge thread has not yet written its setup-socket Goodbye is genuinely
-reachable, so a clean client close can be observed by the host as an abrupt EOF.
+reachable, so a client's departure from the setup socket is not joined to its own
+close, contrary to protocol `:691`'s "followed by joined ring teardown and
+setup-socket close".
 Check: `sometimes` — at least once per campaign, observe the joint state:
 `close()` has returned, `join_tasks_until` reported both Tokio tasks joined, and
 the bridge thread has not yet executed `client.rs:1891`. `sometimes` rather than
@@ -465,19 +533,44 @@ up to a 50-microsecond sleep (`:1886`) or a full in-flight ring write.
 Required faults and enabling state: Independent preconditions, per the
 coverage-check rule: (a) `close()` observed returning with
 `within_deadline == true`; (b) the bridge thread observed still inside its loop
-body or its sleep at that moment. Assert both, never the misclassification
-itself.
+body or its sleep at that moment. Assert both, and assert nothing about how the
+host classified the departure.
 Confidence: high — [evidence](evidence/client-a-a-close-completes-before-its-setup-goodbye-is-written.md).
 Verified `join_tasks_until` (`:1677-1695`) iterates only
 `[&self.writer, &self.reader]` and that the spawn at `:1852` discards its handle.
-Existing check: none.
-Impact: A clean shutdown is recorded by the host as a peer death, which is the
-exact inverse of the previous record. Together they mean the host's
-`record_peer_death` signal is uncorrelated with reality in both directions.
+**The original record's consequence was withdrawn during disposition and is not a
+premise of anything above.** It claimed a clean close is observed by the host as
+an abrupt EOF. It is not, for two independent reasons: `close` sends a ring
+channel-0 `Goodbye` through `send_control_wait` (`:702`) and that call returns
+only after the writer's per-frame `completed_rx` resolved `Ok` and the `ack` fired
+(`:1957-1971`), so the goodbye is published to the ring before `cancel.cancel()`
+at `:711`; and the setup socket is moved into the thread closure at `:1854`, so
+nothing closes it when `close` returns and the host sees no EOF at that instant.
+The host's watcher is additionally a biased select on `peer_read_cancel`
+(`connection.rs:196-198`), which the ring goodbye has already tripped.
+Existing check: none constructs the ordering. Partial credit at the integration
+layer for the thread's exit, in CI: `tests/shm_soak.rs:54-110` (`cycle` plus
+`wait_for_envelope`) and `tests/shm_failure_modes.rs:193-228`
+(`assert_resources_return_to` plus `clean_close_returns_exact_single_connection_capacity`
+at `:218`), both run by `ci.yml:130-135`. They prove the thread terminates after
+a real close; they observe neither the goodbye write nor the ordering. Status
+`unaudited`.
+Impact: Narrower than originally recorded and still real. The client's own
+teardown contract is unjoined: `close` returns while an OS thread it spawned
+still holds the setup socket, the ring attach, and the write-completion channel,
+and the protocol requires that teardown be joined (`:691`). The consequence is a
+contract gap and an unbounded-in-principle residency of one thread past a
+successful `close`, not a peer-death miscount.
 Open questions:
 - Should `Inner` hold the bridge thread's `JoinHandle` so `close` can join it
   under the same 5-second budget? That budget is already shared with route
   teardown. (needs human input)
+- Is there any path on which `close` returns `Ok` *without* the ring goodbye
+  having been published, leaving the host's watcher armed? `close` returns `Err`
+  on the `send_control_wait` timeout (`:706-709`) and cancels regardless, so the
+  candidate is a `close` whose goodbye timed out; that path returns `Err`, so it
+  does not satisfy this record's precondition (a). (unresolved, needs the
+  shutdown-timeout path traced against the host's watcher)
 
 ---
 
@@ -570,52 +663,74 @@ Open questions: None.
 
 ---
 
-## Group D: the liveness path and its two silences
+## Group D: the liveness path and its two failures
 
 Two records on the `Pong`, which is the client's only protocol obligation toward
-host liveness. The first is that a `Pong` the client fails to enqueue leaves no
-trace at all, because the call site binds the result to `_`. The second is that a
-`Pong` it does enqueue can wait a full 30-second frame deadline, because the one
-thread that would publish it may be parked delivering inbound frames. Grouped
-because both make the same probe late for different reasons, and because the
-client's own view of its liveness is unchanged in both cases.
+host liveness. The first is that a `Pong` the client fails to enqueue takes the
+whole generation down with a local admission code, because both surviving
+enqueue-failure paths retire; the `Ping` arm binds the result to `_`, so the
+teardown is never attributed to the probe. The second is that a `Pong` it does
+enqueue can wait a full 30-second frame deadline, because the one thread that
+would publish it may be parked delivering inbound frames. Grouped because both
+make the same probe late for different reasons, and because in neither case does
+anything name the probe as the thing that failed.
 
-### client-a-a-dropped-pong-is-never-observable-to-the-client
+### client-a-a-failed-pong-enqueue-retires-the-generation-as-a-local-fault
 
 Type: safety
 Reachability: default-production
 Status: active
 Exercised: partial — `a_ping_at_any_valid_priority_is_answered_with_an_exact_flag_echo`
-(`client.rs:2754`) covers the success path only
-Guarantee: When the client fails to enqueue a Pong for a reason that does not
-retire the generation, it records nothing, so a well-behaved host retires the
-generation for a missed probe while the client still believes it is healthy.
-Check: `always-or-unreached` — whenever `send_control` returns `Err` from its
-encode branch (`client.rs:1329-1335`) while called from the `Ping` arm (`:1390`),
-no counter, log, or state change results, because the result is bound to `_`.
-`always-or-unreached` because the encode branch may never run against a
-conforming host, but the swallowing must be safe if it does.
-Fault/timing angle: The window is one host probe interval. The client learns only
-when the host's own retirement arrives as an `eof` or `connection_goodbye`, by
-which point the cause is lost; see
-`client-a-a-retired-generation-forgets-why-it-retired`.
-Required faults and enabling state: Inject an `encode_owned_frame` failure for a
-`Pong`, or drive the reserved control channel to a state where the Pong path is
-refused without retiring. Assert that no observable client state changed.
-Confidence: medium — [evidence](evidence/client-a-a-dropped-pong-is-never-observable-to-the-client.md).
-The swallowing at `:1390` is verified. I could not construct an
-`encode_owned_frame` failure for a pure-header frame whose flags
-`validate_inbound` already accepted, so the reachability of the failing branch is
-unresolved and the confidence reflects that, not the code reading.
+(`client.rs:2754`) covers the success path, and
+`control_exhaustion_retires_and_releases_all_queued_bytes` (`:3196`) drives the
+retiring branch from a different caller
+Guarantee: A `Pong` the client fails to enqueue is never merely dropped: both
+enqueue failure paths retire the whole generation with
+`control_capacity_exhausted`, so a missed host probe is reported as a local
+admission fault rather than as a liveness event, and the `Ping` arm proceeds as
+though the answer was sent.
+Check: `always` — whenever `send_control` returns `Err` while called from the
+`Ping` arm (`client.rs:1390`), `self.retired` is true afterwards, and the code
+that produced it is `control_capacity_exhausted` from the charge branch
+(`:1340-1347`) or the try-send branch (`:1355-1361`), never a code naming the
+probe. The encode branch (`:1329-1335`) is excluded because it cannot run for a
+`Pong`; see the confidence line. `always` because the disjunction over
+`send_control`'s failure paths is total, and every path in it retires.
+Fault/timing angle: None for the retirement itself, which is synchronous inside
+the failing call. The consequence lands one layer up: the `let _ =` at `:1390`
+discards the `Err`, so `dispatch` continues to the post-dispatch
+`retired.load` check at `:1983` rather than attributing the teardown to the
+probe it was answering.
+Required faults and enabling state: Exhaust `control_budget` (`:399`, funded by
+`CLIENT_CONTROL_QUEUED_BYTES` at `:76`) or fill `control_tx`, then deliver a
+`Ping`. Assert the generation retired, that the code is
+`control_capacity_exhausted`, and that no state names the unanswered probe.
+Confidence: high — [evidence](evidence/client-a-a-dropped-pong-is-never-observable-to-the-client.md).
+The original record's `always-or-unreached` encode branch is **impossible**, not
+merely unresolved, which is what this disposition changed. `encode_owned_frame`
+(`wire.rs:571-601`) returns `Err` only when `body.len() > MAX_BODY_LEN`
+(`:577-583`), and the `Pong` call passes `Vec::new()` (`client.rs:1329`), so the
+one branch that did not retire cannot be entered. Both surviving branches retire,
+verified by printing `:1340-1361`.
 Existing check: `a_ping_at_any_valid_priority_is_answered_with_an_exact_flag_echo`
-(`:2754`); status `unaudited`.
-Impact: The client's only protocol obligation toward host liveness fails
-silently. Part 2a's `a-timely-pong-sustains-the-generation-within-a-bounded-round`
-is the host-side liveness property this could break.
+(`:2754`) for the success path; `control_exhaustion_retires_and_releases_all_queued_bytes`
+(`:3196`) reaches the retiring branch but not through the `Ping` arm. Status
+`unaudited` for both.
+Impact: Smaller than the original record claimed and differently shaped. The
+client does not silently believe it is healthy: it tears the generation down.
+What is lost is attribution, which routes this back into
+`client-a-a-retired-generation-forgets-why-it-retired`: a caller sees
+`control_capacity_exhausted` or, arriving later, a bare constant, and nothing
+records that a host liveness probe went unanswered. Part 2a's
+`a-timely-pong-sustains-the-generation-within-a-bounded-round` is the host-side
+property, and the two ends disagree about what happened.
 Open questions:
-- Can `encode_owned_frame` reject a flag byte that `validate_inbound:2073-2080`
-  accepted? If not, this branch is unreachable and the record should be
-  downgraded. (unresolved, needs a `wire.rs` read that 2b owns)
+- Is escalating one unanswerable probe to a full-generation retirement the
+  intended policy? The comment at `:1336-1339` argues the reserved-pool choice so
+  that ordinary request traffic cannot cause it, which makes exhaustion a real
+  local fault rather than load; that argues the escalation is deliberate. It does
+  not establish that the caller should be unable to tell a probe failure from any
+  other control-admission failure. (needs human input)
 
 ### client-a-pong-egress-is-not-bounded-by-any-client-side-liveness-budget
 
@@ -752,7 +867,12 @@ operation name, and its doc comment declares that `Ok` the stop linearization
 point a lifecycle owner waits on. `open_route` retries after four terminal codes
 on the premise that each proves no route was bound. Grouped because both are
 trust decisions rather than mechanisms, and because in both cases the fact the
-client needs lives on the host side and the record's own open question says so.
+client needs lives on the host side. **One of the two host-side facts is now
+resolved:** this disposition read `dispatch.rs:1177-1238` and established that no
+current host exit both installs a bind and answers with an error, so the retry
+record's dependency holds today and the record is restated as a coupling plus a
+dead allowlist entry rather than as a suspected defect. The `host_shutdown` echo's
+host-side fact remains open.
 
 ### client-a-host-shutdown-success-rests-only-on-a-json-echo
 
@@ -802,11 +922,12 @@ Open questions:
 Type: safety
 Reachability: default-production
 Status: active
-Exercised: not yet — no test drives the retry loop against a host that binds
-after answering one of the four codes
-Guarantee: `open_route` retries after four specific host terminal codes, and each
-retry is a fresh `route.open` attempt whose safety depends entirely on those
-codes proving no route was bound.
+Exercised: not yet — no test counts host-side binds across a retried `open_route`
+Guarantee: `open_route` retries after four specific host terminal codes on the
+premise that each proves no route was bound, and the client verifies nothing:
+today the premise holds only because of an ordering discipline on the host side
+that this client neither checks nor is told about, and one of the four codes has
+no producer in the tree at all.
 Check: `always` — for a sequence of `open_route` attempts ending in success, the
 number of routes the host bound for that call is exactly one. Per METHOD's
 effect-accounting rule, track attempted and acknowledged separately: attempts
@@ -816,31 +937,62 @@ count. The aggregate bound is the cheap screen; the per-attempt check is the
 oracle. `always` because it must hold for every `open_route` call, not merely be
 witnessed once.
 Fault/timing angle: The retry is gated on `outcome == Terminal` (`:512`), so an
-`OutcomeUnknown` never retries. The risk is confined to whether `module_timeout`
-is a completed rejection or a host-side deadline that leaves module work in
-flight.
-Required faults and enabling state: A fake peer that answers `route.open` with
-`Error{code:"module_timeout"}` and then also binds a route and emits a late
-`Response` on `0/0`. Count host-side binds against client-side handles, and check
-whether `release_stranded_route` (`:1572`) reclaims the extra.
-Confidence: medium — [evidence](evidence/client-a-route-open-retries-treat-four-host-terminals-as-proof-of-no-bind.md).
-The retry predicate and the fresh-correlation-per-attempt behaviour are verified.
-Whether `module_timeout` is authoritative about the bind is a host-side question
-I could not resolve, which is why this is medium and why the guarantee is worded
-as a dependency rather than a defect.
+`OutcomeUnknown` never retries. **Restated during disposition: the window the
+original record described has no producer in the current host.** The bind path is
+`dispatch.rs:1177-1238` and it has no exit that both leaves a route installed and
+answers with an error. `BindOutcome::Accept` plus `BindInstall::Installed`
+installs the bind and emits the `route.open` success response (`:1178-1193`).
+`BindInstall::CloseWins` publishes nothing at all (`:1195-1202`).
+`BindOutcome::Reject` calls `shared.registry.take_rejected_bind(handle)`
+(`:1219`), which cancels the occupant and marks it `Closing`
+(`routing.rs:191-205`), and only then runs route-gone and emits the error terminal
+(`:1220-1236`). The stopped-callback arm does the same and emits nothing
+(`:1164-1170`). And the three codes a host can actually produce are emitted before
+any bind exists or after it is cleaned: `unknown_module` and `target_unavailable`
+are pre-bind classification (`control.rs:15-16`, with capacity exhaustion
+documented "without any handler bind" at `routing.rs:112`), and
+`module_reloading` is a handler bind rejection (`synapse/mod.rs:960-963`) that
+takes the `Reject` arm. `module_timeout`, the code the original record's recipe
+was built on, appears nowhere in the tree outside this client's own allowlist
+(`client.rs:518`), verified by grep.
+Required faults and enabling state: Two forms, and the second is the one that
+survives. **(a) The verifiable form, no fault:** enumerate the host's bind exits
+and assert that every terminal-carrying exit is either pre-bind or preceded by
+`take_rejected_bind`, and that every allowlisted code has such an exit or no
+producer. **(b) The original form, now known to need a non-conforming peer:** a
+fake peer that answers `route.open` with `Error{code:"module_timeout"}` and also
+binds a route, then counting host-side binds against client-side handles and
+checking `release_stranded_route` (`:1572`) for reclamation. Form (b) tests the
+client against a host protocol violation, which is the framing question a human
+must settle; see [portfolio-evaluation.md](portfolio-evaluation.md).
+Confidence: high — [evidence](evidence/client-a-route-open-retries-treat-four-host-terminals-as-proof-of-no-bind.md).
+Raised from medium during disposition, because the question the original record
+could not resolve is now resolved against the current host: the retry is safe
+today, and the reason is `take_rejected_bind` running before
+`emit_error_terminal`. The retry predicate and the fresh-correlation-per-attempt
+behaviour were already verified. What is *not* resolved is whether the client
+should depend on that ordering, which is a contract question rather than a code
+one.
 Existing check: `an_abandoned_control_open_releases_a_late_bound_route` (`:3503`)
-covers the late-bind remedy that would partially mitigate this; status
-`unaudited`.
-Impact: If `module_timeout` is a deadline rather than a rejection, each retry can
-strand a host route and channel permit, bounded only by the 30-second route-open
-deadline divided by the backoff. The mitigation at `:1572` works only while the
-generation stays live.
+covers the late-bind remedy that would mitigate a violating host; status
+`unaudited`. Nothing checks the host-side ordering this record now rests on, and
+nothing flags `module_timeout` as an allowlist entry with no producer.
+Impact: Reframed and smaller, with one durable finding inside it. The client's
+retry safety is a cross-part coupling: it is not derived from anything in
+`client.rs`, and a future host that emitted a retried code after installing a bind
+would strand a route and channel permit per retry, bounded only by the 30-second
+route-open deadline divided by the backoff. The concrete defect that survives on
+this side is the dead allowlist entry: `module_timeout` can only ever be produced
+by a peer that is not this host, so the client retries on a code its own host
+never sends.
 Open questions:
-- Is `module_timeout` emitted after the host proves no bind occurred?
-  `docs/mc-host-wire-protocol.md:658` reserves `target_unavailable` for route
-  admission and gives each code "exactly one recovery rule in Section 10.2",
-  which suggests the codes are meant to be authoritative, but does not state it
-  for `module_timeout`. (unresolved, needs the 2e control-handler pass)
+- Should the client's retry allowlist be derived from, or checked against, the
+  host's emitted code set? They are independent literals today, and one of the
+  four has no producer. (needs human input)
+- Is `module_timeout` reserved for a host version not in this tree, or is it
+  vestigial? `docs/mc-host-wire-protocol.md:658` gives each code "exactly one
+  recovery rule in Section 10.2" but does not say which codes a host must be able
+  to emit. (unresolved, needs the 2e or 2f control-vocabulary pass)
 
 ---
 
@@ -950,25 +1102,31 @@ Grouped by shared mechanism rather than by the headings above, because the
 sharpest relationships cross groups. **Every dominance statement below is a
 hypothesis** about which oracle subsumes which, offered to order the work, not a
 verified claim. None has been tested, and none can be tested by anything CI runs
-today: this sub-part has zero CI-executed source-resident checks, and its six
-CI-executed integration tests touch none of these records directly.
-
+today with one partial exception recorded during disposition: this sub-part has
+zero CI-executed source-resident checks, its six CI-executed `tests/client.rs`
+tests touch none of these records directly, and the thread-count assertions in
+`tests/shm_soak.rs` and `tests/shm_failure_modes.rs` reach only the *termination*
+half of the close-ordering record, never its ordering.
 - **One erased cause, read from four sides.**
   [client-a-a-retired-generation-forgets-why-it-retired](#client-a-a-retired-generation-forgets-why-it-retired),
   [client-a-a-clean-host-close-and-a-transport-failure-share-one-code](#client-a-a-clean-host-close-and-a-transport-failure-share-one-code),
-  [client-a-a-dropped-pong-is-never-observable-to-the-client](#client-a-a-dropped-pong-is-never-observable-to-the-client),
+  [client-a-a-failed-pong-enqueue-retires-the-generation-as-a-local-fault](#client-a-a-failed-pong-enqueue-retires-the-generation-as-a-local-fault),
   [client-a-a-ring-failure-departs-the-setup-socket-as-a-clean-goodbye](#client-a-a-ring-failure-departs-the-setup-socket-as-a-clean-goodbye).
   All four are the same defect at different layers. `retire` keeps no cause
-  (`client.rs:1667-1675`); five bridge exits produce one code (`:1987`); a
-  dropped `Pong` produces no code at all (`:1390`); and the departure signal the
-  host reads carries no cause either (`:1890-1893`). Hypothesis: storing the
+  (`client.rs:1667-1675`); five bridge exits produce one code (`:1987`); a failed
+  `Pong` enqueue produces `control_capacity_exhausted`, which names the pool and
+  not the probe (`:1341`, `:1356`, discarded at `:1390`); and the departure signal
+  the host reads carries no cause either (`:1890-1893`). Hypothesis: storing the
   retirement cause on `Inner` and surfacing it through `CallError`
   *dominates* the first two, because each of their oracles reduces to "a
-  post-retirement caller can name the cause". It dominates neither of the other
-  two: a swallowed `Pong` never reaches `retire`, and the setup-socket signal is
-  read by the host, not by a caller. Fixing the bridge's five exits to carry
-  distinct codes without storing the cause dominates nothing, because the
-  distinction would still be visible only inside `settle_all`'s loop.
+  post-retirement caller can name the cause". **This disposition strengthened its
+  relation to the third**: because a failed `Pong` enqueue now provably retires
+  rather than passing silently, storing the cause dominates that record's
+  attribution half too, though not its policy question. It dominates the
+  setup-socket record not at all, since that signal is read by the host rather
+  than by a caller. Fixing the bridge's five exits to carry distinct codes without
+  storing the cause dominates nothing, because the distinction would still be
+  visible only inside `settle_all`'s loop.
 - **One unjoined thread, three claims.**
   [client-a-a-close-completes-before-its-setup-goodbye-is-written](#client-a-a-close-completes-before-its-setup-goodbye-is-written),
   [client-a-a-ring-failure-departs-the-setup-socket-as-a-clean-goodbye](#client-a-a-ring-failure-departs-the-setup-socket-as-a-clean-goodbye),
