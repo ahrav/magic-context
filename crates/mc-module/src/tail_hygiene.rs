@@ -81,6 +81,7 @@ fn is_drop_sentinel(content: &str) -> bool {
     head.starts_with("[dropped") || head.starts_with("[truncated")
 }
 
+#[cfg(test)]
 fn estimated_tokens(content: &str) -> i64 {
     mc_tokenizer::estimate_tokens(content) as i64
 }
@@ -213,15 +214,6 @@ fn estimate_image_tokens(data_url: &str) -> i64 {
     (tokens as i64).clamp(1, IMAGE_TOKEN_CAP)
 }
 
-fn media_tokens(media: &MediaBlock, content: &str) -> i64 {
-    match media.kind {
-        MediaKind::Image => estimate_image_tokens(content),
-        MediaKind::Audio | MediaKind::Video | MediaKind::File | MediaKind::Document => {
-            estimated_tokens(content)
-        }
-    }
-}
-
 fn tool_output_content(output: &CkOutputKind) -> String {
     match output {
         CkOutputKind::Text { text } | CkOutputKind::ErrorText { text } => text.clone(),
@@ -243,11 +235,17 @@ fn tool_output_content(output: &CkOutputKind) -> String {
     }
 }
 
+enum PartTokens {
+    Zero,
+    Bpe,
+    Image,
+}
+
 fn part_measurement(
     key: String,
     kind: TailHygienePartKind,
     content: &str,
-    tokens: i64,
+    tokens: PartTokens,
     tag_number: Option<i64>,
     protected: bool,
 ) -> TailHygienePartMeasurement {
@@ -262,10 +260,16 @@ fn part_measurement(
     hash_input.push_str(kind_name);
     hash_input.push('\0');
     hash_input.push_str(content);
+    let digest = Sha256::digest(hash_input.as_bytes());
+    let tokens = match tokens {
+        PartTokens::Zero => 0,
+        PartTokens::Bpe => crate::token_cache::count_with_digest(digest.into(), content) as i64,
+        PartTokens::Image => estimate_image_tokens(content),
+    };
     let active = tag_number.is_some();
     TailHygienePartMeasurement {
         key,
-        content_hash: hex_digest(hash_input),
+        content_hash: format!("{digest:x}"),
         kind,
         tokens,
         u_tokens: if active && !protected { tokens } else { 0 },
@@ -276,7 +280,14 @@ fn part_measurement(
 }
 
 fn excluded_part(key: String, content: &str) -> TailHygienePartMeasurement {
-    part_measurement(key, TailHygienePartKind::Excluded, content, 0, None, false)
+    part_measurement(
+        key,
+        TailHygienePartKind::Excluded,
+        content,
+        PartTokens::Zero,
+        None,
+        false,
+    )
 }
 
 fn projection_message_indexes(projection: &FlatProjection) -> HashMap<&str, usize> {
@@ -532,7 +543,7 @@ pub(crate) fn measure_tail_hygiene(
                         key,
                         TailHygienePartKind::Text,
                         content,
-                        estimated_tokens(content),
+                        PartTokens::Bpe,
                         tag_number,
                         protected,
                     )
@@ -544,7 +555,7 @@ pub(crate) fn measure_tail_hygiene(
                     key,
                     TailHygienePartKind::ToolInput,
                     &content,
-                    estimated_tokens(&content),
+                    PartTokens::Bpe,
                     tag_number,
                     protected,
                 )
@@ -559,7 +570,7 @@ pub(crate) fn measure_tail_hygiene(
                         key,
                         TailHygienePartKind::ToolOutput,
                         content,
-                        estimated_tokens(content),
+                        PartTokens::Bpe,
                         tag_number,
                         protected,
                     )
@@ -574,7 +585,11 @@ pub(crate) fn measure_tail_hygiene(
                         key,
                         TailHygienePartKind::File,
                         &content,
-                        media_tokens(media, &content),
+                        if matches!(media.kind, MediaKind::Image) {
+                            PartTokens::Image
+                        } else {
+                            PartTokens::Bpe
+                        },
                         tag_number,
                         protected,
                     )
@@ -766,6 +781,57 @@ mod tests {
             created_at_ms: 0,
             source_bytes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn measurement_is_identical_with_cold_and_warm_token_cache() {
+        let messages = vec![
+            text("a", 1, &"the retry loop needs jittered backoff ".repeat(20)),
+            message(
+                "b",
+                2,
+                "assistant",
+                vec![CkKind::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "bash".to_string(),
+                    input: json!({"command": "grep -rn pattern src/ && cargo test -p mc-module"}),
+                    provider_executed: false,
+                }],
+            ),
+            message(
+                "c",
+                3,
+                "tool",
+                vec![CkKind::ToolResult {
+                    id: "call_1".to_string(),
+                    tool_name: "bash".to_string(),
+                    output: CkToolOutput::bare(mc_store::CkOutputKind::Text {
+                        text: "src/lib.rs:42: pattern matched here\n".repeat(30),
+                    }),
+                    provider_executed: false,
+                }],
+            ),
+        ];
+        let tags = vec![tag(1, "a#0")];
+        let projection = project_messages(&messages).unwrap();
+        let measure = || {
+            measure_tail_hygiene(
+                &projection,
+                &CoreState::default(),
+                None,
+                &tags,
+                0,
+                &HashSet::new(),
+            )
+        };
+        crate::token_cache::clear();
+        let cold = measure();
+        let warm = measure();
+        assert_eq!(cold, warm, "warm-cache measurement diverged from cold");
+        crate::token_cache::clear();
+        let recold = measure();
+        assert_eq!(cold, recold, "cache clear changed the measurement");
+        assert!(cold.t > 0, "fixture must measure real tokens");
     }
 
     #[test]

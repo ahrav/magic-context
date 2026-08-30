@@ -34,6 +34,8 @@ pub mod selection;
 pub mod session_resolver;
 pub mod smart_note_evaluation;
 mod tail_hygiene;
+mod token_cache;
+
 pub mod transform;
 
 /// Generated pre-build release contract (U8). The file is emitted by
@@ -128,6 +130,66 @@ use transform::ReductionDecision;
 
 #[cfg(test)]
 pub mod test_support;
+
+/// Exposes crate-private stages to `benches/hot_path.rs`.
+#[cfg(feature = "bench-internals")]
+pub mod bench_internals {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    use crate::ck_wire::FlatProjection;
+    use crate::memory_render::MirroredClaimMemory;
+    use crate::transform::{
+        ProducerContext, SerializedOutputCache, TransformError, TransformRequest,
+        TransformWithProjection,
+    };
+    use mc_core::CoreState;
+    use mc_store::{McStore, McTagRow};
+
+    pub fn measure_tail_hygiene(
+        projection: &FlatProjection,
+        core: &CoreState,
+        coverage_ordinal: Option<u64>,
+        tag_rows: &[McTagRow],
+        protected_tags: usize,
+        protected_block_ids: &HashSet<String>,
+    ) -> (i64, i64) {
+        let measurement = crate::tail_hygiene::measure_tail_hygiene(
+            projection,
+            core,
+            coverage_ordinal,
+            tag_rows,
+            protected_tags,
+            protected_block_ids,
+        );
+        (measurement.u, measurement.t)
+    }
+
+    pub fn trim_claims_to_budget(claims: &[MirroredClaimMemory], budget_tokens: f64) -> usize {
+        crate::m0_compose::trim_claims_to_budget(
+            claims,
+            budget_tokens,
+            crate::token_cache::cached_estimate_tokens,
+        )
+        .len()
+    }
+
+    #[derive(Default)]
+    pub struct OutputCache(Mutex<SerializedOutputCache>);
+
+    pub fn clear_token_cache() {
+        crate::token_cache::clear();
+    }
+
+    pub fn transform_cached(
+        store: &McStore,
+        req: &TransformRequest,
+        ctx: &ProducerContext<'_>,
+        cache: &OutputCache,
+    ) -> Result<TransformWithProjection, TransformError> {
+        crate::transform::transform_with_projection_cached(store, req, ctx, &cache.0, None)
+    }
+}
 
 #[cfg(test)]
 mod differential_goldens;

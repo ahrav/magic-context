@@ -1218,6 +1218,16 @@ pub struct TransformTimings {
     #[serde(default)]
     pub caveman: f64,
     #[serde(default)]
+    pub tail_hygiene: f64,
+    #[serde(default)]
+    pub tokenize_calls: usize,
+    #[serde(default)]
+    pub tokenize_cache_hits: usize,
+    #[serde(default)]
+    pub tokenize_cache_misses: usize,
+    #[serde(default)]
+    pub tokenize_bytes: usize,
+    #[serde(default)]
     pub tag_mint_candidates: usize,
     #[serde(default)]
     pub tag_mint_new: usize,
@@ -1314,6 +1324,17 @@ pub struct TransformTimings {
 /// Render the one-line, greppable timing record emitted after the response splice.
 ///
 /// Session ids are made whitespace-safe because each field is parsed as one `key=value` token.
+fn record_token_cache_delta(
+    timings: &mut TransformTimings,
+    start: crate::token_cache::TokenCacheStats,
+) {
+    let now = crate::token_cache::stats();
+    timings.tokenize_calls = now.calls.saturating_sub(start.calls) as usize;
+    timings.tokenize_cache_hits = now.hits.saturating_sub(start.hits) as usize;
+    timings.tokenize_cache_misses = now.misses.saturating_sub(start.misses) as usize;
+    timings.tokenize_bytes = now.tokenized_bytes.saturating_sub(start.tokenized_bytes) as usize;
+}
+
 pub fn format_pass_timing_line(
     session_id: &str,
     timings: &TransformTimings,
@@ -1343,6 +1364,7 @@ pub fn format_pass_timing_line(
          identity_enforce={:.1} state_clone={:.1} ingress_meta={:.1} user_hint={:.1} \
          planning={:.1} state_evolution={:.1} finalize={:.1} \
          tag_overlay={:.1} unit_mint={:.1} temporal={:.1} caveman={:.1} \
+         tail_hygiene={:.1} tokenize_calls={} tokenize_cache_hits={} tokenize_cache_misses={} tokenize_bytes={} \
          tag_mint_candidates={} tag_mint_new={} tag_mint_tokenized_bytes={} \
          decide={:.1} seed_or_sync={:.1} compose_m0m1={:.1} selection={:.1} \
          transition_detection={:.3} emergency_reasoning_exclusions={} todo={:.1} \
@@ -1394,6 +1416,11 @@ pub fn format_pass_timing_line(
         timings.unit_mint,
         timings.temporal,
         timings.caveman,
+        timings.tail_hygiene,
+        timings.tokenize_calls,
+        timings.tokenize_cache_hits,
+        timings.tokenize_cache_misses,
+        timings.tokenize_bytes,
         timings.tag_mint_candidates,
         timings.tag_mint_new,
         timings.tag_mint_tokenized_bytes,
@@ -2103,7 +2130,13 @@ pub fn transform_with_projection(
     req: &TransformRequest,
     ctx: &ProducerContext<'_>,
 ) -> Result<TransformWithProjection, TransformError> {
-    let result = apply_once_with_estimator(store, req, ctx, mc_tokenizer::estimate_tokens, None);
+    let result = apply_once_with_estimator(
+        store,
+        req,
+        ctx,
+        crate::token_cache::cached_estimate_tokens,
+        None,
+    );
     record_stable_pass_trace(store, req, ctx, &result);
     result
 }
@@ -2119,7 +2152,7 @@ pub(crate) fn transform_with_projection_cached(
         store,
         req,
         ctx,
-        mc_tokenizer::estimate_tokens,
+        crate::token_cache::cached_estimate_tokens,
         Some(output_cache),
         projection_cache,
     );
@@ -2728,6 +2761,7 @@ fn apply_additive_only(
         projection_projected_messages: req.messages.len(),
         ..TransformTimings::default()
     };
+    let token_cache_stats_at_start = crate::token_cache::stats();
     if let Some(id) = duplicate_ids(&projection.blocks) {
         return Err(TransformError::DuplicateBlockId(id));
     }
@@ -3024,7 +3058,7 @@ fn apply_additive_only(
                 ctx.memory_budget_tokens,
                 ctx.user_profile_budget_tokens,
                 ctx.temporal_awareness,
-                mc_tokenizer::estimate_tokens,
+                crate::token_cache::cached_estimate_tokens,
                 ctx,
             )?;
             note_deliveries = m1.note_deliveries.clone();
@@ -3143,6 +3177,7 @@ fn apply_additive_only(
     timings.store_commit = elapsed_ms(store_commit_started_at);
     timings.store_memories = m1_revision_read_timings.memories_ms;
     timings.store_notes = m1_revision_read_timings.notes_ms;
+    record_token_cache_delta(&mut timings, token_cache_stats_at_start);
     timings.total = elapsed_ms(total_started_at);
 
     let action = action_str(&plan, &core).to_string();
@@ -3235,6 +3270,7 @@ fn apply_once(
     }
     let total_started_at = Instant::now();
     let mut timings = TransformTimings::default();
+    let token_cache_stats_at_start = crate::token_cache::stats();
     let mut m1_revision_read_timings = M1RevisionReadTimings::default();
     // OpenCode transports the frozen todo pair as one marked tool part. Older adapters did not
     // copy that marker into CK metadata, so recognize the reserved call-id namespace here too.
@@ -4873,7 +4909,7 @@ fn apply_once(
                     ctx.memory_budget_tokens,
                     ctx.user_profile_budget_tokens,
                     ctx.temporal_awareness,
-                    mc_tokenizer::estimate_tokens,
+                    crate::token_cache::cached_estimate_tokens,
                     ctx,
                 )?;
                 note_deliveries = m1.note_deliveries.clone();
@@ -5300,6 +5336,7 @@ fn apply_once(
 
     let hygiene_tag_rows =
         tag_rows_for_hygiene(&projection, &tag_rows, &tag_overlay, !tagging_active);
+    let tail_hygiene_started_at = Instant::now();
     let hygiene_measurement = measure_tail_hygiene(
         &projection,
         &core,
@@ -5308,6 +5345,7 @@ fn apply_once(
         req.protected_tags,
         &protected_block_ids,
     );
+    timings.tail_hygiene = elapsed_ms(tail_hygiene_started_at);
     let current_hygiene_baseline = if is_bust_pass {
         let refreshed = refresh_tail_hygiene_baseline(
             hygiene_measurement,
@@ -5645,6 +5683,7 @@ fn apply_once(
     timings.store_memories = m1_revision_read_timings.memories_ms;
     timings.store_notes = m1_revision_read_timings.notes_ms;
     timings.finalize = elapsed_ms(finalize_started_at);
+    record_token_cache_delta(&mut timings, token_cache_stats_at_start);
     timings.total = elapsed_ms(total_started_at);
     Ok(TransformWithProjection {
         tag_numbers,
