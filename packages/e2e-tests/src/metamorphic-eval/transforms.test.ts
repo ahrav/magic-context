@@ -5,15 +5,19 @@ import { join } from "node:path";
 import { splitmix32 } from "../../../plugin/scripts/retrieval-benchmark/synthetic";
 import { estimateTokens } from "../../../plugin/src/shared/token-estimator";
 import {
+    authoredEvidenceText,
+    containsCompleteValue,
     lintScenario,
     MAX_TURN_TEXT_CHARS,
     normalizeContent,
     parseScenario,
+    predicateMatches,
     type HistorianEvalScenario,
 } from "../historian-eval/contract";
 import { validScenario, validScenarioRaw } from "../historian-eval/test-support";
 import {
     ALWAYS_APPLICABLE_TRANSFORM_IDS,
+    CONTRACT_VIOLATION_REASON,
     TRANSFORMS,
     remapGold,
     type Transform,
@@ -240,12 +244,26 @@ describe("metamorphic transforms", () => {
             .expectedAbsent[0]!;
         absent.predicate.value = "bridge token";
         const scenario = parseScenario(raw);
+        const predicate = scenario.gold.expectedAbsent[0]!.predicate;
 
         for (const id of ["paraphrase-irrelevant", "rename-unrelated-symbols"]) {
             const transform = TRANSFORMS.find((candidate) => candidate.id === id)!;
             const result = firstApplicable(transform, scenario)!;
-            expect(result.scenario.transcript.turns[3], id).toEqual(scenario.transcript.turns[3]);
+            // The invariant is that the formation stays authored, not that the
+            // turn is byte-identical: framing text around a message keeps its
+            // wording, so a rewrite that leaves the spanning halves adjacent is
+            // a legitimate perturbation.
+            expect(
+                predicateMatches(predicate, authoredEvidenceText(result.scenario.transcript.turns)),
+                id,
+            ).toBe(true);
         }
+        // Renaming edits inside a message, so it cannot touch a message the
+        // formation runs through at all.
+        const rename = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
+        expect(firstApplicable(rename, scenario)!.scenario.transcript.turns[3]).toEqual(
+            scenario.transcript.turns[3],
+        );
     });
 
     test("duplicate rejection excludes turns containing accepted evidence", () => {
@@ -336,6 +354,152 @@ describe("metamorphic transforms", () => {
             applicable: false,
             reason: "rename does not fit the turn text limit",
         });
+    });
+
+    test("move refuses a span containing a rejected proposal", () => {
+        const raw = movableScenarioRaw();
+        const gold = raw.gold as { expectedAbsent: Array<Record<string, unknown>> };
+        // The only move is turn 1 to position 3, whose span covers turn 2. Giving
+        // turn 2 rejected-proposal evidence would leave that proposal ahead of the
+        // decision it was rejected by.
+        gold.expectedAbsent.push({
+            id: "abs-capacity-proposal",
+            family: "proposed-but-rejected",
+            predicate: { kind: "normalized-substring", value: "set the cache capacity" },
+        });
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "move-accepted-decision")!;
+
+        expect(transform.apply(scenario, 7)).toEqual({
+            applicable: false,
+            reason: "no movable single-turn accepted decision before epilogue",
+        });
+    });
+
+    test("reorder refuses a pair of byte-identical turns", () => {
+        const raw = validScenarioRaw();
+        const transcript = raw.transcript as {
+            turns: Array<{ user: string; assistant: string }>;
+            epilogueStartIndex: number;
+        };
+        transcript.turns.unshift(
+            { user: "Background note.", assistant: "Noted." },
+            { user: "Background note.", assistant: "Noted." },
+        );
+        transcript.epilogueStartIndex += 2;
+        const gold = raw.gold as { expectedClaims: Array<{ sourceTurnRange: [number, number] }> };
+        for (const claim of gold.expectedClaims) {
+            claim.sourceTurnRange = [claim.sourceTurnRange[0] + 2, claim.sourceTurnRange[1] + 2];
+        }
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "reorder-independent-turns")!;
+
+        for (let seed = 0; seed < 40; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            expect(result.scenario.transcript.turns, `seed ${seed}`).not.toEqual(
+                scenario.transcript.turns,
+            );
+        }
+    });
+
+    test("paraphrase still applies when every unprotected message carries negative evidence", () => {
+        const raw = validScenarioRaw();
+        const transcript = raw.transcript as {
+            turns: Array<{ user: string; assistant: string }>;
+            epilogueStartIndex: number;
+        };
+        // Every pre-epilogue turn is covered by an expected-claim range and both
+        // epilogue messages repeat the forbidden formation, so no message is free
+        // of gold or negative evidence.
+        transcript.turns = [
+            {
+                user: "Should we use Redis for the session cache? No — use the in-process LRU cache with capacity 4096 entries.",
+                assistant: "Understood: in-process LRU cache for sessions, capacity 4096 entries.",
+            },
+            {
+                user: "Recap: we did not use Redis for the session cache.",
+                assistant: "Right, we will not use Redis for the session cache.",
+            },
+        ];
+        transcript.epilogueStartIndex = 1;
+        const gold = raw.gold as { expectedClaims: Array<{ sourceTurnRange: [number, number] }> };
+        for (const claim of gold.expectedClaims) claim.sourceTurnRange = [0, 0];
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "paraphrase-irrelevant")!;
+
+        const result = transform.apply(scenario, 0);
+        expect(result.applicable).toBe(true);
+        if (!result.applicable) return;
+        expect(lintScenario(result.scenario)).toEqual([]);
+    });
+
+    test("paraphrase never frames a message with a probe gold answer", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[2] = {
+            user: "Which tier owns the retry budget?",
+            assistant:
+                "Done: cache capacity is 4096 entries and the background tier owns the retry budget.",
+        };
+        const gold = raw.gold as {
+            expectedClaims: Array<{ predicate: { value: string } }>;
+        };
+        gold.expectedClaims[1]!.predicate.value = "background tier owns the retry budget";
+        // `background` is a valid gold answer that also appears in the paraphrase
+        // framing, so an unfiltered rewrite would put the answer into raw history
+        // the probe still reads.
+        (raw.probes as Array<Record<string, unknown>>)[0] = {
+            id: "probe-capacity",
+            question: "Which tier owns the retry budget?",
+            answerType: "exact",
+            goldAnswer: "background",
+            sourceClaimRef: "exp-cache-capacity",
+        };
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "paraphrase-irrelevant")!;
+
+        for (let seed = 0; seed < 30; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            result.scenario.transcript.turns.forEach((turn, index) => {
+                for (const role of ["user", "assistant"] as const) {
+                    const before = scenario.transcript.turns[index]![role];
+                    if (turn[role] === before) continue;
+                    expect(
+                        containsCompleteValue(turn[role], "background"),
+                        `seed ${seed} ${index}:${role}`,
+                    ).toBe(containsCompleteValue(before, "background"));
+                }
+            });
+        }
+    });
+
+    test("duplication refuses to push the rendered transcript past single-chunk headroom", () => {
+        const raw = validScenarioRaw();
+        const transcript = raw.transcript as {
+            turns: Array<{ user: string; assistant: string }>;
+            epilogueStartIndex: number;
+        };
+        const filler = ` ${"filler word ".repeat(14_000 / 12)}`;
+        for (const turn of transcript.turns) {
+            turn.user += filler;
+            turn.assistant += filler;
+        }
+        const scenario = parseScenario(raw);
+        // Lint-clean with margin to spare, but one more rendered turn does not fit.
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "duplicate-rejected-proposal")!;
+
+        const result = transform.apply(scenario, 0);
+        expect(result.applicable).toBe(false);
+        if (result.applicable) return;
+        expect(result.reason).toContain(CONTRACT_VIOLATION_REASON);
+        expect(result.reason).toContain("exceeds-single-chunk-headroom");
     });
 
     test("rename changes every eligible occurrence without colliding", () => {
@@ -451,6 +615,13 @@ describe("metamorphic transforms", () => {
                 const result = transform.apply(scenario, 20_260_830);
                 if (!result.applicable) {
                     expect(ALWAYS_APPLICABLE_TRANSFORM_IDS).not.toContain(transform.id);
+                    // A frozen scenario must never make a transform build a
+                    // derivative the contract rejects: that reason means the
+                    // transform declined at the backstop instead of at candidate
+                    // selection, and the corpus is where it gets fixed.
+                    expect(result.reason, `${scenario.id}/${transform.id}`).not.toContain(
+                        CONTRACT_VIOLATION_REASON,
+                    );
                     continue;
                 }
                 applied += 1;

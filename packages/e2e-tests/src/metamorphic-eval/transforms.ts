@@ -3,6 +3,8 @@ import {
     MAX_TRANSCRIPT_TURNS,
     MAX_TURN_TEXT_CHARS,
     authoredEvidenceText,
+    containsCompleteValue,
+    lintScenario,
     normalizeContent,
     normalizedEvidenceMessages,
     parseScenario,
@@ -76,6 +78,48 @@ export function remapGold(
     };
 }
 
+/**
+ * The reason prefix a derivative that violates the scenario contract carries.
+ * The frozen corpus must never produce one: it means a transform built a
+ * derivative the contract rejects rather than declining the candidate.
+ */
+export const CONTRACT_VIOLATION_REASON = "derivative violates the scenario contract";
+
+/**
+ * A lint diagnostic reduced to what it is about: the scenario ID it is labelled
+ * with differs between a source and its derivative, and a measurement in
+ * parentheses differs whenever the perturbation changed the number, so neither
+ * belongs in an identity used to compare the two.
+ */
+function diagnosticKey(diagnostic: string, scenarioID: string): string {
+    const unlabelled = diagnostic.startsWith(`${scenarioID}.`)
+        ? diagnostic.slice(scenarioID.length + 1)
+        : diagnostic;
+    const measurement = unlabelled.indexOf(" (");
+    return measurement === -1 ? unlabelled : unlabelled.slice(0, measurement);
+}
+
+/**
+ * Builds the derivative, or declines the candidate when the perturbation is what
+ * breaks the contract.
+ *
+ * Perturbing a transcript can push the result past a bound the source satisfied:
+ * a rewrite lengthens a message, an insertion adds a turn and the tokens it
+ * renders to, a reordering separates evidence a rule reads across the whole
+ * range. `parseScenario` answers those by throwing and `lintScenario` by
+ * returning diagnostics, and neither is a defect in the source — so the honest
+ * result is an inapplicable transform, not an exception that aborts enumeration
+ * for the whole scenario, and not an `applicable: true` carrying a scenario the
+ * harness would reject.
+ *
+ * Only diagnostics the source did not already carry count. A scenario that is
+ * unclean on its own stays the corpus's problem to fix, and blaming the
+ * transform for inheriting it would report every transform as inapplicable and
+ * hide whatever the perturbation actually did.
+ *
+ * A transform that can instead choose a different candidate should do so before
+ * arriving here; this is the backstop for the cases where no candidate helps.
+ */
 function derivative(
     base: HistorianEvalScenario,
     transform: Pick<Transform, "id" | "version">,
@@ -83,13 +127,30 @@ function derivative(
     turns: TranscriptTurn[],
     epilogueStartIndex: number,
     turnMap: number[],
-): TurnTransform {
-    const scenario = parseScenario({
-        ...base,
-        id: `${base.id}-d-${transform.id}-v${transform.version}-s${seed}`,
-        transcript: { turns, epilogueStartIndex },
-        gold: remapGold(base.gold, turnMap),
-    });
+): TransformResult {
+    let scenario: HistorianEvalScenario;
+    try {
+        scenario = parseScenario({
+            ...base,
+            id: `${base.id}-d-${transform.id}-v${transform.version}-s${seed}`,
+            transcript: { turns, epilogueStartIndex },
+            gold: remapGold(base.gold, turnMap),
+        });
+    } catch (error) {
+        return {
+            applicable: false,
+            reason: `${CONTRACT_VIOLATION_REASON}: ${error instanceof Error ? error.message : String(error)}`,
+        };
+    }
+    const inherited = new Set(
+        lintScenario(base).map((diagnostic) => diagnosticKey(diagnostic, base.id)),
+    );
+    const introduced = lintScenario(scenario).filter(
+        (diagnostic) => !inherited.has(diagnosticKey(diagnostic, scenario.id)),
+    );
+    if (introduced.length > 0) {
+        return { applicable: false, reason: `${CONTRACT_VIOLATION_REASON}: ${introduced.join("; ")}` };
+    }
     return { applicable: true, scenario, turnMap };
 }
 
@@ -146,14 +207,30 @@ function absentEvidenceMessages(scenario: HistorianEvalScenario): Set<string> {
     return spanned;
 }
 
+/** Turns that authored negative evidence runs through. */
+function absentEvidenceTurnIndexes(scenario: HistorianEvalScenario): Set<number> {
+    return new Set(
+        [...absentEvidenceMessages(scenario)].map((key) => Number(key.slice(0, key.indexOf(":")))),
+    );
+}
+
 function eligibleMessages(scenario: HistorianEvalScenario): EligibleMessage[] {
-    const protectedIndexes = protectedTurnIndexes(scenario);
     const evidenceMessages = absentEvidenceMessages(scenario);
+    return unprotectedMessages(scenario).filter(
+        (message) => !evidenceMessages.has(`${message.turnIndex}:${message.role}`),
+    );
+}
+
+/** Messages outside every expected-claim source range. */
+function unprotectedMessages(scenario: HistorianEvalScenario): EligibleMessage[] {
+    const protectedIndexes = protectedTurnIndexes(scenario);
     return scenario.transcript.turns.flatMap((turn, turnIndex) => {
         if (protectedIndexes.has(turnIndex)) return [];
-        return (["user", "assistant"] as const).flatMap((role) =>
-            evidenceMessages.has(`${turnIndex}:${role}`) ? [] : [{ turnIndex, role, text: turn[role] }],
-        );
+        return (["user", "assistant"] as const).map((role) => ({
+            turnIndex,
+            role,
+            text: turn[role],
+        }));
     });
 }
 
@@ -249,33 +326,28 @@ const paraphraseIrrelevant: Transform = {
     alwaysApplicable: true,
     apply(scenario, rawSeed) {
         const seed = normalizedSeed(rawSeed);
-        const eligible = eligibleMessages(scenario);
-        if (eligible.length === 0) {
-            return { applicable: false, reason: "no irrelevant message to paraphrase" };
-        }
         const rewrites = [
             (text: string) => `For context, ${text.charAt(0).toLowerCase()}${text.slice(1)}`,
             (text: string) => `${text} This is background context only.`,
             (text: string) => `As background: ${text}`,
         ];
-        // Every rewrite lengthens the message, and `derivative()` re-parses,
-        // where an over-limit message throws rather than returning a result. A
-        // message already at the limit is therefore not a candidate at all:
-        // throwing would abort enumeration for the whole scenario over one
-        // unrewritable message.
-        const fits = (text: string) => text.length <= MAX_TURN_TEXT_CHARS;
-        const candidates = eligible.filter((message) =>
-            rewrites.some((rewrite) => fits(rewrite(message.text))),
+        // Each rewrite keeps the original wording and only frames it, so a
+        // forbidden formation inside the message survives; only one that runs
+        // into a neighbouring message can lose its adjacency, and only the
+        // inserted framing can introduce a probe's answer. Candidates are
+        // therefore whole `(message, rewrite)` pairs proven against both, which
+        // keeps a message eligible for the rewrites that are safe for it instead
+        // of excluding it for the one that is not.
+        const candidates = unprotectedMessages(scenario).flatMap((message) =>
+            rewrites
+                .map((rewrite) => rewrite(message.text))
+                .filter((text) => safeParaphrase(scenario, message, text))
+                .map((text) => ({ message, text })),
         );
         if (candidates.length === 0) {
-            return { applicable: false, reason: "no paraphrase fits the turn text limit" };
+            return { applicable: false, reason: "no irrelevant message to paraphrase" };
         }
-        const next = splitmix32(seed);
-        const message = pick(candidates, next);
-        const text = pick(
-            rewrites.filter((rewrite) => fits(rewrite(message.text))),
-            next,
-        )(message.text);
+        const { message, text } = pick(candidates, splitmix32(seed));
         const turnMap = scenario.transcript.turns.map((_, index) => index);
         return derivative(
             scenario,
@@ -288,6 +360,34 @@ const paraphraseIrrelevant: Transform = {
     },
 };
 
+/**
+ * Whether rewriting `message` to `text` leaves the scenario's evidence intact.
+ *
+ * Three ways a framing rewrite can invalidate the comparison: it can outgrow the
+ * per-message ceiling, it can insert framing between the halves of a forbidden
+ * formation authored across a message boundary, and its own wording can state a
+ * probe's gold answer. The last one is the quiet failure — the answer then sits
+ * in raw history the probe still sees, so the probe can copy it without the
+ * injected claim and a passing run overstates accuracy on a source that was
+ * leakage-free.
+ */
+function safeParaphrase(
+    scenario: HistorianEvalScenario,
+    message: EligibleMessage,
+    text: string,
+): boolean {
+    if (text.length > MAX_TURN_TEXT_CHARS) return false;
+    const turns = replaceMessage(scenario.transcript.turns, message, text);
+    if (!preservesAbsentEvidence(scenario, turns, scenario.transcript.epilogueStartIndex)) return false;
+    return scenario.probes.every((probe) => {
+        if (probe.answerType === "claim-id") return true;
+        return (
+            !containsCompleteValue(text, probe.goldAnswer) ||
+            containsCompleteValue(message.text, probe.goldAnswer)
+        );
+    });
+}
+
 const reorderIndependentTurns: Transform = {
     id: "reorder-independent-turns",
     version: 1,
@@ -295,18 +395,20 @@ const reorderIndependentTurns: Transform = {
     apply(scenario, rawSeed) {
         const seed = normalizedSeed(rawSeed);
         const expectedIndexes = protectedTurnIndexes(scenario);
-        const absentIndexes = new Set(
-            scenario.transcript.turns.flatMap((turn, index) => {
-                const text = `${turn.user}\n${turn.assistant}`;
-                return scenario.gold.expectedAbsent.some((absent) => predicateMatches(absent.predicate, text))
-                    ? [index]
-                    : [];
-            }),
-        );
+        const absentIndexes = absentEvidenceTurnIndexes(scenario);
         const candidates = Array.from(
             { length: scenario.transcript.epilogueStartIndex - 1 },
             (_, index) => [index, index + 1] as const,
         ).flatMap(([left, right]) => {
+            // Swapping two byte-identical turns yields the source transcript
+            // back. The derivative would differ only by its generated ID, so the
+            // comparison would score the baseline against itself and report
+            // metamorphic evidence it never gathered.
+            const leftTurn = scenario.transcript.turns[left]!;
+            const rightTurn = scenario.transcript.turns[right]!;
+            if (leftTurn.user === rightTurn.user && leftTurn.assistant === rightTurn.assistant) {
+                return [];
+            }
             const crossesProposalDecision =
                 (absentIndexes.has(left) && expectedIndexes.has(right)) ||
                 (expectedIndexes.has(left) && absentIndexes.has(right));
@@ -350,6 +452,7 @@ const moveAcceptedDecision: Transform = {
     alwaysApplicable: false,
     apply(scenario, rawSeed) {
         const seed = normalizedSeed(rawSeed);
+        const absentIndexes = absentEvidenceTurnIndexes(scenario);
         const sources = [
             ...new Set(
                 scenario.gold.expectedClaims
@@ -370,13 +473,22 @@ const moveAcceptedDecision: Transform = {
             Array.from(
                 { length: Math.max(0, scenario.transcript.epilogueStartIndex - 2 - source) },
                 (_, index) => {
+                    const destination = source + index + 2;
                     const order = scenario.transcript.turns.map((_, turnIndex) => turnIndex);
                     const [moved] = order.splice(source, 1);
-                    order.splice(source + index + 2, 0, moved!);
-                    return { source, order };
+                    order.splice(destination, 0, moved!);
+                    return { source, destination, order };
                 },
             ).filter(
-                ({ order }) =>
+                ({ source: from, destination, order }) =>
+                    // Every turn the decision passes shifts ahead of it, so a
+                    // rejected proposal inside the span would end up preceding
+                    // the decision that rejected it — the same inversion
+                    // `reorder-independent-turns` refuses for an adjacent pair.
+                    !Array.from(
+                        { length: destination - from },
+                        (_, offset) => from + 1 + offset,
+                    ).some((turnIndex) => absentIndexes.has(turnIndex)) &&
                     preservesContiguousGold(scenario, mapForOrder(order)) &&
                     preservesAbsentEvidence(
                         scenario,
