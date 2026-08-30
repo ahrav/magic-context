@@ -231,27 +231,27 @@ pub struct SelectionConfig {
 
 /// A tool ARC grouped from the flat blocks: the selection unit. Each selector picks
 /// arcs to reduce; the arc then expands to per-block decisions.
-struct ToolArc {
-    arc_id: String,
+struct ToolArc<'a> {
+    arc_id: &'a str,
     /// Message that owns the ToolCall block; duplicate fingerprints are owner-qualified.
-    owner_message_id: Option<String>,
+    owner_message_id: Option<&'a str>,
     name: String,
     /// Original tool name, needed because the duplicate-safe set retains the `mcp_` prefix.
-    dedup_name: String,
+    dedup_name: &'a str,
     /// Result position mirrors the order in which the TS tagger allocates tool tags.
     dedup_result_ordinal: u64,
     dedup_result_block_index: usize,
     /// The arc's age key = the ToolCall block's ordinal (or the min block ordinal).
     ordinal: u64,
     provider_executed: bool,
-    input: serde_json::Value,
+    input: &'a serde_json::Value,
     /// FlatBlock ids of ToolCall blocks owned by this `(assistant mid, call id)` arc.
     /// Malformed providers can repeat a call id inside one assistant message; TS treats
     /// those blocks as one drop target, so Rust keeps one composite arc with many blocks.
-    call_inputs: Vec<(String, serde_json::Value)>,
+    call_inputs: Vec<(&'a str, &'a serde_json::Value)>,
     call_bytes: usize,
     /// FlatBlock ids of paired ToolResult blocks (absent when a result has not arrived).
-    result_ids: Vec<String>,
+    result_ids: Vec<&'a str>,
     result_bytes: usize,
     /// Persisted tag-token total; legacy arcs with no estimate remain reclaimable.
     reclaim_tokens: Option<usize>,
@@ -259,7 +259,7 @@ struct ToolArc {
     reduced: bool,
 }
 
-impl ToolArc {
+impl ToolArc<'_> {
     /// Bytes a full arc drop actually removes from the wire. Signed reasoning stays verbatim.
     fn reclaim_bytes(&self) -> usize {
         self.call_bytes + self.result_bytes
@@ -294,24 +294,26 @@ fn read_input_str(input: &serde_json::Value, keys: &[&str]) -> Option<String> {
 /// Group the flat blocks into tool arcs (by `arc_id`), collecting the call/result
 /// bytes and adjacent reasoning. Non-tool, non-arc blocks are ignored here (they
 /// are not reduction targets for the tool selectors; ctx_reduce targets ids directly).
-fn group_arcs(items: &[SelItem], frozen: &HashSet<String>) -> Vec<ToolArc> {
-    let mut arcs: HashMap<String, ToolArc> = HashMap::new();
+static NULL_INPUT: serde_json::Value = serde_json::Value::Null;
+
+fn group_arcs<'a>(items: &'a [SelItem], frozen: &HashSet<String>) -> Vec<ToolArc<'a>> {
+    let mut arcs: HashMap<&'a str, ToolArc<'a>> = HashMap::new();
     // Deterministic arc order = first-appearance order (by min ordinal), applied at
     // the end via a sort. Build the map first.
     for item in items {
-        let Some(arc_id) = item.arc_id.clone() else {
+        let Some(arc_id) = item.arc_id.as_deref() else {
             continue;
         };
-        let entry = arcs.entry(arc_id.clone()).or_insert_with(|| ToolArc {
-            arc_id: arc_id.clone(),
+        let entry = arcs.entry(arc_id).or_insert_with(|| ToolArc {
+            arc_id,
             owner_message_id: None,
             name: String::new(),
-            dedup_name: String::new(),
+            dedup_name: "",
             dedup_result_ordinal: 0,
             dedup_result_block_index: 0,
             ordinal: u64::MAX,
             provider_executed: false,
-            input: serde_json::Value::Null,
+            input: &NULL_INPUT,
             call_inputs: Vec::new(),
             call_bytes: 0,
             result_ids: Vec::new(),
@@ -334,19 +336,19 @@ fn group_arcs(items: &[SelItem], frozen: &HashSet<String>) -> Vec<ToolArc> {
         match &item.kind {
             SelKind::ToolCall { name, input } => {
                 entry.name = normalize_tool_name(name);
-                entry.dedup_name = name.clone();
+                entry.dedup_name = name.as_str();
                 if entry.call_inputs.is_empty() {
-                    entry.input = input.clone();
-                    entry.owner_message_id = item_message_id(item).map(str::to_owned);
+                    entry.input = input;
+                    entry.owner_message_id = item_message_id(item);
                 }
-                entry.call_inputs.push((item.id.clone(), input.clone()));
+                entry.call_inputs.push((item.id.as_str(), input));
                 entry.call_bytes += item.byte_size;
                 entry.provider_executed = item.provider_executed;
             }
             SelKind::ToolResult { tool_name } => {
                 if entry.name.is_empty() {
                     entry.name = normalize_tool_name(tool_name);
-                    entry.dedup_name = tool_name.clone();
+                    entry.dedup_name = tool_name.as_str();
                 }
                 let block_index = item
                     .id
@@ -359,7 +361,7 @@ fn group_arcs(items: &[SelItem], frozen: &HashSet<String>) -> Vec<ToolArc> {
                     entry.dedup_result_ordinal = item.ordinal;
                     entry.dedup_result_block_index = block_index;
                 }
-                entry.result_ids.push(item.id.clone());
+                entry.result_ids.push(item.id.as_str());
                 entry.result_bytes += item.byte_size;
                 if item.provider_executed {
                     entry.provider_executed = true;
@@ -368,11 +370,11 @@ fn group_arcs(items: &[SelItem], frozen: &HashSet<String>) -> Vec<ToolArc> {
             _ => {}
         }
     }
-    let mut out: Vec<ToolArc> = arcs.into_values().collect();
+    let mut out: Vec<ToolArc<'a>> = arcs.into_values().collect();
     out.sort_by(|a, b| {
         a.ordinal
             .cmp(&b.ordinal)
-            .then_with(|| a.arc_id.cmp(&b.arc_id))
+            .then_with(|| a.arc_id.cmp(b.arc_id))
     });
     out
 }
@@ -694,12 +696,12 @@ fn skeleton_payload(input: &serde_json::Value) -> String {
 /// reasoning-only message shapes have already been excluded from the candidate pool.
 /// Skips blocks that are already frozen (never re-decide) or absent.
 fn expand_arc(
-    arc: &ToolArc,
+    arc: &ToolArc<'_>,
     shape: ArcShape,
     frozen: &HashSet<String>,
     out: &mut Vec<ReductionDecision>,
 ) {
-    for (call_id, input) in &arc.call_inputs {
+    for &(call_id, input) in &arc.call_inputs {
         if !frozen.contains(call_id) {
             let (kind, payload) = match shape {
                 ArcShape::Skeleton => (RedKind::Skeleton, skeleton_payload(input)),
@@ -709,16 +711,16 @@ fn expand_arc(
                 ArcShape::EditMarker => (RedKind::EditMarker, edit_marker_payload(input)),
             };
             out.push(ReductionDecision {
-                target_id: call_id.clone(),
+                target_id: call_id.to_string(),
                 kind: kind.as_str().to_string(),
                 payload,
             });
         }
     }
-    for result_id in &arc.result_ids {
+    for &result_id in &arc.result_ids {
         if !frozen.contains(result_id) {
             out.push(ReductionDecision {
-                target_id: result_id.clone(),
+                target_id: result_id.to_string(),
                 kind: RedKind::Drop.as_str().to_string(),
                 payload: DROPPED_PLACEHOLDER.to_string(),
             });
@@ -733,8 +735,8 @@ fn expand_arc(
 
 // --- the five selectors: each returns the ARC-IDs (or block-ids) it targets ---
 
-fn newest_ctx_reduce_arc_ids(arcs: &[&ToolArc]) -> HashSet<String> {
-    let mut newest_first: Vec<&ToolArc> = arcs
+fn newest_ctx_reduce_arc_ids(arcs: &[&ToolArc<'_>]) -> HashSet<String> {
+    let mut newest_first: Vec<&ToolArc<'_>> = arcs
         .iter()
         .copied()
         .filter(|arc| arc.name == "ctx_reduce")
@@ -743,12 +745,12 @@ fn newest_ctx_reduce_arc_ids(arcs: &[&ToolArc]) -> HashSet<String> {
         right
             .ordinal
             .cmp(&left.ordinal)
-            .then_with(|| right.arc_id.cmp(&left.arc_id))
+            .then_with(|| right.arc_id.cmp(left.arc_id))
     });
     newest_first
         .into_iter()
         .take(CTX_REDUCE_KEEP)
-        .map(|arc| arc.arc_id.clone())
+        .map(|arc| arc.arc_id.to_string())
         .collect()
 }
 
@@ -757,14 +759,14 @@ fn newest_ctx_reduce_arc_ids(arcs: &[&ToolArc]) -> HashSet<String> {
 /// meta drop-all, ctx_note drop-on-zero-value-action; edit/write older-per-file →
 /// edit_marker. Returns per-arc intents so the caller expands + shapes them. Active
 /// (non-reduced, client-executed) arcs only.
-fn select_supersession(arcs: &[&ToolArc]) -> HashMap<String, ArcIntent> {
+fn select_supersession(arcs: &[&ToolArc<'_>]) -> HashMap<String, ArcIntent> {
     let mut intents: HashMap<String, ArcIntent> = HashMap::new();
     // Newest-arc-first for keep-N and newest-per-file semantics.
-    let mut newest_first: Vec<&&ToolArc> = arcs.iter().collect();
+    let mut newest_first: Vec<&&ToolArc<'_>> = arcs.iter().collect();
     newest_first.sort_by(|a, b| {
         b.ordinal
             .cmp(&a.ordinal)
-            .then_with(|| b.arc_id.cmp(&a.arc_id))
+            .then_with(|| b.arc_id.cmp(a.arc_id))
     });
 
     let mut todowrite_seen = 0usize;
@@ -775,10 +777,10 @@ fn select_supersession(arcs: &[&ToolArc]) -> HashMap<String, ArcIntent> {
         let name = arc.name.as_str();
         // Edit supersession first (1.2): older-per-file → edit_marker.
         if is_edit_tool(name) {
-            if let Some(fp) = read_input_str(&arc.input, FILE_PATH_KEYS) {
+            if let Some(fp) = read_input_str(arc.input, FILE_PATH_KEYS) {
                 if seen_file.contains(&fp) {
                     intents
-                        .entry(arc.arc_id.clone())
+                        .entry(arc.arc_id.to_string())
                         .or_insert(ArcIntent { edit_marker: true });
                 } else {
                     seen_file.insert(fp); // newest edit to this file stays full
@@ -791,11 +793,11 @@ fn select_supersession(arcs: &[&ToolArc]) -> HashMap<String, ArcIntent> {
             todowrite_seen += 1;
             todowrite_seen > TODOWRITE_KEEP
         } else if name == "ctx_reduce" {
-            !protected_ctx_reduce_arcs.contains(&arc.arc_id)
+            !protected_ctx_reduce_arcs.contains(arc.arc_id)
         } else if ZERO_VALUE_META_TOOLS.contains(&name) {
             true
         } else if name == "ctx_note" {
-            read_input_str(&arc.input, &["action"])
+            read_input_str(arc.input, &["action"])
                 .map(|a| CTX_NOTE_ZERO_VALUE_ACTIONS.contains(&a.as_str()))
                 .unwrap_or(false)
         } else {
@@ -803,7 +805,7 @@ fn select_supersession(arcs: &[&ToolArc]) -> HashMap<String, ArcIntent> {
         };
         if is_drop_target {
             // A full drop supersedes an edit_marker for the same arc (drop wins).
-            intents.insert(arc.arc_id.clone(), ArcIntent { edit_marker: false });
+            intents.insert(arc.arc_id.to_string(), ArcIntent { edit_marker: false });
         }
     }
     intents
@@ -812,12 +814,12 @@ fn select_supersession(arcs: &[&ToolArc]) -> HashMap<String, ArcIntent> {
 /// Select older completed duplicate calls from safe tools. The owner is in both the lookup key
 /// and the fingerprint, so identical calls from distinct assistant messages stay distinct.
 /// Arguments use `serde_json` serialization; a serialization failure skips that candidate.
-fn select_tool_dedup(arcs: &[&ToolArc], ctx: &SelectionContext) -> HashSet<String> {
-    // Like the TS tag-side index, retain an owner-qualified lookup key separately
-    // from the fingerprint bucket. The owner must also remain in the fingerprint value.
-    let mut by_owner_arc: HashMap<(String, String), (&ToolArc, String)> = HashMap::new();
+fn select_tool_dedup(arcs: &[&ToolArc<'_>], ctx: &SelectionContext) -> HashSet<String> {
+    // Including `owner_message_id` in `fingerprint` keeps identical calls from
+    // distinct assistant messages in separate buckets.
+    let mut groups: HashMap<String, Vec<&ToolArc<'_>>> = HashMap::new();
     for arc in arcs {
-        if !DEDUP_SAFE_TOOLS.contains(&arc.dedup_name.as_str())
+        if !DEDUP_SAFE_TOOLS.contains(&arc.dedup_name)
             || arc.owner_message_id.is_none()
             || arc.result_ids.is_empty()
             || arc
@@ -829,21 +831,12 @@ fn select_tool_dedup(arcs: &[&ToolArc], ctx: &SelectionContext) -> HashSet<Strin
         {
             continue;
         }
-        let Some(args) = serde_json::to_string(&arc.input).ok() else {
+        let Some(args) = serde_json::to_string(arc.input).ok() else {
             continue;
         };
-        let owner_message_id = arc
-            .owner_message_id
-            .as_ref()
-            .expect("owner checked above")
-            .clone();
+        let owner_message_id = arc.owner_message_id.expect("owner checked above");
         let fingerprint = format!("{owner_message_id}:{}:{args}", arc.dedup_name);
-        by_owner_arc.insert((owner_message_id, arc.arc_id.clone()), (*arc, fingerprint));
-    }
-
-    let mut groups: HashMap<String, Vec<&ToolArc>> = HashMap::new();
-    for (_, (arc, fingerprint)) in by_owner_arc {
-        groups.entry(fingerprint).or_default().push(arc);
+        groups.entry(fingerprint).or_default().push(*arc);
     }
     groups
         .into_values()
@@ -858,13 +851,13 @@ fn select_tool_dedup(arcs: &[&ToolArc], ctx: &SelectionContext) -> HashSet<Strin
                         left.dedup_result_block_index
                             .cmp(&right.dedup_result_block_index)
                     })
-                    .then_with(|| left.arc_id.cmp(&right.arc_id))
+                    .then_with(|| left.arc_id.cmp(right.arc_id))
             });
             // Preserve the newest (highest tool-result position, then stable arc id).
             group.pop();
             group
                 .into_iter()
-                .map(|arc| arc.arc_id.clone())
+                .map(|arc| arc.arc_id.to_string())
                 .collect::<Vec<_>>()
         })
         .collect()
@@ -877,7 +870,7 @@ fn two_pass_batch_can_apply(ctx: &SelectionContext) -> bool {
 
 /// 1.4 Age-based two-pass: tool arcs whose age (ToolCall ordinal) is at/under the
 /// last-execute watermark. Add-only (the watermark advances forward). Returns arc ids.
-fn select_two_pass(arcs: &[&ToolArc], ctx: &SelectionContext) -> HashSet<String> {
+fn select_two_pass(arcs: &[&ToolArc<'_>], ctx: &SelectionContext) -> HashSet<String> {
     if !two_pass_batch_can_apply(ctx) || ctx.last_execute_ordinal == 0 {
         return HashSet::new();
     }
@@ -888,18 +881,18 @@ fn select_two_pass(arcs: &[&ToolArc], ctx: &SelectionContext) -> HashSet<String>
         .max_by(|left, right| {
             left.ordinal
                 .cmp(&right.ordinal)
-                .then_with(|| left.arc_id.cmp(&right.arc_id))
+                .then_with(|| left.arc_id.cmp(right.arc_id))
         })
-        .map(|arc| arc.arc_id.as_str());
+        .map(|arc| arc.arc_id);
     arcs.iter()
         .filter(|arc| arc.ordinal <= ctx.last_execute_ordinal)
         .filter(|arc| {
             arc.reclaim_tokens
                 .is_none_or(|tokens| tokens >= AGE_RECLAIM_MIN_TOKENS)
         })
-        .filter(|arc| Some(arc.arc_id.as_str()) != newest_todowrite)
-        .filter(|arc| !protected_ctx_reduce_arcs.contains(&arc.arc_id))
-        .map(|arc| arc.arc_id.clone())
+        .filter(|arc| Some(arc.arc_id) != newest_todowrite)
+        .filter(|arc| !protected_ctx_reduce_arcs.contains(arc.arc_id))
+        .map(|arc| arc.arc_id.to_string())
         .collect()
 }
 
@@ -908,12 +901,12 @@ fn select_two_pass(arcs: &[&ToolArc], ctx: &SelectionContext) -> HashSet<String>
 /// isn't needed — the agent marks specific blocks). Frozen/absent filtered by caller.
 fn select_agent_drops(
     ctx: &SelectionContext,
-    live_ids: &HashSet<String>,
+    live_ids: &HashSet<&str>,
     frozen: &HashSet<String>,
     out: &mut Vec<ReductionDecision>,
 ) {
     for id in &ctx.agent_drop_ids {
-        if frozen.contains(id) || !live_ids.contains(id) || ctx.block_is_protected(id) {
+        if frozen.contains(id) || !live_ids.contains(id.as_str()) || ctx.block_is_protected(id) {
             continue;
         }
         let first_applied = ctx.first_applied_agent_drop_ids.contains(id);
@@ -929,7 +922,7 @@ fn select_agent_drops(
                 && ctx.agent_drop_ids.iter().any(|other| {
                     other != id
                         && !ctx.first_applied_agent_drop_ids.contains(other)
-                        && live_ids.contains(other)
+                        && live_ids.contains(other.as_str())
                         && !frozen.contains(other)
                         && !ctx.block_is_protected(other)
                         && ctx.agent_drop_command_ids.get(other)
@@ -994,7 +987,7 @@ fn active_floor_tokens(items: &[SelItem], frozen_keys: &HashSet<String>) -> f64 
 /// and the newest-20% T1/T2 reserve, until reclaim met. The floor covers every active
 /// live tag class, while candidates remain active tool arcs. Returns the arc ids to full-drop.
 fn select_emergency(
-    arcs: &[&ToolArc],
+    arcs: &[&ToolArc<'_>],
     ctx: &SelectionContext,
     all_active_floor_tokens: f64,
 ) -> HashSet<String> {
@@ -1021,7 +1014,7 @@ fn select_emergency(
     }
 
     // Per-tier recency reserve (T1, T2 only): the newest ceil(20%) active arcs.
-    let mut tier_active: HashMap<u8, Vec<&&ToolArc>> = HashMap::new();
+    let mut tier_active: HashMap<u8, Vec<&&ToolArc<'_>>> = HashMap::new();
     for arc in arcs {
         let tier = resolve_tool_tier(&arc.name);
         if tier == 1 || tier == 2 {
@@ -1034,11 +1027,11 @@ fn select_emergency(
             nums.sort_by(|a, b| {
                 b.ordinal
                     .cmp(&a.ordinal)
-                    .then_with(|| b.arc_id.cmp(&a.arc_id))
+                    .then_with(|| b.arc_id.cmp(a.arc_id))
             });
             let reserve_count = (TIER_RECENCY_RESERVE * nums.len() as f64).ceil() as usize;
             for arc in nums.iter().take(reserve_count) {
-                reserved.insert(arc.arc_id.clone());
+                reserved.insert(arc.arc_id.to_string());
             }
         }
     }
@@ -1049,16 +1042,16 @@ fn select_emergency(
     let protected_ctx_reduce_arcs = newest_ctx_reduce_arc_ids(arcs);
 
     // Build candidates per tier (protected tail + reserve excluded).
-    let mut by_tier: HashMap<u8, Vec<&&ToolArc>> = HashMap::new();
+    let mut by_tier: HashMap<u8, Vec<&&ToolArc<'_>>> = HashMap::new();
     for arc in arcs {
         if arc.ordinal > ctx.protected_cutoff_ordinal && ctx.protected_cutoff_ordinal > 0 {
             continue; // global protected tail
         }
-        if protected_ctx_reduce_arcs.contains(&arc.arc_id) {
+        if protected_ctx_reduce_arcs.contains(arc.arc_id) {
             continue;
         }
         let tier = resolve_tool_tier(&arc.name);
-        if (tier == 1 || tier == 2) && reserved.contains(&arc.arc_id) {
+        if (tier == 1 || tier == 2) && reserved.contains(arc.arc_id) {
             continue;
         }
         by_tier.entry(tier).or_default().push(arc);
@@ -1072,10 +1065,10 @@ fn select_emergency(
             group.sort_by(|a, b| {
                 a.ordinal
                     .cmp(&b.ordinal)
-                    .then_with(|| a.arc_id.cmp(&b.arc_id))
+                    .then_with(|| a.arc_id.cmp(b.arc_id))
             });
             for arc in group.iter() {
-                selected.insert(arc.arc_id.clone());
+                selected.insert(arc.arc_id.to_string());
                 reclaimed += bytes_to_tokens(arc.reclaim_bytes());
                 if reclaimed >= reclaim_tokens {
                     break 'outer;
@@ -1133,7 +1126,7 @@ pub fn select_reductions_with_outcome(
     }
 
     let two_pass_batch_can_apply = two_pass_batch_can_apply(ctx);
-    let live_ids: HashSet<String> = items
+    let live_ids: HashSet<&str> = items
         .iter()
         .filter(|item| {
             // Media/Opaque are pass-through carriers; Reasoning is signed
@@ -1145,7 +1138,7 @@ pub fn select_reductions_with_outcome(
                 SelKind::Media | SelKind::Opaque | SelKind::Reasoning | SelKind::RedactedReasoning
             )
         })
-        .map(|item| item.id.clone())
+        .map(|item| item.id.as_str())
         .collect();
     let arcs = group_arcs(items, frozen_keys);
     let reasoning_ineligible_arcs = reasoning_ineligible_arc_ids(items);
@@ -1157,12 +1150,12 @@ pub fn select_reductions_with_outcome(
     let active_arcs: Vec<&ToolArc> = arcs
         .iter()
         .filter(|a| {
-            !a.reduced && !a.provider_executed && !reasoning_ineligible_arcs.contains(&a.arc_id)
+            !a.reduced && !a.provider_executed && !reasoning_ineligible_arcs.contains(a.arc_id)
         })
         .collect();
     let arc_by_id: HashMap<&str, &ToolArc> = active_arcs
         .iter()
-        .map(|arc| (arc.arc_id.as_str(), *arc))
+        .map(|arc| (arc.arc_id, *arc))
         .collect();
 
     // Per-arc reduction intents (arc_id → shape), assembled in TS precedence order.
@@ -1173,7 +1166,7 @@ pub fn select_reductions_with_outcome(
     let arcs_after_dedup: Vec<&ToolArc> = active_arcs
         .iter()
         .copied()
-        .filter(|arc| !dedup_arc_ids.contains(&arc.arc_id))
+        .filter(|arc| !dedup_arc_ids.contains(arc.arc_id))
         .collect();
     let two_pass_arc_ids = select_two_pass(&arcs_after_dedup, ctx);
     let mut eligible_supersession_arc_ids = None;
@@ -1275,11 +1268,11 @@ pub fn select_reductions_with_outcome(
                     arc_by_id.get(arc_id.as_str()).is_some_and(|arc| {
                         arc.call_inputs
                             .iter()
-                            .any(|(id, _)| protected_block_ids.contains(id))
+                            .any(|(id, _)| protected_block_ids.contains(*id))
                             || arc
                                 .result_ids
                                 .iter()
-                                .any(|id| protected_block_ids.contains(id))
+                                .any(|id| protected_block_ids.contains(*id))
                     })
                 })
                 .cloned()
@@ -1299,12 +1292,12 @@ pub fn select_reductions_with_outcome(
     newest_arcs.sort_by(|a, b| {
         b.ordinal
             .cmp(&a.ordinal)
-            .then_with(|| b.arc_id.cmp(&a.arc_id))
+            .then_with(|| b.arc_id.cmp(a.arc_id))
     });
-    let skeleton_window: HashSet<String> = newest_arcs
+    let skeleton_window: HashSet<&str> = newest_arcs
         .iter()
         .take(RECENT_TOOL_SKELETON_WINDOW)
-        .map(|a| a.arc_id.clone())
+        .map(|a| a.arc_id)
         .collect();
 
     let mut out: Vec<ReductionDecision> = Vec::new();
@@ -1326,7 +1319,7 @@ pub fn select_reductions_with_outcome(
             ArcShape::Skeleton => ArcShape::Skeleton,
             ArcShape::FullDrop
                 if reasoning_adjacency_collapse_arcs.contains(arc_id)
-                    || skeleton_window.contains(arc_id) =>
+                    || skeleton_window.contains(arc_id.as_str()) =>
             {
                 ArcShape::Skeleton
             }
