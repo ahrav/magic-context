@@ -1,0 +1,557 @@
+#![cfg(feature = "test-support")]
+
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+
+use mc_store::kernel::{
+    ArtifactDestination, ArtifactEligibility, ArtifactErrorKind, ArtifactHandle,
+    ArtifactIngestFault, ArtifactIngestRequest, CommitIntent, DomainSpec, EligibilityDeniedReason,
+    KernelStore, ProviderEgress, RepositoryProvenance, Sensitivity,
+};
+use rusqlite::{params, Connection};
+use sha2::{Digest, Sha256};
+
+const SECRET: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwxyzABCDEFGH12345678";
+const MIB: usize = 1024 * 1024;
+
+fn assert_send_sync<T: Send + Sync>() {}
+
+fn intent(key: &str, payload: &[u8]) -> CommitIntent {
+    CommitIntent {
+        producer: "kernel-cas-test".to_string(),
+        operation_key: key.to_string(),
+        request_digest: format!("{:x}", Sha256::digest(payload)),
+        actor: "test".to_string(),
+        cause: "proof".to_string(),
+    }
+}
+
+fn seed_domain(store: &KernelStore) {
+    store
+        .commit(intent("domain", b"domain"), |envelope| {
+            envelope.insert_domain(DomainSpec {
+                domain_id: "domain".to_string(),
+                object_id: "domain-object".to_string(),
+                name: "fixture".to_string(),
+                source_kind: "fixture".to_string(),
+                source_id: "domain".to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+            })?;
+            Ok("domain".to_string())
+        })
+        .unwrap();
+}
+
+fn request(key: &str, payload: Vec<u8>) -> ArtifactIngestRequest {
+    ArtifactIngestRequest {
+        intent: intent(key, &payload),
+        payload,
+        evidence_id: format!("evidence-{key}"),
+        object_id: format!("evidence-object-{key}"),
+        object_kind: "evidence".to_string(),
+        domain_id: "domain".to_string(),
+        source_kind: "repository".to_string(),
+        source_id: format!("src/{key}"),
+        source_revision: 1,
+        media_type: "text/plain".to_string(),
+        retention_class: "canonical".to_string(),
+        retain_until: None,
+        asserted_sensitivity: Sensitivity::Normal,
+        provider_egress: ProviderEgress::RemoteAllowed,
+        provenance: Some(RepositoryProvenance {
+            repository_id: "repo".to_string(),
+            revision: "abc123".to_string(),
+        }),
+    }
+}
+
+fn artifact_path(root: &std::path::Path, digest: &str) -> std::path::PathBuf {
+    root.join("artifacts/objects")
+        .join(&digest[..2])
+        .join(&digest[2..])
+}
+
+fn invalidate_evidence(root: &std::path::Path, evidence_id: &str) {
+    let connection = Connection::open(root.join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE evidence_meta SET invalidated_commit_seq=created_commit_seq
+             WHERE evidence_id=?1",
+            [evidence_id],
+        )
+        .unwrap();
+}
+
+fn tree_bytes(path: &std::path::Path) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.is_dir() {
+            pending.extend(
+                fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path()),
+            );
+        } else if metadata.is_file() {
+            bytes.extend(fs::read(path).unwrap());
+        }
+    }
+    bytes
+}
+
+#[test]
+fn ingest_publishes_sharded_redacted_bytes_and_commits_live_reference() {
+    assert_send_sync::<KernelStore>();
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let payload = format!("prefix {SECRET} suffix").into_bytes();
+
+    let handle = store.ingest_artifact(request("happy", payload)).unwrap();
+    let stored = store.read_artifact(&handle).unwrap();
+
+    assert!(!stored
+        .windows(SECRET.len())
+        .any(|window| window == SECRET.as_bytes()));
+    assert_eq!(format!("{:x}", Sha256::digest(&stored)), handle.digest);
+    assert_eq!(
+        fs::read(artifact_path(root.path(), &handle.digest)).unwrap(),
+        stored
+    );
+    assert_eq!(
+        fs::metadata(root.path().join("artifacts"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert!(!tree_bytes(root.path())
+        .windows(SECRET.len())
+        .any(|window| window == SECRET.as_bytes()));
+
+    let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
+    let row: (i64, i64, String, String) = connection
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM evidence_meta WHERE evidence_id=?1 AND invalidated_commit_seq IS NULL),
+                    (SELECT COUNT(*) FROM artifact_ingestion_reservations WHERE artifact_digest=?2),
+                    detector_id,secret_type
+             FROM evidence_meta WHERE evidence_id=?1",
+            params![handle.evidence_id, handle.digest],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        row,
+        (
+            1,
+            0,
+            "redaction-vocabulary-v1".to_string(),
+            "anthropic_api_key".to_string()
+        )
+    );
+}
+
+#[test]
+fn payload_limit_is_inclusive() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+
+    store
+        .ingest_artifact(request("limit", vec![b'x'; 64 * MIB]))
+        .unwrap();
+    let error = store
+        .ingest_artifact(request("over-limit", vec![b'x'; 64 * MIB + 1]))
+        .unwrap_err();
+    assert_eq!(error.kind(), ArtifactErrorKind::PayloadTooLarge);
+}
+
+#[test]
+fn dedup_merges_sensitivity_and_provider_restrictions_restrictively() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let payload = b"same clean bytes".to_vec();
+    let first = store
+        .ingest_artifact(request("dedup-normal", payload.clone()))
+        .unwrap();
+    let mut restrictive = request("dedup-sensitive", payload);
+    restrictive.asserted_sensitivity = Sensitivity::Sensitive;
+    restrictive.provider_egress = ProviderEgress::LocalOnly;
+    let second = store.ingest_artifact(restrictive).unwrap();
+
+    assert_eq!(first.digest, second.digest);
+    assert_eq!(
+        store
+            .artifact_eligibility(&first, ArtifactDestination::Remote)
+            .unwrap(),
+        ArtifactEligibility::Denied(EligibilityDeniedReason::SensitiveRemote)
+    );
+    assert_eq!(
+        store
+            .artifact_eligibility(&second, ArtifactDestination::Remote)
+            .unwrap(),
+        ArtifactEligibility::Denied(EligibilityDeniedReason::SensitiveRemote)
+    );
+    assert_eq!(
+        fs::read_dir(artifact_path(root.path(), &first.digest).parent().unwrap())
+            .unwrap()
+            .count(),
+        1
+    );
+
+    let other_payload = b"same public bytes".to_vec();
+    let first = store
+        .ingest_artifact(request("egress-open", other_payload.clone()))
+        .unwrap();
+    let mut local_only = request("egress-local", other_payload);
+    local_only.provider_egress = ProviderEgress::LocalOnly;
+    store.ingest_artifact(local_only).unwrap();
+    assert_eq!(
+        store
+            .artifact_eligibility(&first, ArtifactDestination::Remote)
+            .unwrap(),
+        ArtifactEligibility::Denied(EligibilityDeniedReason::ProviderRestricted)
+    );
+}
+
+#[test]
+fn unproven_normal_and_non_utf8_are_clamped_sensitive() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let mut unproven = request("unproven", b"clean".to_vec());
+    unproven.provenance = None;
+    let unproven = store.ingest_artifact(unproven).unwrap();
+    let binary = store
+        .ingest_artifact(request("binary", vec![0xff, 0xfe, 0xfd]))
+        .unwrap();
+
+    for handle in [&unproven, &binary] {
+        assert_eq!(
+            store
+                .artifact_eligibility(handle, ArtifactDestination::Remote)
+                .unwrap(),
+            ArtifactEligibility::Denied(EligibilityDeniedReason::SensitiveRemote)
+        );
+        assert_eq!(
+            store
+                .artifact_eligibility(handle, ArtifactDestination::Local)
+                .unwrap(),
+            ArtifactEligibility::Allowed
+        );
+    }
+}
+
+#[test]
+fn cap_error_reports_usage_and_cap_without_poisoning_reads() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open_with_artifact_cap_for_test(root.path(), 8).unwrap();
+    seed_domain(&store);
+    let handle = store
+        .ingest_artifact(request("within-cap", b"12345678".to_vec()))
+        .unwrap();
+    let error = store
+        .ingest_artifact(request("over-cap", b"9".to_vec()))
+        .unwrap_err();
+
+    assert_eq!(error.kind(), ArtifactErrorKind::Capacity);
+    assert_eq!(error.usage(), Some(8));
+    assert_eq!(error.cap(), Some(8));
+    assert_eq!(store.read_artifact(&handle).unwrap(), b"12345678");
+}
+
+#[test]
+fn invalidated_retained_object_still_consumes_cap() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open_with_artifact_cap_for_test(root.path(), 8).unwrap();
+    seed_domain(&store);
+    let retained = store
+        .ingest_artifact(request("retained", b"12345678".to_vec()))
+        .unwrap();
+    invalidate_evidence(root.path(), &retained.evidence_id);
+
+    let error = store
+        .ingest_artifact(request("over-retained-cap", b"9".to_vec()))
+        .unwrap_err();
+    assert_eq!(error.kind(), ArtifactErrorKind::Capacity);
+    assert_eq!(error.usage(), Some(8));
+}
+
+#[test]
+fn read_rejects_missing_and_corrupt_objects() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let missing = store
+        .ingest_artifact(request("missing", b"missing".to_vec()))
+        .unwrap();
+    fs::remove_file(artifact_path(root.path(), &missing.digest)).unwrap();
+    assert_eq!(
+        store.read_artifact(&missing).unwrap_err().kind(),
+        ArtifactErrorKind::MissingObject
+    );
+
+    let corrupt = store
+        .ingest_artifact(request("corrupt", b"correct".to_vec()))
+        .unwrap();
+    fs::write(artifact_path(root.path(), &corrupt.digest), b"wrong").unwrap();
+    assert_eq!(
+        store.read_artifact(&corrupt).unwrap_err().kind(),
+        ArtifactErrorKind::CorruptObject
+    );
+}
+
+#[test]
+fn read_rejects_malformed_digests_without_path_derivation() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+
+    for digest in ["abc".to_string(), format!("{}g", "a".repeat(63))] {
+        let handle = ArtifactHandle {
+            digest,
+            evidence_id: "untrusted".to_string(),
+        };
+        assert_eq!(
+            store.read_artifact(&handle).unwrap_err().kind(),
+            ArtifactErrorKind::InvalidInput
+        );
+    }
+}
+
+#[test]
+fn eligibility_matrix_includes_secret_unknown_and_tombstone() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let normal = store
+        .ingest_artifact(request("normal", b"public".to_vec()))
+        .unwrap();
+    let mut sensitive_request = request("sensitive", b"private".to_vec());
+    sensitive_request.asserted_sensitivity = Sensitivity::Sensitive;
+    let sensitive = store.ingest_artifact(sensitive_request).unwrap();
+    let mut secret_request = request("secret", b"classified".to_vec());
+    secret_request.asserted_sensitivity = Sensitivity::Secret;
+    let secret = store.ingest_artifact(secret_request).unwrap();
+
+    assert_eq!(
+        store
+            .artifact_eligibility(&normal, ArtifactDestination::Remote)
+            .unwrap(),
+        ArtifactEligibility::Allowed
+    );
+    assert_eq!(
+        store
+            .artifact_eligibility(&sensitive, ArtifactDestination::Local)
+            .unwrap(),
+        ArtifactEligibility::Allowed
+    );
+    assert_eq!(
+        store
+            .artifact_eligibility(&sensitive, ArtifactDestination::Remote)
+            .unwrap(),
+        ArtifactEligibility::Denied(EligibilityDeniedReason::SensitiveRemote)
+    );
+    assert_eq!(
+        store
+            .artifact_eligibility(&secret, ArtifactDestination::Local)
+            .unwrap(),
+        ArtifactEligibility::Denied(EligibilityDeniedReason::Secret)
+    );
+    assert_eq!(
+        store
+            .artifact_eligibility(&secret, ArtifactDestination::Remote)
+            .unwrap(),
+        ArtifactEligibility::Denied(EligibilityDeniedReason::Secret)
+    );
+    let unknown = ArtifactHandle {
+        digest: "a".repeat(64),
+        evidence_id: "absent".to_string(),
+    };
+    assert_eq!(
+        store
+            .artifact_eligibility(&unknown, ArtifactDestination::Local)
+            .unwrap(),
+        ArtifactEligibility::Allowed
+    );
+    assert_eq!(
+        store
+            .artifact_eligibility(&unknown, ArtifactDestination::Remote)
+            .unwrap(),
+        ArtifactEligibility::Denied(EligibilityDeniedReason::UnknownSensitive)
+    );
+
+    let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
+    let commit_seq: i64 = connection
+        .query_row("SELECT MAX(commit_seq) FROM commit_log", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    connection.execute(
+        "INSERT INTO artifact_purge_tombstones(artifact_digest,artifact_reference,operator_id,reason,purged_at,commit_seq) VALUES (?1,?2,'operator','test',1,?3)",
+        params![normal.digest, format!("objects/{}/{}", &normal.digest[..2], &normal.digest[2..]), commit_seq],
+    ).unwrap();
+    assert_eq!(
+        store
+            .artifact_eligibility(&normal, ArtifactDestination::Local)
+            .unwrap(),
+        ArtifactEligibility::Denied(EligibilityDeniedReason::Tombstoned)
+    );
+    assert_eq!(
+        store
+            .artifact_eligibility(&normal, ArtifactDestination::Remote)
+            .unwrap(),
+        ArtifactEligibility::Denied(EligibilityDeniedReason::Tombstoned)
+    );
+    assert_eq!(
+        store
+            .ingest_artifact(request("tombstone-reingest", b"public".to_vec()))
+            .unwrap_err()
+            .kind(),
+        ArtifactErrorKind::ReAdmissionBlocked
+    );
+}
+
+#[test]
+fn commit_failure_cleans_reference_and_errors_never_leak_payload() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let payload = format!("payload {SECRET}").into_bytes();
+    let error = store
+        .ingest_artifact_with_fault_for_test(
+            request("fault", payload),
+            ArtifactIngestFault::AfterEvents,
+        )
+        .unwrap_err();
+
+    assert_eq!(error.kind(), ArtifactErrorKind::ReferenceCommit);
+    assert!(!error.to_string().contains(SECRET));
+    assert!(!format!("{error:?}").contains(SECRET));
+    let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM evidence_meta WHERE evidence_id='evidence-fault'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM artifact_ingestion_reservations",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn failed_repopulation_commit_keeps_invalidated_retained_object_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let payload = b"retained dedup bytes".to_vec();
+    let existing = store
+        .ingest_artifact(request("dedup-existing", payload.clone()))
+        .unwrap();
+    invalidate_evidence(root.path(), &existing.evidence_id);
+    let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
+    let commit_seq: i64 = connection
+        .query_row(
+            "SELECT created_commit_seq FROM evidence_meta WHERE evidence_id=?1",
+            [&existing.evidence_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO capture_pins(
+                 capture_pin_id,pin_kind,owner_id,commit_seq,lease_epoch,writer_epoch,
+                 created_at,expires_at
+             ) VALUES ('retained-pin','backup','test',?1,?2,?2,1,1000)",
+            params![commit_seq, i64::try_from(store.lease_epoch()).unwrap()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO capture_pin_refs(capture_pin_id,evidence_id,expires_at)
+             VALUES ('retained-pin',?1,1000)",
+            [&existing.evidence_id],
+        )
+        .unwrap();
+    drop(connection);
+    let object_path = artifact_path(root.path(), &existing.digest);
+    fs::remove_file(&object_path).unwrap();
+    assert!(!object_path.exists());
+
+    let error = store
+        .ingest_artifact_with_fault_for_test(
+            request("dedup-failed", payload),
+            ArtifactIngestFault::AfterEvents,
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), ArtifactErrorKind::ReferenceCommit);
+    assert!(object_path.is_file());
+}
+
+#[test]
+fn directory_sync_failure_latches_ingestion_but_keeps_reads_available() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let healthy = store
+        .ingest_artifact(request("before-fault", b"healthy".to_vec()))
+        .unwrap();
+
+    let error = store
+        .ingest_artifact_with_fault_for_test(
+            request("fsync-fault", b"faulted".to_vec()),
+            ArtifactIngestFault::AfterDirectorySync,
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), ArtifactErrorKind::IngestionFailClosed);
+    assert_eq!(
+        store
+            .ingest_artifact(request("after-fault", b"blocked".to_vec()))
+            .unwrap_err()
+            .kind(),
+        ArtifactErrorKind::IngestionFailClosed
+    );
+    assert_eq!(store.read_artifact(&healthy).unwrap(), b"healthy");
+
+    let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM evidence_meta WHERE evidence_id='evidence-fsync-fault'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn reopen_reclaims_stale_temps() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    drop(store);
+    let stale = root.path().join("artifacts/tmp/.stale.tmp");
+    fs::write(&stale, b"stale").unwrap();
+    fs::set_permissions(&stale, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let _store = KernelStore::open(root.path()).unwrap();
+    assert!(!stale.exists());
+}
