@@ -45,7 +45,7 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "change_event",
-        r#"CREATE TABLE change_event(commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,ordinal INTEGER NOT NULL,object_id TEXT NOT NULL,change_kind TEXT NOT NULL,source_span_id TEXT,idempotency_key TEXT NOT NULL,payload BLOB,PRIMARY KEY(commit_seq,ordinal)) STRICT; CREATE INDEX idx_change_event_object_known_as_of ON change_event(object_id,commit_seq,ordinal); CREATE INDEX idx_change_event_operation ON change_event(idempotency_key,commit_seq,ordinal);"#,
+        r#"CREATE TABLE change_event(commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,ordinal INTEGER NOT NULL,object_id TEXT NOT NULL,change_kind TEXT NOT NULL,source_span_id TEXT,idempotency_key TEXT NOT NULL,payload BLOB,PRIMARY KEY(commit_seq,ordinal)) STRICT; CREATE INDEX idx_change_event_object_known_as_of ON change_event(object_id,commit_seq,ordinal); CREATE INDEX idx_change_event_operation ON change_event(idempotency_key,commit_seq,ordinal); CREATE TRIGGER change_event_identity_immutable BEFORE UPDATE OF commit_seq,ordinal,object_id,change_kind,idempotency_key ON change_event BEGIN SELECT RAISE(ABORT,'change_event identity is immutable'); END; CREATE TRIGGER change_event_no_delete BEFORE DELETE ON change_event BEGIN SELECT RAISE(ABORT,'change_event is append-only'); END;"#,
     ),
     (
         "outbox",
@@ -53,7 +53,7 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "operation_receipts",
-        r#"CREATE TABLE operation_receipts(receipt_id TEXT PRIMARY KEY,producer TEXT NOT NULL,operation_key TEXT NOT NULL,request_digest TEXT NOT NULL,commit_seq INTEGER REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,result_payload BLOB NOT NULL,created_at INTEGER NOT NULL,UNIQUE(producer,operation_key)) STRICT; CREATE INDEX idx_receipts_commit_fk ON operation_receipts(commit_seq);"#,
+        r#"CREATE TABLE operation_receipts(receipt_id TEXT PRIMARY KEY,producer TEXT NOT NULL,operation_key TEXT NOT NULL,request_digest TEXT NOT NULL,commit_seq INTEGER REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,result_payload BLOB NOT NULL,created_at INTEGER NOT NULL,UNIQUE(producer,operation_key)) STRICT; CREATE INDEX idx_receipts_commit_fk ON operation_receipts(commit_seq); CREATE TRIGGER operation_receipts_identity_immutable BEFORE UPDATE OF receipt_id,producer,operation_key,request_digest,commit_seq ON operation_receipts BEGIN SELECT RAISE(ABORT,'operation_receipts identity is immutable'); END; CREATE TRIGGER operation_receipts_no_delete BEFORE DELETE ON operation_receipts BEGIN SELECT RAISE(ABORT,'operation_receipts survive for the database incarnation'); END;"#,
     ),
     (
         "writer_fence",
@@ -69,7 +69,7 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "capture_pins",
-        r#"CREATE TABLE capture_pins(capture_pin_id TEXT PRIMARY KEY,pin_kind TEXT NOT NULL,owner_id TEXT NOT NULL,commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,lease_epoch INTEGER NOT NULL,writer_epoch INTEGER NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER,released_at INTEGER) STRICT; CREATE INDEX idx_capture_pins_commit_fk ON capture_pins(commit_seq); CREATE INDEX idx_capture_pins_ttl ON capture_pins(released_at,expires_at,capture_pin_id);"#,
+        r#"CREATE TABLE capture_pins(capture_pin_id TEXT PRIMARY KEY,pin_kind TEXT NOT NULL,owner_id TEXT NOT NULL,commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,lease_epoch INTEGER NOT NULL,writer_epoch INTEGER NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER,released_at INTEGER) STRICT; CREATE INDEX idx_capture_pins_commit_fk ON capture_pins(commit_seq); CREATE INDEX idx_capture_pins_ttl ON capture_pins(released_at,expires_at,capture_pin_id); CREATE TRIGGER capture_pins_release_before_delete BEFORE DELETE ON capture_pins WHEN OLD.released_at IS NULL BEGIN SELECT RAISE(ABORT,'an active capture pin must be released before deletion'); END;"#,
     ),
     (
         "capture_pin_refs",
@@ -262,6 +262,13 @@ fn apply_schema<F: FnOnce() -> rusqlite::Result<()>>(
         |row| row.get(0),
     )?;
     if existing_objects != 0 {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    // A header-only file has no schema objects for the inventory above to find.
+    let stamped_application_id: i64 =
+        tx.query_row("PRAGMA application_id", [], |row| row.get(0))?;
+    let stamped_user_version: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if stamped_application_id != 0 || stamped_user_version != 0 {
         return Err(rusqlite::Error::InvalidQuery);
     }
     tx.pragma_update(None, "application_id", KERNEL_APPLICATION_ID)?;

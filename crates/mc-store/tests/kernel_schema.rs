@@ -130,7 +130,7 @@ fn kernel_schema_has_one_ordered_full_shape() {
 }
 
 const PINNED_SCHEMA_DIGEST: &str =
-    "8b612a52d93a8696c6d3182fa198cba0a894dc3623dc65c9bb21979120dee74f";
+    "ba6f6f4276a691d91e1b087c147d92cb8a8b7977b712871f93645fa0a3804170";
 
 #[test]
 fn kernel_schema_digest_is_pinned_to_the_frozen_v1_shape() {
@@ -964,4 +964,106 @@ fn staging_terminal_state_and_timestamp_are_set_together() {
     assert!(insert_run("run-b", None, Some(30)).is_err());
     insert_run("run-c", None, None).expect("a live run has neither");
     insert_run("run-d", Some("completed"), Some(30)).expect("a terminal run has both");
+}
+
+#[test]
+fn bootstrap_refuses_a_header_only_database() {
+    let (_dir, mut conn) = open_profiled();
+    // No schema objects, so the inventory check alone would pass this file.
+    conn.pragma_update(None, "application_id", 0x4D43_5458_i64)
+        .unwrap();
+
+    apply_kernel_schema(&mut conn, "incarnation-1", 1_000)
+        .expect_err("a header-stamped file is not pristine");
+    assert_eq!(
+        conn.query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        0x4D43_5458_i64,
+        "the foreign header must survive untouched"
+    );
+    assert_eq!(
+        kernel_schema_inventory(&conn).unwrap(),
+        Vec::<String>::new()
+    );
+
+    let (_dir2, mut conn2) = open_profiled();
+    conn2.pragma_update(None, "user_version", 7_i64).unwrap();
+    apply_kernel_schema(&mut conn2, "incarnation-1", 1_000)
+        .expect_err("a stamped user_version is not pristine");
+}
+
+#[test]
+fn commit_history_identity_is_immutable_and_undeletable() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    let commit_seq = next_commit(&conn, "tx-events");
+    conn.execute(
+        "INSERT INTO change_event(
+             commit_seq, ordinal, object_id, change_kind, idempotency_key, payload
+         ) VALUES (?1, 0, 'object-a', 'create', 'op-1', X'01')",
+        [commit_seq],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO operation_receipts(
+             receipt_id, producer, operation_key, request_digest, commit_seq,
+             result_payload, created_at
+         ) VALUES ('receipt-1', 'producer-a', 'op-1', 'digest-1', ?1, X'02', 2)",
+        [commit_seq],
+    )
+    .unwrap();
+
+    for sql in [
+        "UPDATE change_event SET object_id = 'object-b' WHERE ordinal = 0",
+        "UPDATE change_event SET idempotency_key = 'op-2' WHERE ordinal = 0",
+        "DELETE FROM change_event",
+        "UPDATE operation_receipts SET operation_key = 'op-2'",
+        "UPDATE operation_receipts SET request_digest = 'digest-2'",
+        "DELETE FROM operation_receipts",
+    ] {
+        assert!(conn.execute(sql, []).is_err(), "must be refused: {sql}");
+    }
+
+    // R11 scans these payloads, so R8's remediation overwrite stays reachable.
+    conn.execute(
+        "UPDATE change_event SET payload = X'99' WHERE ordinal = 0",
+        [],
+    )
+    .expect("payload remediation must remain possible");
+    conn.execute("UPDATE operation_receipts SET result_payload = X'99'", [])
+        .expect("result payload remediation must remain possible");
+}
+
+#[test]
+fn active_capture_pin_must_be_released_before_deletion() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    let commit_seq = next_commit(&conn, "tx-pin");
+    conn.execute(
+        "INSERT INTO capture_pins(
+             capture_pin_id, pin_kind, owner_id, commit_seq, lease_epoch, writer_epoch,
+             created_at
+         ) VALUES ('pin-1', 'backup', 'operator-1', ?1, 1, 1, 5)",
+        [commit_seq],
+    )
+    .unwrap();
+
+    // Deleting an active pin would cascade its evidence references away and let
+    // GC reclaim artifacts an in-progress backup still needs.
+    assert!(conn
+        .execute(
+            "DELETE FROM capture_pins WHERE capture_pin_id = 'pin-1'",
+            []
+        )
+        .is_err());
+    conn.execute(
+        "UPDATE capture_pins SET released_at = 6 WHERE capture_pin_id = 'pin-1'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "DELETE FROM capture_pins WHERE capture_pin_id = 'pin-1'",
+        [],
+    )
+    .expect("a released pin is deletable");
 }
