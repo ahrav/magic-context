@@ -6,17 +6,19 @@
  * opencode-e2e standalone selection, never under rust or pi modes.
  */
 
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseScenario, type HistorianEvalScenario } from "./contract";
 import { buildMockHistorianOutput } from "../mock-historian";
+import { TestHarness } from "../harness";
 import {
     carriesInjectedBlockTag,
     extractAnswerEnvelope,
     findOrdinalRange,
     probeResponseLeak,
+    liveRolePromptCount,
     runScenario,
     stripInjectedBlocks,
     type ScriptedHistorianMode,
@@ -369,6 +371,44 @@ describe("runScenario (scripted historian)", () => {
                 expect(score.structuralFindings).toEqual([]);
                 expect(score.failReasons).toEqual(["probe"]);
             } finally {
+                cleanup();
+            }
+        },
+        RUN_TIMEOUT_MS,
+    );
+
+    test(
+        "sends no more prompts than the role budget counts",
+        async () => {
+            // The deadline reserve is built from `liveRolePromptCount`, and every
+            // prompt the runner sends carries only the harness default timeout. So
+            // an uncounted prompt does not fail visibly — it silently shrinks the
+            // reserve, and a role admitted against it overruns the caller's kill
+            // bound and loses the report. That is exactly how the transcript turns,
+            // the probe re-asks, and the per-run trigger turns were each missed.
+            // Pinning the count against a real run makes the next added prompt fail
+            // here instead.
+            const { dir, cleanup } = tempArtifactDir();
+            const sendPrompt = spyOn(TestHarness.prototype, "sendPrompt");
+            try {
+                const scenario = singleRunScenario();
+                await runScenario(scenario, {
+                    mode: {
+                        kind: "scripted",
+                        outputs: [coveringOutput()],
+                        probeResponses: goldProbeResponses(),
+                    },
+                    artifactDir: dir,
+                });
+
+                const budgeted = liveRolePromptCount(scenario);
+                expect(sendPrompt.mock.calls.length).toBeLessThanOrEqual(budgeted);
+                // Not vacuous: the budget must not be wildly loose either, or it
+                // stops being a usable reserve. Gold probes answer first time, so a
+                // healthy run skips only the per-probe re-asks.
+                expect(sendPrompt.mock.calls.length).toBeGreaterThan(budgeted / 2);
+            } finally {
+                sendPrompt.mockRestore();
                 cleanup();
             }
         },

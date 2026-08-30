@@ -21,6 +21,7 @@
         "test:incident-unit": "bun scripts/run-test-selection.ts --incident-unit --timeout 120000",
         "test:prospective-unit": "bun scripts/run-test-selection.ts --prospective-unit --timeout 120000",
         "test:historian-eval-unit": "bun scripts/run-test-selection.ts --historian-eval-unit --timeout 120000",
+        "test:metamorphic-unit": "bun scripts/run-test-selection.ts --metamorphic-eval-unit --timeout 120000",
         "test:dreamer-eval-unit": "bun scripts/run-test-selection.ts --dreamer-eval-unit --timeout 120000",
         "validate:prospective-holdout": "bun scripts/prospective-holdout.ts validate",
         "test:incidents": "bun scripts/run-incident-pool.ts --mode ts --report artifacts/incident-pool-ts-report.json",

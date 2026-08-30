@@ -10,7 +10,7 @@ import {
     liveModeFromEnv,
     opencodeVersion,
 } from "./run-historian-eval";
-import { historianWaitBudgetMs, runSystemTuple, type SystemVersionTuple } from "../src/historian-eval/runner";
+import { liveRoleWallClockBudgetMs, runSystemTuple, type SystemVersionTuple } from "../src/historian-eval/runner";
 import {
     runLiveMetamorphicEval,
     type LiveMetamorphicOptions,
@@ -390,16 +390,41 @@ export async function runLiveAndWriteReport(
     return report;
 }
 
-/** Probe exchanges carry no named bound, so this is a lower bound on a role rather than a guarantee. commentlint: allow(JUDGE) */
+/**
+ * Reserve for one role, taken from the widest scenario in the selection.
+ *
+ * Delegates to `liveRoleWallClockBudgetMs` rather than multiplying the declared
+ * runs by the historian wait: the runs are only the first of three phases the
+ * runner waits on, and reserving just them under-counts a two-run, two-probe
+ * role by half, which is enough for a role admitted just inside the deadline to
+ * overrun the step timeout and lose the final report.
+ *
+ * Per scenario, not a corpus-wide product, because the reserve answers "can the
+ * NEXT role finish" and a role runs exactly one scenario.
+ */
 export function liveRoleBudgetMs(
     scenarios: readonly HistorianEvalScenario[],
     mode: LiveMetamorphicOptions["mode"],
 ): number {
-    const declaredRuns = Math.max(1, ...scenarios.map((scenario) => scenario.trigger.expectedHistorianRuns));
-    return declaredRuns * historianWaitBudgetMs(mode);
+    return Math.max(0, ...scenarios.map((scenario) => liveRoleWallClockBudgetMs(scenario, mode)));
 }
 
 export async function main(args: readonly string[] = Bun.argv.slice(2)): Promise<0 | 1 | 2> {
+    /**
+     * Anchored HERE, before any work, because the deadline's whole purpose is to
+     * stay inside an external kill bound — the workflow step timeout — whose clock
+     * starts when the step starts.
+     *
+     * Anchoring it at the `runLiveAndWriteReport` call instead excluded everything
+     * before it: the output preflight, corpus load, selection, and
+     * `prepareLivePreamble`, which resolves `opencode --version` and the commit.
+     * A slow preamble then shifted the whole deadline later, so
+     * `deadline < step timeout` no longer implied the run finished before the step
+     * was killed, and the process could die mid-role after paid calls with only
+     * partial evidence on disk. Measured from process start the nesting holds by
+     * construction, with the preamble inside the deadline rather than beside it.
+     */
+    const startedAtMs = Date.now();
     const parsed = parseArgs(args);
     /** Output preflight precedes corpus loading and selection, whose throws would otherwise leave a previous green report at the destination. commentlint: allow(JUDGE) */
     if (!parsed.live) {
@@ -438,7 +463,7 @@ export async function main(args: readonly string[] = Bun.argv.slice(2)): Promise
         system: prepared.system,
         transforms: selected.transforms,
         roleBudgetMs,
-        deadlineAtMs: parsed.deadlineMinutes === null ? null : Date.now() + parsed.deadlineMinutes * 60_000,
+        deadlineAtMs: parsed.deadlineMinutes === null ? null : startedAtMs + parsed.deadlineMinutes * 60_000,
     });
     return metamorphicExitCode(report);
 }

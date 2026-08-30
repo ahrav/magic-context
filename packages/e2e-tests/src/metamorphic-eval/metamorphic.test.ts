@@ -5,7 +5,16 @@ import { join } from "node:path";
 
 import { buildMockHistorianOutput } from "../mock-historian";
 import { lintScenario, parseScenario, type HistorianEvalScenario } from "../historian-eval/contract";
-import type { SystemVersionTuple } from "../historian-eval/runner";
+import {
+    MAX_PROBE_ATTEMPTS,
+    TRIGGER_TURNS_PER_HISTORIAN_RUN,
+    fillerTurnCountFor,
+    historianWaitBudgetMs,
+    liveRolePromptCount,
+    paddingTurnCountFor,
+    type SystemVersionTuple,
+} from "../historian-eval/runner";
+import { DEFAULT_PROMPT_TIMEOUT_MS } from "../harness";
 import { scoreRawOutputWithInjectedClaims } from "../historian-eval/scorer";
 import { validScenario } from "../historian-eval/test-support";
 import { INJECTION_CANARY } from "./injection-canary";
@@ -1164,9 +1173,50 @@ describe("live metamorphic control tier", () => {
         const oneRun = { ...scenario, trigger: { ...scenario.trigger, expectedHistorianRuns: 1 } };
         const twoRuns = { ...scenario, trigger: { ...scenario.trigger, expectedHistorianRuns: 2 } };
 
-        expect(liveRoleBudgetMs([twoRuns], mode)).toBe(2 * liveRoleBudgetMs([oneRun], mode));
+        // Marginal, not proportional: one more declared run adds its two trigger
+        // prompts plus one completion wait. The transcript and probe prompts are
+        // per-role costs that do not scale with the run count, so the budget is
+        // deliberately not a multiple of it.
+        expect(liveRoleBudgetMs([twoRuns], mode) - liveRoleBudgetMs([oneRun], mode)).toBe(
+            TRIGGER_TURNS_PER_HISTORIAN_RUN * DEFAULT_PROMPT_TIMEOUT_MS + historianWaitBudgetMs(mode),
+        );
         expect(liveRoleBudgetMs([oneRun, twoRuns], mode)).toBe(liveRoleBudgetMs([twoRuns], mode));
         expect(liveRoleBudgetMs(corpus(), mode)).toBeGreaterThan(liveRoleBudgetMs([oneRun], mode));
+    });
+
+    test("budgets every prompt the role sends, not only the historian runs", () => {
+        // Reserving only the declared runs admitted a role that then spent the whole
+        // transcript, trigger, and probe prompt sequence beyond the reserve. Each of
+        // those prompts carries only the harness default timeout, and they were
+        // missed one class at a time — transcript turns, then probe re-asks, then
+        // per-run triggers — so the budget is now derived from the prompt COUNT
+        // rather than a hand-listed set of phases.
+        const mode = liveMode();
+        const scenario = validScenario();
+        const runsOnly = scenario.trigger.expectedHistorianRuns * historianWaitBudgetMs(mode);
+
+        expect(liveRoleBudgetMs([scenario], mode)).toBe(
+            liveRolePromptCount(scenario) * DEFAULT_PROMPT_TIMEOUT_MS
+                + (scenario.trigger.expectedHistorianRuns + 1) * historianWaitBudgetMs(mode),
+        );
+        expect(liveRoleBudgetMs([scenario], mode)).toBeGreaterThan(runsOnly);
+
+        // The count covers all three prompt classes, so each one moves the budget.
+        const transcript = fillerTurnCountFor(scenario)
+            + scenario.transcript.turns.length
+            + paddingTurnCountFor(scenario);
+        expect(transcript).toBeGreaterThan(0);
+        expect(liveRolePromptCount(scenario)).toBe(
+            transcript
+                + scenario.trigger.expectedHistorianRuns * TRIGGER_TURNS_PER_HISTORIAN_RUN
+                + scenario.probes.length * MAX_PROBE_ATTEMPTS,
+        );
+
+        // Every probe may be asked twice, so probe count moves the budget.
+        const doubled = { ...scenario, probes: [...scenario.probes, ...scenario.probes] };
+        expect(liveRoleBudgetMs([doubled], mode) - liveRoleBudgetMs([scenario], mode)).toBe(
+            scenario.probes.length * MAX_PROBE_ATTEMPTS * DEFAULT_PROMPT_TIMEOUT_MS,
+        );
     });
 
     test("reports a thrown control failure as a control error, not an incomplete run", async () => {
