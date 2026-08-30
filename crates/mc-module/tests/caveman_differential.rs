@@ -897,6 +897,7 @@ fn fragment() -> impl Strategy<Value = String> {
         Just("A an a THE The tHe words".to_string()),
         Just("configuration config repository database directory session".to_string()),
         Just("and then afterwards therefore however furthermore additionally".to_string()),
+        Just("alpha as well as beta or gamma".to_string()),
         Just("\u{0}MC_PRES_0\u{0} literal placeholder collision".to_string()),
         Just("`fence with \u{0}MC_PRES_1\u{0} inside` and \u{0} stray NUL".to_string()),
         Just("https://url\u{0}MC_PRES_2\u{0}adjacent".to_string()),
