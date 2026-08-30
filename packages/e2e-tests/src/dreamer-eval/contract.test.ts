@@ -678,6 +678,7 @@ describe("dreamer eval report contract", () => {
             runtimeDigest: "d".repeat(64),
         },
         trackedFiles: ["src/cache.ts"],
+        fixtureRoot: "/fixture-worktree",
         poolBefore: POOL_CAPTURE,
         poolAfter: POOL_CAPTURE,
         rawManifest: rawVerify(VERIFY_EVIDENCE),

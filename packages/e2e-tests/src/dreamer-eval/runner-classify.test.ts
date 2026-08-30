@@ -56,7 +56,10 @@ function input(overrides: Partial<DreamerRunClassificationInput> = {}): DreamerR
             },
         ],
         rejectionRequestDigest: "b".repeat(64),
-        trackedFiles: [...new Set(dreamerScorerFixture.pool.claims.flatMap((claim) => claim.files))],
+        fixture: {
+            root: "/fixture-worktree",
+            files: [...new Set(dreamerScorerFixture.pool.claims.flatMap((claim) => claim.files))],
+        },
         fixtureUnchanged: true,
         leaseLost: false,
         expectedResultMode: null,

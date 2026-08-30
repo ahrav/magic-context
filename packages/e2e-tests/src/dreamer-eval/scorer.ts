@@ -1,4 +1,4 @@
-import { sep } from "node:path";
+import { isAbsolute, relative as relativePath, sep } from "node:path";
 
 import { hasLengthCappedOutput } from "../../../plugin/src/shared/assistant-message-extractor";
 import { normalizeMemoryContent } from "../../../plugin/src/features/magic-context/memory/normalize-hash";
@@ -160,16 +160,37 @@ export function canonicalObservedPaths(values: readonly string[]): string[] {
  * preconditions — map and classify — projects an empty set, so a pool-derived
  * universe would leave the mapping scorer with nothing to resolve against.
  */
-export function appliedTrackedPaths(values: readonly string[], tracked: readonly string[]): string[] {
-    const trackedSet = new Set(tracked.map(canonicalObservedPath));
+export interface FixtureWorktree {
+    /** Absolute path of the fixture repository the manifest was produced against. */
+    root: string;
+    /** Its tracked paths, repo-relative. */
+    files: readonly string[];
+}
+
+/**
+ * Bring an observed path into the repo-relative form gold is written in, the way
+ * `normalizeVerificationFiles` does: it resolves the value against the session
+ * directory and converts it back with `path.relative`, so an absolute path inside
+ * the fixture is accepted and stored relative. A path that resolves outside stays
+ * as observed, because production skips it rather than resolving it inward.
+ */
+function repoRelative(value: string, root: string): string {
+    if (!isAbsolute(value)) return value;
+    const relative = relativePath(root, value);
+    return relative.length > 0 && !relative.startsWith("..") ? relative : value;
+}
+
+export function appliedTrackedPaths(values: readonly string[], tracked: FixtureWorktree): string[] {
+    const trackedSet = new Set(tracked.files.map(canonicalObservedPath));
     const applied: string[] = [];
-    for (const value of canonicalObservedPaths(values)) {
-        if (trackedSet.has(value)) {
-            applied.push(value);
+    for (const value of values) {
+        const candidate = canonicalObservedPath(repoRelative(value, tracked.root));
+        if (trackedSet.has(candidate)) {
+            applied.push(candidate);
             continue;
         }
-        const folded = value.toLowerCase();
-        const matches = [...trackedSet].filter((candidate) => candidate.toLowerCase() === folded);
+        const folded = candidate.toLowerCase();
+        const matches = [...trackedSet].filter((entry) => entry.toLowerCase() === folded);
         if (matches.length === 1) applied.push(matches[0]!);
     }
     return applied;
@@ -179,7 +200,7 @@ export function scoreVerifyManifest(
     manifestText: string,
     pool: PoolDescriptor,
     gold: VerifyGold,
-    tracked: readonly string[],
+    tracked: FixtureWorktree,
     evidence?: ManifestInfraEvidence,
 ): ManifestScore {
     const rejected = precheck(manifestText, evidence);
@@ -328,7 +349,7 @@ export function scoreMapManifest(
     manifestText: string,
     pool: PoolDescriptor,
     gold: MapGold,
-    tracked: readonly string[],
+    tracked: FixtureWorktree,
     evidence?: ManifestInfraEvidence,
 ): ManifestScore {
     const rejected = precheck(manifestText, evidence);

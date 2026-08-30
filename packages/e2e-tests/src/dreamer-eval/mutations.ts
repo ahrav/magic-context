@@ -13,6 +13,7 @@ import {
     scoreVerifyManifest,
     claimIdentity,
     liveIdentities,
+    type FixtureWorktree,
     type ManifestScore,
     type ManifestScoreStage,
 } from "./scorer";
@@ -543,14 +544,20 @@ function scoreMutation(
  * path a gold layer names, which a pool-derived set would miss whenever a gold
  * file is not also a seeded mapping.
  */
-export function trackedFixtureUniverse(fixture: DreamerMutationFixture): string[] {
-    return [
-        ...new Set([
-            ...fixture.pool.claims.flatMap((claim) => claim.files),
-            ...fixture.verifyGold.claims.flatMap((claim) => claim.expectedFiles),
-            ...fixture.mapGold.claims.flatMap((claim) => claim.files),
-        ]),
-    ];
+export function trackedFixtureUniverse(fixture: DreamerMutationFixture): FixtureWorktree {
+    return {
+        // Synthetic fixtures have no repository on disk. Manifests here are authored
+        // with repo-relative paths, so no absolute path needs resolving, and this
+        // root only has to be a path none of them lies under.
+        root: "/nonexistent-mutation-fixture",
+        files: [
+            ...new Set([
+                ...fixture.pool.claims.flatMap((claim) => claim.files),
+                ...fixture.verifyGold.claims.flatMap((claim) => claim.expectedFiles),
+                ...fixture.mapGold.claims.flatMap((claim) => claim.files),
+            ]),
+        ],
+    };
 }
 
 export function runMutationBattery(

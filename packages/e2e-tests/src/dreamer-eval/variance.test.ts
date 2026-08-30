@@ -27,6 +27,7 @@ function report(index: number, verdict: VerifyVerdict = "verified"): DreamerEval
         runFatal: false,
         system,
         trackedFiles: ["src/cache.ts", "src/config.ts", ".dreamer-eval-fixture"],
+        fixtureRoot: `/fixture-worktree-${index}`,
         poolBefore: [
             {
                 claimId: "claim-cache",
@@ -210,6 +211,27 @@ describe("dreamer eval variance", () => {
             aggregateDreamerEvalVariance([
                 mapReport(1, ["src/cache.ts"]),
                 mapReport(2, ["SRC/CACHE.ts"]),
+            ]).claimHistograms[0],
+        ).toMatchObject({
+            counts: { "independent:false;files:src/cache.ts": 2 },
+            disagreement: false,
+        });
+    });
+
+    test("an absolute path in one repeat matches a relative one in another", () => {
+        const mapReport = (index: number, files: string[]): DreamerEvalRunReport => {
+            const entry = report(index);
+            entry.task = "map-memories";
+            entry.parsedManifest = [{ publicClaimId: "mcm_claim", files, independent: false }];
+            return entry;
+        };
+
+        // Each repeat has its own fixture root, so resolving against the report's
+        // own root is what makes these one applied mapping.
+        expect(
+            aggregateDreamerEvalVariance([
+                mapReport(1, ["src/cache.ts"]),
+                mapReport(2, ["/fixture-worktree-2/src/cache.ts"]),
             ]).claimHistograms[0],
         ).toMatchObject({
             counts: { "independent:false;files:src/cache.ts": 2 },

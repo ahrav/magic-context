@@ -119,6 +119,7 @@ async function main(): Promise<0 | 1 | 2> {
 
     mkdirSync(args.outputDir, { recursive: true });
     const reports: DreamerEvalRunReport[] = [];
+    let aggregationFailed = false;
     const version = opencodeVersion();
     for (const { scenario, task } of groups) {
         const groupDir = join(args.outputDir, scenario.id, task.task);
@@ -135,10 +136,23 @@ async function main(): Promise<0 | 1 | 2> {
             reports.push(report);
             console.log(`${report.runId}: ${report.status}${report.reason === null ? "" : `:${report.reason}`}`);
         }
-        const variance = aggregateDreamerEvalVarianceFiles(groupReportPaths);
-        writeFileSync(join(groupDir, "variance.json"), `${JSON.stringify(variance, null, 2)}\n`);
+        // A failure here must not swallow what the runs already established. The
+        // outer catch exits 1 unconditionally, so letting this throw would downgrade
+        // an applied wrong archival's safety exit 2 to 1 because a later artifact or
+        // system-tuple error happened to surface after it.
+        try {
+            const variance = aggregateDreamerEvalVarianceFiles(groupReportPaths);
+            writeFileSync(join(groupDir, "variance.json"), `${JSON.stringify(variance, null, 2)}\n`);
+        } catch (error) {
+            aggregationFailed = true;
+            console.error(
+                `${scenario.id}/${task.task}: variance aggregation failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+        }
     }
-    return dreamerEvalExitCode(reports);
+    const code = dreamerEvalExitCode(reports);
+    // A run-fatal set keeps exit 2; anything else fails the run.
+    return code === 2 ? code : aggregationFailed ? 1 : code;
 }
 
 if (import.meta.main) {

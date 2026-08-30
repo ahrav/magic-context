@@ -11,7 +11,7 @@ import type {
 } from "./contract";
 import { parseRunReport } from "./contract";
 import { sha256Utf8Hex } from "../../../plugin/src/features/magic-context/memory/storage-claims";
-import { appliedTrackedPaths } from "./scorer";
+import { appliedTrackedPaths, type FixtureWorktree } from "./scorer";
 
 export interface DreamerClaimVerdictHistogram {
     claimId: string;
@@ -57,7 +57,7 @@ function publicClaimId(value: unknown): string | null {
 }
 
 /** The applied path set, resolved against the universe the report recorded. */
-function appliedFiles(observed: readonly string[], tracked: readonly string[]): string[] {
+function appliedFiles(observed: readonly string[], tracked: FixtureWorktree): string[] {
     return [...new Set(appliedTrackedPaths(observed, tracked))].sort();
 }
 
@@ -72,7 +72,7 @@ function appliedFiles(observed: readonly string[], tracked: readonly string[]): 
  * both — independence first, then files — so a claim's bucket has to carry
  * whatever could have made those two checks disagree between repeats.
  */
-function mapVerdict(entry: Record<string, unknown>, tracked: readonly string[]): string {
+function mapVerdict(entry: Record<string, unknown>, tracked: FixtureWorktree): string {
     const observed = Array.isArray(entry.files)
         ? entry.files.filter((file): file is string => typeof file === "string")
         : [];
@@ -119,7 +119,7 @@ function classifyVerdict(entry: Record<string, unknown>, current: ClaimSnapshotP
 function verifyVerdict(
     verdict: "verified" | "update" | "archive",
     entry: Record<string, unknown>,
-    tracked: readonly string[],
+    tracked: FixtureWorktree,
 ): string {
     if (verdict === "archive") return "archive";
     const observed = Array.isArray(entry.files)
@@ -134,10 +134,12 @@ function verifyVerdict(
 function observedVerdicts(report: DreamerEvalRunReport): Map<string, string> {
     const observed = new Map<string, string>();
     if (report.parsedManifest === null) return observed;
-    // The report's own tracked set, not one derived from the capture: a claim's
+    // The report's own fixture worktree, not one derived from the capture: a claim's
     // projected files come from its seeded mapping, so a map or classify report
-    // projects none and equivalent spellings would land in different buckets.
-    const tracked = report.trackedFiles;
+    // projects none and equivalent spellings would land in different buckets. The
+    // root differs per run, and resolving each report against its own is what makes
+    // an absolute path in one repeat comparable to a relative one in another.
+    const tracked: FixtureWorktree = { root: report.fixtureRoot, files: report.trackedFiles };
     if (report.task === "verify" || report.task === "verify-broad") {
         const manifest = object(report.parsedManifest);
         for (const [field, verdict] of [

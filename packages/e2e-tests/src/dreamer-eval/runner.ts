@@ -59,6 +59,7 @@ import {
     scoreClassifyManifest,
     scoreMapManifest,
     scoreVerifyManifest,
+    type FixtureWorktree,
     type ManifestScore,
 } from "./scorer";
 import {
@@ -108,9 +109,9 @@ export interface DreamerRunClassificationInput {
     invocation: DreamerInvocationEvidence | null;
     receipts: readonly DreamerReceiptEvidence[];
     rejectionRequestDigest: string | null;
-    /** Every path the scenario's fixture commits — the universe production's
-     *  `git ls-files` lookup resolves an observed mapping path against. */
-    trackedFiles: readonly string[];
+    /** The seeded fixture repository an observed mapping path is resolved against:
+     *  its root, and the tracked paths production's own lookup would find. */
+    fixture: FixtureWorktree;
     fixtureUnchanged: boolean;
     leaseLost: boolean;
     expectedResultMode: string | null;
@@ -141,10 +142,10 @@ function scoreManifest(input: DreamerRunClassificationInput): ManifestScore {
     const text = input.rawManifest ?? "";
     const evidence = { messages: input.childMessages };
     if ((input.task === "verify" || input.task === "verify-broad") && input.gold.kind === "verify") {
-        return scoreVerifyManifest(text, input.pool, input.gold, input.trackedFiles, evidence);
+        return scoreVerifyManifest(text, input.pool, input.gold, input.fixture, evidence);
     }
     if (input.task === "map-memories" && input.gold.kind === "map") {
-        return scoreMapManifest(text, input.pool, input.gold, input.trackedFiles, evidence);
+        return scoreMapManifest(text, input.pool, input.gold, input.fixture, evidence);
     }
     if (input.task === "classify-memories" && input.gold.kind === "classify") {
         return scoreClassifyManifest(text, input.pool, input.gold, evidence);
@@ -449,17 +450,23 @@ function runtimeProvenance(artifactDir: string): {
         throw new Error("dreamer-eval could not resolve the runtime working-tree state");
     }
     const outputRoot = resolve(artifactDir);
-    // The exclusion below is sound only if the directory holds no runtime inputs.
-    // A caller pointing `artifactDir` at the repository root or a source ancestor
+    // The exclusion below is sound only if the directory holds no runtime inputs. A
+    // caller pointing `artifactDir` at the repository root or a source ancestor
     // would otherwise hide every dirty file under it, letting two different
     // implementations share one tuple. A directory containing tracked files is not
     // an output directory.
-    const trackedUnderOutput = gitOutput(PLUGIN_REPO_ROOT, ["ls-files", "-z", "--", outputRoot]);
-    if (trackedUnderOutput === null) {
-        throw new Error("dreamer-eval could not inspect the artifact directory");
-    }
-    if (trackedUnderOutput.split("\0").some((path) => path.length > 0)) {
-        throw new Error("dreamer-eval artifact directory must not contain tracked files");
+    //
+    // Only a directory inside the worktree can hold tracked files, and `git
+    // ls-files` refuses a pathspec outside the repository outright, so an external
+    // output root is answered by path arithmetic rather than by asking git.
+    if (outputRoot === PLUGIN_REPO_ROOT || outputRoot.startsWith(`${PLUGIN_REPO_ROOT}${sep}`)) {
+        const trackedUnderOutput = gitOutput(PLUGIN_REPO_ROOT, ["ls-files", "-z", "--", outputRoot]);
+        if (trackedUnderOutput === null) {
+            throw new Error("dreamer-eval could not inspect the artifact directory");
+        }
+        if (trackedUnderOutput.split("\0").some((path) => path.length > 0)) {
+            throw new Error("dreamer-eval artifact directory must not contain tracked files");
+        }
     }
     const deviations = status
         .split("\0")
@@ -560,6 +567,7 @@ export async function runDreamerEvalTask(
     let db: ReturnType<typeof openTestDb> | null = null;
     let parentSessionId = "";
     let trackedFiles: string[] = [];
+    let fixtureRoot = "";
     let poolBefore: ClaimSnapshotProjection[] = [];
     let poolAfter: ClaimSnapshotProjection[] = [];
     let rawManifest: string | null = null;
@@ -593,6 +601,7 @@ export async function runDreamerEvalTask(
         const fixtureHead = gitOutput(seeded.workdir, ["rev-parse", "HEAD"]);
         if (fixtureHead === null) throw new Error("dreamer-eval fixture HEAD is unavailable");
         trackedFiles = trackedFixtureFiles(seeded.workdir);
+        fixtureRoot = seeded.workdir;
         poolBefore = seeded.pool.claims;
         holderId = `dreamer-eval:${runId}`;
         leaseKey = leaseKeyFor(task.task, seeded.projectIdentity);
@@ -683,7 +692,7 @@ export async function runDreamerEvalTask(
             invocation,
             receipts,
             rejectionRequestDigest,
-            trackedFiles,
+            fixture: { root: seeded.workdir, files: trackedFiles },
             fixtureUnchanged,
             leaseLost,
             expectedResultMode: task.expectedResultMode,
@@ -742,6 +751,7 @@ export async function runDreamerEvalTask(
         runFatal: classification.runFatal,
         system,
         trackedFiles,
+        fixtureRoot,
         poolBefore,
         poolAfter,
         rawManifest,

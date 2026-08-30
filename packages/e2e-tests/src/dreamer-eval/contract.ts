@@ -932,6 +932,14 @@ export interface DreamerEvalRunReport {
      * against an empty set.
      */
     trackedFiles: string[];
+    /**
+     * Absolute path of that fixture repository. `normalizeVerificationFiles`
+     * resolves an observed path against the session directory before matching it,
+     * so an absolute path inside the fixture is accepted and stored relative —
+     * reproducing that needs the root, and it differs per run, so each report
+     * carries its own.
+     */
+    fixtureRoot: string;
     poolBefore: ClaimSnapshotProjection[];
     poolAfter: ClaimSnapshotProjection[];
     rawManifest: string | null;
@@ -1215,7 +1223,7 @@ function reparseManifest(task: DreamerTask, rawManifest: string): ParsedManifest
 
 export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunReport {
     const root = record(raw, label);
-    exact(root, ["schema", "scenarioId", "task", "runId", "nowMs", "status", "reason", "runFatal", "system", "trackedFiles", "poolBefore", "poolAfter", "rawManifest", "parsedManifest", "receiptOutcomes"], label);
+    exact(root, ["schema", "scenarioId", "task", "runId", "nowMs", "status", "reason", "runFatal", "system", "trackedFiles", "fixtureRoot", "poolBefore", "poolAfter", "rawManifest", "parsedManifest", "receiptOutcomes"], label);
     if (root.schema !== DREAMER_EVAL_REPORT_SCHEMA) fail(`${label}.schema: version-invalid`);
     const task = enumeration(root.task, DREAMER_TASKS, `${label}.task`);
     const status = enumeration(root.status, ["PASS", "FAIL", "ERROR"], `${label}.status`);
@@ -1367,6 +1375,7 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
         runFatal,
         system: parseSystem(root.system, `${label}.system`),
         trackedFiles: parseFilePathArray(root.trackedFiles, `${label}.trackedFiles`),
+        fixtureRoot: parseFilePath(root.fixtureRoot, `${label}.fixtureRoot`),
         poolBefore,
         poolAfter,
         rawManifest,

@@ -77,9 +77,11 @@ const pool: PoolDescriptor = {
     ],
 };
 
-// Every path the fixture repository tracks. The scorers resolve an observed
-// mapping path against this the way production resolves it against `git ls-files`.
-const tracked = [...new Set(pool.claims.flatMap((claim) => claim.files))];
+// The fixture repository an observed mapping path is resolved against: a root, and
+// the paths it tracks. The scorers resolve against this the way production resolves
+// against the session directory and `git ls-files`.
+const FIXTURE_ROOT = "/fixture-worktree";
+const tracked = { root: FIXTURE_ROOT, files: [...new Set(pool.claims.flatMap((claim) => claim.files))] };
 
 const verifyGold = { kind: "verify" as const, claims: [
     {
@@ -152,6 +154,7 @@ export function exitCodeForScore(result: ManifestScore): 0 | 1 | 2 {
             runtimeDigest: "d".repeat(64),
         },
         trackedFiles: [],
+        fixtureRoot: "/fixture-worktree",
         poolBefore: [],
         poolAfter: [],
         rawManifest: null,
@@ -185,6 +188,30 @@ describe("dreamer manifest scorers", () => {
                 verifyGold, tracked,
             ),
         ).toMatchObject({ stage: "scored", status: "PASS" });
+    });
+
+    test("an absolute path inside the fixture resolves to its tracked path", () => {
+        // normalizeVerificationFiles resolves the candidate against the session
+        // directory and converts it back with path.relative, so production accepts
+        // this and stores src/cache.ts.
+        expect(
+            scoreMapManifest(
+                correctMap.replace('files="src/cache.ts,src/config.ts"', `files="${FIXTURE_ROOT}/src/cache.ts,src/config.ts"`),
+                pool,
+                mapGold,
+                tracked,
+            ),
+        ).toMatchObject({ stage: "scored", status: "PASS" });
+        // One that resolves outside the fixture is skipped by production, not
+        // resolved inward, so it must not bind to a tracked path.
+        expect(
+            scoreMapManifest(
+                correctMap.replace('files="src/cache.ts,src/config.ts"', 'files="/elsewhere/src/cache.ts,src/config.ts"'),
+                pool,
+                mapGold,
+                tracked,
+            ),
+        ).toMatchObject({ stage: "scored", status: "FAIL", reason: "wrong-mapping" });
     });
 
     test("an untracked extra path is dropped, a tracked one is not", () => {
