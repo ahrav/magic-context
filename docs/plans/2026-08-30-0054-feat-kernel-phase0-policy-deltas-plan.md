@@ -44,6 +44,8 @@ R-IDs local to this plan. Restructure plan citations written `restructure R<N>`.
 - R1. Canonical rows in `core.sqlite` (object registry, propositions, evidence metadata, decisions, observations, edges): no age-based deletion. Correction append-only (restructure R8); removal only via evidence deletion with propagation (restructure R10).
 - R2. Commit log (`commit_log`, `change_event`) retained indefinitely in Phase 0. Revisit trigger: R7 size alarm firing, never silent pruning.
 - R3. Outbox rows pruned only after every required consumer checkpoint passes them: prune boundary = min acknowledged position across required-consumer set; absent checkpoint for required consumer pins retention; prune refuses outright when required-consumer set empty (matches `pruneClaimOperationEffectsInCurrentTransaction` in `packages/plugin/src/features/magic-context/memory/storage-claim-operations.ts`). R12d lag alarm guards unbounded growth.
+  - Consumer-acknowledgement rows are K2-owned canonical control facts. They have no age pruning and survive derived-store discard.
+  - Required-consumer registration is K2-owned and atomically creates its initial acknowledged checkpoint immediately before the oldest retained position, so the oldest row remains consumable under inclusive prune semantics. Only registered consumers are required. Deregistration succeeds after acknowledgement reaches the current outbox tip; otherwise it refuses unless an operator explicitly authorizes abandoning the pending position. Authorized abandonment records consumer identity, abandoned position, operator identity, and timestamp in the retained commit log.
 - R4. Staging rows (`extraction_runs`, `candidates`, `candidate_scores`, `admission_decisions`) expire 30 days after run completes (mirrors `mc_transform_session_roots` 30-day prune in `crates/mc-store/src/lib.rs`). Rows referenced by admission decision that produced canonical state keep only decision row; expired staging content deleted.
 - R5. Evidence artifacts in `artifacts/`: two retention states. `referenced` (cited by canonical `evidence_meta` — retained unconditionally); `unreferenced` (GC-eligible 14 days after last dereference; never-referenced objects: 14 days after CAS write — mirrors repo 14-day grace patterns). GC runs on daemon maintenance pass at grace expiry + at R8 soft watermark. Deletion propagation + backfill barriers per restructure R10.
 - R6. Derived stores (`search.sqlite`, `vectors/`): no retention obligation — rebuildable, discardable any time (restructure R2, R5).
@@ -73,7 +75,7 @@ R-IDs local to this plan. Restructure plan citations written `restructure R<N>`.
 
 **E. Search-projector lag**
 
-- R12d. Projector lag measured two ways from K2-owned facts in `core.sqlite`: events (max `commit_seq` minus min acknowledged `commit_seq` across all required outbox consumers — R3 consumer-acknowledgement rows, distinct from `search.sqlite` internal projector bookmark named in restructure R2); wall-clock age of oldest unconsumed outbox row. Staleness threshold: 60 seconds or 10,000 events behind, whichever trips first.
+- R12d. Projector lag measured two ways from K2-owned facts in `core.sqlite`: events (max `commit_seq` minus min acknowledged `commit_seq` across all registered required outbox consumers; these are R3 consumer-acknowledgement rows, distinct from the `search.sqlite` internal projector bookmark named in restructure R2); wall-clock age of oldest unconsumed outbox row. Staleness threshold: 60 seconds or 10,000 events behind, whichever trips first.
   - Below threshold: search serves normally; canonical eligibility validation at `known_as_of` (restructure R3, Kernel Design Baseline) already rejects stale rows before injection.
   - At/beyond threshold: explicit search still serves with typed `stale` indicator; automatic prompt injection abstains entirely (fail closed — restructure R8 no-stale-injection obligation). Threshold guards index incompleteness, not row staleness: lagging projector means rows missing from index, which `known_as_of` validation cannot observe — rejects stale rows it sees, never absent rows. Typed indicator lets explicit search keep serving; automatic injection has no channel to disclose gap, so cannot.
   - Projector halted (checkpoint not advancing while outbox grows, or `search.sqlite` absent/rebuilding): search reports typed `unavailable`, matching restructure plan D2 degraded-mode vocabulary. Canonical writes unaffected.
@@ -100,9 +102,9 @@ R-IDs local to this plan. Restructure plan citations written `restructure R<N>`.
 
 #### Deferred to Follow-Up Work
 
-- Backup scheduling/automation (Phase 0 defines objectives for capability only).
-- Sensitivity reclassification flows (upgrading/downgrading stored artifact class) — deferred with R9-family kernel phases.
-- Per-project or per-domain budget overrides beyond single configurable `artifacts/` cap.
+- Backup scheduling/automation (Phase 0 defines objectives for capability only): `magic-context-kh8.16`.
+- Sensitivity reclassification flows (upgrading/downgrading stored artifact class): `magic-context-kh8.17`.
+- Per-project or per-domain budget overrides beyond single configurable `artifacts/` cap: `magic-context-kh8.18`.
 
 ---
 
@@ -126,13 +128,16 @@ Every value above, enforcement owner, test oracle. Each row's oracle lands in th
 | Canonical retention (R1) | append-only, no age deletion | K2 `kh8.2` | correction appends; deletion only via propagation test |
 | Commit-log retention (R2) | indefinite, Phase 0 | K2 `kh8.2` | restore/replay proofs consume full log |
 | Outbox retention (R3) | required-consumer min-checkpoint prune | K2 `kh8.2` | prune respects min required-consumer checkpoint; missing checkpoint pins rows; empty required-consumer set refuses prune |
+| Consumer-acknowledgement retention (R3) | canonical control facts; no age pruning; survive derived-store discard | K2 `kh8.2` | age-prune pass and deletion/rebuild of `search.sqlite` and `vectors/` leave acknowledgement rows unchanged |
+| Required-consumer membership (R3) | register atomically immediately before oldest retained position; only registered consumers required; explicit deregistration | K2 `kh8.2` | registration and checkpoint immediately before the oldest retained position appear atomically; first consumption includes the oldest row; unregistered consumer does not affect prune; caught-up deregistration succeeds; pending deregistration refuses; operator-authorized abandonment succeeds and records the required commit-log audit fields |
 | Staging TTL (R4) | 30 days | K2 `kh8.2` | completed run retained at day 29 and deleted at day 31; admission-decision row survives |
 | Unreferenced-artifact GC (R5) | 14-day grace (CAS-write clock when never referenced) | K3 `kh8.3` | boundary-time GC: referenced survives, expired unreferenced removed, rerun idempotent |
+| Derived-store retention (R6) | no retention obligation; rebuildable and discardable | search `3q5.9`; vectors `3q5.15` | discard each derived store and rebuild identical logical identities and checkpoints from canonical state |
 | core.sqlite size alarm (R7) | 1 GiB, warn only | K2 `kh8.2` | health metric flips at 1 GiB; writes continue |
 | artifacts/ budget (R8) | 4 GiB; 80% warn alarm + soft GC; hard-cap reject | K3 `kh8.3` | configured cap overrides 4 GiB default; alarm fires at 80%; write at configured cap succeeds; cap+1 rejects typed with usage+cap; referencing commit fails atomically; referenced object never GC'd |
 | Per-artifact cap (R9) | 64 MiB | K3 `kh8.3`; K8 `kh8.8` ingestion route | K3 accepts 64 MiB and rejects 64 MiB+1 typed; K8 route accepts a 64 MiB payload end to end |
-| Sensitivity classes + default (R10) | normal/sensitive/secret; default sensitive | K3 `kh8.3` columns; K6 `kh8.6` visibility interplay | unclassifiable ingest lands sensitive; false-normal fixture (user-personal content) lands sensitive; class stored from first schema |
-| Redaction at ingestion (R10) | vocabulary-covered secret bytes never durable | K3 `kh8.3` | planted-secret fixture: CAS + staging-row bytes hold redacted form only; detection metadata holds no secret substring; known-miss corpus records measured coverage; vocabulary proven by one checked-in fixture consumed by both runtimes (`storage-format-epoch` cross-runtime pattern) |
+| Sensitivity classes + default (R10) | normal/sensitive/secret; default sensitive | K2 `kh8.2` staging columns; K3 `kh8.3` artifact columns; K6 `kh8.6` visibility interplay | staging candidate and artifact both store class from first schema; unclassifiable ingest lands sensitive; false-normal fixture (user-personal content) lands sensitive |
+| Redaction at ingestion (R10) | vocabulary-covered secret bytes never durable | K2 `kh8.2` staging writes; K3 `kh8.3` artifact writes | planted-secret fixture: CAS + staging-row bytes hold redacted form only; detection metadata holds no secret substring; known-miss corpus records measured coverage; vocabulary proven by one checked-in fixture consumed by both runtimes (`storage-format-epoch` cross-runtime pattern) |
 | Secret purge (R10) | operator-invoked, propagates deletion | K3 `kh8.3` | purged artifact absent from CAS, search docs, derived support |
 | Egress gate (R11) | derived max sensitivity; sensitive→local only; secret never | K8 `kh8.8`; K10 `kh8.10` delegates | e2e mock provider: normal payload observed; sensitive/secret case asserts gate's typed rejection AND no captured remote request (rejection = proof; absence alone race-prone); under-declared payload rejected; negative scan fails on any out-of-gate provider call |
 | Backup consistency (R12a) | snapshot at one commit_seq, DB-then-artifacts, capture-pinned GC | K2 `kh8.2`; K3 `kh8.3` artifact participation | snapshot under concurrent writes, GC, evidence deletion references only durable artifacts |
@@ -186,16 +191,16 @@ flowchart TB
 - **Goal:** Each owning bead carries note citing this plan path + its policy IDs; implementers find obligations without record restatement.
 - **Requirements:** R13; KTD6.
 - **Dependencies:** none (record final once plan pipeline in Verification Contract has run).
-- **Files:** `.beads/issues.jsonl` via `bd update <id> --notes` (or append via `--body-file` where notes exist).
+- **Files:** Tracker records, changed through `bd update <id> --notes` (or `--body-file` where notes exist). `.beads/issues.jsonl` is a passive export, not the source or edit target.
 - **Approach:**
-  1. `kh8.2`: cite R1–R4, R7, R12a–R12c facts ownership, R12d facts, R12e.
+  1. `kh8.2`: cite R1–R4, including R3 acknowledgement retention and required-consumer membership, R7, R10 staging/redaction ownership, R12a–R12c facts ownership, R12d facts, R12e.
   2. `kh8.3`: cite R5, R8–R10 (columns, redaction-before-durable-write, purge), R12a artifact participation.
   3. `kh8.6`: cite R10 sensitivity/visibility boundary.
   4. `kh8.7`: cite Policy Ownership Matrix cross-check as its addition to restructure R8.
   5. `kh8.8`: cite R9 ingestion-route obligation, R11, R12d serving behavior.
   6. `kh8.10`: cite R11 (extraction delegates to egress gate).
-  7. `3q5.9`: cite R12d lag budget (cross-lane note; performance obligation only).
-  8. `3q5.15`: cite R3 + R12d (cross-lane note; required-consumer registration + lag participation).
+  7. `3q5.9`: cite R6 derived-store retention + R12d lag budget (cross-lane note; performance obligation only).
+  8. `3q5.15`: cite R3 + R6 + R12d (cross-lane note; required-consumer registration, derived-store retention, and lag participation).
 - **Test scenarios:** Test expectation: none — tracker operations; correctness via Verification Contract queries.
 - **Verification:** `bd show` on each of eight beads renders citation note naming this plan's repo-relative path + policy IDs.
 
@@ -204,7 +209,7 @@ flowchart TB
 - **Goal:** `magic-context-kh8.1` closed as completed; `kh8.2` becomes ready.
 - **Requirements:** R13, R14.
 - **Dependencies:** U1.
-- **Files:** `.beads/issues.jsonl` via `bd close magic-context-kh8.1 -r "..."`.
+- **Files:** Tracker record, changed through `bd close magic-context-kh8.1 -r "..."`. `.beads/issues.jsonl` is a passive export, not the source or edit target.
 - **Approach:**
   1. Run gate-duplication check (Verification Contract row) before closing.
   2. Close with reason citing this plan's repo-relative path as reviewed policy record.
