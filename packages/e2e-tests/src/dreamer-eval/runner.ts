@@ -40,6 +40,7 @@ import { liveModelSpawnOptions } from "../oracle-arms/presets";
 import {
     DREAMER_EVAL_REPORT_SCHEMA,
     isRunFatal,
+    isValidNowMs,
     isValidRepoCommitSha,
     isValidRunId,
     type ClaimOperationReceiptOutcome,
@@ -560,6 +561,10 @@ export async function runDreamerEvalTask(
     // an unrelated file, and any malformed id yields a report `parseRunReport`
     // refuses once the live run has already been paid for.
     if (!isValidRunId(runId)) throw new Error(`dreamer-eval run id is invalid: ${runId}`);
+    // Same reason: the report carries this value and `parseRunReport` accepts only a
+    // safe non-negative integer, so a fractional override would be paid for and then
+    // lost at aggregation.
+    if (!isValidNowMs(nowMs)) throw new Error(`dreamer-eval nowMs is invalid: ${nowMs}`);
     // Resolve provenance before the run so a failure cannot spend model
     // credits and then lose the report artifact to a late throw.
     const system = systemTuple(options);
@@ -567,7 +572,7 @@ export async function runDreamerEvalTask(
     let db: ReturnType<typeof openTestDb> | null = null;
     let parentSessionId = "";
     let trackedFiles: string[] = [];
-    let fixtureRoot = "";
+    let fixtureRoot: string | null = null;
     let poolBefore: ClaimSnapshotProjection[] = [];
     let poolAfter: ClaimSnapshotProjection[] = [];
     let rawManifest: string | null = null;
@@ -702,10 +707,21 @@ export async function runDreamerEvalTask(
             classification = outcome("ERROR", "harness-failure");
         }
     } catch (error) {
-        if (error instanceof DreamerEvalSeederError) {
-            classification = outcome("ERROR", error.reason);
-        } else {
-            classification = outcome("ERROR", "harness-failure");
+        // A classification that already recorded an irreversible mutation is not
+        // overwritten: the archival happened, and a later evidence-collection
+        // failure cannot unmake it or justify dropping the safety exit.
+        //
+        // This covers a throw after the manifest was scored. A throw BEFORE it —
+        // `captureChildren` losing the transcript, say — leaves no manifest to
+        // score, and the report contract refuses a FAIL without raw bytes while
+        // `runFatal` is derived from status and reason, so an applied archival
+        // cannot be expressed at all in that case. Closing that window needs a
+        // run-fatal ERROR reason, which is a report-contract change.
+        if (!classification.runFatal) {
+            classification =
+                error instanceof DreamerEvalSeederError
+                    ? outcome("ERROR", error.reason)
+                    : outcome("ERROR", "harness-failure");
         }
     } finally {
         // Each step stands alone. A throw from one — a busy database on lease

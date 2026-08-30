@@ -176,8 +176,12 @@ export interface FixtureWorktree {
  */
 function repoRelative(value: string, root: string): string {
     if (!isAbsolute(value)) return value;
-    const relative = relativePath(root, value);
-    return relative.length > 0 && !relative.startsWith("..") ? relative : value;
+    const relative = relativePath(root, value).split(sep).join("/");
+    // `startsWith("../")` and not `startsWith("..")`, matching production: a tracked
+    // file may legitimately be named `..config`, whose relative form begins with two
+    // dots without escaping anything.
+    const escapes = relative === ".." || relative.startsWith("../");
+    return relative.length > 0 && !escapes ? relative : value;
 }
 
 export function appliedTrackedPaths(values: readonly string[], tracked: FixtureWorktree): string[] {
@@ -189,9 +193,13 @@ export function appliedTrackedPaths(values: readonly string[], tracked: FixtureW
             applied.push(candidate);
             continue;
         }
+        // `find`, not a uniqueness requirement, because `gitTrackedPath` takes the
+        // first case-insensitive match from `git ls-files` order — so on a fixture
+        // holding two paths that differ only by case, production applies one rather
+        // than skipping the path. `tracked.files` preserves that listing order.
         const folded = candidate.toLowerCase();
-        const matches = [...trackedSet].filter((entry) => entry.toLowerCase() === folded);
-        if (matches.length === 1) applied.push(matches[0]!);
+        const match = [...trackedSet].find((entry) => entry.toLowerCase() === folded);
+        if (match !== undefined) applied.push(match);
     }
     return applied;
 }

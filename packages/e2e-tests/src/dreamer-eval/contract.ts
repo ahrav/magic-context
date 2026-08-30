@@ -96,6 +96,10 @@ export function isValidRepoCommitSha(value: string): boolean {
     return SHA_RE.test(value);
 }
 
+export function isValidNowMs(value: number): boolean {
+    return Number.isSafeInteger(value) && value >= 0;
+}
+
 /**
  * Lowest verification timestamp the seeder can build a fixture around.
  * `prepareFixtureRepository` derives the fixture commit time as the earliest
@@ -937,9 +941,10 @@ export interface DreamerEvalRunReport {
      * resolves an observed path against the session directory before matching it,
      * so an absolute path inside the fixture is accepted and stored relative —
      * reproducing that needs the root, and it differs per run, so each report
-     * carries its own.
+     * carries its own. Null when the run failed before the fixture existed, which
+     * is the same partial capture an ERROR report is already allowed to hold.
      */
-    fixtureRoot: string;
+    fixtureRoot: string | null;
     poolBefore: ClaimSnapshotProjection[];
     poolAfter: ClaimSnapshotProjection[];
     rawManifest: string | null;
@@ -1375,7 +1380,7 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
         runFatal,
         system: parseSystem(root.system, `${label}.system`),
         trackedFiles: parseFilePathArray(root.trackedFiles, `${label}.trackedFiles`),
-        fixtureRoot: parseFilePath(root.fixtureRoot, `${label}.fixtureRoot`),
+        fixtureRoot: root.fixtureRoot === null ? null : parseFilePath(root.fixtureRoot, `${label}.fixtureRoot`),
         poolBefore,
         poolAfter,
         rawManifest,

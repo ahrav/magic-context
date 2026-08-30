@@ -139,7 +139,9 @@ function observedVerdicts(report: DreamerEvalRunReport): Map<string, string> {
     // projects none and equivalent spellings would land in different buckets. The
     // root differs per run, and resolving each report against its own is what makes
     // an absolute path in one repeat comparable to a relative one in another.
-    const tracked: FixtureWorktree = { root: report.fixtureRoot, files: report.trackedFiles };
+    // A report with no fixture failed before one existed, so it carries no mapping
+    // evidence to resolve; an empty root simply leaves an absolute path unchanged.
+    const tracked: FixtureWorktree = { root: report.fixtureRoot ?? "", files: report.trackedFiles };
     if (report.task === "verify" || report.task === "verify-broad") {
         const manifest = object(report.parsedManifest);
         for (const [field, verdict] of [

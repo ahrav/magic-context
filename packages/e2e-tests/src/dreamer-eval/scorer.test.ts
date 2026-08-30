@@ -214,6 +214,52 @@ describe("dreamer manifest scorers", () => {
         ).toMatchObject({ stage: "scored", status: "FAIL", reason: "wrong-mapping" });
     });
 
+    test("a dotted filename's absolute path is not read as an escape", () => {
+        // path.relative returns `..config` for this, which is a legitimate tracked
+        // name rather than an escape — production only refuses `../`.
+        const dotted = {
+            root: FIXTURE_ROOT,
+            files: [...tracked.files, "..config"],
+        };
+        const poolWithDotted = {
+            ...pool,
+            claims: pool.claims.map((claim) =>
+                claim.claimId === "claim-true" ? { ...claim, files: ["..config"] } : claim,
+            ),
+        };
+        const goldWithDotted = {
+            ...mapGold,
+            claims: mapGold.claims.map((entry) =>
+                entry.claimId === "claim-true" ? { ...entry, files: ["..config"] } : entry,
+            ),
+        };
+        expect(
+            scoreMapManifest(
+                correctMap.replace('files="src/cache.ts,src/config.ts"', `files="${FIXTURE_ROOT}/..config"`),
+                poolWithDotted,
+                goldWithDotted,
+                dotted,
+            ),
+        ).toMatchObject({ stage: "scored", status: "PASS" });
+    });
+
+    test("a case collision resolves to the first tracked spelling, as production does", () => {
+        // gitTrackedPath takes the first case-insensitive match from ls-files order
+        // instead of skipping an ambiguous path, so a third casing still applies.
+        const colliding = {
+            root: FIXTURE_ROOT,
+            files: ["src/cache.ts", "SRC/cache.ts", "src/config.ts", "src/queue.ts"],
+        };
+        expect(
+            scoreMapManifest(
+                correctMap.replace('files="src/cache.ts,src/config.ts"', 'files="Src/Cache.ts,src/config.ts"'),
+                pool,
+                mapGold,
+                colliding,
+            ),
+        ).toMatchObject({ stage: "scored", status: "PASS" });
+    });
+
     test("an untracked extra path is dropped, a tracked one is not", () => {
         // normalizeVerificationFiles skips a path it cannot bind to a tracked
         // file, so the applied mapping is exactly gold and the run passes.
