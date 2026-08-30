@@ -5,7 +5,6 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use mc_shm_transport::backend::ring::RingGrant;
-use rustix::io::{fcntl_setfd, FdFlags};
 use rustix::net::{recvmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -82,8 +81,8 @@ enum ServerMessage {
 
 pub struct SetupConnection {
     pub stream: UnixStream,
-    pub host_to_peer_fd: OwnedFd,
-    pub peer_to_host_fd: OwnedFd,
+    pub host_to_peer_descriptors: [OwnedFd; 3],
+    pub peer_to_host_descriptors: [OwnedFd; 3],
     pub host_to_peer_grant: RingGrant,
     pub peer_to_host_grant: RingGrant,
 }
@@ -146,11 +145,12 @@ pub fn connect(
     ) {
         return Err(invalid());
     }
-    let [host_to_peer_fd, peer_to_host_fd] = descriptors;
+    let [host_mapping, host_data, host_capacity, peer_mapping, peer_data, peer_capacity] =
+        descriptors;
     Ok(SetupConnection {
         stream,
-        host_to_peer_fd,
-        peer_to_host_fd,
+        host_to_peer_descriptors: [host_mapping, host_data, host_capacity],
+        peer_to_host_descriptors: [peer_mapping, peer_data, peer_capacity],
         host_to_peer_grant,
         peer_to_host_grant,
     })
@@ -249,13 +249,22 @@ fn proof(
     )
 }
 
-fn receive_grant(stream: &mut UnixStream, deadline: Instant) -> io::Result<(Grant, [OwnedFd; 2])> {
+fn receive_grant(
+    stream: &mut UnixStream,
+    deadline: Instant,
+) -> io::Result<(Grant, [OwnedFd; SETUP_DESCRIPTOR_COUNT])> {
     set_timeout(stream, deadline)?;
     let mut bytes = vec![0u8; MAX_SETUP_MESSAGE_LEN + 4];
-    let mut control = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(3))];
+    let mut control = [std::mem::MaybeUninit::uninit();
+        rustix::cmsg_space!(ScmRights(SETUP_DESCRIPTOR_COUNT + 1))];
     let mut ancillary = RecvAncillaryBuffer::new(&mut control);
     let mut iov = [IoSliceMut::new(&mut bytes)];
-    let received = recvmsg(stream.as_fd(), &mut iov, &mut ancillary, RecvFlags::empty())?;
+    let received = recvmsg(
+        stream.as_fd(),
+        &mut iov,
+        &mut ancillary,
+        RecvFlags::CMSG_CLOEXEC,
+    )?;
     if received.bytes == 0 || received.flags.contains(ReturnFlags::CTRUNC) {
         return Err(invalid());
     }
@@ -269,9 +278,6 @@ fn receive_grant(stream: &mut UnixStream, deadline: Instant) -> io::Result<(Gran
     }
     if descriptors.len() != RING_DESCRIPTOR_COUNT {
         return Err(invalid());
-    }
-    for descriptor in &descriptors {
-        fcntl_setfd(descriptor, FdFlags::CLOEXEC)?;
     }
     let descriptors = descriptors.try_into().map_err(|_| invalid())?;
     let message: GrantMessage =

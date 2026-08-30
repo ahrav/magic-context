@@ -128,8 +128,12 @@ function validRawDescriptor(): Record<string, unknown> {
     return {
         profile: "mc-host-test-ring-v1",
         hostToPeerFd: 10,
+        hostToPeerDataReadyFd: 11,
+        hostToPeerCapacityReadyFd: 12,
         hostToPeerGrant: testGrantHex(0, 0xab),
-        peerToHostFd: 11,
+        peerToHostFd: 13,
+        peerToHostDataReadyFd: 14,
+        peerToHostCapacityReadyFd: 15,
         peerToHostGrant: testGrantHex(1, 0xcd),
     };
 }
@@ -178,15 +182,21 @@ describe("raw N-API descriptor boundary", () => {
         const addon = loadRawAddon();
         if (!addon || !["linux", "darwin"].includes(process.platform)) return;
         const hostileFds = [-1, -0, 2 ** 31, 3.5, Number.NaN, "10"];
+        const fields = [
+            "hostToPeerFd",
+            "hostToPeerDataReadyFd",
+            "hostToPeerCapacityReadyFd",
+            "peerToHostFd",
+            "peerToHostDataReadyFd",
+            "peerToHostCapacityReadyFd",
+        ];
         for (const fd of hostileFds) {
-            expectRejectedWithoutEffects(addon, {
-                ...validRawDescriptor(),
-                hostToPeerFd: fd,
-            });
-            expectRejectedWithoutEffects(addon, {
-                ...validRawDescriptor(),
-                peerToHostFd: fd,
-            });
+            for (const field of fields) {
+                expectRejectedWithoutEffects(addon, {
+                    ...validRawDescriptor(),
+                    [field]: fd,
+                });
+            }
         }
     });
 
@@ -210,10 +220,9 @@ describe("raw N-API descriptor boundary", () => {
                 hostToPeerGrant: grant,
             });
         }
-        // One fd or one grant backing both lanes aliases the duplex pair.
         expectRejectedWithoutEffects(addon, {
             ...validRawDescriptor(),
-            peerToHostFd: 10,
+            peerToHostCapacityReadyFd: 10,
         });
         expectRejectedWithoutEffects(addon, {
             ...validRawDescriptor(),

@@ -4,8 +4,7 @@ use mc_shm_transport::arena::{ArenaCounts, ArenaSpan, SpanPlan, MAX_FRAME_BYTES}
 use mc_shm_transport::backend::sample::{SamplePrefix, SAMPLE_PREFIX_BYTES};
 use mc_shm_transport::descriptor::{
     DescriptorCounts, DescriptorError, FrameDescriptor, HardwareProfileId, Incarnation,
-    ReleaseIdentity, SchedulingMode, TransportDescriptor, DESCRIPTOR_SCHEMA_VERSION,
-    WIRE_V2_HEADER_BYTES,
+    ReleaseIdentity, TransportDescriptor, DESCRIPTOR_SCHEMA_VERSION, WIRE_V2_HEADER_BYTES,
 };
 use mc_shm_transport::evidence::OperationCounters;
 use mc_shm_transport::lifecycle::{CloseState, Lifecycle, LifecycleError};
@@ -61,19 +60,11 @@ fn valid_descriptor() -> FrameDescriptor {
 
 #[test]
 fn fixed_ring_identity_survives_profile_validation() {
-    let profile = ring_profile(
-        HardwareProfileId::new("fixed-ring-contract").unwrap(),
-        SchedulingMode::ColdParkWake,
-    )
-    .unwrap();
+    let profile = ring_profile(HardwareProfileId::new("fixed-ring-contract").unwrap()).unwrap();
 
     assert_eq!(
         profile.descriptor().schema_version(),
         DESCRIPTOR_SCHEMA_VERSION
-    );
-    assert_eq!(
-        profile.descriptor().scheduling(),
-        SchedulingMode::ColdParkWake
     );
     assert!(profile.descriptor().hardware_matches("fixed-ring-contract"));
 }
@@ -347,11 +338,7 @@ fn lifecycle_accepts_only_diagram_edges_and_quarantine_is_terminal() {
 
 #[test]
 fn host_admission_retains_quarantined_commitments() {
-    let profile = ring_profile(
-        HardwareProfileId::new("contract-host").unwrap(),
-        SchedulingMode::ColdParkWake,
-    )
-    .unwrap();
+    let profile = ring_profile(HardwareProfileId::new("contract-host").unwrap()).unwrap();
     let charges = profile.charges();
     let controller = Arc::new(AdmissionController::new(HostLimits {
         descriptors: charges.descriptors,
@@ -386,11 +373,7 @@ fn host_admission_retains_quarantined_commitments() {
 
 #[test]
 fn exact_aggregate_capacity_admits_n_and_rejects_n_plus_one_without_charging() {
-    let profile = ring_profile(
-        HardwareProfileId::new("contract-capacity").unwrap(),
-        SchedulingMode::ColdParkWake,
-    )
-    .unwrap();
+    let profile = ring_profile(HardwareProfileId::new("contract-capacity").unwrap()).unwrap();
     let one = profile.charges();
     let count = 3;
     let controller = Arc::new(AdmissionController::new(HostLimits {
@@ -431,10 +414,7 @@ fn exact_aggregate_capacity_admits_n_and_rejects_n_plus_one_without_charging() {
 
 fn span_profile(max_spans: usize) -> TargetProfile {
     TargetProfile::new(ProfileConfig {
-        descriptor: TransportDescriptor::new(
-            SchedulingMode::ColdParkWake,
-            HardwareProfileId::new("contract-spans").unwrap(),
-        ),
+        descriptor: TransportDescriptor::new(HardwareProfileId::new("contract-spans").unwrap()),
         descriptor_depth: 8,
         arena_bytes: mc_shm_transport::MIN_ARENA_BYTES,
         max_spans,
@@ -491,7 +471,7 @@ fn purity_gate_rejects_injected_copy_allocation_queue_and_wake() {
         scheduler_handoffs: 1,
     };
     assert_eq!(
-        injected.disqualifications(SchedulingMode::HotPinnedPoll, false),
+        injected.disqualifications(false),
         [
             "transport_body_copy",
             "native_transport_allocation",
@@ -502,17 +482,14 @@ fn purity_gate_rejects_injected_copy_allocation_queue_and_wake() {
         ]
     );
     assert!(OperationCounters::default()
-        .disqualifications(SchedulingMode::HotPinnedPoll, false)
+        .disqualifications(false)
         .is_empty());
 }
 
 #[test]
 fn debug_and_errors_redact_every_sentinel() {
     let sentinel = "SENTINEL_descriptor_token_object_incarnation_address";
-    let transport = TransportDescriptor::new(
-        SchedulingMode::ColdParkWake,
-        HardwareProfileId::new(sentinel).unwrap(),
-    );
+    let transport = TransportDescriptor::new(HardwareProfileId::new(sentinel).unwrap());
     let incarnation = Incarnation::from_bytes(*b"SENTINEL-SECRET!");
     let release = ReleaseIdentity::new(incarnation, 0x5345_4e54, 0x494e_454c);
     let descriptor = FrameDescriptor::from_untrusted(

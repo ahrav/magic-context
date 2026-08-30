@@ -5,21 +5,13 @@ use serde::{Deserialize, Serialize};
 use crate::arena::{ArenaSpan, MAX_FRAME_BYTES};
 
 /// Shared descriptor schema version.
-pub const DESCRIPTOR_SCHEMA_VERSION: u16 = 2;
+pub const DESCRIPTOR_SCHEMA_VERSION: u16 = 3;
+/// Setup descriptor count. commentlint: allow(JUDGE)
+pub const SETUP_DESCRIPTOR_COUNT: usize = 6;
 /// Frozen wire-v2 header length.
 pub const WIRE_V2_HEADER_BYTES: usize = 21;
 /// Maximum shared spans in one complete-frame descriptor.
 pub const MAX_SPANS: usize = 2;
-
-/// Worker scheduling selected before admission.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SchedulingMode {
-    /// Dedicated workers poll continuously on verified physical cores.
-    HotPinnedPoll,
-    /// Endpoints park and wake for cold traffic.
-    ColdParkWake,
-}
 
 /// Validated opaque hardware-profile identifier.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,16 +49,14 @@ impl fmt::Debug for HardwareProfileId {
 #[derive(Clone, PartialEq, Eq)]
 pub struct TransportDescriptor {
     schema_version: u16,
-    scheduling: SchedulingMode,
     hardware: HardwareProfileId,
 }
 
 impl TransportDescriptor {
-    /// Constructs the current ring descriptor.
-    pub const fn new(scheduling: SchedulingMode, hardware: HardwareProfileId) -> Self {
+    /// Constructs the transport descriptor. commentlint: allow(JUDGE)
+    pub const fn new(hardware: HardwareProfileId) -> Self {
         Self {
             schema_version: DESCRIPTOR_SCHEMA_VERSION,
-            scheduling,
             hardware,
         }
     }
@@ -74,11 +64,6 @@ impl TransportDescriptor {
     /// Schema version.
     pub const fn schema_version(&self) -> u16 {
         self.schema_version
-    }
-
-    /// Selected scheduling.
-    pub const fn scheduling(&self) -> SchedulingMode {
-        self.scheduling
     }
 
     /// Tests equality with expected hardware-profile identifier.

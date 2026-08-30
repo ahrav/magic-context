@@ -9,10 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant as StdInstant};
 use std::{fmt, io};
 
+use crate::setup_socket::RING_DESCRIPTOR_COUNT;
 use crate::wire::{decode_header, EnvelopeHeader, FrameType};
 use mc_shm_transport::backend::ring::RingGrant;
 use mc_shm_transport::backend::ring::{DuplexRing, ProducerReservation, Ring};
-use mc_shm_transport::descriptor::SchedulingMode;
 use mc_shm_transport::profile::{
     AdmissionController, HostLimits as ShmHostLimits, ResourceCharges, TargetProfile,
 };
@@ -93,7 +93,7 @@ pub struct RingTransport {
 
 pub(crate) struct PreparedRing {
     pub(crate) descriptor: serde_json::Value,
-    pub(crate) descriptors: [OwnedFd; 2],
+    pub(crate) descriptors: [OwnedFd; RING_DESCRIPTOR_COUNT],
     pub(crate) sender: crate::frame_channel::FrameSender,
     pub(crate) receiver: ShmReceiver,
     pub(crate) io: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
@@ -308,15 +308,23 @@ struct WireDescriptor {
 
 pub(crate) fn worker_descriptor(
     rings: &DuplexRing,
-) -> Result<(serde_json::Value, [OwnedFd; 2]), ()> {
+) -> Result<(serde_json::Value, [OwnedFd; RING_DESCRIPTOR_COUNT]), ()> {
     let descriptor = WireDescriptor {
         profile: RING_PROFILE.to_owned(),
         host_to_peer_grant: encode_hex(&rings.first.grant().encode()),
         peer_to_host_grant: encode_hex(&rings.second.grant().encode()),
     };
+    let [first_mapping, first_data, first_capacity] =
+        rings.first.attachment().map_err(|_| ())?.into_parts().0;
+    let [second_mapping, second_data, second_capacity] =
+        rings.second.attachment().map_err(|_| ())?.into_parts().0;
     let descriptors = [
-        rings.first.attachment().map_err(|_| ())?.into_parts().0,
-        rings.second.attachment().map_err(|_| ())?.into_parts().0,
+        first_mapping,
+        first_data,
+        first_capacity,
+        second_mapping,
+        second_data,
+        second_capacity,
     ];
     Ok((
         serde_json::to_value(descriptor).map_err(|_| ())?,
@@ -622,22 +630,23 @@ impl RingClientEndpoint {
     /// Attaches a descriptor and its setup-socket file descriptors.
     pub fn attach_with_descriptors(
         descriptor: &serde_json::Value,
-        descriptors: [OwnedFd; 2],
+        descriptors: [OwnedFd; RING_DESCRIPTOR_COUNT],
     ) -> Result<Self, RingClientError> {
         let descriptor: WireDescriptor =
             serde_json::from_value(descriptor.clone()).map_err(|_| RingClientError)?;
         if descriptor.profile != RING_PROFILE {
             return Err(RingClientError);
         }
-        let [from_host_fd, to_host_fd] = descriptors;
+        let [from_mapping, from_data, from_capacity, to_mapping, to_data, to_capacity] =
+            descriptors;
         let from_host_grant = decode_grant(&descriptor.host_to_peer_grant)?;
         let to_host_grant = decode_grant(&descriptor.peer_to_host_grant)?;
         if from_host_grant.geometry() != to_host_grant.geometry() {
             return Err(RingClientError);
         }
-        let from_host = Ring::attach(from_host_fd, from_host_grant, SchedulingMode::ColdParkWake)
+        let from_host = Ring::attach([from_mapping, from_data, from_capacity], from_host_grant)
             .map_err(|_| RingClientError)?;
-        let to_host = Ring::attach(to_host_fd, to_host_grant, SchedulingMode::ColdParkWake)
+        let to_host = Ring::attach([to_mapping, to_data, to_capacity], to_host_grant)
             .map_err(|_| RingClientError)?;
         Ok(Self { to_host, from_host })
     }
