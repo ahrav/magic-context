@@ -278,63 +278,63 @@ async function probeManagedReadiness(root: string, budgetMs: number): Promise<Ob
         },
     });
     const { snapshot: compatibility, status } = await readCompatibilityProbe(client, deadline);
-        if (status === null) {
-            // The probe short-circuited at the daemon or module stage, so
-            // `host.status` never ran and storage and Synapse were never
-            // observed. Report only what the handshake proved and leave the
-            // unobserved components absent rather than asserting failures that
-            // would point remediation away from the version mismatch.
-            return {
-                ...compatibility,
-                readiness: { transport: { state: "ready", reason: "healthy" } },
-            };
-        }
-        const components = asRecord(status.metrics.components);
-        const storage = storageState(status.metrics);
-        const synapseMetrics = asRecord(asRecord(components?.synapse)?.metrics);
-        const synapseState = synapseMetrics?.synapse_state;
-        const synapse =
-            synapseState === "ready"
-                ? { state: "ready" as const, reason: "healthy" as const }
-                : synapseState === "unsupported"
-                  ? {
+    if (status === null) {
+        // The probe short-circuited at the daemon or module stage, so
+        // `host.status` never ran and storage and Synapse were never
+        // observed. Report only what the handshake proved and leave the
+        // unobserved components absent rather than asserting failures that
+        // would point remediation away from the version mismatch.
+        return {
+            ...compatibility,
+            readiness: { transport: { state: "ready", reason: "healthy" } },
+        };
+    }
+    const components = asRecord(status.metrics.components);
+    const storage = storageState(status.metrics);
+    const synapseMetrics = asRecord(asRecord(components?.synapse)?.metrics);
+    const synapseState = synapseMetrics?.synapse_state;
+    const synapse =
+        synapseState === "ready"
+            ? { state: "ready" as const, reason: "healthy" as const }
+            : synapseState === "unsupported"
+              ? {
+                    state: "unsupported" as const,
+                    reason: "synapse_unsupported" as const,
+                }
+              : synapseState === "starting"
+                ? { state: "starting" as const, reason: "synapse_starting" as const }
+                : synapseState === undefined
+                  ? // The status payload omits a component whose state it
+                    // cannot report: the daemon skips any module missing from
+                    // `components`, missing a usable `status`, or missing its
+                    // state key. Absence means the lane is not offered, so it
+                    // reports `unsupported` — the one non-failing readiness
+                    // state, which `addCheck` maps to a skipped check. Calling
+                    // it `degraded` would make `status` and `doctor` answer
+                    // `ok: false` for a daemon that is serving correctly and
+                    // simply has no Synapse lane, which is the normal shape on
+                    // every platform the model lane does not cover.
+                    {
                         state: "unsupported" as const,
                         reason: "synapse_unsupported" as const,
                     }
-                  : synapseState === "starting"
-                    ? { state: "starting" as const, reason: "synapse_starting" as const }
-                    : synapseState === undefined
-                      ? // The status payload omits a component whose state it
-                        // cannot report: the daemon skips any module missing from
-                        // `components`, missing a usable `status`, or missing its
-                        // state key. Absence means the lane is not offered, so it
-                        // reports `unsupported` — the one non-failing readiness
-                        // state, which `addCheck` maps to a skipped check. Calling
-                        // it `degraded` would make `status` and `doctor` answer
-                        // `ok: false` for a daemon that is serving correctly and
-                        // simply has no Synapse lane, which is the normal shape on
-                        // every platform the model lane does not cover.
-                        {
-                            state: "unsupported" as const,
-                            reason: "synapse_unsupported" as const,
-                        }
-                      : { state: "degraded" as const, reason: "synapse_degraded" as const };
-        return {
-            ...compatibility,
-            readiness: {
-                transport: { state: "ready", reason: "healthy" },
-                storage: {
-                    state: storage,
-                    reason:
-                        storage === "ready"
-                            ? "healthy"
-                            : storage === "starting"
-                              ? "storage_starting"
-                              : "storage_unavailable",
-                },
-                synapse,
+                  : { state: "degraded" as const, reason: "synapse_degraded" as const };
+    return {
+        ...compatibility,
+        readiness: {
+            transport: { state: "ready", reason: "healthy" },
+            storage: {
+                state: storage,
+                reason:
+                    storage === "ready"
+                        ? "healthy"
+                        : storage === "starting"
+                          ? "storage_starting"
+                          : "storage_unavailable",
             },
-        };
+            synapse,
+        },
+    };
 }
 
 export interface ManagedLifecyclePolicyOptions

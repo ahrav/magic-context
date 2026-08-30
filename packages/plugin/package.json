@@ -35,7 +35,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc -p ../retina-local-fs/tsconfig.build.json && bun run build:tui && rm -f dist/index.js dist/*-*.js && bun build src/index.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --external @huggingface/transformers --external onnxruntime-web --external bun:sqlite --external node:sqlite && tsc --emitDeclarationOnly",
+    "build": "tsc -p ../retina-local-fs/tsconfig.build.json && bun run build:tui && rm -f dist/index.js dist/*-*.js && bun build src/index.ts --outdir dist --target node --format esm --splitting --external @cortexkit/mc-shm-native --external @opencode-ai/plugin --external @huggingface/transformers --external onnxruntime-web --external bun:sqlite --external node:sqlite && tsc --emitDeclarationOnly",
     "build:tui": "bun scripts/build-tui.ts",
     "check:tui-compiled": "tmp=$(mktemp -d) && cp -R src/tui-compiled/. \"$tmp\" && bun run build:tui && diff -ru \"$tmp\" src/tui-compiled; status=$?; rm -rf \"$tmp\"; exit $status",
     "typecheck": "tsc -p ../retina-local-fs/tsconfig.build.json && tsc --noEmit && tsc -p tsconfig.scripts.json",

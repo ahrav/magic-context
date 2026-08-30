@@ -80,6 +80,7 @@
       "name": "@cortexkit/pi-magic-context",
       "version": "0.38.0",
       "dependencies": {
+        "@cortexkit/mc-shm-native": "0.38.0",
         "@huggingface/transformers": "^4.1.0",
         "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",
         "ai-tokenizer": "^1.0.6",
