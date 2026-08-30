@@ -625,6 +625,28 @@ const VERIFY_EVIDENCE = {
     archived: [],
 };
 
+/** Bytes the production parsers read back as the evidence beside them. */
+function rawVerify(evidence: typeof VERIFY_EVIDENCE): string {
+    const lines = evidence.verified.map(
+        (entry) => `<verified claim="${entry.publicClaimId}" files="${entry.files.join(",")}"/>`,
+    );
+    return `<verify>\n${lines.join("\n")}\n</verify>`;
+}
+
+function rawMap(evidence: Array<{ publicClaimId: string; files: string[]; independent: boolean }>): string {
+    const lines = evidence.map((entry) =>
+        entry.independent
+            ? `<memory claim="${entry.publicClaimId}" independent="true"/>`
+            : `<memory claim="${entry.publicClaimId}" files="${entry.files.join(",")}"/>`,
+    );
+    return `<mappings>\n${lines.join("\n")}\n</mappings>`;
+}
+
+function rawClassify(evidence: Array<{ publicClaimId: string; scope: string }>): string {
+    const lines = evidence.map((entry) => `<memory claim="${entry.publicClaimId}" scope="${entry.scope}"/>`);
+    return `<classify>\n${lines.join("\n")}\n</classify>`;
+}
+
 /** The same capture with `overrides` folded into its first claim. */
 function captureWithFirst(overrides: Record<string, unknown>): Array<Record<string, unknown>> {
     return POOL_CAPTURE.map((claim, index) => (index === 0 ? { ...claim, ...overrides } : claim));
@@ -649,7 +671,7 @@ describe("dreamer eval report contract", () => {
         },
         poolBefore: POOL_CAPTURE,
         poolAfter: POOL_CAPTURE,
-        rawManifest: "<verify></verify>",
+        rawManifest: rawVerify(VERIFY_EVIDENCE),
         parsedManifest: VERIFY_EVIDENCE,
         receiptOutcomes: [],
     };
@@ -692,9 +714,14 @@ describe("dreamer eval report contract", () => {
         // to one entry per claim, so a report that only accepted a record could
         // not carry the evidence two of the three scorers produce.
         const mapShape = [{ publicClaimId: OBSERVED_ID, files: ["src/a.ts"], independent: false }];
-        expect(parseRunReport({ ...baseReport, task: "map-memories", parsedManifest: mapShape }).parsedManifest).toEqual(
-            mapShape,
-        );
+        expect(
+            parseRunReport({
+                ...baseReport,
+                task: "map-memories",
+                rawManifest: rawMap(mapShape),
+                parsedManifest: mapShape,
+            }).parsedManifest,
+        ).toEqual(mapShape);
         const verifyShape = VERIFY_EVIDENCE;
         expect(parseRunReport({ ...baseReport, parsedManifest: verifyShape }).parsedManifest).toEqual(verifyShape);
         // Absent evidence belongs to a run that failed before scoring, so the
@@ -933,6 +960,7 @@ describe("dreamer eval report contract", () => {
                 task: "map-memories",
                 status: "FAIL",
                 reason: "wrong-independence",
+                rawManifest: rawMap([{ publicClaimId: OBSERVED_ID, files: ["src/a.ts"], independent: false }]),
                 parsedManifest: [{ publicClaimId: OBSERVED_ID, files: ["src/a.ts"], independent: false }],
             }).reason,
         ).toBe("wrong-independence");
@@ -953,14 +981,15 @@ describe("dreamer eval report contract", () => {
         );
         // invalid-output is raised when validation threw, so it has no parsed
         // evidence to carry.
-        expect(
-            parseRunReport({ ...baseReport, status: "FAIL", reason: "invalid-output", parsedManifest: null })
-                .parsedManifest,
-        ).toBeNull();
+        const rejected = { ...baseReport, status: "FAIL", reason: "invalid-output", rawManifest: "<verify>" };
+        expect(parseRunReport({ ...rejected, parsedManifest: null }).parsedManifest).toBeNull();
         // And it cannot carry evidence: the reason is raised before any parse
         // result exists.
-        expect(() => parseRunReport({ ...baseReport, status: "FAIL", reason: "invalid-output" })).toThrow(
-            /parsedManifest: invalid-output-has-evidence/,
+        expect(() => parseRunReport(rejected)).toThrow(/parsedManifest: invalid-output-has-evidence/);
+        // The bytes must actually be ones the parser refuses, or the reason is a
+        // claim the artifact contradicts.
+        expect(() => parseRunReport({ ...baseReport, status: "FAIL", reason: "invalid-output", parsedManifest: null })).toThrow(
+            /rawManifest: invalid-output-parses/,
         );
     });
 
@@ -998,8 +1027,12 @@ describe("dreamer eval report contract", () => {
         ).toThrow(/parsedManifest\[0\]: classification-empty/);
         // A partial classification is exactly what the parser produces.
         expect(
-            parseRunReport({ ...baseReport, task: "classify-memories", parsedManifest: CLASSIFY_EVIDENCE })
-                .parsedManifest,
+            parseRunReport({
+                ...baseReport,
+                task: "classify-memories",
+                rawManifest: rawClassify(CLASSIFY_EVIDENCE),
+                parsedManifest: CLASSIFY_EVIDENCE,
+            }).parsedManifest,
         ).toEqual(CLASSIFY_EVIDENCE);
         // Classify validation demands exact id coverage, so evidence for a subset
         // of the observed pool is an artifact no scorer produces.
@@ -1046,6 +1079,39 @@ describe("dreamer eval report contract", () => {
         tasks[0]!.gold.claims[0]!.verdict = "update";
         tasks[0]!.gold.claims[0]!.requiredUpdateAnchors = ["\u0130".repeat(11_000)];
         expect(() => parseScenario(expanding)).not.toThrow();
+    });
+
+    test("parsed evidence must reproduce from the captured bytes", () => {
+        // The exploit this closes: bytes that carry no entries paired with a
+        // fabricated evidence array.
+        expect(() =>
+            parseRunReport({ ...baseReport, rawManifest: "<verify></verify>" }),
+        ).toThrow(/parsedManifest: evidence-mismatch/);
+        // Evidence that differs in a field, not just in coverage.
+        expect(() =>
+            parseRunReport({
+                ...baseReport,
+                parsedManifest: {
+                    ...VERIFY_EVIDENCE,
+                    verified: [{ publicClaimId: OBSERVED_ID, files: ["src/other.ts"] }],
+                },
+            }),
+        ).toThrow(/parsedManifest: evidence-mismatch/);
+        // Bytes the parser refuses cannot back evidence either.
+        expect(() => parseRunReport({ ...baseReport, rawManifest: "<verify>" })).toThrow(
+            /rawManifest: evidence-unparseable/,
+        );
+        // Key order is not part of the comparison.
+        expect(
+            parseRunReport({
+                ...baseReport,
+                parsedManifest: {
+                    archived: [],
+                    updated: [],
+                    verified: [{ files: ["src/a.ts"], publicClaimId: OBSERVED_ID }],
+                },
+            }).status,
+        ).toBe("PASS");
     });
 
     test("a completed report must capture the scenario pool", () => {

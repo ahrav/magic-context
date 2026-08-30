@@ -7,6 +7,9 @@ import {
 import { normalizeMemoryContent } from "../../../plugin/src/features/magic-context/memory/normalize-hash";
 import { sha256Utf8Hex } from "../../../plugin/src/features/magic-context/memory/storage-claims";
 import { VERIFY_UPDATE_CONTENT_MAX_LENGTH } from "../../../plugin/src/features/magic-context/dreamer/verify";
+import { parseVerifyManifest } from "../../../plugin/src/features/magic-context/dreamer/verify-prompt";
+import { parseMapMemoriesManifest } from "../../../plugin/src/features/magic-context/dreamer/map-memories-prompt";
+import { parseClassifyManifest } from "../../../plugin/src/features/magic-context/dreamer/classify-prompt";
 import { hasShareabilitySensitiveText } from "../../../plugin/src/shared/redaction";
 
 export const DREAMER_EVAL_SCENARIO_SCHEMA = "dreamer-eval-scenario/v1";
@@ -961,12 +964,14 @@ function parseManifestEvidence(
     observedPublicIds: ReadonlySet<string> | null,
 ): ParsedManifestEvidence | null {
     if (value === null) return null;
+    const collected: string[] = [];
     const entryId = (entry: Record<string, unknown>, entryLabel: string): void => {
         const publicClaimId = string(entry.publicClaimId, `${entryLabel}.publicClaimId`);
         if (!isValidPublicClaimId(publicClaimId)) fail(`${entryLabel}.publicClaimId: id-invalid`);
         if (observedPublicIds !== null && !observedPublicIds.has(publicClaimId)) {
             fail(`${entryLabel}.publicClaimId: unobserved-claim`);
         }
+        collected.push(publicClaimId);
     };
     const filesOf = (entry: Record<string, unknown>, entryLabel: string): void => {
         for (const [index, file] of array(entry.files, `${entryLabel}.files`).entries()) {
@@ -1009,6 +1014,9 @@ function parseManifestEvidence(
             entries += 1;
         }
         if (entries === 0) fail(`${label}: evidence-empty`);
+        // `verifyIds` spans all three lists, so the parser's duplicate check is
+        // across them rather than within each.
+        if (new Set(collected).size !== collected.length) fail(`${label}: duplicate`);
         return root;
     }
     const entries = array(value, label).map((entry, index) => {
@@ -1037,12 +1045,14 @@ function parseManifestEvidence(
         return item;
     });
     if (entries.length === 0) fail(`${label}: evidence-empty`);
+    const covered = new Set(entries.map((entry) => entry.publicClaimId as string));
+    // Every parser calls `assertNoDuplicateManifestIds` before a scorer result
+    // exists, so a repeated id is an artifact no run produces.
+    if (covered.size !== entries.length) fail(`${label}: duplicate`);
     if (task === "classify-memories" && observedPublicIds !== null) {
         // `validateClassifyManifest` demands exact id coverage, and a classify task
         // takes the whole pool, so a completed run's evidence names every observed
         // claim exactly once.
-        const covered = new Set(entries.map((entry) => entry.publicClaimId as string));
-        if (covered.size !== entries.length) fail(`${label}: duplicate`);
         if (covered.size !== observedPublicIds.size) fail(`${label}: coverage-incomplete`);
     }
     return entries;
@@ -1064,6 +1074,39 @@ function sameIdentityBindings(
     const left = bindings(before);
     const right = bindings(after);
     return left.every((binding, index) => binding === right[index]);
+}
+
+
+/** Key-order-independent encoding, so evidence is compared by value. */
+function canonicalJson(value: unknown): string {
+    if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+    if (value !== null && typeof value === "object") {
+        const fields = Object.entries(value as Record<string, unknown>)
+            .filter(([, item]) => item !== undefined)
+            .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+        return `{${fields.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(",")}}`;
+    }
+    return JSON.stringify(value) ?? "null";
+}
+
+/**
+ * The captured bytes as the task's production parser reads them, or null when it
+ * refuses them. The scorers call the validators, which return exactly what these
+ * parsers produce — coverage is the only thing the validators add, and it needs
+ * an expected-id set the report does not carry.
+ */
+function reparseManifest(task: DreamerTask, rawManifest: string): ParsedManifestEvidence | null {
+    try {
+        if (task === "verify" || task === "verify-broad") {
+            return parseVerifyManifest(rawManifest, new Set()) as unknown as ParsedManifestEvidence;
+        }
+        if (task === "map-memories") {
+            return parseMapMemoriesManifest(rawManifest) as unknown as ParsedManifestEvidence;
+        }
+        return parseClassifyManifest(rawManifest) as unknown as ParsedManifestEvidence;
+    } catch {
+        return null;
+    }
 }
 
 export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunReport {
@@ -1142,6 +1185,21 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
         parsedManifest !== null
     ) {
         fail(`${label}.parsedManifest: prevalidation-error-has-evidence`);
+    }
+    // Bind the evidence to the bytes it claims to come from. `invalid-output` says
+    // the parser refused the manifest, so the captured bytes must still refuse;
+    // every other outcome carrying evidence must reproduce it exactly from those
+    // bytes, or the two halves of the artifact describe different runs.
+    if (status === "FAIL" && reason === "invalid-output") {
+        if (rawManifest !== null && reparseManifest(task, rawManifest) !== null) {
+            fail(`${label}.rawManifest: invalid-output-parses`);
+        }
+    } else if (parsedManifest !== null && rawManifest !== null && rawManifest.trim().length > 0) {
+        const reparsed = reparseManifest(task, rawManifest);
+        if (reparsed === null) fail(`${label}.rawManifest: evidence-unparseable`);
+        if (canonicalJson(reparsed) !== canonicalJson(parsedManifest)) {
+            fail(`${label}.parsedManifest: evidence-mismatch`);
+        }
     }
     if (status === "FAIL") {
         if (rawManifest === null || rawManifest.trim().length === 0) {

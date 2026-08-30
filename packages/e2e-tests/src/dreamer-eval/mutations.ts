@@ -241,12 +241,17 @@ function buildUpdateContent(gold: VerifyGoldClaim): string {
  * cannot introduce one, and untouched gold keeps its exact former bytes.
  */
 function padEdgeWhitespace(content: string, gold: VerifyGoldClaim): string {
-    if (!gold.requiredUpdateAnchors.some((anchor) => anchor !== anchor.trim())) return content;
+    const needsLeading = gold.requiredUpdateAnchors.some((anchor) => /^\s/.test(anchor));
+    const needsTrailing = gold.requiredUpdateAnchors.some((anchor) => /\s$/.test(anchor));
+    if (!needsLeading && !needsTrailing) return content;
+    // Pad each side independently: the contract charges an anchor only for the
+    // edges it actually holds whitespace on, so padding the other side too would
+    // refuse a fixture that just fits.
     const pad = fillerAbsentFrom(
         gold.forbiddenUpdateAnchors,
         "a pad character absent from every forbidden update anchor",
     );
-    return `${pad}${content}${pad}`;
+    return `${needsLeading ? pad : ""}${content}${needsTrailing ? pad : ""}`;
 }
 
 /**
@@ -432,9 +437,16 @@ function mutationManifest(
             return { task: "verify", manifest: replaceEntry(verify, claim.publicClaimId, `<update claim="${claim.publicClaimId}" files="${target.expectedFiles.join(",")}">${content}</update>`) };
         }
         case "wrong-independence": {
-            const target = requiredGold(fixture.mapGold.claims, (entry) => !entry.independent, "file-bound map gold");
+            // Either direction is a wrong independence claim, so an all-independent
+            // map gold is mutable too: replacing an independent entry with one
+            // carrying files parses as file-bound. Requiring a file-bound target
+            // would abort the battery on a contract-valid fixture.
+            const target = requiredGold(fixture.mapGold.claims, () => true, "map gold");
             const claim = claimById(fixture.pool, target.claimId);
-            return { task: "map", manifest: map.replace(new RegExp(`<memory\\b[^>]*claim="${escapeRegExp(claim.publicClaimId)}"[^>]*/>`), () => `<memory claim="${claim.publicClaimId}" independent="true"/>`) };
+            const flipped = target.independent
+                ? `<memory claim="${claim.publicClaimId}" files="${pathAbsentFrom([])}"/>`
+                : `<memory claim="${claim.publicClaimId}" independent="true"/>`;
+            return { task: "map", manifest: map.replace(new RegExp(`<memory\\b[^>]*claim="${escapeRegExp(claim.publicClaimId)}"[^>]*/>`), () => flipped) };
         }
         case "missing-gold-file": {
             const target = requiredGold(fixture.mapGold.claims, (entry) => !entry.independent && entry.files.length > 0, "mapped gold file");
