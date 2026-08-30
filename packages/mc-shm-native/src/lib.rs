@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 
 use mc_shm_transport::backend::ring::RingGrant;
 use mc_shm_transport::backend::ring::{ProducerError, ProducerReservation, Ring};
-use mc_shm_transport::descriptor::SchedulingMode;
 use mc_shm_transport::descriptor::{ReleaseIdentity, WIRE_V2_HEADER_BYTES};
 use mc_shm_transport::profile::mc_host_ring_profile;
 use napi::bindgen_prelude::{Buffer, FnArgs, Function, Object};
@@ -237,18 +236,24 @@ fn strict_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
     Some(bytes)
 }
 
-fn attach_ring(fd: i32, grant: RingGrant) -> Result<Ring> {
-    // Setup transfers descriptors into this process with SCM_RIGHTS. Duplicate
-    // the received descriptor so channel ownership is independent of setup.
-    // SAFETY: fcntl only inspects fd and returns a new descriptor on success.
-    let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-    if duplicated < 0 {
-        return Err(error("shared-memory attachment failed"));
+fn attach_ring(fds: [i32; 3], grant: RingGrant) -> Result<Ring> {
+    let mut descriptors = Vec::with_capacity(3);
+    for fd in fds {
+        // SAFETY: fcntl only inspects fd and returns a new descriptor on success.
+        let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if duplicated < 0 {
+            return Err(error("shared-memory attachment failed"));
+        }
+        // SAFETY: successful F_DUPFD_CLOEXEC returns a newly owned descriptor.
+        descriptors.push(unsafe { OwnedFd::from_raw_fd(duplicated) });
     }
-    // SAFETY: successful F_DUPFD_CLOEXEC returns a newly owned descriptor.
-    let owned = unsafe { OwnedFd::from_raw_fd(duplicated) };
-    Ring::attach(owned, grant, SchedulingMode::ColdParkWake)
-        .map_err(|_| error("shared-memory attachment failed"))
+    Ring::attach(
+        descriptors
+            .try_into()
+            .map_err(|_| error("shared-memory attachment failed"))?,
+        grant,
+    )
+    .map_err(|_| error("shared-memory attachment failed"))
 }
 
 fn cleanup_created_refs(
@@ -508,10 +513,40 @@ pub fn attach(env: &Env, descriptor: Unknown<'_>) -> Result<u32> {
         if profile != PROFILE {
             return Err(error("shared-memory profile is unavailable"));
         }
-        let host_to_peer_fd =
-            integer_field(env, &object, "hostToPeerFd", 0.0, f64::from(i32::MAX))? as i32;
-        let peer_to_host_fd =
-            integer_field(env, &object, "peerToHostFd", 0.0, f64::from(i32::MAX))? as i32;
+        let host_to_peer_fds = [
+            integer_field(env, &object, "hostToPeerFd", 0.0, f64::from(i32::MAX))? as i32,
+            integer_field(
+                env,
+                &object,
+                "hostToPeerDataReadyFd",
+                0.0,
+                f64::from(i32::MAX),
+            )? as i32,
+            integer_field(
+                env,
+                &object,
+                "hostToPeerCapacityReadyFd",
+                0.0,
+                f64::from(i32::MAX),
+            )? as i32,
+        ];
+        let peer_to_host_fds = [
+            integer_field(env, &object, "peerToHostFd", 0.0, f64::from(i32::MAX))? as i32,
+            integer_field(
+                env,
+                &object,
+                "peerToHostDataReadyFd",
+                0.0,
+                f64::from(i32::MAX),
+            )? as i32,
+            integer_field(
+                env,
+                &object,
+                "peerToHostCapacityReadyFd",
+                0.0,
+                f64::from(i32::MAX),
+            )? as i32,
+        ];
         let host_to_peer_grant = RingGrant::decode(
             strict_hex(&string_field(
                 env,
@@ -534,7 +569,11 @@ pub fn attach(env: &Env, descriptor: Unknown<'_>) -> Result<u32> {
         .map_err(|_| descriptor_error())?;
         // Both directions form one duplex pair over two distinct backing
         // objects; an aliased fd or grant collapses them onto one ring.
-        if host_to_peer_fd == peer_to_host_fd || host_to_peer_grant == peer_to_host_grant {
+        let distinct = host_to_peer_fds
+            .into_iter()
+            .chain(peer_to_host_fds)
+            .collect::<BTreeSet<_>>();
+        if distinct.len() != 6 || host_to_peer_grant == peer_to_host_grant {
             return Err(descriptor_error());
         }
         // Exclusive active attachment: a grant already backing a live
@@ -545,8 +584,8 @@ pub fn attach(env: &Env, descriptor: Unknown<'_>) -> Result<u32> {
             host_to_peer_grant.encode().to_vec(),
             peer_to_host_grant.encode().to_vec(),
         )?;
-        let from_host = attach_ring(host_to_peer_fd, host_to_peer_grant)?;
-        let to_host = attach_ring(peer_to_host_fd, peer_to_host_grant)?;
+        let from_host = attach_ring(host_to_peer_fds, host_to_peer_grant)?;
+        let to_host = attach_ring(peer_to_host_fds, peer_to_host_grant)?;
         REGISTRY.with(|registry| {
             let mut registry = registry
                 .try_borrow_mut()
@@ -596,15 +635,13 @@ pub fn connect_setup(env: &Env, options: NativeSetupOptions) -> Result<u32> {
         connected.peer_to_host_grant.encode().to_vec(),
     )?;
     let from_host = Ring::attach(
-        connected.host_to_peer_fd,
+        connected.host_to_peer_descriptors,
         connected.host_to_peer_grant,
-        SchedulingMode::ColdParkWake,
     )
     .map_err(|_| error("shared-memory attachment failed"))?;
     let to_host = Ring::attach(
-        connected.peer_to_host_fd,
+        connected.peer_to_host_descriptors,
         connected.peer_to_host_grant,
-        SchedulingMode::ColdParkWake,
     )
     .map_err(|_| error("shared-memory attachment failed"))?;
     REGISTRY.with(|registry| {

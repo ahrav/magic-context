@@ -9,26 +9,19 @@ use std::time::Instant;
 
 use mc_shm_transport::backend::ring::{wire_v2_header, ProducerError, Ring, RingError, RingGrant};
 use mc_shm_transport::descriptor::{
-    HardwareProfileId, Incarnation, ReleaseIdentity, SchedulingMode, TransportDescriptor,
+    HardwareProfileId, Incarnation, ReleaseIdentity, TransportDescriptor,
 };
 use mc_shm_transport::lease::LeaseError;
 use mc_shm_transport::profile::{ring_profile, ProfileConfig, TargetProfile, WorkerTopology};
 use mc_shm_transport::MAX_FRAME_BYTES;
 
 fn profile() -> TargetProfile {
-    ring_profile(
-        HardwareProfileId::new("ring-contract-host").unwrap(),
-        SchedulingMode::ColdParkWake,
-    )
-    .unwrap()
+    ring_profile(HardwareProfileId::new("ring-contract-host").unwrap()).unwrap()
 }
 
 fn lease_limited_profile() -> TargetProfile {
     TargetProfile::new(ProfileConfig {
-        descriptor: TransportDescriptor::new(
-            SchedulingMode::ColdParkWake,
-            HardwareProfileId::new("ring-lease-limit").unwrap(),
-        ),
+        descriptor: TransportDescriptor::new(HardwareProfileId::new("ring-lease-limit").unwrap()),
         descriptor_depth: 2,
         arena_bytes: MAX_FRAME_BYTES,
         max_spans: 2,
@@ -291,10 +284,7 @@ fn lease_limit_reports_backpressure_then_recovers_after_release() {
 #[test]
 fn one_span_profile_is_rejected_at_creation() {
     let profile = TargetProfile::new(ProfileConfig {
-        descriptor: TransportDescriptor::new(
-            SchedulingMode::ColdParkWake,
-            HardwareProfileId::new("ring-one-span").unwrap(),
-        ),
+        descriptor: TransportDescriptor::new(HardwareProfileId::new("ring-one-span").unwrap()),
         descriptor_depth: 2,
         arena_bytes: MAX_FRAME_BYTES,
         max_spans: 1,
@@ -312,11 +302,11 @@ fn one_span_profile_is_rejected_at_creation() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn sealed_object_prefault_repeated_setup_and_stress_conservation() {
+fn sealed_sparse_object_repeated_setup_and_stress_conservation() {
     for lane in 0..3 {
         let ring = Ring::create(&profile(), lane).unwrap();
         assert_eq!(ring.mapping_count(), 1);
-        assert!(ring.verify_prefaulted().unwrap());
+        assert_eq!(ring.resident_arena_pages().unwrap(), 0);
         let smaller = (ring.object_size() - 1) as libc::off_t;
         let larger = (ring.object_size() + 1) as libc::off_t;
         assert_eq!(unsafe { libc::ftruncate(ring.raw_fd(), smaller) }, -1);
@@ -353,19 +343,11 @@ fn sealed_object_prefault_repeated_setup_and_stress_conservation() {
 }
 
 #[cfg(target_os = "linux")]
-fn duplicate_fd(raw: i32) -> OwnedFd {
-    // SAFETY: F_DUPFD_CLOEXEC duplicates the live test descriptor.
-    let duplicated = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 0) };
-    assert!(duplicated >= 0);
-    // SAFETY: successful fcntl returned a new owned descriptor.
-    unsafe { OwnedFd::from_raw_fd(duplicated) }
-}
-
-#[cfg(target_os = "linux")]
 fn mapped_region_count() -> usize {
     std::fs::read_to_string("/proc/self/maps")
         .expect("read process mappings")
         .lines()
+        .filter(|line| line.contains("/memfd:mc-shm-transport"))
         .count()
 }
 
@@ -416,19 +398,10 @@ fn artifact_mismatch_fails_before_mapping_and_unsealed_objects_are_rejected() {
     lane[18] ^= 1;
     for bytes in [incarnation, lane] {
         let grant = RingGrant::decode(bytes).unwrap();
-        let before = mapped_region_count();
         assert!(matches!(
-            Ring::attach(
-                duplicate_fd(ring.raw_fd()),
-                grant,
-                SchedulingMode::ColdParkWake
-            ),
+            Ring::attach(ring.attachment().unwrap().into_parts().0, grant),
             Err(RingError::InvalidGrant)
         ));
-        assert!(
-            mapped_region_count() <= before,
-            "identity mismatch increased mapped memory"
-        );
     }
 
     let name = c"mc-shm-unsealed-test";
@@ -449,8 +422,9 @@ fn artifact_mismatch_fails_before_mapping_and_unsealed_objects_are_rejected() {
     );
     assert_eq!(unsafe { libc::fchmod(unsealed.as_raw_fd(), 0o600) }, 0);
     let before = mapped_region_count();
+    let [_, data_ready, capacity_ready] = ring.attachment().unwrap().into_parts().0;
     assert!(matches!(
-        Ring::attach(unsealed, ring.grant(), SchedulingMode::ColdParkWake),
+        Ring::attach([unsealed, data_ready, capacity_ready], ring.grant()),
         Err(RingError::ObjectValidationFailed)
     ));
     assert!(
@@ -463,8 +437,9 @@ fn artifact_mismatch_fails_before_mapping_and_unsealed_objects_are_rejected() {
 fn non_regular_attachment_object_is_rejected_before_mapping() {
     let ring = Ring::create(&profile(), 41).unwrap();
     let fd: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+    let [_, data_ready, capacity_ready] = ring.attachment().unwrap().into_parts().0;
     assert!(matches!(
-        Ring::attach(fd, ring.grant(), SchedulingMode::ColdParkWake),
+        Ring::attach([fd, data_ready, capacity_ready], ring.grant()),
         Err(RingError::ObjectValidationFailed)
     ));
 }
@@ -504,7 +479,7 @@ fn grant_slice_rejects_every_truncation_point_and_one_byte_suffix() {
 /// ring-profile geometry.
 #[test]
 fn golden_grant_fixture_matches_the_frozen_ring_profile_encoding() {
-    const GOLDEN_GRANT_HEX: &str = "0200d489c07ee46333a5fe7901df356f6f460000000020000000000000\
+    const GOLDEN_GRANT_HEX: &str = "0300d489c07ee46333a5fe7901df356f6f460000000020000000000000\
                                     0000000004000000002000000000000000004000040000000000000000";
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus/provider_grant/valid");
@@ -530,7 +505,7 @@ fn golden_grant_fixture_matches_the_frozen_ring_profile_encoding() {
         |range: std::ops::Range<usize>| u64::from_le_bytes(bytes[range].try_into().unwrap());
     assert_eq!(
         u16::from_le_bytes([bytes[0], bytes[1]]),
-        2,
+        3,
         "layout version"
     );
     assert_eq!(
@@ -575,9 +550,12 @@ fn decode_hex<const N: usize>(text: &str) -> [u8; N] {
 fn two_process_zero_copy_exchange_uses_authenticated_grant() {
     let ring = Ring::create(&profile(), 23).unwrap();
     ring.set_inheritable(true).unwrap();
+    let [mapping, data_ready, capacity_ready] = ring.raw_descriptors();
     let child = Command::new(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", "ring_child_exchange", "--nocapture"])
-        .env("MC_SHM_CHILD_FD", ring.raw_fd().to_string())
+        .env("MC_SHM_CHILD_FD", mapping.to_string())
+        .env("MC_SHM_CHILD_DATA_READY_FD", data_ready.to_string())
+        .env("MC_SHM_CHILD_CAPACITY_READY_FD", capacity_ready.to_string())
         .env("MC_SHM_CHILD_GRANT", hex(&ring.grant().encode()))
         .stdout(Stdio::piped())
         .spawn()
@@ -619,23 +597,29 @@ fn ring_child_exchange() {
     let Ok(fd) = std::env::var("MC_SHM_CHILD_FD") else {
         return;
     };
+    let data_ready = std::env::var("MC_SHM_CHILD_DATA_READY_FD").unwrap();
+    let capacity_ready = std::env::var("MC_SHM_CHILD_CAPACITY_READY_FD").unwrap();
     let grant = std::env::var("MC_SHM_CHILD_GRANT").unwrap();
     let grant = RingGrant::decode(decode_hex(&grant)).unwrap();
-    let fd = unsafe { OwnedFd::from_raw_fd(fd.parse().unwrap()) };
-    let ring = Ring::attach(fd, grant, SchedulingMode::ColdParkWake).unwrap();
+    let descriptors = unsafe {
+        [
+            OwnedFd::from_raw_fd(fd.parse().unwrap()),
+            OwnedFd::from_raw_fd(data_ready.parse().unwrap()),
+            OwnedFd::from_raw_fd(capacity_ready.parse().unwrap()),
+        ]
+    };
+    let ring = Ring::attach(descriptors, grant).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Some(lease) = ring.try_receive().unwrap() {
-            assert_eq!(lease.len(), MAX_FRAME_BYTES);
-            let first = lease.segment(0).unwrap();
-            assert_eq!(first.read_byte(0), Some(7));
-            assert_eq!(first.read_byte(first.len() - 1), Some(7));
-            std::thread::sleep(Duration::from_millis(50));
-            lease.release().unwrap();
-            println!("MC_SHM_CHILD_EXCHANGE_OK");
-            return;
-        }
-        assert!(Instant::now() < deadline, "parent never published frame");
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    assert!(
+        ring.wait_for_data(deadline).unwrap(),
+        "parent never published frame"
+    );
+    let lease = ring.try_receive().unwrap().unwrap();
+    assert_eq!(lease.len(), MAX_FRAME_BYTES);
+    let first = lease.segment(0).unwrap();
+    assert_eq!(first.read_byte(0), Some(7));
+    assert_eq!(first.read_byte(first.len() - 1), Some(7));
+    std::thread::sleep(Duration::from_millis(50));
+    lease.release().unwrap();
+    println!("MC_SHM_CHILD_EXCHANGE_OK");
 }

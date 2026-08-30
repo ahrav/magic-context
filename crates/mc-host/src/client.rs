@@ -1866,7 +1866,7 @@ fn setup_peer_closed(stream: &StdUnixStream) -> bool {
 
 fn start_ring_bridge(
     descriptor: serde_json::Value,
-    descriptors: [OwnedFd; 2],
+    descriptors: [OwnedFd; crate::setup_socket::RING_DESCRIPTOR_COUNT],
     mut setup: StdUnixStream,
     cancel: CancellationToken,
     read_budget: Arc<ByteCounter>,

@@ -1,7 +1,5 @@
 //! Operation counters and disqualification reason codes. commentlint: allow(JUDGE)
 
-use crate::descriptor::SchedulingMode;
-
 /// Operation counters used to produce disqualification reason codes. commentlint: allow(JUDGE)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OperationCounters {
@@ -21,11 +19,7 @@ pub struct OperationCounters {
 
 impl OperationCounters {
     /// Returns one reason code for each nonzero forbidden operation. commentlint: allow(JUDGE)
-    pub fn disqualifications(
-        self,
-        scheduling: SchedulingMode,
-        cold_native_wake_qualified: bool,
-    ) -> Vec<&'static str> {
+    pub fn disqualifications(self, eventfd_wake_qualified: bool) -> Vec<&'static str> {
         let mut reasons = Vec::new();
         if self.body_copies != 0 {
             reasons.push("transport_body_copy");
@@ -36,7 +30,7 @@ impl OperationCounters {
         if self.generic_queue_hops != 0 {
             reasons.push("generic_queue_hop");
         }
-        let wake_allowed = scheduling == SchedulingMode::ColdParkWake && cold_native_wake_qualified;
+        let wake_allowed = eventfd_wake_qualified;
         if self.syscalls != 0 && !wake_allowed {
             reasons.push("timed_path_syscall");
         }
