@@ -9,7 +9,8 @@
 //! pattern words, boundary traps, Unicode whitespace, protected-region
 //! shapes, and placeholder spoofs.
 //!
-//! Changes to `caveman.ts` require regenerating the golden fixture and updating `caveman.rs`, `reference`, and `caveman_differential.rs`.
+//! Three copies of the transform exist: `caveman.rs`, `reference` below, and the frozen copy
+//! in `caveman_differential.rs`. The golden fixture is generated from `caveman.ts`.
 
 mod reference {
     use regex::Regex;
