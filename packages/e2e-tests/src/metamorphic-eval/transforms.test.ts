@@ -443,6 +443,173 @@ describe("metamorphic transforms", () => {
         }
     });
 
+    test("duplication refuses a rejected turn that also states an accepted claim", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        // The rejected proposal also repeats the accepted capacity, whose declared
+        // source is another turn, so copying it would author that claim twice.
+        turns[0]!.user = "Should we use Redis for the session cache at 4096 entries?";
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "duplicate-rejected-proposal")!;
+
+        expect(transform.apply(scenario, 0)).toEqual({
+            applicable: false,
+            reason: "no rejected proposal insertion preserves contiguous gold ranges",
+        });
+    });
+
+    test("rename refuses a replacement that authors new evidence", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[0]!.assistant = "We could consider it.";
+        turns[2]!.assistant = "Done: cache capacity is 4096 entries via aux_symbol handling.";
+        turns[3] = { user: "Background note about buildAPI.", assistant: "Summary recorded." };
+        const gold = raw.gold as { expectedClaims: Array<Record<string, unknown>> };
+        // Every generated name starts with `aux_symbol`, so renaming anything
+        // authors this predicate in the rewritten message.
+        gold.expectedClaims.push({
+            id: "exp-aux-symbol",
+            category: "ARCHITECTURE",
+            predicate: { kind: "normalized-substring", value: "aux_symbol" },
+            sourceTurnRange: [2, 2],
+        });
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
+
+        for (let seed = 0; seed < 20; seed += 1) {
+            expect(transform.apply(scenario, seed), `seed ${seed}`).toEqual({
+                applicable: false,
+                reason: "rename would change authored evidence",
+            });
+        }
+    });
+
+    test("reorder keeps a swap that only changes identifier case", () => {
+        const raw = validScenarioRaw();
+        const transcript = raw.transcript as {
+            turns: Array<{ user: string; assistant: string }>;
+            epilogueStartIndex: number;
+        };
+        // The historian receives these two turns differently even though the
+        // predicate matcher folds them together.
+        transcript.turns.unshift(
+            { user: "Background about MyFile.ts.", assistant: "Noted." },
+            { user: "Background about myfile.ts.", assistant: "Noted." },
+        );
+        transcript.epilogueStartIndex += 2;
+        const gold = raw.gold as { expectedClaims: Array<{ sourceTurnRange: [number, number] }> };
+        for (const claim of gold.expectedClaims) {
+            claim.sourceTurnRange = [claim.sourceTurnRange[0] + 2, claim.sourceTurnRange[1] + 2];
+        }
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "reorder-independent-turns")!;
+
+        const swapped = Array.from({ length: 40 }, (_, seed) => transform.apply(scenario, seed))
+            .filter((result) => result.applicable)
+            .some(
+                (result) =>
+                    result.applicable &&
+                    result.scenario.transcript.turns[0]!.user.includes("myfile.ts"),
+            );
+        expect(swapped).toBe(true);
+    });
+
+    test("move refuses to rotate a multi-turn claim range", () => {
+        const raw = validScenarioRaw();
+        const transcript = raw.transcript as {
+            turns: Array<{ user: string; assistant: string }>;
+            epilogueStartIndex: number;
+        };
+        transcript.turns = [
+            { user: "First we chose the store.", assistant: "Recorded: in-process LRU cache." },
+            { user: "Then the capacity.", assistant: "Recorded: 4096 entries." },
+            { user: "Finally the eviction policy.", assistant: "Recorded: least recently used." },
+            { user: "Any background left?", assistant: "Nothing further." },
+            { user: "Thanks, wrapping up.", assistant: "Summary recorded." },
+        ];
+        transcript.epilogueStartIndex = 4;
+        const gold = raw.gold as {
+            expectedClaims: Array<Record<string, unknown>>;
+            expectedAbsent: Array<{ predicate: { value: string } }>;
+        };
+        // The singleton decision at turn 0 also sits inside a declared [0,2]
+        // chronology, so moving it to position 2 rotates that range while the
+        // mapped indices stay contiguous once sorted.
+        gold.expectedClaims = [
+            {
+                id: "exp-lru-cache",
+                category: "ARCHITECTURE",
+                predicate: { kind: "normalized-substring", value: "in-process LRU cache" },
+                sourceTurnRange: [0, 0],
+            },
+            {
+                id: "exp-decision-chain",
+                category: "ARCHITECTURE",
+                predicate: { kind: "normalized-substring", value: "recorded: least recently used" },
+                sourceTurnRange: [0, 2],
+            },
+        ];
+        gold.expectedAbsent[0]!.predicate.value = "chose the store";
+        raw.probes = [
+            {
+                id: "probe-store",
+                question: "Which cache backs sessions?",
+                answerType: "multiple-choice",
+                choices: ["redis", "in-process lru"],
+                goldAnswer: "in-process lru",
+                sourceClaimRef: "exp-lru-cache",
+            },
+        ];
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "move-accepted-decision")!;
+
+        expect(transform.apply(scenario, 7)).toEqual({
+            applicable: false,
+            reason: "no movable single-turn accepted decision before epilogue",
+        });
+    });
+
+    test("paraphrase stays cheap at the transcript and expectation limits", () => {
+        const raw = validScenarioRaw();
+        const transcript = raw.transcript as {
+            turns: Array<{ user: string; assistant: string }>;
+            epilogueStartIndex: number;
+        };
+        while (transcript.turns.length < 100) {
+            transcript.turns.push({
+                user: `Background note ${transcript.turns.length} about scheduling.`,
+                assistant: "Noted for the record.",
+            });
+        }
+        transcript.epilogueStartIndex = 99;
+        const gold = raw.gold as { expectedAbsent: Array<Record<string, unknown>> };
+        while (gold.expectedAbsent.length < 100) {
+            gold.expectedAbsent.push({
+                id: `abs-${gold.expectedAbsent.length}`,
+                family: "proposed-but-rejected",
+                predicate: {
+                    kind: "normalized-substring",
+                    value: `note ${gold.expectedAbsent.length} about`,
+                },
+            });
+        }
+        const scenario = parseScenario(raw);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "paraphrase-irrelevant")!;
+
+        const start = performance.now();
+        const result = transform.apply(scenario, 7);
+        const elapsed = performance.now() - start;
+        expect(result.applicable).toBe(true);
+        // Proving every candidate pair instead of the one it uses cost over a
+        // second here; the bound is loose enough for a slow machine and tight
+        // enough to catch a return to eager validation.
+        expect(elapsed).toBeLessThan(400);
+    });
+
     test("paraphrase is conditional because a message at the ceiling admits no rewrite", () => {
         const raw = validScenarioRaw();
         const transcript = raw.transcript as {

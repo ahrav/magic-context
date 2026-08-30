@@ -234,7 +234,10 @@ function absentEvidenceTurnIndexes(scenario: HistorianEvalScenario): Set<number>
 
 /** The transcript reduced to what the historian receives from it. */
 function visibleTranscript(turns: readonly TranscriptTurn[]): string {
-    return normalizedEvidenceMessages(turns)
+    // Case-preserving on purpose: the historian receives the text as authored, so
+    // two turns differing only in an identifier's case are different inputs even
+    // though the predicate matcher would fold them together.
+    return visibleEvidenceMessages(turns)
         .map((message) => `${message.role}:${message.text}`)
         .join("\n");
 }
@@ -316,6 +319,37 @@ function preservesContiguousGold(scenario: HistorianEvalScenario, turnMap: reado
     }
 }
 
+interface EvidenceBaseline {
+    entries: readonly { id: string; predicate: ContentPredicate }[];
+    matches: readonly string[];
+}
+
+interface EvidenceBaselines {
+    absent: EvidenceBaseline;
+    claims: EvidenceBaseline;
+}
+
+/**
+ * The scenario's authored occurrences, enumerated once.
+ *
+ * Every candidate is judged against these, and the source side of that
+ * comparison does not change between candidates — scanning it per candidate made
+ * one `apply` on a hundred-turn scenario with a hundred expectation entries cost
+ * over a second.
+ */
+function evidenceBaselines(scenario: HistorianEvalScenario): EvidenceBaselines {
+    return {
+        absent: {
+            entries: scenario.gold.expectedAbsent,
+            matches: matchSpans(scenario.gold.expectedAbsent, scenario.transcript.turns),
+        },
+        claims: {
+            entries: scenario.gold.expectedClaims,
+            matches: matchSpans(scenario.gold.expectedClaims, scenario.transcript.turns),
+        },
+    };
+}
+
 /**
  * How many authored occurrences the perturbation destroys and creates.
  *
@@ -328,23 +362,18 @@ function preservesContiguousGold(scenario: HistorianEvalScenario, turnMap: reado
  * would hide a simultaneous loss and gain. Each source occurrence is therefore
  * mapped through `turnMap` and matched individually, with multiplicity, and
  * whatever the derivative has left over is a creation.
- *
- * Callers decide which direction they can tolerate: duplication multiplies
- * occurrences by design, while a rewrite or a reordering should change neither
- * count.
  */
 function matchDelta(
-    entries: readonly { id: string; predicate: ContentPredicate }[],
-    scenario: HistorianEvalScenario,
+    baseline: EvidenceBaseline,
     turns: readonly TranscriptTurn[],
     turnMap: readonly number[],
 ): { lost: number; gained: number } {
     const remaining = new Map<string, number>();
-    for (const match of matchSpans(entries, turns)) {
+    for (const match of matchSpans(baseline.entries, turns)) {
         remaining.set(match, (remaining.get(match) ?? 0) + 1);
     }
     let lost = 0;
-    for (const match of matchSpans(entries, scenario.transcript.turns)) {
+    for (const match of baseline.matches) {
         const separator = match.indexOf("|");
         const expected = `${match.slice(0, separator)}|${match
             .slice(separator + 1)
@@ -369,15 +398,6 @@ function matchDelta(
     return { lost, gained };
 }
 
-/** No forbidden formation is destroyed; a duplicated turn may repeat one. */
-function preservesAbsentEvidence(
-    scenario: HistorianEvalScenario,
-    turns: readonly TranscriptTurn[],
-    turnMap: readonly number[],
-): boolean {
-    return matchDelta(scenario.gold.expectedAbsent, scenario, turns, turnMap).lost === 0;
-}
-
 /**
  * Neither gold nor negative evidence changes at all.
  *
@@ -388,14 +408,36 @@ function preservesAbsentEvidence(
  * a reason the comparison does not attribute to the transform.
  */
 function preservesEvidenceExactly(
-    scenario: HistorianEvalScenario,
+    baselines: EvidenceBaselines,
     turns: readonly TranscriptTurn[],
     turnMap: readonly number[],
 ): boolean {
-    return [scenario.gold.expectedAbsent, scenario.gold.expectedClaims].every((entries) => {
-        const { lost, gained } = matchDelta(entries, scenario, turns, turnMap);
+    return [baselines.absent, baselines.claims].every((baseline) => {
+        const { lost, gained } = matchDelta(baseline, turns, turnMap);
         return lost === 0 && gained === 0;
     });
+}
+
+/**
+ * Nothing is lost, and only the rejection may be repeated.
+ *
+ * Duplicating a rejected-proposal turn multiplies its rejection occurrences by
+ * design. Gold evidence is a different matter: a rejected turn that also states
+ * an accepted claim would, when copied, author that claim a second time outside
+ * the range that declares it, changing what the historian may promote for a
+ * reason unrelated to rejection density.
+ */
+function preservesEvidenceForDuplication(
+    baselines: EvidenceBaselines,
+    turns: readonly TranscriptTurn[],
+    turnMap: readonly number[],
+): boolean {
+    const claims = matchDelta(baselines.claims, turns, turnMap);
+    return (
+        matchDelta(baselines.absent, turns, turnMap).lost === 0 &&
+        claims.lost === 0 &&
+        claims.gained === 0
+    );
 }
 
 /** The turn list a candidate order produces, without copying gold. */
@@ -442,47 +484,53 @@ const paraphraseIrrelevant: Transform = {
         // Each rewrite keeps the original wording and only frames it, so a
         // forbidden formation inside the message survives; only one that runs
         // into a neighbouring message can lose its adjacency, and only the
-        // inserted framing can introduce a probe's answer. Candidates are
-        // therefore whole `(message, rewrite)` pairs proven against both, which
-        // keeps a message eligible for the rewrites that are safe for it instead
-        // of excluding it for the one that is not.
-        const candidates = unprotectedMessages(scenario).flatMap((message) =>
-            rewrites
-                .map((rewrite) => rewrite(message.text))
-                .filter((text) => safeParaphrase(scenario, message, text))
-                .map((text) => ({ message, text })),
+        // inserted framing can author new evidence. Candidates are therefore
+        // whole `(message, rewrite)` pairs, which keeps a message eligible for
+        // the rewrites that are safe for it instead of excluding it for the one
+        // that is not.
+        const pairs = unprotectedMessages(scenario).flatMap((message) =>
+            rewrites.map((rewrite) => ({ message, text: rewrite(message.text) })),
         );
-        if (candidates.length === 0) {
+        if (pairs.length === 0) {
             return { applicable: false, reason: "no irrelevant message to paraphrase" };
         }
-        const { message, text } = pick(candidates, splitmix32(seed));
+        // Probed lazily from a seed-chosen offset rather than filtered eagerly:
+        // validating a pair costs a full evidence scan, and a scenario at the
+        // transcript and expectation limits has hundreds of pairs, so proving all
+        // of them to use one made a single application cost over a second.
+        const baselines = evidenceBaselines(scenario);
         const turnMap = scenario.transcript.turns.map((_, index) => index);
-        return derivative(
-            scenario,
-            this,
-            seed,
-            replaceMessage(scenario.transcript.turns, message, text),
-            scenario.transcript.epilogueStartIndex,
-            turnMap,
-        );
+        const start = Math.floor(splitmix32(seed)() * pairs.length);
+        for (let offset = 0; offset < pairs.length; offset += 1) {
+            const { message, text } = pairs[(start + offset) % pairs.length]!;
+            if (!safeParaphrase(scenario, baselines, message, text)) continue;
+            return derivative(
+                scenario,
+                this,
+                seed,
+                replaceMessage(scenario.transcript.turns, message, text),
+                scenario.transcript.epilogueStartIndex,
+                turnMap,
+            );
+        }
+        return { applicable: false, reason: "no irrelevant message to paraphrase" };
     },
 };
 
 /**
  * Whether rewriting `message` to `text` leaves the scenario's evidence intact.
  *
- * Four ways framing can invalidate the comparison. It can outgrow the per-message
- * ceiling. It can separate the halves of a forbidden formation authored across a
- * message boundary. Its own wording can state a probe's gold answer, which is the
- * quiet one — the answer then sits in raw history the probe still reads, so the
- * probe can copy it without the injected claim and a passing run overstates
- * accuracy on a source that was leakage-free. And its wording can satisfy an
- * expected-claim predicate, which authors gold evidence outside the range that
- * declares it and changes what the historian may legitimately promote; a
- * `claim-id` probe has no answer to collide with, so only this check catches it.
+ * Three ways framing can invalidate the comparison. It can outgrow the per-message
+ * ceiling. It can change what is authored — separating the halves of a formation
+ * spanning a message boundary, or authoring one the source never had, including
+ * gold evidence outside the range that declares it. And its own wording can state
+ * a probe's gold answer, which is the quiet one: the answer then sits in raw
+ * history the probe still reads, so the probe can copy it without the injected
+ * claim and a passing run overstates accuracy on a source that was leakage-free.
  */
 function safeParaphrase(
     scenario: HistorianEvalScenario,
+    baselines: EvidenceBaselines,
     message: EligibleMessage,
     text: string,
 ): boolean {
@@ -490,7 +538,7 @@ function safeParaphrase(
     const turns = replaceMessage(scenario.transcript.turns, message, text);
     if (
         !preservesEvidenceExactly(
-            scenario,
+            baselines,
             turns,
             scenario.transcript.turns.map((_, index) => index),
         )
@@ -514,6 +562,7 @@ const reorderIndependentTurns: Transform = {
         const seed = normalizedSeed(rawSeed);
         const expectedIndexes = protectedTurnIndexes(scenario);
         const absentIndexes = absentEvidenceTurnIndexes(scenario);
+        const baselines = evidenceBaselines(scenario);
         const candidates = Array.from(
             { length: scenario.transcript.epilogueStartIndex - 1 },
             (_, index) => [index, index + 1] as const,
@@ -533,7 +582,7 @@ const reorderIndependentTurns: Transform = {
             [order[left], order[right]] = [order[right]!, order[left]!];
             if (!preservesContiguousGold(scenario, mapForOrder(order))) return [];
             const reordered = reorderedTurns(scenario, order);
-            return preservesEvidenceExactly(scenario, reordered, mapForOrder(order)) &&
+            return preservesEvidenceExactly(baselines, reordered, mapForOrder(order)) &&
                 changesVisibleTranscript(scenario, reordered)
                 ? [order]
                 : [];
@@ -560,6 +609,14 @@ const moveAcceptedDecision: Transform = {
     apply(scenario, rawSeed) {
         const seed = normalizedSeed(rawSeed);
         const absentIndexes = absentEvidenceTurnIndexes(scenario);
+        const baselines = evidenceBaselines(scenario);
+        // A multi-turn claim range declares an evidence chronology. Sorting the
+        // mapped indices lets a rotation of that range look contiguous, so the
+        // decision could be moved through it and reverse the order the range
+        // declares — the inversion the adjacent-swap transform already refuses.
+        const multiTurnRanges = scenario.gold.expectedClaims
+            .filter((claim) => claim.sourceTurnRange[0] !== claim.sourceTurnRange[1])
+            .map((claim) => claim.sourceTurnRange);
         const sources = [
             ...new Set(
                 scenario.gold.expectedClaims
@@ -597,8 +654,11 @@ const moveAcceptedDecision: Transform = {
                         (_, offset) => from + 1 + offset,
                     ).some((turnIndex) => absentIndexes.has(turnIndex)) &&
                     preservesContiguousGold(scenario, mapForOrder(order)) &&
+                    !multiTurnRanges.some(
+                        ([first, last]) => first <= destination && from <= last,
+                    ) &&
                     preservesEvidenceExactly(
-                        scenario,
+                        baselines,
                         reorderedTurns(scenario, order),
                         mapForOrder(order),
                     ) &&
@@ -640,7 +700,7 @@ const duplicateRejectedProposal: Transform = {
         // historian receives. Matching the raw strings instead would select a
         // turn whose only occurrence sits in a reminder block or directive
         // production discards, duplicating a turn that carries no rejection at
-        // all — and `preservesAbsentEvidence` would still pass on the occurrence
+        // all — and the evidence comparison would still pass on the occurrence
         // that lives elsewhere.
         // A turn qualifies only when its OWN payload carries a complete
         // occurrence. Every turn a cross-turn occurrence runs through contributes
@@ -653,6 +713,7 @@ const duplicateRejectedProposal: Transform = {
             ),
         );
         const protectedIndexes = protectedTurnIndexes(scenario);
+        const baselines = evidenceBaselines(scenario);
         const candidates = scenario.transcript.turns.flatMap((turn, turnIndex) => {
             if (turnIndex >= scenario.transcript.epilogueStartIndex) return [];
             if (protectedIndexes.has(turnIndex)) return [];
@@ -663,7 +724,7 @@ const duplicateRejectedProposal: Transform = {
             );
             if (!preservesContiguousGold(scenario, turnMap)) return [];
             const turns = duplicatedTurns(scenario, turnIndex, insertion);
-            return preservesAbsentEvidence(scenario, turns, turnMap)
+            return preservesEvidenceForDuplication(baselines, turns, turnMap)
                 ? [{ source: turnIndex, insertion, turnMap }]
                 : [];
         });
@@ -814,7 +875,16 @@ const renameUnrelatedSymbols: Transform = {
         ) {
             return { applicable: false, reason: "rename does not fit the turn text limit" };
         }
+        // A generated name can contain a predicate: a claim predicate of
+        // `aux_symbol` is newly authored the moment a symbol becomes
+        // `aux_symbol_1234`. Exact-spelling collision checks cannot see that, and
+        // the derivative stays lint-clean because the required occurrence still
+        // exists elsewhere, so the rewritten turns are proven against the same
+        // evidence comparison the framing and reordering transforms use.
         const turnMap = scenario.transcript.turns.map((_, index) => index);
+        if (!preservesEvidenceExactly(evidenceBaselines(scenario), turns, turnMap)) {
+            return { applicable: false, reason: "rename would change authored evidence" };
+        }
         return derivative(
             scenario,
             this,
