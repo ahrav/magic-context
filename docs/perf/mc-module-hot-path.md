@@ -132,6 +132,25 @@ Single host, single process pair, fixed corpus seed. One replication —
 direction and magnitude are decisive, but sub-10% deltas here are below the
 design's resolution.
 
+Local raw bundle: `docs/perf/runs/mc-module-token-cache-2026-08-30/criterion/`
+(gitignored, 48 files). Integrity manifest:
+`docs/perf/runs/mc-module-token-cache-2026-08-30/SHA256SUMS` (tracked).
+
+Per the ignore policy in `.gitignore`, Criterion sample bundles are
+host- and build-specific and stay local; a clean checkout holds the report,
+manifest, environment, and hashes but not the samples. So
+`sha256sum -c SHA256SUMS` reports all 48 entries missing in a fresh clone —
+that is the expected state, not lost evidence. The hashes exist to let
+whoever holds the bundle prove it is the one behind the table below:
+
+```sh
+cd docs/perf/runs/mc-module-token-cache-2026-08-30 && sha256sum -c SHA256SUMS
+```
+
+Regenerate the bundle with the benchmark command in `manifest.json`; a
+regenerated run will not match these hashes, since the samples are
+host-specific.
+
 Baseline-arm provenance: the bench harness, `bench-internals` feature, and
 criterion dev-dependency ship with the cache change itself and do not exist
 at the parent commit, so the `precache` arm was collected from a hybrid

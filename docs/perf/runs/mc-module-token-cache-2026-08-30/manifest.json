@@ -21,6 +21,6 @@
     "m0_trim_claims_to_budget/{8,64,256}claims_8k_budget"
   ],
   "estimator": "Criterion mean with 95% CI (only estimator present in both arms of every cell)",
-  "integrity": "SHA256SUMS covers criterion/**",
+  "integrity": "SHA256SUMS (tracked) covers the 48 files under criterion/**, which are gitignored per .gitignore and stay local: a clean checkout cannot verify them, and `sha256sum -c SHA256SUMS` reporting them missing is expected. Run the check from a host holding the bundle to prove it produced the recorded table.",
   "environment": "environment.txt"
 }
