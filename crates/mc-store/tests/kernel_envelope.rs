@@ -815,7 +815,7 @@ fn an_empty_rebuild_is_publishable_through_the_clear_path() {
         KernelError::InvalidInput
     );
 
-    assert_eq!(store.clear_alignment_projection().unwrap(), 1);
+    assert_eq!(store.clear_alignment_projection(1).unwrap(), 1);
     assert_eq!(
         inspect(
             directory.path(),
@@ -832,7 +832,7 @@ fn an_empty_rebuild_is_publishable_through_the_clear_path() {
         0,
         "clearing must retire the projection's redaction rows too"
     );
-    assert_eq!(store.clear_alignment_projection().unwrap(), 0);
+    assert_eq!(store.clear_alignment_projection(1).unwrap(), 0);
 }
 
 #[test]
@@ -914,5 +914,46 @@ fn change_event_identity_distinguishes_two_producers_sharing_an_operation_key() 
         ),
         2,
         "two producers sharing an operation key must not share a change-event identity"
+    );
+}
+
+#[test]
+fn an_empty_rebuild_still_orders_later_replacements() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_projection_inputs(directory.path());
+    let seeder = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    seeder
+        .execute(
+            "INSERT INTO commit_log(
+                 transaction_id,writer_epoch,producer,operation_key,request_digest,
+                 recorded_at,actor,cause
+             ) VALUES ('gen-2',1,'fixture','gen-2','',1,'test','generation')",
+            [],
+        )
+        .unwrap();
+    drop(seeder);
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    // A newer rebuild legitimately produces nothing.
+    store.clear_alignment_projection(2).unwrap();
+    // A slower rebuild from an older snapshot must not repopulate stale rows.
+    assert_eq!(
+        store
+            .replace_alignment_projection(&[AlignmentProjectionSpec {
+                decision_id: "decision".to_string(),
+                observation_id: "observation".to_string(),
+                alignment_kind: "stale".to_string(),
+                alignment_payload: None,
+                built_through_commit_seq: 1,
+            }])
+            .unwrap_err(),
+        KernelError::Conflict
+    );
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM alignment_projection"
+        ),
+        0
     );
 }

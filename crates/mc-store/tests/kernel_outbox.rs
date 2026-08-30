@@ -331,7 +331,7 @@ fn derived_projection_discard_preserves_exact_checkpoints_and_receipts() {
         store.replace_alignment_projection(&[]).unwrap_err(),
         KernelError::InvalidInput
     );
-    store.clear_alignment_projection().unwrap();
+    store.clear_alignment_projection(1).unwrap();
     let connection = inspect(directory.path());
     assert_eq!(
         connection

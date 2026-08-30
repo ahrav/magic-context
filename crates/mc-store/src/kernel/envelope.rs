@@ -718,8 +718,7 @@ impl KernelStore {
         }
         let existing_candidate = tx
             .query_row(
-                "SELECT extraction_run_id,candidate_kind,payload,sensitivity_class,
-                        provenance_witness
+                "SELECT extraction_run_id,sensitivity_class,redaction_metadata
                  FROM candidates WHERE candidate_id=?1",
                 [spec.candidate_id.as_str()],
                 |row| {
@@ -727,24 +726,26 @@ impl KernelStore {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, Vec<u8>>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, Vec<u8>>(4)?,
                     ))
                 },
             )
             .optional()
             .map_err(map_sqlite)?;
-        if let Some(existing_candidate) = existing_candidate {
-            let expected = (
-                spec.extraction_run_id.clone(),
-                spec.candidate_kind.text.clone(),
-                spec.payload.text.as_bytes().to_vec(),
-                candidate_sensitivity.as_str().to_string(),
-                provenance.clone(),
-            );
-            if existing_candidate != expected {
+        if let Some((run_id, stored_class, stored_metadata)) = existing_candidate {
+            let stored_digest = stored_request_digest(&stored_metadata);
+            if run_id != spec.extraction_run_id
+                || stored_class != candidate_sensitivity.as_str()
+                || stored_digest.as_deref() != Some(spec.request_digest.as_str())
+            {
                 return Err(KernelError::Conflict);
             }
+            tx.execute(
+                "UPDATE candidates
+                 SET heartbeat_at=MAX(heartbeat_at,?1),lease_expires_at=MAX(lease_expires_at,?2)
+                 WHERE candidate_id=?3",
+                params![spec.recorded_at, spec.lease_expires_at, spec.candidate_id],
+            )
+            .map_err(map_sqlite)?;
             tx.commit().map_err(map_sqlite)?;
             return Ok(StagingCandidateRow {
                 candidate_id: spec.candidate_id,
@@ -804,16 +805,7 @@ impl KernelStore {
         {
             return Err(KernelError::InvalidInput);
         }
-        let stored: Option<i64> = tx
-            .query_row(
-                "SELECT MAX(built_through_commit_seq) FROM alignment_projection",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(map_sqlite)?;
-        if stored.is_some_and(|stored| generation < stored) {
-            return Err(KernelError::Conflict);
-        }
+        guard_projection_generation(&tx, generation)?;
         truncate_alignment_projection(&tx)?;
         for row in &rows {
             tx.execute(
@@ -834,21 +826,57 @@ impl KernelStore {
             .map_err(map_sqlite)?;
             row.record(&tx)?;
         }
+        record_projection_generation(&tx, generation)?;
         tx.commit().map_err(map_sqlite)?;
         Ok(rows.len())
     }
 
     /// Publishes an empty rebuild, so a rebuild that produced no alignments can retire the previous rows instead of leaving them queryable.
-    pub fn clear_alignment_projection(&self) -> Result<usize, KernelError> {
+    pub fn clear_alignment_projection(
+        &self,
+        built_through_commit_seq: i64,
+    ) -> Result<usize, KernelError> {
+        if built_through_commit_seq < 1 {
+            return Err(KernelError::InvalidInput);
+        }
         let mut writer = self.lock_writer()?;
         let tx = writer
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite)?;
         check_fence(&tx, self.lease_epoch())?;
+        guard_projection_generation(&tx, built_through_commit_seq)?;
         let removed = truncate_alignment_projection(&tx)?;
+        record_projection_generation(&tx, built_through_commit_seq)?;
         tx.commit().map_err(map_sqlite)?;
         Ok(removed)
     }
+}
+
+/// The watermark is stored apart from the rows, so an empty rebuild still orders later replacements.
+fn guard_projection_generation(tx: &Transaction<'_>, generation: i64) -> Result<(), KernelError> {
+    let stored: Option<i64> = tx
+        .query_row(
+            "SELECT built_through_commit_seq FROM alignment_projection_state WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(map_sqlite)?;
+    if stored.is_some_and(|stored| generation < stored) {
+        return Err(KernelError::Conflict);
+    }
+    Ok(())
+}
+
+fn record_projection_generation(tx: &Transaction<'_>, generation: i64) -> Result<(), KernelError> {
+    tx.execute(
+        "INSERT INTO alignment_projection_state(singleton,built_through_commit_seq)
+         VALUES (1,?1)
+         ON CONFLICT(singleton) DO UPDATE SET built_through_commit_seq=excluded.built_through_commit_seq",
+        [generation],
+    )
+    .map_err(map_sqlite)?;
+    Ok(())
 }
 
 fn truncate_alignment_projection(tx: &Transaction<'_>) -> Result<usize, KernelError> {
@@ -1072,10 +1100,12 @@ struct RedactedCandidate {
     provenance: Option<(String, String)>,
     recorded_at: i64,
     lease_expires_at: i64,
+    request_digest: String,
 }
 
 impl RedactedCandidate {
     fn new(spec: StagingCandidateSpec) -> Result<Self, KernelError> {
+        let request_digest = request_digest(&spec);
         let lease_ceiling = spec
             .recorded_at
             .checked_add(MAX_STAGING_LEASE_MS)
@@ -1112,6 +1142,7 @@ impl RedactedCandidate {
                 .transpose()?,
             recorded_at: spec.recorded_at,
             lease_expires_at: spec.lease_expires_at,
+            request_digest,
         })
     }
 
@@ -1161,6 +1192,11 @@ impl RedactedCandidate {
         fields: Vec<(&'static str, &RedactedField)>,
     ) -> Result<Vec<u8>, KernelError> {
         #[derive(Serialize)]
+        struct Envelope<'a> {
+            request_digest: &'a str,
+            detections: Vec<Metadata<'a>>,
+        }
+        #[derive(Serialize)]
         struct Metadata<'a> {
             field: &'a str,
             detector_id: &'a str,
@@ -1180,7 +1216,11 @@ impl RedactedCandidate {
                 })
             })
             .collect::<Vec<_>>();
-        serde_json::to_vec(&metadata).map_err(|_| KernelError::InvalidInput)
+        serde_json::to_vec(&Envelope {
+            request_digest: &self.request_digest,
+            detections: metadata,
+        })
+        .map_err(|_| KernelError::InvalidInput)
     }
 
     fn candidate_detection_json(&self) -> Result<Vec<u8>, KernelError> {
@@ -1257,6 +1297,44 @@ impl RedactedProjection {
         }
         Ok(())
     }
+}
+
+/// Digests the request before redaction, so two payloads that redact alike stay distinguishable.
+fn request_digest(spec: &StagingCandidateSpec) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"mc-kernel-staging-request-v1\0");
+    let provenance = spec
+        .provenance
+        .as_ref()
+        .map(|value| (value.repository_id.as_str(), value.revision.as_str()));
+    for component in [
+        spec.extraction_run_id.as_str(),
+        spec.candidate_id.as_str(),
+        spec.extractor.as_str(),
+        spec.source_kind.as_str(),
+        spec.source_id.as_str(),
+        spec.candidate_kind.as_str(),
+        spec.payload.as_str(),
+        provenance.map(|value| value.0).unwrap_or(""),
+        provenance.map(|value| value.1).unwrap_or(""),
+    ] {
+        hash.update(
+            u64::try_from(component.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        hash.update(component.as_bytes());
+    }
+    hash.update(spec.source_revision.to_be_bytes());
+    format!("{:x}", hash.finalize())
+}
+
+fn stored_request_digest(metadata: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(metadata)
+        .ok()?
+        .get("request_digest")?
+        .as_str()
+        .map(str::to_string)
 }
 
 pub(super) fn check_fence(tx: &Transaction<'_>, expected: u64) -> Result<(), KernelError> {
