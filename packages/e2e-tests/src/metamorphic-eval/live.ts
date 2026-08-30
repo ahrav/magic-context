@@ -262,12 +262,40 @@ export async function runLiveMetamorphicEval(
     };
     const deadlineAtMs = options.deadlineAtMs ?? null;
     const nowMs = options.nowMs ?? Date.now;
-    const deadlineReached = (): boolean => deadlineAtMs !== null && nowMs() >= deadlineAtMs;
+    // Reserve for the next role, learned from the roles already run rather than
+    // predicted — the same bound `run-historian-eval.ts` keeps for its next
+    // scenario, and for the same reason. A bare `now >= deadline` check admits a
+    // role with no time left, and a role is not cheap: one role drives
+    // `trigger.expectedHistorianRuns` historian runs, each bounded by the live
+    // `historianWaitBudgetMs`, so a single role can legitimately need tens of
+    // minutes. Admitted at the deadline it then runs PAST the caller's own kill
+    // bound (the workflow step timeout), which kills the process before the final
+    // report is written — losing the whole artifact the deadline exists to
+    // protect. Starting from 0 the first role always runs, and a role that
+    // overruns the estimate costs the final report rather than the whole run.
+    let longestRoleMs = 0;
+    const deadlineReached = (): boolean =>
+        deadlineAtMs !== null && nowMs() + longestRoleMs >= deadlineAtMs;
+    // Timed in `finally`, so a role that threw still teaches the reserve: the
+    // wall time it burned is spent either way, and a slow failure predicts a slow
+    // successor exactly as well as a slow success does.
+    const runRole = async (
+        scenario: HistorianEvalScenario,
+        role: LiveRole,
+        artifactDir: string,
+    ): Promise<LiveObservation> => {
+        const startedAt = nowMs();
+        try {
+            return await execute(scenario, role, artifactDir);
+        } finally {
+            longestRoleMs = Math.max(longestRoleMs, nowMs() - startedAt);
+        }
+    };
     const deadlineReport = (nextRole: LiveRole): MetamorphicReport =>
         finish({ kind: "deadline-exhausted", nextRole });
     try {
         if (deadlineReached()) return deadlineReport("control-a");
-        const controlA = await execute(
+        const controlA = await runRole(
             controlScenario,
             "control-a",
             liveArtifactDir(options.artifactRoot, controlScenario.id, "control-a"),
@@ -277,7 +305,7 @@ export async function runLiveMetamorphicEval(
             return finish();
         }
         if (deadlineReached()) return deadlineReport("control-b");
-        const controlB = await execute(
+        const controlB = await runRole(
             controlScenario,
             "control-b",
             liveArtifactDir(options.artifactRoot, controlScenario.id, "control-b"),
@@ -317,7 +345,7 @@ export async function runLiveMetamorphicEval(
             const artifactScenarioId = pair.derivative.scenario.id;
             const canaryScenarioId = pair.base.id;
             if (deadlineReached()) return deadlineReport("baseline");
-            const baseline = await execute(
+            const baseline = await runRole(
                 pair.base,
                 "baseline",
                 liveArtifactDir(options.artifactRoot, artifactScenarioId, "baseline"),
@@ -327,7 +355,7 @@ export async function runLiveMetamorphicEval(
                 return finish();
             }
             if (deadlineReached()) return deadlineReport("derivative");
-            const derivative = await execute(
+            const derivative = await runRole(
                 pair.derivative.scenario,
                 "derivative",
                 liveArtifactDir(options.artifactRoot, artifactScenarioId, "derivative"),

@@ -474,9 +474,11 @@ jobs:
   # `needs`, for the same reason: a gate placed in a separate job downstream of
   # check-plugin is skipped whenever check-plugin fails, which reproduces the
   # silent non-enforcement one job away. Contract lint, scorer tests, the freeze
-  # lint, mutation battery, and deterministic metamorphic lane all run per-PR
-  # with no live model calls or credentials; live scenario runs are scheduled or
-  # dispatched through historian-eval.yml only.
+  # lint, and mutation battery all run per-PR with no live model calls or
+  # credentials; live scenario runs are scheduled or dispatched through
+  # historian-eval.yml only. The metamorphic lane is the one deliberate exception
+  # to "HERE": it keeps its own job below, because in-job step order made it
+  # unreachable behind a red historian gate.
   historian-eval-contracts:
     name: Historian eval lane contracts
     runs-on: ubuntu-latest
@@ -503,6 +505,33 @@ jobs:
 
       - name: Run the invalid-state mutation battery
         run: bun packages/e2e-tests/scripts/run-historian-eval.ts --mutations
+
+  # Its own job with no `needs`, for the reason both neighbouring lanes state: a
+  # gate placed as a step in another job is skipped whenever an earlier step
+  # fails. As steps of historian-eval-contracts these two gates were exactly
+  # that — a red historian contract, freeze lint, or mutation battery skipped
+  # both the metamorphic unit contracts and the deterministic invariant run, so a
+  # PR that broke BOTH lanes reported only the historian half and produced no
+  # metamorphic report to debug the rest from. Deterministic and credential-free
+  # like the lanes it sits beside; live metamorphic pairs are scheduled or
+  # dispatched through historian-eval.yml only.
+  metamorphic-eval-contracts:
+    name: Metamorphic eval lane contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
 
       - name: Metamorphic eval unit contracts
         run: bun run test:metamorphic-unit

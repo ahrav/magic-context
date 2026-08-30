@@ -449,6 +449,62 @@ describe("live metamorphic orchestration", () => {
         expect(metamorphicExitCode(report)).toBe(1);
     });
 
+    test("reserves the longest completed role before admitting the next one", async () => {
+        // Every role costs 30 against a budget of 100, so the fourth role starts
+        // at 90 — before the deadline by a bare `now >= deadline` check, yet it
+        // cannot finish until 120. A caller that kills the process at its own
+        // bound would lose the final report entirely, so the reserve must refuse
+        // the role rather than admit it with 10 of its 30 remaining.
+        let now = 0;
+        const roleCost = 30;
+        const calls: string[] = [];
+        const report = await runLiveMetamorphicEval([validScenario()], {
+            mode: { kind: "live", apiKey: "test", historianModel: "anthropic/historian", probeModel: { providerID: "anthropic", modelID: "probe" } },
+            artifactRoot: "/tmp/metamorphic-live-reserve",
+            opencodeVersion: "1.0.0",
+            transforms: [TRANSFORMS[0]!],
+            seeds: [0],
+            admit: () => [],
+            deadlineAtMs: 100,
+            nowMs: () => now,
+            execute: async (_scenario, role) => {
+                calls.push(role);
+                now += roleCost;
+                return observation();
+            },
+        });
+
+        expect(calls).toEqual(["control-a", "control-b", "baseline"]);
+        // The bound the reserve exists to keep: no role ran past the deadline.
+        expect(now).toBeLessThanOrEqual(100);
+        expect(report.tierInvalidReason).toEqual(
+            expect.objectContaining({ kind: "deadline-exhausted", nextRole: "derivative" }),
+        );
+    });
+
+    test("still admits the first role when no role has been timed yet", async () => {
+        // The reserve starts at zero precisely so a lane always buys at least one
+        // observation; a reserve seeded with a guess would let a tight budget
+        // spend the whole run producing nothing.
+        const calls: string[] = [];
+        await runLiveMetamorphicEval([validScenario()], {
+            mode: { kind: "live", apiKey: "test", historianModel: "anthropic/historian", probeModel: { providerID: "anthropic", modelID: "probe" } },
+            artifactRoot: "/tmp/metamorphic-live-reserve-first",
+            opencodeVersion: "1.0.0",
+            transforms: [TRANSFORMS[0]!],
+            seeds: [0],
+            admit: () => [],
+            deadlineAtMs: 1,
+            nowMs: () => 0,
+            execute: async (_scenario, role) => {
+                calls.push(role);
+                return observation();
+            },
+        });
+
+        expect(calls[0]).toBe("control-a");
+    });
+
     test("publishes progress after control completion and every completed product pair", async () => {
         const progress: number[] = [];
         await runLiveMetamorphicEval([validScenario()], {
