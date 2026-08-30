@@ -951,8 +951,19 @@ describe("live metamorphic control tier", () => {
         expect(report.coverage[0]?.violations).toContain("no transforms applied");
     });
 
-    test("reports a thrown control failure as a control error, not an incomplete run", async () => {
-        for (const failing of ["control-a", "control-b"] as const) {
+    test("publishes the completed report so the surviving partial is not marked incomplete", async () => {
+        const progress: MetamorphicReport[] = [];
+        const { report } = await runWithExecutor(() => pairedObservation(), {
+            onProgress: (partial) => progress.push(partial),
+        });
+
+        expect(metamorphicExitCode(report)).toBe(0);
+        expect(progress.at(-1)?.tierInvalidReason).toBeNull();
+        expect(progress.at(-1)).toEqual(report);
+        expect(progress.slice(0, -1).every((partial) => partial.tierInvalidReason !== null)).toBe(true);
+    });
+
+    test("reports a thrown control failure as a control error, not an incomplete run", async () => {        for (const failing of ["control-a", "control-b"] as const) {
             const { report } = await runWithExecutor((role) => {
                 if (role === failing) throw new Error(`${failing} artifact setup failed`);
                 return pairedObservation();

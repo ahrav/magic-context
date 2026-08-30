@@ -397,5 +397,5 @@ export async function runLiveMetamorphicEval(
         observe();
     }
 
-    return finish();
+    return observe(null);
 }
