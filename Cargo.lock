@@ -957,6 +957,7 @@ name = "mc-core"
 version = "0.1.0"
 dependencies = [
  "cortexkit-cache-core",
+ "regex",
  "serde",
  "serde_json",
  "sha2",
