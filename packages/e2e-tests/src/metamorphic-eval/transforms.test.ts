@@ -728,6 +728,101 @@ describe("metamorphic transforms", () => {
         }
     });
 
+    test("rename refuses a bare symbol a protected compound name contains", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[0]!.assistant = "We could consider it.";
+        // Extraction records only `buildAPI/v2` here, leaving the bare spelling in
+        // the eligible message looking unclaimed.
+        turns[2]!.assistant = "Done: cache capacity is 4096 entries via buildAPI/v2.";
+        turns[3] = {
+            user: "Background note about buildAPI and aux_worker.ts.",
+            assistant: "Summary recorded.",
+        };
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
+
+        let applied = 0;
+        for (let seed = 0; seed < 30; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            applied += 1;
+            const rewritten = result.scenario.transcript.turns[3]!.user;
+            expect(rewritten, `seed ${seed}`).toContain("buildAPI");
+            expect(rewritten, `seed ${seed}`).not.toContain("aux_worker.ts");
+        }
+        expect(applied, "never applied").toBeGreaterThan(0);
+    });
+
+    test("rename tries another symbol when the first would orphan a probe term", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[0]!.assistant = "We could consider it.";
+        turns[3] = {
+            user: "Background note about api/v2 and aux_worker.ts.",
+            assistant: "Summary recorded.",
+        };
+        (raw.probes as Array<Record<string, unknown>>)[0] = {
+            id: "probe-capacity",
+            question: "Which api endpoint fronts the capacity record?",
+            answerType: "exact",
+            goldAnswer: "4096",
+            sourceClaimRef: "exp-cache-capacity",
+        };
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
+
+        // `api/v2` reaches the orphan guard, so every seed has to fall through to
+        // the other symbol rather than spend the application.
+        for (let seed = 0; seed < 30; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            expect(result.applicable, `seed ${seed}`).toBe(true);
+            if (!result.applicable) continue;
+            const rewritten = result.scenario.transcript.turns[3]!.user;
+            expect(rewritten, `seed ${seed}`).toContain("api/v2");
+            expect(rewritten, `seed ${seed}`).not.toContain("aux_worker.ts");
+        }
+    });
+
+    test("duplication and renaming stay cheap at the contract limits", () => {
+        const raw = validScenarioRaw();
+        const transcript = raw.transcript as {
+            turns: Array<{ user: string; assistant: string }>;
+            epilogueStartIndex: number;
+        };
+        const gold = raw.gold as { expectedAbsent: Array<Record<string, unknown>> };
+        // Many qualifying rejections and many predicates, so every duplication
+        // candidate reaches the evidence proof. One turn short of the limit, since
+        // the limit itself short-circuits before any candidate is built.
+        while (transcript.turns.length < 99) {
+            const index = transcript.turns.length;
+            transcript.turns.push({
+                user: `Should we adopt sweeper ${index}?`,
+                assistant: `Rejected sweeper ${index} for now.`,
+            });
+        }
+        transcript.epilogueStartIndex = 98;
+        while (gold.expectedAbsent.length < 100) {
+            const index = gold.expectedAbsent.length;
+            gold.expectedAbsent.push({
+                id: `abs-${index}`,
+                family: "proposed-but-rejected",
+                predicate: { kind: "normalized-substring", value: `rejected sweeper ${index + 3}` },
+            });
+        }
+        const scenario = parseScenario(raw);
+
+        // Every transform, because the probe that made duplication cheap is shared
+        // and a regression in it would surface wherever it is used first.
+        for (const transform of TRANSFORMS) {
+            const start = performance.now();
+            transform.apply(scenario, 7);
+            expect(performance.now() - start, transform.id).toBeLessThan(900);
+        }
+    });
+
     test("rename refuses a symbol a protected command span spells only after cleaning", () => {
         const raw = validScenarioRaw();
         const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;

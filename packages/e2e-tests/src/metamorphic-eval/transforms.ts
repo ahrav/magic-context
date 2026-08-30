@@ -80,12 +80,12 @@ function pick<T>(values: readonly T[], next: () => number): T {
  */
 function firstDerivative<T>(
     candidates: readonly T[],
-    seed: number,
+    next: () => number,
     exhaustedReason: string,
     build: (candidate: T) => TransformResult,
 ): TransformResult {
     if (candidates.length === 0) return { applicable: false, reason: exhaustedReason };
-    const start = Math.floor(splitmix32(seed)() * candidates.length);
+    const start = Math.floor(next() * candidates.length);
     let rejection: string | undefined;
     let violation: string | undefined;
     for (let offset = 0; offset < candidates.length; offset += 1) {
@@ -650,7 +650,7 @@ const paraphraseIrrelevant: Transform = {
         const baselines = evidenceBaselines(scenario);
         return firstDerivative(
             pairs,
-            seed,
+            splitmix32(seed),
             "no irrelevant message to paraphrase",
             ({ message, text }) => {
                 if (!safeParaphrase(scenario, baselines, message, text)) {
@@ -739,7 +739,7 @@ const reorderIndependentTurns: Transform = {
                 : [];
         });
         const exhausted = "no independent adjacent turns before epilogue";
-        return firstDerivative(candidates, seed, exhausted, (order) => {
+        return firstDerivative(candidates, splitmix32(seed), exhausted, (order) => {
             const reordered = reorderedTurns(scenario, order);
             if (
                 !preservesEvidenceExactly(baselines, reordered, mapForOrder(order)) ||
@@ -831,7 +831,7 @@ const moveAcceptedDecision: Transform = {
             ),
         );
         const exhausted = "no movable single-turn accepted decision before epilogue";
-        return firstDerivative(candidates, seed, exhausted, ({ order }) => {
+        return firstDerivative(candidates, splitmix32(seed), exhausted, ({ order }) => {
             const reordered = reorderedTurns(scenario, order);
             if (
                 !preservesEvidenceExactly(baselines, reordered, mapForOrder(order)) ||
@@ -895,31 +895,40 @@ const duplicateRejectedProposal: Transform = {
                     index < insertion ? index : index + 1,
                 );
                 if (!preservesContiguousGold(scenario, turnMap)) return [];
-                const turns = duplicatedTurns(scenario, turnIndex, insertion);
-                return preservesEvidenceForDuplication(
-                    baselines,
-                    turns,
-                    turnMap,
-                ) && preservesProbeAnswers(answers, scenario, turns)
-                    ? [{ source: turnIndex, insertion, turnMap }]
-                    : [];
+                return [{ source: turnIndex, insertion, turnMap }];
             },
         );
         return firstDerivative(
             candidates,
-            seed,
+            splitmix32(seed),
             rejected.length === 0
                 ? "no rejected proposal turn"
                 : "no rejected proposal insertion preserves contiguous gold ranges",
-            ({ source, insertion, turnMap }) =>
-                derivative(
+            ({ source, insertion, turnMap }) => {
+                const turns = duplicatedTurns(scenario, source, insertion);
+                // Proved here rather than while building the candidate list: each
+                // proof rescans the transcript for every rejected, other-absent, and
+                // claim predicate, and near the contract limits there are enough
+                // candidates that proving all of them to use one dominates the
+                // application.
+                if (
+                    !preservesEvidenceForDuplication(baselines, turns, turnMap) ||
+                    !preservesProbeAnswers(answers, scenario, turns)
+                ) {
+                    return {
+                        applicable: false,
+                        reason: "no rejected proposal insertion preserves contiguous gold ranges",
+                    };
+                }
+                return derivative(
                     scenario,
                     this,
                     seed,
-                    duplicatedTurns(scenario, source, insertion),
+                    turns,
                     epilogueStartIndexAfter(scenario, insertion),
                     turnMap,
-                ),
+                );
+            },
         );
     },
 };
@@ -935,6 +944,14 @@ const SYMBOL_RE =
 // an expression, and replacing the whole span would rewrite the instruction
 // rather than rename an entity. Admitted backtick contents must therefore
 // satisfy the same shape the unquoted alternatives accept.
+/** Generated replacement names, and the pattern that finds one already taken. */
+const REPLACEMENT_PREFIX = "aux_symbol_";
+const REPLACEMENT_SPACE = 10_000;
+const TAKEN_REPLACEMENT_RE = new RegExp(
+    `(?<![\\p{L}\\p{N}])${REPLACEMENT_PREFIX}\\d+(?![\\p{L}\\p{N}])`,
+    "gu",
+);
+
 const QUOTED_SYMBOL_RE =
     /^(?:[A-Za-z][A-Za-z0-9]*(?:[_./-][A-Za-z0-9]+)+|[a-z]+[A-Z][A-Za-z0-9]*|[A-Z]{2,})$/;
 
@@ -1019,6 +1036,19 @@ const renameUnrelatedSymbols: Transform = {
         // raw string never spells, and it can turn a fragmented command span into a
         // recognisable one whose contents the rename cannot reach.
         const collisionText = [...allText, ...visibleText.values()];
+        const untouchableCorpus = [
+            ...scenario.transcript.turns.flatMap((turn, turnIndex) =>
+                (["user", "assistant"] as const).flatMap((role) =>
+                    eligibleKeys.has(messageKey(turnIndex, role))
+                        ? []
+                        : [
+                              turn[role],
+                              visibleText.get(messageKey(turnIndex, role)) ?? "",
+                          ],
+                ),
+            ),
+            ...probeText,
+        ].join("\n");
         const blocked = new Set([
             ...scenario.transcript.turns.flatMap((turn, turnIndex) =>
                 (["user", "assistant"] as const).flatMap((role) =>
@@ -1069,16 +1099,13 @@ const renameUnrelatedSymbols: Transform = {
                 !blocked.has(symbol) &&
                 // A symbol can carry a probe answer without being one: renaming
                 // `api/v2` deletes the complete-value occurrence of `api`.
-                !answers.some((answer) => containsCompleteValue(symbol, answer)),
+                !answers.some((answer) => containsCompleteValue(symbol, answer)) &&
+                // Extraction yields only the full spelling, so an ineligible
+                // `buildAPI/v2` leaves a bare `buildAPI` looking free. It names the
+                // same entity, and renaming only the reachable half splits it.
+                !containsCompleteValue(untouchableCorpus, symbol),
         );
-        if (candidates.length === 0) {
-            return {
-                applicable: false,
-                reason: "no unrelated symbol to rename",
-            };
-        }
         const next = splitmix32(seed);
-        const original = pick(candidates, next);
         // A replacement that aliases a probe-only entity changes the
         // query-to-history relationship as surely as renaming one would, and one
         // aliasing a name that exists only inside a command span collides with an
@@ -1089,114 +1116,136 @@ const renameUnrelatedSymbols: Transform = {
         ]);
         // Extracted spellings are not the whole answer: `aux_symbol_1234/v2` yields
         // only the full path, while `aux_symbol_1234` names the same entity and is a
-        // complete value inside it. Handing that spelling to an unrelated symbol
-        // would alias the two, so a candidate is also rejected when it appears as a
-        // complete value anywhere the rename can be read.
-        const collisionCorpus = collisionText.join("\n");
-        const replacementStart = Math.floor(next() * 10_000);
-        let replacement: string | undefined;
-        for (let offset = 0; offset < 10_000; offset += 1) {
-            const candidate = `aux_symbol_${(replacementStart + offset) % 10_000}`;
-            // A generated name contains its own parts as complete values, so a
-            // probe whose gold answer is one of them — `aux`, `symbol` — would find
-            // the answer copyable from raw history the moment any rename lands.
-            if (answers.some((answer) => containsCompleteValue(candidate, answer))) {
-                continue;
+        // complete value inside it. Scanned once for the whole family rather than
+        // asked per candidate: `containsCompleteValue` normalizes its whole input,
+        // and a transcript carrying many compound names would renormalize a
+        // six-figure corpus ten thousand times over.
+        const taken = new Set([
+            ...existing,
+            ...[
+                ...normalizeContent(collisionText.join("\n")).matchAll(TAKEN_REPLACEMENT_RE),
+            ].map((match) => match[0]),
+        ]);
+        // Two free names, found once on first use. Whether a free name exists is a
+        // property of the scenario, not of the symbol being renamed, so searching per
+        // candidate would repeat the whole walk for every one of them — and two is all
+        // the per-candidate part needs, since its only rule is that the replacement
+        // differ from the symbol it displaces. Deferred rather than eager so the draw
+        // order stays candidate-offset first, which is what makes a given seed pick
+        // the same symbol it always did.
+        let free: string[] | undefined;
+        const freeReplacements = (): string[] => {
+            if (free !== undefined) return free;
+            const start = Math.floor(next() * REPLACEMENT_SPACE);
+            free = [];
+            for (let offset = 0; offset < REPLACEMENT_SPACE && free.length < 2; offset += 1) {
+                const candidate = `${REPLACEMENT_PREFIX}${(start + offset) % REPLACEMENT_SPACE}`;
+                // A generated name contains its own parts as complete values, so a
+                // probe whose gold answer is one of them — `aux`, `symbol` — would
+                // find the answer copyable from raw history the moment a rename lands.
+                if (answers.some((answer) => containsCompleteValue(candidate, answer))) continue;
+                if (!taken.has(candidate)) free.push(candidate);
             }
+            return free;
+        };
+        // Probed rather than picked: a symbol can pass candidate selection and still
+        // fail the length, evidence, or orphaned-probe check, and discarding the
+        // application for it would drop coverage another symbol would have provided.
+        return firstDerivative(
+            candidates,
+            next,
+            "no unrelated symbol to rename",
+            (original) => {
+                const replacement = freeReplacements().find(
+                    (candidate) => candidate !== original,
+                );
+                if (replacement === undefined) {
+                    return {
+                        applicable: false,
+                        reason: "no unused replacement symbol",
+                    };
+                }
+            const turns = scenario.transcript.turns.map((turn) => ({ ...turn }));
+            for (const message of messages) {
+                turns[message.turnIndex]![message.role] = message.text.replace(
+                    SYMBOL_RE,
+                    (matched, quoted: string | undefined) => {
+                        if ((quoted ?? matched) !== original) return matched;
+                        return quoted === undefined
+                            ? replacement
+                            : `\`${replacement}\``;
+                    },
+                );
+            }
+            // A replacement longer than the symbol it displaces can push a message
+            // past the contract limit, which `derivative()` reports by throwing
+            // instead of returning; enumeration must see an inapplicable transform.
             if (
-                candidate !== original &&
-                !existing.has(candidate) &&
-                !containsCompleteValue(collisionCorpus, candidate)
+                turns.some(
+                    (turn) =>
+                        turn.user.length > MAX_TURN_TEXT_CHARS ||
+                        turn.assistant.length > MAX_TURN_TEXT_CHARS,
+                )
             ) {
-                replacement = candidate;
-                break;
+                return {
+                    applicable: false,
+                    reason: "rename does not fit the turn text limit",
+                };
             }
-        }
-        if (replacement === undefined) {
-            return {
-                applicable: false,
-                reason: "no unused replacement symbol",
-            };
-        }
-        const turns = scenario.transcript.turns.map((turn) => ({ ...turn }));
-        for (const message of messages) {
-            turns[message.turnIndex]![message.role] = message.text.replace(
-                SYMBOL_RE,
-                (matched, quoted: string | undefined) => {
-                    if ((quoted ?? matched) !== original) return matched;
-                    return quoted === undefined
-                        ? replacement
-                        : `\`${replacement}\``;
-                },
+            // A generated name can contain a predicate: a claim predicate of
+            // `aux_symbol` is newly authored the moment a symbol becomes
+            // `aux_symbol_1234`. Exact-spelling collision checks cannot see that, and
+            // the derivative stays lint-clean because the required occurrence still
+            // exists elsewhere, so the rewritten turns are proven against the same
+            // evidence comparison the framing and reordering transforms use.
+            const turnMap = scenario.transcript.turns.map((_, index) => index);
+            if (
+                !preservesEvidenceExactly(
+                    evidenceBaselines(scenario),
+                    turns,
+                    turnMap,
+                ) ||
+                !preservesProbeAnswers(answers, scenario, turns)
+            ) {
+                return {
+                    applicable: false,
+                    reason: "rename would change authored evidence",
+                };
+            }
+            if (!changesVisibleTranscript(scenario, turns)) {
+                return {
+                    applicable: false,
+                    reason: "rename leaves the historian input unchanged",
+                };
+            }
+            // A probe can name an entity by one part of a symbol — a question about the
+            // `api` endpoint refers to `api/v2` — and renaming it would leave the
+            // question asking about something the history no longer mentions. Checked
+            // against the derivative rather than by blocking the candidate outright,
+            // because a part is often an ordinary word: `webhook` is a part of
+            // `webhook_setup`, and a scenario about webhooks says it in many places, so
+            // blocking on mention alone would freeze symbols the probe is not naming.
+            const orphanedTerm = symbolSegments(original).some(
+                (segment) =>
+                    probeText.some((text) => containsCompleteValue(text, segment)) &&
+                    countCompleteValues(authoredEvidenceText(scenario.transcript.turns), segment) > 0 &&
+                    countCompleteValues(authoredEvidenceText(turns), segment) === 0,
             );
-        }
-        // A replacement longer than the symbol it displaces can push a message
-        // past the contract limit, which `derivative()` reports by throwing
-        // instead of returning; enumeration must see an inapplicable transform.
-        if (
-            turns.some(
-                (turn) =>
-                    turn.user.length > MAX_TURN_TEXT_CHARS ||
-                    turn.assistant.length > MAX_TURN_TEXT_CHARS,
-            )
-        ) {
-            return {
-                applicable: false,
-                reason: "rename does not fit the turn text limit",
-            };
-        }
-        // A generated name can contain a predicate: a claim predicate of
-        // `aux_symbol` is newly authored the moment a symbol becomes
-        // `aux_symbol_1234`. Exact-spelling collision checks cannot see that, and
-        // the derivative stays lint-clean because the required occurrence still
-        // exists elsewhere, so the rewritten turns are proven against the same
-        // evidence comparison the framing and reordering transforms use.
-        const turnMap = scenario.transcript.turns.map((_, index) => index);
-        if (
-            !preservesEvidenceExactly(
-                evidenceBaselines(scenario),
-                turns,
-                turnMap,
-            ) ||
-            !preservesProbeAnswers(answers, scenario, turns)
-        ) {
-            return {
-                applicable: false,
-                reason: "rename would change authored evidence",
-            };
-        }
-        if (!changesVisibleTranscript(scenario, turns)) {
-            return {
-                applicable: false,
-                reason: "rename leaves the historian input unchanged",
-            };
-        }
-        // A probe can name an entity by one part of a symbol — a question about the
-        // `api` endpoint refers to `api/v2` — and renaming it would leave the
-        // question asking about something the history no longer mentions. Checked
-        // against the derivative rather than by blocking the candidate outright,
-        // because a part is often an ordinary word: `webhook` is a part of
-        // `webhook_setup`, and a scenario about webhooks says it in many places, so
-        // blocking on mention alone would freeze symbols the probe is not naming.
-        const orphanedTerm = symbolSegments(original).some(
-            (segment) =>
-                probeText.some((text) => containsCompleteValue(text, segment)) &&
-                countCompleteValues(authoredEvidenceText(scenario.transcript.turns), segment) > 0 &&
-                countCompleteValues(authoredEvidenceText(turns), segment) === 0,
-        );
-        if (orphanedTerm) {
-            return {
-                applicable: false,
-                reason: "rename would leave a probe naming an absent entity",
-            };
-        }
-        return derivative(
-            scenario,
-            this,
-            seed,
-            turns,
-            scenario.transcript.epilogueStartIndex,
-            turnMap,
+            if (orphanedTerm) {
+                return {
+                    applicable: false,
+                    reason: "rename would leave a probe naming an absent entity",
+                };
+            }
+            return derivative(
+                    scenario,
+                    this,
+                    seed,
+                    turns,
+                    scenario.transcript.epilogueStartIndex,
+                    turnMap,
+                );
+            },
         );
     },
 };
