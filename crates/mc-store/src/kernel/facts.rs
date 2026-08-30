@@ -16,6 +16,14 @@ pub struct KernelFacts {
     pub minimum_required_checkpoint: Option<i64>,
     pub event_lag: i64,
     pub oldest_unconsumed_age_ms: Option<i64>,
+    pub artifact_budget: ArtifactBudgetFacts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtifactBudgetFacts {
+    pub usage_bytes: u64,
+    pub cap_bytes: u64,
+    pub warn: bool,
 }
 
 impl KernelStore {
@@ -69,6 +77,7 @@ impl KernelStore {
             .try_fold(main_file_bytes, |total, path| {
                 file_len(path).map(|length| total.saturating_add(length))
             })?;
+        let artifact_budget = self.artifact_budget_facts()?;
         Ok(KernelFacts {
             commit_seq,
             main_file_bytes,
@@ -78,6 +87,17 @@ impl KernelStore {
             event_lag,
             oldest_unconsumed_age_ms: oldest_unconsumed_created_at
                 .map(|created_at| now_ms.saturating_sub(created_at).max(0)),
+            artifact_budget,
+        })
+    }
+
+    pub fn artifact_budget_facts(&self) -> Result<ArtifactBudgetFacts, KernelError> {
+        let usage_bytes = super::cas::gc::object_usage(&self.artifacts_path)?;
+        let warn_at = self.artifact_cap.saturating_sub(self.artifact_cap / 5);
+        Ok(ArtifactBudgetFacts {
+            usage_bytes,
+            cap_bytes: self.artifact_cap,
+            warn: usage_bytes >= warn_at,
         })
     }
 

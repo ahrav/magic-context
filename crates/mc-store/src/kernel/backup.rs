@@ -263,8 +263,9 @@ impl KernelStore {
             return Err(KernelError::NotFound);
         }
         tx.execute(
-            "DELETE FROM capture_pin_refs WHERE capture_pin_id=?1",
-            [capture_pin_id],
+            "UPDATE capture_pin_refs SET released_at=?1
+             WHERE capture_pin_id=?2 AND released_at IS NULL",
+            params![released_at, capture_pin_id],
         )
         .map_err(|_| KernelError::Io)?;
         tx.commit().map_err(|_| KernelError::Io)
@@ -283,7 +284,10 @@ impl KernelStore {
         )
         .map_err(|_| KernelError::Io)?;
         tx.execute(
-            "DELETE FROM capture_pin_refs WHERE capture_pin_id IN (
+            "UPDATE capture_pin_refs
+             SET released_at=(SELECT released_at FROM capture_pins
+                              WHERE capture_pin_id=capture_pin_refs.capture_pin_id)
+             WHERE released_at IS NULL AND capture_pin_id IN (
                  SELECT capture_pin_id FROM capture_pins WHERE released_at IS NOT NULL
              )",
             [],

@@ -1,7 +1,9 @@
 use rusqlite::{params, TransactionBehavior};
 
 use super::envelope::check_fence;
+use super::open::current_time_ms;
 use super::{KernelError, KernelStore};
+use crate::kernel::cas::ArtifactGcResult;
 
 const HOUR_MS: i64 = 60 * 60 * 1_000;
 const STAGING_RETENTION_MS: i64 = 30 * 24 * HOUR_MS;
@@ -27,6 +29,7 @@ impl StagingTerminalState {
 pub struct StagingMaintenanceResult {
     pub abandoned: usize,
     pub deleted_runs: usize,
+    pub artifact_gc: ArtifactGcResult,
 }
 
 impl KernelStore {
@@ -100,9 +103,19 @@ impl KernelStore {
         &self,
         now: i64,
     ) -> Result<StagingMaintenanceResult, KernelError> {
+        self.run_staging_maintenance_inner(now, None, false)
+    }
+
+    fn run_staging_maintenance_inner(
+        &self,
+        now: i64,
+        hook: Option<&mut dyn FnMut()>,
+        fault_after_reclaiming: bool,
+    ) -> Result<StagingMaintenanceResult, KernelError> {
         if now < 0 {
             return Err(KernelError::InvalidInput);
         }
+        self.run_capture_pin_maintenance(now)?;
         let mut writer = self.lock_writer()?;
         let tx = writer
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -137,10 +150,39 @@ impl KernelStore {
             )
             .map_err(|_| KernelError::Io)?;
         tx.commit().map_err(|_| KernelError::Io)?;
+        drop(writer);
+        let artifact_gc = self.run_artifact_gc(|| now, hook, fault_after_reclaiming)?;
         Ok(StagingMaintenanceResult {
             abandoned,
             deleted_runs,
+            artifact_gc,
         })
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn run_staging_maintenance_with_hook_for_test(
+        &self,
+        now: i64,
+        mut hook: impl FnMut(),
+    ) -> Result<StagingMaintenanceResult, KernelError> {
+        self.run_staging_maintenance_inner(now, Some(&mut hook), false)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn run_staging_maintenance_with_fault_for_test(
+        &self,
+        now: i64,
+        fault: crate::kernel::cas::ArtifactGcFault,
+    ) -> Result<StagingMaintenanceResult, KernelError> {
+        self.run_staging_maintenance_inner(
+            now,
+            None,
+            fault == crate::kernel::cas::ArtifactGcFault::AfterReclaiming,
+        )
+    }
+
+    pub(super) fn run_startup_maintenance(&self) -> Result<(), KernelError> {
+        self.run_staging_maintenance(current_time_ms()).map(|_| ())
     }
 }
 

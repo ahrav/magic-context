@@ -15,12 +15,12 @@ pub use backup::{
     verify_backup_with_deadline_for_test, BackupFault, RestoreFault,
 };
 pub use backup::{BackupManifest, BackupRequest, BackupResult};
-#[cfg(feature = "test-support")]
-pub use cas::ArtifactIngestFault;
 pub use cas::{
-    ArtifactDestination, ArtifactEligibility, ArtifactError, ArtifactErrorKind, ArtifactHandle,
-    ArtifactIngestRequest, EligibilityDeniedReason, ProviderEgress,
+    ArtifactDestination, ArtifactEligibility, ArtifactError, ArtifactErrorKind, ArtifactGcResult,
+    ArtifactHandle, ArtifactIngestRequest, EligibilityDeniedReason, ProviderEgress,
 };
+#[cfg(feature = "test-support")]
+pub use cas::{ArtifactGcFault, ArtifactIngestFault};
 #[cfg(feature = "test-support")]
 pub use envelope::CommitFault;
 pub use envelope::{
@@ -28,7 +28,7 @@ pub use envelope::{
     ObjectRow, ProjectionReplaceResult, RemediationTarget, RepositoryProvenance, Sensitivity,
     StagingCandidateRow, StagingCandidateSpec, OPERATOR_REDACTION_PLACEHOLDER,
 };
-pub use facts::{KernelFacts, MAIN_FILE_WARN_BYTES};
+pub use facts::{ArtifactBudgetFacts, KernelFacts, MAIN_FILE_WARN_BYTES};
 pub use open::{KernelError, KernelErrorKind, KernelStore};
 pub use outbox::OutboxPruneResult;
 pub use retention::{StagingMaintenanceResult, StagingTerminalState};

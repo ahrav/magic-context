@@ -1,3 +1,4 @@
+pub(super) mod gc;
 mod ingest;
 mod read;
 
@@ -107,6 +108,7 @@ pub enum ArtifactErrorKind {
     CorruptObject,
     ReferenceUnavailable,
     ReferenceCommit,
+    ReclaimInProgress,
     InvalidInput,
 }
 
@@ -132,6 +134,13 @@ impl ArtifactError {
 
     pub fn digest(&self) -> Option<&str> {
         self.digest.as_deref()
+    }
+
+    pub fn is_retriable(&self) -> bool {
+        matches!(
+            self.kind,
+            ArtifactErrorKind::StorageExhausted | ArtifactErrorKind::ReclaimInProgress
+        )
     }
 
     pub(super) fn new(kind: ArtifactErrorKind) -> Self {
@@ -201,10 +210,17 @@ impl fmt::Display for ArtifactError {
             ArtifactErrorKind::ReferenceCommit => {
                 formatter.write_str("artifact canonical reference commit failed")
             }
+            ArtifactErrorKind::ReclaimInProgress => {
+                formatter.write_str("artifact reclamation is in progress; retry ingestion")
+            }
             ArtifactErrorKind::InvalidInput => formatter.write_str("artifact input is invalid"),
         }
     }
 }
+
+#[cfg(feature = "test-support")]
+pub use gc::ArtifactGcFault;
+pub use gc::ArtifactGcResult;
 
 impl fmt::Debug for ArtifactError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

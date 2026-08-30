@@ -496,19 +496,13 @@ fn evidence_manifest_pin_release_and_stale_reap_are_typed() {
         inspect(root.path())
             .query_row(
                 "SELECT COUNT(*) FROM capture_pin_refs
-                 WHERE capture_pin_id=?1 AND released_at IS NULL",
+                 WHERE capture_pin_id=?1 AND released_at=10",
                 [&pin],
                 |row| row.get::<_, i64>(0),
             )
             .unwrap(),
-        0
+        2
     );
-    pinned_connection
-        .execute(
-            "DELETE FROM evidence_meta WHERE evidence_id='a-evidence'",
-            [],
-        )
-        .unwrap();
     drop(pinned_connection);
 
     assert_eq!(
@@ -588,12 +582,13 @@ fn evidence_manifest_pin_release_and_stale_reap_are_typed() {
     assert_eq!(
         inspect(root.path())
             .query_row(
-                "SELECT COUNT(*) FROM capture_pin_refs WHERE capture_pin_id=?1",
-                [&stale],
+                "SELECT COUNT(*) FROM capture_pin_refs
+                 WHERE capture_pin_id=?1 AND released_at=?2",
+                rusqlite::params![stale, now + 90_000],
                 |row| row.get::<_, i64>(0),
             )
             .unwrap(),
-        0
+        2
     );
 }
 

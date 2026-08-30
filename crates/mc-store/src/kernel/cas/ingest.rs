@@ -172,6 +172,17 @@ impl KernelStore {
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
         check_fence(&reservation, self.lease_epoch())
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
+        if artifact_is_reclaiming(&reservation, &prepared.digest)
+            .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?
+        {
+            drop(reservation);
+            let _ =
+                durable_unlink(&tmp, &temp_name).map_err(|cleanup| self.map_storage_error(cleanup));
+            return Err(ArtifactError::for_digest(
+                ArtifactErrorKind::ReclaimInProgress,
+                &prepared.digest,
+            ));
+        }
         if artifact_is_blocked(&reservation, &prepared.digest)
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?
         {
@@ -575,6 +586,20 @@ fn artifact_is_blocked(
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM artifact_purge_tombstones WHERE artifact_digest=?1)
                     OR EXISTS(SELECT 1 FROM artifact_pending_unlinks WHERE artifact_digest=?1)",
+            [digest],
+            |row| row.get(0),
+        )
+        .map_err(|_| KernelError::Io)
+}
+
+fn artifact_is_reclaiming(
+    connection: &rusqlite::Transaction<'_>,
+    digest: &str,
+) -> Result<bool, KernelError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM artifact_ingestion_reservations
+                           WHERE artifact_digest=?1 AND state='Reclaiming')",
             [digest],
             |row| row.get(0),
         )

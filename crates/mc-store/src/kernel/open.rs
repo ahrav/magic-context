@@ -253,8 +253,7 @@ impl KernelStore {
             db_path,
             _lease: lease,
         };
-        store.run_capture_pin_maintenance(current_time_ms())?;
-        store.run_staging_maintenance(current_time_ms())?;
+        store.run_startup_maintenance()?;
         Ok(store)
     }
 
