@@ -4,7 +4,7 @@
  * cannot drift on what a dump summary contains.
  */
 
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 import { parseCompartmentOutput } from "@magic-context/core/hooks/magic-context/compartment-parser";
@@ -40,7 +40,7 @@ export interface HistorianDumpMeta {
 
 export function fileSize(path: string): number {
     try {
-        return existsSync(path) ? statSync(path).size : 0;
+        return statSync(path).size;
     } catch {
         return 0;
     }
@@ -91,7 +91,6 @@ export function listDumpsInDir(
     dir: string,
     limit: number,
 ): { count: number; recent: HistorianDumpSummary[] } {
-    if (!existsSync(dir)) return { count: 0, recent: [] };
     try {
         const entries = readdirSync(dir)
             .filter((name) => name.endsWith(".xml"))
