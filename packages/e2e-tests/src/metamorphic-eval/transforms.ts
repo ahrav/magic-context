@@ -7,6 +7,7 @@ import {
     normalizeContent,
     normalizedEvidenceMessages,
     parseScenario,
+    visibleEvidenceMessages,
     type ContentPredicate,
     type GoldExpectations,
     type HistorianEvalScenario,
@@ -426,7 +427,11 @@ function epilogueStartIndexAfter(scenario: HistorianEvalScenario, insertion: num
 const paraphraseIrrelevant: Transform = {
     id: "paraphrase-irrelevant",
     version: 1,
-    alwaysApplicable: true,
+    // Every rewrite adds characters, so a scenario whose only rewritable messages
+    // already sit at `MAX_TURN_TEXT_CHARS` admits none of them. That is reachable
+    // for a contract-valid scenario, so applicability cannot be promised for
+    // every input — the frozen corpus asserts it directly instead.
+    alwaysApplicable: false,
     apply(scenario, rawSeed) {
         const seed = normalizedSeed(rawSeed);
         const rewrites = [
@@ -637,12 +642,14 @@ const duplicateRejectedProposal: Transform = {
         // production discards, duplicating a turn that carries no rejection at
         // all — and `preservesAbsentEvidence` would still pass on the occurrence
         // that lives elsewhere.
+        // A turn qualifies only when its OWN payload carries a complete
+        // occurrence. Every turn a cross-turn occurrence runs through contributes
+        // to it, but copying just one of them repeats unrelated content and
+        // leaves the rejection density unchanged — the opposite of what this
+        // transform is for.
         const rejectedTurns = new Set(
-            matchSpans(rejected, scenario.transcript.turns).flatMap((match) =>
-                match
-                    .slice(match.indexOf("|") + 1)
-                    .split(",")
-                    .map((key) => Number(key.slice(0, key.indexOf(":")))),
+            scenario.transcript.turns.flatMap((turn, turnIndex) =>
+                matchSpans(rejected, [turn]).length > 0 ? [turnIndex] : [],
             ),
         );
         const protectedIndexes = protectedTurnIndexes(scenario);
@@ -701,6 +708,22 @@ function symbolsIn(text: string): string[] {
     });
 }
 
+/**
+ * Symbols that occur only inside a backtick span the grammar rejects.
+ *
+ * The regex consumes a whole backtick span, so a rename cannot reach the tokens
+ * inside one — and rewriting the other occurrences would leave the span naming
+ * the old entity, splitting one entity into two names. Such a symbol is therefore
+ * not renameable anywhere in the scenario.
+ */
+function shadowedSymbolsIn(text: string): string[] {
+    return [...text.matchAll(SYMBOL_RE)].flatMap((match) => {
+        const quoted = match[1];
+        if (quoted === undefined || QUOTED_SYMBOL_RE.test(quoted)) return [];
+        return symbolsIn(quoted);
+    });
+}
+
 const renameUnrelatedSymbols: Transform = {
     id: "rename-unrelated-symbols",
     version: 1,
@@ -709,40 +732,54 @@ const renameUnrelatedSymbols: Transform = {
         const seed = normalizedSeed(rawSeed);
         const messages = eligibleMessages(scenario);
         const eligibleKeys = new Set(messages.map((message) => `${message.turnIndex}:${message.role}`));
+        // Candidate spellings come from the text the historian receives: a symbol
+        // that exists only inside a stripped reminder can be renamed without
+        // changing the model input at all, and the derivative would carry no
+        // perturbation to compare.
+        const visibleText = new Map(
+            visibleEvidenceMessages(scenario.transcript.turns).map((message) => [
+                messageKey(message.turnIndex, message.role),
+                message.text,
+            ]),
+        );
+        const probeText = scenario.probes.flatMap((probe) => [
+            probe.question,
+            probe.answerType === "claim-id" ? "" : probe.goldAnswer,
+            ...(probe.answerType === "multiple-choice" ? probe.choices : []),
+        ]);
         // Symbols that also occur in text the rename cannot touch stay out of the
         // candidate pool: renaming only some occurrences would name one entity
         // two ways. Probes count as untouchable text — a probe asking what
         // `buildAPI` returns against a history that now says `aux_symbol_N`
         // measures a broken query, not naming robustness.
+        const allText = [
+            ...scenario.transcript.turns.flatMap((turn) => [turn.user, turn.assistant]),
+            ...probeText,
+        ];
         const blocked = new Set([
             ...scenario.transcript.turns.flatMap((turn, turnIndex) =>
                 (["user", "assistant"] as const).flatMap((role) =>
-                    eligibleKeys.has(`${turnIndex}:${role}`)
-                        ? []
-                        : symbolsIn(turn[role]),
+                    eligibleKeys.has(messageKey(turnIndex, role)) ? [] : symbolsIn(turn[role]),
                 ),
             ),
-            ...scenario.probes.flatMap((probe) =>
-                [
-                    probe.question,
-                    probe.answerType === "claim-id" ? "" : probe.goldAnswer,
-                    ...(probe.answerType === "multiple-choice" ? probe.choices : []),
-                ].flatMap((text) => symbolsIn(text)),
-            ),
+            ...probeText.flatMap((text) => symbolsIn(text)),
+            ...allText.flatMap((text) => shadowedSymbolsIn(text)),
         ]);
-        const candidates = [...new Set(messages.flatMap((message) => symbolsIn(message.text)))].filter(
-            (symbol) => !blocked.has(symbol),
-        );
+        const candidates = [
+            ...new Set(
+                messages.flatMap((message) =>
+                    symbolsIn(visibleText.get(messageKey(message.turnIndex, message.role)) ?? ""),
+                ),
+            ),
+        ].filter((symbol) => !blocked.has(symbol));
         if (candidates.length === 0) {
             return { applicable: false, reason: "no unrelated symbol to rename" };
         }
         const next = splitmix32(seed);
         const original = pick(candidates, next);
-        const existing = new Set(
-            scenario.transcript.turns.flatMap((turn) =>
-                [turn.user, turn.assistant].flatMap((text) => symbolsIn(text)),
-            ),
-        );
+        // A replacement that aliases a probe-only entity changes the
+        // query-to-history relationship as surely as renaming one would.
+        const existing = new Set(allText.flatMap((text) => symbolsIn(text)));
         const replacementStart = Math.floor(next() * 10_000);
         let replacement: string | undefined;
         for (let offset = 0; offset < 10_000; offset += 1) {

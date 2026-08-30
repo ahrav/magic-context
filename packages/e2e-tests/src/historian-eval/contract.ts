@@ -1058,14 +1058,30 @@ export function authoredEvidenceText(turns: readonly TranscriptTurn[]): string {
 export interface NormalizedEvidenceMessage {
     turnIndex: number;
     role: "user" | "assistant";
-    /** The message as `predicateMatches` compares it. */
     text: string;
 }
 
 /**
- * The historian-visible messages of `turns` in evidence order, each normalized
- * the way `predicateMatches` compares, with the messages production discards
- * omitted.
+ * The messages of `turns` the historian actually receives, in evidence order,
+ * with the ones production discards omitted.
+ *
+ * Case and spacing are as authored, so a caller that needs the exact spelling of
+ * something — a case-sensitive identifier, say — can read it here rather than
+ * from the raw message, whose discarded parts the historian never sees.
+ */
+export function visibleEvidenceMessages(
+    turns: readonly TranscriptTurn[],
+): NormalizedEvidenceMessage[] {
+    return turns.flatMap((turn, turnIndex) =>
+        (["user", "assistant"] as const).flatMap((role) => {
+            const text = messageAsHistorianSeesIt(role, turn[role]);
+            return normalizeContent(text).length === 0 ? [] : [{ turnIndex, role, text }];
+        }),
+    );
+}
+
+/**
+ * The same messages, each normalized the way `predicateMatches` compares.
  *
  * Joining these with a single space reproduces
  * `normalizeContent(authoredEvidenceText(turns))`, so a caller can map a
@@ -1077,12 +1093,10 @@ export interface NormalizedEvidenceMessage {
 export function normalizedEvidenceMessages(
     turns: readonly TranscriptTurn[],
 ): NormalizedEvidenceMessage[] {
-    return turns.flatMap((turn, turnIndex) =>
-        (["user", "assistant"] as const).flatMap((role) => {
-            const text = normalizeContent(messageAsHistorianSeesIt(role, turn[role]));
-            return text.length === 0 ? [] : [{ turnIndex, role, text }];
-        }),
-    );
+    return visibleEvidenceMessages(turns).map((message) => ({
+        ...message,
+        text: normalizeContent(message.text),
+    }));
 }
 
 /** Authored evidence text for a half-open turn range. */

@@ -319,6 +319,160 @@ describe("metamorphic transforms", () => {
         }
     });
 
+    test("duplication refuses a turn holding only half of a cross-turn rejection", () => {
+        const raw = validScenarioRaw();
+        const transcript = raw.transcript as {
+            turns: Array<{ user: string; assistant: string }>;
+            epilogueStartIndex: number;
+        };
+        // `legacy bridge` is authored only across the turn-0/turn-1 boundary, so
+        // both turns contribute to it and neither carries it alone.
+        transcript.turns.unshift(
+            { user: "Opening note.", assistant: "We could keep the legacy" },
+            { user: "bridge for now.", assistant: "Noted as an option." },
+        );
+        transcript.epilogueStartIndex += 2;
+        const gold = raw.gold as {
+            expectedClaims: Array<{ sourceTurnRange: [number, number] }>;
+            expectedAbsent: Array<Record<string, unknown>>;
+        };
+        for (const claim of gold.expectedClaims) {
+            claim.sourceTurnRange = [claim.sourceTurnRange[0] + 2, claim.sourceTurnRange[1] + 2];
+        }
+        gold.expectedAbsent = [
+            {
+                id: "abs-legacy-bridge",
+                family: "proposed-but-rejected",
+                predicate: { kind: "normalized-substring", value: "legacy bridge" },
+            },
+        ];
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "duplicate-rejected-proposal")!;
+
+        expect(transform.apply(scenario, 0)).toEqual({
+            applicable: false,
+            reason: "no rejected proposal insertion preserves contiguous gold ranges",
+        });
+    });
+
+    test("rename refuses a symbol it cannot reach inside inline code", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[0]!.assistant = "We could consider it.";
+        // `buildAPI` also sits inside a command span the rename cannot edit, so
+        // renaming the bare occurrence would leave two names for one entity.
+        turns[3] = {
+            user: "Wrapping up: `buildAPI --watch`; buildAPI is background tooling for aux_worker.ts.",
+            assistant: "Summary recorded.",
+        };
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
+
+        let renamed = 0;
+        for (let seed = 0; seed < 40; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            const rewritten = result.scenario.transcript.turns[3]!.user;
+            expect(rewritten, `seed ${seed}`).toContain("`buildAPI --watch`; buildAPI is");
+            if (!rewritten.includes("aux_worker.ts")) renamed += 1;
+        }
+        expect(renamed).toBeGreaterThan(0);
+    });
+
+    test("rename selects only symbols the historian receives", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[0]!.assistant = "We could consider it.";
+        // The reminder is stripped before the historian sees the message, so
+        // renaming `hidden_worker.ts` would change no model input at all.
+        turns[3] = {
+            user: "<system-reminder>hidden_worker.ts</system-reminder> Background note about aux_worker.ts.",
+            assistant: "Summary recorded.",
+        };
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
+
+        for (let seed = 0; seed < 40; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            expect(result.scenario.transcript.turns[3]!.user, `seed ${seed}`).toContain(
+                "hidden_worker.ts",
+            );
+        }
+    });
+
+    test("rename replacements avoid names only a probe uses", () => {
+        // The seed decides which `aux_symbol_N` the generator reaches for first:
+        // one draw picks the symbol, the next picks the starting index. Reserving
+        // exactly that name in a probe makes the collision deterministic instead
+        // of a one-in-ten-thousand coincidence.
+        for (let seed = 0; seed < 6; seed += 1) {
+            const next = splitmix32(seed);
+            next();
+            const reserved = `aux_symbol_${Math.floor(next() * 10_000)}`;
+            const raw = validScenarioRaw();
+            const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> })
+                .turns;
+            turns[0]!.assistant = "We could consider it.";
+            turns[3] = {
+                user: "Background note about aux_worker.ts.",
+                assistant: "Summary recorded.",
+            };
+            (raw.probes as Array<Record<string, unknown>>)[0] = {
+                id: "probe-capacity",
+                question: `Does ${reserved} own the capacity record?`,
+                answerType: "exact",
+                goldAnswer: "4096",
+                sourceClaimRef: "exp-cache-capacity",
+            };
+            const scenario = parseScenario(raw);
+            expect(lintScenario(scenario)).toEqual([]);
+            const transform = TRANSFORMS.find(
+                (candidate) => candidate.id === "rename-unrelated-symbols",
+            )!;
+
+            const result = transform.apply(scenario, seed);
+            expect(result.applicable, `seed ${seed}`).toBe(true);
+            if (!result.applicable) continue;
+            const rewritten = result.scenario.transcript.turns[3]!.user;
+            expect(rewritten, `seed ${seed}`).not.toContain("aux_worker.ts");
+            expect(rewritten, `seed ${seed} reserved ${reserved}`).not.toContain(reserved);
+        }
+    });
+
+    test("paraphrase is conditional because a message at the ceiling admits no rewrite", () => {
+        const raw = validScenarioRaw();
+        const transcript = raw.transcript as {
+            turns: Array<{ user: string; assistant: string }>;
+            epilogueStartIndex: number;
+        };
+        const filler = `Background. ${"filler word ".repeat(2_000)}`.slice(0, MAX_TURN_TEXT_CHARS);
+        transcript.turns = [
+            {
+                user: "Should we use Redis for the session cache? No — use the in-process LRU cache with capacity 4096 entries.",
+                assistant: "Understood: in-process LRU cache for sessions, capacity 4096 entries.",
+            },
+            { user: filler, assistant: filler },
+        ];
+        transcript.epilogueStartIndex = 1;
+        const gold = raw.gold as { expectedClaims: Array<{ sourceTurnRange: [number, number] }> };
+        for (const claim of gold.expectedClaims) claim.sourceTurnRange = [0, 0];
+        const scenario = parseScenario(raw);
+        // Contract-valid: the only rewritable messages are already at the ceiling,
+        // so no additive rewrite fits and applicability cannot be promised.
+        expect(lintScenario(scenario)).toEqual([]);
+        expect(scenario.transcript.turns[1]!.user.length).toBe(MAX_TURN_TEXT_CHARS);
+
+        expect(TRANSFORMS.find((candidate) => candidate.id === "paraphrase-irrelevant")!.apply(
+            scenario,
+            0,
+        )).toEqual({ applicable: false, reason: "no irrelevant message to paraphrase" });
+        expect(ALWAYS_APPLICABLE_TRANSFORM_IDS).not.toContain("paraphrase-irrelevant");
+    });
+
     test("paraphrase reports inapplicability instead of throwing at the turn text limit", () => {
         const raw = validScenarioRaw();
         const turns = (raw.transcript as { turns: Array<{ user: string }> }).turns;
@@ -906,6 +1060,18 @@ describe("metamorphic transforms", () => {
                 }
             }
             expect(applied, scenario.id).toBeGreaterThan(0);
+            // Applicability of the framing rewrite is a property of THIS corpus,
+            // not of every contract-valid scenario — a scenario whose only
+            // rewritable messages sit at the length ceiling admits no additive
+            // rewrite — so it is asserted here rather than declared on the
+            // transform.
+            expect(
+                TRANSFORMS.find((transform) => transform.id === "paraphrase-irrelevant")!.apply(
+                    scenario,
+                    20_260_830,
+                ).applicable,
+                scenario.id,
+            ).toBe(true);
         }
         expect([...preEpilogueRewrites].sort()).toEqual([...contentTransformIds].sort());
     });
