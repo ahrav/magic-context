@@ -1,0 +1,13 @@
+{
+  "schema": "magic-context.mc-shm-release-gate-config/v1",
+  "state": "blocked",
+  "blockers": [
+    "designated benchmark host is UNSET_REQUIRES_DESIGNATED_HOST",
+    "qualified frozen pre-cutover TCP artifact and evidence are unavailable"
+  ],
+  "expected_blocks": 10,
+  "required_runtimes": ["bun", "node"],
+  "baseline": null,
+  "candidate": null,
+  "matched_identities": null
+}
