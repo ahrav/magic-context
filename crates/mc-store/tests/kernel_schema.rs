@@ -40,6 +40,7 @@ const EXPECTED_COMPONENTS: &[&str] = &[
     "alignment_projection",
     "mc_kernel_format_marker",
 ];
+const TEST_INCARNATION: &str = "0123456789abcdef0123456789abcdef";
 
 fn open_profiled() -> (tempfile::TempDir, Connection) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -51,7 +52,7 @@ fn open_profiled() -> (tempfile::TempDir, Connection) {
 #[test]
 fn kernel_schema_has_one_ordered_full_shape() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).expect("bootstrap");
+    apply_kernel_schema(&mut conn, TEST_INCARNATION, 1_000).expect("bootstrap");
 
     assert_eq!(KERNEL_SCHEMA_COMPONENT_NAMES, EXPECTED_COMPONENTS);
     assert_eq!(kernel_schema_inventory(&conn).unwrap(), EXPECTED_COMPONENTS);
@@ -87,7 +88,7 @@ fn kernel_profile_is_strict_and_verified() {
 #[test]
 fn first_root_transaction_resolves_deferred_registry_cycle() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, TEST_INCARNATION, 1_000).unwrap();
 
     let tx = conn.transaction().unwrap();
     tx.execute(
@@ -117,7 +118,7 @@ fn first_root_transaction_resolves_deferred_registry_cycle() {
 #[test]
 fn candidate_delete_cascades_scores_but_preserves_admission_audit() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, TEST_INCARNATION, 1_000).unwrap();
     conn.execute(
         "INSERT INTO extraction_runs(
              extraction_run_id, extractor, sensitivity_class, provenance_witness,
@@ -178,7 +179,7 @@ fn candidate_delete_cascades_scores_but_preserves_admission_audit() {
 fn late_bootstrap_failure_leaves_no_partial_schema() {
     let (_dir, mut conn) = open_profiled();
     let error =
-        apply_kernel_schema_with_fault_hook_for_test(&mut conn, "incarnation-1", 1_000, || {
+        apply_kernel_schema_with_fault_hook_for_test(&mut conn, TEST_INCARNATION, 1_000, || {
             Err(rusqlite::Error::InvalidQuery)
         })
         .expect_err("fault must abort bootstrap");
@@ -197,7 +198,7 @@ fn late_bootstrap_failure_leaves_no_partial_schema() {
 #[test]
 fn consumers_checkpoint_independent_outbox_positions() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, TEST_INCARNATION, 1_000).unwrap();
     conn.execute(
         "INSERT INTO commit_log(transaction_id, writer_epoch, recorded_at, actor, cause)
          VALUES ('tx-1', 7, 1, 'test', 'outbox')",
@@ -235,7 +236,7 @@ fn consumers_checkpoint_independent_outbox_positions() {
 #[test]
 fn every_kernel_table_is_strict_and_enforces_types_and_foreign_keys() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, TEST_INCARNATION, 1_000).unwrap();
 
     let mut stmt = conn
         .prepare(
@@ -285,7 +286,7 @@ fn normal_synchronous_mode_fails_kernel_verification() {
 #[test]
 fn commit_receipt_and_change_identity_shapes_are_not_overconstrained() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, TEST_INCARNATION, 1_000).unwrap();
     conn.execute(
         "INSERT INTO commit_log(
              transaction_id, writer_epoch, recorded_at, actor, cause
@@ -333,7 +334,7 @@ fn commit_receipt_and_change_identity_shapes_are_not_overconstrained() {
 #[test]
 fn abandonment_audit_survives_consumer_deletion() {
     let (_dir, mut conn) = open_profiled();
-    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    apply_kernel_schema(&mut conn, TEST_INCARNATION, 1_000).unwrap();
     conn.execute(
         "INSERT INTO outbox_consumers(consumer_id, checkpoint_outbox_position, updated_at)
          VALUES ('search', 9, 10)",
