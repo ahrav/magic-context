@@ -784,6 +784,28 @@ describe("metamorphic transforms", () => {
         expect(applied, "never applied").toBeGreaterThan(0);
     });
 
+    test("rename refuses a bare symbol another eligible message compounds", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        // Both messages are eligible, so neither is in the untouchable surface, and
+        // the replacement matches exactly — renaming the bare spelling alone would
+        // leave the compound naming the old entity.
+        turns[0]!.assistant = "We could consider buildAPI/v2 and aux_worker.ts.";
+        turns[3] = { user: "Background note about buildAPI.", assistant: "Summary recorded." };
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
+
+        let applied = 0;
+        for (let seed = 0; seed < 30; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            applied += 1;
+            expect(result.scenario.transcript.turns[3]!.user, `seed ${seed}`).toContain("buildAPI");
+        }
+        expect(applied, "never applied").toBeGreaterThan(0);
+    });
+
     test("rename refuses a bare symbol a protected compound name contains", () => {
         const raw = validScenarioRaw();
         const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;

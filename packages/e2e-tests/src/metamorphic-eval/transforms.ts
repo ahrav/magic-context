@@ -968,6 +968,26 @@ const QUOTED_SYMBOL_RE =
     /^(?:[A-Za-z][A-Za-z0-9]*(?:[_./-][A-Za-z0-9]+)+|[a-z]+[A-Z][A-Za-z0-9]*|[A-Z]{2,})$/;
 
 /**
+ * Every boundary-delimited run inside `symbol`, the full spelling included.
+ *
+ * `aux_symbol_1234/v2` contains `aux`, `aux_symbol`, `symbol_1234`, `1234/v2`, and
+ * so on — each of them a complete value inside it, because the boundary rule is
+ * letter-or-digit adjacency and a separator is neither. Renaming one of those
+ * spellings on its own would leave the longer one naming the old entity, since the
+ * replacement matches symbols exactly.
+ */
+function containedSpellings(symbol: string): string[] {
+    const parts = symbol.split(/([_./-])/);
+    const spellings: string[] = [];
+    for (let first = 0; first < parts.length; first += 2) {
+        for (let last = first; last < parts.length; last += 2) {
+            spellings.push(parts.slice(first, last + 1).join(""));
+        }
+    }
+    return spellings;
+}
+
+/**
  * The symbol and the parts a separator divides it into.
  *
  * A probe naming one part refers to the whole entity — a question about the `api`
@@ -1096,6 +1116,16 @@ const renameUnrelatedSymbols: Transform = {
                 }),
             ),
         );
+        // Spellings that some other symbol contains, from every message rather than
+        // only the untouchable ones: two eligible messages can hold `buildAPI` and
+        // `buildAPI/v2`, and the replacement matches exactly, so renaming the bare
+        // one leaves the compound naming the old entity.
+        const containedBySymbol = new Set<string>();
+        for (const symbol of new Set(collisionText.flatMap((text) => symbolsIn(text)))) {
+            for (const spelling of containedSpellings(symbol)) {
+                if (spelling !== symbol) containedBySymbol.add(spelling);
+            }
+        }
         const candidates = [
             ...new Set(
                 messages.flatMap((message) => {
@@ -1131,6 +1161,7 @@ const renameUnrelatedSymbols: Transform = {
             (symbol) =>
                 !blocked.has(symbol) &&
                 !commitHashes.has(symbol) &&
+                !containedBySymbol.has(symbol) &&
                 // A symbol can carry a probe answer without being one: renaming
                 // `api/v2` deletes the complete-value occurrence of `api`.
                 !answers.some((answer) => containsCompleteValue(symbol, answer)) &&
@@ -1140,6 +1171,10 @@ const renameUnrelatedSymbols: Transform = {
                 !containsCompleteValue(untouchableCorpus, symbol),
         );
         const next = splitmix32(seed);
+        // Enumerated once: the source side does not vary across candidates, and an
+        // exhaustive probe would otherwise rescan the whole transcript for every
+        // claim and absent predicate on each failed candidate.
+        const baselines = evidenceBaselines(scenario);
         // A replacement that aliases a probe-only entity changes the
         // query-to-history relationship as surely as renaming one would, and one
         // aliasing a name that exists only inside a command span collides with an
@@ -1234,11 +1269,7 @@ const renameUnrelatedSymbols: Transform = {
             // evidence comparison the framing and reordering transforms use.
             const turnMap = scenario.transcript.turns.map((_, index) => index);
             if (
-                !preservesEvidenceExactly(
-                    evidenceBaselines(scenario),
-                    turns,
-                    turnMap,
-                ) ||
+                !preservesEvidenceExactly(baselines, turns, turnMap) ||
                 !preservesProbeAnswers(answers, scenario, turns)
             ) {
                 return {
