@@ -359,6 +359,9 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
         if (record.ok && !effects.start_committed) {
             fail("a successful restart must report a committed start");
         }
+        if (record.ok && (state !== "running" || reason !== "started")) {
+            fail("a successful restart contradicts its start effect");
+        }
     } else if (command === "restart" && record.ok) {
         // Guarding only the non-null branch left the evidence-free case open:
         // `{command:"restart", ok:true, effects:null}` would parse and agree

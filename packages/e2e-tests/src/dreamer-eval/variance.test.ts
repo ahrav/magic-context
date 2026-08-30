@@ -8,7 +8,10 @@ const system = {
     bunVersion: "1.3.11",
     opencodeVersion: "1.0.0",
     modelId: "anthropic/model",
+    platform: "linux",
     parserImpl: "ts" as const,
+    pluginEntry: "src" as const,
+    runtimeDigest: "d".repeat(64),
 };
 
 function report(index: number, verdict: VerifyVerdict = "verified"): DreamerEvalRunReport {
@@ -23,6 +26,8 @@ function report(index: number, verdict: VerifyVerdict = "verified"): DreamerEval
         reason: null,
         runFatal: false,
         system,
+        trackedFiles: ["src/cache.ts", "src/config.ts", ".dreamer-eval-fixture"],
+        fixtureRoot: `/fixture-worktree-${index}`,
         poolBefore: [
             {
                 claimId: "claim-cache",
@@ -49,28 +54,6 @@ function report(index: number, verdict: VerifyVerdict = "verified"): DreamerEval
     };
 }
 
-function claim(claimId: string, publicClaimId: string) {
-    return {
-        ...report(0).poolBefore[0]!,
-        claimId,
-        publicClaimId,
-        revisionLocator: `${publicClaimId}@1`,
-    };
-}
-
-function transformReport(
-    index: number,
-    task: "map-memories" | "classify-memories",
-    parsedManifest: unknown[],
-): DreamerEvalRunReport {
-    return {
-        ...report(index),
-        task,
-        poolBefore: [claim("claim-a", "mcm_a"), claim("claim-b", "mcm_b")],
-        parsedManifest,
-    };
-}
-
 describe("dreamer eval variance", () => {
     test("three agreeing reports produce one zero-disagreement histogram", () => {
         const artifact = aggregateDreamerEvalVariance([report(1), report(2), report(3)]);
@@ -78,10 +61,8 @@ describe("dreamer eval variance", () => {
         expect(artifact.claimHistograms).toEqual([
             {
                 claimId: "claim-cache",
-                counts: { verified: 3 },
+                counts: { "verified;files:src/cache.ts": 3 },
                 disagreement: false,
-                observedRuns: 3,
-                missingRuns: 0,
             },
         ]);
         expect(artifact.red).toBe(false);
@@ -93,72 +74,9 @@ describe("dreamer eval variance", () => {
 
         expect(artifact.claimHistograms[0]).toEqual({
             claimId: "claim-cache",
-            counts: { archive: 1, verified: 2 },
+            counts: { archive: 1, "verified;files:src/cache.ts": 2 },
             disagreement: true,
-            observedRuns: 3,
-            missingRuns: 0,
         });
-    });
-
-    test("map histograms sort files and claims without mutating report manifests", () => {
-        const firstManifest = [
-            { publicClaimId: "mcm_b", files: ["z.ts", "a.ts"], independent: false },
-            { publicClaimId: "mcm_a", independent: true },
-        ];
-        const artifact = aggregateDreamerEvalVariance([
-            transformReport(1, "map-memories", firstManifest),
-            transformReport(2, "map-memories", [
-                { publicClaimId: "mcm_a", independent: true },
-                { publicClaimId: "mcm_b", files: ["a.ts", "z.ts"], independent: false },
-            ]),
-        ]);
-
-        expect(artifact.claimHistograms).toEqual([
-            { claimId: "claim-a", counts: { independent: 2 }, disagreement: false, observedRuns: 2, missingRuns: 0 },
-            { claimId: "claim-b", counts: { "files:a.ts,z.ts": 2 }, disagreement: false, observedRuns: 2, missingRuns: 0 },
-        ]);
-        expect(firstManifest[0]!.files).toEqual(["z.ts", "a.ts"]);
-    });
-
-    test("classify histograms cover two claims and expose sparse observations", () => {
-        const artifact = aggregateDreamerEvalVariance([
-            transformReport(1, "classify-memories", [
-                { publicClaimId: "mcm_a", importance: 50, scope: "project", shareable: false },
-                { publicClaimId: "mcm_b", importance: 80, scope: "universe", shareable: true },
-            ]),
-            transformReport(2, "classify-memories", [
-                { publicClaimId: "mcm_a", importance: 50, scope: "project", shareable: false },
-            ]),
-        ]);
-
-        expect(artifact.claimHistograms).toEqual([
-            {
-                claimId: "claim-a",
-                counts: { "importance:50;scope:project;shareable:false": 2 },
-                disagreement: false,
-                observedRuns: 2,
-                missingRuns: 0,
-            },
-            {
-                claimId: "claim-b",
-                counts: { "importance:80;scope:universe;shareable:true": 1 },
-                disagreement: false,
-                observedRuns: 1,
-                missingRuns: 1,
-            },
-        ]);
-    });
-
-    test("expected repeats expose wholly missing claims and interrupted runs", () => {
-        const sparse = transformReport(1, "classify-memories", []);
-        const artifact = aggregateDreamerEvalVariance([sparse], 3);
-        expect(artifact.repeatCount).toBe(3);
-        expect(artifact.runs).toHaveLength(1);
-        expect(artifact.red).toBe(true);
-        expect(artifact.claimHistograms).toEqual([
-            { claimId: "claim-a", counts: {}, disagreement: false, observedRuns: 0, missingRuns: 3 },
-            { claimId: "claim-b", counts: {}, disagreement: false, observedRuns: 0, missingRuns: 3 },
-        ]);
     });
 
     test("mixed system tuples are rejected", () => {
@@ -170,14 +88,279 @@ describe("dreamer eval variance", () => {
         );
     });
 
-    test("empty, scenario-mismatched, and task-mismatched report sets are rejected", () => {
-        expect(() => aggregateDreamerEvalVariance([])).toThrow("variance requires at least one report");
-        expect(() =>
-            aggregateDreamerEvalVariance([report(1), { ...report(2), scenarioId: "dme-other-pool" }]),
-        ).toThrow("variance reports must share one scenario and task");
-        expect(() =>
-            aggregateDreamerEvalVariance([report(1), { ...report(2), task: "verify-broad" }]),
-        ).toThrow("variance reports must share one scenario and task");
+    test("the same run counted twice is rejected", () => {
+        // One invocation must not read as several agreeing runs: repeatCount and
+        // every bucket would be inflated and the artifact would overstate stability.
+        expect(() => aggregateDreamerEvalVariance([report(1), report(1)])).toThrow(
+            "variance reports must have distinct run ids",
+        );
+    });
+
+    test("reports from different platforms are not one system", () => {
+        // canonicalObservedPath and production's path handling are separator-aware,
+        // and a case-insensitive filesystem changes what resolves, so the same
+        // manifest can score differently per platform.
+        const elsewhere = report(2);
+        elsewhere.system = { ...elsewhere.system, platform: "win32" };
+        expect(() => aggregateDreamerEvalVariance([report(1), elsewhere])).toThrow(
+            "variance reports must share one system tuple",
+        );
+    });
+
+    test("differing plugin bytes are not one system", () => {
+        // repoCommitSha describes the checkout; the digest describes what ran. A
+        // dirty tree or a stale bundle makes two runs at one commit execute
+        // different plugin implementations, and they must not aggregate as repeats.
+        const rebuilt = report(2);
+        rebuilt.system = { ...rebuilt.system, runtimeDigest: "e".repeat(64) };
+        expect(() => aggregateDreamerEvalVariance([report(1), rebuilt])).toThrow(
+            "variance reports must share one system tuple",
+        );
+
+        const bundled = report(2);
+        bundled.system = { ...bundled.system, pluginEntry: "dist" };
+        expect(() => aggregateDreamerEvalVariance([report(1), bundled])).toThrow(
+            "variance reports must share one system tuple",
+        );
+    });
+
+    test("a reordered system tuple is the same system", () => {
+        const reordered = report(2);
+        // Same five fields, rebuilt in another key order — what a report that
+        // round-tripped through a different serializer carries.
+        reordered.system = {
+            runtimeDigest: system.runtimeDigest,
+            pluginEntry: system.pluginEntry,
+            parserImpl: system.parserImpl,
+            platform: system.platform,
+            modelId: system.modelId,
+            opencodeVersion: system.opencodeVersion,
+            bunVersion: system.bunVersion,
+            repoCommitSha: system.repoCommitSha,
+        };
+
+        expect(() => aggregateDreamerEvalVariance([report(1), reordered])).not.toThrow();
+    });
+
+    test("a repeat with no verdict for a claim is counted, not dropped", () => {
+        const lost = report(3);
+        lost.status = "ERROR";
+        lost.reason = "provider-failure";
+        lost.rawManifest = null;
+        lost.parsedManifest = null;
+
+        const artifact = aggregateDreamerEvalVariance([report(1), report(2), lost]);
+
+        expect(artifact.repeatCount).toBe(3);
+        expect(artifact.claimHistograms).toEqual([
+            { claimId: "claim-cache", counts: { missing: 1, "verified;files:src/cache.ts": 2 }, disagreement: true },
+        ]);
+    });
+
+    test("a claim missing from every repeat still appears in the artifact", () => {
+        const lost = (index: number): DreamerEvalRunReport => {
+            const entry = report(index);
+            entry.status = "ERROR";
+            entry.reason = "provider-failure";
+            entry.rawManifest = null;
+            entry.parsedManifest = null;
+            return entry;
+        };
+
+        const artifact = aggregateDreamerEvalVariance([lost(1), lost(2)]);
+
+        expect(artifact.claimHistograms).toEqual([
+            { claimId: "claim-cache", counts: { missing: 2 }, disagreement: false },
+        ]);
+    });
+
+    test("duplicate mapped paths do not read as a different verdict", () => {
+        const mapReport = (index: number, files: string[]): DreamerEvalRunReport => {
+            const entry = report(index);
+            entry.task = "map-memories";
+            entry.parsedManifest = [{ publicClaimId: "mcm_claim", files, independent: false }];
+            return entry;
+        };
+
+        const artifact = aggregateDreamerEvalVariance([
+            mapReport(1, ["src/cache.ts"]),
+            mapReport(2, ["src/cache.ts", "src/cache.ts"]),
+        ]);
+
+        expect(artifact.claimHistograms).toEqual([
+            {
+                claimId: "claim-cache",
+                counts: { "independent:false;files:src/cache.ts": 2 },
+                disagreement: false,
+            },
+        ]);
+    });
+
+    test("map repeats resolve spellings against the report's tracked set", () => {
+        const mapReport = (index: number, files: string[]): DreamerEvalRunReport => {
+            const entry = report(index);
+            entry.task = "map-memories";
+            // A map task has no mapping preconditions, so its capture projects no
+            // files. The universe has to come from the report's own tracked set.
+            entry.poolBefore = [{ ...entry.poolBefore[0]!, files: [] }];
+            entry.parsedManifest = [{ publicClaimId: "mcm_claim", files, independent: false }];
+            return entry;
+        };
+
+        expect(
+            aggregateDreamerEvalVariance([
+                mapReport(1, ["src/cache.ts"]),
+                mapReport(2, ["SRC/CACHE.ts"]),
+            ]).claimHistograms[0],
+        ).toMatchObject({
+            counts: { "independent:false;files:src/cache.ts": 2 },
+            disagreement: false,
+        });
+    });
+
+    test("an absolute path in one repeat matches a relative one in another", () => {
+        const mapReport = (index: number, files: string[]): DreamerEvalRunReport => {
+            const entry = report(index);
+            entry.task = "map-memories";
+            entry.parsedManifest = [{ publicClaimId: "mcm_claim", files, independent: false }];
+            return entry;
+        };
+
+        // Each repeat has its own fixture root, so resolving against the report's
+        // own root is what makes these one applied mapping.
+        expect(
+            aggregateDreamerEvalVariance([
+                mapReport(1, ["src/cache.ts"]),
+                mapReport(2, ["/fixture-worktree-2/src/cache.ts"]),
+            ]).claimHistograms[0],
+        ).toMatchObject({
+            counts: { "independent:false;files:src/cache.ts": 2 },
+            disagreement: false,
+        });
+    });
+
+    test("equivalent path spellings do not read as a different mapping", () => {
+        const mapReport = (index: number, files: string[]): DreamerEvalRunReport => {
+            const entry = report(index);
+            entry.task = "map-memories";
+            entry.parsedManifest = [{ publicClaimId: "mcm_claim", files, independent: false }];
+            return entry;
+        };
+
+        // `scoreMapManifest` canonicalizes before comparing, so these two runs
+        // record the same tracked mapping and the artifact must agree.
+        const artifact = aggregateDreamerEvalVariance([
+            mapReport(1, ["src/cache.ts"]),
+            mapReport(2, ["src/./cache.ts"]),
+        ]);
+
+        expect(artifact.claimHistograms).toEqual([
+            {
+                claimId: "claim-cache",
+                counts: { "independent:false;files:src/cache.ts": 2 },
+                disagreement: false,
+            },
+        ]);
+    });
+
+    test("verify repeats sharing a verdict but not a payload disagree", () => {
+        const verifyReport = (index: number, files: string[]): DreamerEvalRunReport => {
+            const entry = report(index);
+            entry.parsedManifest = {
+                verified: [{ publicClaimId: "mcm_claim", files }],
+                updated: [],
+                archived: [],
+            };
+            return entry;
+        };
+
+        // scoreVerifyManifest judges a retained claim's file set, so one repeat
+        // can pass while the other fails wrong-mapping. The verdict word alone
+        // reported both as unanimous.
+        const artifact = aggregateDreamerEvalVariance([
+            verifyReport(1, ["src/cache.ts"]),
+            verifyReport(2, ["src/cache.ts", "src/config.ts"]),
+        ]);
+
+        expect(artifact.claimHistograms[0]).toMatchObject({ disagreement: true });
+        expect(Object.keys(artifact.claimHistograms[0]!.counts).sort()).toEqual([
+            "verified;files:src/cache.ts",
+            "verified;files:src/cache.ts,src/config.ts",
+        ]);
+
+        // An untracked extra is not part of the applied mapping: production drops
+        // it, so it must not read as disagreement.
+        expect(
+            aggregateDreamerEvalVariance([
+                verifyReport(1, ["src/cache.ts"]),
+                verifyReport(2, ["src/cache.ts", "src/untracked.ts"]),
+            ]).claimHistograms[0],
+        ).toMatchObject({ disagreement: false });
+    });
+
+    test("update repeats differ by replacement body, not by surrounding whitespace", () => {
+        const updateReport = (index: number, content: string): DreamerEvalRunReport => {
+            const entry = report(index);
+            entry.parsedManifest = {
+                verified: [],
+                updated: [{ publicClaimId: "mcm_claim", files: ["src/cache.ts"], content }],
+                archived: [],
+            };
+            return entry;
+        };
+
+        // Production stores entry.content.trim(), so surrounding whitespace is
+        // not part of the applied state.
+        expect(
+            aggregateDreamerEvalVariance([
+                updateReport(1, "Cache holds 4096 entries."),
+                updateReport(2, "  Cache holds 4096 entries.  "),
+            ]).claimHistograms[0],
+        ).toMatchObject({ disagreement: false });
+
+        // Case is part of it: the trim is the only normalization production
+        // applies to a stored body. normalizeMemoryContent lowercases for content
+        // hashing, and the scorer lowercases for anchor matching, but neither
+        // decides what the claim ends up holding.
+        expect(
+            aggregateDreamerEvalVariance([
+                updateReport(1, "Cache holds 4096 entries."),
+                updateReport(2, "cache holds 4096 entries."),
+            ]).claimHistograms[0],
+        ).toMatchObject({ disagreement: true });
+
+        // A different body is a different stored content, which is real variance.
+        expect(
+            aggregateDreamerEvalVariance([
+                updateReport(1, "Cache holds 4096 entries."),
+                updateReport(2, "Cache holds 2048 entries."),
+            ]).claimHistograms[0],
+        ).toMatchObject({ disagreement: true });
+    });
+
+    test("a partial classification resolves omitted fields like the scorer does", () => {
+        const classifyReport = (index: number, entry: Record<string, unknown>): DreamerEvalRunReport => {
+            const built = report(index);
+            built.task = "classify-memories";
+            built.parsedManifest = [{ publicClaimId: "mcm_claim", ...entry }];
+            return built;
+        };
+
+        // poolBefore holds importance 70, scope project, sharing private. One run
+        // states every field, the other omits the two it leaves unchanged; both
+        // apply the same classification, so the artifact must not call it variance.
+        const artifact = aggregateDreamerEvalVariance([
+            classifyReport(1, { importance: 90, scope: "project", shareable: false }),
+            classifyReport(2, { importance: 90 }),
+        ]);
+
+        expect(artifact.claimHistograms).toEqual([
+            {
+                claimId: "claim-cache",
+                counts: { "importance:90;scope:project;shareable:false": 2 },
+                disagreement: false,
+            },
+        ]);
     });
 
     test("any red run marks the set red and a run-fatal report marks it run-fatal", () => {

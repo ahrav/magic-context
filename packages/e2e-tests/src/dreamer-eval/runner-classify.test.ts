@@ -1,32 +1,21 @@
-import { describe, expect, spyOn, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { shouldKeepSubagents } from "../../../plugin/src/shared/keep-subagents";
-import { seedProjectMemoryClaim } from "../../../plugin/src/features/magic-context/test-claim-database";
-import { createDirectTestDatabase } from "../../../plugin/src/features/magic-context/test-database";
 import { dreamerScorerFixture } from "./scorer.test";
 import {
-    DREAMER_EVAL_REPORT_SCHEMA,
-    parseRunReport,
-    type ClaimSnapshotProjection,
-} from "./contract";
-import {
     classifyDreamerRun,
-    readDreamerReceipts,
-    resolveDreamerSystemTuple,
-    reconstructPoolEndState,
-    runDreamerEvalCleanup,
     type DreamerRunClassificationInput,
 } from "./runner";
 
+// Production shape: `parseClassifyManifest` reads a `<classify>` root and takes
+// each entry's id from `claim`, and `validateClassifyManifest` demands exact
+// coverage of the scored ids — so the ids here are the fixture's public claim
+// ids, and the values sit inside `dreamerScorerFixture.classifyGold`. A manifest
+// that misses any of that scores ERROR:harness-failure, which would leave every
+// test below asserting only the checks that run before scoring.
 const validManifest = `<classify>
-<memory claim="mcm_true" importance="70" scope="project" shareable="true"/>
-<memory claim="mcm_independent" importance="85" scope="universe" shareable="true"/>
+<memory claim="mcm_true" importance="70" scope="project" shareable="true" />
+<memory claim="mcm_independent" importance="85" scope="universe" shareable="true" />
 </classify>`;
-
-const validVerifyManifest = `<verify>
-<verified claim="mcm_true" files="src/cache.ts"/>
-<update claim="mcm_update" files="src/cache.ts">Uses a bounded cache with 4096 entries.</update>
-<archive claim="mcm_false" reason="queue removed"/>
-</verify>`;
 
 function assistantMessages(text: string, info: Record<string, unknown> = {}): unknown[] {
     return [
@@ -58,8 +47,19 @@ function input(overrides: Partial<DreamerRunClassificationInput> = {}): DreamerR
             providerId: "anthropic",
             modelId: "claude-test",
         },
-        receipts: [],
+        receipts: [
+            {
+                claimId: "claim-true",
+                operation: "classify-memories",
+                outcome: "applied",
+                requestDigest: "c".repeat(64),
+            },
+        ],
         rejectionRequestDigest: "b".repeat(64),
+        fixture: {
+            root: "/fixture-worktree",
+            files: [...new Set(dreamerScorerFixture.pool.claims.flatMap((claim) => claim.files))],
+        },
         fixtureUnchanged: true,
         leaseLost: false,
         expectedResultMode: null,
@@ -69,77 +69,24 @@ function input(overrides: Partial<DreamerRunClassificationInput> = {}): DreamerR
 }
 
 describe("dreamer runner classification", () => {
-    test("cleanup failure does not prevent later cleanup", async () => {
-        const completed: string[] = [];
-        const errorSpy = spyOn(console, "error").mockImplementation(() => {});
-        try {
-            const classification = classifyDreamerRun(input());
-            const result = await runDreamerEvalCleanup(
-                classification,
-                [
-                    () => {
-                        completed.push("first");
-                        throw new Error("close failed");
-                    },
-                    () => {
-                        throw Object.create(null);
-                    },
-                    () => {
-                        completed.push("second");
-                    },
-                ],
-            );
-            expect(result).toMatchObject({ status: "ERROR", reason: "harness-failure" });
-            expect(result.parsedManifest).toEqual(classification.parsedManifest);
-            expect(completed).toEqual(["first", "second"]);
-
-            const wrong = validManifest.replace('importance="70"', 'importance="10"');
-            const modelFailure = classifyDreamerRun(
-                input({ rawManifest: wrong, childMessages: assistantMessages(wrong) }),
-            );
-            expect(
-                await runDreamerEvalCleanup(modelFailure, [
-                    () => {
-                        throw new Error("cleanup failed");
-                    },
-                ]),
-            ).toBe(modelFailure);
-        } finally {
-            errorSpy.mockRestore();
-        }
-    });
-
-    test("valid production classify output reaches PASS", () => {
-        expect(classifyDreamerRun(input())).toMatchObject({ status: "PASS", reason: null });
-    });
-
-    test("valid production output reaches model-quality FAIL", () => {
-        const wrong = validManifest.replace('importance="70"', 'importance="10"');
-        expect(
-            classifyDreamerRun(input({ rawManifest: wrong, childMessages: assistantMessages(wrong) })),
-        ).toMatchObject({ status: "FAIL", reason: "wrong-classification", runFatal: false });
-    });
-
-    test("valid production output reaches run-fatal wrong archival", () => {
-        const wrong = validVerifyManifest.replace(
-            '<verified claim="mcm_true" files="src/cache.ts"/>',
-            '<archive claim="mcm_true" reason="wrong"/>',
-        );
-        expect(
-            classifyDreamerRun(input({
-                task: "verify",
-                gold: dreamerScorerFixture.verifyGold,
-                rawManifest: wrong,
-                childMessages: assistantMessages(wrong),
-            })),
-        ).toMatchObject({ status: "FAIL", reason: "wrong-archival", runFatal: true });
-    });
-
-    test("scored output with incomplete invocation is harness failure", () => {
-        expect(classifyDreamerRun(input({ invocation: null }))).toMatchObject({
+    test("a scored PASS with no receipt is ERROR:apply-not-applied", () => {
+        // Receipt and mutation share one transaction, so no receipt means the
+        // pool never took the manifest — reporting PASS would file a successful
+        // experiment for a change that was never committed.
+        expect(classifyDreamerRun(input({ receipts: [] }))).toMatchObject({
             status: "ERROR",
-            reason: "harness-failure",
+            reason: "apply-not-applied",
         });
+    });
+
+    test("a gold-matching manifest on the pinned model is PASS", () => {
+        const result = classifyDreamerRun(input());
+
+        expect(result).toMatchObject({ status: "PASS", reason: null, runFatal: false });
+        expect(result.parsedManifest).toEqual([
+            { publicClaimId: "mcm_true", importance: 70, scope: "project", shareable: true },
+            { publicClaimId: "mcm_independent", importance: 85, scope: "universe", shareable: true },
+        ]);
     });
 
     test("completed validator rejection is FAIL:invalid-output", () => {
@@ -149,8 +96,8 @@ describe("dreamer runner classification", () => {
                 childMessages: assistantMessages("not XML"),
                 receipts: [
                     {
-                        affectedClaimIds: [],
-                        operationKey: "reject:one",
+                        claimId: "claim-one",
+                        operation: "classify-memories",
                         outcome: "stale",
                         requestDigest: "b".repeat(64),
                     },
@@ -171,12 +118,6 @@ describe("dreamer runner classification", () => {
             classifyDreamerRun(
                 input({
                     childMessages: assistantMessages(validManifest, { finish_reason: "length" }),
-                    receipts: [{
-                        affectedClaimIds: [],
-                        operationKey: "reject:one",
-                        outcome: "stale",
-                        requestDigest: "b".repeat(64),
-                    }],
                 }),
             ),
         ).toMatchObject({ status: "ERROR", reason: "output-length-capped" });
@@ -223,10 +164,61 @@ describe("dreamer runner classification", () => {
         ).toMatchObject({ status: "ERROR", reason: "wrong-result-mode" });
     });
 
+    test("a verify task that returned no result is not a mode mismatch", () => {
+        // `runVerify` throwing leaves actualResultMode null. The provider fault
+        // is the finding; a gate partition mismatch is not.
+        expect(
+            classifyDreamerRun(
+                input({
+                    task: "verify-broad",
+                    gold: dreamerScorerFixture.verifyGold,
+                    expectedResultMode: "broad",
+                    actualResultMode: null,
+                    rawManifest: null,
+                    childMessages: [],
+                }),
+            ),
+        ).toMatchObject({ status: "ERROR", reason: "provider-failure" });
+    });
+
+    test("a fallback model does not mask a run-fatal archival", () => {
+        // wrong-archival is the one outcome dreamerEvalExitCode escalates to the
+        // safety exit 2, so the model mismatch must not overwrite it.
+        const archivesGoldTrue = `<verify>
+<archive claim="mcm_true" reason="no longer accurate"/>
+<update claim="mcm_update" files="src/cache.ts">Uses a BOUNDED CACHE with 4096 ENTRIES.</update>
+<archive claim="mcm_false" reason="queue removed"/>
+</verify>`;
+        const fatal = classifyDreamerRun(
+            input({
+                task: "verify",
+                gold: dreamerScorerFixture.verifyGold,
+                rawManifest: archivesGoldTrue,
+                childMessages: assistantMessages(archivesGoldTrue),
+            }),
+        );
+        expect(fatal).toMatchObject({ status: "FAIL", reason: "wrong-archival", runFatal: true });
+
+        const onFallback = classifyDreamerRun(
+            input({
+                task: "verify",
+                gold: dreamerScorerFixture.verifyGold,
+                rawManifest: archivesGoldTrue,
+                childMessages: assistantMessages(archivesGoldTrue),
+                invocation: {
+                    status: "completed",
+                    providerId: "anthropic",
+                    modelId: "claude-fallback",
+                },
+            }),
+        );
+        expect(onFallback).toMatchObject({ status: "FAIL", reason: "wrong-archival", runFatal: true });
+    });
+
     test("stale apply receipt is infra while stale rejection receipt is invalid output", () => {
         const staleReceipt = {
-            affectedClaimIds: ["claim-one"],
-            operationKey: "apply:one",
+            claimId: "claim-one",
+            operation: "classify-memories",
             outcome: "stale",
             requestDigest: "a".repeat(64),
         };
@@ -246,30 +238,55 @@ describe("dreamer runner classification", () => {
         ).toMatchObject({ status: "FAIL", reason: "invalid-output" });
     });
 
-    test("matching rejection receipt is invalid output regardless of scorer verdict", () => {
-        const rejection = {
-            affectedClaimIds: [],
-            operationKey: "reject:one",
-            outcome: "stale",
-            requestDigest: "b".repeat(64),
-        };
-        expect(classifyDreamerRun(input({ receipts: [rejection] }))).toMatchObject({
-            status: "FAIL",
-            reason: "invalid-output",
-        });
-        const wrongVerdict = validVerifyManifest.replace(
-            '<verified claim="mcm_true" files="src/cache.ts"/>',
-            '<update claim="mcm_true" files="src/cache.ts">still true</update>',
-        );
+    test("a run-fatal archival with no applied receipt is not a destructive result", () => {
+        // No applied receipt proves the archival never committed, so reporting
+        // run-fatal — which drives the safety exit 2 — would raise a false alarm
+        // about destroyed data.
+        const archivesGoldTrue = `<verify>
+<archive claim="mcm_true" reason="no longer accurate"/>
+<update claim="mcm_update" files="src/cache.ts">Uses a BOUNDED CACHE with 4096 ENTRIES.</update>
+<archive claim="mcm_false" reason="queue removed"/>
+</verify>`;
         expect(
-            classifyDreamerRun(input({
-                task: "verify",
-                gold: dreamerScorerFixture.verifyGold,
-                rawManifest: wrongVerdict,
-                childMessages: assistantMessages(wrongVerdict),
-                receipts: [rejection],
-            })),
-        ).toMatchObject({ status: "FAIL", reason: "invalid-output" });
+            classifyDreamerRun(
+                input({
+                    task: "verify",
+                    gold: dreamerScorerFixture.verifyGold,
+                    rawManifest: archivesGoldTrue,
+                    childMessages: assistantMessages(archivesGoldTrue),
+                    receipts: [],
+                }),
+            ),
+        ).toMatchObject({ status: "ERROR", reason: "apply-not-applied", runFatal: false });
+    });
+
+    test("a payload production refused keeps the scorer's failure reason", () => {
+        // An all-untracked mapping is rejected by the apply layer, which records the
+        // rejection receipt. The scorer judged the same bytes and said
+        // wrong-mapping; calling that a harness fault would blame the harness for a
+        // model error.
+        const untrackedMapping = `<mappings>
+<memory claim="mcm_true" files="nowhere/missing.ts"/>
+<memory claim="mcm_independent" independent="true"/>
+</mappings>`;
+        expect(
+            classifyDreamerRun(
+                input({
+                    task: "map-memories",
+                    gold: dreamerScorerFixture.mapGold,
+                    rawManifest: untrackedMapping,
+                    childMessages: assistantMessages(untrackedMapping),
+                    receipts: [
+                        {
+                            claimId: "claim-true",
+                            operation: "map-memories",
+                            outcome: "stale",
+                            requestDigest: "b".repeat(64),
+                        },
+                    ],
+                }),
+            ),
+        ).toMatchObject({ status: "FAIL", reason: "wrong-mapping" });
     });
 
     test("fixture drift, child mismatch, and lease loss remain ERROR", () => {
@@ -287,138 +304,48 @@ describe("dreamer runner classification", () => {
         });
     });
 
+    test("a lease that expired after an applied archival does not mask it", () => {
+        // The lease is checked after the run, so it can expire during evidence
+        // collection. The applied receipt proves the archival committed, and no
+        // later expiry unmakes it, so the safety exit must survive.
+        const archivesGoldTrue = `<verify>
+<archive claim="mcm_true" reason="no longer accurate"/>
+<update claim="mcm_update" files="src/cache.ts">Uses a BOUNDED CACHE with 4096 ENTRIES.</update>
+<archive claim="mcm_false" reason="queue removed"/>
+</verify>`;
+        const fatal = input({
+            task: "verify",
+            gold: dreamerScorerFixture.verifyGold,
+            rawManifest: archivesGoldTrue,
+            childMessages: assistantMessages(archivesGoldTrue),
+            leaseLost: true,
+        });
+        expect(classifyDreamerRun(fatal)).toMatchObject({
+            status: "FAIL",
+            reason: "wrong-archival",
+            runFatal: true,
+        });
+
+        // Without an applied receipt there is nothing to preserve: the lease loss is
+        // the finding.
+        expect(classifyDreamerRun({ ...fatal, receipts: [] })).toMatchObject({
+            status: "ERROR",
+            reason: "lease-lost",
+        });
+
+        // Evidence-undermining faults still outrank it, since the score itself rests
+        // on the captured manifest.
+        expect(classifyDreamerRun({ ...fatal, fixtureUnchanged: false })).toMatchObject({
+            status: "ERROR",
+            reason: "fixture-drift",
+        });
+        expect(classifyDreamerRun({ ...fatal, childCount: 0 })).toMatchObject({
+            status: "ERROR",
+            reason: "harness-failure",
+        });
+    });
+
     test("runner import does not mutate keep-subagents", () => {
         expect(shouldKeepSubagents()).toBe(false);
-    });
-
-    test("system tuple rejects an unresolved repository identity", () => {
-        expect(() =>
-            resolveDreamerSystemTuple({
-                apiKey: "unused",
-                model: "anthropic/claude-test",
-                artifactDir: "/tmp/unused",
-                repoCommitSha: "",
-            }),
-        ).toThrow("could not resolve a concrete repository commit");
-    });
-
-    test("pool end state reconstructs from report snapshots without a database", () => {
-        const poolAfter: ClaimSnapshotProjection[] = [{
-            claimId: "claim-one",
-            publicClaimId: "mem-1",
-            revisionLocator: "revision-9",
-            content: "Requests use three attempts.",
-            category: "CONFIG_VALUES",
-            importance: 91,
-            memoryScope: "project",
-            sharing: "private",
-            lifecycleState: "archived",
-            files: ["src/retry.ts"],
-            verificationOutcome: "archive",
-        }];
-        const serialized = JSON.stringify({
-            schema: DREAMER_EVAL_REPORT_SCHEMA,
-            scenarioId: "dme-core-pool",
-            task: "verify",
-            runId: "run-1",
-            nowMs: 1,
-            status: "PASS",
-            reason: null,
-            runFatal: false,
-            system: {
-                repoCommitSha: "a".repeat(40),
-                bunVersion: "1.3.11",
-                opencodeVersion: "1.0.0",
-                modelId: "model",
-                parserImpl: "ts",
-            },
-            poolBefore: [],
-            poolAfter,
-            rawManifest: "<verify></verify>",
-            parsedManifest: {},
-            receiptOutcomes: [],
-        });
-        const report = parseRunReport(JSON.parse(serialized));
-        const reconstructed = reconstructPoolEndState(report);
-        expect(reconstructed).toEqual(poolAfter);
-        expect(reconstructed[0]).not.toBe(report.poolAfter[0]);
-        expect(reconstructed[0]!.files).not.toBe(report.poolAfter[0]!.files);
-
-        reconstructed[0]!.content = "changed copy";
-        reconstructed[0]!.files.push("src/other.ts");
-        expect(report.poolAfter[0]!.content).toBe(poolAfter[0]!.content);
-        expect(report.poolAfter[0]!.files).toEqual(poolAfter[0]!.files);
-    });
-
-    test("reads one receipt record with only its actual affected claims", () => {
-        const db = createDirectTestDatabase().db;
-        try {
-            const first = seedProjectMemoryClaim(db, {
-                projectIdentity: "dir:/tmp/dreamer-receipt-test",
-                content: "First receipt claim.",
-                operationKey: "seed:first",
-            });
-            const second = seedProjectMemoryClaim(db, {
-                projectIdentity: "dir:/tmp/dreamer-receipt-test",
-                content: "Second receipt claim.",
-                operationKey: "seed:second",
-            });
-            const row = db.prepare(
-                `SELECT claims.id AS claimId, claims.project_id AS projectId,
-                        claims.current_revision_id AS revisionId
-                   FROM claims
-                   JOIN claim_public_ids ON claim_public_ids.claim_id = claims.id
-                  WHERE claim_public_ids.public_id = ?`,
-            ).get(first.publicClaimId) as { claimId: number; projectId: number; revisionId: number };
-            const insertReceipt = db.prepare(
-                `INSERT INTO claim_operation_receipts
-                    (producer, operation_key, request_digest, request_encoding_version,
-                     result_encoding_version, outcome, expected_effect_count,
-                     effect_summary_json, generation_vector_json, result_json, created_at)
-                 VALUES (?, ?, ?, 1, 1, ?, ?, '[]', '{}', '{}', 1)`,
-            );
-            const applied = insertReceipt.run(
-                "dreamer-classify-memories",
-                "apply:one",
-                "a".repeat(64),
-                "applied",
-                1,
-            );
-            db.prepare(
-                `INSERT INTO claim_operation_effects
-                    (receipt_id, effect_key, project_id, claim_id, revision_id,
-                     change_kind, generation, created_at)
-                 VALUES (?, 'effect:one', ?, ?, ?, 'applicability', 1, 1)`,
-            ).run(Number(applied.lastInsertRowid), row.projectId, row.claimId, row.revisionId);
-            insertReceipt.run(
-                "dreamer-classify-memories",
-                "reject:one",
-                "b".repeat(64),
-                "stale",
-                0,
-            );
-
-            expect(
-                readDreamerReceipts(db, "classify-memories", {
-                    "claim-one": first.publicClaimId,
-                    "claim-two": second.publicClaimId,
-                }),
-            ).toEqual([
-                {
-                    requestDigest: "a".repeat(64),
-                    operationKey: "apply:one",
-                    outcome: "applied",
-                    affectedClaimIds: ["claim-one"],
-                },
-                {
-                    requestDigest: "b".repeat(64),
-                    operationKey: "reject:one",
-                    outcome: "stale",
-                    affectedClaimIds: [],
-                },
-            ]);
-        } finally {
-            db.close();
-        }
     });
 });

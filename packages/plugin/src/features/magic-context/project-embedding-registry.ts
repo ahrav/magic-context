@@ -484,12 +484,27 @@ function commitPrimarySynapseLane(
     );
     const providerIdentity = getEmbeddingProviderIdentity(config);
     const chunkModelId = getChunkEmbeddingModelId(config, providerIdentity);
+    const runtimeFingerprint = getRuntimeFingerprint(config);
+    // A rebind re-runs initialization against the replacement daemon and
+    // reports the same pinned metadata, so this fires again with an identity
+    // that did not move. Advancing the generation then invalidates in-flight
+    // lanes captured before the rebind: `stillCurrent()` compares exactly this
+    // counter, and a lane that fails it discards the vectors the rebind just
+    // recovered. Republish only what actually changed, matching the
+    // re-registration path, which likewise holds the generation steady when a
+    // caller re-registers an unchanged config.
+    const identityUnchanged =
+        registration.providerIdentity === providerIdentity &&
+        registration.chunkModelId === chunkModelId &&
+        registration.runtimeFingerprint === runtimeFingerprint;
     registration.config = config;
     registration.providerIdentity = providerIdentity;
-    registration.runtimeFingerprint = getRuntimeFingerprint(config);
+    registration.runtimeFingerprint = runtimeFingerprint;
     registration.modelId = providerIdentity;
     registration.chunkModelId = chunkModelId;
-    registration.generation = ++globalRegistrationGeneration;
+    if (!identityUnchanged) {
+        registration.generation = ++globalRegistrationGeneration;
+    }
     registration.db.transaction(() => {
         recordActiveEmbeddingIdentityInCurrentTransaction(
             registration.db,

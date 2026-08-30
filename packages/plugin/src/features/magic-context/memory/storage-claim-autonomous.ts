@@ -307,6 +307,28 @@ export function runAutonomousCreationManifestInCurrentTransaction<T>(args: {
     return applyResult(operation);
 }
 
+/**
+ * Digest identifying one rejection of one raw manifest under one identity.
+ * Consumers that need to recognize a rejection receipt (rather than record
+ * one) must derive the digest here so it cannot drift from the recorded value.
+ */
+export function autonomousManifestRejectionRequestDigest(args: {
+    identity: AutonomousManifestIdentity;
+    rawManifest: string;
+}): string {
+    return computeClaimOperationRequestDigest({
+        identity: {
+            batchId: args.identity.batchId,
+            leaseGeneration: String(args.identity.leaseGeneration),
+            leaseKey: args.identity.leaseKey,
+            runId: args.identity.runId,
+            task: args.identity.task,
+        },
+        manifestDigest: sha256Utf8Hex(args.rawManifest),
+        operation: "reject-autonomous-project-memory-manifest",
+    });
+}
+
 function rejectionEnvelope(args: {
     identity: AutonomousManifestIdentity;
     rawManifest: string;
@@ -314,29 +336,8 @@ function rejectionEnvelope(args: {
     return {
         producer: args.identity.producer,
         operationKey: operationKey(args.identity),
-        requestDigest: computeAutonomousManifestRejectionRequestDigest(
-            args.identity,
-            args.rawManifest,
-        ),
+        requestDigest: autonomousManifestRejectionRequestDigest(args),
     };
-}
-
-export function computeAutonomousManifestRejectionRequestDigest(
-    identity: AutonomousManifestIdentity,
-    rawManifest: string,
-): string {
-    assertIdentity(identity);
-    return computeClaimOperationRequestDigest({
-        identity: {
-            batchId: identity.batchId,
-            leaseGeneration: String(identity.leaseGeneration),
-            leaseKey: identity.leaseKey,
-            runId: identity.runId,
-            task: identity.task,
-        },
-        manifestDigest: sha256Utf8Hex(rawManifest),
-        operation: "reject-autonomous-project-memory-manifest",
-    });
 }
 
 /** Records a rejection result only within an active transaction. */

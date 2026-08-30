@@ -59,6 +59,14 @@ const RETIREMENT_SETTLE_GRACE_MS = 50;
  * reserved control frames, and small control-plane bodies.
  */
 const DEFAULT_MEMORY_OVERHEAD_BYTES = 1_048_576;
+/**
+ * Retained-item ceiling for one stream-mode request. The pending byte budget
+ * admits roughly 65 MiB of wire bytes, which a peer can fill with millions of
+ * minimal JSON items whose retained decode overhead (object, text, parsed
+ * value) the budget never counts. Bounding item count keeps a stream's heap
+ * cost proportional to a figure the client actually enforces.
+ */
+const DEFAULT_MAX_STREAM_ITEMS = 100_000;
 const EMPTY_JSON_BODY: JsonReceiveBody = Object.freeze({
     kind: "json",
     byteLength: 0,
@@ -142,6 +150,14 @@ export interface RequestParams {
     /** Absolute operation deadline; covers queueing, writing, and terminal wait. */
     deadline: Deadline;
     mode?: PendingMode;
+    /**
+     * Retained-item ceiling for a stream-mode request. The pending byte budget
+     * counts wire bytes only, so a peer emitting many tiny items can retain
+     * unbounded per-item decode overhead under it; this bounds item count too.
+     * Must be a non-negative safe integer; 0 retains nothing and refuses the
+     * first item.
+     */
+    maxStreamItems?: number;
     responseMode?: "json" | "binary";
     binary?: boolean;
     priority?: Priority;
@@ -250,6 +266,7 @@ interface PendingEntry {
     epoch: number;
     corr: bigint;
     mode: PendingMode;
+    maxStreamItems: number;
     responseMode: "json" | "binary";
     writeInvoked: boolean;
     callerSettled: boolean;
@@ -511,6 +528,20 @@ export class ConnectionGeneration {
                 "deadline_expired",
             );
         }
+        // An empty StreamData frame charges zero pending bytes yet still retains
+        // one decoded item wrapper, so the retained-item ceiling is the only
+        // bound on that growth. A non-finite or fractional ceiling makes the
+        // `streamItems.length >= maxStreamItems` comparison in
+        // `dispatchToPending` unsatisfiable, leaving retention unbounded; refuse
+        // it before a pending entry exists or any byte reaches the peer.
+        const maxStreamItems = params.maxStreamItems ?? DEFAULT_MAX_STREAM_ITEMS;
+        if (!Number.isSafeInteger(maxStreamItems) || maxStreamItems < 0) {
+            throw new McHostCallError(
+                "not_sent",
+                `maxStreamItems must be a non-negative safe integer (got ${maxStreamItems})`,
+                "invalid_max_stream_items",
+            );
+        }
         const flags = buildFlags(
             params.binary ?? false,
             params.priority ?? Priority.Interactive,
@@ -545,6 +576,7 @@ export class ConnectionGeneration {
             epoch: params.epoch,
             corr,
             mode: params.mode ?? "unary",
+            maxStreamItems,
             responseMode: params.responseMode ?? "json",
             writeInvoked: false,
             callerSettled: false,
@@ -849,6 +881,29 @@ export class ConnectionGeneration {
             entry.sawStream = true;
             if (entry.mode === "unary") {
                 releaseQuietly(lease);
+                return;
+            }
+            if (entry.streamItems.length >= entry.maxStreamItems) {
+                releaseQuietly(lease);
+                this.settleCallerReject(
+                    entry,
+                    new McHostCallError(
+                        "terminal",
+                        `stream exceeded ${entry.maxStreamItems} retained items`,
+                        "stream_item_limit",
+                    ),
+                );
+                this.finishEntry(entry);
+                // The caller is settled but the host is still producing. Without
+                // a Cancel it keeps sending frames this connection can only drop,
+                // spending socket and frame-processing capacity that unrelated
+                // requests need. Settle first so the caller reads the ceiling it
+                // hit rather than a retirement; a refused Cancel retires the
+                // generation inside `enqueueControlHeader`, which is the bounded
+                // fallback when the stream cannot be stopped politely.
+                if (header.channel !== 0) {
+                    this.enqueueCancel(header.channel, header.epoch, header.corr);
+                }
                 return;
             }
             let body: RequestReceiveBody;

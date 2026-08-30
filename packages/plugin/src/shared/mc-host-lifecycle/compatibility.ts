@@ -25,13 +25,15 @@ export type CompatibilityVerdict =
 type SemverTriple = [number, number, number];
 
 /**
- * Parse a canonical `X.Y.Z` triple. Each component is either a single `0` or a
- * digit run with no leading zero, so a spelling like `00.1.0` is rejected
- * instead of being silently normalized into the triple `0.1.0` — the grammar
- * the mismatch details name is exactly the one accepted here.
+ * Each part is a semver numeric identifier: a single `0`, or a non-zero digit
+ * followed by any digits. `\d+` would also admit leading zeroes, which
+ * `Number.parseInt` then silently normalizes — `00.01.000` would parse to
+ * `[0, 1, 0]` and pass the range gate, so a non-canonical peer version would
+ * satisfy a check whose verdict promises a canonical `X.Y.Z` value.
  */
+const CANONICAL_SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 export function parseSemverTriple(value: string): SemverTriple | null {
-    const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(value);
+    const match = CANONICAL_SEMVER.exec(value);
     if (!match) return null;
     const triple: SemverTriple = [
         Number.parseInt(match[1] as string, 10),
@@ -144,6 +146,33 @@ export type EpochName = keyof typeof releaseContract.epochs;
 
 export type ObservedEpochs = Partial<Record<EpochName, unknown>>;
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+    return value !== null && typeof value === "object" && !Array.isArray(value)
+        ? (value as Record<string, unknown>)
+        : null;
+}
+
+/**
+ * Map the sanitized Magic Context host-health metric names to the generated
+ * release-contract names. Values stay unknown so the exact epoch evaluator,
+ * rather than a coercion here, owns numeric validation.
+ */
+export function observedEpochsFromMagicContextMetrics(metrics: unknown): ObservedEpochs {
+    const epochs = asRecord(asRecord(metrics)?.epochs);
+    if (epochs === null) return {};
+    return {
+        ...("memory_render_epoch" in epochs ? { memory_render: epochs.memory_render_epoch } : {}),
+        ...("compartment_render_epoch" in epochs
+            ? { compartment_render: epochs.compartment_render_epoch }
+            : {}),
+        ...("profile_epoch" in epochs
+            ? { profile_claude_code_anthropic: epochs.profile_epoch }
+            : {}),
+        ...("tagger_epoch" in epochs ? { tagger: epochs.tagger_epoch } : {}),
+        ...("state_sync_epoch" in epochs ? { state_sync: epochs.state_sync_epoch } : {}),
+    };
+}
+
 /**
  * Evaluate the exact five-part Magic Context epoch set. The observed key set
  * must equal the contract's: `observed` arrives as decoded JSON, which carries
@@ -185,19 +214,64 @@ export function evaluateEpochCompatibility(observed: ObservedEpochs): Compatibil
     return { ok: true };
 }
 
+export interface CompatibilityInput {
+    authenticatedPeer?: AuthenticatedPeer;
+    authenticatedDaemonVer?: string;
+    catalog: CatalogEntry[];
+    epochs: ObservedEpochs;
+}
+
+/**
+ * The single ordered source of truth for the compatibility gate: stage id,
+ * the CLI check id it reports under, and its evaluator. `evaluateCompatibility`,
+ * the managed probe's `evaluatedThrough` labels, and the policy's emitted
+ * `compatibility.*` checks all derive from this list, so a stage added or
+ * reordered in one place cannot leave the probe sequence and the reported
+ * checks disagreeing.
+ */
+export const COMPATIBILITY_STAGES = [
+    {
+        stage: "daemon",
+        checkId: "compatibility.daemon",
+        evaluate: (input: CompatibilityInput): CompatibilityVerdict => {
+            const peer = input.authenticatedPeer ?? {
+                daemonVer: input.authenticatedDaemonVer ?? "",
+                daemonId: new Uint8Array(),
+                proof: "current" as const,
+            };
+            return evaluateDaemonCompatibility(peer);
+        },
+    },
+    {
+        stage: "modules",
+        checkId: "compatibility.modules",
+        evaluate: (input: CompatibilityInput): CompatibilityVerdict =>
+            evaluateModuleCompatibility(input.catalog),
+    },
+    {
+        stage: "epochs",
+        checkId: "compatibility.epochs",
+        evaluate: (input: CompatibilityInput): CompatibilityVerdict =>
+            evaluateEpochCompatibility(input.epochs),
+    },
+] as const;
+
+export type CompatibilityStage = (typeof COMPATIBILITY_STAGES)[number]["stage"];
+
+/** Position of `stage` in the ordered gate; the order is the array order. */
+export function compatibilityStageIndex(stage: CompatibilityStage): number {
+    return COMPATIBILITY_STAGES.findIndex((entry) => entry.stage === stage);
+}
+
 /**
  * The composed demand/status/doctor gate order: daemon range, then modules,
  * then epochs. First failure wins and is reported without any stop, replace,
  * or restart side effect (R17).
  */
-export function evaluateCompatibility(input: {
-    authenticatedPeer: AuthenticatedPeer;
-    catalog: CatalogEntry[];
-    epochs: ObservedEpochs;
-}): CompatibilityVerdict {
-    const daemon = evaluateDaemonCompatibility(input.authenticatedPeer);
-    if (!daemon.ok) return daemon;
-    const modules = evaluateModuleCompatibility(input.catalog);
-    if (!modules.ok) return modules;
-    return evaluateEpochCompatibility(input.epochs);
+export function evaluateCompatibility(input: CompatibilityInput): CompatibilityVerdict {
+    for (const stage of COMPATIBILITY_STAGES) {
+        const verdict = stage.evaluate(input);
+        if (!verdict.ok) return verdict;
+    }
+    return { ok: true };
 }

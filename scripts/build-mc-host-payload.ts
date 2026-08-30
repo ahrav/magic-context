@@ -31,17 +31,25 @@
  */
 
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import {
     chmodSync,
+    closeSync,
+    constants as fsConstants,
     copyFileSync,
     existsSync,
+    fstatSync,
+    fsyncSync,
     lstatSync,
     mkdirSync,
+    openSync,
+    readSync,
     readdirSync,
     readFileSync,
+    writeSync,
     writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -49,11 +57,17 @@ import {
     canonicalJson,
     type ReleaseContract,
     sha256Hex,
+    validateRegistryGate,
+    validateRegistryGateShape,
     validateStopProvenance,
 } from "./generate-mc-host-release-manifest";
 import {
+    INPUT_KEYS,
+    isPlaceholderSha256,
     OUTPUT_PATHS as U9_OUTPUT_PATHS,
+    qualificationEvidenceIdentityMismatch,
     requireQualificationEvidence,
+    SOURCE_MANIFEST_PATH,
 } from "./qualify-mc-host-production-inputs";
 
 function fail(message: string): never {
@@ -91,6 +105,7 @@ export const LAUNCHER_PATH = "payload/bin/ck-mc-host";
 export const LINUX_PRODUCTION_PAYLOAD_SLOTS: Record<string, string> = {
     ort_runtime: "payload/ort/libonnxruntime.so",
     bundle_manifest: "payload/model/gte-modernbert-base-f16/manifest.json",
+    corpus: "payload/model/gte-modernbert-base-f16/corpus.json",
     model_onnx: "payload/model/gte-modernbert-base-f16/model.onnx",
     tokenizer: "payload/model/gte-modernbert-base-f16/tokenizer.json",
     tokenizer_config:
@@ -141,10 +156,6 @@ export const PAYLOAD_TARGETS: readonly PayloadTarget[] = [
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const FORBIDDEN_LIFECYCLE_SCRIPTS = ["preinstall", "install", "postinstall"];
 
-function isPlaceholderSha256(hash: string): boolean {
-    return /^(.)\1{63}$/.test(hash);
-}
-
 // ---------------------------------------------------------------------------
 // Release context: U8 contract + U9 citations + registry-gate reservations.
 // ---------------------------------------------------------------------------
@@ -156,6 +167,15 @@ export interface ReleaseContext {
     lockSha256: string;
     lock: {
         production_qualified: boolean;
+        inputs: Record<
+            string,
+            {
+                qualified: boolean;
+                size_bytes?: number;
+                sha256?: string;
+            }
+        >;
+        unqualified: string[];
         package_size_limits_bytes: Record<
             string,
             { compressed_max: number; unpacked_max: number }
@@ -166,12 +186,10 @@ export interface ReleaseContext {
     reservationVersions: string[];
 }
 
-function readJson(rootDir: string, relative: string): Record<string, unknown> {
-    const path = join(rootDir, relative);
-    if (!existsSync(path)) fail(`missing ${relative}`);
+function parseJson(relative: string, text: string): Record<string, unknown> {
     let parsed: unknown;
     try {
-        parsed = JSON.parse(readFileSync(path, "utf8"));
+        parsed = JSON.parse(text);
     } catch (error) {
         fail(
             `unreadable or malformed ${relative}: ${
@@ -179,11 +197,21 @@ function readJson(rootDir: string, relative: string): Record<string, unknown> {
             }`,
         );
     }
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    if (
+        parsed === null ||
+        typeof parsed !== "object" ||
+        Array.isArray(parsed)
+    ) {
         fail(`${relative} must be a JSON object`);
     }
     // SAFETY: guarded above — parsed is a non-null, non-array object.
     return parsed as Record<string, unknown>;
+}
+
+function readJson(rootDir: string, relative: string): Record<string, unknown> {
+    const path = join(rootDir, relative);
+    if (!existsSync(path)) fail(`missing ${relative}`);
+    return parseJson(relative, readFileSync(path, "utf8"));
 }
 
 /** Load and cross-verify the U8/U9 artifacts every U6 output cites (KTD7). */
@@ -200,25 +228,72 @@ export function loadReleaseContext(rootDir: string): ReleaseContext {
         );
     }
 
-    // U9 evidence citation check (digest citations, not qualification): the
-    // evidence must cite the current U8 digest and the actual lock/credential
-    // file bytes.
-    const evidence = readJson(rootDir, U9_OUTPUT_PATHS.evidence) as Record<
-        string,
-        unknown
-    >;
+    const artifactBytes = {
+        production_inputs_lock: readFileSync(
+            join(rootDir, U9_OUTPUT_PATHS.lock),
+            "utf8",
+        ),
+        provider_credentials: readFileSync(
+            join(rootDir, U9_OUTPUT_PATHS.credentials),
+            "utf8",
+        ),
+    };
+    const lock = parseJson(
+        U9_OUTPUT_PATHS.lock,
+        artifactBytes.production_inputs_lock,
+    ) as ReleaseContext["lock"] & Record<string, unknown>;
+    parseJson(U9_OUTPUT_PATHS.credentials, artifactBytes.provider_credentials);
+    const lockSha256 = sha256Hex(artifactBytes.production_inputs_lock);
     if (
-        evidence.schema !== "magic-context.mc-host-release-qualification/v1" ||
-        evidence.release_contract_sha256 !== u8Digest
+        lock.release_contract_sha256 !== u8Digest ||
+        typeof lock.production_qualified !== "boolean"
     ) {
-        fail(
-            `stale or unknown U9 qualification evidence at ${U9_OUTPUT_PATHS.evidence}`,
-        );
+        fail(`stale U9 production-input lock at ${U9_OUTPUT_PATHS.lock}`);
     }
-    const artifacts = evidence.artifacts as Record<
-        string,
-        { path?: unknown; sha256?: unknown }
-    >;
+
+    const synthesizedCitations = {
+        production_inputs_lock: {
+            path: U9_OUTPUT_PATHS.lock,
+            sha256: lockSha256,
+        },
+        provider_credentials: {
+            path: U9_OUTPUT_PATHS.credentials,
+            sha256: sha256Hex(artifactBytes.provider_credentials),
+        },
+    };
+
+    // Local evidence is optional only for a committed fail-closed lock.
+    const evidencePath = join(rootDir, U9_OUTPUT_PATHS.evidence);
+    let artifacts: Record<string, { path?: unknown; sha256?: unknown }> | undefined;
+    if (existsSync(evidencePath)) {
+        const evidence = readJson(rootDir, U9_OUTPUT_PATHS.evidence);
+        // The identity rules are shared with `requireQualificationEvidence`
+        // (the U2/U6 consumption gate) so the two validators of this document
+        // cannot drift apart.
+        const identityMismatch = qualificationEvidenceIdentityMismatch(
+            evidence,
+            contract,
+            u8Digest,
+        );
+        if (identityMismatch !== null) {
+            fail(
+                `stale or unknown U9 qualification evidence at ${U9_OUTPUT_PATHS.evidence}: ${identityMismatch}`,
+            );
+        }
+        if (lock.production_qualified !== evidence.production_qualified) {
+            fail("U9 lock and evidence disagree on production qualification");
+        }
+        artifacts = evidence.artifacts as
+            | Record<string, { path?: unknown; sha256?: unknown }>
+            | undefined;
+    } else {
+        if (lock.production_qualified) {
+            fail(
+                "production-qualified U9 lock requires local qualification evidence",
+            );
+        }
+        artifacts = synthesizedCitations;
+    }
     for (const [key, relative] of [
         ["production_inputs_lock", U9_OUTPUT_PATHS.lock],
         ["provider_credentials", U9_OUTPUT_PATHS.credentials],
@@ -227,22 +302,9 @@ export function loadReleaseContext(rootDir: string): ReleaseContext {
         if (cited?.path !== relative || typeof cited.sha256 !== "string") {
             fail(`malformed U9 artifact citation for ${key}`);
         }
-        const actual = sha256Hex(readFileSync(join(rootDir, relative), "utf8"));
+        const actual = sha256Hex(artifactBytes[key]);
         if (actual !== cited.sha256)
             fail(`stale U9 artifact digest for ${relative}`);
-    }
-    const lockSha256 = artifacts.production_inputs_lock.sha256 as string;
-
-    const lock = readJson(rootDir, U9_OUTPUT_PATHS.lock) as ReleaseContext["lock"] &
-        Record<string, unknown>;
-    if (
-        lock.release_contract_sha256 !== u8Digest ||
-        typeof lock.production_qualified !== "boolean"
-    ) {
-        fail(`stale U9 production-input lock at ${U9_OUTPUT_PATHS.lock}`);
-    }
-    if (lock.production_qualified !== evidence.production_qualified) {
-        fail("U9 lock and evidence disagree on production qualification");
     }
     const limits = lock.package_size_limits_bytes;
     for (const target of PAYLOAD_TARGETS) {
@@ -433,7 +495,9 @@ export function validatePayloadManifest(
         m.package.version !== contract.release.version ||
         m.package.target !== target.target
     ) {
-        fail(`payload manifest package identity mismatch for ${target.package}`);
+        fail(
+            `payload manifest package identity mismatch for ${target.package}`,
+        );
     }
     if (
         canonicalJson(m.platform_floor) !==
@@ -493,9 +557,7 @@ export function validatePayloadManifest(
                   ...Object.values(LINUX_PRODUCTION_PAYLOAD_SLOTS),
               ].sort()
             : [LAUNCHER_PATH];
-    if (
-        JSON.stringify([...seen].sort()) !== JSON.stringify(expectedPaths)
-    ) {
+    if (JSON.stringify([...seen].sort()) !== JSON.stringify(expectedPaths)) {
         fail(
             `payload file set for ${target.target} (${m.mode}) must be exactly: ${expectedPaths.join(", ")}`,
         );
@@ -530,7 +592,9 @@ export function verifyPayloadDir(
         if (!stat.isFile()) fail(`${entry.path} is not a regular file`);
         const bytes = readFileSync(path);
         if (bytes.length !== entry.size) {
-            fail(`${entry.path}: size drift (${bytes.length} != ${entry.size})`);
+            fail(
+                `${entry.path}: size drift (${bytes.length} != ${entry.size})`,
+            );
         }
         const digest = createHash("sha256").update(bytes).digest("hex");
         if (digest !== entry.sha256) fail(`${entry.path}: digest drift`);
@@ -627,19 +691,33 @@ export function validatePayloadPackageDir(
     }
     if (pkg.license !== "MIT") fail(`${where}: license must be MIT`);
     const files = pkg.files;
-    if (!Array.isArray(files) || !files.includes("payload")) {
-        fail(`${where}: files must ship the payload directory`);
+    const expectedFiles = [
+        "payload",
+        "payload-manifest.json",
+        "README.md",
+        "LICENSE",
+        "NOTICE",
+    ];
+    if (
+        !Array.isArray(files) ||
+        canonicalJson([...files].sort()) !== canonicalJson([...expectedFiles].sort())
+    ) {
+        fail(`${where}: files must ship exactly the payload, manifest, and notices`);
     }
     for (const doc of ["LICENSE", "NOTICE", "README.md"]) {
         const path = join(rootDir, target.dir, doc);
-        if (!existsSync(path) || readFileSync(path, "utf8").trim().length === 0) {
+        if (
+            !existsSync(path) ||
+            readFileSync(path, "utf8").trim().length === 0
+        ) {
             fail(`${target.dir}: missing or empty ${doc}`);
         }
     }
     // No tarball and no committed payload bytes: production bytes exist only
     // after qualification, and U6 never packs parents (R50).
     for (const name of readdirSync(join(rootDir, target.dir))) {
-        if (name.endsWith(".tgz")) fail(`${target.dir}: unexpected tarball ${name}`);
+        if (name.endsWith(".tgz"))
+            fail(`${target.dir}: unexpected tarball ${name}`);
     }
     const payloadDir = join(rootDir, target.dir, "payload");
     if (existsSync(payloadDir)) {
@@ -673,11 +751,18 @@ export function validateParentManifests(
         const where = `${dir}/package.json`;
         const pkg = readJson(rootDir, where) as Record<string, unknown>;
         if (pkg.name !== parent) fail(`${where}: name must be ${parent}`);
+        if (pkg.version !== contract.packages.version) {
+            fail(
+                `${where}: version must be the synchronized release version ${contract.packages.version}`,
+            );
+        }
         const optional = pkg.optionalDependencies as
             | Record<string, unknown>
             | undefined;
         if (optional === undefined || typeof optional !== "object") {
-            fail(`${where}: optionalDependencies must declare the payload packages`);
+            fail(
+                `${where}: optionalDependencies must declare the payload packages`,
+            );
         }
         for (const payload of contract.packages.payloads) {
             const spec = optional[payload];
@@ -705,32 +790,62 @@ export function validateParentManifests(
 // Current-release trust index (R30) and tagged stop-provenance record (R48).
 // ---------------------------------------------------------------------------
 
-export function buildTrustArtifacts(context: ReleaseContext): {
+export function buildTrustArtifacts(
+    context: ReleaseContext,
+    payloadRoot?: string,
+): {
     index: Record<string, unknown>;
     stop: Record<string, unknown>;
     indexText: string;
     stopText: string;
 } {
     const { contract } = context;
-    const entries = PAYLOAD_TARGETS.map((target) => ({
-        package: target.package,
-        version: contract.release.version,
-        target: target.target,
-        platform_floor: platformFloorFor(contract, target.target),
-        synapse: target.synapse,
-        size_budget_bytes:
-            context.lock.package_size_limits_bytes[target.package],
-        // Fail-closed unpublished state (KTD23): no production payload exists,
-        // so no digest exists. Consumers must reject entries that are not
-        // qualified+published with real digests before executing native bytes.
-        qualified: false,
-        published: false,
-        payload_manifest_digest: null,
-        bootstrap_launcher_digest: null,
-        unqualified_reason:
-            "production payload not built: release inputs are not production-qualified " +
-            "(docs/evidence/mc-host-release-qualification.json production_qualified: false)",
-    }));
+    const entries = PAYLOAD_TARGETS.map((target) => {
+        const common = {
+            package: target.package,
+            version: contract.release.version,
+            target: target.target,
+            platform_floor: platformFloorFor(contract, target.target),
+            synapse: target.synapse,
+            size_budget_bytes:
+                context.lock.package_size_limits_bytes[target.package],
+        };
+        if (!context.productionQualified) {
+            return {
+                ...common,
+                qualified: false,
+                published: false,
+                payload_manifest_digest: null,
+                bootstrap_launcher_digest: null,
+                unqualified_reason:
+                    "production payload not built: release inputs are not production-qualified " +
+                    "(tmp/mc-host-release-qualification.json production_qualified: false)",
+            };
+        }
+        if (payloadRoot === undefined) {
+            fail("qualified trust generation requires the complete payload root");
+        }
+        const targetRoot = join(payloadRoot, target.target);
+        const manifest = readJson(targetRoot, "payload-manifest.json");
+        validatePayloadManifest(manifest, context);
+        if (manifest.mode !== "production") {
+            fail(`${target.target}: trust generation requires a production manifest`);
+        }
+        verifyPayloadDir(targetRoot, manifest);
+        const launcher = manifest.files.find(
+            (entry) => entry.path === LAUNCHER_PATH,
+        );
+        if (launcher === undefined) {
+            fail(`${target.target}: production manifest has no launcher`);
+        }
+        return {
+            ...common,
+            qualified: true,
+            published: false,
+            payload_manifest_digest: payloadManifestDigest(manifest),
+            bootstrap_launcher_digest: launcher.sha256,
+        };
+    });
     const index = {
         schema: "magic-context.mc-host-payload-index/v1",
         release: { id: contract.release.id, version: contract.release.version },
@@ -762,9 +877,21 @@ export function buildTrustArtifacts(context: ReleaseContext): {
     };
 }
 
+/**
+ * Full trust-index validation: schema, release identity, cited digests, and
+ * every target entry's package identity, platform floors, and size budgets.
+ *
+ * Takes only the fields it reads rather than a whole `ReleaseContext`, for the
+ * same reason `validateStopRecord` does: the wider type is what kept this
+ * validator reachable only from the payload builder, leaving the evidence
+ * verifier to hand-roll a weaker summary check over the same file.
+ */
 export function validateTrustIndex(
     index: unknown,
-    context: ReleaseContext,
+    context: Pick<
+        ReleaseContext,
+        "contract" | "u8Digest" | "lockSha256" | "productionQualified" | "lock"
+    >,
 ): void {
     assertExactKeys(
         index,
@@ -866,7 +993,9 @@ export function validateTrustIndex(
             fail(`entries[${i}]: Synapse claim drift`);
         if (
             canonicalJson(entry.size_budget_bytes) !==
-            canonicalJson(context.lock.package_size_limits_bytes[target.package])
+            canonicalJson(
+                context.lock.package_size_limits_bytes[target.package],
+            )
         ) {
             fail(`entries[${i}]: size budget drift against the U9 lock`);
         }
@@ -874,6 +1003,11 @@ export function validateTrustIndex(
             if (!context.productionQualified) {
                 fail(
                     `entries[${i}]: cannot be qualified while release inputs are unqualified`,
+                );
+            }
+            if (entry.published !== false || "unqualified_reason" in entry) {
+                fail(
+                    `entries[${i}]: U6 qualified entries must remain unpublished and omit an unqualified reason`,
                 );
             }
             for (const field of [
@@ -886,7 +1020,9 @@ export function validateTrustIndex(
                     !SHA256_RE.test(digest) ||
                     isPlaceholderSha256(digest)
                 ) {
-                    fail(`entries[${i}]: ${field} must be a real 64-hex digest`);
+                    fail(
+                        `entries[${i}]: ${field} must be a real 64-hex digest`,
+                    );
                 }
             }
         } else if (entry.qualified === false) {
@@ -917,9 +1053,18 @@ export function validateTrustIndex(
  * version, and its embedded manifest must hash to the cited digest (modified
  * N-1 rejected).
  */
+/**
+ * Full stop-record validation: schema plus this release's ancestry rules.
+ *
+ * Takes only the contract and the reservation versions rather than a whole
+ * `ReleaseContext`, because that is its real dependency set — the wider type
+ * kept this validator reachable only from the payload builder, which is why the
+ * evidence verifier previously had to settle for the schema-level
+ * `validateStopProvenance` alone.
+ */
 export function validateStopRecord(
     record: unknown,
-    context: ReleaseContext,
+    context: Pick<ReleaseContext, "contract" | "reservationVersions">,
     expectedPredecessorVersion: string | null,
 ): { legacyStopAuthority: boolean } {
     const { contract } = context;
@@ -932,7 +1077,9 @@ export function validateStopRecord(
                 "only the first payload-bearing release may emit genesis (R48)",
             );
         }
-        if (context.reservationVersions.includes(rec.release_version as string)) {
+        if (
+            context.reservationVersions.includes(rec.release_version as string)
+        ) {
             fail("a reservation version can never satisfy genesis (R50)");
         }
         return { legacyStopAuthority: false };
@@ -957,9 +1104,7 @@ export function validateStopRecord(
                 `${predecessorVersion} is skipped or N-2 (R48)`,
         );
     }
-    if (
-        !contract.platforms.supported.some((p) => p.target === rec.target)
-    ) {
+    if (!contract.platforms.supported.some((p) => p.target === rec.target)) {
         fail(`predecessor record names unsupported target ${rec.target}`);
     }
     if (rec.legacy_proof_version !== contract.proof.legacy_stop_only.version) {
@@ -973,7 +1118,9 @@ export function validateStopRecord(
         !SHA256_RE.test(digest) ||
         isPlaceholderSha256(digest)
     ) {
-        fail("predecessor payload_manifest_digest must be a real 64-hex digest");
+        fail(
+            "predecessor payload_manifest_digest must be a real 64-hex digest",
+        );
     }
     if (sha256Hex(canonicalJson(rec.predecessor_manifest)) !== digest) {
         fail(
@@ -1014,9 +1161,7 @@ function runtimeGlibcVersion(): string | null {
 export function hostTarget(): PayloadTarget {
     const key = `${process.platform}-${process.arch}`;
     const target = PAYLOAD_TARGETS.find((t) =>
-        key === "linux-x64"
-            ? t.target === "linux-x64-gnu"
-            : t.target === key,
+        key === "linux-x64" ? t.target === "linux-x64-gnu" : t.target === key,
     );
     if (target === undefined)
         fail(`no payload target for host ${key} (R24 matrix)`);
@@ -1040,6 +1185,472 @@ export interface DevPayloadResult {
     manifest: PayloadManifest;
     digest: string;
     launcherDigest: string;
+}
+
+export interface ProductionPayloadResult extends DevPayloadResult {
+    manifest: PayloadManifest & { mode: "production" };
+    /** True only when both immutable-input and registry gates ran normally. */
+    releaseQualified: boolean;
+}
+
+export interface PackedProductionPayload {
+    payload: ProductionPayloadResult;
+    tarballPath: string;
+}
+
+export interface ProductionPayloadSources {
+    binaryPath: string;
+    qualifiedInputs?: Partial<Record<(typeof INPUT_KEYS)[number], string>>;
+    qualifiedInputExpectations?: Partial<
+        Record<
+            (typeof INPUT_KEYS)[number],
+            { size_bytes: number; sha256: string }
+        >
+    >;
+    /** Deterministic pathname-replacement seam; tests only. */
+    afterSourceOpenForTest?: (relative: string, sourcePath: string) => void;
+}
+
+function copyPayloadSource(
+    sourcePath: string,
+    destination: string,
+    relative: string,
+    expected?: { size_bytes: number; sha256: string },
+    afterSourceOpenForTest?: (relative: string, sourcePath: string) => void,
+): PayloadFileEntry {
+    let sourceFd: number;
+    try {
+        sourceFd = openSync(
+            sourcePath,
+            fsConstants.O_RDONLY |
+                fsConstants.O_NOFOLLOW |
+                fsConstants.O_NONBLOCK,
+        );
+    } catch {
+        fail(`${relative}: production source is not openable without following links`);
+    }
+    const mode = relative === LAUNCHER_PATH ? "755" : "644";
+    let destinationFd: number | undefined;
+    try {
+        const before = fstatSync(sourceFd);
+        if (!before.isFile() || before.size <= 0) {
+            fail(`${relative}: production source is not a nonempty regular file`);
+        }
+        if (expected !== undefined && before.size !== expected.size_bytes) {
+            fail(`${relative}: production source size differs from the U9 lock`);
+        }
+        afterSourceOpenForTest?.(relative, sourcePath);
+        mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
+        destinationFd = openSync(
+            destination,
+            fsConstants.O_WRONLY |
+                fsConstants.O_CREAT |
+                fsConstants.O_TRUNC |
+                fsConstants.O_NOFOLLOW,
+            mode === "755" ? 0o755 : 0o644,
+        );
+        const hash = createHash("sha256");
+        const buffer = Buffer.allocUnsafe(128 * 1024);
+        let position = 0;
+        for (;;) {
+            const count = readSync(
+                sourceFd,
+                buffer,
+                0,
+                buffer.length,
+                position,
+            );
+            if (count === 0) break;
+            position += count;
+            if (position > before.size) {
+                fail(`${relative}: production source grew during copy`);
+            }
+            hash.update(buffer.subarray(0, count));
+            let written = 0;
+            while (written < count) {
+                written += writeSync(
+                    destinationFd,
+                    buffer,
+                    written,
+                    count - written,
+                );
+            }
+        }
+        fsyncSync(destinationFd);
+        const after = fstatSync(sourceFd);
+        if (
+            after.dev !== before.dev ||
+            after.ino !== before.ino ||
+            after.size !== before.size ||
+            after.mtimeMs !== before.mtimeMs ||
+            position !== before.size
+        ) {
+            fail(`${relative}: production source changed during copy`);
+        }
+        const digest = hash.digest("hex");
+        if (expected !== undefined && digest !== expected.sha256) {
+            fail(`${relative}: production source hash differs from the U9 lock`);
+        }
+        const copied = fstatSync(destinationFd);
+        if (!copied.isFile() || copied.nlink !== 1 || copied.size !== position) {
+            fail(`${relative}: copied payload file is not independent`);
+        }
+        return {
+            path: relative,
+            type: "file",
+            size: position,
+            mode,
+            sha256: digest,
+        };
+    } finally {
+        if (destinationFd !== undefined) closeSync(destinationFd);
+        closeSync(sourceFd);
+    }
+}
+
+/**
+ * Assemble one target from already-qualified source paths. This low-level
+ * function is deterministic and independently verifies the copied tree; the
+ * public production entrypoint below first enforces U9 evidence.
+ */
+export function assembleProductionPayload(
+    context: ReleaseContext,
+    target: PayloadTarget,
+    options: {
+        outDir: string;
+        sources: ProductionPayloadSources;
+        packageMetadataDir?: string;
+    },
+): ProductionPayloadResult {
+    if (!context.productionQualified || !context.lock.production_qualified) {
+        fail("production payload assembly requires production-qualified inputs");
+    }
+    const sourceByDest = new Map<
+        string,
+        { path: string; input?: (typeof INPUT_KEYS)[number] }
+    >([
+        [LAUNCHER_PATH, { path: options.sources.binaryPath }],
+    ]);
+    if (target.synapse === "certified_cpu") {
+        for (const [input, relative] of Object.entries(
+            LINUX_PRODUCTION_PAYLOAD_SLOTS,
+        )) {
+            const source =
+                options.sources.qualifiedInputs?.[
+                    input as keyof typeof options.sources.qualifiedInputs
+                ];
+            if (source === undefined) {
+                fail(`${target.target}: missing qualified ${input} source`);
+            }
+            sourceByDest.set(relative, {
+                path: source,
+                input: input as (typeof INPUT_KEYS)[number],
+            });
+        }
+    }
+
+    const generationRoot = join(options.outDir, target.target);
+    if (options.packageMetadataDir !== undefined) {
+        for (const relative of [
+            "package.json",
+            "README.md",
+            "LICENSE",
+            "NOTICE",
+        ]) {
+            const source = join(options.packageMetadataDir, relative);
+            if (!existsSync(source) || lstatSync(source).isSymbolicLink()) {
+                fail(`${target.target}: package metadata ${relative} is invalid`);
+            }
+            mkdirSync(generationRoot, { recursive: true, mode: 0o700 });
+            copyFileSync(source, join(generationRoot, relative));
+        }
+    }
+    const files = [...sourceByDest.entries()]
+        .map(([relative, source]) => {
+            const destination = join(generationRoot, relative);
+            const expected =
+                source.input === undefined
+                    ? undefined
+                    : options.sources.qualifiedInputExpectations?.[
+                          source.input
+                      ];
+            return copyPayloadSource(
+                source.path,
+                destination,
+                relative,
+                expected,
+                options.sources.afterSourceOpenForTest,
+            );
+        })
+        .sort((left, right) =>
+            left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
+        );
+    for (const entry of files) {
+        const destination = join(generationRoot, entry.path);
+        chmodSync(destination, entry.mode === "755" ? 0o755 : 0o644);
+    }
+
+    const manifest: PayloadManifest & { mode: "production" } = {
+        schema: "magic-context.mc-host-payload-manifest/v1",
+        release: {
+            id: context.contract.release.id,
+            version: context.contract.release.version,
+        },
+        release_contract_sha256: context.u8Digest,
+        production_inputs_lock_sha256: context.lockSha256,
+        mode: "production",
+        package: {
+            name: target.package,
+            version: context.contract.release.version,
+            target: target.target,
+        },
+        platform_floor: platformFloorFor(context.contract, target.target),
+        synapse: target.synapse,
+        launcher: LAUNCHER_PATH,
+        files,
+    };
+    validatePayloadManifest(manifest, context);
+    verifyPayloadDir(generationRoot, manifest);
+    const digest = payloadManifestDigest(manifest);
+    const manifestPath = join(generationRoot, "payload-manifest.json");
+    writeFileSync(manifestPath, `${canonicalJson(manifest)}\n`);
+    return {
+        target: target.target,
+        outDir: generationRoot,
+        manifestPath,
+        manifest,
+        digest,
+        releaseQualified: context.productionQualified,
+        launcherDigest:
+            files.find((entry) => entry.path === LAUNCHER_PATH)?.sha256 ??
+            fail("production manifest lost its launcher"),
+    };
+}
+
+function qualifiedInputSources(
+    rootDir: string,
+    context: ReleaseContext,
+): {
+    paths: Partial<Record<(typeof INPUT_KEYS)[number], string>>;
+    expectations: Partial<
+        Record<
+            (typeof INPUT_KEYS)[number],
+            { size_bytes: number; sha256: string }
+        >
+    >;
+} {
+    const manifest = readJson(rootDir, SOURCE_MANIFEST_PATH);
+    const inputs = manifest.inputs;
+    if (inputs === null || typeof inputs !== "object" || Array.isArray(inputs)) {
+        fail("production source manifest inputs are malformed");
+    }
+    const paths: Partial<Record<(typeof INPUT_KEYS)[number], string>> = {};
+    const expectations: Partial<
+        Record<
+            (typeof INPUT_KEYS)[number],
+            { size_bytes: number; sha256: string }
+        >
+    > = {};
+    for (const key of INPUT_KEYS) {
+        const raw = (inputs as Record<string, unknown>)[key];
+        if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+            fail(`production source manifest input ${key} is malformed`);
+        }
+        const entry = raw as Record<string, unknown>;
+        const expected = context.lock.inputs[key];
+        if (
+            entry.qualified !== true ||
+            typeof entry.verify_local_path !== "string" ||
+            !Number.isSafeInteger(entry.size_bytes) ||
+            typeof entry.sha256 !== "string" ||
+            expected?.qualified !== true ||
+            !Number.isSafeInteger(expected.size_bytes) ||
+            typeof expected.sha256 !== "string" ||
+            entry.size_bytes !== expected.size_bytes ||
+            entry.sha256 !== expected.sha256
+        ) {
+            fail(`production source manifest input ${key} is not qualified`);
+        }
+        paths[key] = isAbsolute(entry.verify_local_path)
+            ? entry.verify_local_path
+            : join(rootDir, entry.verify_local_path);
+        expectations[key] = {
+            size_bytes: expected.size_bytes as number,
+            sha256: expected.sha256,
+        };
+    }
+    return { paths, expectations };
+}
+
+export function verifyProductionBinaryIdentity(
+    binaryPath: string,
+    expectedLockSha256: string,
+): void {
+    const executable =
+        process.platform === "linux"
+            ? "/proc/self/fd/3"
+            : process.platform === "darwin"
+              ? "/dev/fd/3"
+              : fail("production binary identity probe is unsupported");
+    let fd: number;
+    try {
+        fd = openSync(
+            binaryPath,
+            fsConstants.O_RDONLY |
+                fsConstants.O_NOFOLLOW |
+                fsConstants.O_NONBLOCK,
+        );
+    } catch {
+        fail("staged production binary is not openable");
+    }
+    try {
+        const identity = spawnSync(executable, ["input-lock-digest"], {
+            encoding: "utf8",
+            shell: false,
+            env: {},
+            cwd: "/",
+            stdio: ["ignore", "pipe", "pipe", fd],
+        });
+        if (
+            identity.status !== 0 ||
+            identity.stdout.trim() !== expectedLockSha256
+        ) {
+            fail(
+                "production binary does not embed the current U9 input-lock digest",
+            );
+        }
+    } finally {
+        closeSync(fd);
+    }
+}
+
+export function buildProductionPayload(
+    rootDir: string,
+    options: {
+        target: PayloadTarget;
+        binaryPath: string;
+        outDir: string;
+        skipRegistryGate?: boolean;
+        allowExactFloorPending?: boolean;
+    },
+): ProductionPayloadResult {
+    if (options.allowExactFloorPending !== true) {
+        requireQualificationEvidence(rootDir);
+    }
+    const loadedContext = loadReleaseContext(rootDir);
+    const exactFloorReason =
+        "oracle: offline semantic oracle passed above the kernel floor; exact kernel 4.18 evidence has not run";
+    const context =
+        options.allowExactFloorPending === true &&
+        loadedContext.lock.unqualified.length === 1 &&
+        loadedContext.lock.unqualified[0] === exactFloorReason
+            ? {
+                  ...loadedContext,
+                  productionQualified: true,
+                  lock: {
+                      ...loadedContext.lock,
+                      production_qualified: true,
+                  },
+              }
+            : loadedContext;
+    if (options.skipRegistryGate !== true) {
+        validateRegistryGate(
+            readJson(rootDir, REGISTRY_GATE_PATH),
+            context.contract,
+        );
+    }
+    const qualifiedInputs =
+        options.target.synapse === "certified_cpu"
+            ? qualifiedInputSources(rootDir, context)
+            : undefined;
+    const payload = assembleProductionPayload(context, options.target, {
+        outDir: options.outDir,
+        packageMetadataDir: join(rootDir, options.target.dir),
+        sources: {
+            binaryPath: options.binaryPath,
+            ...(qualifiedInputs === undefined
+                ? {}
+                : {
+                      qualifiedInputs: qualifiedInputs.paths,
+                      qualifiedInputExpectations:
+                          qualifiedInputs.expectations,
+                  }),
+        },
+    });
+    verifyProductionBinaryIdentity(
+        join(payload.outDir, LAUNCHER_PATH),
+        loadedContext.lockSha256,
+    );
+    return {
+        ...payload,
+        releaseQualified:
+            options.allowExactFloorPending !== true &&
+            options.skipRegistryGate !== true &&
+            payload.releaseQualified,
+    };
+}
+
+export function packProductionPayload(
+    payload: ProductionPayloadResult,
+    packDestination: string,
+): PackedProductionPayload {
+    if (!payload.releaseQualified) {
+        fail("local or gate-bypassed payloads cannot be packed for release");
+    }
+    const version = spawnSync("npm", ["--version"], {
+        encoding: "utf8",
+        shell: false,
+    });
+    if (version.status !== 0 || !/^11\./.test(version.stdout.trim())) {
+        fail("production payload packing requires certified npm 11.x");
+    }
+    mkdirSync(packDestination, { recursive: true, mode: 0o700 });
+    const packed = spawnSync(
+        "npm",
+        [
+            "pack",
+            payload.outDir,
+            "--pack-destination",
+            packDestination,
+            "--json",
+            "--ignore-scripts",
+        ],
+        {
+            encoding: "utf8",
+            shell: false,
+            env: {
+                PATH: process.env.PATH ?? "",
+                HOME: process.env.HOME ?? "",
+                npm_config_audit: "false",
+                npm_config_fund: "false",
+                npm_config_update_notifier: "false",
+            },
+        },
+    );
+    if (packed.status !== 0) fail("npm pack failed for the production payload");
+    let report: unknown;
+    try {
+        report = JSON.parse(packed.stdout) as unknown;
+    } catch {
+        fail("npm pack returned malformed JSON");
+    }
+    if (
+        !Array.isArray(report) ||
+        report.length !== 1 ||
+        report[0] === null ||
+        typeof report[0] !== "object" ||
+        typeof (report[0] as Record<string, unknown>).filename !== "string"
+    ) {
+        fail("npm pack returned an unexpected result");
+    }
+    const tarballPath = join(
+        packDestination,
+        (report[0] as Record<string, string>).filename,
+    );
+    if (!existsSync(tarballPath) || !lstatSync(tarballPath).isFile()) {
+        fail("npm pack did not create the reported tarball");
+    }
+    return { payload, tarballPath };
 }
 
 /**
@@ -1136,15 +1747,24 @@ export interface CheckResult {
 
 export function runCheck(
     rootDir: string,
-    options: { write: boolean },
+    options: { write: boolean; payloadRoot?: string },
 ): CheckResult {
     const context = loadReleaseContext(rootDir);
+    // Drift-only, same as contract generation: structure is checked on every
+    // change, release readiness only where bytes are actually published.
+    validateRegistryGateShape(
+        readJson(rootDir, REGISTRY_GATE_PATH),
+        context.contract,
+    );
     for (const target of PAYLOAD_TARGETS) {
         validatePayloadPackageDir(rootDir, target, context.contract);
     }
     validateParentManifests(rootDir, context.contract);
 
-    const { index, stop, indexText, stopText } = buildTrustArtifacts(context);
+    const { index, stop, indexText, stopText } = buildTrustArtifacts(
+        context,
+        options.payloadRoot,
+    );
     validateTrustIndex(index, context);
     // First payload-bearing release: only genesis is acceptable ancestry.
     validateStopRecord(stop, context, null);
@@ -1172,23 +1792,27 @@ export function runCheck(
     // Re-validate the committed artifacts as parsed JSON so a hand-edited but
     // byte-diverging file reports schema problems, not only drift.
     if (drift.length === 0 && !options.write) {
-        validateTrustIndex(
-            readJson(rootDir, OUTPUT_PATHS.index),
-            context,
-        );
+        validateTrustIndex(readJson(rootDir, OUTPUT_PATHS.index), context);
         validateStopRecord(readJson(rootDir, OUTPUT_PATHS.stop), context, null);
     }
-    return { u8Digest: context.u8Digest, lockSha256: context.lockSha256, drift };
+    return {
+        u8Digest: context.u8Digest,
+        lockSha256: context.lockSha256,
+        drift,
+    };
 }
 
-/** Production build gate: fails closed until U9 qualifies production inputs. */
-export function buildProductionPayloads(rootDir: string): never {
-    // Throws with the exact unqualified reason today (R26, KTD23).
-    requireQualificationEvidence(rootDir);
-    fail(
-        "production payload assembly requires qualified ORT/model bytes staged by " +
-            "release engineering; qualified inputs are locked but no assembly path is qualified yet",
-    );
+/** Build the current host target after the U9 qualification gate passes. */
+export function buildProductionPayloads(
+    rootDir: string,
+    outDir: string = join(rootDir, "tmp", "mc-host-production-payload"),
+): PackedProductionPayload {
+    const payload = buildProductionPayload(rootDir, {
+        target: hostTarget(),
+        binaryPath: join(rootDir, "target", "release", "ck-mc-host"),
+        outDir,
+    });
+    return packProductionPayload(payload, outDir);
 }
 
 // ---------------------------------------------------------------------------
@@ -1208,7 +1832,11 @@ function main(): void {
                 process.exit(2);
             }
             i += 1;
-        } else if (["--check", "--write-trust", "--dev"].includes(arg)) {
+        } else if (
+            ["--check", "--write-trust", "--dev", "--local-production"].includes(
+                arg,
+            )
+        ) {
             flags.add(arg);
         } else {
             console.error(`unknown argument: ${arg}`);
@@ -1216,14 +1844,19 @@ function main(): void {
         }
     }
     if (flags.size > 1) {
-        console.error("--check, --write-trust, and --dev are mutually exclusive");
+        console.error(
+            "--check, --write-trust, --dev, and --local-production are mutually exclusive",
+        );
         process.exit(2);
     }
     const rootDir = join(dirname(fileURLToPath(import.meta.url)), "..");
     try {
         if (flags.has("--check") || flags.has("--write-trust")) {
             const write = flags.has("--write-trust");
-            const result = runCheck(rootDir, { write });
+            const result = runCheck(rootDir, {
+                write,
+                ...(outDir === undefined ? {} : { payloadRoot: outDir }),
+            });
             if (!write && result.drift.length > 0) {
                 console.error("mc-host payload trust drift:");
                 for (const line of result.drift) console.error(`  - ${line}`);
@@ -1245,7 +1878,31 @@ function main(): void {
             );
             return;
         }
-        buildProductionPayloads(rootDir);
+        if (flags.has("--local-production")) {
+            const target = hostTarget();
+            const result = buildProductionPayload(rootDir, {
+                target,
+                binaryPath: join(rootDir, "target", "release", "ck-mc-host"),
+                outDir:
+                    outDir ??
+                    join(rootDir, "tmp", "mc-host-local-production-payload"),
+                skipRegistryGate: true,
+                allowExactFloorPending: true,
+            });
+            console.log(
+                `built local production-input payload for ${result.target} at ${result.outDir} ` +
+                    `(payload-manifest digest ${result.digest}, launcher sha256 ${result.launcherDigest}; registry gate skipped, no tarball or release set emitted)`,
+            );
+            return;
+        }
+        const result = buildProductionPayloads(
+            rootDir,
+            outDir ?? join(rootDir, "tmp", "mc-host-production-payload"),
+        );
+        console.log(
+            `built production payload for ${result.payload.target} at ${result.tarballPath} ` +
+                `(payload-manifest digest ${result.payload.digest}, launcher sha256 ${result.payload.launcherDigest})`,
+        );
     } catch (error) {
         console.error(error instanceof Error ? error.message : String(error));
         process.exit(1);

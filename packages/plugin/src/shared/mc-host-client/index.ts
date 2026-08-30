@@ -20,6 +20,7 @@ export {
     type MonotonicClock,
 } from "./deadline";
 export {
+    DAEMON_GENERATION_CHANGED_CODE,
     isMcHostCallError,
     McHostCallError,
     McHostClientError,
@@ -43,4 +44,5 @@ export {
     type PublicationDiagnostics,
     type RequestOptions,
     type RouteTarget,
+    sameDaemonId,
 } from "./types";

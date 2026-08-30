@@ -86,12 +86,18 @@ function hmacProof(
     domain: string,
     clientNonce: Buffer,
     serverNonce: Buffer,
+    daemonVer: string,
     daemonId: Buffer,
 ): Buffer {
+    const daemonVerBytes = Buffer.from(daemonVer, "utf8");
+    const daemonVerLen = Buffer.allocUnsafe(4);
+    daemonVerLen.writeUInt32BE(daemonVerBytes.length);
     return createHmac("sha256", key)
         .update(Buffer.from(domain, "ascii"))
         .update(clientNonce)
         .update(serverNonce)
+        .update(daemonVerLen)
+        .update(daemonVerBytes)
         .update(daemonId)
         .digest();
 }
@@ -335,6 +341,7 @@ export class FakePeerConnection {
                     "subc-server-v1",
                     this.clientNonce,
                     this.serverNonce,
+                    this.options.daemonVer,
                     this.options.daemonId,
                 );
                 if (this.options.authMode === "wrong-proof") {
@@ -367,6 +374,7 @@ export class FakePeerConnection {
                       "subc-client-v1",
                       this.clientNonce,
                       this.serverNonce,
+                      this.options.daemonVer,
                       this.options.daemonId,
                   )
                 : Buffer.alloc(0);

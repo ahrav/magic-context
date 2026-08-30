@@ -2,7 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { CatalogEntry } from "../mc-host-client";
 import type { PlatformReaders } from "./bootstrap";
+import { releaseContract } from "./generated-contract";
+import { buildManagedCredentialEnvelope } from "./managed-policy";
 import {
     aggregateForTarget,
     McHostLifecyclePolicy,
@@ -17,7 +20,7 @@ function tempDir(prefix: string): string {
 
 /** A handshake-authenticated peer at a given daemon version. */
 function authenticatedPeerAt(daemonVer: string) {
-    return { daemonVer, daemonId: new Uint8Array([1, 2, 3, 4]), proof: "current" as const };
+    return { daemonVer, daemonId: new Uint8Array([7]), proof: "current" as const };
 }
 
 let counter = 0;
@@ -28,7 +31,7 @@ function startResultJson(command: string): string {
         command,
         ok: true,
         state: "running",
-        reason: command === "start" ? "started" : "healthy",
+        reason: command === "start" || command === "restart" ? "started" : "healthy",
         remediation: null,
         // A successful restart must carry its commit evidence, so a fixture that
         // reported null here would be rejected by the parser and land as
@@ -77,6 +80,16 @@ function restartResultJson(): string {
     });
 }
 
+function harnessUnavailableResultJson(): string {
+    return JSON.stringify({
+        ...JSON.parse(startResultJson("start")),
+        ok: false,
+        state: "running",
+        reason: "harness_unavailable",
+        readiness: null,
+    });
+}
+
 /** A fake ck-mc-host recording each invocation and emitting one result. */
 function fakeBinary(
     dir: string,
@@ -117,6 +130,29 @@ function policyFor(
     options: ConstructorParameters<typeof McHostLifecyclePolicy>[0],
 ): McHostLifecyclePolicy {
     return new McHostLifecyclePolicy(options);
+}
+
+function catalogEntry(moduleId: string, moduleVersion = "0.1.0"): CatalogEntry {
+    return {
+        module_id: moduleId,
+        module_version: moduleVersion,
+        roles: [],
+        control_ops: [],
+    };
+}
+
+const compatibleCatalog = [
+    catalogEntry("magic-context"),
+    catalogEntry("synapse"),
+    catalogEntry("broca"),
+];
+
+function compatibleObservation() {
+    return {
+        authenticatedPeer: authenticatedPeerAt(releaseContract.versions.daemon),
+        catalog: compatibleCatalog,
+        epochs: { ...releaseContract.epochs },
+    };
 }
 
 /** A Linux host whose kernel sits below the contract floor. */
@@ -166,18 +202,67 @@ describe("pre-native outcomes", () => {
         }
     });
 
-    test("an unsupported platform fails before any native invocation", async () => {
+    test("unsupported platforms fail every command before native invocation", async () => {
         const root = tempDir("mc-policy-platform-");
         const { binary, invocationLog } = fakeBinary(root);
         try {
+            for (const platformReaders of [
+                {
+                    platform: "linux" as const,
+                    arch: "x64",
+                    kernelRelease: () => "4.17.0",
+                    glibcVersion: () => "2.34",
+                    procSelfFdUsable: () => true,
+                    macosProductVersion: () => null,
+                },
+                {
+                    platform: "darwin" as const,
+                    arch: "arm64",
+                    kernelRelease: () => "23.0.0",
+                    glibcVersion: () => null,
+                    procSelfFdUsable: () => false,
+                    macosProductVersion: () => "13.4",
+                },
+                {
+                    platform: "linux" as const,
+                    arch: "arm64",
+                    kernelRelease: () => "6.8.0",
+                    glibcVersion: () => "2.39",
+                    procSelfFdUsable: () => true,
+                    macosProductVersion: () => null,
+                },
+            ]) {
+                const policy = policyFor({
+                    env: { XDG_DATA_HOME: root },
+                    launchTarget: { kind: "test-binary", path: binary },
+                    platformReaders,
+                });
+                for (const operation of ["start", "status", "doctor"] as const) {
+                    const result = await policy[operation]();
+                    expect(result.reason).toBe("unsupported_platform");
+                    expect(result.remediation).toBe("use_supported_platform");
+                }
+            }
+            expect(invocations(invocationLog)).toEqual([]);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("filesystem rejection keeps precedence over unsupported platform", async () => {
+        const root = tempDir("mc-policy-platform-fs-precedence-");
+        try {
             const policy = policyFor({
                 env: { XDG_DATA_HOME: root },
-                launchTarget: { kind: "test-binary", path: binary },
+                admissionIo: {
+                    platform: "linux",
+                    readMounts: () => "remote:/x / nfs4 rw 0 0\n",
+                },
                 platformReaders: unsupportedPlatformReaders(),
             });
-            const result = await policy.start();
-            expect(result.reason).toBe("unsupported_platform");
-            expect(invocations(invocationLog)).toEqual([]);
+            for (const operation of ["status", "doctor"] as const) {
+                expect((await policy[operation]()).reason).toBe("unsupported_filesystem");
+            }
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
@@ -260,6 +345,19 @@ describe("observational commands without a trusted bootstrap (U3 scenario 21)", 
 });
 
 describe("native invocation mapping", () => {
+    test("managed credential envelopes include only bounded Broca credential names", () => {
+        expect(
+            buildManagedCredentialEnvelope({
+                OPENAI_API_KEY: "secret",
+                PATH: "/poisoned",
+                EMPTY: "",
+            }),
+        ).toEqual({
+            schema: 1,
+            credentials: { OPENAI_API_KEY: "secret" },
+        });
+    });
+
     test("native current validation precedes one deferred certified package lookup", async () => {
         const root = tempDir("mc-policy-fallback-");
         const invocationLog = path.join(root, "fallback-invocations.log");
@@ -375,7 +473,7 @@ describe("native invocation mapping", () => {
                 env: { XDG_DATA_HOME: root },
                 launchTarget: { kind: "test-binary", path: binary },
                 readinessProbe: async () => ({
-                    authenticatedPeer: authenticatedPeerAt("mc-host/0.1.0"),
+                    ...compatibleObservation(),
                     readiness: {
                         transport: { state: "ready", reason: "healthy" },
                         storage: { state: "unavailable", reason: "storage_unavailable" },
@@ -391,10 +489,118 @@ describe("native invocation mapping", () => {
                 expect(result.readiness?.synapse?.state).toBe("degraded");
                 expect(result.versions.daemon).toBe("mc-host/0.1.0");
                 expect(result.checks.map((check) => [check.id, check.status])).toEqual([
+                    ["compatibility.daemon", "pass"],
+                    ["compatibility.epochs", "pass"],
+                    ["compatibility.modules", "pass"],
                     ["readiness.storage", "fail"],
                     ["readiness.synapse", "fail"],
                     ["readiness.transport", "pass"],
                 ]);
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("status and doctor surface authenticated daemon, module, and epoch mismatches", async () => {
+        const cases = [
+            {
+                reason: "incompatible_daemon",
+                observation: {
+                    ...compatibleObservation(),
+                    authenticatedPeer: authenticatedPeerAt("mc-host/0.2.0"),
+                },
+                failedCheck: "compatibility.daemon",
+            },
+            {
+                reason: "incompatible_module",
+                observation: {
+                    ...compatibleObservation(),
+                    catalog: compatibleCatalog.map((entry) =>
+                        entry.module_id === "magic-context"
+                            ? catalogEntry("magic-context", "0.2.0")
+                            : entry,
+                    ),
+                },
+                failedCheck: "compatibility.modules",
+            },
+            {
+                reason: "incompatible_epochs",
+                observation: {
+                    ...compatibleObservation(),
+                    epochs: {
+                        ...releaseContract.epochs,
+                        state_sync: releaseContract.epochs.state_sync + 1,
+                    },
+                },
+                failedCheck: "compatibility.epochs",
+            },
+        ] as const;
+
+        for (const { reason, observation, failedCheck } of cases) {
+            const root = tempDir(`mc-policy-${reason}-`);
+            const { binary, invocationLog } = fakeBinary(root);
+            try {
+                const policy = policyFor({
+                    env: { XDG_DATA_HOME: root },
+                    launchTarget: { kind: "test-binary", path: binary },
+                    readinessProbe: async () => ({
+                        ...observation,
+                        readiness: {
+                            transport: { state: "ready", reason: "healthy" },
+                            storage: { state: "ready", reason: "healthy" },
+                            synapse: { state: "ready", reason: "healthy" },
+                        },
+                    }),
+                });
+
+                for (const result of [await policy.status(), await policy.doctor()]) {
+                    expect(result.ok).toBe(false);
+                    expect(result.state).toBe("running");
+                    expect(result.reason).toBe(reason);
+                    expect(result.remediation).toBe("align_versions");
+                    expect(result.checks.find((check) => check.id === failedCheck)).toMatchObject({
+                        status: "fail",
+                        reason,
+                    });
+                }
+                expect(invocations(invocationLog)).toEqual(["probe", "probe"]);
+            } finally {
+                rmSync(root, { recursive: true, force: true });
+            }
+        }
+    });
+
+    test("a short-circuited probe reports no check for an unobserved component", async () => {
+        const root = tempDir("mc-policy-unobserved-");
+        const { binary } = fakeBinary(root);
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                // The daemon stage failed, so host.status never ran: only the
+                // handshake-proven transport state is reported.
+                readinessProbe: async () => ({
+                    ...compatibleObservation(),
+                    authenticatedPeer: authenticatedPeerAt("mc-host/0.2.0"),
+                    catalog: [],
+                    epochs: {},
+                    evaluatedThrough: "daemon" as const,
+                    readiness: { transport: { state: "ready", reason: "healthy" } },
+                }),
+            });
+
+            for (const result of [await policy.status(), await policy.doctor()]) {
+                expect(result.reason).toBe("incompatible_daemon");
+                const ids = result.checks.map((check) => check.id);
+                expect(ids).toContain("compatibility.daemon");
+                // Never observed, so they must not be asserted as failures that
+                // would point remediation away from the version mismatch.
+                expect(ids).not.toContain("readiness.storage");
+                expect(ids).not.toContain("readiness.synapse");
+                // Stages the probe never reached emit no verdict either.
+                expect(ids).not.toContain("compatibility.modules");
+                expect(ids).not.toContain("compatibility.epochs");
             }
         } finally {
             rmSync(root, { recursive: true, force: true });
@@ -451,7 +657,7 @@ describe("native invocation mapping", () => {
                 readinessProbe: async (budgetMs) => {
                     budgets.push(budgetMs);
                     return {
-                        authenticatedPeer: authenticatedPeerAt("mc-host/0.1.0"),
+                        ...compatibleObservation(),
                         readiness: {
                             transport: { state: "ready", reason: "healthy" },
                         },
@@ -482,6 +688,7 @@ describe("native invocation mapping", () => {
                 env: { XDG_DATA_HOME: root },
                 launchTarget: { kind: "test-binary", path: binary },
                 readinessProbe: async () => ({
+                    ...compatibleObservation(),
                     // Every component is ready, so only the version can fail it.
                     authenticatedPeer: authenticatedPeerAt("mc-host/9.9.9"),
                     readiness: {
@@ -511,7 +718,7 @@ describe("native invocation mapping", () => {
                 env: { XDG_DATA_HOME: root },
                 launchTarget: { kind: "test-binary", path: binary },
                 readinessProbe: async () => ({
-                    authenticatedPeer: authenticatedPeerAt("mc-host/0.1.0"),
+                    ...compatibleObservation(),
                     readiness: {
                         // `readiness.storage` sorts before `readiness.transport`,
                         // but `authentication_failed` outranks `storage_unavailable`
@@ -530,6 +737,9 @@ describe("native invocation mapping", () => {
                 // The check list itself stays sorted by id: the v1 result
                 // requires lexicographically sorted unique check ids.
                 expect(result.checks.map((check) => check.id)).toEqual([
+                    "compatibility.daemon",
+                    "compatibility.epochs",
+                    "compatibility.modules",
                     "readiness.storage",
                     "readiness.synapse",
                     "readiness.transport",
@@ -539,7 +749,6 @@ describe("native invocation mapping", () => {
             rmSync(root, { recursive: true, force: true });
         }
     });
-
     test("restart resolves the certified payload before one native transaction", async () => {
         const root = tempDir("mc-policy-restart-payload-");
         const invocationLog = path.join(root, "restart-invocations.log");
@@ -788,9 +997,38 @@ describe("native invocation mapping", () => {
             // command onto its `internal_error` result. The outcome fields are
             // what prove the native restart was actually accepted.
             expect(result.ok).toBe(true);
-            expect(result.reason).toBe("healthy");
+            expect(result.reason).toBe("started");
             expect(result.effects).toEqual({ stop_committed: true, start_committed: true });
             expect(invocations(invocationLog)).toEqual(["restart"]);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("restart sends the default credential envelope", async () => {
+        const root = tempDir("mc-policy-restart-envelope-");
+        const envelopeLog = path.join(root, "restart-envelope.json");
+        const binary = path.join(root, "restart-envelope-ck-mc-host.sh");
+        writeFileSync(
+            binary,
+            `#!/bin/sh\ncat > ${envelopeLog}\necho '${restartResultJson()}'\nexit 0\n`,
+        );
+        chmodSync(binary, 0o700);
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                defaultStartupEnvelope: {
+                    schema: 1,
+                    credentials: { OPENAI_API_KEY: "preserved-secret" },
+                },
+            });
+            const result = await policy.restart();
+            expect(result.ok).toBe(true);
+            expect(JSON.parse(readFileSync(envelopeLog, "utf8"))).toEqual({
+                schema: 1,
+                credentials: { OPENAI_API_KEY: "preserved-secret" },
+            });
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
@@ -798,6 +1036,234 @@ describe("native invocation mapping", () => {
 });
 
 describe("demand-start coalescing and detachment (U3 scenarios 15-16)", () => {
+    test("compatibility mismatch blocks readiness without stop, restart, or a second start", async () => {
+        const cases = [
+            {
+                reason: "incompatible_daemon",
+                observation: {
+                    ...compatibleObservation(),
+                    authenticatedPeer: authenticatedPeerAt("mc-host/0.2.0"),
+                },
+            },
+            {
+                reason: "incompatible_module",
+                observation: {
+                    ...compatibleObservation(),
+                    catalog: compatibleCatalog.map((entry) =>
+                        entry.module_id === "synapse" ? catalogEntry("synapse", "0.2.0") : entry,
+                    ),
+                },
+            },
+            {
+                reason: "incompatible_epochs",
+                observation: {
+                    ...compatibleObservation(),
+                    epochs: {
+                        ...releaseContract.epochs,
+                        memory_render: releaseContract.epochs.memory_render - 1,
+                    },
+                },
+            },
+        ] as const;
+
+        for (const { reason, observation } of cases) {
+            const root = tempDir(`mc-policy-demand-${reason}-`);
+            const { binary, invocationLog } = fakeBinary(root);
+            let storageProbes = 0;
+            try {
+                const policy = policyFor({
+                    env: { XDG_DATA_HOME: root },
+                    launchTarget: { kind: "test-binary", path: binary },
+                    compatibilityProbe: async () => observation,
+                    storageProbe: async () => {
+                        storageProbes += 1;
+                        return "ready";
+                    },
+                });
+                const outcome = await policy.demandStart({
+                    origin: "managed-default",
+                    capability: "magic-context",
+                });
+
+                expect(outcome.result.ok).toBe(false);
+                expect(outcome.result.state).toBe("running");
+                expect(outcome.result.reason).toBe(reason);
+                expect(outcome.result.remediation).toBe("align_versions");
+                expect(outcome.storage).toBeNull();
+                expect(storageProbes).toBe(0);
+                expect(invocations(invocationLog)).toEqual(["start"]);
+            } finally {
+                rmSync(root, { recursive: true, force: true });
+            }
+        }
+    });
+
+    test("concurrent demands share one compatibility probe", async () => {
+        const root = tempDir("mc-policy-probe-coalesce-");
+        const { binary } = fakeBinary(root);
+        let probes = 0;
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                compatibilityProbe: async () => {
+                    probes += 1;
+                    await new Promise((resolve) => setTimeout(resolve, 5));
+                    return compatibleObservation();
+                },
+            });
+
+            // The snapshot describes the daemon incarnation, not the requesting
+            // capability, so distinct capabilities still share one probe.
+            const outcomes = await Promise.all([
+                policy.demandStart({ origin: "managed-default", capability: "magic-context" }),
+                policy.demandStart({ origin: "managed-default", capability: "synapse" }),
+            ]);
+
+            for (const outcome of outcomes) {
+                expect(outcome.result.ok).toBe(true);
+                expect(outcome.authenticatedDaemonId).toEqual(new Uint8Array([7]));
+            }
+            expect(probes).toBe(1);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("the shared compatibility probe budget does not come from the creating waiter", async () => {
+        const root = tempDir("mc-policy-probe-budget-");
+        const { binary } = fakeBinary(root);
+        const budgets: number[] = [];
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                outerAggregateMs: 30_000,
+                compatibilityProbe: async (budgetMs) => {
+                    budgets.push(budgetMs);
+                    return compatibleObservation();
+                },
+            });
+            const outcome = await policy.demandStart({
+                origin: "managed-default",
+                capability: "magic-context",
+                deadlineMs: 5_000,
+            });
+
+            // Every waiter joins whichever probe exists, so a nearly expired
+            // caller must not mint one too short for the long-lived waiters that
+            // join it — they would read the truncated failure as an unproven
+            // compatibility claim while still holding ample time. The caller's own
+            // deadline still bounds its wait through `raceDetached`.
+            expect(budgets).toEqual([30_000]);
+            expect(outcome.result.ok).toBe(true);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("a failed compatibility probe becomes a typed closed result, not a raw rejection", async () => {
+        const root = tempDir("mc-policy-probe-failure-");
+        const { binary, invocationLog } = fakeBinary(root);
+        let storageProbes = 0;
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                compatibilityProbe: async () => {
+                    throw new Error("authenticated peer changed during compatibility probe");
+                },
+                storageProbe: async () => {
+                    storageProbes += 1;
+                    return "ready";
+                },
+            });
+            const outcome = await policy.demandStart({
+                origin: "managed-default",
+                capability: "magic-context",
+            });
+
+            // An unproven compatibility claim authorizes no application traffic,
+            // and callers act on the reason rather than an unclassified throw.
+            expect(outcome.result.ok).toBe(false);
+            expect(outcome.result.reason).toBe("native_probe_unavailable");
+            expect(outcome.result.remediation).toBe("run_daemon_restart");
+            expect(outcome.authenticatedDaemonId).toBeUndefined();
+            expect(outcome.storage).toBeNull();
+            expect(storageProbes).toBe(0);
+            expect(invocations(invocationLog)).toEqual(["start"]);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("storage readiness read on another incarnation is refused, not reported", async () => {
+        const root = tempDir("mc-policy-storage-rotation-");
+        const { binary, invocationLog } = fakeBinary(root);
+        const expectations: Array<Uint8Array | undefined> = [];
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                compatibilityProbe: async () => compatibleObservation(),
+                storageProbe: async (_budgetMs, expectedDaemonId) => {
+                    expectations.push(expectedDaemonId);
+                    throw new Error(
+                        "storage probe observed a different daemon than compatibility certified",
+                    );
+                },
+            });
+            const outcome = await policy.demandStart({
+                origin: "managed-default",
+                capability: "magic-context",
+            });
+
+            // The probe is told which incarnation was certified. If readiness
+            // cannot be observed there, compatibility remains proven but storage
+            // stays unavailable and application traffic remains blocked.
+            expect(expectations).toEqual([new Uint8Array([7])]);
+            expect(outcome.result.ok).toBe(true);
+            expect(outcome.storage).toBe("unavailable");
+            expect(outcome.authenticatedDaemonId).toEqual(new Uint8Array([7]));
+            expect(invocations(invocationLog)).toEqual(["start"]);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("managed harness mismatch never preempts the running daemon", async () => {
+        const root = tempDir("mc-policy-converge-");
+        const invocationLog = path.join(root, "converge-invocations.log");
+        const binary = path.join(root, "converge-ck-mc-host.sh");
+        writeFileSync(
+            binary,
+            `#!/bin/sh\necho "$1" >> ${invocationLog}\n` +
+                `if [ "$1" = "start" ]; then echo '${harnessUnavailableResultJson()}'; exit 1; fi\n` +
+                `echo '${restartResultJson()}'\nexit 0\n`,
+        );
+        chmodSync(binary, 0o700);
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+            });
+            const outcome = await policy.demandStart({
+                origin: "managed-default",
+                capability: "magic-context",
+                startupEnvelope: {
+                    schema: 1,
+                    credentials: { OPENAI_API_KEY: "shared-secret" },
+                },
+            });
+            expect(outcome.result.command).toBe("start");
+            expect(outcome.result.reason).toBe("harness_unavailable");
+            expect(outcome.result.effects).toBeNull();
+            expect(invocations(invocationLog)).toEqual(["start"]);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     test("non-managed origins are refused before any work", async () => {
         const policy = policyFor({ env: { HOME: "/nonexistent-home" } });
         for (const origin of ["explicit", "injected"] as const) {
@@ -908,9 +1374,8 @@ describe("demand-start coalescing and detachment (U3 scenarios 15-16)", () => {
         // The waiter has already cleared its timer and detached its abort
         // listener by the time the start resolves, so the storage probe needs a
         // bound of its own or it would keep `demandStart` pending forever with
-        // nothing watching. Expiry degrades to `unavailable` rather than
-        // rejecting: the start itself succeeded, and a caller that must not send
-        // an application body already gates on `storage === "ready"`.
+        // nothing watching. Expiry remains caller detachment even though the
+        // shared start itself succeeded.
         const root = tempDir("mc-policy-storage-deadline-");
         const { binary } = fakeBinary(root);
         const budgets: number[] = [];
@@ -926,16 +1391,48 @@ describe("demand-start coalescing and detachment (U3 scenarios 15-16)", () => {
                     return "ready";
                 },
             });
-            const outcome = await policy.demandStart({
-                origin: "managed-default",
-                capability: "magic-context",
-                deadlineMs: CALLER_BUDGET_MS,
+            await expect(
+                policy.demandStart({
+                    origin: "managed-default",
+                    capability: "magic-context",
+                    deadlineMs: CALLER_BUDGET_MS,
+                }),
+            ).rejects.toMatchObject({
+                name: "WaiterDetachedError",
+                cause_kind: "deadline",
             });
-            expect(outcome.result.ok).toBe(true);
-            expect(outcome.storage).toBe("unavailable");
             // The caller's residual budget bounded the probe, not the 5s hard cap.
             expect(budgets).toHaveLength(1);
             expect(budgets[0]).toBeLessThanOrEqual(CALLER_BUDGET_MS);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    }, 20_000);
+
+    test("caller cancellation during storage readiness stays detached", async () => {
+        const root = tempDir("mc-policy-storage-abort-");
+        const { binary } = fakeBinary(root);
+        const controller = new AbortController();
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                storageProbe: () => {
+                    queueMicrotask(() => controller.abort());
+                    return new Promise<never>(() => {});
+                },
+            });
+
+            await expect(
+                policy.demandStart({
+                    origin: "managed-default",
+                    capability: "magic-context",
+                    signal: controller.signal,
+                }),
+            ).rejects.toMatchObject({
+                name: "WaiterDetachedError",
+                cause_kind: "aborted",
+            });
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
@@ -1081,7 +1578,7 @@ describe("demand-start coalescing and detachment (U3 scenarios 15-16)", () => {
         }
     }, 20_000);
 
-    test("a hanging storage probe is bounded and degrades to unavailable", async () => {
+    test("a hanging storage probe detaches at the caller deadline", async () => {
         const root = tempDir("mc-policy-storage-hang-");
         const { binary } = fakeBinary(root);
         try {
@@ -1091,13 +1588,16 @@ describe("demand-start coalescing and detachment (U3 scenarios 15-16)", () => {
                 // Never settles; the policy's own bound must end the wait.
                 storageProbe: () => new Promise<never>(() => {}),
             });
-            const outcome = await policy.demandStart({
-                origin: "managed-default",
-                capability: "magic-context",
-                deadlineMs: 250,
+            await expect(
+                policy.demandStart({
+                    origin: "managed-default",
+                    capability: "magic-context",
+                    deadlineMs: 250,
+                }),
+            ).rejects.toMatchObject({
+                name: "WaiterDetachedError",
+                cause_kind: "deadline",
             });
-            expect(outcome.result.ok).toBe(true);
-            expect(outcome.storage).toBe("unavailable");
         } finally {
             rmSync(root, { recursive: true, force: true });
         }

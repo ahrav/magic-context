@@ -11,8 +11,8 @@ import {
     type DreamerEvalScenario,
     type DreamerTask,
 } from "../src/dreamer-eval/contract";
-import { assertDreamerModelPin, runDreamerEvalTask } from "../src/dreamer-eval/runner";
-import { aggregateDreamerEvalVariance } from "../src/dreamer-eval/variance";
+import { DreamerEvalArtifactError, runDreamerEvalTask } from "../src/dreamer-eval/runner";
+import { aggregateDreamerEvalVarianceFiles } from "../src/dreamer-eval/variance";
 
 const E2E_ROOT = resolve(import.meta.dir, "..");
 
@@ -102,12 +102,18 @@ function selectedScenarios(all: DreamerEvalScenario[], ids: readonly string[]): 
 }
 
 function opencodeVersion(): string {
-    const result = Bun.spawnSync(["opencode", "--version"], {
-        stdout: "pipe",
-        stderr: "ignore",
-    });
-    const version = result.success ? result.stdout.toString().trim() : "";
-    return version || "unknown";
+    // `Bun.spawnSync` throws when the executable is not on PATH, and this runs
+    // before any task, so an absent `opencode` would abort the whole run while
+    // resolving a provenance field the report already accepts as "unknown".
+    try {
+        const result = Bun.spawnSync(["opencode", "--version"], {
+            stdout: "pipe",
+            stderr: "ignore",
+        });
+        return (result.success ? result.stdout.toString().trim() : "") || "unknown";
+    } catch {
+        return "unknown";
+    }
 }
 
 async function main(): Promise<0 | 1 | 2> {
@@ -118,7 +124,9 @@ async function main(): Promise<0 | 1 | 2> {
     if (!apiKey || !model) {
         throw new Error("live run needs ANTHROPIC_API_KEY and DREAMER_EVAL_MODEL (anthropic/model)");
     }
-    assertDreamerModelPin(model);
+    if (!/^anthropic\/[^/\s]+$/.test(model)) {
+        throw new Error("DREAMER_EVAL_MODEL must use the anthropic/model form");
+    }
     const scenarios = selectedScenarios(loadScenarios(), args.scenarioIds);
     const taskFilter = new Set(args.tasks);
     const groups = scenarios.flatMap((scenario) =>
@@ -130,35 +138,74 @@ async function main(): Promise<0 | 1 | 2> {
 
     mkdirSync(args.outputDir, { recursive: true });
     const reports: DreamerEvalRunReport[] = [];
+    let aggregationFailed = false;
+    let runFailed = false;
+    let deadlineReached = false;
     const version = opencodeVersion();
     for (const { scenario, task } of groups) {
+        if (runFailed) break;
         const groupDir = join(args.outputDir, scenario.id, task.task);
-        const groupReports: DreamerEvalRunReport[] = [];
+        const groupReportPaths: string[] = [];
         for (let repeat = 1; repeat <= args.repeat; repeat += 1) {
             if (!canStartDreamerEvalRun(startedAtMs, args.deadlineMinutes, Date.now(), reports.length)) {
+                deadlineReached = true;
                 console.log(`dreamer-eval deadline reached before ${scenario.id}/${task.task} run ${repeat}`);
                 break;
             }
             console.log(`${scenario.id}/${task.task}: run ${repeat}/${args.repeat}`);
-            const report = await runDreamerEvalTask(scenario, task, {
-                apiKey,
-                model,
-                artifactDir: groupDir,
-                opencodeVersion: version,
-            });
-            groupReports.push(report);
+            // A task classifies its own failures into an ERROR report, so a throw
+            // here is structural — provenance, or the artifact write. Letting it
+            // escape would reach the outer catch, which exits 1 without consulting
+            // the reports already collected, dropping a previous repeat's safety
+            // exit 2. Stop instead of continuing: a structural fault repeats, and
+            // every further repeat would spend model credits to fail the same way.
+            let report: DreamerEvalRunReport;
+            try {
+                report = await runDreamerEvalTask(scenario, task, {
+                    apiKey,
+                    model,
+                    artifactDir: groupDir,
+                    opencodeVersion: version,
+                });
+            } catch (error) {
+                runFailed = true;
+                // An artifact failure still carries the run's report: count it, so a
+                // classification the run established — including an irreversible
+                // archival — reaches the exit code. Its path is not recorded, since
+                // the file is what failed to be written.
+                if (error instanceof DreamerEvalArtifactError) reports.push(error.report);
+                console.error(
+                    `${scenario.id}/${task.task}: run ${repeat} failed: ${error instanceof Error ? error.message : String(error)}`,
+                );
+                break;
+            }
+            groupReportPaths.push(join(groupDir, `${report.runId}.json`));
             reports.push(report);
             console.log(`${report.runId}: ${report.status}${report.reason === null ? "" : `:${report.reason}`}`);
         }
-        if (groupReports.length > 0) {
-            const variance = aggregateDreamerEvalVariance(groupReports, args.repeat);
-            writeFileSync(join(groupDir, "variance.json"), `${JSON.stringify(variance, null, 2)}\n`);
+        if (groupReportPaths.length === 0) {
+            if (deadlineReached) break;
+            continue;
         }
-        if (!canStartDreamerEvalRun(startedAtMs, args.deadlineMinutes, Date.now(), reports.length)) break;
+        // A failure here must not swallow what the runs already established. The
+        // outer catch exits 1 unconditionally, so letting this throw would downgrade
+        // an applied wrong archival's safety exit 2 to 1 because a later artifact or
+        // system-tuple error happened to surface after it.
+        try {
+            const variance = aggregateDreamerEvalVarianceFiles(groupReportPaths);
+            writeFileSync(join(groupDir, "variance.json"), `${JSON.stringify(variance, null, 2)}\n`);
+        } catch (error) {
+            aggregationFailed = true;
+            console.error(
+                `${scenario.id}/${task.task}: variance aggregation failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+        }
+        if (deadlineReached) break;
     }
+    const code = dreamerEvalExitCode(reports);
     const expectedRunCount = groups.length * args.repeat;
-    const reportExitCode = dreamerEvalExitCode(reports);
-    return reportExitCode === 2 ? 2 : reports.length === expectedRunCount ? reportExitCode : 1;
+    // A run-fatal set keeps exit 2; anything else fails the run.
+    return code === 2 ? code : aggregationFailed || runFailed || reports.length !== expectedRunCount ? 1 : code;
 }
 
 if (import.meta.main) {

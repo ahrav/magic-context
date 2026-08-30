@@ -714,6 +714,69 @@ describe("stream handling (KTD11)", () => {
         expectCallError(await rejection(request.result), "not_sent", "generation_retired");
         expect(generation.stats().pendingRequests).toBe(0);
     });
+
+    test("an unsatisfiable retained-item ceiling is refused before the Request reaches the peer", async () => {
+        const peer = await h.startPeer();
+        const generation = await h.dial(peer);
+        const connection = await peer.waitForConnection();
+        // An empty StreamData frame charges zero pending bytes while retaining
+        // one decoded item, so a ceiling the item comparison can never reach
+        // leaves retention unbounded.
+        for (const maxStreamItems of [
+            Number.POSITIVE_INFINITY,
+            Number.NaN,
+            -1,
+            2.5,
+            Number.MAX_SAFE_INTEGER + 1,
+        ]) {
+            let refused: unknown;
+            try {
+                generation.request({
+                    channel: CHANNEL,
+                    epoch: EPOCH,
+                    body: Buffer.from("stream"),
+                    deadline: Deadline.start(5_000),
+                    mode: "stream",
+                    maxStreamItems,
+                });
+            } catch (error) {
+                refused = error;
+            }
+            expectCallError(refused, "not_sent", "invalid_max_stream_items");
+        }
+        expect(generation.stats().pendingRequests).toBe(0);
+        // Publication is asynchronous, so a legal request flushed through the
+        // peer is the observation point: exactly its own Request frame arrives,
+        // proving the refusals allocated no correlation and wrote no bytes.
+        await roundTrip(generation, connection);
+        expect(
+            connection.frames.filter((frame) => frame.ty === PeerFrameType.Request),
+        ).toHaveLength(1);
+    });
+
+    test("a zero retained-item ceiling admits the request and refuses the first item", async () => {
+        const peer = await h.startPeer();
+        const generation = await h.dial(peer);
+        const connection = await peer.waitForConnection();
+        const request = generation.request({
+            channel: CHANNEL,
+            epoch: EPOCH,
+            body: Buffer.from("stream"),
+            deadline: Deadline.start(5_000),
+            mode: "stream",
+            maxStreamItems: 0,
+        });
+        await connection.send({
+            ty: PeerFrameType.StreamData,
+            channel: CHANNEL,
+            epoch: EPOCH,
+            corr: request.correlation,
+            body: Buffer.from("s1"),
+        });
+        expectCallError(await rejection(request.result), "terminal", "stream_item_limit");
+        expect(generation.isRetired()).toBe(false);
+        expect(generation.stats().pendingHeldBytes).toBe(0);
+    });
 });
 
 describe("memory accounting and the 64 MiB boundary", () => {

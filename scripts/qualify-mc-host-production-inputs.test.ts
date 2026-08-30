@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { completeRegistryGate } from "./__fixtures__/registry-gate";
 import { buildContract } from "./generate-mc-host-release-manifest";
 import {
     assertPinsMatchContract,
@@ -97,6 +98,18 @@ function freshRoot(): string {
         mkdirSync(join(root, dirname(relative)), { recursive: true });
         cpSync(join(repoRoot, relative), join(root, relative));
     }
+    // The committed gate is fail-closed by design, and generation refuses to run
+    // against it, so every case here would fail on the gate instead of the rule
+    // it means to exercise. Stage a synthetic complete gate instead.
+    const gatePath = join(root, "release/mc-host-registry-gate.json");
+    writeFileSync(
+        gatePath,
+        `${JSON.stringify(
+            completeRegistryGate(JSON.parse(readFileSync(gatePath, "utf8"))),
+            null,
+            2,
+        )}\n`,
+    );
     return root;
 }
 
@@ -419,11 +432,28 @@ describe("deterministic generation and drift", () => {
         expect(result.productionQualified).toBe(false);
     });
 
+    test("check mode ignores local evidence whether absent or present", () => {
+        const root = freshRoot();
+        installManifest(root, fixtureManifest());
+        generate(root, { check: false });
+
+        rmSync(join(root, OUTPUT_PATHS.evidence));
+        expect(generate(root, { check: true }).drift).toEqual([]);
+
+        mkdirSync(join(root, dirname(OUTPUT_PATHS.evidence)), {
+            recursive: true,
+        });
+        writeFileSync(join(root, OUTPUT_PATHS.evidence), '{"stale":true}\n');
+        expect(generate(root, { check: true }).drift).toEqual([]);
+    });
+
     test("pins, floors, budgets, and layout IDs drift only through regeneration", () => {
         const root = freshRoot();
         installManifest(root, fixtureManifest());
         generate(root, { check: false });
-        for (const relative of Object.values(OUTPUT_PATHS)) {
+        for (const relative of Object.values(OUTPUT_PATHS).filter(
+            (path) => path !== OUTPUT_PATHS.evidence,
+        )) {
             const path = join(root, relative);
             const original = readFileSync(path, "utf8");
             writeFileSync(path, `${original.trimEnd()} \n`);
@@ -2619,10 +2649,9 @@ describe("harness runtime closure graph qualification", () => {
 });
 
 describe("build-entrypoint evidence consumption (U2/U6 gate)", () => {
-    test("committed qualification remains blocked on the exact kernel floor", () => {
-        expect(() => requireQualificationEvidence(repoRoot)).toThrow(
-            /not production-qualified/,
-        );
+    test("production build rejects absent local qualification evidence", () => {
+        const root = freshRoot();
+        expect(() => requireQualificationEvidence(root)).toThrow(/absent/);
     });
 
     test("absent, malformed, and test-only evidence are rejected", () => {
@@ -2954,7 +2983,19 @@ describe("release prerequisite (CLI)", () => {
             encoding: "utf8",
         });
         expect(required.status).toBe(1);
-        expect(required.stderr).toContain("not production-qualified");
+        // The refusal is the claim; its reason depends on the checkout. Evidence
+        // lives at an ignored `tmp/` path, so a clean tree rejects it as absent
+        // while a tree that has already generated it rejects the recorded
+        // verdict. Both are the gate refusing on qualification grounds, so
+        // accepting either keeps this independent of ambient files.
+        expect(required.stderr).toContain("qualification evidence rejected");
+        const refusals = [
+            "not production-qualified",
+            `absent (${OUTPUT_PATHS.evidence})`,
+        ];
+        expect(
+            refusals.filter((reason) => required.stderr.includes(reason)),
+        ).not.toEqual([]);
 
         // The drift check over the same tree stays green, which is what keeps CI
         // usable while the real production bytes are still unqualified.

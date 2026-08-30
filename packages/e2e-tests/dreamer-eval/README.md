@@ -53,20 +53,49 @@ setting cannot leak into a shared test process. Output is grouped under
 included a claim, while `missingRuns` includes sparse outputs and repeats skipped
 after the script-level deadline. `repeatCount` remains the requested repeat count.
 The deadline is checked between paid runs, leaving time for variance writes and
-artifact upload before the enclosing workflow timeout.
+artifact upload before the enclosing workflow timeout. Deadline truncation exits
+`1`; `variance.json` records skipped repeats in `missingRuns`.
+
+Every report records the plugin entrypoint and a digest of everything the run's
+outcome depends on that the commit does not pin: the loaded bundle's bytes when a
+bundle is loaded, plus every working-tree deviation from HEAD with its content, so
+an edited untracked module moves the digest too. The scope is the whole repository
+because the runner, scorers, contract, seeder, and corpus decide a result as much
+as the plugin does. The harness prefers `packages/plugin/dist/index.js` when it
+exists and falls back to `packages/plugin/src/index.ts`, so the commit alone does
+not identify what ran, and without the digest two runs of different
+implementations would aggregate as repeats of one experiment. The run's own output tree is excluded, since outputs are not inputs and a report
+written between repeats would otherwise give every repeat a different tuple. The
+tuple also records `process.platform`, because path handling is separator-aware and
+a case-insensitive filesystem changes which paths resolve. Variance refuses a set
+whose reports disagree on any part of that tuple, or whose run ids repeat, so a run
+from a dirty tree is comparable only against runs from the same tree and one
+invocation cannot be counted as several agreeing repeats.
+
+Reports also record the fixture repository's tracked files, read with `git
+ls-files` after seeding. That is the universe production resolves an observed
+mapping path against, so both the scorer and the variance encoder use it to decide
+which paths the host would actually store.
 
 Exit codes are `0` when every run passes, `1` for any ordinary FAIL or ERROR,
 and `2` when any run archives a gold-true claim. Missing credentials, invalid
-filters, malformed scenarios, and artifact failures exit `1`.
+filters, malformed scenarios, deadline truncation, and artifact failures exit
+`1`.
 
 ## Authoring scenarios
 
 Add one JSON file per scenario under `dev/`; its filename must match its id.
-Every pool has at most 50 ordinary claims, including at least 10 hygiene-visible claims. Gold uses logical claim
+Every pool has 10-50 hygiene-visible ordinary claims. Gold uses logical claim
 ids from the pool, while the runner resolves production public ids after
 seeding. Verify gold excludes file-independent claims. Map and classify gold
 include them. Every task declares the exact in-scope and skipped partition that
 the production gate must return before a model request is allowed.
+
+Every scenario also declares `pressureRoles`. Valid roles are
+`semantic-duplicate-pair`, `near-duplicate-pair`, `stale`,
+`contradiction-pair`, `false-fluent`, `high-value-file-independent`,
+`rejected-alternative`, and `branch-specific`. Pair roles name exactly two claim
+ids; other roles name one. Use an empty array when no pressure role applies.
 
 `dme-core-pool` covers semantic duplicates, load-bearing near duplicates,
 stale and contradictory claims, false-but-fluent text, a file-independent

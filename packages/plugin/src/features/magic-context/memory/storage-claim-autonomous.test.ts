@@ -32,6 +32,17 @@ test("rejection receipts match independent operation and digest goldens", () => 
                 requestDigest,
             });
         }
+        recordAutonomousManifestRejection({
+            db,
+            identity: { ...identity, batchId: "batch-3" },
+            rawManifest: "<invalid>",
+            reason: "invalid manifest",
+            nowMs: 1,
+        });
+        const sameManifestDigest = db.prepare(
+            "SELECT request_digest AS requestDigest FROM claim_operation_receipts WHERE operation_key = ?",
+        ).get("verify:session-1:verify:project:3:batch-3") as { requestDigest: string };
+        expect(sameManifestDigest.requestDigest).not.toBe(pairs[0][2]);
     } finally {
         db.close();
     }
