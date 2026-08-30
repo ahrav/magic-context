@@ -193,6 +193,8 @@ function systemIdentity(system: DreamerSystemTuple): string {
         system.opencodeVersion,
         system.modelId,
         system.parserImpl,
+        system.pluginEntry,
+        system.pluginDigest,
     ].join("\u0000");
 }
 

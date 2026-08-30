@@ -673,6 +673,8 @@ describe("dreamer eval report contract", () => {
             opencodeVersion: "1.0.0",
             modelId: "model",
             parserImpl: "ts",
+            pluginEntry: "src",
+            pluginDigest: "d".repeat(64),
         },
         poolBefore: POOL_CAPTURE,
         poolAfter: POOL_CAPTURE,

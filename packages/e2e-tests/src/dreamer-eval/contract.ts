@@ -83,6 +83,7 @@ const RUN_ID_RE = /^run-[a-z0-9]+(?:-[a-z0-9]+)*$/;
  * could not be checked out or verified.
  */
 const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const DIGEST_RE = /^[0-9a-f]{64}$/;
 
 /**
  * Lowest verification timestamp the seeder can build a fixture around.
@@ -844,12 +845,29 @@ export interface PoolDescriptor {
     claims: ClaimSnapshotProjection[];
 }
 
+export const PLUGIN_RUNTIME_SOURCES = ["dist", "src"] as const;
+export type PluginRuntimeSource = (typeof PLUGIN_RUNTIME_SOURCES)[number];
+
 export interface DreamerSystemTuple {
     repoCommitSha: string;
     bunVersion: string;
     opencodeVersion: string;
     modelId: string;
     parserImpl: "ts";
+    /**
+     * Which plugin entrypoint the harness loaded. `spawn.ts` prefers
+     * `packages/plugin/dist/index.js` when it exists and falls back to
+     * `packages/plugin/src/index.ts`, so the commit alone does not say which
+     * bytes ran.
+     */
+    pluginEntry: PluginRuntimeSource;
+    /**
+     * Digest of those bytes. `repoCommitSha` describes the checkout, not the
+     * runtime: a dirty tree or a stale bundle makes two runs at one commit
+     * execute different plugin implementations, and without this they would share
+     * a system tuple and aggregate as repeats of one experiment.
+     */
+    pluginDigest: string;
 }
 
 export type DreamerRunStatus = "PASS" | "FAIL" | "ERROR";
@@ -970,13 +988,19 @@ export function parsePoolDescriptor(raw: unknown, label = "pool"): PoolDescripto
 
 function parseSystem(raw: unknown, label: string): DreamerSystemTuple {
     const value = record(raw, label);
-    exact(value, ["repoCommitSha", "bunVersion", "opencodeVersion", "modelId", "parserImpl"], label);
+    exact(
+        value,
+        ["repoCommitSha", "bunVersion", "opencodeVersion", "modelId", "parserImpl", "pluginEntry", "pluginDigest"],
+        label,
+    );
     return {
         repoCommitSha: staticId(value.repoCommitSha, `${label}.repoCommitSha`, SHA_RE),
         bunVersion: string(value.bunVersion, `${label}.bunVersion`),
         opencodeVersion: string(value.opencodeVersion, `${label}.opencodeVersion`),
         modelId: string(value.modelId, `${label}.modelId`),
         parserImpl: enumeration(value.parserImpl, ["ts"], `${label}.parserImpl`),
+        pluginEntry: enumeration(value.pluginEntry, PLUGIN_RUNTIME_SOURCES, `${label}.pluginEntry`),
+        pluginDigest: staticId(value.pluginDigest, `${label}.pluginDigest`, DIGEST_RE),
     };
 }
 

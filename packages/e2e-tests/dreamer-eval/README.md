@@ -50,6 +50,14 @@ setting cannot leak into a shared test process. Output is grouped under
 `<output-dir>/<scenario>/<task>/`: one versioned run report per repeat and one
 `variance.json` artifact for the set.
 
+Every report records the plugin entrypoint and a digest of the bytes the harness
+loaded, alongside the commit. The harness prefers `packages/plugin/dist/index.js`
+when it exists and falls back to `packages/plugin/src/index.ts`, so the commit
+alone does not identify what ran: a dirty tree or a stale bundle would otherwise
+let two runs of different implementations aggregate as repeats of one experiment.
+Variance refuses a set whose reports disagree on any part of that tuple. Build
+the bundle, or remove it, before a run whose repeats must be comparable.
+
 Exit codes are `0` when every run passes, `1` for any ordinary FAIL or ERROR,
 and `2` when any run archives a gold-true claim. Missing credentials, invalid
 filters, malformed scenarios, and artifact failures exit `1`.

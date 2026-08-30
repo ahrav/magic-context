@@ -9,6 +9,8 @@ const system = {
     opencodeVersion: "1.0.0",
     modelId: "anthropic/model",
     parserImpl: "ts" as const,
+    pluginEntry: "src" as const,
+    pluginDigest: "d".repeat(64),
 };
 
 function report(index: number, verdict: VerifyVerdict = "verified"): DreamerEvalRunReport {
@@ -83,11 +85,30 @@ describe("dreamer eval variance", () => {
         );
     });
 
+    test("differing plugin bytes are not one system", () => {
+        // repoCommitSha describes the checkout; the digest describes what ran. A
+        // dirty tree or a stale bundle makes two runs at one commit execute
+        // different plugin implementations, and they must not aggregate as repeats.
+        const rebuilt = report(2);
+        rebuilt.system = { ...rebuilt.system, pluginDigest: "e".repeat(64) };
+        expect(() => aggregateDreamerEvalVariance([report(1), rebuilt])).toThrow(
+            "variance reports must share one system tuple",
+        );
+
+        const bundled = report(2);
+        bundled.system = { ...bundled.system, pluginEntry: "dist" };
+        expect(() => aggregateDreamerEvalVariance([report(1), bundled])).toThrow(
+            "variance reports must share one system tuple",
+        );
+    });
+
     test("a reordered system tuple is the same system", () => {
         const reordered = report(2);
         // Same five fields, rebuilt in another key order — what a report that
         // round-tripped through a different serializer carries.
         reordered.system = {
+            pluginDigest: system.pluginDigest,
+            pluginEntry: system.pluginEntry,
             parserImpl: system.parserImpl,
             modelId: system.modelId,
             opencodeVersion: system.opencodeVersion,

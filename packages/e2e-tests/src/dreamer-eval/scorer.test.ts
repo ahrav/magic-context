@@ -147,6 +147,8 @@ export function exitCodeForScore(result: ManifestScore): 0 | 1 | 2 {
             opencodeVersion: "test",
             modelId: "test/model",
             parserImpl: "ts",
+            pluginEntry: "src",
+            pluginDigest: "d".repeat(64),
         },
         poolBefore: [],
         poolAfter: [],

@@ -30,9 +30,11 @@ import {
     runClassify,
 } from "../../../plugin/src/features/magic-context/dreamer/classify";
 import { dreamerManifestIdentity } from "../../../plugin/src/features/magic-context/dreamer/claim-manifest";
+import { sha256Utf8Hex } from "../../../plugin/src/features/magic-context/memory/storage-claims";
 import { getSubagentInvocations } from "../../../plugin/src/features/magic-context/storage-subagent-invocations";
 import { autonomousManifestRejectionRequestDigest } from "../../../plugin/src/features/magic-context/memory/storage-claim-autonomous";
 import { TestHarness } from "../harness";
+import { PLUGIN_BUNDLE_ENTRY, PLUGIN_REPO_ROOT, pluginEntryPath } from "../opencode-runner/spawn";
 import { openTestDb } from "../test-db";
 import { liveModelSpawnOptions } from "../oracle-arms/presets";
 import {
@@ -48,6 +50,7 @@ import {
     type ErrorReason,
     type FailReason,
     type ParsedLayerGold,
+    type PluginRuntimeSource,
     type PoolDescriptor,
 } from "./contract";
 import {
@@ -353,6 +356,37 @@ function gitOutput(workdir: string, args: readonly string[]): string | null {
     return result.success ? result.stdout.toString().trim() : null;
 }
 
+/**
+ * The plugin bytes this run will actually load, resolved the way
+ * `opencode-runner/spawn.ts` resolves them: the built bundle when it exists,
+ * otherwise the source entry.
+ *
+ * A bundle is one file, so its own digest is the artifact. Source is a tree, so
+ * the digest covers the commit plus every deviation from it inside
+ * `packages/plugin` — `git status --porcelain` names untracked and modified files,
+ * `git diff HEAD` carries their content. Two runs whose plugin implementation
+ * differs therefore differ here, which is what stops the variance aggregator from
+ * treating them as repeats of one experiment.
+ */
+function pluginRuntime(): { pluginEntry: PluginRuntimeSource; pluginDigest: string } {
+    // Ask the spawner which entry it resolves rather than recomputing it: a second
+    // copy of that choice would describe the wrong file the moment the spawner's
+    // preference changes.
+    if (pluginEntryPath() === PLUGIN_BUNDLE_ENTRY) {
+        return {
+            pluginEntry: "dist",
+            pluginDigest: sha256Utf8Hex(readFileSync(PLUGIN_BUNDLE_ENTRY, "utf8")),
+        };
+    }
+    const head = gitOutput(PLUGIN_REPO_ROOT, ["rev-parse", "HEAD"]);
+    const status = gitOutput(PLUGIN_REPO_ROOT, ["status", "--porcelain", "--", "packages/plugin"]);
+    const diff = gitOutput(PLUGIN_REPO_ROOT, ["diff", "HEAD", "--", "packages/plugin"]);
+    if (head === null || status === null || diff === null) {
+        throw new Error("dreamer-eval could not resolve the loaded plugin source state");
+    }
+    return { pluginEntry: "src", pluginDigest: sha256Utf8Hex([head, status, diff].join("\u0000")) };
+}
+
 function systemTuple(options: RunDreamerEvalTaskOptions) {
     const repoCommitSha =
         options.repoCommitSha ?? gitOutput(import.meta.dir, ["rev-parse", "HEAD"]) ?? "";
@@ -365,6 +399,7 @@ function systemTuple(options: RunDreamerEvalTaskOptions) {
         opencodeVersion: options.opencodeVersion ?? "unknown",
         modelId: options.model,
         parserImpl: "ts" as const,
+        ...pluginRuntime(),
     };
 }
 
