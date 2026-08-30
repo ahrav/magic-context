@@ -9,8 +9,8 @@
 //! same boundary and trigger decision.
 
 use crate::chunk_text::{
-    clean_user_text, compact_role, compact_text_for_summary, extract_key_arg, format_block_line,
-    is_system_directive, merge_commit_hashes, normalize_text,
+    clean_user_text, clean_user_text_cow, compact_role, compact_text_for_summary, extract_key_arg,
+    format_block_line, is_system_directive, merge_commit_hashes, normalize_text,
 };
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -1534,7 +1534,7 @@ struct ChunkBlock {
     start_ordinal: u64,
     end_ordinal: u64,
     parts: Vec<String>,
-    meta: Vec<(u64, String)>,
+    meta: Vec<u64>,
     commit_hashes: Vec<String>,
     is_tool_only: bool,
 }
@@ -1547,7 +1547,7 @@ struct ChunkBuilder<'a> {
     messages_processed: usize,
     last_ordinal: u64,
     current_block: Option<ChunkBlock>,
-    pending_noise_meta: Vec<(u64, String)>,
+    pending_noise_meta: Vec<u64>,
     formatted_blocks: Vec<String>,
     block_tokens: Vec<f64>,
     commit_cluster_count: usize,
@@ -1575,7 +1575,7 @@ impl<'a> ChunkBuilder<'a> {
     }
 
     fn push_message(&mut self, message: &BoundaryMsg) -> bool {
-        let meta = (message.message_ordinal, message.message_id.clone());
+        let meta = message.message_ordinal;
         if message.role == Role::User && !has_meaningful_user_text(&message.blocks) {
             let tc_summaries = extract_tool_call_summaries(&message.blocks);
             if tc_summaries.is_empty() {
@@ -1600,7 +1600,7 @@ impl<'a> ChunkBuilder<'a> {
             let start = self
                 .pending_noise_meta
                 .first()
-                .map(|(ordinal, _)| *ordinal)
+                .copied()
                 .unwrap_or(message.message_ordinal);
             let mut meta_list = std::mem::take(&mut self.pending_noise_meta);
             meta_list.push(meta);
@@ -1618,20 +1618,20 @@ impl<'a> ChunkBuilder<'a> {
 
         let role = compact_role(message.role.as_str());
         let text_parts = text_parts(message);
-        let tool_summaries = if text_parts.is_empty() {
-            extract_tool_call_summaries(&message.blocks)
-        } else {
+        let msg_has_narrative = !text_parts.is_empty();
+        let tool_summaries = if msg_has_narrative {
             Vec::new()
+        } else {
+            extract_tool_call_summaries(&message.blocks)
         };
-        let mut all_parts = text_parts.clone();
+        let mut all_parts = text_parts;
         all_parts.extend(tool_summaries);
-        let compacted = compact_text_for_summary(&all_parts.join(" / "), message.role.as_str());
+        let compacted = compact_text_for_summary(all_parts.join(" / "), message.role.as_str());
         let text = compacted.text;
         if text.is_empty() {
             self.pending_noise_meta.push(meta);
             return true;
         }
-        let msg_has_narrative = !text_parts.is_empty();
         if let Some(current) = self
             .current_block
             .as_mut()
@@ -1655,7 +1655,7 @@ impl<'a> ChunkBuilder<'a> {
         let start = self
             .pending_noise_meta
             .first()
-            .map(|(ordinal, _)| *ordinal)
+            .copied()
             .unwrap_or(message.message_ordinal);
         let mut meta_list = std::mem::take(&mut self.pending_noise_meta);
         meta_list.push(meta);
@@ -1692,7 +1692,7 @@ impl<'a> ChunkBuilder<'a> {
         self.last_ordinal = current_block
             .meta
             .last()
-            .map(|(ordinal, _)| *ordinal)
+            .copied()
             .unwrap_or(current_block.end_ordinal);
         self.messages_processed += current_block.meta.len();
         self.formatted_blocks.push(block_text);
@@ -1734,8 +1734,9 @@ fn has_meaningful_user_text(blocks: &[BoundaryBlock]) -> bool {
         if block.ignored || !matches!(block.kind, SelKind::Text) {
             return false;
         }
-        let cleaned = clean_user_text(&block.original);
-        !cleaned.trim().is_empty() && !is_system_directive(&cleaned)
+        let cleaned = clean_user_text_cow(&block.original);
+        let trimmed = cleaned.trim();
+        !trimmed.is_empty() && !is_system_directive(trimmed)
     })
 }
 

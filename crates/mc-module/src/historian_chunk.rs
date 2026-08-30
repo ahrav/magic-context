@@ -158,7 +158,7 @@ impl Builder {
         };
         let mut all_parts = text_parts.clone();
         all_parts.extend(tool_summaries);
-        let compacted = compact_text_for_summary(&all_parts.join(" / "), message.role);
+        let compacted = compact_text_for_summary(all_parts.join(" / "), message.role);
         if compacted.text.is_empty() {
             self.pending_noise_meta.push(meta);
             return true;
