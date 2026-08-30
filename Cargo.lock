@@ -1046,6 +1046,7 @@ name = "mc-store"
 version = "0.1.0"
 dependencies = [
  "cortexkit-cache-core",
+ "cortexkit-lease",
  "cortexkit-store",
  "cortexkit-store-types",
  "flate2",

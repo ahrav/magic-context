@@ -132,7 +132,7 @@ fn kernel_schema_has_one_ordered_full_shape() {
 const INCARNATION: &str = "0123456789abcdef0123456789abcdef";
 
 const PINNED_SCHEMA_DIGEST: &str =
-    "edd21757592088f528212faa058a1c3dd0feb122dc9fa539ecbfa17b67ab6b01";
+    "92e7c76e51e721720c2123e0bba45ea41995545b308f9767c64c7aef0fe7a9e6";
 
 #[test]
 fn kernel_schema_digest_is_pinned_to_the_frozen_v1_shape() {
@@ -1223,15 +1223,21 @@ fn replace_cannot_bypass_the_append_only_guards() {
     let commit_seq = next_commit(&conn, "tx-replace");
 
     // REPLACE resolves a conflict by deleting the existing row; the delete
-    // trigger only runs when recursive_triggers is on.
-    assert!(conn
-        .execute(
-            "INSERT OR REPLACE INTO mc_kernel_format_marker(
-                 singleton, format_epoch, database_incarnation_id, schema_digest, created_at
-             ) VALUES (1, 99, '99999999999999999999999999999999', ?1, 2)",
-            [PINNED_SCHEMA_DIGEST],
-        )
-        .is_err());
+    // trigger only runs when recursive_triggers is on. Every value below
+    // satisfies the STRICT column types and the length CHECKs, so the BEFORE
+    // INSERT guard is the only thing left that can reject these statements.
+    let columns = "singleton, format_epoch, database_incarnation_id, schema_digest, created_at,
+                   marker_digest";
+    let values = format!(
+        "1, 99, '{}', '{}', 2, '{}'",
+        "9".repeat(32),
+        PINNED_SCHEMA_DIGEST,
+        "d".repeat(64)
+    );
+    for verb in ["INSERT OR REPLACE", "REPLACE"] {
+        let statement = format!("{verb} INTO mc_kernel_format_marker({columns}) VALUES({values})");
+        assert!(conn.execute(&statement, []).is_err(), "{statement}");
+    }
     assert_eq!(
         conn.query_row(
             "SELECT database_incarnation_id FROM mc_kernel_format_marker",

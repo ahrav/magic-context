@@ -14,6 +14,7 @@ mc-core = { workspace = true }
 cortexkit-cache-core = { workspace = true }
 cortexkit-store = { workspace = true }
 cortexkit-store-types = { workspace = true }
+cortexkit-lease = { workspace = true }
 rusqlite = { workspace = true, features = ["functions"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
