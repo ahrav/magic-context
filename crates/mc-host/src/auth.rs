@@ -2,9 +2,7 @@
 
 use std::{error::Error, fmt, future::Future, io, time::Duration};
 
-use hmac::{Hmac, Mac};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -13,14 +11,12 @@ use tokio::{
 
 use crate::connection_file::{ConnectionInfo, DAEMON_ID_LEN, MIN_KEY_LEN};
 
-pub const NONCE_LEN: usize = 32;
-pub const PROOF_LEN: usize = 32;
-pub const MAX_AUTH_MESSAGE_LEN: u32 = 4096;
-pub const SERVER_PROOF_DOMAIN: &str = "subc-server-v1";
-pub const CLIENT_AUTH_DOMAIN: &str = "subc-client-v1";
-pub const DEFAULT_CLIENT_ROLE: &str = "client";
+pub use mc_shm_transport::setup_auth::{
+    CLIENT_AUTH_DOMAIN, DEFAULT_CLIENT_ROLE, NONCE_LEN, PROOF_LEN, SERVER_PROOF_DOMAIN,
+};
 
-type HmacSha256 = Hmac<Sha256>;
+pub const MAX_AUTH_MESSAGE_LEN: u32 = mc_shm_transport::setup_auth::MAX_AUTH_MESSAGE_LEN as u32;
+
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientHello {
@@ -143,17 +139,14 @@ pub fn compute_proof(
     daemon_ver: &str,
     daemon_id: &[u8],
 ) -> [u8; PROOF_LEN] {
-    let daemon_ver_bytes = daemon_ver.as_bytes();
-    let daemon_ver_len =
-        u32::try_from(daemon_ver_bytes.len()).expect("auth messages bound daemon_ver to u32");
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts keys of any length");
-    mac.update(domain.as_bytes());
-    mac.update(client_nonce);
-    mac.update(server_nonce);
-    mac.update(&daemon_ver_len.to_be_bytes());
-    mac.update(daemon_ver_bytes);
-    mac.update(daemon_id);
-    mac.finalize().into_bytes().into()
+    mc_shm_transport::setup_auth::compute_proof(
+        key,
+        domain,
+        client_nonce,
+        server_nonce,
+        daemon_ver,
+        daemon_id,
+    )
 }
 
 /// An absolute handshake deadline. Every per-stage read/write recomputes the time
