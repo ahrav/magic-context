@@ -836,6 +836,7 @@ mod tests {
                 corr: 0,
             },
             &[],
+            StdInstant::now() + Duration::from_secs(1),
         )
         .expect("peer publishes late Goodbye");
         sender.finish();

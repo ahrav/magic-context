@@ -594,6 +594,7 @@ describe("mandatory shared-memory channel", () => {
         const frames: EnvelopeHeader[] = [];
         let peerAlive = true;
         let pending = true;
+        let ready: (() => void) | undefined;
         const nativeLease = {
             header: encodeHeader(responseHeader(FrameType.Response, 7n, 4)),
             byteLength: 4,
@@ -602,11 +603,15 @@ describe("mandatory shared-memory channel", () => {
             release: () => {},
         } as unknown as NativeReceiveLease;
         const native = {
-            poll: (deliver: (lease: NativeReceiveLease) => void) => {
+            drainOne: (deliver: (lease: NativeReceiveLease) => void) => {
                 if (!pending) return false;
                 pending = false;
                 deliver(nativeLease);
                 return true;
+            },
+            startReadiness: (callback: () => void) => {
+                ready = callback;
+                callback();
             },
             close: () => {},
             peerClosed: () => !peerAlive,
@@ -628,6 +633,7 @@ describe("mandatory shared-memory channel", () => {
         expect(closes).toEqual([]);
 
         peerAlive = false;
+        ready?.();
         await waitUntil(() => closes.length === 1);
         // The frame that was already in the ring is delivered before the
         // connection retires, so a graceful Goodbye is never lost.
