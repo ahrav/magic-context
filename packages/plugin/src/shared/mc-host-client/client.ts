@@ -1729,7 +1729,10 @@ export function parseSharedMemoryDiagnostics(value: unknown): SharedMemoryDiagno
             wire_version: PROTOCOL_VERSION,
             descriptor_schema: DESCRIPTOR_SCHEMA_VERSION,
         },
-        bounds: parseResourceCounts(record.bounds, "shared_memory.bounds"),
+        bounds:
+            record.bounds === null
+                ? null
+                : parseResourceCounts(record.bounds, "shared_memory.bounds"),
         accounting,
         activation: parseCounter(record.activation, "completed", "shared_memory.activation") as {
             completed: number;

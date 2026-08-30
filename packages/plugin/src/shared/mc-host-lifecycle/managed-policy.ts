@@ -9,7 +9,6 @@ import {
     type HostStatusSnapshot,
     McHostClient,
     type McHostClientOptions,
-    processMcHostClient,
     sameDaemonId,
 } from "../mc-host-client";
 import { BootstrapError, checkPlatform, type PlatformReaders, parseTrustIndex } from "./bootstrap";
@@ -275,7 +274,11 @@ async function probeManagedCompatibility(
 
 async function probeManagedReadiness(root: string, budgetMs: number): Promise<ObservationalHealth> {
     const deadline = Date.now() + budgetMs;
-    const client = await processMcHostClient({
+    // A private client, like the storage probe's. The residual budget varies per
+    // call and `ownerKey` includes the timeouts, so a shared owner would cache a
+    // new client — and prefault another ring — on every status or doctor, until
+    // admission is exhausted.
+    const client = await McHostClient.connect({
         connectionFile: connectionFilePath(root),
         handshakeTimeoutMs: Math.max(1, budgetMs),
         requestTimeoutMs: Math.max(1, budgetMs),
@@ -286,6 +289,8 @@ async function probeManagedReadiness(root: string, budgetMs: number): Promise<Ob
     } catch (error) {
         if (client.isClosed || client.authenticated === null) throw error;
         throw new ReadinessProbeControlError(error);
+    } finally {
+        await client.closeAsync().catch(() => undefined);
     }
     const { snapshot: compatibility, status } = probe;
     if (status === null) {

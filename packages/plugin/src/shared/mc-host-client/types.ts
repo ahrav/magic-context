@@ -80,7 +80,7 @@ export interface SharedMemoryDiagnostics {
         wire_version: 2;
         descriptor_schema: 2;
     };
-    bounds: SharedMemoryResourceCounts;
+    bounds: SharedMemoryResourceCounts | null;
     accounting: {
         active: SharedMemoryResourceCounts;
         quarantined: SharedMemoryResourceCounts;

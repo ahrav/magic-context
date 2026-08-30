@@ -132,6 +132,14 @@ describe("parseDaemonResult", () => {
         ).toThrow(/terminal shared memory contradicts a successful result/);
     });
 
+    test("unobserved bounds parse as unknown rather than zero", () => {
+        const diagnostics = { ...healthySharedMemory(), bounds: null };
+        const parsed = parseDaemonResult(
+            JSON.stringify(validResult({ shared_memory: diagnostics })),
+        );
+        expect(parsed.shared_memory?.bounds).toBeNull();
+    });
+
     test("accepts a fully populated conforming result", () => {
         const parsed = parseDaemonResult(JSON.stringify(validResult()));
         expect(parsed.command).toBe("status");

@@ -1023,17 +1023,6 @@ export class McHostLifecyclePolicy {
     }
 }
 
-const ZERO_RESOURCE_COUNTS: SharedMemoryResourceCounts = {
-    descriptors: 0,
-    arena_bytes: 0,
-    leases: 0,
-    mappings: 0,
-    file_descriptors: 0,
-    workers: 0,
-    client_instances: 0,
-    pinned_workers: 0,
-};
-
 function terminalSharedMemoryDiagnostics(
     errorClass: SharedMemoryDiagnostics["error_class"],
 ): SharedMemoryDiagnostics {
@@ -1045,7 +1034,7 @@ function terminalSharedMemoryDiagnostics(
             wire_version: 2,
             descriptor_schema: 2,
         },
-        bounds: ZERO_RESOURCE_COUNTS,
+        bounds: null,
         accounting: null,
         activation: { completed: 0 },
         peer_death: { observed: errorClass === "peer_death" ? 1 : 0 },
