@@ -1,6 +1,5 @@
 import { mkdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
-import { storageSubtreePath } from "../../../../plugin/src/shared/data-path";
 import { computeSyntheticCallId } from "../../../../plugin/src/hooks/magic-context/todo-view";
 import { detectRustPrerequisites } from "../../../scripts/check-rust-prerequisites";
 import type { TestHarness } from "../../harness";
@@ -840,7 +839,12 @@ function updateOpenCodeTodoMeta(
     sessionId: string,
     sql: string,
 ): void {
-    const path = join(storageSubtreePath(h.opencode.env.dataDir), "context.db");
+    const path = join(
+        h.opencode.env.dataDir,
+        "cortexkit",
+        "magic-context",
+        "context.db",
+    );
     const db = openTestDb(path);
     try {
         db.prepare(sql).run(sessionId);
@@ -1318,7 +1322,7 @@ export async function driveTodoSyntheticInjection(
  * (`advance_injection_from_meta`).
  */
 function seedRustLegacyAnchor(h: RustTestHarness, sessionId: string): boolean {
-    const path = join(storageSubtreePath(h.env.dataDir), "store.db");
+    const path = join(h.env.dataDir, "cortexkit", "magic-context", "store.db");
     const db = openTestDb(path, { readwrite: true });
     try {
         const row = db
