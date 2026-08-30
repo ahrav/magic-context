@@ -78,13 +78,14 @@ export interface SharedMemoryDiagnostics {
     artifact: {
         profile: "mc-host-test-ring-v1";
         wire_version: 2;
-        descriptor_schema: 2;
+        descriptor_schema: 3;
     };
-    bounds: SharedMemoryResourceCounts | null;
+    bounds: SharedMemoryResourceCounts;
     accounting: {
         active: SharedMemoryResourceCounts;
         quarantined: SharedMemoryResourceCounts;
     } | null;
+    attachment: { completed: number };
     activation: { completed: number };
     peer_death: { observed: number };
     reclamation: { completed: number };

@@ -71,6 +71,23 @@ interface RawAttachAddon {
     activeChannelCount(): number;
     activeExternalRefCount(): number;
     nativeLeakDiagnostics(): number;
+    createTestPair(): { first: number; second: number };
+    produce(
+        channel: number,
+        header: Uint8Array,
+        capacity: number,
+        timeoutMs: number,
+        fill: (segments: Uint8Array[]) => number,
+        beforePublish: () => void,
+    ): void;
+    poll(
+        channel: number,
+        deliver: (token: number, header: Uint8Array, segments: Uint8Array[]) => void,
+    ): boolean;
+    watch(channel: number, callback: () => void): void;
+    readinessHandled(): void;
+    release(channel: number, token: number): void;
+    close(channel: number): void;
 }
 
 function loadRawAddon(): RawAttachAddon | null {
@@ -151,6 +168,74 @@ function validRawDescriptor(): Record<string, unknown> {
 
 describe("raw N-API descriptor boundary", () => {
     const DESCRIPTOR_ERROR = /invalid shared-memory descriptor/;
+
+    test("readiness acknowledgement preserves a frame published during callback", async () => {
+        const addon = loadRawAddon();
+        if (!supportsMechanismTests(addon)) return;
+        const pair = addon.createTestPair();
+        const received: number[] = [];
+        let callbacks = 0;
+        let complete!: () => void;
+        const completed = new Promise<void>((resolve) => (complete = resolve));
+        const publish = (value: number): void => {
+            const header = new Uint8Array(21);
+            const view = new DataView(header.buffer);
+            view.setUint32(0, 1, true);
+            view.setUint8(4, 2);
+            view.setUint8(5, 3);
+            view.setUint16(7, 1, true);
+            view.setUint32(9, 1, true);
+            view.setBigUint64(13, BigInt(value), true);
+            addon.produce(
+                pair.first,
+                header,
+                1,
+                0,
+                (segments) => {
+                    segments[0]![0] = value;
+                    return 1;
+                },
+                () => {},
+            );
+        };
+        addon.watch(pair.second, () => {
+            try {
+                callbacks += 1;
+                addon.poll(pair.second, (token, _header, segments) => {
+                    received.push(segments[0]![0] ?? 0);
+                    addon.release(pair.second, token);
+                });
+                if (callbacks === 1) {
+                    publish(2);
+                } else {
+                    expect(addon.poll(pair.second, () => {})).toBe(false);
+                    complete();
+                }
+            } finally {
+                addon.readinessHandled();
+            }
+        });
+
+        let timeout: ReturnType<typeof setTimeout>;
+        try {
+            publish(1);
+            await Promise.race([
+                completed,
+                new Promise<never>((_, reject) => {
+                    timeout = setTimeout(
+                        () => reject(new Error("readiness callback timed out")),
+                        1_000,
+                    );
+                }),
+            ]);
+        } finally {
+            clearTimeout(timeout!);
+            addon.close(pair.first);
+            addon.close(pair.second);
+        }
+        expect(received).toEqual([1, 2]);
+        expect(callbacks).toBe(2);
+    });
 
     function expectRejectedWithoutEffects(
         addon: RawAttachAddon,

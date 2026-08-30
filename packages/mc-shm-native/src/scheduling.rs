@@ -9,7 +9,21 @@ use napi::bindgen_prelude::Function;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{Error, Result, Status};
 use rustix::buffer::spare_capacity;
-use rustix::event::{epoll, eventfd, EventfdFlags};
+use rustix::event::{epoll, eventfd, EventfdFlags, PollFd, PollFlags};
+
+fn wait_until_handled(control: &OwnedFd, pending: &AtomicBool, closing: &AtomicBool) -> bool {
+    let mut fds = [PollFd::new(control, PollFlags::IN)];
+    while pending.load(Ordering::Acquire) && !closing.load(Ordering::Acquire) {
+        if rustix::event::poll(&mut fds, None).is_err() {
+            return false;
+        }
+        if fds[0].revents().contains(PollFlags::IN) {
+            let mut value = [0u8; 8];
+            let _ = rustix::io::read(control, &mut value);
+        }
+    }
+    !closing.load(Ordering::Acquire)
+}
 
 /// Native worker limit. commentlint: allow(JUDGE)
 pub(crate) const WORKER_LIMIT: u32 = 0;
@@ -91,6 +105,10 @@ impl Reactor {
                             let status = callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
                             if status != Status::Ok {
                                 pending.store(false, Ordering::Release);
+                            } else if !wait_until_handled(&control, &pending, &closing) {
+                                break;
+                            } else if kick.load(Ordering::Acquire) {
+                                let _ = rustix::io::write(&control, &1u64.to_ne_bytes());
                             }
                         }
                     }
@@ -145,6 +163,7 @@ impl Reactor {
 
     pub(crate) fn handled(&self) {
         self.pending.store(false, Ordering::Release);
+        let _ = rustix::io::write(&self.control, &1u64.to_ne_bytes());
     }
 
     fn kick(&self) {
@@ -166,5 +185,44 @@ impl Reactor {
 impl Drop for Reactor {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    use rustix::event::{eventfd, EventfdFlags};
+
+    use super::wait_until_handled;
+
+    #[test]
+    fn pending_callback_waits_for_acknowledgement() {
+        let control = Arc::new(
+            eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).expect("control eventfd"),
+        );
+        let pending = Arc::new(AtomicBool::new(true));
+        let closing = Arc::new(AtomicBool::new(false));
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = {
+            let control = Arc::clone(&control);
+            let pending = Arc::clone(&pending);
+            let closing = Arc::clone(&closing);
+            std::thread::spawn(move || {
+                done_tx
+                    .send(wait_until_handled(&control, &pending, &closing))
+                    .unwrap();
+            })
+        };
+
+        rustix::io::write(&control, &1u64.to_ne_bytes()).unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(25)).is_err());
+
+        pending.store(false, Ordering::Release);
+        rustix::io::write(&control, &1u64.to_ne_bytes()).unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        waiter.join().unwrap();
     }
 }

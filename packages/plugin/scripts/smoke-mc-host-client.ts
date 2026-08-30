@@ -147,6 +147,7 @@ try {
     log(`connected (daemonVer=${client.daemonVer})`);
     try {
         const connectedEvent = events.find((event) => event.type === "connected");
+        assert.equal(connectedEvent?.transport, "shm");
         assert.equal(connectedEvent?.health, "healthy");
         assert.equal(connectedEvent?.artifact?.profile, "mc-host-test-ring-v1");
         log("shared-memory ring active");

@@ -7,7 +7,7 @@ mod setup;
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::BorrowedFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -252,13 +252,13 @@ fn strict_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
 fn attach_ring(fds: [i32; 3], grant: RingGrant) -> Result<Ring> {
     let mut descriptors = Vec::with_capacity(3);
     for fd in fds {
-        // SAFETY: fcntl only inspects fd and returns a new descriptor on success.
-        let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-        if duplicated < 0 {
-            return Err(error("shared-memory attachment failed"));
-        }
-        // SAFETY: successful F_DUPFD_CLOEXEC returns a newly owned descriptor.
-        descriptors.push(unsafe { OwnedFd::from_raw_fd(duplicated) });
+        // SAFETY: N-API caller retains each descriptor through this synchronous clone.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        descriptors.push(
+            borrowed
+                .try_clone_to_owned()
+                .map_err(|_| error("shared-memory attachment failed"))?,
+        );
     }
     Ring::attach(
         descriptors

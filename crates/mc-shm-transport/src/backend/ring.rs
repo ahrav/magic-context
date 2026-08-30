@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use crate::arena::{ArenaCounts, ArenaError, ArenaSpan, SpanPlan, MAX_FRAME_BYTES};
@@ -223,41 +224,66 @@ fn removal_ranges(
     logical_len: u64,
     page_size: usize,
 ) -> Result<[(usize, usize); 2], RingError> {
-    if arena_bytes == 0 || page_size == 0 || !page_size.is_power_of_two() {
+    if arena_bytes == 0
+        || page_size == 0
+        || !page_size.is_power_of_two()
+        || !arena_offset.is_multiple_of(page_size)
+        || !arena_bytes.is_multiple_of(page_size)
+    {
         return Err(RingError::InvalidLayout);
     }
-    let start = usize::try_from(logical_start % arena_bytes as u64)
-        .map_err(|_| RingError::ArithmeticOverflow)?;
-    let len = usize::try_from(logical_len).map_err(|_| RingError::ArithmeticOverflow)?;
-    if len > arena_bytes {
+    let logical_end = logical_start
+        .checked_add(logical_len)
+        .ok_or(RingError::ArithmeticOverflow)?;
+    if logical_len > arena_bytes as u64 {
         return Err(RingError::InvalidSharedState);
     }
+    let page_mask = !(page_size as u64 - 1);
+    let removable_start = logical_start & page_mask;
+    let removable_end = logical_end & page_mask;
+    let len = usize::try_from(removable_end - removable_start)
+        .map_err(|_| RingError::ArithmeticOverflow)?;
+    let start = usize::try_from(removable_start % arena_bytes as u64)
+        .map_err(|_| RingError::ArithmeticOverflow)?;
     let first_len = len.min(arena_bytes - start);
     let segments = [(start, first_len), (0, len - first_len)];
     let mut ranges = [(0, 0); 2];
     for (index, (offset, segment_len)) in segments.into_iter().enumerate() {
-        let absolute_start = arena_offset
-            .checked_add(offset)
-            .ok_or(RingError::ArithmeticOverflow)?;
-        let absolute_end = absolute_start
-            .checked_add(segment_len)
-            .ok_or(RingError::ArithmeticOverflow)?;
-        let aligned_start = align_up(absolute_start, page_size)?;
-        let aligned_end = absolute_end & !(page_size - 1);
-        if aligned_start < aligned_end {
-            ranges[index] = (aligned_start, aligned_end - aligned_start);
+        if segment_len != 0 {
+            ranges[index] = (
+                arena_offset
+                    .checked_add(offset)
+                    .ok_or(RingError::ArithmeticOverflow)?,
+                segment_len,
+            );
         }
     }
     Ok(ranges)
 }
 
+#[cfg(test)]
+static FAIL_NEXT_PAGE_REMOVAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn remove_pages(base: *mut u8, offset: usize, len: usize) -> libc::c_int {
+    #[cfg(test)]
+    if FAIL_NEXT_PAGE_REMOVAL.swap(false, Ordering::AcqRel) {
+        return -1;
+    }
+    // SAFETY: caller supplies a live page-aligned range inside the shared mapping.
+    unsafe { libc::madvise(base.add(offset).cast(), len, libc::MADV_REMOVE) }
+}
+
 fn system_page_size() -> usize {
-    // SAFETY: sysconf has no pointer or lifetime preconditions.
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    usize::try_from(page_size)
-        .ok()
-        .filter(|size| *size > 0)
-        .unwrap_or(PAGE_SIZE)
+    static PAGE_SIZE_CACHE: OnceLock<usize> = OnceLock::new();
+    *PAGE_SIZE_CACHE.get_or_init(|| {
+        // SAFETY: sysconf has no pointer or lifetime preconditions.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        usize::try_from(page_size)
+            .ok()
+            .filter(|size| *size > 0)
+            .unwrap_or(PAGE_SIZE)
+    })
 }
 
 fn residency_vector_len(mapping_len: usize, page_size: usize) -> usize {
@@ -366,13 +392,7 @@ impl Doorbell {
     }
 
     fn duplicate(&self) -> Result<OwnedFd, RingError> {
-        // SAFETY: F_DUPFD_CLOEXEC duplicates one owned descriptor.
-        let raw = unsafe { libc::fcntl(self.0.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-        if raw < 0 {
-            return Err(RingError::DoorbellFailed);
-        }
-        // SAFETY: successful fcntl returns a new owned descriptor.
-        Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+        self.0.try_clone().map_err(|_| RingError::DoorbellFailed)
     }
 
     fn signal(&self) -> Result<(), RingError> {
@@ -778,11 +798,6 @@ impl Ring {
         ]
     }
 
-    /// External event loops use this descriptor to wait for data readiness. commentlint: allow(JUDGE)
-    pub fn data_ready_fd(&self) -> RawFd {
-        self.data_ready.0.as_raw_fd()
-    }
-
     /// Duplicates the data-readiness descriptor for an owning event-loop registration. commentlint: allow(JUDGE)
     pub fn duplicate_data_ready(&self) -> Result<OwnedFd, RingError> {
         self.data_ready.duplicate()
@@ -790,7 +805,7 @@ impl Ring {
 
     /// Binds one data wait to the observed generation. commentlint: allow(JUDGE)
     ///
-    /// Returns `true` only when the caller should block on `data_ready_fd`.
+    /// Returns `true` only when the caller should block on the data-readiness descriptor.
     /// A `false` result means data or a generation change is already visible.
     pub fn arm_data_wait(&self) -> Result<bool, RingError> {
         if self.data_available()? {
@@ -1082,33 +1097,17 @@ impl Ring {
             if Instant::now() >= deadline {
                 return Ok(false);
             }
-            let wake = self.data_wake_ptr()?;
-            // SAFETY: wake page remains mapped and atomics were initialized before activation.
-            let generation = unsafe { (*wake).generation.load(Ordering::Acquire) };
-            unsafe {
-                (*wake)
-                    .parked
-                    .store(generation.wrapping_add(1), Ordering::Release)
-            };
-            if self.data_available()?
-                || unsafe { (*wake).generation.load(Ordering::Acquire) } != generation
-            {
-                unsafe { (*wake).parked.store(0, Ordering::Release) };
-                continue;
-            }
-            self.data_ready.drain()?;
-            if self.data_available()?
-                || unsafe { (*wake).generation.load(Ordering::Acquire) } != generation
-            {
-                unsafe { (*wake).parked.store(0, Ordering::Release) };
+            if !self.arm_data_wait()? {
                 continue;
             }
             let ready = self.data_ready.wait_until(deadline)?;
-            unsafe { (*wake).parked.store(0, Ordering::Release) };
             if !ready && Instant::now() >= deadline {
+                let wake = self.data_wake_ptr()?;
+                // SAFETY: wake page remains mapped and atomics were initialized before activation.
+                unsafe { (*wake).parked.store(0, Ordering::Release) };
                 return Ok(false);
             }
-            self.data_ready.drain()?;
+            self.complete_data_wait()?;
         }
     }
 
@@ -1470,14 +1469,7 @@ impl Ring {
         .into_iter()
         .filter(|(_, len)| *len != 0)
         {
-            // SAFETY: planner returns runtime-page-aligned interior of live arena mapping.
-            let result = unsafe {
-                libc::madvise(
-                    self.mapping.base.as_ptr().add(offset).cast(),
-                    len,
-                    libc::MADV_REMOVE,
-                )
-            };
+            let result = remove_pages(self.mapping.base.as_ptr(), offset, len);
             if result != 0 {
                 self.enter_quarantine();
                 return Err(RingError::PageRemovalFailed);
@@ -2161,7 +2153,28 @@ fn create_macos_shm(len: usize) -> Result<OwnedFd, RingError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{removal_ranges, residency_vector_len};
+    use std::sync::atomic::Ordering;
+
+    use crate::descriptor::HardwareProfileId;
+    use crate::profile::ring_profile;
+
+    use super::{
+        removal_ranges, residency_vector_len, wire_v2_header, ProducerError, Ring, RingError,
+        FAIL_NEXT_PAGE_REMOVAL,
+    };
+
+    fn ring() -> Ring {
+        let profile = ring_profile(HardwareProfileId::new("ring-reclaim-test").unwrap()).unwrap();
+        Ring::create(&profile, 99).unwrap()
+    }
+
+    fn publish(ring: &Ring, bytes: &[u8]) {
+        let mut reservation = ring
+            .try_reserve(bytes.len(), wire_v2_header(bytes.len()).unwrap())
+            .unwrap();
+        reservation.write(bytes).unwrap();
+        reservation.commit(bytes.len()).unwrap();
+    }
 
     #[test]
     fn residency_vector_tracks_runtime_page_size() {
@@ -2176,13 +2189,90 @@ mod tests {
             let arena = page * 4;
             assert_eq!(
                 removal_ranges(page, arena, 1, (page * 3 - 2) as u64, page).unwrap(),
-                [(page * 2, page), (0, 0)]
+                [(page, page * 2), (0, 0)]
             );
             assert_eq!(
                 removal_ranges(page, arena, (arena - page) as u64, (page * 2) as u64, page)
                     .unwrap(),
                 [(page * 4, page), (page, page)]
             );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reclaimed_pages_leave_residency_and_reuse_as_zeroes() {
+        let ring = ring();
+        let arena_len = ring.arena_bytes();
+        publish(&ring, &vec![0xa5; arena_len]);
+        ring.try_receive().unwrap().unwrap().release().unwrap();
+        assert!(ring.resident_arena_pages().unwrap() > 0);
+
+        let reservation = ring
+            .try_reserve(arena_len, wire_v2_header(arena_len).unwrap())
+            .unwrap();
+        assert_eq!(ring.resident_arena_pages().unwrap(), 0);
+        let segment = reservation.segment(0).unwrap().unwrap();
+        assert_eq!(segment.read_byte(0), Some(0));
+        assert_eq!(segment.read_byte(segment.len() - 1), Some(0));
+        reservation.abort();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repeated_subpage_releases_eventually_remove_complete_pages() {
+        let ring = ring();
+        let page = super::system_page_size();
+        assert!(page >= 256 && page.is_multiple_of(256));
+
+        for index in 0..page / 256 {
+            publish(&ring, &[index as u8; 256]);
+            ring.try_receive().unwrap().unwrap().release().unwrap();
+            ring.try_reserve(0, wire_v2_header(0).unwrap())
+                .unwrap()
+                .abort();
+            let expected = usize::from(index + 1 < page / 256);
+            assert_eq!(ring.resident_arena_pages().unwrap(), expected);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn partial_page_reclaim_preserves_live_neighbor() {
+        let ring = ring();
+        publish(&ring, &[0x11; 256]);
+        publish(&ring, &[0x22; 256]);
+        let first = ring.try_receive().unwrap().unwrap();
+        let second = ring.try_receive().unwrap().unwrap();
+        first.release().unwrap();
+
+        ring.try_reserve(0, wire_v2_header(0).unwrap())
+            .unwrap()
+            .abort();
+        assert_eq!(second.segment(0).unwrap().read_byte(0), Some(0x22));
+        assert_eq!(second.segment(0).unwrap().read_byte(255), Some(0x22));
+        second.release().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn page_removal_failure_quarantines_before_capacity_publication() {
+        let ring = ring();
+        let page = super::system_page_size();
+        publish(&ring, &vec![1; page]);
+        ring.try_receive().unwrap().unwrap().release().unwrap();
+        FAIL_NEXT_PAGE_REMOVAL.store(true, Ordering::Release);
+
+        assert!(matches!(
+            ring.try_reserve(0, wire_v2_header(0).unwrap()),
+            Err(ProducerError::Ring(RingError::PageRemovalFailed))
+        ));
+        assert!(ring.is_quarantined());
+        let reclaim = ring.reclaim_ptr().unwrap();
+        // SAFETY: test-owned ring keeps reclaim page mapped.
+        unsafe {
+            assert_eq!((*reclaim).completed.load(Ordering::Acquire), 0);
+            assert_eq!((*reclaim).arena_reclaimed.load(Ordering::Acquire), 0);
         }
     }
 }

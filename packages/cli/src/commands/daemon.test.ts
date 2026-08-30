@@ -242,12 +242,12 @@ describe("daemon command contract", () => {
                     shared_memory: { state: "ready", reason: "healthy" },
                 },
                 shared_memory: {
-                    state: "terminal",
-                    error_class: "peer_death",
+                    state: "quarantined",
+                    error_class: "peer_protocol",
                     artifact: {
                         profile: "mc-host-test-ring-v1",
                         wire_version: 2,
-                        descriptor_schema: 2,
+                        descriptor_schema: 3,
                     },
                     bounds: {
                         descriptors: 16,
@@ -281,6 +281,7 @@ describe("daemon command contract", () => {
                             pinned_workers: 1,
                         },
                     },
+                    attachment: { completed: 41 },
                     activation: { completed: 37 },
                     peer_death: { observed: 31 },
                     reclamation: { completed: 29 },
@@ -289,8 +290,8 @@ describe("daemon command contract", () => {
             }),
         );
 
-        expect(rendered).toContain("Shared memory: terminal (peer_death)");
-        expect(rendered).toContain("profile=mc-host-test-ring-v1 wire=2 descriptor=2");
+        expect(rendered).toContain("Shared memory: quarantined (peer_protocol)");
+        expect(rendered).toContain("profile=mc-host-test-ring-v1 wire=2 descriptor=3");
         expect(rendered).toContain("active_bytes=134217728");
         expect(rendered).toContain("quarantined_bytes=8388608");
         expect(rendered).toContain("activations=37");
