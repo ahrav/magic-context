@@ -95,7 +95,7 @@ function goldSatisfyingFacts(scenario: HistorianEvalScenario): MockHistorianFact
  * before any mutation ran. The count is clamped to the message count because a
  * segment must cover at least one message.
  */
-function baselineCompartments(scenario: HistorianEvalScenario): MockHistorianCompartment[] {
+export function baselineCompartments(scenario: HistorianEvalScenario): MockHistorianCompartment[] {
     const messageCount = scenario.transcript.turns.length * 2;
     const count = Math.max(1, Math.min(scenario.gold.compartments.minCount, messageCount));
     const span = Math.floor(messageCount / count);

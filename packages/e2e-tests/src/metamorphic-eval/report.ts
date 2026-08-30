@@ -112,6 +112,7 @@ export function buildMetamorphicReport(args: {
 export function metamorphicExitCode(report: MetamorphicReport): 0 | 1 | 2 {
     if (report.injectionCanaryHits.length > 0) return 2;
     if (report.tierInvalidReason !== null) return 1;
+    if (report.entries.length === 0) return 1;
     if (report.coverage.some((coverage) => coverage.violations.length > 0)) return 1;
     for (const entry of report.entries) {
         if (entry.kind !== "scored") return 1;

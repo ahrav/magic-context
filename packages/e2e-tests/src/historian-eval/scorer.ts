@@ -748,17 +748,6 @@ export function scoreRawOutputWithInjectedClaims(
         (earliest, compartment) => Math.min(earliest, compartment.startMessage),
         Number.POSITIVE_INFINITY,
     );
-    if (emittedReach < authoredSpan.endMessage || emittedStart > authoredSpan.startMessage) {
-        const covered = Number.isFinite(emittedStart) ? `${emittedStart}-${emittedReach}` : "nothing";
-        return {
-            result: {
-                stage: "authored-evidence-unprocessed",
-                error: `output covers ${covered}, which does not span the authored ordinals ${authoredSpan.startMessage}-${authoredSpan.endMessage}; gold and absence checks over the uncovered part would pass vacuously`,
-            },
-            injectedClaims: [],
-        };
-    }
-
     // Mirror production's publish gating (compartment-runner-incremental):
     // a provisional last compartment inside the healing slack is discarded
     // and unanchored promotion is skipped for the whole pass, so this seam
@@ -785,6 +774,16 @@ export function scoreRawOutputWithInjectedClaims(
         if (visible === null) {
             // A fresh single-writer temp DB cannot legitimately be stale.
             throw new Error("historian-eval scorer: temp-DB claim snapshot unexpectedly stale");
+        }
+        if (emittedReach < authoredSpan.endMessage || emittedStart > authoredSpan.startMessage) {
+            const covered = Number.isFinite(emittedStart) ? `${emittedStart}-${emittedReach}` : "nothing";
+            return {
+                result: {
+                    stage: "authored-evidence-unprocessed",
+                    error: `output covers ${covered}, which does not span the authored ordinals ${authoredSpan.startMessage}-${authoredSpan.endMessage}; gold and absence checks over the uncovered part would pass vacuously`,
+                },
+                injectedClaims: visible,
+            };
         }
         const rows = persisted.map((compartment) => ({
             startMessage: compartment.startMessage,

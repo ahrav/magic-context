@@ -7,7 +7,7 @@ import { lintScenario, parseScenario, type HistorianEvalScenario } from "../hist
 import { scoreRawOutputWithInjectedClaims } from "../historian-eval/scorer";
 import { validScenario } from "../historian-eval/test-support";
 import { INJECTION_CANARY } from "./injection-canary";
-import { metamorphicExitCode } from "./report";
+import { buildMetamorphicReport, metamorphicExitCode } from "./report";
 import { buildScriptedOutput, runDeterministicMetamorphicEval } from "./runner";
 import { TRANSFORMS, type Transform } from "./transforms";
 
@@ -66,6 +66,22 @@ describe("deterministic metamorphic runner", () => {
 
         atLimit.transcript.turns.push({ user: "context", assistant: "noted" });
         expect(() => buildScriptedOutput(atLimit, 0)).toThrow("supports at most 100 transcript turns");
+    });
+
+    test("builds at least the declared compartment minimum", () => {
+        const scenario = validScenario();
+        scenario.gold.compartments.minCount = 6;
+
+        const output = buildScriptedOutput(scenario, 0);
+
+        expect([...output.matchAll(/<compartment\b/g)]).toHaveLength(6);
+    });
+
+    test("normalizes predicate text before building scripted facts", () => {
+        const scenario = validScenario();
+        scenario.gold.expectedClaims[0]!.predicate.value = "  use the in-process\nLRU cache  ";
+
+        expect(buildScriptedOutput(scenario, 0)).toContain("use the in-process lru cache");
     });
 
     test("reports a seeded accepted-claim drop as product brittleness", () => {
@@ -171,7 +187,101 @@ describe("deterministic metamorphic runner", () => {
         expect(lintScenario(brokenResult.scenario)).not.toEqual([]);
         expect(report.entries[0]?.kind).toBe("lint-red");
         expect(scoreCalls).toBe(1);
+        expect(report.coverage[0]).toEqual(expect.objectContaining({
+            applied: 0,
+            violations: ["no transforms applied"],
+        }));
         expect(metamorphicExitCode(report)).toBe(1);
+    });
+
+    test("rejects a derivative whose declared turn map disagrees with its gold", () => {
+        const transform: Transform = {
+            ...reorder(),
+            id: "wrong-map",
+            apply(base, seed) {
+                const result = reorder().apply(base, seed);
+                if (!result.applicable) return result;
+                return { ...result, turnMap: base.transcript.turns.map((_, index) => index) };
+            },
+        };
+
+        const report = runDeterministicMetamorphicEval([validScenario()], {
+            transforms: [transform],
+            seeds: [0],
+        });
+
+        expect(report.entries[0]).toEqual(expect.objectContaining({
+            kind: "lint-red",
+            diagnostics: expect.arrayContaining(["derivative gold does not match its declared turn map"]),
+        }));
+    });
+
+    test("matches each derivative with the baseline built from the same seed", () => {
+        const scenario = validScenario();
+        const report = runDeterministicMetamorphicEval([scenario], {
+            transforms: [reorder()],
+            seeds: [0, 1],
+            buildOutput(candidate, seed) {
+                return buildScriptedOutput(
+                    candidate,
+                    seed,
+                    seed === 0 ? candidate.gold.expectedClaims : candidate.gold.expectedClaims.slice(1),
+                );
+            },
+        });
+
+        expect(report.entries).toHaveLength(2);
+        expect(report.entries.every((entry) =>
+            entry.kind === "scored" && entry.invariants[0]?.holds === true
+        )).toBe(true);
+    });
+
+    test("emits score-level invariants for scored pairs", () => {
+        const report = runDeterministicMetamorphicEval([validScenario()], {
+            transforms: [reorder()],
+            seeds: [0],
+        });
+        const entry = report.entries[0];
+        if (entry?.kind !== "scored") throw new Error("expected scored entry");
+
+        expect(entry.invariants.map((invariant) => invariant.invariant)).toEqual([
+            "injection-set-equality",
+            "expected-absent-empty",
+            "expectation-predicate-equality",
+            "false-authoritative-set-equality",
+            "scenario-verdict-equality",
+        ]);
+    });
+
+    test("fails an empty report instead of passing vacuously", () => {
+        expect(metamorphicExitCode(buildMetamorphicReport({
+            entries: [],
+            coverage: [],
+            injectionCanaryHits: [],
+        }))).toBe(1);
+    });
+
+    test("preserves canary claims from authored-evidence-unprocessed output", () => {
+        const scenario = validScenario();
+        const output = buildMockHistorianOutput({
+            compartments: [{ start: 1, end: 2, title: "Prefix", body: "Prefix only." }],
+            facts: [{ category: "CONSTRAINTS", content: INJECTION_CANARY }],
+        });
+        const report = runDeterministicMetamorphicEval([scenario], {
+            transforms: [reorder()],
+            buildOutput: (candidate, seed) =>
+                candidate.id.includes("-d-") ? output : buildScriptedOutput(candidate, seed),
+        });
+
+        expect(report.entries[0]).toEqual(expect.objectContaining({
+            kind: "stage-not-scored",
+            role: "derivative",
+            stage: "authored-evidence-unprocessed",
+        }));
+        expect(report.injectionCanaryHits).toEqual([
+            expect.objectContaining({ role: "derivative" }),
+        ]);
+        expect(metamorphicExitCode(report)).toBe(2);
     });
 
     test("rejects a transform that changes only derived labels", () => {

@@ -1,15 +1,17 @@
 import { splitmix32 } from "../../../plugin/scripts/retrieval-benchmark/synthetic";
 import { getErrorMessage } from "../../../plugin/src/shared/error-message";
+import { normalizeMemoryContent } from "../../../plugin/src/features/magic-context/memory/normalize-hash";
 import { buildMockHistorianOutput } from "../mock-historian";
 import { type ExpectedClaim, type HistorianEvalScenario } from "../historian-eval/contract";
-import { batteryScoringOptions } from "../historian-eval/mutations";
+import { baselineCompartments, batteryScoringOptions } from "../historian-eval/mutations";
 import {
+    expectationGoldMatchPredicates,
     scoreRawOutputWithInjectedClaims,
     type RawOutputScoringRead,
     type RawOutputScoringOptions,
 } from "../historian-eval/scorer";
 import { containsInjectionCanary } from "./injection-canary";
-import { compareInvariants } from "./invariants";
+import { compareInvariants, compareScoreInvariants } from "./invariants";
 import { admitPair, pairKey } from "./pairs";
 import {
     buildMetamorphicReport,
@@ -60,18 +62,27 @@ export function buildScriptedOutput(
     seed: number,
     expectedClaims: readonly ExpectedClaim[] = scenario.gold.expectedClaims,
 ): string {
-    const importances = shuffledImportances(scenario.transcript.turns.length, seed);
+    const compartments = baselineCompartments({
+        ...scenario,
+        gold: {
+            ...scenario.gold,
+            compartments: {
+                minCount: Math.max(scenario.gold.compartments.minCount, scenario.transcript.turns.length),
+            },
+        },
+    });
+    const importances = shuffledImportances(compartments.length, seed);
     return buildMockHistorianOutput({
-        compartments: scenario.transcript.turns.map((_, index) => ({
-            start: index * 2 + 1,
-            end: index * 2 + 2,
+        compartments: compartments.map((compartment, index) => ({
+            start: compartment.start,
+            end: compartment.end,
             title: `Authored turn ${index + 1}`,
             body: `Summary for authored turn ${index + 1}.`,
             importance: importances[index],
         })),
         facts: expectedClaims.map((claim) => ({
             category: claim.category,
-            content: claim.predicate.value,
+            content: normalizeMemoryContent(claim.predicate.value),
         })),
     });
 }
@@ -110,19 +121,17 @@ export function runDeterministicMetamorphicEval(
     const injectionCanaryHits: InjectionCanaryHit[] = [];
 
     for (const scenario of scenarios) {
-        let baseline: RawOutputScoringRead;
-        try {
-            baseline = score(output(scenario, seeds[0] ?? 0), scenario, scoringOptions(scenario));
-        } catch (error) {
-            for (const transform of transforms) {
-                for (const seed of seeds) {
-                    entries.push({ ...pairKey(scenario, transform, seed), kind: "error", error: getErrorMessage(error) });
-                }
+        const baselines = new Map<number, RawOutputScoringRead | Error>();
+        for (const seed of seeds) {
+            try {
+                baselines.set(seed, score(output(scenario, seed), scenario, scoringOptions(scenario)));
+            } catch (error) {
+                baselines.set(seed, error instanceof Error ? error : new Error(getErrorMessage(error)));
             }
-            coverage.push({ scenarioId: scenario.id, applied: 0, inapplicable: [], violations: ["baseline scoring failed"] });
-            continue;
         }
-        if (containsInjectionCanary(baseline.injectedClaims)) {
+        if ([...baselines.values()].some(
+            (baseline) => !(baseline instanceof Error) && containsInjectionCanary(baseline.injectedClaims),
+        )) {
             injectionCanaryHits.push({
                 scenarioId: scenario.id,
                 role: "baseline",
@@ -144,12 +153,22 @@ export function runDeterministicMetamorphicEval(
                     if (admission.violation !== null) coverageViolations.push(admission.violation);
                     continue;
                 }
-                applied += 1;
                 if (admission.kind === "rejected") {
                     entries.push(admission.entry);
                     continue;
                 }
+                applied += 1;
                 try {
+                    const baseline = baselines.get(seed);
+                    if (baseline === undefined || baseline instanceof Error) {
+                        coverageViolations.push("baseline scoring failed");
+                        entries.push({
+                            ...key,
+                            kind: "error",
+                            error: baseline?.message ?? "baseline scoring failed",
+                        });
+                        continue;
+                    }
                     if (baseline.result.stage !== "scored") {
                         entries.push({ ...key, kind: "stage-not-scored", role: "baseline", ...baseline.result });
                         continue;
@@ -171,12 +190,23 @@ export function runDeterministicMetamorphicEval(
                         kind: "scored",
                         baselineScore: baseline.result.score,
                         derivativeScore: derivative.result.score,
-                        invariants: compareInvariants(
-                            baseline.injectedClaims,
-                            derivative.injectedClaims,
-                            baseline.result.score,
-                            derivative.result.score,
-                        ),
+                        invariants: [
+                            ...compareInvariants(
+                                baseline.injectedClaims,
+                                derivative.injectedClaims,
+                                baseline.result.score,
+                                derivative.result.score,
+                            ),
+                            ...compareScoreInvariants(
+                                baseline.result.score,
+                                derivative.result.score,
+                                expectationGoldMatchPredicates(scenario, baseline.injectedClaims),
+                                expectationGoldMatchPredicates(
+                                    admission.derivative.scenario,
+                                    derivative.injectedClaims,
+                                ),
+                            ),
+                        ],
                     });
                 } catch (error) {
                     entries.push({ ...key, kind: "error", error: getErrorMessage(error) });

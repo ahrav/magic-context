@@ -1,4 +1,5 @@
 import { getErrorMessage } from "../../../plugin/src/shared/error-message";
+import { canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import {
     lintScenario,
     scenarioFingerprint,
@@ -6,6 +7,7 @@ import {
 } from "../historian-eval/contract";
 import type { MetamorphicReportEntry, PairKey } from "./report";
 import type { Transform, TurnTransform } from "./transforms";
+import { remapGold } from "./transforms";
 
 type PairRejection = Extract<MetamorphicReportEntry, { kind: "lint-red" | "error" }>;
 
@@ -46,6 +48,16 @@ export function admitPair(
             };
         }
         const diagnostics = lintScenario(derivative.scenario);
+        const turnMapValid = derivative.turnMap.length === base.transcript.turns.length &&
+            new Set(derivative.turnMap).size === derivative.turnMap.length &&
+            derivative.turnMap.every(
+                (index) => Number.isInteger(index) && index >= 0 && index < derivative.scenario.transcript.turns.length,
+            );
+        if (!turnMapValid) {
+            diagnostics.push("derivative turn map is not a complete one-to-one mapping of baseline turns");
+        } else if (canonicalJson(remapGold(base.gold, derivative.turnMap)) !== canonicalJson(derivative.scenario.gold)) {
+            diagnostics.push("derivative gold does not match its declared turn map");
+        }
         const contentFingerprint = scenarioFingerprint({
             ...derivative.scenario,
             id: base.id,
