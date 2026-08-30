@@ -10,6 +10,7 @@
 
 pub mod claim_operation;
 pub mod decay;
+pub mod redaction;
 
 #[cfg(feature = "cache-core")]
 pub use cortexkit_cache_core::{
