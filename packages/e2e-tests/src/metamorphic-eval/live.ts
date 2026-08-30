@@ -4,7 +4,7 @@ import { canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canon
 import { getErrorMessage } from "../../../plugin/src/shared/error-message";
 import { lintScenario, type HistorianEvalScenario } from "../historian-eval/contract";
 import { runMutationBattery } from "../historian-eval/mutations";
-import { runScenario, type LiveHistorianMode } from "../historian-eval/runner";
+import { historianWaitBudgetMs, runScenario, type LiveHistorianMode } from "../historian-eval/runner";
 import {
     expectationGoldMatchPredicates,
     scoreRunRecord,
@@ -50,6 +50,15 @@ export interface LiveMetamorphicOptions {
     admit?: (derivatives: readonly HistorianEvalScenario[]) => string[];
     execute?: LiveScenarioExecutor;
     deadlineAtMs?: number | null;
+    /**
+     * Upper bound on ONE role's wall time, used as the deadline reserve.
+     *
+     * Defaults to the scenario's declared cost — `trigger.expectedHistorianRuns`
+     * times the mode's enforced per-run historian wait. Supplied explicitly by
+     * tests that drive a synthetic clock, where the real bound would dwarf the
+     * fixture's budget and refuse every role.
+     */
+    roleBudgetMs?: number;
     nowMs?: () => number;
     onProgress?: (report: MetamorphicReport) => void;
 }
@@ -262,20 +271,42 @@ export async function runLiveMetamorphicEval(
     };
     const deadlineAtMs = options.deadlineAtMs ?? null;
     const nowMs = options.nowMs ?? Date.now;
-    // Reserve for the next role, learned from the roles already run rather than
-    // predicted — the same bound `run-historian-eval.ts` keeps for its next
-    // scenario, and for the same reason. A bare `now >= deadline` check admits a
-    // role with no time left, and a role is not cheap: one role drives
-    // `trigger.expectedHistorianRuns` historian runs, each bounded by the live
-    // `historianWaitBudgetMs`, so a single role can legitimately need tens of
-    // minutes. Admitted at the deadline it then runs PAST the caller's own kill
-    // bound (the workflow step timeout), which kills the process before the final
-    // report is written — losing the whole artifact the deadline exists to
-    // protect. Starting from 0 the first role always runs, and a role that
-    // overruns the estimate costs the final report rather than the whole run.
+    // Reserve before admitting a role, so a role is never started that cannot
+    // finish inside the caller's own kill bound (the workflow step timeout). A
+    // role is not cheap: it drives `trigger.expectedHistorianRuns` historian
+    // runs, each bounded by the live `historianWaitBudgetMs`, so one role can
+    // legitimately need tens of minutes. Admitted with minutes left it overruns
+    // the step timeout and the process dies before the final report is written —
+    // losing the whole artifact the deadline exists to protect.
+    //
+    // Two terms, and the MAXIMUM of them, because neither alone is safe:
+    //   * the declared upper bound — `expectedHistorianRuns` times the enforced
+    //     per-run wait. This is the dominant term and it is a real bound, not an
+    //     estimate, so a run of fast roles cannot talk it down. `run-historian-
+    //     eval.ts` cannot do this (a scenario's true bound is unusable there);
+    //     one metamorphic role can, because its cost is one scenario's declared
+    //     run count.
+    //   * the longest role actually observed, which covers what the declared
+    //     bound omits — probe answers, harness and child-session setup,
+    //     persistence.
+    // Taking the max means a fast-role prefix cannot shrink the reserve below
+    // the declared bound, and unmodelled overhead cannot hide under it either.
     let longestRoleMs = 0;
-    const deadlineReached = (): boolean =>
-        deadlineAtMs !== null && nowMs() + longestRoleMs >= deadlineAtMs;
+    let rolesStarted = 0;
+    const declaredRoleBudgetMs = (scenario: HistorianEvalScenario): number =>
+        options.roleBudgetMs ??
+        scenario.trigger.expectedHistorianRuns * historianWaitBudgetMs(options.mode);
+    // The first role is exempt, mirroring `run-historian-eval.ts`'s `index > 0`:
+    // a reserve applied before anything has run makes a tight budget spend the
+    // whole lane producing no observation at all. An already-exhausted deadline
+    // still refuses it, because the reserve is additive to `nowMs()`.
+    const deadlineReached = (nextScenario: HistorianEvalScenario): boolean => {
+        if (deadlineAtMs === null) return false;
+        const reserve = rolesStarted === 0
+            ? 0
+            : Math.max(declaredRoleBudgetMs(nextScenario), longestRoleMs);
+        return nowMs() + reserve >= deadlineAtMs;
+    };
     // Timed in `finally`, so a role that threw still teaches the reserve: the
     // wall time it burned is spent either way, and a slow failure predicts a slow
     // successor exactly as well as a slow success does.
@@ -285,6 +316,7 @@ export async function runLiveMetamorphicEval(
         artifactDir: string,
     ): Promise<LiveObservation> => {
         const startedAt = nowMs();
+        rolesStarted += 1;
         try {
             return await execute(scenario, role, artifactDir);
         } finally {
@@ -294,7 +326,7 @@ export async function runLiveMetamorphicEval(
     const deadlineReport = (nextRole: LiveRole): MetamorphicReport =>
         finish({ kind: "deadline-exhausted", nextRole });
     try {
-        if (deadlineReached()) return deadlineReport("control-a");
+        if (deadlineReached(controlScenario)) return deadlineReport("control-a");
         const controlA = await runRole(
             controlScenario,
             "control-a",
@@ -304,7 +336,7 @@ export async function runLiveMetamorphicEval(
         if (injectionCanaryHits.length > 0) {
             return finish();
         }
-        if (deadlineReached()) return deadlineReport("control-b");
+        if (deadlineReached(controlScenario)) return deadlineReport("control-b");
         const controlB = await runRole(
             controlScenario,
             "control-b",
@@ -327,6 +359,29 @@ export async function runLiveMetamorphicEval(
             });
             return observe({ kind: "control-disagreement", systemMismatch, failedInvariants });
         }
+        // Agreement is not a measurement. Two ERROR controls agree on every
+        // invariant — equal verdicts, equal (empty) injection sets, equal
+        // expectation maps — so the checks above pass while the control tier has
+        // proved nothing about the harness. A provider outage, an unresolved
+        // `opencode`, or a run-never-fired scores ERROR repeatably, and admitting
+        // that tier sends the lane on to spend real tokens on every product pair
+        // and publish a report whose `tierInvalidReason` is null. FAIL is left
+        // admissible on purpose: a scenario the historian genuinely fails is a
+        // valid, repeatable baseline, and stability under transformation is what
+        // the product pairs measure.
+        const controlVerdicts = [controlA.score.verdict, controlB.score.verdict] as const;
+        if (controlVerdicts.includes("ERROR")) {
+            entries.push({
+                ...controlKey,
+                kind: "error",
+                error: `tier-invalid: baseline control did not produce a measurement (${controlVerdicts.join(", ")}); product pairs skipped`,
+            });
+            return observe({
+                kind: "control-not-measured",
+                baselineVerdict: controlA.score.verdict,
+                derivativeVerdict: controlB.score.verdict,
+            });
+        }
         entries.push({
             ...controlKey,
             kind: "scored",
@@ -344,7 +399,7 @@ export async function runLiveMetamorphicEval(
         try {
             const artifactScenarioId = pair.derivative.scenario.id;
             const canaryScenarioId = pair.base.id;
-            if (deadlineReached()) return deadlineReport("baseline");
+            if (deadlineReached(pair.base)) return deadlineReport("baseline");
             const baseline = await runRole(
                 pair.base,
                 "baseline",
@@ -354,7 +409,7 @@ export async function runLiveMetamorphicEval(
             if (injectionCanaryHits.length > 0) {
                 return finish();
             }
-            if (deadlineReached()) return deadlineReport("derivative");
+            if (deadlineReached(pair.derivative.scenario)) return deadlineReport("derivative");
             const derivative = await runRole(
                 pair.derivative.scenario,
                 "derivative",

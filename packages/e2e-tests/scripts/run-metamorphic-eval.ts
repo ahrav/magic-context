@@ -203,6 +203,12 @@ function tierInvalidMessage(destination: string, report: MetamorphicReport): str
     if (reason.kind === "deadline-exhausted") {
         return `metamorphic deadline reached before ${reason.nextRole}; inspect final report ${destination}`;
     }
+    // Distinct from the disagreement message below on purpose: these controls
+    // AGREED. Reporting "disagreed" would send an operator hunting for
+    // nondeterminism when the harness never produced a measurement at all.
+    if (reason.kind === "control-not-measured") {
+        return `metamorphic tier invalid: control runs produced no measurement (baseline=${reason.baselineVerdict}, derivative=${reason.derivativeVerdict}); product pairs were not evaluated`;
+    }
     return "metamorphic tier invalid: control runs disagreed; product pairs were not evaluated";
 }
 

@@ -434,6 +434,9 @@ describe("live metamorphic orchestration", () => {
             seeds: [0, 1],
             admit: () => [],
             deadlineAtMs: 10,
+            // Declared bound pinned to 0: this test is about WHERE the deadline is
+            // checked, so the reserve is left to the observed term alone.
+            roleBudgetMs: 0,
             nowMs: () => now,
             onProgress: (partial) => progress.push(partial.entries.length),
             execute: async (_scenario, role) => {
@@ -466,6 +469,7 @@ describe("live metamorphic orchestration", () => {
             seeds: [0],
             admit: () => [],
             deadlineAtMs: 100,
+            roleBudgetMs: 0,
             nowMs: () => now,
             execute: async (_scenario, role) => {
                 calls.push(role);
@@ -495,6 +499,7 @@ describe("live metamorphic orchestration", () => {
             seeds: [0],
             admit: () => [],
             deadlineAtMs: 1,
+            roleBudgetMs: 0,
             nowMs: () => 0,
             execute: async (_scenario, role) => {
                 calls.push(role);
@@ -503,6 +508,132 @@ describe("live metamorphic orchestration", () => {
         });
 
         expect(calls[0]).toBe("control-a");
+    });
+
+    test("holds the declared role bound even after a run of fast roles", async () => {
+        // The failure mode a learned-only reserve cannot catch. Every role finishes
+        // in 1, so the observed estimate stays 1, while wall time between roles
+        // (report writes, setup) carries the clock to 97 of a 100 budget. An
+        // observed-only reserve of 1 happily admits a role DECLARED to cost 30;
+        // the declared bound is not an estimate and a fast prefix must not talk it
+        // down.
+        let now = 0;
+        let progressCalls = 0;
+        const calls: string[] = [];
+        const report = await runLiveMetamorphicEval([validScenario()], {
+            mode: { kind: "live", apiKey: "test", historianModel: "anthropic/historian", probeModel: { providerID: "anthropic", modelID: "probe" } },
+            artifactRoot: "/tmp/metamorphic-live-declared-bound",
+            opencodeVersion: "1.0.0",
+            transforms: [TRANSFORMS[0]!],
+            seeds: [0],
+            admit: () => [],
+            deadlineAtMs: 100,
+            roleBudgetMs: 30,
+            nowMs: () => now,
+            // Time that passes outside any role, so it never inflates the observed
+            // estimate — exactly the gap a learned-only reserve is blind to. Call 1
+            // is the pre-role seed; call 2 lands after the control tier.
+            onProgress: () => {
+                progressCalls += 1;
+                if (progressCalls === 2) now = 97;
+            },
+            execute: async (_scenario, role) => {
+                calls.push(role);
+                now += 1;
+                return observation();
+            },
+        });
+
+        // Both controls run fast and cheap; at 97 the declared 30 refuses the next
+        // role even though nothing observed has ever taken longer than 1.
+        expect(calls).toEqual(["control-a", "control-b"]);
+        expect(report.tierInvalidReason).toEqual(
+            expect.objectContaining({ kind: "deadline-exhausted", nextRole: "baseline" }),
+        );
+    });
+
+    test("derives the role bound from the scenario's declared historian runs", async () => {
+        // No explicit roleBudgetMs: the reserve must come from the scenario's own
+        // declared cost, so a lane that forgets to configure one is still bounded.
+        const scenario = validScenario();
+        const calls: string[] = [];
+        const report = await runLiveMetamorphicEval([scenario], {
+            mode: { kind: "live", apiKey: "test", historianModel: "anthropic/historian", probeModel: { providerID: "anthropic", modelID: "probe" } },
+            artifactRoot: "/tmp/metamorphic-live-derived-bound",
+            opencodeVersion: "1.0.0",
+            transforms: [TRANSFORMS[0]!],
+            seeds: [0],
+            admit: () => [],
+            // One millisecond past the first role: far below the derived bound of
+            // `expectedHistorianRuns * historianWaitBudgetMs`, which is minutes.
+            deadlineAtMs: 1,
+            nowMs: () => 0,
+            execute: async (_scenario, role) => {
+                calls.push(role);
+                return observation();
+            },
+        });
+
+        expect(scenario.trigger.expectedHistorianRuns).toBeGreaterThan(0);
+        // The first role is exempt, and the derived bound stops everything after.
+        expect(calls).toEqual(["control-a"]);
+        expect(report.tierInvalidReason).toEqual(
+            expect.objectContaining({ kind: "deadline-exhausted", nextRole: "control-b" }),
+        );
+    });
+
+    test("refuses product pairs when the control tier produced no measurement", async () => {
+        // Two ERROR controls AGREE on every invariant — equal verdicts, equal empty
+        // injection sets, equal expectation maps — so the disagreement gate passes
+        // while the tier has proved nothing. Admitting it spends real tokens on
+        // every product pair and publishes a report with tierInvalidReason null.
+        const calls: string[] = [];
+        const report = await runLiveMetamorphicEval([validScenario()], {
+            mode: { kind: "live", apiKey: "test", historianModel: "anthropic/historian", probeModel: { providerID: "anthropic", modelID: "probe" } },
+            artifactRoot: "/tmp/metamorphic-live-error-control",
+            opencodeVersion: "1.0.0",
+            transforms: [TRANSFORMS[0]!],
+            seeds: [0],
+            admit: () => [],
+            execute: async (_scenario, role) => {
+                calls.push(role);
+                return observation({
+                    score: score({ verdict: "ERROR", errorReason: "run-never-fired", errorDetail: "provider unavailable" }),
+                    expectationMatches: {},
+                });
+            },
+        });
+
+        // Controls ran; no paid product role followed them.
+        expect(calls).toEqual(["control-a", "control-b"]);
+        expect(report.tierInvalidReason).toEqual({
+            kind: "control-not-measured",
+            baselineVerdict: "ERROR",
+            derivativeVerdict: "ERROR",
+        });
+        expect(metamorphicExitCode(report)).toBe(1);
+    });
+
+    test("still admits product pairs when both controls repeatably FAIL", async () => {
+        // FAIL is a valid, repeatable baseline — the historian genuinely does not
+        // pass that scenario — and stability under transformation is exactly what
+        // the product pairs measure. Only a non-measurement is tier-invalid.
+        const calls: string[] = [];
+        const report = await runLiveMetamorphicEval([validScenario()], {
+            mode: { kind: "live", apiKey: "test", historianModel: "anthropic/historian", probeModel: { providerID: "anthropic", modelID: "probe" } },
+            artifactRoot: "/tmp/metamorphic-live-fail-control",
+            opencodeVersion: "1.0.0",
+            transforms: [TRANSFORMS[0]!],
+            seeds: [0],
+            admit: () => [],
+            execute: async (_scenario, role) => {
+                calls.push(role);
+                return observation({ score: score({ verdict: "FAIL", failReasons: ["recall"] }) });
+            },
+        });
+
+        expect(calls).toContain("baseline");
+        expect(report.tierInvalidReason).toBeNull();
     });
 
     test("publishes progress after control completion and every completed product pair", async () => {

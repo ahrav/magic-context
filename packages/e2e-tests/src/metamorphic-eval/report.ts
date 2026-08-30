@@ -87,6 +87,11 @@ export type TierInvalidReason =
           failedInvariants: MetamorphicInvariantVerdict["invariant"][];
       }
     | { kind: "selection-empty"; reason: string }
+    | {
+          kind: "control-not-measured";
+          baselineVerdict: ScenarioScore["verdict"];
+          derivativeVerdict: ScenarioScore["verdict"];
+      }
     | { kind: "deadline-exhausted"; nextRole: "control-a" | "control-b" | "baseline" | "derivative" };
 
 function key(entry: PairKey): string {
