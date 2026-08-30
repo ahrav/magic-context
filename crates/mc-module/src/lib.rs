@@ -30464,6 +30464,58 @@ mod release_contract_tests {
         );
     }
 
+    #[test]
+    fn managed_layout_segments_are_version_neutral_and_fixed() {
+        assert_eq!(release_contract::MANAGED_SUBTREE_DIRECTORY, "cortexkit");
+        assert_eq!(release_contract::RUNTIME_DIRECTORY_NAME, "run");
+        assert_eq!(
+            release_contract::CONNECTION_FILE_NAME,
+            "subc-connection.json"
+        );
+        assert_eq!(release_contract::STORAGE_SUBDIRECTORY, "magic-context");
+        // Bind the frozen contract to the constants the daemon actually
+        // creates and publishes under: the layout segments exist in two
+        // authorities (mc-host cannot depend on the contract-bearing
+        // mc-module), and drift between them leaves a resolver naming a
+        // path the daemon never writes.
+        assert_eq!(
+            release_contract::MANAGED_SUBTREE_DIRECTORY,
+            mc_host::MANAGED_DIR_NAME
+        );
+        assert_eq!(
+            release_contract::RUNTIME_DIRECTORY_NAME,
+            mc_host::RUNTIME_DIR_NAME
+        );
+        assert_eq!(
+            release_contract::CONNECTION_FILE_NAME,
+            mc_host::CONNECTION_FILE_NAME
+        );
+        // The storage segment's Rust authority is the module id: the store
+        // path is composed as `cortexkit/{module_id}/store.db`, so the
+        // contract's storage subdirectory must equal the default module id.
+        assert_eq!(
+            release_contract::STORAGE_SUBDIRECTORY,
+            crate::DEFAULT_MODULE_ID
+        );
+        let layout = contract()["layout"].clone();
+        assert_eq!(
+            layout["managed_subtree"],
+            json!(release_contract::MANAGED_SUBTREE_DIRECTORY)
+        );
+        assert_eq!(
+            layout["runtime_directory"],
+            json!(release_contract::RUNTIME_DIRECTORY_NAME)
+        );
+        assert_eq!(
+            layout["connection_file"],
+            json!(release_contract::CONNECTION_FILE_NAME)
+        );
+        assert_eq!(
+            layout["storage_subdirectory"],
+            json!(release_contract::STORAGE_SUBDIRECTORY)
+        );
+    }
+
     /// The contract freezes the daemon version, while mc-host derives its
     /// advertised `daemon_ver` from `CARGO_PKG_VERSION`. Binding them here
     /// makes a crate version bump force contract regeneration instead of

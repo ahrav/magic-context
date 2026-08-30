@@ -42,6 +42,7 @@ import {
     normalizeQueryText,
     normalizedQueryHash,
 } from "../src/features/magic-context/storage-embedding-measurements";
+import { storageSubtreePath } from "../src/shared/data-path";
 import { getAutoSearchHintDecisions } from "../src/features/magic-context/storage-meta-persisted";
 import { extractBoundedAutoSearchQuery } from "../src/hooks/magic-context/auto-search-prompt";
 import {
@@ -750,7 +751,7 @@ async function main(): Promise<void> {
     const { Database: BunDatabase } = await import("bun:sqlite");
     const measurementPath =
         process.env.MAGIC_CONTEXT_DB ??
-        join(homedir(), ".local", "share", "cortexkit", "magic-context", "context.db");
+        join(storageSubtreePath(join(homedir(), ".local", "share")), "context.db");
     const historyPath =
         process.env.OPENCODE_DB ?? join(homedir(), ".local", "share", "opencode", "opencode.db");
     const measurementDb = new BunDatabase(measurementPath, { readonly: true });

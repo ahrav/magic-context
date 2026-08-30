@@ -11,6 +11,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { storageSubtreePath } from "../../../plugin/src/shared/data-path";
 import { createDirectTestDatabase } from "../../../plugin/src/features/magic-context/test-database";
 import { initializeIsolatedContextDb as initializeContextDbFromRelease } from "../initialize-context-db";
 import { waitForChildExit } from "../process-exit";
@@ -58,7 +59,7 @@ function initializeIsolatedContextDb(
         initializeContextDbFromRelease(dataDir, releaseRoot);
         return;
     }
-    const path = join(dataDir, "cortexkit", "magic-context", "context.db");
+    const path = join(storageSubtreePath(dataDir), "context.db");
     if (existsSync(path)) return;
     mkdirSync(dirname(path), { recursive: true });
     createDirectTestDatabase({ path }).db.close();

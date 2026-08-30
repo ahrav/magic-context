@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { join, relative, resolve, sep } from "node:path";
+import { storageSubtreePath } from "../../../../plugin/src/shared/data-path";
 import { Database } from "../../../../plugin/src/shared/sqlite";
 import type { PluginContext } from "../../../../plugin/src/plugin/types";
 import { createDirectTestDatabase } from "../../../../plugin/src/features/magic-context/test-database";
@@ -499,7 +500,7 @@ function barrier(): Barrier {
 }
 
 function contextDbPath(context: CaseDriverContext, dataDir: string): string {
-    const path = join(dataDir, "cortexkit", "magic-context", "context.db");
+    const path = join(storageSubtreePath(dataDir), "context.db");
     if (!pathInside(context.workspaceRoot, path)) {
         throw new Error("A47 context database escaped the case workspace");
     }

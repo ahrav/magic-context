@@ -15,6 +15,8 @@
 import { Database } from "bun:sqlite";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { storageSubtreePath } from "@magic-context/core/shared/data-path";
+import { managedSubtreePath } from "@magic-context/core/shared/mc-host-lifecycle/paths";
 import { ballastProse } from "./ballast";
 import {
     DEFAULT_MOCK_RESPONSE,
@@ -154,7 +156,7 @@ export class RustTestHarness {
             fixtureBin,
         });
 
-        const logPath = join(env.dataDir, "cortexkit", "magic-context-e2e.log");
+        const logPath = join(managedSubtreePath(env.dataDir), "magic-context-e2e.log");
 
         let opencode: SpawnedOpencode;
         try {
@@ -595,12 +597,7 @@ export class RustTestHarness {
     // ── context.db access (plugin state) ──────────────────────────────────────
 
     private contextDbPath(): string {
-        return join(
-            this.env.dataDir,
-            "cortexkit",
-            "magic-context",
-            "context.db",
-        );
+        return join(storageSubtreePath(this.env.dataDir), "context.db");
     }
 
     contextDb(): Database {
@@ -620,7 +617,7 @@ export class RustTestHarness {
     }
 
     readModuleTodoState(sessionId: string): RustModuleTodoState | null {
-        const path = join(this.env.dataDir, "cortexkit", "magic-context", "store.db");
+        const path = join(storageSubtreePath(this.env.dataDir), "store.db");
         if (!existsSync(path)) return null;
         const db = new Database(path, { readonly: true });
         try {

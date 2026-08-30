@@ -166,6 +166,10 @@ pub fn data_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, Instan
 /// the tree behind.
 pub const MANAGED_DIR_NAME: &str = "cortexkit";
 
+/// The runtime-directory segment under the managed subtree, holding the
+/// publication and lock files.
+pub const RUNTIME_DIR_NAME: &str = "run";
+
 /// Resolves `${dataDir}/cortexkit`: the replaceable managed subtree that
 /// holds the runtime directory, the lifecycle root, and module storage.
 pub fn managed_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, InstanceError> {
@@ -176,7 +180,7 @@ pub fn managed_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, Ins
 /// absolute `$XDG_DATA_HOME`, or an absolute `$HOME/.local/share`, in that
 /// order.
 pub fn runtime_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, InstanceError> {
-    Ok(managed_dir_path(data_dir_override)?.join("run"))
+    Ok(managed_dir_path(data_dir_override)?.join(RUNTIME_DIR_NAME))
 }
 
 /// One secured host incarnation: validated directory descriptor, held lock,

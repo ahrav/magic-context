@@ -3,6 +3,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { storageSubtreePath } from "../src/shared/data-path";
 import { Database } from "bun:sqlite";
 
 const DASHBOARD_FORMULA_SOURCE =
@@ -820,8 +821,8 @@ function printHuman(output: Output): void {
 async function main(): Promise<void> {
     const args = parseArgs(process.argv.slice(2));
     const root = dataHome();
-    const contextPath = join(root, "cortexkit", "magic-context", "context.db");
-    const storePath = join(root, "cortexkit", "magic-context", "store.db");
+    const contextPath = join(storageSubtreePath(root), "context.db");
+    const storePath = join(storageSubtreePath(root), "store.db");
     const contextDb = openRequiredReadOnly(contextPath, "Magic Context database");
     const storeDb = openOptionalReadOnly(storePath, "Magic Context module store");
     let usageSource: string;

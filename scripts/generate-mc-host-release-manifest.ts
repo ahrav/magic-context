@@ -219,6 +219,16 @@ const CONTRACT = {
         transaction_lock: "transaction.lock",
         lifetime_lock: "lifetime.lock",
     },
+    // Managed data-root layout segments. The Rust daemon and every
+    // TypeScript resolver derive `${dataRoot}/cortexkit/...` path names from
+    // this one definition, so a rename regenerates every side at once
+    // instead of leaving a stale hand-written copy pointing at the old tree.
+    layout: {
+        managed_subtree: "cortexkit",
+        runtime_directory: "run",
+        connection_file: "subc-connection.json",
+        storage_subdirectory: "magic-context",
+    },
     cli: {
         result_schema: "magic-context.daemon/v1",
         commands: ["start", "stop", "restart", "status", "doctor"],
@@ -622,6 +632,7 @@ export function validateContractSchema(contract: any): void {
             "epochs",
             "harness_unavailable",
             "install_layouts",
+            "layout",
             "model_lane",
             "packages",
             "platforms",
@@ -927,6 +938,26 @@ export function validateContractSchema(contract: any): void {
         contract.coordination.lifetime_lock !== "lifetime.lock"
     ) {
         fail("coordination names are fixed and version-neutral");
+    }
+
+    // Managed data-root layout segments.
+    assertExactKeys(
+        contract.layout,
+        [
+            "connection_file",
+            "managed_subtree",
+            "runtime_directory",
+            "storage_subdirectory",
+        ],
+        "layout",
+    );
+    if (
+        contract.layout.managed_subtree !== "cortexkit" ||
+        contract.layout.runtime_directory !== "run" ||
+        contract.layout.connection_file !== "subc-connection.json" ||
+        contract.layout.storage_subdirectory !== "magic-context"
+    ) {
+        fail("managed layout segments are fixed and version-neutral");
     }
 
     // Closed CLI unions (KTD12).
@@ -1594,6 +1625,36 @@ pub const STATE_SYNC_EPOCH: u32 = ${contract.epochs.state_sync};
 pub const COORDINATION_DIRECTORY: &str = "${contract.coordination.directory}";
 pub const TRANSACTION_LOCK_NAME: &str = "${contract.coordination.transaction_lock}";
 pub const LIFETIME_LOCK_NAME: &str = "${contract.coordination.lifetime_lock}";
+
+/// Managed data-root layout segments (\`\${dataRoot}/cortexkit/...\`).
+pub const MANAGED_SUBTREE_DIRECTORY: &str = "${contract.layout.managed_subtree}";
+pub const RUNTIME_DIRECTORY_NAME: &str = "${contract.layout.runtime_directory}";
+pub const CONNECTION_FILE_NAME: &str = "${contract.layout.connection_file}";
+pub const STORAGE_SUBDIRECTORY: &str = "${contract.layout.storage_subdirectory}";
+`;
+}
+
+export function renderRetinaLayoutTsOutput(
+    contract: ReturnType<typeof buildContract>,
+): string {
+    const banner = GENERATED_BANNER.split("\n")
+        .map((line) => ` * ${line}`)
+        .join("\n");
+    return `/**
+${banner}
+ *
+ * Managed data-root layout segments from the release contract.
+ * \`retina-local-fs\` is a dependency of the plugin packages, so it cannot
+ * import their generated contract module; this standalone copy is emitted
+ * and drift-checked by the same generator instead.
+ */
+
+export const managedLayout = {
+    managedSubtree: ${JSON.stringify(contract.layout.managed_subtree)},
+    runtimeDirectory: ${JSON.stringify(contract.layout.runtime_directory)},
+    connectionFile: ${JSON.stringify(contract.layout.connection_file)},
+    storageSubdirectory: ${JSON.stringify(contract.layout.storage_subdirectory)},
+} as const;
 `;
 }
 
@@ -1631,6 +1692,7 @@ export const OUTPUT_PATHS = {
     rust: "release/generated/mc-host-release-contract.rs",
     typescript:
         "packages/plugin/src/shared/mc-host-lifecycle/generated-contract.ts",
+    retinaLayout: "packages/retina-local-fs/src/generated-layout.ts",
 } as const;
 
 export const REGISTRY_GATE_PATH = "release/mc-host-registry-gate.json";
@@ -1672,6 +1734,7 @@ export function generate(
         contractJson: `${canonical}\n`,
         rust: renderRustOutput(canonical, digest),
         typescript: renderTsOutput(canonical, digest),
+        retinaLayout: renderRetinaLayoutTsOutput(contract),
     };
 
     const drift: string[] = [];

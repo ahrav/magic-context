@@ -215,6 +215,18 @@ describe("pre-build schema", () => {
                 },
             ],
             [
+                "managed layout rename",
+                (c) => {
+                    c.layout.managed_subtree = "cortexkit-v2";
+                },
+            ],
+            [
+                "managed layout extra segment",
+                (c) => {
+                    c.layout.extra_segment = "plexus";
+                },
+            ],
+            [
                 "fingerprint domain drift",
                 (c) => {
                     c.credential_fingerprint.domain =

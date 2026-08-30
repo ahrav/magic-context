@@ -2,6 +2,7 @@
 
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { storageSubtreePath } from "../../plugin/src/shared/data-path";
 import { createDirectTestDatabase } from "../../plugin/src/features/magic-context/test-database";
 import { Database } from "../../plugin/src/shared/sqlite";
 import { ballastProse } from "./ballast";
@@ -40,7 +41,7 @@ function initializeIsolatedContextDb(
     initializeContextDbFromRelease(dataDir, releaseRoot);
     return;
   }
-  const path = join(dataDir, "cortexkit", "magic-context", "context.db");
+  const path = join(storageSubtreePath(dataDir), "context.db");
   if (existsSync(path)) return;
   mkdirSync(dirname(path), { recursive: true });
   createDirectTestDatabase({ path }).db.close();
@@ -187,7 +188,7 @@ export class PiTestHarness {
   }
 
   contextDbPath(): string {
-    return join(this.env.dataDir, "cortexkit", "magic-context", "context.db");
+    return join(storageSubtreePath(this.env.dataDir), "context.db");
   }
 
   contextDb(): Database {

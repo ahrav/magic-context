@@ -74,7 +74,7 @@ pub use handler::{
 };
 pub use instance::{
     data_dir_path, managed_dir_path, runtime_dir_path, InstanceError, CONNECTION_FILE_NAME,
-    MANAGED_DIR_NAME,
+    MANAGED_DIR_NAME, RUNTIME_DIR_NAME,
 };
 pub use lifecycle::{
     coordination_dir_path, is_canonical_payload_digest, lifecycle_dir_path, probe_lifecycle,

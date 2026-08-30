@@ -16,6 +16,7 @@
  */
 
 import { Database } from "bun:sqlite";
+import { storageSubtreePath } from "../../plugin/src/shared/data-path";
 import { existsSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { ballastProse } from "./ballast";
@@ -277,14 +278,9 @@ export class TestHarness {
 
     /** Absolute path of the shared context.db (may not exist yet). */
     contextDbPath(): string {
-        // Plugin v0.16+ uses the shared cortexkit/magic-context path so OpenCode
-        // and Pi can share state. See packages/plugin/src/shared/data-path.ts.
-        return join(
-            this.opencode.env.dataDir,
-            "cortexkit",
-            "magic-context",
-            "context.db",
-        );
+        // The shared cortexkit/magic-context path lets OpenCode and Pi share
+        // state. See packages/plugin/src/shared/data-path.ts.
+        return join(storageSubtreePath(this.opencode.env.dataDir), "context.db");
     }
 
     /** Whether the plugin has created its database yet. */
