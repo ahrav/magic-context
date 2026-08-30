@@ -182,11 +182,11 @@ function buildPairs(
                     if (admission.violation !== null) violations.push(admission.violation);
                     continue;
                 }
-                applied += 1;
                 if (admission.kind === "rejected") {
                     entries.push(admission.entry);
                     continue;
                 }
+                applied += 1;
                 pairs.push({ key: admission.key, base, derivative: admission.derivative });
             }
         }
@@ -268,7 +268,7 @@ export async function runLiveMetamorphicEval(
     const nowMs = options.nowMs ?? Date.now;
     const deadlineReached = (): boolean => deadlineAtMs !== null && nowMs() >= deadlineAtMs;
     const deadlineReport = (nextRole: LiveRole): MetamorphicReport =>
-        finish({ kind: "deadline-exhausted", nextRole });
+        observe({ kind: "deadline-exhausted", nextRole });
     try {
         if (deadlineReached()) return deadlineReport("control-a");
         const controlA = await execute(

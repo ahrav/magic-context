@@ -728,7 +728,7 @@ describe("live metamorphic runner", () => {
 
             expect(readFileSync(victim, "utf8")).toBe("protected");
             expect(lstatSync(reportPath).isFile()).toBe(true);
-            expect(JSON.parse(readFileSync(reportPath, "utf8")).schema).toBe("metamorphic-eval-report/v1");
+            expect(JSON.parse(readFileSync(reportPath, "utf8")).schema).toBe("metamorphic-eval-report/v2");
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
@@ -835,5 +835,46 @@ describe("live metamorphic control tier", () => {
         expect(progress.length).toBeGreaterThan(0);
         expect(progress[0]?.system).toEqual(system);
         expect(report.system).toEqual(system);
+    });
+
+    test("publishes the deadline outcome and next role through the progress callback", async () => {
+        const progress: MetamorphicReport[] = [];
+        let clock = 0;
+        const { report } = await runWithExecutor(() => pairedObservation(), {
+            deadlineAtMs: 10,
+            nowMs: () => (clock += 6),
+            onProgress: (partial) => progress.push(partial),
+        });
+
+        expect(report.tierInvalidReason).toEqual({ kind: "deadline-exhausted", nextRole: "control-b" });
+        expect(progress.at(-1)?.tierInvalidReason).toEqual(report.tierInvalidReason);
+        expect(metamorphicExitCode(report)).toBe(1);
+    });
+
+    test("counts only admitted derivatives as applied coverage", async () => {
+        /** An identity derivative lints red on its fingerprint, which is the `rejected` branch that must not count as applied. commentlint: allow(JUDGE) */
+        const identity: Transform = {
+            id: "identity-fixture",
+            version: 1,
+            alwaysApplicable: true,
+            apply: (scenario) => ({
+                applicable: true,
+                scenario,
+                turnMap: scenario.transcript.turns.map((_, index) => index),
+            }),
+        };
+        const report = await runLiveMetamorphicEval([validScenario()], {
+            mode: liveMode(),
+            artifactRoot: "/tmp/metamorphic-applied-coverage",
+            opencodeVersion: "test",
+            transforms: [identity],
+            seeds: [0],
+            execute: async () => pairedObservation(),
+        });
+
+        expect(report.entries).toHaveLength(1);
+        expect(report.entries[0]?.kind).toBe("lint-red");
+        expect(report.coverage[0]?.applied).toBe(0);
+        expect(report.coverage[0]?.violations).toContain("no transforms applied");
     });
 });

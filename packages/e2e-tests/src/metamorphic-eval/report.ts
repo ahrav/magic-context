@@ -2,7 +2,7 @@ import type { SystemVersionTuple } from "../historian-eval/runner";
 import type { ScenarioScore } from "../historian-eval/scorer";
 import type { InvariantVerdict } from "./invariants";
 
-export const METAMORPHIC_REPORT_SCHEMA = "metamorphic-eval-report/v1";
+export const METAMORPHIC_REPORT_SCHEMA = "metamorphic-eval-report/v2";
 
 export interface PairKey {
     scenarioId: string;
