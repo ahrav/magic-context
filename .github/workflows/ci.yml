@@ -545,6 +545,9 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Build shared-memory addon from source
+        run: bun run --cwd packages/mc-shm-native build:source
+
       - name: Shared-memory client smoke (Node 24)
         run: bun run --cwd packages/plugin test:mc-host-client:node
 

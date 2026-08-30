@@ -1761,7 +1761,7 @@ fn create_macos_shm(len: usize) -> Result<OwnedFd, RingError> {
     let raw = unsafe {
         libc::shm_open(
             name.as_ptr(),
-            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR | libc::O_CLOEXEC,
+            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
             0o600,
         )
     };
@@ -1772,6 +1772,12 @@ fn create_macos_shm(len: usize) -> Result<OwnedFd, RingError> {
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
     // SAFETY: name.as_ptr() remains valid for the call; shm_unlink removes the name immediately.
     if unsafe { libc::shm_unlink(name.as_ptr()) } != 0 {
+        return Err(RingError::ObjectSetupFailed);
+    }
+    // macOS rejects O_CLOEXEC in shm_open flags, so set descriptor inheritance
+    // after opening and unlinking the unique shared-memory name.
+    // SAFETY: fd is owned and F_SETFD changes only its descriptor flags.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
         return Err(RingError::ObjectSetupFailed);
     }
     let len = libc::off_t::try_from(len).map_err(|_| RingError::ArithmeticOverflow)?;

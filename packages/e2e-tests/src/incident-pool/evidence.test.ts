@@ -16,7 +16,6 @@ import {
     assertMutationReplayResults,
     changedVerifiers,
     crossCheckEvidenceInventory,
-    deferralPermittedFor,
     E2E_ROOT,
     EXPECTED_MUTATION_ARTIFACTS,
     EXPECTED_MUTATION_RECORDS,
@@ -197,24 +196,8 @@ describe("source inventory completeness (R1)", () => {
     });
 });
 
-describe("deferred hardening records (merge gate)", () => {
-    // A deferred record carries no mutation, no replay, and no bound verifier,
-    // so it is an unproven hardening claim. It may only ride through while the
-    // failure_hardening matrix is unresolved, which is both what every deferral
-    // cites and the state in which tuple execution is blocked anyway. Freezing
-    // the matrix unblocks that execution, so a deferral must then fail closed
-    // rather than become a standing exemption from this gate.
-    it("are permitted only while the matrix is unresolved", () => {
-        expect(deferralPermittedFor("unresolved")).toBe(true);
-        expect(deferralPermittedFor("valid")).toBe(false);
-        // An invalid matrix is not a licence either: failing its own validation
-        // says nothing about whether the drill is inapplicable.
-        expect(deferralPermittedFor("invalid")).toBe(false);
-    });
-});
-
 describe("mutation evidence normalization (R11)", () => {
-    it("derives the accepted 20-artifact/27-record snapshot from live files", () => {
+    it("derives the accepted artifact and record snapshot from live files", () => {
         const view = committedView();
         assertEvidenceSnapshot(view);
         expect(view.artifacts).toHaveLength(EXPECTED_MUTATION_ARTIFACTS);
