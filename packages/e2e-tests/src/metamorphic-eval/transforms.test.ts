@@ -505,6 +505,126 @@ describe("metamorphic transforms", () => {
         }
     });
 
+    test("duplication tries a shorter rejected turn before declining", () => {
+        const raw = validScenarioRaw();
+        const transcript = raw.transcript as {
+            turns: Array<{ user: string; assistant: string }>;
+            epilogueStartIndex: number;
+        };
+        const gold = raw.gold as {
+            expectedClaims: Array<{ sourceTurnRange: [number, number] }>;
+            expectedAbsent: Array<Record<string, unknown>>;
+        };
+        // Two qualifying rejections: a very large one whose copy would overrun the
+        // single-chunk budget, and a small one whose copy fits.
+        const bulk = `Rejected the batch pipeline. ${"filler word ".repeat(16_000 / 12)}`;
+        transcript.turns.unshift(
+            { user: "Should we adopt the batch pipeline?", assistant: bulk },
+            { user: "Should we adopt the cron sweeper?", assistant: "Rejected the cron sweeper." },
+        );
+        transcript.epilogueStartIndex += 2;
+        for (const claim of gold.expectedClaims) {
+            claim.sourceTurnRange = [claim.sourceTurnRange[0] + 2, claim.sourceTurnRange[1] + 2];
+        }
+        gold.expectedAbsent = [
+            {
+                id: "abs-batch-pipeline",
+                family: "proposed-but-rejected",
+                predicate: { kind: "normalized-substring", value: "rejected the batch pipeline" },
+            },
+            {
+                id: "abs-cron-sweeper",
+                family: "proposed-but-rejected",
+                predicate: { kind: "normalized-substring", value: "rejected the cron sweeper" },
+            },
+        ];
+        // Padded so the source is lint-clean with margin to spare while copying the
+        // bulky turn overruns the single-chunk budget.
+        const pad = ` ${"pad word ".repeat(10_000 / 9)}`;
+        for (const turn of transcript.turns.slice(2)) {
+            turn.user += pad;
+            turn.assistant += pad;
+        }
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "duplicate-rejected-proposal")!;
+
+        for (let seed = 0; seed < 20; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            expect(result.applicable, `seed ${seed}`).toBe(true);
+            if (!result.applicable) continue;
+            expect(lintScenario(result.scenario), `seed ${seed}`).toEqual([]);
+            // The bulky rejection is the one that cannot be copied.
+            expect(
+                result.scenario.transcript.turns.filter((turn) => turn.assistant === bulk),
+                `seed ${seed}`,
+            ).toHaveLength(1);
+        }
+    });
+
+    test("rename refuses a commit hash in commit context", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[0]!.assistant = "We could consider it.";
+        // Production reads this as commit metadata and lifts it out of the summary.
+        turns[3] = {
+            user: "Wrapping up.",
+            assistant: "Committed ABCDEFAB alongside the aux_worker.ts cleanup.",
+        };
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
+
+        let renamed = 0;
+        for (let seed = 0; seed < 30; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            const rewritten = result.scenario.transcript.turns[3]!.assistant;
+            expect(rewritten, `seed ${seed}`).toContain("ABCDEFAB");
+            if (!rewritten.includes("aux_worker.ts")) renamed += 1;
+        }
+        expect(renamed).toBeGreaterThan(0);
+    });
+
+    test("rename replacements avoid names only cleaning spells", () => {
+        for (let seed = 0; seed < 6; seed += 1) {
+            const next = splitmix32(seed);
+            next();
+            const reserved = `aux_symbol_${Math.floor(next() * 10_000)}`;
+            const fragmented = reserved.replace(
+                "_symbol",
+                "_<system-reminder>x</system-reminder>symbol",
+            );
+            const raw = validScenarioRaw();
+            const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> })
+                .turns;
+            turns[0]!.assistant = "We could consider it.";
+            // The historian receives `reserved` contiguously; the raw string never
+            // spells it, so a raw-only collision set would not see it as taken.
+            turns[3] = {
+                user: `Background note about ${fragmented} and aux_worker.ts.`,
+                assistant: "Summary recorded.",
+            };
+            const scenario = parseScenario(raw);
+            expect(lintScenario(scenario)).toEqual([]);
+            const transform = TRANSFORMS.find(
+                (candidate) => candidate.id === "rename-unrelated-symbols",
+            )!;
+
+            const result = transform.apply(scenario, seed);
+            expect(result.applicable, `seed ${seed}`).toBe(true);
+            if (!result.applicable) continue;
+            const visible = normalizedEvidenceMessages(result.scenario.transcript.turns)
+                .map((message) => message.text)
+                .join(" ");
+            expect(visible, `seed ${seed}`).not.toContain("aux_worker.ts");
+            expect(
+                visible.split(reserved).length - 1,
+                `seed ${seed} reserved ${reserved}`,
+            ).toBe(1);
+        }
+    });
+
     test("duplication refuses a rejected turn that repeats a probe answer", () => {
         const raw = validScenarioRaw();
         const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;

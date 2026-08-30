@@ -1,5 +1,9 @@
 import { splitmix32 } from "../../../plugin/scripts/retrieval-benchmark/synthetic";
 import {
+    COMMIT_HASH_TEST_PATTERN,
+    COMMIT_VERB_PATTERN,
+} from "../../../plugin/src/shared/commit-detection";
+import {
     MAX_TRANSCRIPT_TURNS,
     MAX_TURN_TEXT_CHARS,
     authoredEvidenceText,
@@ -55,28 +59,43 @@ function pick<T>(values: readonly T[], next: () => number): T {
 }
 
 /**
- * The first candidate a seed reaches that `accept` allows.
+ * The first candidate a seed reaches whose derivative the contract accepts.
  *
  * Proving a candidate costs a full evidence scan, and a scenario at the transcript
  * and expectation limits generates thousands of them, so proving the whole list to
  * use one of them is the dominant cost of an application. Probing from a
- * seed-chosen offset and stopping at the first acceptance keeps the usual case at
- * one proof while leaving the worst case — nothing acceptable — no worse than
+ * seed-chosen offset and stopping at the first success keeps the usual case at one
+ * proof while leaving the worst case — nothing acceptable — no worse than
  * filtering. The offset makes the choice seed-stable, and the wrap makes it
  * exhaustive.
+ *
+ * Probing all the way through construction, rather than stopping at a validator
+ * and building once, is what keeps one unusable candidate from spending the
+ * application: a turn whose duplication would overrun the chunk budget no longer
+ * hides a shorter one that fits.
+ *
+ * When nothing succeeds, a contract violation is reported ahead of an ordinary
+ * rejection: it is the louder signal, and the corpus guard looks for it.
  */
-function firstAccepted<T>(
+function firstDerivative<T>(
     candidates: readonly T[],
     seed: number,
-    accept: (candidate: T) => boolean,
-): T | undefined {
-    if (candidates.length === 0) return undefined;
+    exhaustedReason: string,
+    build: (candidate: T) => TransformResult,
+): TransformResult {
+    if (candidates.length === 0) return { applicable: false, reason: exhaustedReason };
     const start = Math.floor(splitmix32(seed)() * candidates.length);
+    let rejection: string | undefined;
+    let violation: string | undefined;
     for (let offset = 0; offset < candidates.length; offset += 1) {
-        const candidate = candidates[(start + offset) % candidates.length]!;
-        if (accept(candidate)) return candidate;
+        const result = build(candidates[(start + offset) % candidates.length]!);
+        if (result.applicable) return result;
+        rejection = result.reason;
+        if (violation === undefined && result.reason.startsWith(CONTRACT_VIOLATION_REASON)) {
+            violation = result.reason;
+        }
     }
-    return undefined;
+    return { applicable: false, reason: violation ?? rejection ?? exhaustedReason };
 }
 
 export function remapGold(
@@ -625,26 +644,26 @@ const paraphraseIrrelevant: Transform = {
         // transcript and expectation limits has hundreds of pairs, so proving all
         // of them to use one made a single application cost over a second.
         const baselines = evidenceBaselines(scenario);
-        const chosen = firstAccepted(pairs, seed, ({ message, text }) =>
-            safeParaphrase(scenario, baselines, message, text),
-        );
-        if (chosen === undefined) {
-            return {
-                applicable: false,
-                reason: "no irrelevant message to paraphrase",
-            };
-        }
-        return derivative(
-            scenario,
-            this,
+        return firstDerivative(
+            pairs,
             seed,
-            replaceMessage(
-                scenario.transcript.turns,
-                chosen.message,
-                chosen.text,
-            ),
-            scenario.transcript.epilogueStartIndex,
-            scenario.transcript.turns.map((_, index) => index),
+            "no irrelevant message to paraphrase",
+            ({ message, text }) => {
+                if (!safeParaphrase(scenario, baselines, message, text)) {
+                    return {
+                        applicable: false,
+                        reason: "no irrelevant message to paraphrase",
+                    };
+                }
+                return derivative(
+                    scenario,
+                    this,
+                    seed,
+                    replaceMessage(scenario.transcript.turns, message, text),
+                    scenario.transcript.epilogueStartIndex,
+                    scenario.transcript.turns.map((_, index) => index),
+                );
+            },
         );
     },
 };
@@ -716,30 +735,24 @@ const reorderIndependentTurns: Transform = {
                 ? [order]
                 : [];
         });
-        const order = firstAccepted(candidates, seed, (candidate) => {
-            const reordered = reorderedTurns(scenario, candidate);
-            return (
-                preservesEvidenceExactly(
-                    baselines,
-                    reordered,
-                    mapForOrder(candidate),
-                ) && changesVisibleTranscript(scenario, reordered)
+        const exhausted = "no independent adjacent turns before epilogue";
+        return firstDerivative(candidates, seed, exhausted, (order) => {
+            const reordered = reorderedTurns(scenario, order);
+            if (
+                !preservesEvidenceExactly(baselines, reordered, mapForOrder(order)) ||
+                !changesVisibleTranscript(scenario, reordered)
+            ) {
+                return { applicable: false, reason: exhausted };
+            }
+            return derivative(
+                scenario,
+                this,
+                seed,
+                reordered,
+                scenario.transcript.epilogueStartIndex,
+                mapForOrder(order),
             );
         });
-        if (order === undefined) {
-            return {
-                applicable: false,
-                reason: "no independent adjacent turns before epilogue",
-            };
-        }
-        return derivative(
-            scenario,
-            this,
-            seed,
-            reorderedTurns(scenario, order),
-            scenario.transcript.epilogueStartIndex,
-            mapForOrder(order),
-        );
     },
 };
 
@@ -812,31 +825,24 @@ const moveAcceptedDecision: Transform = {
                     ),
             ),
         );
-        const chosen = firstAccepted(candidates, seed, ({ order }) => {
+        const exhausted = "no movable single-turn accepted decision before epilogue";
+        return firstDerivative(candidates, seed, exhausted, ({ order }) => {
             const reordered = reorderedTurns(scenario, order);
-            return (
-                preservesEvidenceExactly(
-                    baselines,
-                    reordered,
-                    mapForOrder(order),
-                ) && changesVisibleTranscript(scenario, reordered)
+            if (
+                !preservesEvidenceExactly(baselines, reordered, mapForOrder(order)) ||
+                !changesVisibleTranscript(scenario, reordered)
+            ) {
+                return { applicable: false, reason: exhausted };
+            }
+            return derivative(
+                scenario,
+                this,
+                seed,
+                reordered,
+                scenario.transcript.epilogueStartIndex,
+                mapForOrder(order),
             );
         });
-        if (chosen === undefined) {
-            return {
-                applicable: false,
-                reason: "no movable single-turn accepted decision before epilogue",
-            };
-        }
-        const { order } = chosen;
-        return derivative(
-            scenario,
-            this,
-            seed,
-            reorderedTurns(scenario, order),
-            scenario.transcript.epilogueStartIndex,
-            mapForOrder(order),
-        );
     },
 };
 
@@ -893,26 +899,21 @@ const duplicateRejectedProposal: Transform = {
                     : [];
             },
         );
-        if (candidates.length === 0) {
-            return {
-                applicable: false,
-                reason:
-                    rejected.length === 0
-                        ? "no rejected proposal turn"
-                        : "no rejected proposal insertion preserves contiguous gold ranges",
-            };
-        }
-        const { source, insertion, turnMap } = pick(
+        return firstDerivative(
             candidates,
-            splitmix32(seed),
-        );
-        return derivative(
-            scenario,
-            this,
             seed,
-            duplicatedTurns(scenario, source, insertion),
-            epilogueStartIndexAfter(scenario, insertion),
-            turnMap,
+            rejected.length === 0
+                ? "no rejected proposal turn"
+                : "no rejected proposal insertion preserves contiguous gold ranges",
+            ({ source, insertion, turnMap }) =>
+                derivative(
+                    scenario,
+                    this,
+                    seed,
+                    duplicatedTurns(scenario, source, insertion),
+                    epilogueStartIndexAfter(scenario, insertion),
+                    turnMap,
+                ),
         );
     },
 };
@@ -1018,16 +1019,27 @@ const renameUnrelatedSymbols: Transform = {
         const candidates = [
             ...new Set(
                 messages.flatMap((message) => {
+                    // Production reads a hash-shaped token in a commit sentence as
+                    // commit metadata and lifts it out of the assistant summary, so
+                    // renaming it deletes the revision the block refers to rather
+                    // than exercising an unrelated identifier.
+                    const visibleMessage =
+                        visibleText.get(
+                            messageKey(message.turnIndex, message.role),
+                        ) ?? "";
+                    const commitContext =
+                        message.role === "assistant" &&
+                        COMMIT_VERB_PATTERN.test(visibleMessage);
                     // A candidate has to be present in BOTH views: the
                     // historian's, so renaming it changes the model input, and the
                     // raw text, so the replacement can find it at all — cleaning
                     // can join fragments into a symbol the raw string never spells.
                     const raw = new Set(symbolsIn(message.text));
-                    return symbolsIn(
-                        visibleText.get(
-                            messageKey(message.turnIndex, message.role),
-                        ) ?? "",
-                    ).filter((symbol) => raw.has(symbol));
+                    return symbolsIn(visibleMessage).filter(
+                        (symbol) =>
+                            raw.has(symbol) &&
+                            !(commitContext && COMMIT_HASH_TEST_PATTERN.test(symbol)),
+                    );
                 }),
             ),
         ].filter(
@@ -1049,9 +1061,12 @@ const renameUnrelatedSymbols: Transform = {
         // query-to-history relationship as surely as renaming one would, and one
         // aliasing a name that exists only inside a command span collides with an
         // entity the rename cannot even reach.
+        // The cleaned view too: a name the historian receives contiguously only
+        // after reminder stripping is still a name the derivative must not alias.
+        const collisionText = [...allText, ...visibleText.values()];
         const existing = new Set([
-            ...allText.flatMap((text) => symbolsIn(text)),
-            ...allText.flatMap((text) => shadowedSymbolsIn(text)),
+            ...collisionText.flatMap((text) => symbolsIn(text)),
+            ...collisionText.flatMap((text) => shadowedSymbolsIn(text)),
         ]);
         const replacementStart = Math.floor(next() * 10_000);
         let replacement: string | undefined;
