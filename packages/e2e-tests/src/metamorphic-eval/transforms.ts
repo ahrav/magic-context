@@ -231,11 +231,28 @@ function absentEvidenceTurnIndexes(scenario: HistorianEvalScenario): Set<number>
     );
 }
 
-/** One turn reduced to what the historian receives from it. */
-function visibleTurnPayload(turn: TranscriptTurn): string {
-    return normalizedEvidenceMessages([turn])
+/** The transcript reduced to what the historian receives from it. */
+function visibleTranscript(turns: readonly TranscriptTurn[]): string {
+    return normalizedEvidenceMessages(turns)
         .map((message) => `${message.role}:${message.text}`)
         .join("\n");
+}
+
+/**
+ * Whether the historian would receive a different transcript.
+ *
+ * A reordering whose turns are interchangeable in the historian's view produces
+ * the same model input, so the derivative differs only in bytes the historian
+ * never sees and the comparison would score the baseline against itself. Compared
+ * over the whole transcript rather than the turns being exchanged: a set of
+ * interchangeable turns can be permuted without any adjacent pair matching, and
+ * two turns can differ only inside a reminder block production strips.
+ */
+function changesVisibleTranscript(
+    scenario: HistorianEvalScenario,
+    turns: readonly TranscriptTurn[],
+): boolean {
+    return visibleTranscript(turns) !== visibleTranscript(scenario.transcript.turns);
 }
 
 function eligibleMessages(scenario: HistorianEvalScenario): EligibleMessage[] {
@@ -299,28 +316,34 @@ function preservesContiguousGold(scenario: HistorianEvalScenario, turnMap: reado
 }
 
 /**
- * Whether every authored occurrence of a forbidden formation survives the
- * perturbation.
+ * How many authored occurrences the perturbation destroys and creates.
  *
  * An occurrence can be authored across a turn boundary, so moving, inserting, or
  * duplicating a turn can separate halves that no single turn contains, and
- * framing text inserted between them does the same. Asking only whether the
- * predicate still matches somewhere is not enough: a predicate authored twice
- * would let the surviving occurrence hide the loss of the other, and the
- * derivative would carry less rejection evidence than the scenario declares while
- * every check still passed. Each source occurrence is therefore mapped through
- * `turnMap` and looked for individually, with multiplicity.
+ * framing text inserted between them does the same — or, in the other direction,
+ * can bring two neighbours into a formation neither authored. Asking only whether
+ * the predicate matches somewhere answers neither: a predicate authored twice
+ * would let the surviving occurrence hide the loss of the other, and a count
+ * would hide a simultaneous loss and gain. Each source occurrence is therefore
+ * mapped through `turnMap` and matched individually, with multiplicity, and
+ * whatever the derivative has left over is a creation.
+ *
+ * Callers decide which direction they can tolerate: duplication multiplies
+ * occurrences by design, while a rewrite or a reordering should change neither
+ * count.
  */
-function preservesAbsentEvidence(
+function matchDelta(
+    entries: readonly { id: string; predicate: ContentPredicate }[],
     scenario: HistorianEvalScenario,
     turns: readonly TranscriptTurn[],
     turnMap: readonly number[],
-): boolean {
+): { lost: number; gained: number } {
     const remaining = new Map<string, number>();
-    for (const match of matchSpans(scenario.gold.expectedAbsent, turns)) {
+    for (const match of matchSpans(entries, turns)) {
         remaining.set(match, (remaining.get(match) ?? 0) + 1);
     }
-    for (const match of matchSpans(scenario.gold.expectedAbsent, scenario.transcript.turns)) {
+    let lost = 0;
+    for (const match of matchSpans(entries, scenario.transcript.turns)) {
         const separator = match.indexOf("|");
         const expected = `${match.slice(0, separator)}|${match
             .slice(separator + 1)
@@ -334,10 +357,44 @@ function preservesAbsentEvidence(
             })
             .join(",")}`;
         const count = remaining.get(expected) ?? 0;
-        if (count === 0) return false;
+        if (count === 0) {
+            lost += 1;
+            continue;
+        }
         remaining.set(expected, count - 1);
     }
-    return true;
+    let gained = 0;
+    for (const count of remaining.values()) gained += count;
+    return { lost, gained };
+}
+
+/** No forbidden formation is destroyed; a duplicated turn may repeat one. */
+function preservesAbsentEvidence(
+    scenario: HistorianEvalScenario,
+    turns: readonly TranscriptTurn[],
+    turnMap: readonly number[],
+): boolean {
+    return matchDelta(scenario.gold.expectedAbsent, scenario, turns, turnMap).lost === 0;
+}
+
+/**
+ * Neither gold nor negative evidence changes at all.
+ *
+ * The perturbation a rewrite or a reordering stands for is wording or placement,
+ * so authoring a formation the source never authored is as much a confound as
+ * losing one: a derivative with extra rejection evidence, or with gold evidence
+ * outside the range that declares it, can change what the historian promotes for
+ * a reason the comparison does not attribute to the transform.
+ */
+function preservesEvidenceExactly(
+    scenario: HistorianEvalScenario,
+    turns: readonly TranscriptTurn[],
+    turnMap: readonly number[],
+): boolean {
+    return [scenario.gold.expectedAbsent, scenario.gold.expectedClaims].every((entries) => {
+        const { lost, gained } = matchDelta(entries, scenario, turns, turnMap);
+        return lost === 0 && gained === 0;
+    });
 }
 
 /** The turn list a candidate order produces, without copying gold. */
@@ -426,12 +483,12 @@ function safeParaphrase(
 ): boolean {
     if (text.length > MAX_TURN_TEXT_CHARS) return false;
     const turns = replaceMessage(scenario.transcript.turns, message, text);
-    if (!preservesAbsentEvidence(scenario, turns, scenario.transcript.turns.map((_, index) => index))) {
-        return false;
-    }
     if (
-        matchSpans(scenario.gold.expectedClaims, turns).length >
-        matchSpans(scenario.gold.expectedClaims, scenario.transcript.turns).length
+        !preservesEvidenceExactly(
+            scenario,
+            turns,
+            scenario.transcript.turns.map((_, index) => index),
+        )
     ) {
         return false;
     }
@@ -456,18 +513,6 @@ const reorderIndependentTurns: Transform = {
             { length: scenario.transcript.epilogueStartIndex - 1 },
             (_, index) => [index, index + 1] as const,
         ).flatMap(([left, right]) => {
-            // Swapping two turns the historian receives identically produces the
-            // same model input, so the derivative would differ only in bytes the
-            // historian never sees and the comparison would score the baseline
-            // against itself. Compared on the cleaned view rather than the raw
-            // strings: two turns can differ only in a reminder block that
-            // production strips.
-            if (
-                visibleTurnPayload(scenario.transcript.turns[left]!) ===
-                visibleTurnPayload(scenario.transcript.turns[right]!)
-            ) {
-                return [];
-            }
             const crossesProposalDecision =
                 (absentIndexes.has(left) && expectedIndexes.has(right)) ||
                 (expectedIndexes.has(left) && absentIndexes.has(right));
@@ -482,7 +527,9 @@ const reorderIndependentTurns: Transform = {
             const order = scenario.transcript.turns.map((_, index) => index);
             [order[left], order[right]] = [order[right]!, order[left]!];
             if (!preservesContiguousGold(scenario, mapForOrder(order))) return [];
-            return preservesAbsentEvidence(scenario, reorderedTurns(scenario, order), mapForOrder(order))
+            const reordered = reorderedTurns(scenario, order);
+            return preservesEvidenceExactly(scenario, reordered, mapForOrder(order)) &&
+                changesVisibleTranscript(scenario, reordered)
                 ? [order]
                 : [];
         });
@@ -545,7 +592,12 @@ const moveAcceptedDecision: Transform = {
                         (_, offset) => from + 1 + offset,
                     ).some((turnIndex) => absentIndexes.has(turnIndex)) &&
                     preservesContiguousGold(scenario, mapForOrder(order)) &&
-                    preservesAbsentEvidence(scenario, reorderedTurns(scenario, order), mapForOrder(order)),
+                    preservesEvidenceExactly(
+                        scenario,
+                        reorderedTurns(scenario, order),
+                        mapForOrder(order),
+                    ) &&
+                    changesVisibleTranscript(scenario, reorderedTurns(scenario, order)),
             ),
         );
         if (candidates.length === 0) {

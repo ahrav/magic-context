@@ -560,6 +560,84 @@ describe("metamorphic transforms", () => {
         expect(renamed).toBeGreaterThan(0);
     });
 
+    test("paraphrase never frames a message into negative evidence", () => {
+        const raw = validScenarioRaw();
+        const gold = raw.gold as { expectedAbsent: Array<Record<string, unknown>> };
+        // The framing wording itself satisfies a forbidden formation already
+        // authored elsewhere, so a rewrite could strengthen the rejection
+        // evidence the derivative carries.
+        gold.expectedAbsent.push({
+            id: "abs-background-context",
+            family: "proposed-but-rejected",
+            predicate: { kind: "normalized-substring", value: "background context" },
+        });
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[0]!.user = "Should we use Redis for the session cache as background context?";
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "paraphrase-irrelevant")!;
+        const occurrences = (candidate: HistorianEvalScenario) =>
+            normalizeContent(authoredEvidenceText(candidate.transcript.turns)).split(
+                "background context",
+            ).length - 1;
+
+        for (let seed = 0; seed < 30; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            expect(occurrences(result.scenario), `seed ${seed}`).toBe(occurrences(scenario));
+        }
+    });
+
+    test("move refuses an order the historian receives unchanged", () => {
+        const raw = validScenarioRaw();
+        const transcript = raw.transcript as {
+            turns: Array<{ user: string; assistant: string }>;
+            epilogueStartIndex: number;
+        };
+        // The moved accepted decision and every turn it crosses are
+        // interchangeable in the historian's view, so no permutation of them
+        // changes the model input. The rejected proposal stays outside every span
+        // so the proposal-ordering guard is not what declines these candidates.
+        const repeated = { user: "Status check.", assistant: "All good." };
+        transcript.turns = [
+            {
+                user: "Should we use Redis for the session cache?",
+                assistant: "We could; Redis would give us TTL eviction out of the box.",
+            },
+            { ...repeated },
+            { ...repeated },
+            { ...repeated },
+            { ...repeated },
+            { user: "Thanks, wrapping up this thread now.", assistant: "Summary recorded." },
+        ];
+        transcript.epilogueStartIndex = 5;
+        const gold = raw.gold as { expectedClaims: Array<Record<string, unknown>> };
+        gold.expectedClaims = [
+            {
+                id: "exp-status",
+                category: "ARCHITECTURE",
+                predicate: { kind: "normalized-substring", value: "all good" },
+                sourceTurnRange: [1, 1],
+            },
+        ];
+        raw.probes = [
+            {
+                id: "probe-status",
+                question: "Which claim records the status?",
+                answerType: "claim-id",
+                expectedClaimRef: "exp-status",
+            },
+        ];
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "move-accepted-decision")!;
+
+        expect(transform.apply(scenario, 7)).toEqual({
+            applicable: false,
+            reason: "no movable single-turn accepted decision before epilogue",
+        });
+    });
+
     test("reorder refuses a pair the historian receives identically", () => {
         const raw = validScenarioRaw();
         const transcript = raw.transcript as {

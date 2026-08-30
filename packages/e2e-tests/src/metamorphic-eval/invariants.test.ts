@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import type { InjectedClaimRecord } from "../historian-eval/claim-read";
+import type { FailReason, ScenarioScore } from "../historian-eval/scorer";
 import { compareInvariants } from "./invariants";
 
 function claim(
@@ -17,7 +18,17 @@ function claim(
     };
 }
 
-const cleanScore = { falseAuthoritativeMatches: [] };
+type ComparableScore = Pick<ScenarioScore, "verdict" | "failReasons" | "falseAuthoritativeMatches">;
+
+function score(
+    verdict: ScenarioScore["verdict"] = "PASS",
+    failReasons: FailReason[] = [],
+    falseAuthoritativeMatches: string[] = [],
+): ComparableScore {
+    return { verdict, failReasons, falseAuthoritativeMatches };
+}
+
+const cleanScore = score();
 
 describe("metamorphic invariant comparator", () => {
     test("ignores array order, public claim ids, case, and whitespace", () => {
@@ -41,6 +52,13 @@ describe("metamorphic invariant comparator", () => {
                 holds: true,
                 baselineMatches: [],
                 derivativeMatches: [],
+            },
+            {
+                invariant: "verdict-monotonicity",
+                holds: true,
+                baselineVerdict: "PASS",
+                derivativeVerdict: "PASS",
+                introducedFailReasons: [],
             },
         ]);
     });
@@ -100,8 +118,8 @@ describe("metamorphic invariant comparator", () => {
         const verdict = compareInvariants(
             [],
             [],
-            { falseAuthoritativeMatches: ["abs-baseline"] },
-            { falseAuthoritativeMatches: ["abs-derivative"] },
+            score("FAIL", ["false-authoritative"], ["abs-baseline"]),
+            score("FAIL", ["false-authoritative"], ["abs-derivative"]),
         )[1];
 
         expect(verdict).toEqual({
@@ -120,14 +138,56 @@ describe("metamorphic invariant comparator", () => {
             compareInvariants(
                 [],
                 [],
-                { falseAuthoritativeMatches: baselineMatches },
-                { falseAuthoritativeMatches: derivativeMatches },
+                score("FAIL", ["false-authoritative"], baselineMatches),
+                score("FAIL", ["false-authoritative"], derivativeMatches),
             )[1],
         ).toEqual({
             invariant: "expected-absent-empty",
             holds: false,
             baselineMatches,
             derivativeMatches,
+        });
+    });
+
+    test.each([
+        ["FAIL" as const, ["probe" as const]],
+        ["FAIL" as const, ["recall" as const]],
+        ["FAIL" as const, ["structural" as const]],
+        ["FAIL" as const, ["invalid-output" as const]],
+        ["ERROR" as const, [] as FailReason[]],
+    ])(
+        "rejects a baseline-PASS derivative-%s pair whose claims and absent matches agree: %j",
+        (derivativeVerdict, failReasons) => {
+            const verdicts = compareInvariants(
+                [claim("Use the in-process LRU cache")],
+                [claim("Use the in-process LRU cache")],
+                cleanScore,
+                score(derivativeVerdict, failReasons),
+            );
+
+            // The regression is invisible to the other two invariants by
+            // construction: both claim sets and both match sets are equal.
+            expect(verdicts[0]!.holds).toBe(true);
+            expect(verdicts[1]!.holds).toBe(true);
+            expect(verdicts[2]).toEqual({
+                invariant: "verdict-monotonicity",
+                holds: false,
+                baselineVerdict: "PASS",
+                derivativeVerdict,
+                introducedFailReasons: failReasons,
+            });
+        },
+    );
+
+    test("holds when a failing baseline yields a passing derivative", () => {
+        expect(
+            compareInvariants([], [], score("FAIL", ["recall"]), cleanScore)[2],
+        ).toEqual({
+            invariant: "verdict-monotonicity",
+            holds: true,
+            baselineVerdict: "FAIL",
+            derivativeVerdict: "PASS",
+            introducedFailReasons: [],
         });
     });
 });

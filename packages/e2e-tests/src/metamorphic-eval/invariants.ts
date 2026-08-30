@@ -1,6 +1,6 @@
 import type { InjectedClaimRecord } from "../historian-eval/claim-read";
 import { normalizeContent } from "../historian-eval/contract";
-import type { ScenarioScore } from "../historian-eval/scorer";
+import { FAIL_REASONS, type FailReason, type ScenarioScore } from "../historian-eval/scorer";
 
 export interface CanonicalInjectedClaim {
     category: string;
@@ -24,9 +24,31 @@ export interface ExpectedAbsentEmptyVerdict {
     derivativeMatches: string[];
 }
 
-export type InvariantVerdict = InjectionSetEqualityVerdict | ExpectedAbsentEmptyVerdict;
+export interface VerdictMonotonicityVerdict {
+    invariant: "verdict-monotonicity";
+    holds: boolean;
+    baselineVerdict: ScenarioScore["verdict"];
+    derivativeVerdict: ScenarioScore["verdict"];
+    /** Fail reasons the derivative has and the baseline does not. */
+    introducedFailReasons: FailReason[];
+}
 
-type AbsentMatchScore = Pick<ScenarioScore, "falseAuthoritativeMatches">;
+export type InvariantVerdict =
+    | InjectionSetEqualityVerdict
+    | ExpectedAbsentEmptyVerdict
+    | VerdictMonotonicityVerdict;
+
+/**
+ * What the comparator needs from a scored run.
+ *
+ * The verdict and its reasons are part of it, not just the expected-absent
+ * matches: a derivative can regress through recall, a probe, a structural
+ * finding, or invalid output while both injected claim sets and both
+ * expected-absent match sets stay equal. Narrowing this to
+ * `falseAuthoritativeMatches` made verdict monotonicity unrepresentable rather
+ * than merely unchecked.
+ */
+type ComparableScore = Pick<ScenarioScore, "verdict" | "failReasons" | "falseAuthoritativeMatches">;
 
 function claimKey(claim: CanonicalInjectedClaim): string {
     return JSON.stringify([claim.category, claim.content]);
@@ -54,8 +76,8 @@ function canonicalizeInjectionSet(
 export function compareInvariants(
     baselineClaims: readonly InjectedClaimRecord[],
     derivativeClaims: readonly InjectedClaimRecord[],
-    baselineScore: AbsentMatchScore,
-    derivativeScore: AbsentMatchScore,
+    baselineScore: ComparableScore,
+    derivativeScore: ComparableScore,
 ): InvariantVerdict[] {
     const baseline = canonicalizeInjectionSet(baselineClaims);
     const derivative = canonicalizeInjectionSet(derivativeClaims);
@@ -72,6 +94,11 @@ export function compareInvariants(
     const baselineMatches = [...new Set(baselineScore.falseAuthoritativeMatches)].sort();
     const derivativeMatches = [...new Set(derivativeScore.falseAuthoritativeMatches)].sort();
 
+    const baselineReasons = new Set(baselineScore.failReasons);
+    const introducedFailReasons = FAIL_REASONS.filter(
+        (reason) => derivativeScore.failReasons.includes(reason) && !baselineReasons.has(reason),
+    );
+
     return [
         {
             invariant: "injection-set-equality",
@@ -83,6 +110,19 @@ export function compareInvariants(
             holds: baselineMatches.length === 0 && derivativeMatches.length === 0,
             baselineMatches,
             derivativeMatches,
+        },
+        {
+            invariant: "verdict-monotonicity",
+            // A derivative preserves the scenario's semantics, so a baseline that
+            // passed and a derivative that does not is the transform's doing.
+            // Only that direction is a violation: a derivative that passes where
+            // the baseline failed is not a regression to report here.
+            holds: !(
+                baselineScore.verdict === "PASS" && derivativeScore.verdict !== "PASS"
+            ),
+            baselineVerdict: baselineScore.verdict,
+            derivativeVerdict: derivativeScore.verdict,
+            introducedFailReasons,
         },
     ];
 }
