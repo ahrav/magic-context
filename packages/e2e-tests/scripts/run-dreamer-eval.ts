@@ -21,7 +21,8 @@ interface CliArgs {
     tasks: DreamerTask[];
     repeat: number;
     outputDir: string;
-    deadlineMinutes: number;
+    /** Wall-clock budget for the whole live loop, in minutes, or null for none. */
+    deadlineMinutes: number | null;
 }
 
 function parseArgs(args: string[]): CliArgs {
@@ -29,7 +30,7 @@ function parseArgs(args: string[]): CliArgs {
     const tasks: DreamerTask[] = [];
     let repeat = 1;
     let outputDir = join(E2E_ROOT, "artifacts", "dreamer-eval");
-    let deadlineMinutes = 280;
+    let deadlineMinutes: number | null = null;
     const value = (flag: string, candidate: string | undefined): string => {
         if (candidate === undefined || candidate.startsWith("-")) throw new Error(`${flag} requires a value`);
         return candidate;
@@ -76,13 +77,19 @@ function parseArgs(args: string[]): CliArgs {
     };
 }
 
+/**
+ * Reserves `longestRunMs` before admitting a subsequent run so it can finish
+ * by `deadlineAtMs` instead of being killed mid-flight by an external timeout.
+ * The first run is always admitted so a tight budget still produces evidence.
+ */
 export function canStartDreamerEvalRun(
-    startedAtMs: number,
-    deadlineMinutes: number,
+    deadlineAtMs: number | null,
     nowMs: number,
+    longestRunMs: number,
     completedRuns: number,
 ): boolean {
-    return completedRuns === 0 || nowMs < startedAtMs + deadlineMinutes * 60_000;
+    if (deadlineAtMs === null || completedRuns === 0) return true;
+    return nowMs + longestRunMs <= deadlineAtMs;
 }
 
 function loadScenarios(): DreamerEvalScenario[] {
@@ -117,7 +124,6 @@ function opencodeVersion(): string {
 }
 
 async function main(): Promise<0 | 1 | 2> {
-    const startedAtMs = Date.now();
     const args = parseArgs(Bun.argv.slice(2));
     const apiKey = process.env.ANTHROPIC_API_KEY;
     const model = process.env.DREAMER_EVAL_MODEL;
@@ -142,12 +148,16 @@ async function main(): Promise<0 | 1 | 2> {
     let runFailed = false;
     let deadlineReached = false;
     const version = opencodeVersion();
+    // The deadline starts after argument parsing and scenario loading, so it
+    // bounds evaluation runs only.
+    const deadlineAtMs = args.deadlineMinutes === null ? null : Date.now() + args.deadlineMinutes * 60_000;
+    let longestRunMs = 0;
     for (const { scenario, task } of groups) {
         if (runFailed) break;
         const groupDir = join(args.outputDir, scenario.id, task.task);
         const groupReportPaths: string[] = [];
         for (let repeat = 1; repeat <= args.repeat; repeat += 1) {
-            if (!canStartDreamerEvalRun(startedAtMs, args.deadlineMinutes, Date.now(), reports.length)) {
+            if (!canStartDreamerEvalRun(deadlineAtMs, Date.now(), longestRunMs, reports.length)) {
                 deadlineReached = true;
                 console.log(`dreamer-eval deadline reached before ${scenario.id}/${task.task} run ${repeat}`);
                 break;
@@ -160,6 +170,7 @@ async function main(): Promise<0 | 1 | 2> {
             // exit 2. Stop instead of continuing: a structural fault repeats, and
             // every further repeat would spend model credits to fail the same way.
             let report: DreamerEvalRunReport;
+            const runStartedAtMs = Date.now();
             try {
                 report = await runDreamerEvalTask(scenario, task, {
                     apiKey,
@@ -179,6 +190,7 @@ async function main(): Promise<0 | 1 | 2> {
                 );
                 break;
             }
+            longestRunMs = Math.max(longestRunMs, Date.now() - runStartedAtMs);
             groupReportPaths.push(join(groupDir, `${report.runId}.json`));
             reports.push(report);
             console.log(`${report.runId}: ${report.status}${report.reason === null ? "" : `:${report.reason}`}`);

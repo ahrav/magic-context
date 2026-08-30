@@ -41,7 +41,6 @@ bun scripts/run-dreamer-eval.ts \
   --scenario dme-core-pool \
   --task verify \
   --repeat 3 \
-  --deadline-minutes 280 \
   --output-dir artifacts/dreamer-eval
 ```
 
@@ -49,12 +48,14 @@ Each task repeat gets a fresh harness database and fixture repository. The
 command runs in its own Bun process so the runner's temporary keep-subagents
 setting cannot leak into a shared test process. Output is grouped under
 `<output-dir>/<scenario>/<task>/`: one versioned run report per repeat and one
-`variance.json` artifact for the set. `observedRuns` counts manifests that
-included a claim, while `missingRuns` includes sparse outputs and repeats skipped
-after the script-level deadline. `repeatCount` remains the requested repeat count.
-The deadline is checked between paid runs, leaving time for variance writes and
-artifact upload before the enclosing workflow timeout. Deadline truncation exits
-`1`; `variance.json` records skipped repeats in `missingRuns`.
+`variance.json` artifact for the set. A run that produced no verdict for a
+claim counts in that claim's histogram under the `missing` bucket, so sparse
+outputs stay visible; `repeatCount` counts the reports actually aggregated.
+There is no deadline by default. `--deadline-minutes <n>` bounds the live loop
+for callers running under an external timeout: before each run after the
+first, the script checks that the longest completed run still fits in the
+remaining budget, so a run is never started that the enclosing workflow
+timeout would kill mid-flight. Deadline truncation exits `1`.
 
 Every report records the plugin entrypoint and a digest of everything the run's
 outcome depends on that the commit does not pin: the loaded bundle's bytes when a

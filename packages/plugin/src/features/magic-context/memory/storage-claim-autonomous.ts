@@ -316,6 +316,7 @@ export function autonomousManifestRejectionRequestDigest(args: {
     identity: AutonomousManifestIdentity;
     rawManifest: string;
 }): string {
+    assertIdentity(args.identity);
     return computeClaimOperationRequestDigest({
         identity: {
             batchId: args.identity.batchId,

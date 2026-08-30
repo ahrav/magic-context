@@ -717,9 +717,11 @@ export async function runDreamerEvalTask(
         let fixtureUnchanged = true;
         try {
             assertFixtureFilesCommitted(seeded.workdir, fixturePaths(scenario));
+            // `--untracked-files=no`: the harness may drop untracked output
+            // files into the worktree, which is not fixture drift.
             fixtureUnchanged =
                 gitOutput(seeded.workdir, ["rev-parse", "HEAD"]) === fixtureHead &&
-                gitOutput(seeded.workdir, ["status", "--porcelain"]) === "";
+                gitOutput(seeded.workdir, ["status", "--porcelain", "--untracked-files=no"]) === "";
         } catch {
             fixtureUnchanged = false;
         }

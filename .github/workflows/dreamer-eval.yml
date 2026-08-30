@@ -60,7 +60,9 @@ jobs:
         env:
           NODE_ENV: ""
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          DREAMER_EVAL_MODEL: ${{ secrets.DREAMER_EVAL_MODEL }}
+          # A plain literal, not a secret: reports embed the model ID and are
+          # uploaded as artifacts without secret masking.
+          DREAMER_EVAL_MODEL: anthropic/claude-sonnet-4-5
         run: |
           bun packages/e2e-tests/scripts/run-dreamer-eval.ts \
             --repeat 3 \

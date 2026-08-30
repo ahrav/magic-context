@@ -256,6 +256,18 @@ describe("dreamer eval seeder", () => {
         );
     });
 
+    test("ignores unrelated untracked harness files", async () => {
+        const selectedScenario = scenario("map-memories");
+        const result = await seedDreamerEvalTask({
+            db: database(),
+            scenario: selectedScenario,
+            task: selectedScenario.tasks[0]!,
+            workdir: workdir(),
+        });
+        writeFileSync(join(result.workdir, "harness-output.log"), "unrelated\n");
+        expect(() => assertFixtureFilesCommitted(result.workdir, ["src/current.ts"])).not.toThrow();
+    });
+
     test("refuses fixture paths that target the git control directory", async () => {
         const selectedScenario = scenario("map-memories");
         selectedScenario.pool.claims[0]!.fixtureFiles = [
