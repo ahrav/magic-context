@@ -1884,6 +1884,128 @@ describe("metamorphic transforms", () => {
         expect(renamed).toBeGreaterThan(0);
     });
 
+    test("reorder refuses a swap that makes a probe answer copyable", () => {
+        const raw = validScenarioRaw();
+        const transcript = raw.transcript as {
+            turns: Array<{ user: string; assistant: string }>;
+            epilogueStartIndex: number;
+        };
+        const gold = raw.gold as {
+            expectedClaims: Array<Record<string, unknown>>;
+            expectedAbsent: Array<{ predicate: { value: string } }>;
+        };
+        // `blue green` is authored across the protected turn and the turn after it,
+        // so injection removes it with the source range. Swapping those two turns
+        // recreates it across two unprotected turns instead, leaving the total count
+        // unchanged while the occurrence becomes copyable.
+        transcript.turns = [
+            { user: "Opening note.", assistant: "The first swatch is blue" },
+            {
+                user: "Palette decision.",
+                assistant: "Recorded: blue green capacity 4096 for the blue",
+            },
+            { user: "green rollout is confirmed.", assistant: "Noted." },
+            // Two further background turns, so the transform has a safe swap and the
+            // assertion is about which swap it refuses rather than about never
+            // applying.
+            { user: "Standup moved to Thursday.", assistant: "Noted informally." },
+            { user: "Docs were reviewed.", assistant: "Acknowledged." },
+            { user: "Thanks, wrapping up.", assistant: "Summary recorded." },
+        ];
+        transcript.epilogueStartIndex = 5;
+        gold.expectedClaims = [
+            {
+                id: "exp-cache-capacity",
+                category: "CONFIG_VALUES",
+                predicate: { kind: "normalized-substring", value: "blue green capacity 4096" },
+                sourceTurnRange: [1, 1],
+            },
+        ];
+        gold.expectedAbsent[0]!.predicate.value = "first swatch is blue";
+        raw.probes = [
+            {
+                id: "probe-rollout",
+                question: "Which rollout owns the capacity record?",
+                answerType: "exact",
+                goldAnswer: "blue green",
+                sourceClaimRef: "exp-cache-capacity",
+            },
+        ];
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "reorder-independent-turns")!;
+        // The whole-transcript count is two either way, which is what a global
+        // comparison cannot distinguish.
+        const copyable = (candidate: HistorianEvalScenario, protectedIndex: number) =>
+            normalizeContent(
+                authoredEvidenceText(
+                    candidate.transcript.turns.map((turn, index) =>
+                        index === protectedIndex ? { user: "zz", assistant: "zz" } : turn,
+                    ),
+                ),
+            ).split("blue green").length - 1;
+
+        let applied = 0;
+        for (let seed = 0; seed < 40; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            applied += 1;
+            expect(copyable(result.scenario, result.turnMap[1]!), `seed ${seed}`).toBe(
+                copyable(scenario, 1),
+            );
+        }
+        expect(applied, "never applied").toBeGreaterThan(0);
+    });
+
+    test("duplication refuses a copy boundary that authors a second rejection", () => {
+        const raw = validScenarioRaw();
+        const transcript = raw.transcript as {
+            turns: Array<{ user: string; assistant: string }>;
+            epilogueStartIndex: number;
+        };
+        const gold = raw.gold as {
+            expectedClaims: Array<{ sourceTurnRange: [number, number] }>;
+            expectedAbsent: Array<Record<string, unknown>>;
+        };
+        // The turn ends with `legacy` and starts with `bridge`, so copying it puts
+        // them adjacent at the new self-boundary and authors a second rejection.
+        transcript.turns.unshift({
+            user: "bridge adoption was proposed.",
+            assistant: "Rejected the sweeper; keep the legacy",
+        });
+        transcript.epilogueStartIndex += 1;
+        for (const claim of gold.expectedClaims) {
+            claim.sourceTurnRange = [claim.sourceTurnRange[0] + 1, claim.sourceTurnRange[1] + 1];
+        }
+        gold.expectedAbsent = [
+            {
+                id: "abs-sweeper",
+                family: "proposed-but-rejected",
+                predicate: { kind: "normalized-substring", value: "rejected the sweeper" },
+            },
+            {
+                id: "abs-legacy-bridge",
+                family: "proposed-but-rejected",
+                predicate: { kind: "normalized-substring", value: "legacy bridge" },
+            },
+        ];
+        // Authored in a protected turn, so that turn is not a duplication candidate
+        // and the only occurrence the copy can add is the one at its own boundary.
+        transcript.turns[3]!.assistant += " The legacy bridge stays for now.";
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "duplicate-rejected-proposal")!;
+        const occurrences = (candidate: HistorianEvalScenario) =>
+            normalizeContent(authoredEvidenceText(candidate.transcript.turns)).split("legacy bridge")
+                .length - 1;
+
+        for (let seed = 0; seed < 20; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            expect(occurrences(result.scenario), `seed ${seed}`).toBe(occurrences(scenario));
+        }
+    });
+
     test("reorder refuses a swap that creates a probe answer", () => {
         const raw = validScenarioRaw();
         const transcript = raw.transcript as {

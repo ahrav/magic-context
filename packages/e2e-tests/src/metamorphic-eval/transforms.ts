@@ -456,6 +456,30 @@ function evidenceBaselines(scenario: HistorianEvalScenario): EvidenceBaselines {
     };
 }
 
+/** The turn indexes an occurrence signature runs through. */
+function matchTurns(match: string): number[] {
+    return match
+        .slice(match.indexOf("|") + 1)
+        .split(",")
+        .map((key) => Number(key.slice(0, key.indexOf(":"))));
+}
+
+/** An occurrence signature with its turn indexes mapped through `turnMap`. */
+function remapMatch(match: string, turnMap: readonly number[]): string {
+    const separator = match.indexOf("|");
+    return `${match.slice(0, separator)}|${match
+        .slice(separator + 1)
+        .split(",")
+        .map((key) => {
+            const colon = key.indexOf(":");
+            return messageKey(
+                turnMap[Number(key.slice(0, colon))]!,
+                key.slice(colon + 1) as "user" | "assistant",
+            );
+        })
+        .join(",")}`;
+}
+
 /**
  * How many authored occurrences the perturbation destroys and creates.
  *
@@ -480,18 +504,7 @@ function matchDelta(
     }
     let lost = 0;
     for (const match of baseline.matches) {
-        const separator = match.indexOf("|");
-        const expected = `${match.slice(0, separator)}|${match
-            .slice(separator + 1)
-            .split(",")
-            .map((key) => {
-                const colon = key.indexOf(":");
-                return messageKey(
-                    turnMap[Number(key.slice(0, colon))]!,
-                    key.slice(colon + 1) as "user" | "assistant",
-                );
-            })
-            .join(",")}`;
+        const expected = remapMatch(match, turnMap);
         const count = remaining.get(expected) ?? 0;
         if (count === 0) {
             lost += 1;
@@ -524,60 +537,127 @@ function preservesEvidenceExactly(
     });
 }
 
+/** A probe's answer and the turn range whose text backs it. */
+interface ProbeAnswer {
+    answer: string;
+    range: readonly [number, number];
+}
+
 /**
- * Nothing is lost, and only the rejection may be repeated.
+ * The answers a probe could copy out of raw history, with the range that backs each.
  *
- * Duplicating a rejected-proposal turn multiplies its rejection occurrences by
- * design — that is the perturbation. Every other kind of evidence on that turn is
- * collateral: a copied turn that also states an accepted claim authors it a second
- * time outside the range that declares it, and one that also carries an injection
- * canary or a superseded fact strengthens a family the transform does not claim to
- * vary. A behaviour change could then be attributed to the wrong cause, so
- * everything but the rejection is held exactly.
+ * The backing range is what injection replaces, so an occurrence inside it is not
+ * copyable — the probe is supposed to need the injected claim to answer. Only
+ * occurrences outside it are leakage, which is why the range travels with the
+ * answer.
+ */
+function probeAnswers(scenario: HistorianEvalScenario): ProbeAnswer[] {
+    const ranges = new Map(
+        scenario.gold.expectedClaims.map((claim) => [claim.id, claim.sourceTurnRange]),
+    );
+    return scenario.probes.flatMap((probe) => {
+        if (probe.answerType === "claim-id") return [];
+        const range = ranges.get(probe.sourceClaimRef);
+        return range === undefined ? [] : [{ answer: probe.goldAnswer, range }];
+    });
+}
+
+/**
+ * Evidence text with the turns in `excluded` replaced, so an occurrence touching
+ * one of them is not counted.
+ *
+ * Replaced rather than dropped: removing a turn would let its neighbours become
+ * adjacent and author a formation neither side had.
+ */
+const RANGE_SENTINEL = "zzmetamorphicrangesentinelzz";
+
+function evidenceOutside(
+    turns: readonly TranscriptTurn[],
+    excluded: (index: number) => boolean,
+): string {
+    return authoredEvidenceText(
+        turns.map((turn, index) =>
+            excluded(index)
+                ? { user: RANGE_SENTINEL, assistant: RANGE_SENTINEL }
+                : turn,
+        ),
+    );
+}
+
+/**
+ * Whether the derivative leaves each probe answer exactly as copyable as the source.
+ *
+ * Counted outside the range that backs the answer, not over the whole transcript: a
+ * reordering can move an occurrence off a protected boundary and into wholly
+ * unprotected history while the total stays the same, which turns a non-copyable
+ * occurrence into a copyable one. Adding a copyable occurrence hands the probe its
+ * answer without retrieval; removing one changes what the leakage gate sees. The
+ * expected-claim comparison cannot stand in for either — a turn can carry the answer
+ * `4096` without matching the claim predicate `capacity is 4096`.
+ */
+function preservesProbeAnswers(
+    answers: readonly ProbeAnswer[],
+    scenario: HistorianEvalScenario,
+    turns: readonly TranscriptTurn[],
+    turnMap: readonly number[],
+): boolean {
+    return answers.every(({ answer, range }) => {
+        const inSource = (index: number) => index >= range[0] && index <= range[1];
+        const mapped = new Set(
+            scenario.transcript.turns.flatMap((_, index) =>
+                inSource(index) ? [turnMap[index]!] : [],
+            ),
+        );
+        return (
+            countCompleteValues(
+                evidenceOutside(turns, (index) => mapped.has(index)),
+                answer,
+            ) ===
+            countCompleteValues(evidenceOutside(scenario.transcript.turns, inSource), answer)
+        );
+    });
+}
+
+/**
+ * The evidence a duplication is allowed to produce, and nothing else.
+ *
+ * Copying turn `source` to `insertion` should repeat exactly the rejection
+ * occurrences that turn carries on its own, at the copy's position. Permitting any
+ * gain across the rejection baseline is too loose: the copy creates a new boundary
+ * between the turn's own end and its own beginning, and a suffix and prefix that
+ * form a different forbidden formation would strengthen a second proposal the
+ * transform makes no claim about. Every other kind of evidence is held exactly, so
+ * a copied turn cannot author an accepted claim or another negative family either.
  */
 function preservesEvidenceForDuplication(
     baselines: EvidenceBaselines,
     turns: readonly TranscriptTurn[],
     turnMap: readonly number[],
+    source: number,
+    insertion: number,
 ): boolean {
-    return (
-        matchDelta(baselines.rejected, turns, turnMap).lost === 0 &&
-        [baselines.otherAbsent, baselines.claims].every((baseline) => {
-            const { lost, gained } = matchDelta(baseline, turns, turnMap);
-            return lost === 0 && gained === 0;
-        })
-    );
-}
-
-/** The gold answers a probe could copy out of raw history. */
-function probeAnswers(scenario: HistorianEvalScenario): string[] {
-    return scenario.probes.flatMap((probe) =>
-        probe.answerType === "claim-id" ? [] : [probe.goldAnswer],
-    );
-}
-
-/**
- * Whether the derivative states each probe answer exactly as often as the source.
- *
- * A probe is meant to be answerable only by retrieving the injected claim, and the
- * source is authored so its answer is not copyable from raw history beyond the
- * range that backs it. Adding an occurrence hands the probe a copyable answer;
- * removing one changes what the leakage gate sees. Neither is a perturbation these
- * transforms advertise, and the expected-claim comparison cannot stand in for it —
- * a turn can carry the answer `4096` without matching the claim predicate
- * `capacity is 4096`.
- */
-function preservesProbeAnswers(
-    answers: readonly string[],
-    scenario: HistorianEvalScenario,
-    turns: readonly TranscriptTurn[],
-): boolean {
-    if (answers.length === 0) return true;
-    const before = authoredEvidenceText(scenario.transcript.turns);
-    const after = authoredEvidenceText(turns);
-    return answers.every(
-        (answer) => countCompleteValues(after, answer) === countCompleteValues(before, answer),
-    );
+    const expected = new Map<string, number>();
+    const add = (match: string) => expected.set(match, (expected.get(match) ?? 0) + 1);
+    for (const match of baselines.rejected.matches) {
+        add(remapMatch(match, turnMap));
+        // An occurrence wholly inside the copied turn appears once more, at the copy.
+        const turns_ = matchTurns(match);
+        if (turns_.length === 1 && turns_[0] === source) {
+            add(remapMatch(match, turnMap.map((_, index) => (index === source ? insertion : -1))));
+        }
+    }
+    const actual = new Map<string, number>();
+    for (const match of matchSpans(baselines.rejected.entries, turns)) {
+        actual.set(match, (actual.get(match) ?? 0) + 1);
+    }
+    if (expected.size !== actual.size) return false;
+    for (const [match, count] of expected) {
+        if (actual.get(match) !== count) return false;
+    }
+    return [baselines.otherAbsent, baselines.claims].every((baseline) => {
+        const { lost, gained } = matchDelta(baseline, turns, turnMap);
+        return lost === 0 && gained === 0;
+    });
 }
 
 /** The turn list a candidate order produces, without copying gold. */
@@ -704,7 +784,12 @@ function safeParaphrase(
     // answer sitting inside a stripped reminder is not something the probe can
     // copy, so treating it as pre-existing would let the framing add the first
     // occurrence the historian actually receives.
-    return preservesProbeAnswers(probeAnswers(scenario), scenario, turns);
+    return preservesProbeAnswers(
+        probeAnswers(scenario),
+        scenario,
+        turns,
+        scenario.transcript.turns.map((_, index) => index),
+    );
 }
 
 const reorderIndependentTurns: Transform = {
@@ -743,7 +828,7 @@ const reorderIndependentTurns: Transform = {
             const reordered = reorderedTurns(scenario, order);
             if (
                 !preservesEvidenceExactly(baselines, reordered, mapForOrder(order)) ||
-                !preservesProbeAnswers(answers, scenario, reordered) ||
+                !preservesProbeAnswers(answers, scenario, reordered, mapForOrder(order)) ||
                 !changesVisibleTranscript(scenario, reordered)
             ) {
                 return { applicable: false, reason: exhausted };
@@ -835,7 +920,7 @@ const moveAcceptedDecision: Transform = {
             const reordered = reorderedTurns(scenario, order);
             if (
                 !preservesEvidenceExactly(baselines, reordered, mapForOrder(order)) ||
-                !preservesProbeAnswers(answers, scenario, reordered) ||
+                !preservesProbeAnswers(answers, scenario, reordered, mapForOrder(order)) ||
                 !changesVisibleTranscript(scenario, reordered)
             ) {
                 return { applicable: false, reason: exhausted };
@@ -912,8 +997,14 @@ const duplicateRejectedProposal: Transform = {
                 // candidates that proving all of them to use one dominates the
                 // application.
                 if (
-                    !preservesEvidenceForDuplication(baselines, turns, turnMap) ||
-                    !preservesProbeAnswers(answers, scenario, turns)
+                    !preservesEvidenceForDuplication(
+                        baselines,
+                        turns,
+                        turnMap,
+                        source,
+                        insertion,
+                    ) ||
+                    !preservesProbeAnswers(answers, scenario, turns, turnMap)
                 ) {
                     return {
                         applicable: false,
@@ -1077,19 +1168,6 @@ const renameUnrelatedSymbols: Transform = {
         // raw string never spells, and it can turn a fragmented command span into a
         // recognisable one whose contents the rename cannot reach.
         const collisionText = [...allText, ...visibleText.values()];
-        const untouchableCorpus = [
-            ...scenario.transcript.turns.flatMap((turn, turnIndex) =>
-                (["user", "assistant"] as const).flatMap((role) =>
-                    eligibleKeys.has(messageKey(turnIndex, role))
-                        ? []
-                        : [
-                              turn[role],
-                              visibleText.get(messageKey(turnIndex, role)) ?? "",
-                          ],
-                ),
-            ),
-            ...probeText,
-        ].join("\n");
         const blocked = new Set([
             ...scenario.transcript.turns.flatMap((turn, turnIndex) =>
                 (["user", "assistant"] as const).flatMap((role) =>
@@ -1223,11 +1301,7 @@ const renameUnrelatedSymbols: Transform = {
                 !sharesAnEntity(symbol) &&
                 // A symbol can carry a probe answer without being one: renaming
                 // `api/v2` deletes the complete-value occurrence of `api`.
-                !answers.some((answer) => containsCompleteValue(symbol, answer)) &&
-                // Extraction yields only the full spelling, so an ineligible
-                // `buildAPI/v2` leaves a bare `buildAPI` looking free. It names the
-                // same entity, and renaming only the reachable half splits it.
-                !containsCompleteValue(untouchableCorpus, symbol),
+                !answers.some(({ answer }) => containsCompleteValue(symbol, answer)),
         );
         const next = splitmix32(seed);
         // Enumerated once: the source side does not vary across candidates, and an
@@ -1271,7 +1345,9 @@ const renameUnrelatedSymbols: Transform = {
                 // A generated name contains its own parts as complete values, so a
                 // probe whose gold answer is one of them — `aux`, `symbol` — would
                 // find the answer copyable from raw history the moment a rename lands.
-                if (answers.some((answer) => containsCompleteValue(candidate, answer))) continue;
+                if (answers.some(({ answer }) => containsCompleteValue(candidate, answer))) {
+                    continue;
+                }
                 if (!taken.has(candidate)) free.push(candidate);
             }
             return free;
@@ -1329,7 +1405,7 @@ const renameUnrelatedSymbols: Transform = {
             const turnMap = scenario.transcript.turns.map((_, index) => index);
             if (
                 !preservesEvidenceExactly(baselines, turns, turnMap) ||
-                !preservesProbeAnswers(answers, scenario, turns)
+                !preservesProbeAnswers(answers, scenario, turns, turnMap)
             ) {
                 return {
                     applicable: false,

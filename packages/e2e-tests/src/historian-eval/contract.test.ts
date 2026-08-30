@@ -1273,6 +1273,18 @@ describe("complete-value counting", () => {
         expect(countCompleteValues("", "blue")).toBe(0);
         expect(containsCompleteValue("blue blue blue", "blue blue")).toBe(true);
     });
+
+    test("stays linear against a repetitive haystack", () => {
+        // A regex advanced one character at a time re-derives every overlapping
+        // match, which turned a long answer against a megabyte of repetition into
+        // seconds. Both sizes are inside the contract's own limits.
+        const haystack = "a ".repeat(500_000);
+        const needle = "a ".repeat(1_000).trim();
+        const start = performance.now();
+        expect(countCompleteValues(haystack, needle)).toBeGreaterThan(0);
+        expect(containsCompleteValue(haystack, needle)).toBe(true);
+        expect(performance.now() - start).toBeLessThan(900);
+    });
 });
 
 describe("compacted evidence view", () => {

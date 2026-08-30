@@ -1003,7 +1003,7 @@ export function matchesGold(
  * inside a sentence while `"4"` no longer matches inside `"4096"`.
  */
 export function containsCompleteValue(content: string, value: string): boolean {
-    return countCompleteValues(content, value) > 0;
+    return findCompleteValues(content, value, true) > 0;
 }
 
 /**
@@ -1015,6 +1015,25 @@ export function containsCompleteValue(content: string, value: string): boolean {
  * keeps presence unchanged.
  */
 export function countCompleteValues(content: string, value: string): number {
+    return findCompleteValues(content, value, false);
+}
+
+/** A letter or digit, the adjacency that makes a match part of a larger value. */
+const VALUE_CHARACTER_RE = /[\p{L}\p{N}]/u;
+
+/**
+ * Occurrences of `value` in `content`, by starting position, stopping at the first
+ * when `firstOnly`.
+ *
+ * Substring search plus a boundary test on the two adjacent characters, rather than
+ * a regex advanced one character at a time: a repeated-substring haystack makes the
+ * regex re-derive each overlapping match, which turned a two-thousand-character
+ * answer against a megabyte of repetitive text into seconds of work. Counted by
+ * starting position, so `blue blue` occurs twice in `blue blue blue` — a caller
+ * comparing counts across a perturbation would otherwise miss the loss of one
+ * overlapping occurrence.
+ */
+function findCompleteValues(content: string, value: string, firstOnly: boolean): number {
     // Both sides decoded first, so every collision guard uses the SAME equality
     // `compareProbeAnswer` accepts on. Without it a gold of `A&B` was accepted when a
     // model answered `A&amp;B`, while a question or an earlier reply containing
@@ -1022,17 +1041,14 @@ export function countCompleteValues(content: string, value: string): number {
     // prompt or the shared history and still score.
     const needle = normalizeContent(decodeXmlEntities(value));
     if (needle.length === 0) return 0;
-    const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const matcher = new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, "gu");
     const haystack = normalizeContent(decodeXmlEntities(content));
-    // Counted by starting position, not by consumed span: a global `matchAll`
-    // resumes after each match, so `blue blue` occurs twice in `blue blue blue` and
-    // that reports one. A caller comparing counts across a perturbation would then
-    // miss the loss of one overlapping occurrence.
     let count = 0;
-    for (let match = matcher.exec(haystack); match !== null; match = matcher.exec(haystack)) {
+    for (let at = haystack.indexOf(needle); at !== -1; at = haystack.indexOf(needle, at + 1)) {
+        const before = at === 0 ? "" : haystack.charAt(at - 1);
+        const after = haystack.charAt(at + needle.length);
+        if (VALUE_CHARACTER_RE.test(before) || VALUE_CHARACTER_RE.test(after)) continue;
         count += 1;
-        matcher.lastIndex = match.index + 1;
+        if (firstOnly) return count;
     }
     return count;
 }
