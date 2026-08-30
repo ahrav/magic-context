@@ -264,6 +264,7 @@ async function probeManagedCompatibility(
         connectionFile: connectionFilePath(root),
         handshakeTimeoutMs: Math.max(1, budgetMs),
         requestTimeoutMs: Math.max(1, budgetMs),
+        shutdownDeadlineMs: Math.max(1, budgetMs),
     });
     try {
         return await readCompatibilityProbe(client, deadline, signal);
@@ -290,7 +291,10 @@ async function probeManagedReadiness(root: string, budgetMs: number): Promise<Ob
         if (client.isClosed || client.authenticated === null) throw error;
         throw new ReadinessProbeControlError(error);
     } finally {
-        await client.closeAsync().catch(() => undefined);
+        // Teardown is not part of the observation, and `closeAsync` opens its own
+        // shutdown deadline, so awaiting it here could settle this promise after
+        // the lifecycle command's aggregate expired.
+        void client.closeAsync().catch(() => undefined);
     }
     const { snapshot: compatibility, status } = probe;
     if (status === null) {
