@@ -123,3 +123,106 @@ and `rnq` (piolium not digest-pinned; land with incident-pool tests). The two
 conditional beads (shared model-pinning, source-trust lost-call) were not
 filed: their triggering units (U7 step 9 fallback, U8 T2-5 resolution) did
 not run.
+
+## Second execution run (resume)
+
+Resumed at `2c9e8db9`; this section records the U6-remainder and U7 work.
+
+### Completed
+
+- U6 remainder (commit `bc1570bc` + review fixes): X10 harness fixtures,
+  tests P1–P12 `test.each` parameterization (row-per-test, counts preserved),
+  CC-6 identical members, CC-7 identical members (`createCountingPi`,
+  `assistantMessages`, `makeSeededGitCommit`).
+- U7 item 1 — F1 facade CAS divergence (`9ea829d0`): shared `*_tx` functions,
+  McStore mutation-neutral semantics canonical (archaeology: facade copied
+  2026-07-23 in `22d45928`; the McStore fix landed 2026-08-19 in `336aa9b3`
+  and never reached the facade — drift, not intent). Facade-path regression
+  test observed red (ready reset to pending) before the fix. Outcome recorded
+  on bead 3q5.8.
+- U7 item 2 — pi F-3 (`a1ba3f0f` step 1, `8a151f6c` step 2): shared
+  code-point stringify + shared isRecord + cross-leg hash parity test
+  (observed red); then structural extraction of the hash/memo/prefix core
+  into `tail-hygiene-memo.ts`. New bug bead filed from review: dreamer
+  `claim-manifest.ts` batchId still sorts with `localeCompare`.
+- U7 item 3 — M3/X1 (`dda646cd`): six-fixture cross-loader parity test
+  (green before unification, per the plan's gate), one shared
+  `parseConfigJsonc` (comment-json) behind both loaders and the CLI config
+  readers, sanitizer tightened to flag any non-plain prototype,
+  experimental-absence schema assertion added; bead 1cy commented and closed.
+- U7 item 4 — tests CC-1 (`49645553`): 18 historian classifiers (the 13
+  audited `isHistorianRequest` + 3 `isHistorian` + `tool-loop.ts` +
+  `compaction-off.test.ts`) unified on union semantics in
+  `cache-analysis.ts`, marker wired into the production-signature drift pin,
+  unit tests per input shape. Coordination note appended to bead 4t7.
+- U7 item 5 — mc-module T2-1 (`73338bdb`, `0551c5d6`): see stale note below;
+  retention invariants pinned by tests on the boundary-token and
+  tag-baseline members.
+
+### Stale findings (dropped) — this run
+
+| Finding | Reason |
+|---|---|
+| mc-module T2-1 self-eviction bug (5 unguarded caches) | Premise fails at the audit's own HEAD `9c1eb4d1`: all six members carry a pre-insert budget guard (`retained_bytes > max → refuse`), and with `remove()`+`push_back` ordering the newcomer alone always fits, so the eviction loop can never pop the just-inserted session. No fix needed; invariant pinned by new tests instead. |
+| X10 destination (`contract-primitives.ts`) | That module is the fail-closed artifact-validator home, not a fixture home; consolidated into a new `harness-primitives.ts` leaf instead. |
+| CC-6 "(sessionId) variants" fold | The two `(sessionId)` variants have drifted schemas (NOT NULL columns, AUTOINCREMENT part, `createDirectTestDatabase` delegation) and are not identical members; only the 4 byte-identical `(dataHome)` copies were folded. |
+
+### Narrowings and residuals (open audit work, exact resume point)
+
+- U7 remaining, in plan order: item 6 features T2-2 (embedding singleton
+  lane), item 7 X4+X2 (fence + contract extension), item 8 X3 (doctor
+  migration), item 9 shared T2-3 (conflict-warning senders), item 10 tests
+  CC-2 (16 `session_meta` DDL sites — re-verified heterogeneous: most sites
+  create several sibling tables beside `session_meta`, so each needs per-site
+  judgment before `createDirectTestDatabase` adoption).
+- X1 orchestration unification (one `loadMagicContextConfig` with harness
+  injection, est. −350..450 LOC) remains open BEHIND the now-landed parity
+  gate; the load-bearing parser divergence is fixed.
+- T2-1 `SessionLruCache<E>` consolidation remains open; review found a
+  seventh family member (`TransformSnapshotCache`, lib.rs ready-LRU) the
+  audit table missed.
+- U8 (ungated non-correctness T2s), U10 (Wave 5 drift anchors), and the U11
+  final-review/PR tail were not attempted this run.
+- Grammar note (X1): comment-json rejects raw U+2028/U+2029 inside string
+  values that JSON.parse accepted, and accepts BOM/NBSP whitespace it
+  rejected; judged small and net-favorable in review. A primitive-valued
+  `__proto__` key is silently dropped by comment-json construction (no
+  warning), unlike the old own-key path; prototype safety is unaffected.
+
+### Pre-existing failures observed this run (verified failing at base, not caused by this branch)
+
+- `packages/e2e-tests` incident-unit: `src/incident-pool/evidence.test.ts`
+  (18) — `verifierFromCommand` cannot resolve `cargo test -p
+  mc-shm-transport` mutation commands introduced by `35555157`.
+- `packages/e2e-tests/src/historian-eval/promote.test.ts` (1) —
+  whole-tree byte-identity case, environment-dependent.
+- `packages/plugin` `bun test src/shared/` directory-run interference (28,
+  incl. `data-path.test.ts` members green in isolation); the pinned shard
+  gate shows only the recorded 31-failure baseline.
+- Rust full gate this run: 1 failure (`lifecycle_cli
+  full_dev_mode_lifecycle_roundtrip`), a strict subset of the recorded
+  7-failure baseline.
+
+### Review dispositions — this run
+
+- U6 remainder: two fresh-context CLI reviews; fixed unused import, cron
+  Sunday-intent comment, OMO release note, `makeSeededGitCommit` rename;
+  declined import-line style nit. `undefined/` stray artifact noted
+  (pre-existing, untracked, untouched).
+- F1: fixed ctx_note caller trimmed-compare divergence, dead conjunct,
+  facade changed-condition test tail. All three review findings applied.
+- F-3: fixed empty-arguments toolInput parity, dead ternary, comment
+  overstatement; extracted `contentSignature`/`safeStableStringify` per
+  review; declined type-ownership move and `memoizedContent` API narrowing
+  (behavior-neutral follow-ups); TAG_PREFIX copies outside the walks left
+  (out of finding scope). Aliased-array `[Circular]` note recorded
+  (pre-existing shared-helper behavior, parity holds).
+- X1: fixed vacuous pollution assertions (per-source outcome + warning
+  needles), inert grammar fixture, unswitched CLI readers, comment nits;
+  strengthened test caught and documented the combined-vs-per-source
+  outcome contract.
+- CC-1: fixed marker drift-pin wiring, JSON.stringify system-shape
+  narrowing, two residual copies, stale comment; declined
+  system-marker-first hardening (recorded as unit-test comment instead).
+- T2-1: fixed charge derivation, duplicate eviction pin, import placement,
+  Arc qualification; seventh-member note carried to the residual above.
