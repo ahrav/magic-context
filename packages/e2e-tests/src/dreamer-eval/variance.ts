@@ -101,11 +101,12 @@ function classifyVerdict(entry: Record<string, unknown>, current: ClaimSnapshotP
  * `wrong-update-content`, so two repeats can share a verdict while one passes and
  * the other fails.
  *
- * The body is recorded as a digest of its trimmed, lowercased form — the shape
- * the scorer's anchor matching sees — so whitespace and case differences do not
- * register, while a genuinely different replacement body does. That is real
- * variance: the body becomes the claim's stored content, so two repeats writing
- * different text left the pool in different states.
+ * The body is recorded as a digest of its trimmed form, which is exactly what
+ * production stores: the verify apply path writes `entry.content.trim()`. Case
+ * survives on purpose — `normalizeMemoryContent` lowercases only for content
+ * hashing, and the scorer lowercases only for anchor matching, so two bodies
+ * differing in case leave the claim holding different content and that is real
+ * variance, as is any other differing replacement body.
  *
  * Archived entries carry neither: the parser forces their file set empty and the
  * scorer skips both checks for them.
@@ -121,7 +122,7 @@ function verifyVerdict(
         : [];
     const files = [...new Set(canonicalTrackedPaths(observed, tracked))].sort().join(",");
     if (verdict === "verified") return `verified;files:${files}`;
-    const content = typeof entry.content === "string" ? entry.content.trim().toLowerCase() : "";
+    const content = typeof entry.content === "string" ? entry.content.trim() : "";
     return `update;files:${files};content:${sha256Utf8Hex(content).slice(0, 12)}`;
 }
 

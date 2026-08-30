@@ -202,7 +202,7 @@ describe("dreamer eval variance", () => {
         ]);
     });
 
-    test("update repeats differ by replacement body, not by whitespace or case", () => {
+    test("update repeats differ by replacement body, not by surrounding whitespace", () => {
         const updateReport = (index: number, content: string): DreamerEvalRunReport => {
             const entry = report(index);
             entry.parsedManifest = {
@@ -213,14 +213,25 @@ describe("dreamer eval variance", () => {
             return entry;
         };
 
-        // The scorer matches anchors against the trimmed, lowercased body, so
-        // these two are one applied state.
+        // Production stores entry.content.trim(), so surrounding whitespace is
+        // not part of the applied state.
         expect(
             aggregateDreamerEvalVariance([
                 updateReport(1, "Cache holds 4096 entries."),
-                updateReport(2, "  cache holds 4096 entries.  "),
+                updateReport(2, "  Cache holds 4096 entries.  "),
             ]).claimHistograms[0],
         ).toMatchObject({ disagreement: false });
+
+        // Case is part of it: the trim is the only normalization production
+        // applies to a stored body. normalizeMemoryContent lowercases for content
+        // hashing, and the scorer lowercases for anchor matching, but neither
+        // decides what the claim ends up holding.
+        expect(
+            aggregateDreamerEvalVariance([
+                updateReport(1, "Cache holds 4096 entries."),
+                updateReport(2, "cache holds 4096 entries."),
+            ]).claimHistograms[0],
+        ).toMatchObject({ disagreement: true });
 
         // A different body is a different stored content, which is real variance.
         expect(
