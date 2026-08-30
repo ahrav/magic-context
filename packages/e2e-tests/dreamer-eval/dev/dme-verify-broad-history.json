@@ -63,8 +63,8 @@
         "fileIndependent": false,
         "fixtureFiles": [
           {
-            "path": "docs/release.md",
-            "content": "Release artifacts are immutable and signed. Rollback keeps the prior artifact.\n"
+            "path": "src/release.ts",
+            "content": "export const ARTIFACTS_IMMUTABLE = true;\nexport const ARTIFACTS_SIGNED = true;\nexport const ROLLBACK_KEEPS_PRIOR_ARTIFACT = true;\n"
           }
         ]
       },
@@ -79,8 +79,8 @@
         "fileIndependent": false,
         "fixtureFiles": [
           {
-            "path": "docs/release.md",
-            "content": "Release artifacts are immutable and signed. Rollback keeps the prior artifact.\n"
+            "path": "src/release.ts",
+            "content": "export const ARTIFACTS_IMMUTABLE = true;\nexport const ARTIFACTS_SIGNED = true;\nexport const ROLLBACK_KEEPS_PRIOR_ARTIFACT = true;\n"
           }
         ]
       },
@@ -95,8 +95,8 @@
         "fileIndependent": false,
         "fixtureFiles": [
           {
-            "path": "docs/release.md",
-            "content": "Release artifacts are immutable and signed. Rollback keeps the prior artifact.\n"
+            "path": "src/release.ts",
+            "content": "export const ARTIFACTS_IMMUTABLE = true;\nexport const ARTIFACTS_SIGNED = true;\nexport const ROLLBACK_KEEPS_PRIOR_ARTIFACT = true;\n"
           }
         ]
       },
@@ -111,8 +111,8 @@
         "fileIndependent": false,
         "fixtureFiles": [
           {
-            "path": "docs/deploy.md",
-            "content": "Run database migrations before shifting traffic. Bake for 15 minutes.\n"
+            "path": "src/deploy.ts",
+            "content": "export const MIGRATIONS_BEFORE_TRAFFIC_SHIFT = true;\nexport const BAKE_MINUTES = 15;\n"
           }
         ]
       },
@@ -127,8 +127,8 @@
         "fileIndependent": false,
         "fixtureFiles": [
           {
-            "path": "docs/deploy.md",
-            "content": "Run database migrations before shifting traffic. Bake for 15 minutes.\n"
+            "path": "src/deploy.ts",
+            "content": "export const MIGRATIONS_BEFORE_TRAFFIC_SHIFT = true;\nexport const BAKE_MINUTES = 15;\n"
           }
         ]
       },
@@ -169,11 +169,11 @@
           { "claimId": "claim-history-1", "files": ["src/history.ts"] },
           { "claimId": "claim-history-2", "files": ["src/history.ts"] },
           { "claimId": "claim-history-3", "files": ["src/history.ts"] },
-          { "claimId": "claim-history-4", "files": ["docs/release.md"] },
-          { "claimId": "claim-history-5", "files": ["docs/release.md"] },
-          { "claimId": "claim-history-6", "files": ["docs/release.md"] },
-          { "claimId": "claim-history-7", "files": ["docs/deploy.md"] },
-          { "claimId": "claim-history-8", "files": ["docs/deploy.md"] },
+          { "claimId": "claim-history-4", "files": ["src/release.ts"] },
+          { "claimId": "claim-history-5", "files": ["src/release.ts"] },
+          { "claimId": "claim-history-6", "files": ["src/release.ts"] },
+          { "claimId": "claim-history-7", "files": ["src/deploy.ts"] },
+          { "claimId": "claim-history-8", "files": ["src/deploy.ts"] },
           { "claimId": "claim-history-9", "files": ["src/health.ts"] }
         ],
         "verifications": [
@@ -225,35 +225,35 @@
           {
             "claimId": "claim-history-4",
             "verdict": "verified",
-            "expectedFiles": ["docs/release.md"],
+            "expectedFiles": ["src/release.ts"],
             "requiredUpdateAnchors": [],
             "forbiddenUpdateAnchors": []
           },
           {
             "claimId": "claim-history-5",
             "verdict": "verified",
-            "expectedFiles": ["docs/release.md"],
+            "expectedFiles": ["src/release.ts"],
             "requiredUpdateAnchors": [],
             "forbiddenUpdateAnchors": []
           },
           {
             "claimId": "claim-history-6",
             "verdict": "verified",
-            "expectedFiles": ["docs/release.md"],
+            "expectedFiles": ["src/release.ts"],
             "requiredUpdateAnchors": [],
             "forbiddenUpdateAnchors": []
           },
           {
             "claimId": "claim-history-7",
             "verdict": "verified",
-            "expectedFiles": ["docs/deploy.md"],
+            "expectedFiles": ["src/deploy.ts"],
             "requiredUpdateAnchors": [],
             "forbiddenUpdateAnchors": []
           },
           {
             "claimId": "claim-history-8",
             "verdict": "verified",
-            "expectedFiles": ["docs/deploy.md"],
+            "expectedFiles": ["src/deploy.ts"],
             "requiredUpdateAnchors": [],
             "forbiddenUpdateAnchors": []
           },

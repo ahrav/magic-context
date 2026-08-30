@@ -144,7 +144,35 @@ describe("dreamer eval variance", () => {
         ]);
 
         expect(artifact.claimHistograms).toEqual([
-            { claimId: "claim-cache", counts: { "files:src/cache.ts": 2 }, disagreement: false },
+            {
+                claimId: "claim-cache",
+                counts: { "independent:false;files:src/cache.ts": 2 },
+                disagreement: false,
+            },
+        ]);
+    });
+
+    test("equivalent path spellings do not read as a different mapping", () => {
+        const mapReport = (index: number, files: string[]): DreamerEvalRunReport => {
+            const entry = report(index);
+            entry.task = "map-memories";
+            entry.parsedManifest = [{ publicClaimId: "mcm_claim", files, independent: false }];
+            return entry;
+        };
+
+        // `scoreMapManifest` canonicalizes before comparing, so these two runs
+        // record the same tracked mapping and the artifact must agree.
+        const artifact = aggregateDreamerEvalVariance([
+            mapReport(1, ["src/cache.ts"]),
+            mapReport(2, ["src/./cache.ts"]),
+        ]);
+
+        expect(artifact.claimHistograms).toEqual([
+            {
+                claimId: "claim-cache",
+                counts: { "independent:false;files:src/cache.ts": 2 },
+                disagreement: false,
+            },
         ]);
     });
 

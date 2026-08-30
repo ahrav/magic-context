@@ -154,8 +154,13 @@ export function classifyDreamerRun(input: DreamerRunClassificationInput): Dreame
     if (!input.fixtureUnchanged) return outcome("ERROR", "fixture-drift");
     if (input.childCount !== input.expectedChildCount) return outcome("ERROR", "harness-failure");
     if (input.leaseLost) return outcome("ERROR", "lease-lost");
+    // Only a task that returned a result can disagree about its mode. A verify
+    // lane whose task threw — a credential, transport, abort, or typed provider
+    // output failure — leaves this null, and reporting that as a gate partition
+    // mismatch buries the real fault; the checks below name it instead.
     if (
         input.expectedResultMode !== null &&
+        input.actualResultMode !== null &&
         input.actualResultMode !== input.expectedResultMode
     ) {
         return outcome("ERROR", "wrong-result-mode");
@@ -171,7 +176,12 @@ export function classifyDreamerRun(input: DreamerRunClassificationInput): Dreame
     if (scored.stage === "scored" && input.invocation?.status !== "completed") {
         return outcome("ERROR", "harness-failure", scored.parsedManifest);
     }
-    if (input.invocation?.status === "completed") {
+    // A run-fatal score records an effect that cannot be undone, and
+    // `dreamerEvalExitCode` turns it into the safety exit 2. Replacing it with
+    // the model mismatch below would drop that to exit 1, reporting an invalid
+    // experiment where a destructive one happened — so a fatal score keeps its
+    // classification and continues through the receipt checks.
+    if (!isRunFatal(scored.status, scored.reason) && input.invocation?.status === "completed") {
         const actualModel =
             input.invocation.providerId && input.invocation.modelId
                 ? `${input.invocation.providerId}/${input.invocation.modelId}`

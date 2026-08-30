@@ -129,7 +129,7 @@ function canonicalObservedPath(value: string): string {
     return /^[\\/]/.test(value) ? `/${joined}` : joined;
 }
 
-function canonicalObservedPaths(values: readonly string[]): string[] {
+export function canonicalObservedPaths(values: readonly string[]): string[] {
     return values.map(canonicalObservedPath);
 }
 

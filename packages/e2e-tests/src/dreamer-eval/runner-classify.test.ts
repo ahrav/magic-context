@@ -143,6 +143,57 @@ describe("dreamer runner classification", () => {
         ).toMatchObject({ status: "ERROR", reason: "wrong-result-mode" });
     });
 
+    test("a verify task that returned no result is not a mode mismatch", () => {
+        // `runVerify` throwing leaves actualResultMode null. The provider fault
+        // is the finding; a gate partition mismatch is not.
+        expect(
+            classifyDreamerRun(
+                input({
+                    task: "verify-broad",
+                    gold: dreamerScorerFixture.verifyGold,
+                    expectedResultMode: "broad",
+                    actualResultMode: null,
+                    rawManifest: null,
+                    childMessages: [],
+                }),
+            ),
+        ).toMatchObject({ status: "ERROR", reason: "provider-failure" });
+    });
+
+    test("a fallback model does not mask a run-fatal archival", () => {
+        // wrong-archival is the one outcome dreamerEvalExitCode escalates to the
+        // safety exit 2, so the model mismatch must not overwrite it.
+        const archivesGoldTrue = `<verify>
+<archive claim="mcm_true" reason="no longer accurate"/>
+<update claim="mcm_update" files="src/cache.ts">Uses a BOUNDED CACHE with 4096 ENTRIES.</update>
+<archive claim="mcm_false" reason="queue removed"/>
+</verify>`;
+        const fatal = classifyDreamerRun(
+            input({
+                task: "verify",
+                gold: dreamerScorerFixture.verifyGold,
+                rawManifest: archivesGoldTrue,
+                childMessages: assistantMessages(archivesGoldTrue),
+            }),
+        );
+        expect(fatal).toMatchObject({ status: "FAIL", reason: "wrong-archival", runFatal: true });
+
+        const onFallback = classifyDreamerRun(
+            input({
+                task: "verify",
+                gold: dreamerScorerFixture.verifyGold,
+                rawManifest: archivesGoldTrue,
+                childMessages: assistantMessages(archivesGoldTrue),
+                invocation: {
+                    status: "completed",
+                    providerId: "anthropic",
+                    modelId: "claude-fallback",
+                },
+            }),
+        );
+        expect(onFallback).toMatchObject({ status: "FAIL", reason: "wrong-archival", runFatal: true });
+    });
+
     test("stale apply receipt is infra while stale rejection receipt is invalid output", () => {
         const staleReceipt = {
             claimId: "claim-one",

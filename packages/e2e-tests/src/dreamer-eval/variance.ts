@@ -10,6 +10,7 @@ import type {
     FailReason,
 } from "./contract";
 import { parseRunReport } from "./contract";
+import { canonicalObservedPaths } from "./scorer";
 
 export interface DreamerClaimVerdictHistogram {
     claimId: string;
@@ -55,17 +56,21 @@ function publicClaimId(value: unknown): string | null {
 }
 
 /**
- * Encode a mapping entry the way `scoreMapManifest` compares one: it tests the
- * observed paths against gold with set equality, so duplicate paths in one run's
- * output are already immaterial to PASS/FAIL and must not read as a different
- * verdict from a run that emitted the same set once.
+ * Encode a mapping entry the way `scoreMapManifest` compares one: it canonicalizes
+ * the observed paths, then tests them against gold with set equality, so
+ * duplicate entries and equivalent spellings such as `src/./cache.ts` are already
+ * immaterial to PASS/FAIL and must not read as a different verdict.
+ *
+ * Independence and the path set are encoded together because the scorer checks
+ * both — independence first, then files — so a claim's bucket has to carry
+ * whatever could have made those two checks disagree between repeats.
  */
 function mapVerdict(entry: Record<string, unknown>): string {
-    if (entry.independent === true) return "independent";
-    const files = Array.isArray(entry.files)
-        ? [...new Set(entry.files.filter((file): file is string => typeof file === "string"))].sort()
+    const observed = Array.isArray(entry.files)
+        ? entry.files.filter((file): file is string => typeof file === "string")
         : [];
-    return `files:${files.join(",")}`;
+    const files = [...new Set(canonicalObservedPaths(observed))].sort();
+    return `independent:${String(entry.independent === true)};files:${files.join(",")}`;
 }
 
 /**
