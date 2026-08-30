@@ -3,7 +3,7 @@ import {
     NativeChannel,
     probeCapabilities,
     QUALIFIED_TEST_PROFILE,
-} from "@magic-context/mc-shm-native";
+} from "@cortexkit/mc-shm-native";
 import { ByteBudget, ReceiveLease } from "../src/shared/mc-host-client/frame-channel.ts";
 import { FrameType, PROTOCOL_VERSION, encodeHeader } from "../src/shared/mc-host-client/protocol.ts";
 import { ShmFrameChannel } from "../src/shared/mc-host-client/shm-frame-channel.ts";

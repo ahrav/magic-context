@@ -126,7 +126,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, macos-15-intel]
     steps:
       - uses: actions/checkout@v5
 
@@ -163,12 +163,10 @@ jobs:
           cargo nextest run -p mc-host \
             --test shm_transport --test transport_negotiation
 
-      # No retained macOS provider: Linux-gated crash/soak harnesses
-      # are absent by cfg, so this proves side-effect-free omission
-      # (R15), not active parity. commentlint: allow(JUDGE)
-      - name: Contracts, observer self-tests, and omission proof (macOS)
+      - name: Fixed-ring contracts (macOS)
         if: runner.os == 'macOS'
         run: |
+          cargo nextest run -p mc-shm-native
           cargo nextest run -p mc-shm-transport \
             --test contract --test fuzz_corpus
           cargo nextest run -p mc-host --test shm_soak
@@ -187,7 +185,7 @@ jobs:
       - name: Native behavior (Node 24)
         run: bun run --cwd packages/mc-shm-native test:node
 
-      - name: Capability activation or clean omission (Bun and Node 24)
+      - name: Mandatory capability activation (Bun and Node 24)
         run: |
           bun run --cwd packages/mc-shm-native test:capability:bun
           bun run --cwd packages/mc-shm-native test:capability:node

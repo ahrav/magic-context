@@ -4,7 +4,7 @@ import {
     type NativeReceiveLease,
     probeCapabilities,
     QUALIFIED_TEST_PROFILE,
-} from "@magic-context/mc-shm-native";
+} from "@cortexkit/mc-shm-native";
 import { ConnectionGeneration } from "./connection";
 import { Deadline } from "./deadline";
 import {

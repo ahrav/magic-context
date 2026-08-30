@@ -2,7 +2,7 @@ import {
     type NativeDescriptor,
     probeCapabilities,
     QUALIFIED_TEST_PROFILE,
-} from "@magic-context/mc-shm-native";
+} from "@cortexkit/mc-shm-native";
 import { ShmFrameChannel } from "./shm-frame-channel";
 import { decodeShmGrant } from "./shm-grant";
 import type { ClientTransportProvider } from "./transport-provider";
@@ -56,7 +56,6 @@ export function createExplicitShmTestProvider(
             };
             const descriptor: NativeDescriptor = {
                 profile: decoded.profile,
-                pid: decoded.pid,
                 hostToPeerFd: decoded.hostToPeerFd,
                 hostToPeerGrant: decoded.hostToPeerGrant,
                 peerToHostFd: decoded.peerToHostFd,

@@ -4,7 +4,7 @@ import {
     type NativeProducerReservation,
     type NativeReceiveLease,
     type ProducerCursor,
-} from "@magic-context/mc-shm-native";
+} from "@cortexkit/mc-shm-native";
 import type { Deadline } from "./deadline";
 import { McHostCallError } from "./errors";
 import {
