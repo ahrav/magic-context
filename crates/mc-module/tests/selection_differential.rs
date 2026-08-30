@@ -2051,6 +2051,35 @@ fn dedup_specs() -> impl Strategy<Value = Vec<ItemSpec>> {
         })
 }
 
+fn ctx_reduce_supersession_specs() -> impl Strategy<Value = Vec<ItemSpec>> {
+    (4u8..8, 0u8..10).prop_map(|(arc_count, input)| {
+        let mut specs = Vec::with_capacity(usize::from(arc_count) * 2);
+        for arc in 0..arc_count {
+            let mut push = |kind: u8, byte_size: u16| {
+                specs.push(ItemSpec {
+                    msg: arc,
+                    ordinal_slot: arc,
+                    role: ROLE_ASSISTANT,
+                    kind,
+                    tool: 6,
+                    input,
+                    provider_executed: false,
+                    byte_size,
+                    token_count: None,
+                    arc: Some(arc),
+                    frozen: false,
+                    agent_drop: false,
+                    tag_protected: false,
+                    exempt_protected: false,
+                });
+            };
+            push(KIND_TOOL_CALL, 900);
+            push(KIND_TOOL_RESULT, 400);
+        }
+        specs
+    })
+}
+
 fn supersession_withheld_specs() -> impl Strategy<Value = Vec<ItemSpec>> {
     (
         3u8..7,
@@ -2160,6 +2189,18 @@ proptest! {
     fn optimized_matches_frozen_reference_on_duplicate_calls(
         specs in dedup_specs(),
         bits in ctx_bits(),
+    ) {
+        let (optimized, expected, specs, bits) = outcome_pair!(specs, bits);
+        prop_assert_eq!(optimized, expected, "diverged on {:?} {:?}", specs, bits);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(192))]
+    #[test]
+    fn optimized_matches_frozen_reference_across_ctx_reduce_keep_boundary(
+        specs in ctx_reduce_supersession_specs(),
+        bits in pressured_ctx_bits(),
     ) {
         let (optimized, expected, specs, bits) = outcome_pair!(specs, bits);
         prop_assert_eq!(optimized, expected, "diverged on {:?} {:?}", specs, bits);
