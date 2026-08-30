@@ -1689,7 +1689,7 @@ async fn probe_observes_running_then_stopped_across_an_incarnation() {
     assert_eq!(observed.state, mc_host::LifecycleState::Running);
     assert!(!observed.instance_lock_free);
     let summary = observed.publication.expect("publication summary");
-    assert_eq!(summary.port, host.info.port);
+    assert!(std::path::Path::new(&summary.setup_socket).is_absolute());
 
     // Stop through the authenticated wire operation, then reprobe.
     let mut client = host.client().await;

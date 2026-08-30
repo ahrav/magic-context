@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use crate::wire::{FrameType, HEADER_LEN};
-use tokio::net::TcpStream;
+use tokio::net::UnixStream;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::{timeout_at, Instant};
 use tokio_util::sync::CancellationToken;
@@ -27,7 +27,6 @@ use crate::frame_channel::{
 use crate::handler::McHostHandler;
 use crate::routing::CloseDecision;
 use crate::runtime::HostShared;
-use crate::tcp_frame_channel::TcpFrameChannel;
 use crate::transport_negotiation::{
     activate_response_json, commit_response_json, decode_activate_request, decode_commit_request,
     encode_negotiate_response, FallbackReason, NegotiateRequest, NegotiateResponse,
@@ -124,27 +123,21 @@ pub struct GenerationCore {
     pub liveness: Mutex<Option<LivenessHandle>>,
 }
 
-/// Runs one accepted socket to completion: authenticate, promote into
-/// authenticated capacity, then serve frames until retirement.
+/// Runs one accepted setup socket to completion: authenticate, transfer the
+/// fixed ring descriptors, commit activation, then retain the socket only as
+/// peer-lifetime evidence while application frames use the ring.
 ///
 /// `handshake_permit` is held from before the first byte is read; it releases
 /// on every exit path once authenticated capacity is acquired or the socket
 /// dies (protocol §5.1).
 ///
-/// This task is the connection's setup owner: it holds the authenticated
-/// connection permit for the whole setup (bounding prepared candidates by
-/// `max_connections`), owns the bootstrap and candidate cancellation roots,
-/// keeps the generation visible to shutdown through the connection registry,
-/// and reaps the unpromoted candidate and its I/O task. A TCP selection
-/// (explicit or by omission) keeps serving the bootstrap channel directly; a
-/// committed grant retires the bootstrap and serves the promoted candidate
-/// with a fresh generation whose application correlations start at 3.
+/// This task owns the setup socket and ring candidate together. Any setup
+/// failure or unexpected socket closure retires that exact ring generation.
 pub async fn run_connection<H: McHostHandler>(
     shared: Arc<HostShared<H>>,
-    mut stream: TcpStream,
+    mut stream: UnixStream,
     handshake_permit: OwnedSemaphorePermit,
 ) {
-    let _ = stream.set_nodelay(true);
     let auth = crate::auth::authenticate_server(
         &mut stream,
         shared.auth_key.bytes(),
@@ -168,71 +161,76 @@ pub async fn run_connection<H: McHostHandler>(
     drop(handshake_permit);
     let _connection_permit = connection_permit;
 
-    // Generation tokens are independent roots rather than children of the
-    // shutdown token. Admission stops when `shutdown` fires, but the drain must
-    // still emit terminals and a Goodbye on a live generation, so only
-    // `shutdown_sequence` may retire these — in protocol order.
-    let gen_token = CancellationToken::new();
-    let read_cancel = gen_token.child_token();
-    let (read_half, write_half) = stream.into_split();
-    let (writer, channel, channel_io) = TcpFrameChannel::start(
-        read_half,
-        write_half,
-        shared.limits.writer_queue_frames,
-        shared.timing.frame_deadline,
-        shared.ingress_budget.clone(),
-        gen_token.clone(),
-        read_cancel.clone(),
-    );
-    let writer_task = AbortOnDropHandle::new(shared.tracker.spawn(channel_io));
-    let gen = new_generation(&shared, gen_token, read_cancel, writer);
-    let handoff = serve_generation(
-        &shared,
-        gen,
-        channel,
-        writer_task,
-        ConnectionSetup::bootstrap(),
-    )
-    .await;
-
-    let Some(handoff) = handoff else {
+    let Some(provider) = shared.providers.fixed_ring() else {
         return;
     };
-    let io_task = handoff.io.lock().expect("candidate io lock").take();
-    let promoted = handoff
-        .promoted
-        .lock()
-        .expect("candidate promotion lock")
-        .take();
-    match promoted {
-        Some(receiver) => {
-            let io_task =
-                AbortOnDropHandle::new(io_task.expect("candidate io is spawned at grant"));
-            let gen = new_generation(
-                &shared,
-                handoff.root.clone(),
-                handoff.read_cancel.clone(),
-                handoff.sender.clone(),
-            );
-            serve_generation(
-                &shared,
-                gen,
-                receiver,
-                io_task,
-                ConnectionSetup::provider_active(),
-            )
-            .await;
-        }
-        None => {
-            // The candidate never promoted: reap it here so the setup owner
-            // — not the provider — is what guarantees resource release.
-            handoff.sender.discard();
-            handoff.root.cancel();
-            if let Some(io) = io_task {
-                let _ = io.await;
+    let ctx = ProviderContext::new(
+        shared.ingress_budget.clone(),
+        shared.limits.writer_queue_frames,
+        shared.timing.frame_deadline,
+        Some(crate::shm_provider::qualified_test_parameters()),
+    );
+    let prepared = shared.providers.prepare_on_worker(provider, ctx);
+    let Ok(Ok(Ok(PreparedCandidate {
+        descriptor,
+        descriptors: Some(descriptors),
+        candidate,
+        ..
+    }))) = timeout_at(
+        Instant::now() + shared.timing.transport_setup_deadline,
+        prepared,
+    )
+    .await
+    else {
+        return;
+    };
+    let token = fresh_activation_token();
+    if crate::setup_socket::activate_server(
+        &mut stream,
+        &descriptors,
+        &descriptor,
+        crate::wire::PROTOCOL_VERSION,
+        mc_shm_transport::descriptor::DESCRIPTOR_SCHEMA_VERSION,
+        token.as_str(),
+        shared.timing.transport_setup_deadline,
+    )
+    .await
+    .is_err()
+    {
+        candidate.sender.discard();
+        candidate.root.cancel();
+        return;
+    }
+
+    let Candidate {
+        sender,
+        receiver,
+        io,
+        root,
+        read_cancel,
+    } = candidate;
+    let io_task = AbortOnDropHandle::new(shared.tracker.spawn(io));
+    let gen = new_generation(&shared, root.clone(), read_cancel.clone(), sender);
+    let peer_gen = Arc::clone(&gen);
+    let peer_read_cancel = read_cancel.clone();
+    shared.spawn_tracked(gen.read_tasks.track_future(async move {
+        tokio::select! {
+            biased;
+            () = peer_read_cancel.cancelled() => {}
+            _ = crate::setup_socket::observe_peer(&mut stream) => {
+                peer_gen.token.cancel();
+                peer_gen.read_cancel.cancel();
             }
         }
-    }
+    }));
+    serve_generation(
+        &shared,
+        gen,
+        receiver,
+        io_task,
+        ConnectionSetup::provider_active(),
+    )
+    .await;
 }
 
 fn new_generation<H: McHostHandler>(
@@ -783,7 +781,6 @@ enum ControlFlow {
 /// [`run_candidate_setup`]; the bootstrap observes them all as
 /// [`TransportState::CandidateSetup`].
 enum TransportState {
-    BootstrapTcp,
     TcpCommitted,
     /// A candidate is being activated; the bootstrap accepts no further
     /// requests.
@@ -799,20 +796,12 @@ pub(crate) struct ConnectionSetup {
 }
 
 impl ConnectionSetup {
-    fn bootstrap() -> Self {
-        Self {
-            state: TransportState::BootstrapTcp,
-            initial_watermark: 0,
-            handoff: None,
-        }
-    }
-
     /// Correlations 1 and 2 were consumed by activation and commit, so the
     /// first application request on a promoted candidate is 3 (§7.7.4).
     fn provider_active() -> Self {
         Self {
             state: TransportState::ProviderActive,
-            initial_watermark: COMMIT_CORRELATION,
+            initial_watermark: 0,
             handoff: None,
         }
     }
@@ -824,9 +813,7 @@ impl ConnectionSetup {
 pub(crate) struct CandidateHandoff {
     sender: FrameSender,
     root: CancellationToken,
-    read_cancel: CancellationToken,
     promoted: Mutex<Option<BoxedReceiver>>,
-    io: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 fn transport_ready(setup: &ConnectionSetup) -> bool {
@@ -843,7 +830,7 @@ async fn handle_negotiate<H: McHostHandler>(
     decoded: Result<NegotiateRequest, NegotiationError>,
     setup: &mut ConnectionSetup,
 ) -> ControlFlow {
-    if !matches!(setup.state, TransportState::BootstrapTcp) {
+    if !matches!(setup.state, TransportState::TcpCommitted) {
         return ControlFlow::Close(ReadExit::Peer);
     }
     let request = match decoded {
@@ -1040,6 +1027,7 @@ async fn grant_candidate<H: McHostHandler>(
     // TCP continuation.
     let PreparedCandidate {
         descriptor,
+        descriptors: _,
         candidate_id,
         candidate,
     } = match timeout_at(deadline, reply).await {
@@ -1076,15 +1064,13 @@ async fn grant_candidate<H: McHostHandler>(
         receiver,
         io,
         root,
-        read_cancel,
+        read_cancel: _,
     } = candidate;
-    let io_task = shared.spawn_tracked(io);
+    shared.spawn_tracked(io);
     let handoff = Arc::new(CandidateHandoff {
         sender,
         root,
-        read_cancel,
         promoted: Mutex::new(None),
-        io: Mutex::new(Some(io_task)),
     });
     let shared_task = Arc::clone(shared);
     let gen_task = Arc::clone(gen);

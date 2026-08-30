@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::auth::{ServerProof, MAX_AUTH_MESSAGE_LEN, NONCE_LEN, PROOF_LEN};
 use crate::connection_file::{
-    ConnectionInfo, Endpoint, DAEMON_ID_LEN, KEY_LEN, MAX_CONNECTION_FILE_LEN, SCHEMA_VERSION,
+    ConnectionInfo, DAEMON_ID_LEN, KEY_LEN, MAX_CONNECTION_FILE_LEN, SCHEMA_VERSION,
 };
 use crate::wire::{HEADER_LEN, MAX_BODY_LEN, PROTOCOL_VERSION};
 
@@ -294,7 +294,13 @@ impl Default for HostConfig {
             limits: HostLimits::default(),
             timing: HostTiming::default(),
             liveness: None,
-            transport_providers: crate::transport_provider::TransportProviders::default(),
+            transport_providers: crate::transport_provider::TransportProviders::with_injected(
+                vec![std::sync::Arc::new(
+                    crate::shm_provider::ShmProvider::for_qualified_test_profile(
+                        crate::shm_provider::single_candidate_limits(),
+                    ),
+                )],
+            ),
         }
     }
 }
@@ -325,10 +331,7 @@ impl HostConfig {
         let connection_file_bytes = serde_json::to_vec_pretty(&ConnectionInfo {
             schema: SCHEMA_VERSION,
             wire_version: PROTOCOL_VERSION,
-            endpoints: vec![Endpoint {
-                host: "127.0.0.1".to_owned(),
-                port: u16::MAX,
-            }],
+            setup_socket: "/tmp/mc-host.sock".to_owned(),
             key: vec![u8::MAX; KEY_LEN],
             daemon_id: [u8::MAX; DAEMON_ID_LEN],
             pid: u32::MAX,

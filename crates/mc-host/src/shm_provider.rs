@@ -1,21 +1,16 @@
-//! Explicit shared-memory transport provider for qualified test profiles.
+//! Shared-memory ring transport provider.
 //!
-//! Production configuration never installs this provider. One dedicated OS
-//! thread creates and owns both `!Send` ring endpoints. Host tasks exchange
-//! frame tickets and completion notifications with that thread.
+//! One dedicated OS thread creates and owns both `!Send` ring endpoints. Host
+//! tasks exchange frame tickets and completion notifications with that thread.
 
 use std::fmt;
-#[cfg(target_os = "linux")]
-use std::fs::OpenOptions;
 use std::io;
-#[cfg(target_os = "linux")]
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant as StdInstant};
 
 use crate::wire::{decode_header, EnvelopeHeader, FrameType};
-#[cfg(target_os = "linux")]
 use mc_shm_transport::backend::ring::RingGrant;
 use mc_shm_transport::backend::ring::{DuplexRing, ProducerReservation, Ring};
 use mc_shm_transport::descriptor::{HardwareProfileId, SchedulingMode, TransportDescriptor};
@@ -260,7 +255,7 @@ impl InjectedProvider for ShmProvider {
     }
 
     fn preflight(&self, parameters: Option<&serde_json::Value>) -> PreflightEligibility {
-        if !cfg!(target_os = "linux") || !Self::offer_is_exact(parameters) {
+        if !Self::offer_is_exact(parameters) {
             return PreflightEligibility::StaticallyOmitted;
         }
         if self.recovery.readiness() != ProviderReadiness::Ready
@@ -272,7 +267,7 @@ impl InjectedProvider for ShmProvider {
     }
 
     fn prepare(&self, ctx: &ProviderContext) -> Result<PreparedCandidate, ProviderFailure> {
-        if !cfg!(target_os = "linux") || !Self::offer_is_exact(ctx.offer_parameters()) {
+        if !Self::offer_is_exact(ctx.offer_parameters()) {
             return Err(ProviderFailure::Unavailable);
         }
         let candidate_id = NEXT_CANDIDATE_ID.fetch_add(1, Ordering::Relaxed);
@@ -322,12 +317,12 @@ impl InjectedProvider for ShmProvider {
                         return;
                     }
                 };
-                let descriptor = worker_descriptor(candidate_id, &rings);
-                let Ok(descriptor) = descriptor else {
+                let transfer = worker_descriptor(candidate_id, &rings);
+                let Ok((descriptor, descriptors)) = transfer else {
                     let _ = initialized_tx.send(Err(ProviderFailure::Unavailable));
                     return;
                 };
-                if initialized_tx.send(Ok(descriptor)).is_err() {
+                if initialized_tx.send(Ok((descriptor, descriptors))).is_err() {
                     return;
                 }
                 // An endpoint panic is an unclean close: catching it here
@@ -361,7 +356,7 @@ impl InjectedProvider for ShmProvider {
         if spawned.is_err() {
             return Err(ProviderFailure::Unavailable);
         }
-        let descriptor = initialized_rx
+        let (descriptor, descriptors) = initialized_rx
             .recv()
             .map_err(|_| ProviderFailure::Unavailable)??;
         let receiver = BoxedReceiver::new(ShmReceiver {
@@ -372,6 +367,7 @@ impl InjectedProvider for ShmProvider {
         });
         Ok(PreparedCandidate {
             descriptor,
+            descriptors: Some(descriptors),
             candidate_id,
             candidate: Candidate {
                 sender,
@@ -388,36 +384,29 @@ impl InjectedProvider for ShmProvider {
 #[serde(deny_unknown_fields)]
 struct WireDescriptor {
     profile: String,
-    pid: u32,
-    host_to_peer_fd: i32,
     host_to_peer_grant: String,
-    peer_to_host_fd: i32,
     peer_to_host_grant: String,
 }
 
-fn worker_descriptor(candidate_id: u64, rings: &DuplexRing) -> Result<serde_json::Value, ()> {
-    #[cfg(target_os = "linux")]
-    {
-        let descriptor = WireDescriptor {
-            profile: QUALIFIED_TEST_PROFILE.to_owned(),
-            pid: std::process::id(),
-            host_to_peer_fd: rings.first.raw_fd(),
-            host_to_peer_grant: encode_hex(&rings.first.grant().encode()),
-            peer_to_host_fd: rings.second.raw_fd(),
-            peer_to_host_grant: encode_hex(&rings.second.grant().encode()),
-        };
-        let mut value = serde_json::to_value(descriptor).map_err(|_| ())?;
-        value
-            .as_object_mut()
-            .ok_or(())?
-            .insert("candidate_id".to_owned(), candidate_id.into());
-        Ok(value)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (candidate_id, rings);
-        Err(())
-    }
+fn worker_descriptor(
+    candidate_id: u64,
+    rings: &DuplexRing,
+) -> Result<(serde_json::Value, [OwnedFd; 2]), ()> {
+    let descriptor = WireDescriptor {
+        profile: QUALIFIED_TEST_PROFILE.to_owned(),
+        host_to_peer_grant: encode_hex(&rings.first.grant().encode()),
+        peer_to_host_grant: encode_hex(&rings.second.grant().encode()),
+    };
+    let descriptors = [
+        rings.first.attachment().map_err(|_| ())?.into_parts().0,
+        rings.second.attachment().map_err(|_| ())?.into_parts().0,
+    ];
+    let mut value = serde_json::to_value(descriptor).map_err(|_| ())?;
+    value
+        .as_object_mut()
+        .ok_or(())?
+        .insert("candidate_id".to_owned(), candidate_id.into());
+    Ok((value, descriptors))
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -704,9 +693,18 @@ pub struct TestShmPeer {
 }
 
 impl TestShmPeer {
-    /// Attaches descriptor received over authenticated bootstrap.
-    #[cfg(target_os = "linux")]
-    pub fn attach(descriptor: &serde_json::Value) -> Result<Self, TestPeerError> {
+    /// Rejects descriptor-only attachment because setup transfers ring
+    /// ownership through `SCM_RIGHTS` rather than process-local descriptor
+    /// numbers embedded in JSON.
+    pub fn attach(_descriptor: &serde_json::Value) -> Result<Self, TestPeerError> {
+        Err(TestPeerError)
+    }
+
+    /// Attaches a descriptor and its setup-socket file descriptors.
+    pub fn attach_with_descriptors(
+        descriptor: &serde_json::Value,
+        descriptors: [OwnedFd; 2],
+    ) -> Result<Self, TestPeerError> {
         let mut descriptor = descriptor.clone();
         descriptor
             .as_object_mut()
@@ -717,16 +715,9 @@ impl TestShmPeer {
         if descriptor.profile != QUALIFIED_TEST_PROFILE {
             return Err(TestPeerError);
         }
-        let from_host = attach_ring(
-            descriptor.pid,
-            descriptor.host_to_peer_fd,
-            &descriptor.host_to_peer_grant,
-        )?;
-        let to_host = attach_ring(
-            descriptor.pid,
-            descriptor.peer_to_host_fd,
-            &descriptor.peer_to_host_grant,
-        )?;
+        let [from_host_fd, to_host_fd] = descriptors;
+        let from_host = attach_ring(from_host_fd, &descriptor.host_to_peer_grant)?;
+        let to_host = attach_ring(to_host_fd, &descriptor.peer_to_host_grant)?;
         Ok(Self { to_host, from_host })
     }
 
@@ -763,16 +754,9 @@ impl TestShmPeer {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn attach_ring(pid: u32, fd: i32, grant: &str) -> Result<Ring, TestPeerError> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(format!("/proc/{pid}/fd/{fd}"))
-        .map_err(|_| TestPeerError)?;
+fn attach_ring(fd: OwnedFd, grant: &str) -> Result<Ring, TestPeerError> {
     let grant = RingGrant::decode(decode_hex(grant)?).map_err(|_| TestPeerError)?;
-    Ring::attach(OwnedFd::from(file), grant, SchedulingMode::ColdParkWake)
-        .map_err(|_| TestPeerError)
+    Ring::attach(fd, grant, SchedulingMode::ColdParkWake).map_err(|_| TestPeerError)
 }
 
 fn decode_hex<const N: usize>(text: &str) -> Result<[u8; N], TestPeerError> {

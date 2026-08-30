@@ -19,7 +19,7 @@ use std::{
 use serde_json::Value;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    net::{tcp::OwnedWriteHalf, TcpStream},
+    net::{unix::OwnedWriteHalf, UnixStream},
     sync::{mpsc, oneshot},
     task::JoinHandle,
     time::{timeout_at, Instant},
@@ -352,22 +352,10 @@ impl Client {
     }
 
     async fn connect_info(info: ConnectionInfo, deadline: Instant) -> Result<Self, ClientError> {
-        let endpoint = info
-            .endpoints
-            .first()
-            .ok_or_else(|| ClientError::new("discovery_failed", "secure discovery failed"))?
-            .clone();
-        let mut stream = timeout_at(
-            deadline,
-            TcpStream::connect((endpoint.host.as_str(), endpoint.port)),
-        )
-        .await
-        .map_err(|_| ClientError::new("handshake_timeout", "client handshake timed out"))?
-        .map_err(|_| ClientError::new("dial_failed", "daemon dial failed"))?;
-        // Interactive request/response traffic; Nagle would add up to one RTT
-        // of coalescing delay per small frame. Best-effort, as in the server's
-        // accept path.
-        let _ = stream.set_nodelay(true);
+        let mut stream = timeout_at(deadline, UnixStream::connect(&info.setup_socket))
+            .await
+            .map_err(|_| ClientError::new("handshake_timeout", "client handshake timed out"))?
+            .map_err(|_| ClientError::new("dial_failed", "daemon dial failed"))?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(ClientError::new(
@@ -2151,7 +2139,7 @@ fn encode_data_frame(
     })
 }
 
-async fn negotiate_tcp(stream: &mut TcpStream, deadline: Instant) -> Result<(), ClientError> {
+async fn negotiate_tcp(stream: &mut UnixStream, deadline: Instant) -> Result<(), ClientError> {
     // One offers value feeds both the encoded request and response
     // validation, so the selection is checked against exactly what was sent.
     let request = NegotiateRequest {
@@ -2202,7 +2190,7 @@ async fn negotiate_tcp(stream: &mut TcpStream, deadline: Instant) -> Result<(), 
 }
 
 async fn read_setup_frame(
-    stream: &mut TcpStream,
+    stream: &mut UnixStream,
     deadline: Instant,
 ) -> Result<InboundFrame, ClientError> {
     let mut header_bytes = [0u8; HEADER_LEN];
@@ -2242,7 +2230,7 @@ async fn read_setup_frame(
 
 /// Reads exactly `buf.len()` setup bytes under the shared handshake deadline.
 async fn read_setup_exact(
-    stream: &mut TcpStream,
+    stream: &mut UnixStream,
     buf: &mut [u8],
     deadline: Instant,
 ) -> Result<(), ClientError> {
@@ -2625,11 +2613,7 @@ mod tests {
         assert!(!claim_for_write(&publish));
         assert!(control_rx.try_recv().is_err(), "not-sent needs no Cancel");
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut peer = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (socket, _) = listener.accept().await.unwrap();
+        let (mut peer, socket) = UnixStream::pair().unwrap();
         let (_read, write) = socket.into_split();
         let writer_inner = Arc::clone(&inner);
         let writer = tokio::spawn(async move {
@@ -3697,10 +3681,8 @@ mod tests {
         // check the client accepts the header and allocates the declared body —
         // roughly 64 MiB on every connect attempt. The peer below sends no body
         // at all, so only a header-only rejection completes inside the bound.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let (mut stream, mut socket) = UnixStream::pair().unwrap();
         let peer = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
             let header = EnvelopeHeader {
                 len: MAX_CONTROL_BODY_LEN + 1,
                 ver: PROTOCOL_VERSION,
@@ -3714,7 +3696,6 @@ mod tests {
             socket.write_all(&header).await.unwrap();
             socket
         });
-        let mut stream = TcpStream::connect(addr).await.unwrap();
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(1),

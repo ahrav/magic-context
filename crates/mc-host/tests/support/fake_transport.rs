@@ -84,6 +84,7 @@ impl InjectedProvider for FakeProvider {
         self.peers.send(peer).expect("test holds the peer receiver");
         Ok(PreparedCandidate {
             descriptor: self.descriptor.clone(),
+            descriptors: None,
             candidate_id,
             candidate,
         })

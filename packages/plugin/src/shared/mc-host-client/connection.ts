@@ -181,8 +181,9 @@ export interface PendingRequest {
 }
 
 export interface ConnectionGenerationOptions {
-    host: string;
-    port: number;
+    host?: string;
+    port?: number;
+    setupSocket?: string;
     /**
      * Validated connection-file credentials. `daemonVer` is the file's
      * `daemon_ver`, which the handshake requires the peer to report back.
@@ -424,6 +425,7 @@ export class ConnectionGeneration {
             this.authChannel = new TcpFrameChannel({
                 host: options.host,
                 port: options.port,
+                setupSocket: options.setupSocket,
                 credentials: options.credentials,
                 budget: this.budget,
                 frameDeadlineMs: options.frameDeadlineMs,
