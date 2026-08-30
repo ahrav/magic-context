@@ -85,6 +85,17 @@ const RUN_ID_RE = /^run-[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const DIGEST_RE = /^[0-9a-f]{64}$/;
 
+/** The report contract's own identity predicates. A caller overriding either value
+ *  can reject it before a live run rather than after `parseRunReport` refuses the
+ *  artifact that run produced. */
+export function isValidRunId(value: string): boolean {
+    return RUN_ID_RE.test(value);
+}
+
+export function isValidRepoCommitSha(value: string): boolean {
+    return SHA_RE.test(value);
+}
+
 /**
  * Lowest verification timestamp the seeder can build a fixture around.
  * `prepareFixtureRepository` derives the fixture commit time as the earliest

@@ -40,6 +40,8 @@ import { liveModelSpawnOptions } from "../oracle-arms/presets";
 import {
     DREAMER_EVAL_REPORT_SCHEMA,
     isRunFatal,
+    isValidRepoCommitSha,
+    isValidRunId,
     type ClaimOperationReceiptOutcome,
     type ClaimSnapshotProjection,
     type DreamerEvalRunReport,
@@ -156,10 +158,27 @@ function scoreManifest(input: DreamerRunClassificationInput): ManifestScore {
     };
 }
 
+/** The scored outcome when this run committed an irreversible mutation, or null. */
+function appliedRunFatalScore(input: DreamerRunClassificationInput): ManifestScore | null {
+    if (input.rawManifest === null || input.rawManifest.trim().length === 0) return null;
+    if (!input.receipts.some((receipt) => receipt.outcome === "applied")) return null;
+    const scored = scoreManifest(input);
+    return isRunFatal(scored.status, scored.reason) ? scored : null;
+}
+
 export function classifyDreamerRun(input: DreamerRunClassificationInput): DreamerRunClassification {
     if (!input.fixtureUnchanged) return outcome("ERROR", "fixture-drift");
     if (input.childCount !== input.expectedChildCount) return outcome("ERROR", "harness-failure");
-    if (input.leaseLost) return outcome("ERROR", "lease-lost");
+    // The lease is checked after the run, so it can expire while evidence is being
+    // collected. An `applied` receipt under this run's producer proves its write
+    // committed, and a run-fatal score says what committed was irreversible — an
+    // expiry afterwards cannot unmake that, and reporting `lease-lost` would drop
+    // the safety exit 2 for data that really was destroyed. Scoped to this check
+    // deliberately: fixture drift and a child-count mismatch undermine the evidence
+    // the score itself rests on, so they still win.
+    if (input.leaseLost && appliedRunFatalScore(input) === null) {
+        return outcome("ERROR", "lease-lost");
+    }
     // Only a task that returned a result can disagree about its mode. A verify
     // lane whose task threw — a credential, transport, abort, or typed provider
     // output failure — leaves this null, and reporting that as a gate partition
@@ -370,9 +389,13 @@ function fixturePaths(scenario: DreamerEvalScenario): string[] {
  * the extra mapping.
  */
 function trackedFixtureFiles(workdir: string): string[] {
-    const listed = gitOutput(workdir, ["ls-files"]);
+    // `-z`: plain `ls-files` quotes and escapes a path with non-ASCII bytes, a
+    // backslash, or a newline, which would record the displayed spelling instead of
+    // the tracked path production resolves — and a quoted form can itself violate
+    // the report's path rules.
+    const listed = gitOutput(workdir, ["ls-files", "-z"]);
     if (listed === null) throw new Error("dreamer-eval could not list the fixture's tracked files");
-    return listed.split("\n").filter((path) => path.length > 0);
+    return listed.split("\0").filter((path) => path.length > 0);
 }
 
 function reportCleanupFailure(step: string, error: unknown): void {
@@ -426,6 +449,18 @@ function runtimeProvenance(artifactDir: string): {
         throw new Error("dreamer-eval could not resolve the runtime working-tree state");
     }
     const outputRoot = resolve(artifactDir);
+    // The exclusion below is sound only if the directory holds no runtime inputs.
+    // A caller pointing `artifactDir` at the repository root or a source ancestor
+    // would otherwise hide every dirty file under it, letting two different
+    // implementations share one tuple. A directory containing tracked files is not
+    // an output directory.
+    const trackedUnderOutput = gitOutput(PLUGIN_REPO_ROOT, ["ls-files", "-z", "--", outputRoot]);
+    if (trackedUnderOutput === null) {
+        throw new Error("dreamer-eval could not inspect the artifact directory");
+    }
+    if (trackedUnderOutput.split("\0").some((path) => path.length > 0)) {
+        throw new Error("dreamer-eval artifact directory must not contain tracked files");
+    }
     const deviations = status
         .split("\0")
         .filter((entry) => entry.length > 3)
@@ -457,7 +492,9 @@ function runtimeProvenance(artifactDir: string): {
 function systemTuple(options: RunDreamerEvalTaskOptions) {
     const repoCommitSha =
         options.repoCommitSha ?? gitOutput(import.meta.dir, ["rev-parse", "HEAD"]) ?? "";
-    if (!/^[0-9a-f]{40,64}$/.test(repoCommitSha)) {
+    // The report contract's own predicate: a length this accepted but that refused
+    // would spend a model run and then lose the artifact to `parseRunReport`.
+    if (!isValidRepoCommitSha(repoCommitSha)) {
         throw new Error("dreamer-eval could not resolve a concrete repository commit");
     }
     return {
@@ -511,6 +548,11 @@ export async function runDreamerEvalTask(
 ): Promise<DreamerEvalRunReport> {
     const nowMs = options.nowMs ?? Date.now();
     const runId = options.runId ?? `run-${randomUUID().replaceAll("-", "")}`;
+    // Checked before the harness starts: this value is interpolated into the
+    // artifact filename, so `../../result` would escape `artifactDir` and overwrite
+    // an unrelated file, and any malformed id yields a report `parseRunReport`
+    // refuses once the live run has already been paid for.
+    if (!isValidRunId(runId)) throw new Error(`dreamer-eval run id is invalid: ${runId}`);
     // Resolve provenance before the run so a failure cannot spend model
     // credits and then lose the report artifact to a late throw.
     const system = systemTuple(options);

@@ -301,6 +301,47 @@ describe("dreamer runner classification", () => {
         });
     });
 
+    test("a lease that expired after an applied archival does not mask it", () => {
+        // The lease is checked after the run, so it can expire during evidence
+        // collection. The applied receipt proves the archival committed, and no
+        // later expiry unmakes it, so the safety exit must survive.
+        const archivesGoldTrue = `<verify>
+<archive claim="mcm_true" reason="no longer accurate"/>
+<update claim="mcm_update" files="src/cache.ts">Uses a BOUNDED CACHE with 4096 ENTRIES.</update>
+<archive claim="mcm_false" reason="queue removed"/>
+</verify>`;
+        const fatal = input({
+            task: "verify",
+            gold: dreamerScorerFixture.verifyGold,
+            rawManifest: archivesGoldTrue,
+            childMessages: assistantMessages(archivesGoldTrue),
+            leaseLost: true,
+        });
+        expect(classifyDreamerRun(fatal)).toMatchObject({
+            status: "FAIL",
+            reason: "wrong-archival",
+            runFatal: true,
+        });
+
+        // Without an applied receipt there is nothing to preserve: the lease loss is
+        // the finding.
+        expect(classifyDreamerRun({ ...fatal, receipts: [] })).toMatchObject({
+            status: "ERROR",
+            reason: "lease-lost",
+        });
+
+        // Evidence-undermining faults still outrank it, since the score itself rests
+        // on the captured manifest.
+        expect(classifyDreamerRun({ ...fatal, fixtureUnchanged: false })).toMatchObject({
+            status: "ERROR",
+            reason: "fixture-drift",
+        });
+        expect(classifyDreamerRun({ ...fatal, childCount: 0 })).toMatchObject({
+            status: "ERROR",
+            reason: "harness-failure",
+        });
+    });
+
     test("runner import does not mutate keep-subagents", () => {
         expect(shouldKeepSubagents()).toBe(false);
     });
