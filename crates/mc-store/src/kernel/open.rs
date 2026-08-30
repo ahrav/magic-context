@@ -40,6 +40,9 @@ pub enum KernelError {
     InvalidInput,
     FutureSnapshot,
     NotFound,
+    InvalidCheckpoint,
+    NoRequiredConsumers,
+    ConsumerPending,
     Fault,
 }
 
@@ -56,6 +59,9 @@ pub enum KernelErrorKind {
     InvalidInput,
     FutureSnapshot,
     NotFound,
+    InvalidCheckpoint,
+    NoRequiredConsumers,
+    ConsumerPending,
     Fault,
 }
 
@@ -73,6 +79,9 @@ impl KernelError {
             Self::InvalidInput => KernelErrorKind::InvalidInput,
             Self::FutureSnapshot => KernelErrorKind::FutureSnapshot,
             Self::NotFound => KernelErrorKind::NotFound,
+            Self::InvalidCheckpoint => KernelErrorKind::InvalidCheckpoint,
+            Self::NoRequiredConsumers => KernelErrorKind::NoRequiredConsumers,
+            Self::ConsumerPending => KernelErrorKind::ConsumerPending,
             Self::Fault => KernelErrorKind::Fault,
         }
     }
@@ -92,6 +101,9 @@ impl fmt::Display for KernelError {
             Self::InvalidInput => "kernel operation input is invalid",
             Self::FutureSnapshot => "kernel snapshot is newer than the committed tip",
             Self::NotFound => "kernel object was not found",
+            Self::InvalidCheckpoint => "outbox checkpoint is invalid",
+            Self::NoRequiredConsumers => "outbox pruning requires at least one consumer",
+            Self::ConsumerPending => "outbox consumer has not reached the commit-log tip",
             Self::Fault => "kernel operation was interrupted",
         })
     }
@@ -184,13 +196,15 @@ impl KernelStore {
         let readers = open_read_pool(&db_path)?;
         harden_family(&db_path)?;
 
-        Ok(Self {
+        let store = Self {
             writer: Mutex::new(writer),
             readers,
             next_reader: AtomicUsize::new(0),
             lease_epoch,
             _lease: lease,
-        })
+        };
+        store.run_staging_maintenance(current_time_ms())?;
+        Ok(store)
     }
 
     pub fn lease_epoch(&self) -> u64 {

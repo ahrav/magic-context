@@ -119,6 +119,13 @@ pub struct ProjectionReplaceResult {
     pub rows: usize,
 }
 
+pub const OPERATOR_REDACTION_PLACEHOLDER: &str = "[redacted:operator]";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemediationTarget {
+    CanonicalDomainName { object_id: String },
+}
+
 #[cfg(feature = "test-support")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitFault {
@@ -126,11 +133,12 @@ pub enum CommitFault {
     AfterEvents,
 }
 
-struct PendingChange {
-    object: ObjectRow,
-    kind: &'static str,
-    replaced_object_id: Option<String>,
-    redactions: Vec<(String, RedactedField)>,
+pub(super) struct PendingChange {
+    pub(super) object: ObjectRow,
+    pub(super) kind: &'static str,
+    pub(super) replaced_object_id: Option<String>,
+    pub(super) redactions: Vec<(String, RedactedField)>,
+    pub(super) audit: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -138,12 +146,14 @@ struct ChangePayload<'a> {
     change_kind: &'a str,
     object: &'a ObjectRow,
     replaced_object_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audit: Option<&'a serde_json::Value>,
 }
 
 pub struct Envelope<'tx> {
-    tx: &'tx Transaction<'tx>,
-    commit_seq: i64,
-    changes: Vec<PendingChange>,
+    pub(super) tx: &'tx Transaction<'tx>,
+    pub(super) commit_seq: i64,
+    pub(super) changes: Vec<PendingChange>,
 }
 
 impl Envelope<'_> {
@@ -155,6 +165,7 @@ impl Envelope<'_> {
             kind: "insert",
             replaced_object_id: None,
             redactions: spec.text_fields(),
+            audit: None,
         });
         Ok(())
     }
@@ -210,6 +221,7 @@ impl Envelope<'_> {
             kind: "correct",
             replaced_object_id: Some(replaced.text),
             redactions: replacement.text_fields(),
+            audit: None,
         });
         Ok(())
     }
@@ -249,7 +261,56 @@ impl Envelope<'_> {
             kind: "retire",
             replaced_object_id: None,
             redactions: vec![("object_id".to_string(), object_id)],
+            audit: None,
         });
+        Ok(())
+    }
+
+    pub fn remediate_text(
+        &mut self,
+        target: RemediationTarget,
+        operator_id: &str,
+        remediated_at: i64,
+    ) -> Result<(), KernelError> {
+        if operator_id.trim().is_empty() || remediated_at < 0 {
+            return Err(KernelError::InvalidInput);
+        }
+        let operator_id = redact(operator_id);
+        match target {
+            RemediationTarget::CanonicalDomainName { object_id } => {
+                let object_id = redact(&object_id);
+                let object = load_object(self.tx, &object_id.text)?.ok_or(KernelError::NotFound)?;
+                if object.object_kind != "domain"
+                    || self
+                        .tx
+                        .execute(
+                            "UPDATE domains SET name=?1 WHERE object_id=?2",
+                            params![OPERATOR_REDACTION_PLACEHOLDER, object_id.text],
+                        )
+                        .map_err(|_| KernelError::Io)?
+                        != 1
+                {
+                    return Err(KernelError::NotFound);
+                }
+                let audit = serde_json::json!({
+                    "target": "canonical_domain_name",
+                    "target_object_id": object_id.text.clone(),
+                    "operator_id": operator_id.text.clone(),
+                    "remediated_at": remediated_at,
+                    "replacement": OPERATOR_REDACTION_PLACEHOLDER,
+                });
+                self.changes.push(PendingChange {
+                    object,
+                    kind: "operator_remediation",
+                    replaced_object_id: None,
+                    redactions: vec![
+                        ("object_id".to_string(), object_id),
+                        ("operator_id".to_string(), operator_id.clone()),
+                    ],
+                    audit: Some(audit.clone()),
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -349,6 +410,7 @@ impl KernelStore {
                 change_kind: change.kind,
                 object: &change.object,
                 replaced_object_id: change.replaced_object_id.as_deref(),
+                audit: change.audit.as_ref(),
             };
             tx.execute(
                 "INSERT INTO change_event(
@@ -392,6 +454,7 @@ impl KernelStore {
                 change_kind: change.kind,
                 object: &change.object,
                 replaced_object_id: change.replaced_object_id.as_deref(),
+                audit: change.audit.as_ref(),
             })
             .map_err(|_| KernelError::InvalidInput)?;
             tx.execute(
@@ -620,17 +683,22 @@ impl KernelStore {
             if existing != expected {
                 return Err(KernelError::Conflict);
             }
-            tx.execute(
-                "UPDATE extraction_runs
+            if tx
+                .execute(
+                    "UPDATE extraction_runs
                  SET heartbeat_at=MAX(heartbeat_at,?1),lease_expires_at=MAX(lease_expires_at,?2)
-                 WHERE extraction_run_id=?3",
-                params![
-                    spec.recorded_at,
-                    spec.lease_expires_at,
-                    spec.extraction_run_id.text
-                ],
-            )
-            .map_err(|_| KernelError::Io)?;
+                 WHERE extraction_run_id=?3 AND terminal_state IS NULL",
+                    params![
+                        spec.recorded_at,
+                        spec.lease_expires_at,
+                        spec.extraction_run_id.text
+                    ],
+                )
+                .map_err(|_| KernelError::Io)?
+                != 1
+            {
+                return Err(KernelError::Conflict);
+            }
         } else {
             tx.execute(
                 "INSERT INTO extraction_runs(
@@ -909,6 +977,7 @@ impl RedactedCandidate {
         if spec.source_revision < 0
             || spec.recorded_at < 0
             || spec.lease_expires_at < spec.recorded_at
+            || spec.lease_expires_at > spec.recorded_at.saturating_add(60 * 60 * 1_000)
         {
             return Err(KernelError::InvalidInput);
         }
@@ -1076,7 +1145,7 @@ impl RedactedProjection {
     }
 }
 
-fn check_fence(tx: &Transaction<'_>, expected: u64) -> Result<(), KernelError> {
+pub(super) fn check_fence(tx: &Transaction<'_>, expected: u64) -> Result<(), KernelError> {
     let durable: i64 = tx
         .query_row(
             "SELECT writer_epoch FROM writer_fence WHERE id=0",

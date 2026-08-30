@@ -117,6 +117,58 @@ fn first_root_transaction_resolves_deferred_registry_cycle() {
 }
 
 #[test]
+fn canonical_tables_reject_arbitrary_in_place_updates() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, TEST_INCARNATION, 1_000).unwrap();
+    let tx = conn.transaction().unwrap();
+    tx.execute(
+        "INSERT INTO commit_log(transaction_id,writer_epoch,recorded_at,actor,cause)
+         VALUES ('tx-guard',7,1000,'test','guard')",
+        [],
+    )
+    .unwrap();
+    let commit_seq = tx.last_insert_rowid();
+    tx.execute(
+        "INSERT INTO domains(domain_id,object_id,name,created_commit_seq,sensitivity_class)
+         VALUES ('domain-guard','object-guard','original',?1,'internal')",
+        [commit_seq],
+    )
+    .unwrap();
+    tx.execute(
+        "INSERT INTO object_registry(
+             object_id,object_kind,domain_id,source_kind,source_id,source_revision,
+             created_commit_seq,sensitivity_class
+         ) VALUES ('object-guard','domain','domain-guard','test','source',1,?1,'internal')",
+        [commit_seq],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    assert!(conn
+        .execute(
+            "UPDATE domains SET name='arbitrary-rewrite' WHERE domain_id='domain-guard'",
+            [],
+        )
+        .is_err());
+    assert!(conn
+        .execute(
+            "UPDATE object_registry SET source_id='arbitrary-rewrite'
+             WHERE object_id='object-guard'",
+            [],
+        )
+        .is_err());
+    assert_eq!(
+        conn.query_row(
+            "SELECT name FROM domains WHERE domain_id='domain-guard'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        "original"
+    );
+}
+
+#[test]
 fn candidate_delete_cascades_scores_but_preserves_admission_audit() {
     let (_dir, mut conn) = open_profiled();
     apply_kernel_schema(&mut conn, TEST_INCARNATION, 1_000).unwrap();
@@ -197,7 +249,7 @@ fn late_bootstrap_failure_leaves_no_partial_schema() {
 }
 
 #[test]
-fn consumers_checkpoint_independent_outbox_positions() {
+fn consumers_checkpoint_commit_sequences() {
     let (_dir, mut conn) = open_profiled();
     apply_kernel_schema(&mut conn, TEST_INCARNATION, 1_000).unwrap();
     conn.execute(
@@ -215,22 +267,21 @@ fn consumers_checkpoint_independent_outbox_positions() {
         [commit_seq],
     )
     .unwrap();
-    let outbox_position = conn.last_insert_rowid();
     conn.execute(
         "INSERT INTO outbox_consumers(
-             consumer_id, checkpoint_outbox_position, updated_at
+             consumer_id, checkpoint_commit_seq, updated_at
          ) VALUES ('search', ?1, 3)",
-        params![outbox_position],
+        params![commit_seq],
     )
     .unwrap();
     assert_eq!(
         conn.query_row(
-            "SELECT checkpoint_outbox_position FROM outbox_consumers WHERE consumer_id = 'search'",
+            "SELECT checkpoint_commit_seq FROM outbox_consumers WHERE consumer_id = 'search'",
             [],
             |row| row.get::<_, i64>(0),
         )
         .unwrap(),
-        outbox_position
+        commit_seq
     );
 }
 
@@ -337,17 +388,24 @@ fn abandonment_audit_survives_consumer_deletion() {
     let (_dir, mut conn) = open_profiled();
     apply_kernel_schema(&mut conn, TEST_INCARNATION, 1_000).unwrap();
     conn.execute(
-        "INSERT INTO outbox_consumers(consumer_id, checkpoint_outbox_position, updated_at)
+        "INSERT INTO commit_log(transaction_id,writer_epoch,recorded_at,actor,cause)
+         VALUES ('abandonment-commit',1,1,'test','fixture')",
+        [],
+    )
+    .unwrap();
+    let commit_seq = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO outbox_consumers(consumer_id, checkpoint_commit_seq, updated_at)
          VALUES ('search', 9, 10)",
         [],
     )
     .unwrap();
     conn.execute(
         "INSERT INTO consumer_abandonments(
-             abandonment_id, consumer_id, operator_id, last_checkpoint_outbox_position,
-             reason, abandoned_at
-         ) VALUES ('abandon-1', 'search', 'operator-1', 9, 'retired', 11)",
-        [],
+             abandonment_id, consumer_id, operator_id, last_checkpoint_commit_seq,
+             reason, abandoned_at, commit_seq
+         ) VALUES ('abandon-1', 'search', 'operator-1', 9, 'retired', 11, ?1)",
+        [commit_seq],
     )
     .unwrap();
     conn.execute(
