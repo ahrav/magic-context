@@ -772,6 +772,56 @@ impl Ring {
         ]
     }
 
+    /// External event loops use this descriptor to wait for data readiness. commentlint: allow(JUDGE)
+    pub fn data_ready_fd(&self) -> RawFd {
+        self.data_ready.0.as_raw_fd()
+    }
+
+    /// Duplicates the data-readiness descriptor for an owning event-loop registration. commentlint: allow(JUDGE)
+    pub fn duplicate_data_ready(&self) -> Result<OwnedFd, RingError> {
+        self.data_ready.duplicate()
+    }
+
+    /// Binds one data wait to the observed generation. commentlint: allow(JUDGE)
+    ///
+    /// Returns `true` only when the caller should block on `data_ready_fd`.
+    /// A `false` result means data or a generation change is already visible.
+    pub fn arm_data_wait(&self) -> Result<bool, RingError> {
+        if self.data_available()? {
+            return Ok(false);
+        }
+        let wake = self.data_wake_ptr()?;
+        // SAFETY: wake page remains mapped and atomics were initialized before activation.
+        let generation = unsafe { (*wake).generation.load(Ordering::Acquire) };
+        unsafe {
+            (*wake)
+                .parked
+                .store(generation.wrapping_add(1), Ordering::Release)
+        };
+        if self.data_available()?
+            || unsafe { (*wake).generation.load(Ordering::Acquire) } != generation
+        {
+            unsafe { (*wake).parked.store(0, Ordering::Release) };
+            return Ok(false);
+        }
+        self.data_ready.drain()?;
+        if self.data_available()?
+            || unsafe { (*wake).generation.load(Ordering::Acquire) } != generation
+        {
+            unsafe { (*wake).parked.store(0, Ordering::Release) };
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Ends an external data wait and drains its coalesced token. commentlint: allow(JUDGE)
+    pub fn complete_data_wait(&self) -> Result<(), RingError> {
+        let wake = self.data_wake_ptr()?;
+        // SAFETY: wake page remains mapped and atomics were initialized before activation.
+        unsafe { (*wake).parked.store(0, Ordering::Release) };
+        self.data_ready.drain()
+    }
+
     /// Duplicates attachment handle. commentlint: allow(JUDGE)
     pub fn attachment(&self) -> Result<RingAttachment, RingError> {
         // SAFETY: F_DUPFD_CLOEXEC duplicates owned valid descriptor.

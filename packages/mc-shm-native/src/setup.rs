@@ -84,21 +84,24 @@ enum ServerMessage {
     Committed,
 }
 
-pub struct SetupConnection {
-    pub stream: UnixStream,
-    pub host_to_peer_descriptors: [OwnedFd; 3],
-    pub peer_to_host_descriptors: [OwnedFd; 3],
+pub struct PendingSetup {
+    stream: UnixStream,
+    descriptors: Option<[OwnedFd; SETUP_DESCRIPTOR_COUNT]>,
     pub host_to_peer_grant: RingGrant,
     pub peer_to_host_grant: RingGrant,
+    wire_version: u8,
+    descriptor_schema: u16,
+    activation_token: String,
+    deadline: Instant,
 }
 
-pub fn connect(
+pub fn begin_connect(
     path: &Path,
     key: &[u8],
     expected_daemon_id: &[u8],
     expected_daemon_ver: &str,
     timeout: Duration,
-) -> io::Result<SetupConnection> {
+) -> io::Result<PendingSetup> {
     if key.len() != 32 || expected_daemon_id.len() != DAEMON_ID_LEN || timeout.is_zero() {
         return Err(invalid());
     }
@@ -122,43 +125,54 @@ pub fn connect(
     if grant.descriptor.profile != super::PROFILE || host_to_peer_grant == peer_to_host_grant {
         return Err(invalid());
     }
-    write_message(
-        &mut stream,
-        &ClientMessage::Activate {
-            wire_version: grant.wire_version,
-            descriptor_schema: grant.descriptor_schema,
-            activation_token: &grant.activation_token,
-        },
-        deadline,
-        MAX_SETUP_MESSAGE_LEN,
-    )?;
-    if !matches!(
-        read_message::<ServerMessage>(&mut stream, deadline, MAX_SETUP_MESSAGE_LEN)?,
-        ServerMessage::Activated
-    ) {
-        return Err(invalid());
-    }
-    write_message(
-        &mut stream,
-        &ClientMessage::Commit,
-        deadline,
-        MAX_SETUP_MESSAGE_LEN,
-    )?;
-    if !matches!(
-        read_message::<ServerMessage>(&mut stream, deadline, MAX_SETUP_MESSAGE_LEN)?,
-        ServerMessage::Committed
-    ) {
-        return Err(invalid());
-    }
-    let [host_mapping, host_data, host_capacity, peer_mapping, peer_data, peer_capacity] =
-        descriptors;
-    Ok(SetupConnection {
+    Ok(PendingSetup {
         stream,
-        host_to_peer_descriptors: [host_mapping, host_data, host_capacity],
-        peer_to_host_descriptors: [peer_mapping, peer_data, peer_capacity],
+        descriptors: Some(descriptors),
         host_to_peer_grant,
         peer_to_host_grant,
+        wire_version: grant.wire_version,
+        descriptor_schema: grant.descriptor_schema,
+        activation_token: grant.activation_token,
+        deadline,
     })
+}
+
+impl PendingSetup {
+    pub fn take_descriptors(&mut self) -> io::Result<[OwnedFd; SETUP_DESCRIPTOR_COUNT]> {
+        self.descriptors.take().ok_or_else(invalid)
+    }
+
+    pub fn activate(mut self) -> io::Result<UnixStream> {
+        write_message(
+            &mut self.stream,
+            &ClientMessage::Activate {
+                wire_version: self.wire_version,
+                descriptor_schema: self.descriptor_schema,
+                activation_token: &self.activation_token,
+            },
+            self.deadline,
+            MAX_SETUP_MESSAGE_LEN,
+        )?;
+        if !matches!(
+            read_message::<ServerMessage>(&mut self.stream, self.deadline, MAX_SETUP_MESSAGE_LEN)?,
+            ServerMessage::Activated
+        ) {
+            return Err(invalid());
+        }
+        write_message(
+            &mut self.stream,
+            &ClientMessage::Commit,
+            self.deadline,
+            MAX_SETUP_MESSAGE_LEN,
+        )?;
+        if !matches!(
+            read_message::<ServerMessage>(&mut self.stream, self.deadline, MAX_SETUP_MESSAGE_LEN)?,
+            ServerMessage::Committed
+        ) {
+            return Err(invalid());
+        }
+        Ok(self.stream)
+    }
 }
 
 pub fn goodbye(stream: &mut UnixStream) {

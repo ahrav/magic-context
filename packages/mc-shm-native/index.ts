@@ -78,7 +78,8 @@ interface NativeAddon {
     workerLimit(): number;
     activeChannelCount(): number;
     attach(descriptor: NativeDescriptor): number;
-    connectSetup(options: NativeSetupOptions): number;
+    connectSetup(options: NativeSetupOptions): Promise<number>;
+    finishSetup(pending: number): Promise<number>;
     createTestPair(): {
         first: number;
         second: number;
@@ -115,6 +116,8 @@ interface NativeAddon {
             segments: Uint8Array[],
         ) => void,
     ): boolean;
+    watch(channel: number, callback: () => void): void;
+    readinessHandled(): void;
     release(channel: number, token: number): void;
     close(channel: number): void;
     forceClose(channel: number): void;
@@ -155,10 +158,15 @@ function packageAddonPath(platform: PlatformPackage): string {
     if (!existsSync(manifestPath)) {
         throw new NativeStartupError("missing_manifest");
     }
-    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+    let manifest: {
         package?: { name?: string; target?: string };
         files?: { path?: string; sha256?: string }[];
     };
+    try {
+        manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    } catch {
+        throw new NativeStartupError("missing_manifest");
+    }
     if (
         manifest.package?.name !== platform.package ||
         manifest.package.target !== platform.target
@@ -509,6 +517,16 @@ export class NativeReceiveLease {
     }
 }
 
+const readinessHandlers = new Map<number, () => void>();
+
+function dispatchReadiness(): void {
+    try {
+        for (const handler of [...readinessHandlers.values()]) handler();
+    } finally {
+        loaded?.readinessHandled();
+    }
+}
+
 export class NativeChannel {
     private closed = false;
 
@@ -522,9 +540,10 @@ export class NativeChannel {
         return new NativeChannel(native, native.attach(descriptor));
     }
 
-    static connectSetup(options: NativeSetupOptions): NativeChannel {
+    static async connectSetup(options: NativeSetupOptions): Promise<NativeChannel> {
         const native = capableAddon();
-        return new NativeChannel(native, native.connectSetup(options));
+        const pending = await native.connectSetup(options);
+        return new NativeChannel(native, await native.finishSetup(pending));
     }
 
     static createTestPair(): NativeTestPair {
@@ -587,7 +606,18 @@ export class NativeChannel {
         );
     }
 
-    poll(deliver: (lease: NativeReceiveLease) => void): boolean {
+    startReadiness(handler: () => void): void {
+        this.assertOpen();
+        readinessHandlers.set(this.id, handler);
+        try {
+            this.native.watch(this.id, dispatchReadiness);
+        } catch (error) {
+            readinessHandlers.delete(this.id);
+            throw error;
+        }
+    }
+
+    drainOne(deliver: (lease: NativeReceiveLease) => void): boolean {
         this.assertOpen();
         return this.native.poll(this.id, (token, header, segments) => {
             deliver(
@@ -604,12 +634,14 @@ export class NativeChannel {
 
     close(): void {
         if (this.closed) return;
+        readinessHandlers.delete(this.id);
         this.native.close(this.id);
         this.closed = true;
     }
 
     forceClose(): void {
         if (this.closed) return;
+        readinessHandlers.delete(this.id);
         this.native.forceClose(this.id);
         this.closed = true;
     }

@@ -16,7 +16,7 @@ libc = "0.2"
 mc-shm-transport = { path = "../../crates/mc-shm-transport", default-features = false }
 napi = { version = "=3.12.2", default-features = false, features = ["napi8"] }
 napi-derive = "=3.6.3"
-rustix = { version = "1.1.4", features = ["fs", "net"] }
+rustix = { version = "1.1.4", features = ["event", "fs", "net"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
