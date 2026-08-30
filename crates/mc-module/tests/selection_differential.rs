@@ -1602,6 +1602,9 @@ fn large_input() -> serde_json::Value {
     serde_json::json!({
         "filePath": "src/a.rs",
         "oldString": "x".repeat(640),
+        "five": "abcde",
+        "six": "abcdef",
+        "unicode_six": "éééééé",
         "items": (0..12).collect::<Vec<u32>>(),
         "nested": {"k": "value", "deep": {"a": 1, "b": "two"}},
         "flag": true,
@@ -2204,6 +2207,70 @@ fn optimized_matches_frozen_reference_for_cross_owner_duplicates() {
         }
     }
     let bits: CtxBits = (0, 0.0, 100_000.0, 0, 0, false, 0, false, false, true);
+
+    let (optimized, expected, _, _) = outcome_pair!(specs, bits);
+    assert_eq!(optimized, expected);
+    assert!(optimized.0.is_empty());
+}
+
+#[test]
+fn optimized_matches_frozen_reference_for_tied_duplicate_ordinals() {
+    let mut specs = Vec::with_capacity(6);
+    for arc in 0..3 {
+        for kind in [KIND_TOOL_CALL, KIND_TOOL_RESULT] {
+            specs.push(ItemSpec {
+                msg: 0,
+                ordinal_slot: 1,
+                role: ROLE_ASSISTANT,
+                kind,
+                tool: 0,
+                input: 0,
+                provider_executed: false,
+                byte_size: 800,
+                token_count: None,
+                arc: Some(arc),
+                frozen: false,
+                agent_drop: false,
+                tag_protected: false,
+                exempt_protected: false,
+            });
+        }
+    }
+    let bits: CtxBits = (0, 0.0, 100_000.0, 0, 0, false, 0, false, false, true);
+
+    let (optimized, expected, _, _) = outcome_pair!(specs, bits);
+    assert_eq!(optimized, expected);
+    assert_eq!(optimized.0.len(), 4);
+    assert!(optimized
+        .0
+        .iter()
+        .all(|(id, _, _)| id != "m0#4" && id != "m0#5"));
+}
+
+#[test]
+fn optimized_matches_frozen_reference_for_distinct_edit_paths() {
+    let mut specs = Vec::with_capacity(4);
+    for (arc, input) in [(0, 0), (1, 1)] {
+        for kind in [KIND_TOOL_CALL, KIND_TOOL_RESULT] {
+            specs.push(ItemSpec {
+                msg: arc,
+                ordinal_slot: arc,
+                role: ROLE_ASSISTANT,
+                kind,
+                tool: 3,
+                input,
+                provider_executed: false,
+                byte_size: 800,
+                token_count: None,
+                arc: Some(arc),
+                frozen: false,
+                agent_drop: false,
+                tag_protected: false,
+                exempt_protected: false,
+            });
+        }
+    }
+    let bits: CtxBits = (0, 0.0, 100_000.0, 0, 0, false, 0, false, true, true);
 
     let (optimized, expected, _, _) = outcome_pair!(specs, bits);
     assert_eq!(optimized, expected);

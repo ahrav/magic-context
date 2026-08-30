@@ -893,6 +893,8 @@ fn fragment() -> impl Strategy<Value = String> {
         Just("compartments compartments compartments messages messages messages".to_string(),),
         Just("implemented implemented implemented".to_string()),
         Just("U: keep this user line untouched".to_string()),
+        Just("u: I just really think this should compress".to_string()),
+        Just(" U: I just really think this should compress".to_string()),
         Just("`inline code with  spaces`".to_string()),
         Just("```rust\nfn nested() { let a = 1; }\n```".to_string()),
         // Protected regions contain removable phrases.
@@ -914,10 +916,16 @@ fn fragment() -> impl Strategy<Value = String> {
         Just("configuration config repository database directory session".to_string()),
         Just("and then afterwards therefore however furthermore additionally".to_string()),
         Just("then after the first step".to_string()),
+        Just("ALPHA AND THEN BETA".to_string()),
+        Just("ALPHA AND BETA OR GAMMA".to_string()),
         Just("alpha as well as beta or gamma".to_string()),
         Just("\u{0}MC_PRES_0\u{0} literal placeholder collision".to_string()),
         Just("`fence with \u{0}MC_PRES_1\u{0} inside` and \u{0} stray NUL".to_string()),
         Just("https://url\u{0}MC_PRES_2\u{0}adjacent".to_string()),
+        Just(
+            "\u{0}MC_PRES_999999999999999999999999999999999999999999999999999999999999999999\u{0}"
+                .to_string()
+        ),
         "[ -~]{0,40}".prop_map(|s| s),
         "\\PC{0,20}".prop_map(|s| s),
     ]
@@ -974,6 +982,30 @@ proptest! {
             );
         }
     }
+}
+
+#[test]
+fn targeted_case_and_placeholder_edges_match_reference() {
+    let cases = [
+        "ALPHA AND THEN BETA",
+        "ALPHA AND BETA OR GAMMA",
+        "u: I just really think this should compress",
+        " U: I just really think this should compress",
+        "\u{0}MC_PRES_999999999999999999999999999999999999999999999999999999999999999999\u{0}",
+    ];
+    for input in cases {
+        for (level, ref_level) in levels() {
+            assert_eq!(
+                compress(input, level),
+                reference::compress(input, ref_level)
+            );
+        }
+    }
+
+    assert_eq!(compress(cases[0], CavemanLevel::Ultra), "ALPHA → BETA");
+    assert_eq!(compress(cases[1], CavemanLevel::Ultra), cases[1]);
+    assert_ne!(compress(cases[2], CavemanLevel::Full), cases[2]);
+    assert_ne!(compress(cases[3], CavemanLevel::Full), cases[3]);
 }
 
 proptest! {
