@@ -20,6 +20,7 @@ import { buildMetamorphicReport, metamorphicExitCode, type MetamorphicReport } f
 import { buildScriptedOutput, runDeterministicMetamorphicEval } from "./runner";
 import { TRANSFORMS, type Transform } from "./transforms";
 import {
+    liveRoleBudgetMs,
     partialReportPath,
     prepareDeterministicOutputPaths,
     prepareLiveOutputPaths,
@@ -1010,6 +1011,17 @@ describe("live metamorphic control tier", () => {
 
         expect(roles).toEqual([]);
         expect(report.tierInvalidReason).toEqual({ kind: "deadline-exhausted", nextRole: "control-a" });
+    });
+
+    test("budgets every declared historian run in a role", () => {
+        const mode = liveMode();
+        const scenario = validScenario();
+        const oneRun = { ...scenario, trigger: { ...scenario.trigger, expectedHistorianRuns: 1 } };
+        const twoRuns = { ...scenario, trigger: { ...scenario.trigger, expectedHistorianRuns: 2 } };
+
+        expect(liveRoleBudgetMs([twoRuns], mode)).toBe(2 * liveRoleBudgetMs([oneRun], mode));
+        expect(liveRoleBudgetMs([oneRun, twoRuns], mode)).toBe(liveRoleBudgetMs([twoRuns], mode));
+        expect(liveRoleBudgetMs(corpus(), mode)).toBeGreaterThan(liveRoleBudgetMs([oneRun], mode));
     });
 
     test("reports a thrown control failure as a control error, not an incomplete run", async () => {

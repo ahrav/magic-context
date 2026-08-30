@@ -390,6 +390,15 @@ export async function runLiveAndWriteReport(
     return report;
 }
 
+/** Probe exchanges carry no named bound, so this is a lower bound on a role rather than a guarantee. commentlint: allow(JUDGE) */
+export function liveRoleBudgetMs(
+    scenarios: readonly HistorianEvalScenario[],
+    mode: LiveMetamorphicOptions["mode"],
+): number {
+    const declaredRuns = Math.max(1, ...scenarios.map((scenario) => scenario.trigger.expectedHistorianRuns));
+    return declaredRuns * historianWaitBudgetMs(mode);
+}
+
 export async function main(args: readonly string[] = Bun.argv.slice(2)): Promise<0 | 1 | 2> {
     const parsed = parseArgs(args);
     /** Output preflight precedes corpus loading and selection, whose throws would otherwise leave a previous green report at the destination. commentlint: allow(JUDGE) */
@@ -410,11 +419,11 @@ export async function main(args: readonly string[] = Bun.argv.slice(2)): Promise
     const selected = selectInputs(corpus, parsed);
     const prepared = prepareLivePreamble(corpus);
     if (prepared === null) return 1;
-    const roleBudgetMs = historianWaitBudgetMs(prepared.mode);
-    /** Refused up front rather than silently declining every role, which would spend the invocation to publish an empty deadline report. commentlint: allow(JUDGE) */
-    if (parsed.deadlineMinutes !== null && parsed.deadlineMinutes * 60_000 < roleBudgetMs) {
+    const roleBudgetMs = liveRoleBudgetMs(selected.scenarios, prepared.mode);
+    /** Inclusive, matching the runner's own gate, so a deadline it would refuse never reaches paid setup. commentlint: allow(JUDGE) */
+    if (parsed.deadlineMinutes !== null && parsed.deadlineMinutes * 60_000 <= roleBudgetMs) {
         console.error(
-            `--deadline-minutes ${parsed.deadlineMinutes} is below one role's budget of ${Math.ceil(roleBudgetMs / 60_000)} minutes; no scenario role could start`,
+            `--deadline-minutes ${parsed.deadlineMinutes} does not exceed one role's budget of ${Math.ceil(roleBudgetMs / 60_000)} minutes; no scenario role could start`,
         );
         return 1;
     }
