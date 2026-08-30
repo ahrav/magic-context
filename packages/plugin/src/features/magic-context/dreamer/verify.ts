@@ -67,6 +67,15 @@ import {
 const VERIFY_BATCH_SIZE = 50;
 const IDENTICAL_PROVIDER_FAILURE_BATCH_LIMIT = 2;
 
+/**
+ * Longest trimmed replacement body an update entry may carry. Applying a longer
+ * body would write a revision no reviewer can read back, so the manifest is
+ * rejected before any write. Exported because a caller that predicts whether
+ * this stage accepts a manifest has to test the same bound, and a second copy of
+ * the number would let the prediction and the gate disagree.
+ */
+export const VERIFY_UPDATE_CONTENT_MAX_LENGTH = 20_000;
+
 interface VerifyBatchResult {
     verified: number;
     updated: number;
@@ -669,7 +678,7 @@ export async function applyVerifyManifest(
     }
     for (const entry of parsed.updated) {
         const content = entry.content.trim();
-        if (!content || content.length > 20_000) {
+        if (!content || content.length > VERIFY_UPDATE_CONTENT_MAX_LENGTH) {
             const error = new Error(`verify update ${entry.publicClaimId} has invalid content`);
             recordDreamerManifestRejection({
                 ...args,

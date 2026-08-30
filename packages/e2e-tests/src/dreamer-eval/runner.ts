@@ -541,7 +541,7 @@ export async function runDreamerEvalTask(
         poolBefore,
         poolAfter,
         rawManifest,
-        parsedManifest: classification.parsedManifest as Record<string, unknown> | unknown[] | null,
+        parsedManifest: classification.parsedManifest,
         receiptOutcomes: receipts.map(({ claimId, operation, outcome: receiptOutcome }) => ({
             claimId,
             operation,

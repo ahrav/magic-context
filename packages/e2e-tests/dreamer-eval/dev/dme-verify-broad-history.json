@@ -193,9 +193,10 @@
         "claim-history-5",
         "claim-history-6",
         "claim-history-7",
-        "claim-history-8"
+        "claim-history-8",
+        "claim-history-9"
       ],
-      "expectedSkippedClaimIds": ["claim-history-9", "claim-history-independent"],
+      "expectedSkippedClaimIds": ["claim-history-independent"],
       "expectedResultMode": "broad",
       "gold": {
         "kind": "verify",
@@ -203,48 +204,63 @@
           {
             "claimId": "claim-history-1",
             "verdict": "verified",
+            "expectedFiles": ["src/history.ts"],
             "requiredUpdateAnchors": [],
             "forbiddenUpdateAnchors": []
           },
           {
             "claimId": "claim-history-2",
             "verdict": "verified",
+            "expectedFiles": ["src/history.ts"],
             "requiredUpdateAnchors": [],
             "forbiddenUpdateAnchors": []
           },
           {
             "claimId": "claim-history-3",
             "verdict": "verified",
+            "expectedFiles": ["src/history.ts"],
             "requiredUpdateAnchors": [],
             "forbiddenUpdateAnchors": []
           },
           {
             "claimId": "claim-history-4",
             "verdict": "verified",
+            "expectedFiles": ["docs/release.md"],
             "requiredUpdateAnchors": [],
             "forbiddenUpdateAnchors": []
           },
           {
             "claimId": "claim-history-5",
             "verdict": "verified",
+            "expectedFiles": ["docs/release.md"],
             "requiredUpdateAnchors": [],
             "forbiddenUpdateAnchors": []
           },
           {
             "claimId": "claim-history-6",
             "verdict": "verified",
+            "expectedFiles": ["docs/release.md"],
             "requiredUpdateAnchors": [],
             "forbiddenUpdateAnchors": []
           },
           {
             "claimId": "claim-history-7",
             "verdict": "verified",
+            "expectedFiles": ["docs/deploy.md"],
             "requiredUpdateAnchors": [],
             "forbiddenUpdateAnchors": []
           },
           {
             "claimId": "claim-history-8",
             "verdict": "verified",
+            "expectedFiles": ["docs/deploy.md"],
+            "requiredUpdateAnchors": [],
+            "forbiddenUpdateAnchors": []
+          },
+          {
+            "claimId": "claim-history-9",
+            "verdict": "verified",
+            "expectedFiles": ["src/health.ts"],
             "requiredUpdateAnchors": [],
             "forbiddenUpdateAnchors": []
           }

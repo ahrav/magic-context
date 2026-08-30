@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { execSync } from "node:child_process";
 import {
     cpSync,
+    mkdirSync,
     mkdtempSync,
     readFileSync,
     rmSync,
@@ -11,6 +12,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { completeRegistryGate } from "./__fixtures__/registry-gate";
 import {
     buildContract,
     canonicalJson,
@@ -22,6 +24,7 @@ import {
     sha256Hex,
     validateContractSchema,
     validateRegistryGate,
+    validateRegistryGateShape,
     validateStopProvenance,
 } from "./generate-mc-host-release-manifest";
 
@@ -31,7 +34,11 @@ const tempRoots: string[] = [];
 function freshRoot(): string {
     const root = mkdtempSync(join(tmpdir(), "mc-host-release-"));
     tempRoots.push(root);
-    cpSync(join(repoRoot, REGISTRY_GATE_PATH), join(root, REGISTRY_GATE_PATH));
+    mkdirSync(join(root, dirname(REGISTRY_GATE_PATH)), { recursive: true });
+    writeFileSync(
+        join(root, REGISTRY_GATE_PATH),
+        `${JSON.stringify(gateCopy(), null, 2)}\n`,
+    );
     return root;
 }
 
@@ -49,7 +56,9 @@ function contractCopy(): any {
 
 // biome-ignore lint/suspicious/noExplicitAny: tests mutate deep copies of the gate
 function gateCopy(): any {
-    return JSON.parse(readFileSync(join(repoRoot, REGISTRY_GATE_PATH), "utf8"));
+    return completeRegistryGate(
+        JSON.parse(readFileSync(join(repoRoot, REGISTRY_GATE_PATH), "utf8")),
+    );
 }
 
 describe("deterministic generation", () => {
@@ -68,7 +77,12 @@ describe("deterministic generation", () => {
     });
 
     test("committed outputs match a clean regeneration (--check green)", () => {
-        const result = generate(repoRoot, { check: true });
+        const root = freshRoot();
+        for (const relative of Object.values(OUTPUT_PATHS)) {
+            mkdirSync(dirname(join(root, relative)), { recursive: true });
+            cpSync(join(repoRoot, relative), join(root, relative));
+        }
+        const result = generate(root, { check: true });
         expect(result.drift).toEqual([]);
     });
 
@@ -276,8 +290,14 @@ describe("pre-build schema", () => {
 });
 
 describe("registry gate", () => {
-    test("the committed gate passes", () => {
+    test("a synthetic complete gate passes while the committed gate stays fail-closed", () => {
         validateRegistryGate(gateCopy(), buildContract());
+        const committed = JSON.parse(
+            readFileSync(join(repoRoot, REGISTRY_GATE_PATH), "utf8"),
+        );
+        expect(() => validateRegistryGate(committed, buildContract())).toThrow(
+            /is not unpublished|ownership not verified/,
+        );
     });
 
     test("generation fails when the gate file is absent", () => {
@@ -389,14 +409,87 @@ describe("registry gate", () => {
         }
     });
 
-    test("a failing gate blocks file generation end to end", () => {
+    test("a malformed gate blocks file generation end to end", () => {
+        const root = freshRoot();
+        const gate = gateCopy();
+        gate.packages[4].name = "@cortexkit/unknown";
+        writeFileSync(join(root, REGISTRY_GATE_PATH), JSON.stringify(gate));
+        expect(() => generate(root, { check: false })).toThrow(
+            /unexpected package/,
+        );
+    });
+
+    test("a fail-closed gate does not block generation but does block publication", () => {
         const root = freshRoot();
         const gate = gateCopy();
         gate.packages[4].synchronized_version_unpublished = false;
         writeFileSync(join(root, REGISTRY_GATE_PATH), JSON.stringify(gate));
-        expect(() => generate(root, { check: false })).toThrow(
+        // The committed gate records a live npm audit and is honestly
+        // fail-closed for most of a release cycle. Generation and drift must
+        // stay usable in that state, or the drift signal is permanently red and
+        // stops catching hand-edited gates; only publication demands readiness.
+        expect(() => generate(root, { check: false })).not.toThrow();
+        expect(() =>
+            validateRegistryGateShape(gate, buildContract()),
+        ).not.toThrow();
+        expect(() => validateRegistryGate(gate, buildContract())).toThrow(
             /is not unpublished/,
         );
+    });
+
+    test("a non-boolean audited field is drift, not a readiness question", () => {
+        const gate = gateCopy();
+        gate.packages[0].synchronized_version_unpublished = "true";
+        expect(() => validateRegistryGateShape(gate, buildContract())).toThrow(
+            /synchronized_version_unpublished .* must be boolean/,
+        );
+    });
+
+    test("an unreserved payload name is shape-valid and readiness-invalid", () => {
+        const gate = gateCopy();
+        gate.packages[3].reservation_version = null;
+        expect(() =>
+            validateRegistryGateShape(gate, buildContract()),
+        ).not.toThrow();
+        expect(() => validateRegistryGate(gate, buildContract())).toThrow(
+            /missing inert reservation version/,
+        );
+    });
+
+    test("a reservation version that is present must still be inert", () => {
+        const gate = gateCopy();
+        gate.packages[3].reservation_version = "0.38.0";
+        expect(() => validateRegistryGateShape(gate, buildContract())).toThrow(
+            /must be an inert prerelease/,
+        );
+    });
+
+    test("a reservation version npm could not publish is rejected", () => {
+        // SemVer §9 forbids leading zeroes in numeric prerelease identifiers, so
+        // npm's parser rejects these outright — a gate accepting one would claim a
+        // reserved name that cannot exist. Same rule for the core version.
+        for (const invalid of [
+            "0.0.1-01",
+            "0.0.1-reserved.01",
+            "01.0.1-reserved.0",
+            "0.0.1-reserved.0+meta",
+        ]) {
+            const gate = gateCopy();
+            gate.packages[3].reservation_version = invalid;
+            expect(
+                () => validateRegistryGateShape(gate, buildContract()),
+                invalid,
+            ).toThrow(/must be an inert prerelease/);
+        }
+        // Alphanumeric identifiers and a bare `0` remain valid prereleases.
+        for (const valid of ["0.0.1-reserved.0", "0.0.1-0", "0.0.1-rc.1"]) {
+            const gate = gateCopy();
+            gate.packages[3].reservation_version = valid;
+            expect(
+                () => validateRegistryGateShape(gate, buildContract()),
+                valid,
+            ).not.toThrow();
+        }
     });
 });
 

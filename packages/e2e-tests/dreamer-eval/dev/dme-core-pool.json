@@ -216,60 +216,70 @@
           {
             "claimId": "claim-cache-primary",
             "verdict": "verified",
+            "expectedFiles": ["src/cache.ts"],
             "requiredUpdateAnchors": [],
             "forbiddenUpdateAnchors": []
           },
           {
             "claimId": "claim-cache-duplicate",
             "verdict": "verified",
+            "expectedFiles": ["src/cache.ts"],
             "requiredUpdateAnchors": [],
             "forbiddenUpdateAnchors": []
           },
           {
             "claimId": "claim-retry-attempts",
             "verdict": "verified",
+            "expectedFiles": ["src/retry.ts"],
             "requiredUpdateAnchors": [],
             "forbiddenUpdateAnchors": []
           },
           {
             "claimId": "claim-retry-backoff",
             "verdict": "verified",
+            "expectedFiles": ["src/retry.ts"],
             "requiredUpdateAnchors": [],
             "forbiddenUpdateAnchors": []
           },
           {
             "claimId": "claim-worker-stale",
             "verdict": "update",
+            "expectedFiles": ["src/workers.ts"],
             "requiredUpdateAnchors": ["8 threads"],
             "forbiddenUpdateAnchors": ["4 threads"]
           },
           {
             "claimId": "claim-feature-enabled",
             "verdict": "verified",
+            "expectedFiles": ["src/uploads.ts"],
             "requiredUpdateAnchors": [],
             "forbiddenUpdateAnchors": []
           },
           {
             "claimId": "claim-feature-disabled",
             "verdict": "archive",
+            "expectedFiles": [],
             "requiredUpdateAnchors": [],
             "forbiddenUpdateAnchors": []
           },
           {
             "claimId": "claim-legacy-queue",
             "verdict": "archive",
+            "expectedFiles": [],
             "requiredUpdateAnchors": [],
             "forbiddenUpdateAnchors": []
           },
           {
             "claimId": "claim-rejected-redis",
             "verdict": "verified",
+            "expectedFiles": ["docs/storage.md"],
             "requiredUpdateAnchors": [],
             "forbiddenUpdateAnchors": []
           },
           {
             "claimId": "claim-release-branch",
             "verdict": "verified",
+            "expectedFiles": ["config/release.ts"],
             "requiredUpdateAnchors": [],
             "forbiddenUpdateAnchors": []
           }

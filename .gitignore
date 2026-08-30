@@ -66,6 +66,7 @@ docs/specs/
 
 # Rust workspace build output
 /target
+/target-*
 
 # Standalone evidence crates under docs/evidence/ (workspace-excluded; compiled
 # ad hoc for verification) — their build output and lockfiles are throwaway.

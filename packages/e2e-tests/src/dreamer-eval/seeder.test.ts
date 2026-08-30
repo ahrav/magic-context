@@ -1,7 +1,8 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeQuietly } from "../../../plugin/src/shared/sqlite-helpers";
@@ -40,10 +41,14 @@ function task(taskName: DreamerTask): DreamerTaskScenario {
     const all = Array.from({ length: 10 }, (_, index) => `claim-${index}`);
     const mapped = all.slice(0, 9);
     const verifyInScope = mapped.slice(0, 8);
+    // Broad re-sweeps already-verified claims, so its scope is every mapped
+    // claim; incremental drops the one carrying a fresh verification.
     const expectedInScopeClaimIds =
         taskName === "map-memories" || taskName === "classify-memories"
             ? all
-            : verifyInScope;
+            : taskName === "verify-broad"
+              ? mapped
+              : verifyInScope;
     return {
         task: taskName,
         preconditions: {
@@ -90,9 +95,10 @@ function task(taskName: DreamerTask): DreamerTaskScenario {
                     }
                   : {
                         kind: "verify",
-                        claims: verifyInScope.map((claimId) => ({
+                        claims: expectedInScopeClaimIds.map((claimId) => ({
                             claimId,
                             verdict: "verified",
+                            expectedFiles: ["src/current.ts"],
                             requiredUpdateAnchors: [],
                             forbiddenUpdateAnchors: [],
                         })),
@@ -200,6 +206,16 @@ describe("dreamer eval seeder", () => {
         });
 
         expect(repeated.mode).toBe("broad");
+        // The seeded verification is the claim incremental would skip, so its
+        // presence here is what distinguishes broad scope from incremental.
+        // Broad orders candidates by verifiedAt then public id, so compare sets.
+        expect(repeated.inScopeClaimIds).toContain("claim-8");
+        expect([...repeated.inScopeClaimIds].sort()).toEqual(
+            [...task("verify-broad").expectedInScopeClaimIds].sort(),
+        );
+        expect(repeated.inScopeClaimIds.length).toBeGreaterThan(
+            task("verify").expectedInScopeClaimIds.length,
+        );
         expect(JSON.stringify(getTaskScheduleState(db, result.projectIdentity, "verify-broad"))).toBe(
             before,
         );
@@ -237,5 +253,238 @@ describe("dreamer eval seeder", () => {
         expect(() => assertFixtureFilesCommitted(result.workdir, ["src/current.ts"])).toThrow(
             "ERROR:fixture-drift: fixture file is not committed: src/current.ts",
         );
+    });
+
+    test("refuses fixture paths that target the git control directory", async () => {
+        const selectedScenario = scenario("map-memories");
+        selectedScenario.pool.claims[0]!.fixtureFiles = [
+            { path: ".git/hooks/pre-commit", content: "#!/bin/sh\nexit 1\n" },
+        ];
+
+        await expect(
+            seedDreamerEvalTask({
+                db: database(),
+                scenario: selectedScenario,
+                task: selectedScenario.tasks[0]!,
+                workdir: workdir(),
+            }),
+        ).rejects.toThrow("ERROR:fixture-drift: fixture path targets the git control directory");
+    });
+
+    test("refuses an alias of a fixture path already declared by another claim", async () => {
+        // `src/current.ts` and `src/./current.ts` resolve to one file, so an
+        // alias would let two claims declare different evidence for the same
+        // path while every per-path check still passed.
+        const selectedScenario = scenario("map-memories");
+        selectedScenario.pool.claims[1]!.fixtureFiles = [
+            { path: "src/./current.ts", content: "export const current = 99;\n" },
+        ];
+
+        await expect(
+            seedDreamerEvalTask({
+                db: database(),
+                scenario: selectedScenario,
+                task: selectedScenario.tasks[0]!,
+                workdir: workdir(),
+            }),
+        ).rejects.toThrow("ERROR:fixture-drift: fixture path is not canonical: src/./current.ts");
+    });
+
+    test("names the claim whose fixture content contradicts an existing path", async () => {
+        const selectedScenario = scenario("map-memories");
+        selectedScenario.pool.claims[1]!.fixtureFiles = [
+            { path: "src/current.ts", content: "export const current = 99;\n" },
+        ];
+
+        await expect(
+            seedDreamerEvalTask({
+                db: database(),
+                scenario: selectedScenario,
+                task: selectedScenario.tasks[0]!,
+                workdir: workdir(),
+            }),
+        ).rejects.toThrow("ERROR:fixture-drift: fixture content conflicts for src/current.ts");
+    });
+
+    test("seeds a workdir nested inside another repository", async () => {
+        // `git rev-parse` walks parents, so probing HEAD before `git init`
+        // resolved the surrounding repository and reported drift that the
+        // run-owned workdir did not have.
+        const outer = workdir();
+        const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+        expect(spawnSync("git", ["init", "--quiet"], { cwd: outer, env }).status).toBe(0);
+        expect(
+            spawnSync(
+                "git",
+                ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "--quiet", "--allow-empty", "--no-gpg-sign", "-m", "outer"],
+                { cwd: outer, env },
+            ).status,
+        ).toBe(0);
+        const nested = join(outer, "nested", "work");
+        mkdirSync(nested, { recursive: true });
+
+        const selectedScenario = scenario("map-memories");
+        const result = await seedDreamerEvalTask({
+            db: database(),
+            scenario: selectedScenario,
+            task: selectedScenario.tasks[0]!,
+            workdir: nested,
+        });
+
+        expect(result.pool.claims).toHaveLength(10);
+        expect(result.preflight.inScopeClaimIds).toEqual(
+            selectedScenario.tasks[0]!.expectedInScopeClaimIds,
+        );
+    });
+
+    test("a claim cannot declare the reserved fixture marker path", async () => {
+        const selectedScenario = scenario("verify");
+        // The marker is rewritten after fixture content is written, so authored
+        // content here would be silently replaced while the tracked-and-clean
+        // commit check still passed.
+        selectedScenario.pool.claims[0]!.fixtureFiles = [
+            { path: ".dreamer-eval-fixture", content: "not the marker\n" },
+        ];
+
+        await expect(
+            seedDreamerEvalTask({
+                db: database(),
+                scenario: selectedScenario,
+                task: selectedScenario.tasks[0]!,
+                workdir: workdir(),
+            }),
+        ).rejects.toThrow("ERROR:fixture-drift: fixture path is reserved: .dreamer-eval-fixture");
+    });
+
+    test("a fixture file cannot nest under another declared fixture file", async () => {
+        const selectedScenario = scenario("verify");
+        // Writing these in either order fails with EEXIST from mkdir or EISDIR
+        // from the write, and that raw filesystem error would escape untyped.
+        selectedScenario.pool.claims[0]!.fixtureFiles = [{ path: "src/config", content: "a\n" }];
+        selectedScenario.pool.claims[1]!.fixtureFiles = [
+            { path: "src/config/settings.ts", content: "b\n" },
+        ];
+
+        await expect(
+            seedDreamerEvalTask({
+                db: database(),
+                scenario: selectedScenario,
+                task: selectedScenario.tasks[0]!,
+                workdir: workdir(),
+            }),
+        ).rejects.toThrow(
+            "ERROR:fixture-drift: fixture path src/config/settings.ts nests under declared file src/config",
+        );
+    });
+
+    test("a claim cannot declare a case alias of the reserved fixture marker", async () => {
+        const selectedScenario = scenario("verify");
+        // A case-insensitive filesystem maps this onto the marker, so the marker
+        // write would replace the authored content while every check passed.
+        selectedScenario.pool.claims[0]!.fixtureFiles = [
+            { path: ".DREAMER-EVAL-FIXTURE", content: "not the marker\n" },
+        ];
+
+        await expect(
+            seedDreamerEvalTask({
+                db: database(),
+                scenario: selectedScenario,
+                task: selectedScenario.tasks[0]!,
+                workdir: workdir(),
+            }),
+        ).rejects.toThrow("ERROR:fixture-drift: fixture path is reserved: .DREAMER-EVAL-FIXTURE");
+    });
+
+    test("two fixture paths cannot differ only by case", async () => {
+        const selectedScenario = scenario("verify");
+        // Every other mapped claim declares src/current.ts, so this differs from
+        // them only in case and would share one file on a case-insensitive
+        // volume.
+        selectedScenario.pool.claims[0]!.fixtureFiles = [{ path: "src/Current.ts", content: "a\n" }];
+
+        await expect(
+            seedDreamerEvalTask({
+                db: database(),
+                scenario: selectedScenario,
+                task: selectedScenario.tasks[0]!,
+                workdir: workdir(),
+            }),
+        ).rejects.toThrow("differ only by case");
+    });
+
+    test("an authored gitignore cannot suppress another fixture file", async () => {
+        const selectedScenario = scenario("verify");
+        // Without --force, `git add` exits nonzero on the ignored path and the
+        // scenario cannot be seeded at all.
+        selectedScenario.pool.claims[0]!.fixtureFiles = [
+            { path: ".gitignore", content: "src/current.ts\n" },
+        ];
+        selectedScenario.tasks[0]!.preconditions.mappings = selectedScenario.tasks[0]!.preconditions.mappings.map(
+            (mapping) => (mapping.claimId === "claim-0" ? { ...mapping, files: [".gitignore"] } : mapping),
+        );
+
+        const result = await seedDreamerEvalTask({
+            db: database(),
+            scenario: selectedScenario,
+            task: selectedScenario.tasks[0]!,
+            workdir: workdir(),
+        });
+
+        expect(result.pool.claims).toHaveLength(10);
+        assertFixtureFilesCommitted(result.workdir, [".gitignore", "src/current.ts"]);
+    });
+
+    test("the contract's latest verification timestamp still seeds", async () => {
+        const selectedScenario = scenario("verify");
+        // The exact ceiling the contract admits: one millisecond more derives a
+        // commit second git rejects outright.
+        const latestAuthorable = 4_102_444_801_999;
+        selectedScenario.tasks[0]!.preconditions.verifications = [
+            { claimId: "claim-8", outcome: "verified", verifiedAt: latestAuthorable },
+        ];
+
+        const result = await seedDreamerEvalTask({
+            db: database(),
+            scenario: selectedScenario,
+            task: selectedScenario.tasks[0]!,
+            workdir: workdir(),
+        });
+
+        expect(result.fixtureCommitTimeMs).toBe(4_102_444_799_000);
+    });
+
+    test("a claim cannot declare a descendant of the fixture marker", async () => {
+        const selectedScenario = scenario("verify");
+        // Writing this creates the marker as a directory, after which the marker
+        // write fails with a raw EISDIR outside the typed fixture-drift path.
+        selectedScenario.pool.claims[0]!.fixtureFiles = [
+            { path: ".dreamer-eval-fixture/payload", content: "x\n" },
+        ];
+
+        await expect(
+            seedDreamerEvalTask({
+                db: database(),
+                scenario: selectedScenario,
+                task: selectedScenario.tasks[0]!,
+                workdir: workdir(),
+            }),
+        ).rejects.toThrow("ERROR:fixture-drift: fixture path is reserved: .dreamer-eval-fixture/payload");
+    });
+
+    test("reports a result mode the production gate did not return", async () => {
+        const selectedScenario = scenario("verify");
+        const selectedTask = selectedScenario.tasks[0]!;
+        // Same candidate set, different mode: what a later cycle re-sweeps
+        // changes, so the scenario is no longer the experiment it declares.
+        selectedTask.expectedResultMode = "full";
+
+        await expect(
+            seedDreamerEvalTask({
+                db: database(),
+                scenario: selectedScenario,
+                task: selectedTask,
+                workdir: workdir(),
+            }),
+        ).rejects.toThrow("ERROR:gate-mismatch: result mode: expected full, got incremental");
     });
 });

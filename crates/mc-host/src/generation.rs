@@ -24,6 +24,7 @@ use rustix::fd::OwnedFd;
 use rustix::fs::{fsync, mkdirat, openat, renameat, unlinkat, AtFlags, Mode, OFlags};
 use sha2::Digest;
 
+use crate::file_mode::raw_mode;
 use crate::instance::{
     hex, io_err, is_safe_ancestor, is_secure_regular, mode_bits, open_secure_dir_existing,
     read_all_fd, secure_runtime_dir, write_all_fd, InstanceError, S_IFDIR, S_IFLNK, S_IFMT,
@@ -406,20 +407,6 @@ fn open_rel_dir_nofollow(dir: &OwnedFd, rel: &str) -> Option<OwnedFd> {
 
 fn owner_uid() -> u32 {
     rustix::process::geteuid().as_raw()
-}
-
-/// Permission bits as rustix's platform-width `RawMode`.
-///
-/// `RawMode` is `u32` on Linux and `u16` on the Darwin targets, while the
-/// manifest commits `mode` as `u32`, so the two cannot meet without an explicit
-/// conversion — leaving it implicit compiles on Linux and fails on Darwin. Only
-/// the permission and set-id bits are meaningful to any caller here, and every
-/// value passed is already within them (0o600 or 0o700 for staged output, and a
-/// manifest mode that validation requires to equal `mode & 0o777`), so the mask
-/// documents that range rather than narrowing a value that could exceed it.
-#[allow(clippy::unnecessary_cast)]
-fn raw_mode(mode: u32) -> rustix::fs::RawMode {
-    (mode & 0o7777) as rustix::fs::RawMode
 }
 
 fn verify_file_against_entry(fd: &OwnedFd, entry: &ManifestFile) -> Result<(), GenerationError> {

@@ -1,10 +1,11 @@
 import { spawnSync } from "node:child_process";
 import {
+    existsSync,
     mkdirSync,
     realpathSync,
     writeFileSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
     readProjectMemoryCurrentState,
     resolveProjectIdentity,
@@ -35,6 +36,8 @@ import {
 
 const CLASSIFY_MIN_POOL = 10;
 const FIXTURE_MARKER = ".dreamer-eval-fixture";
+const NULL_DEVICE = process.platform === "win32" ? "NUL" : "/dev/null";
+const PATH_SEGMENT_RE = /[\\/]/;
 
 type SeederFailureReason = "fixture-drift" | "gate-mismatch";
 
@@ -76,11 +79,34 @@ function fixtureError(detail: string): never {
     throw new DreamerEvalSeederError("fixture-drift", detail);
 }
 
-function git(workdir: string, args: readonly string[], env?: NodeJS.ProcessEnv): string {
+/**
+ * Environment for every fixture git invocation. GIT_DIR, GIT_INDEX_FILE,
+ * GIT_WORK_TREE, and GIT_OBJECT_DIRECTORY override repository discovery, so an
+ * ambient value (a git hook, `git rebase --exec`, or an outer harness) would
+ * redirect these writes at the surrounding repository instead of the run-owned
+ * workdir. Neutralizing global and system config additionally keeps
+ * `core.hooksPath` from running host scripts during the fixture commit.
+ */
+function fixtureGitEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+    const inherited: NodeJS.ProcessEnv = {};
+    for (const [key, value] of Object.entries(process.env)) {
+        if (!key.startsWith("GIT_")) inherited[key] = value;
+    }
+    return {
+        ...inherited,
+        GIT_CONFIG_GLOBAL: NULL_DEVICE,
+        GIT_CONFIG_SYSTEM: NULL_DEVICE,
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_TERMINAL_PROMPT: "0",
+        ...overrides,
+    };
+}
+
+function git(workdir: string, args: readonly string[], overrides?: NodeJS.ProcessEnv): string {
     const result = spawnSync("git", args, {
         cwd: workdir,
         encoding: "utf8",
-        env: env ?? process.env,
+        env: fixtureGitEnv(overrides),
     });
     if (result.status !== 0) {
         const detail = (result.stderr || result.stdout || `exit ${result.status}`).trim();
@@ -93,21 +119,84 @@ function fixturePath(workdir: string, path: string): string {
     if (isAbsolute(path)) fixtureError(`fixture path must be relative: ${path}`);
     const target = resolve(workdir, path);
     const fromRoot = relative(workdir, target);
-    if (fromRoot === "" || fromRoot === ".." || fromRoot.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`)) {
+    if (fromRoot === "" || fromRoot === ".." || fromRoot.startsWith(`..${sep}`)) {
         fixtureError(`fixture path escapes workdir: ${path}`);
+    }
+    // `relative` reports the platform separator, so on Windows the portable
+    // spelling a manifest and `git ls-files` use (`src/file.ts`) comes back as
+    // `src\file.ts`. Compare against a POSIX-normalized copy so forward slashes
+    // stay canonical on every platform; `.` and `..` aliases still differ from
+    // their resolved form and are still rejected.
+    const canonical = sep === "/" ? fromRoot : fromRoot.split(sep).join("/");
+    // Aliases of one target (`src/./a.ts`, `src/sub/../a.ts`) must not reach the
+    // repository. Mapping preconditions, gold file sets, and `git ls-files`
+    // compare the authored string, so two aliases would satisfy every check
+    // while writing one file — the second content silently replacing the first.
+    if (canonical !== path) fixtureError(`fixture path is not canonical: ${path}`);
+    // The marker names the scenario that owns this workdir and is written after
+    // fixture content, so a claim declaring it would have its authored content
+    // silently overwritten. The commit and `assertFixtureFilesCommitted` would
+    // still pass — they only check that the path is tracked and clean — leaving
+    // the evaluation to run against evidence the claim never declared. A
+    // descendant is reserved for a blunter reason: writing it creates the marker
+    // as a directory, and the marker write then fails with a raw EISDIR outside
+    // the typed fixture-drift path. Folded like the `.git` check below, because a
+    // case-insensitive filesystem maps `.DREAMER-EVAL-FIXTURE` onto the same
+    // name.
+    const foldedCanonical = canonical.toLowerCase();
+    if (foldedCanonical === FIXTURE_MARKER || foldedCanonical.startsWith(`${FIXTURE_MARKER}/`)) {
+        fixtureError(`fixture path is reserved: ${path}`);
+    }
+    // The control directory lives inside the workdir but is not fixture
+    // content: a write there steers the seeder's own git invocations, and
+    // `.git/hooks` would execute during the fixture commit.
+    if (fromRoot.split(PATH_SEGMENT_RE).some((segment) => segment.toLowerCase() === ".git")) {
+        fixtureError(`fixture path targets the git control directory: ${path}`);
     }
     return target;
 }
 
-function fixtureFiles(scenario: DreamerEvalScenario): Map<string, string> {
+function fixtureFiles(workdir: string, scenario: DreamerEvalScenario): Map<string, string> {
     const files = new Map<string, string>();
     for (const claim of scenario.pool.claims) {
         for (const file of claim.fixtureFiles) {
+            // Validate before keying: conflict detection must run on the path
+            // that reaches disk, not on the authored spelling.
+            fixturePath(workdir, file.path);
             const existing = files.get(file.path);
             if (existing !== undefined && existing !== file.content) {
                 fixtureError(`fixture content conflicts for ${file.path}`);
             }
             files.set(file.path, file.content);
+        }
+    }
+    // Windows and default macOS volumes map paths differing only in case onto
+    // one file, so two such declarations would share storage and the second
+    // content would replace the first. Folding refuses the ambiguity on every
+    // platform rather than letting the outcome depend on the filesystem the run
+    // lands on, and it gives the nesting check below the same identity rule.
+    const byFoldedPath = new Map<string, string>();
+    for (const path of files.keys()) {
+        const folded = path.toLowerCase();
+        const existing = byFoldedPath.get(folded);
+        if (existing !== undefined) {
+            fixtureError(`fixture paths ${existing} and ${path} differ only by case`);
+        }
+        byFoldedPath.set(folded, path);
+    }
+    // A declared file and a declared descendant of it cannot both exist. The
+    // write loop would fail with EEXIST from mkdir or EISDIR from the write
+    // depending on declaration order, and that raw filesystem error escapes
+    // untyped — bypassing the fixture-drift path a caller matches on. Paths are
+    // canonical and POSIX-normalized by fixturePath, so segment prefixes of one
+    // path are exactly its ancestors.
+    for (const [folded, path] of byFoldedPath) {
+        const segments = folded.split("/");
+        for (let index = 1; index < segments.length; index += 1) {
+            const ancestor = byFoldedPath.get(segments.slice(0, index).join("/"));
+            if (ancestor !== undefined) {
+                fixtureError(`fixture path ${path} nests under declared file ${ancestor}`);
+            }
         }
     }
     return files;
@@ -119,14 +208,20 @@ function prepareFixtureRepository(
     task: DreamerTaskScenario,
     nowMs: number,
 ): number {
-    const existingHead = spawnSync("git", ["rev-parse", "--verify", "HEAD"], {
-        cwd: workdir,
-        stdio: "ignore",
-    });
-    if (existingHead.status === 0) fixtureError("workdir already contains a commit");
+    // Only probe a repository the workdir itself owns. `git rev-parse` walks
+    // parent directories, so an unprobed nested workdir resolves the
+    // surrounding repository's HEAD and reports drift that does not exist.
+    if (existsSync(join(workdir, ".git"))) {
+        const existingHead = spawnSync("git", ["rev-parse", "--verify", "HEAD"], {
+            cwd: workdir,
+            stdio: "ignore",
+            env: fixtureGitEnv(),
+        });
+        if (existingHead.status === 0) fixtureError("workdir already contains a commit");
+    }
 
     git(workdir, ["init", "--quiet"]);
-    const files = fixtureFiles(scenario);
+    const files = fixtureFiles(workdir, scenario);
     for (const [path, content] of files) {
         const target = fixturePath(workdir, path);
         mkdirSync(dirname(target), { recursive: true });
@@ -139,7 +234,10 @@ function prepareFixtureRepository(
     const commitTimeMs = Number.isFinite(firstVerification) ? firstVerification - 2_000 : nowMs - 2_000;
     if (commitTimeMs <= 0) fixtureError("verification timestamps leave no positive fixture commit time");
     const commitDate = new Date(commitTimeMs).toISOString();
-    git(workdir, ["add", "--", FIXTURE_MARKER, ...files.keys()]);
+    // Every path here was explicitly authored and has to be committed for the
+    // evaluation to run, so a fixture-local .gitignore must not suppress one:
+    // without --force `git add` exits nonzero on an ignored path.
+    git(workdir, ["add", "--force", "--", FIXTURE_MARKER, ...files.keys()]);
     git(
         workdir,
         [
@@ -154,7 +252,6 @@ function prepareFixtureRepository(
             `fixture: ${scenario.id}`,
         ],
         {
-            ...process.env,
             GIT_AUTHOR_DATE: commitDate,
             GIT_COMMITTER_DATE: commitDate,
         },
@@ -177,6 +274,7 @@ export function assertFixtureFilesCommitted(workdir: string, paths: readonly str
         const tracked = spawnSync("git", ["ls-files", "--error-unmatch", "--", path], {
             cwd: workdir,
             stdio: "ignore",
+            env: fixtureGitEnv(),
         });
         const status = git(workdir, ["status", "--porcelain", "--", path]);
         if (tracked.status !== 0 || status !== "") {
@@ -250,6 +348,17 @@ export async function preflightDreamerEvalTask(args: {
     const skipped = Object.keys(args.publicClaimIds).filter((claimId) => !inScopeSet.has(claimId));
     assertExpectedSet("in-scope claims", inScope, args.task.expectedInScopeClaimIds);
     assertExpectedSet("skipped claims", skipped, args.task.expectedSkippedClaimIds);
+    // The scenario contract pins a mode for every task: a verify mode for
+    // verify, "broad" for verify-broad, and null for map and classify. A gate
+    // that returns the expected candidates under the wrong mode still
+    // invalidates the experiment, because mode decides what a later cycle
+    // re-sweeps.
+    if (mode !== args.task.expectedResultMode) {
+        throw new DreamerEvalSeederError(
+            "gate-mismatch",
+            `result mode: expected ${args.task.expectedResultMode ?? "none"}, got ${mode ?? "none"}`,
+        );
+    }
     return {
         task: args.task.task,
         mode,
@@ -405,7 +514,13 @@ export async function seedDreamerEvalTask(
             (entry) => entry.verifiedAt,
         );
         if (verificationTimes.length === 0) fixtureError("verify-broad requires seeded verification history");
-        const lastBroadRunAt = Math.min(...verificationTimes) - 1;
+        // partitionVerifyScope keeps a claim whose verifiedAt precedes the broad
+        // cycle start, so the watermark must sit after every seeded
+        // verification. A watermark below them filters the verified claims out
+        // and collapses broad scope onto the never-verified set that
+        // incremental already selects, which is the one behavior broad exists
+        // to differ on.
+        const lastBroadRunAt = Math.max(...verificationTimes) + 1;
         if (lastBroadRunAt <= 0) fixtureError("verify-broad watermark must be positive");
         seedTaskScheduleState(
             options.db,

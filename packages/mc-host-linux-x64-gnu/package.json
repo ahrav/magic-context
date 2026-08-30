@@ -20,6 +20,7 @@
   ],
   "files": [
     "payload",
+    "payload-manifest.json",
     "README.md",
     "LICENSE",
     "NOTICE"
