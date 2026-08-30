@@ -45,6 +45,14 @@ third).
 - **Matrix**: message counts {100, 1400, 2500} × payload {256 B, 2 KiB,
   4 KiB} (tokenizer group), 2 KiB elsewhere, class variants at the
   1,400-message production-shaped point.
+- **Payload labels name the requested `payload_bytes`, not the delivered
+  volume.** `corpus::messages` caps the `tool_call` `command` argument at
+  256 B. Three of every four messages carry the full label; the tool_call
+  quarter carries 256 B, so at a 2 KiB label the session holds
+  `(3*2048 + 256) / (4*2048)` ≈ 78% of `count * payload_bytes` of content.
+  Cells stay comparable across arms because the corpus is seeded and
+  identical on both sides, but do not read a cell label as total tokenized
+  bytes.
 
 ## Groups
 
@@ -110,9 +118,13 @@ the heavier IPC benches; the same hygiene applies here.
 - **Stage counters**: `TransformTimings` isolates `tail_hygiene` and reports
   `tokenize_calls`, `tokenize_cache_hits`, `tokenize_cache_misses`,
   `tokenize_cache_bypassed` (contents under the 64-byte cache threshold),
-  and `tokenize_bytes` per pass (delta of the global cache stats). The
-  counters are process-global: concurrent passes attribute each other's
-  work, so per-pass deltas are trustworthy only single-session.
+  and `tokenize_bytes` per pass. These are deltas of thread-local counters,
+  and a pass holds one thread from its start snapshot to its end snapshot
+  (`apply_once_with_estimator_and_projection` is synchronous and spawns
+  nothing), so a delta counts that pass alone even when concurrent handler
+  tasks tokenize at the same time. `calls` therefore equals
+  `hits + misses + bypassed` exactly. Consumers must classify all five as
+  counters, not millisecond stage samples.
 
 ## Recorded comparison: token-count cache (2026-08-30)
 

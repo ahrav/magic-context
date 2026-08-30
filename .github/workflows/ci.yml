@@ -250,8 +250,8 @@ jobs:
             --test harness_closure \
             --test protocol_vectors
 
-      # The token cache is process-global state; tests that clear or delta
-      # its statics require separate processes, which nextest provides.
+      # Tail-hygiene tests clear the process-global token cache, so they need
+      # the process-per-test isolation nextest provides.
       - name: Module transform and token-cache proofs (Linux)
         if: runner.os == 'Linux'
         run: cargo nextest run -p mc-module --lib

@@ -6,8 +6,8 @@
 //! projected blocks every pass; tail hygiene already computes a per-part
 //! SHA-256, so the lookup key is free on that path.
 
+use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use sha2::{Digest, Sha256};
@@ -28,14 +28,7 @@ struct Generations {
 }
 
 static CACHE: Mutex<Option<Generations>> = Mutex::new(None);
-static HITS: AtomicU64 = AtomicU64::new(0);
-static MISSES: AtomicU64 = AtomicU64::new(0);
-static BYPASSED: AtomicU64 = AtomicU64::new(0);
-static CALLS: AtomicU64 = AtomicU64::new(0);
-static TOKENIZED_BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// Concurrent counter updates can make `calls != hits + misses + bypassed`
-/// in one snapshot.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct TokenCacheStats {
     pub hits: u64,
@@ -45,14 +38,33 @@ pub(crate) struct TokenCacheStats {
     pub tokenized_bytes: u64,
 }
 
-pub(crate) fn stats() -> TokenCacheStats {
-    TokenCacheStats {
-        hits: HITS.load(Ordering::Relaxed),
-        misses: MISSES.load(Ordering::Relaxed),
-        bypassed: BYPASSED.load(Ordering::Relaxed),
-        calls: CALLS.load(Ordering::Relaxed),
-        tokenized_bytes: TOKENIZED_BYTES.load(Ordering::Relaxed),
-    }
+thread_local! {
+    /// Thread-local counters exclude updates from other threads. commentlint: allow(JUDGE)
+    static LOCAL: Cell<TokenCacheStats> = const {
+        Cell::new(TokenCacheStats {
+            hits: 0,
+            misses: 0,
+            bypassed: 0,
+            calls: 0,
+            tokenized_bytes: 0,
+        })
+    };
+}
+
+/// Counters for the calling thread, monotonic for the life of the thread.
+///
+/// `calls` equals `hits + misses + bypassed` in any single reading. commentlint: allow(JUDGE)
+/// Only differences are meaningful. commentlint: allow(JUDGE)
+pub(crate) fn local_stats() -> TokenCacheStats {
+    LOCAL.with(Cell::get)
+}
+
+fn bump_local(update: impl FnOnce(&mut TokenCacheStats)) {
+    LOCAL.with(|local| {
+        let mut stats = local.get();
+        update(&mut stats);
+        local.set(stats);
+    });
 }
 
 fn lock_cache() -> std::sync::MutexGuard<'static, Option<Generations>> {
@@ -78,26 +90,28 @@ fn insert_current(generations: &mut Generations, digest: [u8; 32], count: u32) {
 /// hashes `NUL ‖ content`, which no kind name can prefix.
 /// commentlint: allow(JUDGE)
 pub(crate) fn count_with_digest(digest: [u8; 32], content: &str) -> usize {
-    CALLS.fetch_add(1, Ordering::Relaxed);
+    bump_local(|stats| stats.calls += 1);
     // ponytail: one global lock; shard per digest byte if concurrent sessions
     // ever contend here.
     {
         let mut guard = lock_cache();
         let generations = guard.get_or_insert_with(Generations::default);
         if let Some(&count) = generations.current.get(&digest) {
-            HITS.fetch_add(1, Ordering::Relaxed);
+            bump_local(|stats| stats.hits += 1);
             return count as usize;
         }
         if let Some(&count) = generations.previous.get(&digest) {
-            HITS.fetch_add(1, Ordering::Relaxed);
+            bump_local(|stats| stats.hits += 1);
             insert_current(generations, digest, count);
             return count as usize;
         }
     }
     // Tokenize outside the lock: a 2 KiB payload costs ~80 us and would
     // serialize every concurrent session behind one merge loop.
-    MISSES.fetch_add(1, Ordering::Relaxed);
-    TOKENIZED_BYTES.fetch_add(content.len() as u64, Ordering::Relaxed);
+    bump_local(|stats| {
+        stats.misses += 1;
+        stats.tokenized_bytes += content.len() as u64;
+    });
     let count = mc_tokenizer::estimate_tokens(content);
     // Return counts that exceed u32 uncached to avoid truncated cache hits.
     let Ok(cached) = u32::try_from(count) else {
@@ -119,9 +133,11 @@ pub fn clear() {
 /// caches contents long enough to be worth it.
 pub(crate) fn cached_estimate_tokens(content: &str) -> usize {
     if content.len() < MIN_CACHED_LEN {
-        CALLS.fetch_add(1, Ordering::Relaxed);
-        BYPASSED.fetch_add(1, Ordering::Relaxed);
-        TOKENIZED_BYTES.fetch_add(content.len() as u64, Ordering::Relaxed);
+        bump_local(|stats| {
+            stats.calls += 1;
+            stats.bypassed += 1;
+            stats.tokenized_bytes += content.len() as u64;
+        });
         return mc_tokenizer::estimate_tokens(content);
     }
     // The leading NUL keeps this key domain disjoint from tail hygiene's
@@ -164,9 +180,9 @@ mod tests {
         let digest: [u8; 32] = Sha256::digest(content.as_bytes()).into();
         let expected = mc_tokenizer::estimate_tokens(&content);
         assert_eq!(count_with_digest(digest, &content), expected);
-        let before = stats();
+        let before = local_stats();
         assert_eq!(count_with_digest(digest, &content), expected);
-        let after = stats();
+        let after = local_stats();
         assert_eq!(after.hits, before.hits + 1);
         assert_eq!(after.misses, before.misses);
     }
@@ -199,13 +215,14 @@ mod tests {
 
     #[test]
     fn stats_partition_calls_into_hits_misses_and_bypassed() {
-        let long = "stats partition fixture: unique sentence long enough to clear the cache threshold";
+        let long =
+            "stats partition fixture: unique sentence long enough to clear the cache threshold";
         assert!(long.len() >= MIN_CACHED_LEN);
-        let before = stats();
+        let before = local_stats();
         cached_estimate_tokens("tiny");
         cached_estimate_tokens(long);
         cached_estimate_tokens(long);
-        let after = stats();
+        let after = local_stats();
         assert_eq!(after.calls - before.calls, 3);
         assert_eq!(after.bypassed - before.bypassed, 1);
         assert_eq!(after.misses - before.misses, 1);

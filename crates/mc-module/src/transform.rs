@@ -1323,14 +1323,12 @@ pub struct TransformTimings {
     pub cache_dirty_skips: usize,
 }
 
-/// Render the one-line, greppable timing record emitted after the response splice.
-///
-/// Session ids are made whitespace-safe because each field is parsed as one `key=value` token.
+/// Record this pass's token-cache counter deltas into `timings`. commentlint: allow(JUDGE)
 fn record_token_cache_delta(
     timings: &mut TransformTimings,
     start: crate::token_cache::TokenCacheStats,
 ) {
-    let now = crate::token_cache::stats();
+    let now = crate::token_cache::local_stats();
     timings.tokenize_calls = now.calls.saturating_sub(start.calls) as usize;
     timings.tokenize_cache_hits = now.hits.saturating_sub(start.hits) as usize;
     timings.tokenize_cache_misses = now.misses.saturating_sub(start.misses) as usize;
@@ -1338,6 +1336,9 @@ fn record_token_cache_delta(
     timings.tokenize_bytes = now.tokenized_bytes.saturating_sub(start.tokenized_bytes) as usize;
 }
 
+/// Render the one-line, greppable timing record emitted after the response splice.
+///
+/// Session ids are made whitespace-safe because each field is parsed as one `key=value` token.
 pub fn format_pass_timing_line(
     session_id: &str,
     timings: &TransformTimings,
@@ -2207,7 +2208,7 @@ fn pass_scheduler_observation(
 
 /// The retry wrapper around [`apply_once`], parameterized by the token estimator so tests
 /// can inject a panicking/counting one to prove the estimator is HARD-only (never called
-/// on SOFT/defer). Production always passes [`mc_tokenizer::estimate_tokens`].
+/// on SOFT/defer). Production always passes [`crate::token_cache::cached_estimate_tokens`]. commentlint: allow(JUDGE)
 fn apply_once_with_estimator(
     store: &McStore,
     req: &TransformRequest,
@@ -2765,7 +2766,7 @@ fn apply_additive_only(
         projection_projected_messages: req.messages.len(),
         ..TransformTimings::default()
     };
-    let token_cache_stats_at_start = crate::token_cache::stats();
+    let token_cache_stats_at_start = crate::token_cache::local_stats();
     if let Some(id) = duplicate_ids(&projection.blocks) {
         return Err(TransformError::DuplicateBlockId(id));
     }
@@ -3274,7 +3275,7 @@ fn apply_once(
     }
     let total_started_at = Instant::now();
     let mut timings = TransformTimings::default();
-    let token_cache_stats_at_start = crate::token_cache::stats();
+    let token_cache_stats_at_start = crate::token_cache::local_stats();
     let mut m1_revision_read_timings = M1RevisionReadTimings::default();
     // OpenCode transports the frozen todo pair as one marked tool part. Older adapters did not
     // copy that marker into CK metadata, so recognize the reserved call-id namespace here too.

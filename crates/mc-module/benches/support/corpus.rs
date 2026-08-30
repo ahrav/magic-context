@@ -161,6 +161,10 @@ fn truncate_at_char_boundary(mut s: String, max: usize) -> String {
 
 /// A session-shaped ingress array: repeating user → assistant → tool_call →
 /// tool_result turns, `payload_bytes` of class content per message.
+///
+/// The `tool_call` `command` argument is capped at 256 bytes. commentlint: allow(JUDGE)
+/// A `payload_bytes` above that leaves three full-size messages per four. commentlint: allow(JUDGE)
+/// Cell labels name `payload_bytes`, not the resulting tokenized volume. commentlint: allow(JUDGE)
 pub fn messages(
     class: ContentClass,
     count: usize,
