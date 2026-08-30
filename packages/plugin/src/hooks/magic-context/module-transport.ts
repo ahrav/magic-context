@@ -153,9 +153,7 @@ function closureCandidate(
     resolvePath: (path: string) => string,
 ): { manifest_sha256: string; source_roots: Record<string, string> } | undefined {
     const platform =
-        process.platform === "linux" && process.arch === "x64"
-            ? "linux-x64-gnu"
-            : undefined;
+        process.platform === "linux" && process.arch === "x64" ? "linux-x64-gnu" : undefined;
     if (platform === undefined || !closure.platforms.includes(platform)) {
         return undefined;
     }
