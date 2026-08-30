@@ -120,22 +120,40 @@ async function main(): Promise<0 | 1 | 2> {
     mkdirSync(args.outputDir, { recursive: true });
     const reports: DreamerEvalRunReport[] = [];
     let aggregationFailed = false;
+    let runFailed = false;
     const version = opencodeVersion();
     for (const { scenario, task } of groups) {
+        if (runFailed) break;
         const groupDir = join(args.outputDir, scenario.id, task.task);
         const groupReportPaths: string[] = [];
         for (let repeat = 1; repeat <= args.repeat; repeat += 1) {
             console.log(`${scenario.id}/${task.task}: run ${repeat}/${args.repeat}`);
-            const report = await runDreamerEvalTask(scenario, task, {
-                apiKey,
-                model,
-                artifactDir: groupDir,
-                opencodeVersion: version,
-            });
+            // A task classifies its own failures into an ERROR report, so a throw
+            // here is structural — provenance, or the artifact write. Letting it
+            // escape would reach the outer catch, which exits 1 without consulting
+            // the reports already collected, dropping a previous repeat's safety
+            // exit 2. Stop instead of continuing: a structural fault repeats, and
+            // every further repeat would spend model credits to fail the same way.
+            let report: DreamerEvalRunReport;
+            try {
+                report = await runDreamerEvalTask(scenario, task, {
+                    apiKey,
+                    model,
+                    artifactDir: groupDir,
+                    opencodeVersion: version,
+                });
+            } catch (error) {
+                runFailed = true;
+                console.error(
+                    `${scenario.id}/${task.task}: run ${repeat} failed: ${error instanceof Error ? error.message : String(error)}`,
+                );
+                break;
+            }
             groupReportPaths.push(join(groupDir, `${report.runId}.json`));
             reports.push(report);
             console.log(`${report.runId}: ${report.status}${report.reason === null ? "" : `:${report.reason}`}`);
         }
+        if (groupReportPaths.length === 0) continue;
         // A failure here must not swallow what the runs already established. The
         // outer catch exits 1 unconditionally, so letting this throw would downgrade
         // an applied wrong archival's safety exit 2 to 1 because a later artifact or
@@ -152,7 +170,7 @@ async function main(): Promise<0 | 1 | 2> {
     }
     const code = dreamerEvalExitCode(reports);
     // A run-fatal set keeps exit 2; anything else fails the run.
-    return code === 2 ? code : aggregationFailed ? 1 : code;
+    return code === 2 ? code : aggregationFailed || runFailed ? 1 : code;
 }
 
 if (import.meta.main) {

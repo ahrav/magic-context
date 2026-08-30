@@ -337,6 +337,19 @@ function parseFilePath(value: unknown, label: string): string {
     return path;
 }
 
+/**
+ * An absolute host path, not a manifest path. The fixture worktree lives under the
+ * host temp directory, which may legitimately contain a comma, a quote, or edge
+ * whitespace — characters `parseFilePath` forbids because a manifest lists paths
+ * comma-separated inside an XML attribute. Applying that rule here would reject an
+ * otherwise valid report for the shape of the machine's temp directory.
+ */
+function parseHostDirectory(value: unknown, label: string): string {
+    const path = string(value, label);
+    if (!/^(?:[/\\]|[A-Za-z]:[/\\])/.test(path)) fail(`${label}: path-not-absolute`);
+    return path;
+}
+
 function parseFilePathArray(raw: unknown, label: string): string[] {
     const values = array(raw, label).map((entry, index) => parseFilePath(entry, `${label}[${index}]`));
     unique(values, label);
@@ -1380,7 +1393,7 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
         runFatal,
         system: parseSystem(root.system, `${label}.system`),
         trackedFiles: parseFilePathArray(root.trackedFiles, `${label}.trackedFiles`),
-        fixtureRoot: root.fixtureRoot === null ? null : parseFilePath(root.fixtureRoot, `${label}.fixtureRoot`),
+        fixtureRoot: root.fixtureRoot === null ? null : parseHostDirectory(root.fixtureRoot, `${label}.fixtureRoot`),
         poolBefore,
         poolAfter,
         rawManifest,
