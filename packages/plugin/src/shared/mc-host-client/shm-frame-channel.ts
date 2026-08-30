@@ -342,49 +342,52 @@ export class ShmFrameChannel implements SetupFrameChannel {
         if (this.closed) return;
         try {
             for (let frames = 0; frames < 64; frames += 1) {
-                if (!this.attached().drainOne((nativeLease: NativeReceiveLease) => {
-                    const header = decodeHeader(nativeLease.header);
-                    const violation = headerViolation(header);
-                    const structuralError =
-                        header.ver !== PROTOCOL_VERSION
-                            ? "unsupported protocol version"
-                            : header.len !== nativeLease.byteLength
-                              ? "ring frame length mismatch"
-                              : header.len > this.options.maxBodyLen
-                                ? "ring frame exceeds configured body limit"
-                                : null;
-                    if (structuralError !== null || violation !== null) {
-                        nativeLease.release();
-                        throw new InboundFrameError(
-                            violation?.reason ?? "protocol_violation",
-                            structuralError ?? violation?.detail ?? "invalid ring frame",
-                        );
-                    }
-                    const segments = Array.from({ length: nativeLease.segmentCount }, (_, index) =>
-                        nativeLease.segment(index),
-                    );
-                    let lease: ReceiveLease;
-                    lease = new ReceiveLease(
-                        segments,
-                        (outcome) => {
-                            this.receiveLeases.delete(lease);
-                            if (outcome === "quarantined") this.quarantinedBytes += header.len;
-                            this.options.handlers.onLeaseReleased?.();
-                        },
-                        this.copies,
-                        () => {
+                if (
+                    !this.attached().drainOne((nativeLease: NativeReceiveLease) => {
+                        const header = decodeHeader(nativeLease.header);
+                        const violation = headerViolation(header);
+                        const structuralError =
+                            header.ver !== PROTOCOL_VERSION
+                                ? "unsupported protocol version"
+                                : header.len !== nativeLease.byteLength
+                                  ? "ring frame length mismatch"
+                                  : header.len > this.options.maxBodyLen
+                                    ? "ring frame exceeds configured body limit"
+                                    : null;
+                        if (structuralError !== null || violation !== null) {
                             nativeLease.release();
-                            return "released";
-                        },
-                    );
-                    this.receiveLeases.add(lease);
-                    try {
-                        this.options.handlers.onFrame({ header, body: lease });
-                    } catch (error) {
-                        lease.release();
-                        throw error;
-                    }
-                })) {
+                            throw new InboundFrameError(
+                                violation?.reason ?? "protocol_violation",
+                                structuralError ?? violation?.detail ?? "invalid ring frame",
+                            );
+                        }
+                        const segments = Array.from(
+                            { length: nativeLease.segmentCount },
+                            (_, index) => nativeLease.segment(index),
+                        );
+                        let lease: ReceiveLease;
+                        lease = new ReceiveLease(
+                            segments,
+                            (outcome) => {
+                                this.receiveLeases.delete(lease);
+                                if (outcome === "quarantined") this.quarantinedBytes += header.len;
+                                this.options.handlers.onLeaseReleased?.();
+                            },
+                            this.copies,
+                            () => {
+                                nativeLease.release();
+                                return "released";
+                            },
+                        );
+                        this.receiveLeases.add(lease);
+                        try {
+                            this.options.handlers.onFrame({ header, body: lease });
+                        } catch (error) {
+                            lease.release();
+                            throw error;
+                        }
+                    })
+                ) {
                     // Readiness includes setup-socket closure. Check only after an empty drain so graceful Goodbye reaches dispatcher first. commentlint: allow(JUDGE)
                     if (this.attached().peerClosed()) {
                         this.options.handlers.onClosed("eof", undefined);

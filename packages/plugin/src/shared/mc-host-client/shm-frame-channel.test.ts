@@ -612,9 +612,9 @@ describe("mandatory shared-memory channel", () => {
         }
         publish(pair.second, responseHeader(FrameType.Response, 99n, 0), new Uint8Array());
 
-        expect(() =>
-            channel.produce(responseHeader(FrameType.Request, 100n, 0), body),
-        ).toThrow(McHostCallError);
+        expect(() => channel.produce(responseHeader(FrameType.Request, 100n, 0), body)).toThrow(
+            McHostCallError,
+        );
         await waitUntil(() => received.length === 1);
         expect(received).toEqual([99n]);
 

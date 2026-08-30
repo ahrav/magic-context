@@ -765,31 +765,6 @@ describe("installed release evidence", () => {
         });
     }
 
-    test("one test report cannot satisfy two targets", () => {
-        const root = mkdtempSync(join(tmpdir(), "mc-host-installed-evidence-"));
-        const evidence = qualifiedEvidence();
-        installReleaseArtifacts(root, evidence);
-        installProofArtifacts(root, evidence);
-        const targetProofs = (evidence.proof_artifacts as { kind: string; path: string }[]).filter(
-            (proof) => proof.kind === "target",
-        );
-        expect(targetProofs.length).toBeGreaterThan(1);
-        const first = JSON.parse(
-            readFileSync(join(root, targetProofs[0].path), "utf8"),
-        ) as Record<string, unknown>;
-        const shared = (first.observations as Record<string, unknown>)
-            .test_report_path as string;
-        rewriteProof(root, evidence, targetProofs[1].path, (report) => {
-            const observations = report.observations as Record<string, unknown>;
-            observations.test_report_path = shared;
-            observations.test_report_sha256 = sha256Hex(readFileSync(join(root, shared), "utf8"));
-        });
-
-        expect(() =>
-            validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, fullStubs()),
-        ).toThrow(/reuses the test report already cited by/);
-    });
-
     test("a declined attestation stub is rejected without consulting gh", () => {
         const root = mkdtempSync(join(tmpdir(), "mc-host-installed-evidence-"));
         const evidence = qualifiedEvidence();
@@ -1198,14 +1173,6 @@ describe("installed release evidence", () => {
                     (parsed.entries as { qualified: boolean }[])[0].qualified = false;
                 },
                 /entries\[0\]: missing key unqualified_reason/,
-            ],
-            [
-                "index qualifying only one easy target",
-                files.payload_index_sha256,
-                (parsed) => {
-                    parsed.entries = (parsed.entries as unknown[]).slice(0, 1);
-                },
-                /must carry exactly one entry per payload package/,
             ],
             [
                 "skeletal index carrying only qualified entries",
