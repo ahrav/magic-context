@@ -48,6 +48,59 @@ fn open_profiled() -> (tempfile::TempDir, Connection) {
     (dir, conn)
 }
 
+/// Append a `commit_log` row and return its allocated `commit_seq`.
+fn next_commit(conn: &Connection, transaction_id: &str) -> i64 {
+    conn.execute(
+        "INSERT INTO commit_log(transaction_id, writer_epoch, recorded_at, actor, cause)
+         VALUES (?1, 1, 1, 'test', 'fixture')",
+        [transaction_id],
+    )
+    .unwrap();
+    conn.last_insert_rowid()
+}
+
+/// Bootstrap the registry/domain cycle so later fixtures have a valid domain.
+fn seed_root_domain(conn: &mut Connection) -> i64 {
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    tx.execute(
+        "INSERT INTO commit_log(transaction_id, writer_epoch, recorded_at, actor, cause)
+         VALUES ('tx-root', 1, 1, 'test', 'root')",
+        [],
+    )
+    .unwrap();
+    let commit_seq = tx.last_insert_rowid();
+    tx.execute(
+        "INSERT INTO domains(domain_id, object_id, name, created_commit_seq, sensitivity_class)
+         VALUES ('domain-1', 'object-domain-1', 'root', ?1, 'internal')",
+        [commit_seq],
+    )
+    .unwrap();
+    tx.execute(
+        "INSERT INTO object_registry(
+             object_id, object_kind, domain_id, source_kind, source_id, source_revision,
+             created_commit_seq, sensitivity_class
+         ) VALUES ('object-domain-1', 'domain', 'domain-1', 'test', 'root', 1, ?1, 'internal')",
+        [commit_seq],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    commit_seq
+}
+
+/// Register a canonical object so a typed row can reference it.
+fn seed_object(conn: &Connection, object_id: &str, object_kind: &str, commit_seq: i64) {
+    conn.execute(
+        "INSERT INTO object_registry(
+             object_id, object_kind, domain_id, source_kind, source_id, source_revision,
+             created_commit_seq, sensitivity_class
+         ) VALUES (?1, ?2, 'domain-1', 'test', ?1, 1, ?3, 'internal')",
+        params![object_id, object_kind, commit_seq],
+    )
+    .unwrap();
+}
+
 #[test]
 fn kernel_schema_has_one_ordered_full_shape() {
     let (_dir, mut conn) = open_profiled();
@@ -76,7 +129,7 @@ fn kernel_schema_has_one_ordered_full_shape() {
 }
 
 const PINNED_SCHEMA_DIGEST: &str =
-    "bc9a2b9d8a63fa552e117a420bdd7a7e362da09064fc24919c5c5f777b8b4f53";
+    "ca1ee7fb16048d86186ed2e36fed6a05b170094e4fab8ec3ec9566cff57f50a6";
 
 #[test]
 fn kernel_schema_digest_is_pinned_to_the_frozen_v1_shape() {
@@ -380,11 +433,18 @@ fn abandonment_audit_survives_consumer_deletion() {
     )
     .unwrap();
     conn.execute(
+        "INSERT INTO commit_log(transaction_id, writer_epoch, recorded_at, actor, cause)
+         VALUES ('tx-abandon', 7, 10, 'operator-1', 'abandonment')",
+        [],
+    )
+    .unwrap();
+    let commit_seq = conn.last_insert_rowid();
+    conn.execute(
         "INSERT INTO consumer_abandonments(
              abandonment_id, consumer_id, operator_id, last_checkpoint_outbox_position,
-             reason, abandoned_at
-         ) VALUES ('abandon-1', 'search', 'operator-1', 9, 'retired', 11)",
-        [],
+             reason, commit_seq, abandoned_at
+         ) VALUES ('abandon-1', 'search', 'operator-1', 9, 'retired', ?1, 11)",
+        [commit_seq],
     )
     .unwrap();
     conn.execute(
@@ -398,5 +458,228 @@ fn abandonment_audit_survives_consumer_deletion() {
         })
         .unwrap(),
         1
+    );
+}
+
+#[test]
+fn superseded_predicate_schema_replacement_reuses_its_name() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    let created = seed_root_domain(&mut conn);
+
+    seed_object(&conn, "object-pred-1", "predicate_schema", created);
+    conn.execute(
+        "INSERT INTO predicate_schemas(
+             predicate_schema_id, object_id, domain_id, predicate_name, value_schema,
+             freshness_class, created_commit_seq, sensitivity_class
+         ) VALUES ('pred-1', 'object-pred-1', 'domain-1', 'owner', X'01', 'stable', ?1,
+                   'internal')",
+        [created],
+    )
+    .unwrap();
+
+    // R8 correction: bind the predecessor's invalidation and append a successor
+    // that keeps the same domain-scoped predicate name.
+    let corrected = next_commit(&conn, "tx-correct");
+    seed_object(&conn, "object-pred-2", "predicate_schema", corrected);
+    conn.execute(
+        "UPDATE predicate_schemas
+            SET invalidated_commit_seq = ?1, superseded_by = 'object-pred-2'
+          WHERE predicate_schema_id = 'pred-1'",
+        [corrected],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO predicate_schemas(
+             predicate_schema_id, object_id, domain_id, predicate_name, value_schema,
+             freshness_class, created_commit_seq, sensitivity_class
+         ) VALUES ('pred-2', 'object-pred-2', 'domain-1', 'owner', X'02', 'stable', ?1,
+                   'internal')",
+        [corrected],
+    )
+    .expect("successor must reuse the invalidated predicate name");
+
+    // Exactly one active row may hold the name at a time.
+    let third = next_commit(&conn, "tx-third");
+    seed_object(&conn, "object-pred-3", "predicate_schema", third);
+    assert!(conn
+        .execute(
+            "INSERT INTO predicate_schemas(
+                 predicate_schema_id, object_id, domain_id, predicate_name, value_schema,
+                 freshness_class, created_commit_seq, sensitivity_class
+             ) VALUES ('pred-3', 'object-pred-3', 'domain-1', 'owner', X'03', 'stable', ?1,
+                       'internal')",
+            [third],
+        )
+        .is_err());
+}
+
+#[test]
+fn superseded_domain_and_relation_names_are_reusable_once_invalidated() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    let created = seed_root_domain(&mut conn);
+    let corrected = next_commit(&conn, "tx-correct");
+
+    conn.execute(
+        "UPDATE domains SET invalidated_commit_seq = ?1 WHERE domain_id = 'domain-1'",
+        [corrected],
+    )
+    .unwrap();
+    seed_object(&conn, "object-domain-2", "domain", corrected);
+    conn.execute(
+        "INSERT INTO domains(domain_id, object_id, name, created_commit_seq, sensitivity_class)
+         VALUES ('domain-2', 'object-domain-2', 'root', ?1, 'internal')",
+        [corrected],
+    )
+    .expect("successor domain must reuse the invalidated name");
+
+    seed_object(&conn, "object-rel-1", "relation", created);
+    conn.execute(
+        "INSERT INTO relation_registry(
+             relation_id, object_id, relation_name, source_kind, target_kind, symmetry,
+             cardinality, created_commit_seq, invalidated_commit_seq, sensitivity_class
+         ) VALUES ('rel-1', 'object-rel-1', 'depends_on', 'entity', 'entity', 'directed',
+                   'many_to_many', ?1, ?2, 'internal')",
+        params![created, corrected],
+    )
+    .unwrap();
+    seed_object(&conn, "object-rel-2", "relation", corrected);
+    conn.execute(
+        "INSERT INTO relation_registry(
+             relation_id, object_id, relation_name, source_kind, target_kind, symmetry,
+             cardinality, created_commit_seq, sensitivity_class
+         ) VALUES ('rel-2', 'object-rel-2', 'depends_on', 'entity', 'entity', 'directed',
+                   'many_to_many', ?1, 'internal')",
+        [corrected],
+    )
+    .expect("successor relation must reuse the invalidated name");
+}
+
+#[test]
+fn inverted_and_empty_validity_intervals_are_refused() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    let created = seed_root_domain(&mut conn);
+    let later = next_commit(&conn, "tx-later");
+
+    seed_object(&conn, "object-entity-1", "entity", later);
+    let insert_entity = |invalidated: i64| {
+        conn.execute(
+            "INSERT INTO entities(
+                 entity_id, object_id, domain_id, entity_kind, canonical_name,
+                 created_commit_seq, invalidated_commit_seq, sensitivity_class
+             ) VALUES ('entity-1', 'object-entity-1', 'domain-1', 'service', 'api', ?1, ?2,
+                       'internal')",
+            params![later, invalidated],
+        )
+    };
+    // Inverted: invalidation precedes creation.
+    assert!(insert_entity(created).is_err());
+    // Empty: `created <= N < invalidated` selects no snapshot.
+    assert!(insert_entity(later).is_err());
+
+    let after = next_commit(&conn, "tx-after");
+    insert_entity(after).expect("invalidation after creation is a legal interval");
+}
+
+#[test]
+fn format_marker_rejects_update_and_delete() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+
+    assert!(conn
+        .execute(
+            "UPDATE mc_kernel_format_marker SET format_epoch = 2 WHERE singleton = 1",
+            [],
+        )
+        .is_err());
+    assert!(conn
+        .execute("UPDATE mc_kernel_format_marker SET schema_digest = 'x'", [])
+        .is_err());
+    assert!(conn
+        .execute("DELETE FROM mc_kernel_format_marker", [])
+        .is_err());
+
+    let (epoch, incarnation): (i64, String) = conn
+        .query_row(
+            "SELECT format_epoch, database_incarnation_id FROM mc_kernel_format_marker",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(epoch, 1);
+    assert_eq!(incarnation, "incarnation-1");
+}
+
+#[test]
+fn one_source_revision_admits_many_objects_of_one_kind() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    let created = seed_root_domain(&mut conn);
+
+    // One extraction over one file revision yields many propositions; object
+    // identity is the object id, not the source triple.
+    for object_id in ["object-prop-1", "object-prop-2"] {
+        conn.execute(
+            "INSERT INTO object_registry(
+                 object_id, object_kind, domain_id, source_kind, source_id, source_revision,
+                 created_commit_seq, sensitivity_class
+             ) VALUES (?1, 'proposition', 'domain-1', 'file', 'src/lib.rs', 7, ?2, 'internal')",
+            params![object_id, created],
+        )
+        .expect("a source revision may yield many objects of one kind");
+    }
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM object_registry WHERE object_kind = 'proposition'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn canonical_evidence_delete_is_refused_while_referenced() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    let created = seed_root_domain(&mut conn);
+
+    seed_object(&conn, "object-ev-1", "evidence", created);
+    conn.execute(
+        "INSERT INTO evidence_meta(
+             evidence_id, object_id, artifact_reference, artifact_digest, byte_length,
+             media_type, retention_class, provider_egress_class, redaction_metadata,
+             created_commit_seq, sensitivity_class
+         ) VALUES ('ev-1', 'object-ev-1', 'cas://a', 'digest-a', 3, 'text/plain', 'standard',
+                   'internal', X'7b7d', ?1, 'internal')",
+        [created],
+    )
+    .unwrap();
+    seed_object(&conn, "object-obs-1", "observation", created);
+    conn.execute(
+        "INSERT INTO observations(
+             observation_id, object_id, evidence_id, observation_kind, observation_payload,
+             observed_at, created_commit_seq, sensitivity_class
+         ) VALUES ('obs-1', 'object-obs-1', 'ev-1', 'measured', X'01', 5, ?1, 'internal')",
+        [created],
+    )
+    .unwrap();
+
+    // R8 forbids canonical DELETE; RESTRICT refuses rather than silently
+    // nulling the link and losing the historical association.
+    assert!(conn
+        .execute("DELETE FROM evidence_meta WHERE evidence_id = 'ev-1'", [])
+        .is_err());
+    assert_eq!(
+        conn.query_row(
+            "SELECT evidence_id FROM observations WHERE observation_id = 'obs-1'",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .unwrap(),
+        Some("ev-1".to_string())
     );
 }
