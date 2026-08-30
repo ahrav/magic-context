@@ -8,7 +8,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use super::schema::{
@@ -24,6 +24,7 @@ const BUSY_TIMEOUT_MS: i64 = 5_000;
 const READ_POOL_SIZE: usize = 2;
 const RESET_MARKER_PROTOCOL: &str = "mc-kernel-reset-marker-v1";
 const RESET_MARKER_SUFFIX: &str = ".mc-reset";
+const RESTORE_MARKER_SUFFIX: &str = ".mc-restore";
 const QUARANTINE_INFIX: &str = ".mc-quarantine-";
 const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 
@@ -44,6 +45,10 @@ pub enum KernelError {
     NoRequiredConsumers,
     ConsumerPending,
     Fault,
+    Deadline,
+    UnsafeDestination,
+    InvalidBackup,
+    InvalidRestore,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +68,10 @@ pub enum KernelErrorKind {
     NoRequiredConsumers,
     ConsumerPending,
     Fault,
+    Deadline,
+    UnsafeDestination,
+    InvalidBackup,
+    InvalidRestore,
 }
 
 impl KernelError {
@@ -83,6 +92,10 @@ impl KernelError {
             Self::NoRequiredConsumers => KernelErrorKind::NoRequiredConsumers,
             Self::ConsumerPending => KernelErrorKind::ConsumerPending,
             Self::Fault => KernelErrorKind::Fault,
+            Self::Deadline => KernelErrorKind::Deadline,
+            Self::UnsafeDestination => KernelErrorKind::UnsafeDestination,
+            Self::InvalidBackup => KernelErrorKind::InvalidBackup,
+            Self::InvalidRestore => KernelErrorKind::InvalidRestore,
         }
     }
 }
@@ -105,6 +118,10 @@ impl fmt::Display for KernelError {
             Self::NoRequiredConsumers => "outbox pruning requires at least one consumer",
             Self::ConsumerPending => "outbox consumer has not reached the commit-log tip",
             Self::Fault => "kernel operation was interrupted",
+            Self::Deadline => "kernel operation exceeded its deadline",
+            Self::UnsafeDestination => "kernel backup destination is unsafe",
+            Self::InvalidBackup => "kernel backup could not be verified",
+            Self::InvalidRestore => "kernel restore source could not be verified",
         })
     }
 }
@@ -119,9 +136,11 @@ impl std::error::Error for KernelError {}
 
 pub struct KernelStore {
     writer: Mutex<Connection>,
-    readers: Vec<Mutex<Connection>>,
+    pub(super) readers: Vec<Mutex<Connection>>,
     next_reader: AtomicUsize,
+    poisoned: AtomicBool,
     lease_epoch: u64,
+    pub(super) db_path: PathBuf,
     _lease: Box<dyn LeaseHandle>,
 }
 
@@ -168,6 +187,10 @@ impl KernelStore {
         let lease = lease_store.acquire(&lease_key).map_err(map_lease_error)?;
         let lease_epoch = lease.epoch();
 
+        if restore_marker_path(&db_path).exists() {
+            return Err(KernelError::Inconclusive);
+        }
+
         if reset_marker_path(&db_path).exists() {
             resume_quarantine(&db_path)?;
         }
@@ -200,9 +223,12 @@ impl KernelStore {
             writer: Mutex::new(writer),
             readers,
             next_reader: AtomicUsize::new(0),
+            poisoned: AtomicBool::new(false),
             lease_epoch,
+            db_path,
             _lease: lease,
         };
+        store.run_capture_pin_maintenance(current_time_ms())?;
         store.run_staging_maintenance(current_time_ms())?;
         Ok(store)
     }
@@ -212,12 +238,30 @@ impl KernelStore {
     }
 
     pub(super) fn lock_writer(&self) -> Result<std::sync::MutexGuard<'_, Connection>, KernelError> {
-        self.writer.lock().map_err(|_| KernelError::Io)
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(KernelError::InvalidRestore);
+        }
+        let writer = self.writer.lock().map_err(|_| KernelError::Io)?;
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(KernelError::InvalidRestore);
+        }
+        Ok(writer)
     }
 
     pub(super) fn lock_reader(&self) -> Result<std::sync::MutexGuard<'_, Connection>, KernelError> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(KernelError::InvalidRestore);
+        }
         let index = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
-        self.readers[index].lock().map_err(|_| KernelError::Io)
+        let reader = self.readers[index].lock().map_err(|_| KernelError::Io)?;
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(KernelError::InvalidRestore);
+        }
+        Ok(reader)
+    }
+
+    pub(super) fn poison(&self) {
+        self.poisoned.store(true, Ordering::Release);
     }
 
     #[cfg(feature = "test-support")]
@@ -227,6 +271,18 @@ impl KernelStore {
             .execute(
                 "UPDATE writer_fence SET writer_epoch=writer_epoch+1 WHERE id=0",
                 [],
+            )
+            .map_err(|_| KernelError::Io)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn set_writer_fence_for_test(&self, epoch: i64) -> Result<(), KernelError> {
+        let writer = self.lock_writer()?;
+        writer
+            .execute(
+                "UPDATE writer_fence SET writer_epoch=?1 WHERE id=0",
+                [epoch],
             )
             .map_err(|_| KernelError::Io)?;
         Ok(())
@@ -294,6 +350,19 @@ fn expected_identity() -> Result<ExpectedIdentity, KernelError> {
 enum OpenIdentity {
     Exact,
     Mismatch { incarnation: String },
+}
+
+pub(super) fn verify_exact_identity(conn: &mut Connection) -> Result<(), KernelError> {
+    let integrity_check: String = conn
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(|_| KernelError::Inconclusive)?;
+    if integrity_check != "ok" {
+        return Err(KernelError::Inconclusive);
+    }
+    match classify_open_kernel(conn, &expected_identity()?)? {
+        OpenIdentity::Exact => Ok(()),
+        OpenIdentity::Mismatch { .. } => Err(KernelError::IdentityMismatch),
+    }
 }
 
 struct FormatMarker {
@@ -408,7 +477,7 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn open_writer(path: &Path) -> rusqlite::Result<Connection> {
+pub(super) fn open_writer(path: &Path) -> rusqlite::Result<Connection> {
     Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -427,21 +496,21 @@ fn bootstrap(path: &Path) -> Result<Connection, KernelError> {
     Ok(conn)
 }
 
-fn apply_preclassification_profile(conn: &Connection) -> rusqlite::Result<()> {
+pub(super) fn apply_preclassification_profile(conn: &Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "trusted_schema", "OFF")?;
     conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)?;
     Ok(())
 }
 
-fn activate_wal(conn: &Connection) -> Result<(), KernelError> {
+pub(super) fn activate_wal(conn: &Connection) -> Result<(), KernelError> {
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|_| KernelError::Io)?;
     conn.pragma_update(None, "synchronous", "FULL")
         .map_err(|_| KernelError::Io)
 }
 
-fn stamp_writer_fence(conn: &mut Connection, epoch: u64) -> Result<(), KernelError> {
+pub(super) fn stamp_writer_fence(conn: &mut Connection, epoch: u64) -> Result<(), KernelError> {
     let epoch = i64::try_from(epoch).map_err(|_| KernelError::IdentityMismatch)?;
     let tx = conn.transaction().map_err(|_| KernelError::Io)?;
     if tx
@@ -459,21 +528,23 @@ fn stamp_writer_fence(conn: &mut Connection, epoch: u64) -> Result<(), KernelErr
 
 fn open_read_pool(path: &Path) -> Result<Vec<Mutex<Connection>>, KernelError> {
     (0..READ_POOL_SIZE)
-        .map(|_| {
-            let conn = Connection::open_with_flags(
-                path,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )
-            .map_err(|_| KernelError::Io)?;
-            conn.pragma_update(None, "query_only", "ON")
-                .map_err(|_| KernelError::Io)?;
-            apply_preclassification_profile(&conn).map_err(|_| KernelError::Io)?;
-            Ok(Mutex::new(conn))
-        })
+        .map(|_| open_reader(path).map(Mutex::new))
         .collect()
 }
 
-fn family_sidecars(path: &Path) -> [PathBuf; 3] {
+pub(super) fn open_reader(path: &Path) -> Result<Connection, KernelError> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|_| KernelError::Io)?;
+    conn.pragma_update(None, "query_only", "ON")
+        .map_err(|_| KernelError::Io)?;
+    apply_preclassification_profile(&conn).map_err(|_| KernelError::Io)?;
+    Ok(conn)
+}
+
+pub(super) fn family_sidecars(path: &Path) -> [PathBuf; 3] {
     [
         suffix_path(path, "-wal"),
         suffix_path(path, "-shm"),
@@ -481,7 +552,7 @@ fn family_sidecars(path: &Path) -> [PathBuf; 3] {
     ]
 }
 
-fn harden_family(path: &Path) -> Result<(), KernelError> {
+pub(super) fn harden_family(path: &Path) -> Result<(), KernelError> {
     protect_file(path).map_err(|_| KernelError::Io)?;
     for sidecar in family_sidecars(path) {
         protect_file(&sidecar).map_err(|_| KernelError::Io)?;
@@ -630,6 +701,10 @@ fn reset_marker_path(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}{}", path.display(), RESET_MARKER_SUFFIX))
 }
 
+pub(super) fn restore_marker_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}{}", path.display(), RESTORE_MARKER_SUFFIX))
+}
+
 fn suffix_path(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(format!("{}{suffix}", path.display()))
 }
@@ -666,18 +741,18 @@ fn prepare_private_dir(path: &Path) -> Result<(), KernelError> {
     Ok(())
 }
 
-fn sync_parent(path: &Path) -> Result<(), KernelError> {
+pub(super) fn sync_parent(path: &Path) -> Result<(), KernelError> {
     let parent = path.parent().ok_or(KernelError::Io)?;
     sync_directory(parent)
 }
 
-fn sync_directory(path: &Path) -> Result<(), KernelError> {
+pub(super) fn sync_directory(path: &Path) -> Result<(), KernelError> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|_| KernelError::Io)
 }
 
-fn current_time_ms() -> i64 {
+pub(super) fn current_time_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))

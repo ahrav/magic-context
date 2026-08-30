@@ -763,6 +763,11 @@ impl KernelStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| KernelError::Io)?;
         check_fence(&tx, self.lease_epoch())?;
+        tx.execute(
+            "DELETE FROM durable_text_redactions WHERE owner_kind='alignment_projection'",
+            [],
+        )
+        .map_err(|_| KernelError::Io)?;
         tx.execute("DELETE FROM alignment_projection", [])
             .map_err(|_| KernelError::Io)?;
         for row in &rows {

@@ -147,6 +147,46 @@ fn staging_requires_affirmative_repository_provenance_for_normal() {
         })
         .unwrap();
     assert_eq!(proven.sensitivity, Sensitivity::Normal);
+    let connection = Connection::open_with_flags(
+        directory.path().join("core.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    assert_eq!(
+        connection
+            .prepare("SELECT candidate_id,sensitivity_class FROM candidates ORDER BY candidate_id",)
+            .unwrap()
+            .query_map([], |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?
+            )))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap(),
+        [
+            ("candidate-proven".to_string(), "normal".to_string()),
+            ("candidate-unknown".to_string(), "sensitive".to_string())
+        ]
+    );
+    assert_eq!(
+        connection
+            .prepare(
+                "SELECT extraction_run_id,sensitivity_class FROM extraction_runs
+                 ORDER BY extraction_run_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?
+            )))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap(),
+        [
+            ("run-proven".to_string(), "normal".to_string()),
+            ("run-unknown".to_string(), "sensitive".to_string())
+        ]
+    );
     assert!(!family_bytes(directory.path())
         .windows(SECRET.len())
         .any(|window| window == SECRET.as_bytes()));

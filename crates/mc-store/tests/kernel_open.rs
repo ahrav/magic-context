@@ -135,7 +135,7 @@ fn second_opener_is_held_without_touching_database_family() {
 
 #[test]
 fn every_conclusive_kernel_mismatch_is_quarantined_and_rebuilt() {
-    for mismatch in ["epoch", "digest", "inventory"] {
+    for mismatch in ["epoch", "digest", "inventory", "column"] {
         let dir = tempfile::tempdir().unwrap();
         let conn = seed_kernel(dir.path());
         match mismatch {
@@ -148,6 +148,9 @@ fn every_conclusive_kernel_mismatch_is_quarantined_and_rebuilt() {
                 conn.execute_batch("CREATE TABLE unexpected(value INTEGER) STRICT;")
                     .unwrap();
             }
+            "column" => conn
+                .execute_batch("ALTER TABLE domains ADD COLUMN drift_probe TEXT;")
+                .unwrap(),
             _ => unreachable!(),
         }
         drop(conn);
@@ -213,6 +216,22 @@ fn malformed_marker_is_inconclusive_and_untouched() {
     );
     assert_eq!(fs::read(&path).unwrap(), before);
     assert!(quarantine_dirs(dir.path()).is_empty());
+}
+
+#[test]
+fn restore_marker_fails_closed_before_pristine_bootstrap() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("core.sqlite.mc-restore"),
+        br#"{"protocol":"mc-kernel-restore-marker-v1"}"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        KernelStore::open(dir.path()).unwrap_err(),
+        KernelError::Inconclusive
+    );
+    assert!(!core_path(dir.path()).exists());
 }
 
 #[test]

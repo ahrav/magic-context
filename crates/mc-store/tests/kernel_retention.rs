@@ -130,7 +130,7 @@ fn open_runs_staging_sweep_after_fencing() {
 }
 
 #[test]
-fn completed_staging_survives_day_29_and_is_deleted_day_31() {
+fn completed_staging_is_retained_at_elapsed_day_29_and_deleted_at_elapsed_day_30() {
     let directory = tempfile::tempdir().unwrap();
     let store = KernelStore::open(directory.path()).unwrap();
     store
@@ -148,7 +148,7 @@ fn completed_staging_survives_day_29_and_is_deleted_day_31() {
     );
     assert_eq!(
         store
-            .run_staging_maintenance(30 * DAY_MS)
+            .run_staging_maintenance(DAY_MS + 30 * DAY_MS - 1)
             .unwrap()
             .deleted_runs,
         0
@@ -163,7 +163,7 @@ fn completed_staging_survives_day_29_and_is_deleted_day_31() {
     );
     assert_eq!(
         store
-            .run_staging_maintenance(32 * DAY_MS)
+            .run_staging_maintenance(DAY_MS + 30 * DAY_MS)
             .unwrap()
             .deleted_runs,
         1

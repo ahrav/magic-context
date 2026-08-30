@@ -403,18 +403,64 @@ fn randomized_history_matches_reference_model() {
 
 #[test]
 fn stale_writer_is_rejected_before_user_operation() {
+    for delta in [-1_i64, 1] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = KernelStore::open(directory.path()).unwrap();
+        let expected = i64::try_from(store.lease_epoch()).unwrap();
+        store.set_writer_fence_for_test(expected + delta).unwrap();
+        let called = Cell::new(false);
+        let error = store
+            .commit(intent(&format!("stale-{delta}"), 'f'), |_| {
+                called.set(true);
+                Ok(String::new())
+            })
+            .unwrap_err();
+        assert_eq!(error, KernelError::FenceLost);
+        assert!(!called.get());
+    }
+}
+
+#[test]
+fn envelope_persists_declared_sensitivity_across_canonical_and_outbox_rows() {
     let directory = tempfile::tempdir().unwrap();
     let store = KernelStore::open(directory.path()).unwrap();
-    store.invalidate_writer_fence_for_test().unwrap();
-    let called = Cell::new(false);
-    let error = store
-        .commit(intent("stale", 'f'), |_| {
-            called.set(true);
-            Ok(String::new())
+    let mut normal = domain(1);
+    normal.sensitivity = Sensitivity::Normal;
+    let mut sensitive = domain(2);
+    sensitive.sensitivity = Sensitivity::Sensitive;
+    store
+        .commit(intent("mixed-sensitivity", 'a'), |envelope| {
+            envelope.insert_domain(normal)?;
+            envelope.insert_domain(sensitive)?;
+            Ok("stored".to_string())
         })
-        .unwrap_err();
-    assert_eq!(error, KernelError::FenceLost);
-    assert!(!called.get());
+        .unwrap();
+    let connection = Connection::open_with_flags(
+        directory.path().join("core.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    for table in ["domains", "object_registry", "outbox"] {
+        let values = connection
+            .prepare(&format!(
+                "SELECT object_id,sensitivity_class FROM {table} ORDER BY object_id"
+            ))
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            values,
+            [
+                ("object-1".to_string(), "normal".to_string()),
+                ("object-2".to_string(), "sensitive".to_string())
+            ],
+            "{table}"
+        );
+    }
 }
 
 #[test]
@@ -428,18 +474,25 @@ fn projection_full_replace_is_coordinator_side_and_creates_no_commit_or_events()
         decision_id: "decision".to_string(),
         observation_id: "observation".to_string(),
         alignment_kind: "intended".to_string(),
-        alignment_payload: Some("first".to_string()),
+        alignment_payload: Some("api_key=first-private-value".to_string()),
         built_through_commit_seq: 1,
     };
     assert_eq!(
         store.replace_alignment_projection(&[first]).unwrap().rows,
         1
     );
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM durable_text_redactions WHERE owner_kind='alignment_projection'"
+        ),
+        1
+    );
     let second = AlignmentProjectionSpec {
         decision_id: "decision".to_string(),
         observation_id: "observation".to_string(),
         alignment_kind: "implemented".to_string(),
-        alignment_payload: Some("second".to_string()),
+        alignment_payload: Some("password=second-private-value".to_string()),
         built_through_commit_seq: 1,
     };
     assert_eq!(
@@ -468,5 +521,35 @@ fn projection_full_replace_is_coordinator_side_and_creates_no_commit_or_events()
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(row, ("implemented".to_string(), "second".to_string()));
+    assert_eq!(
+        row,
+        (
+            "implemented".to_string(),
+            "password=<REDACTED:password>".to_string()
+        )
+    );
+    let redactions = connection
+        .prepare(
+            "SELECT owner_id,field_name,secret_type FROM durable_text_redactions
+             WHERE owner_kind='alignment_projection' ORDER BY detection_ordinal",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        redactions,
+        [(
+            "decision:observation".to_string(),
+            "alignment_payload".to_string(),
+            "password".to_string()
+        )]
+    );
 }

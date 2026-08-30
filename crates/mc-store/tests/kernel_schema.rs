@@ -2,10 +2,12 @@
 use mc_store::kernel::schema::apply_kernel_schema_with_fault_hook_for_test;
 use mc_store::kernel::schema::{
     apply_kernel_connection_profile, apply_kernel_schema, kernel_schema_digest,
-    kernel_schema_inventory, KERNEL_APPLICATION_ID, KERNEL_SCHEMA_COMPONENT_NAMES,
+    kernel_schema_inventory, KERNEL_APPLICATION_ID, KERNEL_FORMAT_EPOCH,
+    KERNEL_SCHEMA_COMPONENT_NAMES,
 };
 use mc_store::sqlite_runtime::verify_sqlite_connection_contract;
 use rusqlite::{params, Connection};
+use serde::Deserialize;
 
 const EXPECTED_COMPONENTS: &[&str] = &[
     "commit_log",
@@ -43,6 +45,16 @@ const EXPECTED_COMPONENTS: &[&str] = &[
 ];
 const TEST_INCARNATION: &str = "0123456789abcdef0123456789abcdef";
 
+#[derive(Deserialize)]
+struct FormatVocabulary {
+    schema: String,
+    application_id: u32,
+    format_epoch: i64,
+    schema_digest_protocol: String,
+    schema_digest: String,
+    ordered_components: Vec<String>,
+}
+
 fn open_profiled() -> (tempfile::TempDir, Connection) {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut conn = Connection::open(dir.path().join("core.sqlite")).expect("open");
@@ -75,6 +87,38 @@ fn kernel_schema_has_one_ordered_full_shape() {
         .unwrap()
         .iter()
         .all(|name| !name.starts_with("sqlite_")));
+}
+
+#[test]
+fn generated_schema_matches_pinned_format_vocabulary() {
+    let fixture: FormatVocabulary =
+        serde_json::from_str(include_str!("fixtures/kernel-format-vocabulary-v1.json")).unwrap();
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, TEST_INCARNATION, 1_000).unwrap();
+
+    assert_eq!(fixture.schema, "magic-context.kernel-format-vocabulary/v1");
+    assert_eq!(fixture.application_id, KERNEL_APPLICATION_ID);
+    assert_eq!(fixture.format_epoch, KERNEL_FORMAT_EPOCH);
+    assert_eq!(fixture.schema_digest_protocol, "mc-kernel-schema-v1");
+    assert_eq!(
+        fixture.ordered_components,
+        kernel_schema_inventory(&conn).unwrap()
+    );
+    assert_eq!(fixture.schema_digest, kernel_schema_digest(&conn).unwrap());
+}
+
+#[test]
+fn column_only_drift_changes_digest_without_changing_component_inventory() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, TEST_INCARNATION, 1_000).unwrap();
+    let inventory = kernel_schema_inventory(&conn).unwrap();
+    let digest = kernel_schema_digest(&conn).unwrap();
+
+    conn.execute_batch("ALTER TABLE domains ADD COLUMN drift_probe TEXT")
+        .unwrap();
+
+    assert_eq!(kernel_schema_inventory(&conn).unwrap(), inventory);
+    assert_ne!(kernel_schema_digest(&conn).unwrap(), digest);
 }
 
 #[test]
@@ -117,7 +161,9 @@ fn first_root_transaction_resolves_deferred_registry_cycle() {
 }
 
 #[test]
-fn canonical_tables_reject_arbitrary_in_place_updates() {
+fn structural_guards_reject_arbitrary_updates_while_envelope_records_authorization_audit() {
+    // Structural guards constrain row shapes; authorization and its audit record belong to the
+    // private Connection envelope boundary. commentlint: allow(JUDGE)
     let (_dir, mut conn) = open_profiled();
     apply_kernel_schema(&mut conn, TEST_INCARNATION, 1_000).unwrap();
     let tx = conn.transaction().unwrap();

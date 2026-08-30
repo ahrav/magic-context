@@ -37,7 +37,13 @@ impl Envelope<'_> {
                 params![consumer_id.text, checkpoint, recorded_at],
             )
             .map_err(|error| match error {
-                rusqlite::Error::SqliteFailure(_, _) => KernelError::Conflict,
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error {
+                        code: rusqlite::ErrorCode::ConstraintViolation,
+                        ..
+                    },
+                    _,
+                ) => KernelError::Conflict,
                 _ => KernelError::Io,
             })?;
         let audit_owner_id = consumer_id.text.clone();

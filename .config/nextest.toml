@@ -22,3 +22,12 @@ default-filter = 'package(mc-host) and binary(shm_soak) and test(full_soak_cycle
 filter = 'package(mc-host) and binary(shm_soak)'
 test-group = 'shm-crash'
 slow-timeout = { period = "300s", terminate-after = 12 }
+
+[profile.kernel-rto]
+# Run the ignored restore RTO proof with:
+#   cargo nextest run -P kernel-rto --features test-support --run-ignored ignored-only
+default-filter = 'package(mc-store) and binary(kernel_backup) and test(threshold_size_restore_rto)'
+
+[[profile.kernel-rto.overrides]]
+filter = 'package(mc-store) and binary(kernel_backup)'
+slow-timeout = { period = "360s", terminate-after = 1 }

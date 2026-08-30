@@ -6,7 +6,7 @@ use crate::sqlite_runtime::compute_marker_digest_for_application_id;
 
 pub const KERNEL_APPLICATION_ID: u32 = 0x4D43_4B52;
 pub const KERNEL_FORMAT_EPOCH: i64 = 1;
-pub const KERNEL_SCHEMA_COMPONENT_NAMES: &[&str] = &[
+pub const KERNEL_SCHEMA_COMPONENT_NAMES: [&str; 32] = [
     "commit_log",
     "change_event",
     "outbox",
@@ -41,7 +41,7 @@ pub const KERNEL_SCHEMA_COMPONENT_NAMES: &[&str] = &[
     "mc_kernel_format_marker",
 ];
 
-const COMPONENTS: &[(&str, &str)] = &[
+const COMPONENTS: [(&str, &str); KERNEL_SCHEMA_COMPONENT_NAMES.len()] = [
     (
         "commit_log",
         r#"CREATE TABLE commit_log(commit_seq INTEGER PRIMARY KEY AUTOINCREMENT,transaction_id TEXT NOT NULL UNIQUE,writer_epoch INTEGER NOT NULL,producer TEXT NOT NULL DEFAULT 'legacy',operation_key TEXT NOT NULL DEFAULT 'legacy',request_digest TEXT NOT NULL DEFAULT '',recorded_at INTEGER NOT NULL,actor TEXT NOT NULL,cause TEXT NOT NULL) STRICT; CREATE UNIQUE INDEX idx_commit_operation ON commit_log(producer,operation_key);"#,
@@ -204,8 +204,13 @@ fn apply_schema<F: FnOnce() -> rusqlite::Result<()>>(
     let tx = conn.transaction()?;
     tx.pragma_update(None, "application_id", KERNEL_APPLICATION_ID)?;
     tx.pragma_update(None, "user_version", KERNEL_FORMAT_EPOCH)?;
-    for ((name, sql), expected) in COMPONENTS.iter().zip(KERNEL_SCHEMA_COMPONENT_NAMES) {
-        debug_assert_eq!(name, expected);
+    assert_eq!(
+        COMPONENTS.map(|(name, _)| name),
+        KERNEL_SCHEMA_COMPONENT_NAMES,
+        "kernel schema component names must stay aligned with their SQL"
+    );
+    for (name, sql) in COMPONENTS {
+        assert!(KERNEL_SCHEMA_COMPONENT_NAMES.contains(&name));
         tx.execute_batch(sql)?;
     }
     tx.execute("INSERT INTO writer_fence(id) VALUES(0)", [])?;
