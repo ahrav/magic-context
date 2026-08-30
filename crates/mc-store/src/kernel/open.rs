@@ -367,10 +367,16 @@ fn read_valid_marker(conn: &Connection) -> Result<FormatMarker, KernelError> {
     if present.is_none() {
         return Err(KernelError::Inconclusive);
     }
+    // A lookalike table has no singleton constraint, so `LIMIT 2` detects multiple
+    // rows.
     let mut statement = conn
         .prepare(
             "SELECT format_epoch,database_incarnation_id,schema_digest,created_at,marker_digest
-             FROM mc_kernel_format_marker",
+             FROM mc_kernel_format_marker
+             WHERE length(database_incarnation_id)=32
+               AND length(schema_digest)=64
+               AND length(marker_digest)=64
+             LIMIT 2",
         )
         .map_err(|_| KernelError::Inconclusive)?;
     let rows = statement
@@ -439,6 +445,9 @@ fn apply_preclassification_profile(conn: &Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "trusted_schema", "OFF")?;
     conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)?;
+    // REPLACE deletes the conflicting row, which fires its BEFORE DELETE trigger
+    // only when recursive_triggers is ON.
+    conn.pragma_update(None, "recursive_triggers", "ON")?;
     Ok(())
 }
 
@@ -780,6 +789,65 @@ mod tests {
                     tx.query_row("SELECT COUNT(*) FROM commit_log", [], |row| row
                         .get::<_, i64>(0))?,
                     0
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn store_connections_run_delete_triggers_for_replace() {
+        // The schema-level guard test drives a connection built by
+        // `apply_kernel_connection_profile`, so it cannot observe the pragmas
+        // `KernelStore` sets on its own writer.
+        let directory = tempfile::tempdir().unwrap();
+        let store = KernelStore::open(directory.path()).unwrap();
+        store
+            .with_writer(|tx| {
+                assert_eq!(
+                    tx.query_row("PRAGMA recursive_triggers", [], |row| row.get::<_, i64>(0))?,
+                    1
+                );
+                tx.execute(
+                    "INSERT INTO commit_log(transaction_id,writer_epoch,recorded_at,actor,cause)
+                     VALUES('t1',1,1,'actor','cause')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let commit_seq = store
+            .with_reader(|tx| {
+                tx.query_row("SELECT commit_seq FROM commit_log", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+            })
+            .unwrap();
+
+        for verb in ["INSERT OR REPLACE", "REPLACE"] {
+            let error = store
+                .with_writer(|tx| {
+                    tx.execute(
+                        &format!(
+                            "{verb} INTO commit_log(
+                                 commit_seq,transaction_id,writer_epoch,recorded_at,actor,cause
+                             ) VALUES(?1,'hijack',1,1,'attacker','rewrite')"
+                        ),
+                        [commit_seq],
+                    )?;
+                    Ok(())
+                })
+                .unwrap_err();
+            assert_eq!(error, KernelError::Io, "{verb} must be refused");
+        }
+
+        store
+            .with_reader(|tx| {
+                assert_eq!(
+                    tx.query_row("SELECT actor FROM commit_log", [], |row| row
+                        .get::<_, String>(0))?,
+                    "actor"
                 );
                 Ok(())
             })
