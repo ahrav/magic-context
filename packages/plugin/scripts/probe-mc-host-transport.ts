@@ -453,6 +453,11 @@ const moduleCounters = new Set([
     "tag_mint_tokenized_bytes",
     "tail_messages_emitted",
     "tail_units_matched",
+    "tokenize_bytes",
+    "tokenize_cache_bypassed",
+    "tokenize_cache_hits",
+    "tokenize_cache_misses",
+    "tokenize_calls",
     "trigger_tokenized_blocks",
 ]);
 const decisions = new Map<string, number>();
