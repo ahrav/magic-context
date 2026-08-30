@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
     NativeChannel,
     type NativeReceiveLease,
+    NativeStartupError,
     probeCapabilities,
 } from "@cortexkit/mc-shm-native";
 import { ConnectionGeneration } from "./connection";
@@ -21,6 +22,7 @@ import {
     MAX_FRAME_BODY_LEN,
     PROTOCOL_VERSION,
 } from "./protocol";
+import { classifySharedMemoryFailure } from "./shared-memory-failure";
 import { ShmFrameChannel } from "./shm-frame-channel";
 import {
     type ContractPeerFrame,
@@ -41,6 +43,23 @@ function responseHeader(ty: FrameType, corr: bigint, length: number, flags = 0):
         corr,
     };
 }
+
+test("shared-memory failures collapse to five terminal diagnostic classes", () => {
+    const cases: readonly [Error, string][] = [
+        [new NativeStartupError("missing_addon"), "missing_addon"],
+        [new NativeStartupError("wrong_platform_binary"), "setup_failure"],
+        [new NativeStartupError("debug_build"), "setup_failure"],
+        [new NativeStartupError("checksum_mismatch"), "setup_failure"],
+        [new NativeStartupError("capability_unavailable"), "setup_failure"],
+        [new Error("shared-memory identity mismatch"), "identity_mismatch"],
+        [new Error("shared-memory setup failed /private/secret?token=abc"), "setup_failure"],
+        [new Error("peer closed unexpectedly /private/secret"), "peer_death"],
+        [new Error("shared-memory resource limit exhausted handle=77"), "resource_exhaustion"],
+    ];
+    for (const [error, expected] of cases) {
+        expect(classifySharedMemoryFailure(error)).toBe(expected);
+    }
+});
 
 function publish(peer: NativeChannel, header: EnvelopeHeader, body: Uint8Array): void {
     peer.produce(encodeHeader(header), body.byteLength, (cursor) => cursor.write(body));

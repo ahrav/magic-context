@@ -9,11 +9,13 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use mc_host::{Client, RequestOptions, RouteIdentity, RouteTarget, TargetKind};
+use support::process_resources::ResourceCounts;
 use support::TestHost;
 
 const ROLE_ENV: &str = "MC_SHM_FAILURE_ROLE";
 const PUBLICATION_ENV: &str = "MC_SHM_FAILURE_PUBLICATION";
 const BUDGET: Duration = Duration::from_secs(10);
+const RSS_TOLERANCE_BYTES: u64 = 16 * 1024 * 1024;
 
 async fn serial_failure_test() -> tokio::sync::OwnedSemaphorePermit {
     static SERIAL: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
@@ -165,14 +167,65 @@ async fn connect_after_reclamation(path: &Path) -> Client {
     }
 }
 
+fn stable_resources() -> ResourceCounts {
+    let deadline = Instant::now() + BUDGET;
+    let mut previous = None;
+    let mut equal = 0;
+    loop {
+        let counts = support::process_resources::observe(std::process::id()).unwrap();
+        if previous == Some(counts) {
+            equal += 1;
+            if equal == 2 {
+                return counts;
+            }
+        } else {
+            previous = Some(counts);
+            equal = 0;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "resource counters did not stabilize"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+async fn assert_resources_return_to(baseline: ResourceCounts) {
+    let deadline = Instant::now() + BUDGET;
+    loop {
+        let actual = support::process_resources::observe(std::process::id()).unwrap();
+        if actual.fds == baseline.fds
+            && actual.mapped_regions == baseline.mapped_regions
+            && actual.threads == baseline.threads
+            && actual.rss_bytes <= baseline.rss_bytes.saturating_add(RSS_TOLERANCE_BYTES)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "resources did not return to baseline: baseline={baseline:?} actual={actual:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn warm_connection(host: &TestHost) {
+    let client = Client::connect(host.publication_path()).await.unwrap();
+    client.close().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn clean_close_returns_exact_single_connection_capacity() {
     let _serial = serial_failure_test().await;
     let host = TestHost::start_with(|config| config.limits.max_connections = 1).await;
+    warm_connection(&host).await;
+    let baseline = stable_resources();
     let client = Client::connect(host.publication_path()).await.unwrap();
     client.close().await.unwrap();
+    assert_resources_return_to(baseline).await;
     let replacement = connect_after_reclamation(&host.publication_path()).await;
     replacement.close().await.unwrap();
+    assert_resources_return_to(baseline).await;
     host.shutdown_gracefully().await;
 }
 
@@ -181,9 +234,12 @@ async fn setup_active_and_idle_sigkill_each_return_exact_capacity() {
     let _serial = serial_failure_test().await;
     for role in ["setup", "active", "idle"] {
         let host = TestHost::start_with(|config| config.limits.max_connections = 1).await;
+        warm_connection(&host).await;
+        let baseline = stable_resources();
         Victim::spawn(&host.publication_path(), role).kill();
         let replacement = connect_after_reclamation(&host.publication_path()).await;
         replacement.close().await.unwrap();
+        assert_resources_return_to(baseline).await;
         host.shutdown_gracefully().await;
     }
 }
@@ -192,6 +248,8 @@ async fn setup_active_and_idle_sigkill_each_return_exact_capacity() {
 async fn repeated_crashes_do_not_ratchet_single_connection_capacity() {
     let _serial = serial_failure_test().await;
     let host = TestHost::start_with(|config| config.limits.max_connections = 1).await;
+    warm_connection(&host).await;
+    let baseline = stable_resources();
     for cycle in 0..12 {
         Victim::spawn(
             &host.publication_path(),
@@ -200,6 +258,7 @@ async fn repeated_crashes_do_not_ratchet_single_connection_capacity() {
         .kill();
         let probe = connect_after_reclamation(&host.publication_path()).await;
         probe.close().await.unwrap();
+        assert_resources_return_to(baseline).await;
     }
     host.shutdown_gracefully().await;
 }
@@ -212,7 +271,10 @@ async fn exact_capacity_succeeds_and_plus_one_creates_no_ring_resources() {
     let second = Client::connect(host.publication_path()).await.unwrap();
     let before = support::process_resources::observe(std::process::id()).unwrap();
 
-    assert!(Client::connect(host.publication_path()).await.is_err());
+    let error = Client::connect(host.publication_path())
+        .await
+        .expect_err("connection above exact capacity must fail");
+    assert_eq!(error.code(), "setup_failed");
     let deadline = Instant::now() + BUDGET;
     loop {
         let after = support::process_resources::observe(std::process::id()).unwrap();
@@ -239,12 +301,21 @@ async fn exact_capacity_succeeds_and_plus_one_creates_no_ring_resources() {
 async fn daemon_restart_discards_old_rings_and_accepts_fresh_client() {
     let _serial = serial_failure_test().await;
     let data_root = tempfile::tempdir().expect("data root");
-    let publication;
-    {
+    let (publication, stale_client) = {
         let host = support::echo_host::InProcessHost::start(data_root.path());
-        publication = host.publication.clone();
+        let publication = host.publication.clone();
         let client = Client::connect(&publication).await.unwrap();
-        client.close().await.unwrap();
+        (publication, client)
+    };
+    let deadline = Instant::now() + BUDGET;
+    loop {
+        match stale_client.host_status().await {
+            Err(error) if error.code() == "client_closed" => break,
+            Err(_) | Ok(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            outcome => panic!("stale client did not become terminal: {outcome:?}"),
+        }
     }
     let host = support::echo_host::InProcessHost::start(data_root.path());
     let client = Client::connect(&publication).await.unwrap();

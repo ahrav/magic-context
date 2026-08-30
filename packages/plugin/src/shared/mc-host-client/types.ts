@@ -51,6 +51,45 @@ export interface CatalogSnapshot {
 export interface HostStatusSnapshot {
     health: "ok" | "degraded" | "failing";
     metrics: Record<string, unknown>;
+    sharedMemory: SharedMemoryDiagnostics;
+}
+
+export interface SharedMemoryResourceCounts {
+    descriptors: number;
+    arena_bytes: number;
+    leases: number;
+    mappings: number;
+    file_descriptors: number;
+    workers: number;
+    client_instances: number;
+    pinned_workers: number;
+}
+
+export type SharedMemoryTerminalClass =
+    | "missing_addon"
+    | "identity_mismatch"
+    | "setup_failure"
+    | "peer_death"
+    | "resource_exhaustion";
+
+export interface SharedMemoryDiagnostics {
+    state: "healthy" | "terminal";
+    error_class: SharedMemoryTerminalClass | null;
+    artifact: {
+        profile: "mc-host-test-ring-v1";
+        wire_version: 2;
+        descriptor_schema: 2;
+    };
+    bounds: SharedMemoryResourceCounts;
+    accounting: {
+        active: SharedMemoryResourceCounts;
+        quarantined: SharedMemoryResourceCounts;
+    } | null;
+    attachment: { completed: number };
+    activation: { completed: number };
+    peer_death: { observed: number };
+    reclamation: { completed: number };
+    exhaustion: { observed: number };
 }
 
 /**

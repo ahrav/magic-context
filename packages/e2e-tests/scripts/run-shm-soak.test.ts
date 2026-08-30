@@ -19,9 +19,19 @@ describe("shared-memory soak runner", () => {
 
     it("selects the release soak and converts hours to seconds", () => {
         const invocation = soakInvocation(["--hours", "8"]);
-        expect(invocation.command).toContain("--release");
-        expect(invocation.command).toContain("installed_eight_hour_soak");
-        expect(invocation.command.slice(-3)).toEqual(["--", "--ignored", "--exact"]);
+        expect(invocation.command).toEqual([
+            "cargo",
+            "test",
+            "--release",
+            "-p",
+            "mc-host",
+            "--test",
+            "shm_soak",
+            "release_eight_hour_source_tree_soak",
+            "--",
+            "--ignored",
+            "--exact",
+        ]);
         expect(invocation.environment).toEqual({ MC_SHM_SOAK_SECONDS: "28800" });
     });
 

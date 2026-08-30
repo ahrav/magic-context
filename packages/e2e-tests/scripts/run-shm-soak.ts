@@ -36,7 +36,7 @@ export function soakInvocation(args: string[]): SoakInvocation {
                   "mc-host",
                   "--test",
                   "shm_soak",
-                  "installed_eight_hour_soak",
+                  "release_eight_hour_source_tree_soak",
                   "--",
                   "--ignored",
                   "--exact",

@@ -66,7 +66,6 @@ const SYNAPSE_QUEUE_FULL_MAX_ATTEMPTS = 64;
  * uninitialized, which silently degrades embeddings to no-ops rather than
  * surfacing an error, so the wait is deliberately generous.
  */
-export const SYNAPSE_HANDSHAKE_TIMEOUT_MS = 10_000;
 
 export type SynapseErrorCode =
     | "queue_full"
@@ -611,7 +610,6 @@ async function getSharedClient(
     const file = options.connectionFile ?? defaultConnectionFile();
     const promise = processMcHostClient({
         connectionFile: file,
-        handshakeTimeoutMs: SYNAPSE_HANDSHAKE_TIMEOUT_MS,
     });
     sharedClientFile = file;
     sharedClientPromise = promise;
