@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { PluginContext } from "../../../plugin/src/plugin/types";
 import { extractLatestAssistantText } from "../../../plugin/src/shared/assistant-message-extractor";
@@ -195,32 +195,52 @@ export function classifyDreamerRun(input: DreamerRunClassificationInput): Dreame
         if (actualModel !== input.pinnedModel) return outcome("ERROR", "fallback-engaged");
     }
 
-    const stale = input.receipts.find((receipt) => receipt.outcome === "stale");
-    if (stale !== undefined) {
-        if (
-            input.rejectionRequestDigest !== null &&
-            stale.requestDigest === input.rejectionRequestDigest
-        ) {
-            return scored.status === "FAIL" && scored.reason === "invalid-output"
-                ? outcome("FAIL", "invalid-output", scored.parsedManifest)
-                : outcome("ERROR", "harness-failure", scored.parsedManifest);
-        }
+    // A receipt and the mutations it covers are written in one transaction —
+    // `runClaimOperationInCurrentTransaction` records it inside the transaction
+    // that stages the items, with a `noop` outcome when nothing changed — so an
+    // applied or noop receipt is the only proof the pool took the manifest, and a
+    // `stale` one is proof it did not.
+    const applied = input.receipts.some(
+        (receipt) => receipt.outcome === "applied" || receipt.outcome === "noop",
+    );
+    const refusedThisManifest =
+        input.rejectionRequestDigest !== null &&
+        input.receipts.some(
+            (receipt) =>
+                receipt.outcome === "stale" && receipt.requestDigest === input.rejectionRequestDigest,
+        );
+    const staleApply = input.receipts.some(
+        (receipt) =>
+            receipt.outcome === "stale" &&
+            !(refusedThisManifest && receipt.requestDigest === input.rejectionRequestDigest),
+    );
+
+    // Two claims depend on the manifest having been committed: a PASS reports a
+    // successful applied experiment, and a run-fatal reason reports an
+    // irreversible mutation and drives the safety exit 2. Without an applied
+    // receipt neither happened, and reporting exit 2 for a proposal the pool
+    // refused is a false alarm about destroyed data. Ordinary failures assert
+    // neither, so they keep the scorer's reason.
+    const overstated = scored.status === "PASS" || isRunFatal(scored.status, scored.reason);
+    if (overstated && !applied) {
         return outcome("ERROR", "apply-not-applied", scored.parsedManifest);
     }
+    if (refusedThisManifest) {
+        // Production refused these exact bytes and recorded the rejection. The
+        // scorer judged the same bytes, so its failure reason is the honest report
+        // — `wrong-mapping` for a manifest whose paths are all untracked,
+        // `wrong-update-content` for a blank or over-long body, `invalid-output`
+        // for one the validator threw on. A PASS beside a refusal is the two
+        // contracts disagreeing, which is a harness fault rather than a result.
+        return scored.status === "FAIL"
+            ? outcome(scored.status, scored.reason, scored.parsedManifest)
+            : outcome("ERROR", "harness-failure", scored.parsedManifest);
+    }
+    if (staleApply) return outcome("ERROR", "apply-not-applied", scored.parsedManifest);
     if (scored.status === "FAIL" && scored.reason === "invalid-output") {
+        // The validator threw but production recorded no rejection for it, so the
+        // two disagree about the same bytes.
         return outcome("ERROR", "harness-failure", scored.parsedManifest);
-    }
-    // A receipt and the mutations it covers are written in one transaction, so a
-    // committed apply always leaves one behind — `runClaimOperationInCurrentTransaction`
-    // records the receipt inside the same transaction that stages the items, and
-    // records a `noop` outcome when nothing changed. No receipt therefore means
-    // nothing was applied, and a PASS would report a successful experiment for a
-    // manifest the pool never took. Reachable because the task records the
-    // invocation as completed before applying and its rejection-receipt write is
-    // itself best-effort, so an apply-time database fault can leave a captured,
-    // gold-matching manifest with no receipt of any kind.
-    if (scored.status === "PASS" && input.receipts.length === 0) {
-        return outcome("ERROR", "apply-not-applied", scored.parsedManifest);
     }
     return outcome(scored.status, scored.reason, scored.parsedManifest);
 }
@@ -340,6 +360,21 @@ function fixturePaths(scenario: DreamerEvalScenario): string[] {
     return [...new Set(scenario.pool.claims.flatMap((claim) => claim.fixtureFiles.map((file) => file.path)))];
 }
 
+/**
+ * Every path the seeded fixture repository tracks, which is the universe
+ * production's `git ls-files` lookup resolves an observed mapping path against.
+ *
+ * Read from git rather than from the scenario's declared fixture files: the seeder
+ * also commits its `.dreamer-eval-fixture` marker, so production would accept and
+ * store a mapping naming it while a declared-file universe would drop it and hide
+ * the extra mapping.
+ */
+function trackedFixtureFiles(workdir: string): string[] {
+    const listed = gitOutput(workdir, ["ls-files"]);
+    if (listed === null) throw new Error("dreamer-eval could not list the fixture's tracked files");
+    return listed.split("\n").filter((path) => path.length > 0);
+}
+
 function reportCleanupFailure(step: string, error: unknown): void {
     console.error(
         `dreamer-eval cleanup failed at ${step}: ${error instanceof Error ? error.message : String(error)}`,
@@ -357,34 +392,52 @@ function gitOutput(workdir: string, args: readonly string[]): string | null {
 }
 
 /**
- * The plugin bytes this run will actually load, resolved the way
- * `opencode-runner/spawn.ts` resolves them: the built bundle when it exists,
- * otherwise the source entry.
+ * What this run will actually execute, beyond what the commit pins.
  *
- * A bundle is one file, so its own digest is the artifact. Source is a tree, so
- * the digest covers the commit plus every deviation from it inside
- * `packages/plugin` — `git status --porcelain` names untracked and modified files,
- * `git diff HEAD` carries their content. Two runs whose plugin implementation
- * differs therefore differ here, which is what stops the variance aggregator from
- * treating them as repeats of one experiment.
+ * `pluginEntry` is resolved by asking the spawner, not by recomputing its choice:
+ * a second copy would describe the wrong file the moment its preference changed.
+ *
+ * The digest covers the loaded bundle's bytes when a bundle is loaded — the bundle
+ * is one file with every import inlined, and it is normally ignored by git, so the
+ * tree says nothing about it — plus every working-tree deviation from HEAD across
+ * the whole repository. Deviations carry content, not just names: `git diff HEAD`
+ * omits untracked files entirely, so an untracked module that an import already
+ * resolves could be edited without moving the digest. The scope is the repository
+ * rather than `packages/plugin` because the runner, scorers, contract, seeder, and
+ * scenario corpus all decide a run's outcome too.
  */
-function pluginRuntime(): { pluginEntry: PluginRuntimeSource; pluginDigest: string } {
-    // Ask the spawner which entry it resolves rather than recomputing it: a second
-    // copy of that choice would describe the wrong file the moment the spawner's
-    // preference changes.
-    if (pluginEntryPath() === PLUGIN_BUNDLE_ENTRY) {
-        return {
-            pluginEntry: "dist",
-            pluginDigest: sha256Utf8Hex(readFileSync(PLUGIN_BUNDLE_ENTRY, "utf8")),
-        };
-    }
+function runtimeProvenance(): { pluginEntry: PluginRuntimeSource; runtimeDigest: string } {
+    const pluginEntry: PluginRuntimeSource = pluginEntryPath() === PLUGIN_BUNDLE_ENTRY ? "dist" : "src";
     const head = gitOutput(PLUGIN_REPO_ROOT, ["rev-parse", "HEAD"]);
-    const status = gitOutput(PLUGIN_REPO_ROOT, ["status", "--porcelain", "--", "packages/plugin"]);
-    const diff = gitOutput(PLUGIN_REPO_ROOT, ["diff", "HEAD", "--", "packages/plugin"]);
-    if (head === null || status === null || diff === null) {
-        throw new Error("dreamer-eval could not resolve the loaded plugin source state");
+    // `-z` because a path may contain whitespace, and porcelain quotes such paths
+    // otherwise. Ignored files stay out, which is what keeps artifact directories
+    // from entering the digest.
+    const status = gitOutput(PLUGIN_REPO_ROOT, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+    if (head === null || status === null) {
+        throw new Error("dreamer-eval could not resolve the runtime working-tree state");
     }
-    return { pluginEntry: "src", pluginDigest: sha256Utf8Hex([head, status, diff].join("\u0000")) };
+    const deviations = status
+        .split("\0")
+        .filter((entry) => entry.length > 3)
+        .map((entry) => {
+            const path = entry.slice(3);
+            const absolute = join(PLUGIN_REPO_ROOT, path);
+            let content = "";
+            try {
+                content = statSync(absolute).isFile() ? readFileSync(absolute, "utf8") : "";
+            } catch {
+                // Deleted, or unreadable: the status code below still records the
+                // deviation, and an unreadable path cannot be an evaluator input.
+                content = "";
+            }
+            return `${entry.slice(0, 2)}\u0000${path}\u0000${sha256Utf8Hex(content)}`;
+        })
+        .sort();
+    const bundle = pluginEntry === "dist" ? sha256Utf8Hex(readFileSync(PLUGIN_BUNDLE_ENTRY, "utf8")) : "";
+    return {
+        pluginEntry,
+        runtimeDigest: sha256Utf8Hex([head, bundle, ...deviations].join("\u0001")),
+    };
 }
 
 function systemTuple(options: RunDreamerEvalTaskOptions) {
@@ -399,7 +452,7 @@ function systemTuple(options: RunDreamerEvalTaskOptions) {
         opencodeVersion: options.opencodeVersion ?? "unknown",
         modelId: options.model,
         parserImpl: "ts" as const,
-        ...pluginRuntime(),
+        ...runtimeProvenance(),
     };
 }
 
@@ -449,6 +502,7 @@ export async function runDreamerEvalTask(
     let harness: TestHarness | null = null;
     let db: ReturnType<typeof openTestDb> | null = null;
     let parentSessionId = "";
+    let trackedFiles: string[] = [];
     let poolBefore: ClaimSnapshotProjection[] = [];
     let poolAfter: ClaimSnapshotProjection[] = [];
     let rawManifest: string | null = null;
@@ -481,6 +535,7 @@ export async function runDreamerEvalTask(
         });
         const fixtureHead = gitOutput(seeded.workdir, ["rev-parse", "HEAD"]);
         if (fixtureHead === null) throw new Error("dreamer-eval fixture HEAD is unavailable");
+        trackedFiles = trackedFixtureFiles(seeded.workdir);
         poolBefore = seeded.pool.claims;
         holderId = `dreamer-eval:${runId}`;
         leaseKey = leaseKeyFor(task.task, seeded.projectIdentity);
@@ -571,7 +626,7 @@ export async function runDreamerEvalTask(
             invocation,
             receipts,
             rejectionRequestDigest,
-            trackedFiles: fixturePaths(scenario),
+            trackedFiles,
             fixtureUnchanged,
             leaseLost,
             expectedResultMode: task.expectedResultMode,
@@ -629,6 +684,7 @@ export async function runDreamerEvalTask(
         reason: classification.reason,
         runFatal: classification.runFatal,
         system,
+        trackedFiles,
         poolBefore,
         poolAfter,
         rawManifest,

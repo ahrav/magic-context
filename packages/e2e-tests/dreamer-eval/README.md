@@ -50,13 +50,22 @@ setting cannot leak into a shared test process. Output is grouped under
 `<output-dir>/<scenario>/<task>/`: one versioned run report per repeat and one
 `variance.json` artifact for the set.
 
-Every report records the plugin entrypoint and a digest of the bytes the harness
-loaded, alongside the commit. The harness prefers `packages/plugin/dist/index.js`
-when it exists and falls back to `packages/plugin/src/index.ts`, so the commit
-alone does not identify what ran: a dirty tree or a stale bundle would otherwise
-let two runs of different implementations aggregate as repeats of one experiment.
-Variance refuses a set whose reports disagree on any part of that tuple. Build
-the bundle, or remove it, before a run whose repeats must be comparable.
+Every report records the plugin entrypoint and a digest of everything the run's
+outcome depends on that the commit does not pin: the loaded bundle's bytes when a
+bundle is loaded, plus every working-tree deviation from HEAD with its content, so
+an edited untracked module moves the digest too. The scope is the whole repository
+because the runner, scorers, contract, seeder, and corpus decide a result as much
+as the plugin does. The harness prefers `packages/plugin/dist/index.js` when it
+exists and falls back to `packages/plugin/src/index.ts`, so the commit alone does
+not identify what ran, and without the digest two runs of different
+implementations would aggregate as repeats of one experiment. Variance refuses a
+set whose reports disagree on any part of that tuple, so a run from a dirty tree is
+comparable only against runs from the same tree.
+
+Reports also record the fixture repository's tracked files, read with `git
+ls-files` after seeding. That is the universe production resolves an observed
+mapping path against, so both the scorer and the variance encoder use it to decide
+which paths the host would actually store.
 
 Exit codes are `0` when every run passes, `1` for any ordinary FAIL or ERROR,
 and `2` when any run archives a gold-true claim. Missing credentials, invalid

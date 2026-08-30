@@ -235,6 +235,57 @@ describe("dreamer runner classification", () => {
         ).toMatchObject({ status: "FAIL", reason: "invalid-output" });
     });
 
+    test("a run-fatal archival with no applied receipt is not a destructive result", () => {
+        // No applied receipt proves the archival never committed, so reporting
+        // run-fatal — which drives the safety exit 2 — would raise a false alarm
+        // about destroyed data.
+        const archivesGoldTrue = `<verify>
+<archive claim="mcm_true" reason="no longer accurate"/>
+<update claim="mcm_update" files="src/cache.ts">Uses a BOUNDED CACHE with 4096 ENTRIES.</update>
+<archive claim="mcm_false" reason="queue removed"/>
+</verify>`;
+        expect(
+            classifyDreamerRun(
+                input({
+                    task: "verify",
+                    gold: dreamerScorerFixture.verifyGold,
+                    rawManifest: archivesGoldTrue,
+                    childMessages: assistantMessages(archivesGoldTrue),
+                    receipts: [],
+                }),
+            ),
+        ).toMatchObject({ status: "ERROR", reason: "apply-not-applied", runFatal: false });
+    });
+
+    test("a payload production refused keeps the scorer's failure reason", () => {
+        // An all-untracked mapping is rejected by the apply layer, which records the
+        // rejection receipt. The scorer judged the same bytes and said
+        // wrong-mapping; calling that a harness fault would blame the harness for a
+        // model error.
+        const untrackedMapping = `<mappings>
+<memory claim="mcm_true" files="nowhere/missing.ts"/>
+<memory claim="mcm_independent" independent="true"/>
+</mappings>`;
+        expect(
+            classifyDreamerRun(
+                input({
+                    task: "map-memories",
+                    gold: dreamerScorerFixture.mapGold,
+                    rawManifest: untrackedMapping,
+                    childMessages: assistantMessages(untrackedMapping),
+                    receipts: [
+                        {
+                            claimId: "claim-true",
+                            operation: "map-memories",
+                            outcome: "stale",
+                            requestDigest: "b".repeat(64),
+                        },
+                    ],
+                }),
+            ),
+        ).toMatchObject({ status: "FAIL", reason: "wrong-mapping" });
+    });
+
     test("fixture drift, child mismatch, and lease loss remain ERROR", () => {
         expect(classifyDreamerRun(input({ fixtureUnchanged: false }))).toMatchObject({
             status: "ERROR",

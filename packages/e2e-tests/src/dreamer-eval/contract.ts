@@ -862,12 +862,15 @@ export interface DreamerSystemTuple {
      */
     pluginEntry: PluginRuntimeSource;
     /**
-     * Digest of those bytes. `repoCommitSha` describes the checkout, not the
-     * runtime: a dirty tree or a stale bundle makes two runs at one commit
-     * execute different plugin implementations, and without this they would share
-     * a system tuple and aggregate as repeats of one experiment.
+     * Digest of everything the run's outcome depends on that the commit does not
+     * pin: the loaded bundle's bytes when a bundle is loaded, plus every working-
+     * tree deviation from `repoCommitSha` — content included, so editing an
+     * untracked module changes it. `repoCommitSha` describes the checkout, not the
+     * runtime, and a dirty tree or a stale bundle makes two runs at one commit
+     * execute different plugin and evaluator code. Without this they would share a
+     * system tuple and aggregate as repeats of one experiment.
      */
-    pluginDigest: string;
+    runtimeDigest: string;
 }
 
 export type DreamerRunStatus = "PASS" | "FAIL" | "ERROR";
@@ -898,6 +901,17 @@ export interface DreamerEvalRunReport {
     reason: ErrorReason | FailReason | null;
     runFatal: boolean;
     system: DreamerSystemTuple;
+    /**
+     * Every path the fixture repository tracks, read with `git ls-files` after
+     * seeding — the universe production's own lookup resolves an observed mapping
+     * path against, so it includes the seeder's `.dreamer-eval-fixture` marker.
+     *
+     * Recorded rather than rederived because a claim's projected files come from
+     * its seeded mapping: a task with no mapping preconditions projects none, and
+     * a consumer deriving the universe from `poolBefore` would resolve map runs
+     * against an empty set.
+     */
+    trackedFiles: string[];
     poolBefore: ClaimSnapshotProjection[];
     poolAfter: ClaimSnapshotProjection[];
     rawManifest: string | null;
@@ -990,7 +1004,7 @@ function parseSystem(raw: unknown, label: string): DreamerSystemTuple {
     const value = record(raw, label);
     exact(
         value,
-        ["repoCommitSha", "bunVersion", "opencodeVersion", "modelId", "parserImpl", "pluginEntry", "pluginDigest"],
+        ["repoCommitSha", "bunVersion", "opencodeVersion", "modelId", "parserImpl", "pluginEntry", "runtimeDigest"],
         label,
     );
     return {
@@ -1000,7 +1014,7 @@ function parseSystem(raw: unknown, label: string): DreamerSystemTuple {
         modelId: string(value.modelId, `${label}.modelId`),
         parserImpl: enumeration(value.parserImpl, ["ts"], `${label}.parserImpl`),
         pluginEntry: enumeration(value.pluginEntry, PLUGIN_RUNTIME_SOURCES, `${label}.pluginEntry`),
-        pluginDigest: staticId(value.pluginDigest, `${label}.pluginDigest`, DIGEST_RE),
+        runtimeDigest: staticId(value.runtimeDigest, `${label}.runtimeDigest`, DIGEST_RE),
     };
 }
 
@@ -1171,7 +1185,7 @@ function reparseManifest(task: DreamerTask, rawManifest: string): ParsedManifest
 
 export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunReport {
     const root = record(raw, label);
-    exact(root, ["schema", "scenarioId", "task", "runId", "nowMs", "status", "reason", "runFatal", "system", "poolBefore", "poolAfter", "rawManifest", "parsedManifest", "receiptOutcomes"], label);
+    exact(root, ["schema", "scenarioId", "task", "runId", "nowMs", "status", "reason", "runFatal", "system", "trackedFiles", "poolBefore", "poolAfter", "rawManifest", "parsedManifest", "receiptOutcomes"], label);
     if (root.schema !== DREAMER_EVAL_REPORT_SCHEMA) fail(`${label}.schema: version-invalid`);
     const task = enumeration(root.task, DREAMER_TASKS, `${label}.task`);
     const status = enumeration(root.status, ["PASS", "FAIL", "ERROR"], `${label}.status`);
@@ -1322,6 +1336,7 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
         reason,
         runFatal,
         system: parseSystem(root.system, `${label}.system`),
+        trackedFiles: parseFilePathArray(root.trackedFiles, `${label}.trackedFiles`),
         poolBefore,
         poolAfter,
         rawManifest,

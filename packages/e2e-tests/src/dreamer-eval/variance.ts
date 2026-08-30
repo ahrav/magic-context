@@ -11,7 +11,7 @@ import type {
 } from "./contract";
 import { parseRunReport } from "./contract";
 import { sha256Utf8Hex } from "../../../plugin/src/features/magic-context/memory/storage-claims";
-import { appliedTrackedPaths, canonicalObservedPaths } from "./scorer";
+import { appliedTrackedPaths } from "./scorer";
 
 export interface DreamerClaimVerdictHistogram {
     claimId: string;
@@ -56,20 +56,9 @@ function publicClaimId(value: unknown): string | null {
     return typeof entry?.publicClaimId === "string" ? entry.publicClaimId : null;
 }
 
-/**
- * The path universe a report carries, or none.
- *
- * A claim's projected files come from its seeded mapping, so a task with no
- * mapping preconditions — map and classify — reports an empty set. Dropping every
- * observed path against an empty universe would collapse each claim into one
- * bucket and report agreement between repeats that mapped different files, so an
- * empty universe falls back to canonicalization alone. That still compares
- * repeats consistently, which is what this artifact measures; only the scorer
- * compares against gold, and it is handed the scenario's committed fixture paths.
- */
+/** The applied path set, resolved against the universe the report recorded. */
 function appliedFiles(observed: readonly string[], tracked: readonly string[]): string[] {
-    const files = tracked.length === 0 ? canonicalObservedPaths(observed) : appliedTrackedPaths(observed, tracked);
-    return [...new Set(files)].sort();
+    return [...new Set(appliedTrackedPaths(observed, tracked))].sort();
 }
 
 /**
@@ -145,7 +134,10 @@ function verifyVerdict(
 function observedVerdicts(report: DreamerEvalRunReport): Map<string, string> {
     const observed = new Map<string, string>();
     if (report.parsedManifest === null) return observed;
-    const tracked = [...new Set(report.poolBefore.flatMap((claim) => claim.files))];
+    // The report's own tracked set, not one derived from the capture: a claim's
+    // projected files come from its seeded mapping, so a map or classify report
+    // projects none and equivalent spellings would land in different buckets.
+    const tracked = report.trackedFiles;
     if (report.task === "verify" || report.task === "verify-broad") {
         const manifest = object(report.parsedManifest);
         for (const [field, verdict] of [
@@ -194,7 +186,7 @@ function systemIdentity(system: DreamerSystemTuple): string {
         system.modelId,
         system.parserImpl,
         system.pluginEntry,
-        system.pluginDigest,
+        system.runtimeDigest,
     ].join("\u0000");
 }
 

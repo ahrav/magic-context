@@ -10,7 +10,7 @@ const system = {
     modelId: "anthropic/model",
     parserImpl: "ts" as const,
     pluginEntry: "src" as const,
-    pluginDigest: "d".repeat(64),
+    runtimeDigest: "d".repeat(64),
 };
 
 function report(index: number, verdict: VerifyVerdict = "verified"): DreamerEvalRunReport {
@@ -25,6 +25,7 @@ function report(index: number, verdict: VerifyVerdict = "verified"): DreamerEval
         reason: null,
         runFatal: false,
         system,
+        trackedFiles: ["src/cache.ts", "src/config.ts", ".dreamer-eval-fixture"],
         poolBefore: [
             {
                 claimId: "claim-cache",
@@ -90,7 +91,7 @@ describe("dreamer eval variance", () => {
         // dirty tree or a stale bundle makes two runs at one commit execute
         // different plugin implementations, and they must not aggregate as repeats.
         const rebuilt = report(2);
-        rebuilt.system = { ...rebuilt.system, pluginDigest: "e".repeat(64) };
+        rebuilt.system = { ...rebuilt.system, runtimeDigest: "e".repeat(64) };
         expect(() => aggregateDreamerEvalVariance([report(1), rebuilt])).toThrow(
             "variance reports must share one system tuple",
         );
@@ -107,7 +108,7 @@ describe("dreamer eval variance", () => {
         // Same five fields, rebuilt in another key order — what a report that
         // round-tripped through a different serializer carries.
         reordered.system = {
-            pluginDigest: system.pluginDigest,
+            runtimeDigest: system.runtimeDigest,
             pluginEntry: system.pluginEntry,
             parserImpl: system.parserImpl,
             modelId: system.modelId,
@@ -173,6 +174,28 @@ describe("dreamer eval variance", () => {
         ]);
     });
 
+    test("map repeats resolve spellings against the report's tracked set", () => {
+        const mapReport = (index: number, files: string[]): DreamerEvalRunReport => {
+            const entry = report(index);
+            entry.task = "map-memories";
+            // A map task has no mapping preconditions, so its capture projects no
+            // files. The universe has to come from the report's own tracked set.
+            entry.poolBefore = [{ ...entry.poolBefore[0]!, files: [] }];
+            entry.parsedManifest = [{ publicClaimId: "mcm_claim", files, independent: false }];
+            return entry;
+        };
+
+        expect(
+            aggregateDreamerEvalVariance([
+                mapReport(1, ["src/cache.ts"]),
+                mapReport(2, ["SRC/CACHE.ts"]),
+            ]).claimHistograms[0],
+        ).toMatchObject({
+            counts: { "independent:false;files:src/cache.ts": 2 },
+            disagreement: false,
+        });
+    });
+
     test("equivalent path spellings do not read as a different mapping", () => {
         const mapReport = (index: number, files: string[]): DreamerEvalRunReport => {
             const entry = report(index);
@@ -200,9 +223,6 @@ describe("dreamer eval variance", () => {
     test("verify repeats sharing a verdict but not a payload disagree", () => {
         const verifyReport = (index: number, files: string[]): DreamerEvalRunReport => {
             const entry = report(index);
-            // Both paths are tracked, so both are part of what the host would
-            // apply — the universe comes from the capture's projected files.
-            entry.poolBefore = [{ ...entry.poolBefore[0]!, files: ["src/cache.ts", "src/config.ts"] }];
             entry.parsedManifest = {
                 verified: [{ publicClaimId: "mcm_claim", files }],
                 updated: [],
