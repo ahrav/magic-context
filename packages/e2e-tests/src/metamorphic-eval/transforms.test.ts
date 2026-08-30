@@ -35,6 +35,21 @@ function firstApplicable(transform: Transform, scenario: HistorianEvalScenario) 
     return undefined;
 }
 
+/** Inserts a background turn so `move-accepted-decision` has a two-position move. */
+function movableScenarioRaw(): Record<string, unknown> {
+    const raw = validScenarioRaw();
+    const transcript = raw.transcript as {
+        turns: Array<{ user: string; assistant: string }>;
+        epilogueStartIndex: number;
+    };
+    transcript.turns.splice(3, 0, {
+        user: "Unrelated: the standup moved to 9am.",
+        assistant: "Noted; standup time recorded informally.",
+    });
+    transcript.epilogueStartIndex = 4;
+    return raw;
+}
+
 describe("metamorphic transforms", () => {
     test("pins the shared splitmix32 sequence", () => {
         const next = splitmix32(20_260_830);
@@ -58,9 +73,9 @@ describe("metamorphic transforms", () => {
     });
 
     test("each applicable transform produces a parsed lint-clean derivative", () => {
-        const raw = validScenarioRaw();
+        const raw = movableScenarioRaw();
         const turns = (raw.transcript as { turns: Array<{ user: string }> }).turns;
-        turns[3].user = "Close the aux_worker.ts notes.";
+        turns[4].user = "Close the aux_worker.ts notes.";
         const scenario = parseScenario(raw);
         for (const transform of TRANSFORMS) {
             const result = firstApplicable(transform, scenario);
@@ -116,7 +131,7 @@ describe("metamorphic transforms", () => {
     });
 
     test("move relocates an accepted decision and keeps its gold attached", () => {
-        const scenario = validScenario();
+        const scenario = parseScenario(movableScenarioRaw());
         const transform = TRANSFORMS.find((candidate) => candidate.id === "move-accepted-decision")!;
         const result = firstApplicable(transform, scenario)!;
         const movedClaim = scenario.gold.expectedClaims.find((claim, index) =>
@@ -125,11 +140,20 @@ describe("metamorphic transforms", () => {
         const derivativeClaim = result.scenario.gold.expectedClaims.find(
             (claim) => claim.id === movedClaim.id,
         )!;
-        expect(derivativeClaim.sourceTurnRange[0]).toBeGreaterThan(movedClaim.sourceTurnRange[0]);
+        expect(derivativeClaim.sourceTurnRange[0]).toBeGreaterThan(movedClaim.sourceTurnRange[0] + 1);
         expect(derivativeClaim.sourceTurnRange[1]).toBeLessThan(
             result.scenario.transcript.epilogueStartIndex,
         );
         expect(lintScenario(result.scenario)).toEqual([]);
+    });
+
+    test("move refuses when the only relocation is an adjacent swap", () => {
+        const scenario = validScenario();
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "move-accepted-decision")!;
+        expect(transform.apply(scenario, 7)).toEqual({
+            applicable: false,
+            reason: "no movable single-turn accepted decision before epilogue",
+        });
     });
 
     test("duplicate inserts one rejected proposal and shifts original turn bindings", () => {
@@ -228,6 +252,7 @@ describe("metamorphic transforms", () => {
     test("rename changes every eligible occurrence without colliding", () => {
         const raw = validScenarioRaw();
         const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[0].assistant = "We could consider it.";
         turns[3] = {
             user: "Close aux_worker.ts after aux_worker.ts and aux_symbol_1234 are checked.",
             assistant: "Background only.",
@@ -245,6 +270,37 @@ describe("metamorphic transforms", () => {
         expect(introduced).toHaveLength(2);
         expect(new Set(introduced).size).toBe(1);
         expect(introduced[0]).not.toBe("aux_symbol_1234");
+    });
+
+    test("rename never picks a symbol shared with an ineligible message", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[0].assistant = "We could consider it.";
+        turns[3] = {
+            user: "Close the in-process LRU work and the aux_worker.ts notes.",
+            assistant: "Background only.",
+        };
+        const scenario = parseScenario(raw);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
+        for (let seed = 0; seed < 50; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            expect(result.applicable, `seed ${seed}`).toBe(true);
+            if (!result.applicable) continue;
+            expect(result.scenario.transcript.turns[3]!.user).toContain("in-process LRU");
+            expect(result.scenario.transcript.turns[1]).toEqual(scenario.transcript.turns[1]);
+        }
+    });
+
+    test("rename symbol scan stays fast on long separator runs", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string }> }).turns;
+        turns[3].user = `Rule A${"-".repeat(5_000)} applies, then close the aux_worker.ts notes.`;
+        const scenario = parseScenario(raw);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
+        const start = performance.now();
+        const result = transform.apply(scenario, 0);
+        expect(performance.now() - start).toBeLessThan(1_000);
+        expect(result.applicable).toBe(true);
     });
 
     test("same input is byte-identical while different seeds select different rewrites", () => {
@@ -298,6 +354,8 @@ describe("metamorphic transforms", () => {
     });
 
     test("whole corpus has anti-vacuous coverage and lint-clean derivatives", () => {
+        const contentTransformIds = ["paraphrase-irrelevant", "rename-unrelated-symbols"];
+        const preEpilogueRewrites = new Set<string>();
         for (const scenario of corpus()) {
             let applied = 0;
             for (const transform of TRANSFORMS) {
@@ -308,9 +366,23 @@ describe("metamorphic transforms", () => {
                 }
                 applied += 1;
                 expect(lintScenario(result.scenario), `${scenario.id}/${transform.id}`).toEqual([]);
+                if (contentTransformIds.includes(transform.id)) {
+                    for (let seed = 0; seed < 10; seed += 1) {
+                        const seeded = transform.apply(scenario, seed);
+                        if (!seeded.applicable) continue;
+                        const changedBeforeEpilogue = seeded.scenario.transcript.turns.some(
+                            (turn, index) =>
+                                index < scenario.transcript.epilogueStartIndex &&
+                                (turn.user !== scenario.transcript.turns[index].user ||
+                                    turn.assistant !== scenario.transcript.turns[index].assistant),
+                        );
+                        if (changedBeforeEpilogue) preEpilogueRewrites.add(transform.id);
+                    }
+                }
             }
             expect(applied, scenario.id).toBeGreaterThan(0);
         }
+        expect([...preEpilogueRewrites].sort()).toEqual([...contentTransformIds].sort());
     });
 
     test("injection canary text and non-binding claim budget survive every derivative", () => {

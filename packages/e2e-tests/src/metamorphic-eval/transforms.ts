@@ -1,7 +1,6 @@
 import { splitmix32 } from "../../../plugin/scripts/retrieval-benchmark/synthetic";
 import {
     MAX_TRANSCRIPT_TURNS,
-    normalizeContent,
     parseScenario,
     predicateMatches,
     type GoldExpectations,
@@ -105,13 +104,21 @@ function eligibleMessages(scenario: HistorianEvalScenario): EligibleMessage[] {
     const absentPredicates = scenario.gold.expectedAbsent.map((absent) => absent.predicate);
     return scenario.transcript.turns.flatMap((turn, turnIndex) => {
         if (protectedIndexes.has(turnIndex)) return [];
-        const turnText = `${turn.user}\n${turn.assistant}`;
-        if (absentPredicates.some((predicate) => predicateMatches(predicate, turnText))) return [];
-        return (["user", "assistant"] as const).map((role) => ({
-            turnIndex,
-            role,
-            text: turn[role],
-        }));
+        // Do not rewrite either message when only their combined text matches:
+        // changing either message can make the combined text stop matching.
+        const spansRoles = absentPredicates.some(
+            (predicate) =>
+                predicateMatches(predicate, `${turn.user}\n${turn.assistant}`) &&
+                !predicateMatches(predicate, turn.user) &&
+                !predicateMatches(predicate, turn.assistant),
+        );
+        if (spansRoles) return [];
+        return (["user", "assistant"] as const).flatMap((role) => {
+            const text = turn[role];
+            return absentPredicates.some((predicate) => predicateMatches(predicate, text))
+                ? []
+                : [{ turnIndex, role, text }];
+        });
     });
 }
 
@@ -190,28 +197,26 @@ const reorderIndependentTurns: Transform = {
         const candidates = Array.from(
             { length: scenario.transcript.epilogueStartIndex - 1 },
             (_, index) => [index, index + 1] as const,
-        ).filter(([left, right]) => {
+        ).flatMap(([left, right]) => {
             const crossesProposalDecision =
                 (absentIndexes.has(left) && expectedIndexes.has(right)) ||
                 (expectedIndexes.has(left) && absentIndexes.has(right));
-            if (crossesProposalDecision) return false;
+            if (crossesProposalDecision) return [];
             const rangeSafe = scenario.gold.expectedClaims.every(
                 (claim) =>
                     claim.sourceTurnRange[1] < left ||
                     claim.sourceTurnRange[0] > right ||
                     claim.sourceTurnRange[0] === claim.sourceTurnRange[1],
             );
-            if (!rangeSafe) return false;
+            if (!rangeSafe) return [];
             const order = scenario.transcript.turns.map((_, index) => index);
             [order[left], order[right]] = [order[right]!, order[left]!];
-            return preservesContiguousGold(scenario, mapForOrder(order));
+            return preservesContiguousGold(scenario, mapForOrder(order)) ? [order] : [];
         });
         if (candidates.length === 0) {
             return { applicable: false, reason: "no independent adjacent turns before epilogue" };
         }
-        const [left, right] = pick(candidates, splitmix32(seed));
-        const order = scenario.transcript.turns.map((_, index) => index);
-        [order[left], order[right]] = [order[right]!, order[left]!];
+        const order = pick(candidates, splitmix32(seed));
         return derivative(
             scenario,
             this,
@@ -241,12 +246,17 @@ const moveAcceptedDecision: Transform = {
             ),
         ];
         const candidates = sources.flatMap((source) =>
+            // A one-position move produces the same order as the adjacent swap
+            // in `reorder-independent-turns`, so only moves of two or more
+            // positions are candidates; otherwise both transforms can emit
+            // identical derivative transcripts that get scored twice.
+            // commentlint: allow(JUDGE)
             Array.from(
-                { length: scenario.transcript.epilogueStartIndex - 1 - source },
-                (_, offset) => {
-                    const order = scenario.transcript.turns.map((_, index) => index);
+                { length: Math.max(0, scenario.transcript.epilogueStartIndex - 2 - source) },
+                (_, index) => {
+                    const order = scenario.transcript.turns.map((_, turnIndex) => turnIndex);
                     const [moved] = order.splice(source, 1);
-                    order.splice(source + offset + 1, 0, moved!);
+                    order.splice(source + index + 2, 0, moved!);
                     return { source, order };
                 },
             ).filter(({ order }) => preservesContiguousGold(scenario, mapForOrder(order))),
@@ -292,7 +302,7 @@ const duplicateRejectedProposal: Transform = {
             const turnMap = scenario.transcript.turns.map((_, index) =>
                 index < insertion ? index : index + 1,
             );
-            return preservesContiguousGold(scenario, turnMap) ? [turnIndex] : [];
+            return preservesContiguousGold(scenario, turnMap) ? [{ source: turnIndex, insertion, turnMap }] : [];
         });
         if (candidates.length === 0) {
             return {
@@ -302,13 +312,9 @@ const duplicateRejectedProposal: Transform = {
                     : "no rejected proposal insertion preserves contiguous gold ranges",
             };
         }
-        const source = pick(candidates, splitmix32(seed));
-        const insertion = source + 1;
+        const { source, insertion, turnMap } = pick(candidates, splitmix32(seed));
         const turns = scenario.transcript.turns.map((turn) => ({ ...turn }));
         turns.splice(insertion, 0, { ...scenario.transcript.turns[source]! });
-        const turnMap = scenario.transcript.turns.map((_, index) =>
-            index < insertion ? index : index + 1,
-        );
         return derivative(
             scenario,
             this,
@@ -321,7 +327,11 @@ const duplicateRejectedProposal: Transform = {
     },
 };
 
-const SYMBOL_RE = /`([^`]+)`|\b(?:[A-Za-z][A-Za-z0-9]*(?:[_./-][A-Za-z0-9_.-]+)+|[a-z]+[A-Z][A-Za-z0-9]*|[A-Z]{2,})\b/g;
+// The separator class `[_./-]` must remain disjoint from `[A-Za-z0-9]`: if a
+// segment can also contain separators, a long `-` run after a letter
+// backtracks exponentially when the trailing `\b` fails.
+// commentlint: allow(JUDGE)
+const SYMBOL_RE = /`([^`]+)`|\b(?:[A-Za-z][A-Za-z0-9]*(?:[_./-][A-Za-z0-9]+)+|[a-z]+[A-Z][A-Za-z0-9]*|[A-Z]{2,})\b/g;
 
 const renameUnrelatedSymbols: Transform = {
     id: "rename-unrelated-symbols",
@@ -330,11 +340,24 @@ const renameUnrelatedSymbols: Transform = {
     apply(scenario, rawSeed) {
         const seed = normalizedSeed(rawSeed);
         const messages = eligibleMessages(scenario);
+        const eligibleKeys = new Set(messages.map((message) => `${message.turnIndex}:${message.role}`));
+        // Symbols that also occur in a message the rename cannot touch stay
+        // out of the candidate pool: renaming only some occurrences would name
+        // one entity two ways within the derivative transcript.
+        const blocked = new Set(
+            scenario.transcript.turns.flatMap((turn, turnIndex) =>
+                (["user", "assistant"] as const).flatMap((role) =>
+                    eligibleKeys.has(`${turnIndex}:${role}`)
+                        ? []
+                        : [...turn[role].matchAll(SYMBOL_RE)].map((match) => match[1] ?? match[0]),
+                ),
+            ),
+        );
         const candidates = [
             ...new Set(messages.flatMap((message) =>
                 [...message.text.matchAll(SYMBOL_RE)].map((match) => match[1] ?? match[0])
             )),
-        ];
+        ].filter((symbol) => !blocked.has(symbol));
         if (candidates.length === 0) {
             return { applicable: false, reason: "no unrelated symbol to rename" };
         }

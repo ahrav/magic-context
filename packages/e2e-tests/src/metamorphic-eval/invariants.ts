@@ -1,5 +1,5 @@
-import { normalizeMemoryContent } from "../../../plugin/src/features/magic-context/memory/normalize-hash";
 import type { InjectedClaimRecord } from "../historian-eval/claim-read";
+import { normalizeContent } from "../historian-eval/contract";
 import type { ScenarioScore } from "../historian-eval/scorer";
 
 export interface CanonicalInjectedClaim {
@@ -32,14 +32,17 @@ function claimKey(claim: CanonicalInjectedClaim): string {
     return JSON.stringify([claim.category, claim.content]);
 }
 
-export function canonicalizeInjectionSet(
+function canonicalizeInjectionSet(
     claims: readonly InjectedClaimRecord[],
 ): CanonicalInjectedClaim[] {
     const unique = new Map<string, CanonicalInjectedClaim>();
     for (const claim of claims) {
         const canonical = {
             category: claim.category,
-            content: normalizeMemoryContent(claim.content),
+            // `normalizeContent` is the normalizer behind `predicateMatches`:
+            // set equality and expected-absent scoring use the same
+            // claim-content identity.
+            content: normalizeContent(claim.content),
         };
         unique.set(claimKey(canonical), canonical);
     }
