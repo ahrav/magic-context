@@ -944,6 +944,18 @@ const SYMBOL_RE =
 // an expression, and replacing the whole span would rewrite the instruction
 // rather than rename an entity. Admitted backtick contents must therefore
 // satisfy the same shape the unquoted alternatives accept.
+/**
+ * Whether `symbol` is used as a markup element name — `<symbol>` or `</symbol>`.
+ *
+ * Production strips `<system-reminder>` blocks from user text, so renaming the tag
+ * name rewrites the delimiter rather than an entity: the block stops being
+ * recognised and text the baseline hid reaches the historian.
+ */
+function isMarkupName(symbol: string, text: string): boolean {
+    const escaped = symbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`</?${escaped}\\s*>`, "i").test(text);
+}
+
 /** Generated replacement names, and the pattern that finds one already taken. */
 const REPLACEMENT_PREFIX = "aux_symbol_";
 const REPLACEMENT_SPACE = 10_000;
@@ -1068,6 +1080,22 @@ const renameUnrelatedSymbols: Transform = {
             ...probeText.flatMap((text) => symbolsIn(text)),
             ...collisionText.flatMap((text) => shadowedSymbolsIn(text)),
         ]);
+        // Commit-hash spellings are collected across the whole transcript before the
+        // pool is formed: admission is per occurrence and then unioned, so the same
+        // spelling appearing in one message without a commit verb would re-enable a
+        // revision identifier another message uses as one, and the replacement runs
+        // over every occurrence.
+        const commitHashes = new Set(
+            scenario.transcript.turns.flatMap((turn, turnIndex) =>
+                (["user", "assistant"] as const).flatMap((role) => {
+                    const text = visibleText.get(messageKey(turnIndex, role)) ?? "";
+                    if (role !== "assistant" || !COMMIT_VERB_PATTERN.test(text)) return [];
+                    return symbolsIn(text).filter((symbol) =>
+                        COMMIT_HASH_TEST_PATTERN.test(symbol),
+                    );
+                }),
+            ),
+        );
         const candidates = [
             ...new Set(
                 messages.flatMap((message) => {
@@ -1090,13 +1118,19 @@ const renameUnrelatedSymbols: Transform = {
                     return symbolsIn(visibleMessage).filter(
                         (symbol) =>
                             raw.has(symbol) &&
-                            !(commitContext && COMMIT_HASH_TEST_PATTERN.test(symbol)),
+                            !(commitContext && COMMIT_HASH_TEST_PATTERN.test(symbol)) &&
+                            // Renaming a markup name rewrites the delimiter, not an
+                            // entity: `<system-reminder>` becomes `<aux_symbol_N>`,
+                            // production stops stripping the block, and text the
+                            // baseline hid reaches the historian.
+                            !isMarkupName(symbol, message.text),
                     );
                 }),
             ),
         ].filter(
             (symbol) =>
                 !blocked.has(symbol) &&
+                !commitHashes.has(symbol) &&
                 // A symbol can carry a probe answer without being one: renaming
                 // `api/v2` deletes the complete-value occurrence of `api`.
                 !answers.some((answer) => containsCompleteValue(symbol, answer)) &&

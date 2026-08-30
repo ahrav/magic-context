@@ -728,6 +728,62 @@ describe("metamorphic transforms", () => {
         }
     });
 
+    test("rename refuses a markup name that delimits hidden text", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[0]!.assistant = "We could consider it.";
+        // The tag name is also mentioned as prose, so it reaches the candidate scan
+        // through the historian-visible text while the raw text still uses it as a
+        // delimiter.
+        turns[3] = {
+            user: "<system-reminder>secret</system-reminder> Background about system-reminder and aux_worker.ts.",
+            assistant: "Summary recorded.",
+        };
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
+
+        let applied = 0;
+        for (let seed = 0; seed < 30; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            applied += 1;
+            const rewritten = result.scenario.transcript.turns[3]!.user;
+            expect(rewritten, `seed ${seed}`).toContain("<system-reminder>secret</system-reminder>");
+            expect(rewritten, `seed ${seed}`).not.toContain("secret</aux_symbol");
+        }
+        expect(applied, "never applied").toBeGreaterThan(0);
+    });
+
+    test("rename refuses a commit hash another message spells without a verb", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        // One message uses the spelling as a commit hash; another mentions it with no
+        // commit verb, which is where per-occurrence admission let it back in.
+        turns[0]!.assistant = "Committed ABCDEFAB while exploring.";
+        turns[3] = {
+            user: "Wrapping up.",
+            assistant: "Reference ABCDEFAB and aux_worker.ts remain open.",
+        };
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
+
+        let applied = 0;
+        for (let seed = 0; seed < 30; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            applied += 1;
+            for (const turn of result.scenario.transcript.turns) {
+                expect(turn.assistant, `seed ${seed}`).not.toContain("Committed aux_symbol");
+            }
+            expect(result.scenario.transcript.turns[3]!.assistant, `seed ${seed}`).toContain(
+                "ABCDEFAB",
+            );
+        }
+        expect(applied, "never applied").toBeGreaterThan(0);
+    });
+
     test("rename refuses a bare symbol a protected compound name contains", () => {
         const raw = validScenarioRaw();
         const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
