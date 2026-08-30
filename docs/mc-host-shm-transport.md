@@ -8,7 +8,7 @@ There is no runtime transport selector, alternate shared-memory backend, compati
 
 The accepted identity is fixed by the release:
 
-- profile: `mc-host-eventfd-ring-v2`
+- profile: `mc-host-test-ring-v1`
 - wire version: `2`
 - descriptor schema: `3`
 
@@ -63,7 +63,7 @@ A healthy report includes only bounded, aggregate data:
 - fixed artifact identity;
 - process bounds;
 - active and quarantined accounting;
-- completed attachment and activation counts;
+- completed activation counts;
 - observed peer-death count;
 - completed reclamation count;
 - observed exhaustion count.
@@ -74,7 +74,7 @@ Reports never include setup-socket paths, native handles, mapping descriptors, g
 
 ## Resource bounds
 
-The fixed profile charges both directions. One connection charges 64 ring descriptors, 128 MiB of sparse virtual arena capacity, 64 receive leases, two mappings, six transferred file descriptors, no endpoint or pinned worker, and one client instance. Native JS integration adds one environment watcher, not one watcher per connection. Process bounds multiply this profile by the configured maximum connection count with checked arithmetic. Resident memory grows on first touch and returns through FIFO page removal; the virtual arena charge stays fixed.
+The fixed profile charges both directions. One connection charges 16 ring descriptors, 128 MiB of sparse virtual arena capacity, 16 receive leases, two mappings, six transferred file descriptors, no endpoint or pinned worker, and one client instance. Native JS integration adds one environment watcher, not one watcher per connection. Process bounds multiply this profile by the configured maximum connection count with checked arithmetic. Resident memory grows on first touch and returns through FIFO page removal; the virtual arena charge stays fixed.
 
 Exact-capacity admission succeeds. Capacity plus one fails without creating another mapping or worker. Repeated peer crashes must not increase active charges after reclamation, and quarantined charges remain within the configured process bound.
 

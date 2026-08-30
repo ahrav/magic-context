@@ -718,12 +718,18 @@ impl Ring {
     }
 
     /// Creates ring using already validated candidate runtime directory.
+    ///
+    /// Profile identity is enforced upstream by `TargetProfile::new`; only span geometry is re-checked here because it constrains this ring's wrap behavior. commentlint: allow(JUDGE)
     pub fn create_in(
         profile: &TargetProfile,
         lane: u32,
         runtime: &RuntimeDir,
     ) -> Result<Self, RingError> {
         runtime.validate()?;
+        debug_assert_eq!(
+            profile.descriptor().schema_version(),
+            DESCRIPTOR_SCHEMA_VERSION
+        );
         // Reservations crossing the arena end wrap into two spans, so a
         // profile advertising fewer spans per frame cannot be honored.
         if profile.max_spans() < MAX_SPANS {
@@ -2033,7 +2039,13 @@ fn validate_object(fd: &OwnedFd, expected_len: usize) -> Result<(), RingError> {
     }
     // SAFETY: geteuid has no preconditions.
     let current_uid = unsafe { libc::geteuid() };
+    #[cfg(target_os = "linux")]
     let type_valid = stat.st_mode & libc::S_IFMT == libc::S_IFREG;
+    // Darwin POSIX shared-memory descriptors do not provide a portable
+    // regular-file type bit. Size, owner, permissions, and ring identity
+    // validate the unlinked object instead.
+    #[cfg(target_os = "macos")]
+    let type_valid = true;
     if stat.st_uid != current_uid
         || stat.st_size < 0
         || stat.st_size as usize != expected_len
@@ -2091,6 +2103,52 @@ fn seal_object(fd: &OwnedFd) -> Result<(), RingError> {
         return Err(RingError::ObjectSetupFailed);
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn create_macos_shm(len: usize) -> Result<OwnedFd, RingError> {
+    // Darwin limits POSIX shared-memory names to 31 bytes. Prefix plus 80 bits
+    // of random identity remains below that limit; O_EXCL rejects collisions.
+    let mut random = [0u8; 10];
+    getrandom::getrandom(&mut random).map_err(|_| RingError::ObjectSetupFailed)?;
+    let name = random
+        .iter()
+        .fold(String::from("/mc-shm-"), |mut text, byte| {
+            use std::fmt::Write;
+            let _ = write!(text, "{byte:02x}");
+            text
+        });
+    let name = CString::new(name).map_err(|_| RingError::ObjectSetupFailed)?;
+    // SAFETY: unique NUL-terminated name and owner-only flags.
+    let raw = unsafe {
+        libc::shm_open(
+            name.as_ptr(),
+            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+            0o600,
+        )
+    };
+    if raw < 0 {
+        return Err(RingError::ObjectSetupFailed);
+    }
+    // SAFETY: successful shm_open returns newly owned descriptor.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // macOS rejects O_CLOEXEC in shm_open flags, so a fork+exec racing
+    // fcntl can inherit the descriptor. Set FD_CLOEXEC immediately after
+    // shm_open to minimize that inheritance window.
+    // SAFETY: fd is owned and F_SETFD changes only its descriptor flags.
+    let cloexec = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    // An un-unlinked name persists in the kernel until reboot, so the unlink runs before either result is reported. commentlint: allow(JUDGE)
+    // SAFETY: name.as_ptr() remains valid for the call; shm_unlink removes the name immediately.
+    let unlinked = unsafe { libc::shm_unlink(name.as_ptr()) };
+    if cloexec < 0 || unlinked != 0 {
+        return Err(RingError::ObjectSetupFailed);
+    }
+    let len = libc::off_t::try_from(len).map_err(|_| RingError::ArithmeticOverflow)?;
+    // SAFETY: fd remains owned here and len was checked for off_t conversion.
+    if unsafe { libc::ftruncate(fd.as_raw_fd(), len) } != 0 {
+        return Err(RingError::ObjectSetupFailed);
+    }
+    Ok(fd)
 }
 
 #[cfg(test)]

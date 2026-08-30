@@ -13,24 +13,21 @@ use crate::setup_socket::RING_DESCRIPTOR_COUNT;
 use crate::wire::{decode_header, EnvelopeHeader, FrameType};
 use mc_shm_transport::backend::ring::RingGrant;
 use mc_shm_transport::backend::ring::{DuplexRing, ProducerReservation, Ring};
-use mc_shm_transport::descriptor::{HardwareProfileId, TransportDescriptor};
 use mc_shm_transport::profile::{
-    AdmissionController, CompletionMode, HostLimits as ShmHostLimits, ProducerTopology,
-    ProfileConfig, ResourceCharges, TargetProfile, WorkerTopology,
+    AdmissionController, HostLimits as ShmHostLimits, ResourceCharges, TargetProfile,
 };
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::frame_channel::{
-    frame_sender, validate_inbound_header, BoxedReceiver, CopyCounter, DirectFrame, FrameReceiver,
-    InboundEvent, InboundFrame, OutboundFrame, ReadClose, RejectedFrame, SenderQueue, COMPLETE,
+    frame_sender, validate_inbound_header, CopyCounter, DirectFrame, InboundEvent, InboundFrame,
+    OutboundFrame, ReadClose, RejectedFrame, SenderQueue, COMPLETE,
 };
 use crate::wire::{ByteBudget, MAX_CONTROL_BODY_LEN};
 
 /// Current ring profile accepted by every process in one release.
-pub const RING_PROFILE: &str = "mc-host-eventfd-ring-v2";
-const DESCRIPTOR_DEPTH: usize = 8;
+pub const RING_PROFILE: &str = mc_shm_transport::profile::MC_HOST_RING_PROFILE;
 
 /// Test-only observer invoked after each successful frame publication with
 /// the published frame's type and channel. It receives no descriptors,
@@ -39,21 +36,8 @@ const DESCRIPTOR_DEPTH: usize = 8;
 pub type PublishHook = Arc<dyn Fn(FrameType, u16) + Send + Sync>;
 
 pub fn ring_profile() -> TargetProfile {
-    TargetProfile::new(ProfileConfig {
-        descriptor: TransportDescriptor::new(
-            HardwareProfileId::new(RING_PROFILE).expect("static hardware profile is valid"),
-        ),
-        descriptor_depth: DESCRIPTOR_DEPTH,
-        arena_bytes: mc_shm_transport::MIN_ARENA_BYTES,
-        max_spans: 2,
-        max_leases: DESCRIPTOR_DEPTH,
-        mappings: 2,
-        pinned_workers: 0,
-        producer_topology: ProducerTopology::Arbitrated,
-        worker_topology: WorkerTopology::Fused,
-        completion_mode: CompletionMode::SynchronousPull,
-    })
-    .expect("static shared-memory profile is valid")
+    mc_shm_transport::profile::mc_host_ring_profile()
+        .expect("static shared-memory profile is valid")
 }
 
 /// Admission limits sufficient for one connection.
@@ -71,9 +55,17 @@ pub fn per_connection_limits() -> ShmHostLimits {
     }
 }
 
+/// Ceiling on sparse ring virtual arena bytes this process admits at once. commentlint: allow(JUDGE)
+pub const MAX_RING_RESIDENT_BYTES: u64 = 1 << 30;
+
+/// Admission limits for `connections` concurrent sparse rings, bounded by aggregate virtual arena bytes. One connection stays admissible. commentlint: allow(JUDGE)
 pub fn process_limits(connections: usize) -> Option<ShmHostLimits> {
-    let count = u64::try_from(connections).ok()?;
     let one = per_connection_limits();
+    let affordable = MAX_RING_RESIDENT_BYTES
+        .checked_div(one.arena_bytes)
+        .unwrap_or(1)
+        .max(1);
+    let count = u64::try_from(connections).ok()?.min(affordable).max(1);
     Some(ShmHostLimits {
         descriptors: one.descriptors.checked_mul(count)?,
         arena_bytes: one.arena_bytes.checked_mul(count)?,
@@ -91,7 +83,6 @@ pub struct RingTransport {
     profile: Arc<TargetProfile>,
     admission: Arc<AdmissionController>,
     limits: ShmHostLimits,
-    preparations: AtomicU64,
     activations: AtomicU64,
     peer_deaths: AtomicU64,
     reclamations: AtomicU64,
@@ -103,7 +94,7 @@ pub(crate) struct PreparedRing {
     pub(crate) descriptor: serde_json::Value,
     pub(crate) descriptors: [OwnedFd; RING_DESCRIPTOR_COUNT],
     pub(crate) sender: crate::frame_channel::FrameSender,
-    pub(crate) receiver: BoxedReceiver,
+    pub(crate) receiver: ShmReceiver,
     pub(crate) io: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
     pub(crate) root: CancellationToken,
     pub(crate) read_cancel: CancellationToken,
@@ -129,7 +120,6 @@ impl RingTransport {
             profile,
             admission,
             limits,
-            preparations: AtomicU64::new(0),
             activations: AtomicU64::new(0),
             peer_deaths: AtomicU64::new(0),
             reclamations: AtomicU64::new(0),
@@ -197,16 +187,11 @@ impl RingTransport {
             },
             "bounds": limits,
             "accounting": accounting,
-            "attachment": {"completed": self.preparations.load(Ordering::Acquire)},
             "activation": {"completed": self.activations.load(Ordering::Acquire)},
             "peer_death": {"observed": self.peer_deaths.load(Ordering::Acquire)},
             "reclamation": {"completed": self.reclamations.load(Ordering::Acquire)},
             "exhaustion": {"observed": self.exhaustions.load(Ordering::Acquire)},
         })
-    }
-
-    pub(crate) fn record_attachment(&self) {
-        self.preparations.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_activation(&self) {
@@ -295,9 +280,9 @@ impl RingTransport {
             return Err(RingUnavailable);
         }
         let (descriptor, descriptors) = initialized_rx.recv().map_err(|_| RingUnavailable)??;
-        let receiver = BoxedReceiver::new(ShmReceiver {
+        let receiver = ShmReceiver {
             inbound: inbound_rx,
-        });
+        };
         let io = Box::pin(async move {
             let _ = done_rx.await;
         });
@@ -321,7 +306,7 @@ struct WireDescriptor {
     peer_to_host_grant: String,
 }
 
-fn worker_descriptor(
+pub(crate) fn worker_descriptor(
     rings: &DuplexRing,
 ) -> Result<(serde_json::Value, [OwnedFd; RING_DESCRIPTOR_COUNT]), ()> {
     let descriptor = WireDescriptor {
@@ -357,12 +342,12 @@ fn encode_hex(bytes: &[u8]) -> String {
         })
 }
 
-struct ShmReceiver {
+pub(crate) struct ShmReceiver {
     inbound: mpsc::Receiver<Result<InboundEvent, ReadClose>>,
 }
 
-impl FrameReceiver for ShmReceiver {
-    async fn recv(&mut self) -> Result<InboundEvent, ReadClose> {
+impl ShmReceiver {
+    pub(crate) async fn recv(&mut self) -> Result<InboundEvent, ReadClose> {
         self.inbound
             .recv()
             .await
@@ -695,15 +680,16 @@ impl RingClientEndpoint {
         Ok(Self { to_host, from_host })
     }
 
-    /// Publishes one complete consumer frame.
-    pub fn send(&self, header: EnvelopeHeader, body: &[u8]) -> Result<(), RingClientError> {
+    /// Publishes one complete consumer frame under the caller's deadline.
+    pub fn send(
+        &self,
+        header: EnvelopeHeader,
+        body: &[u8],
+        deadline: StdInstant,
+    ) -> Result<(), RingClientError> {
         let mut reservation = self
             .to_host
-            .reserve_until(
-                body.len(),
-                header.encode(),
-                StdInstant::now() + Duration::from_secs(2),
-            )
+            .reserve_until(body.len(), header.encode(), deadline)
             .map_err(|_| RingClientError)?;
         reservation.write(body).map_err(|_| RingClientError)?;
         reservation
@@ -850,6 +836,7 @@ mod tests {
                 corr: 0,
             },
             &[],
+            StdInstant::now() + Duration::from_secs(1),
         )
         .expect("peer publishes late Goodbye");
         sender.finish();
@@ -872,7 +859,6 @@ mod tests {
     fn diagnostics_report_fixed_identity_bounds_accounting_and_lifecycle_counts() {
         let limits = per_connection_limits();
         let transport = RingTransport::for_ring_profile(limits);
-        transport.record_attachment();
         transport.record_activation();
         transport.record_peer_death();
         transport.record_reclamation();
@@ -892,7 +878,6 @@ mod tests {
         assert_eq!(diagnostics["bounds"]["arena_bytes"], limits.arena_bytes);
         assert_eq!(diagnostics["accounting"]["active"]["arena_bytes"], 0);
         assert_eq!(diagnostics["accounting"]["quarantined"]["arena_bytes"], 0);
-        assert_eq!(diagnostics["attachment"]["completed"], 1);
         assert_eq!(diagnostics["activation"]["completed"], 1);
         assert_eq!(diagnostics["peer_death"]["observed"], 1);
         assert_eq!(diagnostics["reclamation"]["completed"], 1);

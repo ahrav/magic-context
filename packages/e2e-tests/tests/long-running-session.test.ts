@@ -10,10 +10,10 @@ import { TestHarness } from "../src/harness";
 import { buildMockHistorianPayload } from "../src/mock-historian";
 import type { MockUsage } from "../src/mock-provider/server";
 import { openTestDb } from "../src/test-db";
+import { isHistorianRequest } from "../src/cache-analysis";
 
 type Database = ReturnType<typeof openTestDb>;
 
-const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
 const RUST_MODE = process.env.MC_E2E_MODE === "rust";
 
 const LOW_USAGE: MockUsage = {
@@ -101,13 +101,6 @@ function serialize(value: unknown): string {
 
 function isMagicContextRequest(body: Record<string, unknown>): boolean {
     return JSON.stringify(body.system ?? "").includes("## Magic Context");
-}
-
-function isHistorianRequest(body: Record<string, unknown>): boolean {
-    return (
-        JSON.stringify(body.system ?? "").includes(HISTORIAN_SYSTEM_MARKER) ||
-        JSON.stringify(body.messages ?? "").includes("<new_messages>")
-    );
 }
 
 function mainRequests() {
@@ -611,7 +604,7 @@ describe("long-running OpenCode Magic Context session", () => {
             // f5a0f403 routed Rust memory writes through the module backend. Use
             // the public tool, then verify the local read-model mirror caught up.
             emitToolOnce(/^ctx_memory$/, {
-                action: "write",
+                action: "create",
                 category: "PROJECT_RULES",
                 content: autoSearchMemory,
             });

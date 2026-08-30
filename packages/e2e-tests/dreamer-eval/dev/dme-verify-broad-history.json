@@ -1,0 +1,272 @@
+{
+  "schema": "dreamer-eval-scenario/v1",
+  "id": "dme-verify-broad-history",
+  "title": "Broad verification revisits seeded history",
+  "pressureRoles": [],
+  "pool": {
+    "claims": [
+      {
+        "id": "claim-history-1",
+        "content": "API requests use version v2.",
+        "category": "ARCHITECTURE",
+        "importance": 60,
+        "memoryScope": "project",
+        "sharing": "private",
+        "hygieneVisible": true,
+        "fileIndependent": false,
+        "fixtureFiles": [
+          {
+            "path": "src/history.ts",
+            "content": "export const API_VERSION = \"v2\";\nexport const REGION = \"us-east-1\";\nexport const PORT = 8443;\n"
+          }
+        ]
+      },
+      {
+        "id": "claim-history-2",
+        "content": "The primary region is us-east-1.",
+        "category": "CONFIG_VALUES",
+        "importance": 60,
+        "memoryScope": "project",
+        "sharing": "private",
+        "hygieneVisible": true,
+        "fileIndependent": false,
+        "fixtureFiles": [
+          {
+            "path": "src/history.ts",
+            "content": "export const API_VERSION = \"v2\";\nexport const REGION = \"us-east-1\";\nexport const PORT = 8443;\n"
+          }
+        ]
+      },
+      {
+        "id": "claim-history-3",
+        "content": "The service listens on port 8443.",
+        "category": "CONFIG_VALUES",
+        "importance": 60,
+        "memoryScope": "project",
+        "sharing": "private",
+        "hygieneVisible": true,
+        "fileIndependent": false,
+        "fixtureFiles": [
+          {
+            "path": "src/history.ts",
+            "content": "export const API_VERSION = \"v2\";\nexport const REGION = \"us-east-1\";\nexport const PORT = 8443;\n"
+          }
+        ]
+      },
+      {
+        "id": "claim-history-4",
+        "content": "Release artifacts are immutable.",
+        "category": "CONSTRAINTS",
+        "importance": 70,
+        "memoryScope": "project",
+        "sharing": "private",
+        "hygieneVisible": true,
+        "fileIndependent": false,
+        "fixtureFiles": [
+          {
+            "path": "src/release.ts",
+            "content": "export const ARTIFACTS_IMMUTABLE = true;\nexport const ARTIFACTS_SIGNED = true;\nexport const ROLLBACK_KEEPS_PRIOR_ARTIFACT = true;\n"
+          }
+        ]
+      },
+      {
+        "id": "claim-history-5",
+        "content": "Release artifacts are signed.",
+        "category": "CONSTRAINTS",
+        "importance": 70,
+        "memoryScope": "project",
+        "sharing": "private",
+        "hygieneVisible": true,
+        "fileIndependent": false,
+        "fixtureFiles": [
+          {
+            "path": "src/release.ts",
+            "content": "export const ARTIFACTS_IMMUTABLE = true;\nexport const ARTIFACTS_SIGNED = true;\nexport const ROLLBACK_KEEPS_PRIOR_ARTIFACT = true;\n"
+          }
+        ]
+      },
+      {
+        "id": "claim-history-6",
+        "content": "Rollback keeps the prior artifact.",
+        "category": "ARCHITECTURE",
+        "importance": 65,
+        "memoryScope": "project",
+        "sharing": "private",
+        "hygieneVisible": true,
+        "fileIndependent": false,
+        "fixtureFiles": [
+          {
+            "path": "src/release.ts",
+            "content": "export const ARTIFACTS_IMMUTABLE = true;\nexport const ARTIFACTS_SIGNED = true;\nexport const ROLLBACK_KEEPS_PRIOR_ARTIFACT = true;\n"
+          }
+        ]
+      },
+      {
+        "id": "claim-history-7",
+        "content": "Database migrations run before traffic shifts.",
+        "category": "PROJECT_RULES",
+        "importance": 75,
+        "memoryScope": "project",
+        "sharing": "private",
+        "hygieneVisible": true,
+        "fileIndependent": false,
+        "fixtureFiles": [
+          {
+            "path": "src/deploy.ts",
+            "content": "export const MIGRATIONS_BEFORE_TRAFFIC_SHIFT = true;\nexport const BAKE_MINUTES = 15;\n"
+          }
+        ]
+      },
+      {
+        "id": "claim-history-8",
+        "content": "Deployment bake time is 15 minutes.",
+        "category": "CONFIG_VALUES",
+        "importance": 55,
+        "memoryScope": "project",
+        "sharing": "private",
+        "hygieneVisible": true,
+        "fileIndependent": false,
+        "fixtureFiles": [
+          {
+            "path": "src/deploy.ts",
+            "content": "export const MIGRATIONS_BEFORE_TRAFFIC_SHIFT = true;\nexport const BAKE_MINUTES = 15;\n"
+          }
+        ]
+      },
+      {
+        "id": "claim-history-9",
+        "content": "Health checks use the ready endpoint.",
+        "category": "PROJECT_RULES",
+        "importance": 65,
+        "memoryScope": "project",
+        "sharing": "private",
+        "hygieneVisible": true,
+        "fileIndependent": false,
+        "fixtureFiles": [
+          {
+            "path": "src/health.ts",
+            "content": "export const HEALTH_PATH = \"/ready\";\n"
+          }
+        ]
+      },
+      {
+        "id": "claim-history-independent",
+        "content": "Credentials must never be committed.",
+        "category": "CONSTRAINTS",
+        "importance": 95,
+        "memoryScope": "universe",
+        "sharing": "shareable",
+        "hygieneVisible": true,
+        "fileIndependent": true,
+        "fixtureFiles": []
+      }
+    ]
+  },
+  "tasks": [
+    {
+      "task": "verify-broad",
+      "preconditions": {
+        "mappings": [
+          { "claimId": "claim-history-1", "files": ["src/history.ts"] },
+          { "claimId": "claim-history-2", "files": ["src/history.ts"] },
+          { "claimId": "claim-history-3", "files": ["src/history.ts"] },
+          { "claimId": "claim-history-4", "files": ["src/release.ts"] },
+          { "claimId": "claim-history-5", "files": ["src/release.ts"] },
+          { "claimId": "claim-history-6", "files": ["src/release.ts"] },
+          { "claimId": "claim-history-7", "files": ["src/deploy.ts"] },
+          { "claimId": "claim-history-8", "files": ["src/deploy.ts"] },
+          { "claimId": "claim-history-9", "files": ["src/health.ts"] }
+        ],
+        "verifications": [
+          {
+            "claimId": "claim-history-9",
+            "outcome": "verified",
+            "verifiedAt": 1700000010000
+          }
+        ],
+        "classifiedClaimIds": []
+      },
+      "expectedInScopeClaimIds": [
+        "claim-history-1",
+        "claim-history-2",
+        "claim-history-3",
+        "claim-history-4",
+        "claim-history-5",
+        "claim-history-6",
+        "claim-history-7",
+        "claim-history-8",
+        "claim-history-9"
+      ],
+      "expectedSkippedClaimIds": ["claim-history-independent"],
+      "expectedResultMode": "broad",
+      "gold": {
+        "kind": "verify",
+        "claims": [
+          {
+            "claimId": "claim-history-1",
+            "verdict": "verified",
+            "expectedFiles": ["src/history.ts"],
+            "requiredUpdateAnchors": [],
+            "forbiddenUpdateAnchors": []
+          },
+          {
+            "claimId": "claim-history-2",
+            "verdict": "verified",
+            "expectedFiles": ["src/history.ts"],
+            "requiredUpdateAnchors": [],
+            "forbiddenUpdateAnchors": []
+          },
+          {
+            "claimId": "claim-history-3",
+            "verdict": "verified",
+            "expectedFiles": ["src/history.ts"],
+            "requiredUpdateAnchors": [],
+            "forbiddenUpdateAnchors": []
+          },
+          {
+            "claimId": "claim-history-4",
+            "verdict": "verified",
+            "expectedFiles": ["src/release.ts"],
+            "requiredUpdateAnchors": [],
+            "forbiddenUpdateAnchors": []
+          },
+          {
+            "claimId": "claim-history-5",
+            "verdict": "verified",
+            "expectedFiles": ["src/release.ts"],
+            "requiredUpdateAnchors": [],
+            "forbiddenUpdateAnchors": []
+          },
+          {
+            "claimId": "claim-history-6",
+            "verdict": "verified",
+            "expectedFiles": ["src/release.ts"],
+            "requiredUpdateAnchors": [],
+            "forbiddenUpdateAnchors": []
+          },
+          {
+            "claimId": "claim-history-7",
+            "verdict": "verified",
+            "expectedFiles": ["src/deploy.ts"],
+            "requiredUpdateAnchors": [],
+            "forbiddenUpdateAnchors": []
+          },
+          {
+            "claimId": "claim-history-8",
+            "verdict": "verified",
+            "expectedFiles": ["src/deploy.ts"],
+            "requiredUpdateAnchors": [],
+            "forbiddenUpdateAnchors": []
+          },
+          {
+            "claimId": "claim-history-9",
+            "verdict": "verified",
+            "expectedFiles": ["src/health.ts"],
+            "requiredUpdateAnchors": [],
+            "forbiddenUpdateAnchors": []
+          }
+        ]
+      }
+    }
+  ]
+}

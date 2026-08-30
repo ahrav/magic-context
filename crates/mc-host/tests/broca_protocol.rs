@@ -2,6 +2,8 @@
 //! request boundary, bind validation, and wire-shape compatibility with the
 //! JSON `HistorianProducer` sends and parses today.
 
+// Broca conformance drives a Synapse primary, which ships only for `linux-x64-gnu`. commentlint: allow(JUDGE)
+#![cfg(target_os = "linux")]
 mod support;
 
 use std::sync::Arc;
@@ -423,6 +425,21 @@ fn harness_vocabulary_is_closed() {
     for alias in ["OpenCode", "PI", "opencode ", "codex", ""] {
         assert_eq!(Harness::parse(alias), None, "{alias:?} must not parse");
     }
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&protocol::harness_dispatch_unit(
+            "broca-run-1",
+            Harness::Pi,
+        ))
+        .expect("dispatch unit JSON"),
+        serde_json::json!({
+            "kind": "control",
+            "unit": {
+                "type": "harness_dispatch",
+                "run_id": "broca-run-1",
+                "harness": "pi",
+            },
+        })
+    );
 }
 
 #[tokio::test]

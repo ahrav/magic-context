@@ -1,5 +1,3 @@
-import { createHash } from "node:crypto";
-
 import type { Database } from "../../../shared/sqlite";
 
 /**
@@ -153,17 +151,4 @@ export function recordClaimMuralCueRejection(
             updated_at = excluded.updated_at`,
     ).run(claimId, args.revisionLocator, MURAL_CUE_RENDERER_EPOCH, count, Date.now());
     return count;
-}
-
-/**
- * The staleness key: sha256 of the RAW memory content the cue was compressed
- * FROM. Any edit to the content changes this hash, so a stored cue whose hash no
- * longer matches the current content is detected as stale — re-selected by the
- * compress-cues gate and excluded by resolveMural until recompressed. This is
- * deliberately distinct from `normalizedHash` (md5 of normalized text used for
- * dedup): cue staleness must react to every content change, including
- * whitespace/case edits that normalization would erase.
- */
-export function computeCueContentHash(content: string): string {
-    return createHash("sha256").update(content).digest("hex");
 }

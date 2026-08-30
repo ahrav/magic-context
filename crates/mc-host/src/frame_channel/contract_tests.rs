@@ -1,20 +1,22 @@
 //! Semantic contract suite for the mandatory shared-memory frame channel.
 //!
 //! Every scenario exercises only the neutral boundary — [`FrameSender`],
-//! [`FrameReceiver`], shared lifecycle tokens, and byte-charge ownership —
+//! the concrete `ShmReceiver` receive side, shared lifecycle tokens, and
+//! byte-charge ownership —
 //! through a [`ChannelFactory`]. The sole instantiation below uses the
 //! production ring transport. The in-process ownership tests remain local to
 //! this module and cannot be selected as a production transport.
 
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use tokio::time::{Duration, Instant};
 
 use crate::wire::{EnvelopeHeader, Flags, FrameType};
 use tokio_util::sync::CancellationToken;
 
-use crate::frame_channel::{FrameReceiver, FrameSender, InboundEvent, OutboundFrame};
+use crate::frame_channel::{FrameSender, InboundEvent, OutboundFrame};
+use crate::ring_transport::ShmReceiver;
 use crate::wire::{encode_frame, pure_header_flags, response_flags, ByteBudget, FrameId};
 
 /// Channel dimensions a scenario controls; the factory maps them onto its
@@ -24,6 +26,7 @@ pub(crate) struct ContractConfig {
     pub write_deadline: Duration,
     /// Pool backing every inbound and test-created outbound charge.
     pub budget_bytes: u64,
+    pub publish_hook: Option<crate::ring_transport::PublishHook>,
 }
 
 impl Default for ContractConfig {
@@ -32,15 +35,16 @@ impl Default for ContractConfig {
             queue_frames: 8,
             write_deadline: Duration::from_secs(5),
             budget_bytes: 1 << 20,
+            publish_hook: None,
         }
     }
 }
 
 /// One connected channel under test plus the independent peer driving the
 /// far side.
-pub(crate) struct Harness<C, P> {
+pub(crate) struct Harness<P> {
     pub sender: FrameSender,
-    pub channel: C,
+    pub channel: ShmReceiver,
     pub peer: P,
     /// The engine-side retirement root shared with the channel.
     pub generation: CancellationToken,
@@ -72,12 +76,8 @@ pub(crate) trait PeerDriver {
 /// Builds connected channels for the semantic suite. Each provider supplies
 /// one factory; the scenarios themselves never change per provider.
 pub(crate) trait ChannelFactory {
-    type Channel: FrameReceiver;
     type Peer: PeerDriver;
-    fn connect(
-        &self,
-        cfg: ContractConfig,
-    ) -> impl Future<Output = Harness<Self::Channel, Self::Peer>>;
+    fn connect(&self, cfg: ContractConfig) -> impl Future<Output = Harness<Self::Peer>>;
 }
 
 fn request_id(corr: u64) -> FrameId {
@@ -330,7 +330,20 @@ pub(crate) async fn graceful_finish_drains_admitted_frames_before_close<F: Chann
 pub(crate) async fn discard_drops_queued_frames_and_releases_charges<F: ChannelFactory>(
     factory: &F,
 ) {
-    let h = factory.connect(ContractConfig::default()).await;
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let hook_release = Arc::clone(&release);
+    let h = factory
+        .connect(ContractConfig {
+            publish_hook: Some(Arc::new(move |_, _| {
+                let (released, changed) = &*hook_release;
+                let mut released = released.lock().expect("publication gate lock");
+                while !*released {
+                    released = changed.wait(released).expect("publication gate wait");
+                }
+            })),
+            ..ContractConfig::default()
+        })
+        .await;
     let baseline = h.budget.available();
     for corr in 1..=3u64 {
         let charge = h.budget.try_charge(1024).expect("charge");
@@ -340,6 +353,11 @@ pub(crate) async fn discard_drops_queued_frames_and_releases_charges<F: ChannelF
     }
     assert!(h.budget.available() < baseline);
     h.sender.discard();
+    {
+        let (released, changed) = &*release;
+        *released.lock().expect("publication gate lock") = true;
+        changed.notify_all();
+    }
     h.io_task.await.expect("transport task");
     assert_eq!(
         h.budget.available(),
@@ -479,6 +497,7 @@ impl PeerDriver for RingPeer {
                     corr: id.corr,
                 },
                 &body,
+                std::time::Instant::now() + Duration::from_secs(2),
             )
             .expect("peer publishes frame");
     }
@@ -493,14 +512,16 @@ impl PeerDriver for RingPeer {
 }
 
 impl ChannelFactory for RingFactory {
-    type Channel = crate::frame_channel::BoxedReceiver;
     type Peer = RingPeer;
 
-    async fn connect(&self, cfg: ContractConfig) -> Harness<Self::Channel, Self::Peer> {
+    async fn connect(&self, cfg: ContractConfig) -> Harness<Self::Peer> {
         let budget = ByteBudget::new(cfg.budget_bytes);
         let transport = crate::ring_transport::RingTransport::for_ring_profile(
             crate::ring_transport::per_connection_limits(),
         );
+        if let Some(hook) = cfg.publish_hook {
+            transport.set_publish_hook(hook);
+        }
         let prepared = transport
             .prepare(budget.clone(), cfg.queue_frames, cfg.write_deadline)
             .expect("production ring prepares");

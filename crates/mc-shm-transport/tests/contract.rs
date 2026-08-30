@@ -9,8 +9,8 @@ use mc_shm_transport::descriptor::{
 use mc_shm_transport::evidence::OperationCounters;
 use mc_shm_transport::lifecycle::{CloseState, Lifecycle, LifecycleError};
 use mc_shm_transport::profile::{
-    ring_profile, AdmissionController, AdmissionError, CompletionMode, HostLimits,
-    ProducerTopology, ProfileConfig, ResourceCharges, TargetProfile, WorkerTopology,
+    ring_profile, AdmissionController, AdmissionError, HostLimits, ProfileConfig, ResourceCharges,
+    TargetProfile, WorkerTopology,
 };
 
 fn header(len: usize) -> [u8; WIRE_V2_HEADER_BYTES] {
@@ -421,9 +421,7 @@ fn span_profile(max_spans: usize) -> TargetProfile {
         max_leases: 8,
         mappings: 2,
         pinned_workers: 0,
-        producer_topology: ProducerTopology::CallerConfined,
         worker_topology: WorkerTopology::CallerThread,
-        completion_mode: CompletionMode::SynchronousPull,
     })
     .unwrap()
 }

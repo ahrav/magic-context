@@ -409,9 +409,6 @@ export function applyMigrateSession(
 
 // ── CLI wrapper ─────────────────────────────────────────────────────────────
 
-function defaultOpenCodeDbPath(): string {
-    return getOpenCodeDatabasePath();
-}
 function defaultContextDbPath(): string {
     return join(getMagicContextStorageDir(), "context.db");
 }
@@ -493,7 +490,7 @@ export async function runMigrateSessionCli(args: string[]): Promise<number> {
         return 1;
     }
 
-    const opencodeDbPath = defaultOpenCodeDbPath();
+    const opencodeDbPath = getOpenCodeDatabasePath();
     const contextDbPath = defaultContextDbPath();
     let opencodeDb: DatabaseLike | null = null;
     let contextDb: DatabaseLike | null = null;

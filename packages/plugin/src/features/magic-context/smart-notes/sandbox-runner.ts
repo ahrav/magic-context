@@ -10,8 +10,8 @@
 // These two modules are imported LAZILY inside getAsyncModule() (below), not at
 // the top of this file. The singlefile variant inlines ~2.6MB of base64 WASM into
 // the bundle; a top-level import forced the JS engine to parse that blob on every
-// plugin load — and on every subagent child spawn — adding hundreds of ms (issue
-// #242). Deferring the import to the first smart-note evaluation splits the variant
+// plugin load — and on every subagent child spawn — adding hundreds of ms.
+// Deferring the import to the first smart-note evaluation splits the variant
 // into its own chunk that stays out of the cold-start parse. The type-only import
 // below is erased at build time and pulls in no runtime code.
 import type {

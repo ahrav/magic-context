@@ -77,6 +77,70 @@ pub fn observe(pid: u32) -> Result<ResourceCounts, ObserveError> {
     })
 }
 
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Returns a baseline for `pid` once three consecutive samples are identical.
+/// Requiring three matching samples rejects counters still changing between
+/// polls.
+///
+/// Uses Tokio sleep to avoid blocking a runtime worker thread while polling.
+pub async fn stabilize(pid: u32, within: std::time::Duration) -> ResourceCounts {
+    let deadline = std::time::Instant::now() + within;
+    let mut previous = None;
+    let mut repeats = 0;
+    loop {
+        let counts = observe(pid).expect("observe process resources");
+        if previous == Some(counts) {
+            repeats += 1;
+            if repeats == 2 {
+                return counts;
+            }
+        } else {
+            previous = Some(counts);
+            repeats = 0;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "resource counters did not stabilize"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Descriptors, regions, and threads must equal `baseline`; RSS may exceed
+/// `baseline.rss_bytes` by at most `rss_tolerance` bytes.
+/// commentlint: allow(JUDGE)
+///
+/// `context` names the caller's iteration so a ratcheting leak reports which
+/// cycle exceeded the envelope rather than only that one did.
+///
+/// Uses Tokio sleep to avoid blocking a runtime worker thread while polling.
+pub async fn await_envelope(
+    pid: u32,
+    baseline: ResourceCounts,
+    rss_tolerance: u64,
+    within: std::time::Duration,
+    context: &str,
+) {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        let counts = observe(pid).expect("observe process resources");
+        if counts.fds == baseline.fds
+            && counts.mapped_regions == baseline.mapped_regions
+            && counts.threads == baseline.threads
+            && counts.rss_bytes <= baseline.rss_bytes.saturating_add(rss_tolerance)
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{context}: resources did not return to envelope: \
+             baseline={baseline:?} actual={counts:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// Linux scheduler/accounting counters for one task. Values are raw kernel
 /// clock ticks and context-switch counts, so deltas need no wall-clock
 /// conversion and retain exact `/proc` evidence.

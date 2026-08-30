@@ -51,45 +51,8 @@ export interface CatalogSnapshot {
 export interface HostStatusSnapshot {
     health: "ok" | "degraded" | "failing";
     metrics: Record<string, unknown>;
-    sharedMemory: SharedMemoryDiagnostics;
-}
-
-export interface SharedMemoryResourceCounts {
-    descriptors: number;
-    arena_bytes: number;
-    leases: number;
-    mappings: number;
-    file_descriptors: number;
-    workers: number;
-    client_instances: number;
-    pinned_workers: number;
-}
-
-export type SharedMemoryTerminalClass =
-    | "missing_addon"
-    | "identity_mismatch"
-    | "setup_failure"
-    | "peer_death"
-    | "resource_exhaustion";
-
-export interface SharedMemoryDiagnostics {
-    state: "healthy" | "terminal";
-    error_class: SharedMemoryTerminalClass | null;
-    artifact: {
-        profile: "mc-host-eventfd-ring-v2";
-        wire_version: 2;
-        descriptor_schema: 3;
-    };
-    bounds: SharedMemoryResourceCounts;
-    accounting: {
-        active: SharedMemoryResourceCounts;
-        quarantined: SharedMemoryResourceCounts;
-    } | null;
-    attachment: { completed: number };
-    activation: { completed: number };
-    peer_death: { observed: number };
-    reclamation: { completed: number };
-    exhaustion: { observed: number };
+    /** Ring diagnostics when the host reports them; absent on hosts that do not. */
+    sharedMemory?: Record<string, unknown>;
 }
 
 /**
@@ -105,6 +68,20 @@ export interface AuthenticatedPeer {
     daemonVer: string;
     daemonId: Uint8Array;
     proof: "current";
+}
+
+/**
+ * Single owner of the daemon-incarnation equality predicate every fence uses.
+ * Absent bytes on either side are never equal, so a caller that cannot name an
+ * identity cannot accidentally satisfy the comparison.
+ */
+export function sameDaemonId(
+    left: Uint8Array | null | undefined,
+    right: Uint8Array | null | undefined,
+): boolean {
+    if (left === null || left === undefined || right === null || right === undefined) return false;
+    if (left.length !== right.length) return false;
+    return left.every((byte, index) => byte === right[index]);
 }
 
 export interface PublicationDiagnostics {
@@ -151,6 +128,8 @@ export interface RequestOptions {
     timeoutMs?: number;
     /** The facade attaches `McHostCallError.cleanup` when this signal aborts the request. */
     signal?: AbortSignal;
+    /** Reject before publication unless the active authenticated generation has this daemon ID. */
+    expectedDaemonId?: Uint8Array;
 }
 
 /** Options for the managed `call()` path (embedding-synapse usage). */

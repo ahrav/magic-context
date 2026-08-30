@@ -2,9 +2,7 @@
 
 use std::{error::Error, fmt, future::Future, io, time::Duration};
 
-use hmac::{Hmac, Mac};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -13,14 +11,11 @@ use tokio::{
 
 use crate::connection_file::{ConnectionInfo, DAEMON_ID_LEN, MIN_KEY_LEN};
 
-pub const NONCE_LEN: usize = 32;
-pub const PROOF_LEN: usize = 32;
-pub const MAX_AUTH_MESSAGE_LEN: u32 = 4096;
-pub const SERVER_PROOF_DOMAIN: &str = "subc-server-v1";
-pub const CLIENT_AUTH_DOMAIN: &str = "subc-client-v1";
-pub const DEFAULT_CLIENT_ROLE: &str = "client";
+pub use mc_shm_transport::setup_auth::{
+    CLIENT_AUTH_DOMAIN, DEFAULT_CLIENT_ROLE, NONCE_LEN, PROOF_LEN, SERVER_PROOF_DOMAIN,
+};
 
-type HmacSha256 = Hmac<Sha256>;
+pub const MAX_AUTH_MESSAGE_LEN: u32 = mc_shm_transport::setup_auth::MAX_AUTH_MESSAGE_LEN as u32;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientHello {
@@ -129,10 +124,8 @@ pub enum AuthError {
     },
     InvalidServerProof,
     DaemonIdMismatch,
-    /// The peer reported a `daemon_ver` other than the one in the connection-file
-    /// snapshot this handshake authenticated against. `daemon_ver` is not an
-    /// input to either proof, so this comparison is what binds the reported
-    /// version to that snapshot and makes it usable for compatibility gating.
+    /// The peer authenticated a `daemon_ver` other than the one in the
+    /// connection-file snapshot, so the discovered identity is inconsistent.
     DaemonVerMismatch,
     InvalidClientAuth,
 }
@@ -142,14 +135,17 @@ pub fn compute_proof(
     domain: &str,
     client_nonce: &[u8; NONCE_LEN],
     server_nonce: &[u8; NONCE_LEN],
+    daemon_ver: &str,
     daemon_id: &[u8],
 ) -> [u8; PROOF_LEN] {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts keys of any length");
-    mac.update(domain.as_bytes());
-    mac.update(client_nonce);
-    mac.update(server_nonce);
-    mac.update(daemon_id);
-    mac.finalize().into_bytes().into()
+    mc_shm_transport::setup_auth::compute_proof(
+        key,
+        domain,
+        client_nonce,
+        server_nonce,
+        daemon_ver,
+        daemon_id,
+    )
 }
 
 /// An absolute handshake deadline. Every per-stage read/write recomputes the time
@@ -248,6 +244,7 @@ where
         SERVER_PROOF_DOMAIN,
         &hello.client_nonce,
         &server_nonce,
+        daemon_ver,
         daemon_id,
     );
 
@@ -270,6 +267,7 @@ where
         CLIENT_AUTH_DOMAIN,
         &hello.client_nonce,
         &server_nonce,
+        daemon_ver,
         daemon_id,
     );
     if !constant_time_eq(&expected_client_auth, &client_auth.client_auth) {
@@ -328,6 +326,7 @@ where
         SERVER_PROOF_DOMAIN,
         &client_nonce,
         &server_proof.server_nonce,
+        &server_proof.daemon_ver,
         &server_proof.daemon_id,
     );
     if !constant_time_eq(&expected_server_proof, &server_proof.server_proof) {
@@ -338,11 +337,8 @@ where
     }
     // Wire protocol §5.2: the client MUST require `ServerProof.daemon_ver` to
     // equal the connection-file `daemon_ver`, and MUST emit no `ClientAuth`
-    // until all three checks succeed. `daemon_ver` is not an input to either
-    // proof, so without this comparison the returned version is whatever the
-    // peer claimed rather than the version of the snapshot that was
-    // authenticated — and a consumer gating compatibility on it would be
-    // trusting an unbound field.
+    // until all three checks succeed. The proof authenticates `daemon_ver`;
+    // this comparison also binds it to the discovery snapshot used to dial.
     if server_proof.daemon_ver != conn.daemon_ver {
         return Err(AuthError::DaemonVerMismatch);
     }
@@ -352,6 +348,7 @@ where
         CLIENT_AUTH_DOMAIN,
         &client_nonce,
         &server_proof.server_nonce,
+        &server_proof.daemon_ver,
         &server_proof.daemon_id,
     );
     write_message(
@@ -698,34 +695,29 @@ mod tests {
     /// that has not been rebuilt.
     #[test]
     fn committed_wire_vectors_pin_the_proof_construction() {
-        fn unhex(hex: &str) -> Vec<u8> {
-            assert!(hex.len().is_multiple_of(2), "odd-length hex");
-            (0..hex.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex byte"))
-                .collect()
-        }
-
-        let key = unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
-        let client_nonce: [u8; NONCE_LEN] = unhex(&"ab".repeat(NONCE_LEN))
-            .try_into()
-            .expect("client nonce length");
-        let server_nonce: [u8; NONCE_LEN] = unhex(&"cd".repeat(NONCE_LEN))
-            .try_into()
-            .expect("server nonce length");
-        let daemon_id = unhex("000102030405060708090a0b0c0d0e0f");
+        let key: Vec<u8> = (0x00..0x20).collect();
+        let client_nonce = std::array::from_fn(|index| 0x20 + index as u8);
+        let server_nonce = std::array::from_fn(|index| 0x40 + index as u8);
+        let daemon_id: Vec<u8> = (0x60..0x70).collect();
 
         for (domain, expected) in [
             (
                 SERVER_PROOF_DOMAIN,
-                "ea06076a980bc7558e45017df86de89f3d2fc09861f8460795dea31eadf40527",
+                "409a5444176474bd0279894fb1ac6b346cae98d0da19f9a09ad42a445b6c5583",
             ),
             (
                 CLIENT_AUTH_DOMAIN,
-                "a3bc64784dbd94c4f52799e0c66f7b2b8183aa4655594630245c5d4a2fa387a9",
+                "b88af33700bd5834361b047081d6ca39fc924bdd77b1f700c1cece1a5a93f7bb",
             ),
         ] {
-            let proof = compute_proof(&key, domain, &client_nonce, &server_nonce, &daemon_id);
+            let proof = compute_proof(
+                &key,
+                domain,
+                &client_nonce,
+                &server_nonce,
+                "mc-host/0.1.0",
+                &daemon_id,
+            );
             let actual: String = proof.iter().map(|byte| format!("{byte:02x}")).collect();
             assert_eq!(
                 actual, expected,
@@ -911,6 +903,7 @@ mod tests {
             CLIENT_AUTH_DOMAIN,
             &client_nonce,
             &server_proof.server_nonce,
+            &server_proof.daemon_ver,
             &server_proof.daemon_id,
         );
         write_auth_json(&mut client, &ClientAuth { client_auth }).await;
@@ -986,6 +979,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_auth_is_bound_to_the_server_reported_daemon_version() {
+        let key = vec![0x5a; MIN_KEY_LEN];
+        let daemon_id = [0x6b; DAEMON_ID_LEN];
+        let (mut client, mut server) = duplex(4096);
+        let key_task = key.clone();
+        let server_task = tokio::spawn(async move {
+            authenticate_server(
+                &mut server,
+                &key_task,
+                &daemon_id,
+                TEST_DAEMON_VER,
+                Duration::from_secs(5),
+            )
+            .await
+        });
+
+        let client_nonce = [0x11; NONCE_LEN];
+        write_auth_json(
+            &mut client,
+            &ClientHello {
+                client_nonce,
+                role: TEST_ROLE.to_owned(),
+            },
+        )
+        .await;
+        let server_proof: ServerProof = read_auth_json(&mut client).await;
+        let client_auth = compute_proof(
+            &key,
+            CLIENT_AUTH_DOMAIN,
+            &client_nonce,
+            &server_proof.server_nonce,
+            "mc-host-auth-test-mutated",
+            &server_proof.daemon_id,
+        );
+        write_auth_json(&mut client, &ClientAuth { client_auth }).await;
+
+        assert!(matches!(
+            server_task
+                .await
+                .expect("join")
+                .expect_err("a version-substituted client proof must fail"),
+            AuthError::InvalidClientAuth
+        ));
+    }
+
+    #[tokio::test]
     async fn over_cap_auth_message_is_rejected_before_allocation() {
         let key = vec![0x5a; MIN_KEY_LEN];
         let daemon_id = [0x6b; DAEMON_ID_LEN];
@@ -1047,6 +1086,7 @@ mod tests {
                 SERVER_PROOF_DOMAIN,
                 &hello.client_nonce,
                 &server_nonce,
+                TEST_DAEMON_VER,
                 &server_daemon_id,
             )
         } else {

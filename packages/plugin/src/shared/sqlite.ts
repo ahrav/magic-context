@@ -316,6 +316,35 @@ export function isInTransaction(db: Database): boolean {
 }
 
 /**
+ * Run `body` under an explicit `BEGIN IMMEDIATE` transaction. The write lock
+ * is taken at BEGIN time — not at the first write, as the deferred BEGIN that
+ * `db.transaction()` emits would — so a read-then-write is atomic across the
+ * OpenCode+Pi processes that share one SQLite file. Without IMMEDIATE, two
+ * processes could both read stale state under WAL snapshot isolation and both
+ * write. `busy_timeout` (set in initializeDatabase) makes the loser wait
+ * rather than throw SQLITE_BUSY. Keep this distinct from `db.transaction()`;
+ * the two take the write lock at different times.
+ */
+export function runImmediate<T>(db: Database, body: () => T): T {
+    db.exec("BEGIN IMMEDIATE");
+    let committed = false;
+    try {
+        const result = body();
+        db.exec("COMMIT");
+        committed = true;
+        return result;
+    } finally {
+        if (!committed) {
+            try {
+                db.exec("ROLLBACK");
+            } catch {
+                // already rolled back / no active transaction
+            }
+        }
+    }
+}
+
+/**
  * Run a storage operation with the managed-write privilege enabled.
  *
  * The privilege is recorded in the durable `context_privilege_state` table (row
@@ -375,11 +404,11 @@ export function withPrivilegedWriter<T>(db: Database, operation: () => T): T {
 // ---------------------------------------------------------------------------
 
 /**
- * Minimum SQLite release whose WAL machinery carries the wal-reset fix
- * (https://www.sqlite.org/wal.html#walresetbug, fixed in 3.47.1). Writers on
- * an older source may corrupt a shared WAL family and must not open it.
+ * Minimum supported SQLite release, carrying the complete WAL-reset race fix
+ * (https://www.sqlite.org/wal.html#walresetbug). Writers on an older source may
+ * corrupt a shared WAL family and must not open it.
  */
-export const SQLITE_WAL_RESET_SAFE_MIN_VERSION = "3.47.1";
+export const MIN_SUPPORTED_SQLITE_VERSION = "3.51.3";
 
 /** Node floor whose node:sqlite ships a WAL-reset-safe SQLite (KTD2). */
 export const MIN_SUPPORTED_NODE_VERSION = "24.15.0";
@@ -459,9 +488,9 @@ export function evaluateSqliteRuntimeGate(input: SqliteRuntimeGateInput): Sqlite
             `${input.runtime} ${input.runtimeVersion} is below the supported floor ${runtimeFloor}`,
         );
     }
-    if (!isVersionAtLeast(input.sqliteVersion, SQLITE_WAL_RESET_SAFE_MIN_VERSION)) {
+    if (!isVersionAtLeast(input.sqliteVersion, MIN_SUPPORTED_SQLITE_VERSION)) {
         reasons.push(
-            `SQLite ${input.sqliteVersion} predates the WAL-reset fix in ${SQLITE_WAL_RESET_SAFE_MIN_VERSION}`,
+            `SQLite ${input.sqliteVersion} is below the supported floor ${MIN_SUPPORTED_SQLITE_VERSION}`,
         );
     }
     if (!SQLITE_SOURCE_ID_PATTERN.test(input.sqliteSourceId)) {

@@ -39,15 +39,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { TestHarness } from "../src/harness";
 import { buildMockHistorianPayload } from "../src/mock-historian";
-
-const HISTORIAN_MARKER = "the hippocampus of a long-running coding agent";
-
-function isHistorian(body: Record<string, unknown>): boolean {
-    const sys = body.system;
-    if (sys === undefined || sys === null) return false;
-    const asString = typeof sys === "string" ? sys : JSON.stringify(sys);
-    return asString.includes(HISTORIAN_MARKER);
-}
+import { isHistorianRequest } from "../src/cache-analysis";
 
 function bigReplyText(turn: number, targetBytes: number): string {
     const header = `turn-${turn}-reply: `;
@@ -78,7 +70,7 @@ describe("short context accumulating overflow", () => {
             h.mock.reset();
 
             h.mock.addMatcher((body) => {
-                if (!isHistorian(body)) return null;
+                if (!isHistorianRequest(body)) return null;
                 const msgs = body.messages as Array<{ content?: unknown }> | undefined;
                 const flat = JSON.stringify(msgs ?? []);
                 const rangeHdr = flat.match(/Messages (\d+)-(\d+):/);
@@ -103,7 +95,7 @@ describe("short context accumulating overflow", () => {
 
             let mainCalls = 0;
             h.mock.addMatcher((body) => {
-                if (isHistorian(body)) return null;
+                if (isHistorianRequest(body)) return null;
                 mainCalls++;
                 const approxInputTokens = Math.floor(JSON.stringify(body).length / 4);
                 // ~20KB per turn — enough growth to cross 85% within 25 turns
@@ -141,7 +133,7 @@ describe("short context accumulating overflow", () => {
                     });
                 }
                 const reqs = h.mock.requests().slice(reqBefore);
-                const mainReq = reqs.find((r) => !isHistorian(r.body));
+                const mainReq = reqs.find((r) => !isHistorianRequest(r.body));
                 const observed = mainReq ? Math.floor(JSON.stringify(mainReq.body).length / 4) : 0;
                 turnUsage.push(Math.round((observed / 128_000) * 1000) / 10);
             }

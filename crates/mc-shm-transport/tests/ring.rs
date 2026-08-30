@@ -12,9 +12,7 @@ use mc_shm_transport::descriptor::{
     HardwareProfileId, Incarnation, ReleaseIdentity, TransportDescriptor,
 };
 use mc_shm_transport::lease::LeaseError;
-use mc_shm_transport::profile::{
-    ring_profile, CompletionMode, ProducerTopology, ProfileConfig, TargetProfile, WorkerTopology,
-};
+use mc_shm_transport::profile::{ring_profile, ProfileConfig, TargetProfile, WorkerTopology};
 use mc_shm_transport::MAX_FRAME_BYTES;
 
 fn profile() -> TargetProfile {
@@ -30,9 +28,7 @@ fn lease_limited_profile() -> TargetProfile {
         max_leases: 1,
         mappings: 2,
         pinned_workers: 0,
-        producer_topology: ProducerTopology::CallerConfined,
         worker_topology: WorkerTopology::CallerThread,
-        completion_mode: CompletionMode::SynchronousPull,
     })
     .unwrap()
 }
@@ -300,9 +296,7 @@ fn one_span_profile_is_rejected_at_creation() {
         max_leases: 1,
         mappings: 2,
         pinned_workers: 0,
-        producer_topology: ProducerTopology::CallerConfined,
         worker_topology: WorkerTopology::CallerThread,
-        completion_mode: CompletionMode::SynchronousPull,
     })
     .unwrap();
     assert!(matches!(

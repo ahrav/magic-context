@@ -4,7 +4,7 @@
  * Flow (presets-with-custom-escape, defaults-first):
  *   1. Enable dreamer? (caller asks; this runs only when enabled)
  *   2. Pick ONE dreamer model (applies to every task; per-task model overrides
- *      stay an advanced config/dashboard option — 8 model pickers is too much
+ *      stay an advanced config option — 8 model pickers is too much
  *      friction for the wizard).
  *   3. "Use recommended schedules?" → yes: return no `tasks` (schema defaults
  *      apply, preserving v1 behavior). no: per-task loop, each task gets a

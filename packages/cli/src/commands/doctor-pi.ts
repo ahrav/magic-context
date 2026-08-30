@@ -20,12 +20,9 @@ import {
 } from "@magic-context/core/features/magic-context/memory/embedding-probe";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
-import {
-    isPrototypePollutionKey,
-    sanitizeParsedJson,
-} from "@magic-context/core/shared/jsonc-parser";
+import { isPrototypePollutionKey, parseConfigJsonc } from "@magic-context/core/shared/jsonc-parser";
 import { loadPiConfig } from "@magic-context/pi-core/config";
-import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
+import { stringify as stringifyJsonc } from "comment-json";
 
 import { writeFileAtomic } from "../lib/atomic-write";
 import {
@@ -40,13 +37,14 @@ import {
     formatLocalEmbeddingRuntimeDoctorWarning,
     isLocalEmbeddingRuntimeBroken,
 } from "../lib/embedding-runtime";
+import { readJsoncLenient } from "../lib/jsonc-config";
 import { bundleIssueReport } from "../lib/logs-pi";
 import {
     getMagicContextLogPath,
-    getPiAgentConfigDir,
+    getPiAgentDir,
     getPiCacheRoot,
-    getPiUserConfigPath,
     getPiUserExtensionsPath,
+    getSharedUserConfigPath,
 } from "../lib/paths";
 import {
     detectPiBinary,
@@ -218,22 +216,6 @@ function summarize(results: CheckResult[]): Pick<HealthReport, "pass" | "warn" |
     };
 }
 
-function readJsonc(path: string): {
-    value: Record<string, unknown>;
-    error?: string;
-} {
-    try {
-        return {
-            value: parseJsonc(readFileSync(path, "utf-8")) as Record<string, unknown>,
-        };
-    } catch (error) {
-        return {
-            value: {},
-            error: error instanceof Error ? error.message : String(error),
-        };
-    }
-}
-
 function packagesFrom(settings: Record<string, unknown>): unknown[] {
     return Array.isArray(settings.packages) ? settings.packages : [];
 }
@@ -248,7 +230,7 @@ function packagesFrom(settings: Record<string, unknown>): unknown[] {
  */
 function piPluginDirCandidates(packages: unknown[], cwd: string): string[] {
     const dirs: string[] = [];
-    const agentDir = getPiAgentConfigDir();
+    const agentDir = getPiAgentDir();
 
     // Local dev-path entries: a string spec that is NOT an npm: specifier and
     // resolves to a directory on disk. Relative entries are resolved against the
@@ -288,7 +270,7 @@ function readConfigForEmbedding(
             isProjectConfig,
         });
         const rejectedKeyPaths: string[] = [];
-        const parsed = sanitizeParsedJson(parseJsonc(substituted.text) as Record<string, unknown>, {
+        const parsed = parseConfigJsonc<Record<string, unknown>>(substituted.text, {
             onRejectedKey: (keyPath) => rejectedKeyPaths.push(keyPath.join(".")),
         });
         if (rejectedKeyPaths.length > 0) {
@@ -370,8 +352,8 @@ function cacheRoots(cwd: string): string[] {
         join(piCacheRoot, "packages"),
         join(cacheHome, "pi", "extensions"),
         join(cacheHome, "pi", "packages"),
-        join(getPiAgentConfigDir(), "cache", "extensions"),
-        join(getPiAgentConfigDir(), "npm", "node_modules", PACKAGE_NAME),
+        join(getPiAgentDir(), "cache", "extensions"),
+        join(getPiAgentDir(), "npm", "node_modules", PACKAGE_NAME),
         join(cwd, ".pi", "npm", "node_modules", PACKAGE_NAME),
     ];
 }
@@ -491,9 +473,13 @@ async function runHealthChecks(options: {
         add(results, "fail", `Pi settings not found at ${settingsPath}`);
         repairPlan.addPackageEntry = true;
     } else {
-        const parsed = readJsonc(settingsPath);
-        if (parsed.error) {
-            add(results, "fail", `Could not parse Pi settings ${settingsPath}: ${parsed.error}`);
+        const parsed = readJsoncLenient(settingsPath);
+        if (parsed.parseError) {
+            add(
+                results,
+                "fail",
+                `Could not parse Pi settings ${settingsPath}: ${parsed.parseError}`,
+            );
         } else {
             packages = packagesFrom(parsed.value);
             add(results, "pass", `Pi settings found at ${settingsPath}`);
@@ -506,7 +492,7 @@ async function runHealthChecks(options: {
         }
     }
 
-    const userConfigPath = getPiUserConfigPath();
+    const userConfigPath = getSharedUserConfigPath();
     const projectPath = projectConfigPath(options.cwd);
     for (const [label, path, required] of [
         ["user", userConfigPath, true],
@@ -529,9 +515,13 @@ async function runHealthChecks(options: {
             }
             continue;
         }
-        const parsed = readJsonc(path);
-        if (parsed.error)
-            add(results, "fail", `${label} magic-context.jsonc is invalid JSONC: ${parsed.error}`);
+        const parsed = readJsoncLenient(path);
+        if (parsed.parseError)
+            add(
+                results,
+                "fail",
+                `${label} magic-context.jsonc is invalid JSONC: ${parsed.parseError}`,
+            );
         else add(results, "pass", `${label} magic-context.jsonc is valid JSONC: ${path}`);
     }
 
@@ -894,7 +884,7 @@ function repair(plan: RepairPlan, prompts: PromptIO): number {
     }
 
     if (plan.writeUserConfig) {
-        const configPath = getPiUserConfigPath();
+        const configPath = getSharedUserConfigPath();
         if (!existsSync(configPath)) {
             try {
                 writeDefaultMagicContextConfig(configPath);

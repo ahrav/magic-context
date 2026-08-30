@@ -23,12 +23,11 @@ import {
 import { substituteConfigVariables } from "@magic-context/core/config/variable";
 import {
 	isPrototypePollutionKey,
-	sanitizeParsedJson,
+	parseConfigJsonc,
 } from "@magic-context/core/shared/jsonc-parser";
 import { setOutputReserveConfig } from "@magic-context/core/shared/models-dev-cache";
 import type { PromptSurfaceConfig } from "@magic-context/core/shared/prompt-surface";
 import { setWindowOverlayPath } from "@magic-context/core/shared/window-geometry";
-import { parse as parseCommentJson } from "comment-json";
 
 export interface LoadPiConfigOptions {
 	cwd?: string;
@@ -116,10 +115,9 @@ function loadConfigFile(
 			isProjectConfig: scope === "project",
 		});
 		const rejectedKeyPaths: string[] = [];
-		const config = sanitizeParsedJson(
-			parseCommentJson(substituted.text) as Record<string, unknown>,
-			{ onRejectedKey: (keyPath) => rejectedKeyPaths.push(keyPath.join(".")) },
-		);
+		const config = parseConfigJsonc<Record<string, unknown>>(substituted.text, {
+			onRejectedKey: (keyPath) => rejectedKeyPaths.push(keyPath.join(".")),
+		});
 		const unsafeKeyWarnings = rejectedKeyPaths.map(
 			(keyPath) =>
 				`Ignored unsafe config key "${keyPath}" (security: prototype-pollution keys are not allowed).`,

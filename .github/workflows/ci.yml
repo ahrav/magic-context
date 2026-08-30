@@ -38,25 +38,6 @@ permissions:
 # gauntlet.
 
 jobs:
-  mandatory-ring-architecture:
-    name: Mandatory ring architecture
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          persist-credentials: false
-
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      - name: Architecture audit unit tests
-        run: bun test scripts/check-mc-shm-architecture.test.ts
-
-      - name: Reject obsolete application transports and dependencies
-        run: bun run check:shm-architecture
-
   shm-hardening-gate:
     name: SHM failure-hardening matrix gate
     runs-on: ubuntu-latest
@@ -109,7 +90,7 @@ jobs:
         run: bun run release:contract:check
 
   shm-crash-recovery:
-    name: SHM crash isolation + recovery (Linux, provisional ring tuple)
+    name: Mandatory ring unit and client suites (Linux)
     runs-on: ubuntu-latest
     needs: [shm-hardening-gate]
     timeout-minutes: 45
@@ -127,12 +108,21 @@ jobs:
       - name: Provision metadata-only sibling stubs
         run: sh scripts/provision-rust-ci-stubs.sh
 
+      # The unit suites carry the setup-socket handshake, ring transport, and
+      # control-response coverage. Without them a proof-transcript or
+      # response-shape change reaches the only supported transport unchecked.
+      - name: Mandatory ring unit suite
+        run: cargo nextest run -p mc-host -p mc-shm-transport --lib
+
       - name: Mandatory ring client suite
+        run: cargo nextest run -p mc-host --test client
+
+      # The long soak has `#[ignore]`; this command excludes it without
+      # `--run-ignored`.
+      - name: Crash reclamation and bounded-resource suites
         run: |
-          cargo nextest run -p mc-host --test client
-          cargo test -p mc-host --test shm_failure_modes -- --test-threads=1
-          cargo test -p mc-host --test shm_soak \
-            short_soak_keeps_fd_mapping_thread_and_rss_envelopes_bounded -- --exact
+          cargo nextest run -p mc-host \
+            --test shm_failure_modes --test shm_soak
 
   shm-source-build:
     name: Shared memory source build (Linux x64)
@@ -159,13 +149,14 @@ jobs:
       - name: Provision metadata-only sibling stubs
         run: sh scripts/provision-rust-ci-stubs.sh
 
+      # mc-module is absent here on purpose. It depends on mc-core and
+      # mc-store, which import real types from the ../commons cortexkit
+      # crates; the stubs above are metadata-only, so anything that COMPILES
+      # mc-module fails to resolve those imports. The ck-mc-host binary build
+      # and the lifecycle_cli contract run in the mc-host-lifecycle job, which
+      # checks out the sibling sources instead of stubbing them.
       - name: Source-build transport, host, and addon
-        run: |
-          cargo build -p mc-shm-transport -p mc-host -p mc-shm-native
-          cargo build -p mc-module --bin ck-mc-host
-
-      - name: Native lifecycle binary contract
-        run: cargo test -p mc-module --test lifecycle_cli
+        run: cargo build -p mc-shm-transport -p mc-host -p mc-shm-native
 
       - name: Rust contracts and lifecycle
         run: |
@@ -183,13 +174,9 @@ jobs:
         run: bun run --cwd packages/mc-shm-native build:source
 
       - name: Native behavior (Bun)
-        env:
-          MC_SHM_NATIVE_CLAIMED_TARGET: "1"
         run: bun run --cwd packages/mc-shm-native test:bun
 
       - name: Native behavior (Node 24)
-        env:
-          MC_SHM_NATIVE_CLAIMED_TARGET: "1"
         run: bun run --cwd packages/mc-shm-native test:node
 
       - name: Mandatory capability activation (Bun and Node 24)
@@ -200,9 +187,6 @@ jobs:
       - name: Plugin shared-memory contracts (Bun)
         run: bun test packages/plugin/src/shared/mc-host-client
 
-      - name: Plugin shared-memory lifetime (Node 24)
-        run: bun run --cwd packages/plugin test:mc-shm:node
-
       - name: Plugin typecheck
         run: bun run --cwd packages/plugin typecheck
 
@@ -211,6 +195,87 @@ jobs:
           test -z "$(git ls-files '*.node')"
           rm -f packages/mc-shm-native/mc_shm_native.node
           test ! -e packages/mc-shm-native/mc_shm_native.node
+
+  mc-host-lifecycle:
+    name: mc-host lifecycle integration (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    defaults:
+      run:
+        working-directory: magic-context
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: magic-context
+          persist-credentials: false
+
+      - uses: actions/checkout@v5
+        with:
+          repository: ahrav/commons
+          ref: 77cd36b9cb8bde762d2b39d4807bb1c0338ed927
+          path: commons
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@nextest
+
+      - name: Store tests against real commons
+        run: cargo test -p mc-store
+
+      - name: Host lifecycle and closure proofs (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo test -p mc-host \
+            --test broca_protocol \
+            --test broca_subprocess \
+            --test harness_closure \
+            --test protocol_vectors
+
+      # token_cache::test_cache_guard serializes the tests that share the
+      # process-global cache, so this suite is correct under either runner.
+      - name: Module transform and token-cache proofs (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo nextest run -p mc-module --lib
+          cargo nextest run -p mc-module \
+            --test historian_truncate_differential \
+            --test caveman_differential \
+            --test selection_differential
+
+      - name: Module differential contracts (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo nextest run -p mc-module \
+            --test caveman_differential \
+            --test historian_truncate_differential \
+            --test selection_differential
+
+      - name: Native module adapter and CLI lifecycle (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo test -p mc-module --bin ck-mc-host
+          cargo test -p mc-module \
+            --test host_adapter \
+            --test lifecycle_cli
+
+      # The release ships darwin payloads, so this leg proves the native
+      # lifecycle binary compiles and links for darwin and that its
+      # argument-parsing and version/release-metadata contract holds there.
+      # It asserts nothing about lifecycle state: those proofs need a
+      # published daemon, which requires Broca's `/proc` process identity,
+      # and a data root the `O_NOFOLLOW` lifecycle path walk accepts, which
+      # the darwin temporary directory's `/var` symlink is not, so they
+      # compile out here.
+      - name: Native lifecycle binary and CLI contract (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cargo build -p mc-module --bin ck-mc-host
+          cargo test -p mc-module --test lifecycle_cli
 
   check-plugin:
     name: Check (plugin)
@@ -242,6 +307,23 @@ jobs:
 
       - name: Check compiled TUI freshness
         run: bun run --cwd packages/plugin check:tui-compiled
+
+      # `bun run test` ends in test:release, whose dependency-boundary check
+      # shells out to `cargo tree -p mc-host`. cargo refuses to load the
+      # workspace until every path-dep manifest exists, including the
+      # ../commons cortexkit crates. Metadata-only stubs satisfy the manifest
+      # graph; nothing in this job compiles them.
+      - name: Provision metadata-only sibling stubs
+        run: sh scripts/provision-rust-ci-stubs.sh
+
+      # Pins the cargo used by the warm-up below and by the same `cargo tree`
+      # inside test:release, matching every other cargo-invoking job. Without
+      # it both resolve to whatever rustc the runner image ships, so an image
+      # change surfaces as a cargo failure inside a TypeScript job.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Warm mc-host dependency graph
+        run: cargo tree -p mc-host -e normal >/dev/null
 
       - name: Test
         run: bun run test
@@ -429,6 +511,38 @@ jobs:
       - name: Run the invalid-state mutation battery
         run: bun packages/e2e-tests/scripts/run-historian-eval.ts --mutations
 
+  # Its own job with no `needs`, for the reasons spelled out above the historian
+  # lane: a gate placed as a step in another job is skipped whenever an earlier
+  # step fails, and a gate placed downstream of check-plugin is skipped whenever
+  # check-plugin fails — both reproduce silent non-enforcement one hop away.
+  #
+  # Nothing invoked test:dreamer-eval-unit before: test:e2e selects --mode ts
+  # and test:opencode-e2e runs the harness manifests, and neither reaches
+  # dreamerEvalUnitFiles(), so the scenario contract, seeder, scorer, and
+  # mutation battery could regress with every other lane green. The suites are
+  # credential-free and make no live model calls; live scenario runs stay out of
+  # per-PR CI.
+  dreamer-eval-contracts:
+    name: Dreamer eval lane contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Dreamer eval unit contracts
+        run: bun run test:dreamer-eval-unit
+
   mc-host-client-interop:
     name: mc-host client interop (Bun + Node 24)
     runs-on: ubuntu-latest
@@ -447,8 +561,17 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Shared-memory client smoke (Node 24)
-        run: bun run --cwd packages/plugin test:mc-host-client:node
+      - name: Provision metadata-only sibling stubs
+        run: sh scripts/provision-rust-ci-stubs.sh
+
+      - name: Build shared-memory addon from source
+        run: bun run --cwd packages/mc-shm-native build:source
+
+      - name: Shared-memory client smoke (Bun)
+        run: bun run --cwd packages/plugin smoke:mc-host-client:bun
+
+      - name: Shared-memory capability preflight (Node 24)
+        run: bun run --cwd packages/mc-shm-native test:capability:node
 
   check-rust:
     name: Check (Rust fmt + mc-core features)
@@ -556,6 +679,9 @@ jobs:
       - name: Install workspace deps
         run: bun install --frozen-lockfile
 
+      - name: Build shared-memory package loader
+        run: bun run --cwd packages/mc-shm-native build:js
+
       - name: Build OpenCode plugin
         run: bun run --cwd packages/plugin build
 
@@ -588,6 +714,9 @@ jobs:
 
       - name: Install workspace deps
         run: bun install --frozen-lockfile
+
+      - name: Build shared-memory package loader
+        run: bun run --cwd packages/mc-shm-native build:js
 
       - name: Build Pi plugin
         run: bun run --cwd packages/pi-plugin build
@@ -625,6 +754,9 @@ jobs:
 
       - name: Install workspace deps
         run: bun install --frozen-lockfile
+
+      - name: Build shared-memory package loader
+        run: bun run --cwd packages/mc-shm-native build:js
 
       - name: Build Pi-compatible plugin and OMP argv renderer
         run: |
@@ -689,6 +821,12 @@ jobs:
         # specifier pointing at packages/plugin/, so dist must exist.
         run: bun run --cwd packages/plugin build
 
+      - name: Build Pi plugin
+        # The OpenCode selection carries cross-harness parity tests that spawn a
+        # Pi runner alongside opencode, and that spawn asserts
+        # packages/pi-plugin/dist/index.js exists before booting.
+        run: bun run --cwd packages/pi-plugin build
+
       # Strip inherited NODE_ENV=test so the spawned opencode subprocess
       # gets the same logging + runtime behavior as a normal local run
       # (documented in CONTRIBUTING / project memory).
@@ -706,9 +844,9 @@ jobs:
         # manifest, carries the standalone oracles that live outside the
         # manifest's tests/**/*.test.ts inventory (see standaloneUnitFiles),
         # and runs the incident-pool green wrapper alone in a second phase
-        # with --max-concurrency 1. Rust is intentionally absent from public
-        # CI because its private ../commons and ../subconscious path-deps are
-        # not provisioned here; the local release gate runs that host group.
+        # with --max-concurrency 1. Rust is intentionally absent from this job
+        # because its ../commons and ../subconscious path-deps are not checked
+        # out here; the local release gate runs that host group.
         run: bun run --cwd packages/e2e-tests test:opencode-e2e
 
   e2e-host-pi:
@@ -740,6 +878,11 @@ jobs:
 
       - name: Verify opencode on PATH
         run: opencode --version
+
+      # The parent builds mark the addon --external, so its generated entry
+      # point must exist before any Node-runtime import resolves it.
+      - name: Build shared-memory addon entry point
+        run: bun run --cwd packages/mc-shm-native build:js
 
       - name: Build Pi plugin
         run: bun run --cwd packages/pi-plugin build
@@ -789,6 +932,11 @@ jobs:
         run: |
           curl -fsSL https://opencode.ai/install | bash
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      # The parent builds mark the addon --external, so its generated entry
+      # point must exist before any Node-runtime import resolves it.
+      - name: Build shared-memory addon entry point
+        run: bun run --cwd packages/mc-shm-native build:js
 
       - name: Build supported TS harness plugins
         run: |

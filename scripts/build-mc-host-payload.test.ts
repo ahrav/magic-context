@@ -53,7 +53,6 @@ const CONTEXT_FILES = [
     "release/mc-host-production-inputs.lock.json",
     "release/mc-host-provider-credentials.json",
     "release/mc-host-registry-gate.json",
-    "docs/evidence/mc-host-release-qualification.json",
 ];
 const PACKAGE_DIRS = [
     "packages/mc-host-darwin-arm64",
@@ -93,6 +92,43 @@ function freshRoot(): string {
     return root;
 }
 
+function writeFailClosedQualification(root: string): void {
+    const contract = buildContract();
+    const releaseContractSha256 = sha256Hex(canonicalJson(contract));
+    const lockPath = "release/mc-host-production-inputs.lock.json";
+    const credentialsPath = "release/mc-host-provider-credentials.json";
+    const lockText = readFileSync(join(root, lockPath), "utf8");
+    const credentialsText = readFileSync(join(root, credentialsPath), "utf8");
+    const lock = JSON.parse(lockText) as {
+        production_qualified: boolean;
+        unqualified: string[];
+    };
+    const evidence = {
+        schema: "magic-context.mc-host-release-qualification/v1",
+        release: {
+            id: contract.release.id,
+            version: contract.release.version,
+        },
+        release_contract_sha256: releaseContractSha256,
+        artifacts: {
+            production_inputs_lock: {
+                path: lockPath,
+                sha256: sha256Hex(lockText),
+            },
+            provider_credentials: {
+                path: credentialsPath,
+                sha256: sha256Hex(credentialsText),
+            },
+        },
+        production_qualified: lock.production_qualified,
+        test_only: false,
+        unqualified: lock.unqualified,
+    };
+    const path = join(root, "tmp/mc-host-release-qualification.json");
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, `${canonicalJson(evidence)}\n`);
+}
+
 // biome-ignore lint/suspicious/noExplicitAny: tests mutate deep copies
 function readMutable(root: string, relative: string): any {
     return JSON.parse(readFileSync(join(root, relative), "utf8"));
@@ -111,8 +147,46 @@ function markRegistryGatePassing(root: string): void {
 }
 
 function context() {
-    return loadReleaseContext(repoRoot);
+    return loadReleaseContext(freshRoot());
 }
+
+describe("release context qualification evidence", () => {
+    test("an unqualified lock is usable without local evidence", () => {
+        const root = freshRoot();
+        expect(loadReleaseContext(root).productionQualified).toBe(false);
+    });
+
+    test("local evidence is validated when present", () => {
+        const root = freshRoot();
+        writeFailClosedQualification(root);
+        expect(loadReleaseContext(root).productionQualified).toBe(false);
+
+        const evidencePath = join(
+            root,
+            "tmp/mc-host-release-qualification.json",
+        );
+        const evidence = JSON.parse(readFileSync(evidencePath, "utf8"));
+        evidence.artifacts.production_inputs_lock.sha256 = "f".repeat(64);
+        writeFileSync(evidencePath, `${canonicalJson(evidence)}\n`);
+        expect(() => loadReleaseContext(root)).toThrow(
+            /stale U9 artifact digest/,
+        );
+    });
+
+    test("a production-qualified lock requires local evidence", () => {
+        const root = freshRoot();
+        const lockPath = join(
+            root,
+            "release/mc-host-production-inputs.lock.json",
+        );
+        const lock = JSON.parse(readFileSync(lockPath, "utf8"));
+        lock.production_qualified = true;
+        writeFileSync(lockPath, `${canonicalJson(lock)}\n`);
+        expect(() => loadReleaseContext(root)).toThrow(
+            /production-qualified U9 lock requires local qualification evidence/,
+        );
+    });
+});
 
 function unqualifiedContext(): ReleaseContext {
     const unqualified = structuredClone(context());
@@ -177,18 +251,24 @@ function devManifest(): PayloadManifest {
 }
 
 describe("payload package metadata", () => {
+    test("committed fail-closed registry gate passes artifact drift checks", () => {
+        const root = freshRoot();
+        expect(() => runCheck(root, { write: false })).not.toThrow();
+    });
+
     test("the committed fail-closed gate passes drift but blocks publication", () => {
         // `runCheck` is the drift lane (`release:payload:check`), which runs on
         // every change. The committed gate records a live npm audit that is
         // honestly fail-closed between releases, so asserting readiness here
         // would leave the drift signal permanently red and unable to catch a
         // hand-edited gate. Readiness is asserted where bytes get published.
-        expect(() => runCheck(repoRoot, { write: false })).not.toThrow();
+        const root = freshRoot();
+        expect(() => runCheck(root, { write: false })).not.toThrow();
         expect(() =>
             validateRegistryGate(
                 JSON.parse(
                     readFileSync(
-                        join(repoRoot, "release/mc-host-registry-gate.json"),
+                        join(root, "release/mc-host-registry-gate.json"),
                         "utf8",
                     ),
                 ),
@@ -1091,14 +1171,15 @@ describe("dev payload build", () => {
     test("dev payload manifest recomputes to the same digest from disk", () => {
         const root = mkdtempSync(join(tmpdir(), "mc-host-dev-"));
         tempRoots.push(root);
+        const releaseRoot = freshRoot();
         const fakeBinary = join(root, "ck-mc-host-src");
         writeFileSync(fakeBinary, "\x7fELF fake dev binary bytes\n");
-        const result = buildDevPayload(repoRoot, {
+        const result = buildDevPayload(releaseRoot, {
             outDir: join(root, "out"),
             binaryPath: fakeBinary,
             target: targetFor("darwin-x64"),
         });
-        const ctx = context();
+        const ctx = loadReleaseContext(releaseRoot);
         const reloaded = JSON.parse(readFileSync(result.manifestPath, "utf8"));
         validatePayloadManifest(reloaded, ctx);
         expect(payloadManifestDigest(reloaded)).toBe(result.digest);
@@ -1111,9 +1192,10 @@ describe("dev payload build", () => {
     test("staged dev bytes are mutation-detected", () => {
         const root = mkdtempSync(join(tmpdir(), "mc-host-dev-"));
         tempRoots.push(root);
+        const releaseRoot = freshRoot();
         const fakeBinary = join(root, "ck-mc-host-src");
         writeFileSync(fakeBinary, "dev binary");
-        const result = buildDevPayload(repoRoot, {
+        const result = buildDevPayload(releaseRoot, {
             outDir: join(root, "out"),
             binaryPath: fakeBinary,
             target: targetFor("darwin-arm64"),

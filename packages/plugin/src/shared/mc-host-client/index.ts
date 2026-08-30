@@ -20,6 +20,7 @@ export {
     type MonotonicClock,
 } from "./deadline";
 export {
+    DAEMON_GENERATION_CHANGED_CODE,
     isMcHostCallError,
     McHostCallError,
     McHostClientError,
@@ -27,7 +28,11 @@ export {
     SocketTimeoutError,
 } from "./errors";
 export { ReceiveLease, type ReceiveReleaseOutcome } from "./frame-channel";
-export { processMcHostClient, resetProcessMcHostClientsForTest } from "./owner";
+export {
+    evictProcessMcHostClient,
+    processMcHostClient,
+    resetProcessMcHostClientsForTest,
+} from "./owner";
 export { RouteHandle, StaleRouteHandleError } from "./route-handle";
 export {
     AdmissionClass,
@@ -44,4 +49,5 @@ export {
     type PublicationDiagnostics,
     type RequestOptions,
     type RouteTarget,
+    sameDaemonId,
 } from "./types";

@@ -3,6 +3,8 @@
 //! linearization, retention, and charge/permit baselines — driven with
 //! paused tokio time and backend gates, never wall-clock sleeps.
 
+// Broca conformance drives a Synapse primary, which ships only for `linux-x64-gnu`. commentlint: allow(JUDGE)
+#![cfg(target_os = "linux")]
 mod support;
 
 use std::sync::Arc;

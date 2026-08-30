@@ -32,7 +32,7 @@ import {
     getOmpPackageDir,
     getOmpPluginsLockPath,
     getOmpSessionsRoot,
-    getOmpUserConfigPath,
+    getSharedUserConfigPath,
 } from "../lib/paths";
 import { type PromptIO, promptIO } from "../lib/prompts";
 import { sanitizeDiagnosticText } from "../lib/redaction";
@@ -253,7 +253,7 @@ async function runHealthChecks(options: {
         }
     }
 
-    const userConfigPath = getOmpUserConfigPath();
+    const userConfigPath = getSharedUserConfigPath();
     if (!existsSync(userConfigPath)) {
         add(results, "warn", `No Magic Context user config at ${userConfigPath}`);
         repairPlan.writeUserConfig = true;
@@ -337,9 +337,9 @@ async function repair(
     cwd: string,
 ): Promise<number> {
     let fixed = 0;
-    if (plan.writeUserConfig && !existsSync(getOmpUserConfigPath())) {
-        writeDefaultConfig(getOmpUserConfigPath());
-        prompts.log.success(`Wrote default Magic Context config to ${getOmpUserConfigPath()}`);
+    if (plan.writeUserConfig && !existsSync(getSharedUserConfigPath())) {
+        writeDefaultConfig(getSharedUserConfigPath());
+        prompts.log.success(`Wrote default Magic Context config to ${getSharedUserConfigPath()}`);
         fixed += 1;
     }
     const omp = deps.detectOmpBinary();

@@ -3,6 +3,7 @@ import { getDataDir } from "../../../shared/data-path";
 import { getHarness } from "../../../shared/harness";
 import { log } from "../../../shared/logger";
 import {
+    DAEMON_GENERATION_CHANGED_CODE,
     isMcHostCallError,
     processMcHostClient,
     resetProcessMcHostClientsForTest,
@@ -14,6 +15,7 @@ import {
     resolveConnectionOrigin,
     STORAGE_HARD_BUDGET_MS,
     type StorageReadiness,
+    WaiterDetachedError,
 } from "../../../shared/mc-host-lifecycle";
 import {
     createSynapseLedgerPage,
@@ -64,6 +66,7 @@ const SYNAPSE_QUEUE_FULL_MAX_ATTEMPTS = 64;
  * uninitialized, which silently degrades embeddings to no-ops rather than
  * surfacing an error, so the wait is deliberately generous.
  */
+export const SYNAPSE_HANDSHAKE_TIMEOUT_MS = 10_000;
 
 export type SynapseErrorCode =
     | "queue_full"
@@ -113,6 +116,7 @@ export interface SynapseClientLike {
             timeoutMs?: number;
             identity?: { project_root: string; harness: string; session: string };
             targetKind?: "management_surface" | "tool_provider";
+            expectedDaemonId?: Uint8Array;
         },
     ): Promise<Response>;
     close(): void;
@@ -149,7 +153,12 @@ export type SynapseDemandStart = (request: {
     origin: ConnectionOrigin;
     capability: "synapse";
     deadlineMs?: number;
-}) => Promise<{ ok: boolean; reason: string; storage: StorageReadiness | null }>;
+}) => Promise<{
+    ok: boolean;
+    reason: string;
+    storage: StorageReadiness | null;
+    authenticatedDaemonId?: Uint8Array;
+}>;
 
 let configuredManagedDemandStart: SynapseDemandStart | undefined;
 
@@ -202,6 +211,23 @@ export class SynapseEmbeddingError extends Error {
     readonly permanent: boolean;
     /** Ledger receipt this failure was recorded against, when one exists. */
     ledgerRowId?: number;
+    /**
+     * Set when this failure is the client's pre-publication daemon fence. The
+     * fence refuses before any byte is enqueued (`not_sent`), so the request
+     * provably never reached the daemon. Classification maps it to `transport`
+     * so it cannot masquerade as `module_restarted` evidence and spend a page's
+     * single durable restart budget; this flag lets a caller that can re-derive
+     * the binding resubmit the identical request key without that charge.
+     */
+    prePublicationFence?: boolean;
+    /**
+     * Daemon identity the failed attempt published against, recorded when the
+     * failure reports a rotation. `null` records an attempt made with no bound
+     * identity. The lane's certified identity can advance while an attempt is
+     * in flight, so recovery compares against this value rather than assuming
+     * the installed identity is the one that failed.
+     */
+    attemptDaemonId?: Uint8Array | null;
 
     constructor(
         code: SynapseErrorCode,
@@ -308,6 +334,11 @@ function classifyError(value: unknown): SynapseEmbeddingError {
     else if (normalized.includes("probe_required")) mapped = "probe_required";
     else if (normalized.includes("idempotency_conflict")) mapped = "idempotency_conflict";
     else if (normalized.includes("schema")) mapped = "schema_violation";
+    // A daemon_generation_changed rejection is client-side and pre-publication:
+    // no request reached the daemon, so it is transient transport failure, not
+    // `module_restarted` evidence, which spends a page's single durable restart
+    // budget on an attempt the daemon never saw.
+    else if (normalized.includes("daemon_generation_changed")) mapped = "transport";
     else if (normalized.includes("abort")) mapped = "cancelled";
     // The host's shutdown teardown rejects in-flight work with the wire code
     // `cancelled` ("the host is shutting down"). That is evidence about one
@@ -580,6 +611,7 @@ async function getSharedClient(
     const file = options.connectionFile ?? defaultConnectionFile();
     const promise = processMcHostClient({
         connectionFile: file,
+        handshakeTimeoutMs: SYNAPSE_HANDSHAKE_TIMEOUT_MS,
     });
     sharedClientFile = file;
     sharedClientPromise = promise;
@@ -628,9 +660,11 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
     private readonly options: SynapseEmbeddingProviderOptions;
     private readonly connectionOrigin: ConnectionOrigin;
     private readonly demandStart: SynapseDemandStart | undefined;
+    private compatibleDaemonId: Uint8Array | null = null;
     private client: SynapseClientLike | null = null;
     private initialized = false;
     private initializing: Promise<boolean> | null = null;
+    private managedDemand: ReturnType<SynapseDemandStart> | null = null;
     private demandFailedUntilMs = 0;
     private permanentFailure = false;
     private batchLimit = 16;
@@ -745,9 +779,9 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
      * missing lifecycle owner keeps this path passive (dial-only): explicit
      * and CLI contexts must be able to reach an already-running daemon.
      */
-    private async demandManagedLane(): Promise<void> {
+    private async demandManagedLane(deadlineMs?: number): Promise<void> {
         if (this.connectionOrigin !== "managed-default" || !this.demandStart) return;
-        if (Date.now() < this.demandFailedUntilMs) {
+        if (this.now() < this.demandFailedUntilMs) {
             throw new SynapseEmbeddingError(
                 "transport",
                 "managed Synapse demand recently failed; backing off",
@@ -761,15 +795,25 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         // invocation — exactly what the backoff exists to prevent. No abort
         // signal is passed and the deadline is a fixed positive budget, so a
         // detach here means the start really did exhaust it.
-        let outcome: Awaited<ReturnType<SynapseDemandStart>>;
-        try {
-            outcome = await this.demandStart({
+        let demand = this.managedDemand;
+        if (!demand) {
+            demand = this.demandStart({
                 origin: this.connectionOrigin,
                 capability: "synapse",
-                deadlineMs: SYNAPSE_DEMAND_STARTUP_BUDGET_MS,
+                deadlineMs: deadlineMs ?? SYNAPSE_DEMAND_STARTUP_BUDGET_MS,
             });
+            this.managedDemand = demand;
+            const evict = (): void => {
+                if (this.managedDemand === demand) this.managedDemand = null;
+            };
+            void demand.then(evict, evict);
+        }
+        let outcome: Awaited<ReturnType<SynapseDemandStart>>;
+        try {
+            outcome = await demand;
         } catch (error) {
-            this.demandFailedUntilMs = Date.now() + SYNAPSE_DEMAND_RETRY_BACKOFF_MS;
+            if (error instanceof WaiterDetachedError) throw error;
+            this.demandFailedUntilMs = this.now() + SYNAPSE_DEMAND_RETRY_BACKOFF_MS;
             if (error instanceof SynapseEmbeddingError) throw error;
             throw new SynapseEmbeddingError(
                 "transport",
@@ -778,15 +822,28 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
             );
         }
         if (!outcome.ok) {
-            this.demandFailedUntilMs = Date.now() + SYNAPSE_DEMAND_RETRY_BACKOFF_MS;
+            this.demandFailedUntilMs = this.now() + SYNAPSE_DEMAND_RETRY_BACKOFF_MS;
             throw new SynapseEmbeddingError(
                 "transport",
                 `managed Synapse demand failed: ${outcome.reason}`,
             );
         }
+        if (outcome.authenticatedDaemonId === undefined) {
+            // An owner that reports success without the identity has certified
+            // nothing this lane can fence against, so the demand failed on its
+            // own terms and arms the same window as the other failure outcomes.
+            // Without it every later call re-enters the demand and drives
+            // another native start and storage probe at request rate.
+            this.demandFailedUntilMs = this.now() + SYNAPSE_DEMAND_RETRY_BACKOFF_MS;
+            throw new SynapseEmbeddingError(
+                "transport",
+                "managed lifecycle compatibility returned no daemon identity",
+            );
+        }
+        this.compatibleDaemonId = Uint8Array.from(outcome.authenticatedDaemonId);
     }
 
-    async initialize(signal?: AbortSignal): Promise<boolean> {
+    async initialize(signal?: AbortSignal, demandDeadlineMs?: number): Promise<boolean> {
         if (this.initialized) return true;
         if (this.permanentFailure) return false;
         if (this.initializing) {
@@ -810,7 +867,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         if (signal?.aborted) return false;
         this.initializing = (async () => {
             try {
-                await this.demandManagedLane();
+                await this.demandManagedLane(demandDeadlineMs);
                 this.client = await getSharedClient(this.options);
                 if (!this.metadata) {
                     const discovered = await this.callWithRetry<SynapseCatalogEntry[]>(
@@ -897,6 +954,46 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         }
     }
 
+    /**
+     * Re-certify the managed lane after a rotation, within the page's remaining
+     * budget. A restart budget authorizes one resubmission, and a resubmission
+     * may publish only against a freshly certified incarnation, so clearing
+     * `initialized` forces `initialize` to re-derive the identity from a fresh
+     * demand.
+     *
+     * Only the managed lane owns its own certification; a caller-supplied
+     * connection is not ours to re-derive, so it recertifies trivially.
+     *
+     * The identity is not cleared here. `initialize` is its only writer and
+     * writes it on the success path, so one operation entering recertification
+     * cannot erase an incarnation a sibling already certified and is dispatching
+     * against — a sibling that spent its own restart budget would otherwise fail
+     * permanently on a fence it had already re-established. An identity that did
+     * rotate away is refused by the client fence before any byte is written, and
+     * that refusal is the sibling's own `module_restarted` to spend.
+     */
+    private async rebindAfterModuleRestart(
+        deadlineAt: number,
+        signal?: AbortSignal,
+    ): Promise<void> {
+        if (this.connectionOrigin !== "managed-default") return;
+        this.initialized = false;
+        this.managedDemand = null;
+        const remainingMs = deadlineAt - this.now();
+        if (remainingMs <= 0) {
+            throw new SynapseEmbeddingError("timeout", "Synapse page deadline exhausted");
+        }
+        if (!(await this.initialize(signal, remainingMs))) {
+            if (signal?.aborted) {
+                throw new SynapseEmbeddingError("cancelled", "Synapse request aborted");
+            }
+            throw new SynapseEmbeddingError(
+                "transport",
+                "Synapse daemon compatibility rebind failed",
+            );
+        }
+    }
+
     async embed(text: string, signal?: AbortSignal): Promise<Float32Array | null> {
         if (!(await this.initialize(signal)) || signal?.aborted || !this.metadata) return null;
         try {
@@ -953,6 +1050,11 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         }
         for (let start = 0; start < items.length; ) {
             if (signal?.aborted || this.permanentFailure) break;
+            // A `module_restarted` failure on an earlier page invalidated the
+            // compatible daemon identity. Re-run the full initialization so
+            // the remaining pages only proceed against an incarnation that
+            // re-passed lifecycle compatibility validation.
+            if (!this.initialized && !(await this.initialize(signal))) break;
             const page = this.nextPage(items, start);
             start += page.length;
             try {
@@ -966,6 +1068,13 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 const deadlineAt = this.now() + this.pageTimeoutMs;
                 for (;;) {
                     try {
+                        const remainingMs = deadlineAt - this.now();
+                        if (remainingMs <= 0) {
+                            throw new SynapseEmbeddingError(
+                                "timeout",
+                                "Synapse page deadline exhausted",
+                            );
+                        }
                         body = await this.callWithRetry(
                             "embed.batch",
                             this.batchRequest(page, requestKey),
@@ -989,6 +1098,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                         const classified = classifyError(error);
                         if (classified.code !== "module_restarted" || restarted) throw classified;
                         restarted = true;
+                        await this.rebindAfterModuleRestart(deadlineAt, signal);
                     }
                 }
                 const batchEnvelope = responseBody(body);
@@ -1050,15 +1160,20 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
             if (group) group.push(item);
             else groups.set(item.applicationGroup, [item]);
         }
-        const ready = await this.initialize();
+        const ready = await this.initialize(signal);
         if (!ready || !this.metadata) {
+            const cancelled = signal?.aborted === true;
             for (const [applicationGroup, groupItems] of groups) {
                 result.failures.push({
                     applicationGroup,
                     items: groupItems.map(({ id, contentSha256 }) => ({ id, contentSha256 })),
                     rowId: null,
-                    code: this.permanentFailure ? "artifact_invalid" : "transport",
-                    message: "Synapse lane is unavailable",
+                    code: this.permanentFailure
+                        ? "artifact_invalid"
+                        : cancelled
+                          ? "cancelled"
+                          : "transport",
+                    message: cancelled ? "Synapse request aborted" : "Synapse lane is unavailable",
                     disposition: this.permanentFailure ? "permanent" : "retryable",
                 });
             }
@@ -1080,6 +1195,35 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                         message: this.permanentFailure
                             ? "Synapse lane disabled after a permanent failure"
                             : "Synapse request aborted",
+                        disposition: this.permanentFailure ? "permanent" : "retryable",
+                    });
+                    continue;
+                }
+                // A `module_restarted` failure on an earlier page invalidated
+                // the compatible daemon identity; re-validate before this page
+                // so it never rides an unverified incarnation.
+                if (!this.initialized && !(await this.initialize(signal))) {
+                    // `initialize` reports an abort raised during its own await
+                    // as a plain `false`, so the signal is re-read here. Without
+                    // it a caller-cancelled request records this one page as a
+                    // retryable `transport` failure — inviting a retry of work
+                    // the caller withdrew — while every later page correctly
+                    // reports `cancelled` from the check above.
+                    const aborted = signal?.aborted === true;
+                    result.failures.push({
+                        applicationGroup,
+                        items: manifest,
+                        rowId: null,
+                        code: this.permanentFailure
+                            ? "artifact_invalid"
+                            : aborted
+                              ? "cancelled"
+                              : "transport",
+                        message: this.permanentFailure
+                            ? "Synapse lane disabled after a permanent failure"
+                            : aborted
+                              ? "Synapse request aborted"
+                              : "Synapse lane is unavailable",
                         disposition: this.permanentFailure ? "permanent" : "retryable",
                     });
                     continue;
@@ -1241,7 +1385,8 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                     // daemon resubmits it without bound. `page_terminal` is the
                     // page-scoped code for a spent budget: it belongs to this
                     // row alone and leaves the lane's other pages runnable.
-                    if (row.restartCount !== 0 || (row.deadlineAt ?? 0) <= this.now()) {
+                    const readyDeadlineAt = row.deadlineAt ?? 0;
+                    if (row.restartCount !== 0 || readyDeadlineAt <= this.now()) {
                         const terminal = new SynapseEmbeddingError(
                             "page_terminal",
                             "restart budget or page deadline exhausted",
@@ -1249,6 +1394,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                         terminal.ledgerRowId = row.rowId;
                         throw terminal;
                     }
+                    await this.rebindAfterModuleRestart(readyDeadlineAt, signal);
                 }
             }
             markSynapseLedgerObsolete(db, {
@@ -1262,7 +1408,12 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         let servedPollDelayMs: number | undefined;
         try {
             if (row.state === "pending") {
-                const submitted = await this.submitBatchPage(page, requestKey, deadlineAt, signal);
+                const submitted = await this.submitBatchPageWithRebind(
+                    page,
+                    requestKey,
+                    deadlineAt,
+                    signal,
+                );
                 servedPollDelayMs = submitted.retryAfterMs;
                 row = markSynapseLedgerPolling(db, {
                     rowId: row.rowId,
@@ -1275,7 +1426,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 if (!row.jobId) {
                     // A crash between the restart CAS and resubmission leaves a
                     // polling row without a job; resubmit the same page key.
-                    const submitted = await this.submitBatchPage(
+                    const submitted = await this.submitBatchPageWithRebind(
                         page,
                         requestKey,
                         deadlineAt,
@@ -1356,6 +1507,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                             expectedStateVersion: row.stateVersion,
                             jobId,
                         });
+                        await this.rebindAfterModuleRestart(deadlineAt, signal);
                     } catch (casError) {
                         if (!(casError instanceof SynapseLedgerConflictError)) throw casError;
                         // The single durable restart is already spent or the
@@ -1424,6 +1576,41 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
             );
         }
         return { jobId, retryAfterMs: readRetryAfter(parsed) };
+    }
+
+    /**
+     * Submit one page, absorbing at most one daemon rotation observed at
+     * submission time. A rotation during submission is the normal first
+     * symptom after a replacement (`initialize` short-circuits on a live
+     * provider, leaving a stale binding), and the replacement daemon dedupes
+     * by `request_key`, so one rebind-and-resubmit under the page's original
+     * absolute deadline is safe. A second rotation propagates to the caller's
+     * disposition handling.
+     *
+     * Two codes describe that rotation, and both belong here. `module_restarted`
+     * is the daemon's own report. `daemon_generation_changed` is the client
+     * fence refusing before publication: it is `not_sent`, so the page is
+     * provably unpublished and resubmitting the same key duplicates nothing.
+     * Classification maps the fence to `transport` precisely so it never spends
+     * the page's single durable restart budget, and rebinding here keeps that
+     * property — the budget is spent by the ledger, never by this helper.
+     */
+    private async submitBatchPageWithRebind(
+        page: readonly { id: string; text: string; contentSha256: string }[],
+        requestKey: string,
+        deadlineAt: number,
+        signal?: AbortSignal,
+    ): Promise<{ jobId: string; retryAfterMs?: number }> {
+        try {
+            return await this.submitBatchPage(page, requestKey, deadlineAt, signal);
+        } catch (error) {
+            const classified = classifyError(error);
+            const rotated =
+                classified.code === "module_restarted" || classified.prePublicationFence === true;
+            if (!rotated) throw classified;
+            await this.rebindAfterModuleRestart(deadlineAt, signal);
+            return this.submitBatchPage(page, requestKey, deadlineAt, signal);
+        }
     }
 
     private async collectJobPages(
@@ -1747,9 +1934,33 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                     `Synapse ${method} deadline of ${timeoutMs}ms exhausted`,
                 );
             const attemptDeadlineMs = Math.floor(remainingMs);
+            // The identity this attempt publishes against, read before the
+            // call so a failure reports the binding it carried rather than a
+            // binding a concurrent re-certification installed since.
+            const attemptDaemonId = this.compatibleDaemonId;
             try {
                 if (!this.client)
                     throw new SynapseEmbeddingError("transport", "Synapse client is unavailable");
+                // The managed lane publishes only against the incarnation its
+                // lifecycle owner certified. The owner is the sole writer of
+                // that identity, so when one is configured an absent identity
+                // means the fence was never proved or a rotation invalidated
+                // it, and publishing would go unfenced onto an unknown
+                // incarnation. With no owner configured nothing certifies an
+                // incarnation and the lane is dial-only: there is no fence to
+                // prove, and requiring one would refuse every call against an
+                // already-running daemon. The same field gates the demand, so
+                // certifier and fence cannot disagree about which lanes are
+                // owned.
+                if (
+                    this.connectionOrigin === "managed-default" &&
+                    this.demandStart &&
+                    this.compatibleDaemonId === null
+                )
+                    throw new SynapseEmbeddingError(
+                        "module_restarted",
+                        "managed Synapse lane has no certified daemon identity",
+                    );
                 const attemptParams =
                     typeof params === "function" ? params(attemptDeadlineMs) : params;
                 return await this.client.call<T>(
@@ -1767,14 +1978,30 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                             harness: getHarness(),
                             session: this.options.session,
                         },
+                        ...(this.compatibleDaemonId === null
+                            ? {}
+                            : { expectedDaemonId: this.compatibleDaemonId }),
                     },
                 );
             } catch (error) {
                 const classified = classifyError(error);
+                // The daemon-identity fence rejected before publication: the
+                // bound identity is stale, and every retry carrying it fails
+                // identically. Drop the binding and surface the failure so the
+                // next initialize() revalidates against the live daemon.
+                if (readErrorCode(error) === DAEMON_GENERATION_CHANGED_CODE) {
+                    this.initialized = false;
+                    this.compatibleDaemonId = null;
+                    classified.prePublicationFence = true;
+                    throw classified;
+                }
                 if (classified.code === "idempotency_conflict") throw classified;
                 // R21: module_restarted bypasses generic retry entirely; the
                 // caller owns the single durable restart resubmission.
-                if (classified.code === "module_restarted") throw classified;
+                if (classified.code === "module_restarted") {
+                    classified.attemptDaemonId = attemptDaemonId;
+                    throw classified;
+                }
                 if (classified.code === "cancelled") throw classified;
                 const outcomeUnknown = isMcHostCallError(error) && error.kind === "outcome_unknown";
                 const retryable = !classified.permanent && (retryEmbeddings || !outcomeUnknown);
@@ -1853,6 +2080,24 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
 
     private logCallFailure(error: unknown, operation: string): void {
         const classified = classifyError(error);
+        // A rotation condemns the identity the failed attempt published
+        // against, not whatever is installed now: overlapping operations can
+        // straddle one rotation, with a sibling installing the re-certified
+        // identity before this attempt's failure against the old generation
+        // arrives. `initialize` is the identity's only writer and installs a
+        // fresh array per certification, so a mismatch here means the binding
+        // has already been replaced, and clearing it would strand the sibling
+        // without the fence it just proved — its own restart budget is spent,
+        // so its next call would refuse for want of an identity. A failure
+        // that records no identity carries no such evidence and clears.
+        if (
+            classified.code === "module_restarted" &&
+            (classified.attemptDaemonId === undefined ||
+                classified.attemptDaemonId === this.compatibleDaemonId)
+        ) {
+            this.initialized = false;
+            this.compatibleDaemonId = null;
+        }
         if (classified.permanent && !isPageScopedSynapseCode(classified.code)) {
             this.permanentFailure = true;
         }

@@ -1811,6 +1811,8 @@ mod tests {
 
     #[test]
     fn hostile_shapes_at_the_lock_names_fail_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
         for name in [TRANSACTION_LOCK_NAME, LIFETIME_LOCK_NAME] {
             // A symlink at the lock name.
             let root = temp_root();

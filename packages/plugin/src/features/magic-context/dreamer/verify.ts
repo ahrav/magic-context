@@ -1,6 +1,9 @@
 import { DREAMER_MEMORY_MAPPER_AGENT } from "../../../agents/dreamer";
 import { withContentLanguageDirective } from "../../../agents/language-directive";
-import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
+import {
+    childSessionMessagesFetcher,
+    createChildSessionWithFence,
+} from "../../../hooks/magic-context/child-session-spawn";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import {
@@ -52,7 +55,7 @@ import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from
 import type { DreamerModuleRoute } from "./module-apply";
 import {
     DreamerProviderOutputFailureError,
-    providerOutputFailureFromInvalidManifest,
+    rethrowInvalidManifestAsProviderFailure,
 } from "./provider-output-failure";
 import { getTaskScheduleState, writeTaskScheduleState } from "./storage-task-schedule";
 import { partitionVerifyScope } from "./verify-gate";
@@ -64,8 +67,18 @@ import {
     validateVerifyManifest,
 } from "./verify-prompt";
 
-const VERIFY_BATCH_SIZE = 50;
+export const VERIFY_BATCH_SIZE = 50;
+export const DREAM_VERIFY_SESSION_TITLE = "magic-context-dream-verify";
 const IDENTICAL_PROVIDER_FAILURE_BATCH_LIMIT = 2;
+
+/**
+ * Longest trimmed replacement body an update entry may carry. Applying a longer
+ * body would write a revision no reviewer can read back, so the manifest is
+ * rejected before any write. Exported because a caller that predicts whether
+ * this stage accepts a manifest has to test the same bound, and a second copy of
+ * the number would let the prediction and the gate disagree.
+ */
+export const VERIFY_UPDATE_CONTENT_MAX_LENGTH = 20_000;
 
 interface VerifyBatchResult {
     verified: number;
@@ -218,7 +231,7 @@ async function verifyOneBatch(
             client: args.client,
             db: args.db,
             parentSessionId: args.parentSessionId,
-            title: "magic-context-dream-verify",
+            title: DREAM_VERIFY_SESSION_TITLE,
             directory: args.sessionDirectory,
         });
         const created = shared.normalizeSDKResponse(
@@ -280,15 +293,12 @@ async function verifyOneBatch(
                 signal,
                 fallbackModels: args.fallbackModels,
                 callContext: "dreamer:verify",
-                fetchOutput: async () => {
-                    const messagesResponse = await args.client.session.messages({
-                        path: { id: agentSessionId as string },
-                        query: { directory: args.sessionDirectory, limit: 100 },
-                    });
-                    return shared.normalizeSDKResponse(messagesResponse, [] as unknown[], {
-                        preferResponseOnMissingData: true,
-                    });
-                },
+                fetchOutput: childSessionMessagesFetcher(
+                    args.client,
+                    agentSessionId as string,
+                    args.sessionDirectory,
+                    100,
+                ),
                 validateOutput: (messages) => {
                     if (hasLengthCappedOutput(messages)) {
                         throw new Error("verify returned length-capped output");
@@ -296,16 +306,9 @@ async function verifyOneBatch(
                     const text = extractLatestAssistantText(messages);
                     if (!text) throw new Error("verify returned no output");
                     rawManifest = text;
-                    try {
+                    rethrowInvalidManifestAsProviderFailure(messages, text, () => {
                         validateVerifyBatch(text, batch);
-                    } catch (error) {
-                        const providerFailure = providerOutputFailureFromInvalidManifest(
-                            messages,
-                            text,
-                        );
-                        if (providerFailure) throw providerFailure;
-                        throw error;
-                    }
+                    });
                     return text;
                 },
             },
@@ -669,7 +672,7 @@ export async function applyVerifyManifest(
     }
     for (const entry of parsed.updated) {
         const content = entry.content.trim();
-        if (!content || content.length > 20_000) {
+        if (!content || content.length > VERIFY_UPDATE_CONTENT_MAX_LENGTH) {
             const error = new Error(`verify update ${entry.publicClaimId} has invalid content`);
             recordDreamerManifestRejection({
                 ...args,

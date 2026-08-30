@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { renderStatusText } from "./status-line";
-import { createTestDb, fakeContext } from "./test-utils.test";
+import { createTestDb, fakeContext } from "./test-utils";
 
 describe("Pi footer status", () => {
 	it("reports percentage against the scheduler usable window", () => {

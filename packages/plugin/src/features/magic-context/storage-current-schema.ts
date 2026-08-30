@@ -1,9 +1,9 @@
 /**
- * U1 direct-cutover groundwork (KTD1): the composable current-schema snapshot
- * source. The converged non-memory schema (claims/evidence v82, applicability
- * v85, policy v86) is registered here as explicit components so the direct
- * bootstrap (U8) and the direct test factory can create the exact current
- * schema without running the legacy migration chain.
+ * The composable current-schema snapshot source. The converged non-memory
+ * schema (claims/evidence v82, applicability v85, policy v86) is registered
+ * here as explicit components so the direct bootstrap and the direct test
+ * factory can create the exact current schema without running the legacy
+ * migration chain.
  *
  * Registered-component contract:
  *   - every component declares the top-level tables it OWNS (`provides`);

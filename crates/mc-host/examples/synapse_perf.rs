@@ -283,6 +283,8 @@ fn lane() -> LaneInfo {
         fingerprint: FINGERPRINT.to_owned(),
         table_epoch: 1,
         dims: 8,
+        // The inline delay engine computes on CPU, matching a bundle-backed
+        // CPU lane's advertised execution provider.
         execution_provider: "cpu",
         max_tokens: 512,
         max_text_bytes: 1024,

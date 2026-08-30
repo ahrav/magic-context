@@ -1,0 +1,477 @@
+{
+  "schema": "dreamer-eval-scenario/v1",
+  "id": "dme-core-pool",
+  "title": "Core dreamer maintenance pressures",
+  "pressureRoles": [
+    { "role": "semantic-duplicate-pair", "claimIds": ["claim-cache-primary", "claim-cache-duplicate"] },
+    { "role": "near-duplicate-pair", "claimIds": ["claim-retry-attempts", "claim-retry-backoff"] },
+    { "role": "stale", "claimIds": ["claim-worker-stale"] },
+    { "role": "contradiction-pair", "claimIds": ["claim-feature-enabled", "claim-feature-disabled"] },
+    { "role": "false-fluent", "claimIds": ["claim-legacy-queue"] },
+    { "role": "high-value-file-independent", "claimIds": ["claim-tls-constraint"] },
+    { "role": "rejected-alternative", "claimIds": ["claim-rejected-redis"] },
+    { "role": "branch-specific", "claimIds": ["claim-release-branch"] }
+  ],
+  "pool": {
+    "claims": [
+      {
+        "id": "claim-cache-primary",
+        "content": "The cache retains at most 4096 entries.",
+        "category": "CONFIG_VALUES",
+        "importance": 40,
+        "memoryScope": "ecosystem",
+        "sharing": "private",
+        "hygieneVisible": true,
+        "fileIndependent": false,
+        "fixtureFiles": [
+          {
+            "path": "src/cache.ts",
+            "content": "export const CACHE_ENTRY_LIMIT = 4096;\n"
+          }
+        ]
+      },
+      {
+        "id": "claim-cache-duplicate",
+        "content": "Cache capacity is capped at 4096 entries.",
+        "category": "CONFIG_VALUES",
+        "importance": 38,
+        "memoryScope": "ecosystem",
+        "sharing": "private",
+        "hygieneVisible": true,
+        "fileIndependent": false,
+        "fixtureFiles": [
+          {
+            "path": "src/cache.ts",
+            "content": "export const CACHE_ENTRY_LIMIT = 4096;\n"
+          }
+        ]
+      },
+      {
+        "id": "claim-retry-attempts",
+        "content": "Foreground requests allow 3 total attempts, including the first call.",
+        "category": "CONFIG_VALUES",
+        "importance": 35,
+        "memoryScope": "ecosystem",
+        "sharing": "private",
+        "hygieneVisible": true,
+        "fileIndependent": false,
+        "fixtureFiles": [
+          {
+            "path": "src/retry.ts",
+            "content": "export const TOTAL_ATTEMPTS = 3;\nexport const BACKOFF_BASE_MS = 250;\n"
+          }
+        ]
+      },
+      {
+        "id": "claim-retry-backoff",
+        "content": "Retry backoff starts at 250 ms.",
+        "category": "CONFIG_VALUES",
+        "importance": 30,
+        "memoryScope": "ecosystem",
+        "sharing": "private",
+        "hygieneVisible": true,
+        "fileIndependent": false,
+        "fixtureFiles": [
+          {
+            "path": "src/retry.ts",
+            "content": "export const TOTAL_ATTEMPTS = 3;\nexport const BACKOFF_BASE_MS = 250;\n"
+          }
+        ]
+      },
+      {
+        "id": "claim-worker-stale",
+        "content": "The worker pool has 4 threads.",
+        "category": "CONFIG_VALUES",
+        "importance": 25,
+        "memoryScope": "ecosystem",
+        "sharing": "private",
+        "hygieneVisible": true,
+        "fileIndependent": false,
+        "fixtureFiles": [
+          {
+            "path": "src/workers.ts",
+            "content": "export const WORKER_THREADS = 8;\n"
+          }
+        ]
+      },
+      {
+        "id": "claim-feature-enabled",
+        "content": "Streaming uploads are enabled.",
+        "category": "ARCHITECTURE",
+        "importance": 45,
+        "memoryScope": "ecosystem",
+        "sharing": "private",
+        "hygieneVisible": true,
+        "fileIndependent": false,
+        "fixtureFiles": [
+          {
+            "path": "src/uploads.ts",
+            "content": "export const STREAMING_UPLOADS = true;\n"
+          }
+        ]
+      },
+      {
+        "id": "claim-feature-disabled",
+        "content": "Streaming uploads are disabled.",
+        "category": "ARCHITECTURE",
+        "importance": 20,
+        "memoryScope": "ecosystem",
+        "sharing": "private",
+        "hygieneVisible": true,
+        "fileIndependent": false,
+        "fixtureFiles": [
+          {
+            "path": "src/uploads.ts",
+            "content": "export const STREAMING_UPLOADS = true;\n"
+          }
+        ]
+      },
+      {
+        "id": "claim-legacy-queue",
+        "content": "The legacy delivery queue remains the authoritative write path.",
+        "category": "ARCHITECTURE",
+        "importance": 22,
+        "memoryScope": "ecosystem",
+        "sharing": "private",
+        "hygieneVisible": true,
+        "fileIndependent": false,
+        "fixtureFiles": [
+          {
+            "path": "src/delivery.ts",
+            "content": "export const DELIVERY_PATH = \"direct\";\n// The legacy queue was removed.\n"
+          }
+        ]
+      },
+      {
+        "id": "claim-tls-constraint",
+        "content": "Provider traffic must use TLS 1.3 or newer.",
+        "category": "CONSTRAINTS",
+        "importance": 50,
+        "memoryScope": "project",
+        "sharing": "private",
+        "hygieneVisible": true,
+        "fileIndependent": true,
+        "fixtureFiles": []
+      },
+      {
+        "id": "claim-rejected-redis",
+        "content": "Redis was rejected; SQLite remains the authoritative store.",
+        "category": "CONSTRAINTS",
+        "importance": 42,
+        "memoryScope": "ecosystem",
+        "sharing": "private",
+        "hygieneVisible": true,
+        "fileIndependent": false,
+        "fixtureFiles": [
+          {
+            "path": "src/storage.ts",
+            "content": "// Redis was evaluated and rejected; SQLite remains the authoritative store.\nexport const AUTHORITATIVE_STORE = \"sqlite\";\n"
+          }
+        ]
+      },
+      {
+        "id": "claim-release-branch",
+        "content": "On the release branch, uploads use a 2 MiB chunk size.",
+        "category": "CONFIG_VALUES",
+        "importance": 18,
+        "memoryScope": "ecosystem",
+        "sharing": "private",
+        "hygieneVisible": true,
+        "fileIndependent": false,
+        "fixtureFiles": [
+          {
+            "path": "config/release.ts",
+            "content": "export const DEFAULT_UPLOAD_CHUNK_MIB = 8;\nexport const RELEASE_UPLOAD_CHUNK_MIB = 2;\n\n// The 2 MiB size applies on the release branch only; every other branch keeps\n// the default.\nexport function uploadChunkMib(onReleaseBranch: boolean): number {\n    return onReleaseBranch ? RELEASE_UPLOAD_CHUNK_MIB : DEFAULT_UPLOAD_CHUNK_MIB;\n}\n"
+          }
+        ]
+      }
+    ]
+  },
+  "tasks": [
+    {
+      "task": "verify",
+      "preconditions": {
+        "mappings": [
+          { "claimId": "claim-cache-primary", "files": ["src/cache.ts"] },
+          { "claimId": "claim-cache-duplicate", "files": ["src/cache.ts"] },
+          { "claimId": "claim-retry-attempts", "files": ["src/retry.ts"] },
+          { "claimId": "claim-retry-backoff", "files": ["src/retry.ts"] },
+          { "claimId": "claim-worker-stale", "files": ["src/workers.ts"] },
+          { "claimId": "claim-feature-enabled", "files": ["src/uploads.ts"] },
+          { "claimId": "claim-feature-disabled", "files": ["src/uploads.ts"] },
+          { "claimId": "claim-legacy-queue", "files": ["src/delivery.ts"] },
+          { "claimId": "claim-rejected-redis", "files": ["src/storage.ts"] },
+          { "claimId": "claim-release-branch", "files": ["config/release.ts"] }
+        ],
+        "verifications": [],
+        "classifiedClaimIds": []
+      },
+      "expectedInScopeClaimIds": [
+        "claim-cache-primary",
+        "claim-cache-duplicate",
+        "claim-retry-attempts",
+        "claim-retry-backoff",
+        "claim-worker-stale",
+        "claim-feature-enabled",
+        "claim-feature-disabled",
+        "claim-legacy-queue",
+        "claim-rejected-redis",
+        "claim-release-branch"
+      ],
+      "expectedSkippedClaimIds": ["claim-tls-constraint"],
+      "expectedResultMode": "incremental",
+      "gold": {
+        "kind": "verify",
+        "claims": [
+          {
+            "claimId": "claim-cache-primary",
+            "verdict": "verified",
+            "expectedFiles": ["src/cache.ts"],
+            "requiredUpdateAnchors": [],
+            "forbiddenUpdateAnchors": []
+          },
+          {
+            "claimId": "claim-cache-duplicate",
+            "verdict": "verified",
+            "expectedFiles": ["src/cache.ts"],
+            "requiredUpdateAnchors": [],
+            "forbiddenUpdateAnchors": []
+          },
+          {
+            "claimId": "claim-retry-attempts",
+            "verdict": "verified",
+            "expectedFiles": ["src/retry.ts"],
+            "requiredUpdateAnchors": [],
+            "forbiddenUpdateAnchors": []
+          },
+          {
+            "claimId": "claim-retry-backoff",
+            "verdict": "verified",
+            "expectedFiles": ["src/retry.ts"],
+            "requiredUpdateAnchors": [],
+            "forbiddenUpdateAnchors": []
+          },
+          {
+            "claimId": "claim-worker-stale",
+            "verdict": "update",
+            "expectedFiles": ["src/workers.ts"],
+            "requiredUpdateAnchors": ["8 threads"],
+            "forbiddenUpdateAnchors": ["4 threads"]
+          },
+          {
+            "claimId": "claim-feature-enabled",
+            "verdict": "verified",
+            "expectedFiles": ["src/uploads.ts"],
+            "requiredUpdateAnchors": [],
+            "forbiddenUpdateAnchors": []
+          },
+          {
+            "claimId": "claim-feature-disabled",
+            "verdict": "archive",
+            "expectedFiles": [],
+            "requiredUpdateAnchors": [],
+            "forbiddenUpdateAnchors": []
+          },
+          {
+            "claimId": "claim-legacy-queue",
+            "verdict": "archive",
+            "expectedFiles": [],
+            "requiredUpdateAnchors": [],
+            "forbiddenUpdateAnchors": []
+          },
+          {
+            "claimId": "claim-rejected-redis",
+            "verdict": "verified",
+            "expectedFiles": ["src/storage.ts"],
+            "requiredUpdateAnchors": [],
+            "forbiddenUpdateAnchors": []
+          },
+          {
+            "claimId": "claim-release-branch",
+            "verdict": "verified",
+            "expectedFiles": ["config/release.ts"],
+            "requiredUpdateAnchors": [],
+            "forbiddenUpdateAnchors": []
+          }
+        ]
+      }
+    },
+    {
+      "task": "map-memories",
+      "preconditions": {
+        "mappings": [],
+        "verifications": [],
+        "classifiedClaimIds": []
+      },
+      "expectedInScopeClaimIds": [
+        "claim-cache-primary",
+        "claim-cache-duplicate",
+        "claim-retry-attempts",
+        "claim-retry-backoff",
+        "claim-worker-stale",
+        "claim-feature-enabled",
+        "claim-feature-disabled",
+        "claim-legacy-queue",
+        "claim-tls-constraint",
+        "claim-rejected-redis",
+        "claim-release-branch"
+      ],
+      "expectedSkippedClaimIds": [],
+      "expectedResultMode": null,
+      "gold": {
+        "kind": "map",
+        "claims": [
+          {
+            "claimId": "claim-cache-primary",
+            "files": ["src/cache.ts"],
+            "independent": false
+          },
+          {
+            "claimId": "claim-cache-duplicate",
+            "files": ["src/cache.ts"],
+            "independent": false
+          },
+          {
+            "claimId": "claim-retry-attempts",
+            "files": ["src/retry.ts"],
+            "independent": false
+          },
+          {
+            "claimId": "claim-retry-backoff",
+            "files": ["src/retry.ts"],
+            "independent": false
+          },
+          {
+            "claimId": "claim-worker-stale",
+            "files": ["src/workers.ts"],
+            "independent": false
+          },
+          {
+            "claimId": "claim-feature-enabled",
+            "files": ["src/uploads.ts"],
+            "independent": false
+          },
+          {
+            "claimId": "claim-feature-disabled",
+            "files": ["src/uploads.ts"],
+            "independent": false
+          },
+          {
+            "claimId": "claim-legacy-queue",
+            "files": ["src/delivery.ts"],
+            "independent": false
+          },
+          {
+            "claimId": "claim-tls-constraint",
+            "files": [],
+            "independent": true
+          },
+          {
+            "claimId": "claim-rejected-redis",
+            "files": ["src/storage.ts"],
+            "independent": false
+          },
+          {
+            "claimId": "claim-release-branch",
+            "files": ["config/release.ts"],
+            "independent": false
+          }
+        ]
+      }
+    },
+    {
+      "task": "classify-memories",
+      "preconditions": {
+        "mappings": [],
+        "verifications": [],
+        "classifiedClaimIds": []
+      },
+      "expectedInScopeClaimIds": [
+        "claim-cache-primary",
+        "claim-cache-duplicate",
+        "claim-retry-attempts",
+        "claim-retry-backoff",
+        "claim-worker-stale",
+        "claim-feature-enabled",
+        "claim-feature-disabled",
+        "claim-legacy-queue",
+        "claim-tls-constraint",
+        "claim-rejected-redis",
+        "claim-release-branch"
+      ],
+      "expectedSkippedClaimIds": [],
+      "expectedResultMode": null,
+      "gold": {
+        "kind": "classify",
+        "claims": [
+          {
+            "claimId": "claim-cache-primary",
+            "importance": { "min": 65, "max": 85 },
+            "scope": "project",
+            "shareable": true
+          },
+          {
+            "claimId": "claim-cache-duplicate",
+            "importance": { "min": 65, "max": 85 },
+            "scope": "project",
+            "shareable": true
+          },
+          {
+            "claimId": "claim-retry-attempts",
+            "importance": { "min": 60, "max": 80 },
+            "scope": "project",
+            "shareable": true
+          },
+          {
+            "claimId": "claim-retry-backoff",
+            "importance": { "min": 58, "max": 78 },
+            "scope": "project",
+            "shareable": true
+          },
+          {
+            "claimId": "claim-worker-stale",
+            "importance": { "min": 55, "max": 75 },
+            "scope": "project",
+            "shareable": true
+          },
+          {
+            "claimId": "claim-feature-enabled",
+            "importance": { "min": 68, "max": 88 },
+            "scope": "project",
+            "shareable": true
+          },
+          {
+            "claimId": "claim-feature-disabled",
+            "importance": { "min": 45, "max": 65 },
+            "scope": "project",
+            "shareable": true
+          },
+          {
+            "claimId": "claim-legacy-queue",
+            "importance": { "min": 50, "max": 70 },
+            "scope": "project",
+            "shareable": true
+          },
+          {
+            "claimId": "claim-tls-constraint",
+            "importance": { "min": 85, "max": 100 },
+            "scope": "universe",
+            "shareable": true
+          },
+          {
+            "claimId": "claim-rejected-redis",
+            "importance": { "min": 72, "max": 92 },
+            "scope": "project",
+            "shareable": true
+          },
+          {
+            "claimId": "claim-release-branch",
+            "importance": { "min": 48, "max": 68 },
+            "scope": "project",
+            "shareable": true
+          }
+        ]
+      }
+    }
+  ]
+}

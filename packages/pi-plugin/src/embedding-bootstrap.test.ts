@@ -9,7 +9,7 @@ import {
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
-import { createTestDb } from "./test-utils.test";
+import { createTestDb } from "./test-utils";
 
 describe("ensureProjectRegisteredFromPiDirectory", () => {
 	it("registers Synapse as deferred intent without persisting a pending lane", async () => {

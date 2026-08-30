@@ -16,7 +16,7 @@ use std::{
         atomic::{AtomicBool, AtomicU8, Ordering},
         Arc, LazyLock, Mutex, MutexGuard, Weak,
     },
-    time::Duration,
+    time::{Duration, Instant as StdInstant},
 };
 
 use serde_json::Value;
@@ -257,6 +257,7 @@ pub struct Response {
 pub struct HostStatusSnapshot {
     pub health: String,
     pub metrics: serde_json::Value,
+    pub shared_memory: serde_json::Value,
 }
 
 /// One ordered streaming response item.
@@ -623,6 +624,7 @@ impl Client {
             op: String,
             health: String,
             metrics: serde_json::Value,
+            shared_memory: serde_json::Value,
         }
 
         if self.inner.closed.load(Ordering::Acquire) {
@@ -664,6 +666,7 @@ impl Client {
         Ok(HostStatusSnapshot {
             health: decoded.health,
             metrics: decoded.metrics,
+            shared_memory: decoded.shared_memory,
         })
     }
 
@@ -1750,6 +1753,7 @@ impl Correlations {
 struct ByteCounter {
     cap: usize,
     used: Mutex<usize>,
+    wake: Mutex<Option<Weak<OwnedFd>>>,
 }
 
 impl ByteCounter {
@@ -1757,6 +1761,7 @@ impl ByteCounter {
         Self {
             cap,
             used: Mutex::new(0),
+            wake: Mutex::new(None),
         }
     }
 
@@ -1771,6 +1776,14 @@ impl ByteCounter {
             owner: Arc::downgrade(self),
             bytes,
         })
+    }
+
+    const fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    fn set_wake(&self, wake: &Arc<OwnedFd>) {
+        *lock_unpoisoned(&self.wake) = Some(Arc::downgrade(wake));
     }
 
     #[cfg(test)]
@@ -1800,8 +1813,16 @@ impl ByteCharge {
 impl Drop for ByteCharge {
     fn drop(&mut self) {
         if let Some(owner) = self.owner.upgrade() {
-            let mut used = lock_unpoisoned(&owner.used);
-            *used = used.saturating_sub(self.bytes);
+            {
+                let mut used = lock_unpoisoned(&owner.used);
+                *used = used.saturating_sub(self.bytes);
+            }
+            if let Some(wake) = lock_unpoisoned(&owner.wake)
+                .as_ref()
+                .and_then(Weak::upgrade)
+            {
+                signal_eventfd(&wake);
+            }
         }
     }
 }
@@ -1834,6 +1855,7 @@ struct QueuedFrame {
 struct RingWrite {
     bytes: Vec<u8>,
     completed: oneshot::Sender<Result<(), ()>>,
+    deadline: StdInstant,
 }
 
 struct RingWriteSender {
@@ -1856,6 +1878,23 @@ impl Drop for RingWriteSender {
 }
 
 type RingFrameReceiver = mpsc::Receiver<(EnvelopeHeader, Vec<u8>, ByteCharge)>;
+
+/// The mapped ring cannot express host death: a host that exits without a
+/// Goodbye leaves its rings looking merely idle, so the setup socket is the
+/// only liveness signal. `MSG_PEEK` keeps the probe side-effect free.
+fn setup_peer_closed(stream: &StdUnixStream) -> bool {
+    use std::os::fd::AsFd;
+    let mut probe = [0u8; 1];
+    match rustix::net::recv(
+        stream.as_fd(),
+        &mut probe,
+        rustix::net::RecvFlags::PEEK | rustix::net::RecvFlags::DONTWAIT,
+    ) {
+        Ok(_) => true,
+        Err(rustix::io::Errno::AGAIN) | Err(rustix::io::Errno::INTR) => false,
+        Err(_) => true,
+    }
+}
 
 fn signal_eventfd(fd: &OwnedFd) {
     let _ = rustix::io::write(fd, &1u64.to_ne_bytes());
@@ -1882,6 +1921,7 @@ fn start_ring_bridge(
         .map_err(|_| ClientError::new("setup_failed", "shared-memory setup failed"))?,
     );
     let worker_wake = Arc::clone(&wake_fd);
+    read_budget.set_wake(&wake_fd);
     let (read_tx, read_rx) = mpsc::channel(CLIENT_DATA_QUEUE_FRAMES);
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
@@ -1903,10 +1943,15 @@ fn start_ring_bridge(
                 return;
             }
             while !cancel.is_cancelled() {
+                if setup_peer_closed(&setup) {
+                    break;
+                }
                 match write_rx.try_recv() {
                     Ok(write) => {
-                        let result = decode_outbound(&write.bytes)
-                            .and_then(|(header, body)| endpoint.send(header, body).map_err(|_| ()));
+                        let deadline = write.deadline;
+                        let result = decode_outbound(&write.bytes).and_then(|(header, body)| {
+                            endpoint.send(header, body, deadline).map_err(|_| ())
+                        });
                         let failed = result.is_err();
                         let _ = write.completed.send(result);
                         if failed {
@@ -1917,7 +1962,41 @@ fn start_ring_bridge(
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                     Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 }
-                match endpoint.try_recv_with(|bytes| read_budget.charge(bytes)) {
+                // `endpoint.try_recv_with` advances the ring's consumed cursor,
+                // so refusing a charge would discard a valid response. Waiting
+                // is backpressure against `ring_reader_loop`, which releases
+                // each queued charge as it drains; cancellation ends the wait.
+                // Frames wider than `read_budget.capacity()` cannot be admitted
+                // by any drain, so they refuse without waiting.
+                let charge = |bytes: usize| loop {
+                    if bytes > read_budget.capacity() {
+                        return None;
+                    }
+                    if let Some(charge) = read_budget.charge(bytes) {
+                        return Some(charge);
+                    }
+                    if cancel.is_cancelled() {
+                        return None;
+                    }
+                    let mut fds = [
+                        rustix::event::PollFd::new(&*worker_wake, rustix::event::PollFlags::IN),
+                        rustix::event::PollFd::new(
+                            &setup,
+                            rustix::event::PollFlags::HUP | rustix::event::PollFlags::ERR,
+                        ),
+                    ];
+                    if rustix::event::poll(&mut fds, None).is_err()
+                        || fds[1].revents().intersects(
+                            rustix::event::PollFlags::HUP | rustix::event::PollFlags::ERR,
+                        )
+                    {
+                        return None;
+                    }
+                    if fds[0].revents().contains(rustix::event::PollFlags::IN) {
+                        drain_eventfd(&worker_wake);
+                    }
+                };
+                match endpoint.try_recv_with(charge) {
                     Ok(Some(frame)) => {
                         if read_tx.blocking_send(frame).is_err() {
                             break;
@@ -2025,6 +2104,7 @@ async fn writer_loop(
             .try_send(RingWrite {
                 bytes: frame.bytes,
                 completed: completed_tx,
+                deadline: frame.deadline.into_std(),
             })
             .is_err()
         {
@@ -4079,5 +4159,27 @@ mod tests {
         assert_eq!(SendOutcome::NotSent.as_str(), "not_sent");
         assert_eq!(SendOutcome::OutcomeUnknown.as_str(), "outcome_unknown");
         assert_eq!(SendOutcome::Terminal.as_str(), "terminal");
+    }
+
+    #[test]
+    fn ring_bridge_retires_when_host_drops_setup_socket() {
+        let rings = mc_shm_transport::backend::ring::DuplexRing::create(
+            &crate::ring_transport::ring_profile(),
+        )
+        .expect("duplex ring");
+        let (descriptor, descriptors) =
+            crate::ring_transport::worker_descriptor(&rings).expect("descriptor");
+        let (client_end, host_end) = StdUnixStream::pair().expect("socket pair");
+        let (_write_tx, mut read_rx) = start_ring_bridge(
+            descriptor,
+            descriptors,
+            client_end,
+            CancellationToken::new(),
+            Arc::new(ByteCounter::new(CLIENT_INBOUND_FRAME_BYTES)),
+        )
+        .expect("bridge");
+        drop(host_end);
+        // A hang here means the bridge never observed the dead setup socket.
+        assert!(read_rx.blocking_recv().is_none());
     }
 }

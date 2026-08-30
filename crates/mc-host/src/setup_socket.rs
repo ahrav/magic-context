@@ -328,13 +328,6 @@ pub async fn activate_client(
     Ok((descriptor, descriptors))
 }
 
-/// Sends the only legal post-commit setup message.
-pub async fn goodbye_client(stream: &mut UnixStream) {
-    let deadline = Instant::now() + Duration::from_millis(100);
-    let _ = write_message(stream, &ClientMessage::Goodbye, deadline).await;
-    let _ = stream.shutdown().await;
-}
-
 pub(crate) fn encoded_goodbye() -> Result<Vec<u8>, SetupError> {
     encode_message(&ClientMessage::Goodbye)
 }

@@ -3,6 +3,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { TestHarness } from "../src/harness";
 import { FOLD_SKIP_REASON } from "../src/rust-scenario-support";
+import { isHistorianRequest } from "../src/cache-analysis";
 
 /**
  * Slow historian, fast main agent.
@@ -38,18 +39,7 @@ import { FOLD_SKIP_REASON } from "../src/rust-scenario-support";
  *      turns happening while the first historian run is still pending.
  */
 
-// Historian system prompt marker, see compartment-prompt.ts.
-const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
-
 const HISTORIAN_DELAY_MS = 8_000;
-
-function isHistorianRequest(body: Record<string, unknown>): boolean {
-    if (JSON.stringify(body.messages ?? "").includes("<new_messages>")) return true;
-    const system = body.system;
-    if (system === undefined || system === null) return false;
-    const asString = typeof system === "string" ? system : JSON.stringify(system);
-    return asString.includes(HISTORIAN_SYSTEM_MARKER);
-}
 
 let h: TestHarness;
 

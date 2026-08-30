@@ -25,11 +25,10 @@ function validResult(overrides: Record<string, unknown> = {}): Record<string, un
         remediation: null,
         effects: null,
         readiness: {
-            shared_memory: { state: "ready", reason: "healthy" },
+            transport: { state: "ready", reason: "healthy" },
             storage: { state: "ready", reason: "healthy" },
             synapse: { state: "ready", reason: "healthy" },
         },
-        shared_memory: null,
         checks: [
             { id: "compatibility.daemon", status: "pass", reason: "healthy", remediation: null },
             { id: "lifecycle.publication", status: "pass", reason: "healthy", remediation: null },
@@ -46,35 +45,6 @@ function validResult(overrides: Record<string, unknown> = {}): Record<string, un
     };
 }
 
-function healthySharedMemory(): Record<string, unknown> {
-    const zero = {
-        descriptors: 0,
-        arena_bytes: 0,
-        leases: 0,
-        mappings: 0,
-        file_descriptors: 0,
-        workers: 0,
-        client_instances: 0,
-        pinned_workers: 0,
-    };
-    return {
-        state: "healthy",
-        error_class: null,
-        artifact: {
-            profile: "mc-host-eventfd-ring-v2",
-            wire_version: 2,
-            descriptor_schema: 3,
-        },
-        bounds: { ...zero, arena_bytes: 134_217_728 },
-        accounting: { active: zero, quarantined: zero },
-        attachment: { completed: 1 },
-        activation: { completed: 1 },
-        peer_death: { observed: 0 },
-        reclamation: { completed: 0 },
-        exhaustion: { observed: 0 },
-    };
-}
-
 describe("parseDaemonResult", () => {
     test("accepts a fully populated conforming result", () => {
         const parsed = parseDaemonResult(JSON.stringify(validResult()));
@@ -83,54 +53,6 @@ describe("parseDaemonResult", () => {
         expect(parsed.reason).toBe("healthy");
         expect(parsed.checks.length).toBe(2);
         expect(parsed.versions.daemon).toBe("mc-host/0.1.0");
-    });
-
-    test("accepts bounded fixed-ring diagnostics", () => {
-        const parsed = parseDaemonResult(
-            JSON.stringify(validResult({ shared_memory: healthySharedMemory() })),
-        );
-        expect(parsed.shared_memory?.state).toBe("healthy");
-        expect(parsed.shared_memory?.artifact.profile).toBe("mc-host-eventfd-ring-v2");
-        expect(parsed.shared_memory?.bounds.arena_bytes).toBe(134_217_728);
-    });
-
-    test("rejects superseded shared-memory artifact identity", () => {
-        const diagnostics = healthySharedMemory();
-        diagnostics.artifact = {
-            profile: "mc-host-test-ring-v1",
-            wire_version: 2,
-            descriptor_schema: 2,
-        };
-        expect(() =>
-            parseDaemonResult(JSON.stringify(validResult({ shared_memory: diagnostics }))),
-        ).toThrow(/shared_memory diagnostics violate the closed schema/);
-    });
-
-    test("accepts exactly five terminal shared-memory classes", () => {
-        for (const errorClass of [
-            "missing_addon",
-            "identity_mismatch",
-            "setup_failure",
-            "peer_death",
-            "resource_exhaustion",
-        ] as const) {
-            const diagnostics = healthySharedMemory();
-            diagnostics.state = "terminal";
-            diagnostics.error_class = errorClass;
-            diagnostics.accounting = null;
-            const parsed = parseDaemonResult(
-                JSON.stringify(validResult({ shared_memory: diagnostics })),
-            );
-            expect(parsed.shared_memory?.error_class).toBe(errorClass);
-        }
-    });
-
-    test("rejects unbounded or identifying shared-memory fields", () => {
-        const diagnostics = healthySharedMemory();
-        diagnostics.socket_path = "/private/service.sock";
-        expect(() =>
-            parseDaemonResult(JSON.stringify(validResult({ shared_memory: diagnostics }))),
-        ).toThrow(ContractViolation);
     });
 
     test("rejects a probe command in a result and accepts the status it really emits", () => {
@@ -185,20 +107,20 @@ describe("parseDaemonResult", () => {
             );
         expect(() =>
             parseDaemonResult(
-                withReadiness({ shared_memory: { state: "ready", reason: "internal_error" } }),
+                withReadiness({ transport: { state: "ready", reason: "internal_error" } }),
             ),
-        ).toThrow(/readiness\.shared_memory is ready with a failing reason/);
+        ).toThrow(/readiness\.transport is ready with a failing reason/);
         // The converse stays legal, and must: `unsupported` with
         // `synapse_unsupported` is a non-failing pairing for a non-ready state,
         // and every `starting` reason is a failing one.
         const legal = parseDaemonResult(
             withReadiness({
-                shared_memory: { state: "ready", reason: "healthy" },
+                transport: { state: "ready", reason: "healthy" },
                 storage: { state: "starting", reason: "storage_starting" },
                 synapse: { state: "unsupported", reason: "synapse_unsupported" },
             }),
         );
-        expect(legal.readiness?.shared_memory?.state).toBe("ready");
+        expect(legal.readiness?.transport?.state).toBe("ready");
         expect(legal.readiness?.synapse?.reason).toBe("synapse_unsupported");
     });
 
@@ -383,7 +305,7 @@ describe("parseDaemonResult", () => {
             }),
             readiness_reason_mismatch: validResult({
                 readiness: {
-                    shared_memory: { state: "ready", reason: "not_running" },
+                    transport: { state: "ready", reason: "not_running" },
                 },
             }),
             successful_result_with_failed_check: validResult({
@@ -402,7 +324,7 @@ describe("parseDaemonResult", () => {
             extra_top_level_field: validResult({ extra: 1 }),
             unknown_readiness_component: validResult({
                 readiness: {
-                    shared_memory: { state: "ready", reason: "healthy" },
+                    transport: { state: "ready", reason: "healthy" },
                     gpu: { state: "ready", reason: "healthy" },
                 },
             }),
@@ -499,6 +421,36 @@ describe("parseDaemonResult", () => {
             ),
         );
         expect(restart.effects).toEqual({ stop_committed: false, start_committed: false });
+
+        for (const outcome of [
+            {
+                state: "stopped",
+                reason: "internal_error",
+                remediation: "report_bug",
+            },
+            {
+                state: "stopping",
+                reason: "shutdown_timeout",
+                remediation: "inspect_daemon_process",
+            },
+        ] as const) {
+            const committedFailure = parseDaemonResult(
+                JSON.stringify(
+                    validResult({
+                        command: "restart",
+                        ok: false,
+                        ...outcome,
+                        readiness: null,
+                        checks: [],
+                        effects: { stop_committed: true, start_committed: true },
+                    }),
+                ),
+            );
+            expect(committedFailure.effects).toEqual({
+                stop_committed: true,
+                start_committed: true,
+            });
+        }
     });
 
     test("schema violations never echo oversized native text", () => {

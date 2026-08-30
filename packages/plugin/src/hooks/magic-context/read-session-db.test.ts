@@ -93,15 +93,63 @@ describe("isMidTurnFromOpenCodeDb", () => {
         expect(isMidTurnFromOpenCodeDb(db, "session-1")).toBe(false);
     });
 
-    it("does not release mid-turn for synthetic-part user messages after a stale tool-calls tail", () => {
+    // Machine-authored single-part user messages must not release a stale
+    // tool-calls tail: each row inserts one user part variant after the stale
+    // assistant and asserts the session still reads as mid-turn.
+    it.each([
+        [
+            "does not release mid-turn for synthetic-part user messages after a stale tool-calls tail",
+            "agent nudge",
+            { type: "text", text: "agent nudge", synthetic: true },
+        ],
+        [
+            "does not release mid-turn for marker-part user messages after a stale tool-calls tail",
+            "✉ Inbox from peer",
+            {
+                type: "text",
+                text: "✉ Inbox from peer",
+                metadata: {
+                    marker: {
+                        kind: "inbox",
+                        from: "Peer Session",
+                        sessionId: "ses_peer0000000000000000000",
+                    },
+                },
+            },
+        ],
+        [
+            "does not release mid-turn for an ignored-only user part after a stale tool-calls tail",
+            "status notification",
+            { type: "text", text: "## Claude Routing Status", ignored: true },
+        ],
+        [
+            "does not release mid-turn when ignored is numeric 1 (truthy variant)",
+            "status notification",
+            { type: "text", text: "## Claude Quotas", ignored: 1 },
+        ],
+        [
+            "does not release mid-turn for interrupt marker parts after a stale tool-calls tail",
+            "interrupt",
+            {
+                type: "text",
+                text: "interrupt",
+                metadata: { marker: { kind: "interrupt", intent: "abort", origin: "parent" } },
+            },
+        ],
+        [
+            "does not release mid-turn for message marker parts after a stale tool-calls tail",
+            "peer message",
+            {
+                type: "text",
+                text: "peer message",
+                metadata: { marker: { kind: "message", peer: "subagent", expectReply: false } },
+            },
+        ],
+    ] as Array<[string, string, Record<string, unknown>]>)("%s", (_title, content, part) => {
         const db = createMidTurnDb();
         insertAssistant(db, "session-1", "assistant-1", { finish: "tool-calls" }, 100);
-        insertUser(db, "session-1", "user-1", { content: "agent nudge" }, 200);
-        insertPart(db, "session-1", "user-1", "part-1", {
-            type: "text",
-            text: "agent nudge",
-            synthetic: true,
-        });
+        insertUser(db, "session-1", "user-1", { content }, 200);
+        insertPart(db, "session-1", "user-1", "part-1", part);
 
         expect(isMidTurnFromOpenCodeDb(db, "session-1")).toBe(true);
     });
@@ -146,25 +194,6 @@ describe("isMidTurnFromOpenCodeDb", () => {
         insertPart(db, "session-1", "assistant-1", "part-1", { type: "text", text: "done" });
 
         expect(isMidTurnFromOpenCodeDb(db, "session-1")).toBe(false);
-    });
-
-    it("does not release mid-turn for marker-part user messages after a stale tool-calls tail", () => {
-        const db = createMidTurnDb();
-        insertAssistant(db, "session-1", "assistant-1", { finish: "tool-calls" }, 100);
-        insertUser(db, "session-1", "user-1", { content: "✉ Inbox from peer" }, 200);
-        insertPart(db, "session-1", "user-1", "part-1", {
-            type: "text",
-            text: "✉ Inbox from peer",
-            metadata: {
-                marker: {
-                    kind: "inbox",
-                    from: "Peer Session",
-                    sessionId: "ses_peer0000000000000000000",
-                },
-            },
-        });
-
-        expect(isMidTurnFromOpenCodeDb(db, "session-1")).toBe(true);
     });
 
     it("releases mid-turn for an @mention operator prompt with a synthetic agent part", () => {
@@ -279,19 +308,6 @@ describe("isMidTurnFromOpenCodeDb", () => {
         expect(isMidTurnFromOpenCodeDb(db, "session-1")).toBe(false);
     });
 
-    it("does not release mid-turn for an ignored-only user part after a stale tool-calls tail", () => {
-        const db = createMidTurnDb();
-        insertAssistant(db, "session-1", "assistant-1", { finish: "tool-calls" }, 100);
-        insertUser(db, "session-1", "user-1", { content: "status notification" }, 200);
-        insertPart(db, "session-1", "user-1", "part-1", {
-            type: "text",
-            text: "## Claude Routing Status",
-            ignored: true,
-        });
-
-        expect(isMidTurnFromOpenCodeDb(db, "session-1")).toBe(true);
-    });
-
     it("releases mid-turn when a user message has an ignored part AND a real text part", () => {
         const db = createMidTurnDb();
         insertAssistant(db, "session-1", "assistant-1", { finish: "tool-calls" }, 100);
@@ -307,57 +323,6 @@ describe("isMidTurnFromOpenCodeDb", () => {
         });
 
         expect(isMidTurnFromOpenCodeDb(db, "session-1")).toBe(false);
-    });
-
-    it("does not release mid-turn when ignored is numeric 1 (truthy variant)", () => {
-        const db = createMidTurnDb();
-        insertAssistant(db, "session-1", "assistant-1", { finish: "tool-calls" }, 100);
-        insertUser(db, "session-1", "user-1", { content: "status notification" }, 200);
-        insertPart(db, "session-1", "user-1", "part-1", {
-            type: "text",
-            text: "## Claude Quotas",
-            ignored: 1,
-        });
-
-        expect(isMidTurnFromOpenCodeDb(db, "session-1")).toBe(true);
-    });
-
-    it("does not release mid-turn for interrupt marker parts after a stale tool-calls tail", () => {
-        const db = createMidTurnDb();
-        insertAssistant(db, "session-1", "assistant-1", { finish: "tool-calls" }, 100);
-        insertUser(db, "session-1", "user-1", { content: "interrupt" }, 200);
-        insertPart(db, "session-1", "user-1", "part-1", {
-            type: "text",
-            text: "interrupt",
-            metadata: {
-                marker: {
-                    kind: "interrupt",
-                    intent: "abort",
-                    origin: "parent",
-                },
-            },
-        });
-
-        expect(isMidTurnFromOpenCodeDb(db, "session-1")).toBe(true);
-    });
-
-    it("does not release mid-turn for message marker parts after a stale tool-calls tail", () => {
-        const db = createMidTurnDb();
-        insertAssistant(db, "session-1", "assistant-1", { finish: "tool-calls" }, 100);
-        insertUser(db, "session-1", "user-1", { content: "peer message" }, 200);
-        insertPart(db, "session-1", "user-1", "part-1", {
-            type: "text",
-            text: "peer message",
-            metadata: {
-                marker: {
-                    kind: "message",
-                    peer: "subagent",
-                    expectReply: false,
-                },
-            },
-        });
-
-        expect(isMidTurnFromOpenCodeDb(db, "session-1")).toBe(true);
     });
 });
 

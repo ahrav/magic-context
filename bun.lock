@@ -15,6 +15,7 @@
       },
       "dependencies": {
         "@clack/prompts": "^1.6.0",
+        "@cortexkit/mc-shm-native": "0.38.0",
         "comment-json": "^5.0.0",
         "jsonc-parser": "^3.3.1",
       },
@@ -80,6 +81,7 @@
       "name": "@cortexkit/pi-magic-context",
       "version": "0.38.0",
       "dependencies": {
+        "@cortexkit/mc-shm-native": "0.38.0",
         "@huggingface/transformers": "^4.1.0",
         "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",
         "ai-tokenizer": "^1.0.6",

@@ -34,7 +34,7 @@ const SYSTEM_PROMPT_GUIDANCE_SEPARATOR = "\n\n";
  * sticky-date/cached-docs maps (the latter passed in via the cleanup handle).
  * Called from the session-deleted event path.
  */
-export function clearSystemPromptHashSession(
+function clearSystemPromptHashSession(
     sessionId: string,
     handleMaps: {
         stickyDateBySession: Map<string, string>;
@@ -514,8 +514,6 @@ export function createSystemPromptHashHandler(deps: {
         // Early returns at lines 375 / 388 also benefit: they preserve
         // any pre-existing flag set by `/ctx-flush` or variant change so
         // the next valid pass can consume it.
-        //
-        // See Oracle review 2026-04-26 Finding A1 for the bug this fixes.
         if (isCacheBusting) {
             deps.systemPromptRefreshSessions.delete(sessionId);
         }

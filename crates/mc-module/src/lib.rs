@@ -7,33 +7,36 @@
 
 pub mod boundary;
 pub mod caveman;
+pub(crate) mod chunk_text;
 pub mod ck_wire;
 pub mod classify;
 pub mod codec;
-pub mod compartment_coverage;
-pub mod config;
+pub(crate) mod compartment_coverage;
+pub(crate) mod config;
 pub mod decay_render;
 pub mod dispatch;
-pub mod divergence;
+pub(crate) mod divergence;
 pub mod healing;
 pub mod historian;
 pub mod historian_chunk;
 pub mod historian_producer;
-pub mod historian_prompt;
-pub mod historian_validate;
+pub(crate) mod historian_prompt;
+pub(crate) mod historian_validate;
 pub mod injection;
 pub mod m0_compose;
-pub mod m1_compose;
-pub mod memory_render;
+pub(crate) mod m1_compose;
+pub(crate) mod memory_render;
 pub mod memory_tool;
-pub mod project_docs;
-pub mod prompt_surface;
+pub(crate) mod project_docs;
+pub(crate) mod prompt_surface;
 mod retained_size;
 pub mod scheduler;
 pub mod selection;
 pub mod session_resolver;
-pub mod smart_note_evaluation;
+pub(crate) mod smart_note_evaluation;
 mod tail_hygiene;
+mod token_cache;
+
 pub mod transform;
 
 /// Generated pre-build release contract (U8). The file is emitted by
@@ -128,6 +131,66 @@ use transform::ReductionDecision;
 
 #[cfg(test)]
 pub mod test_support;
+
+/// Exposes crate-private stages to `benches/hot_path.rs`.
+#[cfg(feature = "bench-internals")]
+pub mod bench_internals {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    use crate::ck_wire::FlatProjection;
+    use crate::memory_render::MirroredClaimMemory;
+    use crate::transform::{
+        ProducerContext, SerializedOutputCache, TransformError, TransformRequest,
+        TransformWithProjection,
+    };
+    use mc_core::CoreState;
+    use mc_store::{McStore, McTagRow};
+
+    pub fn measure_tail_hygiene(
+        projection: &FlatProjection,
+        core: &CoreState,
+        coverage_ordinal: Option<u64>,
+        tag_rows: &[McTagRow],
+        protected_tags: usize,
+        protected_block_ids: &HashSet<String>,
+    ) -> (i64, i64) {
+        let measurement = crate::tail_hygiene::measure_tail_hygiene(
+            projection,
+            core,
+            coverage_ordinal,
+            tag_rows,
+            protected_tags,
+            protected_block_ids,
+        );
+        (measurement.u, measurement.t)
+    }
+
+    pub fn trim_claims_to_budget(claims: &[MirroredClaimMemory], budget_tokens: f64) -> usize {
+        crate::m0_compose::trim_claims_to_budget(
+            claims,
+            budget_tokens,
+            crate::token_cache::cached_estimate_tokens,
+        )
+        .len()
+    }
+
+    #[derive(Default)]
+    pub struct OutputCache(Mutex<SerializedOutputCache>);
+
+    pub fn clear_token_cache() {
+        crate::token_cache::clear();
+    }
+
+    pub fn transform_cached(
+        store: &McStore,
+        req: &TransformRequest,
+        ctx: &ProducerContext<'_>,
+        cache: &OutputCache,
+    ) -> Result<TransformWithProjection, TransformError> {
+        crate::transform::transform_with_projection_cached(store, req, ctx, &cache.0, None)
+    }
+}
 
 #[cfg(test)]
 mod differential_goldens;
@@ -11823,9 +11886,18 @@ impl McHandler {
                 // already-conditioned note resets the compiled artifact, which the
                 // evaluator recompiles once it is available again; refusing it here
                 // would make every conditioned note uneditable for as long as the
-                // evaluator is down.
-                let condition_changed = condition
-                    .is_some_and(|value| current.surface_condition.as_deref() != Some(value));
+                // evaluator is down. The trimmed comparison mirrors the store's
+                // own change predicate, so a whitespace-only re-supply is not
+                // refused for an update the store would treat as a no-op.
+                let current_condition = current
+                    .surface_condition
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let condition_changed = condition.is_some_and(|value| {
+                    let next_condition = Some(value.trim()).filter(|value| !value.is_empty());
+                    next_condition != current_condition
+                });
                 if condition_changed && !self.has_live_note_evaluator(project, now) {
                     return refuse_conditioned_note_without_evaluator(
                         &store,
@@ -12040,6 +12112,16 @@ impl CompositeComponent for McHandler {
         metrics.insert(
             "storage_state".to_owned(),
             serde_json::Value::String(storage_state.to_owned()),
+        );
+        metrics.insert(
+            "epochs".to_owned(),
+            json!({
+                "memory_render_epoch": MEMORY_RENDER_FORMAT_EPOCH,
+                "compartment_render_epoch": COMPARTMENT_RENDER_FORMAT_EPOCH,
+                "profile_epoch": PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
+                "tagger_epoch": TAGGER_FEATURE_EPOCH,
+                "state_sync_epoch": STATE_SYNC_EPOCH,
+            }),
         );
         report.metrics = Some(serde_json::Value::Object(metrics));
         report
@@ -16002,6 +16084,7 @@ fn test_route(channel_id: u16) -> RouteHandle {
 mod tests {
     use super::*;
     use std::collections::{HashMap, VecDeque};
+
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -16019,6 +16102,36 @@ mod tests {
         PendingAgentDrop, StoredCompartment, TagMintInput,
     };
     use tokio::sync::Notify;
+
+    fn boundary_snapshot_with_entry(block_id: &str) -> BoundaryTokenCacheSnapshot {
+        let mut entry_updates = HashMap::new();
+        entry_updates.insert(
+            block_id.to_string(),
+            BoundaryTokenCacheEntry {
+                byte_size: 1,
+                content_hash: [0u8; 32],
+                token_count: 1,
+            },
+        );
+        BoundaryTokenCacheSnapshot {
+            entry_updates,
+            ..BoundaryTokenCacheSnapshot::default()
+        }
+    }
+
+    /// One boundary-token entry's byte charge for an `id_len`-byte block id.
+    fn boundary_entry_charge(id_len: usize) -> usize {
+        id_len + std::mem::size_of::<BoundaryTokenCacheEntry>() + 64
+    }
+
+    #[test]
+    fn boundary_token_cache_refuses_an_insert_larger_than_its_budget() {
+        let mut cache = BoundaryTokenCache::new(boundary_entry_charge(2) - 1);
+        cache.replace("s1", boundary_snapshot_with_entry("b1"));
+        assert!(cache.sessions.is_empty());
+        assert_eq!(cache.retained_bytes, 0);
+        assert!(cache.lru.is_empty());
+    }
 
     struct SettlementWriter {
         events: Arc<Mutex<Vec<&'static str>>>,
@@ -30420,6 +30533,58 @@ mod release_contract_tests {
         assert_eq!(
             coordination["lifetime_lock"],
             json!(release_contract::LIFETIME_LOCK_NAME)
+        );
+    }
+
+    #[test]
+    fn managed_layout_segments_are_version_neutral_and_fixed() {
+        assert_eq!(release_contract::MANAGED_SUBTREE_DIRECTORY, "cortexkit");
+        assert_eq!(release_contract::RUNTIME_DIRECTORY_NAME, "run");
+        assert_eq!(
+            release_contract::CONNECTION_FILE_NAME,
+            "subc-connection.json"
+        );
+        assert_eq!(release_contract::STORAGE_SUBDIRECTORY, "magic-context");
+        // Bind the frozen contract to the constants the daemon actually
+        // creates and publishes under: the layout segments exist in two
+        // authorities (mc-host cannot depend on the contract-bearing
+        // mc-module), and drift between them leaves a resolver naming a
+        // path the daemon never writes.
+        assert_eq!(
+            release_contract::MANAGED_SUBTREE_DIRECTORY,
+            mc_host::MANAGED_DIR_NAME
+        );
+        assert_eq!(
+            release_contract::RUNTIME_DIRECTORY_NAME,
+            mc_host::RUNTIME_DIR_NAME
+        );
+        assert_eq!(
+            release_contract::CONNECTION_FILE_NAME,
+            mc_host::CONNECTION_FILE_NAME
+        );
+        // The storage segment's Rust authority is the module id: the store
+        // path is composed as `cortexkit/{module_id}/store.db`, so the
+        // contract's storage subdirectory must equal the default module id.
+        assert_eq!(
+            release_contract::STORAGE_SUBDIRECTORY,
+            crate::DEFAULT_MODULE_ID
+        );
+        let layout = contract()["layout"].clone();
+        assert_eq!(
+            layout["managed_subtree"],
+            json!(release_contract::MANAGED_SUBTREE_DIRECTORY)
+        );
+        assert_eq!(
+            layout["runtime_directory"],
+            json!(release_contract::RUNTIME_DIRECTORY_NAME)
+        );
+        assert_eq!(
+            layout["connection_file"],
+            json!(release_contract::CONNECTION_FILE_NAME)
+        );
+        assert_eq!(
+            layout["storage_subdirectory"],
+            json!(release_contract::STORAGE_SUBDIRECTORY)
         );
     }
 

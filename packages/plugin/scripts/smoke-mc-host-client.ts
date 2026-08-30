@@ -31,7 +31,7 @@ function findRepoRoot(): string {
 }
 
 function buildPerfHost(repoRoot: string, binary: string): Promise<void> {
-    log("perf_host binary missing; running cargo build -p mc-host --example perf_host");
+    log("building current perf_host source");
     return new Promise((resolvePromise, rejectPromise) => {
         const build = spawn("cargo", ["build", "-p", "mc-host", "--example", "perf_host"], {
             cwd: repoRoot,
@@ -105,9 +105,7 @@ function waitForExit(child: ChildProcess, deadlineMs: number): Promise<number | 
 const repoRoot = findRepoRoot();
 const binary =
     process.env.PERF_HOST_BIN ?? join(repoRoot, "target", "debug", "examples", "perf_host");
-if (!existsSync(binary)) {
-    await buildPerfHost(repoRoot, binary);
-}
+await buildPerfHost(repoRoot, binary);
 
 const dataDir = mkdtempSync(join(tmpdir(), "mc-host-client-smoke-"));
 let child: ChildProcess | null = null;
@@ -149,8 +147,11 @@ try {
     log(`connected (daemonVer=${client.daemonVer})`);
     try {
         const connectedEvent = events.find((event) => event.type === "connected");
-        assert.equal(connectedEvent?.health, "healthy");
-        assert.equal(connectedEvent?.artifact?.profile, "mc-host-eventfd-ring-v2");
+        assert.equal(
+            connectedEvent?.transport,
+            "shm",
+            `connection must use shared memory (got ${connectedEvent?.transport})`,
+        );
         log("shared-memory ring active");
 
         const previousXdgDataHome = process.env.XDG_DATA_HOME;

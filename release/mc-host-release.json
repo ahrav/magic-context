@@ -20,9 +20,9 @@
       "lifecycle.fences",
       "lifecycle.publication",
       "platform.support",
-      "readiness.shared_memory",
       "readiness.storage",
-      "readiness.synapse"
+      "readiness.synapse",
+      "readiness.transport"
     ],
     "check_statuses": [
       "pass",
@@ -50,11 +50,6 @@
       "usage": 2
     },
     "readiness_states": {
-      "shared_memory": [
-        "ready",
-        "starting",
-        "unavailable"
-      ],
       "storage": [
         "ready",
         "starting",
@@ -65,6 +60,11 @@
         "starting",
         "degraded",
         "unsupported"
+      ],
+      "transport": [
+        "ready",
+        "starting",
+        "unavailable"
       ]
     },
     "reasons": {
@@ -299,6 +299,12 @@
     "npm_hoisted",
     "npm_nested"
   ],
+  "layout": {
+    "connection_file": "subc-connection.json",
+    "managed_subtree": "cortexkit",
+    "runtime_directory": "run",
+    "storage_subdirectory": "magic-context"
+  },
   "model_lane": {
     "execution_provider": "cpu",
     "id": "gte-modernbert-base-f16",
@@ -311,6 +317,9 @@
     }
   },
   "packages": {
+    "addons": [
+      "@cortexkit/mc-shm-native"
+    ],
     "parents": [
       "@cortexkit/magic-context",
       "@cortexkit/opencode-magic-context",

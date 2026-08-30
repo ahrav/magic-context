@@ -197,7 +197,7 @@ describe("source inventory completeness (R1)", () => {
 });
 
 describe("mutation evidence normalization (R11)", () => {
-    it("derives the accepted 13-artifact/21-record snapshot from live files", () => {
+    it("derives the accepted artifact and record snapshot from live files", () => {
         const view = committedView();
         assertEvidenceSnapshot(view);
         expect(view.artifacts).toHaveLength(EXPECTED_MUTATION_ARTIFACTS);

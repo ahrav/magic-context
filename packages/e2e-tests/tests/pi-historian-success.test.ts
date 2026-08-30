@@ -3,24 +3,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { PiTestHarness } from "../src/pi-harness";
 import { buildMockHistorianPayload } from "../src/mock-historian";
-
-const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
-
-function isHistorianRequest(body: Record<string, unknown>): boolean {
-    const system = body.system;
-    if (typeof system === "string") return system.includes(HISTORIAN_SYSTEM_MARKER);
-    if (Array.isArray(system)) {
-        for (const block of system) {
-            if (block && typeof block === "object") {
-                const text = (block as { text?: unknown }).text;
-                if (typeof text === "string" && text.includes(HISTORIAN_SYSTEM_MARKER)) {
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
-}
+import { isHistorianRequest } from "../src/cache-analysis";
 
 function findOrdinalRange(body: Record<string, unknown>): { start: number; end: number } | null {
     const messages = body.messages as Array<{ role: string; content: unknown }> | undefined;

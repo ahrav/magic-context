@@ -2,14 +2,13 @@
 //! a transport.
 //!
 //! The contract is directional: a cloneable [`FrameSender`] admits complete
-//! outbound frames in FIFO order against one logical writer, and a
-//! single-owner [`FrameReceiver`] yields complete, structurally validated
+//! outbound frames in FIFO order against one logical writer, and the
+//! single-owner receive side yields complete, structurally validated
 //! inbound frames. Direct producers fill bounded transport spans through a
 //! cursor and commit one exact length. Receive bytes are visible only through
 //! a lexical [`ReceiveLease`]; contiguous consumers use the explicit
 //! copying adapter before entering asynchronous work.
 
-use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -210,7 +209,7 @@ impl<'storage, C> ProducerReservation<'storage, C> {
         Ok(ProducedBody {
             spans: std::mem::take(&mut self.spans),
             len: body_len,
-            charge: self.charge.take(),
+            _charge: self.charge.take(),
         })
     }
 
@@ -231,7 +230,8 @@ impl<'storage, C> ProducerReservation<'storage, C> {
 pub struct ProducedBody<'storage, C> {
     spans: &'storage mut [&'storage mut [u8]],
     len: usize,
-    charge: Option<C>,
+    /// Held only for its drop: releasing the body returns the charge.
+    _charge: Option<C>,
 }
 
 impl<C> ProducedBody<'_, C> {
@@ -277,13 +277,6 @@ impl<C> ProducedBody<'_, C> {
             remaining -= take;
         }
         None
-    }
-
-    /// Releases storage and returns the backend charge guard to its owner.
-    pub fn into_charge(mut self) -> C {
-        self.charge
-            .take()
-            .expect("a committed body always owns its charge")
     }
 }
 
@@ -443,17 +436,11 @@ impl LeaseTracker {
     }
 }
 
-/// Transport-owned body storage.
-enum ReceiveBody {
-    Segmented(Vec<u8>, Vec<u8>),
-    Owned(Vec<u8>),
-}
-
 /// One admitted inbound frame. Body bytes can only be observed through
 /// [`InboundFrame::with_lease`] or moved/copied through [`InboundFrame::into_owned`].
 pub struct InboundFrame {
     pub header: EnvelopeHeader,
-    body: ReceiveBody,
+    body: Vec<u8>,
     charge: crate::wire::ByteCharge,
     copies: CopyCounter,
 }
@@ -467,23 +454,7 @@ impl InboundFrame {
     ) -> Self {
         Self {
             header,
-            body: ReceiveBody::Owned(body),
-            charge,
-            copies,
-        }
-    }
-
-    #[allow(dead_code, reason = "shared-memory backends supply wrapped bodies")]
-    pub(crate) fn segmented(
-        header: EnvelopeHeader,
-        first: Vec<u8>,
-        second: Vec<u8>,
-        charge: crate::wire::ByteCharge,
-        copies: CopyCounter,
-    ) -> Self {
-        Self {
-            header,
-            body: ReceiveBody::Segmented(first, second),
+            body,
             charge,
             copies,
         }
@@ -496,36 +467,22 @@ impl InboundFrame {
     }
 
     pub fn body_len(&self) -> usize {
-        match &self.body {
-            ReceiveBody::Owned(body) => body.len(),
-            ReceiveBody::Segmented(first, second) => first.len().saturating_add(second.len()),
-        }
+        self.body.len()
     }
 
     /// Runs transport-byte decoding inside a non-escaping lexical scope.
     pub fn with_lease<T>(&self, decode: impl for<'lease> FnOnce(ReceiveLease<'lease>) -> T) -> T {
-        match &self.body {
-            ReceiveBody::Owned(body) => decode(ReceiveLease::contiguous(body)),
-            ReceiveBody::Segmented(first, second) => {
-                decode(ReceiveLease::segmented(first, Some(second)))
-            }
-        }
+        decode(ReceiveLease::contiguous(&self.body))
     }
 
-    /// Moves owned storage directly and flattens segmented storage.
+    /// `InboundFrame::into_owned` moves the body without copying.
     pub fn into_owned(self) -> OwnedInboundFrame {
         let Self {
             header,
             body,
             charge,
-            copies,
+            copies: _,
         } = self;
-        let body = match body {
-            ReceiveBody::Owned(body) => body,
-            ReceiveBody::Segmented(first, second) => {
-                ReceiveLease::segmented(&first, Some(&second)).to_owned(&copies)
-            }
-        };
         OwnedInboundFrame {
             header,
             body,
@@ -549,39 +506,6 @@ pub struct RejectedFrame {
 pub enum InboundEvent {
     Frame(InboundFrame),
     Rejected(RejectedFrame),
-}
-
-/// Receive side of one connection's frame channel.
-pub(crate) trait FrameReceiver: Send {
-    fn recv(&mut self) -> impl Future<Output = Result<InboundEvent, ReadClose>> + Send;
-}
-
-pub(crate) trait DynFrameReceiver: Send {
-    fn recv_dyn(
-        &mut self,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<InboundEvent, ReadClose>> + Send + '_>>;
-}
-
-impl<T: FrameReceiver> DynFrameReceiver for T {
-    fn recv_dyn(
-        &mut self,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<InboundEvent, ReadClose>> + Send + '_>> {
-        Box::pin(self.recv())
-    }
-}
-
-pub(crate) struct BoxedReceiver(Box<dyn DynFrameReceiver>);
-
-impl BoxedReceiver {
-    pub(crate) fn new<T: FrameReceiver + 'static>(receiver: T) -> Self {
-        Self(Box::new(receiver))
-    }
-}
-
-impl FrameReceiver for BoxedReceiver {
-    fn recv(&mut self) -> impl Future<Output = Result<InboundEvent, ReadClose>> + Send {
-        self.0.recv_dyn()
-    }
 }
 
 pub(crate) type DirectSerializer =

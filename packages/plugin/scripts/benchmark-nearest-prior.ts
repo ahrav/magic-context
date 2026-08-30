@@ -1,7 +1,6 @@
 /* eslint-disable no-console */
 /**
- * Microbenchmark for `getPersistedToolOwnerNearestPrior` — plan v3.3.1
- * Layer C, Test #45.
+ * Microbenchmark for the nearest-prior tool-owner pick (inlined SQL below).
  *
  * Plan budget: average added latency from JOIN to `oc.message` must be
  * under 0.5 ms per invocation on a session with ≥30k tool tags.
@@ -26,6 +25,7 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { storageSubtreePath } from "../src/shared/data-path";
 import { Database } from "../src/shared/sqlite";
 
 const sessionId = process.argv[2];
@@ -37,7 +37,7 @@ if (!sessionId) {
 }
 
 const dataHome = process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share");
-const mcDbPath = join(dataHome, "cortexkit", "magic-context", "db.sqlite");
+const mcDbPath = join(storageSubtreePath(dataHome), "db.sqlite");
 const ocDbPath = join(dataHome, "opencode", "storage", "sqlite", "db.sqlite");
 
 if (!existsSync(mcDbPath)) {

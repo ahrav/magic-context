@@ -8,12 +8,15 @@
 //! store access, or ambient cache state here: the same inputs always produce the
 //! same boundary and trigger decision.
 
-use std::collections::{BTreeMap, HashMap};
+use crate::chunk_text::{
+    clean_user_text, clean_user_text_cow, compact_role, compact_text_for_summary, extract_key_arg,
+    format_block_line, is_system_directive, merge_commit_hashes, normalize_text,
+};
+use std::collections::BTreeMap;
 use std::ops::Range;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use mc_tokenizer::estimate_tokens;
-use regex::Regex;
 use serde_json::Value;
 
 use crate::scheduler::escalation_bands;
@@ -46,10 +49,6 @@ const DEFAULT_MIN_COMMIT_CLUSTERS_FOR_TRIGGER: usize = 3;
 const TAIL_SIZE_TRIGGER_MULTIPLIER: f64 = 3.0;
 const FORCE80_CAP_TIER_PERCENTAGE: f64 = 80.0;
 const BLOCK_UNTIL_DONE_PERCENTAGE: f64 = 95.0;
-const MAX_COMMITS_PER_BLOCK: usize = 5;
-
-const SYSTEM_DIRECTIVE_PREFIX: &str = "[SYSTEM DIRECTIVE: MAGIC-CONTEXT";
-const OMO_INTERNAL_INITIATOR_MARKER: &str = "<!-- OMO_INTERNAL_INITIATOR -->";
 
 /// Message role used by boundary and trigger decisions.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -998,7 +997,6 @@ struct TokenIndex {
     terminal_ordinal: u64,
     ordinals: Vec<u64>,
     prefix: Vec<f64>,
-    tokens_by_ordinal: HashMap<u64, f64>,
 }
 
 impl TokenIndex {
@@ -1015,7 +1013,7 @@ impl TokenIndex {
         messages: &[BoundaryMsg],
         mut block_tokens: impl FnMut(&BoundaryBlock) -> usize,
     ) -> Self {
-        let mut totals_by_ordinal = BTreeMap::new();
+        let mut message_totals = Vec::with_capacity(messages.len());
         for message in messages {
             let total = message
                 .blocks
@@ -1023,27 +1021,32 @@ impl TokenIndex {
                 .map(&mut block_tokens)
                 .map(|tokens| tokens as f64)
                 .sum::<f64>();
-            *totals_by_ordinal
-                .entry(message.message_ordinal)
-                .or_insert(0.0) += total;
+            message_totals.push((message.message_ordinal, total));
+        }
+        if !message_totals.is_sorted_by_key(|(ordinal, _)| *ordinal) {
+            message_totals.sort_by_key(|(ordinal, _)| *ordinal);
         }
 
-        let ordinals: Vec<u64> = totals_by_ordinal.keys().copied().collect();
+        let mut ordinals: Vec<u64> = Vec::with_capacity(message_totals.len());
+        let mut prefix = Vec::with_capacity(message_totals.len() + 1);
+        prefix.push(0.0);
+        for (ordinal, total) in message_totals {
+            if ordinals.last() == Some(&ordinal) {
+                let last = prefix.len() - 1;
+                prefix[last] += total;
+            } else {
+                ordinals.push(ordinal);
+                let previous = prefix.last().copied().unwrap_or(0.0);
+                prefix.push(previous + total);
+            }
+        }
+
         let first_ordinal = ordinals.first().copied().unwrap_or(1);
         let last_ordinal = ordinals.last().copied().unwrap_or(0);
         let terminal_ordinal = ordinals
             .last()
             .map(|ordinal| ordinal.saturating_add(1))
             .unwrap_or(1);
-        let mut prefix = Vec::with_capacity(ordinals.len() + 1);
-        prefix.push(0.0);
-        let mut tokens_by_ordinal = HashMap::new();
-        for ordinal in &ordinals {
-            let total = totals_by_ordinal.get(ordinal).copied().unwrap_or(0.0);
-            tokens_by_ordinal.insert(*ordinal, total);
-            let previous = prefix.last().copied().unwrap_or(0.0);
-            prefix.push(previous + total);
-        }
 
         Self {
             raw_message_count: ordinals.len() as u64,
@@ -1052,12 +1055,16 @@ impl TokenIndex {
             terminal_ordinal,
             ordinals,
             prefix,
-            tokens_by_ordinal,
         }
     }
 
+    /// Per-message totals are integer-valued, so adjacent prefix sums differ
+    /// by the exact stored total.
     fn token_for_ordinal(&self, ordinal: u64) -> f64 {
-        self.tokens_by_ordinal.get(&ordinal).copied().unwrap_or(0.0)
+        match self.ordinals.binary_search(&ordinal) {
+            Ok(index) => self.prefix[index + 1] - self.prefix[index],
+            Err(_) => 0.0,
+        }
     }
 
     fn total_tokens(&self) -> f64 {
@@ -1216,16 +1223,16 @@ fn build_tool_arcs(messages: &[BoundaryMsg]) -> Vec<ToolArc> {
         res: Vec<u64>,
     }
 
-    let mut partial: BTreeMap<String, PartialArc> = BTreeMap::new();
+    let mut partial: BTreeMap<&str, PartialArc> = BTreeMap::new();
     for message in messages {
         for block in &message.blocks {
             if block.provider_executed {
                 continue;
             }
-            let Some(arc_id) = &block.arc_id else {
+            let Some(arc_id) = block.arc_id.as_deref() else {
                 continue;
             };
-            let entry = partial.entry(arc_id.clone()).or_default();
+            let entry = partial.entry(arc_id).or_default();
             match &block.kind {
                 SelKind::ToolCall { .. } => entry.inv.push(message.message_ordinal),
                 SelKind::ToolResult { .. } => entry.res.push(message.message_ordinal),
@@ -1527,7 +1534,7 @@ struct ChunkBlock {
     start_ordinal: u64,
     end_ordinal: u64,
     parts: Vec<String>,
-    meta: Vec<(u64, String)>,
+    meta: Vec<u64>,
     commit_hashes: Vec<String>,
     is_tool_only: bool,
 }
@@ -1540,7 +1547,7 @@ struct ChunkBuilder<'a> {
     messages_processed: usize,
     last_ordinal: u64,
     current_block: Option<ChunkBlock>,
-    pending_noise_meta: Vec<(u64, String)>,
+    pending_noise_meta: Vec<u64>,
     formatted_blocks: Vec<String>,
     block_tokens: Vec<f64>,
     commit_cluster_count: usize,
@@ -1568,7 +1575,7 @@ impl<'a> ChunkBuilder<'a> {
     }
 
     fn push_message(&mut self, message: &BoundaryMsg) -> bool {
-        let meta = (message.message_ordinal, message.message_id.clone());
+        let meta = message.message_ordinal;
         if message.role == Role::User && !has_meaningful_user_text(&message.blocks) {
             let tc_summaries = extract_tool_call_summaries(&message.blocks);
             if tc_summaries.is_empty() {
@@ -1593,7 +1600,7 @@ impl<'a> ChunkBuilder<'a> {
             let start = self
                 .pending_noise_meta
                 .first()
-                .map(|(ordinal, _)| *ordinal)
+                .copied()
                 .unwrap_or(message.message_ordinal);
             let mut meta_list = std::mem::take(&mut self.pending_noise_meta);
             meta_list.push(meta);
@@ -1611,20 +1618,20 @@ impl<'a> ChunkBuilder<'a> {
 
         let role = compact_role(message.role.as_str());
         let text_parts = text_parts(message);
-        let tool_summaries = if text_parts.is_empty() {
-            extract_tool_call_summaries(&message.blocks)
-        } else {
+        let msg_has_narrative = !text_parts.is_empty();
+        let tool_summaries = if msg_has_narrative {
             Vec::new()
+        } else {
+            extract_tool_call_summaries(&message.blocks)
         };
-        let mut all_parts = text_parts.clone();
+        let mut all_parts = text_parts;
         all_parts.extend(tool_summaries);
-        let compacted = compact_text_for_summary(&all_parts.join(" / "), message.role.as_str());
+        let compacted = compact_text_for_summary(all_parts.join(" / "), message.role.as_str());
         let text = compacted.text;
         if text.is_empty() {
             self.pending_noise_meta.push(meta);
             return true;
         }
-        let msg_has_narrative = !text_parts.is_empty();
         if let Some(current) = self
             .current_block
             .as_mut()
@@ -1648,7 +1655,7 @@ impl<'a> ChunkBuilder<'a> {
         let start = self
             .pending_noise_meta
             .first()
-            .map(|(ordinal, _)| *ordinal)
+            .copied()
             .unwrap_or(message.message_ordinal);
         let mut meta_list = std::mem::take(&mut self.pending_noise_meta);
         meta_list.push(meta);
@@ -1685,7 +1692,7 @@ impl<'a> ChunkBuilder<'a> {
         self.last_ordinal = current_block
             .meta
             .last()
-            .map(|(ordinal, _)| *ordinal)
+            .copied()
             .unwrap_or(current_block.end_ordinal);
         self.messages_processed += current_block.meta.len();
         self.formatted_blocks.push(block_text);
@@ -1722,19 +1729,14 @@ impl<'a> ChunkBuilder<'a> {
     }
 }
 
-#[derive(Debug, Clone)]
-struct CompactedText {
-    text: String,
-    commit_hashes: Vec<String>,
-}
-
 fn has_meaningful_user_text(blocks: &[BoundaryBlock]) -> bool {
     blocks.iter().any(|block| {
         if block.ignored || !matches!(block.kind, SelKind::Text) {
             return false;
         }
-        let cleaned = clean_user_text(&block.original);
-        !cleaned.trim().is_empty() && !is_system_directive(&cleaned)
+        let cleaned = clean_user_text_cow(&block.original);
+        let trimmed = cleaned.trim();
+        !trimmed.is_empty() && !is_system_directive(trimmed)
     })
 }
 
@@ -1789,191 +1791,20 @@ fn extract_tool_call_summaries(blocks: &[BoundaryBlock]) -> Vec<String> {
     summaries
 }
 
-fn extract_key_arg(input: &Value) -> Option<String> {
-    let object = input.as_object()?;
-    for key in ["filePath", "path", "pattern", "query"] {
-        if let Some(value) = object.get(key).and_then(Value::as_str) {
-            return Some(truncate_arg(value));
-        }
-    }
-    for key in ["symbol", "module", "action"] {
-        if let Some(value) = object.get(key).and_then(Value::as_str) {
-            return Some(value.to_string());
-        }
-    }
-    None
-}
-
-fn truncate_arg(value: &str) -> String {
-    let max_len = 60;
-    if value.chars().count() <= max_len {
-        return value.to_string();
-    }
-    let mut out = value.chars().take(max_len).collect::<String>();
-    out.push('…');
-    out
-}
-
-fn clean_user_text(text: &str) -> String {
-    let without_reminders = system_reminder_regex().replace_all(text, "");
-    without_reminders
-        .replace(OMO_INTERNAL_INITIATOR_MARKER, "")
-        .trim()
-        .to_string()
-}
-
-fn is_system_directive(text: &str) -> bool {
-    text.trim_start().starts_with(SYSTEM_DIRECTIVE_PREFIX)
-}
-
-fn normalize_text(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn compact_role(role: &str) -> String {
-    match role {
-        "assistant" => "A".to_string(),
-        "user" => "U".to_string(),
-        _ => role
-            .chars()
-            .next()
-            .map(|ch| ch.to_uppercase().collect::<String>())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "M".to_string()),
-    }
-}
-
 fn format_block(block: &ChunkBlock) -> String {
-    let range = if block.start_ordinal == block.end_ordinal {
-        format!("[{}]", block.start_ordinal)
-    } else {
-        format!("[{}-{}]", block.start_ordinal, block.end_ordinal)
-    };
-    let commit_suffix = if block.commit_hashes.is_empty() {
-        String::new()
-    } else {
-        format!(" commits: {}", block.commit_hashes.join(", "))
-    };
-    format!(
-        "{} {}:{} {}",
-        range,
-        block.role,
-        commit_suffix,
-        block.parts.join(" / ")
+    format_block_line(
+        &block.role,
+        block.start_ordinal,
+        block.end_ordinal,
+        &block.commit_hashes,
+        &block.parts,
     )
-}
-
-fn extract_commit_hashes(text: &str) -> Vec<String> {
-    let mut hashes = Vec::new();
-    for capture in commit_hash_extract_regex().captures_iter(text) {
-        let Some(hash) = capture.get(1).map(|value| value.as_str().to_lowercase()) else {
-            continue;
-        };
-        if hashes.contains(&hash) {
-            continue;
-        }
-        hashes.push(hash);
-        if hashes.len() >= MAX_COMMITS_PER_BLOCK {
-            break;
-        }
-    }
-    hashes
-}
-
-fn compact_text_for_summary(text: &str, role: &str) -> CompactedText {
-    let commit_hashes = if role == "assistant" {
-        extract_commit_hashes(text)
-    } else {
-        Vec::new()
-    };
-    if commit_hashes.is_empty() || !commit_verb_regex().is_match(text) {
-        return CompactedText {
-            text: text.to_string(),
-            commit_hashes,
-        };
-    }
-    let without_hashes = commit_hash_extract_regex().replace_all(text, "");
-    let without_hashes = empty_parens_regex().replace_all(&without_hashes, "");
-    let without_hashes = space_before_comma_regex().replace_all(&without_hashes, ",");
-    let without_hashes = repeated_comma_regex().replace_all(&without_hashes, ", ");
-    let without_hashes = repeated_space_regex().replace_all(&without_hashes, " ");
-    let without_hashes = space_before_punct_regex().replace_all(&without_hashes, "$1");
-    let trimmed = without_hashes.trim();
-    CompactedText {
-        text: if trimmed.is_empty() {
-            text.to_string()
-        } else {
-            trimmed.to_string()
-        },
-        commit_hashes,
-    }
-}
-
-fn merge_commit_hashes(existing: &[String], next: &[String]) -> Vec<String> {
-    if next.is_empty() {
-        return existing.to_vec();
-    }
-    let mut merged = existing.to_vec();
-    for hash in next {
-        if merged.contains(hash) {
-            continue;
-        }
-        merged.push(hash.clone());
-        if merged.len() >= MAX_COMMITS_PER_BLOCK {
-            break;
-        }
-    }
-    merged
-}
-
-fn system_reminder_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?is)<system-reminder>[\s\S]*?</system-reminder>").unwrap())
-}
-
-fn commit_hash_extract_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)`?\b([0-9a-f]{7,12})\b`?").unwrap())
-}
-
-fn commit_verb_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)\b(?:commit(?:ted|ting|s)?|cherry-?pick(?:ed|ing|s)?|merge[ds]?|merging|rebas(?:e|ed|es|ing))\b",
-        )
-        .unwrap()
-    })
-}
-
-fn empty_parens_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\(\s*\)").unwrap())
-}
-
-fn space_before_comma_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\s+,").unwrap())
-}
-
-fn repeated_comma_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r",\s*,+").unwrap())
-}
-
-fn repeated_space_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\s{2,}").unwrap())
-}
-
-fn space_before_punct_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\s+([,.;:])").unwrap())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chunk_text::MAX_COMMITS_PER_BLOCK;
     use serde::Deserialize;
 
     #[derive(Deserialize)]

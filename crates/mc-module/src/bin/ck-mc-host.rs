@@ -131,7 +131,7 @@ struct ReadinessRecord {
 
 #[derive(serde::Serialize)]
 struct Readiness {
-    shared_memory: ReadinessRecord,
+    transport: ReadinessRecord,
 }
 
 #[derive(serde::Serialize)]
@@ -171,7 +171,6 @@ struct DaemonResult {
     remediation: Option<&'static str>,
     effects: Option<Effects>,
     readiness: Option<Readiness>,
-    shared_memory: Option<serde_json::Value>,
     checks: Vec<Check>,
     versions: Versions,
 }
@@ -187,7 +186,6 @@ impl DaemonResult {
             remediation: remediation_for(reason),
             effects: None,
             readiness: None,
-            shared_memory: None,
             checks: Vec::new(),
             versions: Versions::local(),
         }
@@ -445,16 +443,11 @@ impl Runtime {
     }
 
     /// One bounded authenticated connect (bearer handshake) then close.
-    /// `true` is the transport-authenticated success signal.
-    ///
-    /// Bounded by the caller's phase deadline, not just by the client's own
-    /// handshake timeout: an existing publication whose endpoint is unreachable
-    /// or whose handshake stalls would otherwise let one attempt run past the
-    /// phase's hard cap while the lifecycle transaction lock is still held.
-    fn authenticate(&self, publication: &Path, deadline: Instant) -> bool {
+    /// Returns the proof-authenticated daemon version, never publication metadata.
+    fn authenticate(&self, publication: &Path, deadline: Instant) -> Option<String> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return false;
+            return None;
         }
         let path = publication.to_path_buf();
         self.inner.block_on(async move {
@@ -467,10 +460,11 @@ impl Runtime {
             // stalled peer cannot hang the phase.
             match tokio::time::timeout(remaining, Client::connect(&path)).await {
                 Ok(Ok(client)) => {
+                    let daemon_ver = client.daemon_ver().to_owned();
                     let _ = tokio::time::timeout(CLOSE_GRACE, client.close()).await;
-                    true
+                    Some(daemon_ver)
                 }
-                _ => false,
+                _ => None,
             }
         })
     }
@@ -622,6 +616,7 @@ fn cmd_probe() -> DaemonResult {
 /// authenticated-transport readiness.
 struct StartOutcome {
     ok: bool,
+    start_committed: bool,
     state: &'static str,
     reason: &'static str,
     daemon_ver: Option<String>,
@@ -653,7 +648,7 @@ fn start_phase(
     generation: SuccessorGeneration<'_>,
     anchor: &NamespaceAnchor,
     outer: Instant,
-    launcher_envelope: serve::LauncherEnvelope,
+    launcher_envelope: serve::PreparedLauncherEnvelope,
     stop_committed: bool,
 ) -> StartOutcome {
     // Resolution failures are the only ones that say anything about the retained
@@ -661,6 +656,7 @@ fn start_phase(
     // failing.
     let unresolved = |state: &'static str, reason: &'static str| StartOutcome {
         ok: false,
+        start_committed: false,
         state,
         reason,
         daemon_ver: None,
@@ -673,6 +669,7 @@ fn start_phase(
     // corrupt on the strength of an unrelated lifecycle or spawn error.
     let resolved_but_failed = |state: &'static str, reason: &'static str| StartOutcome {
         ok: false,
+        start_committed: false,
         state,
         reason,
         daemon_ver: None,
@@ -719,11 +716,7 @@ fn start_phase(
     // The library owns the managed layout; deriving the data root by
     // walking parents off a derived path would silently break if that
     // layout ever gained or lost a level.
-    let data_dir = match mc_host::data_dir_path(None) {
-        Ok(data_dir) => data_dir,
-        Err(_) => return resolved_but_failed("stopped", "internal_error"),
-    };
-    let envelope = launcher_envelope.materialize_into_startup(data_dir, digest);
+    let envelope = launcher_envelope.to_startup(digest);
     let envelope_bytes = match serde_json::to_vec(&envelope) {
         Ok(bytes) => bytes,
         // A Unix data root may hold bytes that are not valid UTF-8, which the
@@ -754,26 +747,49 @@ fn start_phase(
         // on. A coherent `Running` probe is the local evidence that a lock-held
         // incarnation exists here, and the daemon publishes only after taking its
         // fences, so requiring it costs nothing on the success path.
-        if publication.exists() && runtime.authenticate(&publication, deadline) {
+        if let Some(daemon_ver) = publication
+            .exists()
+            .then(|| runtime.authenticate(&publication, deadline))
+            .flatten()
+        {
             if let Ok(observed) = probe() {
                 if observed.state == LifecycleState::Running {
-                    let daemon_ver = publication_daemon_ver(&observed);
-                    if let Some(daemon_ver) = &daemon_ver {
-                        if !daemon_version_compatible(daemon_ver) {
-                            return StartOutcome {
+                    if !daemon_version_compatible(&daemon_ver) {
+                        return StartOutcome {
+                            ok: false,
+                            start_committed: true,
+                            state: "running",
+                            reason: "incompatible_daemon",
+                            daemon_ver: Some(daemon_ver),
+                            generation_check: Some(("pass", "healthy")),
+                        };
+                    }
+                    if launcher_envelope.commit_selection(&publication).is_err() {
+                        return match stop_phase(runtime, outer) {
+                            (_, Ok(())) => StartOutcome {
                                 ok: false,
-                                state: "running",
-                                reason: "incompatible_daemon",
-                                daemon_ver: Some(daemon_ver.clone()),
+                                start_committed: true,
+                                state: "stopped",
+                                reason: "internal_error",
+                                daemon_ver: Some(daemon_ver),
                                 generation_check: Some(("pass", "healthy")),
-                            };
-                        }
+                            },
+                            (_, Err((state, reason))) => StartOutcome {
+                                ok: false,
+                                start_committed: true,
+                                state,
+                                reason,
+                                daemon_ver: Some(daemon_ver),
+                                generation_check: Some(("pass", "healthy")),
+                            },
+                        };
                     }
                     return StartOutcome {
                         ok: true,
+                        start_committed: true,
                         state: "running",
                         reason: "started",
-                        daemon_ver,
+                        daemon_ver: Some(daemon_ver),
                         generation_check: Some(("pass", "healthy")),
                     };
                 }
@@ -791,6 +807,7 @@ fn start_phase(
             };
             return StartOutcome {
                 ok: false,
+                start_committed: false,
                 state,
                 reason: "startup_timeout",
                 daemon_ver: None,
@@ -938,7 +955,14 @@ fn generation_launcher(
         .iter()
         .any(|file| file.path == PRODUCTION_LAUNCHER)
     {
-        return Ok(None);
+        return if validated.manifest.source_payload_manifest_sha256.as_deref()
+            == Some("unqualified-dev-manifest")
+            && spawn::test_self_exec_allowed()
+        {
+            Ok(None)
+        } else {
+            Err(("stopped", "native_payload_invalid"))
+        };
     }
     validated
         .open_verified_file(PRODUCTION_LAUNCHER)
@@ -965,6 +989,9 @@ fn resolve_generation(
     };
     match payload_dir {
         Some(dir) => {
+            let payload = payload_sources(dir, payload_manifest_digest)?;
+            mc_host::generation::verify_sources(&payload.sources)
+                .map_err(|e| generation_failure(&e))?;
             let store = GenerationStore::open(None).map_err(|e| generation_failure(&e))?;
             let mut protected = BTreeSet::new();
             if let Ok(mc_host::generation::CurrentProfile::Current(current)) = store.read_current()
@@ -976,7 +1003,6 @@ fn resolve_generation(
             store
                 .prune(&protected)
                 .map_err(|e| generation_failure(&e))?;
-            let payload = payload_sources(dir, payload_manifest_digest)?;
             let meta = StageMeta {
                 target: target.to_owned(),
                 release_contract_sha256: release_contract::RELEASE_CONTRACT_SHA256.to_owned(),
@@ -1255,6 +1281,16 @@ fn unqualified_payload_sources(
     Ok(sources)
 }
 
+fn prepare_launcher_envelope(
+    envelope: serve::LauncherEnvelope,
+    mode: serve::SelectionMode<'_>,
+) -> Result<serve::PreparedLauncherEnvelope, &'static str> {
+    let data_dir = mc_host::data_dir_path(None)
+        .ok()
+        .ok_or("lifecycle data directory is unavailable")?;
+    envelope.prepare(data_dir, mode)
+}
+
 fn cmd_start(
     payload_dir: Option<&Path>,
     payload_manifest_digest: Option<&str>,
@@ -1301,23 +1337,44 @@ fn cmd_start(
                 Err(_) => return DaemonResult::new(command, false, "running", "internal_error"),
             };
             let auth_deadline = phase_deadline(outer, phase_cap(SPAWN_PUBLICATION_AUTH));
-            if !runtime.authenticate(&publication, auth_deadline) {
+            let Some(daemon_ver) = runtime.authenticate(&publication, auth_deadline) else {
                 return DaemonResult::new(command, false, "running", "authentication_failed");
+            };
+            if !daemon_version_compatible(&daemon_ver) {
+                let mut result =
+                    DaemonResult::new(command, false, "running", "incompatible_daemon");
+                result.versions.daemon = Some(daemon_ver);
+                return result;
             }
-            let daemon_ver = publication_daemon_ver(&observed);
-            if let Some(daemon_ver) = &daemon_ver {
-                if !daemon_version_compatible(daemon_ver) {
-                    let mut result =
-                        DaemonResult::new(command, false, "running", "incompatible_daemon");
-                    result.versions.daemon = Some(daemon_ver.clone());
-                    return result;
+            let credential_identity_key = match serve::credential_identity_key(&publication) {
+                Ok(key) => key,
+                Err(_) => {
+                    return DaemonResult::new(command, false, "running", "authentication_failed")
                 }
+            };
+            let prepared = match prepare_launcher_envelope(
+                launcher_envelope,
+                serve::SelectionMode::Running {
+                    credential_identity_key: &credential_identity_key,
+                    require_previous_credentials: false,
+                },
+            ) {
+                Ok(prepared) => prepared,
+                Err("unsupported active harness selection schema") => {
+                    return DaemonResult::new(command, false, "wedged", "unsupported_state_schema")
+                }
+                Err(_) => {
+                    return DaemonResult::new(command, false, "running", "harness_unavailable")
+                }
+            };
+            if prepared.changed {
+                return DaemonResult::new(command, false, "running", "harness_unavailable");
             }
             let mut result = DaemonResult::new(command, true, "running", "already_running");
-            result.versions.daemon = daemon_ver;
+            result.versions.daemon = Some(daemon_ver);
             result.versions.proof = Some("current");
             result.readiness = Some(Readiness {
-                shared_memory: ReadinessRecord {
+                transport: ReadinessRecord {
                     state: "ready",
                     reason: "healthy",
                 },
@@ -1332,6 +1389,21 @@ fn cmd_start(
         ),
         LifecycleState::Wedged => DaemonResult::new(command, false, "wedged", "wedged"),
         LifecycleState::Stopped => {
+            let prepared =
+                match prepare_launcher_envelope(launcher_envelope, serve::SelectionMode::Fresh) {
+                    Ok(prepared) => prepared,
+                    Err("unsupported active harness selection schema") => {
+                        return DaemonResult::new(
+                            command,
+                            false,
+                            "wedged",
+                            "unsupported_state_schema",
+                        )
+                    }
+                    Err(_) => {
+                        return DaemonResult::new(command, false, "stopped", "harness_unavailable")
+                    }
+                };
             let outcome = start_phase(
                 &runtime,
                 SuccessorGeneration::Resolve {
@@ -1340,7 +1412,7 @@ fn cmd_start(
                 },
                 &anchor,
                 outer,
-                launcher_envelope,
+                prepared,
                 false,
             );
             start_outcome_result(command, outcome, None)
@@ -1358,7 +1430,7 @@ fn start_outcome_result(
     if outcome.ok {
         result.versions.proof = Some("current");
         result.readiness = Some(Readiness {
-            shared_memory: ReadinessRecord {
+            transport: ReadinessRecord {
                 state: "ready",
                 reason: "healthy",
             },
@@ -1471,9 +1543,29 @@ fn cmd_stop() -> DaemonResult {
         return DaemonResult::new(command, false, state, reason);
     }
     match observed.state {
-        // No lock-held incarnation: nothing to signal, unlink, or clean.
-        LifecycleState::Stopped => DaemonResult::new(command, true, "stopped", "already_stopped"),
-        LifecycleState::Wedged => DaemonResult::new(command, false, "wedged", "wedged"),
+        // No lock-held incarnation exists, so the state the caller asked for
+        // holds before any cleanup runs. Selector cleanup is best-effort
+        // stale-state removal under the transaction ownership boundary: a
+        // removal or fsync fault leaves behind a stale selector the next start
+        // rewrites, which cannot unmake the stopped state, so it is swallowed
+        // rather than reported as a failed `stop`. An unsupported schema is not
+        // that: the file is owned by a newer binary, is preserved as evidence
+        // for it, and blocks the next start until `align_versions`, so it stays
+        // a `wedged` failure.
+        LifecycleState::Stopped => match serve::clear_active_selection() {
+            Err("unsupported active harness selection schema") => {
+                DaemonResult::new(command, false, "wedged", "unsupported_state_schema")
+            }
+            Ok(()) | Err(_) => DaemonResult::new(command, true, "stopped", "already_stopped"),
+        },
+        LifecycleState::Wedged => {
+            let reason = if observed.reason == "unsupported_state_schema" {
+                "unsupported_state_schema"
+            } else {
+                "wedged"
+            };
+            DaemonResult::new(command, false, "wedged", reason)
+        }
         LifecycleState::Starting | LifecycleState::Stopping => DaemonResult::new(
             command,
             false,
@@ -1481,7 +1573,20 @@ fn cmd_stop() -> DaemonResult {
             "lifecycle_busy",
         ),
         LifecycleState::Running => match stop_phase(&runtime, outer) {
-            (_, Ok(())) => DaemonResult::new(command, true, "stopped", "stopped"),
+            // The stop transaction committed: the incarnation was signalled,
+            // acknowledged, and observed stopped. Nothing after that point can
+            // un-commit it, so a best-effort selector-cleanup fault — stale
+            // bookkeeping the next start rewrites — must not turn a stop that
+            // already happened into a failed command. An unsupported schema
+            // still fails `wedged`: that file is owned by a newer binary, is
+            // preserved as evidence for it, and blocks the next start until
+            // `align_versions`.
+            (_, Ok(())) => match serve::clear_active_selection() {
+                Err("unsupported active harness selection schema") => {
+                    DaemonResult::new(command, false, "wedged", "unsupported_state_schema")
+                }
+                Ok(()) | Err(_) => DaemonResult::new(command, true, "stopped", "stopped"),
+            },
             (_, Err((state, reason))) => DaemonResult::new(command, false, state, reason),
         },
     }
@@ -1572,6 +1677,54 @@ fn cmd_restart(
                 .with_effects(effects(false, false));
         }
     };
+    let credential_identity_key = if observed.state == LifecycleState::Running {
+        let publication = match publication_path() {
+            Ok(path) => path,
+            Err(_) => {
+                return DaemonResult::new(command, false, "running", "internal_error")
+                    .with_effects(effects(false, false))
+            }
+        };
+        let auth_deadline = phase_deadline(outer, phase_cap(SPAWN_PUBLICATION_AUTH));
+        if runtime.authenticate(&publication, auth_deadline).is_none() {
+            return DaemonResult::new(command, false, "running", "authentication_failed")
+                .with_effects(effects(false, false));
+        }
+        match serve::credential_identity_key(&publication) {
+            Ok(key) => Some(key),
+            Err(_) => {
+                return DaemonResult::new(command, false, "running", "authentication_failed")
+                    .with_effects(effects(false, false))
+            }
+        }
+    } else {
+        None
+    };
+    let prepared = match prepare_launcher_envelope(
+        launcher_envelope,
+        match credential_identity_key.as_ref() {
+            Some(key) => serve::SelectionMode::Running {
+                credential_identity_key: key,
+                require_previous_credentials: true,
+            },
+            None => serve::SelectionMode::Fresh,
+        },
+    ) {
+        Ok(prepared) => prepared,
+        Err("unsupported active harness selection schema") => {
+            return DaemonResult::new(command, false, "wedged", "unsupported_state_schema")
+                .with_effects(effects(false, false))
+        }
+        Err(_) => {
+            return DaemonResult::new(
+                command,
+                false,
+                probe_state(observed.state),
+                "harness_unavailable",
+            )
+            .with_effects(effects(false, false))
+        }
+    };
     let stop_committed = match observed.state {
         LifecycleState::Running => {
             // The stop is irreversible and the successor start needs a budget of
@@ -1626,10 +1779,10 @@ fn cmd_restart(
         },
         &anchor,
         outer,
-        launcher_envelope,
+        prepared,
         stop_committed,
     );
-    let start_committed = outcome.ok;
+    let start_committed = outcome.start_committed;
     start_outcome_result(
         command,
         outcome,
@@ -1973,7 +2126,10 @@ mod tests {
                 PathBuf::from(secret_source),
             )]),
         });
-        let startup = envelope.materialize_into_startup(root.path().to_path_buf(), "cd".repeat(32));
+        let startup = envelope
+            .prepare(root.path().to_path_buf(), serve::SelectionMode::Fresh)
+            .expect("prepare isolated envelope")
+            .to_startup("cd".repeat(32));
         assert!(matches!(
             startup.opencode,
             Some(serve::HarnessSnapshot::Unavailable {
@@ -2014,13 +2170,7 @@ mod tests {
         assert!(!daemon_version_compatible("other/0.1.0"));
         assert!(!daemon_version_compatible("mc-host/1"));
     }
-
-    /// The accepted shape must match `evaluateDaemonCompatibility`'s
-    /// `^(\d+)\.(\d+)\.(\d+)$` in
-    /// `packages/plugin/src/shared/mc-host-lifecycle/compatibility.ts`. A
-    /// component that side accepts and this one rejects (or the reverse) makes
-    /// a native result and the TypeScript policy verdict contradict each other
-    /// for the same daemon.
+    /// The accepted shape matches the plugin's canonical semver grammar.
     #[test]
     fn daemon_version_shape_matches_the_typescript_gate() {
         // `u64::from_str` alone accepts these; the regex does not.

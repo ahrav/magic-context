@@ -1,6 +1,7 @@
 import { homedir, userInfo } from "node:os";
 
-function escapeRegex(value: string): string {
+/** Escape a literal string for interpolation into a RegExp. */
+export function escapeRegex(value: string): string {
     return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 

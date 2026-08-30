@@ -12,6 +12,15 @@
 const CALL_ERROR_KINDS: readonly string[] = ["not_sent", "outcome_unknown", "terminal"];
 
 /**
+ * Stable wire code: the authenticated daemon no longer matches the
+ * lifecycle-validated incarnation the caller bound to. The facade produces
+ * it and consumers (transport reconnect classification, Synapse restart
+ * classification) recognize daemon rotation by this exact string, so every
+ * producer and consumer must reference this one constant.
+ */
+export const DAEMON_GENERATION_CHANGED_CODE = "daemon_generation_changed";
+
+/**
  * Cross-bundle recognition of {@link McHostCallError}. A different bundled
  * copy of this class fails `instanceof`, so recognition is structural; old
  * runtime names (the previous `Subc`-prefixed spellings) are deliberately

@@ -77,7 +77,7 @@ export function getEmbeddingProviderIdentity(config: EmbeddingConfig): string {
     // spaces. Spread CONDITIONALLY and EXCLUDE the default "fp32": omitting the
     // term when unset OR when set to the default keeps the identity byte-
     // identical for the common config, so adding this field does not force a
-    // global re-embed on upgrade. Mirrors the truncate fold above. See #259.
+    // global re-embed on upgrade. Mirrors the truncate fold above.
     const localDtype =
         config.provider === "local" && config.local_dtype && config.local_dtype !== "fp32"
             ? config.local_dtype

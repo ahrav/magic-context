@@ -4,21 +4,16 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use hmac::{Hmac, Mac};
 use mc_shm_transport::backend::ring::RingGrant;
+use mc_shm_transport::descriptor::SETUP_DESCRIPTOR_COUNT;
 use rustix::net::{recvmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
-const NONCE_LEN: usize = 32;
-const PROOF_LEN: usize = 32;
-const DAEMON_ID_LEN: usize = 16;
-const MAX_AUTH_MESSAGE_LEN: usize = 4096;
-const MAX_SETUP_MESSAGE_LEN: usize = 16 * 1024;
-const SETUP_DESCRIPTOR_COUNT: usize = mc_shm_transport::descriptor::SETUP_DESCRIPTOR_COUNT;
-const SERVER_PROOF_DOMAIN: &[u8] = b"subc-server-v1";
-const CLIENT_AUTH_DOMAIN: &[u8] = b"subc-client-v1";
+use mc_shm_transport::setup_auth::{
+    self, CLIENT_AUTH_DOMAIN, DAEMON_ID_LEN, DEFAULT_CLIENT_ROLE, MAX_AUTH_MESSAGE_LEN,
+    MAX_SETUP_MESSAGE_LEN, NONCE_LEN, PROOF_LEN, PROTOCOL_VERSION, SERVER_PROOF_DOMAIN,
+};
 
 #[derive(Serialize)]
 struct ClientHello {
@@ -115,7 +110,7 @@ pub fn begin_connect(
         deadline,
     )?;
     let (grant, descriptors) = receive_grant(&mut stream, deadline)?;
-    if grant.wire_version != 2
+    if grant.wire_version != PROTOCOL_VERSION
         || grant.descriptor_schema != mc_shm_transport::descriptor::DESCRIPTOR_SCHEMA_VERSION
     {
         return Err(invalid());
@@ -135,6 +130,20 @@ pub fn begin_connect(
         activation_token: grant.activation_token,
         deadline,
     })
+}
+
+/// A ring alone cannot express peer death: a host that exits without a Goodbye frame leaves its rings looking merely idle, so the setup socket is the only liveness signal. `MSG_PEEK` keeps the probe side-effect free and repeatable. commentlint: allow(JUDGE)
+pub fn peer_closed(stream: &UnixStream) -> bool {
+    let mut probe = [0u8; 1];
+    match rustix::net::recv(
+        stream.as_fd(),
+        &mut probe,
+        rustix::net::RecvFlags::PEEK | rustix::net::RecvFlags::DONTWAIT,
+    ) {
+        Ok(_) => true,
+        Err(rustix::io::Errno::AGAIN) | Err(rustix::io::Errno::INTR) => false,
+        Err(_) => true,
+    }
 }
 
 impl PendingSetup {
@@ -199,7 +208,7 @@ fn authenticate(
         stream,
         &ClientHello {
             client_nonce,
-            role: "client",
+            role: DEFAULT_CLIENT_ROLE,
         },
         deadline,
         MAX_AUTH_MESSAGE_LEN,
@@ -210,6 +219,7 @@ fn authenticate(
         SERVER_PROOF_DOMAIN,
         &client_nonce,
         &server.server_nonce,
+        &server.daemon_ver,
         &server.daemon_id,
     );
     if !bool::from(expected.ct_eq(&server.server_proof))
@@ -226,6 +236,7 @@ fn authenticate(
                 CLIENT_AUTH_DOMAIN,
                 &client_nonce,
                 &server.server_nonce,
+                &server.daemon_ver,
                 &server.daemon_id,
             ),
         },
@@ -236,17 +247,20 @@ fn authenticate(
 
 fn proof(
     key: &[u8],
-    domain: &[u8],
+    domain: &str,
     client_nonce: &[u8; NONCE_LEN],
     server_nonce: &[u8; NONCE_LEN],
+    daemon_ver: &str,
     daemon_id: &[u8],
 ) -> [u8; PROOF_LEN] {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts every key length");
-    mac.update(domain);
-    mac.update(client_nonce);
-    mac.update(server_nonce);
-    mac.update(daemon_id);
-    mac.finalize().into_bytes().into()
+    setup_auth::compute_proof(
+        key,
+        domain,
+        client_nonce,
+        server_nonce,
+        daemon_ver,
+        daemon_id,
+    )
 }
 
 fn receive_grant(
@@ -355,12 +369,27 @@ fn write_message<T: Serialize>(
     stream.write_all(&frame)
 }
 
-fn read_exact(stream: &mut UnixStream, bytes: &mut [u8], deadline: Instant) -> io::Result<()> {
-    if bytes.is_empty() {
-        return Ok(());
+fn read_exact(stream: &mut UnixStream, mut bytes: &mut [u8], deadline: Instant) -> io::Result<()> {
+    // `std::io::Read::read_exact` grants each underlying recv the full
+    // remaining budget, so a trickling peer could stretch wall time to
+    // remaining × len. Re-arming the timeout per chunk caps the whole read
+    // at the deadline.
+    while !bytes.is_empty() {
+        set_timeout(stream, deadline)?;
+        match stream.read(bytes) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(read) => bytes = &mut bytes[read..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(error),
+        }
     }
-    set_timeout(stream, deadline)?;
-    stream.read_exact(bytes)
+    Ok(())
 }
 
 fn set_timeout(stream: &UnixStream, deadline: Instant) -> io::Result<()> {
@@ -398,6 +427,7 @@ fn timed_out() -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::{proof, GrantMessage, CLIENT_AUTH_DOMAIN, SERVER_PROOF_DOMAIN};
+    use mc_shm_transport::setup_auth::vectors;
 
     #[test]
     fn grant_message_accepts_tagged_setup_envelope() {
@@ -407,7 +437,7 @@ mod tests {
             "descriptor_schema": mc_shm_transport::descriptor::DESCRIPTOR_SCHEMA_VERSION,
             "activation_token": "token",
             "descriptor": {
-                "profile": "mc-host-eventfd-ring-v2",
+                "profile": "mc-host-test-ring-v1",
                 "host_to_peer_grant": "aa",
                 "peer_to_host_grant": "bb"
             }
@@ -420,22 +450,17 @@ mod tests {
 
     #[test]
     fn auth_proofs_match_committed_wire_vectors() {
-        let key = std::array::from_fn::<_, 32, _>(|index| index as u8);
-        let client_nonce = std::array::from_fn::<_, 32, _>(|index| index as u8 + 0x20);
-        let server_nonce = std::array::from_fn::<_, 32, _>(|index| index as u8 + 0x40);
-        let daemon_id = std::array::from_fn::<_, 16, _>(|index| index as u8 + 0x60);
+        let (key, client_nonce, server_nonce, daemon_id) = vectors::inputs();
         assert_eq!(
             proof(
                 &key,
                 SERVER_PROOF_DOMAIN,
                 &client_nonce,
                 &server_nonce,
+                vectors::DAEMON_VER,
                 &daemon_id,
             ),
-            [
-                234, 174, 245, 201, 145, 181, 54, 105, 225, 195, 92, 24, 185, 58, 79, 43, 27, 172,
-                41, 84, 85, 12, 15, 144, 129, 65, 174, 41, 163, 57, 206, 192,
-            ],
+            vectors::SERVER_PROOF,
         );
         assert_eq!(
             proof(
@@ -443,12 +468,24 @@ mod tests {
                 CLIENT_AUTH_DOMAIN,
                 &client_nonce,
                 &server_nonce,
+                vectors::DAEMON_VER,
                 &daemon_id,
             ),
-            [
-                168, 51, 199, 61, 160, 183, 32, 109, 223, 82, 6, 97, 222, 1, 81, 240, 135, 27, 140,
-                91, 196, 171, 21, 161, 69, 59, 214, 117, 64, 99, 228, 205,
-            ],
+            vectors::CLIENT_AUTH,
+        );
+    }
+
+    #[test]
+    fn peer_closed_reports_live_then_dropped_sentinel() {
+        let (client, host) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        assert!(
+            !super::peer_closed(&client),
+            "a held setup socket is not closed"
+        );
+        drop(host);
+        assert!(
+            super::peer_closed(&client),
+            "dropping the host end must surface as closed"
         );
     }
 }

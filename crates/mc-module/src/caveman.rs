@@ -1,11 +1,24 @@
 //! Deterministic caveman-style text compression.
 //!
-//! This is a byte-for-byte Rust port of
-//! `packages/plugin/src/hooks/magic-context/caveman.ts`. Keep the transformation
-//! order and ASCII word-boundary rules aligned with that source: the committed
-//! differential fixture is the compatibility contract.
+//! Two artifacts define the byte-level output contract: the committed
+//! differential fixture (`testdata/caveman-golden.json`) and the naive
+//! reference model in `tests/caveman_reference.rs`, which is a direct port of
+//! `packages/plugin/src/hooks/magic-context/caveman.ts`. `compress` must
+//! match both exactly; keep the transformation order and ASCII word-boundary
+//! rules aligned with that source.
+//!
+//! Pattern scanning uses prepared matchers: one case-insensitive Aho-Corasick
+//! automaton per dropped-phrase set, and one `memmem::Finder` per replacement
+//! pattern scanning a lowercase byte shadow of the working text. Sequential
+//! per-pattern pass order is semantically load-bearing: a pass can create
+//! text that a later pattern matches ("due in order to the fact that"
+//! shortens to "due to the fact that", which the next pattern shortens to
+//! "because"), so the passes must not be merged into one automaton.
 
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use memchr::memmem::Finder;
 use regex::Regex;
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,18 +163,327 @@ fn ascii_eq_at(text: &str, offset: usize, needle: &str) -> bool {
     candidate.len() == needle.len() && candidate.eq_ignore_ascii_case(needle)
 }
 
-fn find_phrase_at<'a>(text: &str, offset: usize, phrases: &'a [&'a str]) -> Option<&'a str> {
-    phrases.iter().copied().find(|phrase| {
-        ascii_eq_at(text, offset, phrase)
-            && has_word_boundary_before(text, offset)
-            && has_word_boundary_after(text, offset + phrase.len())
+/// Byte-level twin of `has_word_boundary_before`/`after`. All needles are
+/// pure ASCII, so a match's edge offsets sit on char boundaries, and any
+/// UTF-8 lead or continuation byte (>= 0x80) is non-word exactly like the
+/// non-ASCII char it belongs to.
+#[inline]
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn phrase_automaton(patterns: &[&str]) -> AhoCorasick {
+    AhoCorasickBuilder::new()
+        .ascii_case_insensitive(true)
+        .match_kind(MatchKind::LeftmostFirst)
+        .build(patterns)
+        .expect("static pattern set builds")
+}
+
+fn filler_automaton() -> &'static AhoCorasick {
+    static A: OnceLock<AhoCorasick> = OnceLock::new();
+    A.get_or_init(|| phrase_automaton(FILLER_WORDS))
+}
+
+fn hedging_automaton() -> &'static AhoCorasick {
+    static A: OnceLock<AhoCorasick> = OnceLock::new();
+    A.get_or_init(|| phrase_automaton(HEDGING_PHRASES))
+}
+
+fn pleasantries_automaton() -> &'static AhoCorasick {
+    static A: OnceLock<AhoCorasick> = OnceLock::new();
+    A.get_or_init(|| phrase_automaton(PLEASANTRIES))
+}
+
+/// Drops every whole-word occurrence of the automaton's phrases, along with
+/// the whitespace run immediately preceding each dropped phrase.
+///
+/// The automaton must be leftmost-first over a set in which no phrase is a
+/// prefix of another (asserted by `pattern_set_invariants`): at most one
+/// phrase can then match at a given start position, so the leftmost match is
+/// the same one a position-by-position scan selects. A candidate that fails a
+/// word-boundary check restarts the search one byte later, which keeps
+/// overlapping later candidates reachable.
+fn drop_phrases<'a>(text: &'a str, automaton: &AhoCorasick) -> Cow<'a, str> {
+    let bytes = text.as_bytes();
+    let mut out: Option<String> = None;
+    // Bytes below `pending` are already emitted or dropped.
+    let mut pending = 0usize;
+    let mut search = 0usize;
+    while search < bytes.len() {
+        let Some(m) = automaton.find(&bytes[search..]) else {
+            break;
+        };
+        let s = search + m.start();
+        let e = search + m.end();
+        let before_ok = s == 0 || !is_word_byte(bytes[s - 1]);
+        let after_ok = e >= bytes.len() || !is_word_byte(bytes[e]);
+        if !(before_ok && after_ok) {
+            search = s + 1;
+            continue;
+        }
+        // A dropped phrase absorbs the maximal Unicode-whitespace run
+        // immediately before it, bounded by the previous drop point.
+        let mut run_start = s;
+        while run_start > pending {
+            let ch = text[..run_start]
+                .chars()
+                .next_back()
+                .expect("run_start > 0 within text");
+            if ch.is_whitespace() {
+                run_start -= ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let out_ref = out.get_or_insert_with(|| String::with_capacity(text.len()));
+        out_ref.push_str(&text[pending..run_start]);
+        pending = e;
+        search = e;
+    }
+    match out {
+        None => Cow::Borrowed(text),
+        Some(mut o) => {
+            o.push_str(&text[pending..]);
+            Cow::Owned(o)
+        }
+    }
+}
+
+/// Working text plus a lowercase byte shadow kept in exact sync. ASCII
+/// lowering is length-preserving, so shadow offsets equal text offsets, and
+/// a case-insensitive needle search over the shadow is an exact byte search.
+struct ShadowedText {
+    text: String,
+    shadow: Vec<u8>,
+}
+
+impl ShadowedText {
+    fn new(text: String) -> Self {
+        let shadow = text.bytes().map(|b| b.to_ascii_lowercase()).collect();
+        Self { text, shadow }
+    }
+}
+
+/// Replaces whole-word, ASCII-case-insensitive occurrences of the finder's
+/// needle. With `uppercase_first`, a match whose first source byte is an
+/// ASCII uppercase letter receives the replacement with its first letter
+/// uppercased (the abbreviation-pass case rule). A pass with no verified
+/// match leaves the buffers untouched.
+fn replace_word_phrase(
+    buf: &mut ShadowedText,
+    finder: &Finder<'_>,
+    needle_len: usize,
+    replacement: &str,
+    uppercase_first: bool,
+) {
+    let mut pos = 0usize;
+    let mut pending = 0usize;
+    let mut out: Option<(String, Vec<u8>)> = None;
+    while pos < buf.shadow.len() {
+        let Some(off) = finder.find(&buf.shadow[pos..]) else {
+            break;
+        };
+        let s = pos + off;
+        let e = s + needle_len;
+        let before_ok = s == 0 || !is_word_byte(buf.shadow[s - 1]);
+        let after_ok = e >= buf.shadow.len() || !is_word_byte(buf.shadow[e]);
+        if !(before_ok && after_ok) {
+            pos = s + 1;
+            continue;
+        }
+        let (out_text, out_shadow) = out.get_or_insert_with(|| {
+            (
+                String::with_capacity(buf.text.len()),
+                Vec::with_capacity(buf.text.len()),
+            )
+        });
+        out_text.push_str(&buf.text[pending..s]);
+        out_shadow.extend_from_slice(&buf.shadow[pending..s]);
+        if uppercase_first && buf.text.as_bytes()[s].is_ascii_uppercase() {
+            let mut cased = replacement.to_string();
+            if let Some(first) = cased.get_mut(0..1) {
+                first.make_ascii_uppercase();
+            }
+            out_text.push_str(&cased);
+        } else {
+            out_text.push_str(replacement);
+        }
+        out_shadow.extend(replacement.bytes().map(|b| b.to_ascii_lowercase()));
+        pending = e;
+        pos = e;
+    }
+    if let Some((mut out_text, mut out_shadow)) = out {
+        out_text.push_str(&buf.text[pending..]);
+        out_shadow.extend_from_slice(&buf.shadow[pending..]);
+        buf.text = out_text;
+        buf.shadow = out_shadow;
+    }
+}
+
+/// Replaces case-sensitive literal occurrences of the finder's needle, with
+/// no word-boundary requirement. The finder must scan the original text, not
+/// the shadow, to preserve case sensitivity.
+fn replace_literal_phrase(
+    buf: &mut ShadowedText,
+    finder: &Finder<'_>,
+    needle_len: usize,
+    replacement: &str,
+) {
+    let mut pos = 0usize;
+    let mut pending = 0usize;
+    let mut out: Option<(String, Vec<u8>)> = None;
+    while pos < buf.text.len() {
+        let Some(off) = finder.find(&buf.text.as_bytes()[pos..]) else {
+            break;
+        };
+        let s = pos + off;
+        let e = s + needle_len;
+        let (out_text, out_shadow) = out.get_or_insert_with(|| {
+            (
+                String::with_capacity(buf.text.len()),
+                Vec::with_capacity(buf.text.len()),
+            )
+        });
+        out_text.push_str(&buf.text[pending..s]);
+        out_shadow.extend_from_slice(&buf.shadow[pending..s]);
+        out_text.push_str(replacement);
+        out_shadow.extend(replacement.bytes().map(|b| b.to_ascii_lowercase()));
+        pending = e;
+        pos = e;
+    }
+    if let Some((mut out_text, mut out_shadow)) = out {
+        out_text.push_str(&buf.text[pending..]);
+        out_shadow.extend_from_slice(&buf.shadow[pending..]);
+        buf.text = out_text;
+        buf.shadow = out_shadow;
+    }
+}
+
+/// Counts whole-word occurrences, stopping at `limit`. The only caller
+/// compares the count against 3, so counting past the limit is wasted work.
+fn count_word_occurrences(
+    buf: &ShadowedText,
+    finder: &Finder<'_>,
+    needle_len: usize,
+    limit: usize,
+) -> usize {
+    let mut pos = 0usize;
+    let mut count = 0usize;
+    while pos < buf.shadow.len() {
+        let Some(off) = finder.find(&buf.shadow[pos..]) else {
+            break;
+        };
+        let s = pos + off;
+        let e = s + needle_len;
+        let before_ok = s == 0 || !is_word_byte(buf.shadow[s - 1]);
+        let after_ok = e >= buf.shadow.len() || !is_word_byte(buf.shadow[e]);
+        if before_ok && after_ok {
+            count += 1;
+            if count >= limit {
+                return count;
+            }
+            pos = e;
+        } else {
+            pos = s + 1;
+        }
+    }
+    count
+}
+
+fn shortening_finders() -> &'static [Finder<'static>] {
+    static F: OnceLock<Vec<Finder<'static>>> = OnceLock::new();
+    F.get_or_init(|| {
+        PHRASE_SHORTENINGS
+            .iter()
+            .map(|(phrase, _)| Finder::new(phrase.as_bytes()))
+            .collect()
     })
 }
 
+fn connective_finders() -> &'static [Finder<'static>] {
+    static F: OnceLock<Vec<Finder<'static>>> = OnceLock::new();
+    F.get_or_init(|| {
+        ULTRA_CONNECTIVE_REPLACEMENTS
+            .iter()
+            .map(|(phrase, _)| Finder::new(phrase.as_bytes()))
+            .collect()
+    })
+}
+
+fn abbreviation_finders() -> &'static [Finder<'static>] {
+    static F: OnceLock<Vec<Finder<'static>>> = OnceLock::new();
+    F.get_or_init(|| {
+        ULTRA_ABBREVIATIONS
+            .iter()
+            .map(|(term, _)| Finder::new(term.as_bytes()))
+            .collect()
+    })
+}
+
+fn apply_phrase_shortenings(buf: &mut ShadowedText) {
+    for (i, (phrase, replacement)) in PHRASE_SHORTENINGS.iter().enumerate() {
+        replace_word_phrase(
+            buf,
+            &shortening_finders()[i],
+            phrase.len(),
+            replacement,
+            false,
+        );
+    }
+}
+
+fn apply_ultra_connectives(buf: &mut ShadowedText) {
+    for (i, (phrase, replacement)) in ULTRA_CONNECTIVE_REPLACEMENTS.iter().enumerate() {
+        if phrase.starts_with(' ') && phrase.ends_with(' ') {
+            replace_literal_phrase(buf, &connective_finders()[i], phrase.len(), replacement);
+        } else {
+            replace_word_phrase(
+                buf,
+                &connective_finders()[i],
+                phrase.len(),
+                replacement,
+                false,
+            );
+        }
+    }
+}
+
+fn apply_ultra_abbreviations(buf: &mut ShadowedText) {
+    for (i, (term, abbreviation)) in ULTRA_ABBREVIATIONS.iter().enumerate() {
+        if count_word_occurrences(buf, &abbreviation_finders()[i], term.len(), 3) < 3 {
+            continue;
+        }
+        replace_word_phrase(
+            buf,
+            &abbreviation_finders()[i],
+            term.len(),
+            abbreviation,
+            true,
+        );
+    }
+}
+
 fn protect_regex(text: &str, regex: &Regex, preserved: &mut Vec<PreservedRegion>) -> String {
+    protect_regex_filtered(text, regex, preserved, |_, _, _| true)
+}
+
+/// Like `protect_regex`, but a match is preserved only when `accept(text,
+/// start, end)` holds; rejected matches pass through unchanged. This keeps the
+/// placeholder-minting invariant (`\u{0}MC_PRES_{index}\u{0}` with
+/// `preserved.len()` as the index) in one owner.
+fn protect_regex_filtered(
+    text: &str,
+    regex: &Regex,
+    preserved: &mut Vec<PreservedRegion>,
+    accept: impl Fn(&str, usize, usize) -> bool,
+) -> String {
     let mut output = String::with_capacity(text.len());
     let mut cursor = 0;
     for matched in regex.find_iter(text) {
+        if !accept(text, matched.start(), matched.end()) {
+            continue;
+        }
         output.push_str(&text[cursor..matched.start()]);
         let placeholder = format!("\u{0}MC_PRES_{}\u{0}", preserved.len());
         preserved.push(PreservedRegion {
@@ -178,49 +500,18 @@ fn protect_regex(text: &str, regex: &Regex, preserved: &mut Vec<PreservedRegion>
 fn protect_identifier_regions(text: &str, preserved: &mut Vec<PreservedRegion>) -> String {
     static IDENTIFIER: OnceLock<Regex> = OnceLock::new();
     let regex = IDENTIFIER.get_or_init(|| Regex::new(r"(?:msg|ses|toolu)_[A-Za-z0-9]+").unwrap());
-    let mut output = String::with_capacity(text.len());
-    let mut cursor = 0;
-    for matched in regex.find_iter(text) {
-        if !has_word_boundary_before(text, matched.start())
-            || !has_word_boundary_after(text, matched.end())
-        {
-            continue;
-        }
-        output.push_str(&text[cursor..matched.start()]);
-        let placeholder = format!("\u{0}MC_PRES_{}\u{0}", preserved.len());
-        preserved.push(PreservedRegion {
-            placeholder: placeholder.clone(),
-            original: matched.as_str().to_string(),
-        });
-        output.push_str(&placeholder);
-        cursor = matched.end();
-    }
-    output.push_str(&text[cursor..]);
-    output
+    protect_regex_filtered(text, regex, preserved, |text, start, end| {
+        has_word_boundary_before(text, start) && has_word_boundary_after(text, end)
+    })
 }
 
 fn protect_hash_regions(text: &str, preserved: &mut Vec<PreservedRegion>) -> String {
     static HASH: OnceLock<Regex> = OnceLock::new();
     let regex = HASH.get_or_init(|| Regex::new(r"[0-9a-fA-F]{7,40}").unwrap());
-    let mut output = String::with_capacity(text.len());
-    let mut cursor = 0;
-    for matched in regex.find_iter(text) {
-        if previous_char(text, matched.start()).is_some_and(|ch| ch.is_ascii_alphanumeric())
-            || next_char(text, matched.end()).is_some_and(|ch| ch.is_ascii_alphanumeric())
-        {
-            continue;
-        }
-        output.push_str(&text[cursor..matched.start()]);
-        let placeholder = format!("\u{0}MC_PRES_{}\u{0}", preserved.len());
-        preserved.push(PreservedRegion {
-            placeholder: placeholder.clone(),
-            original: matched.as_str().to_string(),
-        });
-        output.push_str(&placeholder);
-        cursor = matched.end();
-    }
-    output.push_str(&text[cursor..]);
-    output
+    protect_regex_filtered(text, regex, preserved, |text, start, end| {
+        !previous_char(text, start).is_some_and(|ch| ch.is_ascii_alphanumeric())
+            && !next_char(text, end).is_some_and(|ch| ch.is_ascii_alphanumeric())
+    })
 }
 
 fn protect_regions(text: &str) -> (String, Vec<PreservedRegion>) {
@@ -265,42 +556,64 @@ fn protect_regions(text: &str) -> (String, Vec<PreservedRegion>) {
     (working, preserved)
 }
 
-fn restore_regions(text: &str, preserved: &[PreservedRegion]) -> String {
-    let mut working = text.to_string();
-    for region in preserved.iter().rev() {
-        working = working.replace(&region.placeholder, &region.original);
-    }
-    working
+fn placeholder_marker_finder() -> &'static Finder<'static> {
+    static F: OnceLock<Finder<'static>> = OnceLock::new();
+    F.get_or_init(|| Finder::new(b"\0MC_PRES_"))
 }
 
-fn drop_phrases(text: &str, phrases: &[&str]) -> String {
-    let mut output = String::with_capacity(text.len());
-    let mut cursor = 0;
-    while cursor < text.len() {
-        if text[cursor..]
-            .chars()
-            .next()
-            .is_some_and(char::is_whitespace)
-        {
-            let mut phrase_start = cursor;
-            while phrase_start < text.len()
-                && next_char(text, phrase_start).is_some_and(char::is_whitespace)
-            {
-                phrase_start += next_char(text, phrase_start).unwrap().len_utf8();
-            }
-            if let Some(phrase) = find_phrase_at(text, phrase_start, phrases) {
-                cursor = phrase_start + phrase.len();
-                continue;
-            }
-        } else if let Some(phrase) = find_phrase_at(text, cursor, phrases) {
-            cursor += phrase.len();
+const PLACEHOLDER_MARKER_LEN: usize = "\u{0}MC_PRES_".len();
+
+/// Restores preserved regions in one left-to-right scan with recursive
+/// expansion of nested placeholders.
+///
+/// Region `i`'s captured original can only embed placeholders with index
+/// less than `i`: later regions did not exist when `i` was captured, and
+/// matches within one protect pass never overlap. `max_idx` enforces that
+/// bound, so recursion strictly decreases and terminates. Text that merely
+/// resembles a placeholder — an out-of-bound index, malformed digits, or any
+/// byte mismatch against the canonical placeholder string — stays literal.
+fn restore_regions(text: &str, preserved: &[PreservedRegion]) -> String {
+    if preserved.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    restore_into(text, preserved, preserved.len(), &mut out);
+    out
+}
+
+fn restore_into(text: &str, preserved: &[PreservedRegion], max_idx: usize, out: &mut String) {
+    let bytes = text.as_bytes();
+    let mut pos = 0usize;
+    let mut pending = 0usize;
+    while pos < bytes.len() {
+        let Some(off) = placeholder_marker_finder().find(&bytes[pos..]) else {
+            break;
+        };
+        let s = pos + off;
+        let digits_start = s + PLACEHOLDER_MARKER_LEN;
+        let mut j = digits_start;
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j == digits_start || j >= bytes.len() || bytes[j] != 0 {
+            pos = s + 1;
             continue;
         }
-        let ch = next_char(text, cursor).expect("cursor is on a character boundary");
-        output.push(ch);
-        cursor += ch.len_utf8();
+        let idx: usize = std::str::from_utf8(&bytes[digits_start..j])
+            .expect("digits are ascii")
+            .parse()
+            .unwrap_or(usize::MAX);
+        let end = j + 1;
+        if idx < max_idx && preserved[idx].placeholder.as_bytes() == &bytes[s..end] {
+            out.push_str(&text[pending..s]);
+            restore_into(&preserved[idx].original, preserved, idx, out);
+            pending = end;
+            pos = end;
+        } else {
+            pos = s + 1;
+        }
     }
-    output
+    out.push_str(&text[pending..]);
 }
 
 fn drop_articles(text: &str) -> String {
@@ -375,9 +688,19 @@ fn matches_participle(text: &str, offset: usize) -> bool {
         .any(|suffix| token.ends_with(suffix))
 }
 
+/// `AUXILIARIES` ordered longest-first, so multi-word forms ("has been") win
+/// over their embedded single words ("been") at the same position.
+fn sorted_auxiliaries() -> &'static [&'static str] {
+    static SORTED: OnceLock<Vec<&'static str>> = OnceLock::new();
+    SORTED.get_or_init(|| {
+        let mut auxiliaries = AUXILIARIES.to_vec();
+        auxiliaries.sort_by_key(|aux| std::cmp::Reverse(aux.len()));
+        auxiliaries
+    })
+}
+
 fn drop_auxiliaries(text: &str) -> String {
-    let mut auxiliaries = AUXILIARIES.to_vec();
-    auxiliaries.sort_by_key(|aux| std::cmp::Reverse(aux.len()));
+    let auxiliaries = sorted_auxiliaries();
 
     let mut output = String::with_capacity(text.len());
     let mut cursor = 0;
@@ -426,113 +749,6 @@ fn drop_auxiliaries(text: &str) -> String {
     collapse_ascii_spaces(&output)
 }
 
-fn replace_word_phrase(text: &str, phrase: &str, replacement: &str) -> String {
-    let mut output = String::with_capacity(text.len());
-    let mut cursor = 0;
-    while cursor < text.len() {
-        if ascii_eq_at(text, cursor, phrase)
-            && has_word_boundary_before(text, cursor)
-            && has_word_boundary_after(text, cursor + phrase.len())
-        {
-            output.push_str(replacement);
-            cursor += phrase.len();
-        } else {
-            let ch = next_char(text, cursor).unwrap();
-            output.push(ch);
-            cursor += ch.len_utf8();
-        }
-    }
-    output
-}
-
-fn replace_literal_phrase(text: &str, phrase: &str, replacement: &str) -> String {
-    let mut output = String::with_capacity(text.len());
-    let mut cursor = 0;
-    while cursor < text.len() {
-        if text[cursor..].starts_with(phrase) {
-            output.push_str(replacement);
-            cursor += phrase.len();
-        } else {
-            let ch = next_char(text, cursor).unwrap();
-            output.push(ch);
-            cursor += ch.len_utf8();
-        }
-    }
-    output
-}
-
-fn apply_phrase_shortenings(text: &str) -> String {
-    PHRASE_SHORTENINGS
-        .iter()
-        .fold(text.to_string(), |working, (phrase, replacement)| {
-            replace_word_phrase(&working, phrase, replacement)
-        })
-}
-
-fn apply_ultra_connectives(text: &str) -> String {
-    ULTRA_CONNECTIVE_REPLACEMENTS
-        .iter()
-        .fold(text.to_string(), |working, (phrase, replacement)| {
-            if phrase.starts_with(' ') && phrase.ends_with(' ') {
-                replace_literal_phrase(&working, phrase, replacement)
-            } else {
-                replace_word_phrase(&working, phrase, replacement)
-            }
-        })
-}
-
-fn count_word_occurrences(text: &str, term: &str) -> usize {
-    let mut count = 0;
-    let mut cursor = 0;
-    while cursor < text.len() {
-        if ascii_eq_at(text, cursor, term)
-            && has_word_boundary_before(text, cursor)
-            && has_word_boundary_after(text, cursor + term.len())
-        {
-            count += 1;
-            cursor += term.len();
-        } else {
-            cursor += next_char(text, cursor).unwrap().len_utf8();
-        }
-    }
-    count
-}
-
-fn apply_ultra_abbreviations(text: &str) -> String {
-    ULTRA_ABBREVIATIONS
-        .iter()
-        .fold(text.to_string(), |working, (term, abbreviation)| {
-            if count_word_occurrences(&working, term) < 3 {
-                return working;
-            }
-            let mut output = String::with_capacity(working.len());
-            let mut cursor = 0;
-            while cursor < working.len() {
-                if ascii_eq_at(&working, cursor, term)
-                    && has_word_boundary_before(&working, cursor)
-                    && has_word_boundary_after(&working, cursor + term.len())
-                {
-                    let first = working[cursor..].chars().next().unwrap();
-                    if first.is_ascii_uppercase() {
-                        let mut replacement = abbreviation.to_string();
-                        if let Some(first) = replacement.get_mut(0..1) {
-                            first.make_ascii_uppercase();
-                        }
-                        output.push_str(&replacement);
-                    } else {
-                        output.push_str(abbreviation);
-                    }
-                    cursor += term.len();
-                } else {
-                    let ch = next_char(&working, cursor).unwrap();
-                    output.push(ch);
-                    cursor += ch.len_utf8();
-                }
-            }
-            output
-        })
-}
-
 fn transform_preserving_user_lines(text: &str, transform: impl Fn(&str) -> String) -> String {
     let lines: Vec<&str> = text.split('\n').collect();
     let mut output = Vec::with_capacity(lines.len());
@@ -576,9 +792,23 @@ fn normalize_whitespace(text: &str) -> String {
         }
         lines.push(normalized);
     }
-    let mut output = lines.join("\n");
-    while output.contains("\n\n\n") {
-        output = output.replace("\n\n\n", "\n\n");
+    let joined = lines.join("\n");
+    if !joined.contains("\n\n\n") {
+        return joined;
+    }
+    // Cap every newline run at two, the fixpoint of "\n\n\n" -> "\n\n".
+    let mut output = String::with_capacity(joined.len());
+    let mut run = 0usize;
+    for ch in joined.chars() {
+        if ch == '\n' {
+            run += 1;
+            if run > 2 {
+                continue;
+            }
+        } else {
+            run = 0;
+        }
+        output.push(ch);
     }
     output
 }
@@ -590,19 +820,21 @@ pub fn compress(text: &str, level: CavemanLevel) -> String {
     }
     let (protected_text, preserved) = protect_regions(text);
     let transformed = transform_preserving_user_lines(&protected_text, |chunk| {
-        let mut working = drop_phrases(chunk, FILLER_WORDS);
-        working = drop_phrases(&working, HEDGING_PHRASES);
-        working = drop_phrases(&working, PLEASANTRIES);
-        working = apply_phrase_shortenings(&working);
+        let a = drop_phrases(chunk, filler_automaton());
+        let b = drop_phrases(&a, hedging_automaton());
+        let c = drop_phrases(&b, pleasantries_automaton());
+
+        let mut buf = ShadowedText::new(c.into_owned());
+        apply_phrase_shortenings(&mut buf);
         if matches!(level, CavemanLevel::Full | CavemanLevel::Ultra) {
-            working = drop_auxiliaries(&working);
-            working = drop_articles(&working);
+            let working = drop_auxiliaries(&buf.text);
+            buf = ShadowedText::new(drop_articles(&working));
         }
         if level == CavemanLevel::Ultra {
-            working = apply_ultra_connectives(&working);
-            working = apply_ultra_abbreviations(&working);
+            apply_ultra_connectives(&mut buf);
+            apply_ultra_abbreviations(&mut buf);
         }
-        working
+        buf.text
     });
     normalize_whitespace(&restore_regions(&transformed, &preserved))
         .trim()
@@ -645,6 +877,51 @@ mod tests {
                 case.ultra,
                 "ultra: {:?}",
                 case.text
+            );
+        }
+    }
+
+    /// `drop_phrases` relies on leftmost-first automaton semantics matching a
+    /// position-by-position scan, which requires that no phrase in a set is a
+    /// prefix of another and that every phrase is non-empty ASCII starting
+    /// with a non-whitespace byte. Guards pattern-set edits that would break
+    /// those assumptions silently.
+    #[test]
+    fn pattern_set_invariants() {
+        for set in [FILLER_WORDS, HEDGING_PHRASES, PLEASANTRIES] {
+            for (i, a) in set.iter().enumerate() {
+                assert!(a.is_ascii(), "needle must be ascii: {a:?}");
+                assert!(!a.is_empty(), "needle must be non-empty");
+                assert!(
+                    !a.as_bytes()[0].is_ascii_whitespace(),
+                    "needle must start non-whitespace: {a:?}"
+                );
+                assert_eq!(
+                    a.to_ascii_lowercase(),
+                    *a,
+                    "needle must be lowercase: {a:?}"
+                );
+                for (j, b) in set.iter().enumerate() {
+                    if i != j {
+                        assert!(
+                            !b.starts_with(a),
+                            "prefix pair breaks leftmost-first equivalence: {a:?} / {b:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // Shadow scans require ASCII lowercase needles.
+        for (needle, _) in PHRASE_SHORTENINGS
+            .iter()
+            .chain(ULTRA_CONNECTIVE_REPLACEMENTS)
+            .chain(ULTRA_ABBREVIATIONS)
+        {
+            assert!(needle.is_ascii(), "needle must be ascii: {needle:?}");
+            assert_eq!(
+                needle.to_ascii_lowercase(),
+                *needle,
+                "needle must be lowercase: {needle:?}"
             );
         }
     }

@@ -20,11 +20,9 @@ use crate::control::{parse_control, ControlAction, CODE_INVALID_CONTROL_REQUEST}
 use crate::dispatch::{
     close_generation, dispatch_request, emit_error_terminal, handle_cancel, open_route,
 };
-use crate::frame_channel::{
-    FrameReceiver, FrameSender, InboundEvent, OutboundFrame, ReadClose, RejectedFrame,
-};
+use crate::frame_channel::{FrameSender, InboundEvent, OutboundFrame, ReadClose, RejectedFrame};
 use crate::handler::McHostHandler;
-use crate::ring_transport::PreparedRing;
+use crate::ring_transport::{PreparedRing, ShmReceiver};
 use crate::routing::CloseDecision;
 use crate::runtime::HostShared;
 use crate::wire::{encode_owned_frame, pure_header_flags, FrameId};
@@ -144,9 +142,29 @@ pub async fn run_connection<H: McHostHandler>(
     let ingress = shared.ingress_budget.clone();
     let queue_frames = shared.limits.writer_queue_frames;
     let frame_deadline = shared.timing.frame_deadline;
-    let prepared =
+    let mut prepared =
         tokio::task::spawn_blocking(move || ring.prepare(ingress, queue_frames, frame_deadline));
-    let Ok(Ok(Ok(PreparedRing {
+    // A timed-out `prepare` continues because `spawn_blocking` cannot abort it.
+    // A dropped `CancellationToken` does not cancel `root`; late completion
+    // discards `sender` and cancels `root`.
+    let prepared = match timeout_at(
+        Instant::now() + shared.timing.transport_setup_deadline,
+        &mut prepared,
+    )
+    .await
+    {
+        Ok(joined) => joined,
+        Err(_) => {
+            shared.spawn_tracked(async move {
+                if let Ok(Ok(late)) = prepared.await {
+                    late.sender.discard();
+                    late.root.cancel();
+                }
+            });
+            return;
+        }
+    };
+    let Ok(Ok(PreparedRing {
         descriptor,
         descriptors,
         sender,
@@ -154,11 +172,7 @@ pub async fn run_connection<H: McHostHandler>(
         io,
         root,
         read_cancel,
-    }))) = timeout_at(
-        Instant::now() + shared.timing.transport_setup_deadline,
-        prepared,
-    )
-    .await
+    })) = prepared
     else {
         return;
     };
@@ -184,7 +198,6 @@ pub async fn run_connection<H: McHostHandler>(
         return;
     }
     drop(descriptors);
-    shared.ring.record_attachment();
     shared.ring.record_activation();
 
     let io_task = AbortOnDropHandle::new(shared.tracker.spawn(io));
@@ -249,10 +262,10 @@ fn new_generation<H: McHostHandler>(
 /// Serves one finalized frame channel to retirement: register, read, drain,
 /// close. Returns the candidate handoff if the read loop granted one, so the
 /// caller can promote or reap it after this channel is fully torn down.
-async fn serve_generation<H: McHostHandler, C: FrameReceiver>(
+async fn serve_generation<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     gen: Arc<GenerationCore>,
-    channel: C,
+    channel: ShmReceiver,
     mut io_task: AbortOnDropHandle<()>,
 ) {
     // Retained past `gen`: the writer must be told to stop even when a
@@ -370,10 +383,10 @@ enum ReadExit {
 }
 
 /// Serves validated frames until close. Returning retires the generation.
-async fn read_loop<H: McHostHandler, C: FrameReceiver>(
+async fn read_loop<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     gen: &Arc<GenerationCore>,
-    mut channel: C,
+    mut channel: ShmReceiver,
 ) -> ReadExit {
     // Highest consumer Request correlation seen; any non-increasing Request
     // closes the generation before dispatch (protocol §8.3, V44). A promoted

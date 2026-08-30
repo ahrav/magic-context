@@ -32,13 +32,13 @@ import {
 import { credentialFingerprints } from "./credential-fingerprint";
 import { armExpiryTimer, Deadline, type MonotonicClock } from "./deadline";
 import {
+    DAEMON_GENERATION_CHANGED_CODE,
     isMcHostCallError,
     McHostCallError,
     McHostClientError,
     SocketTimeoutError,
 } from "./errors";
 import { bytesFrameBody, type DirectFrameBody, ReceiveLease, utf8FrameBody } from "./frame-channel";
-import { PROTOCOL_VERSION } from "./protocol";
 import {
     belongsToConnection,
     createRouteHandle,
@@ -46,7 +46,6 @@ import {
     type RouteHandle,
     StaleRouteHandleError,
 } from "./route-handle";
-import { classifySharedMemoryFailure } from "./shared-memory-failure";
 import type {
     AuthenticatedPeer,
     BindIdentity,
@@ -60,13 +59,8 @@ import type {
     PublicationDiagnostics,
     RequestOptions,
     RouteTarget,
-    SharedMemoryDiagnostics,
-    SharedMemoryResourceCounts,
-    SharedMemoryTerminalClass,
 } from "./types";
-
-const QUALIFIED_TEST_PROFILE = "mc-host-eventfd-ring-v2" as const;
-const DESCRIPTOR_SCHEMA_VERSION = 3 as const;
+import { sameDaemonId } from "./types";
 
 /** Preserves the repo's current 2-second TypeScript handshake budget. */
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 2_000;
@@ -109,13 +103,8 @@ export interface McHostDiagnosticsEvent {
     readonly daemonVer?: string;
     readonly pid?: number;
     readonly reason?: string;
-    readonly health?: "healthy" | "terminal";
-    readonly errorClass?: SharedMemoryTerminalClass;
-    readonly artifact?: Readonly<{
-        profile: typeof QUALIFIED_TEST_PROFILE;
-        wireVersion: typeof PROTOCOL_VERSION;
-        descriptorSchema: typeof DESCRIPTOR_SCHEMA_VERSION;
-    }>;
+    /** Sole application transport. */
+    readonly transport?: "shm";
 }
 
 export type McHostDiagnosticsObserver = (event: McHostDiagnosticsEvent) => void;
@@ -153,6 +142,8 @@ interface ActiveConnection {
     readonly token: object;
     readonly snapshot: ConnectionSnapshot;
     readonly liveRoutes: Map<number, RouteHandle>;
+    /** Sole application transport. */
+    transport: "shm";
 }
 
 interface CachedManagedRoute {
@@ -272,6 +263,9 @@ interface RequestParams {
     deadline: Deadline;
     options: RequestOptions;
     responseMode?: "json" | "binary";
+    mode?: "unary" | "stream";
+    /** Retained-item ceiling for a stream-mode request. */
+    maxStreamItems?: number;
     binary?: boolean;
 }
 
@@ -397,17 +391,8 @@ export class McHostClient {
      */
     static async connect(options: McHostClientOptions): Promise<McHostClient> {
         const client = new McHostClient(options);
-        try {
-            await client.ensureConnection(Deadline.start(client.handshakeTimeoutMs, client.clock));
-            return client;
-        } catch (error) {
-            client.emitDiagnostics({
-                type: "retired",
-                health: "terminal",
-                errorClass: classifySharedMemoryFailure(error),
-            });
-            throw error;
-        }
+        await client.ensureConnection(Deadline.start(client.handshakeTimeoutMs, client.clock));
+        return client;
     }
 
     /** The daemon version reported by the current connection, if any. */
@@ -445,19 +430,18 @@ export class McHostClient {
         return { daemonVer: active.snapshot.daemonVer, pid: active.snapshot.pid };
     }
 
-    /** True after irreversible owner close begins. */
-    get isClosed(): boolean {
-        return this.closeStarted;
-    }
-
     /**
      * Open a route and return its connection-bound immutable handle. One
      * attempt under one bounded deadline; retry policy belongs to owners
      * above (managed `call()` owns its own allowlisted retry loop).
      */
-    async routeOpen(target: RouteTarget, identity: BindIdentity): Promise<RouteHandle> {
+    async routeOpen(
+        target: RouteTarget,
+        identity: BindIdentity,
+        options: Pick<RequestOptions, "expectedDaemonId"> = {},
+    ): Promise<RouteHandle> {
         const deadline = Deadline.start(this.routeOpenDeadlineMs, this.clock);
-        const active = await this.ensureConnection(deadline);
+        const active = await this.ensureConnection(deadline, options.expectedDaemonId);
         return this.controlRouteOpen(
             active,
             target,
@@ -513,6 +497,50 @@ export class McHostClient {
             );
         }
         return terminal.body;
+    }
+
+    /**
+     * Collect one bounded JSON stream through StreamEnd, preserving item order.
+     * The stream is bounded by both the connection's pending byte budget and a
+     * retained-item ceiling, so a peer cannot make the client hold unbounded
+     * per-item decode overhead under the byte budget alone.
+     */
+    async requestStream<Item = unknown>(
+        handle: RouteHandle,
+        body: unknown,
+        options: RequestOptions & { maxStreamItems?: number } = {},
+    ): Promise<Item[]> {
+        const active = this.requireLiveHandle(handle);
+        const deadline = Deadline.start(options.timeoutMs ?? this.requestTimeoutMs, this.clock);
+        const terminal = await this.awaitRequest(active.generation, {
+            channel: handle.channel,
+            epoch: handle.epoch,
+            body: encodeBody(body),
+            deadline,
+            options,
+            mode: "stream",
+            ...(options.maxStreamItems === undefined
+                ? {}
+                : { maxStreamItems: options.maxStreamItems }),
+        });
+        if (terminal.kind !== "stream_end") {
+            throw new McHostCallError(
+                "terminal",
+                "stream request did not receive StreamEnd",
+                "expected_stream_response",
+            );
+        }
+        return terminal.stream.map((item) => {
+            const json = requireJsonReceiveBody(item);
+            if (!json.valid) {
+                throw new McHostCallError(
+                    "terminal",
+                    "stream item body was not valid JSON",
+                    "invalid_response_body",
+                );
+            }
+            return json.value as Item;
+        });
     }
 
     /**
@@ -579,6 +607,10 @@ export class McHostClient {
      * compatibility the rule for this family, so a newer daemon adding a field
      * must not strand an older client. The negotiation family (§7.7.1) is the
      * one closed-shape exception and is validated elsewhere.
+     *
+     * `timeoutMs` overrides the client-wide request timeout so a caller holding
+     * an aggregate deadline can spend only the time it has left here instead of
+     * starting a fresh full-length request budget.
      */
     async catalogSnapshot(options: { timeoutMs?: number } = {}): Promise<CatalogSnapshot> {
         const deadline = Deadline.start(options.timeoutMs ?? this.requestTimeoutMs, this.clock);
@@ -651,7 +683,10 @@ export class McHostClient {
     // Connection ownership: single-flight connect and retirement reaction.
     // ------------------------------------------------------------------
 
-    private async ensureConnection(deadline: Deadline): Promise<ActiveConnection> {
+    private async ensureConnection(
+        deadline: Deadline,
+        expectedDaemonId?: Uint8Array,
+    ): Promise<ActiveConnection> {
         // R1: one immutable handshake stage per caller, derived once from its
         // own operation deadline and kept through every join and replacement.
         const stage = deadline.stage(this.handshakeTimeoutMs);
@@ -659,7 +694,10 @@ export class McHostClient {
         for (;;) {
             if (this.closeStarted) throw new McHostClientError("client closed", "client_closed");
             const active = this.active;
-            if (active && !active.generation.isRetired()) return active;
+            if (active && !active.generation.isRetired()) {
+                this.assertExpectedDaemon(active.generation, expectedDaemonId);
+                return active;
+            }
             let flight = this.connecting;
             let owner = false;
             if (!flight) {
@@ -690,8 +728,11 @@ export class McHostClient {
                 continue;
             }
             // KTD4: adopt only a still-current, non-retired generation; a
-            // A stale success re-enters setup under the unchanged stage.
-            if (this.active === conn && !conn.generation.isRetired()) return conn;
+            // stale success re-enters recovery under the unchanged stage.
+            if (this.active === conn && !conn.generation.isRetired()) {
+                this.assertExpectedDaemon(conn.generation, expectedDaemonId);
+                return conn;
+            }
             if (stage.isExpired()) throw connectionStageError();
             // Pace the replacement dial unless a live candidate is already
             // installed (the loop head adopts it without new I/O).
@@ -748,6 +789,7 @@ export class McHostClient {
             token: newConnectionToken(),
             snapshot,
             liveRoutes: new Map(),
+            transport: "shm",
         };
         try {
             await generation.start(stage);
@@ -764,11 +806,6 @@ export class McHostClient {
         }
         // A generation that retires during setup is never published.
         if (generation.isRetired()) return conn;
-        if (this.closeStarted) {
-            generation.retire("owner_close");
-            throw new McHostClientError("client closed", "client_closed");
-        }
-        if (generation.isRetired()) return conn;
         this.active = conn;
         this.emitConnected(conn);
         return conn;
@@ -781,13 +818,7 @@ export class McHostClient {
                 cached.handle = null;
             }
         }
-        this.emitDiagnostics({
-            type: "retired",
-            reason: info.reason,
-            ...(isPeerDeath(info.reason)
-                ? { health: "terminal" as const, errorClass: "peer_death" as const }
-                : {}),
-        });
+        this.emitDiagnostics({ type: "retired", reason: info.reason });
     }
 
     private onRouteGoodbye(conn: ActiveConnection, channel: number, epoch: number): void {
@@ -824,6 +855,20 @@ export class McHostClient {
         return conn;
     }
 
+    private assertExpectedDaemon(
+        generation: ConnectionGeneration,
+        expectedDaemonId?: Uint8Array,
+    ): void {
+        if (expectedDaemonId === undefined) return;
+        if (!sameDaemonId(generation.authenticatedDaemonId, expectedDaemonId)) {
+            throw new McHostCallError(
+                "not_sent",
+                "authenticated daemon changed after lifecycle compatibility validation",
+                DAEMON_GENERATION_CHANGED_CODE,
+            );
+        }
+    }
+
     private evictHandle(handle: RouteHandle): void {
         const conn = this.connectionFor(handle);
         if (conn !== null) conn.liveRoutes.delete(handle.channel);
@@ -850,12 +895,7 @@ export class McHostClient {
             type: "connected",
             daemonVer: conn.snapshot.daemonVer.slice(0, MAX_DIAGNOSTIC_STRING_LEN),
             pid: conn.snapshot.pid,
-            health: "healthy",
-            artifact: {
-                profile: QUALIFIED_TEST_PROFILE,
-                wireVersion: PROTOCOL_VERSION,
-                descriptorSchema: DESCRIPTOR_SCHEMA_VERSION,
-            },
+            transport: conn.transport,
         });
     }
 
@@ -874,13 +914,20 @@ export class McHostClient {
         generation: ConnectionGeneration,
         params: RequestParams,
     ): Promise<RequestTerminal> {
+        // The one publication choke point every request-shaped method passes
+        // through: the daemon-binding gate runs here, before any byte is
+        // enqueued, so no publisher can forget it.
+        this.assertExpectedDaemon(generation, params.options.expectedDaemonId);
         const signal = params.options.signal;
         const pending: PendingRequest = generation.request({
             channel: params.channel,
             epoch: params.epoch,
             body: params.body,
             deadline: params.deadline,
-            mode: "unary",
+            mode: params.mode ?? "unary",
+            ...(params.maxStreamItems === undefined
+                ? {}
+                : { maxStreamItems: params.maxStreamItems }),
             responseMode: params.responseMode,
             binary: params.binary,
             priority: params.options.priority,
@@ -1055,6 +1102,12 @@ export class McHostClient {
             { kind: ManagedRouteKind }
         >;
         const consumerIdentity = this.envConsumerIdentity();
+        // The key stays daemon-independent so one logical binding owns one slot:
+        // a rotation retires the generation, so `isPrimaryLiveHandle` already
+        // refuses a handle from the previous daemon, and `assertExpectedDaemon`
+        // fences publication. Keying by identity instead would strand one entry
+        // per rotation and let a caller without an expectation open a second
+        // concurrent route for the same target.
         const key = routeCacheKey(target, identity, consumerIdentity);
         // R1: one immutable route-open stage per caller, derived once and
         // kept through every join and replacement decision.
@@ -1097,7 +1150,7 @@ export class McHostClient {
                 owner = true;
                 const slot = cached;
                 flight = makeSetupFlight(
-                    (f) => this.openCachedRoute(slot, stage, f),
+                    (f) => this.openCachedRoute(slot, stage, f, options.expectedDaemonId),
                     (f) => {
                         if (slot.opening === f) slot.opening = null;
                     },
@@ -1147,6 +1200,7 @@ export class McHostClient {
         cached: CachedManagedRoute,
         deadline: Deadline,
         flight: SetupFlight<RouteHandle>,
+        expectedDaemonId?: Uint8Array,
     ): Promise<RouteHandle> {
         let delayMs = SETUP_RETRY_BASE_MS;
         const backoff = async (): Promise<boolean> => {
@@ -1169,7 +1223,7 @@ export class McHostClient {
             }
             let active: ActiveConnection;
             try {
-                active = await this.ensureConnection(deadline);
+                active = await this.ensureConnection(deadline, expectedDaemonId);
             } catch (error) {
                 if (error instanceof McHostCallError) throw error;
                 // KTD3: a snapshot that outlives its stage names the clamped
@@ -1463,15 +1517,6 @@ function requireOpArray(value: unknown, field: string, allowEmpty: boolean): str
 }
 
 function parseHostStatusResponse(parsed: Record<string, unknown>): HostStatusSnapshot {
-    const keys = Object.keys(parsed).sort();
-    const expected = ["health", "metrics", "op", "shared_memory"];
-    if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
-        throw new McHostCallError(
-            "terminal",
-            "host.status response rejected: unexpected shape",
-            "malformed_control_response",
-        );
-    }
     if (parsed.op !== "host.status") {
         throw new McHostCallError(
             "terminal",
@@ -1498,161 +1543,24 @@ function parseHostStatusResponse(parsed: Record<string, unknown>): HostStatusSna
             "malformed_control_response",
         );
     }
+    const sharedMemory = parsed.shared_memory;
+    if (
+        sharedMemory !== undefined &&
+        (sharedMemory === null || typeof sharedMemory !== "object" || Array.isArray(sharedMemory))
+    ) {
+        throw new McHostCallError(
+            "terminal",
+            "host.status response rejected: shared_memory is not an object",
+            "malformed_control_response",
+        );
+    }
     return {
         health,
         metrics: parsed.metrics as Record<string, unknown>,
-        sharedMemory: parseSharedMemoryDiagnostics(parsed.shared_memory),
+        ...(sharedMemory === undefined
+            ? {}
+            : { sharedMemory: sharedMemory as Record<string, unknown> }),
     };
-}
-
-const RESOURCE_FIELDS = [
-    "arena_bytes",
-    "client_instances",
-    "descriptors",
-    "file_descriptors",
-    "leases",
-    "mappings",
-    "pinned_workers",
-    "workers",
-] as const;
-
-function requireRecord(value: unknown, what: string): Record<string, unknown> {
-    if (value === null || typeof value !== "object" || Array.isArray(value)) {
-        throw malformedStatus(`${what} is not an object`);
-    }
-    return value as Record<string, unknown>;
-}
-
-function exactKeys(
-    record: Record<string, unknown>,
-    expected: readonly string[],
-    what: string,
-): void {
-    const keys = Object.keys(record).sort();
-    const sorted = [...expected].sort();
-    if (keys.length !== sorted.length || keys.some((key, index) => key !== sorted[index])) {
-        throw malformedStatus(`${what} has an unexpected shape`);
-    }
-}
-
-function boundedCount(value: unknown, what: string): number {
-    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
-        throw malformedStatus(`${what} is not a nonnegative safe integer`);
-    }
-    return value;
-}
-
-function parseResourceCounts(value: unknown, what: string): SharedMemoryResourceCounts {
-    const record = requireRecord(value, what);
-    exactKeys(record, RESOURCE_FIELDS, what);
-    return Object.fromEntries(
-        RESOURCE_FIELDS.map((field) => [field, boundedCount(record[field], `${what}.${field}`)]),
-    ) as unknown as SharedMemoryResourceCounts;
-}
-
-function parseCounter(value: unknown, field: "completed" | "observed", what: string) {
-    const record = requireRecord(value, what);
-    exactKeys(record, [field], what);
-    return { [field]: boundedCount(record[field], `${what}.${field}`) } as
-        | { completed: number }
-        | { observed: number };
-}
-
-function malformedStatus(detail: string): McHostCallError {
-    return new McHostCallError(
-        "terminal",
-        `host.status response rejected: ${detail}`,
-        "malformed_control_response",
-    );
-}
-
-export function parseSharedMemoryDiagnostics(value: unknown): SharedMemoryDiagnostics {
-    const record = requireRecord(value, "shared_memory");
-    exactKeys(
-        record,
-        [
-            "state",
-            "error_class",
-            "artifact",
-            "bounds",
-            "accounting",
-            "attachment",
-            "activation",
-            "peer_death",
-            "reclamation",
-            "exhaustion",
-        ],
-        "shared_memory",
-    );
-    const terminalClasses = new Set<SharedMemoryTerminalClass>([
-        "missing_addon",
-        "identity_mismatch",
-        "setup_failure",
-        "peer_death",
-        "resource_exhaustion",
-    ]);
-    const state = record.state;
-    const errorClass = record.error_class;
-    if (
-        (state !== "healthy" && state !== "terminal") ||
-        (state === "healthy" && errorClass !== null) ||
-        (state === "terminal" &&
-            (typeof errorClass !== "string" ||
-                !terminalClasses.has(errorClass as SharedMemoryTerminalClass)))
-    ) {
-        throw malformedStatus("shared_memory state contradicts its error class");
-    }
-    const artifact = requireRecord(record.artifact, "shared_memory.artifact");
-    exactKeys(artifact, ["profile", "wire_version", "descriptor_schema"], "shared_memory.artifact");
-    if (
-        artifact.profile !== QUALIFIED_TEST_PROFILE ||
-        artifact.wire_version !== PROTOCOL_VERSION ||
-        artifact.descriptor_schema !== DESCRIPTOR_SCHEMA_VERSION
-    ) {
-        throw malformedStatus("shared_memory artifact identity mismatch");
-    }
-    let accounting: SharedMemoryDiagnostics["accounting"] = null;
-    if (record.accounting !== null) {
-        const raw = requireRecord(record.accounting, "shared_memory.accounting");
-        exactKeys(raw, ["active", "quarantined"], "shared_memory.accounting");
-        accounting = {
-            active: parseResourceCounts(raw.active, "shared_memory.accounting.active"),
-            quarantined: parseResourceCounts(
-                raw.quarantined,
-                "shared_memory.accounting.quarantined",
-            ),
-        };
-    }
-    return {
-        state,
-        error_class: errorClass as SharedMemoryTerminalClass | null,
-        artifact: {
-            profile: QUALIFIED_TEST_PROFILE,
-            wire_version: PROTOCOL_VERSION,
-            descriptor_schema: DESCRIPTOR_SCHEMA_VERSION,
-        },
-        bounds: parseResourceCounts(record.bounds, "shared_memory.bounds"),
-        accounting,
-        attachment: parseCounter(record.attachment, "completed", "shared_memory.attachment") as {
-            completed: number;
-        },
-        activation: parseCounter(record.activation, "completed", "shared_memory.activation") as {
-            completed: number;
-        },
-        peer_death: parseCounter(record.peer_death, "observed", "shared_memory.peer_death") as {
-            observed: number;
-        },
-        reclamation: parseCounter(record.reclamation, "completed", "shared_memory.reclamation") as {
-            completed: number;
-        },
-        exhaustion: parseCounter(record.exhaustion, "observed", "shared_memory.exhaustion") as {
-            observed: number;
-        },
-    };
-}
-
-function isPeerDeath(reason: RetirementReason): boolean {
-    return reason === "eof" || reason === "socket_closed" || reason === "socket_error";
 }
 
 /**

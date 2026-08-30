@@ -4,14 +4,15 @@
  * One `ConnectionGeneration` owns correlation allocation, pending entries,
  * terminal settlement, stream collection, route notifications, aggregate
  * memory policy, and one idempotent retirement path. Transport mechanics —
- * setup-socket auth, descriptor transfer, ring framing, and the
+ * the `node:net` socket, dial, auth byte I/O, incremental framing, and the
  * single bounded FIFO writer — live below the complete-frame channel
  * boundary in `ShmFrameChannel`; the generation owns no setup socket. It
  * owns no route cache and no reconnect policy; the facade layer above
  * reacts to retirement but is never imported here.
  *
  * Send-outcome boundary: a queued request is classified `not_sent` until
- * the channel begins publishing its bytes. After publication starts,
+ * the channel begins publishing its bytes — the instant immediately before
+ * `socket.write()` is invoked for any of them. After publication starts,
  * only a matching terminal frame is authoritative; losing the terminal
  * (retirement, timeout, abort, EOF, error, close) classifies the request
  * `outcome_unknown`. Local write completion proves local handling only,
@@ -57,6 +58,14 @@ const RETIREMENT_SETTLE_GRACE_MS = 50;
  * reserved control frames, and small control-plane bodies.
  */
 const DEFAULT_MEMORY_OVERHEAD_BYTES = 1_048_576;
+/**
+ * Retained-item ceiling for one stream-mode request. The pending byte budget
+ * admits roughly 65 MiB of wire bytes, which a peer can fill with millions of
+ * minimal JSON items whose retained decode overhead (object, text, parsed
+ * value) the budget never counts. Bounding item count keeps a stream's heap
+ * cost proportional to a figure the client actually enforces.
+ */
+const DEFAULT_MAX_STREAM_ITEMS = 100_000;
 const EMPTY_JSON_BODY: JsonReceiveBody = Object.freeze({
     kind: "json",
     byteLength: 0,
@@ -68,17 +77,11 @@ const EMPTY_JSON_BODY: JsonReceiveBody = Object.freeze({
 export type RetirementReason =
     | "setup_failed"
     | "setup_deadline"
-    | "socket_error"
     | "eof"
-    | "socket_closed"
-    | "socket_timeout"
     | "protocol_violation"
     | "role_violation"
-    | "frame_deadline"
     | "connection_goodbye"
-    | "control_capacity_exhausted"
     | "cleanup_deadline"
-    | "write_failed"
     | "quarantined"
     | "ambiguous_route_open"
     | "owner_close";
@@ -138,6 +141,14 @@ export interface RequestParams {
     /** Absolute operation deadline; covers queueing, writing, and terminal wait. */
     deadline: Deadline;
     mode?: PendingMode;
+    /**
+     * Retained-item ceiling for a stream-mode request. The pending byte budget
+     * counts wire bytes only, so a peer emitting many tiny items can retain
+     * unbounded per-item decode overhead under it; this bounds item count too.
+     * Must be a non-negative safe integer; 0 retains nothing and refuses the
+     * first item.
+     */
+    maxStreamItems?: number;
     responseMode?: "json" | "binary";
     binary?: boolean;
     priority?: Priority;
@@ -241,6 +252,7 @@ interface PendingEntry {
     epoch: number;
     corr: bigint;
     mode: PendingMode;
+    maxStreamItems: number;
     responseMode: "json" | "binary";
     writeInvoked: boolean;
     callerSettled: boolean;
@@ -321,7 +333,8 @@ export class ConnectionGeneration {
     authenticatedDaemonId: Uint8Array | null = null;
 
     private readonly channel: SetupFrameChannel;
-    private readonly identity: { daemonVer: string; daemonId: Uint8Array | null };
+    private readonly credentials: AuthCredentials;
+    private readonly inheritedIdentity: { daemonVer: string; daemonId: Uint8Array | null } | null;
     /**
      * The same channel as {@link channel} when this generation dials and
      * authenticates for itself, and the only source of a proven identity.
@@ -352,10 +365,17 @@ export class ConnectionGeneration {
     private pendingHeld = 0;
 
     constructor(options: ConnectionGenerationOptions) {
-        this.identity = options.inheritedIdentity ?? {
+        this.credentials = {
+            key: options.credentials.key.slice(),
+            daemonId: options.credentials.daemonId.slice(),
             daemonVer: options.credentials.daemonVer,
-            daemonId: options.credentials.daemonId,
         };
+        this.inheritedIdentity = options.inheritedIdentity
+            ? {
+                  daemonVer: options.inheritedIdentity.daemonVer,
+                  daemonId: options.inheritedIdentity.daemonId?.slice() ?? null,
+              }
+            : null;
         const maxBodyLen = options.maxBodyLen ?? MAX_FRAME_BODY_LEN;
         this.budget = new ByteBudget(
             options.memoryCapBytes ?? maxBodyLen + DEFAULT_MEMORY_OVERHEAD_BYTES,
@@ -375,8 +395,7 @@ export class ConnectionGeneration {
         });
         const handlers: FrameChannelHandlers = {
             onFrame: (frame) => this.dispatch(frame.header, frame.body),
-            onClosed: (reason: FrameChannelCloseReason, error) =>
-                this.retire(reason === "truncated_frame" ? "eof" : reason, error),
+            onClosed: (reason: FrameChannelCloseReason, error) => this.retire(reason, error),
             onDiagnostic: (type, meta) => this.emitDiagnostic(type, meta),
             onLeaseReleased: () => {
                 try {
@@ -485,6 +504,20 @@ export class ConnectionGeneration {
                 "deadline_expired",
             );
         }
+        // An empty StreamData frame charges zero pending bytes yet still retains
+        // one decoded item wrapper, so the retained-item ceiling is the only
+        // bound on that growth. A non-finite or fractional ceiling makes the
+        // `streamItems.length >= maxStreamItems` comparison in
+        // `dispatchToPending` unsatisfiable, leaving retention unbounded; refuse
+        // it before a pending entry exists or any byte reaches the peer.
+        const maxStreamItems = params.maxStreamItems ?? DEFAULT_MAX_STREAM_ITEMS;
+        if (!Number.isSafeInteger(maxStreamItems) || maxStreamItems < 0) {
+            throw new McHostCallError(
+                "not_sent",
+                `maxStreamItems must be a non-negative safe integer (got ${maxStreamItems})`,
+                "invalid_max_stream_items",
+            );
+        }
         const flags = buildFlags(
             params.binary ?? false,
             params.priority ?? Priority.Interactive,
@@ -519,6 +552,7 @@ export class ConnectionGeneration {
             epoch: params.epoch,
             corr,
             mode: params.mode ?? "unary",
+            maxStreamItems,
             responseMode: params.responseMode ?? "json",
             writeInvoked: false,
             callerSettled: false,
@@ -749,10 +783,13 @@ export class ConnectionGeneration {
                           `connection retired during setup: ${this.retiredInfo.reason}`,
                       );
             }
-            // Identity comes from the ring channel's authenticated setup or
-            // from the test-only pre-attached channel seam.
-            this.daemonVer = this.identity.daemonVer;
-            this.authenticatedDaemonId = this.identity.daemonId;
+            // Identity comes from whichever channel proved it: the TCP
+            // channel's own handshake, or — for a candidate channel, which
+            // runs none — the identity the negotiating generation
+            // authenticated and passed in.
+            const identity = this.inheritedIdentity ?? this.credentials;
+            this.daemonVer = identity.daemonVer;
+            this.authenticatedDaemonId = identity.daemonId?.slice() ?? null;
             this.phase = "frames";
         } finally {
             cancelSetupTimer();
@@ -820,6 +857,29 @@ export class ConnectionGeneration {
             entry.sawStream = true;
             if (entry.mode === "unary") {
                 releaseQuietly(lease);
+                return;
+            }
+            if (entry.streamItems.length >= entry.maxStreamItems) {
+                releaseQuietly(lease);
+                this.settleCallerReject(
+                    entry,
+                    new McHostCallError(
+                        "terminal",
+                        `stream exceeded ${entry.maxStreamItems} retained items`,
+                        "stream_item_limit",
+                    ),
+                );
+                this.finishEntry(entry);
+                // The caller is settled but the host is still producing. Without
+                // a Cancel it keeps sending frames this connection can only drop,
+                // spending socket and frame-processing capacity that unrelated
+                // requests need. Settle first so the caller reads the ceiling it
+                // hit rather than a retirement; a refused Cancel retires the
+                // generation inside `enqueueControlHeader`, which is the bounded
+                // fallback when the stream cannot be stopped politely.
+                if (header.channel !== 0) {
+                    this.enqueueCancel(header.channel, header.epoch, header.corr);
+                }
                 return;
             }
             let body: RequestReceiveBody;

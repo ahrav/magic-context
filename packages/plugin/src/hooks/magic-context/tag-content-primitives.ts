@@ -63,11 +63,11 @@ export function stripWellFormedLeadingTagPrefix(value: string): string {
     return value.replace(/^(\u00a7\d+\u00a7\s*)+/, "");
 }
 
-export function stripCompleteTagPairsGlobally(value: string): string {
+function stripCompleteTagPairsGlobally(value: string): string {
     return value.replace(COMPLETE_TAG_PAIR_GLOBAL_REGEX, "");
 }
 
-export function stripMalformedTagNotationGlobally(value: string): string {
+function stripMalformedTagNotationGlobally(value: string): string {
     return value.replace(MALFORMED_TAG_GLOBAL_REGEX, "");
 }
 
