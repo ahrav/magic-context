@@ -1,6 +1,6 @@
 # `mc-host` Wire Protocol and Handshake
 
-Status: normative direct-linked static three-target profile
+Status: normative Linux-only eventfd sparse-ring profile
 Wire version: 2
 Connection-file schema: 1
 Task: `magic-context-c50.2`; two-target revision and Synapse application protocol: `magic-context-c50.6`; three-target revision and reserved capacity classes: `magic-context-c50.11`
@@ -607,9 +607,11 @@ Commit runs inside retained host work (the connection writer task), so cancellin
 
 ### 7.7 Transport establishment
 
-There is no transport negotiation. Authentication over the setup socket is followed by ring establishment on the same connection: the host sends the two ring descriptors with the grant and an activation token, and the client attaches both directions before any application traffic. A client that cannot attach the ring has no alternative transport and MUST treat the failure as terminal for the connection.
+Transport setup completes before application wire traffic. Authentication over the owner-only Unix setup socket transfers exactly two memfds and four nonblocking eventfds, profile `mc-host-test-ring-v1`, wire version 2, descriptor schema 3, grants, and a one-use activation token. The client validates and attaches both directions, then commits activation. Memfds carry ring metadata and application bytes. Eventfds carry coalesced data-ready and capacity-ready notifications only. A client that cannot attach the ring has no alternative transport and MUST treat failure as terminal for the connection.
 
-`transport.negotiate`, `transport.activate`, and `transport.commit` are not operations of this protocol. A host advertises exactly four channel-0 operations in `subc_ops`: `route.open`, `catalog.list`, `host.shutdown`, and `host.status`. Any other operation receives terminal `unsupported_operation` while the host stays connected if framing remains valid.
+Producers publish before signaling readiness. Consumers arm by generation, recheck after arming, block only when still empty, drain the coalesced token, and recheck the ring. Capacity readiness uses the same lost-wake-safe order. No timed ring poll, prefault, runtime scheduling selector, or fallback path exists.
+
+`transport.negotiate`, `transport.activate`, and `transport.commit` are not application operations of this protocol. A host advertises exactly four channel-0 operations in `subc_ops`: `route.open`, `catalog.list`, `host.shutdown`, and `host.status`. Any other operation receives terminal `unsupported_operation` while the host stays connected if framing remains valid.
 
 `Retired` is terminal; no descriptor, token, correlation, or route survives into a later generation.
 
@@ -643,8 +645,9 @@ sequenceDiagram
   H->>F: atomic owner-only publish
   C->>F: bounded validate/read
   C->>H: setup socket + three-message authentication
-  H-->>C: ring descriptors, grant, activation token
-  C->>C: attach both ring directions
+  H-->>C: two memfds + four eventfds, grants, activation token
+  C->>C: validate and attach both ring directions
+  C->>H: commit activation
   C->>H: application v2 envelope traffic
 ```
 
@@ -824,8 +827,8 @@ An authenticated `host.shutdown` (Section 7.6) initiates this same graceful orde
 
 1. Host locks runtime state, creates fresh credentials, initializes directly linked components, binds the owner-only setup socket, and publishes schema 2 with `wire_version: 2`.
 2. Client validates one descriptor-anchored snapshot and completes all three auth messages.
-3. Client receives the two ring descriptors, attaches both directions, and activates as correlation 1.
-4. Client sends channel-0 `route.open` correlation 2.
+3. Client receives two memfds and four eventfds, validates both grants, attaches, and commits activation.
+4. Client sends channel-0 `route.open` correlation 1.
 5. Host allocates global channel 7, epoch 77, binds the component, and returns the tagged response.
 6. Client sends an opaque request on `(7,77,3)`.
 7. Host dispatches once and returns one terminal on `(7,77,3)`.

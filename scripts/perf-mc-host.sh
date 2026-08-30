@@ -60,15 +60,9 @@ shm_run() {
   }
   shm_build
   "$SHM_BENCH" "${args[@]}" >"$evidence"
-  # Assert on fields the fixed-ring report actually emits. The previous guard
-  # required a "verdict" key the harness no longer writes, so every run failed
-  # after producing valid evidence.
-  grep -q '"campaign": "smoke"' "$evidence" || {
-    echo "shared-memory harness did not retain smoke campaign output" >&2
-    exit 1
-  }
-  grep -q '"state": "complete"' "$evidence" || {
-    echo "shared-memory harness did not retain complete measurement state" >&2
+  grep -q '"local_verdict": "MECHANISM_SMOKE_ONLY"' "$evidence" &&
+    grep -q '"designated_host_verdict": "BLOCKED"' "$evidence" || {
+    echo "shared-memory harness did not retain separate local/designated verdicts" >&2
     exit 1
   }
   cat "$evidence"

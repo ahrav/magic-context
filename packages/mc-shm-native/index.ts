@@ -140,6 +140,10 @@ const ADDON_PAYLOAD_PATH = "payload/native/mc_shm_native.node";
 
 type PlatformPackage = (typeof PLATFORM_PACKAGES)[keyof typeof PLATFORM_PACKAGES];
 
+export function supportsNativePlatform(platform: string, arch: string): boolean {
+    return `${platform}-${arch}` in PLATFORM_PACKAGES;
+}
+
 function platformPackage(): PlatformPackage {
     const platform = PLATFORM_PACKAGES[`${process.platform}-${process.arch}` as keyof typeof PLATFORM_PACKAGES];
     if (!platform) throw new NativeStartupError("unsupported_platform");

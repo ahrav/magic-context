@@ -10,7 +10,8 @@ This repository is a monorepo containing TypeScript packages (under `packages/`)
 │   ├── mc-core/            # Cache-stability core transform & classifier
 │   ├── mc-store/           # Durable cache-state store (SQLite backed)
 │   ├── mc-tokenizer/       # Claude BPE token estimator
-│   ├── mc-host/            # Direct-linked authenticated loopback host runtime
+│   ├── mc-host/            # Direct-linked authenticated shared-memory host runtime
+│   ├── mc-shm-transport/   # Linux eventfd sparse ring, reclaim, and accounting
 │   └── mc-module/          # Magic Context adapter and ck-mc-host lifecycle executable
 ├── packages/               # TypeScript packages
 │   ├── plugin/             # OpenCode plugin package (published as @cortexkit/opencode-magic-context)
@@ -114,6 +115,8 @@ All paths below are relative to `packages/plugin/` — the published OpenCode np
   - `crates/mc-store/`: Durable SQLite session database schema, metadata, and CAS transitions.
   - `crates/mc-tokenizer/`: tiktoken BPE-based token count estimator.
   - `crates/mc-host/`: Generic direct-linked host library. Owns secure instance publication, HMAC authentication, wire-v2 framing, control/catalog handling for the fixed three-target profile, process-global routes and epochs, bounded request settlement split into general and reserved pending/task permit classes, Ping/Pong capability, and ordered shutdown behind repo-owned handler types. `src/composite.rs` dispatches routes across the three static components, `src/synapse/` serves the certified offline embedding lane (bundle validation, dynamic ONNX Runtime, four-operation protocol, bounded ephemeral jobs), and `src/broca/` serves the five-operation LLM run lane (strict protocol, bounded process-local run supervisor with ordered replay, hardened OpenCode/Pi subprocess adapters behind one `LlmExecutionBackend` seam, and the bundled Pi payload hook in `assets/`). Production `McHandler` adaptation and client cutover are not in this crate.
+  - `crates/mc-shm-transport/`: Linux fixed eventfd ring with sparse 64 MiB arenas, FIFO page reclaim, six-descriptor grants, leases, and admission accounting.
+  - `packages/mc-shm-native/`: Linux x64 addon selection, async setup, one environment readiness watcher, and TSFN delivery.
   - `crates/mc-module/`: The Magic Context adapter, autonomous historian coordinator, and `ck-mc-host` production leaf. The binary depends on both `mc-module` and `mc-host`; the host crate never depends on the module.
 
 **Pi Sibling Package (`packages/pi-plugin/`):**
