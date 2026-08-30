@@ -3,6 +3,7 @@ import {
     NativeChannel,
     type NativeReceiveLease,
     NativeStartupError,
+    type ProducerCursor,
     probeCapabilities,
 } from "@cortexkit/mc-shm-native";
 import { ConnectionGeneration } from "./connection";
@@ -211,18 +212,7 @@ const shmContractFactory: FrameChannelContractFactory = async (overrides = {}) =
 };
 
 describe("frame channel semantic contract (shared-memory factory)", () => {
-    const scenarios = new Set([
-        "concurrent send and receive preserve FIFO order",
-        "publication and local completion fire exactly once, in order",
-        "byte saturation refuses admission at the aggregate cap",
-        "coalesced frames deliver in order without recursive re-entry",
-        "bounded producers commit empty, boundary, segmented, and large bodies exactly",
-        "underfill, overflow, and abort return reservations without publication",
-        "owned receive adapter copies once after transport lease release",
-        "close revokes active receive aliases before storage reuse",
-    ]);
     for (const scenario of frameChannelContractScenarios) {
-        if (!scenarios.has(scenario.name)) continue;
         test(scenario.name, async () => {
             if (!probeCapabilities().available) return;
             await runFrameChannelContractScenario(scenario, shmContractFactory);
@@ -456,6 +446,7 @@ describe("mandatory shared-memory channel", () => {
             close: () => {
                 nativeCloseCalls++;
             },
+            peerClosed: () => false,
         } as unknown as NativeChannel;
         const channel = new ShmFrameChannel({
             nativeChannel: native,
@@ -488,6 +479,7 @@ describe("mandatory shared-memory channel", () => {
                 throw new Error("reserve must not be reached");
             },
             close: () => {},
+            peerClosed: () => false,
         } as unknown as NativeChannel;
         const channel = new ShmFrameChannel({
             nativeChannel: native,
@@ -520,6 +512,7 @@ describe("mandatory shared-memory channel", () => {
                 produceCalls++;
             },
             close: () => {},
+            peerClosed: () => false,
         } as unknown as NativeChannel;
         const channel = new ShmFrameChannel({
             nativeChannel: native,
@@ -533,6 +526,106 @@ describe("mandatory shared-memory channel", () => {
         channel.close();
         expect(() => channel.sendControl(responseHeader(FrameType.Pong, 1n, 0))).not.toThrow();
         expect(produceCalls).toBe(0);
+    });
+
+    test("a full ring is retryable backpressure, not a terminal failure", () => {
+        const budget = new ByteBudget(1 << 20);
+        let blockMs: number | undefined;
+        const native = {
+            produce: (
+                _header: Uint8Array,
+                _capacity: number,
+                _fill: unknown,
+                _beforePublish: unknown,
+                timeoutMs: number,
+            ) => {
+                blockMs = timeoutMs;
+                throw new Error("shared-memory ring is full");
+            },
+            reserve: () => {
+                throw new Error("shared-memory ring is full");
+            },
+            close: () => {},
+            peerClosed: () => false,
+        } as unknown as NativeChannel;
+        const channel = new ShmFrameChannel({
+            nativeChannel: native,
+            budget,
+            maxBodyLen: 1 << 20,
+            handlers: { onFrame: () => {}, onClosed: () => {} },
+        });
+        const header = responseHeader(FrameType.Request, 1n, 4);
+        const body = {
+            byteLength: 4,
+            fill: (cursor: ProducerCursor) => cursor.write(new Uint8Array(4)),
+        };
+
+        for (const attempt of [
+            () => channel.produce(header, body),
+            () => channel.reserve(header, 4),
+        ]) {
+            let caught: unknown;
+            try {
+                attempt();
+            } catch (error) {
+                caught = error;
+            }
+            expect(caught).toBeInstanceOf(McHostCallError);
+            expect((caught as McHostCallError).kind).toBe("not_sent");
+            expect((caught as McHostCallError).code).toBe("ring_full");
+        }
+        // A publication must not hold the event loop for a request deadline;
+        // the loop is also the only consumer draining the inbound ring.
+        expect(blockMs).toBeLessThanOrEqual(5);
+        // Every refused attempt returns its charge.
+        expect(budget.used).toBe(0);
+    });
+
+    test("a dropped setup socket retires the channel as eof after draining", async () => {
+        const closes: { reason: FrameChannelCloseReason; error: unknown }[] = [];
+        const frames: EnvelopeHeader[] = [];
+        let peerAlive = true;
+        let pending = true;
+        const nativeLease = {
+            header: encodeHeader(responseHeader(FrameType.Response, 7n, 4)),
+            byteLength: 4,
+            segmentCount: 1,
+            segment: () => new Uint8Array(Buffer.from("last")),
+            release: () => {},
+        } as unknown as NativeReceiveLease;
+        const native = {
+            poll: (deliver: (lease: NativeReceiveLease) => void) => {
+                if (!pending) return false;
+                pending = false;
+                deliver(nativeLease);
+                return true;
+            },
+            close: () => {},
+            peerClosed: () => !peerAlive,
+        } as unknown as NativeChannel;
+        const channel = new ShmFrameChannel({
+            nativeChannel: native,
+            budget: new ByteBudget(1024),
+            maxBodyLen: 1 << 20,
+            handlers: {
+                onFrame: (frame) => {
+                    frames.push(frame.header);
+                    frame.body.release();
+                },
+                onClosed: (reason, error) => closes.push({ reason, error }),
+            },
+        });
+        channel.beginFrames();
+        await waitUntil(() => frames.length === 1);
+        expect(closes).toEqual([]);
+
+        peerAlive = false;
+        await waitUntil(() => closes.length === 1);
+        // The frame that was already in the ring is delivered before the
+        // connection retires, so a graceful Goodbye is never lost.
+        expect(frames).toHaveLength(1);
+        expect(closes[0]?.reason).toBe("eof");
+        expect(channel.isClosed()).toBe(true);
     });
 
     test("handler throw releases JSON lease before fail-close", async () => {

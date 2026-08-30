@@ -36,7 +36,7 @@ const DAEMON_ID = Array.from({ length: 16 }, (_, i) => 0x60 + i);
 
 function validJson(overrides: Record<string, unknown> = {}): Record<string, unknown> {
     return {
-        schema: 1,
+        schema: 2,
         wire_version: 2,
         setup_socket: "/tmp/mc-host.sock",
         key: KEY,
@@ -252,8 +252,8 @@ describe("snapshot JSON validation", () => {
     });
 
     test("rejects a missing or wrong schema", async () => {
-        await writeInvalid(validJson({ schema: 2 }), "invalid_schema");
-        await writeInvalid(validJson({ schema: "1" }), "invalid_schema");
+        await writeInvalid(validJson({ schema: 1 }), "invalid_schema");
+        await writeInvalid(validJson({ schema: "2" }), "invalid_schema");
         const noSchema = validJson();
         delete noSchema.schema;
         await writeInvalid(noSchema, "invalid_schema");

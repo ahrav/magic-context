@@ -14,17 +14,17 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use mc_shm_transport::backend::ring::RingGrant;
-use mc_shm_transport::backend::ring::{ProducerReservation, Ring};
-use mc_shm_transport::descriptor::{HardwareProfileId, SchedulingMode};
+use mc_shm_transport::backend::ring::{ProducerError, ProducerReservation, Ring};
+use mc_shm_transport::descriptor::SchedulingMode;
 use mc_shm_transport::descriptor::{ReleaseIdentity, WIRE_V2_HEADER_BYTES};
-use mc_shm_transport::profile::ring_profile;
+use mc_shm_transport::profile::mc_host_ring_profile;
 use napi::bindgen_prelude::{Buffer, FnArgs, Function, Object};
 use napi::{sys, Env, Error, JsValue, Result, Status, Unknown, ValueType};
 use napi_derive::napi;
 
 use napi_buffers::ExternalRef;
 
-const PROFILE: &str = "mc-host-test-ring-v1";
+const PROFILE: &str = mc_shm_transport::profile::MC_HOST_RING_PROFILE;
 
 /// The one bounded, redacted failure every malformed raw descriptor maps
 /// to. Grant bytes, pids, fds, and key names never reach error messages.
@@ -356,6 +356,10 @@ fn close_channel(env: &Env, channel: &mut Channel) -> Result<()> {
 
 fn quarantine_channel(env: &Env, channel: &mut Channel) -> Result<()> {
     channel.closed = true;
+    // The quarantine retains the mapping, not the peer. Holding `setup` keeps the host's connection permit and both rings for the process lifetime. commentlint: allow(JUDGE)
+    if let Some(mut setup) = channel.setup.take() {
+        setup::goodbye(&mut setup);
+    }
     channel.to_host.enter_quarantine();
     channel.from_host.enter_quarantine();
     let producer_tokens: Vec<u32> = channel.producers.keys().copied().collect();
@@ -577,9 +581,8 @@ pub fn connect_setup(env: &Env, options: NativeSetupOptions) -> Result<u32> {
         Duration::from_millis(u64::from(options.timeout_ms)),
     )
     .map_err(|failure| {
-        if failure.kind() == std::io::ErrorKind::PermissionDenied
-            && failure.to_string() == "shared-memory identity mismatch"
-        {
+        // `setup::connect` reports identity mismatch as its only `PermissionDenied` failure, so the kind alone selects the message. commentlint: allow(JUDGE)
+        if failure.kind() == std::io::ErrorKind::PermissionDenied {
             error("shared-memory identity mismatch")
         } else {
             error("shared-memory setup failed")
@@ -630,11 +633,7 @@ pub fn connect_setup(env: &Env, options: NativeSetupOptions) -> Result<u32> {
 #[napi]
 pub fn create_test_pair(env: &Env) -> Result<NativeTestPair> {
     {
-        let profile = ring_profile(
-            HardwareProfileId::new(PROFILE).map_err(|_| error("test profile unavailable"))?,
-            SchedulingMode::ColdParkWake,
-        )
-        .map_err(|_| error("test profile unavailable"))?;
+        let profile = mc_host_ring_profile().map_err(|_| error("test profile unavailable"))?;
         let first_to_second = Ring::create(&profile, 1)
             .map_err(|_| error("shared-memory test pair creation failed"))?;
         let second_from_first = first_to_second
@@ -728,7 +727,7 @@ pub fn produce(
                 header,
                 Instant::now() + Duration::from_millis(u64::from(timeout_ms)),
             )
-            .map_err(|_| error("shared-memory reservation failed"))?;
+            .map_err(reservation_error)?;
         let mut views = Vec::with_capacity(reservation.segment_count());
         let mut refs = Vec::with_capacity(reservation.segment_count());
         let built = (|| -> Result<()> {
@@ -804,7 +803,7 @@ pub fn reserve(
                 [0; WIRE_V2_HEADER_BYTES],
                 Instant::now() + Duration::from_millis(u64::from(timeout_ms)),
             )
-            .map_err(|_| error("shared-memory reservation failed"))?;
+            .map_err(reservation_error)?;
         let mut views = Vec::with_capacity(reservation.segment_count());
         let mut refs = Vec::with_capacity(reservation.segment_count());
         let built = (|| -> Result<()> {
@@ -909,11 +908,7 @@ mod tests {
 
     #[test]
     fn channel_drops_borrowing_reservations_before_the_ring() {
-        let profile = ring_profile(
-            HardwareProfileId::new(PROFILE).expect("static profile"),
-            SchedulingMode::ColdParkWake,
-        )
-        .expect("profile");
+        let profile = mc_host_ring_profile().expect("profile");
         let to_host = Box::new(Ring::create(&profile, 1).expect("producer ring"));
         let from_host = Ring::create(&profile, 2).expect("consumer ring");
         let ring_ptr: *const Ring = to_host.as_ref();
@@ -1048,6 +1043,31 @@ pub fn release(env: &Env, channel_id: u32, token: u32) -> Result<()> {
             .get_mut(&channel_id)
             .ok_or_else(|| error("native channel is closed"))?;
         detach_active(env, channel, token, true)
+    })
+}
+
+/// A full ring is ordinary backpressure, so it carries a distinct message the caller can classify as retryable instead of terminal. commentlint: allow(JUDGE)
+fn reservation_error(failure: ProducerError) -> Error {
+    match failure {
+        ProducerError::Exhausted | ProducerError::Deadline => error("shared-memory ring is full"),
+        _ => error("shared-memory reservation failed"),
+    }
+}
+
+#[napi]
+pub fn peer_closed(channel_id: u32) -> Result<bool> {
+    REGISTRY.with(|registry| {
+        let registry = registry
+            .try_borrow()
+            .map_err(|_| error("native channel is busy"))?;
+        let channel = registry
+            .channels
+            .get(&channel_id)
+            .ok_or_else(|| error("native channel is closed"))?;
+        Ok(match channel.setup.as_ref() {
+            Some(stream) => setup::peer_closed(stream),
+            None => false,
+        })
     })
 }
 

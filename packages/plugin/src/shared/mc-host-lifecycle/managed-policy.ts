@@ -8,6 +8,7 @@ import {
     type CatalogEntry,
     type HostStatusSnapshot,
     McHostClient,
+    type McHostClientOptions,
     processMcHostClient,
     sameDaemonId,
 } from "../mc-host-client";
@@ -103,10 +104,15 @@ async function probeManagedStorage(
     expectedDaemonId?: Uint8Array,
 ): Promise<"ready" | "starting" | "unavailable"> {
     const deadline = Date.now() + budgetMs;
+    const options: McHostClientOptions = {
+        connectionFile: connectionFilePath(root),
+        handshakeTimeoutMs: Math.max(1, budgetMs),
+        requestTimeoutMs: Math.max(1, budgetMs),
+    };
+    // A cached client is shared; closing it would disconnect a concurrent probe for the same root and budget, which would report a healthy daemon as unavailable. commentlint: allow(JUDGE)
+    let client: McHostClient | undefined;
     try {
-        const client = await processMcHostClient({
-            connectionFile: connectionFilePath(root),
-        });
+        client = await McHostClient.connect(options);
         assertStorageProbePeer(client, expectedDaemonId);
         for (;;) {
             const snapshot = await client.hostStatus({
@@ -125,6 +131,9 @@ async function probeManagedStorage(
     } catch (error) {
         if (error instanceof StorageProbeDaemonMismatchError) throw error;
         return Date.now() >= deadline ? "starting" : "unavailable";
+    } finally {
+        // The connected channel holds a referenced interval, so a one-shot caller stays alive until this client closes. commentlint: allow(JUDGE)
+        if (client !== undefined) await client.closeAsync().catch(() => undefined);
     }
 }
 

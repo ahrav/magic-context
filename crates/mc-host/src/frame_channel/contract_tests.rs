@@ -1,7 +1,8 @@
 //! Semantic contract suite for the mandatory shared-memory frame channel.
 //!
 //! Every scenario exercises only the neutral boundary — [`FrameSender`],
-//! [`FrameReceiver`], shared lifecycle tokens, and byte-charge ownership —
+//! the concrete `ShmReceiver` receive side, shared lifecycle tokens, and
+//! byte-charge ownership —
 //! through a [`ChannelFactory`]. The sole instantiation below uses the
 //! production ring transport. The in-process ownership tests remain local to
 //! this module and cannot be selected as a production transport.
@@ -14,7 +15,8 @@ use tokio::time::{Duration, Instant};
 use crate::wire::{EnvelopeHeader, Flags, FrameType};
 use tokio_util::sync::CancellationToken;
 
-use crate::frame_channel::{FrameReceiver, FrameSender, InboundEvent, OutboundFrame};
+use crate::frame_channel::{FrameSender, InboundEvent, OutboundFrame};
+use crate::ring_transport::ShmReceiver;
 use crate::wire::{encode_frame, pure_header_flags, response_flags, ByteBudget, FrameId};
 
 /// Channel dimensions a scenario controls; the factory maps them onto its
@@ -40,9 +42,9 @@ impl Default for ContractConfig {
 
 /// One connected channel under test plus the independent peer driving the
 /// far side.
-pub(crate) struct Harness<C, P> {
+pub(crate) struct Harness<P> {
     pub sender: FrameSender,
-    pub channel: C,
+    pub channel: ShmReceiver,
     pub peer: P,
     /// The engine-side retirement root shared with the channel.
     pub generation: CancellationToken,
@@ -74,12 +76,8 @@ pub(crate) trait PeerDriver {
 /// Builds connected channels for the semantic suite. Each provider supplies
 /// one factory; the scenarios themselves never change per provider.
 pub(crate) trait ChannelFactory {
-    type Channel: FrameReceiver;
     type Peer: PeerDriver;
-    fn connect(
-        &self,
-        cfg: ContractConfig,
-    ) -> impl Future<Output = Harness<Self::Channel, Self::Peer>>;
+    fn connect(&self, cfg: ContractConfig) -> impl Future<Output = Harness<Self::Peer>>;
 }
 
 fn request_id(corr: u64) -> FrameId {
@@ -499,6 +497,7 @@ impl PeerDriver for RingPeer {
                     corr: id.corr,
                 },
                 &body,
+                std::time::Instant::now() + Duration::from_secs(2),
             )
             .expect("peer publishes frame");
     }
@@ -513,10 +512,9 @@ impl PeerDriver for RingPeer {
 }
 
 impl ChannelFactory for RingFactory {
-    type Channel = crate::frame_channel::BoxedReceiver;
     type Peer = RingPeer;
 
-    async fn connect(&self, cfg: ContractConfig) -> Harness<Self::Channel, Self::Peer> {
+    async fn connect(&self, cfg: ContractConfig) -> Harness<Self::Peer> {
         let budget = ByteBudget::new(cfg.budget_bytes);
         let transport = crate::ring_transport::RingTransport::for_ring_profile(
             crate::ring_transport::per_connection_limits(),

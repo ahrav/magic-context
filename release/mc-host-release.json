@@ -317,6 +317,9 @@
     }
   },
   "packages": {
+    "addons": [
+      "@cortexkit/mc-shm-native"
+    ],
     "parents": [
       "@cortexkit/magic-context",
       "@cortexkit/opencode-magic-context",

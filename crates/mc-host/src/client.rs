@@ -16,7 +16,7 @@ use std::{
         atomic::{AtomicBool, AtomicU8, Ordering},
         Arc, LazyLock, Mutex, MutexGuard, Weak,
     },
-    time::Duration,
+    time::{Duration, Instant as StdInstant},
 };
 
 use serde_json::Value;
@@ -1776,6 +1776,10 @@ impl ByteCounter {
         })
     }
 
+    const fn capacity(&self) -> usize {
+        self.cap
+    }
+
     #[cfg(test)]
     fn used(&self) -> usize {
         *lock_unpoisoned(&self.used)
@@ -1837,10 +1841,28 @@ struct QueuedFrame {
 struct RingWrite {
     bytes: Vec<u8>,
     completed: oneshot::Sender<Result<(), ()>>,
+    deadline: StdInstant,
 }
 
 type RingWriteSender = std::sync::mpsc::SyncSender<RingWrite>;
 type RingFrameReceiver = mpsc::Receiver<(EnvelopeHeader, Vec<u8>, ByteCharge)>;
+
+/// The mapped ring cannot express host death: a host that exits without a
+/// Goodbye leaves its rings looking merely idle, so the setup socket is the
+/// only liveness signal. `MSG_PEEK` keeps the probe side-effect free.
+fn setup_peer_closed(stream: &StdUnixStream) -> bool {
+    use std::os::fd::AsFd;
+    let mut probe = [0u8; 1];
+    match rustix::net::recv(
+        stream.as_fd(),
+        &mut probe,
+        rustix::net::RecvFlags::PEEK | rustix::net::RecvFlags::DONTWAIT,
+    ) {
+        Ok(_) => true,
+        Err(rustix::io::Errno::AGAIN) | Err(rustix::io::Errno::INTR) => false,
+        Err(_) => true,
+    }
+}
 
 fn start_ring_bridge(
     descriptor: serde_json::Value,
@@ -1867,10 +1889,15 @@ fn start_ring_bridge(
                 return;
             }
             while !cancel.is_cancelled() {
+                if setup_peer_closed(&setup) {
+                    break;
+                }
                 match write_rx.try_recv() {
                     Ok(write) => {
-                        let result = decode_outbound(&write.bytes)
-                            .and_then(|(header, body)| endpoint.send(header, body).map_err(|_| ()));
+                        let deadline = write.deadline;
+                        let result = decode_outbound(&write.bytes).and_then(|(header, body)| {
+                            endpoint.send(header, body, deadline).map_err(|_| ())
+                        });
                         let failed = result.is_err();
                         let _ = write.completed.send(result);
                         if failed {
@@ -1880,7 +1907,25 @@ fn start_ring_bridge(
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                     Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 }
-                match endpoint.try_recv_with(|bytes| read_budget.charge(bytes)) {
+                // `endpoint.try_recv_with` advances the ring's consumed cursor,
+                // so refusing a charge would discard a valid response. Waiting
+                // is backpressure against `ring_reader_loop`, which releases
+                // each queued charge as it drains; cancellation ends the wait.
+                // Frames wider than `read_budget.capacity()` cannot be admitted
+                // by any drain, so they refuse without waiting.
+                let charge = |bytes: usize| loop {
+                    if bytes > read_budget.capacity() {
+                        return None;
+                    }
+                    if let Some(charge) = read_budget.charge(bytes) {
+                        return Some(charge);
+                    }
+                    if cancel.is_cancelled() {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_micros(50));
+                };
+                match endpoint.try_recv_with(charge) {
                     Ok(Some(frame)) => {
                         if read_tx.blocking_send(frame).is_err() {
                             break;
@@ -1951,6 +1996,7 @@ async fn writer_loop(
             .try_send(RingWrite {
                 bytes: frame.bytes,
                 completed: completed_tx,
+                deadline: frame.deadline.into_std(),
             })
             .is_err()
         {
@@ -3997,5 +4043,27 @@ mod tests {
         assert_eq!(SendOutcome::NotSent.as_str(), "not_sent");
         assert_eq!(SendOutcome::OutcomeUnknown.as_str(), "outcome_unknown");
         assert_eq!(SendOutcome::Terminal.as_str(), "terminal");
+    }
+
+    #[test]
+    fn ring_bridge_retires_when_host_drops_setup_socket() {
+        let rings = mc_shm_transport::backend::ring::DuplexRing::create(
+            &crate::ring_transport::ring_profile(),
+        )
+        .expect("duplex ring");
+        let (descriptor, descriptors) =
+            crate::ring_transport::worker_descriptor(&rings).expect("descriptor");
+        let (client_end, host_end) = StdUnixStream::pair().expect("socket pair");
+        let (_write_tx, mut read_rx) = start_ring_bridge(
+            descriptor,
+            descriptors,
+            client_end,
+            CancellationToken::new(),
+            Arc::new(ByteCounter::new(CLIENT_INBOUND_FRAME_BYTES)),
+        )
+        .expect("bridge");
+        drop(host_end);
+        // A hang here means the bridge never observed the dead setup socket.
+        assert!(read_rx.blocking_recv().is_none());
     }
 }

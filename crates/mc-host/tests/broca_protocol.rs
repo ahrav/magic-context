@@ -2,6 +2,8 @@
 //! request boundary, bind validation, and wire-shape compatibility with the
 //! JSON `HistorianProducer` sends and parses today.
 
+// Broca conformance drives a Synapse primary, which ships only for `linux-x64-gnu`. commentlint: allow(JUDGE)
+#![cfg(target_os = "linux")]
 mod support;
 
 use std::sync::Arc;

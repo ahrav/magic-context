@@ -830,11 +830,6 @@ export class McHostClient {
         }
         // A generation that retires during setup is never published.
         if (generation.isRetired()) return conn;
-        if (this.closeStarted) {
-            generation.retire("owner_close");
-            throw new McHostClientError("client closed", "client_closed");
-        }
-        if (generation.isRetired()) return conn;
         this.active = conn;
         this.emitConnected(conn);
         return conn;
@@ -1557,15 +1552,6 @@ function requireOpArray(value: unknown, field: string, allowEmpty: boolean): str
 }
 
 function parseHostStatusResponse(parsed: Record<string, unknown>): HostStatusSnapshot {
-    const keys = Object.keys(parsed).sort();
-    const expected = ["health", "metrics", "op", "shared_memory"];
-    if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
-        throw new McHostCallError(
-            "terminal",
-            "host.status response rejected: unexpected shape",
-            "malformed_control_response",
-        );
-    }
     if (parsed.op !== "host.status") {
         throw new McHostCallError(
             "terminal",
@@ -1592,10 +1578,21 @@ function parseHostStatusResponse(parsed: Record<string, unknown>): HostStatusSna
             "malformed_control_response",
         );
     }
+    const sharedMemory = parsed.shared_memory;
+    if (
+        sharedMemory !== undefined &&
+        (sharedMemory === null || typeof sharedMemory !== "object" || Array.isArray(sharedMemory))
+    ) {
+        throw new McHostCallError(
+            "terminal",
+            "host.status response rejected: shared_memory is not an object",
+            "malformed_control_response",
+        );
+    }
     return {
         health,
         metrics: parsed.metrics as Record<string, unknown>,
-        sharedMemory: parseSharedMemoryDiagnostics(parsed.shared_memory),
+        sharedMemory: parseSharedMemoryDiagnostics(sharedMemory),
     };
 }
 
@@ -1746,7 +1743,9 @@ export function parseSharedMemoryDiagnostics(value: unknown): SharedMemoryDiagno
 }
 
 function isPeerDeath(reason: RetirementReason): boolean {
-    return reason === "eof" || reason === "socket_closed" || reason === "socket_error";
+    // A dead peer reaches this client as a channel EOF;
+    // `FrameChannelCloseReason` carries no socket-level variants.
+    return reason === "eof";
 }
 
 /**

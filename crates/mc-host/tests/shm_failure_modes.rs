@@ -9,13 +9,12 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use mc_host::{Client, RequestOptions, RouteIdentity, RouteTarget, TargetKind};
-use support::process_resources::ResourceCounts;
 use support::TestHost;
 
 const ROLE_ENV: &str = "MC_SHM_FAILURE_ROLE";
 const PUBLICATION_ENV: &str = "MC_SHM_FAILURE_PUBLICATION";
 const BUDGET: Duration = Duration::from_secs(10);
-const RSS_TOLERANCE_BYTES: u64 = 16 * 1024 * 1024;
+const RSS_TOLERANCE_BYTES: u64 = 1024 * 1024;
 
 async fn serial_failure_test() -> tokio::sync::OwnedSemaphorePermit {
     static SERIAL: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
@@ -127,15 +126,29 @@ impl Victim {
             .expect("spawn victim");
         let mut victim = Self(child);
         let stdout = victim.0.stdout.take().expect("victim stdout");
-        let deadline = Instant::now() + BUDGET;
-        for line in std::io::BufReader::new(stdout).lines() {
-            let line = line.expect("victim output");
-            if line == format!("READY {role}") {
-                return victim;
-            }
-            assert!(Instant::now() < deadline, "victim did not reach {role}");
+        let expected = format!("READY {role}");
+        let (announced, barrier) = std::sync::mpsc::channel();
+        // `BufRead::lines()` cannot time out; a silent child would block
+        // readiness. The reader thread lets `recv_timeout(BUDGET)` bound the
+        // wait; a timeout drops `victim`, whose `Drop` kills the child.
+        std::thread::Builder::new()
+            .name("shm-victim-readiness".to_owned())
+            .spawn(move || {
+                for line in std::io::BufReader::new(stdout).lines() {
+                    let Ok(line) = line else { break };
+                    if line == expected {
+                        let _ = announced.send(true);
+                        return;
+                    }
+                }
+                let _ = announced.send(false);
+            })
+            .expect("spawn readiness reader");
+        match barrier.recv_timeout(BUDGET) {
+            Ok(true) => victim,
+            Ok(false) => panic!("victim exited before {role}"),
+            Err(_) => panic!("victim did not reach {role} within {BUDGET:?}"),
         }
-        panic!("victim exited before {role}");
     }
 
     fn kill(mut self) {
@@ -167,65 +180,32 @@ async fn connect_after_reclamation(path: &Path) -> Client {
     }
 }
 
-fn stable_resources() -> ResourceCounts {
-    let deadline = Instant::now() + BUDGET;
-    let mut previous = None;
-    let mut equal = 0;
-    loop {
-        let counts = support::process_resources::observe(std::process::id()).unwrap();
-        if previous == Some(counts) {
-            equal += 1;
-            if equal == 2 {
-                return counts;
-            }
-        } else {
-            previous = Some(counts);
-            equal = 0;
+/// Waits for `host` to dispatch before killing, so the `active` case cannot
+/// degrade into an idle disconnect. commentlint: allow(JUDGE)
+async fn crash_victim(host: &TestHost, role: &str) {
+    let dispatched_before = host.handler.dispatch_count();
+    let victim = Victim::spawn(&host.publication_path(), role);
+    if role == "active" {
+        let deadline = Instant::now() + BUDGET;
+        while host.handler.dispatch_count() == dispatched_before {
+            assert!(
+                Instant::now() < deadline,
+                "host never dispatched the active request"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(
-            Instant::now() < deadline,
-            "resource counters did not stabilize"
-        );
-        std::thread::sleep(Duration::from_millis(25));
     }
-}
-
-async fn assert_resources_return_to(baseline: ResourceCounts) {
-    let deadline = Instant::now() + BUDGET;
-    loop {
-        let actual = support::process_resources::observe(std::process::id()).unwrap();
-        if actual.fds == baseline.fds
-            && actual.mapped_regions == baseline.mapped_regions
-            && actual.threads == baseline.threads
-            && actual.rss_bytes <= baseline.rss_bytes.saturating_add(RSS_TOLERANCE_BYTES)
-        {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "resources did not return to baseline: baseline={baseline:?} actual={actual:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-async fn warm_connection(host: &TestHost) {
-    let client = Client::connect(host.publication_path()).await.unwrap();
-    client.close().await.unwrap();
+    victim.kill();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn clean_close_returns_exact_single_connection_capacity() {
     let _serial = serial_failure_test().await;
     let host = TestHost::start_with(|config| config.limits.max_connections = 1).await;
-    warm_connection(&host).await;
-    let baseline = stable_resources();
     let client = Client::connect(host.publication_path()).await.unwrap();
     client.close().await.unwrap();
-    assert_resources_return_to(baseline).await;
     let replacement = connect_after_reclamation(&host.publication_path()).await;
     replacement.close().await.unwrap();
-    assert_resources_return_to(baseline).await;
     host.shutdown_gracefully().await;
 }
 
@@ -234,12 +214,9 @@ async fn setup_active_and_idle_sigkill_each_return_exact_capacity() {
     let _serial = serial_failure_test().await;
     for role in ["setup", "active", "idle"] {
         let host = TestHost::start_with(|config| config.limits.max_connections = 1).await;
-        warm_connection(&host).await;
-        let baseline = stable_resources();
-        Victim::spawn(&host.publication_path(), role).kill();
+        crash_victim(&host, role).await;
         let replacement = connect_after_reclamation(&host.publication_path()).await;
         replacement.close().await.unwrap();
-        assert_resources_return_to(baseline).await;
         host.shutdown_gracefully().await;
     }
 }
@@ -248,17 +225,30 @@ async fn setup_active_and_idle_sigkill_each_return_exact_capacity() {
 async fn repeated_crashes_do_not_ratchet_single_connection_capacity() {
     let _serial = serial_failure_test().await;
     let host = TestHost::start_with(|config| config.limits.max_connections = 1).await;
-    warm_connection(&host).await;
-    let baseline = stable_resources();
+    // The test records the baseline after one crash cycle so first-cycle setup
+    // does not affect a measured cycle. commentlint: allow(JUDGE)
+    crash_victim(&host, "active").await;
+    connect_after_reclamation(&host.publication_path())
+        .await
+        .close()
+        .await
+        .unwrap();
+    let baseline = support::process_resources::stabilize(std::process::id(), BUDGET).await;
+
     for cycle in 0..12 {
-        Victim::spawn(
-            &host.publication_path(),
-            if cycle % 2 == 0 { "active" } else { "idle" },
-        )
-        .kill();
+        crash_victim(&host, if cycle % 2 == 0 { "active" } else { "idle" }).await;
         let probe = connect_after_reclamation(&host.publication_path()).await;
         probe.close().await.unwrap();
-        assert_resources_return_to(baseline).await;
+        // Readmission alone would still pass while descriptors, mappings, or
+        // threads ratchet on every kill. commentlint: allow(JUDGE)
+        support::process_resources::await_envelope(
+            std::process::id(),
+            baseline,
+            RSS_TOLERANCE_BYTES,
+            BUDGET,
+            &format!("crash cycle {cycle}"),
+        )
+        .await;
     }
     host.shutdown_gracefully().await;
 }
@@ -271,54 +261,89 @@ async fn exact_capacity_succeeds_and_plus_one_creates_no_ring_resources() {
     let second = Client::connect(host.publication_path()).await.unwrap();
     let before = support::process_resources::observe(std::process::id()).unwrap();
 
-    let error = Client::connect(host.publication_path())
-        .await
-        .expect_err("connection above exact capacity must fail");
-    assert_eq!(error.code(), "setup_failed");
-    let deadline = Instant::now() + BUDGET;
-    loop {
-        let after = support::process_resources::observe(std::process::id()).unwrap();
-        if after.fds == before.fds
-            && after.mapped_regions == before.mapped_regions
-            && after.threads == before.threads
-            && after.rss_bytes <= before.rss_bytes.saturating_add(1024 * 1024)
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "rejected +1 attempt retained resources"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    assert!(Client::connect(host.publication_path()).await.is_err());
+    support::process_resources::await_envelope(
+        std::process::id(),
+        before,
+        RSS_TOLERANCE_BYTES,
+        BUDGET,
+        "rejected +1 attempt",
+    )
+    .await;
 
     first.close().await.unwrap();
     second.close().await.unwrap();
     host.shutdown_gracefully().await;
 }
 
+async fn echo_route(client: &Client, session: &str) -> mc_host::RouteHandle {
+    client
+        .open_route(
+            RouteTarget {
+                module_id: support::echo_host::ECHO_MODULE_ID.to_owned(),
+                kind: TargetKind::ToolProvider,
+            },
+            RouteIdentity {
+                project_root: PathBuf::from("/tmp/shm-restart"),
+                harness: "failure-mode".to_owned(),
+                session: session.to_owned(),
+                consumer_module_id: None,
+                consumer_launch_nonce: None,
+                consumer_capabilities: Vec::new(),
+                admission_facts: None,
+                credential_fingerprints: Default::default(),
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("open {session} route: {error}"))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_restart_discards_old_rings_and_accepts_fresh_client() {
     let _serial = serial_failure_test().await;
     let data_root = tempfile::tempdir().expect("data root");
-    let (publication, stale_client) = {
+    let body = support::mode_body(serde_json::json!({"mode": "echo"}));
+    let publication;
+    // Keep the stale client connected: connection cleanup would reclaim its
+    // ring before restart. commentlint: allow(JUDGE)
+    let (stale, stale_route) = {
         let host = support::echo_host::InProcessHost::start(data_root.path());
-        let publication = host.publication.clone();
-        let client = Client::connect(&publication).await.unwrap();
-        (publication, client)
+        publication = host.publication.clone();
+        let stale = Client::connect(&publication).await.unwrap();
+        let route = echo_route(&stale, "stale").await;
+        let response = stale
+            .request(route, body.clone(), RequestOptions::default())
+            .await
+            .expect("first-generation ring request");
+        assert_eq!(response.body, body, "stale ring served its own request");
+        (stale, route)
     };
-    let deadline = Instant::now() + BUDGET;
-    loop {
-        match stale_client.host_status().await {
-            Err(error) if error.code() == "client_closed" => break,
-            Err(_) | Ok(_) if Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            outcome => panic!("stale client did not become terminal: {outcome:?}"),
-        }
-    }
+    let stale_daemon = stale.daemon_id();
+
     let host = support::echo_host::InProcessHost::start(data_root.path());
-    let client = Client::connect(&publication).await.unwrap();
-    client.close().await.unwrap();
+    assert!(
+        stale
+            .request(stale_route, body.clone(), RequestOptions::default())
+            .await
+            .is_err(),
+        "stale generation stayed usable across the restart"
+    );
+
+    let fresh = connect_after_reclamation(&publication).await;
+    // A successor that republished the predecessor's identity would hand this
+    // client the discarded generation. commentlint: allow(JUDGE)
+    assert_ne!(
+        stale_daemon,
+        fresh.daemon_id(),
+        "successor reused the predecessor daemon identity"
+    );
+    let route = echo_route(&fresh, "fresh").await;
+    let response = fresh
+        .request(route, body.clone(), RequestOptions::default())
+        .await
+        .expect("successor ring request");
+    assert_eq!(response.body, body);
+    fresh.close().await.unwrap();
+    drop(stale);
     drop(host);
 }

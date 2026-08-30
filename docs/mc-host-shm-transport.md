@@ -4,15 +4,19 @@
 
 The fixed ring is the only application transport. Linux and macOS clients use the owner-only Unix setup socket to authenticate, receive two mapping descriptors, validate the current release identity, attach, and commit activation. Application frames never use the setup socket.
 
+The host publishes the setup socket's absolute path as `setup_socket` in the connection file. The client dials it, proves identity over the shared HMAC construction, and receives the two ring descriptors over `SCM_RIGHTS`. Because those descriptors cross the boundary as file descriptors, the setup socket cannot be proxied by a byte forwarder: any container or remote topology has to make the socket itself reachable.
+
 There is no runtime transport selector, alternate shared-memory backend, compatibility reader, or degraded data path. A transport failure is terminal for the affected connection.
 
 The accepted identity is fixed by the release:
 
-- profile: `mc-host-test-ring-v1`
+- profile: `mc-host-test-ring-v1`, exposed as `MC_HOST_RING_PROFILE`
 - wire version: `2`
 - descriptor schema: `2`
 
 An install that cannot load the native addon or establish this identity fails before application traffic.
+
+Host receive still calls `lease.to_vec()` and records one transport-body copy before semantic dispatch, so this path must not support a zero-copy claim.
 
 ## Ring and ownership
 

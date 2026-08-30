@@ -45,20 +45,13 @@ shm_build() {
 
 shm_run() {
   local out="${1:?outdir}" mode="${2:?mode}" args=()
-  local manifest="$ROOT/crates/mc-shm-transport/benches/manifests/v1.json"
-  if [[ "$mode" == "shm-smoke" ]]; then
-    args+=(--smoke)
-  else
-    [[ "${MC_SHM_DESIGNATED_HOST:-}" == "1" ]] || {
-      echo "shm-evidence requires MC_SHM_DESIGNATED_HOST=1" >&2
-      exit 1
-    }
-    if grep -q 'UNSET' "$manifest"; then
-      echo "shm-evidence refused: designated-host manifest fields remain UNSET" >&2
-      exit 1
-    fi
-    args+=(--designated-host)
-  fi
+  # The fixed-ring harness rejects --designated-host outright, so smoke is the
+  # only campaign it can produce.
+  [[ "$mode" == "shm-smoke" ]] || {
+    echo "unsupported shared-memory mode: $mode (expected shm-smoke)" >&2
+    exit 1
+  }
+  args+=(--smoke)
   mkdir -p "$out"
   local evidence="$out/hardware-envelope-${mode#shm-}.json"
   [[ ! -e "$evidence" ]] || {
@@ -67,8 +60,15 @@ shm_run() {
   }
   shm_build
   "$SHM_BENCH" "${args[@]}" >"$evidence"
-  grep -q '"verdict": "INCONCLUSIVE"' "$evidence" || {
-    echo "shared-memory harness did not retain structured INCONCLUSIVE output" >&2
+  # Assert on fields the fixed-ring report actually emits. The previous guard
+  # required a "verdict" key the harness no longer writes, so every run failed
+  # after producing valid evidence.
+  grep -q '"campaign": "smoke"' "$evidence" || {
+    echo "shared-memory harness did not retain smoke campaign output" >&2
+    exit 1
+  }
+  grep -q '"state": "complete"' "$evidence" || {
+    echo "shared-memory harness did not retain complete measurement state" >&2
     exit 1
   }
   cat "$evidence"
@@ -216,7 +216,7 @@ budget-preflight)
 esac
 
 case "${2:-}" in
-shm-smoke | shm-evidence)
+shm-smoke)
   shm_run "${1:?outdir}" "$2"
   exit 0
   ;;

@@ -9,9 +9,7 @@ use std::time::{Duration, Instant};
 use mc_shm_transport::backend::ring::{wire_v2_header, Ring};
 use mc_shm_transport::descriptor::{HardwareProfileId, SchedulingMode, TransportDescriptor};
 use mc_shm_transport::evidence::OperationCounters;
-use mc_shm_transport::profile::{
-    CompletionMode, ProducerTopology, ProfileConfig, TargetProfile, WorkerTopology,
-};
+use mc_shm_transport::profile::{ProfileConfig, TargetProfile, WorkerTopology};
 use serde::{Deserialize, Serialize};
 
 const ARMS: &[&str] = &[
@@ -303,9 +301,7 @@ fn ring_profile(scheduling: SchedulingMode) -> Result<TargetProfile, &'static st
         max_leases: 32,
         mappings: 2,
         pinned_workers: usize::from(scheduling == SchedulingMode::HotPinnedPoll) * 2,
-        producer_topology: ProducerTopology::CallerConfined,
         worker_topology: WorkerTopology::CallerThread,
-        completion_mode: CompletionMode::SynchronousPull,
     })
     .map_err(|_| "profile")
 }

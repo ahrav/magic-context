@@ -9,6 +9,7 @@ export const WAKE_PLANE_CAPABILITY = "wake.create";
 export type WakePlaneStatus = "present" | "absent" | "unknown";
 
 const WAKE_PLANE_STATUS_TTL_MS = 5 * 60 * 1_000;
+const WAKE_PLANE_HANDSHAKE_TIMEOUT_MS = 2_000;
 /** Bounds the catalog request directly; the client default is 30 seconds. */
 const WAKE_PLANE_CATALOG_TIMEOUT_MS = 2_000;
 
@@ -54,8 +55,11 @@ function readDaemonPublication(): string | null {
 }
 
 async function probeWakePlaneCatalog(): Promise<readonly CatalogEntry[]> {
+    // `requestTimeoutMs` is part of the process-client cache key. Setting it here buys this probe its own client and its own ring mappings; the per-call timeout reaches the same deadline on the shared client. commentlint: allow(JUDGE)
     const client = await processMcHostClient({
         connectionFile: connectionFile(),
+        handshakeTimeoutMs: WAKE_PLANE_HANDSHAKE_TIMEOUT_MS,
+        credentialSource: process.env,
     });
     return client.catalogList({ timeoutMs: WAKE_PLANE_CATALOG_TIMEOUT_MS });
 }

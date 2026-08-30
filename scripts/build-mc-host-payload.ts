@@ -786,6 +786,39 @@ export function validateParentManifests(
                 fail(`${where}: unknown payload optional dependency ${name}`);
             }
         }
+        // npm continues when optionalDependencies installation fails, so an addon listed in optionalDependencies overrides its required entry. commentlint: allow(JUDGE)
+        for (const addon of contract.packages.addons) {
+            if (addon in optional) {
+                fail(
+                    `${where}: optionalDependencies[${addon}] makes a required ` +
+                        `addon optional; declare it only in dependencies`,
+                );
+            }
+        }
+        // Addons are non-optional, so an install fails outright when the name
+        // or version is wrong. Validating only optionalDependencies let a hard
+        // requirement sit entirely outside the contract.
+        const required = (pkg.dependencies ?? {}) as Record<string, unknown>;
+        if (typeof required !== "object" || Array.isArray(required)) {
+            fail(`${where}: dependencies must be an object`);
+        }
+        for (const addon of contract.packages.addons) {
+            const spec = required[addon];
+            if (spec !== contract.release.version) {
+                fail(
+                    `${where}: dependencies[${addon}] must be the exact ` +
+                        `version ${contract.release.version}, got ${JSON.stringify(spec)}`,
+                );
+            }
+        }
+        for (const name of Object.keys(required)) {
+            if (
+                name.startsWith("@cortexkit/mc-") &&
+                !(contract.packages.addons as readonly string[]).includes(name)
+            ) {
+                fail(`${where}: unknown @cortexkit/mc- dependency ${name}`);
+            }
+        }
     }
 }
 

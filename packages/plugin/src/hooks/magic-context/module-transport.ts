@@ -16,10 +16,12 @@ import {
     BROCA_CREDENTIAL_VALUE_CAP_BYTES,
     DAEMON_GENERATION_CHANGED_CODE,
     Deadline,
+    evictProcessMcHostClient,
     isConsumerReconnectTransient,
     isMcHostCallError,
     McHostCallError,
     type McHostClient,
+    type McHostClientOptions,
     Priority,
     processMcHostClient,
     type RouteHandle,
@@ -72,6 +74,7 @@ import {
 const DEFAULT_MODULE_ID = "magic-context";
 const CONNECT_BACKOFF_INITIAL_MS = 1_000;
 const CONNECT_BACKOFF_MAX_MS = 30_000;
+const HANDSHAKE_TIMEOUT_MS = 2_000;
 const MODULE_SEND_TIMEOUT_MS = 15_000;
 const TRANSFORM_SEND_TIMEOUT_MS = 5_000;
 /** Consumer deadline for the module's exported historian::MAX_WRAPUP_REQUEST_BUDGET. */
@@ -472,6 +475,7 @@ export class McHostModuleTransport {
     private readonly requestTimeoutMs: number;
     private readonly routeSessionPrefix: string;
     private client: McHostClient | null = null;
+    private clientCacheOptions: McHostClientOptions | null = null;
     private routes = new Map<string, CachedRoute>();
     private routeOpenings = new Map<string, OpeningRoute>();
     private canonicalRootCache = new Map<string, string>();
@@ -1262,10 +1266,26 @@ export class McHostModuleTransport {
         return resolved;
     }
 
-    private connectClient(_deadline?: Deadline): Promise<McHostClient> {
-        return processMcHostClient({
+    private clientOptions(deadline?: Deadline): McHostClientOptions {
+        // Derive the handshake stage from the operation deadline without ever
+        // extending the preserved 2-second handshake budget (plan KTD5).
+        const handshakeTimeoutMs = deadline
+            ? Math.max(1, deadline.stageBudgetMs(HANDSHAKE_TIMEOUT_MS))
+            : HANDSHAKE_TIMEOUT_MS;
+        return {
             connectionFile: this.connectionFile,
-        });
+            handshakeTimeoutMs,
+            // Credentials are presented on every real connection, not only the
+            // one this transport is allowed to start. Lifecycle ownership and
+            // route authentication are independent: an explicit
+            // `subc.connection_file` can point at a shared daemon that another
+            // managed harness started with a credential envelope, and that
+            // daemon installs `CredentialVerifier`, which fails every Broca send
+            // with `credential_snapshot_mismatch` when the route presents no
+            // fingerprint. Gating this on `managed-default` let such a client
+            // complete its handshake and then fail every provider call.
+            credentialSource: process.env,
+        };
     }
 
     private async demandManagedReadiness(
@@ -1410,20 +1430,27 @@ export class McHostModuleTransport {
         const connecting = (async (): Promise<CertifiedConnection> => {
             let candidate: McHostClient | null = null;
             try {
-                candidate = await this.connectClient(deadline);
+                const options = this.clientOptions(deadline);
+                candidate = await processMcHostClient(options);
                 if (
                     expectedDaemonId !== undefined &&
                     !sameDaemonId(candidate.authenticated?.daemonId, expectedDaemonId)
                 ) {
+                    // The owner cache retains this resolved client; closing it without eviction serves a closed instance to later callers under the same key. commentlint: allow(JUDGE)
+                    await evictProcessMcHostClient(options, candidate);
                     candidate.close();
                     throw this.connectionChangedError(
                         "daemon changed after lifecycle compatibility validation",
                     );
                 }
                 if (generation !== this.connectionGeneration) {
+                    // On generation mismatch, the catch skips `invalidateConnection`, so this branch evicts and closes `candidate`. commentlint: allow(JUDGE)
+                    await evictProcessMcHostClient(options, candidate);
+                    candidate.close();
                     throw this.connectionChangedError("subc connection attempt was superseded");
                 }
                 this.client = candidate;
+                this.clientCacheOptions = options;
                 this.routes.clear();
                 this.backoffMs = CONNECT_BACKOFF_INITIAL_MS;
                 this.nextProbeMs = 0;
@@ -1456,9 +1483,19 @@ export class McHostModuleTransport {
         this.connectionGeneration += 1;
         this.connectionCertification = null;
         this.invalidateStateSyncCapabilities();
+        const superseded = this.client;
+        const supersededOptions = this.clientCacheOptions;
         this.client = null;
+        this.clientCacheOptions = null;
         this.routes.clear();
         this.routeOpenings.clear();
+        // A retained entry holds a resolved client whose channel owns a polling interval and two ring mappings, and `handshakeTimeoutMs` is deadline-derived, so reconnects do not reuse one entry. commentlint: allow(JUDGE)
+        if (superseded && supersededOptions) {
+            void evictProcessMcHostClient(supersededOptions, superseded).then(
+                () => superseded.closeAsync().catch(() => undefined),
+                () => undefined,
+            );
+        }
     }
 }
 

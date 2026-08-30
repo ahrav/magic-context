@@ -67,13 +67,13 @@ flowchart TB
 
 ### 4.1 Canonical path and schema
 
-Clients MUST read `${dataDir}/cortexkit/run/subc-connection.json`. Host and client configuration MAY supply an explicit equivalent path. The host MUST publish schema 1:
+Clients MUST read `${dataDir}/cortexkit/run/subc-connection.json`. Host and client configuration MAY supply an explicit equivalent path. The host MUST publish schema 2:
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
   "wire_version": 2,
-  "setup_socket": "/run/user/1000/cortexkit/mc-host.sock",
+  "setup_socket": "/home/user/.local/share/cortexkit/run/setup.sock",
   "key": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],
   "daemon_id": [96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111],
   "pid": 4242,
@@ -83,17 +83,19 @@ Clients MUST read `${dataDir}/cortexkit/run/subc-connection.json`. Host and clie
 
 Example bytes are deterministic and non-secret. Real key and daemon-ID bytes MUST come from the OS CSPRNG.
 
-Writers MUST include numeric `wire_version: 2`. Clients MUST reject an absent, null, string, fractional, or non-2 value before opening the setup socket. There is no omission default and no version downgrade.
+Writers MUST include numeric `wire_version: 2`. Clients MUST reject an absent, null, string, fractional, or non-2 value before dialing the setup socket. There is no omission default and no version downgrade.
 
 A client MUST:
 
 1. open the parent and connection file without following links, then take one descriptor-anchored regular-file snapshot capped at 65,536 bytes;
 2. reject a larger file before JSON parsing;
-3. require schema 1, numeric wire version 2, one nonempty absolute `setup_socket`, exactly 32 key bytes, exactly 16 daemon-ID bytes, a numeric PID, and a nonempty daemon version;
+3. require schema 2, numeric wire version 2, a nonempty absolute `setup_socket` path, exactly 32 key bytes, exactly 16 daemon-ID bytes, a numeric PID, and a nonempty daemon version;
 4. verify owner-only regular-file metadata before and after the read and verify the directory entry still names the same file;
-5. reject relative or empty setup-socket paths, replacement, and insecure ownership or permissions.
+5. dial `setup_socket` as a Unix stream socket;
+6. reject a relative `setup_socket`, since the host resolves it from its own data directory and a relative path names a different socket for a client with another working directory;
+7. reject replacement and insecure ownership or permissions.
 
-The validated descriptor snapshot is the sole source of credentials and setup-socket authority. A client MUST NOT validate by pathname and then reopen that pathname for the key, daemon ID, or socket path.
+The validated descriptor snapshot is the sole source of credentials and setup-socket authority. A client MUST NOT validate by pathname and then reopen that pathname for the key, daemon ID, or setup socket.
 
 Publication and acceptance require exactly 32 key bytes so all direct implementations use one credential shape.
 
@@ -411,7 +413,7 @@ The Synapse and Broca entries are immutable identity, not readiness: each stays 
 
 ### 7.4 Operation classification
 
-`route.open`, `catalog.list`, `host.shutdown` (Section 7.6), and `host.status` are the only required channel-0 operations. Every other operation receives terminal `unsupported_operation`; host stays connected if framing remains valid. `host.status` reads the last completed host-owned health snapshot; it never invokes a handler callback on the requesting connection and exposes only closed component states, shared-memory diagnostics, and sanitized metrics, never handler detail text.
+`route.open`, `catalog.list`, `host.shutdown` (Section 7.6), and `host.status` (Section 7.6) are the only required channel-0 operations. Every other operation receives terminal `unsupported_operation`; host stays connected if framing remains valid. `host.status` reads the last completed host-owned health snapshot; it never invokes a handler callback on the requesting connection and exposes only closed component states and sanitized metrics, never handler detail text.
 
 Canonical error body:
 
@@ -629,6 +631,8 @@ stateDiagram-v2
 
 `Failed` and `Closed` are terminal for that connection. A caller may establish a fresh connection, which reruns discovery, authentication, descriptor transfer, validation, and attachment from the beginning.
 
+`transport.negotiate`, `transport.activate`, and `transport.commit` are not operations of this protocol. A host advertises exactly four channel-0 operations in `subc_ops`: `route.open`, `catalog.list`, `host.shutdown`, and `host.status`. Any other operation receives terminal `unsupported_operation` while the host stays connected if framing remains valid.
+
 ## 8. Host and handler lifecycle
 
 ### 8.1 Startup and readiness
@@ -659,9 +663,9 @@ sequenceDiagram
   H->>F: atomic owner-only publish
   C->>F: bounded validate/read
   C->>H: setup socket + three-message authentication
-  H-->>C: two descriptors + fixed identity + activation
-  C->>H: commit attachment
-  C->>H: application v2 frames through ring
+  H-->>C: ring descriptors, grant, activation token
+  C->>C: attach both ring directions
+  C->>H: application v2 envelope traffic
 ```
 
 ### 8.2 Route allocation and bind
@@ -838,7 +842,7 @@ An authenticated `host.shutdown` (Section 7.6) initiates this same graceful orde
 
 ### 13.1 Startup, route, call, close
 
-1. Host locks runtime state, creates fresh credentials, initializes directly linked components, binds the owner-only setup socket, and publishes schema 1 with `wire_version: 2`.
+1. Host locks runtime state, creates fresh credentials, initializes directly linked components, binds the owner-only setup socket, and publishes schema 2 with `wire_version: 2`.
 2. Client validates one descriptor-anchored snapshot, authenticates, receives two ring descriptors, validates the fixed identity, attaches, and commits activation.
 3. Client sends channel-0 `route.open` correlation 1 through the ring.
 5. Host allocates global channel 7, epoch 77, binds the component, and returns the tagged response.

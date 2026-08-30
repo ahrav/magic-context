@@ -76,17 +76,11 @@ const EMPTY_JSON_BODY: JsonReceiveBody = Object.freeze({
 export type RetirementReason =
     | "setup_failed"
     | "setup_deadline"
-    | "socket_error"
     | "eof"
-    | "socket_closed"
-    | "socket_timeout"
     | "protocol_violation"
     | "role_violation"
-    | "frame_deadline"
     | "connection_goodbye"
-    | "control_capacity_exhausted"
     | "cleanup_deadline"
-    | "write_failed"
     | "quarantined"
     | "ambiguous_route_open"
     | "owner_close";
@@ -392,8 +386,7 @@ export class ConnectionGeneration {
         });
         const handlers: FrameChannelHandlers = {
             onFrame: (frame) => this.dispatch(frame.header, frame.body),
-            onClosed: (reason: FrameChannelCloseReason, error) =>
-                this.retire(reason === "truncated_frame" ? "eof" : reason, error),
+            onClosed: (reason: FrameChannelCloseReason, error) => this.retire(reason, error),
             onDiagnostic: (type, meta) => this.emitDiagnostic(type, meta),
             onLeaseReleased: () => {
                 try {
