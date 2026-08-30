@@ -239,6 +239,8 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: taiki-e/install-action@nextest
+
       - name: Host lifecycle and closure proofs (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -247,6 +249,12 @@ jobs:
             --test broca_subprocess \
             --test harness_closure \
             --test protocol_vectors
+
+      # The token cache is process-global state; tests that clear or delta
+      # its statics require separate processes, which nextest provides.
+      - name: Module transform and token-cache proofs (Linux)
+        if: runner.os == 'Linux'
+        run: cargo nextest run -p mc-module --lib
 
       - name: Native module adapter and CLI lifecycle (Linux)
         if: runner.os == 'Linux'

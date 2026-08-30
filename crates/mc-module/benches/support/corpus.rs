@@ -111,7 +111,7 @@ pub fn text(class: ContentClass, target_bytes: usize, rng: &mut Rng) -> String {
     while out.len() < target_bytes {
         match class {
             ContentClass::Prose => {
-                out.push_str(*rng.pick(PROSE_FRAGMENTS));
+                out.push_str(rng.pick(PROSE_FRAGMENTS));
                 if rng.next().is_multiple_of(3) {
                     out.push_str(&format!(
                         "See `{}` (rev {}). ",
@@ -122,7 +122,7 @@ pub fn text(class: ContentClass, target_bytes: usize, rng: &mut Rng) -> String {
             }
             ContentClass::Code => {
                 out.push_str(&format!("// case {}\n", rng.next() % 100_000));
-                out.push_str(*rng.pick(CODE_FRAGMENTS));
+                out.push_str(rng.pick(CODE_FRAGMENTS));
             }
             ContentClass::JsonTool => {
                 let value = json!({
@@ -139,7 +139,7 @@ pub fn text(class: ContentClass, target_bytes: usize, rng: &mut Rng) -> String {
                 out.push('\n');
             }
             ContentClass::Log => {
-                out.push_str(*rng.pick(LOG_FRAGMENTS));
+                out.push_str(rng.pick(LOG_FRAGMENTS));
             }
             ContentClass::Mixed => unreachable!("mixed resolved above"),
         }

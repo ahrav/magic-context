@@ -30,13 +30,17 @@ struct Generations {
 static CACHE: Mutex<Option<Generations>> = Mutex::new(None);
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
+static BYPASSED: AtomicU64 = AtomicU64::new(0);
 static CALLS: AtomicU64 = AtomicU64::new(0);
 static TOKENIZED_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Concurrent counter updates can make `calls != hits + misses + bypassed`
+/// in one snapshot.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct TokenCacheStats {
     pub hits: u64,
     pub misses: u64,
+    pub bypassed: u64,
     pub calls: u64,
     pub tokenized_bytes: u64,
 }
@@ -45,6 +49,7 @@ pub(crate) fn stats() -> TokenCacheStats {
     TokenCacheStats {
         hits: HITS.load(Ordering::Relaxed),
         misses: MISSES.load(Ordering::Relaxed),
+        bypassed: BYPASSED.load(Ordering::Relaxed),
         calls: CALLS.load(Ordering::Relaxed),
         tokenized_bytes: TOKENIZED_BYTES.load(Ordering::Relaxed),
     }
@@ -115,7 +120,7 @@ pub fn clear() {
 pub(crate) fn cached_estimate_tokens(content: &str) -> usize {
     if content.len() < MIN_CACHED_LEN {
         CALLS.fetch_add(1, Ordering::Relaxed);
-        MISSES.fetch_add(1, Ordering::Relaxed);
+        BYPASSED.fetch_add(1, Ordering::Relaxed);
         TOKENIZED_BYTES.fetch_add(content.len() as u64, Ordering::Relaxed);
         return mc_tokenizer::estimate_tokens(content);
     }
@@ -190,6 +195,21 @@ mod tests {
         assert!(generations.current.len() <= GENERATION_CAP);
         assert_eq!(generations.current.get(&[0xAA; 32]), Some(&7));
         assert_eq!(generations.previous.len(), GENERATION_CAP);
+    }
+
+    #[test]
+    fn stats_partition_calls_into_hits_misses_and_bypassed() {
+        let long = "stats partition fixture: unique sentence long enough to clear the cache threshold";
+        assert!(long.len() >= MIN_CACHED_LEN);
+        let before = stats();
+        cached_estimate_tokens("tiny");
+        cached_estimate_tokens(long);
+        cached_estimate_tokens(long);
+        let after = stats();
+        assert_eq!(after.calls - before.calls, 3);
+        assert_eq!(after.bypassed - before.bypassed, 1);
+        assert_eq!(after.misses - before.misses, 1);
+        assert_eq!(after.hits - before.hits, 1);
     }
 
     #[test]

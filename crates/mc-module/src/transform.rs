@@ -1226,6 +1226,8 @@ pub struct TransformTimings {
     #[serde(default)]
     pub tokenize_cache_misses: usize,
     #[serde(default)]
+    pub tokenize_cache_bypassed: usize,
+    #[serde(default)]
     pub tokenize_bytes: usize,
     #[serde(default)]
     pub tag_mint_candidates: usize,
@@ -1332,6 +1334,7 @@ fn record_token_cache_delta(
     timings.tokenize_calls = now.calls.saturating_sub(start.calls) as usize;
     timings.tokenize_cache_hits = now.hits.saturating_sub(start.hits) as usize;
     timings.tokenize_cache_misses = now.misses.saturating_sub(start.misses) as usize;
+    timings.tokenize_cache_bypassed = now.bypassed.saturating_sub(start.bypassed) as usize;
     timings.tokenize_bytes = now.tokenized_bytes.saturating_sub(start.tokenized_bytes) as usize;
 }
 
@@ -1364,7 +1367,7 @@ pub fn format_pass_timing_line(
          identity_enforce={:.1} state_clone={:.1} ingress_meta={:.1} user_hint={:.1} \
          planning={:.1} state_evolution={:.1} finalize={:.1} \
          tag_overlay={:.1} unit_mint={:.1} temporal={:.1} caveman={:.1} \
-         tail_hygiene={:.1} tokenize_calls={} tokenize_cache_hits={} tokenize_cache_misses={} tokenize_bytes={} \
+         tail_hygiene={:.1} tokenize_calls={} tokenize_cache_hits={} tokenize_cache_misses={} tokenize_cache_bypassed={} tokenize_bytes={} \
          tag_mint_candidates={} tag_mint_new={} tag_mint_tokenized_bytes={} \
          decide={:.1} seed_or_sync={:.1} compose_m0m1={:.1} selection={:.1} \
          transition_detection={:.3} emergency_reasoning_exclusions={} todo={:.1} \
@@ -1420,6 +1423,7 @@ pub fn format_pass_timing_line(
         timings.tokenize_calls,
         timings.tokenize_cache_hits,
         timings.tokenize_cache_misses,
+        timings.tokenize_cache_bypassed,
         timings.tokenize_bytes,
         timings.tag_mint_candidates,
         timings.tag_mint_new,

@@ -1,0 +1,26 @@
+{
+  "run": "mc-module token-count cache, recorded comparison 2026-08-30",
+  "contract": "docs/perf/mc-module-hot-path.md",
+  "bench": "crates/mc-module/benches/hot_path.rs (--features bench-internals)",
+  "arms": {
+    "precache": {
+      "role": "baseline",
+      "provenance": "hybrid tree: this harness applied onto the pre-cache implementation. The harness, bench-internals feature, and criterion dev-dependency do not exist at the parent commit (cbfecb41), so this arm is not re-derivable from a single commit.",
+      "sampling_mode_caveat": "tail_hygiene 1400/2500 and e2e_steady 1400 sampled in Criterion flat mode (no slope estimate); compare via mean only."
+    },
+    "new": {
+      "role": "candidate",
+      "provenance": "PR 97 head at bench time (perf/token-count-cache, commit b90fd2ee lineage; later amends are formatting-only)."
+    }
+  },
+  "replication": "one process pair on one host; sub-10% deltas are below this design's resolution (see contract, Comparing a change)",
+  "cells": [
+    "tail_hygiene_measure/{100,1400,2500}msgs_2KiB_mixed",
+    "e2e_steady/1400msgs_2KiB_mixed",
+    "e2e_first_hard/1400msgs_2KiB_mixed",
+    "m0_trim_claims_to_budget/{8,64,256}claims_8k_budget"
+  ],
+  "estimator": "Criterion mean with 95% CI (only estimator present in both arms of every cell)",
+  "integrity": "SHA256SUMS covers criterion/**",
+  "environment": "environment.txt"
+}
