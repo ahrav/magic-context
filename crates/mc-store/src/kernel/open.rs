@@ -286,10 +286,13 @@ fn expected_identity() -> Result<&'static ExpectedIdentity, KernelError> {
     EXPECTED_IDENTITY.as_ref().ok_or(KernelError::Io)
 }
 
-/// Classification must leave the family byte-identical.
+/// Classification must leave the database and its `-wal` byte-identical.
 ///
-/// The `Foreign` and `Inconclusive` outcomes promise an untouched family.
+/// The `Foreign` and `Inconclusive` outcomes promise untouched durable content.
 /// Journal recovery and WAL checkpointing would both break that promise.
+///
+/// A read-only open may recreate a missing `-shm`; it contains no durable data.
+/// SQLite rebuilds the `-shm` from the `-wal` on demand.
 fn classify_existing_family(path: &Path) -> Result<OpenIdentity, KernelError> {
     let expected = expected_identity()?;
     let mut conn = Connection::open_with_flags(
