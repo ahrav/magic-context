@@ -407,6 +407,19 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
             fail("shared_memory diagnostics violate the closed schema");
         }
     }
+    // The same coupling checks and reasons already get: a terminal ring is not a
+    // second opinion about the same connection, so a payload cannot report one
+    // while calling the component ready or the command successful. Accepting it
+    // lets the CLI exit 0 while rendering a ready component beside terminal ring
+    // diagnostics.
+    if (sharedMemory !== null && sharedMemory.state === "terminal") {
+        if (readiness?.shared_memory?.state === "ready") {
+            fail("terminal shared memory contradicts a ready shared-memory component");
+        }
+        if (record.ok === true) {
+            fail("terminal shared memory contradicts a successful result");
+        }
+    }
     if (!Array.isArray(record.checks) || record.checks.length > CHECK_IDS.size) {
         fail("checks is not a bounded array");
     }

@@ -102,6 +102,36 @@ describe("parseDaemonResult", () => {
         ).toThrow(/shared_memory/);
     });
 
+    test("a terminal ring cannot ride alongside a ready component or a pass", () => {
+        const terminal = { ...healthySharedMemory(), state: "terminal", error_class: "peer_death" };
+        expect(() =>
+            parseDaemonResult(
+                JSON.stringify(
+                    validResult({
+                        readiness: { shared_memory: { state: "ready", reason: "healthy" } },
+                        shared_memory: terminal,
+                    }),
+                ),
+            ),
+        ).toThrow(/terminal shared memory contradicts a ready/);
+        expect(() =>
+            parseDaemonResult(
+                JSON.stringify(
+                    validResult({
+                        ok: true,
+                        readiness: {
+                            shared_memory: {
+                                state: "unavailable",
+                                reason: "native_probe_unavailable",
+                            },
+                        },
+                        shared_memory: terminal,
+                    }),
+                ),
+            ),
+        ).toThrow(/terminal shared memory contradicts a successful result/);
+    });
+
     test("accepts a fully populated conforming result", () => {
         const parsed = parseDaemonResult(JSON.stringify(validResult()));
         expect(parsed.command).toBe("status");
@@ -133,7 +163,20 @@ describe("parseDaemonResult", () => {
             diagnostics.error_class = errorClass;
             diagnostics.accounting = null;
             const parsed = parseDaemonResult(
-                JSON.stringify(validResult({ shared_memory: diagnostics })),
+                JSON.stringify(
+                    validResult({
+                        ok: false,
+                        reason: "native_probe_unavailable",
+                        remediation: "run_daemon_restart",
+                        readiness: {
+                            shared_memory: {
+                                state: "unavailable",
+                                reason: "native_probe_unavailable",
+                            },
+                        },
+                        shared_memory: diagnostics,
+                    }),
+                ),
             );
             expect(parsed.shared_memory?.error_class).toBe(errorClass);
         }

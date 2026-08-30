@@ -277,6 +277,8 @@ async function probeManagedReadiness(root: string, budgetMs: number): Promise<Ob
     const deadline = Date.now() + budgetMs;
     const client = await processMcHostClient({
         connectionFile: connectionFilePath(root),
+        handshakeTimeoutMs: Math.max(1, budgetMs),
+        requestTimeoutMs: Math.max(1, budgetMs),
     });
     let probe: CompatibilityProbeResult;
     try {
