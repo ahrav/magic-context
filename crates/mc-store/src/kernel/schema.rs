@@ -48,7 +48,7 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "outbox",
-        r#"CREATE TABLE outbox(outbox_position INTEGER PRIMARY KEY AUTOINCREMENT,commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,ordinal INTEGER NOT NULL,object_id TEXT NOT NULL,object_kind TEXT NOT NULL,source_kind TEXT NOT NULL,source_id TEXT NOT NULL,source_revision INTEGER NOT NULL,sensitivity_class TEXT NOT NULL,payload BLOB NOT NULL,created_at INTEGER NOT NULL,published_at INTEGER,UNIQUE(commit_seq,ordinal)) STRICT; CREATE INDEX idx_outbox_poll ON outbox(published_at,outbox_position); CREATE INDEX idx_outbox_prune ON outbox(published_at,created_at,outbox_position); CREATE INDEX idx_outbox_commit_fk ON outbox(commit_seq);"#,
+        r#"CREATE TABLE outbox(outbox_position INTEGER PRIMARY KEY AUTOINCREMENT,commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,ordinal INTEGER NOT NULL,object_id TEXT NOT NULL,object_kind TEXT NOT NULL,source_kind TEXT NOT NULL,source_id TEXT NOT NULL,source_revision INTEGER NOT NULL,sensitivity_class TEXT NOT NULL,payload BLOB NOT NULL,created_at INTEGER NOT NULL,published_at INTEGER,UNIQUE(commit_seq,ordinal)) STRICT; CREATE INDEX idx_outbox_poll ON outbox(published_at,outbox_position); CREATE INDEX idx_outbox_prune ON outbox(published_at,created_at,outbox_position);"#,
     ),
     (
         "operation_receipts",
@@ -96,7 +96,7 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "predicate_schemas",
-        r#"CREATE TABLE predicate_schemas(predicate_schema_id TEXT PRIMARY KEY,object_id TEXT NOT NULL UNIQUE REFERENCES object_registry(object_id),domain_id TEXT NOT NULL REFERENCES domains(domain_id),predicate_name TEXT NOT NULL,value_schema BLOB NOT NULL,freshness_class TEXT NOT NULL,created_commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq),invalidated_commit_seq INTEGER REFERENCES commit_log(commit_seq),superseded_by TEXT REFERENCES object_registry(object_id),sensitivity_class TEXT NOT NULL,UNIQUE(domain_id,predicate_name)) STRICT; CREATE INDEX idx_predicate_domain_fk ON predicate_schemas(domain_id); CREATE INDEX idx_predicate_known_as_of ON predicate_schemas(created_commit_seq,invalidated_commit_seq,predicate_schema_id);"#,
+        r#"CREATE TABLE predicate_schemas(predicate_schema_id TEXT PRIMARY KEY,object_id TEXT NOT NULL UNIQUE REFERENCES object_registry(object_id),domain_id TEXT NOT NULL REFERENCES domains(domain_id),predicate_name TEXT NOT NULL,value_schema BLOB NOT NULL,freshness_class TEXT NOT NULL,created_commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq),invalidated_commit_seq INTEGER REFERENCES commit_log(commit_seq),superseded_by TEXT REFERENCES object_registry(object_id),sensitivity_class TEXT NOT NULL,UNIQUE(domain_id,predicate_name)) STRICT; CREATE INDEX idx_predicate_known_as_of ON predicate_schemas(created_commit_seq,invalidated_commit_seq,predicate_schema_id);"#,
     ),
     (
         "scopes",
@@ -163,6 +163,8 @@ const COMPONENTS: &[(&str, &str)] = &[
         r#"CREATE TABLE mc_kernel_format_marker(singleton INTEGER PRIMARY KEY CHECK(singleton=1),format_epoch INTEGER NOT NULL,database_incarnation_id TEXT NOT NULL,schema_digest TEXT NOT NULL,created_at INTEGER NOT NULL) STRICT;"#,
     ),
 ];
+
+const _: () = assert!(COMPONENTS.len() == KERNEL_SCHEMA_COMPONENT_NAMES.len());
 
 pub fn apply_kernel_connection_profile(
     conn: &mut Connection,
