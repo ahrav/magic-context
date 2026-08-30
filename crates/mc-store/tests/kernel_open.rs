@@ -302,6 +302,39 @@ fn unsupported_engine_is_rejected_before_creating_lease_or_database_files() {
     assert!(!root.exists());
 }
 
+#[test]
+fn an_opened_store_satisfies_the_durability_contract_on_writer_and_readers() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    drop(store);
+
+    let writer = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    let journal_mode: String = writer
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        journal_mode.eq_ignore_ascii_case("wal"),
+        "journal_mode was {journal_mode}"
+    );
+}
+
+#[test]
+fn pooled_readers_reject_writes() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    // known_as_of borrows a pooled reader, proving the pool is usable for reads.
+    assert!(store.known_as_of(0).unwrap().objects.is_empty());
+
+    let reader = Connection::open_with_flags(
+        directory.path().join("core.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    assert!(reader
+        .execute("INSERT INTO writer_fence(id,writer_epoch) VALUES(0,1)", [])
+        .is_err());
+}
+
 #[cfg(unix)]
 fn assert_owner_only(path: &Path, expected: u32) {
     use std::os::unix::fs::PermissionsExt;

@@ -93,8 +93,10 @@ fn first_root_transaction_resolves_deferred_registry_cycle() {
 
     let tx = conn.transaction().unwrap();
     tx.execute(
-        "INSERT INTO commit_log(transaction_id, writer_epoch, recorded_at, actor, cause)
-         VALUES ('tx-1', 7, 1000, 'test', 'root')",
+        "INSERT INTO commit_log(
+             transaction_id, writer_epoch, producer, operation_key, request_digest,
+             recorded_at, actor, cause
+         ) VALUES ('tx-1', 7, 'fixture', 'root', '', 1000, 'test', 'root')",
         [],
     )
     .unwrap();
@@ -201,8 +203,10 @@ fn consumers_checkpoint_independent_outbox_positions() {
     let (_dir, mut conn) = open_profiled();
     apply_kernel_schema(&mut conn, TEST_INCARNATION, 1_000).unwrap();
     conn.execute(
-        "INSERT INTO commit_log(transaction_id, writer_epoch, recorded_at, actor, cause)
-         VALUES ('tx-1', 7, 1, 'test', 'outbox')",
+        "INSERT INTO commit_log(
+             transaction_id, writer_epoch, producer, operation_key, request_digest,
+             recorded_at, actor, cause
+         ) VALUES ('tx-1', 7, 'fixture', 'outbox', '', 1, 'test', 'outbox')",
         [],
     )
     .unwrap();
@@ -290,8 +294,9 @@ fn commit_receipt_and_change_identity_shapes_are_not_overconstrained() {
     apply_kernel_schema(&mut conn, TEST_INCARNATION, 1_000).unwrap();
     conn.execute(
         "INSERT INTO commit_log(
-             transaction_id, writer_epoch, recorded_at, actor, cause
-         ) VALUES ('tx-identity', 42, 1, 'test', 'identity')",
+             transaction_id, writer_epoch, producer, operation_key, request_digest,
+             recorded_at, actor, cause
+         ) VALUES ('tx-identity', 42, 'fixture', 'identity', '', 1, 'test', 'identity')",
         [],
     )
     .unwrap();
@@ -388,8 +393,8 @@ fn durable_text_redactions_is_digest_covered_normalized_metadata_with_restricted
             "detection_ordinal",
             "detector_id",
             "secret_type",
-            "utf8_offset",
-            "utf8_length",
+            "source_utf8_offset",
+            "source_utf8_length",
             "commit_seq",
         ]
     );
@@ -403,8 +408,10 @@ fn durable_text_redactions_is_digest_covered_normalized_metadata_with_restricted
     let (_dir, mut conn) = open_profiled();
     apply_kernel_schema(&mut conn, TEST_INCARNATION, 1_000).unwrap();
     conn.execute(
-        "INSERT INTO commit_log(transaction_id,writer_epoch,recorded_at,actor,cause)
-         VALUES ('redaction-parent',1,1,'test','fixture')",
+        "INSERT INTO commit_log(
+             transaction_id,writer_epoch,producer,operation_key,request_digest,
+             recorded_at,actor,cause
+         ) VALUES ('redaction-parent',1,'fixture','redaction','',1,'test','fixture')",
         [],
     )
     .unwrap();
@@ -412,7 +419,7 @@ fn durable_text_redactions_is_digest_covered_normalized_metadata_with_restricted
     conn.execute(
         "INSERT INTO durable_text_redactions(
              owner_kind,owner_id,field_name,detection_ordinal,detector_id,secret_type,
-             utf8_offset,utf8_length,commit_seq
+             source_utf8_offset,source_utf8_length,commit_seq
          ) VALUES ('commit_log','redaction-parent','cause',0,'detector','token',0,10,?1)",
         [commit_seq],
     )
@@ -427,4 +434,54 @@ fn durable_text_redactions_is_digest_covered_normalized_metadata_with_restricted
         .unwrap(),
         1
     );
+}
+
+#[test]
+fn commit_log_requires_an_explicit_operation_identity() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, TEST_INCARNATION, 1_000).unwrap();
+
+    let omitted = conn.execute(
+        "INSERT INTO commit_log(transaction_id,writer_epoch,recorded_at,actor,cause)
+         VALUES ('tx-omitted',1,1,'test','omitted')",
+        [],
+    );
+    assert!(
+        omitted.is_err(),
+        "producer and operation_key must have no default that two writers can share"
+    );
+
+    for (transaction_id, operation_key) in [("tx-a", "op-a"), ("tx-b", "op-b")] {
+        conn.execute(
+            "INSERT INTO commit_log(
+                 transaction_id,writer_epoch,producer,operation_key,request_digest,
+                 recorded_at,actor,cause
+             ) VALUES (?1,1,'fixture',?2,'',1,'test','explicit')",
+            params![transaction_id, operation_key],
+        )
+        .unwrap();
+    }
+    let repeated = conn.execute(
+        "INSERT INTO commit_log(
+             transaction_id,writer_epoch,producer,operation_key,request_digest,
+             recorded_at,actor,cause
+         ) VALUES ('tx-c',1,'fixture','op-a','',1,'test','repeat')",
+        [],
+    );
+    assert!(repeated.is_err(), "idx_commit_operation must stay unique");
+}
+
+#[test]
+fn an_unstamped_writer_fence_reads_as_a_typed_epoch() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, TEST_INCARNATION, 1_000).unwrap();
+
+    let epoch: i64 = conn
+        .query_row(
+            "SELECT writer_epoch FROM writer_fence WHERE id=0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(epoch, -1, "bootstrap must seed a sentinel, not NULL");
 }

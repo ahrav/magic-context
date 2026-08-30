@@ -1,6 +1,7 @@
 use cortexkit_lease::{
     protect_file, FileLeaseStore, LeaseError, LeaseHandle, LeaseKey, LeaseStore,
 };
+use mc_core::claim_operation::is_lower_hex;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,9 +16,10 @@ use super::schema::{
     apply_kernel_schema, kernel_schema_digest, kernel_schema_object_inventory,
     KERNEL_APPLICATION_ID, KERNEL_FORMAT_EPOCH,
 };
+use crate::current_time_ms;
 use crate::sqlite_runtime::{
     compute_marker_digest_for_application_id, evaluate_sqlite_runtime_gate,
-    probe_sqlite_engine_identity_off_path, SqliteEngineIdentity,
+    probe_sqlite_engine_identity_off_path, verify_sqlite_connection_contract, SqliteEngineIdentity,
 };
 
 const BUSY_TIMEOUT_MS: i64 = 5_000;
@@ -34,22 +36,7 @@ pub enum KernelError {
     Foreign,
     Inconclusive,
     Io,
-    IdentityMismatch,
-    FenceLost,
-    Conflict,
-    InvalidInput,
-    FutureSnapshot,
-    NotFound,
-    Fault,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KernelErrorKind {
-    Held,
-    EngineUnsupported,
-    Foreign,
-    Inconclusive,
-    Io,
+    Busy,
     IdentityMismatch,
     FenceLost,
     Conflict,
@@ -60,21 +47,9 @@ pub enum KernelErrorKind {
 }
 
 impl KernelError {
-    pub fn kind(self) -> KernelErrorKind {
-        match self {
-            Self::Held => KernelErrorKind::Held,
-            Self::EngineUnsupported => KernelErrorKind::EngineUnsupported,
-            Self::Foreign => KernelErrorKind::Foreign,
-            Self::Inconclusive => KernelErrorKind::Inconclusive,
-            Self::Io => KernelErrorKind::Io,
-            Self::IdentityMismatch => KernelErrorKind::IdentityMismatch,
-            Self::FenceLost => KernelErrorKind::FenceLost,
-            Self::Conflict => KernelErrorKind::Conflict,
-            Self::InvalidInput => KernelErrorKind::InvalidInput,
-            Self::FutureSnapshot => KernelErrorKind::FutureSnapshot,
-            Self::NotFound => KernelErrorKind::NotFound,
-            Self::Fault => KernelErrorKind::Fault,
-        }
+    /// Returns true only when retrying the unchanged request is valid.
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::Busy)
     }
 }
 
@@ -86,6 +61,7 @@ impl fmt::Display for KernelError {
             Self::Foreign => "kernel store path contains a foreign database family",
             Self::Inconclusive => "kernel store identity could not be established safely",
             Self::Io => "kernel store I/O failed",
+            Self::Busy => "kernel store lock was not acquired before the busy timeout",
             Self::IdentityMismatch => "kernel store identity does not match this build",
             Self::FenceLost => "kernel store writer fence was lost",
             Self::Conflict => "kernel operation conflicts with an existing receipt",
@@ -180,6 +156,7 @@ impl KernelStore {
 
         activate_wal(&writer)?;
         stamp_writer_fence(&mut writer, lease_epoch)?;
+        verify_connection_contract(&writer, true)?;
         harden_family(&db_path)?;
         let readers = open_read_pool(&db_path)?;
         harden_family(&db_path)?;
@@ -387,13 +364,6 @@ fn read_valid_marker(conn: &Connection) -> Result<FormatMarker, KernelError> {
     })
 }
 
-fn is_lower_hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
 fn open_writer(path: &Path) -> rusqlite::Result<Connection> {
     Connection::open_with_flags(
         path,
@@ -421,10 +391,26 @@ fn apply_preclassification_profile(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 fn activate_wal(conn: &Connection) -> Result<(), KernelError> {
-    conn.pragma_update(None, "journal_mode", "WAL")
+    let journal_mode: String = conn
+        .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
         .map_err(|_| KernelError::Io)?;
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        return Err(KernelError::Io);
+    }
     conn.pragma_update(None, "synchronous", "FULL")
         .map_err(|_| KernelError::Io)
+}
+
+/// `pragma_update` discards SQLite's returned mode, so it cannot detect a
+/// declined update.
+fn verify_connection_contract(conn: &Connection, expect_wal: bool) -> Result<(), KernelError> {
+    let violations = verify_sqlite_connection_contract(conn, expect_wal, BUSY_TIMEOUT_MS)
+        .map_err(|_| KernelError::Io)?;
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(KernelError::Io)
+    }
 }
 
 fn stamp_writer_fence(conn: &mut Connection, epoch: u64) -> Result<(), KernelError> {
@@ -454,6 +440,13 @@ fn open_read_pool(path: &Path) -> Result<Vec<Mutex<Connection>>, KernelError> {
             conn.pragma_update(None, "query_only", "ON")
                 .map_err(|_| KernelError::Io)?;
             apply_preclassification_profile(&conn).map_err(|_| KernelError::Io)?;
+            let query_only: i64 = conn
+                .query_row("PRAGMA query_only", [], |row| row.get(0))
+                .map_err(|_| KernelError::Io)?;
+            if query_only != 1 {
+                return Err(KernelError::Io);
+            }
+            verify_connection_contract(&conn, true)?;
             Ok(Mutex::new(conn))
         })
         .collect()
@@ -661,13 +654,6 @@ fn sync_directory(path: &Path) -> Result<(), KernelError> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|_| KernelError::Io)
-}
-
-fn current_time_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
 }
 
 fn map_lease_error(error: LeaseError) -> KernelError {

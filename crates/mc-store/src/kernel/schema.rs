@@ -5,7 +5,8 @@ use std::collections::BTreeSet;
 use crate::sqlite_runtime::compute_marker_digest_for_application_id;
 
 pub const KERNEL_APPLICATION_ID: u32 = 0x4D43_4B52;
-pub const KERNEL_FORMAT_EPOCH: i64 = 1;
+/// Epoch changes quarantine prior databases instead of migrating them; `every_conclusive_kernel_mismatch_is_quarantined_and_rebuilt` pins that contract. commentlint: allow(JUDGE)
+pub const KERNEL_FORMAT_EPOCH: i64 = 2;
 pub const KERNEL_SCHEMA_COMPONENT_NAMES: &[&str] = &[
     "commit_log",
     "change_event",
@@ -44,7 +45,7 @@ pub const KERNEL_SCHEMA_COMPONENT_NAMES: &[&str] = &[
 const COMPONENTS: &[(&str, &str)] = &[
     (
         "commit_log",
-        r#"CREATE TABLE commit_log(commit_seq INTEGER PRIMARY KEY AUTOINCREMENT,transaction_id TEXT NOT NULL UNIQUE,writer_epoch INTEGER NOT NULL,producer TEXT NOT NULL DEFAULT 'legacy',operation_key TEXT NOT NULL DEFAULT 'legacy',request_digest TEXT NOT NULL DEFAULT '',recorded_at INTEGER NOT NULL,actor TEXT NOT NULL,cause TEXT NOT NULL) STRICT; CREATE UNIQUE INDEX idx_commit_operation ON commit_log(producer,operation_key);"#,
+        r#"CREATE TABLE commit_log(commit_seq INTEGER PRIMARY KEY AUTOINCREMENT,transaction_id TEXT NOT NULL UNIQUE,writer_epoch INTEGER NOT NULL,producer TEXT NOT NULL,operation_key TEXT NOT NULL,request_digest TEXT NOT NULL,recorded_at INTEGER NOT NULL,actor TEXT NOT NULL,cause TEXT NOT NULL) STRICT; CREATE UNIQUE INDEX idx_commit_operation ON commit_log(producer,operation_key);"#,
     ),
     (
         "change_event",
@@ -60,11 +61,11 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "durable_text_redactions",
-        r#"CREATE TABLE durable_text_redactions(owner_kind TEXT NOT NULL,owner_id TEXT NOT NULL,field_name TEXT NOT NULL,detection_ordinal INTEGER NOT NULL,detector_id TEXT NOT NULL,secret_type TEXT NOT NULL,utf8_offset INTEGER NOT NULL,utf8_length INTEGER NOT NULL,commit_seq INTEGER REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,PRIMARY KEY(owner_kind,owner_id,field_name,detection_ordinal)) STRICT; CREATE INDEX idx_text_redactions_commit_fk ON durable_text_redactions(commit_seq);"#,
+        r#"CREATE TABLE durable_text_redactions(owner_kind TEXT NOT NULL,owner_id TEXT NOT NULL,field_name TEXT NOT NULL,detection_ordinal INTEGER NOT NULL,detector_id TEXT NOT NULL,secret_type TEXT NOT NULL,source_utf8_offset INTEGER NOT NULL,source_utf8_length INTEGER NOT NULL,commit_seq INTEGER REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,PRIMARY KEY(owner_kind,owner_id,field_name,detection_ordinal)) STRICT; CREATE INDEX idx_text_redactions_commit_fk ON durable_text_redactions(commit_seq);"#,
     ),
     (
         "writer_fence",
-        r#"CREATE TABLE writer_fence(id INTEGER PRIMARY KEY CHECK(id=0),writer_epoch INTEGER) STRICT;"#,
+        r#"CREATE TABLE writer_fence(id INTEGER PRIMARY KEY CHECK(id=0),writer_epoch INTEGER NOT NULL DEFAULT -1 CHECK(writer_epoch>=-1)) STRICT;"#,
     ),
     (
         "outbox_consumers",

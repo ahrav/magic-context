@@ -3,12 +3,14 @@
 use std::fs;
 
 use mc_store::kernel::{
-    CommitIntent, DomainSpec, KernelErrorKind, KernelStore, RepositoryProvenance, Sensitivity,
+    CommitIntent, DomainSpec, KernelError, KernelStore, RepositoryProvenance, Sensitivity,
     StagingCandidateSpec,
 };
 use rusqlite::{Connection, OpenFlags};
 
 const SECRET: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwxyzABCDEFGH12345678";
+const SECRET_MASK: &str = "<ANTHROPIC_API_KEY_REDACTED>";
+const CONTROL: &str = "redacted-domain";
 
 fn intent(key: &str, digest: char) -> CommitIntent {
     CommitIntent {
@@ -22,7 +24,7 @@ fn intent(key: &str, digest: char) -> CommitIntent {
 
 fn domain() -> DomainSpec {
     DomainSpec {
-        domain_id: "redacted-domain".to_string(),
+        domain_id: CONTROL.to_string(),
         object_id: "redacted-object".to_string(),
         name: format!("name {SECRET}"),
         source_kind: "fixture".to_string(),
@@ -32,16 +34,29 @@ fn domain() -> DomainSpec {
     }
 }
 
+/// Reads the on-disk family, failing when a member is unreadable so a scan of zero bytes cannot pass a "secret is absent" assertion. commentlint: allow(JUDGE)
 fn family_bytes(root: &std::path::Path) -> Vec<u8> {
     let base = root.join("core.sqlite");
-    [
-        base.clone(),
-        std::path::PathBuf::from(format!("{}-wal", base.display())),
-    ]
-    .into_iter()
-    .filter_map(|path| fs::read(path).ok())
-    .flatten()
-    .collect()
+    let mut bytes = fs::read(&base).expect("main database is readable");
+    let wal = std::path::PathBuf::from(format!("{}-wal", base.display()));
+    if wal.exists() {
+        bytes.extend(fs::read(&wal).expect("write-ahead log is readable"));
+    }
+    assert!(!bytes.is_empty(), "scanned zero bytes");
+    bytes
+}
+
+fn assert_absent_and_scan_is_live(root: &std::path::Path) {
+    let bytes = family_bytes(root);
+    assert!(
+        bytes
+            .windows(CONTROL.len())
+            .any(|window| window == CONTROL.as_bytes()),
+        "scan did not observe stored text, so an absence check would be vacuous"
+    );
+    assert!(!bytes
+        .windows(SECRET.len())
+        .any(|window| window == SECRET.as_bytes()));
 }
 
 fn inspect_text(root: &std::path::Path, sql: &str) -> String {
@@ -62,16 +77,20 @@ fn envelope_redacts_before_bind_and_never_leaks_secret_to_storage_or_errors() {
         })
         .unwrap();
     assert!(!receipt.result.contains(SECRET));
-    assert!(inspect_text(directory.path(), "SELECT actor FROM commit_log").contains("REDACTED"));
-    assert!(inspect_text(directory.path(), "SELECT name FROM domains").contains("REDACTED"));
-    assert!(!family_bytes(directory.path())
-        .windows(SECRET.len())
-        .any(|window| window == SECRET.as_bytes()));
+    assert_eq!(
+        inspect_text(directory.path(), "SELECT actor FROM commit_log"),
+        format!("actor {SECRET_MASK}")
+    );
+    assert_eq!(
+        inspect_text(directory.path(), "SELECT name FROM domains"),
+        format!("name {SECRET_MASK}")
+    );
+    assert_absent_and_scan_is_live(directory.path());
 
     let conflict = store
         .commit(intent("secret-operation", 'b'), |_| Ok(String::new()))
         .unwrap_err();
-    assert_eq!(conflict.kind(), KernelErrorKind::Conflict);
+    assert_eq!(conflict, KernelError::Conflict);
     assert!(!conflict.to_string().contains(SECRET));
     assert!(!format!("{conflict:?}").contains(SECRET));
 
@@ -82,15 +101,20 @@ fn envelope_redacts_before_bind_and_never_leaks_secret_to_storage_or_errors() {
     .unwrap();
     let metadata: (String, String, i64, i64) = connection
         .query_row(
-            "SELECT detector_id,secret_type,utf8_offset,utf8_length
-             FROM durable_text_redactions ORDER BY owner_kind,field_name LIMIT 1",
+            "SELECT detector_id,secret_type,source_utf8_offset,source_utf8_length
+             FROM durable_text_redactions
+             WHERE owner_kind='commit_log' AND field_name='actor'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .unwrap();
     assert_eq!(metadata.0, "redaction-vocabulary-v1");
     assert_eq!(metadata.1, "anthropic_api_key");
-    assert!(metadata.2 >= 0 && metadata.3 > 0);
+    // The span indexes the pre-redaction input: "actor " is 6 bytes, then the secret.
+    assert_eq!(
+        (metadata.2, metadata.3),
+        (6, i64::try_from(SECRET.len()).unwrap())
+    );
     let owner_kinds = connection
         .prepare("SELECT DISTINCT owner_kind FROM durable_text_redactions ORDER BY owner_kind")
         .unwrap()
@@ -147,7 +171,8 @@ fn staging_requires_affirmative_repository_provenance_for_normal() {
         })
         .unwrap();
     assert_eq!(proven.sensitivity, Sensitivity::Normal);
-    assert!(!family_bytes(directory.path())
+    let bytes = family_bytes(directory.path());
+    assert!(!bytes
         .windows(SECRET.len())
         .any(|window| window == SECRET.as_bytes()));
 }
@@ -221,7 +246,7 @@ fn staging_run_reuse_with_changed_immutable_metadata_is_a_typed_conflict() {
     let mut mismatch = shared_run_candidate("candidate-b", 5);
     mismatch.source_id = "different-source".to_string();
     let error = store.stage_candidate(mismatch).unwrap_err();
-    assert_eq!(error.kind(), KernelErrorKind::Conflict);
+    assert_eq!(error, KernelError::Conflict);
 
     let connection = Connection::open_with_flags(
         directory.path().join("core.sqlite"),
