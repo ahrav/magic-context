@@ -117,6 +117,13 @@ jobs:
       - name: Mandatory ring client suite
         run: cargo nextest run -p mc-host --test client
 
+      # The long soak has `#[ignore]`; this command excludes it without
+      # `--run-ignored`.
+      - name: Crash reclamation and bounded-resource suites
+        run: |
+          cargo nextest run -p mc-host \
+            --test shm_failure_modes --test shm_soak
+
   shm-source-build:
     name: Shared memory source build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
