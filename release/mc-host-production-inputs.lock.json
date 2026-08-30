@@ -226,7 +226,7 @@
     "id": "mc-host-release",
     "version": "0.38.0"
   },
-  "release_contract_sha256": "a2f7c195f769d369e4495c55806a1645a4ca575cad351b5f2b7a751d83b8eda4",
+  "release_contract_sha256": "3a3d9cc2b1ae1e1cc43f9ac8d6d721116247699bcb200fb19d5dfab17dee7f90",
   "rust_runtime": {
     "fastembed": "6.0.0",
     "ort": "2.0.0-rc.13",
