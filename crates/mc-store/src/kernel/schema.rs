@@ -57,7 +57,7 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "writer_fence",
-        r#"CREATE TABLE writer_fence(id INTEGER PRIMARY KEY CHECK(id=0),writer_epoch INTEGER) STRICT;"#,
+        r#"CREATE TABLE writer_fence(id INTEGER PRIMARY KEY CHECK(id=0),writer_epoch INTEGER) STRICT; CREATE TRIGGER writer_fence_no_delete BEFORE DELETE ON writer_fence BEGIN SELECT RAISE(ABORT,'writer_fence is a declared singleton'); END;"#,
     ),
     (
         "outbox_consumers",
@@ -89,7 +89,7 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "entity_aliases",
-        r#"CREATE TABLE entity_aliases(entity_id TEXT NOT NULL REFERENCES entities(entity_id) ON DELETE CASCADE,alias TEXT NOT NULL,alias_kind TEXT NOT NULL,created_commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq),invalidated_commit_seq INTEGER REFERENCES commit_log(commit_seq),superseded_by TEXT REFERENCES object_registry(object_id),sensitivity_class TEXT NOT NULL,PRIMARY KEY(entity_id,alias,alias_kind),CHECK(invalidated_commit_seq IS NULL OR invalidated_commit_seq>created_commit_seq)) STRICT; CREATE INDEX idx_alias_lookup ON entity_aliases(alias,alias_kind,entity_id); CREATE INDEX idx_alias_known_as_of ON entity_aliases(created_commit_seq,invalidated_commit_seq,entity_id);"#,
+        r#"CREATE TABLE entity_aliases(entity_id TEXT NOT NULL REFERENCES entities(entity_id) ON DELETE RESTRICT,alias TEXT NOT NULL,alias_kind TEXT NOT NULL,created_commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq),invalidated_commit_seq INTEGER REFERENCES commit_log(commit_seq),superseded_by TEXT REFERENCES object_registry(object_id),sensitivity_class TEXT NOT NULL,PRIMARY KEY(entity_id,alias,alias_kind,created_commit_seq),CHECK(invalidated_commit_seq IS NULL OR invalidated_commit_seq>created_commit_seq)) STRICT; CREATE INDEX idx_alias_lookup ON entity_aliases(alias,alias_kind,entity_id); CREATE INDEX idx_alias_known_as_of ON entity_aliases(created_commit_seq,invalidated_commit_seq,entity_id); CREATE UNIQUE INDEX idx_alias_active ON entity_aliases(entity_id,alias,alias_kind) WHERE invalidated_commit_seq IS NULL;"#,
     ),
     (
         "propositions",
@@ -105,7 +105,7 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "scope_term",
-        r#"CREATE TABLE scope_term(scope_id TEXT NOT NULL REFERENCES scopes(scope_id) ON DELETE CASCADE,ordinal INTEGER NOT NULL,dimension TEXT NOT NULL,operator TEXT NOT NULL,exact_value TEXT,set_values BLOB,range_start TEXT,range_end TEXT,version_range TEXT,git_oid TEXT,git_start_oid TEXT,git_end_oid TEXT,payload BLOB,PRIMARY KEY(scope_id,ordinal)) STRICT;"#,
+        r#"CREATE TABLE scope_term(scope_id TEXT NOT NULL REFERENCES scopes(scope_id) ON DELETE RESTRICT,ordinal INTEGER NOT NULL,dimension TEXT NOT NULL,operator TEXT NOT NULL,exact_value TEXT,set_values BLOB,range_start TEXT,range_end TEXT,version_range TEXT,git_oid TEXT,git_start_oid TEXT,git_end_oid TEXT,payload BLOB,PRIMARY KEY(scope_id,ordinal)) STRICT;"#,
     ),
     (
         "anchors",
@@ -125,11 +125,11 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "extraction_runs",
-        r#"CREATE TABLE extraction_runs(extraction_run_id TEXT PRIMARY KEY,extractor TEXT NOT NULL,source_kind TEXT,source_id TEXT,source_revision INTEGER,sensitivity_class TEXT NOT NULL,provenance_witness BLOB NOT NULL,redaction_metadata BLOB NOT NULL,detector_id TEXT,secret_type TEXT,utf8_offset INTEGER,utf8_length INTEGER,started_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,lease_expires_at INTEGER NOT NULL,terminal_state TEXT,terminal_at INTEGER,CHECK(lease_expires_at>heartbeat_at)) STRICT; CREATE INDEX idx_runs_ttl ON extraction_runs(terminal_at,lease_expires_at,extraction_run_id); CREATE INDEX idx_runs_heartbeat ON extraction_runs(terminal_at,heartbeat_at,extraction_run_id);"#,
+        r#"CREATE TABLE extraction_runs(extraction_run_id TEXT PRIMARY KEY,extractor TEXT NOT NULL,source_kind TEXT,source_id TEXT,source_revision INTEGER,sensitivity_class TEXT NOT NULL,provenance_witness BLOB NOT NULL,redaction_metadata BLOB NOT NULL,detector_id TEXT,secret_type TEXT,utf8_offset INTEGER,utf8_length INTEGER,started_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,lease_expires_at INTEGER NOT NULL,terminal_state TEXT,terminal_at INTEGER,CHECK(lease_expires_at>heartbeat_at),CHECK((terminal_state IS NULL)=(terminal_at IS NULL))) STRICT; CREATE INDEX idx_runs_ttl ON extraction_runs(terminal_at,lease_expires_at,extraction_run_id); CREATE INDEX idx_runs_heartbeat ON extraction_runs(terminal_at,heartbeat_at,extraction_run_id);"#,
     ),
     (
         "candidates",
-        r#"CREATE TABLE candidates(candidate_id TEXT PRIMARY KEY,extraction_run_id TEXT NOT NULL REFERENCES extraction_runs(extraction_run_id) ON DELETE CASCADE,candidate_kind TEXT NOT NULL,payload BLOB NOT NULL,sensitivity_class TEXT NOT NULL,provenance_witness BLOB NOT NULL,redaction_metadata BLOB NOT NULL,detector_id TEXT,secret_type TEXT,utf8_offset INTEGER,utf8_length INTEGER,created_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,lease_expires_at INTEGER NOT NULL,terminal_state TEXT,terminal_at INTEGER,CHECK(lease_expires_at>heartbeat_at)) STRICT; CREATE INDEX idx_candidates_run_fk ON candidates(extraction_run_id,candidate_id); CREATE INDEX idx_candidates_ttl ON candidates(terminal_at,lease_expires_at,candidate_id);"#,
+        r#"CREATE TABLE candidates(candidate_id TEXT PRIMARY KEY,extraction_run_id TEXT NOT NULL REFERENCES extraction_runs(extraction_run_id) ON DELETE CASCADE,candidate_kind TEXT NOT NULL,payload BLOB NOT NULL,sensitivity_class TEXT NOT NULL,provenance_witness BLOB NOT NULL,redaction_metadata BLOB NOT NULL,detector_id TEXT,secret_type TEXT,utf8_offset INTEGER,utf8_length INTEGER,created_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,lease_expires_at INTEGER NOT NULL,terminal_state TEXT,terminal_at INTEGER,CHECK(lease_expires_at>heartbeat_at),CHECK((terminal_state IS NULL)=(terminal_at IS NULL))) STRICT; CREATE INDEX idx_candidates_run_fk ON candidates(extraction_run_id,candidate_id); CREATE INDEX idx_candidates_ttl ON candidates(terminal_at,lease_expires_at,candidate_id);"#,
     ),
     (
         "candidate_scores",
@@ -145,7 +145,7 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "decision_events",
-        r#"CREATE TABLE decision_events(decision_id TEXT NOT NULL REFERENCES decisions(decision_id) ON DELETE CASCADE,event_ordinal INTEGER NOT NULL,commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq),event_kind TEXT NOT NULL,event_payload BLOB NOT NULL,evidence_id TEXT REFERENCES evidence_meta(evidence_id) ON DELETE RESTRICT,recorded_at INTEGER NOT NULL,PRIMARY KEY(decision_id,event_ordinal)) STRICT; CREATE INDEX idx_decision_events_commit ON decision_events(commit_seq,decision_id,event_ordinal); CREATE INDEX idx_decision_events_evidence_fk ON decision_events(evidence_id);"#,
+        r#"CREATE TABLE decision_events(decision_id TEXT NOT NULL REFERENCES decisions(decision_id) ON DELETE RESTRICT,event_ordinal INTEGER NOT NULL,commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq),event_kind TEXT NOT NULL,event_payload BLOB NOT NULL,evidence_id TEXT REFERENCES evidence_meta(evidence_id) ON DELETE RESTRICT,recorded_at INTEGER NOT NULL,PRIMARY KEY(decision_id,event_ordinal)) STRICT; CREATE INDEX idx_decision_events_commit ON decision_events(commit_seq,decision_id,event_ordinal); CREATE INDEX idx_decision_events_evidence_fk ON decision_events(evidence_id);"#,
     ),
     (
         "observations",
@@ -153,11 +153,11 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "observation_dependencies",
-        r#"CREATE TABLE observation_dependencies(observation_id TEXT NOT NULL REFERENCES observations(observation_id) ON DELETE CASCADE,dependency_object_id TEXT NOT NULL REFERENCES object_registry(object_id),dependency_kind TEXT NOT NULL,dependency_payload BLOB,PRIMARY KEY(observation_id,dependency_object_id,dependency_kind)) STRICT; CREATE INDEX idx_observation_dependency_fk ON observation_dependencies(dependency_object_id,observation_id);"#,
+        r#"CREATE TABLE observation_dependencies(observation_id TEXT NOT NULL REFERENCES observations(observation_id) ON DELETE RESTRICT,dependency_object_id TEXT NOT NULL REFERENCES object_registry(object_id),dependency_kind TEXT NOT NULL,dependency_payload BLOB,PRIMARY KEY(observation_id,dependency_object_id,dependency_kind)) STRICT; CREATE INDEX idx_observation_dependency_fk ON observation_dependencies(dependency_object_id,observation_id);"#,
     ),
     (
         "alignment_projection",
-        r#"CREATE TABLE alignment_projection(decision_id TEXT NOT NULL REFERENCES decisions(decision_id) ON DELETE CASCADE,observation_id TEXT NOT NULL REFERENCES observations(observation_id) ON DELETE CASCADE,alignment_kind TEXT NOT NULL,alignment_payload BLOB,built_through_commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq),PRIMARY KEY(decision_id,observation_id)) STRICT; CREATE INDEX idx_alignment_observation_fk ON alignment_projection(observation_id,decision_id); CREATE INDEX idx_alignment_built ON alignment_projection(built_through_commit_seq,decision_id);"#,
+        r#"CREATE TABLE alignment_projection(decision_id TEXT NOT NULL REFERENCES decisions(decision_id) ON DELETE RESTRICT,observation_id TEXT NOT NULL REFERENCES observations(observation_id) ON DELETE RESTRICT,alignment_kind TEXT NOT NULL,alignment_payload BLOB,built_through_commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq),PRIMARY KEY(decision_id,observation_id)) STRICT; CREATE INDEX idx_alignment_observation_fk ON alignment_projection(observation_id,decision_id); CREATE INDEX idx_alignment_built ON alignment_projection(built_through_commit_seq,decision_id);"#,
     ),
     (
         "mc_kernel_format_marker",
@@ -195,6 +195,12 @@ pub fn apply_kernel_connection_profile(
     busy_timeout_ms: i64,
 ) -> rusqlite::Result<()> {
     if !conn.is_autocommit() {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    // Switching journal_mode rewrites the real file, so the WAL-reset gate runs
+    // first: an engine below the floor must never reach that write.
+    let identity = crate::sqlite_runtime::probe_sqlite_engine_identity_off_path()?;
+    if !crate::sqlite_runtime::evaluate_sqlite_runtime_gate(&identity).is_empty() {
         return Err(rusqlite::Error::InvalidQuery);
     }
     // `PRAGMA journal_mode` returns the resulting mode; reject a mode other than WAL.

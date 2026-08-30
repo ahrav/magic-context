@@ -130,7 +130,7 @@ fn kernel_schema_has_one_ordered_full_shape() {
 }
 
 const PINNED_SCHEMA_DIGEST: &str =
-    "13668a809c0453a7551afd59a341695a731f681bdda368e5c8c256a30d2f5110";
+    "8b612a52d93a8696c6d3182fa198cba0a894dc3623dc65c9bb21979120dee74f";
 
 #[test]
 fn kernel_schema_digest_is_pinned_to_the_frozen_v1_shape() {
@@ -831,4 +831,137 @@ fn bootstrap_refuses_a_database_holding_foreign_objects() {
             .unwrap(),
         0
     );
+}
+
+#[test]
+fn invalidated_alias_can_be_reintroduced_for_the_same_entity() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    let created = seed_root_domain(&mut conn);
+
+    seed_object(&conn, "object-entity-1", "entity", created);
+    conn.execute(
+        "INSERT INTO entities(
+             entity_id, object_id, domain_id, entity_kind, canonical_name,
+             created_commit_seq, sensitivity_class
+         ) VALUES ('entity-1', 'object-entity-1', 'domain-1', 'service', 'api', ?1, 'internal')",
+        [created],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO entity_aliases(
+             entity_id, alias, alias_kind, created_commit_seq, sensitivity_class
+         ) VALUES ('entity-1', 'api-svc', 'short', ?1, 'internal')",
+        [created],
+    )
+    .unwrap();
+
+    // A second active row for the same alias is still refused.
+    let retired = next_commit(&conn, "tx-retire");
+    assert!(conn
+        .execute(
+            "INSERT INTO entity_aliases(
+                 entity_id, alias, alias_kind, created_commit_seq, sensitivity_class
+             ) VALUES ('entity-1', 'api-svc', 'short', ?1, 'internal')",
+            [retired],
+        )
+        .is_err());
+
+    conn.execute(
+        "UPDATE entity_aliases SET invalidated_commit_seq = ?1
+          WHERE entity_id = 'entity-1' AND alias = 'api-svc' AND alias_kind = 'short'",
+        [retired],
+    )
+    .unwrap();
+    let revived = next_commit(&conn, "tx-revive");
+    conn.execute(
+        "INSERT INTO entity_aliases(
+             entity_id, alias, alias_kind, created_commit_seq, sensitivity_class
+         ) VALUES ('entity-1', 'api-svc', 'short', ?1, 'internal')",
+        [revived],
+    )
+    .expect("an invalidated alias must be reintroducible");
+
+    // Both intervals are retained, so history survives the reintroduction.
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM entity_aliases WHERE alias = 'api-svc'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn canonical_parents_refuse_deletion_instead_of_cascading() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+    let created = seed_root_domain(&mut conn);
+
+    seed_object(&conn, "object-decision-1", "decision", created);
+    conn.execute(
+        "INSERT INTO decisions(
+             decision_id, object_id, decision_kind, decision_payload, created_commit_seq,
+             sensitivity_class
+         ) VALUES ('decision-1', 'object-decision-1', 'accept', X'01', ?1, 'internal')",
+        [created],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO decision_events(
+             decision_id, event_ordinal, commit_seq, event_kind, event_payload, recorded_at
+         ) VALUES ('decision-1', 0, ?1, 'opened', X'02', 5)",
+        [created],
+    )
+    .unwrap();
+
+    // Cascading would destroy canonical event history while the registry row
+    // still claims the decision exists.
+    assert!(conn
+        .execute("DELETE FROM decisions WHERE decision_id = 'decision-1'", [])
+        .is_err());
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM decision_events", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn writer_fence_singleton_cannot_be_deleted() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+
+    assert!(conn.execute("DELETE FROM writer_fence", []).is_err());
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM writer_fence", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn staging_terminal_state_and_timestamp_are_set_together() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, "incarnation-1", 1_000).unwrap();
+
+    let insert_run = |id: &str, state: Option<&str>, at: Option<i64>| {
+        conn.execute(
+            "INSERT INTO extraction_runs(
+                 extraction_run_id, extractor, sensitivity_class, provenance_witness,
+                 redaction_metadata, started_at, heartbeat_at, lease_expires_at,
+                 terminal_state, terminal_at
+             ) VALUES (?1, 'test', 'internal', X'01', X'7b7d', 1, 10, 20, ?2, ?3)",
+            params![id, state, at],
+        )
+    };
+    // R10 starts the retention clock at completion, so a terminal row needs one.
+    assert!(insert_run("run-a", Some("completed"), None).is_err());
+    assert!(insert_run("run-b", None, Some(30)).is_err());
+    insert_run("run-c", None, None).expect("a live run has neither");
+    insert_run("run-d", Some("completed"), Some(30)).expect("a terminal run has both");
 }
