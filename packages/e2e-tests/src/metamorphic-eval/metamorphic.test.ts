@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { buildMockHistorianOutput } from "../mock-historian";
@@ -7,9 +8,19 @@ import { lintScenario, parseScenario, type HistorianEvalScenario } from "../hist
 import { scoreRawOutputWithInjectedClaims } from "../historian-eval/scorer";
 import { validScenario } from "../historian-eval/test-support";
 import { INJECTION_CANARY } from "./injection-canary";
+import {
+    compareLivePair,
+    runLiveMetamorphicEval,
+    type LiveObservation,
+} from "./live";
 import { buildMetamorphicReport, metamorphicExitCode } from "./report";
 import { buildScriptedOutput, runDeterministicMetamorphicEval } from "./runner";
 import { TRANSFORMS, type Transform } from "./transforms";
+import {
+    partialReportPath,
+    prepareLiveOutputPaths,
+    runLiveAndWriteReport,
+} from "../../scripts/run-metamorphic-eval";
 
 const CORPUS_DIR = join(import.meta.dir, "../../historian-eval/dev");
 
@@ -22,6 +33,41 @@ function corpus(): HistorianEvalScenario[] {
 
 function reorder(): Transform {
     return TRANSFORMS.find((transform) => transform.id === "reorder-independent-turns")!;
+}
+
+function liveObservation(claims: LiveObservation["injectedClaims"]): LiveObservation {
+    return {
+        expectationMatches: {},
+        injectedClaims: claims,
+        score: {
+            scenarioId: "scenario",
+            verdict: "PASS",
+            failReasons: [],
+            errorReason: null,
+            errorDetail: null,
+            precision: 1,
+            recall: 1,
+            expectedClaimsMatched: 0,
+            expectedClaimsTotal: 0,
+            visibleClaimsMatched: 0,
+            visibleClaimsTotal: claims.length,
+            falseAuthoritativeMatches: [],
+            structuralFindings: [],
+            probeVerdicts: [],
+            system: null,
+            source: "raw-output",
+        },
+    };
+}
+
+function injectedClaim(content: string) {
+    return {
+        publicClaimId: "clm_01h00000000000000000000000",
+        revisionLocator: `clm_01h00000000000000000000000@1:${"a".repeat(64)}`,
+        content,
+        category: "ARCHITECTURE",
+        revision: 1,
+    } as const;
 }
 
 describe("deterministic metamorphic runner", () => {
@@ -441,5 +487,109 @@ describe("deterministic metamorphic runner", () => {
         }));
         expect(report.injectionCanaryHits).toEqual([]);
         expect(metamorphicExitCode(report)).toBe(1);
+    });
+});
+
+describe("live metamorphic runner", () => {
+    test("fails injection equality when an unscored claim changes", () => {
+        const verdict = compareLivePair(
+            liveObservation([injectedClaim("keep the cache local")]),
+            liveObservation([injectedClaim("keep the cache local"), injectedClaim("use redis")]),
+        )[0];
+
+        expect(verdict).toEqual(expect.objectContaining({
+            invariant: "injection-set-equality",
+            holds: false,
+            changes: [expect.objectContaining({ direction: "added-in-derivative" })],
+        }));
+    });
+
+    test("marks every progress report incomplete", async () => {
+        const progress: ReturnType<typeof runDeterministicMetamorphicEval>[] = [];
+        const observation = liveObservation([]);
+        const report = await runLiveMetamorphicEval([validScenario()], {
+            mode: {
+                kind: "live",
+                apiKey: "test",
+                historianModel: "test/historian",
+                probeModel: { providerID: "test", modelID: "probe" },
+            },
+            artifactRoot: "/tmp/metamorphic-live-test",
+            opencodeVersion: "test",
+            transforms: [reorder()],
+            seeds: [0],
+            admit: () => [],
+            execute: async () => observation,
+            onProgress: (partial) => progress.push(partial),
+        });
+
+        expect(progress.length).toBeGreaterThan(0);
+        expect(progress[0]?.tierInvalidReason?.kind).toBe("incomplete");
+        expect(progress.every((partial) => metamorphicExitCode(partial) === 1)).toBe(true);
+        expect(metamorphicExitCode(report)).toBe(1);
+    });
+
+    test("rejects live outputs that overlap the scenario corpus", () => {
+        const root = mkdtempSync(join(tmpdir(), "metamorphic-paths-"));
+        try {
+            const corpus = join(root, "corpus");
+            mkdirSync(corpus);
+            expect(() => prepareLiveOutputPaths(join(corpus, "report.json"), corpus)).toThrow(
+                "must not overlap the scenario corpus",
+            );
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("clears stale regular reports before live admission", () => {
+        const root = mkdtempSync(join(tmpdir(), "metamorphic-stale-"));
+        try {
+            const corpus = join(root, "corpus");
+            const report = join(root, "output", "report.json");
+            mkdirSync(corpus);
+            mkdirSync(join(root, "output"));
+            writeFileSync(report, "stale");
+            writeFileSync(partialReportPath(report), "stale partial");
+
+            prepareLiveOutputPaths(report, corpus);
+
+            expect(existsSync(report)).toBe(false);
+            expect(existsSync(partialReportPath(report))).toBe(false);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("does not remove an unowned partial directory", async () => {
+        const root = mkdtempSync(join(tmpdir(), "metamorphic-partial-"));
+        try {
+            const reportPath = join(root, "report.json");
+            const partialPath = partialReportPath(reportPath);
+            mkdirSync(partialPath);
+            const never: Transform = {
+                id: "never",
+                version: 1,
+                alwaysApplicable: false,
+                apply: () => ({ applicable: false, reason: "fixture" }),
+            };
+
+            await runLiveAndWriteReport(reportPath, [validScenario()], {
+                mode: {
+                    kind: "live",
+                    apiKey: "test",
+                    historianModel: "test/historian",
+                    probeModel: { providerID: "test", modelID: "probe" },
+                },
+                artifactRoot: join(root, "artifacts"),
+                opencodeVersion: "test",
+                transforms: [never],
+                seeds: [0],
+            });
+
+            expect(existsSync(partialPath)).toBe(true);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
     });
 });

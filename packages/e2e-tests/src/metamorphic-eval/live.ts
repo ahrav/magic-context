@@ -13,6 +13,7 @@ import {
 } from "../historian-eval/scorer";
 import type { InjectedClaimRecord } from "../historian-eval/claim-read";
 import { containsInjectionCanary } from "./injection-canary";
+import { compareInvariants } from "./invariants";
 import { admitPair } from "./pairs";
 import {
     buildMetamorphicReport,
@@ -80,6 +81,12 @@ export function compareLivePair(
     const derivativeMatches = sortedUnique(derivative.score.falseAuthoritativeMatches);
 
     return [
+        compareInvariants(
+            baseline.injectedClaims,
+            derivative.injectedClaims,
+            baseline.score,
+            derivative.score,
+        )[0]!,
         {
             invariant: "expectation-predicate-equality",
             holds: changedExpectationIds.length === 0,
@@ -208,7 +215,9 @@ export async function runLiveMetamorphicEval(
             injectionCanaryHits,
             ...(tierInvalidReason === undefined ? {} : { tierInvalidReason }),
         });
-    const observe = (tierInvalidReason?: MetamorphicReport["tierInvalidReason"]): MetamorphicReport => {
+    const observe = (
+        tierInvalidReason: MetamorphicReport["tierInvalidReason"] = { kind: "incomplete" },
+    ): MetamorphicReport => {
         const current = finish(tierInvalidReason);
         options.onProgress?.(current);
         return current;

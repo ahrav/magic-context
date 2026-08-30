@@ -80,6 +80,7 @@ export interface MetamorphicReport {
 }
 
 export type TierInvalidReason =
+    | { kind: "incomplete" }
     | {
           kind: "control-disagreement";
           systemMismatch: boolean;

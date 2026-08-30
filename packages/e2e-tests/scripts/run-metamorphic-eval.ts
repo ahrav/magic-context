@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { parseScenario, type HistorianEvalScenario } from "../src/historian-eval/contract";
 import {
@@ -163,9 +163,42 @@ function writeReportFile(destination: string, report: MetamorphicReport): void {
     }
 }
 
+export function partialReportPath(destination: string): string {
+    return destination.endsWith(".json")
+        ? `${destination.slice(0, -".json".length)}.partial.json`
+        : `${destination}.partial.json`;
+}
+
+function containsPath(parent: string, candidate: string): boolean {
+    const path = relative(resolve(parent), resolve(candidate));
+    return path === "" || (!path.startsWith(`..${sep}`) && path !== ".." && !isAbsolute(path));
+}
+
+function removeRegularFile(path: string): void {
+    if (existsSync(path) && lstatSync(path).isFile()) rmSync(path);
+}
+
+export function prepareLiveOutputPaths(
+    reportPath: string,
+    corpusDirectory: string,
+): { artifactNamespace: string; partialPath: string } {
+    const partialPath = partialReportPath(reportPath);
+    const artifactNamespace = join(dirname(reportPath), "metamorphic-eval-artifacts");
+    const overlapsCorpus = [reportPath, partialPath, artifactNamespace].some((path) =>
+        containsPath(corpusDirectory, path),
+    ) || containsPath(artifactNamespace, corpusDirectory);
+    if (overlapsCorpus) {
+        throw new Error("live report, partial report, and artifact paths must not overlap the scenario corpus");
+    }
+    removeRegularFile(reportPath);
+    removeRegularFile(partialPath);
+    return { artifactNamespace, partialPath };
+}
+
 function tierInvalidMessage(destination: string, report: MetamorphicReport): string | null {
     const reason = report.tierInvalidReason;
     if (reason === null) return null;
+    if (reason.kind === "incomplete") return "metamorphic evaluation is incomplete";
     if (reason.kind === "selection-empty") return `metamorphic selection invalid: ${reason.reason}`;
     if (reason.kind === "deadline-exhausted") {
         return `metamorphic deadline reached before ${reason.nextRole}; inspect final report ${destination}`;
@@ -218,9 +251,7 @@ export async function runLiveAndWriteReport(
     scenarios: readonly HistorianEvalScenario[],
     options: LiveMetamorphicOptions,
 ): Promise<MetamorphicReport> {
-    const partialPath = destination.endsWith(".json")
-        ? `${destination.slice(0, -".json".length)}.partial.json`
-        : `${destination}.partial.json`;
+    const partialPath = partialReportPath(destination);
     const callerProgress = options.onProgress;
     let partialSeeded = false;
     const report = await runLiveMetamorphicEval(scenarios, {
@@ -244,7 +275,7 @@ export async function runLiveAndWriteReport(
         },
     });
     writeReportFile(destination, report);
-    rmSync(partialPath, { force: true, recursive: true });
+    if (partialSeeded) removeRegularFile(partialPath);
     logReport(destination, report);
     return report;
 }
@@ -260,11 +291,11 @@ export async function main(args: readonly string[] = Bun.argv.slice(2)): Promise
         );
     }
 
+    const outputPaths = prepareLiveOutputPaths(parsed.reportPath, parsed.corpusDirectory);
     const prepared = prepareLivePreamble(corpus);
     if (prepared === null) return 1;
     const artifactRoot = join(
-        dirname(parsed.reportPath),
-        "metamorphic-eval-artifacts",
+        outputPaths.artifactNamespace,
         `${basename(parsed.reportPath)}-${Date.now()}`,
     );
     const report = await runLiveAndWriteReport(parsed.reportPath, selected.scenarios, {
