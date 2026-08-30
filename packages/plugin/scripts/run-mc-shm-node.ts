@@ -12,7 +12,7 @@ try {
         outdir: outDir,
         target: "node",
         format: "esm",
-        external: ["@magic-context/mc-shm-native"],
+        external: ["@cortexkit/mc-shm-native"],
     });
     if (!build.success) {
         console.error(build.logs.map(String).join("; "));

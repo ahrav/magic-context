@@ -28,12 +28,12 @@ if (capability.available) {
 } else {
         assert.throws(
                 () => NativeChannel.createTestPair(),
-                /capability unavailable/,
+                /shared-memory native addon|shared-memory native startup failed/,
         );
         assert.equal(activeNativeChannels(), 0);
         console.log(
                 JSON.stringify({
-                        capabilityOutcome: "OMITTED_WITHOUT_CANDIDATE",
+                        capabilityOutcome: "TERMINAL_STARTUP_FAILURE",
                         runtime: process.release.name,
                         reason: capability.reason,
                 }),

@@ -6,21 +6,15 @@ mod scheduling;
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
-#[cfg(target_os = "linux")]
-use std::fs::OpenOptions;
-#[cfg(target_os = "linux")]
-use std::os::fd::OwnedFd;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-#[cfg(target_os = "linux")]
 use mc_shm_transport::backend::ring::RingGrant;
 use mc_shm_transport::backend::ring::{ProducerReservation, Ring};
-#[cfg(target_os = "linux")]
 use mc_shm_transport::descriptor::{HardwareProfileId, SchedulingMode};
 use mc_shm_transport::descriptor::{ReleaseIdentity, WIRE_V2_HEADER_BYTES};
-#[cfg(target_os = "linux")]
 use mc_shm_transport::profile::ring_profile;
 use napi::bindgen_prelude::{Buffer, FnArgs, Function, Object};
 use napi::{sys, Env, Error, JsValue, Result, Status, Unknown, ValueType};
@@ -28,7 +22,6 @@ use napi_derive::napi;
 
 use napi_buffers::ExternalRef;
 
-#[cfg(target_os = "linux")]
 const PROFILE: &str = "mc-host-test-ring-v1";
 
 /// The one bounded, redacted failure every malformed raw descriptor maps
@@ -85,7 +78,6 @@ struct GrantReservation {
 impl GrantReservation {
     /// Atomically claims both lane grants; either grant already active
     /// anywhere in the process is a replayed or duplicated descriptor.
-    #[cfg(target_os = "linux")]
     fn claim(first: Vec<u8>, second: Vec<u8>) -> Result<Self> {
         let mut active = ACTIVE_GRANTS
             .lock()
@@ -113,10 +105,8 @@ impl Drop for GrantReservation {
 
 #[derive(Default)]
 struct Registry {
-    #[cfg(target_os = "linux")]
     next_channel: u32,
     channels: HashMap<u32, Channel>,
-    #[cfg(target_os = "linux")]
     cleanup_registered: bool,
 }
 
@@ -212,7 +202,6 @@ fn string_field(env: &Env, object: &Object<'_>, name: &str, max_len: usize) -> R
     unsafe { value.cast::<String>() }.map_err(|_| cleared_descriptor_error(env))
 }
 
-#[cfg(target_os = "linux")]
 fn decode_hex<const N: usize>(text: &str) -> Result<[u8; N]> {
     let ascii = text.as_bytes();
     if ascii.len() != N * 2 {
@@ -234,14 +223,17 @@ fn decode_hex<const N: usize>(text: &str) -> Result<[u8; N]> {
     Ok(bytes)
 }
 
-#[cfg(target_os = "linux")]
-fn attach_ring(pid: u32, fd: i32, grant: RingGrant) -> Result<Ring> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(format!("/proc/{pid}/fd/{fd}"))
-        .map_err(|_| error("shared-memory attachment failed"))?;
-    Ring::attach(OwnedFd::from(file), grant, SchedulingMode::ColdParkWake)
+fn attach_ring(fd: i32, grant: RingGrant) -> Result<Ring> {
+    // Setup transfers descriptors into this process with SCM_RIGHTS. Duplicate
+    // the received descriptor so channel ownership is independent of setup.
+    // SAFETY: fcntl only inspects fd and returns a new descriptor on success.
+    let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicated < 0 {
+        return Err(error("shared-memory attachment failed"));
+    }
+    // SAFETY: successful F_DUPFD_CLOEXEC returns a newly owned descriptor.
+    let owned = unsafe { OwnedFd::from_raw_fd(duplicated) };
+    Ring::attach(owned, grant, SchedulingMode::ColdParkWake)
         .map_err(|_| error("shared-memory attachment failed"))
 }
 
@@ -361,7 +353,6 @@ fn quarantine_channel(env: &Env, channel: &mut Channel) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 fn insert_channel(registry: &mut Registry, channel: Channel) -> Result<u32> {
     registry.next_channel = registry
         .next_channel
@@ -372,7 +363,6 @@ fn insert_channel(registry: &mut Registry, channel: Channel) -> Result<u32> {
     Ok(id)
 }
 
-#[cfg(target_os = "linux")]
 fn cleanup_env(raw_env: usize) {
     let raw_env = raw_env as napi::sys::napi_env;
     let env = Env::from_raw(raw_env);
@@ -395,7 +385,6 @@ fn cleanup_env(raw_env: usize) {
     });
 }
 
-#[cfg(target_os = "linux")]
 fn ensure_cleanup(env: &Env, registry: &mut Registry) -> Result<()> {
     if registry.cleanup_registered {
         return Ok(());
@@ -416,6 +405,20 @@ pub fn napi_version(env: &Env) -> Result<u32> {
     } else {
         Err(error("N-API version probe failed"))
     }
+}
+
+#[napi]
+pub fn build_profile() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    }
+}
+
+#[napi]
+pub fn build_target() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
 #[napi]
@@ -469,14 +472,6 @@ pub fn active_channel_count() -> Result<u32> {
 
 #[napi]
 pub fn attach(env: &Env, descriptor: Unknown<'_>) -> Result<u32> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (env, descriptor);
-        return Err(error(
-            "shared-memory transport is unsupported on this platform",
-        ));
-    }
-    #[cfg(target_os = "linux")]
     {
         const GRANT_HEX_LEN: usize = RingGrant::encoded_len() * 2;
         // The argument is decoded as a RAW value — before any bindgen
@@ -492,7 +487,6 @@ pub fn attach(env: &Env, descriptor: Unknown<'_>) -> Result<u32> {
         if profile != PROFILE {
             return Err(error("shared-memory profile is unavailable"));
         }
-        let pid = integer_field(env, &object, "pid", 1.0, f64::from(u32::MAX))? as u32;
         let host_to_peer_fd =
             integer_field(env, &object, "hostToPeerFd", 0.0, f64::from(i32::MAX))? as i32;
         let peer_to_host_fd =
@@ -524,8 +518,8 @@ pub fn attach(env: &Env, descriptor: Unknown<'_>) -> Result<u32> {
             host_to_peer_grant.encode().to_vec(),
             peer_to_host_grant.encode().to_vec(),
         )?;
-        let from_host = attach_ring(pid, host_to_peer_fd, host_to_peer_grant)?;
-        let to_host = attach_ring(pid, peer_to_host_fd, peer_to_host_grant)?;
+        let from_host = attach_ring(host_to_peer_fd, host_to_peer_grant)?;
+        let to_host = attach_ring(peer_to_host_fd, peer_to_host_grant)?;
         REGISTRY.with(|registry| {
             let mut registry = registry
                 .try_borrow_mut()
@@ -551,14 +545,6 @@ pub fn attach(env: &Env, descriptor: Unknown<'_>) -> Result<u32> {
 
 #[napi]
 pub fn create_test_pair(env: &Env) -> Result<NativeTestPair> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = env;
-        return Err(error(
-            "shared-memory test pair is unsupported on this platform",
-        ));
-    }
-    #[cfg(target_os = "linux")]
     {
         let profile = ring_profile(
             HardwareProfileId::new(PROFILE).map_err(|_| error("test profile unavailable"))?,

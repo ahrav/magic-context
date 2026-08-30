@@ -3,7 +3,7 @@ import {
     activeExternalRefs,
     activeNativeChannels,
     QUALIFIED_TEST_PROFILE,
-} from "@magic-context/mc-shm-native";
+} from "@cortexkit/mc-shm-native";
 import { ByteBudget, type FrameChannelHandlers } from "./frame-channel";
 import { decodeShmGrant, ShmGrantError } from "./shm-grant";
 import { createExplicitShmTestProvider } from "./shm-transport-provider";

@@ -92,6 +92,7 @@ const PARENT_DIRS: Record<string, string> = {
 };
 
 export const LAUNCHER_PATH = "payload/bin/ck-mc-host";
+export const NATIVE_ADDON_PATH = "payload/native/mc_shm_native.node";
 
 /** Linux-only U9-gated production slots (R25). Corpus is a certification input,
  *  not a shipped file. Populated only from qualified locked bytes; never committed.
@@ -547,14 +548,16 @@ export function validatePayloadManifest(
             fail(`files[${index}]: sha256 must be a real 64-hex digest`);
         }
     }
-    // Exact allowed file set per target/mode (R25, plan scenario 8): dev payloads
-    // and macOS payloads carry only the launcher; a Linux production payload
-    // carries the launcher plus exactly the U9-gated ORT/model slots.
+    // Every production payload carries the one mandatory native ring addon.
+    // Linux additionally carries the U9-gated ORT/model slots.
     const expectedPaths =
-        m.mode === "production" && target.synapse === "certified_cpu"
+        m.mode === "production"
             ? [
                   LAUNCHER_PATH,
-                  ...Object.values(LINUX_PRODUCTION_PAYLOAD_SLOTS),
+                  NATIVE_ADDON_PATH,
+                  ...(target.synapse === "certified_cpu"
+                      ? Object.values(LINUX_PRODUCTION_PAYLOAD_SLOTS)
+                      : []),
               ].sort()
             : [LAUNCHER_PATH];
     if (JSON.stringify([...seen].sort()) !== JSON.stringify(expectedPaths)) {
@@ -835,8 +838,14 @@ export function buildTrustArtifacts(
         const launcher = manifest.files.find(
             (entry) => entry.path === LAUNCHER_PATH,
         );
+        const nativeAddon = manifest.files.find(
+            (entry) => entry.path === NATIVE_ADDON_PATH,
+        );
         if (launcher === undefined) {
             fail(`${target.target}: production manifest has no launcher`);
+        }
+        if (nativeAddon === undefined) {
+            fail(`${target.target}: production manifest has no native addon`);
         }
         return {
             ...common,
@@ -1200,6 +1209,7 @@ export interface PackedProductionPayload {
 
 export interface ProductionPayloadSources {
     binaryPath: string;
+    nativeAddonPath: string;
     qualifiedInputs?: Partial<Record<(typeof INPUT_KEYS)[number], string>>;
     qualifiedInputExpectations?: Partial<
         Record<
@@ -1330,6 +1340,7 @@ export function assembleProductionPayload(
         { path: string; input?: (typeof INPUT_KEYS)[number] }
     >([
         [LAUNCHER_PATH, { path: options.sources.binaryPath }],
+        [NATIVE_ADDON_PATH, { path: options.sources.nativeAddonPath }],
     ]);
     if (target.synapse === "certified_cpu") {
         for (const [input, relative] of Object.entries(
@@ -1529,6 +1540,7 @@ export function buildProductionPayload(
     options: {
         target: PayloadTarget;
         binaryPath: string;
+        nativeAddonPath?: string;
         outDir: string;
         skipRegistryGate?: boolean;
         allowExactFloorPending?: boolean;
@@ -1568,6 +1580,16 @@ export function buildProductionPayload(
         packageMetadataDir: join(rootDir, options.target.dir),
         sources: {
             binaryPath: options.binaryPath,
+            nativeAddonPath:
+                options.nativeAddonPath ??
+                join(
+                    rootDir,
+                    "target",
+                    "release",
+                    process.platform === "darwin"
+                        ? "libmc_shm_native.dylib"
+                        : "libmc_shm_native.so",
+                ),
             ...(qualifiedInputs === undefined
                 ? {}
                 : {
@@ -1810,6 +1832,14 @@ export function buildProductionPayloads(
     const payload = buildProductionPayload(rootDir, {
         target: hostTarget(),
         binaryPath: join(rootDir, "target", "release", "ck-mc-host"),
+        nativeAddonPath: join(
+            rootDir,
+            "target",
+            "release",
+            process.platform === "darwin"
+                ? "libmc_shm_native.dylib"
+                : "libmc_shm_native.so",
+        ),
         outDir,
     });
     return packProductionPayload(payload, outDir);
@@ -1883,6 +1913,14 @@ function main(): void {
             const result = buildProductionPayload(rootDir, {
                 target,
                 binaryPath: join(rootDir, "target", "release", "ck-mc-host"),
+                nativeAddonPath: join(
+                    rootDir,
+                    "target",
+                    "release",
+                    process.platform === "darwin"
+                        ? "libmc_shm_native.dylib"
+                        : "libmc_shm_native.so",
+                ),
                 outDir:
                     outDir ??
                     join(rootDir, "tmp", "mc-host-local-production-payload"),

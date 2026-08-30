@@ -1,4 +1,8 @@
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { markAsUntransferable } from "node:worker_threads";
 
 export const QUALIFIED_TEST_PROFILE = "mc-host-test-ring-v1";
@@ -16,7 +20,6 @@ export interface NativeCapabilities {
 
 export interface NativeDescriptor {
     profile: string;
-    pid: number;
     hostToPeerFd: number;
     hostToPeerGrant: string;
     peerToHostFd: number;
@@ -32,6 +35,8 @@ export interface NativeTestPair {
 
 interface NativeAddon {
     napiVersion(): number;
+    buildProfile(): string;
+    buildTarget(): string;
     createExternalProbe(length: number): Uint8Array;
     detachArrayBuffer(buffer: ArrayBuffer): boolean;
     registerCleanupProbe(path: string): void;
@@ -83,17 +88,98 @@ interface NativeAddon {
 }
 
 let loaded: NativeAddon | null | undefined;
+let loadError: Error | undefined;
+
+const PLATFORM_PACKAGES = {
+    "darwin-arm64": {
+        package: "@cortexkit/mc-host-darwin-arm64",
+        target: "darwin-arm64",
+        nativeTarget: "macos-aarch64",
+    },
+    "darwin-x64": {
+        package: "@cortexkit/mc-host-darwin-x64",
+        target: "darwin-x64",
+        nativeTarget: "macos-x86_64",
+    },
+    "linux-x64": {
+        package: "@cortexkit/mc-host-linux-x64-gnu",
+        target: "linux-x64-gnu",
+        nativeTarget: "linux-x86_64",
+    },
+} as const;
+
+const ADDON_PAYLOAD_PATH = "payload/native/mc_shm_native.node";
+
+function packageAddonPath(): string {
+    const platform = PLATFORM_PACKAGES[`${process.platform}-${process.arch}` as keyof typeof PLATFORM_PACKAGES];
+    if (!platform) throw new Error("shared-memory native addon: unsupported platform");
+    const require = createRequire(import.meta.url);
+    let packageJsonPath: string;
+    try {
+        packageJsonPath = require.resolve(`${platform.package}/package.json`);
+    } catch {
+        throw new Error(`shared-memory native addon: missing ${platform.package}`);
+    }
+    const packageDir = dirname(packageJsonPath);
+    const manifestPath = join(packageDir, "payload-manifest.json");
+    if (!existsSync(manifestPath)) {
+        throw new Error("shared-memory native addon: payload manifest is missing");
+    }
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+        package?: { name?: string; target?: string };
+        files?: { path?: string; sha256?: string }[];
+    };
+    if (
+        manifest.package?.name !== platform.package ||
+        manifest.package.target !== platform.target
+    ) {
+        throw new Error("shared-memory native addon: wrong-platform payload");
+    }
+    const entry = manifest.files?.find(({ path }) => path === ADDON_PAYLOAD_PATH);
+    if (!entry || !/^[0-9a-f]{64}$/.test(entry.sha256 ?? "")) {
+        throw new Error("shared-memory native addon: payload manifest lacks addon checksum");
+    }
+    const addonPath = join(packageDir, ADDON_PAYLOAD_PATH);
+    if (!existsSync(addonPath)) {
+        throw new Error("shared-memory native addon: addon is missing");
+    }
+    const actual = createHash("sha256").update(readFileSync(addonPath)).digest("hex");
+    if (actual !== entry.sha256) {
+        throw new Error("shared-memory native addon: checksum mismatch");
+    }
+    return addonPath;
+}
+
+function requireAddon(): NativeAddon {
+    if (loaded) return loaded;
+    if (loadError) throw loadError;
+    try {
+        const localPath = new URL("./mc_shm_native.node", import.meta.url);
+        const addonPath = existsSync(localPath) ? fileURLToPath(localPath) : packageAddonPath();
+        const native = createRequire(import.meta.url)(addonPath) as NativeAddon;
+        if (native.buildProfile() !== "release") {
+            throw new Error("shared-memory native addon: debug build rejected");
+        }
+        const nativeArch = process.arch === "arm64" ? "aarch64" : process.arch === "x64" ? "x86_64" : process.arch;
+        const nativeOs = process.platform === "darwin" ? "macos" : process.platform;
+        if (native.buildTarget() !== `${nativeOs}-${nativeArch}`) {
+            throw new Error("shared-memory native addon: wrong-platform binary");
+        }
+        loaded = native;
+        return native;
+    } catch (error) {
+        loadError = error instanceof Error ? error : new Error(String(error));
+        loaded = null;
+        throw loadError;
+    }
+}
 
 function addon(): NativeAddon | null {
-    if (loaded !== undefined) return loaded;
     try {
-        loaded = createRequire(import.meta.url)(
-            "./mc_shm_native.node",
-        ) as NativeAddon;
+        return requireAddon();
     } catch {
-        loaded = null;
+        return null;
     }
-    return loaded;
 }
 
 function protect(segments: readonly Uint8Array[]): void {
@@ -114,16 +200,6 @@ export function probeCapabilities(): NativeCapabilities {
         transferPrevention: false,
         cleanupHooks: false,
     };
-    if (process.platform !== "linux") {
-        return { available: false, ...base, reason: "platform_unsupported" };
-    }
-    if (!("Bun" in globalThis) && process.release.name === "node") {
-        return {
-            available: false,
-            ...base,
-            reason: "node_detachment_unavailable",
-        };
-    }
     const native = addon();
     if (!native)
         return { available: false, ...base, reason: "addon_unavailable" };
@@ -199,6 +275,18 @@ export function probeCapabilities(): NativeCapabilities {
                 reason: "detachment_unavailable",
             };
         }
+        if (typeof native.registerCleanupProbe !== "function") {
+            return {
+                available: false,
+                ...base,
+                napiVersion,
+                externalArrayBuffer,
+                exactBounds,
+                detachment: true,
+                transferPrevention,
+                reason: "cleanup_hooks_unavailable",
+            };
+        }
         return {
             available: true,
             napiVersion,
@@ -206,7 +294,7 @@ export function probeCapabilities(): NativeCapabilities {
             exactBounds,
             detachment: true,
             transferPrevention,
-            cleanupHooks: typeof native.registerCleanupProbe === "function",
+            cleanupHooks: true,
         };
     } catch {
         return {
@@ -392,17 +480,19 @@ export class NativeChannel {
     ) {}
 
     static attach(descriptor: NativeDescriptor): NativeChannel {
-        const native = addon();
-        if (!native || !probeCapabilities().available) {
-            throw new Error("shared-memory native capability unavailable");
+        const native = requireAddon();
+        const capability = probeCapabilities();
+        if (!capability.available) {
+            throw new Error(`shared-memory native startup failed: ${capability.reason}`);
         }
         return new NativeChannel(native, native.attach(descriptor));
     }
 
     static createTestPair(): NativeTestPair {
-        const native = addon();
-        if (!native || !probeCapabilities().available) {
-            throw new Error("shared-memory native capability unavailable");
+        const native = requireAddon();
+        const capability = probeCapabilities();
+        if (!capability.available) {
+            throw new Error(`shared-memory native startup failed: ${capability.reason}`);
         }
         const pair = native.createTestPair();
         return {

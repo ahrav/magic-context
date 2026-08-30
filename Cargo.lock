@@ -1037,6 +1037,7 @@ dependencies = [
 name = "mc-shm-native"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "mc-shm-transport",
  "napi",
  "napi-build",
