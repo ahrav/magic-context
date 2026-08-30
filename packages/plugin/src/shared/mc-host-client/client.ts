@@ -1700,6 +1700,12 @@ export function parseSharedMemoryDiagnostics(value: unknown): SharedMemoryDiagno
     ) {
         throw malformedStatus("shared_memory state contradicts its error class");
     }
+    // Healthy is reported only after a successful accounting snapshot, and bounds
+    // are always concrete, so a healthy record withholding either describes
+    // resources it never observed.
+    if (state === "healthy" && (record.bounds === null || record.accounting === null)) {
+        throw malformedStatus("healthy shared_memory withholds observed resource data");
+    }
     const artifact = requireRecord(record.artifact, "shared_memory.artifact");
     exactKeys(artifact, ["profile", "wire_version", "descriptor_schema"], "shared_memory.artifact");
     if (

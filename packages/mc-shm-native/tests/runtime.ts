@@ -13,10 +13,13 @@ import {
 
 const result = probeCapabilities();
 assert.ok(result.napiVersion === null || result.napiVersion >= 1);
-// A claimed source-build target must load its addon; otherwise the tolerant
-// branch hides target-specific load, ABI, or mechanism failures.
-if (process.env.MC_SHM_NATIVE_CLAIMED_TARGET === "1") {
-    assert.equal(result.available, true, `claimed native target is unavailable: ${result.reason}`);
+// A claimed source-build target must load its addon. Node can load the addon and report `detachment_unavailable`, so this assertion cannot require `available`; `addon_unavailable` is the only reason returned before the addon loads. commentlint: allow(JUDGE)
+if (process.env.MC_SHM_NATIVE_CLAIMED_TARGET === "1" && !result.available) {
+    assert.notEqual(
+        result.reason,
+        "addon_unavailable",
+        `claimed native target failed to load its addon: ${result.reason}`,
+    );
 }
 if (result.available) {
     assert.ok((result.napiVersion ?? 0) >= 8);

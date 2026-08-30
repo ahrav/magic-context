@@ -133,11 +133,39 @@ describe("parseDaemonResult", () => {
     });
 
     test("unobserved bounds parse as unknown rather than zero", () => {
-        const diagnostics = { ...healthySharedMemory(), bounds: null };
+        // A setup that fails before `host.status` observes neither bounds nor
+        // accounting, so unknown is only legal on a terminal record.
+        const terminal = {
+            ...healthySharedMemory(),
+            state: "terminal",
+            error_class: "missing_addon",
+            bounds: null,
+            accounting: null,
+        };
         const parsed = parseDaemonResult(
-            JSON.stringify(validResult({ shared_memory: diagnostics })),
+            JSON.stringify(
+                validResult({
+                    ok: false,
+                    reason: "native_probe_unavailable",
+                    remediation: "run_daemon_restart",
+                    readiness: {
+                        shared_memory: {
+                            state: "unavailable",
+                            reason: "native_probe_unavailable",
+                        },
+                    },
+                    shared_memory: terminal,
+                }),
+            ),
         );
         expect(parsed.shared_memory?.bounds).toBeNull();
+        expect(() =>
+            parseDaemonResult(
+                JSON.stringify(
+                    validResult({ shared_memory: { ...healthySharedMemory(), bounds: null } }),
+                ),
+            ),
+        ).toThrow(/shared_memory/);
     });
 
     test("accepts a fully populated conforming result", () => {
