@@ -410,6 +410,21 @@ export function liveRoleBudgetMs(
 }
 
 export async function main(args: readonly string[] = Bun.argv.slice(2)): Promise<0 | 1 | 2> {
+    /**
+     * Anchored HERE, before any work, because the deadline's whole purpose is to
+     * stay inside an external kill bound — the workflow step timeout — whose clock
+     * starts when the step starts.
+     *
+     * Anchoring it at the `runLiveAndWriteReport` call instead excluded everything
+     * before it: the output preflight, corpus load, selection, and
+     * `prepareLivePreamble`, which resolves `opencode --version` and the commit.
+     * A slow preamble then shifted the whole deadline later, so
+     * `deadline < step timeout` no longer implied the run finished before the step
+     * was killed, and the process could die mid-role after paid calls with only
+     * partial evidence on disk. Measured from process start the nesting holds by
+     * construction, with the preamble inside the deadline rather than beside it.
+     */
+    const startedAtMs = Date.now();
     const parsed = parseArgs(args);
     /** Output preflight precedes corpus loading and selection, whose throws would otherwise leave a previous green report at the destination. commentlint: allow(JUDGE) */
     if (!parsed.live) {
@@ -448,7 +463,7 @@ export async function main(args: readonly string[] = Bun.argv.slice(2)): Promise
         system: prepared.system,
         transforms: selected.transforms,
         roleBudgetMs,
-        deadlineAtMs: parsed.deadlineMinutes === null ? null : Date.now() + parsed.deadlineMinutes * 60_000,
+        deadlineAtMs: parsed.deadlineMinutes === null ? null : startedAtMs + parsed.deadlineMinutes * 60_000,
     });
     return metamorphicExitCode(report);
 }

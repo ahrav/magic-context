@@ -225,13 +225,17 @@ jobs:
       - name: Run the live metamorphic pair
         # Same nesting as the historian lane above:
         #   script --deadline-minutes 290  <  this step 300  <  job 360
-        # What makes 290 sufficient here is that the script RESERVES the longest
-        # completed role before admitting the next one. A bare `now >= deadline`
-        # check would admit a role at minute 289 that legitimately needs tens of
-        # minutes — one role drives `trigger.expectedHistorianRuns` historian runs,
-        # each bounded by the live per-run wait budget — and this step's timeout
-        # would then kill the process before it wrote the final report, losing the
-        # artifact the deadline exists to protect.
+        # Two properties make 290 sufficient rather than merely smaller than 300.
+        # The script anchors its deadline at process START, so its own preamble
+        # (corpus load, selection, `opencode --version`, commit resolution) is
+        # inside the 290 rather than pushing it past the step bound. And it
+        # RESERVES one role's full wall clock before admitting a role, where a
+        # role's cost is every prompt it sends — transcript, per-run triggers and
+        # probes, each bounded only by the harness prompt timeout — plus the run
+        # completion and quiescence waits. A bare `now >= deadline` check would
+        # admit a role at minute 289 that legitimately needs two hours, and this
+        # step's timeout would then kill the process before it wrote the final
+        # report, losing the artifact the deadline exists to protect.
         timeout-minutes: 300
         env:
           NODE_ENV: ""
