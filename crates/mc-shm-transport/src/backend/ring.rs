@@ -384,8 +384,15 @@ impl Doorbell {
     }
 
     fn from_fd(fd: OwnedFd) -> Result<Self, RingError> {
-        // SAFETY: F_GETFD validates descriptor liveness.
-        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } < 0 {
+        // SAFETY: F_GETFL validates descriptor liveness and returns its status flags.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 || flags & libc::O_NONBLOCK == 0 {
+            return Err(RingError::DoorbellFailed);
+        }
+        let target =
+            std::fs::read_link(Path::new("/proc/self/fd").join(fd.as_raw_fd().to_string()))
+                .map_err(|_| RingError::DoorbellFailed)?;
+        if target.as_os_str().as_bytes() != b"anon_inode:[eventfd]" {
             return Err(RingError::DoorbellFailed);
         }
         Ok(Self(fd))
@@ -2181,14 +2188,15 @@ fn create_macos_shm(len: usize) -> Result<OwnedFd, RingError> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::sync::atomic::Ordering;
 
     use crate::descriptor::HardwareProfileId;
     use crate::profile::ring_profile;
 
     use super::{
-        removal_ranges, residency_vector_len, wire_v2_header, ProducerError, Ring, RingError,
-        FAIL_NEXT_PAGE_REMOVAL,
+        removal_ranges, residency_vector_len, wire_v2_header, Doorbell, ProducerError, Ring,
+        RingError, FAIL_NEXT_PAGE_REMOVAL,
     };
 
     fn ring() -> Ring {
@@ -2202,6 +2210,30 @@ mod tests {
             .unwrap();
         reservation.write(bytes).unwrap();
         reservation.commit(bytes.len()).unwrap();
+    }
+
+    #[test]
+    fn doorbell_attachment_requires_nonblocking_eventfd() {
+        // SAFETY: eventfd returns a fresh owned descriptor on success.
+        let blocking = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+        assert!(blocking >= 0);
+        // SAFETY: the successful eventfd result transfers ownership here.
+        let blocking = unsafe { OwnedFd::from_raw_fd(blocking) };
+        assert!(matches!(
+            Doorbell::from_fd(blocking),
+            Err(RingError::DoorbellFailed)
+        ));
+
+        let non_eventfd: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        // SAFETY: F_SETFL updates status flags on this live owned descriptor.
+        assert_eq!(
+            unsafe { libc::fcntl(non_eventfd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK,) },
+            0
+        );
+        assert!(matches!(
+            Doorbell::from_fd(non_eventfd),
+            Err(RingError::DoorbellFailed)
+        ));
     }
 
     #[test]
