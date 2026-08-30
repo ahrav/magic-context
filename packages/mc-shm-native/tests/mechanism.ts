@@ -110,7 +110,7 @@ const GRANT_MAX_LEASES = 8n;
 const GRANT_LAYOUT_OVERHEAD_BYTES = 8_192n;
 
 /**
- * Encodes one RingGrant wire image (layout version 2) as lowercase hex:
+ * Encodes one RingGrant wire image (layout version 3) as lowercase hex:
  * layout_version u16, incarnation [16], lane u32, descriptor_depth u64,
  * arena_bytes u64, max_leases u64, total_bytes u64, reserved u32 zero —
  * all little-endian.
@@ -118,7 +118,7 @@ const GRANT_LAYOUT_OVERHEAD_BYTES = 8_192n;
 function testGrantHex(lane: number, incarnation: number): string {
     const bytes = new Uint8Array(58);
     const view = new DataView(bytes.buffer);
-    view.setUint16(0, 2, true);
+    view.setUint16(0, 3, true);
     bytes[2] = incarnation;
     view.setUint32(18, lane, true);
     view.setBigUint64(22, GRANT_DESCRIPTOR_DEPTH, true);

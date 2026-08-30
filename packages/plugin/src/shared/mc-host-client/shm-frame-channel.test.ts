@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
     NativeChannel,
     type NativeReceiveLease,
@@ -32,6 +33,12 @@ import {
     runFrameChannelContractScenario,
     waitUntil,
 } from "./test-support/frame-channel-contract";
+
+test("production shared-memory delivery has no timer polling", () => {
+    const source = readFileSync(new URL("./shm-frame-channel.ts", import.meta.url), "utf8");
+    expect(source).not.toContain("setInterval");
+    expect(source).not.toContain([".po", "ll("].join(""));
+});
 
 function responseHeader(ty: FrameType, corr: bigint, length: number, flags = 0): EnvelopeHeader {
     return {
@@ -68,7 +75,7 @@ function publish(peer: NativeChannel, header: EnvelopeHeader, body: Uint8Array):
 
 function take(peer: NativeChannel): NativeReceiveLease {
     let lease: NativeReceiveLease | undefined;
-    expect(peer.poll((value) => (lease = value))).toBe(true);
+    expect(peer.drainOne((value) => (lease = value))).toBe(true);
     if (!lease) throw new Error("missing native lease");
     return lease;
 }
@@ -124,7 +131,7 @@ const shmContractFactory: FrameChannelContractFactory = async (overrides = {}) =
     const drain = (): void => {
         if (!reading || cleaning) return;
         while (
-            pair.second.poll((lease) => {
+            pair.second.drainOne((lease) => {
                 const header = decodeHeader(lease.header);
                 const body = new Uint8Array(lease.byteLength);
                 let offset = 0;
@@ -357,7 +364,7 @@ describe("mandatory shared-memory channel", () => {
                     }),
                 ).toThrow(expected);
                 expect(alias?.byteLength).toBe(0);
-                expect(peer.poll(() => {})).toBe(false);
+                expect(peer.drainOne(() => {})).toBe(false);
 
                 generation.request({
                     channel: 7,
@@ -437,7 +444,8 @@ describe("mandatory shared-memory channel", () => {
             },
         } as unknown as NativeReceiveLease;
         const native = {
-            poll: (deliver: (lease: NativeReceiveLease) => void) => {
+            startReadiness: (handler: () => void) => handler(),
+            drainOne: (deliver: (lease: NativeReceiveLease) => void) => {
                 if (delivered) return false;
                 delivered = true;
                 deliver(nativeLease);
@@ -658,7 +666,7 @@ describe("mandatory shared-memory channel", () => {
         const encoded = encodeHeader(responseHeader(FrameType.Response, 1n, 0));
         encoded[4] = PROTOCOL_VERSION + 1;
         expect(() => pair.second.produce(encoded, 0, () => {})).toThrow();
-        expect(pair.first.poll(() => {})).toBe(false);
+        expect(pair.first.drainOne(() => {})).toBe(false);
         pair.first.close();
         pair.second.close();
 

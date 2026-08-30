@@ -1844,7 +1844,25 @@ struct RingWrite {
     deadline: StdInstant,
 }
 
-type RingWriteSender = std::sync::mpsc::SyncSender<RingWrite>;
+struct RingWriteSender {
+    tx: std::sync::mpsc::SyncSender<RingWrite>,
+    wake: Arc<OwnedFd>,
+}
+
+impl RingWriteSender {
+    fn try_send(&self, write: RingWrite) -> Result<(), std::sync::mpsc::TrySendError<RingWrite>> {
+        self.tx.try_send(write)?;
+        signal_eventfd(&self.wake);
+        Ok(())
+    }
+}
+
+impl Drop for RingWriteSender {
+    fn drop(&mut self) {
+        signal_eventfd(&self.wake);
+    }
+}
+
 type RingFrameReceiver = mpsc::Receiver<(EnvelopeHeader, Vec<u8>, ByteCharge)>;
 
 /// The mapped ring cannot express host death: a host that exits without a
@@ -1864,6 +1882,15 @@ fn setup_peer_closed(stream: &StdUnixStream) -> bool {
     }
 }
 
+fn signal_eventfd(fd: &OwnedFd) {
+    let _ = rustix::io::write(fd, &1u64.to_ne_bytes());
+}
+
+fn drain_eventfd(fd: &OwnedFd) {
+    let mut value = [0u8; size_of::<u64>()];
+    let _ = rustix::io::read(fd, &mut value);
+}
+
 fn start_ring_bridge(
     descriptor: serde_json::Value,
     descriptors: [OwnedFd; crate::setup_socket::RING_DESCRIPTOR_COUNT],
@@ -1872,6 +1899,14 @@ fn start_ring_bridge(
     read_budget: Arc<ByteCounter>,
 ) -> Result<(RingWriteSender, RingFrameReceiver), ClientError> {
     let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<RingWrite>(CLIENT_DATA_QUEUE_FRAMES);
+    let wake_fd = Arc::new(
+        rustix::event::eventfd(
+            0,
+            rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK,
+        )
+        .map_err(|_| ClientError::new("setup_failed", "shared-memory setup failed"))?,
+    );
+    let worker_wake = Arc::clone(&wake_fd);
     let (read_tx, read_rx) = mpsc::channel(CLIENT_DATA_QUEUE_FRAMES);
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
@@ -1903,6 +1938,7 @@ fn start_ring_bridge(
                         if failed {
                             break;
                         }
+                        continue;
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                     Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -1930,9 +1966,44 @@ fn start_ring_bridge(
                         if read_tx.blocking_send(frame).is_err() {
                             break;
                         }
+                        continue;
                     }
-                    Ok(None) => std::thread::sleep(Duration::from_micros(50)),
+                    Ok(None) => {}
                     Err(_) => break,
+                }
+                match endpoint.from_host.arm_data_wait() {
+                    Ok(false) => continue,
+                    Ok(true) => {}
+                    Err(_) => break,
+                }
+                let data_ready = match endpoint.from_host.duplicate_data_ready() {
+                    Ok(fd) => fd,
+                    Err(_) => break,
+                };
+                let mut fds = [
+                    rustix::event::PollFd::new(&*worker_wake, rustix::event::PollFlags::IN),
+                    rustix::event::PollFd::new(&data_ready, rustix::event::PollFlags::IN),
+                    rustix::event::PollFd::new(
+                        &setup,
+                        rustix::event::PollFlags::HUP | rustix::event::PollFlags::ERR,
+                    ),
+                ];
+                if rustix::event::poll(&mut fds, None).is_err() {
+                    break;
+                }
+                if fds[0].revents().contains(rustix::event::PollFlags::IN) {
+                    drain_eventfd(&worker_wake);
+                }
+                if fds[1].revents().contains(rustix::event::PollFlags::IN)
+                    && endpoint.from_host.complete_data_wait().is_err()
+                {
+                    break;
+                }
+                if fds[2]
+                    .revents()
+                    .intersects(rustix::event::PollFlags::HUP | rustix::event::PollFlags::ERR)
+                {
+                    break;
                 }
             }
             if let Ok(goodbye) = crate::setup_socket::encoded_goodbye() {
@@ -1945,7 +2016,13 @@ fn start_ring_bridge(
         .recv()
         .map_err(|_| ClientError::new("setup_failed", "shared-memory setup failed"))?
         .map_err(|_| ClientError::new("setup_failed", "shared-memory setup failed"))?;
-    Ok((write_tx, read_rx))
+    Ok((
+        RingWriteSender {
+            tx: write_tx,
+            wake: wake_fd,
+        },
+        read_rx,
+    ))
 }
 
 fn decode_outbound(bytes: &[u8]) -> Result<(EnvelopeHeader, &[u8]), ()> {
@@ -1963,7 +2040,7 @@ fn decode_outbound(bytes: &[u8]) -> Result<(EnvelopeHeader, &[u8]), ()> {
 
 async fn writer_loop(
     inner: Arc<Inner>,
-    write: std::sync::mpsc::SyncSender<RingWrite>,
+    write: RingWriteSender,
     mut data_rx: mpsc::Receiver<QueuedFrame>,
     mut control_rx: mpsc::Receiver<QueuedFrame>,
 ) {
@@ -2539,6 +2616,14 @@ mod tests {
         assert!(control_rx.try_recv().is_err(), "not-sent needs no Cancel");
 
         let (write, writes) = std::sync::mpsc::sync_channel(1);
+        let wake = Arc::new(
+            rustix::event::eventfd(
+                0,
+                rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK,
+            )
+            .unwrap(),
+        );
+        let write = RingWriteSender { tx: write, wake };
         let writer_inner = Arc::clone(&inner);
         let writer = tokio::spawn(async move {
             writer_loop(writer_inner, write, data_rx, control_rx).await;
