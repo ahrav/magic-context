@@ -26,12 +26,15 @@ const SECRET_SEGMENT_PATTERN = new RegExp(
 const TRAILING_DESCRIPTORS = new Set(["id", "ids", "value", "values", "header", "headers"]);
 
 function redactionTypeForKey(key: string): string {
-    const normalized = key
+    const segments = key
         .trim()
         .toLowerCase()
-        .replace(/[^a-z0-9_.-]+/g, "_");
-    const suffix = normalized.split(".").filter(Boolean).at(-1) ?? normalized;
-    return suffix || "secret";
+        .split(/[^a-z0-9]+/)
+        .filter(
+            (segment) =>
+                SECRET_SEGMENT_PATTERN.test(segment) || SECRET_QUALIFIERS.has(segment),
+        );
+    return segments.join("_") || "secret";
 }
 
 // A bare number / boolean / null is never a secret — an API key, bearer token,
@@ -40,9 +43,7 @@ function redactionTypeForKey(key: string): string {
 // the KEY containing a word like "token", but the VALUE is numeric/boolean, it's
 // a count or flag, not a secret. These must stay readable in logs:
 // `tokens.input=45000`, `hasUsageTokens=true`, `max_tokens=4096` are diagnostics,
-// not credentials. (High-entropy secret VALUES are still caught by the
-// value-shaped patterns above — bearer, JWT, AKIA, gh*_, etc. — independent of
-// the key name, so relaxing the key-based match for scalars loses no coverage.)
+// not credentials.
 function isNonSecretScalarValue(value: string): boolean {
     const v = value.trim();
     if (v === "true" || v === "false" || v === "null" || v === "undefined") return true;
@@ -140,6 +141,27 @@ const SECRET_TEXT_PATTERNS: Array<{
     replacement: string | ((match: string, ...groups: string[]) => string);
 }> = [
     {
+        pattern:
+            /(["'])([^"']*(?:key|token|secret|password|auth|bearer|credential)[^"']*)\1(\s*:\s*)(["'])([^"']*)\4/gi,
+        replacement: (
+            full: string,
+            quote: string,
+            key: string,
+            separator: string,
+            valueQuote: string,
+            value: string,
+        ) =>
+            isNonSecretScalarValue(value)
+                ? full
+                : `${quote}${key}${quote}${separator}${valueQuote}<REDACTED:${redactionTypeForKey(key)}>${valueQuote}`,
+    },
+    {
+        pattern:
+            /\b([A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)\s*=\s*([^\s'"`]+)/gi,
+        replacement: (full: string, key: string, value: string) =>
+            isNonSecretScalarValue(value) ? full : `${key}=<REDACTED:${redactionTypeForKey(key)}>`,
+    },
+    {
         pattern: /\bsk-ant-(?:api03-)?[A-Za-z0-9_-]{32,}/g,
         replacement: "<ANTHROPIC_API_KEY_REDACTED>",
     },
@@ -160,7 +182,7 @@ const SECRET_TEXT_PATTERNS: Array<{
         replacement: "<HUGGINGFACE_TOKEN_REDACTED>",
     },
     {
-        pattern: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
+        pattern: /\b(?:AKIA|ASIA)[0-9A-Z]{16}/g,
         replacement: "<AWS_ACCESS_KEY_ID_REDACTED>",
     },
     {
@@ -168,7 +190,7 @@ const SECRET_TEXT_PATTERNS: Array<{
         replacement: "<SLACK_TOKEN_REDACTED>",
     },
     {
-        pattern: /\bAIza[A-Za-z0-9_-]{35}\b/g,
+        pattern: /\bAIza[A-Za-z0-9_-]{35}/g,
         replacement: "<GOOGLE_API_KEY_REDACTED>",
     },
     {
@@ -178,32 +200,6 @@ const SECRET_TEXT_PATTERNS: Array<{
     {
         pattern: /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g,
         replacement: "<JWT_REDACTED>",
-    },
-    {
-        pattern:
-            /(["'])([^"']*(?:key|token|secret|password|auth|bearer|credential)[^"']*)\1(\s*:\s*)(["'])([^"']*)\4/gi,
-        replacement: (
-            full: string,
-            quote: string,
-            key: string,
-            separator: string,
-            valueQuote: string,
-            value: string,
-        ) =>
-            // A numeric/boolean value matched only because the KEY contains a
-            // secret word (e.g. "max_tokens": "4096") is a count, not a secret.
-            isNonSecretScalarValue(value)
-                ? full
-                : `${quote}${key}${quote}${separator}${valueQuote}<REDACTED:${redactionTypeForKey(key)}>${valueQuote}`,
-    },
-    {
-        pattern:
-            /\b([A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)\s*=\s*([^\s'"`]+)/gi,
-        replacement: (full: string, key: string, value: string) =>
-            // tokens.input=45000 / hasUsageTokens=true are diagnostics, not
-            // secrets — keep them readable. Real secret values are still caught
-            // by the value-shaped patterns above.
-            isNonSecretScalarValue(value) ? full : `${key}=<REDACTED:${redactionTypeForKey(key)}>`,
     },
 ];
 

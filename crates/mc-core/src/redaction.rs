@@ -75,7 +75,7 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
             "<HUGGINGFACE_TOKEN_REDACTED>",
         ),
         Rule::static_pattern(
-            r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
+            r"\b(?:AKIA|ASIA)[0-9A-Z]{16}",
             "aws_access_key_id",
             "<AWS_ACCESS_KEY_ID_REDACTED>",
         ),
@@ -85,7 +85,7 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
             "<SLACK_TOKEN_REDACTED>",
         ),
         Rule::static_pattern(
-            r"\bAIza[A-Za-z0-9_-]{35}\b",
+            r"\bAIza[A-Za-z0-9_-]{35}",
             "google_api_key",
             "<GOOGLE_API_KEY_REDACTED>",
         ),
@@ -231,23 +231,66 @@ fn is_non_secret_scalar_value(value: &str) -> bool {
 }
 
 fn redaction_type_for_key(key: &str) -> String {
-    let mut normalized = String::new();
-    let mut replacing = false;
-    for character in key.trim().to_lowercase().chars() {
-        if character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | '-') {
-            normalized.push(character);
-            replacing = false;
-        } else if !replacing {
-            normalized.push('_');
-            replacing = true;
-        }
+    const SECRET_WORDS: &[&str] = &[
+        "key",
+        "keys",
+        "token",
+        "tokens",
+        "secret",
+        "secrets",
+        "password",
+        "passwords",
+        "auth",
+        "auths",
+        "authorization",
+        "authorizations",
+        "bearer",
+        "bearers",
+        "credential",
+        "credentials",
+    ];
+    const QUALIFIERS: &[&str] = &[
+        "api",
+        "access",
+        "private",
+        "client",
+        "auth",
+        "authorization",
+        "secret",
+        "bearer",
+        "session",
+        "refresh",
+        "service",
+        "x",
+        "openai",
+        "anthropic",
+        "google",
+        "github",
+        "huggingface",
+        "aws",
+        "azure",
+    ];
+
+    let normalized = key
+        .chars()
+        .flat_map(char::to_lowercase)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let vocabulary = normalized
+        .split('_')
+        .filter(|segment| SECRET_WORDS.contains(segment) || QUALIFIERS.contains(segment))
+        .collect::<Vec<_>>();
+    if vocabulary.is_empty() {
+        "secret".to_owned()
+    } else {
+        vocabulary.join("_")
     }
-    normalized
-        .split('.')
-        .rfind(|part| !part.is_empty())
-        .filter(|part| !part.is_empty())
-        .unwrap_or("secret")
-        .to_owned()
 }
 
 #[cfg(test)]

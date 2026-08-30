@@ -96,6 +96,24 @@
       "input": "api_key=sk-proj-IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII",
       "expected_redacted": "api_key=<REDACTED:api_key>",
       "detections": [{ "secret_type": "api_key", "offset": 8, "length": 40 }]
+    },
+    {
+      "name": "aws provider bytes inside assignment key",
+      "input": "AKIAJJJJJJJJJJJJJJJJ_key=private-value",
+      "expected_redacted": "<AWS_ACCESS_KEY_ID_REDACTED>_key=<REDACTED:key>",
+      "detections": [
+        { "secret_type": "aws_access_key_id", "offset": 0, "length": 20 },
+        { "secret_type": "key", "offset": 25, "length": 13 }
+      ]
+    },
+    {
+      "name": "google provider bytes inside quoted key",
+      "input": "\"AIzaKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK_key\":\"private-value\"",
+      "expected_redacted": "\"<GOOGLE_API_KEY_REDACTED>_key\":\"<REDACTED:key>\"",
+      "detections": [
+        { "secret_type": "google_api_key", "offset": 1, "length": 39 },
+        { "secret_type": "key", "offset": 47, "length": 13 }
+      ]
     }
   ],
   "exemptions": [
