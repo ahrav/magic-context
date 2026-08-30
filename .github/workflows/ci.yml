@@ -233,13 +233,16 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: ahrav/commons
-          ref: d2208eda95d845193d84199dbfd0781a1f479291
+          ref: 77cd36b9cb8bde762d2b39d4807bb1c0338ed927
           path: commons
           persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: taiki-e/install-action@nextest
+
+      - name: Store tests against real commons
+        run: cargo test -p mc-store
 
       - name: Host lifecycle and closure proofs (Linux)
         if: runner.os == 'Linux'
