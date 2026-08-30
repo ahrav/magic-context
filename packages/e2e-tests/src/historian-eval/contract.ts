@@ -1003,17 +1003,28 @@ export function matchesGold(
  * inside a sentence while `"4"` no longer matches inside `"4096"`.
  */
 export function containsCompleteValue(content: string, value: string): boolean {
+    return countCompleteValues(content, value) > 0;
+}
+
+/**
+ * How many times `content` states `value` as a complete value.
+ *
+ * A caller comparing a transcript with a perturbation of it needs the count, not
+ * just presence: a rewrite that adds or removes one occurrence of a probe's answer
+ * changes what the probe can copy from raw history even when another occurrence
+ * keeps presence unchanged.
+ */
+export function countCompleteValues(content: string, value: string): number {
     // Both sides decoded first, so every collision guard uses the SAME equality
     // `compareProbeAnswer` accepts on. Without it a gold of `A&B` was accepted when a
     // model answered `A&amp;B`, while a question or an earlier reply containing
     // `A&amp;B` passed these guards — so the escaped form could be copied out of the
     // prompt or the shared history and still score.
-    content = decodeXmlEntities(content);
-    value = decodeXmlEntities(value);
-    const needle = normalizeContent(value);
-    if (needle.length === 0) return false;
+    const needle = normalizeContent(decodeXmlEntities(value));
+    if (needle.length === 0) return 0;
     const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, "u").test(normalizeContent(content));
+    const matcher = new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, "gu");
+    return [...normalizeContent(decodeXmlEntities(content)).matchAll(matcher)].length;
 }
 
 /**

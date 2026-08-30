@@ -2,7 +2,9 @@ import { splitmix32 } from "../../../plugin/scripts/retrieval-benchmark/syntheti
 import {
     MAX_TRANSCRIPT_TURNS,
     MAX_TURN_TEXT_CHARS,
+    authoredEvidenceText,
     containsCompleteValue,
+    countCompleteValues,
     lintScenario,
     normalizeContent,
     normalizedEvidenceMessages,
@@ -524,6 +526,37 @@ function preservesEvidenceForDuplication(
     );
 }
 
+/** The gold answers a probe could copy out of raw history. */
+function probeAnswers(scenario: HistorianEvalScenario): string[] {
+    return scenario.probes.flatMap((probe) =>
+        probe.answerType === "claim-id" ? [] : [probe.goldAnswer],
+    );
+}
+
+/**
+ * Whether the derivative states each probe answer exactly as often as the source.
+ *
+ * A probe is meant to be answerable only by retrieving the injected claim, and the
+ * source is authored so its answer is not copyable from raw history beyond the
+ * range that backs it. Adding an occurrence hands the probe a copyable answer;
+ * removing one changes what the leakage gate sees. Neither is a perturbation these
+ * transforms advertise, and the expected-claim comparison cannot stand in for it —
+ * a turn can carry the answer `4096` without matching the claim predicate
+ * `capacity is 4096`.
+ */
+function preservesProbeAnswers(
+    answers: readonly string[],
+    scenario: HistorianEvalScenario,
+    turns: readonly TranscriptTurn[],
+): boolean {
+    if (answers.length === 0) return true;
+    const before = authoredEvidenceText(scenario.transcript.turns);
+    const after = authoredEvidenceText(turns);
+    return answers.every(
+        (answer) => countCompleteValues(after, answer) === countCompleteValues(before, answer),
+    );
+}
+
 /** The turn list a candidate order produces, without copying gold. */
 function reorderedTurns(
     scenario: HistorianEvalScenario,
@@ -821,6 +854,7 @@ const duplicateRejectedProposal: Transform = {
         }
         const baselines = evidenceBaselines(scenario);
         const rejected = baselines.rejected.entries;
+        const answers = probeAnswers(scenario);
         // Turns the rejection evidence actually runs through in the text the
         // historian receives. Matching the raw strings instead would select a
         // turn whose only occurrence sits in a reminder block or directive
@@ -854,7 +888,7 @@ const duplicateRejectedProposal: Transform = {
                     baselines,
                     turns,
                     turnMap,
-                )
+                ) && preservesProbeAnswers(answers, scenario, turns)
                     ? [{ source: turnIndex, insertion, turnMap }]
                     : [];
             },
@@ -949,6 +983,7 @@ const renameUnrelatedSymbols: Transform = {
             probe.answerType === "claim-id" ? "" : probe.goldAnswer,
             ...(probe.answerType === "multiple-choice" ? probe.choices : []),
         ]);
+        const answers = probeAnswers(scenario);
         // Symbols that also occur in text the rename cannot touch stay out of the
         // candidate pool: renaming only some occurrences would name one entity
         // two ways. Probes count as untouchable text — a probe asking what
@@ -966,7 +1001,15 @@ const renameUnrelatedSymbols: Transform = {
                 (["user", "assistant"] as const).flatMap((role) =>
                     eligibleKeys.has(messageKey(turnIndex, role))
                         ? []
-                        : symbolsIn(turn[role]),
+                        : // Both views: cleaning can join fragments into a symbol
+                          // that never appears contiguously in the raw text, so a
+                          // raw-only scan misses what the historian receives.
+                          [
+                              ...symbolsIn(turn[role]),
+                              ...symbolsIn(
+                                  visibleText.get(messageKey(turnIndex, role)) ?? "",
+                              ),
+                          ],
                 ),
             ),
             ...probeText.flatMap((text) => symbolsIn(text)),
@@ -974,15 +1017,26 @@ const renameUnrelatedSymbols: Transform = {
         ]);
         const candidates = [
             ...new Set(
-                messages.flatMap((message) =>
-                    symbolsIn(
+                messages.flatMap((message) => {
+                    // A candidate has to be present in BOTH views: the
+                    // historian's, so renaming it changes the model input, and the
+                    // raw text, so the replacement can find it at all — cleaning
+                    // can join fragments into a symbol the raw string never spells.
+                    const raw = new Set(symbolsIn(message.text));
+                    return symbolsIn(
                         visibleText.get(
                             messageKey(message.turnIndex, message.role),
                         ) ?? "",
-                    ),
-                ),
+                    ).filter((symbol) => raw.has(symbol));
+                }),
             ),
-        ].filter((symbol) => !blocked.has(symbol));
+        ].filter(
+            (symbol) =>
+                !blocked.has(symbol) &&
+                // A symbol can carry a probe answer without being one: renaming
+                // `api/v2` deletes the complete-value occurrence of `api`.
+                !answers.some((answer) => containsCompleteValue(symbol, answer)),
+        );
         if (candidates.length === 0) {
             return {
                 applicable: false,
@@ -999,22 +1053,16 @@ const renameUnrelatedSymbols: Transform = {
             ...allText.flatMap((text) => symbolsIn(text)),
             ...allText.flatMap((text) => shadowedSymbolsIn(text)),
         ]);
-        // A generated name contains its own parts as complete values, so a probe
-        // whose gold answer is one of them — `aux`, `symbol` — would find the
-        // answer copyable from raw history the moment any rename lands.
-        const probeAnswers = scenario.probes.flatMap((probe) =>
-            probe.answerType === "claim-id" ? [] : [probe.goldAnswer],
-        );
         const replacementStart = Math.floor(next() * 10_000);
         let replacement: string | undefined;
         for (let offset = 0; offset < 10_000; offset += 1) {
             const candidate = `aux_symbol_${(replacementStart + offset) % 10_000}`;
-            if (
-                probeAnswers.some((answer) =>
-                    containsCompleteValue(candidate, answer),
-                )
-            )
+            // A generated name contains its own parts as complete values, so a
+            // probe whose gold answer is one of them — `aux`, `symbol` — would find
+            // the answer copyable from raw history the moment any rename lands.
+            if (answers.some((answer) => containsCompleteValue(candidate, answer))) {
                 continue;
+            }
             if (candidate !== original && !existing.has(candidate)) {
                 replacement = candidate;
                 break;
@@ -1065,11 +1113,18 @@ const renameUnrelatedSymbols: Transform = {
                 evidenceBaselines(scenario),
                 turns,
                 turnMap,
-            )
+            ) ||
+            !preservesProbeAnswers(answers, scenario, turns)
         ) {
             return {
                 applicable: false,
                 reason: "rename would change authored evidence",
+            };
+        }
+        if (!changesVisibleTranscript(scenario, turns)) {
+            return {
+                applicable: false,
+                reason: "rename leaves the historian input unchanged",
             };
         }
         return derivative(

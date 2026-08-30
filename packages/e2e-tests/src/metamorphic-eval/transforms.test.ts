@@ -505,6 +505,122 @@ describe("metamorphic transforms", () => {
         }
     });
 
+    test("duplication refuses a rejected turn that repeats a probe answer", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        // `4096` is a probe answer, and the claim predicate is the longer phrase the
+        // rejected turn does not state, so the expected-claim comparison sees
+        // nothing while the answer count still rises.
+        turns[0]!.user = "Should we use Redis for the session cache with 4096 entries?";
+        const gold = raw.gold as { expectedClaims: Array<{ predicate: { value: string } }> };
+        gold.expectedClaims[1]!.predicate.value = "cache capacity is 4096";
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "duplicate-rejected-proposal")!;
+
+        expect(transform.apply(scenario, 0)).toEqual({
+            applicable: false,
+            reason: "no rejected proposal insertion preserves contiguous gold ranges",
+        });
+    });
+
+    test("rename refuses a symbol that carries a probe answer", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[0]!.assistant = "We could consider it.";
+        // `api` stands alone in the protected turn, so it is not a renameable
+        // symbol there and the exact-symbol blocklist never records it. `api/v2`
+        // in the eligible message is one, and renaming it deletes an occurrence.
+        turns[2]!.assistant = "Done: cache capacity is 4096 entries served over api.";
+        // The message also names a symbol carrying no answer, so filtering the
+        // unsafe one out lets the rename proceed rather than fail the application.
+        turns[3] = {
+            user: "Background note about api/v2 and aux_worker.ts handling.",
+            assistant: "Summary recorded.",
+        };
+        const gold = raw.gold as { expectedClaims: Array<{ predicate: { value: string } }> };
+        gold.expectedClaims[1]!.predicate.value = "4096 entries served over api";
+        // `api` is not a renameable symbol on its own, so the exact-symbol
+        // blocklist never sees it, but renaming `api/v2` deletes it.
+        (raw.probes as Array<Record<string, unknown>>)[0] = {
+            id: "probe-capacity",
+            question: "Which interface version fronts the capacity record?",
+            answerType: "exact",
+            goldAnswer: "api",
+            sourceClaimRef: "exp-cache-capacity",
+        };
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
+
+        for (let seed = 0; seed < 20; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            expect(result.applicable, `seed ${seed}`).toBe(true);
+            if (!result.applicable) continue;
+            const rewritten = result.scenario.transcript.turns[3]!.user;
+            expect(rewritten, `seed ${seed}`).toContain("api/v2");
+            expect(rewritten, `seed ${seed}`).not.toContain("aux_worker.ts");
+        }
+    });
+
+    test("rename refuses a symbol only cleaning spells", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[0]!.assistant = "We could consider it.";
+        // Cleaning joins the fragments into `buildAPI`, which the raw string never
+        // spells, so a raw-text replacement would find nothing to rewrite. The
+        // message also names a real symbol, so selecting the unreachable one would
+        // waste the application rather than rename the reachable one.
+        turns[3] = {
+            user: "Background note about build<system-reminder>x</system-reminder>API and aux_worker.ts.",
+            assistant: "Summary recorded.",
+        };
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
+
+        for (let seed = 0; seed < 20; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            expect(result.applicable, `seed ${seed}`).toBe(true);
+            if (!result.applicable) continue;
+            expect(result.scenario.transcript.turns[3]!.user, `seed ${seed}`).not.toContain(
+                "aux_worker.ts",
+            );
+            // Whatever it renamed, the historian input has to differ.
+            expect(
+                normalizedEvidenceMessages(result.scenario.transcript.turns)
+                    .map((message) => message.text)
+                    .join("|"),
+                `seed ${seed}`,
+            ).not.toBe(
+                normalizedEvidenceMessages(scenario.transcript.turns)
+                    .map((message) => message.text)
+                    .join("|"),
+            );
+        }
+    });
+
+    test("rename refuses a symbol a protected message spells only after cleaning", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[0]!.assistant = "We could consider it.";
+        // The protected turn spells `buildAPI` only once the reminder is stripped
+        // (production cleans user messages), so a raw-only blocklist records `API`
+        // and misses the whole symbol.
+        turns[2]!.user =
+            "Also set the cache capacity via build<system-reminder>x</system-reminder>API.";
+        turns[3] = { user: "Background note about buildAPI handling.", assistant: "Summary recorded." };
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
+
+        for (let seed = 0; seed < 20; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            expect(result.scenario.transcript.turns[3]!.user, `seed ${seed}`).toContain("buildAPI");
+        }
+    });
+
     test("duplication refuses a rejected turn carrying another negative family", () => {
         const raw = validScenarioRaw();
         const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
