@@ -488,7 +488,8 @@ mod reference {
 
     fn protect_identifier_regions(text: &str, preserved: &mut Vec<PreservedRegion>) -> String {
         static IDENTIFIER: OnceLock<Regex> = OnceLock::new();
-        let regex = IDENTIFIER.get_or_init(|| Regex::new(r"(?:msg|ses|toolu)_[A-Za-z0-9]+").unwrap());
+        let regex =
+            IDENTIFIER.get_or_init(|| Regex::new(r"(?:msg|ses|toolu)_[A-Za-z0-9]+").unwrap());
         protect_regex_filtered(text, regex, preserved, |text, start, end| {
             has_word_boundary_before(text, start) && has_word_boundary_after(text, end)
         })
@@ -627,7 +628,8 @@ mod reference {
                 if !word.is_empty() && has_word_boundary_after(text, cursor + word.len()) {
                     let mut end = cursor + word.len();
                     if end < text.len() && next_char(text, end).is_some_and(char::is_whitespace) {
-                        while end < text.len() && next_char(text, end).is_some_and(char::is_whitespace)
+                        while end < text.len()
+                            && next_char(text, end).is_some_and(char::is_whitespace)
                         {
                             end += next_char(text, end).unwrap().len_utf8();
                         }
@@ -714,12 +716,15 @@ mod reference {
                     continue;
                 };
                 let mut aux_end = whitespace_end + aux.len();
-                if aux_end >= text.len() || !next_char(text, aux_end).is_some_and(char::is_whitespace) {
+                if aux_end >= text.len()
+                    || !next_char(text, aux_end).is_some_and(char::is_whitespace)
+                {
                     output.push_str(&text[cursor..aux_end]);
                     cursor = aux_end;
                     continue;
                 }
-                while aux_end < text.len() && next_char(text, aux_end).is_some_and(char::is_whitespace)
+                while aux_end < text.len()
+                    && next_char(text, aux_end).is_some_and(char::is_whitespace)
                 {
                     aux_end += next_char(text, aux_end).unwrap().len_utf8();
                 }
@@ -829,7 +834,6 @@ mod reference {
             .trim()
             .to_string()
     }
-
 }
 
 use mc_module::caveman::{compress, CavemanLevel};
@@ -846,13 +850,37 @@ fn levels() -> [(CavemanLevel, reference::CavemanLevel); 3] {
 fn fragment() -> impl Strategy<Value = String> {
     prop_oneof![
         Just("I just really wanted to basically explain the implementation clearly".to_string()),
-        Just("i think it seems the results are being computed, and in order to understand".to_string()),
+        Just(
+            "i think it seems the results are being computed, and in order to understand"
+                .to_string()
+        ),
         Just("please review this, thanks, kind of a bit urgent".to_string()),
-        Just("the historian will be summarized because of the compartment context message".to_string()),
-        Just("was were is are am be been being has been had been have been will be tested".to_string()),
+        Just(
+            "the historian will be summarized because of the compartment context message"
+                .to_string()
+        ),
+        Just(
+            "was were is are am be been being has been had been have been will be tested"
+                .to_string()
+        ),
+        // `in order to` -> `to` creates `due to the fact that`, which a later pass turns
+        // into `because`. A single-pass or reordered implementation stops at the first.
+        Just("due in order to the fact that at this point in time it failed".to_string()),
+        // Mixed-case phrase forms, matched ASCII-insensitively.
+        Just("I JUST Really Basically wanted to Simply explain".to_string()),
+        Just("I Think It Seems Maybe the results Are ok".to_string()),
+        Just("Please review, Thanks, Kind Of A Bit urgent".to_string()),
+        Just("In Order To understand At The Moment, Due To The Fact That".to_string()),
+        Just("Was Were Has Been Have Been Will Be tested".to_string()),
         Just("U: keep this user line untouched".to_string()),
         Just("`inline code with  spaces`".to_string()),
         Just("```rust\nfn nested() { let a = 1; }\n```".to_string()),
+        // Protected regions contain removable phrases.
+        Just("`fn f() { /* just really in order to */ }`".to_string()),
+        Just(
+            "```ts\n// i think just really in order to at the moment\nconst a = 1;\n```"
+                .to_string()
+        ),
         Just("https://example.com/really/long/path?query=1&flag".to_string()),
         Just("§7§ tag and msg_ABC123 plus deadbeefcafe1234 hash".to_string()),
         Just("src/some_dir/file_name.rs and ../rel/path.txt".to_string()),
@@ -874,15 +902,18 @@ fn fragment() -> impl Strategy<Value = String> {
 fn document() -> impl Strategy<Value = String> {
     (
         proptest::collection::vec(fragment(), 0..24),
-        proptest::collection::vec(prop_oneof![
-            Just(" "),
-            Just("  "),
-            Just("\n"),
-            Just("\n\n"),
-            Just("\n\n\n\n   \n"),
-            Just(", "),
-            Just(". "),
-        ], 0..24),
+        proptest::collection::vec(
+            prop_oneof![
+                Just(" "),
+                Just("  "),
+                Just("\n"),
+                Just("\n\n"),
+                Just("\n\n\n\n   \n"),
+                Just(", "),
+                Just(". "),
+            ],
+            0..24,
+        ),
     )
         .prop_map(|(frags, seps)| {
             let mut doc = String::new();

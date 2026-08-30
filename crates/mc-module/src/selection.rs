@@ -1085,8 +1085,12 @@ fn select_emergency(
     selected
 }
 
+/// `two_pass_batch_can_apply` gates persisted `meta.last_execute_ordinal` advancement.
+/// `two_pass_batch_can_apply` can diverge while `decisions` stays byte-identical, so
+/// out-of-crate readers need the whole outcome.
+#[doc(hidden)]
 #[derive(Debug, Default)]
-pub(crate) struct SelectionOutcome {
+pub struct SelectionOutcome {
     pub decisions: Vec<ReductionDecision>,
     /// The pressure pass was already busting, or was in the force band, so the age
     /// batch had an application opportunity. Empty opportunities still advance the
@@ -1116,7 +1120,8 @@ pub fn select_reductions(
     select_reductions_with_outcome(items, frozen_keys, ctx, cfg).decisions
 }
 
-pub(crate) fn select_reductions_with_outcome(
+#[doc(hidden)]
+pub fn select_reductions_with_outcome(
     items: &[SelItem],
     frozen_keys: &HashSet<String>,
     ctx: &SelectionContext,

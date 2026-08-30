@@ -37,23 +37,23 @@ mod reference {
 
     pub use mc_module::transform::ReductionDecision;
 
-        fn utf16_len(text: &str) -> usize {
-            text.encode_utf16().count()
-        }
+    fn utf16_len(text: &str) -> usize {
+        text.encode_utf16().count()
+    }
 
-        fn utf16_prefix(text: &str, limit: usize) -> &str {
-            let mut used = 0;
-            let mut end = 0;
-            for (start, character) in text.char_indices() {
-                let next = used + character.len_utf16();
-                if next > limit {
-                    break;
-                }
-                used = next;
-                end = start + character.len_utf8();
+    fn utf16_prefix(text: &str, limit: usize) -> &str {
+        let mut used = 0;
+        let mut end = 0;
+        for (start, character) in text.char_indices() {
+            let next = used + character.len_utf16();
+            if next > limit {
+                break;
             }
-            &text[..end]
+            used = next;
+            end = start + character.len_utf8();
         }
+        &text[..end]
+    }
 
     // --- ported TS constants (exact; the differential golden is the arbiter) ---
 
@@ -520,7 +520,9 @@ mod reference {
             let message = messages.entry(mid).or_default();
             match &item.kind {
                 SelKind::Reasoning | SelKind::RedactedReasoning => message.has_reasoning = true,
-                SelKind::ToolCall { .. } | SelKind::ToolResult { .. } if !item.provider_executed => {
+                SelKind::ToolCall { .. } | SelKind::ToolResult { .. }
+                    if !item.provider_executed =>
+                {
                     if let Some(arc_id) = &item.arc_id {
                         message.tool_arc_ids.insert(arc_id.clone());
                     } else {
@@ -856,10 +858,7 @@ mod reference {
             let Some(args) = serde_json::to_string(&arc.input).ok() else {
                 continue;
             };
-            let owner_message_id = arc
-                .owner_message_id
-                .as_ref()
-                .expect("owner checked above");
+            let owner_message_id = arc.owner_message_id.as_ref().expect("owner checked above");
             let fingerprint = format!("{owner_message_id}:{}:{args}", arc.dedup_name);
             groups.entry(fingerprint).or_default().push(*arc);
         }
@@ -931,7 +930,8 @@ mod reference {
         out: &mut Vec<ReductionDecision>,
     ) {
         for id in &ctx.agent_drop_ids {
-            if frozen.contains(id) || !live_ids.contains(id.as_str()) || ctx.block_is_protected(id) {
+            if frozen.contains(id) || !live_ids.contains(id.as_str()) || ctx.block_is_protected(id)
+            {
                 continue;
             }
             let first_applied = ctx.first_applied_agent_drop_ids.contains(id);
@@ -1155,7 +1155,10 @@ mod reference {
                 // via agent-directed ctx_reduce ids.
                 !matches!(
                     item.kind,
-                    SelKind::Media | SelKind::Opaque | SelKind::Reasoning | SelKind::RedactedReasoning
+                    SelKind::Media
+                        | SelKind::Opaque
+                        | SelKind::Reasoning
+                        | SelKind::RedactedReasoning
                 )
             })
             .map(|item| item.id.as_str())
@@ -1200,7 +1203,8 @@ mod reference {
                 // text, media, reasoning, and non-droppable tools; system-prefix and opaque metadata
                 // remain outside that population. Only active client tool arcs can be selected below.
                 let all_active_floor_tokens = active_floor_tokens(items, frozen_keys);
-                let emergency_arc_ids = select_emergency(&active_arcs, ctx, all_active_floor_tokens);
+                let emergency_arc_ids =
+                    select_emergency(&active_arcs, ctx, all_active_floor_tokens);
                 if !emergency_arc_ids.is_empty() || !two_pass_arc_ids.is_empty() {
                     for arc_id in &dedup_arc_ids {
                         arc_shapes.insert(arc_id.clone(), ArcShape::DedupFullDrop);
@@ -1222,7 +1226,9 @@ mod reference {
                 // emergency eviction or a two-pass reclaim batch. If emergency mode has met
                 // its headroom target but selected nothing, defer supersession so it cannot
                 // create a cache bust by itself.
-                if cfg.smart_drops && (!emergency_arc_ids.is_empty() || !two_pass_arc_ids.is_empty()) {
+                if cfg.smart_drops
+                    && (!emergency_arc_ids.is_empty() || !two_pass_arc_ids.is_empty())
+                {
                     // A superseded arc remains eligible while the ride gate is shut, so the count
                     // observed when it next opens summarizes everything accumulated between rides.
                     let intents = select_supersession(&active_arcs);
@@ -1253,7 +1259,8 @@ mod reference {
                 // Supersession is deferred work: ordinary execute-band pressure and a held
                 // emergency latch cannot authorize a rewrite. Concrete scheduled work or an
                 // admitted two-pass batch lets the whole pending set ride the same bust.
-                if cfg.smart_drops && (ctx.supersession_ride_available || !two_pass_arc_ids.is_empty())
+                if cfg.smart_drops
+                    && (ctx.supersession_ride_available || !two_pass_arc_ids.is_empty())
                 {
                     // Count the exact selector output before overlap precedence removes members.
                     let intents = select_supersession(&active_arcs);
@@ -1427,13 +1434,12 @@ mod reference {
         out.sort_by(|a, b| a.target_id.cmp(&b.target_id));
         out
     }
-
 }
 
 use std::collections::{HashMap, HashSet};
 
 use mc_module::selection::{
-    select_reductions, PassClass, SelItem, SelKind, SelMessageRole, SelectionConfig,
+    select_reductions_with_outcome, PassClass, SelItem, SelKind, SelMessageRole, SelectionConfig,
     SelectionContext,
 };
 use proptest::prelude::*;
@@ -1460,8 +1466,20 @@ struct ItemSpec {
 fn item_spec() -> impl Strategy<Value = ItemSpec> {
     (
         (0u8..12, 0u8..3, 0u8..32, 0u8..3, 0u8..7),
-        (0u8..10, 0u8..6, any::<bool>(), 0u16..4096, proptest::option::of(0u16..2048)),
-        (proptest::option::of(0u8..8), any::<bool>(), any::<bool>(), any::<bool>(), any::<bool>()),
+        (
+            0u8..15,
+            0u8..10,
+            any::<bool>(),
+            0u16..4096,
+            proptest::option::of(0u16..2048),
+        ),
+        (
+            proptest::option::of(0u8..8),
+            any::<bool>(),
+            any::<bool>(),
+            any::<bool>(),
+            any::<bool>(),
+        ),
     )
         .prop_map(
             |(
@@ -1488,10 +1506,41 @@ fn item_spec() -> impl Strategy<Value = ItemSpec> {
         )
 }
 
-const TOOLS: [&str; 10] = [
-    "mcp_read", "mcp_grep", "read", "edit", "write", "todowrite", "ctx_reduce", "ctx_note",
-    "bash", "glob",
+const TOOLS: [&str; 15] = [
+    "mcp_read",
+    "mcp_grep",
+    "read",
+    "edit",
+    "write",
+    "todowrite",
+    "ctx_reduce",
+    "ctx_note",
+    "bash",
+    "glob",
+    // `ZERO_VALUE_META_TOOLS` members.
+    "bash_status",
+    "bash_kill",
+    // Mixed-case tool names test `normalize_tool_name`.
+    "MCP_READ",
+    "Edit",
+    "TodoWrite",
 ];
+
+/// The rocket's UTF-16 surrogate pair crosses `EDIT_REGION_HINT_LEN`.
+const DIFF_ACROSS_HINT_BOUNDARY: &str = "012345678901234567890123456789012345678\u{1F680}tail";
+
+/// `large_input` exceeds 500 serialized bytes and exercises `clamp_object` truncation for
+/// strings, arrays, and objects.
+fn large_input() -> serde_json::Value {
+    serde_json::json!({
+        "filePath": "src/a.rs",
+        "oldString": "x".repeat(640),
+        "items": (0..12).collect::<Vec<u32>>(),
+        "nested": {"k": "value", "deep": {"a": 1, "b": "two"}},
+        "flag": true,
+        "limit": 7,
+    })
+}
 
 fn input_value(variant: u8) -> serde_json::Value {
     match variant {
@@ -1500,6 +1549,15 @@ fn input_value(variant: u8) -> serde_json::Value {
         2 => serde_json::json!({"path": "src/a.rs", "limit": 5}),
         3 => serde_json::json!({"action": "list"}),
         4 => serde_json::json!({"description": "do things"}),
+        // `CTX_NOTE_ZERO_VALUE_ACTIONS` members.
+        5 => serde_json::json!({"action": "read"}),
+        6 => serde_json::json!({"action": "dismiss"}),
+        7 => large_input(),
+        8 => serde_json::json!({
+            "filePath": "src/a.rs",
+            "oldString": DIFF_ACROSS_HINT_BOUNDARY,
+            "newString": "short",
+        }),
         _ => serde_json::json!({}),
     }
 }
@@ -1518,8 +1576,18 @@ macro_rules! build_inputs {
         type Ctx = $SelectionContext;
         type Cfg = $SelectionConfig;
         let specs = $specs;
-        let (pass_class, tokens, ceiling, cutoff_slot, execute_slot, pressure, prior, busting, ride, smart) =
-            $ctx_bits;
+        let (
+            pass_class,
+            tokens,
+            ceiling,
+            cutoff_slot,
+            execute_slot,
+            pressure,
+            prior,
+            busting,
+            ride,
+            smart,
+        ) = $ctx_bits;
         let items: Vec<Item> = specs
             .iter()
             .map(|s| {
@@ -1588,8 +1656,15 @@ macro_rules! build_inputs {
             protected_cutoff_ordinal: max_ordinal * u64::from(cutoff_slot) / 4,
             last_execute_ordinal: max_ordinal * u64::from(execute_slot) / 4,
             scheduler_pressure_execute: pressure,
-            prior_input_sample: if prior { tokens } else { 0.0 },
-            has_prior_drop: prior,
+            // Arm 1 sets `prior_input_sample` to `tokens` so `prior_input_sample == tokens`
+            // exercises the early return in `select_emergency`.
+            prior_input_sample: match prior {
+                0 => 0.0,
+                1 => tokens,
+                2 => tokens * 0.5,
+                _ => tokens * 1.5,
+            },
+            has_prior_drop: prior != 0,
             agent_drop_ids,
             agent_drop_command_ids,
             first_applied_agent_drop_ids: first_applied,
@@ -1611,21 +1686,186 @@ macro_rules! build_inputs {
     }};
 }
 
-type CtxBits = (u8, f64, f64, u8, u8, bool, bool, bool, bool, bool);
+type CtxBits = (u8, f64, f64, u8, u8, bool, u8, bool, bool, bool);
 
 fn ctx_bits() -> impl Strategy<Value = CtxBits> {
     (
         (0u8..3, 0.0f64..200_000.0, 0.0f64..150_000.0, 0u8..5, 0u8..5),
-        (any::<bool>(), any::<bool>(), any::<bool>(), any::<bool>(), any::<bool>()),
+        (
+            any::<bool>(),
+            0u8..4,
+            any::<bool>(),
+            any::<bool>(),
+            any::<bool>(),
+        ),
     )
         .prop_map(|((a, b, c, d, e), (f, g, h, i, j))| (a, b, c, d, e, f, g, h, i, j))
 }
 
-fn decision_rows(decisions: &[mc_module::transform::ReductionDecision]) -> Vec<(String, String, String)> {
+fn decision_rows(
+    decisions: &[mc_module::transform::ReductionDecision],
+) -> Vec<(String, String, String)> {
     decisions
         .iter()
         .map(|d| (d.target_id.clone(), d.kind.clone(), d.payload.clone()))
         .collect()
+}
+
+/// Compare all outcome fields: `transform` uses `two_pass_batch_can_apply` to update
+/// `meta.last_execute_ordinal`, so scalar fields can differ when decisions are
+/// byte-identical.
+macro_rules! outcome_rows {
+    ($outcome:expr) => {{
+        let outcome = $outcome;
+        (
+            decision_rows(&outcome.decisions),
+            outcome.two_pass_batch_can_apply,
+            outcome.eligible_supersession_count,
+            outcome.supersession_withheld_by_tag_window_count,
+            outcome.supersession_withheld_by_exempt_message_count,
+            outcome.applied_supersession_count,
+        )
+    }};
+}
+
+/// `arc_window_specs` generates 24 to 30 arcs, exceeding `RECENT_TOOL_SKELETON_WINDOW` (20).
+/// `frozen_tail` freezes the newest arc's call, which drops that arc from `active_arcs`.
+fn arc_window_specs() -> impl Strategy<Value = Vec<ItemSpec>> {
+    (
+        24u8..31,
+        0u8..15,
+        0u8..10,
+        any::<bool>(),
+        any::<bool>(),
+        any::<bool>(),
+    )
+        .prop_map(
+            |(arc_count, tool, input, provider_executed, agent_drop, frozen_tail)| {
+                let mut specs = Vec::with_capacity(usize::from(arc_count) * 2);
+                for arc in 0..arc_count {
+                    let mut push = |block: u8, kind: u8, byte_size: u16, agent_drop: bool| {
+                        specs.push(ItemSpec {
+                            msg: arc,
+                            block,
+                            ordinal_slot: arc,
+                            role: 0,
+                            kind,
+                            tool,
+                            input,
+                            provider_executed,
+                            byte_size,
+                            token_count: None,
+                            arc: Some(arc),
+                            frozen: frozen_tail && arc + 1 == arc_count,
+                            agent_drop,
+                            tag_protected: false,
+                            exempt_protected: false,
+                        });
+                    };
+                    push(0, 0, 1200, agent_drop);
+                    push(1, 1, 600, false);
+                }
+                specs
+            },
+        )
+}
+
+macro_rules! outcome_pair {
+    ($specs:expr, $bits:expr) => {{
+        let specs = $specs;
+        let bits = $bits;
+        let (items, frozen, ctx, cfg) = build_inputs!(
+            &specs,
+            bits,
+            SelItem,
+            SelKind,
+            SelMessageRole,
+            SelectionContext,
+            PassClass,
+            SelectionConfig
+        );
+        let (ref_items, ref_frozen, ref_ctx, ref_cfg) = build_inputs!(
+            &specs,
+            bits,
+            reference::SelItem,
+            reference::SelKind,
+            reference::SelMessageRole,
+            reference::SelectionContext,
+            reference::PassClass,
+            reference::SelectionConfig
+        );
+        let optimized = outcome_rows!(select_reductions_with_outcome(&items, &frozen, &ctx, &cfg));
+        let expected = outcome_rows!(reference::select_reductions_with_outcome(
+            &ref_items,
+            &ref_frozen,
+            &ref_ctx,
+            &ref_cfg,
+        ));
+        (optimized, expected, specs, bits)
+    }};
+}
+
+fn payload_clamp_specs() -> impl Strategy<Value = Vec<ItemSpec>> {
+    (
+        3u8..8,
+        prop_oneof![
+            Just(3u8),
+            Just(4u8),
+            Just(13u8),
+            Just(0u8),
+            Just(2u8),
+            Just(12u8)
+        ],
+        proptest::collection::vec(prop_oneof![Just(7u8), Just(8u8)], 8),
+        any::<bool>(),
+    )
+        .prop_map(|(arc_count, tool, inputs, agent_drop)| {
+            let mut specs = Vec::with_capacity(usize::from(arc_count) * 2);
+            for arc in 0..arc_count {
+                let input = inputs[usize::from(arc) % inputs.len()];
+                let mut push = |block: u8, kind: u8, byte_size: u16, agent_drop: bool| {
+                    specs.push(ItemSpec {
+                        msg: arc,
+                        block,
+                        ordinal_slot: arc,
+                        role: 0,
+                        kind,
+                        tool,
+                        input,
+                        provider_executed: false,
+                        byte_size,
+                        token_count: None,
+                        arc: Some(arc),
+                        frozen: false,
+                        agent_drop,
+                        tag_protected: false,
+                        exempt_protected: false,
+                    });
+                };
+                push(0, 0, 1400, agent_drop && arc == 0);
+                push(1, 1, 700, false);
+            }
+            specs
+        })
+}
+
+fn pressured_ctx_bits() -> impl Strategy<Value = CtxBits> {
+    (0u8..5, 0u8..5, 0u8..4, any::<bool>()).prop_map(
+        |(cutoff_slot, execute_slot, prior, busting)| {
+            (
+                0,
+                180_000.0,
+                100_000.0,
+                cutoff_slot,
+                execute_slot,
+                true,
+                prior,
+                busting,
+                true,
+                true,
+            )
+        },
+    )
 }
 
 proptest! {
@@ -1635,19 +1875,31 @@ proptest! {
         specs in proptest::collection::vec(item_spec(), 0..40),
         bits in ctx_bits(),
     ) {
-        let (items, frozen, ctx, cfg) = build_inputs!(
-            &specs, bits,
-            SelItem, SelKind, SelMessageRole, SelectionContext, PassClass, SelectionConfig
-        );
-        let (ref_items, ref_frozen, ref_ctx, ref_cfg) = build_inputs!(
-            &specs, bits,
-            reference::SelItem, reference::SelKind, reference::SelMessageRole,
-            reference::SelectionContext, reference::PassClass, reference::SelectionConfig
-        );
-        let optimized = decision_rows(&select_reductions(&items, &frozen, &ctx, &cfg));
-        let expected = decision_rows(&reference::select_reductions(
-            &ref_items, &ref_frozen, &ref_ctx, &ref_cfg,
-        ));
+        let (optimized, expected, specs, bits) = outcome_pair!(specs, bits);
+        prop_assert_eq!(optimized, expected, "diverged on {:?} {:?}", specs, bits);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(192))]
+    #[test]
+    fn optimized_matches_frozen_reference_across_skeleton_window(
+        specs in arc_window_specs(),
+        bits in ctx_bits(),
+    ) {
+        let (optimized, expected, specs, bits) = outcome_pair!(specs, bits);
+        prop_assert_eq!(optimized, expected, "diverged on {:?} {:?}", specs, bits);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(192))]
+    #[test]
+    fn optimized_matches_frozen_reference_on_clamped_payloads(
+        specs in payload_clamp_specs(),
+        bits in pressured_ctx_bits(),
+    ) {
+        let (optimized, expected, specs, bits) = outcome_pair!(specs, bits);
         prop_assert_eq!(optimized, expected, "diverged on {:?} {:?}", specs, bits);
     }
 }
