@@ -193,18 +193,7 @@ const shmContractFactory: FrameChannelContractFactory = async (overrides = {}) =
 };
 
 describe("frame channel semantic contract (shared-memory factory)", () => {
-    const scenarios = new Set([
-        "concurrent send and receive preserve FIFO order",
-        "publication and local completion fire exactly once, in order",
-        "byte saturation refuses admission at the aggregate cap",
-        "coalesced frames deliver in order without recursive re-entry",
-        "bounded producers commit empty, boundary, segmented, and large bodies exactly",
-        "underfill, overflow, and abort return reservations without publication",
-        "owned receive adapter copies once after transport lease release",
-        "close revokes active receive aliases before storage reuse",
-    ]);
     for (const scenario of frameChannelContractScenarios) {
-        if (!scenarios.has(scenario.name)) continue;
         test(scenario.name, async () => {
             if (!probeCapabilities().available) return;
             await runFrameChannelContractScenario(scenario, shmContractFactory);

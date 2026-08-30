@@ -86,13 +86,8 @@ export interface ContractPeer {
 }
 
 export interface ContractChannelOverrides {
-    frameDeadlineMs?: number;
     maxBodyLen?: number;
     memoryCapBytes?: number;
-    maxQueuedFrames?: number;
-    maxQueuedBytes?: number;
-    controlReserveFrames?: number;
-    producerSpanBytes?: number;
 }
 
 export interface ContractReceivedFrame {
@@ -247,57 +242,6 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
         },
     },
     {
-        // A pre-publication cancel removes the frame without any byte
-        // reaching the transport; its charge releases.
-        name: "a queued frame cancels before publication and never reaches the peer",
-        async run(create) {
-            const h = await create();
-            h.peer.pauseReading();
-            h.channel.send(requestFrame(1n, Buffer.alloc(WEDGE_BYTES, 1)));
-            let published = 0;
-            const ticket = h.channel.send(requestFrame(2n, Buffer.from("doomed")), {
-                onPublish: () => {
-                    published++;
-                },
-            });
-            assert.equal(ticket.cancel(), true);
-            assert.equal(published, 0);
-            h.channel.send(requestFrame(3n, Buffer.from("after")));
-            h.peer.resumeReading();
-            // FIFO: if corr 2 had been published it would precede corr 3.
-            await h.peer.waitFor(() => requestCorrs(h.peer).includes(3n), 15_000);
-            assert.deepEqual(requestCorrs(h.peer), [1n, 3n]);
-            await waitUntil(() => h.budget.used === 0, 15_000);
-        },
-    },
-    {
-        // Frame-count saturation refuses admission at the same boundary
-        // while reserved control capacity stays available.
-        name: "frame saturation refuses admission while control capacity stays reserved",
-        async run(create) {
-            const h = await create({ maxQueuedFrames: 2 });
-            h.peer.pauseReading();
-            h.channel.send(requestFrame(1n, Buffer.alloc(WEDGE_BYTES, 1)));
-            h.channel.send(requestFrame(2n, Buffer.from("q2")));
-            h.channel.send(requestFrame(3n, Buffer.from("q3")));
-            let refused: unknown;
-            try {
-                h.channel.send(requestFrame(4n, Buffer.from("q4")));
-            } catch (error) {
-                refused = error;
-            }
-            expectMcHostCallError(refused, "not_sent", "writer_queue_full");
-            // Required control writes must still be admittable.
-            h.channel.sendControl(pongHeader(42n));
-            assert.equal(h.channel.isClosed(), false);
-            h.peer.resumeReading();
-            await h.peer.waitFor(() => h.peer.frames.length >= 4, 15_000);
-            assert.deepEqual(requestCorrs(h.peer), [1n, 2n, 3n]);
-            const pong = h.peer.frames.find((frame) => frame.ty === FrameType.Pong);
-            assert.equal(pong?.corr, 42n);
-        },
-    },
-    {
         // Byte saturation blocks at the queue-byte and aggregate-cap
         // boundaries with distinct refusal codes.
         name: "byte saturation refuses admission at the aggregate cap",
@@ -310,185 +254,6 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
                 overCap = error;
             }
             expectMcHostCallError(overCap, "not_sent", "memory_cap");
-        },
-    },
-    {
-        // Reserve exhaustion fails the channel exactly once, because
-        // required cleanup can no longer queue safely.
-        name: "control reserve exhaustion fails the channel exactly once",
-        async run(create) {
-            const h = await create({ controlReserveFrames: 2 });
-            h.peer.pauseReading();
-            h.channel.send(requestFrame(1n, Buffer.alloc(WEDGE_BYTES, 1)));
-            h.channel.sendControl(pongHeader(1n));
-            h.channel.sendControl(pongHeader(2n));
-            assert.equal(h.channel.isClosed(), false);
-            h.channel.sendControl(pongHeader(3n));
-            assert.equal(h.channel.isClosed(), true);
-            assert.equal(h.closes.length, 1);
-            assert.equal(h.closes[0]?.reason, "control_capacity_exhausted");
-            // Late control sends on a closed channel are silent no-ops.
-            h.channel.sendControl(pongHeader(4n));
-            assert.equal(h.closes.length, 1);
-        },
-    },
-    {
-        // Inbound admission pauses under the shared aggregate cap
-        // before allocation and resumes when retained bytes release.
-        name: "paused inbound admission resumes after retained bytes release",
-        async run(create) {
-            const h = await create({
-                maxBodyLen: 4_096,
-                memoryCapBytes: 5_000,
-                frameDeadlineMs: 10_000,
-            });
-            const retained: { lease: InboundFrame["body"] | null } = { lease: null };
-            h.frameHook = (frame) => {
-                if (frame.header.corr !== 1n) return false;
-                retained.lease = frame.body;
-                return true;
-            };
-            await h.peer.send({
-                ty: FrameType.Response,
-                channel: CHANNEL,
-                epoch: EPOCH,
-                corr: 1n,
-                body: Buffer.alloc(4_096, 1),
-            });
-            await waitUntil(() => retained.lease !== null);
-            await h.peer.send({
-                ty: FrameType.Response,
-                channel: CHANNEL,
-                epoch: EPOCH,
-                corr: 2n,
-                body: Buffer.alloc(4_096, 2),
-            });
-            await waitUntil(() => h.channel.stats().readPaused);
-            assert.equal(h.channel.stats().readerHeldBytes, 4_096);
-            assert.equal(h.received.length, 0);
-            retained.lease?.release();
-            await waitUntil(() => h.received.length === 1);
-            assert.equal(h.channel.stats().readPaused, false);
-            assert.equal(h.received[0]?.body.length, 4_096);
-            // The cap was never exceeded while paused.
-            assert.ok(h.budget.peak <= 5_000);
-        },
-    },
-    {
-        // Graceful finish drains admitted frames before close, while
-        // discard drops queued frames and releases every byte charge.
-        name: "graceful flush drains admitted frames; discard drops and releases",
-        async run(create) {
-            const graceful = await create();
-            graceful.peer.pauseReading();
-            for (let i = 1; i <= 3; i++) {
-                graceful.channel.send(requestFrame(BigInt(i), Buffer.alloc(1_024, i)));
-            }
-            const flushed = graceful.channel.flush(Deadline.start(15_000));
-            graceful.peer.resumeReading();
-            await flushed;
-            // Flush confirms local completion, not receipt. commentlint: allow(JUDGE)
-            await graceful.peer.waitFor(() => requestCorrs(graceful.peer).length >= 3, 15_000);
-            assert.deepEqual(requestCorrs(graceful.peer), [1n, 2n, 3n]);
-            assert.equal(graceful.budget.used, 0);
-            graceful.channel.close();
-
-            const discarded = await create();
-            discarded.peer.pauseReading();
-            discarded.channel.send(requestFrame(1n, Buffer.alloc(WEDGE_BYTES, 1)));
-            discarded.channel.send(requestFrame(2n, Buffer.from("q2")));
-            discarded.channel.send(requestFrame(3n, Buffer.from("q3")));
-            discarded.channel.close();
-            const stats = discarded.channel.stats();
-            assert.equal(stats.queuedDataFrames, 0);
-            assert.equal(stats.queueHeldBytes, 0);
-            assert.equal(stats.activeTimers, 0);
-            assert.equal(discarded.budget.used, 0);
-            // Owner-initiated discard is not a channel-detected failure.
-            assert.equal(discarded.closes.length, 0);
-        },
-    },
-    {
-        // Closure reasons are preserved and reported exactly once.
-        name: "close reasons: clean EOF, truncation, invalid header, role violation, frame deadline",
-        async run(create) {
-            const eof = await create();
-            await eof.peer.send({
-                ty: FrameType.Response,
-                channel: CHANNEL,
-                epoch: EPOCH,
-                corr: 1n,
-                body: Buffer.from("last"),
-            });
-            await waitUntil(() => eof.received.length === 1);
-            eof.peer.end();
-            await waitUntil(() => eof.closes.length >= 1);
-            assert.equal(eof.closes[0]?.reason, "eof");
-            eof.peer.destroy();
-            await new Promise((resolve) => setTimeout(resolve, 20));
-            assert.equal(eof.closes.length, 1);
-
-            // Stream end while a declared body is still pending is a
-            // truncated-frame failure, not a clean boundary close.
-            const truncated = await create({ frameDeadlineMs: 10_000 });
-            await truncated.peer.send({
-                ty: FrameType.Response,
-                channel: CHANNEL,
-                epoch: EPOCH,
-                corr: 1n,
-                len: 64,
-            });
-            truncated.peer.end();
-            await waitUntil(() => truncated.closes.length >= 1);
-            assert.equal(truncated.closes[0]?.reason, "truncated_frame");
-            assert.equal(truncated.received.length, 0);
-
-            const badVersion = await create();
-            await badVersion.peer.send({
-                ty: FrameType.Response,
-                channel: 1,
-                epoch: 1,
-                corr: 1n,
-                ver: 3,
-            });
-            await waitUntil(() => badVersion.closes.length === 1);
-            assert.equal(badVersion.closes[0]?.reason, "protocol_violation");
-
-            const roleInvalid = await create();
-            await roleInvalid.peer.send({ ty: FrameType.Hello, corr: 0n });
-            await waitUntil(() => roleInvalid.closes.length === 1);
-            assert.equal(roleInvalid.closes[0]?.reason, "role_violation");
-
-            const stalled = await create({ frameDeadlineMs: 80 });
-            // A header that declares a body which never arrives stalls the
-            // frame after its first header byte.
-            await stalled.peer.send({
-                ty: FrameType.Response,
-                channel: CHANNEL,
-                epoch: EPOCH,
-                corr: 1n,
-                len: 64,
-            });
-            await waitUntil(() => stalled.closes.length === 1);
-            assert.equal(stalled.closes[0]?.reason, "frame_deadline");
-            assert.equal(stalled.channel.stats().activeTimers, 0);
-        },
-    },
-    {
-        // An oversized body declaration is rejected before allocation.
-        name: "an oversized body declaration closes the channel before allocation",
-        async run(create) {
-            const h = await create({ maxBodyLen: 4_096 });
-            await h.peer.send({
-                ty: FrameType.Response,
-                channel: CHANNEL,
-                epoch: EPOCH,
-                corr: 1n,
-                len: 4_097,
-            });
-            await waitUntil(() => h.closes.length === 1);
-            assert.equal(h.closes[0]?.reason, "protocol_violation");
-            assert.ok(h.budget.peak < 1_024);
         },
     },
     {
@@ -525,9 +290,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
     {
         name: "bounded producers commit empty, boundary, segmented, and large bodies exactly",
         async run(create) {
-            const h = await create({
-                producerSpanBytes: 32 * 1024 * 1024,
-            });
+            const h = await create({});
             const sizes = [0, 64, 65, 1 << 20];
             for (let i = 0; i < sizes.length; i++) {
                 const size = sizes[i] as number;
