@@ -1024,7 +1024,17 @@ export function countCompleteValues(content: string, value: string): number {
     if (needle.length === 0) return 0;
     const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const matcher = new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, "gu");
-    return [...normalizeContent(decodeXmlEntities(content)).matchAll(matcher)].length;
+    const haystack = normalizeContent(decodeXmlEntities(content));
+    // Counted by starting position, not by consumed span: a global `matchAll`
+    // resumes after each match, so `blue blue` occurs twice in `blue blue blue` and
+    // that reports one. A caller comparing counts across a perturbation would then
+    // miss the loss of one overlapping occurrence.
+    let count = 0;
+    for (let match = matcher.exec(haystack); match !== null; match = matcher.exec(haystack)) {
+        count += 1;
+        matcher.lastIndex = match.index + 1;
+    }
+    return count;
 }
 
 /**
@@ -1194,6 +1204,32 @@ export function renderedFillerBlocks(scenario: HistorianEvalScenario): string[] 
     // Ballast comes from the scenario's own trigger inside the renderer, so the
     // filler turns carry exactly what the runner attaches to them.
     return renderedTranscriptBlocks(filler);
+}
+
+/**
+ * The messages of `turns` as the chunk builder renders their content: production
+ * cleaning, then `compactTextForSummary`, with the messages production drops
+ * omitted and the commit metadata compaction extracts carried alongside the text.
+ *
+ * Positional ordinals are deliberately excluded, so two callers can ask whether a
+ * reordering changes what the historian receives at all. Compaction matters for
+ * that question: it lifts a commit hash out of assistant prose and lowercases it
+ * into metadata, so `Committed ABCDEF1` and `Committed abcdef1` reach the model
+ * identically even though the authored strings differ.
+ */
+export function compactedEvidenceMessages(
+    turns: readonly TranscriptTurn[],
+): NormalizedEvidenceMessage[] {
+    return visibleEvidenceMessages(turns).flatMap((message) => {
+        const compacted = compactTextForSummary(message.text, message.role);
+        if (!compacted.text) return [];
+        return [
+            {
+                ...message,
+                text: [compacted.text, ...compacted.commitHashes].join(" "),
+            },
+        ];
+    });
 }
 
 export function renderedTranscriptBlocks(scenario: HistorianEvalScenario): string[] {

@@ -1360,6 +1360,72 @@ describe("metamorphic transforms", () => {
         });
     });
 
+    test("reorder refuses a pair differing only in commit hash spelling", () => {
+        const raw = validScenarioRaw();
+        const transcript = raw.transcript as {
+            turns: Array<{ user: string; assistant: string }>;
+            epilogueStartIndex: number;
+        };
+        // Compaction lifts the hash out of the prose and lowercases it into
+        // metadata, so the historian receives these two turns identically.
+        transcript.turns.unshift(
+            { user: "Status check.", assistant: "Committed ABCDEF1 for the record." },
+            { user: "Status check.", assistant: "Committed abcdef1 for the record." },
+        );
+        transcript.epilogueStartIndex += 2;
+        const gold = raw.gold as { expectedClaims: Array<{ sourceTurnRange: [number, number] }> };
+        for (const claim of gold.expectedClaims) {
+            claim.sourceTurnRange = [claim.sourceTurnRange[0] + 2, claim.sourceTurnRange[1] + 2];
+        }
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "reorder-independent-turns")!;
+
+        for (let seed = 0; seed < 40; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            // Turn 0 and turn 1 must not simply have traded places.
+            expect(
+                result.scenario.transcript.turns[0]!.assistant,
+                `seed ${seed}`,
+            ).toBe(scenario.transcript.turns[0]!.assistant);
+        }
+    });
+
+    test("rename replacements avoid the segments of existing symbols", () => {
+        for (let seed = 0; seed < 6; seed += 1) {
+            const next = splitmix32(seed);
+            next();
+            const reserved = `aux_symbol_${Math.floor(next() * 10_000)}`;
+            const raw = validScenarioRaw();
+            const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> })
+                .turns;
+            turns[0]!.assistant = "We could consider it.";
+            // `reserved` is not spelled on its own, only as a segment of a longer
+            // path, and that path already names the entity it refers to.
+            turns[3] = {
+                user: `Background note about ${reserved}/v2 and aux_worker.ts.`,
+                assistant: "Summary recorded.",
+            };
+            const scenario = parseScenario(raw);
+            expect(lintScenario(scenario)).toEqual([]);
+            const transform = TRANSFORMS.find(
+                (candidate) => candidate.id === "rename-unrelated-symbols",
+            )!;
+
+            const result = transform.apply(scenario, seed);
+            expect(result.applicable, `seed ${seed}`).toBe(true);
+            if (!result.applicable) continue;
+            const rewritten = result.scenario.transcript.turns[3]!.user;
+            // Whichever symbol it renamed, the bare segment spelling must not
+            // appear as a fresh name aliasing the path that already uses it.
+            expect(
+                new RegExp(`\\b${reserved}\\b(?!/)`).test(rewritten),
+                `seed ${seed} reserved ${reserved}`,
+            ).toBe(false);
+        }
+    });
+
     test("reorder refuses a pair the historian receives identically", () => {
         const raw = validScenarioRaw();
         const transcript = raw.transcript as {

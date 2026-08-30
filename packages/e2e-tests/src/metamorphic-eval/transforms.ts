@@ -7,6 +7,7 @@ import {
     MAX_TRANSCRIPT_TURNS,
     MAX_TURN_TEXT_CHARS,
     authoredEvidenceText,
+    compactedEvidenceMessages,
     containsCompleteValue,
     countCompleteValues,
     lintScenario,
@@ -309,10 +310,13 @@ function absentEvidenceTurnIndexes(
 
 /** The transcript reduced to what the historian receives from it. */
 function visibleTranscript(turns: readonly TranscriptTurn[]): string {
-    // Case-preserving on purpose: the historian receives the text as authored, so
-    // two turns differing only in an identifier's case are different inputs even
-    // though the predicate matcher would fold them together.
-    return visibleEvidenceMessages(turns)
+    // The compacted view, which is the content the chunk builder actually emits.
+    // Case-preserving on purpose — two turns differing only in an identifier's case
+    // are different inputs even though the predicate matcher folds them together —
+    // but commit hashes are compaction's business: it lifts them into lowercased
+    // metadata, so two spellings of one hash are the same input and swapping them
+    // changes nothing.
+    return compactedEvidenceMessages(turns)
         .map((message) => `${message.role}:${message.text}`)
         .join("\n");
 }
@@ -1083,6 +1087,12 @@ const renameUnrelatedSymbols: Transform = {
             ...collisionText.flatMap((text) => symbolsIn(text)),
             ...collisionText.flatMap((text) => shadowedSymbolsIn(text)),
         ]);
+        // Extracted spellings are not the whole answer: `aux_symbol_1234/v2` yields
+        // only the full path, while `aux_symbol_1234` names the same entity and is a
+        // complete value inside it. Handing that spelling to an unrelated symbol
+        // would alias the two, so a candidate is also rejected when it appears as a
+        // complete value anywhere the rename can be read.
+        const collisionCorpus = collisionText.join("\n");
         const replacementStart = Math.floor(next() * 10_000);
         let replacement: string | undefined;
         for (let offset = 0; offset < 10_000; offset += 1) {
@@ -1093,7 +1103,11 @@ const renameUnrelatedSymbols: Transform = {
             if (answers.some((answer) => containsCompleteValue(candidate, answer))) {
                 continue;
             }
-            if (candidate !== original && !existing.has(candidate)) {
+            if (
+                candidate !== original &&
+                !existing.has(candidate) &&
+                !containsCompleteValue(collisionCorpus, candidate)
+            ) {
                 replacement = candidate;
                 break;
             }
