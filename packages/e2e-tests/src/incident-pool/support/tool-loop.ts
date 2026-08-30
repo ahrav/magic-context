@@ -14,6 +14,7 @@ import type { MockUsage } from "../../mock-provider/server";
 import { openTestDb } from "../../test-db";
 import { DEFAULT_SCRIPTED_TOOL_USAGE } from "../../scripted-tool-call";
 import type { CaseDriverContext } from "../registry";
+import { HISTORIAN_SYSTEM_MARKER, isHistorianRequest } from "../../cache-analysis";
 
 /** Shared low-pressure usage stays below a 20% execute threshold at 100k. */
 export const DEFER_USAGE = DEFAULT_SCRIPTED_TOOL_USAGE;
@@ -105,30 +106,7 @@ export function caseNamespaceIsUnique(context: CaseDriverContext): boolean {
  * `cache-analysis.test.ts`: editing the production historian opener without
  * updating this marker fails loudly instead of silently desyncing.
  */
-const HISTORIAN_SYSTEM_MARKER =
-    "the hippocampus of a long-running coding agent";
-
 export const HISTORIAN_SYSTEM_MARKER_FOR_DRIFT_TEST = HISTORIAN_SYSTEM_MARKER;
-
-function isHistorianRequest(body: Record<string, unknown>): boolean {
-    if (JSON.stringify(body.messages ?? "").includes("<new_messages>"))
-        return true;
-    const system = body.system;
-    if (typeof system === "string")
-        return system.includes(HISTORIAN_SYSTEM_MARKER);
-    if (Array.isArray(system)) {
-        return system.some(
-            (block) =>
-                block &&
-                typeof block === "object" &&
-                typeof (block as { text?: unknown }).text === "string" &&
-                (block as { text: string }).text.includes(
-                    HISTORIAN_SYSTEM_MARKER,
-                ),
-        );
-    }
-    return false;
-}
 
 /** Parse the `[N] U:` / `[N] A:` ordinal range from a historian prompt. */
 function findOrdinalRange(
