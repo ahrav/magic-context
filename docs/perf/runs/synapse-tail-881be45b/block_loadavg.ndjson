@@ -1,6 +1,0 @@
-{"phase": "calibration", "block": 1, "sequence_start": 1, "utc": "2026-08-26T22:15:21.554208Z", "loadavg": "1.72 1.95 2.03 4/3976 425121"}
-{"phase": "calibration", "block": 2, "sequence_start": 3, "utc": "2026-08-26T22:15:23.794118Z", "loadavg": "2.06 2.02 2.06 5/3977 425286"}
-{"phase": "aa", "block": 1, "sequence_start": 1, "utc": "2026-08-26T22:15:39.727771Z", "loadavg": "2.11 2.03 2.06 3/3979 425646"}
-{"phase": "aa", "block": 2, "sequence_start": 289, "utc": "2026-08-26T22:22:13.095056Z", "loadavg": "3.24 2.62 2.28 3/3973 457958"}
-{"phase": "treatment", "block": 1, "sequence_start": 1, "utc": "2026-08-26T22:29:16.832566Z", "loadavg": "1.64 2.47 2.42 2/3973 490027"}
-{"phase": "treatment", "block": 2, "sequence_start": 1153, "utc": "2026-08-26T22:55:29.910166Z", "loadavg": "2.47 2.84 2.71 4/3994 629811"}
