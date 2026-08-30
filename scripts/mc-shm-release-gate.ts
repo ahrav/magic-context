@@ -152,7 +152,7 @@ interface Metrics {
     wakeups: number;
 }
 
-export interface ReleaseGateReport {
+export interface CompleteReleaseGateReport {
     schema: typeof REPORT_SCHEMA;
     local_verdict: "evidence_complete";
     designated_host_verdict: DesignatedHostState;
@@ -188,6 +188,18 @@ interface MetricComparison {
     cpu_ratio: number;
     wakeups_delta: number;
 }
+
+export interface BlockedReleaseGateReport {
+    schema: typeof REPORT_SCHEMA;
+    local_verdict: "blocked";
+    local_blockers: string[];
+    designated_host_verdict: DesignatedHostState;
+    baseline: null;
+    candidate: null;
+    comparison: null;
+}
+
+export type ReleaseGateReport = CompleteReleaseGateReport | BlockedReleaseGateReport;
 
 function fail(message: string): never {
     throw new Error(`mc-shm release gate: ${message}`);
@@ -470,6 +482,10 @@ function assertRun(config: GateConfig, run: RunEvidence, role: Role): void {
     if (!run.installed_artifact) fail(`${role} run must exercise an installed artifact`);
     if (run.transport !== "ring") fail(`${role} transport must be ring`);
     if (run.blocks.length !== config.expected_blocks || run.blocks.some((block) => block.state !== "complete")) fail(`${role} run expected ${config.expected_blocks} complete blocks`);
+    const connectionCounts = [...new Set(run.blocks.map((block) => block.connection_count))].sort((a, b) => a - b);
+    if (connectionCounts.length !== 3 || connectionCounts[0] !== 1 || connectionCounts[1] !== 8 || connectionCounts[2] !== 64) {
+        fail(`${role} run connection counts must be exactly 1, 8, 64`);
+    }
     const ids = run.blocks.map((block) => block.block).sort((a, b) => a - b);
     if (ids.some((block, index) => block !== index + 1)) fail(`${role} blocks must be unique and contiguous`);
     const processIds = new Set(run.blocks.map((block) => block.process_id));
@@ -549,6 +565,46 @@ function compare(base: Metrics, next: Metrics): MetricComparison {
     };
 }
 
+function blockViolations(
+    runtime: "bun" | "node",
+    baseline: RunBlock,
+    candidate: RunBlock,
+    contract: FrozenContract,
+): string[] {
+    const label = `${runtime} block ${baseline.block}`;
+    const base = blockMetrics(baseline);
+    const next = blockMetrics(candidate);
+    const upper = 1 + contract.equivalence_margin_ratio;
+    const lower = 1 - contract.equivalence_margin_ratio;
+    const violations: string[] = [];
+    const upperBound = (metric: keyof Pick<Metrics, "p50_latency_ns" | "p99_latency_ns" | "body_copies" | "allocations" | "cpu_ns" | "wakeups">) => {
+        const limit = base[metric] * upper;
+        if (next[metric] > limit) violations.push(`${label} candidate ${metric} ${next[metric]} exceeds baseline limit ${limit}`);
+    };
+    upperBound("p50_latency_ns");
+    upperBound("p99_latency_ns");
+    const throughputFloor = base.throughput_ops_per_second * lower;
+    if (next.throughput_ops_per_second < throughputFloor) {
+        violations.push(`${label} candidate throughput_ops_per_second ${next.throughput_ops_per_second} is below baseline floor ${throughputFloor}`);
+    }
+    upperBound("body_copies");
+    upperBound("allocations");
+    upperBound("cpu_ns");
+    upperBound("wakeups");
+    for (const [field, ceiling] of [
+        ["rss_bytes", contract.max_rss_bytes],
+        ["pss_bytes", contract.max_pss_bytes],
+        ["page_table_bytes", contract.max_page_table_bytes],
+        ["fd_count", contract.max_fd_count],
+        ["watcher_count", contract.max_watcher_count],
+    ] as const) {
+        if (candidate[field] > ceiling) {
+            violations.push(`${label} candidate ${field} ${candidate[field]} exceeds ${`max_${field}`} ${ceiling}`);
+        }
+    }
+    return violations;
+}
+
 export function buildReleaseGateReport(config: GateConfig, baselineInput: unknown, candidateInput: unknown): ReleaseGateReport {
     if (config.state === "blocked") fail(`release gate blocked: ${config.blockers.join("; ")}`);
     const parseSuite = (input: unknown, role: Role) => {
@@ -570,6 +626,7 @@ export function buildReleaseGateReport(config: GateConfig, baselineInput: unknow
     };
     const baselineSuite = parseSuite(baselineInput, "baseline");
     const candidateSuite = parseSuite(candidateInput, "candidate");
+    const localBlockers: string[] = [];
     const runtimeResults = config.required_runtimes.map((runtime, index) => {
         const blocker = baselineSuite.blockers[0] ?? candidateSuite.blockers[0];
         if (runtime === "node" && blocker) return { runtime, local_verdict: "blocked" as const, blocker: blocker.reason };
@@ -586,6 +643,7 @@ export function buildReleaseGateReport(config: GateConfig, baselineInput: unknow
             if (candidateBlock.workload !== baselineBlock.workload || candidateBlock.connection_count !== baselineBlock.connection_count || candidateBlock.callback_budget !== baselineBlock.callback_budget) fail("paired block workload identity mismatch");
             const baselineMetrics = blockMetrics(baselineBlock);
             const candidateMetrics = blockMetrics(candidateBlock);
+            localBlockers.push(...blockViolations(runtime, baselineBlock, candidateBlock, config.frozen_contract!));
             return {
                 block: baselineBlock.block,
                 workload: baselineBlock.workload,
@@ -605,6 +663,17 @@ export function buildReleaseGateReport(config: GateConfig, baselineInput: unknow
             comparison: compare(base, next),
         };
     });
+    if (localBlockers.length > 0) {
+        return {
+            schema: REPORT_SCHEMA,
+            local_verdict: "blocked",
+            local_blockers: localBlockers,
+            designated_host_verdict: config.designated_host,
+            baseline: null,
+            candidate: null,
+            comparison: null,
+        };
+    }
     return {
         schema: REPORT_SCHEMA,
         local_verdict: "evidence_complete",
@@ -648,6 +717,7 @@ function complete(config: GateConfig, candidateInput: unknown, outPath: string):
         throw error;
     }
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    if (report.local_verdict === "blocked") process.exitCode = 1;
 }
 
 function main(): void {

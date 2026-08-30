@@ -245,9 +245,9 @@ describe("daemon command contract", () => {
                     state: "quarantined",
                     error_class: "peer_protocol",
                     artifact: {
-                        profile: "mc-host-test-ring-v1",
+                        profile: "mc-host-eventfd-ring-v2",
                         wire_version: 2,
-                        descriptor_schema: 2,
+                        descriptor_schema: 3,
                     },
                     bounds: {
                         descriptors: 16,
@@ -291,7 +291,7 @@ describe("daemon command contract", () => {
         );
 
         expect(rendered).toContain("Shared memory: quarantined (peer_protocol)");
-        expect(rendered).toContain("profile=mc-host-test-ring-v1 wire=2 descriptor=2");
+        expect(rendered).toContain("profile=mc-host-eventfd-ring-v2 wire=2 descriptor=3");
         expect(rendered).toContain("active_bytes=134217728");
         expect(rendered).toContain("quarantined_bytes=8388608");
         expect(rendered).toContain("attachments=41 activations=37");

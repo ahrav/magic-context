@@ -65,8 +65,8 @@ import type {
     SharedMemoryTerminalClass,
 } from "./types";
 
-const QUALIFIED_TEST_PROFILE = "mc-host-test-ring-v1" as const;
-const DESCRIPTOR_SCHEMA_VERSION = 2 as const;
+const QUALIFIED_TEST_PROFILE = "mc-host-eventfd-ring-v2" as const;
+const DESCRIPTOR_SCHEMA_VERSION = 3 as const;
 
 /** Preserves the repo's current 2-second TypeScript handshake budget. */
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 2_000;

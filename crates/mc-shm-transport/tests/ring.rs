@@ -194,6 +194,11 @@ fn retained_oldest_lease_enforces_fifo_reclamation_and_release_validation() {
 
     first_lease.release().unwrap();
     let mut reservation = ring.try_reserve(1, wire_v2_header(1).unwrap()).unwrap();
+    assert_eq!(
+        ring.resident_arena_pages().unwrap(),
+        0,
+        "releasing oldest lease must make all completed full pages removable",
+    );
     reservation.write(&[9]).unwrap();
     reservation.commit(1).unwrap();
     let lease = ring.try_receive().unwrap().unwrap();

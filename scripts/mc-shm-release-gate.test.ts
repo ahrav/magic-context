@@ -63,7 +63,7 @@ function evidence(role: "baseline" | "candidate", runtime: "bun" | "node" = "bun
                 state: "complete",
                 completed_ops: 2,
                 elapsed_ns: candidate ? 800 : 1_000,
-                latencies_ns: candidate ? [125, 375] : [100, 300],
+                latencies_ns: candidate ? [95, 285] : [100, 300],
                 body_copies: candidate ? 1 : 2,
                 allocations: candidate ? 3 : 4,
                 cpu_ns: candidate ? 560 : 700,
@@ -100,7 +100,7 @@ function evidence(role: "baseline" | "candidate", runtime: "bun" | "node" = "bun
                 state: "complete",
                 completed_ops: 2,
                 elapsed_ns: candidate ? 800 : 1_000,
-                latencies_ns: candidate ? [250, 500] : [200, 400],
+                latencies_ns: candidate ? [190, 380] : [200, 400],
                 body_copies: candidate ? 1 : 2,
                 allocations: candidate ? 3 : 4,
                 cpu_ns: candidate ? 560 : 700,
@@ -111,6 +111,43 @@ function evidence(role: "baseline" | "candidate", runtime: "bun" | "node" = "bun
                 resident_pages: candidate ? 4 : 8,
                 page_table_bytes: 8192,
                 fd_count: 49,
+                watcher_count: 1,
+                eventfd_attempts: 4,
+                eventfd_successes: 4,
+                eventfd_eagain: 0,
+                eventfd_reads: 4,
+                parks: 4,
+                spurious_wakes: 0,
+                publications: 2,
+                tsfn_callbacks: 2,
+                scheduler_handoffs: 2,
+                reclaim_scans: 1,
+                reclaim_bytes: candidate ? 4096 : 0,
+                reclaim_runs: candidate ? 1 : 0,
+                madv_remove_calls: candidate ? 1 : 0,
+                madv_remove_pages: candidate ? 1 : 0,
+                queue_hops: 0,
+            },
+            {
+                block: 3,
+                process_id: 103,
+                workload: "idle",
+                connection_count: 64,
+                callback_budget: 64,
+                state: "complete",
+                completed_ops: 2,
+                elapsed_ns: candidate ? 800 : 1_000,
+                latencies_ns: candidate ? [285, 475] : [300, 500],
+                body_copies: candidate ? 1 : 2,
+                allocations: candidate ? 3 : 4,
+                cpu_ns: candidate ? 560 : 700,
+                wakeups: candidate ? 4 : 6,
+                p99_event_loop_delay_ns: candidate ? 60 : 70,
+                rss_bytes: candidate ? 3000 : 3600,
+                pss_bytes: candidate ? 2400 : 2700,
+                resident_pages: candidate ? 6 : 12,
+                page_table_bytes: 12_288,
+                fd_count: 63,
                 watcher_count: 1,
                 eventfd_attempts: 4,
                 eventfd_successes: 4,
@@ -145,7 +182,7 @@ function config(): GateConfig {
         schema: "magic-context.mc-shm-release-gate-config/v1",
         state: "ready",
         blockers: [],
-        expected_blocks: 2,
+        expected_blocks: 3,
         required_runtimes: ["bun", "node"],
         baseline: {
             path: "baseline.json",
@@ -205,41 +242,43 @@ describe("installed shared-memory release gate", () => {
             state: "blocked",
             blockers: ["designated host unavailable"],
         });
+        if (report.local_verdict !== "evidence_complete") throw new Error(report.local_blockers.join("; "));
         expect(report.runtime_results.map((result) => result.runtime)).toEqual(["bun", "node"]);
         for (const result of report.runtime_results) {
             expect(result.local_verdict).toBe("evidence_complete");
             if (result.local_verdict !== "evidence_complete") throw new Error("fixture runtime unexpectedly blocked");
             expect(result.baseline.metrics).toEqual({
-                p50_latency_ns: 200,
-                p99_latency_ns: 400,
+                p50_latency_ns: 300,
+                p99_latency_ns: 500,
                 throughput_ops_per_second: 2_000_000,
-                body_copies: 4,
-                allocations: 8,
-                cpu_ns: 1_400,
-                wakeups: 12,
+                body_copies: 6,
+                allocations: 12,
+                cpu_ns: 2_100,
+                wakeups: 18,
             });
             expect(result.candidate.metrics).toEqual({
-                p50_latency_ns: 250,
-                p99_latency_ns: 500,
+                p50_latency_ns: 285,
+                p99_latency_ns: 475,
                 throughput_ops_per_second: 2_500_000,
-                body_copies: 2,
-                allocations: 6,
-                cpu_ns: 1_120,
-                wakeups: 8,
+                body_copies: 3,
+                allocations: 9,
+                cpu_ns: 1_680,
+                wakeups: 12,
             });
-            expect(result.paired_blocks).toHaveLength(2);
+            expect(result.paired_blocks).toHaveLength(3);
             expect(result.paired_blocks.map((block) => [block.block, block.workload, block.connection_count])).toEqual([
                 [1, "cold_first_frame", 1],
                 [2, "active_path", 8],
+                [3, "idle", 64],
             ]);
             expect(result.comparison).toEqual({
-                p50_ratio: 1.25,
-                p99_ratio: 1.25,
+                p50_ratio: 0.95,
+                p99_ratio: 0.95,
                 throughput_ratio: 1.25,
-                copies_delta: -2,
-                allocations_delta: -2,
+                copies_delta: -3,
+                allocations_delta: -3,
                 cpu_ratio: 0.8,
-                wakeups_delta: -4,
+                wakeups_delta: -6,
             });
         }
         expect("pass" in report || "winner" in report).toBeFalse();
@@ -278,7 +317,7 @@ describe("installed shared-memory release gate", () => {
         const missing = suite("candidate");
         missing.runs[0]!.blocks.pop();
         expect(() => buildReleaseGateReport(config(), suite("baseline"), missing)).toThrow(
-            /expected 2 complete blocks/,
+            /expected 3 complete blocks/,
         );
 
         const missingRuntime = suite("candidate");
@@ -294,10 +333,48 @@ describe("installed shared-memory release gate", () => {
         );
 
         const pooledOrMismatched = suite("candidate");
-        pooledOrMismatched.runs[0]!.blocks[0]!.connection_count = 64;
+        pooledOrMismatched.runs[0]!.blocks[0]!.connection_count = 8;
+        pooledOrMismatched.runs[0]!.blocks[1]!.connection_count = 1;
         expect(() => buildReleaseGateReport(config(), suite("baseline"), pooledOrMismatched)).toThrow(
             /paired block workload identity mismatch/,
         );
+    });
+
+    test("rejects complete runs that omit required connection scale points", () => {
+        const candidate = suite("candidate");
+        for (const block of candidate.runs[0]!.blocks) block.connection_count = 1;
+        expect(() => buildReleaseGateReport(config(), suite("baseline"), candidate)).toThrow(
+            /candidate run connection counts must be exactly 1, 8, 64/,
+        );
+    });
+
+    test("blocks paired regressions outside the frozen equivalence margin", () => {
+        const candidate = suite("candidate");
+        candidate.runs[0]!.blocks[0]!.latencies_ns = [106, 300];
+        const report = buildReleaseGateReport(config(), suite("baseline"), candidate);
+        expect(report).toMatchObject({
+            local_verdict: "blocked",
+            local_blockers: ["bun block 1 candidate p50_latency_ns 106 exceeds baseline limit 105"],
+        });
+    });
+
+    test("blocks candidate resource use above every frozen ceiling class", () => {
+        const candidate = suite("candidate");
+        candidate.runs[0]!.blocks[0]!.rss_bytes = 4097;
+        candidate.runs[0]!.blocks[1]!.pss_bytes = 4097;
+        candidate.runs[0]!.blocks[2]!.page_table_bytes = 16385;
+        candidate.runs[1]!.blocks[0]!.fd_count = 65;
+        candidate.runs[1]!.blocks[1]!.watcher_count = 2;
+        const report = buildReleaseGateReport(config(), suite("baseline"), candidate);
+        expect(report.local_verdict).toBe("blocked");
+        if (report.local_verdict !== "blocked") throw new Error("resource violation was not blocked");
+        expect(report.local_blockers).toEqual([
+            "bun block 1 candidate rss_bytes 4097 exceeds max_rss_bytes 4096",
+            "bun block 2 candidate pss_bytes 4097 exceeds max_pss_bytes 4096",
+            "bun block 3 candidate page_table_bytes 16385 exceeds max_page_table_bytes 16384",
+            "node block 1 candidate fd_count 65 exceeds max_fd_count 64",
+            "node block 2 candidate watcher_count 2 exceeds max_watcher_count 1",
+        ]);
     });
 
     test("records Node baseline ineligibility as blocked without weakening Bun evidence", () => {

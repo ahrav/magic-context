@@ -61,9 +61,9 @@ function healthySharedMemory(): Record<string, unknown> {
         state: "healthy",
         error_class: null,
         artifact: {
-            profile: "mc-host-test-ring-v1",
+            profile: "mc-host-eventfd-ring-v2",
             wire_version: 2,
-            descriptor_schema: 2,
+            descriptor_schema: 3,
         },
         bounds: { ...zero, arena_bytes: 134_217_728 },
         accounting: { active: zero, quarantined: zero },
@@ -90,8 +90,20 @@ describe("parseDaemonResult", () => {
             JSON.stringify(validResult({ shared_memory: healthySharedMemory() })),
         );
         expect(parsed.shared_memory?.state).toBe("healthy");
-        expect(parsed.shared_memory?.artifact.profile).toBe("mc-host-test-ring-v1");
+        expect(parsed.shared_memory?.artifact.profile).toBe("mc-host-eventfd-ring-v2");
         expect(parsed.shared_memory?.bounds.arena_bytes).toBe(134_217_728);
+    });
+
+    test("rejects superseded shared-memory artifact identity", () => {
+        const diagnostics = healthySharedMemory();
+        diagnostics.artifact = {
+            profile: "mc-host-test-ring-v1",
+            wire_version: 2,
+            descriptor_schema: 2,
+        };
+        expect(() =>
+            parseDaemonResult(JSON.stringify(validResult({ shared_memory: diagnostics }))),
+        ).toThrow(/shared_memory diagnostics violate the closed schema/);
     });
 
     test("accepts exactly five terminal shared-memory classes", () => {

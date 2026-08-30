@@ -35,9 +35,9 @@ function healthySharedMemory() {
         state: "healthy" as const,
         error_class: null,
         artifact: {
-            profile: "mc-host-test-ring-v1",
+            profile: "mc-host-eventfd-ring-v2",
             wire_version: 2,
-            descriptor_schema: 2,
+            descriptor_schema: 3,
         },
         bounds: zero,
         accounting: { active: zero, quarantined: zero },

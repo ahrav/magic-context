@@ -76,9 +76,9 @@ export interface SharedMemoryDiagnostics {
     state: "healthy" | "terminal";
     error_class: SharedMemoryTerminalClass | null;
     artifact: {
-        profile: "mc-host-test-ring-v1";
+        profile: "mc-host-eventfd-ring-v2";
         wire_version: 2;
-        descriptor_schema: 2;
+        descriptor_schema: 3;
     };
     bounds: SharedMemoryResourceCounts;
     accounting: {

@@ -858,9 +858,9 @@ function terminalSharedMemoryDiagnostics(
         state: "terminal",
         error_class: errorClass,
         artifact: {
-            profile: "mc-host-test-ring-v1",
+            profile: "mc-host-eventfd-ring-v2",
             wire_version: 2,
-            descriptor_schema: 2,
+            descriptor_schema: 3,
         },
         bounds: ZERO_RESOURCE_COUNTS,
         accounting: null,

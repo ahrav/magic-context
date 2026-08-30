@@ -150,7 +150,7 @@ try {
     try {
         const connectedEvent = events.find((event) => event.type === "connected");
         assert.equal(connectedEvent?.health, "healthy");
-        assert.equal(connectedEvent?.artifact?.profile, "mc-host-test-ring-v1");
+        assert.equal(connectedEvent?.artifact?.profile, "mc-host-eventfd-ring-v2");
         log("shared-memory ring active");
 
         const previousXdgDataHome = process.env.XDG_DATA_HOME;

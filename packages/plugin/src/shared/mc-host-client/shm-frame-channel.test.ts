@@ -36,7 +36,7 @@ import {
 test("production shared-memory delivery has no timer polling", () => {
     const source = readFileSync(new URL("./shm-frame-channel.ts", import.meta.url), "utf8");
     expect(source).not.toContain("setInterval");
-    expect(source).not.toContain([".po", "ll("].join(""));
+    expect(source).not.toContain(".poll(");
 });
 
 function responseHeader(ty: FrameType, corr: bigint, length: number, flags = 0): EnvelopeHeader {
