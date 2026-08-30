@@ -828,6 +828,60 @@ describe("metamorphic transforms", () => {
         expect(applied, "never applied").toBeGreaterThan(0);
     });
 
+    test("rename refuses a markup name another message mentions as prose", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        // One eligible message mentions the tag name as prose, the other uses it as a
+        // delimiter, and the replacement rewrites every occurrence.
+        turns[0]!.assistant = "We could note system-reminder handling and aux_worker.ts.";
+        turns[3] = {
+            user: "<system-reminder>secret</system-reminder> Background note.",
+            assistant: "Summary recorded.",
+        };
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
+
+        let applied = 0;
+        for (let seed = 0; seed < 30; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            applied += 1;
+            expect(result.scenario.transcript.turns[3]!.user, `seed ${seed}`).toContain(
+                "<system-reminder>secret</system-reminder>",
+            );
+        }
+        expect(applied, "never applied").toBeGreaterThan(0);
+    });
+
+    test("rename stays cheap against thousands of unrelated identifiers", () => {
+        const raw = validScenarioRaw();
+        const transcript = raw.transcript as {
+            turns: Array<{ user: string; assistant: string }>;
+            epilogueStartIndex: number;
+        };
+        transcript.turns[0]!.assistant = "We could consider it.";
+        while (transcript.turns.length < 30) {
+            transcript.turns.push({ user: "Background.", assistant: "Noted." });
+        }
+        transcript.epilogueStartIndex = 29;
+        // Thousands of distinct camel-case identifiers, none containing another, is
+        // the shape a candidate-by-surface cross product turns quadratic.
+        for (let turn = 5; turn < 15; turn += 1) {
+            const names = Array.from(
+                { length: 600 },
+                (_, index) => `svc${turn}x${index}Handler`,
+            );
+            transcript.turns[turn]!.assistant = `Catalogue: ${names.join(" ")}`.slice(0, 19_000);
+        }
+        const scenario = parseScenario(raw);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
+
+        const start = performance.now();
+        transform.apply(scenario, 7);
+        expect(performance.now() - start).toBeLessThan(900);
+    });
+
     test("rename stays cheap against a separator-heavy message", () => {
         const raw = validScenarioRaw();
         const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;

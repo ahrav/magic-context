@@ -977,6 +977,9 @@ const QUOTED_SYMBOL_RE =
  */
 const MAX_SYMBOL_PARTS = 32;
 
+/** The separator class the symbol grammar and every boundary check share. */
+const SYMBOL_SEPARATOR_RE = /[_./-]/;
+
 /** A symbol split into its parts, with the offset each part starts at. */
 function symbolParts(symbol: string): { parts: string[]; offsets: number[] } {
     const pieces = symbol.split(/([_./-])/);
@@ -991,28 +994,6 @@ function symbolParts(symbol: string): { parts: string[]; offsets: number[] } {
         offset += pieces[index]!.length;
     }
     return { parts, offsets };
-}
-
-/**
- * Whether `symbol` contains `spelling` as a boundary-delimited run of its parts.
- *
- * The boundary rule is letter-or-digit adjacency and a separator is neither, so
- * `aux_symbol_1234/v2` contains `aux`, `symbol_1234`, and `1234/v2` as complete
- * values. Renaming one of those on its own would leave the longer spelling naming
- * the old entity, because the replacement matches symbols exactly.
- */
-function containsSpelling(
-    symbol: string,
-    layout: { parts: string[]; offsets: number[] },
-    spelling: string,
-): boolean {
-    for (const [index, offset] of layout.offsets.entries()) {
-        if (layout.parts[index] !== spelling.split(/[_./-]/, 1)[0]) continue;
-        if (!symbol.startsWith(spelling, offset)) continue;
-        const after = symbol.charAt(offset + spelling.length);
-        if (after === "" || /[_./-]/.test(after)) return true;
-    }
-    return false;
 }
 
 /**
@@ -1133,6 +1114,17 @@ const renameUnrelatedSymbols: Transform = {
         // spelling appearing in one message without a commit verb would re-enable a
         // revision identifier another message uses as one, and the replacement runs
         // over every occurrence.
+        // Markup names, like commit hashes, are collected before the pool is formed:
+        // admission is per occurrence and then unioned, so one message mentioning
+        // `system-reminder` as prose would admit a spelling another message uses as a
+        // delimiter — and the replacement rewrites every occurrence.
+        const markupNames = new Set(
+            scenario.transcript.turns.flatMap((turn) =>
+                (["user", "assistant"] as const).flatMap((role) =>
+                    symbolsIn(turn[role]).filter((symbol) => isMarkupName(symbol, turn[role])),
+                ),
+            ),
+        );
         const commitHashes = new Set(
             scenario.transcript.turns.flatMap((turn, turnIndex) =>
                 (["user", "assistant"] as const).flatMap((role) => {
@@ -1151,10 +1143,19 @@ const renameUnrelatedSymbols: Transform = {
             ...collisionText.flatMap((text) => symbolsIn(text)),
             ...collisionText.flatMap((text) => shadowedSymbolsIn(text)),
         ]);
-        const surfaceLayouts = [...surfaceSymbols].map((symbol) => ({
-            symbol,
-            layout: symbolParts(symbol),
-        }));
+        // Indexed by part, not scanned per candidate: a containment can only start
+        // where a part matches, and a legal transcript may hold thousands of
+        // identifiers — the cross product was about a hundred million comparisons.
+        const byPart = new Map<string, Array<{ symbol: string; offset: number }>>();
+        for (const symbol of surfaceSymbols) {
+            const layout = symbolParts(symbol);
+            layout.parts.forEach((part, index) => {
+                const at = byPart.get(part);
+                const entry = { symbol, offset: layout.offsets[index]! };
+                if (at === undefined) byPart.set(part, [entry]);
+                else at.push(entry);
+            });
+        }
         /**
          * Whether renaming `symbol` alone would leave another spelling of the same
          * entity behind.
@@ -1166,14 +1167,11 @@ const renameUnrelatedSymbols: Transform = {
         const sharesAnEntity = (symbol: string): boolean => {
             const layout = symbolParts(symbol);
             if (layout.parts.length > MAX_SYMBOL_PARTS) return true;
-            if (
-                surfaceLayouts.some(
-                    (other) =>
-                        other.symbol !== symbol &&
-                        containsSpelling(other.symbol, other.layout, symbol),
-                )
-            ) {
-                return true;
+            for (const { symbol: other, offset } of byPart.get(layout.parts[0]!) ?? []) {
+                if (other === symbol) continue;
+                if (!other.startsWith(symbol, offset)) continue;
+                const after = other.charAt(offset + symbol.length);
+                if (after === "" || SYMBOL_SEPARATOR_RE.test(after)) return true;
             }
             for (let first = 0; first < layout.parts.length; first += 1) {
                 for (let last = first; last < layout.parts.length; last += 1) {
@@ -1209,12 +1207,7 @@ const renameUnrelatedSymbols: Transform = {
                     return symbolsIn(visibleMessage).filter(
                         (symbol) =>
                             raw.has(symbol) &&
-                            !(commitContext && COMMIT_HASH_TEST_PATTERN.test(symbol)) &&
-                            // Renaming a markup name rewrites the delimiter, not an
-                            // entity: `<system-reminder>` becomes `<aux_symbol_N>`,
-                            // production stops stripping the block, and text the
-                            // baseline hid reaches the historian.
-                            !isMarkupName(symbol, message.text),
+                            !(commitContext && COMMIT_HASH_TEST_PATTERN.test(symbol)),
                     );
                 }),
             ),
@@ -1222,6 +1215,11 @@ const renameUnrelatedSymbols: Transform = {
             (symbol) =>
                 !blocked.has(symbol) &&
                 !commitHashes.has(symbol) &&
+                // Renaming a markup name rewrites the delimiter, not an entity:
+                // `<system-reminder>` becomes `<aux_symbol_N>`, production stops
+                // stripping the block, and text the baseline hid reaches the
+                // historian.
+                !markupNames.has(symbol) &&
                 !sharesAnEntity(symbol) &&
                 // A symbol can carry a probe answer without being one: renaming
                 // `api/v2` deletes the complete-value occurrence of `api`.
