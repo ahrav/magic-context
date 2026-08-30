@@ -968,23 +968,51 @@ const QUOTED_SYMBOL_RE =
     /^(?:[A-Za-z][A-Za-z0-9]*(?:[_./-][A-Za-z0-9]+)+|[a-z]+[A-Z][A-Za-z0-9]*|[A-Z]{2,})$/;
 
 /**
- * Every boundary-delimited run inside `symbol`, the full spelling included.
+ * A name with more separator-delimited parts than this is not treated as a name.
  *
- * `aux_symbol_1234/v2` contains `aux`, `aux_symbol`, `symbol_1234`, `1234/v2`, and
- * so on — each of them a complete value inside it, because the boundary rule is
- * letter-or-digit adjacency and a separator is neither. Renaming one of those
- * spellings on its own would leave the longer one naming the old entity, since the
- * replacement matches symbols exactly.
+ * The containment analysis below is quadratic in a candidate's own part count, and
+ * a legal message may hold twenty thousand characters of separators. Refusing such
+ * a spelling costs nothing real — nothing anyone renames looks like that — and
+ * bounds the work.
  */
-function containedSpellings(symbol: string): string[] {
-    const parts = symbol.split(/([_./-])/);
-    const spellings: string[] = [];
-    for (let first = 0; first < parts.length; first += 2) {
-        for (let last = first; last < parts.length; last += 2) {
-            spellings.push(parts.slice(first, last + 1).join(""));
+const MAX_SYMBOL_PARTS = 32;
+
+/** A symbol split into its parts, with the offset each part starts at. */
+function symbolParts(symbol: string): { parts: string[]; offsets: number[] } {
+    const pieces = symbol.split(/([_./-])/);
+    const parts: string[] = [];
+    const offsets: number[] = [];
+    let offset = 0;
+    for (let index = 0; index < pieces.length; index += 1) {
+        if (index % 2 === 0) {
+            parts.push(pieces[index]!);
+            offsets.push(offset);
         }
+        offset += pieces[index]!.length;
     }
-    return spellings;
+    return { parts, offsets };
+}
+
+/**
+ * Whether `symbol` contains `spelling` as a boundary-delimited run of its parts.
+ *
+ * The boundary rule is letter-or-digit adjacency and a separator is neither, so
+ * `aux_symbol_1234/v2` contains `aux`, `symbol_1234`, and `1234/v2` as complete
+ * values. Renaming one of those on its own would leave the longer spelling naming
+ * the old entity, because the replacement matches symbols exactly.
+ */
+function containsSpelling(
+    symbol: string,
+    layout: { parts: string[]; offsets: number[] },
+    spelling: string,
+): boolean {
+    for (const [index, offset] of layout.offsets.entries()) {
+        if (layout.parts[index] !== spelling.split(/[_./-]/, 1)[0]) continue;
+        if (!symbol.startsWith(spelling, offset)) continue;
+        const after = symbol.charAt(offset + spelling.length);
+        if (after === "" || /[_./-]/.test(after)) return true;
+    }
+    return false;
 }
 
 /**
@@ -1116,16 +1144,49 @@ const renameUnrelatedSymbols: Transform = {
                 }),
             ),
         );
-        // Spellings that some other symbol contains, from every message rather than
-        // only the untouchable ones: two eligible messages can hold `buildAPI` and
-        // `buildAPI/v2`, and the replacement matches exactly, so renaming the bare
-        // one leaves the compound naming the old entity.
-        const containedBySymbol = new Set<string>();
-        for (const symbol of new Set(collisionText.flatMap((text) => symbolsIn(text)))) {
-            for (const spelling of containedSpellings(symbol)) {
-                if (spelling !== symbol) containedBySymbol.add(spelling);
+        // Every spelling on the collision surface, including the ones inside command
+        // spans the rename cannot edit: a compound sharing a name with a bare symbol
+        // splits the entity whether or not the rename can reach both halves.
+        const surfaceSymbols = new Set([
+            ...collisionText.flatMap((text) => symbolsIn(text)),
+            ...collisionText.flatMap((text) => shadowedSymbolsIn(text)),
+        ]);
+        const surfaceLayouts = [...surfaceSymbols].map((symbol) => ({
+            symbol,
+            layout: symbolParts(symbol),
+        }));
+        /**
+         * Whether renaming `symbol` alone would leave another spelling of the same
+         * entity behind.
+         *
+         * Both directions: another symbol may contain this one — `buildAPI/v2`
+         * against a bare `buildAPI` — or this one may contain another that stands on
+         * its own, which the exact-match replacement would leave untouched.
+         */
+        const sharesAnEntity = (symbol: string): boolean => {
+            const layout = symbolParts(symbol);
+            if (layout.parts.length > MAX_SYMBOL_PARTS) return true;
+            if (
+                surfaceLayouts.some(
+                    (other) =>
+                        other.symbol !== symbol &&
+                        containsSpelling(other.symbol, other.layout, symbol),
+                )
+            ) {
+                return true;
             }
-        }
+            for (let first = 0; first < layout.parts.length; first += 1) {
+                for (let last = first; last < layout.parts.length; last += 1) {
+                    const end =
+                        last + 1 < layout.offsets.length
+                            ? layout.offsets[last + 1]! - 1
+                            : symbol.length;
+                    const spelling = symbol.slice(layout.offsets[first]!, end);
+                    if (spelling !== symbol && surfaceSymbols.has(spelling)) return true;
+                }
+            }
+            return false;
+        };
         const candidates = [
             ...new Set(
                 messages.flatMap((message) => {
@@ -1161,7 +1222,7 @@ const renameUnrelatedSymbols: Transform = {
             (symbol) =>
                 !blocked.has(symbol) &&
                 !commitHashes.has(symbol) &&
-                !containedBySymbol.has(symbol) &&
+                !sharesAnEntity(symbol) &&
                 // A symbol can carry a probe answer without being one: renaming
                 // `api/v2` deletes the complete-value occurrence of `api`.
                 !answers.some((answer) => containsCompleteValue(symbol, answer)) &&

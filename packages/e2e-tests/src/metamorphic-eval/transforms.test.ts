@@ -784,6 +784,69 @@ describe("metamorphic transforms", () => {
         expect(applied, "never applied").toBeGreaterThan(0);
     });
 
+    test("rename refuses a compound whose bare segment stands on its own", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[0]!.assistant = "We could consider buildAPI and aux_worker.ts.";
+        // Renaming the compound alone would leave the standalone spelling naming the
+        // old entity, which is the mirror of the bare-symbol case.
+        turns[3] = { user: "Background note about buildAPI/v2.", assistant: "Summary recorded." };
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
+
+        let applied = 0;
+        for (let seed = 0; seed < 30; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            applied += 1;
+            expect(result.scenario.transcript.turns[3]!.user, `seed ${seed}`).toContain(
+                "buildAPI/v2",
+            );
+        }
+        expect(applied, "never applied").toBeGreaterThan(0);
+    });
+
+    test("rename refuses a bare symbol only inline code compounds", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        // The compound lives inside a command span, which the symbol grammar rejects
+        // and the replacement cannot enter, so the bare spelling must stay put.
+        turns[0]!.assistant = "We could run `buildAPI/v2 --watch` and aux_worker.ts.";
+        turns[3] = { user: "Background note about buildAPI.", assistant: "Summary recorded." };
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
+
+        let applied = 0;
+        for (let seed = 0; seed < 30; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            applied += 1;
+            expect(result.scenario.transcript.turns[3]!.user, `seed ${seed}`).toContain("buildAPI");
+        }
+        expect(applied, "never applied").toBeGreaterThan(0);
+    });
+
+    test("rename stays cheap against a separator-heavy message", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[0]!.assistant = "We could consider it.";
+        // A legal message may be twenty thousand characters of separators, which a
+        // materialize-every-substring analysis would turn into tens of millions of
+        // strings.
+        turns[3] = {
+            user: `Background ${"a-".repeat(9_000)}a and aux_worker.ts.`.slice(0, 19_000),
+            assistant: "Summary recorded.",
+        };
+        const scenario = parseScenario(raw);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
+
+        const start = performance.now();
+        transform.apply(scenario, 7);
+        expect(performance.now() - start).toBeLessThan(900);
+    });
+
     test("rename refuses a bare symbol another eligible message compounds", () => {
         const raw = validScenarioRaw();
         const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
