@@ -211,6 +211,33 @@ function reportDestinations(reportPath: string): string[] {
     return [reportPath, stagingReportPath(reportPath), partialPath, stagingReportPath(partialPath)];
 }
 
+/** Suffixes the runner derives for its own auxiliary files and unlinks during preflight. commentlint: allow(JUDGE) */
+const RESERVED_REPORT_SUFFIXES = [".tmp", ".partial.json"] as const;
+
+function requireOwnableReportPath(reportPath: string): void {
+    for (const suffix of RESERVED_REPORT_SUFFIXES) {
+        if (reportPath.endsWith(suffix)) {
+            throw new Error(
+                `report path may not end in ${suffix}, a name this runner derives and deletes for its own auxiliary files: ${reportPath}`,
+            );
+        }
+    }
+}
+
+/** Resolves each corpus entry, because a scenario symlink can target a path the directory-level containment check does not cover. commentlint: allow(JUDGE) */
+function corpusFileTargets(corpusDirectory: string): Set<string> {
+    if (!existsSync(corpusDirectory)) return new Set();
+    try {
+        return new Set(
+            readdirSync(corpusDirectory)
+                .filter((file) => file.endsWith(".json"))
+                .map((file) => canonicalPath(join(corpusDirectory, file))),
+        );
+    } catch {
+        return new Set();
+    }
+}
+
 function requireReplaceableReportPath(label: string, path: string): void {
     const occupant = lstatSync(path, { throwIfNoEntry: false });
     if (occupant === undefined) return;
@@ -222,12 +249,26 @@ function requireReplaceableReportPath(label: string, path: string): void {
     }
 }
 
+function validateReportDestinations(
+    label: string,
+    reportPath: string,
+    corpusDirectory: string,
+    outputs: readonly string[],
+): void {
+    requireOwnableReportPath(reportPath);
+    if (outputs.some((path) => containsPath(corpusDirectory, path))) {
+        throw new Error(`${label} must not overlap the scenario corpus`);
+    }
+    const corpusTargets = corpusFileTargets(corpusDirectory);
+    if (outputs.some((path) => corpusTargets.has(canonicalPath(path)))) {
+        throw new Error(`${label} must not resolve onto a scenario file in the corpus`);
+    }
+    for (const path of outputs) requireReplaceableReportPath(label, path);
+}
+
 export function prepareDeterministicOutputPaths(reportPath: string, corpusDirectory: string): void {
     const outputs = reportDestinations(reportPath);
-    if (outputs.some((path) => containsPath(corpusDirectory, path))) {
-        throw new Error("report and staging paths must not overlap the scenario corpus");
-    }
-    for (const path of outputs) requireReplaceableReportPath("report path", path);
+    validateReportDestinations("report and staging paths", reportPath, corpusDirectory, outputs);
     for (const path of outputs) removeRegularFile(path);
 }
 
@@ -238,17 +279,15 @@ export function prepareLiveOutputPaths(
     const partialPath = partialReportPath(reportPath);
     const artifactNamespace = join(dirname(reportPath), "metamorphic-eval-artifacts");
     const outputs = reportDestinations(reportPath);
-    const overlapsCorpus = [...outputs, artifactNamespace].some((path) =>
-        containsPath(corpusDirectory, path),
-    ) || containsPath(artifactNamespace, corpusDirectory);
-    if (overlapsCorpus) {
-        throw new Error("live report, partial report, staging, and artifact paths must not overlap the scenario corpus");
+    const label = "live report, partial report, staging, and artifact paths";
+    if (containsPath(artifactNamespace, corpusDirectory)) {
+        throw new Error(`${label} must not overlap the scenario corpus`);
     }
+    validateReportDestinations(label, reportPath, corpusDirectory, [...outputs, artifactNamespace]);
     /** The control run creates the namespace as a directory, so renameSync could never publish a report that lives inside it. commentlint: allow(JUDGE) */
     if (outputs.some((path) => containsPath(artifactNamespace, path))) {
         throw new Error(`live report paths must stay outside the artifact namespace: ${artifactNamespace}`);
     }
-    for (const path of outputs) requireReplaceableReportPath("live report path", path);
     for (const path of outputs) removeRegularFile(path);
     return { artifactNamespace, partialPath };
 }

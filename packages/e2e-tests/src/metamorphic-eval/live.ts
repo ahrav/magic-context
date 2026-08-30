@@ -269,9 +269,11 @@ export async function runLiveMetamorphicEval(
     const deadlineReached = (): boolean => deadlineAtMs !== null && nowMs() >= deadlineAtMs;
     const deadlineReport = (nextRole: LiveRole): MetamorphicReport =>
         observe({ kind: "deadline-exhausted", nextRole });
+    let controlA: LiveObservation | null = null;
+    let controlB: LiveObservation | null = null;
     try {
         if (deadlineReached()) return deadlineReport("control-a");
-        const controlA = await execute(
+        controlA = await execute(
             controlScenario,
             "control-a",
             liveArtifactDir(options.artifactRoot, controlScenario.id, "control-a"),
@@ -281,7 +283,7 @@ export async function runLiveMetamorphicEval(
             return observe();
         }
         if (deadlineReached()) return deadlineReport("control-b");
-        const controlB = await execute(
+        controlB = await execute(
             controlScenario,
             "control-b",
             liveArtifactDir(options.artifactRoot, controlScenario.id, "control-b"),
@@ -324,7 +326,16 @@ export async function runLiveMetamorphicEval(
         });
         observe();
     } catch (error) {
-        entries.push({ ...controlKey, kind: "error", error: getErrorMessage(error) });
+        const reason = getErrorMessage(error);
+        entries.push({ ...controlKey, kind: "error", error: reason });
+        /** Attributed to the control that produced no observation; a throw after both ran is a runner fault, not a control-tier outcome. commentlint: allow(JUDGE) */
+        if (controlA === null || controlB === null) {
+            return observe({
+                kind: "control-error",
+                controlAErrorReason: controlA === null ? reason : null,
+                controlBErrorReason: controlA === null ? null : reason,
+            });
+        }
         return observe();
     }
 

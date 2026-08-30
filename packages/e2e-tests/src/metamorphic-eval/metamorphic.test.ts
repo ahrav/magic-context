@@ -851,6 +851,49 @@ describe("live metamorphic control tier", () => {
         expect(metamorphicExitCode(report)).toBe(1);
     });
 
+    test("rejects report destinations that reserve another run's auxiliary names", () => {
+        const root = mkdtempSync(join(tmpdir(), "metamorphic-reserved-"));
+        try {
+            const corpusDirectory = join(root, "corpus");
+            mkdirSync(corpusDirectory);
+            // `foo.json` derives and unlinks both of these, so accepting either as a
+            // canonical destination lets one invocation delete another's report.
+            for (const reserved of ["foo.partial.json", "foo.json.tmp"]) {
+                expect(() => prepareLiveOutputPaths(join(root, reserved), corpusDirectory)).toThrow(
+                    "a name this runner derives and deletes",
+                );
+                expect(() => prepareDeterministicOutputPaths(join(root, reserved), corpusDirectory)).toThrow(
+                    "a name this runner derives and deletes",
+                );
+            }
+            expect(() => prepareLiveOutputPaths(join(root, "foo.json"), corpusDirectory)).not.toThrow();
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("rejects outputs that resolve onto a symlinked corpus scenario", () => {
+        const root = mkdtempSync(join(tmpdir(), "metamorphic-corpus-link-"));
+        try {
+            const corpusDirectory = join(root, "corpus");
+            mkdirSync(corpusDirectory);
+            const outsideTarget = join(root, "shared", "scenario.json");
+            mkdirSync(join(root, "shared"));
+            writeFileSync(outsideTarget, "{}");
+            symlinkSync(outsideTarget, join(corpusDirectory, "linked.json"));
+
+            expect(() => prepareLiveOutputPaths(outsideTarget, corpusDirectory)).toThrow(
+                "must not resolve onto a scenario file",
+            );
+            expect(() => prepareDeterministicOutputPaths(outsideTarget, corpusDirectory)).toThrow(
+                "must not resolve onto a scenario file",
+            );
+            expect(readFileSync(outsideTarget, "utf8")).toBe("{}");
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     test("counts only admitted derivatives as applied coverage", async () => {
         /** An identity derivative lints red on its fingerprint, which is the `rejected` branch that must not count as applied. commentlint: allow(JUDGE) */
         const identity: Transform = {
@@ -876,5 +919,20 @@ describe("live metamorphic control tier", () => {
         expect(report.entries[0]?.kind).toBe("lint-red");
         expect(report.coverage[0]?.applied).toBe(0);
         expect(report.coverage[0]?.violations).toContain("no transforms applied");
+    });
+
+    test("reports a thrown control failure as a control error, not an incomplete run", async () => {
+        for (const failing of ["control-a", "control-b"] as const) {
+            const { report } = await runWithExecutor((role) => {
+                if (role === failing) throw new Error(`${failing} artifact setup failed`);
+                return pairedObservation();
+            });
+
+            expect(report.tierInvalidReason).toEqual({
+                kind: "control-error",
+                controlAErrorReason: failing === "control-a" ? "control-a artifact setup failed" : null,
+                controlBErrorReason: failing === "control-b" ? "control-b artifact setup failed" : null,
+            });
+        }
     });
 });
