@@ -62,6 +62,10 @@ export function historianEvalUnitFiles(root: string = E2E_ROOT): string[] {
             cwd: root,
             onlyFiles: true,
         }),
+        ...new Glob("src/metamorphic-eval/**/*.test.ts").scanSync({
+            cwd: root,
+            onlyFiles: true,
+        }),
     ]
         .filter((file) => !HISTORIAN_EVAL_HARNESS_TESTS.includes(file))
         .sort();

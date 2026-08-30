@@ -180,6 +180,7 @@ describe("deterministic metamorphic runner", () => {
             id: "broken-remap",
             version: 1,
             alwaysApplicable: false,
+            preservesTurnText: true,
             apply(base) {
                 return {
                     applicable: true,
@@ -315,6 +316,7 @@ describe("deterministic metamorphic runner", () => {
             id: "no-op-labels",
             version: 1,
             alwaysApplicable: true,
+            preservesTurnText: true,
             apply(base) {
                 return {
                     applicable: true,
@@ -468,11 +470,88 @@ describe("deterministic metamorphic runner", () => {
         expect(metamorphicExitCode(report)).toBe(2);
     });
 
+    test("rejects a text-preserving transform whose turn map misstates provenance", () => {
+        const scenario = validScenario();
+        const liar: Transform = {
+            id: "liar-map",
+            version: 1,
+            alwaysApplicable: true,
+            preservesTurnText: true,
+            apply(base) {
+                const turns = [...base.transcript.turns];
+                const order = turns.map((_, index) => index);
+                [order[0], order[1]] = [order[1]!, order[0]!];
+                return {
+                    applicable: true,
+                    scenario: parseScenario({
+                        ...base,
+                        id: `${base.id}-d-liar-map-v1-s0`,
+                        transcript: {
+                            ...base.transcript,
+                            turns: order.map((index) => ({ ...turns[index]! })),
+                        },
+                    }),
+                    turnMap: turns.map((_, index) => index),
+                };
+            },
+        };
+        const report = runDeterministicMetamorphicEval([scenario], {
+            transforms: [liar],
+            seeds: [0],
+        });
+
+        expect(report.entries).toEqual([
+            expect.objectContaining({
+                kind: "lint-red",
+                diagnostics: expect.arrayContaining([
+                    expect.stringContaining("turn map does not match the transcript"),
+                ]),
+            }),
+        ]);
+    });
+
+    test("rejects a transform that mutates authored fields outside the transcript", () => {
+        const scenario = validScenario();
+        const probeDrift: Transform = {
+            id: "probe-drift",
+            version: 1,
+            alwaysApplicable: true,
+            preservesTurnText: true,
+            apply(base) {
+                return {
+                    applicable: true,
+                    scenario: parseScenario({
+                        ...base,
+                        id: `${base.id}-d-probe-drift-v1-s0`,
+                        probes: base.probes.map((probe, index) =>
+                            index === 0 ? { ...probe, question: `${probe.question} (drifted)` } : probe,
+                        ),
+                    }),
+                    turnMap: base.transcript.turns.map((_, index) => index),
+                };
+            },
+        };
+        const report = runDeterministicMetamorphicEval([scenario], {
+            transforms: [probeDrift],
+            seeds: [0],
+        });
+
+        expect(report.entries).toEqual([
+            expect.objectContaining({
+                kind: "lint-red",
+                diagnostics: expect.arrayContaining([
+                    expect.stringContaining("authored fields outside the transcript"),
+                ]),
+            }),
+        ]);
+    });
+
     test("fails coverage when every transform is inapplicable", () => {
         const never: Transform = {
             id: "never",
             version: 1,
             alwaysApplicable: false,
+            preservesTurnText: true,
             apply: () => ({ applicable: false, reason: "fixture has no target" }),
         };
         const report = runDeterministicMetamorphicEval([validScenario()], {

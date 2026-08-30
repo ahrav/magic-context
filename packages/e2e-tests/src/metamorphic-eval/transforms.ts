@@ -27,6 +27,9 @@ export interface Transform {
     id: string;
     version: number;
     alwaysApplicable: boolean;
+    /** A rewritten turn is indistinguishable from a misplaced one, so admission
+     * verifies `turnMap` against the transcript only when this is `true`. */
+    preservesTurnText: boolean;
     apply(scenario: HistorianEvalScenario, seed: number): TransformResult;
 }
 
@@ -146,6 +149,7 @@ const paraphraseIrrelevant: Transform = {
     id: "paraphrase-irrelevant",
     version: 1,
     alwaysApplicable: true,
+    preservesTurnText: false,
     apply(scenario, rawSeed) {
         const seed = normalizedSeed(rawSeed);
         const candidates = eligibleMessages(scenario);
@@ -176,6 +180,7 @@ const reorderIndependentTurns: Transform = {
     id: "reorder-independent-turns",
     version: 1,
     alwaysApplicable: false,
+    preservesTurnText: true,
     apply(scenario, rawSeed) {
         const seed = normalizedSeed(rawSeed);
         const expectedIndexes = protectedTurnIndexes(scenario);
@@ -227,6 +232,7 @@ const moveAcceptedDecision: Transform = {
     id: "move-accepted-decision",
     version: 1,
     alwaysApplicable: false,
+    preservesTurnText: true,
     apply(scenario, rawSeed) {
         const seed = normalizedSeed(rawSeed);
         const sources = [
@@ -274,6 +280,7 @@ const duplicateRejectedProposal: Transform = {
     id: "duplicate-rejected-proposal",
     version: 1,
     alwaysApplicable: false,
+    preservesTurnText: true,
     apply(scenario, rawSeed) {
         const seed = normalizedSeed(rawSeed);
         if (scenario.transcript.turns.length >= MAX_TRANSCRIPT_TURNS) {
@@ -327,6 +334,7 @@ const renameUnrelatedSymbols: Transform = {
     id: "rename-unrelated-symbols",
     version: 1,
     alwaysApplicable: false,
+    preservesTurnText: false,
     apply(scenario, rawSeed) {
         const seed = normalizedSeed(rawSeed);
         const messages = eligibleMessages(scenario);
