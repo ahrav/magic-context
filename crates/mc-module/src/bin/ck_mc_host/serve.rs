@@ -9,8 +9,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
-use std::io::Read;
-use std::os::unix::fs::DirBuilderExt;
+use std::io::{Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -31,10 +31,13 @@ use mc_host::harness_closure::{
 };
 use mc_host::synapse::{SynapseComponent, SynapseConfig, SynapseLimits};
 use mc_host::{CancellationToken, HostConfig, HostInit, StaticComposite};
+use sha2::{Digest, Sha256};
 
 use crate::spawn::MAX_ENVELOPE_BYTES;
 
 const STORE_FILE: &str = "mc-store.db";
+const ACTIVE_HARNESS_SELECTION: &str = "active-selection.json";
+const ACTIVE_SELECTION_CREDENTIAL_DOMAIN: &[u8] = b"mc-host-active-selection-credential-v1";
 const MAX_DESCRIPTOR_ITEMS: usize = 32;
 const MAX_DESCRIPTOR_ITEM_BYTES: usize = 4096;
 const CREDENTIAL_NAMES: [&str; 3] = ["ANTHROPIC_API_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY"];
@@ -46,7 +49,7 @@ const CREDENTIAL_NAMES: [&str; 3] = ["ANTHROPIC_API_KEY", "GEMINI_API_KEY", "OPE
 /// The launcher materializes qualified harness candidates before detach, so
 /// this serve envelope carries only retained closure digests or closed
 /// per-harness unavailability reasons. Source paths never cross into serve.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartupEnvelope {
     pub schema: u32,
@@ -82,7 +85,7 @@ pub struct HarnessCandidate {
     pub source_roots: BTreeMap<String, PathBuf>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HarnessSnapshot {
     Ready { manifest_sha256: String },
@@ -90,11 +93,7 @@ pub enum HarnessSnapshot {
 }
 
 /// The closed set of per-harness unavailability reasons the launcher may
-/// hand to serve. A typed enum (not a string) so serde rejects unknown
-/// reasons at decode and every consumer match is exhaustiveness-checked —
-/// a reason added to the producer without a consumer arm fails the build
-/// instead of silently degrading to `descriptor_invalid`. Variants must
-/// stay in the release contract's `harness_unavailable.reasons_by_precedence`.
+/// hand to serve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HarnessUnavailableReason {
@@ -113,10 +112,58 @@ impl HarnessUnavailableReason {
     }
 }
 
-/// Current startup envelope schema. Bumped whenever the envelope's decoded
-/// shape changes so a cross-version launcher/serve pairing fails as a typed
-/// schema mismatch instead of an opaque decode error.
+/// Current startup envelope schema.
 pub const STARTUP_ENVELOPE_SCHEMA: u32 = 2;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessSelection {
+    schema: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    opencode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pi: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    credential_identities: BTreeMap<String, String>,
+}
+
+pub struct PreparedLauncherEnvelope {
+    data_dir: PathBuf,
+    closure_root: PathBuf,
+    selection: HarnessSelection,
+    opencode: Option<HarnessSnapshot>,
+    pi: Option<HarnessSnapshot>,
+    credentials: BTreeMap<String, String>,
+    pub changed: bool,
+}
+
+pub enum SelectionMode<'a> {
+    Fresh,
+    Running {
+        credential_identity_key: &'a [u8; 32],
+        require_previous_credentials: bool,
+    },
+}
+
+impl PreparedLauncherEnvelope {
+    pub fn to_startup(&self, payload_manifest_digest: String) -> StartupEnvelope {
+        StartupEnvelope {
+            schema: STARTUP_ENVELOPE_SCHEMA,
+            data_dir: self.data_dir.clone(),
+            payload_manifest_digest,
+            opencode: self.opencode.clone(),
+            pi: self.pi.clone(),
+            credentials: self.credentials.clone(),
+        }
+    }
+
+    pub fn commit_selection(&self, publication: &Path) -> Result<(), &'static str> {
+        let key = credential_identity_key(publication)?;
+        let mut selection = self.selection.clone();
+        selection.credential_identities = credential_identities(&self.credentials, &key);
+        write_selection(&self.closure_root, &selection)
+    }
+}
 
 impl StartupEnvelope {
     pub fn validate(&self) -> Result<(), &'static str> {
@@ -153,38 +200,207 @@ impl LauncherEnvelope {
         validate_credentials(&self.credentials)
     }
 
-    pub fn materialize_into_startup(
+    pub fn prepare(
         self,
         data_dir: PathBuf,
-        payload_manifest_digest: String,
-    ) -> StartupEnvelope {
+        mode: SelectionMode<'_>,
+    ) -> Result<PreparedLauncherEnvelope, &'static str> {
         let closure_root = data_dir.join("cortexkit").join("mc-host-harness-closures");
         let store = HarnessClosureStore::open(&closure_root).ok();
-        // Closures are content-addressed and never referenced across starts
-        // except through this envelope, so every digest the candidates do
-        // not name — superseded harness versions and staging directories
-        // orphaned by an interrupted copy — is reclaimed here, under the
-        // launcher's start transaction. Without this each qualified harness
-        // version retains its full runtime copy forever.
-        if let Some(store) = store.as_ref() {
-            let protected: BTreeSet<String> = [self.opencode.as_ref(), self.pi.as_ref()]
-                .into_iter()
-                .flatten()
-                .map(|candidate| candidate.manifest_sha256.clone())
-                .collect();
-            let _ = store.prune(&protected);
+        // One memo for the whole call: the recorded selection, the supplied
+        // candidates, and the merged selection routinely name the same digests,
+        // and each `validate` re-hashes the entire closure tree.
+        let mut validator = ClosureValidator::new(store.as_ref());
+        let running = matches!(mode, SelectionMode::Running { .. });
+        let (previous, mut credential_identities, require_previous_credentials) = match mode {
+            SelectionMode::Fresh => {
+                // A fresh start discards the previous selection, so a stale one
+                // (its cited closure no longer qualified or validatable) is
+                // tolerated here: the commit that follows a successful start
+                // replaces the file. Hostile or unsupported shapes still fail.
+                read_selection(&closure_root, &mut validator)?;
+                (
+                    HarnessSelection {
+                        schema: 1,
+                        ..HarnessSelection::default()
+                    },
+                    BTreeMap::new(),
+                    false,
+                )
+            }
+            SelectionMode::Running {
+                credential_identity_key,
+                require_previous_credentials,
+            } => (
+                match read_selection(&closure_root, &mut validator)? {
+                    SelectionState::Active(previous) => previous,
+                    SelectionState::Absent => HarnessSelection {
+                        schema: 1,
+                        ..HarnessSelection::default()
+                    },
+                    // The running daemon's committed selection cites a closure
+                    // this binary can no longer qualify or validate, so no
+                    // merge can honor it. `stop` clears stale selections and a
+                    // fresh start replaces them, which is the recovery path.
+                    SelectionState::Stale => return Err("active harness selection is stale"),
+                },
+                credential_identities(&self.credentials, credential_identity_key),
+                require_previous_credentials,
+            ),
+        };
+        if running && !require_previous_credentials && self.credentials.is_empty() {
+            credential_identities = previous.credential_identities.clone();
         }
-        let opencode = materialize_snapshot("opencode", self.opencode, store.as_ref());
-        let pi = materialize_snapshot("pi", self.pi, store.as_ref());
-        StartupEnvelope {
-            schema: STARTUP_ENVELOPE_SCHEMA,
+        let supplied_opencode = self.opencode.is_some();
+        let supplied_pi = self.pi.is_some();
+        let candidate_digests: BTreeSet<String> = [self.opencode.as_ref(), self.pi.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|candidate| candidate.manifest_sha256.clone())
+            .collect();
+        let opencode_candidate = materialize_snapshot("opencode", self.opencode, &mut validator);
+        let pi_candidate = materialize_snapshot("pi", self.pi, &mut validator);
+        if running
+            && ((supplied_opencode
+                && matches!(
+                    &opencode_candidate,
+                    Some(HarnessSnapshot::Unavailable { .. })
+                ))
+                || (supplied_pi
+                    && matches!(&pi_candidate, Some(HarnessSnapshot::Unavailable { .. }))))
+        {
+            return Err("new owner supplied an unavailable harness descriptor");
+        }
+        let next_opencode = match &opencode_candidate {
+            Some(HarnessSnapshot::Ready { manifest_sha256 }) => Some(manifest_sha256.clone()),
+            _ => None,
+        };
+        let next_pi = match &pi_candidate {
+            Some(HarnessSnapshot::Ready { manifest_sha256 }) => Some(manifest_sha256.clone()),
+            _ => None,
+        };
+        let (selection, changed) = merge_selection(
+            &previous,
+            next_opencode,
+            next_pi,
+            credential_identities,
+            require_previous_credentials,
+        )?;
+        let opencode = selected_snapshot(
+            "opencode",
+            selection.opencode.as_deref(),
+            opencode_candidate,
+            &mut validator,
+        );
+        let pi = selected_snapshot("pi", selection.pi.as_deref(), pi_candidate, &mut validator);
+        // Pruning follows all validation and materialization. Protect every
+        // digest visible in the active, candidate, or merged selection so a
+        // failed validation cannot delete the only recoverable closure.
+        if let Some(store) = store.as_ref() {
+            let mut protected = candidate_digests;
+            protected.extend(previous.opencode.iter().cloned());
+            protected.extend(previous.pi.iter().cloned());
+            protected.extend(selection.opencode.iter().cloned());
+            protected.extend(selection.pi.iter().cloned());
+            store
+                .prune(&protected)
+                .map_err(|_| "harness closure prune failed")?;
+        }
+        Ok(PreparedLauncherEnvelope {
             data_dir,
-            payload_manifest_digest,
+            closure_root,
+            selection,
             opencode,
             pi,
             credentials: self.credentials,
-        }
+            changed,
+        })
     }
+}
+
+fn merge_selection(
+    previous: &HarnessSelection,
+    opencode: Option<String>,
+    pi: Option<String>,
+    credential_identities: BTreeMap<String, String>,
+    require_previous_credentials: bool,
+) -> Result<(HarnessSelection, bool), &'static str> {
+    let mut selection = previous.clone();
+    if let Some(opencode) = opencode {
+        selection.opencode = Some(opencode);
+    }
+    if let Some(pi) = pi {
+        selection.pi = Some(pi);
+    }
+    let changed = selection.opencode != previous.opencode
+        || selection.pi != previous.pi
+        || credential_identities != previous.credential_identities;
+    if require_previous_credentials && changed {
+        return Err("restart cannot change the active harness selection");
+    }
+    // Only reachable with `changed`, so no `require_previous_credentials`
+    // disjunct: a restart that reaches here matched the previous selection
+    // exactly, which already implies identical credential identities.
+    if changed
+        && previous
+            .credential_identities
+            .iter()
+            .any(|(name, identity)| credential_identities.get(name) != Some(identity))
+    {
+        return Err("new owner cannot preserve the active credential source");
+    }
+    selection.credential_identities = credential_identities;
+    Ok((selection, changed))
+}
+
+fn credential_identities(
+    credentials: &BTreeMap<String, String>,
+    connection_key: &[u8; 32],
+) -> BTreeMap<String, String> {
+    let derived = hmac_sha256(connection_key, &[ACTIVE_SELECTION_CREDENTIAL_DOMAIN]);
+    credentials
+        .iter()
+        .map(|(name, value)| {
+            let name_len = (name.len() as u64).to_be_bytes();
+            let value_len = (value.len() as u64).to_be_bytes();
+            let identity = hmac_sha256(
+                &derived,
+                &[&name_len, name.as_bytes(), &value_len, value.as_bytes()],
+            )
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+            (name.clone(), identity)
+        })
+        .collect()
+}
+
+fn hmac_sha256(key: &[u8], segments: &[&[u8]]) -> [u8; 32] {
+    debug_assert!(key.len() <= 64);
+    let mut inner_pad = [0x36; 64];
+    let mut outer_pad = [0x5c; 64];
+    for (index, byte) in key.iter().enumerate() {
+        inner_pad[index] ^= byte;
+        outer_pad[index] ^= byte;
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    for segment in segments {
+        inner.update(segment);
+    }
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner.finalize());
+    outer.finalize().into()
+}
+
+pub fn credential_identity_key(publication: &Path) -> Result<[u8; 32], &'static str> {
+    let info =
+        mc_host::read_connection_file(publication).map_err(|_| "connection key is unavailable")?;
+    info.key
+        .as_slice()
+        .try_into()
+        .map_err(|_| "connection key is invalid")
 }
 
 fn validate_credentials(credentials: &BTreeMap<String, String>) -> Result<(), &'static str> {
@@ -282,32 +498,274 @@ fn qualified_manifest(
     Ok(manifest)
 }
 
+/// One `prepare()`-scoped memo over `HarnessClosureStore::validate`.
+///
+/// `validate` re-opens and re-hashes the whole closure tree on every call, and
+/// a single `prepare()` asks the same question up to three times about the same
+/// digest: once in `read_selection` to classify the recorded selection, once
+/// inside `HarnessClosureStore::materialize`, and once in `selected_snapshot`
+/// for the merged selection. With the committed closures totalling hundreds of
+/// megabytes across thousands of files, and `start`/`stop` holding the
+/// exclusive lifecycle lock across the call, that repetition is the dominant
+/// cost of a demand-start against an already-running daemon.
+///
+/// Memoizing is sound only because the store is immutable for the lifetime of
+/// one `prepare()`: it is keyed by content digest, the process holds the
+/// lifecycle transaction lock, and a digest that validated once cannot become
+/// invalid without a concurrent writer the lock excludes.
+struct ClosureValidator<'a> {
+    store: Option<&'a HarnessClosureStore>,
+    validated: BTreeMap<String, bool>,
+}
+
+impl<'a> ClosureValidator<'a> {
+    fn new(store: Option<&'a HarnessClosureStore>) -> Self {
+        Self {
+            store,
+            validated: BTreeMap::new(),
+        }
+    }
+
+    fn store(&self) -> Option<&'a HarnessClosureStore> {
+        self.store
+    }
+
+    /// Whether `digest` names a closure this binary can validate, hashing the
+    /// tree at most once per digest.
+    fn is_valid(&mut self, digest: &str) -> bool {
+        if let Some(known) = self.validated.get(digest) {
+            return *known;
+        }
+        let valid = self
+            .store
+            .and_then(|store| store.validate(digest).ok())
+            .is_some();
+        self.validated.insert(digest.to_owned(), valid);
+        valid
+    }
+
+    /// Records a digest proven valid by a successful `materialize`, so the
+    /// `selected_snapshot` pass over the same digest does not re-hash it.
+    fn note_valid(&mut self, digest: &str) {
+        self.validated.insert(digest.to_owned(), true);
+    }
+}
+
 fn materialize_snapshot(
     harness: &str,
     candidate: Option<HarnessCandidate>,
-    store: Option<&HarnessClosureStore>,
+    validator: &mut ClosureValidator<'_>,
 ) -> Option<HarnessSnapshot> {
     let candidate = candidate?;
     let manifest = match qualified_manifest(harness, &candidate.manifest_sha256) {
         Ok(manifest) => manifest,
         Err(reason) => return Some(HarnessSnapshot::Unavailable { reason }),
     };
-    let Some(store) = store else {
+    let Some(store) = validator.store() else {
         return Some(HarnessSnapshot::Unavailable {
             reason: HarnessUnavailableReason::ClosureIncomplete,
         });
     };
+    // A digest already proven valid in this `prepare()` needs no second pass:
+    // `materialize` itself short-circuits on `validate`, so reusing the memo is
+    // the same decision without re-hashing the tree.
+    if validator.is_valid(&candidate.manifest_sha256) {
+        return Some(HarnessSnapshot::Ready {
+            manifest_sha256: candidate.manifest_sha256,
+        });
+    }
     let closure = ClosureCandidate {
         manifest,
         source_roots: candidate.source_roots,
     };
     match store.materialize(&closure) {
-        Ok(validated) => Some(HarnessSnapshot::Ready {
-            manifest_sha256: validated.digest().to_owned(),
-        }),
+        Ok(validated) => {
+            validator.note_valid(validated.digest());
+            Some(HarnessSnapshot::Ready {
+                manifest_sha256: validated.digest().to_owned(),
+            })
+        }
         Err(_) => Some(HarnessSnapshot::Unavailable {
             reason: HarnessUnavailableReason::ClosureIncomplete,
         }),
+    }
+}
+
+fn selected_snapshot(
+    harness: &str,
+    digest: Option<&str>,
+    candidate: Option<HarnessSnapshot>,
+    validator: &mut ClosureValidator<'_>,
+) -> Option<HarnessSnapshot> {
+    if matches!(candidate, Some(HarnessSnapshot::Unavailable { .. })) {
+        return candidate;
+    }
+    let digest = digest?;
+    if qualified_manifest(harness, digest).is_err() || !validator.is_valid(digest) {
+        return Some(HarnessSnapshot::Unavailable {
+            reason: HarnessUnavailableReason::ClosureIncomplete,
+        });
+    }
+    Some(HarnessSnapshot::Ready {
+        manifest_sha256: digest.to_owned(),
+    })
+}
+
+/// What one read of the active-selection file established.
+///
+/// The split between `Stale` and an `Err` is load-bearing for recovery: an
+/// error names a shape this binary must not touch (hostile metadata, malformed
+/// bytes, or a schema owned by a newer binary), while `Stale` names well-formed
+/// schema-1 state whose cited closure this binary can no longer qualify or
+/// validate — the residue of a qualified-set rotation or a pruned closure
+/// store. Owners may remove stale state and a fresh start may ignore it;
+/// collapsing it into the error class would wedge `stop`, `start`, and
+/// `restart` on a file only manual deletion could clear.
+enum SelectionState {
+    /// No selection file exists.
+    Absent,
+    /// A well-formed selection whose cited closures all qualify and validate.
+    Active(HarnessSelection),
+    /// A well-formed schema-1 selection citing a closure that is no longer
+    /// qualified or no longer validates.
+    Stale,
+}
+
+fn read_selection(
+    closure_root: &Path,
+    validator: &mut ClosureValidator<'_>,
+) -> Result<SelectionState, &'static str> {
+    let path = closure_root.join(ACTIVE_HARNESS_SELECTION);
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SelectionState::Absent)
+        }
+        Err(_) => return Err("active harness selection is unreadable"),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|_| "active harness selection is unreadable")?;
+    let root_metadata =
+        std::fs::metadata(closure_root).map_err(|_| "active harness selection is unreadable")?;
+    if !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > MAX_ENVELOPE_BYTES as u64
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.nlink() != 1
+        || metadata.uid() != root_metadata.uid()
+    {
+        return Err("active harness selection is invalid");
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|_| "active harness selection is unreadable")?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| "active harness selection is invalid")?;
+    if value.get("schema").and_then(serde_json::Value::as_u64) != Some(1) {
+        return Err("unsupported active harness selection schema");
+    }
+    let selection: HarnessSelection =
+        serde_json::from_value(value).map_err(|_| "active harness selection is invalid")?;
+    if selection.schema != 1
+        || selection
+            .credential_identities
+            .iter()
+            .any(|(name, identity)| {
+                !CREDENTIAL_NAMES.contains(&name.as_str())
+                    || !mc_host::is_canonical_payload_digest(identity)
+            })
+    {
+        return Err("active harness selection is invalid");
+    }
+    for (harness, digest) in [
+        ("opencode", selection.opencode.as_deref()),
+        ("pi", selection.pi.as_deref()),
+    ] {
+        if let Some(digest) = digest {
+            if qualified_manifest(harness, digest).is_err() || !validator.is_valid(digest) {
+                return Ok(SelectionState::Stale);
+            }
+        }
+    }
+    Ok(SelectionState::Active(selection))
+}
+
+fn write_selection(closure_root: &Path, selection: &HarnessSelection) -> Result<(), &'static str> {
+    let bytes = serde_json::to_vec(selection).map_err(|_| "selection serialization failed")?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "active harness selection clock failed")?
+        .as_nanos();
+    let temp = closure_root.join(format!(
+        ".{ACTIVE_HARNESS_SELECTION}.{}.{nonce}.tmp",
+        std::process::id()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temp)
+        .map_err(|_| "active harness selection temp creation failed")?;
+    let final_path = closure_root.join(ACTIVE_HARNESS_SELECTION);
+    let mut promoted = false;
+    let result = (|| {
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|_| "active harness selection write failed")?;
+        std::fs::rename(&temp, &final_path)
+            .map_err(|_| "active harness selection promotion failed")?;
+        promoted = true;
+        #[cfg(debug_assertions)]
+        if std::env::var_os("CK_MC_HOST_TEST_FAIL_SELECTION_FSYNC").is_some() {
+            return Err("injected active selection fsync failure");
+        }
+        std::fs::File::open(closure_root)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|_| "active harness selection fsync failed")
+    })();
+    if !promoted {
+        let _ = std::fs::remove_file(temp);
+    } else if result.is_err() {
+        let _ = std::fs::remove_file(&final_path);
+        let _ = std::fs::File::open(closure_root).and_then(|dir| dir.sync_all());
+    }
+    result
+}
+
+pub fn clear_active_selection() -> Result<(), &'static str> {
+    let data_dir = mc_host::data_dir_path(None)
+        .ok()
+        .ok_or("active harness selection root is unavailable")?;
+    let closure_root = data_dir.join("cortexkit").join("mc-host-harness-closures");
+    let path = closure_root.join(ACTIVE_HARNESS_SELECTION);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err("active harness selection is unreadable"),
+    }
+    let store = HarnessClosureStore::open(&closure_root)
+        .map_err(|_| "active harness selection root is unavailable")?;
+    // Every readable state — active, absent, or stale — is removable stale
+    // state once the owner decided to clear it. Only hostile shapes and
+    // schemas owned by a newer binary keep failing, preserving the file as
+    // evidence for the binary that understands it.
+    read_selection(&closure_root, &mut ClosureValidator::new(Some(&store)))?;
+    #[cfg(debug_assertions)]
+    if std::env::var_os("CK_MC_HOST_TEST_FAIL_SELECTION_REMOVAL").is_some() {
+        return Err("injected active selection removal failure");
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => std::fs::File::open(closure_root)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|_| "active harness selection fsync failed"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("active harness selection removal failed"),
     }
 }
 
@@ -507,7 +965,8 @@ fn synapse_component(generation: &ValidatedGeneration) -> SynapseComponent {
         else {
             return SynapseComponent::new(None);
         };
-        let bundle_dir = generation.path().join(BUNDLE_DIR);
+        let descriptor_root = generation.descriptor_root_path();
+        let bundle_dir = descriptor_root.join(BUNDLE_DIR);
         // The generation manifest is the trust root: its digest already covers
         // these bytes, so carrying the bundle manifest's own hash forward binds
         // every artifact `load_bundle` verifies to the generation that was
@@ -525,8 +984,8 @@ fn synapse_component(generation: &ValidatedGeneration) -> SynapseComponent {
         };
         SynapseComponent::new(Some(SynapseConfig {
             bundle_dir,
+            ort_library: descriptor_root.join(ORT_LIBRARY),
             bundle_manifest_sha256: Some(bundle_manifest.sha256.clone()),
-            ort_library: generation.path().join(ORT_LIBRARY),
             ort_library_sha256: ort.sha256.clone(),
             limits: SynapseLimits::default(),
         }))
@@ -634,4 +1093,245 @@ pub fn run() -> Result<(), &'static str> {
         let _ = signal_task.await;
         result.map_err(|_| "host runtime exited with an error")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credential_mac_matches_hmac_sha256() {
+        let digest = hmac_sha256(b"key", &[b"The quick brown fox jumps over the lazy dog"]);
+        let encoded: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(
+            encoded,
+            "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+        );
+    }
+
+    #[test]
+    fn harness_selection_merges_without_losing_prior_credentials() {
+        let key = [7; 32];
+        let previous_credentials =
+            BTreeMap::from([("ANTHROPIC_API_KEY".to_owned(), "shared-secret".to_owned())]);
+        let previous = HarnessSelection {
+            schema: 1,
+            opencode: Some("a".repeat(64)),
+            pi: None,
+            credential_identities: credential_identities(&previous_credentials, &key),
+        };
+        let credentials = BTreeMap::from([
+            ("ANTHROPIC_API_KEY".to_owned(), "shared-secret".to_owned()),
+            ("OPENAI_API_KEY".to_owned(), "second-secret".to_owned()),
+        ]);
+        let (merged, changed) = merge_selection(
+            &previous,
+            None,
+            Some("b".repeat(64)),
+            credential_identities(&credentials, &key),
+            false,
+        )
+        .expect("qualified second owner merges");
+        assert!(changed);
+        assert_eq!(merged.opencode, previous.opencode);
+        assert_eq!(merged.pi, Some("b".repeat(64)));
+        assert!(merged
+            .credential_identities
+            .contains_key("ANTHROPIC_API_KEY"));
+        assert!(merged.credential_identities.contains_key("OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn harness_selection_requires_exact_prior_credentials() {
+        let key = [9; 32];
+        let previous_credentials =
+            BTreeMap::from([("ANTHROPIC_API_KEY".to_owned(), "first-secret".to_owned())]);
+        let previous = HarnessSelection {
+            schema: 1,
+            opencode: Some("a".repeat(64)),
+            pi: None,
+            credential_identities: credential_identities(&previous_credentials, &key),
+        };
+        assert!(merge_selection(
+            &previous,
+            None,
+            Some("b".repeat(64)),
+            credential_identities(
+                &BTreeMap::from([("OPENAI_API_KEY".to_owned(), "other-secret".to_owned())]),
+                &key,
+            ),
+            false,
+        )
+        .is_err());
+        assert!(merge_selection(
+            &previous,
+            None,
+            None,
+            credential_identities(
+                &BTreeMap::from([(
+                    "ANTHROPIC_API_KEY".to_owned(),
+                    "different-secret".to_owned()
+                )]),
+                &key,
+            ),
+            true,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn harness_restart_refuses_a_new_descriptor_even_with_exact_credentials() {
+        let key = [10; 32];
+        let credentials =
+            BTreeMap::from([("ANTHROPIC_API_KEY".to_owned(), "shared-secret".to_owned())]);
+        let previous = HarnessSelection {
+            schema: 1,
+            opencode: Some("a".repeat(64)),
+            pi: None,
+            credential_identities: credential_identities(&credentials, &key),
+        };
+        assert!(merge_selection(
+            &previous,
+            None,
+            Some("b".repeat(64)),
+            credential_identities(&credentials, &key),
+            true,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn harness_selection_persists_only_digests_and_keyed_credential_identities() {
+        let root = tempfile::tempdir().expect("selection root");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("selection root mode");
+        let store = HarnessClosureStore::open(root.path()).expect("closure store");
+        let credentials = BTreeMap::from([(
+            "ANTHROPIC_API_KEY".to_owned(),
+            "credential-value".to_owned(),
+        )]);
+        let selection = HarnessSelection {
+            schema: 1,
+            opencode: None,
+            pi: None,
+            credential_identities: credential_identities(&credentials, &[11; 32]),
+        };
+        write_selection(root.path(), &selection).expect("write selection");
+        let loaded = match read_selection(root.path(), &mut ClosureValidator::new(Some(&store)))
+            .expect("read selection")
+        {
+            SelectionState::Active(loaded) => loaded,
+            _ => panic!("a committed selection must read back as active"),
+        };
+        assert_eq!(loaded, selection);
+        let bytes =
+            std::fs::read(root.path().join(ACTIVE_HARNESS_SELECTION)).expect("selection bytes");
+        assert!(!String::from_utf8_lossy(&bytes).contains("credential-value"));
+        assert!(!String::from_utf8_lossy(&bytes).contains("first-secret"));
+        let mode = std::fs::metadata(root.path().join(ACTIVE_HARNESS_SELECTION))
+            .expect("selection metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    /// Plants a well-formed schema-1 selection citing a digest outside the
+    /// qualified closure set, the residue an upgrade that rotates the
+    /// qualified inputs leaves behind.
+    fn plant_stale_selection(closure_root: &Path) {
+        std::fs::create_dir_all(closure_root).expect("closure root");
+        std::fs::set_permissions(closure_root, std::fs::Permissions::from_mode(0o700))
+            .expect("closure root mode");
+        write_selection(
+            closure_root,
+            &HarnessSelection {
+                schema: 1,
+                opencode: Some("f".repeat(64)),
+                pi: None,
+                credential_identities: BTreeMap::new(),
+            },
+        )
+        .expect("write stale selection");
+    }
+
+    #[test]
+    fn a_selection_citing_an_unqualified_closure_reads_as_stale_not_invalid() {
+        let root = tempfile::tempdir().expect("selection root");
+        let closure_root = root.path().join("closures");
+        plant_stale_selection(&closure_root);
+        let store = HarnessClosureStore::open(&closure_root).expect("closure store");
+        assert!(matches!(
+            read_selection(&closure_root, &mut ClosureValidator::new(Some(&store)))
+                .expect("stale selection reads"),
+            SelectionState::Stale
+        ));
+    }
+
+    #[test]
+    fn fresh_prepare_ignores_a_stale_selection_and_running_prepare_refuses_it() {
+        let root = tempfile::tempdir().expect("data root");
+        let data_dir = root.path().to_path_buf();
+        let closure_root = data_dir.join("cortexkit").join("mc-host-harness-closures");
+        plant_stale_selection(&closure_root);
+
+        let envelope = || LauncherEnvelope {
+            schema: 1,
+            opencode: None,
+            pi: None,
+            credentials: BTreeMap::new(),
+        };
+        // A fresh start discards the previous selection, so stale residue must
+        // not block it; the wedge it would otherwise cause has no CLI recovery.
+        let prepared = envelope()
+            .prepare(data_dir.clone(), SelectionMode::Fresh)
+            .expect("fresh start ignores a stale selection");
+        assert!(!prepared.changed);
+        // A running merge cannot honor a selection whose closure is gone, and
+        // must refuse without adopting or rewriting it.
+        match envelope().prepare(
+            data_dir,
+            SelectionMode::Running {
+                credential_identity_key: &[12; 32],
+                require_previous_credentials: true,
+            },
+        ) {
+            Err(reason) => assert_eq!(reason, "active harness selection is stale"),
+            Ok(_) => panic!("running merge must refuse a stale selection"),
+        }
+    }
+
+    /// `HarnessClosureStore::validate` re-hashes the whole closure tree, and one
+    /// `prepare()` asks about the same digest up to three times. The memo must
+    /// answer identically while consulting the store only once per digest,
+    /// including for the negative answer: an unqualified digest that re-hashed
+    /// on every ask is what made a demand-start against an already-running
+    /// daemon pay for the closure set two to three times over.
+    #[test]
+    fn the_closure_validator_answers_each_digest_once() {
+        let root = tempfile::tempdir().expect("closure root");
+        let closure_root = root.path().join("closures");
+        std::fs::create_dir_all(&closure_root).expect("closure root");
+        std::fs::set_permissions(&closure_root, std::fs::Permissions::from_mode(0o700))
+            .expect("closure root mode");
+        let store = HarnessClosureStore::open(&closure_root).expect("closure store");
+        let absent = "f".repeat(64);
+
+        let mut validator = ClosureValidator::new(Some(&store));
+        assert!(!validator.is_valid(&absent));
+        assert!(!validator.is_valid(&absent));
+        assert_eq!(validator.validated.len(), 1);
+        assert_eq!(validator.validated.get(&absent), Some(&false));
+
+        // A digest proven valid by `materialize` is recorded, so the later
+        // `selected_snapshot` pass over the merged selection reuses it.
+        validator.note_valid(&absent);
+        assert!(validator.is_valid(&absent));
+        assert_eq!(validator.validated.len(), 1);
+
+        // Absent stores answer negatively without consulting anything.
+        let mut storeless = ClosureValidator::new(None);
+        assert!(!storeless.is_valid(&absent));
+        assert!(storeless.store().is_none());
+    }
 }

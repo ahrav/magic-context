@@ -686,6 +686,41 @@ pub fn host_status_response_json(report: &crate::handler::HealthReport) -> Vec<u
             state_key.to_owned(),
             serde_json::Value::String(state.to_owned()),
         );
+        if module == "magic-context" {
+            let epoch_names = [
+                "memory_render_epoch",
+                "compartment_render_epoch",
+                "profile_epoch",
+                "tagger_epoch",
+                "state_sync_epoch",
+            ];
+            if let Some(raw_epochs) = component
+                .get("metrics")
+                .and_then(|metrics| metrics.get("epochs"))
+                .and_then(serde_json::Value::as_object)
+            {
+                let keys_valid = raw_epochs.len() == epoch_names.len()
+                    && raw_epochs
+                        .keys()
+                        .all(|key| epoch_names.contains(&key.as_str()));
+                let values = epoch_names
+                    .iter()
+                    .map(|name| {
+                        raw_epochs
+                            .get(*name)
+                            .and_then(serde_json::Value::as_u64)
+                            .filter(|value| *value <= u32::MAX as u64)
+                            .map(|value| ((*name).to_owned(), serde_json::Value::from(value)))
+                    })
+                    .collect::<Option<serde_json::Map<String, serde_json::Value>>>();
+                if keys_valid {
+                    if let Some(values) = values {
+                        sanitized_metrics
+                            .insert("epochs".to_owned(), serde_json::Value::Object(values));
+                    }
+                }
+            }
+        }
         components.insert(
             module.to_owned(),
             serde_json::json!({
@@ -1201,7 +1236,16 @@ mod tests {
                 "components": {
                     "magic-context": {
                         "status": "degraded",
-                        "metrics": {"storage_state": "starting"}
+                        "metrics": {
+                            "storage_state": "starting",
+                            "epochs": {
+                                "memory_render_epoch": 2,
+                                "compartment_render_epoch": 2,
+                                "profile_epoch": 2,
+                                "tagger_epoch": 3,
+                                "state_sync_epoch": 1
+                            }
+                        }
                     }
                 }
             })),
@@ -1213,6 +1257,16 @@ mod tests {
         assert_eq!(
             response["metrics"]["components"]["magic-context"]["metrics"]["storage_state"],
             "starting"
+        );
+        assert_eq!(
+            response["metrics"]["components"]["magic-context"]["metrics"]["epochs"],
+            serde_json::json!({
+                "memory_render_epoch": 2,
+                "compartment_render_epoch": 2,
+                "profile_epoch": 2,
+                "tagger_epoch": 3,
+                "state_sync_epoch": 1,
+            })
         );
         assert!(
             !String::from_utf8(host_status_response_json(&report))

@@ -25,6 +25,7 @@ import {
     waitUntil,
     writeConnectionFile,
 } from "../../shared/mc-host-client/test-support/test-util";
+import { WaiterDetachedError } from "../../shared/mc-host-lifecycle";
 import {
     __moduleTransportTest,
     buildManagedStartupEnvelope,
@@ -341,6 +342,37 @@ describe("McHostModuleTransport", () => {
         expect(events).toEqual(["demand"]);
     });
 
+    it("a detached caller does not arm the transport-wide connection backoff", async () => {
+        const events: string[] = [];
+        const transport = trackTransport(
+            new McHostModuleTransport({
+                requestTimeoutMs: 100,
+                demandStart: async () => {
+                    events.push("demand");
+                    throw new WaiterDetachedError("aborted");
+                },
+            }),
+        );
+
+        const detached = {
+            sessionId: "detached-caller",
+            projectRoot: "/workspace/project",
+            method: "transform",
+            body: { method: "transform", v: 1 },
+        } as const;
+        await expect(transport.call(detached)).rejects.toMatchObject({
+            name: "WaiterDetachedError",
+        });
+
+        // The backoff is transport-wide. One caller's own abort or deadline is no
+        // evidence about the daemon, so the next session still reaches the demand
+        // instead of failing on MC_HOST_CONNECTION_BACKOFF.
+        await expect(
+            transport.call({ ...detached, sessionId: "unrelated-caller" }),
+        ).rejects.toMatchObject({ name: "WaiterDetachedError" });
+        expect(events).toEqual(["demand", "demand"]);
+    });
+
     it("a failed demand arms connection backoff instead of re-demanding per call", async () => {
         let demands = 0;
         const transport = trackTransport(
@@ -385,6 +417,7 @@ describe("McHostModuleTransport", () => {
                     ok: true,
                     reason: "already_running",
                     storage: "ready",
+                    authenticatedDaemonId: Uint8Array.from(peer.daemonId),
                 }),
             }),
         );
@@ -446,6 +479,47 @@ describe("McHostModuleTransport", () => {
         }
     });
 
+    it("rejects a rotated daemon before route open or application body", async () => {
+        const peer = await startPeer();
+        const dataHome = join(tempDir, `rotated-home-${++fileCounter}`);
+        const connectionFile = join(dataHome, "cortexkit", "run", "subc-connection.json");
+        mkdirSync(join(dataHome, "cortexkit", "run"), { recursive: true });
+        await writeConnectionFile(connectionFile, peer);
+        const oldDataHome = process.env.XDG_DATA_HOME;
+        process.env.XDG_DATA_HOME = dataHome;
+        const wrongDaemonId = Uint8Array.from(peer.daemonId);
+        wrongDaemonId[0] = (wrongDaemonId[0] ?? 0) ^ 1;
+        const transport = trackTransport(
+            new McHostModuleTransport({
+                requestTimeoutMs: 100,
+                demandStart: async () => ({
+                    ok: true,
+                    reason: "already_running",
+                    storage: "ready",
+                    authenticatedDaemonId: wrongDaemonId,
+                }),
+            }),
+        );
+
+        try {
+            const error = await rejection(
+                transport.call({
+                    sessionId: "rotated-daemon",
+                    projectRoot: "/workspace/project",
+                    method: "transform",
+                    body: { method: "transform", v: 1 },
+                }),
+            );
+            expect(__moduleTransportTest.isConnectionFailure(error)).toBe(true);
+            expect(
+                peer.connections.flatMap((connection) => connection.frames).some(isRouteOpen),
+            ).toBe(false);
+        } finally {
+            if (oldDataHome === undefined) delete process.env.XDG_DATA_HOME;
+            else process.env.XDG_DATA_HOME = oldDataHome;
+        }
+    });
+
     it("stays passive without a managed lifecycle owner and dials the default file", async () => {
         const peer = await startPeer();
         const dataHome = join(tempDir, `passive-home-${++fileCounter}`);
@@ -477,6 +551,182 @@ describe("McHostModuleTransport", () => {
             if (oldDataHome === undefined) delete process.env.XDG_DATA_HOME;
             else process.env.XDG_DATA_HOME = oldDataHome;
         }
+    });
+
+    it("reuses one passive connection across requests without a managed owner", async () => {
+        const peer = await startPeer();
+        const dataHome = join(tempDir, `passive-reuse-home-${++fileCounter}`);
+        const connectionFile = join(dataHome, "cortexkit", "run", "subc-connection.json");
+        mkdirSync(join(dataHome, "cortexkit", "run"), { recursive: true });
+        await writeConnectionFile(connectionFile, peer);
+        const oldDataHome = process.env.XDG_DATA_HOME;
+        process.env.XDG_DATA_HOME = dataHome;
+        try {
+            const transport = trackTransport(
+                new McHostModuleTransport({ requestTimeoutMs: 2_000 }),
+            );
+            const internals = transport as unknown as { client: McHostClient | null };
+            const args = {
+                sessionId: "passive-reuse",
+                projectRoot: "/workspace/project",
+                method: "transform" as const,
+                body: { method: "transform", v: 1 },
+            };
+
+            const first = transport.call(args);
+            const conn = await peer.waitForConnection();
+            await conn.authenticated;
+            const cursor = frameCursor(conn);
+            const firstOpen = await cursor.next(isRouteOpen);
+            await sendRouteOpenOk(conn, firstOpen.corr, 7, 77);
+            const firstRequest = await cursor.next(isRoutedRequest(7));
+            await sendResponse(conn, firstRequest.corr, { ok: true }, 7, 77);
+            await expect(first).resolves.toEqual({ ok: true });
+
+            const passiveClient = internals.client;
+            expect(passiveClient).not.toBeNull();
+            let closes = 0;
+            const closeClient = (passiveClient as McHostClient).close.bind(passiveClient);
+            (passiveClient as unknown as { close: () => void }).close = () => {
+                closes += 1;
+                closeClient();
+            };
+
+            const second = transport.call(args);
+            // Nothing about the peer changed, so the second request must ride the
+            // live connection. Watch for either outcome so a reconnect fails here
+            // instead of stalling on a connection this test never answers.
+            await waitUntil(
+                () =>
+                    conn.frames.filter(isRoutedRequest(7)).length >= 2 ||
+                    peer.connections.length > 1,
+            );
+            expect(peer.connections).toHaveLength(1);
+            const secondRequest = await cursor.next(isRoutedRequest(7));
+            await sendResponse(conn, secondRequest.corr, { ok: true }, 7, 77);
+            await expect(second).resolves.toEqual({ ok: true });
+
+            // A transport with no lifecycle owner certifies no daemon identity, so
+            // there is nothing to re-check between requests: one dial, one client,
+            // no close, and the cached route survives.
+            expect(internals.client).toBe(passiveClient);
+            expect(closes).toBe(0);
+            expect(conn.frames.filter(isRouteOpen)).toHaveLength(1);
+        } finally {
+            if (oldDataHome === undefined) delete process.env.XDG_DATA_HOME;
+            else process.env.XDG_DATA_HOME = oldDataHome;
+        }
+    });
+
+    it("a caller arriving mid-request never closes the shared client under it", async () => {
+        const peer = await startPeer();
+        const dataHome = join(tempDir, `inflight-home-${++fileCounter}`);
+        const connectionFile = join(dataHome, "cortexkit", "run", "subc-connection.json");
+        mkdirSync(join(dataHome, "cortexkit", "run"), { recursive: true });
+        await writeConnectionFile(connectionFile, peer);
+        const oldDataHome = process.env.XDG_DATA_HOME;
+        process.env.XDG_DATA_HOME = dataHome;
+        try {
+            const transport = trackTransport(
+                new McHostModuleTransport({ requestTimeoutMs: 5_000 }),
+            );
+            const shared = {
+                projectRoot: "/workspace/project",
+                method: "transform" as const,
+            };
+
+            const holder = transport.call({
+                ...shared,
+                sessionId: "inflight-holder",
+                body: { method: "transform", v: 1, page: "holder" },
+            });
+            const conn = await peer.waitForConnection();
+            await conn.authenticated;
+            const cursor = frameCursor(conn);
+            const holderOpen = await cursor.next(isRouteOpen);
+            await sendRouteOpenOk(conn, holderOpen.corr, 7, 77);
+            // Invoked and unanswered: this body is exactly the work a close of the
+            // shared client would retire as outcome_unknown.
+            const holderBody = await cursor.next(isRoutedRequest(7));
+
+            const arriver = transport.call({
+                ...shared,
+                sessionId: "inflight-arriver",
+                body: { method: "transform", v: 1, page: "arriver" },
+            });
+            await waitUntil(
+                () => conn.frames.filter(isRouteOpen).length >= 2 || peer.connections.length > 1,
+            );
+            expect(peer.connections).toHaveLength(1);
+            const arriverOpen = await cursor.next(isRouteOpen);
+            await sendRouteOpenOk(conn, arriverOpen.corr, 9, 1);
+            const arriverBody = await cursor.next(isRoutedRequest(9));
+            await sendResponse(conn, arriverBody.corr, { page: "arriver" }, 9, 1);
+            await expect(arriver).resolves.toEqual({ page: "arriver" });
+
+            // The daemon never changed, so the pending request keeps its own
+            // terminal instead of inheriting a connection-level unknown outcome.
+            await sendResponse(conn, holderBody.corr, { page: "holder" }, 7, 77);
+            await expect(holder).resolves.toEqual({ page: "holder" });
+        } finally {
+            if (oldDataHome === undefined) delete process.env.XDG_DATA_HOME;
+            else process.env.XDG_DATA_HOME = oldDataHome;
+        }
+    });
+
+    it("joins an in-flight dial instead of demanding managed readiness again", async () => {
+        const daemonId = Uint8Array.from([9, 8, 7, 6]);
+        let demands = 0;
+        const transport = trackTransport(
+            new McHostModuleTransport({
+                requestTimeoutMs: 5_000,
+                demandStart: async () => {
+                    demands += 1;
+                    return {
+                        ok: true,
+                        reason: "already_running",
+                        storage: "ready",
+                        authenticatedDaemonId: daemonId,
+                    };
+                },
+            }),
+        );
+        const route = { channel: 7, epoch: 77 } as RouteHandle;
+        const dial = deferred<McHostClient>();
+        let connects = 0;
+        const client = {
+            authenticated: { daemonId, daemonVer: "fake-peer/0.0.1", proof: "current" },
+            routeOpen: async () => route,
+            request: async () => ({ ok: true }),
+            close: () => undefined,
+        } as unknown as McHostClient;
+        const internals = transport as unknown as {
+            connectClient(deadline?: Deadline): Promise<McHostClient>;
+        };
+        internals.connectClient = () => {
+            connects += 1;
+            return dial.promise;
+        };
+        const shared = {
+            projectRoot: "/workspace/project",
+            method: "transform" as const,
+            body: { method: "transform", v: 1 },
+        };
+
+        const first = transport.call({ ...shared, sessionId: "dial-holder" });
+        await waitUntil(() => connects === 1);
+        expect(demands).toBe(1);
+        const second = transport.call({ ...shared, sessionId: "dial-joiner" });
+        // The joining caller lands on the held dial, so its own start transaction
+        // and compatibility probe would buy nothing but deadline and lock time.
+        await delay(30);
+        expect(demands).toBe(1);
+
+        dial.resolve(client);
+        await expect(first).resolves.toEqual({ ok: true });
+        await expect(second).resolves.toEqual({ ok: true });
+        expect(demands).toBe(1);
+        expect(connects).toBe(1);
     });
 
     it("keeps an explicit connection lifecycle-neutral", async () => {
@@ -781,13 +1031,13 @@ describe("McHostModuleTransport", () => {
         ] as unknown as McHostClient[];
         const internals = transport as unknown as {
             client: McHostClient | null;
-            ensureConnected(): Promise<McHostClient>;
+            ensureConnected(): Promise<{ client: McHostClient; expectedDaemonId?: Uint8Array }>;
         };
         internals.ensureConnected = async () => {
             const client = clients[connectionCount++];
             if (!client) throw new Error("unexpected third connection attempt");
             internals.client = client;
-            return client;
+            return { client };
         };
 
         await expect(
@@ -827,11 +1077,11 @@ describe("McHostModuleTransport", () => {
         } as unknown as McHostClient;
         const internals = transport as unknown as {
             client: McHostClient | null;
-            ensureConnected(): Promise<McHostClient>;
+            ensureConnected(): Promise<{ client: McHostClient; expectedDaemonId?: Uint8Array }>;
         };
         internals.ensureConnected = async () => {
             internals.client = client;
-            return client;
+            return { client };
         };
 
         const error = await rejection(
@@ -868,11 +1118,11 @@ describe("McHostModuleTransport", () => {
         } as unknown as McHostClient;
         const internals = transport as unknown as {
             client: McHostClient | null;
-            ensureConnected(): Promise<McHostClient>;
+            ensureConnected(): Promise<{ client: McHostClient; expectedDaemonId?: Uint8Array }>;
         };
         internals.ensureConnected = async () => {
             internals.client = client;
-            return client;
+            return { client };
         };
 
         const error = await rejection(
@@ -902,11 +1152,11 @@ describe("McHostModuleTransport", () => {
         } as unknown as McHostClient;
         const internals = transport as unknown as {
             client: McHostClient | null;
-            ensureConnected(): Promise<McHostClient>;
+            ensureConnected(): Promise<{ client: McHostClient; expectedDaemonId?: Uint8Array }>;
         };
         internals.ensureConnected = async () => {
             internals.client = client;
-            return client;
+            return { client };
         };
 
         await expect(
@@ -943,11 +1193,11 @@ describe("McHostModuleTransport", () => {
         } as unknown as McHostClient;
         const internals = transport as unknown as {
             client: McHostClient | null;
-            ensureConnected(): Promise<McHostClient>;
+            ensureConnected(): Promise<{ client: McHostClient; expectedDaemonId?: Uint8Array }>;
         };
         internals.ensureConnected = async () => {
             internals.client = client;
-            return client;
+            return { client };
         };
 
         const error = await rejection(
@@ -981,12 +1231,12 @@ describe("McHostModuleTransport", () => {
         } as unknown as McHostClient;
         const internals = transport as unknown as {
             client: McHostClient | null;
-            ensureConnected(): Promise<McHostClient>;
+            ensureConnected(): Promise<{ client: McHostClient; expectedDaemonId?: Uint8Array }>;
         };
         internals.ensureConnected = async () => {
             connectionCount += 1;
             internals.client = client;
-            return client;
+            return { client };
         };
         const startedAt = performance.now();
 
@@ -1025,12 +1275,12 @@ describe("McHostModuleTransport", () => {
         } as unknown as McHostClient;
         const internals = transport as unknown as {
             client: McHostClient | null;
-            ensureConnected(): Promise<McHostClient>;
+            ensureConnected(): Promise<{ client: McHostClient; expectedDaemonId?: Uint8Array }>;
         };
         internals.ensureConnected = async () => {
             connectionCount += 1;
             internals.client = client;
-            return client;
+            return { client };
         };
         const startedAt = performance.now();
 

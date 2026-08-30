@@ -18,6 +18,7 @@
 
 use std::collections::BTreeSet;
 use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use rustix::fd::OwnedFd;
@@ -305,15 +306,16 @@ pub struct ValidatedGeneration {
     pub digest: String,
     pub manifest: GenerationManifest,
     dir: OwnedFd,
-    path: PathBuf,
 }
 
 impl ValidatedGeneration {
-    /// Stable managed path for libraries that require pathname-based loading.
-    /// Every consumer must still perform its own no-follow/hash validation;
-    /// the retained directory descriptor remains the generation identity.
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// Stable descriptor-rooted path for in-process loaders. The generation
+    /// object must remain alive while the path is used.
+    ///
+    /// Directory traversal through this path is Linux-only; see
+    /// [`crate::harness_closure::descriptor_path`] for the platform contract.
+    pub fn descriptor_root_path(&self) -> PathBuf {
+        crate::harness_closure::descriptor_path(self.dir.as_raw_fd())
     }
 
     /// Opens one manifest-listed file through the retained validated
@@ -611,7 +613,6 @@ impl GenerationStore {
             digest: digest.to_owned(),
             manifest,
             dir,
-            path: self.generation_path(digest),
         })
     }
 
@@ -684,13 +685,6 @@ impl GenerationStore {
             }
         }
         Ok(manifest)
-    }
-
-    /// Managed pathname of one generation directory, derived from the store
-    /// root rather than resolved, so it names the same location whether or not
-    /// the directory exists yet.
-    fn generation_path(&self, name: &str) -> PathBuf {
-        self.root.join(GENERATIONS_DIR_NAME).join(name)
     }
 
     /// Available bytes for this store's destination filesystem, as seen by
@@ -1486,6 +1480,35 @@ mod tests {
         // Restaging the identical sources converges on the same digest.
         let again = stage_default(&store, src.path());
         assert_eq!(again, digest);
+    }
+
+    #[test]
+    fn descriptor_root_survives_generation_path_replacement() {
+        let root = tempfile::tempdir().expect("root");
+        let src = tempfile::tempdir().expect("src");
+        let store = store_at(root.path());
+        let digest = stage_default(&store, src.path());
+        let validated = store.validate(&digest).expect("validate");
+        let descriptor_path = validated.descriptor_root_path().join("bin/ck-mc-host");
+        let expected = std::fs::read(&descriptor_path).expect("descriptor bytes");
+
+        let generation_path = store.root().join(GENERATIONS_DIR_NAME).join(&digest);
+        let moved = store
+            .root()
+            .join(GENERATIONS_DIR_NAME)
+            .join("moved-generation");
+        std::fs::rename(&generation_path, moved).expect("rename generation");
+        std::fs::create_dir_all(generation_path.join("bin")).expect("replacement tree");
+        std::fs::write(
+            generation_path.join("bin/ck-mc-host"),
+            b"malicious replacement",
+        )
+        .expect("replacement bytes");
+
+        assert_eq!(
+            std::fs::read(descriptor_path).expect("retained descriptor bytes"),
+            expected
+        );
     }
 
     #[test]

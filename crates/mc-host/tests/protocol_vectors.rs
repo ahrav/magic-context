@@ -18,6 +18,7 @@ use support::raw_client::{
 use support::{TestHost, LINKED_MODULE_ID};
 
 const BUDGET: Duration = Duration::from_secs(5);
+const VECTOR_DAEMON_VER: &str = "mc-host/0.1.0";
 
 /// Key `00..1f`, client nonce `20..3f`, server nonce `40..5f`, daemon ID
 /// `60..6f` — the inputs the protocol's canonical proofs are computed over.
@@ -35,12 +36,12 @@ fn committed_auth_proof_vectors_pin_the_construction() {
     let (key, client_nonce, server_nonce, daemon_id) = vector_inputs();
 
     let expected_server_proof: [u8; 32] = [
-        234, 174, 245, 201, 145, 181, 54, 105, 225, 195, 92, 24, 185, 58, 79, 43, 27, 172, 41, 84,
-        85, 12, 15, 144, 129, 65, 174, 41, 163, 57, 206, 192,
+        64, 154, 84, 68, 23, 100, 116, 189, 2, 121, 137, 79, 177, 172, 107, 52, 108, 174, 152, 208,
+        218, 25, 249, 160, 154, 212, 42, 68, 91, 108, 85, 131,
     ];
     let expected_client_auth: [u8; 32] = [
-        168, 51, 199, 61, 160, 183, 32, 109, 223, 82, 6, 97, 222, 1, 81, 240, 135, 27, 140, 91,
-        196, 171, 21, 161, 69, 59, 214, 117, 64, 99, 228, 205,
+        184, 138, 243, 55, 0, 189, 88, 52, 54, 27, 4, 112, 129, 214, 202, 57, 252, 146, 75, 221,
+        119, 177, 247, 0, 193, 206, 206, 26, 90, 147, 247, 187,
     ];
 
     assert_eq!(
@@ -49,6 +50,7 @@ fn committed_auth_proof_vectors_pin_the_construction() {
             SERVER_DOMAIN,
             &client_nonce,
             &server_nonce,
+            VECTOR_DAEMON_VER,
             &daemon_id
         ),
         expected_server_proof.to_vec(),
@@ -60,6 +62,7 @@ fn committed_auth_proof_vectors_pin_the_construction() {
             CLIENT_DOMAIN,
             &client_nonce,
             &server_nonce,
+            VECTOR_DAEMON_VER,
             &daemon_id
         ),
         expected_client_auth.to_vec(),
@@ -78,6 +81,7 @@ fn proof_folds_every_input() {
         SERVER_DOMAIN,
         &client_nonce,
         &server_nonce,
+        VECTOR_DAEMON_VER,
         &daemon_id,
     );
 
@@ -98,6 +102,7 @@ fn proof_folds_every_input() {
                 SERVER_DOMAIN,
                 &client_nonce,
                 &server_nonce,
+                VECTOR_DAEMON_VER,
                 &daemon_id,
             ),
         ),
@@ -108,6 +113,7 @@ fn proof_folds_every_input() {
                 SERVER_DOMAIN,
                 &other_client,
                 &server_nonce,
+                VECTOR_DAEMON_VER,
                 &daemon_id,
             ),
         ),
@@ -118,6 +124,7 @@ fn proof_folds_every_input() {
                 SERVER_DOMAIN,
                 &client_nonce,
                 &other_server,
+                VECTOR_DAEMON_VER,
                 &daemon_id,
             ),
         ),
@@ -128,7 +135,19 @@ fn proof_folds_every_input() {
                 SERVER_DOMAIN,
                 &client_nonce,
                 &server_nonce,
+                VECTOR_DAEMON_VER,
                 &other_daemon,
+            ),
+        ),
+        (
+            "daemon version",
+            raw_client::proof(
+                &key,
+                SERVER_DOMAIN,
+                &client_nonce,
+                &server_nonce,
+                "mc-host/0.1.1",
+                &daemon_id,
             ),
         ),
     ] {

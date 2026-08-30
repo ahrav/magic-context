@@ -65,6 +65,7 @@ import {
     INPUT_KEYS,
     isPlaceholderSha256,
     OUTPUT_PATHS as U9_OUTPUT_PATHS,
+    qualificationEvidenceIdentityMismatch,
     requireQualificationEvidence,
     SOURCE_MANIFEST_PATH,
 } from "./qualify-mc-host-production-inputs";
@@ -185,12 +186,10 @@ export interface ReleaseContext {
     reservationVersions: string[];
 }
 
-function readJson(rootDir: string, relative: string): Record<string, unknown> {
-    const path = join(rootDir, relative);
-    if (!existsSync(path)) fail(`missing ${relative}`);
+function parseJson(relative: string, text: string): Record<string, unknown> {
     let parsed: unknown;
     try {
-        parsed = JSON.parse(readFileSync(path, "utf8"));
+        parsed = JSON.parse(text);
     } catch (error) {
         fail(
             `unreadable or malformed ${relative}: ${
@@ -209,6 +208,12 @@ function readJson(rootDir: string, relative: string): Record<string, unknown> {
     return parsed as Record<string, unknown>;
 }
 
+function readJson(rootDir: string, relative: string): Record<string, unknown> {
+    const path = join(rootDir, relative);
+    if (!existsSync(path)) fail(`missing ${relative}`);
+    return parseJson(relative, readFileSync(path, "utf8"));
+}
+
 /** Load and cross-verify the U8/U9 artifacts every U6 output cites (KTD7). */
 export function loadReleaseContext(rootDir: string): ReleaseContext {
     const contract = buildContract();
@@ -223,25 +228,72 @@ export function loadReleaseContext(rootDir: string): ReleaseContext {
         );
     }
 
-    // U9 evidence citation check (digest citations, not qualification): the
-    // evidence must cite the current U8 digest and the actual lock/credential
-    // file bytes.
-    const evidence = readJson(rootDir, U9_OUTPUT_PATHS.evidence) as Record<
-        string,
-        unknown
-    >;
+    const artifactBytes = {
+        production_inputs_lock: readFileSync(
+            join(rootDir, U9_OUTPUT_PATHS.lock),
+            "utf8",
+        ),
+        provider_credentials: readFileSync(
+            join(rootDir, U9_OUTPUT_PATHS.credentials),
+            "utf8",
+        ),
+    };
+    const lock = parseJson(
+        U9_OUTPUT_PATHS.lock,
+        artifactBytes.production_inputs_lock,
+    ) as ReleaseContext["lock"] & Record<string, unknown>;
+    parseJson(U9_OUTPUT_PATHS.credentials, artifactBytes.provider_credentials);
+    const lockSha256 = sha256Hex(artifactBytes.production_inputs_lock);
     if (
-        evidence.schema !== "magic-context.mc-host-release-qualification/v1" ||
-        evidence.release_contract_sha256 !== u8Digest
+        lock.release_contract_sha256 !== u8Digest ||
+        typeof lock.production_qualified !== "boolean"
     ) {
-        fail(
-            `stale or unknown U9 qualification evidence at ${U9_OUTPUT_PATHS.evidence}`,
-        );
+        fail(`stale U9 production-input lock at ${U9_OUTPUT_PATHS.lock}`);
     }
-    const artifacts = evidence.artifacts as Record<
-        string,
-        { path?: unknown; sha256?: unknown }
-    >;
+
+    const synthesizedCitations = {
+        production_inputs_lock: {
+            path: U9_OUTPUT_PATHS.lock,
+            sha256: lockSha256,
+        },
+        provider_credentials: {
+            path: U9_OUTPUT_PATHS.credentials,
+            sha256: sha256Hex(artifactBytes.provider_credentials),
+        },
+    };
+
+    // Local evidence is optional only for a committed fail-closed lock.
+    const evidencePath = join(rootDir, U9_OUTPUT_PATHS.evidence);
+    let artifacts: Record<string, { path?: unknown; sha256?: unknown }> | undefined;
+    if (existsSync(evidencePath)) {
+        const evidence = readJson(rootDir, U9_OUTPUT_PATHS.evidence);
+        // The identity rules are shared with `requireQualificationEvidence`
+        // (the U2/U6 consumption gate) so the two validators of this document
+        // cannot drift apart.
+        const identityMismatch = qualificationEvidenceIdentityMismatch(
+            evidence,
+            contract,
+            u8Digest,
+        );
+        if (identityMismatch !== null) {
+            fail(
+                `stale or unknown U9 qualification evidence at ${U9_OUTPUT_PATHS.evidence}: ${identityMismatch}`,
+            );
+        }
+        if (lock.production_qualified !== evidence.production_qualified) {
+            fail("U9 lock and evidence disagree on production qualification");
+        }
+        artifacts = evidence.artifacts as
+            | Record<string, { path?: unknown; sha256?: unknown }>
+            | undefined;
+    } else {
+        if (lock.production_qualified) {
+            fail(
+                "production-qualified U9 lock requires local qualification evidence",
+            );
+        }
+        artifacts = synthesizedCitations;
+    }
     for (const [key, relative] of [
         ["production_inputs_lock", U9_OUTPUT_PATHS.lock],
         ["provider_credentials", U9_OUTPUT_PATHS.credentials],
@@ -250,24 +302,9 @@ export function loadReleaseContext(rootDir: string): ReleaseContext {
         if (cited?.path !== relative || typeof cited.sha256 !== "string") {
             fail(`malformed U9 artifact citation for ${key}`);
         }
-        const actual = sha256Hex(readFileSync(join(rootDir, relative), "utf8"));
+        const actual = sha256Hex(artifactBytes[key]);
         if (actual !== cited.sha256)
             fail(`stale U9 artifact digest for ${relative}`);
-    }
-    const lockSha256 = artifacts.production_inputs_lock.sha256 as string;
-
-    const lock = readJson(
-        rootDir,
-        U9_OUTPUT_PATHS.lock,
-    ) as ReleaseContext["lock"] & Record<string, unknown>;
-    if (
-        lock.release_contract_sha256 !== u8Digest ||
-        typeof lock.production_qualified !== "boolean"
-    ) {
-        fail(`stale U9 production-input lock at ${U9_OUTPUT_PATHS.lock}`);
-    }
-    if (lock.production_qualified !== evidence.production_qualified) {
-        fail("U9 lock and evidence disagree on production qualification");
     }
     const limits = lock.package_size_limits_bytes;
     for (const target of PAYLOAD_TARGETS) {
@@ -782,7 +819,7 @@ export function buildTrustArtifacts(
                 bootstrap_launcher_digest: null,
                 unqualified_reason:
                     "production payload not built: release inputs are not production-qualified " +
-                    "(docs/evidence/mc-host-release-qualification.json production_qualified: false)",
+                    "(tmp/mc-host-release-qualification.json production_qualified: false)",
             };
         }
         if (payloadRoot === undefined) {

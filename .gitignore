@@ -74,6 +74,12 @@ docs/specs/
 docs/evidence/**/target/
 docs/evidence/**/Cargo.lock
 
+# Local mc-host qualification output. These records are generated from
+# machine-specific campaigns and must not be committed.
+docs/evidence/mc-host-installed-release-evidence.json
+docs/evidence/mc-host-release-qualification.json
+docs/evidence/mc-host-synapse-smoke.json
+
 # Source-built N-API modules stay local; CI never publishes prebuilds.
 *.node
 

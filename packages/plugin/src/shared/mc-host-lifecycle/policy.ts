@@ -15,9 +15,17 @@
  * path, stderr text, or native error chain rides on any result.
  */
 
-import type { AuthenticatedPeer } from "../mc-host-client/types";
+import type { AuthenticatedPeer, CatalogEntry } from "../mc-host-client";
 import { checkPlatform, type LifecycleFailureReason, type PlatformReaders } from "./bootstrap";
-import { evaluateDaemonCompatibility } from "./compatibility";
+import {
+    COMPATIBILITY_STAGES,
+    type CompatibilityInput,
+    type CompatibilityStage,
+    type CompatibilityVerdict,
+    compatibilityStageIndex,
+    evaluateCompatibility,
+    type ObservedEpochs,
+} from "./compatibility";
 import {
     classifyPreNativeRoots,
     type DaemonCheck,
@@ -70,15 +78,30 @@ export type LifecycleCommand = "start" | "stop" | "restart" | "status" | "doctor
 
 export type StorageReadiness = "ready" | "starting" | "unavailable";
 
-export interface ObservationalHealth {
-    readiness: DaemonReadiness;
-    /**
-     * The peer the probe authenticated, not just its version string. The
-     * compatibility gate is applied to it here, so handing over only the version
-     * would let an observation report `healthy` for a daemon outside the
-     * supported range while stamping that version with `proof: "current"`.
-     */
+export type { CompatibilityStage } from "./compatibility";
+
+export interface CompatibilitySnapshot {
     authenticatedPeer: AuthenticatedPeer;
+    /** Compatibility alias retained for callers reading the staged snapshot. */
+    authenticatedDaemonVersion?: string;
+    /** Compatibility alias retained for callers fencing from the staged snapshot. */
+    authenticatedDaemonId?: Uint8Array;
+    catalog: CatalogEntry[];
+    epochs: ObservedEpochs;
+    /** Last stage reached by the ordered authenticated compatibility probe. */
+    evaluatedThrough?: CompatibilityStage;
+}
+
+export interface ObservationalHealth extends CompatibilitySnapshot {
+    readiness: DaemonReadiness;
+}
+
+function compatibilityInput(snapshot: CompatibilitySnapshot): CompatibilityInput {
+    return {
+        authenticatedPeer: snapshot.authenticatedPeer,
+        catalog: snapshot.catalog,
+        epochs: snapshot.epochs,
+    };
 }
 
 /**
@@ -124,13 +147,21 @@ export interface LifecyclePolicyOptions {
     admissionIo?: AdmissionIo;
     /**
      * Post-transport storage probe used by managed Magic Context demand.
-     * U4 wires the real Magic Context status call. There is deliberately no
+     * The default reports `ready` for explicit and test-only policy instances.
+     *
+     * `expectedDaemonId` is the incarnation compatibility just certified. A probe
+     * that cannot observe that incarnation must reject rather than report a
+     * reading from another one, because the caller fences its traffic to the
+     * certified identity and would act on readiness it will never reach.
+     * U4 wires the real Magic Context status call. There is no
      * permissive default: an unset probe reports `unavailable`, because a
      * default of `ready` would authorize application bodies against a daemon
      * whose storage state was never examined. Explicit CLI flows are
      * unaffected — they never reach `demandStart`.
      */
-    storageProbe?: (budgetMs: number) => Promise<StorageReadiness>;
+    storageProbe?: (budgetMs: number, expectedDaemonId?: Uint8Array) => Promise<StorageReadiness>;
+    /** Authenticated daemon, catalog, and Magic Context epoch snapshot for demand. */
+    compatibilityProbe?: (budgetMs: number, signal?: AbortSignal) => Promise<CompatibilitySnapshot>;
     /** Authenticated route-free component health for status and doctor. */
     readinessProbe?: (budgetMs: number) => Promise<ObservationalHealth>;
     /** Dev/test payload directory forwarded to native start/restart. */
@@ -139,6 +170,8 @@ export interface LifecyclePolicyOptions {
     payloadManifestDigest?: string;
     /** Deferred certified package lookup after native current validation says missing. */
     payloadDirFallback?: () => string | null;
+    /** Credential-only fallback used by CLI start/restart callers. */
+    defaultStartupEnvelope?: NativeStartupEnvelope;
     outerAggregateMs?: number;
 }
 
@@ -212,6 +245,8 @@ export interface DemandStartOutcome {
      * Callers must send no Rust application body unless this is `ready`.
      */
     storage: StorageReadiness | null;
+    /** Authenticated incarnation that passed compatibility; bind application traffic to it. */
+    authenticatedDaemonId?: Uint8Array;
 }
 
 export class McHostLifecyclePolicy {
@@ -220,15 +255,24 @@ export class McHostLifecyclePolicy {
     private readonly bootstrapFailure: LifecycleFailureReason | undefined;
     private readonly platformReaders: PlatformReaders | undefined;
     private readonly admissionIo: AdmissionIo | undefined;
-    private readonly storageProbe: (budgetMs: number) => Promise<StorageReadiness>;
+    private readonly storageProbe: (
+        budgetMs: number,
+        expectedDaemonId?: Uint8Array,
+    ) => Promise<StorageReadiness>;
+    private readonly compatibilityProbe:
+        | ((budgetMs: number, signal?: AbortSignal) => Promise<CompatibilitySnapshot>)
+        | undefined;
     private readonly readinessProbe:
         | ((budgetMs: number) => Promise<ObservationalHealth>)
         | undefined;
     private readonly payloadDir: string | undefined;
     private readonly payloadManifestDigest: string | undefined;
     private readonly payloadDirFallback: (() => string | null) | undefined;
+    private readonly defaultStartupEnvelope: NativeStartupEnvelope | undefined;
     private readonly outerAggregateMs: number | undefined;
     private readonly inflightStarts = new Map<string, Promise<DaemonResultV1>>();
+    /** One in-flight compatibility probe per data root, keyed independently of capability. */
+    private readonly inflightCompatibility = new Map<string, Promise<CompatibilitySnapshot>>();
 
     constructor(options: LifecyclePolicyOptions = {}) {
         this.env = options.env ?? process.env;
@@ -238,10 +282,12 @@ export class McHostLifecyclePolicy {
         this.admissionIo = options.admissionIo;
         // Fail closed: an unwired probe must not assert readiness.
         this.storageProbe = options.storageProbe ?? (async () => "unavailable");
+        this.compatibilityProbe = options.compatibilityProbe;
         this.readinessProbe = options.readinessProbe;
         this.payloadDir = options.payloadDir;
         this.payloadManifestDigest = options.payloadManifestDigest;
         this.payloadDirFallback = options.payloadDirFallback;
+        this.defaultStartupEnvelope = options.defaultStartupEnvelope;
         // Left undefined when the caller does not pin it: the qualified default
         // depends on the platform-gate target, which `preflight` resolves per
         // command rather than in the constructor — `checkPlatform`'s darwin arm
@@ -254,7 +300,9 @@ export class McHostLifecyclePolicy {
         return this.inflightStarts.size;
     }
 
-    async start(startupEnvelope?: NativeStartupEnvelope): Promise<DaemonResultV1> {
+    async start(
+        startupEnvelope: NativeStartupEnvelope | undefined = this.defaultStartupEnvelope,
+    ): Promise<DaemonResultV1> {
         return this.mutatingCommand("start", startupEnvelope);
     }
 
@@ -263,8 +311,10 @@ export class McHostLifecyclePolicy {
     }
 
     /** One native restart transaction; never emulated as TS stop+start. */
-    async restart(): Promise<DaemonResultV1> {
-        return this.mutatingCommand("restart");
+    async restart(
+        startupEnvelope: NativeStartupEnvelope | undefined = this.defaultStartupEnvelope,
+    ): Promise<DaemonResultV1> {
+        return this.mutatingCommand("restart", startupEnvelope);
     }
 
     async status(): Promise<DaemonResultV1> {
@@ -327,72 +377,161 @@ export class McHostLifecyclePolicy {
                 });
         }
         const result = await this.raceWaiter(shared, request, startedAt);
-        if (request.capability !== "magic-context" || !result.ok) {
+        if (!result.ok) {
             return { result, storage: null };
         }
-        const storage = await this.boundedStorageProbe(request, startedAt);
-        return { result, storage };
+        const remaining = (): number | undefined =>
+            request.deadlineMs === undefined
+                ? undefined
+                : Math.max(0, request.deadlineMs - (monotonicNow() - startedAt));
+        let remainingMs = remaining();
+        if (remainingMs === 0) throw new WaiterDetachedError("deadline");
+        let compatibleResult = result;
+        let authenticatedDaemonId: Uint8Array | undefined;
+        if (this.compatibilityProbe !== undefined) {
+            let snapshot: CompatibilitySnapshot;
+            try {
+                snapshot = await this.raceDetached(
+                    this.sharedCompatibility(
+                        rootResolution.ok ? rootResolution.root : "\u0000no-root",
+                        this.compatibilityAggregateMs(),
+                    ),
+                    request.signal,
+                    remainingMs,
+                );
+            } catch (error) {
+                // Detachment is the caller's own deadline or signal and stays a
+                // thrown control outcome. Any other probe failure is an unproven
+                // compatibility claim, so it becomes a typed closed result rather
+                // than an unclassified rejection callers cannot act on.
+                if (error instanceof WaiterDetachedError) throw error;
+                return {
+                    result: {
+                        ...result,
+                        ok: false,
+                        reason: "native_probe_unavailable",
+                        remediation: remediationForReason("native_probe_unavailable"),
+                    },
+                    storage: null,
+                };
+            }
+            const applied = this.applyCompatibility(result, snapshot);
+            compatibleResult = applied.result;
+            if (!applied.verdict.ok) return { result: compatibleResult, storage: null };
+            authenticatedDaemonId = Uint8Array.from(snapshot.authenticatedPeer.daemonId);
+            remainingMs = remaining();
+            if (remainingMs === 0) throw new WaiterDetachedError("deadline");
+        }
+        if (request.capability !== "magic-context") {
+            return { result: compatibleResult, storage: null, authenticatedDaemonId };
+        }
+        const storageBudget =
+            remainingMs === undefined
+                ? STORAGE_HARD_BUDGET_MS
+                : Math.min(STORAGE_HARD_BUDGET_MS, remainingMs);
+        let storage: StorageReadiness;
+        try {
+            storage = await this.raceDetached(
+                this.storageProbe(storageBudget, authenticatedDaemonId),
+                request.signal,
+                storageBudget,
+            );
+        } catch (error) {
+            if (error instanceof WaiterDetachedError) throw error;
+            // Compatibility is already proven. A failed storage observation
+            // cannot erase that proof; it only means this demand may not publish
+            // application traffic.
+            return { result: compatibleResult, storage: "unavailable", authenticatedDaemonId };
+        }
+        return { result: compatibleResult, storage, authenticatedDaemonId };
     }
 
     /**
-     * Run the storage probe under the policy's own bound rather than trusting
-     * it to honor the budget it is handed.
+     * One compatibility probe per data root in flight. The snapshot describes the
+     * daemon incarnation, not the requesting capability, so concurrent demands
+     * share one connection and one `catalog.list`/`host.status` pair instead of
+     * each opening its own. The shared probe carries no caller signal; callers
+     * bound their own wait with `raceDetached`, so one detaching caller cannot
+     * cancel the probe another is still awaiting.
      *
-     * `raceWaiter` has already cleared its timer and detached the abort
-     * listener by the time the start resolves, so without this the probe would
-     * be both unbounded and uncancellable: a hanging probe would keep
-     * `demandStart` pending forever with the caller's signal and deadline no
-     * longer watching. Expiry, abort, and probe failure — rejected or thrown
-     * synchronously — all degrade to `unavailable`, never to `ready`, and the
-     * already-successful start result is still returned.
+     * Its budget is the policy's own aggregate, never the creating caller's
+     * remaining deadline: a nearly expired waiter arriving first would otherwise
+     * mint a probe too short for the long-lived waiters that join it, and they
+     * would read that truncated failure as an unproven compatibility claim while
+     * still holding ample time.
      */
-    private async boundedStorageProbe(
-        request: DemandStartRequest,
-        startedAt: number,
-    ): Promise<StorageReadiness> {
-        const remaining =
-            request.deadlineMs === undefined
-                ? STORAGE_HARD_BUDGET_MS
-                : Math.min(
-                      STORAGE_HARD_BUDGET_MS,
-                      request.deadlineMs - (monotonicNow() - startedAt),
-                  );
-        if (remaining <= 0) return "unavailable";
-        let timer: ReturnType<typeof setTimeout> | null = null;
-        let onAbort: (() => void) | null = null;
-        try {
-            return await new Promise<StorageReadiness>((resolve) => {
-                let settled = false;
-                const finish = (value: StorageReadiness): void => {
+    private sharedCompatibility(root: string, budgetMs: number): Promise<CompatibilitySnapshot> {
+        const probe = this.compatibilityProbe;
+        if (probe === undefined) {
+            return Promise.reject(new Error("compatibility probe is unavailable"));
+        }
+        const existing = this.inflightCompatibility.get(root);
+        if (existing) return existing;
+        const shared = probe(budgetMs);
+        this.inflightCompatibility.set(root, shared);
+        const evict = (): void => {
+            if (this.inflightCompatibility.get(root) === shared) {
+                this.inflightCompatibility.delete(root);
+            }
+        };
+        void shared.then(evict, evict);
+        return shared;
+    }
+
+    private compatibilityAggregateMs(): number {
+        if (this.outerAggregateMs !== undefined) return this.outerAggregateMs;
+        const platform = checkPlatform(this.platformReaders);
+        return platform.ok ? aggregateForTarget(platform.target) : OUTER_AGGREGATE_MS;
+    }
+
+    private raceDetached<T>(
+        shared: Promise<T>,
+        signal: AbortSignal | undefined,
+        deadlineMs: number | undefined,
+    ): Promise<T> {
+        if (!signal && deadlineMs === undefined) return shared;
+        return new Promise<T>((resolve, reject) => {
+            let settled = false;
+            let timer: ReturnType<typeof setTimeout> | null = null;
+            const detach = (kind: "aborted" | "deadline"): void => {
+                if (settled) return;
+                settled = true;
+                if (timer !== null) clearTimeout(timer);
+                signal?.removeEventListener("abort", onAbort);
+                reject(new WaiterDetachedError(kind));
+            };
+            const onAbort = (): void => detach("aborted");
+            if (signal) {
+                if (signal.aborted) {
+                    detach("aborted");
+                    return;
+                }
+                signal.addEventListener("abort", onAbort, { once: true });
+            }
+            if (deadlineMs !== undefined) {
+                if (deadlineMs <= 0) {
+                    detach("deadline");
+                    return;
+                }
+                timer = setTimeout(() => detach("deadline"), deadlineMs);
+            }
+            shared.then(
+                (value) => {
                     if (settled) return;
                     settled = true;
+                    if (timer !== null) clearTimeout(timer);
+                    signal?.removeEventListener("abort", onAbort);
                     resolve(value);
-                };
-                timer = setTimeout(() => finish("unavailable"), remaining);
-                if (request.signal) {
-                    if (request.signal.aborted) {
-                        finish("unavailable");
-                        return;
-                    }
-                    onAbort = () => finish("unavailable");
-                    request.signal.addEventListener("abort", onAbort, { once: true });
-                }
-                // A probe that throws before returning its promise fails the
-                // same way a rejection does; letting it escape the executor
-                // would reject `demandStart` instead of reporting readiness.
-                try {
-                    this.storageProbe(remaining).then(
-                        (value) => finish(value),
-                        () => finish("unavailable"),
-                    );
-                } catch {
-                    finish("unavailable");
-                }
-            });
-        } finally {
-            if (timer !== null) clearTimeout(timer);
-            if (onAbort !== null) request.signal?.removeEventListener("abort", onAbort);
-        }
+                },
+                (error: unknown) => {
+                    if (settled) return;
+                    settled = true;
+                    if (timer !== null) clearTimeout(timer);
+                    signal?.removeEventListener("abort", onAbort);
+                    reject(error instanceof Error ? error : new Error(String(error)));
+                },
+            );
+        });
     }
 
     private raceWaiter(
@@ -605,6 +744,11 @@ export class McHostLifecyclePolicy {
     private async observationalCommand(command: "status" | "doctor"): Promise<DaemonResultV1> {
         const preflight = this.preflight(command);
         if (!preflight.ok) return preflight.result;
+        const platform = checkPlatform(this.platformReaders);
+        if (!platform.ok) {
+            const state = preNativeState(classifyPreNativeRoots(preflight.root));
+            return localResult(command, false, state, "unsupported_platform");
+        }
         if (this.launchTarget === null) {
             // No trusted retained current-release bootstrap: only the bounded
             // no-follow classifier may speak, and it authorizes nothing.
@@ -644,7 +788,10 @@ export class McHostLifecyclePolicy {
             } catch {
                 return relabeled;
             }
-            const checks: DaemonCheck[] = [...relabeled.checks];
+            const { result: compatible } = this.applyCompatibility(relabeled, observed);
+            const checksById = new Map(
+                compatible.checks.map((check) => [check.id, check] as const),
+            );
             const addCheck = (
                 id: "readiness.transport" | "readiness.storage" | "readiness.synapse",
                 record: NonNullable<DaemonReadiness[keyof DaemonReadiness]>,
@@ -655,7 +802,7 @@ export class McHostLifecyclePolicy {
                         : record.state === "unsupported"
                           ? "skip"
                           : "fail";
-                checks.push({
+                checksById.set(id, {
                     id,
                     status,
                     reason: record.reason,
@@ -671,23 +818,9 @@ export class McHostLifecyclePolicy {
             if (observed.readiness.synapse) {
                 addCheck("readiness.synapse", observed.readiness.synapse);
             }
-            // Readiness answers "are the components serving", never "may this
-            // client talk to this daemon at all". Without this gate an
-            // observation of a running daemon whose authenticated version is
-            // outside the supported half-open range reported `healthy` and then
-            // stamped that version with `proof: "current"` — a compatibility
-            // verdict inverted by omission. It joins `checks` rather than
-            // short-circuiting so the contract's failing-reason precedence still
-            // decides what gets reported when readiness is also degraded.
-            const compatibility = evaluateDaemonCompatibility(observed.authenticatedPeer);
-            if (!compatibility.ok) {
-                checks.push({
-                    id: "compatibility.daemon",
-                    status: "fail",
-                    reason: compatibility.reason,
-                    remediation: remediationForReason(compatibility.reason),
-                });
-            }
+            const checks = [...checksById.values()].sort((left, right) =>
+                left.id.localeCompare(right.id),
+            );
             // The check list is ordered by id because the v1 result requires
             // lexicographically sorted unique check ids. The reported reason is
             // NOT that order: the release contract ships one precedence list for
@@ -704,21 +837,64 @@ export class McHostLifecyclePolicy {
                     return candidate < winning ? check : winner;
                 }, undefined);
             return {
-                ...relabeled,
+                ...compatible,
+                command,
                 ok: failed === undefined,
                 reason: failed?.reason ?? "healthy",
                 remediation: failed?.remediation ?? null,
                 readiness: observed.readiness,
                 checks,
-                versions: {
-                    ...relabeled.versions,
-                    proof: "current",
-                    daemon: observed.authenticatedPeer.daemonVer,
-                },
             };
         } catch (error) {
             return this.launchFailure(command, preflight.root, error);
         }
+    }
+
+    private applyCompatibility(
+        result: DaemonResultV1,
+        snapshot: CompatibilitySnapshot,
+    ): { result: DaemonResultV1; verdict: CompatibilityVerdict } {
+        const input = compatibilityInput(snapshot);
+        const verdict = evaluateCompatibility(input);
+        const evaluatedThroughIndex = compatibilityStageIndex(
+            snapshot.evaluatedThrough ?? "epochs",
+        );
+        const checksById = new Map(result.checks.map((check) => [check.id, check] as const));
+        for (const [index, stage] of COMPATIBILITY_STAGES.entries()) {
+            // Only stages the probe actually reached are reported; a check for
+            // an unevaluated stage would assert an observation never made.
+            if (index > evaluatedThroughIndex) continue;
+            const stageVerdict = stage.evaluate(input);
+            const reason = stageVerdict.ok ? "healthy" : stageVerdict.reason;
+            checksById.set(stage.checkId, {
+                id: stage.checkId,
+                status: stageVerdict.ok ? "pass" : "fail",
+                reason,
+                remediation: remediationForReason(reason),
+            });
+        }
+        const moduleVersion = (moduleId: string): string | null =>
+            snapshot.catalog.find((entry) => entry.module_id === moduleId)?.module_version ?? null;
+        return {
+            verdict,
+            result: {
+                ...result,
+                ok: result.ok && verdict.ok,
+                reason: verdict.ok ? result.reason : verdict.reason,
+                remediation: verdict.ok ? result.remediation : remediationForReason(verdict.reason),
+                checks: [...checksById.values()].sort((left, right) =>
+                    left.id.localeCompare(right.id),
+                ),
+                versions: {
+                    ...result.versions,
+                    proof: "current",
+                    daemon: snapshot.authenticatedPeer.daemonVer,
+                    magic_context: moduleVersion("magic-context"),
+                    synapse: moduleVersion("synapse"),
+                    broca: moduleVersion("broca"),
+                },
+            },
+        };
     }
 
     /**
