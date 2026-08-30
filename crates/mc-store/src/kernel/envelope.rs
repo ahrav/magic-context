@@ -11,6 +11,7 @@ use crate::current_time_ms;
 pub enum Sensitivity {
     Normal,
     Sensitive,
+    Secret,
 }
 
 impl Sensitivity {
@@ -18,14 +19,16 @@ impl Sensitivity {
         match self {
             Self::Normal => "normal",
             Self::Sensitive => "sensitive",
+            Self::Secret => "secret",
         }
     }
 
-    /// An unrecognized or legacy stored class resolves to `Sensitive` rather than to `Normal`.
+    /// An unrecognized stored class resolves to `Secret`, the strictest handling.
     fn from_stored(value: &str) -> Self {
         match value {
             "normal" => Self::Normal,
-            _ => Self::Sensitive,
+            "sensitive" => Self::Sensitive,
+            _ => Self::Secret,
         }
     }
 }
@@ -117,6 +120,8 @@ pub struct AlignmentProjectionSpec {
 }
 
 const DOMAIN_OBJECT_KIND: &str = "domain";
+/// R4 caps an active staging lease at one hour past its last heartbeat.
+const MAX_STAGING_LEASE_MS: i64 = 3_600_000;
 
 struct PendingChange {
     object: ObjectRow,
@@ -720,7 +725,10 @@ struct RedactedIntent {
 
 impl RedactedIntent {
     fn new(intent: CommitIntent) -> Result<Self, KernelError> {
-        if !mc_core::claim_operation::is_lower_hex(&intent.request_digest, 64) {
+        if !mc_core::claim_operation::is_lower_hex(&intent.request_digest, 64)
+            || intent.producer.trim().is_empty()
+            || intent.operation_key.trim().is_empty()
+        {
             return Err(KernelError::InvalidInput);
         }
         Ok(Self {
@@ -879,9 +887,14 @@ struct RedactedCandidate {
 
 impl RedactedCandidate {
     fn new(spec: StagingCandidateSpec) -> Result<Self, KernelError> {
+        let lease_ceiling = spec
+            .recorded_at
+            .checked_add(MAX_STAGING_LEASE_MS)
+            .ok_or(KernelError::InvalidInput)?;
         if spec.source_revision < 0
             || spec.recorded_at < 0
             || spec.lease_expires_at <= spec.recorded_at
+            || spec.lease_expires_at > lease_ceiling
             || spec.extraction_run_id.trim().is_empty()
             || spec.candidate_id.trim().is_empty()
         {
@@ -921,14 +934,15 @@ impl RedactedCandidate {
         }
     }
 
-    /// Repository provenance does not by itself make a payload shareable.
+    /// A vocabulary-covered detection is secret, which is stricter than the
+    /// sensitive class that unproven provenance already yields.
     fn candidate_sensitivity(&self) -> Sensitivity {
         let detected = self
             .candidate_fields()
             .into_iter()
             .any(|(_, field)| !field.detections.is_empty());
         if detected {
-            Sensitivity::Sensitive
+            Sensitivity::Secret
         } else {
             self.run_sensitivity()
         }

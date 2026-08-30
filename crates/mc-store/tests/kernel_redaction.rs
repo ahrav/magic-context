@@ -149,8 +149,33 @@ fn staging_requires_affirmative_repository_provenance_for_normal() {
             lease_expires_at: 2,
         })
         .unwrap();
-    assert_eq!(unknown.sensitivity, Sensitivity::Sensitive);
+    assert_eq!(
+        unknown.sensitivity,
+        Sensitivity::Secret,
+        "a vocabulary detection is secret, not merely sensitive"
+    );
     assert!(!unknown.payload.contains(SECRET));
+
+    let unproven_clean = store
+        .stage_candidate(StagingCandidateSpec {
+            extraction_run_id: "run-unproven-clean".to_string(),
+            candidate_id: "candidate-unproven-clean".to_string(),
+            extractor: "fixture".to_string(),
+            source_kind: "tool".to_string(),
+            source_id: "unknown-clean".to_string(),
+            source_revision: 1,
+            candidate_kind: "observation".to_string(),
+            payload: "no secret here".to_string(),
+            provenance: None,
+            recorded_at: 1,
+            lease_expires_at: 2,
+        })
+        .unwrap();
+    assert_eq!(
+        unproven_clean.sensitivity,
+        Sensitivity::Sensitive,
+        "unproven provenance defaults to sensitive"
+    );
 
     let proven = store
         .stage_candidate(StagingCandidateSpec {
@@ -285,7 +310,7 @@ fn one_run_accepts_candidates_with_different_classifications() {
     );
     assert_eq!(
         store.stage_candidate(secret).unwrap().sensitivity,
-        Sensitivity::Sensitive
+        Sensitivity::Secret
     );
 
     let connection = Connection::open_with_flags(
@@ -310,7 +335,7 @@ fn one_run_accepts_candidates_with_different_classifications() {
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
     classes.sort();
-    assert_eq!(classes, ["normal", "sensitive"]);
+    assert_eq!(classes, ["normal", "secret"]);
 }
 
 #[test]
@@ -391,4 +416,56 @@ fn a_zero_duration_lease_is_invalid_input_not_a_conflict() {
         store.stage_candidate(spec).unwrap_err(),
         KernelError::InvalidInput
     );
+}
+
+#[test]
+fn a_lease_beyond_the_one_hour_ceiling_is_rejected() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let mut over = shared_run_candidate("candidate-over", 1_000);
+    over.lease_expires_at = over.recorded_at + 3_600_001;
+    assert_eq!(
+        store.stage_candidate(over).unwrap_err(),
+        KernelError::InvalidInput
+    );
+
+    let mut saturating = shared_run_candidate("candidate-saturating", 1_000);
+    saturating.recorded_at = i64::MAX;
+    saturating.lease_expires_at = i64::MAX;
+    assert_eq!(
+        store.stage_candidate(saturating).unwrap_err(),
+        KernelError::InvalidInput,
+        "the ceiling must use checked arithmetic"
+    );
+
+    let mut exact = shared_run_candidate("candidate-exact", 1_000);
+    exact.lease_expires_at = exact.recorded_at + 3_600_000;
+    store.stage_candidate(exact).unwrap();
+}
+
+#[test]
+fn a_blank_commit_identity_component_is_rejected() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    for (producer, operation_key) in [("", "op"), ("   ", "op"), ("prod", ""), ("prod", "\t")] {
+        let mut bad = intent("unused", 'a');
+        bad.producer = producer.to_string();
+        bad.operation_key = operation_key.to_string();
+        assert_eq!(
+            store.commit(bad, |_| Ok(String::new())).unwrap_err(),
+            KernelError::InvalidInput,
+            "producer={producer:?} operation_key={operation_key:?}"
+        );
+    }
+    assert_eq!(
+        inspect_count(directory.path(), "SELECT COUNT(*) FROM commit_log"),
+        0
+    );
+}
+
+fn inspect_count(root: &std::path::Path, sql: &str) -> i64 {
+    let connection =
+        Connection::open_with_flags(root.join("core.sqlite"), OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    connection.query_row(sql, [], |row| row.get(0)).unwrap()
 }
