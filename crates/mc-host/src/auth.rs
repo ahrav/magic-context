@@ -1029,10 +1029,7 @@ mod tests {
         let conn = ConnectionInfo {
             schema: crate::connection_file::SCHEMA_VERSION,
             wire_version: crate::wire::PROTOCOL_VERSION,
-            endpoints: vec![crate::connection_file::Endpoint {
-                host: "127.0.0.1".to_owned(),
-                port: 1,
-            }],
+            setup_socket: "/tmp/mc-host.sock".to_owned(),
             key: key.clone(),
             daemon_id: expected_daemon_id,
             pid: 1,

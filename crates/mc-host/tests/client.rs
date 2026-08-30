@@ -6,9 +6,8 @@ use std::{path::PathBuf, time::Duration};
 use std::os::unix::fs::{symlink, PermissionsExt};
 
 use mc_host::{
-    auth::authenticate_server,
-    connection_file::{ConnectionInfo, Endpoint},
-    Client, LivenessPolicy, RequestOptions, RouteIdentity, RouteTarget, SendOutcome, TargetKind,
+    auth::authenticate_server, connection_file::ConnectionInfo, Client, LivenessPolicy,
+    RequestOptions, RouteIdentity, RouteTarget, SendOutcome, TargetKind,
 };
 use support::{
     mode_body,
@@ -367,10 +366,11 @@ async fn managed_client_negotiation_failures_retire_socket_without_application_f
         let info = ConnectionInfo {
             schema: 1,
             wire_version: 2,
-            endpoints: vec![Endpoint {
-                host: "127.0.0.1".to_owned(),
-                port: listener.local_addr().unwrap().port(),
-            }],
+            setup_socket: root
+                .path()
+                .join("setup.sock")
+                .to_string_lossy()
+                .into_owned(),
             key: key.clone(),
             daemon_id,
             pid: std::process::id(),
@@ -461,10 +461,11 @@ async fn a_rewritten_daemon_ver_fails_the_handshake() {
     let info = ConnectionInfo {
         schema: 1,
         wire_version: 2,
-        endpoints: vec![Endpoint {
-            host: "127.0.0.1".to_owned(),
-            port: listener.local_addr().unwrap().port(),
-        }],
+        setup_socket: root
+            .path()
+            .join("setup.sock")
+            .to_string_lossy()
+            .into_owned(),
         key: key.clone(),
         daemon_id,
         pid: std::process::id(),
@@ -527,10 +528,11 @@ async fn zero_length_stream_item_is_delivered_and_does_not_retire_the_connection
     let info = ConnectionInfo {
         schema: 1,
         wire_version: 2,
-        endpoints: vec![Endpoint {
-            host: "127.0.0.1".to_owned(),
-            port: listener.local_addr().unwrap().port(),
-        }],
+        setup_socket: root
+            .path()
+            .join("setup.sock")
+            .to_string_lossy()
+            .into_owned(),
         key: key.clone(),
         daemon_id,
         pid: std::process::id(),

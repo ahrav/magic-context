@@ -38,6 +38,8 @@ mod instance;
 mod panic_boundary;
 mod routing;
 mod runtime;
+#[doc(hidden)]
+pub mod setup_socket;
 mod tcp_frame_channel;
 // Doc-hidden rather than private because `shm_provider`'s public `send`/`recv`
 // already take and return `EnvelopeHeader`, so the type must be nameable by any
@@ -65,8 +67,8 @@ pub use composite::{
 };
 pub use config::{ConfigError, HostConfig, HostInit, HostLimits, HostTiming, LivenessPolicy};
 pub use connection_file::{
-    read_for_client as read_connection_file, ConnectionFileError, ConnectionInfo, Endpoint,
-    DAEMON_ID_LEN, KEY_LEN, MAX_CONNECTION_FILE_LEN, MIN_KEY_LEN, SCHEMA_VERSION,
+    read_for_client as read_connection_file, ConnectionFileError, ConnectionInfo, DAEMON_ID_LEN,
+    KEY_LEN, MAX_CONNECTION_FILE_LEN, MIN_KEY_LEN, SCHEMA_VERSION,
 };
 pub use handler::{
     BindOutcome, HealthReport, HealthStatus, InitError, ManifestSnapshot, McHostHandler,

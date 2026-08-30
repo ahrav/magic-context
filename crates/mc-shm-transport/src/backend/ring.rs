@@ -4,7 +4,6 @@ use std::fmt;
 use std::fs::File;
 use std::marker::PhantomData;
 use std::mem::size_of;
-#[cfg(target_os = "linux")]
 use std::os::fd::RawFd;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
@@ -206,7 +205,6 @@ fn residency_vector_len(mapping_len: usize, page_size: usize) -> usize {
 }
 
 struct Mapping {
-    #[cfg(target_os = "linux")]
     fd: OwnedFd,
     base: NonNull<u8>,
     len: usize,
@@ -236,14 +234,7 @@ impl Mapping {
             return Err(RingError::ObjectSetupFailed);
         }
         let base = NonNull::new(mapped.cast()).ok_or(RingError::ObjectSetupFailed)?;
-        #[cfg(target_os = "macos")]
-        drop(fd);
-        Ok(Self {
-            #[cfg(target_os = "linux")]
-            fd,
-            base,
-            len,
-        })
+        Ok(Self { fd, base, len })
     }
 
     fn attach(fd: OwnedFd, len: usize) -> Result<Self, RingError> {
@@ -265,17 +256,9 @@ impl Mapping {
             return Err(RingError::ObjectSetupFailed);
         }
         let base = NonNull::new(mapped.cast()).ok_or(RingError::ObjectSetupFailed)?;
-        #[cfg(target_os = "macos")]
-        drop(fd);
-        Ok(Self {
-            #[cfg(target_os = "linux")]
-            fd,
-            base,
-            len,
-        })
+        Ok(Self { fd, base, len })
     }
 
-    #[cfg(target_os = "linux")]
     const fn fd(&self) -> &OwnedFd {
         &self.fd
     }
@@ -494,14 +477,12 @@ impl fmt::Debug for RingGrant {
 }
 
 /// Ring attachment handle. commentlint: allow(JUDGE)
-#[cfg(target_os = "linux")]
 pub struct RingAttachment {
     fd: OwnedFd,
     grant: RingGrant,
     scheduling: SchedulingMode,
 }
 
-#[cfg(target_os = "linux")]
 impl RingAttachment {
     /// Attaches ring. commentlint: allow(JUDGE)
     pub fn attach(self) -> Result<Ring, RingError> {
@@ -512,9 +493,13 @@ impl RingAttachment {
     pub const fn grant(&self) -> RingGrant {
         self.grant
     }
+
+    /// Splits the transferable descriptor from its authenticated grant.
+    pub fn into_parts(self) -> (OwnedFd, RingGrant, SchedulingMode) {
+        (self.fd, self.grant, self.scheduling)
+    }
 }
 
-#[cfg(target_os = "linux")]
 impl fmt::Debug for RingAttachment {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("RingAttachment(<redacted>)")
@@ -613,13 +598,11 @@ impl Ring {
     }
 
     /// Shared object descriptor for authenticated transfer.
-    #[cfg(target_os = "linux")]
     pub fn raw_fd(&self) -> RawFd {
         self.mapping.fd.as_raw_fd()
     }
 
     /// Duplicates attachment handle. commentlint: allow(JUDGE)
-    #[cfg(target_os = "linux")]
     pub fn attachment(&self) -> Result<RingAttachment, RingError> {
         // SAFETY: F_DUPFD_CLOEXEC duplicates owned valid descriptor.
         let raw = unsafe { libc::fcntl(self.raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
@@ -636,7 +619,6 @@ impl Ring {
     }
 
     /// Controls close-on-exec for child re-exec tests and handle transfer.
-    #[cfg(target_os = "linux")]
     pub fn set_inheritable(&self, inheritable: bool) -> Result<(), RingError> {
         // SAFETY: F_GETFD reads flags from owned valid fd.
         let current = unsafe { libc::fcntl(self.raw_fd(), libc::F_GETFD) };

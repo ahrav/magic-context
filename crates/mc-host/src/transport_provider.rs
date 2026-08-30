@@ -14,6 +14,7 @@
 
 use std::fmt;
 use std::future::Future;
+use std::os::fd::OwnedFd;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -82,6 +83,7 @@ pub struct Candidate {
 /// descriptor for the client, a binding identity, and the candidate channel.
 pub struct PreparedCandidate {
     pub descriptor: serde_json::Value,
+    pub descriptors: Option<[OwnedFd; crate::setup_socket::RING_DESCRIPTOR_COUNT]>,
     pub candidate_id: u64,
     pub candidate: Candidate,
 }
@@ -91,6 +93,7 @@ impl fmt::Debug for PreparedCandidate {
         // The descriptor is provider data and never reaches formatting (R14).
         f.debug_struct("PreparedCandidate")
             .field("descriptor", &"<opaque>")
+            .field("descriptors", &"<redacted>")
             .field("candidate_id", &self.candidate_id)
             .finish_non_exhaustive()
     }
@@ -287,6 +290,14 @@ impl TransportProviders {
         self.injected
             .iter()
             .any(|entry| &*entry.transport == transport)
+    }
+
+    pub(crate) fn fixed_ring(&self) -> Option<Arc<dyn InjectedProvider>> {
+        self.find(
+            crate::shm_provider::SHM_TRANSPORT,
+            crate::shm_provider::SHM_CAPABILITY_VERSION,
+        )
+        .cloned()
     }
 }
 

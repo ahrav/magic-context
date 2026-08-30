@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use tokio::net::TcpListener;
+use tokio::net::UnixListener;
 use tokio::sync::Semaphore;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::{timeout, timeout_at, Instant};
@@ -819,13 +819,15 @@ pub async fn run<H: McHostHandler>(
         if shutdown.is_cancelled() {
             return Ok(None);
         }
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .map_err(HostError::Io)?;
-        let port = listener.local_addr().map_err(HostError::Io)?.port();
+        let setup_socket = cleanup.guard_mut().dir_path().join("setup.sock");
+        let listener =
+            crate::setup_socket::bind_owner_only(&setup_socket).map_err(HostError::Io)?;
         cleanup
             .guard_mut()
-            .publish(port, &config.daemon_ver)
+            .register_setup_socket(setup_socket.clone());
+        cleanup
+            .guard_mut()
+            .publish(&setup_socket, &config.daemon_ver)
             .map_err(HostError::Instance)?;
         // Best effort: transport is already published, so a failed phase
         // rewrite must not tear down a serving host — probes then observe a
@@ -833,10 +835,10 @@ pub async fn run<H: McHostHandler>(
         let _ = cleanup
             .guard_mut()
             .write_lifecycle_record(crate::lifecycle::LifecyclePhase::Running);
-        Ok(Some(listener))
+        Ok(Some((listener, setup_socket)))
     }
     .await;
-    let listener = match setup {
+    let (listener, setup_socket) = match setup {
         Ok(Some(listener)) => listener,
         Ok(None) => {
             cleanup.finish().await;
@@ -908,6 +910,7 @@ pub async fn run<H: McHostHandler>(
     spawn_activation_task(&shared);
     spawn_health_task(&shared);
     accept_loop(&shared, listener).await;
+    let _ = std::fs::remove_file(setup_socket);
     let graceful = shutdown_sequence(&shared, abandon_guard.guard_mut()).await;
     let guard = abandon_guard.disarm();
 
@@ -989,7 +992,7 @@ fn spawn_activation_task<H: McHostHandler>(shared: &Arc<HostShared<H>>) {
 /// registered with the task tracker before the next await — the
 /// accepted-socket linearization point — so shutdown always finds and closes
 /// it (plan KTD10).
-async fn accept_loop<H: McHostHandler>(shared: &Arc<HostShared<H>>, listener: TcpListener) {
+async fn accept_loop<H: McHostHandler>(shared: &Arc<HostShared<H>>, listener: UnixListener) {
     loop {
         let accepted = tokio::select! {
             biased;

@@ -20,7 +20,7 @@ fastembed = { version = "=6.0.0", default-features = false, features = ["ort-loa
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "ndarray", "std"] }
 tokio = { workspace = true, features = ["process"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-rustix = { version = "1.1.4", features = ["fs", "process", "thread"] }
+rustix = { version = "1.1.4", features = ["fs", "net", "process", "thread"] }
 getrandom = "0.2"
 mc-shm-transport = { path = "../mc-shm-transport", default-features = false }
 

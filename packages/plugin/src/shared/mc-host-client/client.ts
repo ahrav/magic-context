@@ -806,8 +806,7 @@ export class McHostClient {
         let conn: ActiveConnection | null = null;
         let retiredReason: RetirementReason | null = null;
         const generation = new ConnectionGeneration({
-            host: snapshot.endpoint.host,
-            port: snapshot.endpoint.port,
+            setupSocket: snapshot.setupSocket,
             credentials: {
                 key: snapshot.key,
                 daemonId: snapshot.daemonId,
@@ -1041,8 +1040,7 @@ export class McHostClient {
             // throwing provider surfaces here, before the activation `try`
             // below exists to retire the channels.
             candidate = new ConnectionGeneration({
-                host: snapshot.endpoint.host,
-                port: snapshot.endpoint.port,
+                setupSocket: snapshot.setupSocket,
                 credentials: {
                     key: snapshot.key,
                     daemonId: snapshot.daemonId,
@@ -1348,8 +1346,7 @@ export class McHostClient {
             return { kind: "stop" };
         }
         const generation = new ConnectionGeneration({
-            host: snapshot.endpoint.host,
-            port: snapshot.endpoint.port,
+            setupSocket: snapshot.setupSocket,
             credentials: {
                 key: snapshot.key,
                 daemonId: snapshot.daemonId,

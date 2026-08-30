@@ -65,8 +65,9 @@ const MAX_AUTH_BUFFERED_BYTES = 65_536;
 const EMPTY_BODY = new Uint8Array(0);
 
 export interface TcpFrameChannelOptions {
-    host: string;
-    port: number;
+    host?: string;
+    port?: number;
+    setupSocket?: string;
     /**
      * Validated connection-file credentials. `daemonVer` is the file's
      * `daemon_ver`, which the handshake requires the peer to report back
@@ -126,8 +127,9 @@ function metaFromHeader(header: EnvelopeHeader): FrameMeta {
  */
 export class TcpFrameChannel implements FrameChannel {
     private readonly socket: Socket;
-    private readonly host: string;
-    private readonly port: number;
+    private readonly host?: string;
+    private readonly port?: number;
+    private readonly setupSocket?: string;
     private readonly credentials: AuthCredentials;
     private readonly budget: ByteBudget;
     private readonly frameDeadlineMs: number;
@@ -196,6 +198,7 @@ export class TcpFrameChannel implements FrameChannel {
     constructor(options: TcpFrameChannelOptions) {
         this.host = options.host;
         this.port = options.port;
+        this.setupSocket = options.setupSocket;
         this.credentials = options.credentials;
         this.budget = options.budget;
         this.frameDeadlineMs = options.frameDeadlineMs ?? DEFAULT_FRAME_DEADLINE_MS;
@@ -680,7 +683,13 @@ export class TcpFrameChannel implements FrameChannel {
                 return;
             }
             this.connectWaiter = { resolve, reject };
-            this.socket.connect({ host: this.host, port: this.port });
+            if (this.setupSocket !== undefined) {
+                this.socket.connect({ path: this.setupSocket });
+            } else if (this.host !== undefined && this.port !== undefined) {
+                this.socket.connect({ host: this.host, port: this.port });
+            } else {
+                throw new TypeError("socket endpoint is missing");
+            }
         });
     }
 

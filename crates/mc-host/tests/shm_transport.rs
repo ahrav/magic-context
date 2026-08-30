@@ -545,6 +545,7 @@ impl InjectedProvider for MatrixProvider {
         self.peers.lock().expect("peer lock").push(peer);
         Ok(PreparedCandidate {
             descriptor: serde_json::json!({}),
+            descriptors: None,
             candidate_id: 1,
             candidate,
         })
