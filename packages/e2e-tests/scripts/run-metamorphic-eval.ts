@@ -10,7 +10,7 @@ import {
     liveModeFromEnv,
     opencodeVersion,
 } from "./run-historian-eval";
-import { historianWaitBudgetMs, runSystemTuple, type SystemVersionTuple } from "../src/historian-eval/runner";
+import { liveRoleWallClockBudgetMs, runSystemTuple, type SystemVersionTuple } from "../src/historian-eval/runner";
 import {
     runLiveMetamorphicEval,
     type LiveMetamorphicOptions,
@@ -390,13 +390,23 @@ export async function runLiveAndWriteReport(
     return report;
 }
 
-/** Probe exchanges carry no named bound, so this is a lower bound on a role rather than a guarantee. commentlint: allow(JUDGE) */
+/**
+ * Reserve for one role, taken from the widest scenario in the selection.
+ *
+ * Delegates to `liveRoleWallClockBudgetMs` rather than multiplying the declared
+ * runs by the historian wait: the runs are only the first of three phases the
+ * runner waits on, and reserving just them under-counts a two-run, two-probe
+ * role by half, which is enough for a role admitted just inside the deadline to
+ * overrun the step timeout and lose the final report.
+ *
+ * Per scenario, not a corpus-wide product, because the reserve answers "can the
+ * NEXT role finish" and a role runs exactly one scenario.
+ */
 export function liveRoleBudgetMs(
     scenarios: readonly HistorianEvalScenario[],
     mode: LiveMetamorphicOptions["mode"],
 ): number {
-    const declaredRuns = Math.max(1, ...scenarios.map((scenario) => scenario.trigger.expectedHistorianRuns));
-    return declaredRuns * historianWaitBudgetMs(mode);
+    return Math.max(0, ...scenarios.map((scenario) => liveRoleWallClockBudgetMs(scenario, mode)));
 }
 
 export async function main(args: readonly string[] = Bun.argv.slice(2)): Promise<0 | 1 | 2> {

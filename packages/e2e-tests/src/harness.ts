@@ -50,6 +50,15 @@ export interface SdkClient extends SdkClientCore {
     };
 }
 
+/**
+ * Wall-clock ceiling for one `sendPrompt` when the caller names none.
+ *
+ * Exported because callers that must BUDGET for a prompt they do not time
+ * themselves need the same number the call enforces — a local copy silently
+ * drifts from it and under-reserves.
+ */
+export const DEFAULT_PROMPT_TIMEOUT_MS = 180_000;
+
 export class TestHarness {
     readonly mock: MockProvider;
     readonly opencode: SpawnedOpencode;
@@ -236,7 +245,7 @@ export class TestHarness {
         // when historian/compressor work is involved. 180s leaves room for
         // multi-step assistant turns while still catching genuinely stuck
         // prompts. Individual tests can still pass a smaller timeoutMs.
-        const timeoutMs = options.timeoutMs ?? 180_000;
+        const timeoutMs = options.timeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS;
         const promptPromise = this.client.session.prompt({
             path: { id: sessionId },
             body: {

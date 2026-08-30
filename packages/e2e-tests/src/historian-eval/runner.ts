@@ -29,7 +29,7 @@ import {
     MAGIC_CONTEXT_INTERNAL_AGENT_SIGNATURES,
 } from "../../../plugin/src/hooks/magic-context/internal-agent-signatures";
 import { openTestDb } from "../test-db";
-import { TestHarness, type TestHarnessOptions } from "../harness";
+import { DEFAULT_PROMPT_TIMEOUT_MS, TestHarness, type TestHarnessOptions } from "../harness";
 import { MockProvider, type MockResponse } from "../mock-provider/server";
 import {
     EXECUTE_THRESHOLD_PERCENTAGE,
@@ -570,6 +570,40 @@ export interface RunScenarioOptions {
  */
 export function historianWaitBudgetMs(mode: RunScenarioOptions["mode"]): number {
     return mode.kind === "live" ? 2 * DEFAULT_HISTORIAN_TIMEOUT_MS + LIVE_HISTORIAN_OVERHEAD_MS : 90_000;
+}
+
+/** A probe is asked once, then re-asked at most once when its envelope is malformed. */
+export const MAX_PROBE_ATTEMPTS = 2;
+
+/**
+ * Upper bound on ONE scenario role's wall clock, for callers that must decide
+ * whether to START a role under an external kill bound.
+ *
+ * `historianWaitBudgetMs` alone is not that bound. It covers the declared
+ * historian runs and nothing else, so a caller reserving only that admits a role
+ * that then legitimately spends two further phases the runner also waits on:
+ *
+ *   - the probe phase, where every probe may be asked twice (`MAX_PROBE_ATTEMPTS`)
+ *     and each ask is a `sendPrompt` the runner leaves at the harness default;
+ *   - the post-probe quiescence wait, which `driveProbes` bounds by the same
+ *     per-run historian budget so an undeclared pass cannot escape accounting.
+ *
+ * For a two-run, two-probe scenario the runs are 24 minutes but the role is 48,
+ * so a reserve built from the runs alone under-counts by half and the role
+ * overruns whatever the caller sized against it.
+ *
+ * This is an upper bound on the waits, not a prediction: a healthy role finishes
+ * far inside it. Callers wanting the smaller number should measure, not shrink
+ * this.
+ */
+export function liveRoleWallClockBudgetMs(
+    scenario: HistorianEvalScenario,
+    mode: RunScenarioOptions["mode"],
+): number {
+    const historianWait = historianWaitBudgetMs(mode);
+    const declaredRuns = scenario.trigger.expectedHistorianRuns * historianWait;
+    const probePhase = scenario.probes.length * MAX_PROBE_ATTEMPTS * DEFAULT_PROMPT_TIMEOUT_MS;
+    return declaredRuns + probePhase + historianWait;
 }
 
 /**

@@ -65,12 +65,14 @@ export function prospectiveUnitFiles(root: string = E2E_ROOT): string[] {
  * because `--historian-eval-unit` selects no standalone files at all.
  */
 export function historianEvalUnitFiles(root: string = E2E_ROOT): string[] {
+    // Historian only. The metamorphic suite is owned by `metamorphicEvalUnitFiles`
+    // and runs in its own CI job; globbing it here as well ran every metamorphic
+    // test twice per PR and made a metamorphic-only regression fail the HISTORIAN
+    // status, which contradicts that job being the single owner.
+    // `assertSrcTestsClassified` already claims those files through
+    // `metamorphicEvalUnitFiles`, so dropping them here leaves nothing unclassified.
     const files = [
         ...new Glob("src/historian-eval/**/*.test.ts").scanSync({
-            cwd: root,
-            onlyFiles: true,
-        }),
-        ...new Glob("src/metamorphic-eval/**/*.test.ts").scanSync({
             cwd: root,
             onlyFiles: true,
         }),

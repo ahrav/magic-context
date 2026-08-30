@@ -5,7 +5,12 @@ import { join } from "node:path";
 
 import { buildMockHistorianOutput } from "../mock-historian";
 import { lintScenario, parseScenario, type HistorianEvalScenario } from "../historian-eval/contract";
-import type { SystemVersionTuple } from "../historian-eval/runner";
+import {
+    MAX_PROBE_ATTEMPTS,
+    historianWaitBudgetMs,
+    type SystemVersionTuple,
+} from "../historian-eval/runner";
+import { DEFAULT_PROMPT_TIMEOUT_MS } from "../harness";
 import { scoreRawOutputWithInjectedClaims } from "../historian-eval/scorer";
 import { validScenario } from "../historian-eval/test-support";
 import { INJECTION_CANARY } from "./injection-canary";
@@ -1164,9 +1169,37 @@ describe("live metamorphic control tier", () => {
         const oneRun = { ...scenario, trigger: { ...scenario.trigger, expectedHistorianRuns: 1 } };
         const twoRuns = { ...scenario, trigger: { ...scenario.trigger, expectedHistorianRuns: 2 } };
 
-        expect(liveRoleBudgetMs([twoRuns], mode)).toBe(2 * liveRoleBudgetMs([oneRun], mode));
+        // Marginal, not proportional: one more declared run adds exactly one
+        // historian wait. The probe phase and the post-probe quiescence wait are
+        // per-role costs that do not scale with the run count, so the budget is
+        // deliberately no longer a multiple of the run count.
+        expect(liveRoleBudgetMs([twoRuns], mode) - liveRoleBudgetMs([oneRun], mode)).toBe(
+            historianWaitBudgetMs(mode),
+        );
         expect(liveRoleBudgetMs([oneRun, twoRuns], mode)).toBe(liveRoleBudgetMs([twoRuns], mode));
         expect(liveRoleBudgetMs(corpus(), mode)).toBeGreaterThan(liveRoleBudgetMs([oneRun], mode));
+    });
+
+    test("budgets the probe phase and the post-probe quiescence wait, not only the runs", () => {
+        // Reserving only the declared runs admits a role that then spends two more
+        // phases the runner waits on: for the default two-run, two-probe shape that
+        // is 24 minutes reserved against 48 actual, and a role admitted just inside
+        // the deadline overruns the caller's kill bound and loses the final report.
+        const mode = liveMode();
+        const scenario = validScenario();
+        const runs = scenario.trigger.expectedHistorianRuns * historianWaitBudgetMs(mode);
+        const probePhase = scenario.probes.length * MAX_PROBE_ATTEMPTS * DEFAULT_PROMPT_TIMEOUT_MS;
+
+        expect(liveRoleBudgetMs([scenario], mode)).toBe(
+            runs + probePhase + historianWaitBudgetMs(mode),
+        );
+        expect(liveRoleBudgetMs([scenario], mode)).toBeGreaterThan(runs);
+
+        // Every probe may be asked twice, so probe count moves the budget.
+        const doubled = { ...scenario, probes: [...scenario.probes, ...scenario.probes] };
+        expect(liveRoleBudgetMs([doubled], mode) - liveRoleBudgetMs([scenario], mode)).toBe(
+            probePhase,
+        );
     });
 
     test("reports a thrown control failure as a control error, not an incomplete run", async () => {

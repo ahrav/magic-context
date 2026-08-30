@@ -8,6 +8,7 @@ import {
     assertSrcTestsClassified,
     historianEvalUnitFiles,
     incidentUnitFiles,
+    metamorphicEvalUnitFiles,
     parseArgs,
     prospectiveUnitFiles,
     standaloneFilesForSelection,
@@ -206,19 +207,26 @@ describe("mode manifest validator", () => {
         }
     });
 
-    it("runs the metamorphic lane in the historian gate, not the host-mode suites", () => {
+    it("runs the metamorphic lane in its own gate, not the host-mode suites", () => {
         // `assertSrcTestsClassified` is satisfied by any claimant, so moving these
-        // back into `standaloneUnitFiles` would pass it while removing them from
-        // `historian-eval-contracts` — the job whose whole point is that a
-        // deterministic historian gate cannot be skipped by an unrelated failure.
-        // `--historian-eval-unit` selects no standalone files, so that move is
+        // into `standaloneUnitFiles` would pass it while removing them from the
+        // dedicated `metamorphic-eval-contracts` job — the job whose whole point is
+        // that a deterministic metamorphic gate cannot be skipped by an unrelated
+        // failure. No unit selection picks up standalone files, so that move is
         // silent non-enforcement.
-        const metamorphic = historianEvalUnitFiles().filter((file) =>
-            file.startsWith("src/metamorphic-eval/"),
-        );
+        const metamorphic = metamorphicEvalUnitFiles();
         expect(metamorphic).toContain("src/metamorphic-eval/transforms.test.ts");
         expect(metamorphic).toContain("src/metamorphic-eval/invariants.test.ts");
         expect(metamorphic).toContain("src/metamorphic-eval/injection-canary.test.ts");
+
+        // Owned by exactly one gate. The historian selection used to glob these too,
+        // which ran every metamorphic test twice per PR and made a metamorphic-only
+        // regression fail the historian status as well.
+        const historian = historianEvalUnitFiles();
+        for (const file of metamorphic) {
+            expect(historian).not.toContain(file);
+        }
+
         for (const file of metamorphic) {
             for (const selection of [
                 standaloneFilesForSelection("ts", "opencode"),
