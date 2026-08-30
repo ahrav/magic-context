@@ -389,7 +389,7 @@ Requests MAY omit `module_id` to list all entries or supply a filter. Unknown fi
 ```
 
 ```json
-{"op":"catalog.list","generation":1,"modules":[],"subc_ops":["route.open","catalog.list","host.shutdown","host.status","transport.negotiate"]}
+{"op":"catalog.list","generation":1,"modules":[],"subc_ops":["route.open","catalog.list","host.shutdown","host.status"]}
 ```
 
 An unfiltered request MUST return exactly three entries — `magic-context`, then `synapse`, then `broca`, in that deterministic order — and an exact-module filter MUST return that one entry, each derived without lossy rewriting from its startup manifest:
@@ -402,15 +402,13 @@ An unfiltered request MUST return exactly three entries — `magic-context`, the
 | `modules[i].module_version` | that manifest's exact build version |
 | `modules[i].roles` | that manifest's complete `provides` array, including tool schemas |
 | `modules[i].control_ops` | implemented module control operations only; the direct profile never includes `wake.create` |
-| `subc_ops` | `route.open`, `catalog.list`, `host.shutdown`, `host.status`, `transport.negotiate` |
-
-`transport.activate` and `transport.commit` (Section 7.7) are candidate-channel-only operations and MUST NOT appear in `subc_ops`: the catalog advertises bootstrap channel-0 capabilities, and those two operations are never valid on a bootstrap connection.
+| `subc_ops` | `route.open`, `catalog.list`, `host.shutdown`, `host.status` |
 
 The Synapse and Broca entries are immutable identity, not readiness: each stays in the catalog even when its component cannot currently serve a bind (Section 7.5.1). The direct host is final-decision unsupported for `wake.create`: an advertised `wake.create` entry is an ownership certificate for the complete scheduled-wake lifecycle (durable scheduling, agent-callable lifecycle operations, backlog adoption, and readiness withdrawal), not a readiness hint, and the direct profile owns none of it. Wake-plane probing therefore remains fail-open against this profile; only a future host that owns the complete lifecycle may advertise the capability. `generation` changes only when catalog content changes and is unrelated to connection generation.
 
 ### 7.4 Operation classification
 
-`route.open`, `catalog.list`, `host.shutdown` (Section 7.6), `host.status` (Section 7.6), and `transport.negotiate` (Section 7.7) are the only required channel-0 operations. Every other operation receives terminal `unsupported_operation`; host stays connected if framing remains valid. `transport.activate` and `transport.commit` are candidate-channel-only (Section 7.7): on a bootstrap connection they are unrecognized operations and receive terminal `unsupported_operation` like any other. `host.status` reads the last completed host-owned health snapshot; it never invokes a handler callback on the requesting connection and exposes only closed component states and sanitized metrics, never handler detail text.
+`route.open`, `catalog.list`, `host.shutdown` (Section 7.6), and `host.status` (Section 7.6) are the only required channel-0 operations. Every other operation receives terminal `unsupported_operation`; host stays connected if framing remains valid. `host.status` reads the last completed host-owned health snapshot; it never invokes a handler callback on the requesting connection and exposes only closed component states and sanitized metrics, never handler detail text.
 
 Canonical error body:
 
@@ -607,121 +605,13 @@ The host owns one shutdown commit latch per incarnation with phases `open -> res
 
 Commit runs inside retained host work (the connection writer task), so cancelling the requester's task after enqueue cannot lose an acknowledged shutdown. `host.shutdown` performs no PID signaling and no publication cleanup of its own: stop-side effects are exactly the Section 12 sequence, and stop verification (publication removal, instance-lock release) is observed through Section 4.3 evidence.
 
-### 7.7 Transport negotiation and candidate activation
+### 7.7 Transport establishment
 
-Negotiation selects one connection-scoped frame transport for the authenticated generation. It is mandatory and versioned independently of the base wire: this section defines **negotiation version 1**. Authentication creates a setup-only generation. Its first post-authentication request MUST be a valid channel-0 `transport.negotiate` request using negotiation version 1. No application or other control traffic is permitted until a valid selection commits the transport.
+There is no transport negotiation. Authentication over the setup socket is followed by ring establishment on the same connection: the host sends the two ring descriptors with the grant and an activation token, and the client attaches both directions before any application traffic. A client that cannot attach the ring has no alternative transport and MUST treat the failure as terminal for the connection.
 
-A first application request, routed request, other control operation, `Cancel`, `Pong`, or `Goodbye` retires the setup generation without dispatch or same-generation TCP continuation. A client that receives `unsupported_operation`, `connection_in_use`, a malformed response, a mismatched version, or an unoffered selection while negotiating MUST retire the generation and MUST NOT continue on TCP.
+`transport.negotiate`, `transport.activate`, and `transport.commit` are not operations of this protocol. A host advertises exactly four channel-0 operations in `subc_ops`: `route.open`, `catalog.list`, `host.shutdown`, and `host.status`. Any other operation receives terminal `unsupported_operation` while the host stays connected if framing remains valid.
 
-#### 7.7.1 Bounds and strict decoding
-
-Negotiation-family bodies (`transport.negotiate`, `transport.activate`, `transport.commit`, requests and responses) are UTF-8 JSON channel-0 control bodies under the Section 7.1 cap, with these additional rules:
-
-| Field | Limit and validation |
-| --- | --- |
-| `negotiation_version` | JSON integer in `1..=4,294,967,295` (`u32`). Zero, fractions, exponents, and larger values are malformed |
-| `offers` | ordered array of 1 to 8 offer objects; MUST contain at least one `tcp` entry; duplicate `(transport, capability_version)` identities are malformed |
-| `offers[i].transport` | 1-32 ASCII bytes matching `^[a-z][a-z0-9._-]{0,31}$` |
-| `offers[i].capability_version` | JSON integer in `1..=4,294,967,295` (`u32`) |
-| `offers[i].parameters`, `descriptor` | optional / grant-only opaque JSON **objects**; each at most 8,192 bytes of compact UTF-8 JSON serialization and at most 8 nesting levels, counted as in Section 7.1 (1 at the subtree root, +1 per nested object/array) |
-| `activation_token` | exactly 32 lowercase hexadecimal ASCII characters |
-| `reason` | one of the closed fallback values in Section 7.7.3 |
-
-Decoding is strict, as an explicit exception to the Section 7.1 unknown-field rule: every negotiation-family object has a closed field set and an unrecognized or repeated field is malformed. Forward compatibility is owned by `negotiation_version`, never by ignored fields. A duplicate object key at **any** depth — including inside the opaque `parameters` and `descriptor` values — is rejected before any typed or opaque value is materialized, so provider code can never observe an ambiguous document.
-
-Malformed negotiation content — invalid JSON, recursive duplicate keys, type or bound violations, a missing `tcp` offer, an unoffered selection, or a grant/selection field mix from Section 7.7.3 — receives terminal `Error{code:"invalid_control_request"}` and the host then retires the generation. It is never fallback evidence and MUST NOT select or retain TCP (R12 in the owning plan).
-
-#### 7.7.2 Offer and selection grammar
-
-The client sends one `transport.negotiate` request before any other operation. Offers are ordered by client preference. A `tcp` offer is required so an explicit fallback always has an exact entry to select:
-
-```json
-{"op":"transport.negotiate","negotiation_version":1,"offers":[{"transport":"shm","capability_version":1,"parameters":{}},{"transport":"tcp","capability_version":1}]}
-```
-
-The host MUST select exactly one offered `(transport, capability_version)` entry; it never invents a transport, version, or parameter shape. A TCP selection names the exact offered entry. `reason` is omitted for a direct selection and carries one Section 7.7.3 value for a fallback:
-
-```json
-{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"tcp","capability_version":1}}
-```
-
-```json
-{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"tcp","capability_version":1},"reason":"capability_version_mismatch"}
-```
-
-A non-TCP grant adds a one-use activation token and a bounded opaque provider descriptor. Both fields are required together on a non-TCP selection, and both are malformed on a TCP selection. `reason` is malformed on a grant:
-
-```json
-{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"shm","capability_version":1},"activation_token":"00000000000000000000000000000000","descriptor":{}}
-```
-
-The all-zero example token is a documentation-only placeholder. A real token MUST be freshly generated from the OS CSPRNG for each grant, is bound to the granting generation, and is consumed by exactly one activation. Descriptors and activation tokens are binding data, not authority: the authenticated bootstrap remains the sole authorization boundary, and every non-TCP provider MUST enforce owner-only endpoint access, exclusive peer attachment, provider-incarnation fencing, and stale-descriptor rejection before it yields a candidate channel.
-
-A response whose `negotiation_version` differs from the request's grammar version, or whose `selected` entry was not offered, is malformed on the client side and retires the setup; the client MUST NOT treat it as fallback evidence. Tokens, descriptors, and offer parameters MUST stay absent from events, errors, cause chains, stacks, `Debug`/`Display` formatting, and panic output on both sides.
-
-#### 7.7.3 Fallback reasons
-
-The fallback vocabulary is closed. Fallback always selects the exact offered `tcp` entry:
-
-| `reason` | Meaning |
-| --- | --- |
-| `unavailable` | an installed, statically eligible non-TCP offer is dynamically unavailable: provider readiness (`Recovering`/`Quarantined`) or admission pressure. Permanent absence of a provider and statically ineligible offer parameters are NOT `unavailable`; they select TCP with no `reason` |
-| `capability_version_mismatch` | an offered transport is installed but no offered `capability_version` intersects the host's |
-
-A direct TCP selection or a valid TCP selection carrying one of these reasons commits TCP. This preserves explicit negotiated fallback when an optional candidate is unavailable. Negotiation-version mismatch, `unsupported_operation`, `connection_in_use`, timeout, malformed content, an unoffered selection, token mismatch, provider attachment failure, activation or commit failure, channel failure, and base-wire or authentication failure are not fallback evidence and MUST fail closed without same-generation TCP continuation.
-
-Exact `unavailable` is the only selection that authorizes an automatic client re-upgrade probe: the client keeps the committed TCP generation primary and MAY retry a fresh shadow setup (discovery, authentication, negotiation, activation, commit) under one immutable bounded episode deadline, moving only new managed work after a successful commit. A reasonless TCP selection, every other fallback reason, the legacy terminal, and any post-grant failure MUST NOT start or extend that probe window.
-
-#### 7.7.4 Candidate activation and commit
-
-A non-TCP grant creates a setup-only, non-routable candidate channel. The candidate owns a fresh pair of correlation namespaces (Section 8.3): consumer correlation 1 is reserved for `transport.activate`, consumer correlation 2 for `transport.commit`, and the application allocator starts at 3. On a TCP-committed generation the bootstrap namespaces simply continue; negotiation consumed one ordinary correlation.
-
-Candidate `Request` correlation 1 and its `Response`:
-
-```json
-{"op":"transport.activate","negotiation_version":1,"activation_token":"00000000000000000000000000000000"}
-```
-
-```json
-{"op":"transport.activate","negotiation_version":1}
-```
-
-Candidate `Request` correlation 2 and its `Response`:
-
-```json
-{"op":"transport.commit","negotiation_version":1}
-```
-
-```json
-{"op":"transport.commit","negotiation_version":1}
-```
-
-Both responses are tagged and carry no provider data; under Section 7.7.1 strictness any additional field is malformed. The host compares the activation token in constant time and atomically consumes the one-use grant record. The candidate becomes routable only after the exact commit response reaches per-frame local completion on the host and validates on the client. Any uncertainty — wrong or reused token, wrong correlation, an application frame before commit, timeout, or channel loss — closes both candidate and bootstrap without TCP continuation.
-
-#### 7.7.5 Setup states
-
-Selection is sticky for the generation: a direct TCP selection, a negotiated TCP fallback, or a committed non-TCP grant remains fixed until retirement. Reconnect rereads discovery data, reauthenticates, and negotiates from a fresh setup-only state. At most one candidate may be prepared. Any late or repeated negotiation, or any application-bearing operation while a candidate is being set up, retires the generation.
-
-```mermaid
-stateDiagram-v2
-  [*] --> Authenticating
-  Authenticating --> SetupOnly: auth succeeds
-  Authenticating --> Retired: auth or base-wire failure
-  SetupOnly --> TcpCommitted: valid direct or fallback TCP selection
-  SetupOnly --> CandidatePrepared: valid optional candidate grant
-  SetupOnly --> Retired: application traffic, wrong version, malformed exchange, or timeout
-  CandidatePrepared --> Activating: grant sent
-  CandidatePrepared --> Retired: provider failure
-  Activating --> AwaitingCommit: activation corr 1 acknowledged
-  Activating --> Retired: token, timeout, or channel failure
-  AwaitingCommit --> ProviderActive: commit corr 2 complete and valid
-  AwaitingCommit --> Retired: commit or promotion failure
-  TcpCommitted --> Retired: late negotiation or retirement
-  ProviderActive --> Retired: late negotiation or channel retirement
-  Retired --> [*]
-```
-
-`Retired` is terminal; no provider choice, descriptor, token, correlation, or route survives into a later generation.
+`Retired` is terminal; no descriptor, token, correlation, or route survives into a later generation.
 
 ## 8. Host and handler lifecycle
 
@@ -749,12 +639,12 @@ sequenceDiagram
   participant C as Client
   H->>H: lock, fresh key and daemon ID
   H->>M: HostInit; initialize once
-  H->>H: bind numeric loopback
+  H->>H: bind owner-only setup socket
   H->>F: atomic owner-only publish
   C->>F: bounded validate/read
-  C->>H: TCP + three-message authentication
-  C->>H: first Request transport.negotiate v1
-  H-->>C: valid transport selection
+  C->>H: setup socket + three-message authentication
+  H-->>C: ring descriptors, grant, activation token
+  C->>C: attach both ring directions
   C->>H: application v2 envelope traffic
 ```
 

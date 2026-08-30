@@ -1444,6 +1444,9 @@ export class McHostModuleTransport {
                     );
                 }
                 if (generation !== this.connectionGeneration) {
+                    // On generation mismatch, the catch skips `invalidateConnection`, so this branch evicts and closes `candidate`. commentlint: allow(JUDGE)
+                    await evictProcessMcHostClient(options, candidate);
+                    candidate.close();
                     throw this.connectionChangedError("subc connection attempt was superseded");
                 }
                 this.client = candidate;

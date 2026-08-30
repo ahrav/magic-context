@@ -58,9 +58,9 @@ Explicit test profile charges both directions before activation:
 
 Host implementation also starts one fused, unpinned owner thread per prepared candidate. Admission accounts active and quarantined descriptor, arena, lease, mapping, and pinned-worker commitments. Quarantine retains charges instead of making uncertain storage reusable.
 
-## Failure, fallback, and close
+## Failure and close
 
-TCP fallback is valid only during offer filtering, before provider preparation. After preparation starts, setup timeout, malformed data, peer loss, publication failure, cleanup uncertainty, or quarantine closes the connection without TCP replay.
+There is no fallback. Setup timeout, malformed data, peer loss, publication failure, cleanup uncertainty, and quarantine each close the connection, and a client that cannot establish a ring has no other transport to fall back to.
 
 Close stops admission, drains published data, revokes JavaScript aliases on the environment thread, waits for Rust scopes, releases samples, drops transport objects, and joins workers. Duplicate close is harmless. Unknown alias state quarantines storage, rejects successful close, and keeps its host charge.
 
@@ -68,7 +68,12 @@ Diagnostics redact descriptors, activation tokens, object names, grants, incarna
 
 ## Recovery contract
 
-This section documents the implemented behavior of `crates/mc-host/src/provider_recovery.rs`, `crates/mc-host/src/shm_provider.rs`, and the client recovery loop in `packages/plugin/src/shared/mc-host-client/client.ts` (R16). Wire-level fallback semantics are normative in `docs/mc-host-wire-protocol.md` §7.7.3.
+> **Stale.** The sections below describe the provider abstraction in
+> `crates/mc-host/src/provider_recovery.rs` and `crates/mc-host/src/shm_provider.rs`,
+> both of which were removed when the fixed ring became mandatory. Provider
+> readiness, offer filtering, typed `unavailable`, and provider incarnations no
+> longer exist, so nothing here is normative. It is retained only until the
+> replacement contract for ring establishment failure is written.
 
 ### Typed `unavailable`
 

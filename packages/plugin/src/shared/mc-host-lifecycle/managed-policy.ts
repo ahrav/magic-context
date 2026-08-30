@@ -6,7 +6,6 @@ import {
     type AuthenticatedPeer,
     BROCA_CREDENTIAL_NAMES,
     type CatalogEntry,
-    evictProcessMcHostClient,
     type HostStatusSnapshot,
     McHostClient,
     type McHostClientOptions,
@@ -109,9 +108,10 @@ async function probeManagedStorage(
         handshakeTimeoutMs: Math.max(1, budgetMs),
         requestTimeoutMs: Math.max(1, budgetMs),
     };
+    // A cached client is shared; closing it would disconnect a concurrent probe for the same root and budget, which would report a healthy daemon as unavailable. commentlint: allow(JUDGE)
     let client: McHostClient | undefined;
     try {
-        client = await processMcHostClient(options);
+        client = await McHostClient.connect(options);
         assertStorageProbePeer(client, expectedDaemonId);
         for (;;) {
             const snapshot = await client.hostStatus({
@@ -131,12 +131,8 @@ async function probeManagedStorage(
         if (error instanceof StorageProbeDaemonMismatchError) throw error;
         return Date.now() >= deadline ? "starting" : "unavailable";
     } finally {
-        // The connected channel holds a referenced interval, so a one-shot caller stays alive until this client closes. Evict before closing because the owner cache retains resolved clients. commentlint: allow(JUDGE)
-        if (client !== undefined) {
-            const probed = client;
-            await evictProcessMcHostClient(options, probed);
-            await probed.closeAsync().catch(() => undefined);
-        }
+        // The connected channel holds a referenced interval, so a one-shot caller stays alive until this client closes. commentlint: allow(JUDGE)
+        if (client !== undefined) await client.closeAsync().catch(() => undefined);
     }
 }
 

@@ -1776,6 +1776,10 @@ impl ByteCounter {
         })
     }
 
+    const fn capacity(&self) -> usize {
+        self.cap
+    }
+
     #[cfg(test)]
     fn used(&self) -> usize {
         *lock_unpoisoned(&self.used)
@@ -1907,7 +1911,12 @@ fn start_ring_bridge(
                 // so refusing a charge would discard a valid response. Waiting
                 // is backpressure against `ring_reader_loop`, which releases
                 // each queued charge as it drains; cancellation ends the wait.
+                // Frames wider than `read_budget.capacity()` cannot be admitted
+                // by any drain, so they refuse without waiting.
                 let charge = |bytes: usize| loop {
+                    if bytes > read_budget.capacity() {
+                        return None;
+                    }
                     if let Some(charge) = read_budget.charge(bytes) {
                         return Some(charge);
                     }

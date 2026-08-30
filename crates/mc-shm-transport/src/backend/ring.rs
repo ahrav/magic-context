@@ -1788,11 +1788,11 @@ fn create_macos_shm(len: usize) -> Result<OwnedFd, RingError> {
     // fcntl can inherit the descriptor. Set FD_CLOEXEC immediately after
     // shm_open to minimize that inheritance window.
     // SAFETY: fd is owned and F_SETFD changes only its descriptor flags.
-    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-        return Err(RingError::ObjectSetupFailed);
-    }
+    let cloexec = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    // An un-unlinked name persists in the kernel until reboot, so the unlink runs before either result is reported. commentlint: allow(JUDGE)
     // SAFETY: name.as_ptr() remains valid for the call; shm_unlink removes the name immediately.
-    if unsafe { libc::shm_unlink(name.as_ptr()) } != 0 {
+    let unlinked = unsafe { libc::shm_unlink(name.as_ptr()) };
+    if cloexec < 0 || unlinked != 0 {
         return Err(RingError::ObjectSetupFailed);
     }
     let len = libc::off_t::try_from(len).map_err(|_| RingError::ArithmeticOverflow)?;

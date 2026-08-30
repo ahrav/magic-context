@@ -59,6 +59,7 @@ async function probeWakePlaneCatalog(): Promise<readonly CatalogEntry[]> {
     const client = await processMcHostClient({
         connectionFile: connectionFile(),
         handshakeTimeoutMs: WAKE_PLANE_HANDSHAKE_TIMEOUT_MS,
+        credentialSource: process.env,
     });
     return client.catalogList({ timeoutMs: WAKE_PLANE_CATALOG_TIMEOUT_MS });
 }
