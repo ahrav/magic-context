@@ -128,7 +128,7 @@ function baselineCompartments(scenario: HistorianEvalScenario): MockHistorianCom
  * minimum above one unpromotable. The authored span stays explicit so
  * `compartment-count` still measures only compartments over authored content.
  */
-function batteryScoringOptions(scenario: HistorianEvalScenario): {
+export function batteryScoringOptions(scenario: HistorianEvalScenario): {
     chunkStartOrdinal: number;
     chunkEndOrdinal: number;
     authoredStartOrdinal: number;
