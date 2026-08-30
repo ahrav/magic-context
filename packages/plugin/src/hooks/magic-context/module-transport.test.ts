@@ -14,11 +14,16 @@ import {
     StaleRouteHandleError,
 } from "../../shared/mc-host-client";
 import {
+    bodyJson,
     FakePeer,
     type FakePeerConnection,
+    frameCursor,
     PEER_PROTOCOL_VERSION,
     type PeerFrame,
     PeerFrameType,
+    sendErrorBody,
+    sendResponse,
+    sendRouteOpenOk,
 } from "../../shared/mc-host-client/test-support/fake-peer";
 import {
     rejection,
@@ -106,14 +111,6 @@ async function peerTransport(
     return { peer, transport };
 }
 
-function bodyJson(frame: PeerFrame): unknown {
-    try {
-        return JSON.parse(frame.body.toString("utf8"));
-    } catch {
-        return undefined;
-    }
-}
-
 function isRouteOpen(frame: PeerFrame): boolean {
     if (frame.ty !== PeerFrameType.Request || frame.channel !== 0) return false;
     const parsed = bodyJson(frame) as { op?: unknown } | undefined;
@@ -126,75 +123,6 @@ const isRoutedRequest =
         frame.ty === PeerFrameType.Request &&
         frame.channel !== 0 &&
         (channel === undefined || frame.channel === channel);
-
-interface FrameCursor {
-    next(predicate: (frame: PeerFrame) => boolean, timeoutMs?: number): Promise<PeerFrame>;
-}
-
-/** Ordered frame consumption: each `next` scans forward from the last hit. */
-function frameCursor(conn: FakePeerConnection): FrameCursor {
-    let index = 0;
-    return {
-        async next(predicate, timeoutMs = 4_000) {
-            let found: PeerFrame | null = null;
-            await conn.waitFor(() => {
-                for (let i = index; i < conn.frames.length; i++) {
-                    const frame = conn.frames[i] as PeerFrame;
-                    if (predicate(frame)) {
-                        index = i + 1;
-                        found = frame;
-                        return true;
-                    }
-                }
-                return false;
-            }, timeoutMs);
-            return found as unknown as PeerFrame;
-        },
-    };
-}
-
-function jsonBody(value: unknown): Buffer {
-    return Buffer.from(JSON.stringify(value), "utf8");
-}
-
-function sendResponse(
-    conn: FakePeerConnection,
-    corr: bigint,
-    value: unknown,
-    channel = 0,
-    epoch = 0,
-): Promise<void> {
-    return conn.send({ ty: PeerFrameType.Response, channel, epoch, corr, body: jsonBody(value) });
-}
-
-function sendErrorBody(
-    conn: FakePeerConnection,
-    corr: bigint,
-    code: string,
-    channel = 0,
-    epoch = 0,
-): Promise<void> {
-    return conn.send({
-        ty: PeerFrameType.Error,
-        channel,
-        epoch,
-        corr,
-        body: jsonBody({ code, message: `error ${code}` }),
-    });
-}
-
-function sendRouteOpenOk(
-    conn: FakePeerConnection,
-    corr: bigint,
-    channel: number,
-    epoch: number,
-): Promise<void> {
-    return sendResponse(conn, corr, {
-        op: "route.open",
-        route_channel: channel,
-        route_epoch: epoch,
-    });
-}
 
 /** Every routed application body the peer ever observed, across connections. */
 function routedBodies(peer: FakePeer): PeerFrame[] {

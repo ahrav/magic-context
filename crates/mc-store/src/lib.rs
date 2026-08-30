@@ -3780,6 +3780,19 @@ const AUTHORITY_SELECT_SQL: &str = "SELECT context_store_uuid, project, domain, 
     checksum_expected, checksum_actual, checksum_ok
     FROM mc_authority WHERE context_store_uuid = ?1 AND project = ?2 AND domain = ?3";
 
+/// The two `mc_cache_state` row reads, shared so every reader stays on the
+/// same projection.
+const CACHE_STATE_META_SELECT: &str =
+    "SELECT row_version, meta FROM mc_cache_state WHERE session_id = ?1";
+const CACHE_STATE_FULL_SELECT: &str =
+    "SELECT row_version, core_state, meta FROM mc_cache_state WHERE session_id = ?1";
+
+/// Column list every `stored_compartment_from_row` reader selects, in the
+/// positional order that mapper reads. All compartment SELECTs interpolate
+/// this one constant: the mapper indexes by position, so a reordered or
+/// partial per-site list would silently mis-map fields.
+const COMPARTMENT_SELECT_COLUMNS: &str = "sequence, start_message, end_message, start_message_id, end_message_id, start_date, end_date, title, content, p1, p2, p3, p4, importance, episode_type, legacy, created_at";
+
 const CLAIM_INTENT_COLUMNS: &str = "producer, operation_key, database_incarnation_id,
     format_epoch, authority_project, authority_generation, request_digest, state,
     result_json, created_at_ms, updated_at_ms";
@@ -4395,23 +4408,7 @@ impl<'a> FacadeMutationTxn<'a> {
         if content.is_empty() {
             return Err("note content must not be empty".to_string());
         }
-        self.tx
-            .execute(
-                "INSERT INTO mc_notes
-                 (type, project_path, session_id, content, status, surface_condition,
-                  anchor_block_id, harness, created_at_ms, updated_at_ms)
-                 VALUES ('session', ?1, ?2, ?3, 'active', ?4, ?5, 'module', ?6, ?6)",
-                params![
-                    input.project_path,
-                    input.session_id,
-                    content,
-                    input.surface_condition,
-                    input.anchor_block_id,
-                    input.now_ms,
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-        load_note_tx(self.tx, self.tx.last_insert_rowid()).map_err(|error| error.to_string())
+        insert_note_tx(self.tx, &input, content).map_err(|error| error.to_string())
     }
 
     pub fn insert_project_note(&self, input: NoteWriteInput<'_>) -> Result<StoredNote, String> {
@@ -4419,41 +4416,7 @@ impl<'a> FacadeMutationTxn<'a> {
         if content.is_empty() {
             return Err("note content must not be empty".to_string());
         }
-        let status = if input
-            .surface_condition
-            .is_some_and(|condition| !condition.trim().is_empty())
-        {
-            "pending"
-        } else {
-            "active"
-        };
-        self.tx
-            .execute(
-                "INSERT INTO mc_notes
-                 (type, project_path, session_id, content, status, surface_condition,
-                  anchor_block_id, anchor_ordinal, harness, compiled_provider, compiled_config,
-                  compiled_at, compile_status, created_at_ms, updated_at_ms)
-                 VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'module', ?8, ?9, ?10, ?11, ?12, ?12)",
-                params![
-                    input.project_path,
-                    input.session_id,
-                    content,
-                    status,
-                    input
-                        .surface_condition
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty()),
-                    input.anchor_block_id,
-                    input.anchor_ordinal,
-                    input.compiled_provider,
-                    input.compiled_config,
-                    input.compiled_at,
-                    input.compile_status,
-                    input.now_ms,
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-        load_note_tx(self.tx, self.tx.last_insert_rowid()).map_err(|error| error.to_string())
+        insert_project_note_tx(self.tx, &input, content).map_err(|error| error.to_string())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4468,84 +4431,18 @@ impl<'a> FacadeMutationTxn<'a> {
         condition_compile: Option<NoteConditionCompile<'_>>,
         now_ms: i64,
     ) -> Result<NoteCasOutcome, String> {
-        let current = load_note_tx(self.tx, note_id)
-            .optional()
-            .map_err(|error| error.to_string())?;
-        let Some(current) = current else {
-            return Ok(NoteCasOutcome::Conflict { current: None });
-        };
-        if current.project_path != project_path
-            || current.status != expected_status
-            || current.status_version != expected_version
-        {
-            return Ok(NoteCasOutcome::Conflict {
-                current: Some(current),
-            });
-        }
-        let next_content = content.map(str::trim).unwrap_or(&current.content);
-        if next_content.is_empty() {
-            return Ok(NoteCasOutcome::Conflict {
-                current: Some(current),
-            });
-        }
-        let condition_changed = surface_condition.is_some();
-        let next_condition = surface_condition
-            .flatten()
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        let content_changed = next_content != current.content;
-        let compiler_edit = condition_changed || content_changed;
-        let remaining_condition = if condition_changed {
-            next_condition
-        } else {
-            current
-                .surface_condition
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-        };
-        let next_status = if compiler_edit && remaining_condition.is_some() {
-            "pending"
-        } else {
-            current.status.as_str()
-        };
-        let compile = condition_compile.unwrap_or_default();
-        let changed = self
-            .tx
-            .execute(
-                NOTE_CAS_UPDATE_SQL,
-                params![
-                    next_content,
-                    condition_changed,
-                    next_condition,
-                    next_status,
-                    compiler_edit,
-                    now_ms,
-                    compile.compiled_provider,
-                    compile.compiled_config,
-                    compile.compiled_at,
-                    compile.compile_status,
-                    note_id,
-                    project_path,
-                    expected_status,
-                    expected_version,
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-        if changed == 0 {
-            return Ok(NoteCasOutcome::Conflict {
-                current: load_note_tx(self.tx, note_id)
-                    .optional()
-                    .map_err(|error| error.to_string())?,
-            });
-        }
-        if compiler_edit {
-            fence_active_note_claims_tx(self.tx, project_path, Some(note_id), "stale", now_ms)
-                .map_err(|error| error.to_string())?;
-        }
-        Ok(NoteCasOutcome::Applied(
-            load_note_tx(self.tx, note_id).map_err(|error| error.to_string())?,
-        ))
+        update_note_cas_tx(
+            self.tx,
+            project_path,
+            note_id,
+            expected_status,
+            expected_version,
+            content,
+            surface_condition,
+            condition_compile,
+            now_ms,
+        )
+        .map_err(|error| error.to_string())
     }
 
     pub fn dismiss_note(
@@ -4556,54 +4453,15 @@ impl<'a> FacadeMutationTxn<'a> {
         resolution: Option<&str>,
         now_ms: i64,
     ) -> Result<Option<StoredNote>, String> {
-        let Some(current) = load_note_tx(self.tx, note_id)
-            .optional()
-            .map_err(|error| error.to_string())?
-        else {
-            return Ok(None);
-        };
-        if current.project_path != project_path
-            || current.session_id != session_id
-            || !matches!(
-                current.status.as_str(),
-                "active" | "pending" | "ready" | "surfacing" | "surfaced"
-            )
-        {
-            return Ok(None);
-        }
-        let resolution = resolution.map(str::trim).filter(|value| !value.is_empty());
-        let content = resolution
-            .map(|value| format!("{}\n\nResolution: {value}", current.content))
-            .unwrap_or_else(|| current.content.clone());
-        let changed = self
-            .tx
-            .execute(
-                "UPDATE mc_notes
-                    SET status = 'dismissed', content = ?1,
-                        status_version = status_version + 1, state_version = state_version + 1,
-                        updated_at_ms = ?2,
-                        dismissed_at = ?2, dismissal_resolution = ?3
-                  WHERE id = ?4 AND project_path = ?5
-                    AND status = ?6 AND status_version = ?7",
-                params![
-                    content,
-                    now_ms,
-                    resolution,
-                    note_id,
-                    project_path,
-                    current.status,
-                    current.status_version,
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-        if changed == 0 {
-            return Ok(None);
-        }
-        fence_active_note_claims_tx(self.tx, project_path, Some(note_id), "stale", now_ms)
-            .map_err(|error| error.to_string())?;
-        Ok(Some(
-            load_note_tx(self.tx, note_id).map_err(|error| error.to_string())?,
-        ))
+        dismiss_note_tx(
+            self.tx,
+            project_path,
+            Some(session_id),
+            note_id,
+            resolution,
+            now_ms,
+        )
+        .map_err(|error| error.to_string())
     }
 }
 
@@ -4805,6 +4663,61 @@ fn materialize_strip_seed_units(
         core.frozen_units.push(unit);
     }
     skipped
+}
+
+/// One fully-specified lineage-descent commit: serialize the target state,
+/// upsert the `mc_cache_state` row at the next version, and build the
+/// committed outcome. Every early-return commit tail in `descend_lineage`
+/// funnels through here so the upsert and the outcome cannot drift.
+#[allow(clippy::too_many_arguments)]
+fn commit_lineage_disposition(
+    tx: &rusqlite::Transaction<'_>,
+    target_key: &str,
+    now_ms: i64,
+    target_core: CoreState,
+    target_meta: ModuleMeta,
+    current_target_version: i64,
+    disposition: LineageDescentDisposition,
+    source_key: Option<String>,
+    acknowledge: bool,
+) -> rusqlite::Result<LineageDescentTxnOutcome> {
+    let next_version = current_target_version.max(0) as u64 + 1;
+    let core_json = match serde_json::to_string(&target_core) {
+        Ok(json) => json,
+        Err(error) => return Ok(LineageDescentTxnOutcome::Serde(error.to_string())),
+    };
+    let meta_json = match serde_json::to_string(&target_meta) {
+        Ok(json) => json,
+        Err(error) => return Ok(LineageDescentTxnOutcome::Serde(error.to_string())),
+    };
+    tx.execute(
+        "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta, last_activity_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(session_id) DO UPDATE SET
+             row_version = excluded.row_version,
+             core_state = excluded.core_state,
+             meta = excluded.meta,
+             last_activity_at = excluded.last_activity_at",
+        params![
+            target_key,
+            next_version as i64,
+            core_json,
+            meta_json,
+            now_ms
+        ],
+    )?;
+    Ok(LineageDescentTxnOutcome::Committed(LineageDescentOutcome {
+        loaded: LoadedState {
+            core: target_core,
+            meta: target_meta,
+            row_version: Some(next_version),
+        },
+        disposition,
+        source_key,
+        prior_last_ordinal: None,
+        materialization_required: false,
+        acknowledge,
+    }))
 }
 
 impl McStore {
@@ -5481,19 +5394,14 @@ impl McStore {
     pub fn load(&self, session_id: &str) -> Result<LoadedState, McStoreError> {
         let row = self.inner.with_conn(|conn| {
             Ok(conn
-                .prepare_cached(
-                    "SELECT row_version, core_state, meta FROM mc_cache_state WHERE session_id = ?1",
-                )?
-                .query_row(
-                    params![session_id],
-                    |r| {
-                        Ok((
-                            r.get::<_, i64>(0)? as u64,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, String>(2)?,
-                        ))
-                    },
-                )
+                .prepare_cached(CACHE_STATE_FULL_SELECT)?
+                .query_row(params![session_id], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)? as u64,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })
                 .ok())
         })?;
 
@@ -5532,17 +5440,13 @@ impl McStore {
             let transaction = conn.unchecked_transaction()?;
             let cache_state_started_at = Instant::now();
             let state = transaction
-                .query_row(
-                    "SELECT row_version, core_state, meta FROM mc_cache_state WHERE session_id = ?1",
-                    params![session_id],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)? as u64,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                        ))
-                    },
-                )
+                .query_row(CACHE_STATE_FULL_SELECT, params![session_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as u64,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
                 .optional()?;
             let loaded = match state {
                 Some((row_version, core_json, meta_json)) => LoadedState {
@@ -5663,17 +5567,13 @@ impl McStore {
         let snapshot = self.inner.with_conn(|conn| {
             let transaction = conn.unchecked_transaction()?;
             let state = transaction
-                .query_row(
-                    "SELECT row_version, core_state, meta FROM mc_cache_state WHERE session_id = ?1",
-                    params![session_id],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)? as u64,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                        ))
-                    },
-                )
+                .query_row(CACHE_STATE_FULL_SELECT, params![session_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as u64,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
                 .optional()?;
             let loaded = match state {
                 Some((row_version, core_json, meta_json)) => LoadedState {
@@ -5700,12 +5600,13 @@ impl McStore {
                 },
             };
             let count = |table: &str| -> Result<usize, rusqlite::Error> {
-                transaction.query_row(
-                    &format!("SELECT COUNT(*) FROM {table} WHERE session_id = ?1"),
-                    params![session_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .map(|value| value.max(0) as usize)
+                transaction
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE session_id = ?1"),
+                        params![session_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map(|value| value.max(0) as usize)
             };
             let compartment_page = compartment_page
                 .map(|(after_sequence, limit)| {
@@ -5716,17 +5617,19 @@ impl McStore {
                             |row| row.get::<_, Option<i64>>(0),
                         )?
                         .map_or(after_sequence, |max| max.max(after_sequence));
-                    let mut statement = transaction.prepare(
-                        "SELECT sequence, start_message, end_message, start_message_id, end_message_id,
-                                start_date, end_date, title, content, p1, p2, p3, p4, importance,
-                                episode_type, legacy, created_at
-                           FROM mc_compartments
+                    let mut statement = transaction.prepare(&format!(
+                        "SELECT {COMPARTMENT_SELECT_COLUMNS}
+                       FROM mc_compartments
                           WHERE session_id = ?1 AND sequence > ?2
-                          ORDER BY sequence ASC LIMIT ?3",
-                    )?;
+                          ORDER BY sequence ASC LIMIT ?3"
+                    ))?;
                     let compartments = statement
                         .query_map(
-                            params![session_id, after_sequence, i64::try_from(limit).unwrap_or(i64::MAX)],
+                            params![
+                                session_id,
+                                after_sequence,
+                                i64::try_from(limit).unwrap_or(i64::MAX)
+                            ],
                             Self::stored_compartment_from_row,
                         )?
                         .collect::<Result<Vec<_>, _>>()?;
@@ -5753,16 +5656,14 @@ impl McStore {
                             receive_count: row.get::<_, i64>(5)?.max(0) as u64,
                             first_divergence: row.get(6)?,
                             last_divergence: row.get(7)?,
-                            scheduler_history: serde_json::from_str(
-                                &row.get::<_, String>(8)?,
-                            )
-                            .map_err(|error| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    8,
-                                    rusqlite::types::Type::Text,
-                                    Box::new(error),
-                                )
-                            })?,
+                            scheduler_history: serde_json::from_str(&row.get::<_, String>(8)?)
+                                .map_err(|error| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        8,
+                                        rusqlite::types::Type::Text,
+                                        Box::new(error),
+                                    )
+                                })?,
                         })
                     },
                 )
@@ -6650,6 +6551,29 @@ impl McStore {
         })?)
     }
 
+    /// Canonical test descriptor: an `mc_cache`-namespace module store on
+    /// `<dir>/store.db`. Unit tests reach it through `cfg(test)`; this
+    /// crate's integration tests and sibling crates through the
+    /// `test-support` feature.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_descriptor(dir: &std::path::Path, module_id: &str) -> StorageDescriptor {
+        use cortexkit_store_types::{Isolation, StorageBackend};
+        StorageDescriptor {
+            module_id: module_id.to_string(),
+            storage_namespace: "mc_cache".to_string(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: dir.join("store.db").to_string_lossy().into_owned(),
+            },
+        }
+    }
+
+    /// Opens the [`McStore::test_descriptor`] fixture.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn open_for_test(dir: &std::path::Path, module_id: &str) -> McStore {
+        McStore::open(&Self::test_descriptor(dir, module_id)).expect("open test store")
+    }
+
     #[cfg(feature = "test-support")]
     pub fn seed_tags_for_test(
         &self,
@@ -6990,11 +6914,9 @@ impl McStore {
             .map_err(|_| McStoreError::Serde("wrapup rounds exceed SQLite range".to_string()))?;
         Ok(self.inner.with_conn_fenced(|transaction| {
             let current = transaction
-                .query_row(
-                    "SELECT row_version, meta FROM mc_cache_state WHERE session_id = ?1",
-                    params![record.session_id],
-                    |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?)),
-                )
+                .query_row(CACHE_STATE_META_SELECT, params![record.session_id], |row| {
+                    Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
+                })
                 .optional()?;
             let (found_row_version, found_revert_epoch) = match current {
                 Some((row_version, meta_json)) => {
@@ -7623,7 +7545,7 @@ impl McStore {
         let outcome = self.inner.with_conn_fenced(|tx| {
             let row = tx
                 .query_row(
-                    "SELECT row_version, core_state, meta FROM mc_cache_state WHERE session_id = ?1",
+                    CACHE_STATE_FULL_SELECT,
                     params![request.session_id],
                     |r| {
                         Ok((
@@ -7961,12 +7883,10 @@ impl McStore {
         session_id: &str,
     ) -> Result<Vec<StoredCompartment>, McStoreError> {
         let rows = self.inner.with_conn(|conn| {
-            let mut stmt = conn.prepare_cached(
-                "SELECT sequence, start_message, end_message, start_message_id, end_message_id,
-                        start_date, end_date, title, content, p1, p2, p3, p4, importance,
-                        episode_type, legacy, created_at
-                 FROM mc_compartments WHERE session_id = ?1 ORDER BY sequence ASC",
-            )?;
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT {COMPARTMENT_SELECT_COLUMNS}
+                       FROM mc_compartments WHERE session_id = ?1 ORDER BY sequence ASC"
+            ))?;
             let mapped = stmt
                 .query_map(params![session_id], Self::stored_compartment_from_row)?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -8024,17 +7944,15 @@ impl McStore {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         self.inner
             .with_conn(|conn| {
-                let mut stmt = conn.prepare_cached(
-                    "SELECT sequence, start_message, end_message, start_message_id, end_message_id,
-                            start_date, end_date, title, content, p1, p2, p3, p4, importance,
-                            episode_type, legacy, created_at
+                let mut stmt = conn.prepare_cached(&format!(
+                    "SELECT {COMPARTMENT_SELECT_COLUMNS}
                        FROM mc_compartments
                       WHERE session_id = ?1
                         AND end_message >= ?2
                         AND start_message <= ?3
                       ORDER BY sequence ASC
-                      LIMIT ?4",
-                )?;
+                      LIMIT ?4"
+                ))?;
                 let mapped = stmt
                     .query_map(
                         params![session_id, start, end, limit],
@@ -8044,44 +7962,6 @@ impl McStore {
                 Ok(mapped)
             })
             .map_err(Into::into)
-    }
-
-    /// Read the next chronological compartment page and the highest sequence currently
-    /// published for the session. The caller supplies the protocol page cap.
-    pub fn load_compartments_after(
-        &self,
-        session_id: &str,
-        after_sequence: i64,
-        limit: usize,
-    ) -> Result<CompartmentPage, McStoreError> {
-        let page = self.inner.with_conn(|conn| {
-            let max_sequence = conn
-                .query_row(
-                    "SELECT MAX(sequence) FROM mc_compartments WHERE session_id = ?1",
-                    params![session_id],
-                    |row| row.get::<_, Option<i64>>(0),
-                )?
-                .map_or(after_sequence, |max| max.max(after_sequence));
-            let mut stmt = conn.prepare_cached(
-                "SELECT sequence, start_message, end_message, start_message_id, end_message_id,
-                        start_date, end_date, title, content, p1, p2, p3, p4, importance,
-                        episode_type, legacy, created_at
-                 FROM mc_compartments
-                 WHERE session_id = ?1 AND sequence > ?2
-                 ORDER BY sequence ASC LIMIT ?3",
-            )?;
-            let compartments = stmt
-                .query_map(
-                    params![session_id, after_sequence, limit as i64],
-                    Self::stored_compartment_from_row,
-                )?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(CompartmentPage {
-                compartments,
-                max_sequence,
-            })
-        })?;
-        Ok(page)
     }
 
     /// Read the compartment rows and session revert epoch in one store snapshot for
@@ -8099,12 +7979,10 @@ impl McStore {
                         |r| r.get::<_, String>(0),
                     )
                     .optional()?;
-                let mut stmt = conn.prepare_cached(
-                    "SELECT sequence, start_message, end_message, start_message_id, end_message_id,
-                        start_date, end_date, title, content, p1, p2, p3, p4, importance,
-                        episode_type, legacy, created_at
-                 FROM mc_compartments WHERE session_id = ?1 ORDER BY sequence ASC",
-                )?;
+                let mut stmt = conn.prepare_cached(&format!(
+                    "SELECT {COMPARTMENT_SELECT_COLUMNS}
+                       FROM mc_compartments WHERE session_id = ?1 ORDER BY sequence ASC"
+                ))?;
                 let compartments = stmt
                     .query_map(params![session_id], Self::stored_compartment_from_row)?
                     .collect::<Result<Vec<_>, _>>()?;
@@ -8182,7 +8060,7 @@ impl McStore {
         let outcome = self.inner.with_conn_fenced(|tx| {
             let current_target = tx
                 .query_row(
-                    "SELECT row_version, core_state, meta FROM mc_cache_state WHERE session_id = ?1",
+                    CACHE_STATE_FULL_SELECT,
                     params![request.target_key],
                     |row| {
                         Ok((
@@ -8295,47 +8173,17 @@ impl McStore {
                     None,
                     false,
                 );
-                let next_version = current_target_version.max(0) as u64 + 1;
-                let core_json = match serde_json::to_string(&target_core) {
-                    Ok(json) => json,
-                    Err(error) => {
-                        return Ok(LineageDescentTxnOutcome::Serde(error.to_string()))
-                    }
-                };
-                let meta_json = match serde_json::to_string(&target_meta) {
-                    Ok(json) => json,
-                    Err(error) => {
-                        return Ok(LineageDescentTxnOutcome::Serde(error.to_string()))
-                    }
-                };
-                tx.execute(
-                    "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta, last_activity_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(session_id) DO UPDATE SET
-                         row_version = excluded.row_version,
-                         core_state = excluded.core_state,
-                         meta = excluded.meta,
-                         last_activity_at = excluded.last_activity_at",
-                    params![
-                        request.target_key,
-                        next_version as i64,
-                        core_json,
-                        meta_json,
-                        request.now_ms
-                    ],
-                )?;
-                return Ok(LineageDescentTxnOutcome::Committed(LineageDescentOutcome {
-                    loaded: LoadedState {
-                        core: target_core,
-                        meta: target_meta,
-                        row_version: Some(next_version),
-                    },
+                return commit_lineage_disposition(
+                    tx,
+                    request.target_key,
+                    request.now_ms,
+                    target_core,
+                    target_meta,
+                    current_target_version,
                     disposition,
-                    source_key: None,
-                    prior_last_ordinal: None,
-                    materialization_required: false,
-                    acknowledge: true,
-                }));
+                    None,
+                    true,
+                );
             }
 
             let mut source_key = None;
@@ -8386,47 +8234,17 @@ impl McStore {
                     None,
                     false,
                 );
-                let next_version = current_target_version.max(0) as u64 + 1;
-                let core_json = match serde_json::to_string(&target_core) {
-                    Ok(json) => json,
-                    Err(error) => {
-                        return Ok(LineageDescentTxnOutcome::Serde(error.to_string()))
-                    }
-                };
-                let meta_json = match serde_json::to_string(&target_meta) {
-                    Ok(json) => json,
-                    Err(error) => {
-                        return Ok(LineageDescentTxnOutcome::Serde(error.to_string()))
-                    }
-                };
-                tx.execute(
-                    "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta, last_activity_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(session_id) DO UPDATE SET
-                         row_version = excluded.row_version,
-                         core_state = excluded.core_state,
-                         meta = excluded.meta,
-                         last_activity_at = excluded.last_activity_at",
-                    params![
-                        request.target_key,
-                        next_version as i64,
-                        core_json,
-                        meta_json,
-                        request.now_ms
-                    ],
-                )?;
-                return Ok(LineageDescentTxnOutcome::Committed(LineageDescentOutcome {
-                    loaded: LoadedState {
-                        core: target_core,
-                        meta: target_meta,
-                        row_version: Some(next_version),
-                    },
+                return commit_lineage_disposition(
+                    tx,
+                    request.target_key,
+                    request.now_ms,
+                    target_core,
+                    target_meta,
+                    current_target_version,
                     disposition,
-                    source_key: None,
-                    prior_last_ordinal: None,
-                    materialization_required: false,
-                    acknowledge: true,
-                }));
+                    None,
+                    true,
+                );
             };
 
             let source_row = tx
@@ -8463,47 +8281,17 @@ impl McStore {
                     .lineage_descent_counters
                     .pending_build_skew
                     .saturating_add(1);
-                let next_version = current_target_version.max(0) as u64 + 1;
-                let core_json = match serde_json::to_string(&target_core) {
-                    Ok(json) => json,
-                    Err(error) => {
-                        return Ok(LineageDescentTxnOutcome::Serde(error.to_string()))
-                    }
-                };
-                let meta_json = match serde_json::to_string(&target_meta) {
-                    Ok(json) => json,
-                    Err(error) => {
-                        return Ok(LineageDescentTxnOutcome::Serde(error.to_string()))
-                    }
-                };
-                tx.execute(
-                    "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta, last_activity_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(session_id) DO UPDATE SET
-                         row_version = excluded.row_version,
-                         core_state = excluded.core_state,
-                         meta = excluded.meta,
-                         last_activity_at = excluded.last_activity_at",
-                    params![
-                        request.target_key,
-                        next_version as i64,
-                        core_json,
-                        meta_json,
-                        request.now_ms
-                    ],
-                )?;
-                return Ok(LineageDescentTxnOutcome::Committed(LineageDescentOutcome {
-                    loaded: LoadedState {
-                        core: target_core,
-                        meta: target_meta,
-                        row_version: Some(next_version),
-                    },
-                    disposition: LineageDescentDisposition::PendingBuildSkew,
-                    source_key: Some(source_key),
-                    prior_last_ordinal: None,
-                    materialization_required: false,
-                    acknowledge: false,
-                }));
+                return commit_lineage_disposition(
+                    tx,
+                    request.target_key,
+                    request.now_ms,
+                    target_core,
+                    target_meta,
+                    current_target_version,
+                    LineageDescentDisposition::PendingBuildSkew,
+                    Some(source_key),
+                    false,
+                );
             }
 
             let mut statement = tx.prepare_cached(
@@ -8579,7 +8367,7 @@ impl McStore {
             // success-shaped validation outcome that could commit a partial adoption.
             let prior_row = tx
                 .query_row(
-                    "SELECT row_version, meta FROM mc_cache_state WHERE session_id = ?1",
+                    CACHE_STATE_META_SELECT,
                     params![request.prior_key],
                     |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
                 )
@@ -8920,11 +8708,9 @@ impl McStore {
     ) -> Result<TruncateOutcome, McStoreError> {
         let outcome = self.inner.with_conn_fenced(|tx| {
             let row = tx
-                .query_row(
-                    "SELECT row_version, meta FROM mc_cache_state WHERE session_id = ?1",
-                    params![session_id],
-                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-                )
+                .query_row(CACHE_STATE_META_SELECT, params![session_id], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })
                 .optional()?;
             let Some((current, meta_json)) = row else {
                 return Ok(TruncateTxnOutcome::CasConflict(0));
@@ -9021,7 +8807,7 @@ impl McStore {
         let outcome = self.inner.with_conn_fenced(|tx| {
             let row = tx
                 .query_row(
-                    "SELECT row_version, meta FROM mc_cache_state WHERE session_id = ?1",
+                    CACHE_STATE_META_SELECT,
                     params![session_id],
                     |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
                 )
@@ -9220,11 +9006,9 @@ impl McStore {
     ) -> Result<Option<u64>, McStoreError> {
         let outcome = self.inner.with_conn_fenced(|tx| {
             let row = tx
-                .query_row(
-                    "SELECT row_version, meta FROM mc_cache_state WHERE session_id = ?1",
-                    params![session_id],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-                )
+                .query_row(CACHE_STATE_META_SELECT, params![session_id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
                 .optional()?;
             let Some((current, meta_json)) = row else {
                 return Ok(AbandonHistorianTxnOutcome::Unchanged);
@@ -9299,7 +9083,7 @@ impl McStore {
         let outcome = self.inner.with_conn_fenced(|tx| {
             let row = tx
                 .query_row(
-                    "SELECT row_version, meta FROM mc_cache_state WHERE session_id = ?1",
+                    CACHE_STATE_META_SELECT,
                     params![session_id],
                     |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
                 )
@@ -9360,7 +9144,7 @@ impl McStore {
         let outcome = self.inner.with_conn_fenced(|tx| {
             let row = tx
                 .query_row(
-                    "SELECT row_version, meta FROM mc_cache_state WHERE session_id = ?1",
+                    CACHE_STATE_META_SELECT,
                     params![session_id],
                     |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
                 )
@@ -10144,23 +9928,7 @@ impl McStore {
         // This compatibility entry point keeps legacy callers on the active-status path
         // used by the previous context-note surface; the full project smart-note writer
         // below deliberately uses pending instead while still recording condition text.
-        self.with_note_conn_fenced(input.project_path, |tx| {
-            tx.execute(
-                "INSERT INTO mc_notes
-                 (type, project_path, session_id, content, status, surface_condition,
-                  anchor_block_id, harness, created_at_ms, updated_at_ms)
-                 VALUES ('session', ?1, ?2, ?3, 'active', ?4, ?5, 'module', ?6, ?6)",
-                params![
-                    input.project_path,
-                    input.session_id,
-                    content,
-                    input.surface_condition,
-                    input.anchor_block_id,
-                    input.now_ms,
-                ],
-            )?;
-            load_note_tx(tx, tx.last_insert_rowid())
-        })
+        self.with_note_conn_fenced(input.project_path, |tx| insert_note_tx(tx, &input, content))
     }
 
     pub fn insert_project_note(
@@ -10180,40 +9948,8 @@ impl McStore {
                 "note content must not be empty".to_string(),
             ));
         }
-        let status = if input
-            .surface_condition
-            .is_some_and(|condition| !condition.trim().is_empty())
-        {
-            "pending"
-        } else {
-            "active"
-        };
         self.with_note_conn_fenced(input.project_path, |tx| {
-            tx.execute(
-                "INSERT INTO mc_notes
-                 (type, project_path, session_id, content, status, surface_condition,
-                  anchor_block_id, anchor_ordinal, harness, compiled_provider, compiled_config,
-                  compiled_at, compile_status, created_at_ms, updated_at_ms)
-                 VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'module', ?8, ?9, ?10, ?11, ?12, ?12)",
-                params![
-                    input.project_path,
-                    input.session_id,
-                    content,
-                    status,
-                    input
-                        .surface_condition
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty()),
-                    input.anchor_block_id,
-                    input.anchor_ordinal,
-                    input.compiled_provider,
-                    input.compiled_config,
-                    input.compiled_at,
-                    input.compile_status,
-                    input.now_ms,
-                ],
-            )?;
-            load_note_tx(tx, tx.last_insert_rowid())
+            insert_project_note_tx(tx, &input, content)
         })
     }
 
@@ -10419,87 +10155,17 @@ impl McStore {
     ) -> Result<NoteCasOutcome, McStoreError> {
         self.require_note_project(project_path, note_id)?;
         let result = self.with_note_conn_fenced(project_path, |tx| {
-            let current = load_note_tx(tx, note_id).optional()?;
-            let Some(current) = current else {
-                return Ok(NoteCasOutcome::Conflict { current: None });
-            };
-            if current.project_path != project_path {
-                return Ok(NoteCasOutcome::Conflict {
-                    current: Some(current),
-                });
-            }
-            if current.status != expected_status || current.status_version != expected_version {
-                return Ok(NoteCasOutcome::Conflict {
-                    current: Some(current),
-                });
-            }
-            let next_content = content.map(str::trim).unwrap_or(&current.content);
-            if next_content.is_empty() {
-                return Ok(NoteCasOutcome::Conflict {
-                    current: Some(current),
-                });
-            }
-            let next_condition = surface_condition
-                .flatten()
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            let current_condition = current
-                .surface_condition
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            // Presence alone is not an edit: an update that re-supplies the
-            // existing condition unchanged must not invalidate the compiled
-            // artifact, reset a ready note to pending, or fence active claims.
-            let condition_changed =
-                surface_condition.is_some() && next_condition != current_condition;
-            let content_changed = next_content != current.content;
-            let compiler_edit = condition_changed || content_changed;
-            if !compiler_edit {
-                // A fully unchanged update is mutation-neutral: bumping the
-                // versions would fence an active evaluation claim and re-run
-                // billable work for compiler inputs that did not change.
-                return Ok(NoteCasOutcome::Applied(current));
-            }
-            let remaining_condition = if condition_changed {
-                next_condition
-            } else {
-                current_condition
-            };
-            let next_status = if compiler_edit && remaining_condition.is_some() {
-                "pending"
-            } else {
-                current.status.as_str()
-            };
-            let compile = condition_compile.unwrap_or_default();
-            let changed = tx.execute(
-                NOTE_CAS_UPDATE_SQL,
-                params![
-                    next_content,
-                    condition_changed,
-                    next_condition,
-                    next_status,
-                    compiler_edit,
-                    now_ms,
-                    compile.compiled_provider,
-                    compile.compiled_config,
-                    compile.compiled_at,
-                    compile.compile_status,
-                    note_id,
-                    project_path,
-                    expected_status,
-                    expected_version,
-                ],
-            )?;
-            if changed == 0 {
-                return Ok(NoteCasOutcome::Conflict {
-                    current: load_note_tx(tx, note_id).optional()?,
-                });
-            }
-            if compiler_edit {
-                fence_active_note_claims_tx(tx, project_path, Some(note_id), "stale", now_ms)?;
-            }
-            Ok(NoteCasOutcome::Applied(load_note_tx(tx, note_id)?))
+            update_note_cas_tx(
+                tx,
+                project_path,
+                note_id,
+                expected_status,
+                expected_version,
+                content,
+                surface_condition,
+                condition_compile,
+                now_ms,
+            )
         })?;
         Ok(result)
     }
@@ -10518,45 +10184,8 @@ impl McStore {
         {
             return Ok(None);
         }
-        let resolution = resolution.map(str::trim).filter(|value| !value.is_empty());
         self.with_note_conn_fenced(project_path, |tx| {
-            let Some(current) = load_note_tx(tx, note_id).optional()? else {
-                return Ok(None);
-            };
-            if current.project_path != project_path
-                || !matches!(
-                    current.status.as_str(),
-                    "active" | "pending" | "ready" | "surfacing" | "surfaced"
-                )
-            {
-                return Ok(None);
-            }
-            let content = resolution
-                .map(|value| format!("{}\n\nResolution: {value}", current.content))
-                .unwrap_or_else(|| current.content.clone());
-            let changed = tx.execute(
-                "UPDATE mc_notes
-                    SET status = 'dismissed', content = ?1,
-                        status_version = status_version + 1, state_version = state_version + 1,
-                        updated_at_ms = ?2,
-                        dismissed_at = ?2, dismissal_resolution = ?3
-                  WHERE id = ?4 AND project_path = ?5
-                    AND status = ?6 AND status_version = ?7",
-                params![
-                    content,
-                    now_ms,
-                    resolution,
-                    note_id,
-                    project_path,
-                    current.status,
-                    current.status_version,
-                ],
-            )?;
-            if changed == 0 {
-                return Ok(None);
-            }
-            fence_active_note_claims_tx(tx, project_path, Some(note_id), "stale", now_ms)?;
-            Ok(Some(load_note_tx(tx, note_id)?))
+            dismiss_note_tx(tx, project_path, None, note_id, resolution, now_ms)
         })
     }
 
@@ -12835,8 +12464,15 @@ fn tag_row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<McTagRow> {
     })
 }
 
-const NOTE_SELECT_COLUMNS: &str = "id, type, project_path, session_id, content, status, surface_condition, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id, source_revision, state_version, compiled_source_revision, compiled_project_path, compiled_provider, compiled_config, compiled_at, compile_status";
-const NOTE_INSERT_COLUMNS: &str = "type, project_path, session_id, content, status, surface_condition, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id, source_revision, state_version, compiled_source_revision, compiled_project_path, compiled_provider, compiled_config, compiled_at, compile_status";
+/// One source list: the select list is the insert list with the generated
+/// `id` in front, derived by `concat!` so the two cannot drift.
+macro_rules! note_columns {
+    () => {
+        "type, project_path, session_id, content, status, surface_condition, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id, source_revision, state_version, compiled_source_revision, compiled_project_path, compiled_provider, compiled_config, compiled_at, compile_status"
+    };
+}
+const NOTE_INSERT_COLUMNS: &str = note_columns!();
+const NOTE_SELECT_COLUMNS: &str = concat!("id, ", note_columns!());
 
 // ?2 = condition changed, ?5 = compiler-input edit (content or condition). A compiler-input
 // edit advances source_revision and resets compiled evaluation state; ?7..?10 replace the
@@ -12923,6 +12559,224 @@ fn load_note_tx(tx: &rusqlite::Transaction<'_>, id: i64) -> rusqlite::Result<Sto
         params![id],
         stored_note_from_row,
     )
+}
+
+/// Single definition of the session-note insert executed by both the
+/// `McStore` method and the facade command path. `content` is the
+/// already-trimmed, non-empty note text (each caller validates it against
+/// its own error type).
+fn insert_note_tx(
+    tx: &rusqlite::Transaction<'_>,
+    input: &NoteInput<'_>,
+    content: &str,
+) -> rusqlite::Result<StoredNote> {
+    tx.execute(
+        "INSERT INTO mc_notes
+         (type, project_path, session_id, content, status, surface_condition,
+          anchor_block_id, harness, created_at_ms, updated_at_ms)
+         VALUES ('session', ?1, ?2, ?3, 'active', ?4, ?5, 'module', ?6, ?6)",
+        params![
+            input.project_path,
+            input.session_id,
+            content,
+            input.surface_condition,
+            input.anchor_block_id,
+            input.now_ms,
+        ],
+    )?;
+    load_note_tx(tx, tx.last_insert_rowid())
+}
+
+/// Single definition of the project smart-note insert executed by both the
+/// `McStore` method and the facade command path. A non-empty surface
+/// condition starts the note `pending` (awaiting compile); otherwise it is
+/// immediately `active`.
+fn insert_project_note_tx(
+    tx: &rusqlite::Transaction<'_>,
+    input: &NoteWriteInput<'_>,
+    content: &str,
+) -> rusqlite::Result<StoredNote> {
+    let status = if input
+        .surface_condition
+        .is_some_and(|condition| !condition.trim().is_empty())
+    {
+        "pending"
+    } else {
+        "active"
+    };
+    tx.execute(
+        "INSERT INTO mc_notes
+         (type, project_path, session_id, content, status, surface_condition,
+          anchor_block_id, anchor_ordinal, harness, compiled_provider, compiled_config,
+          compiled_at, compile_status, created_at_ms, updated_at_ms)
+         VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'module', ?8, ?9, ?10, ?11, ?12, ?12)",
+        params![
+            input.project_path,
+            input.session_id,
+            content,
+            status,
+            input
+                .surface_condition
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+            input.anchor_block_id,
+            input.anchor_ordinal,
+            input.compiled_provider,
+            input.compiled_config,
+            input.compiled_at,
+            input.compile_status,
+            input.now_ms,
+        ],
+    )?;
+    load_note_tx(tx, tx.last_insert_rowid())
+}
+
+/// Single definition of the note CAS update executed by both the `McStore`
+/// method and the facade command path.
+#[allow(clippy::too_many_arguments)]
+fn update_note_cas_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project_path: &str,
+    note_id: i64,
+    expected_status: &str,
+    expected_version: i64,
+    content: Option<&str>,
+    surface_condition: Option<Option<&str>>,
+    condition_compile: Option<NoteConditionCompile<'_>>,
+    now_ms: i64,
+) -> rusqlite::Result<NoteCasOutcome> {
+    let current = load_note_tx(tx, note_id).optional()?;
+    let Some(current) = current else {
+        return Ok(NoteCasOutcome::Conflict { current: None });
+    };
+    if current.project_path != project_path
+        || current.status != expected_status
+        || current.status_version != expected_version
+    {
+        return Ok(NoteCasOutcome::Conflict {
+            current: Some(current),
+        });
+    }
+    let next_content = content.map(str::trim).unwrap_or(&current.content);
+    if next_content.is_empty() {
+        return Ok(NoteCasOutcome::Conflict {
+            current: Some(current),
+        });
+    }
+    let next_condition = surface_condition
+        .flatten()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let current_condition = current
+        .surface_condition
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    // Presence alone is not an edit: an update that re-supplies the
+    // existing condition unchanged must not invalidate the compiled
+    // artifact, reset a ready note to pending, or fence active claims.
+    let condition_changed = surface_condition.is_some() && next_condition != current_condition;
+    let content_changed = next_content != current.content;
+    let compiler_edit = condition_changed || content_changed;
+    if !compiler_edit {
+        // A fully unchanged update is mutation-neutral: bumping the
+        // versions would fence an active evaluation claim and re-run
+        // billable work for compiler inputs that did not change.
+        return Ok(NoteCasOutcome::Applied(current));
+    }
+    let remaining_condition = if condition_changed {
+        next_condition
+    } else {
+        current_condition
+    };
+    let next_status = if remaining_condition.is_some() {
+        "pending"
+    } else {
+        current.status.as_str()
+    };
+    let compile = condition_compile.unwrap_or_default();
+    let changed = tx.execute(
+        NOTE_CAS_UPDATE_SQL,
+        params![
+            next_content,
+            condition_changed,
+            next_condition,
+            next_status,
+            compiler_edit,
+            now_ms,
+            compile.compiled_provider,
+            compile.compiled_config,
+            compile.compiled_at,
+            compile.compile_status,
+            note_id,
+            project_path,
+            expected_status,
+            expected_version,
+        ],
+    )?;
+    if changed == 0 {
+        return Ok(NoteCasOutcome::Conflict {
+            current: load_note_tx(tx, note_id).optional()?,
+        });
+    }
+    if compiler_edit {
+        fence_active_note_claims_tx(tx, project_path, Some(note_id), "stale", now_ms)?;
+    }
+    Ok(NoteCasOutcome::Applied(load_note_tx(tx, note_id)?))
+}
+
+/// Single definition of the note dismissal executed by both the `McStore`
+/// method and the facade command path. `session_id` is an extra ownership
+/// gate: `Some` requires the note's writer session to match (the facade
+/// carries the caller's session), `None` relies on the caller's own
+/// session-scoped precheck.
+fn dismiss_note_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project_path: &str,
+    session_id: Option<&str>,
+    note_id: i64,
+    resolution: Option<&str>,
+    now_ms: i64,
+) -> rusqlite::Result<Option<StoredNote>> {
+    let Some(current) = load_note_tx(tx, note_id).optional()? else {
+        return Ok(None);
+    };
+    if current.project_path != project_path
+        || session_id.is_some_and(|session| current.session_id != session)
+        || !matches!(
+            current.status.as_str(),
+            "active" | "pending" | "ready" | "surfacing" | "surfaced"
+        )
+    {
+        return Ok(None);
+    }
+    let resolution = resolution.map(str::trim).filter(|value| !value.is_empty());
+    let content = resolution
+        .map(|value| format!("{}\n\nResolution: {value}", current.content))
+        .unwrap_or_else(|| current.content.clone());
+    let changed = tx.execute(
+        "UPDATE mc_notes
+            SET status = 'dismissed', content = ?1,
+                status_version = status_version + 1, state_version = state_version + 1,
+                updated_at_ms = ?2,
+                dismissed_at = ?2, dismissal_resolution = ?3
+          WHERE id = ?4 AND project_path = ?5
+            AND status = ?6 AND status_version = ?7",
+        params![
+            content,
+            now_ms,
+            resolution,
+            note_id,
+            project_path,
+            current.status,
+            current.status_version,
+        ],
+    )?;
+    if changed == 0 {
+        return Ok(None);
+    }
+    fence_active_note_claims_tx(tx, project_path, Some(note_id), "stale", now_ms)?;
+    Ok(Some(load_note_tx(tx, note_id)?))
 }
 
 const NOTE_EVAL_CLAIM_COLUMNS: &str = "claim_id, note_id, phase, acquisition_id, \
@@ -13932,16 +13786,38 @@ fn capped_trace_error(error: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cortexkit_store_types::{Isolation, StorageBackend};
+    use cortexkit_store_types::StorageBackend;
 
     fn descriptor(dir: &std::path::Path) -> StorageDescriptor {
-        StorageDescriptor {
-            module_id: "magic-context-test".to_string(),
-            storage_namespace: "mc_cache".to_string(),
-            isolation: Isolation::Module,
-            backend: StorageBackend::Sqlite {
-                path: dir.join("store.db").to_string_lossy().to_string(),
-            },
+        McStore::test_descriptor(dir, "magic-context-test")
+    }
+
+    /// A "nothing happened" commit: every optional effect empty. Tests
+    /// override only the fields they exercise via struct update.
+    fn base_commit<'a>(
+        expected: Option<u64>,
+        core: &'a CoreState,
+        meta: &'a ModuleMeta,
+    ) -> TransformCommit<'a> {
+        TransformCommit {
+            expected,
+            core,
+            meta,
+            consumed_drop_ids: &[],
+            first_applied_command_ids: &[],
+            claim_snapshot_vector: None,
+            compartment_max_seq: None,
+            project_root: None,
+            first_divergence: None,
+            scheduler_observation: None,
+            scheduler_request_observed_at_ms: None,
+            scheduler_full_array_fingerprint: None,
+            scheduler_eligible_supersession_count: None,
+            scheduler_withheld_by_tag_window: None,
+            scheduler_withheld_by_exempt_message: None,
+            scheduler_applied_supersession_count: None,
+            scheduler_applied_reductions: false,
+            overlays: TransformOverlayBatch::default(),
         }
     }
 
@@ -14297,24 +14173,8 @@ mod tests {
             .commit_transform(
                 "canonical-write",
                 TransformCommit {
-                    expected: initial.row_version,
-                    core: &initial.core,
-                    meta: &initial.meta,
-                    consumed_drop_ids: &[],
-                    first_applied_command_ids: &[],
-                    claim_snapshot_vector: None,
-                    compartment_max_seq: None,
                     project_root: Some(link_text),
-                    first_divergence: None,
-                    scheduler_observation: None,
-                    scheduler_request_observed_at_ms: None,
-                    scheduler_full_array_fingerprint: None,
-                    scheduler_eligible_supersession_count: None,
-                    scheduler_withheld_by_tag_window: None,
-                    scheduler_withheld_by_exempt_message: None,
-                    scheduler_applied_supersession_count: None,
-                    scheduler_applied_reductions: false,
-                    overlays: TransformOverlayBatch::default(),
+                    ..base_commit(initial.row_version, &initial.core, &initial.meta)
                 },
             )
             .unwrap();
@@ -14373,24 +14233,12 @@ mod tests {
             .commit_transform(
                 "missing-root",
                 TransformCommit {
-                    expected: missing_initial.row_version,
-                    core: &missing_initial.core,
-                    meta: &missing_initial.meta,
-                    consumed_drop_ids: &[],
-                    first_applied_command_ids: &[],
-                    claim_snapshot_vector: None,
-                    compartment_max_seq: None,
                     project_root: Some(missing_text),
-                    first_divergence: None,
-                    scheduler_observation: None,
-                    scheduler_request_observed_at_ms: None,
-                    scheduler_full_array_fingerprint: None,
-                    scheduler_eligible_supersession_count: None,
-                    scheduler_withheld_by_tag_window: None,
-                    scheduler_withheld_by_exempt_message: None,
-                    scheduler_applied_supersession_count: None,
-                    scheduler_applied_reductions: false,
-                    overlays: TransformOverlayBatch::default(),
+                    ..base_commit(
+                        missing_initial.row_version,
+                        &missing_initial.core,
+                        &missing_initial.meta,
+                    )
                 },
             )
             .unwrap();
@@ -14512,23 +14360,6 @@ mod tests {
             .commit_transform(
                 "ses",
                 TransformCommit {
-                    expected: split_state.row_version,
-                    core: &split_state.core,
-                    meta: &split_state.meta,
-                    consumed_drop_ids: &[],
-                    first_applied_command_ids: &[],
-                    claim_snapshot_vector: None,
-                    compartment_max_seq: None,
-                    project_root: None,
-                    first_divergence: None,
-                    scheduler_observation: None,
-                    scheduler_request_observed_at_ms: None,
-                    scheduler_full_array_fingerprint: None,
-                    scheduler_eligible_supersession_count: None,
-                    scheduler_withheld_by_tag_window: None,
-                    scheduler_withheld_by_exempt_message: None,
-                    scheduler_applied_supersession_count: None,
-                    scheduler_applied_reductions: false,
                     overlays: TransformOverlayBatch {
                         max_seen_ordinal: Some(1),
                         tag_mints: &tag_mints,
@@ -14537,6 +14368,11 @@ mod tests {
                         channel1_append: Some(&channel1),
                         created_at_ms: 10,
                     },
+                    ..base_commit(
+                        split_state.row_version,
+                        &split_state.core,
+                        &split_state.meta,
+                    )
                 },
             )
             .unwrap();
@@ -14598,23 +14434,6 @@ mod tests {
             .commit_transform(
                 "ses",
                 TransformCommit {
-                    expected: stale.row_version,
-                    core: &stale.core,
-                    meta: &stale.meta,
-                    consumed_drop_ids: &[],
-                    first_applied_command_ids: &[],
-                    claim_snapshot_vector: None,
-                    compartment_max_seq: None,
-                    project_root: None,
-                    first_divergence: None,
-                    scheduler_observation: None,
-                    scheduler_request_observed_at_ms: None,
-                    scheduler_full_array_fingerprint: None,
-                    scheduler_eligible_supersession_count: None,
-                    scheduler_withheld_by_tag_window: None,
-                    scheduler_withheld_by_exempt_message: None,
-                    scheduler_applied_supersession_count: None,
-                    scheduler_applied_reductions: false,
                     overlays: TransformOverlayBatch {
                         max_seen_ordinal: Some(1),
                         tag_mints: &tags,
@@ -14623,6 +14442,7 @@ mod tests {
                         channel1_append: Some(&channel1),
                         created_at_ms: 1,
                     },
+                    ..base_commit(stale.row_version, &stale.core, &stale.meta)
                 },
             )
             .unwrap_err();
@@ -14729,24 +14549,9 @@ mod tests {
             .commit_transform(
                 "ses",
                 TransformCommit {
-                    expected: loaded.row_version,
-                    core: &loaded.core,
-                    meta: &loaded.meta,
                     consumed_drop_ids: &[pending[0].id],
                     first_applied_command_ids: &command_ids,
-                    claim_snapshot_vector: None,
-                    compartment_max_seq: None,
-                    project_root: None,
-                    first_divergence: None,
-                    scheduler_observation: None,
-                    scheduler_request_observed_at_ms: None,
-                    scheduler_full_array_fingerprint: None,
-                    scheduler_eligible_supersession_count: None,
-                    scheduler_withheld_by_tag_window: None,
-                    scheduler_withheld_by_exempt_message: None,
-                    scheduler_applied_supersession_count: None,
-                    scheduler_applied_reductions: false,
-                    overlays: TransformOverlayBatch::default(),
+                    ..base_commit(loaded.row_version, &loaded.core, &loaded.meta)
                 },
             )
             .unwrap();
@@ -15228,23 +15033,6 @@ mod tests {
                 store.commit_transform(
                     "race",
                     TransformCommit {
-                        expected: loaded.row_version,
-                        core: &loaded.core,
-                        meta: &loaded.meta,
-                        consumed_drop_ids: &[],
-                        first_applied_command_ids: &[],
-                        claim_snapshot_vector: None,
-                        compartment_max_seq: None,
-                        project_root: None,
-                        first_divergence: None,
-                        scheduler_observation: None,
-                        scheduler_request_observed_at_ms: None,
-                        scheduler_full_array_fingerprint: None,
-                        scheduler_eligible_supersession_count: None,
-                        scheduler_withheld_by_tag_window: None,
-                        scheduler_withheld_by_exempt_message: None,
-                        scheduler_applied_supersession_count: None,
-                        scheduler_applied_reductions: false,
                         overlays: TransformOverlayBatch {
                             max_seen_ordinal: Some(3),
                             temporal_marks: &temporal_marks,
@@ -15252,6 +15040,7 @@ mod tests {
                             created_at_ms: 100,
                             ..Default::default()
                         },
+                        ..base_commit(loaded.row_version, &loaded.core, &loaded.meta)
                     },
                 )
             }));
@@ -15293,23 +15082,6 @@ mod tests {
             .commit_transform(
                 "race",
                 TransformCommit {
-                    expected: loaded.row_version,
-                    core: &loaded.core,
-                    meta: &loaded.meta,
-                    consumed_drop_ids: &[],
-                    first_applied_command_ids: &[],
-                    claim_snapshot_vector: None,
-                    compartment_max_seq: None,
-                    project_root: None,
-                    first_divergence: None,
-                    scheduler_observation: None,
-                    scheduler_request_observed_at_ms: None,
-                    scheduler_full_array_fingerprint: None,
-                    scheduler_eligible_supersession_count: None,
-                    scheduler_withheld_by_tag_window: None,
-                    scheduler_withheld_by_exempt_message: None,
-                    scheduler_applied_supersession_count: None,
-                    scheduler_applied_reductions: false,
                     overlays: TransformOverlayBatch {
                         max_seen_ordinal: Some(4),
                         temporal_marks: &late_mark,
@@ -15317,6 +15089,7 @@ mod tests {
                         created_at_ms: 200,
                         ..Default::default()
                     },
+                    ..base_commit(loaded.row_version, &loaded.core, &loaded.meta)
                 },
             )
             .unwrap();
@@ -17437,6 +17210,119 @@ mod tests {
     }
 
     #[test]
+    fn facade_note_update_with_unchanged_condition_is_not_a_compiler_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let note = store
+            .insert_project_note(NoteWriteInput {
+                project_path: "git:proj",
+                route_project_root: None,
+                session_id: Some("writer-session"),
+                content: "wait for the release",
+                surface_condition: Some("release exists"),
+                anchor_block_id: None,
+                anchor_ordinal: None,
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
+                now_ms: 10,
+            })
+            .unwrap();
+        let claimed = store.claim_due_note("git:proj", 20).unwrap().unwrap();
+        let ready = match store
+            .write_note_evaluation(NoteEvaluationInput {
+                project_path: "git:proj",
+                note_id: note.id,
+                source_revision: claimed.status_version,
+                verdict: true,
+                compiled_check: Some("release exists"),
+                manifest_json: Some("{}"),
+                check_hash: Some("hash"),
+                next_due_at: None,
+                now_ms: 30,
+            })
+            .unwrap()
+        {
+            NoteCasOutcome::Applied(note) => note,
+            other => panic!("unexpected evaluation outcome: {other:?}"),
+        };
+
+        // The same unchanged-condition update the McStore path treats as
+        // mutation-neutral, driven through the facade command path.
+        let mut outcome = None;
+        store
+            .with_facade_command(
+                "git:proj",
+                "git:proj",
+                "notes",
+                "writer-session",
+                "ctx_note",
+                "update",
+                None,
+                |txn| {
+                    outcome = Some(txn.update_note_cas(
+                        "git:proj",
+                        note.id,
+                        &ready.status,
+                        ready.status_version,
+                        None,
+                        Some(Some("  release exists  ")),
+                        None,
+                        40,
+                    )?);
+                    Ok(Vec::new())
+                },
+            )
+            .unwrap();
+        let unchanged = match outcome.unwrap() {
+            NoteCasOutcome::Applied(note) => note,
+            other => panic!("unexpected unchanged-condition outcome: {other:?}"),
+        };
+        // Mutation-neutral on the facade path too: no status reset, no version
+        // bump, no compiled-artifact invalidation.
+        assert_eq!(unchanged.status, ready.status);
+        assert_eq!(unchanged.status_version, ready.status_version);
+        assert_eq!(unchanged.state_version, ready.state_version);
+        assert_eq!(unchanged.compiled_check, ready.compiled_check);
+        assert_eq!(unchanged.source_revision, ready.source_revision);
+
+        // A genuinely changed condition through the facade still recompiles.
+        let mut changed_outcome = None;
+        store
+            .with_facade_command(
+                "git:proj",
+                "git:proj",
+                "notes",
+                "writer-session",
+                "ctx_note",
+                "update",
+                None,
+                |txn| {
+                    changed_outcome = Some(txn.update_note_cas(
+                        "git:proj",
+                        note.id,
+                        &unchanged.status,
+                        unchanged.status_version,
+                        None,
+                        Some(Some("release tagged")),
+                        None,
+                        50,
+                    )?);
+                    Ok(Vec::new())
+                },
+            )
+            .unwrap();
+        let changed = match changed_outcome.unwrap() {
+            NoteCasOutcome::Applied(note) => note,
+            other => panic!("unexpected changed-condition outcome: {other:?}"),
+        };
+        assert_eq!(changed.status, "pending");
+        assert_eq!(changed.source_revision, unchanged.source_revision + 1);
+        assert!(changed.compiled_check.is_none());
+    }
+
+    #[test]
     fn project_notes_use_cas_and_at_least_once_delivery() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
@@ -19421,18 +19307,9 @@ mod tests {
 #[cfg(test)]
 mod shadow_tests {
     use super::*;
-    use cortexkit_store_types::{Isolation, StorageBackend};
 
     fn store(dir: &std::path::Path) -> McStore {
-        McStore::open(&StorageDescriptor {
-            module_id: "magic-context-test".to_string(),
-            storage_namespace: "mc_cache".to_string(),
-            isolation: Isolation::Module,
-            backend: StorageBackend::Sqlite {
-                path: dir.join("store.db").to_string_lossy().to_string(),
-            },
-        })
-        .unwrap()
+        McStore::open_for_test(dir, "magic-context-test")
     }
 
     fn comp(sequence: i64, end: i64, end_id: &str) -> StoredCompartment {
@@ -19981,18 +19858,9 @@ mod shadow_tests {
 #[cfg(test)]
 mod lineage_descent_tests {
     use super::*;
-    use cortexkit_store_types::{Isolation, StorageBackend};
 
     fn store(dir: &std::path::Path) -> McStore {
-        McStore::open(&StorageDescriptor {
-            module_id: "magic-context-lineage-test".to_string(),
-            storage_namespace: "mc_cache".to_string(),
-            isolation: Isolation::Module,
-            backend: StorageBackend::Sqlite {
-                path: dir.join("store.db").to_string_lossy().to_string(),
-            },
-        })
-        .unwrap()
+        McStore::open_for_test(dir, "magic-context-lineage-test")
     }
 
     fn compartment(sequence: i64, start: i64, end: i64, end_id: &str) -> StoredCompartment {

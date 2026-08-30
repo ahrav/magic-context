@@ -2,7 +2,7 @@
 
 Task: `magic-context-c50.1` (epic `magic-context-c50`, hand-rolled Rust module host)
 Date: 2026-08-17
-Plan: `2026-08-17-0505-subc-api-surface-spike-plan.md`
+Plan: `docs/plans-archive/2026-08-17-0505-subc-api-surface-spike-plan.md`
 Final disposition: direct migration completed by the direct `mc-host` boundary plan dated 2026-08-24.
 
 ## Final decision

@@ -1008,14 +1008,12 @@ function maxNullableNumber(a: number | null, b: number | null): number | null {
     return null;
 }
 
-function getPiFallbackFoldTagRowByNumber(
-    db: Database,
-    sessionId: string,
-    tagNumber: number,
-): PiFallbackFoldTagRow | null {
-    const row = db
-        .prepare(
-            `SELECT tag_number AS tagNumber,
+/**
+ * Alias projection consumed by `isPiFallbackFoldTagRow`: every reader that
+ * gates rows through that predicate must select exactly this column list, or
+ * rows are silently filtered out.
+ */
+const PI_FALLBACK_FOLD_TAG_PROJECTION = `SELECT tag_number AS tagNumber,
                     message_id AS messageId,
                     tool_owner_message_id AS toolOwnerMessageId,
                     type,
@@ -1026,7 +1024,16 @@ function getPiFallbackFoldTagRowByNumber(
                     token_count AS tokenCount,
                     input_token_count AS inputTokenCount,
                     reasoning_token_count AS reasoningTokenCount
-             FROM tags
+             FROM tags`;
+
+function getPiFallbackFoldTagRowByNumber(
+    db: Database,
+    sessionId: string,
+    tagNumber: number,
+): PiFallbackFoldTagRow | null {
+    const row = db
+        .prepare(
+            `${PI_FALLBACK_FOLD_TAG_PROJECTION}
              WHERE session_id = ? AND tag_number = ?`,
         )
         .get(sessionId, tagNumber);
@@ -1041,18 +1048,7 @@ function getPiFallbackToolFoldTagRowByOwner(
 ): PiFallbackFoldTagRow | null {
     const row = db
         .prepare(
-            `SELECT tag_number AS tagNumber,
-                    message_id AS messageId,
-                    tool_owner_message_id AS toolOwnerMessageId,
-                    type,
-                    status,
-                    byte_size AS byteSize,
-                    reasoning_byte_size AS reasoningByteSize,
-                    input_byte_size AS inputByteSize,
-                    token_count AS tokenCount,
-                    input_token_count AS inputTokenCount,
-                    reasoning_token_count AS reasoningTokenCount
-             FROM tags
+            `${PI_FALLBACK_FOLD_TAG_PROJECTION}
              WHERE session_id = ?
                AND message_id = ?
                AND type = 'tool'
@@ -1070,18 +1066,7 @@ function getPiFallbackMessageFoldTagRowsByMessageId(
 ): PiFallbackFoldTagRow[] {
     return db
         .prepare(
-            `SELECT tag_number AS tagNumber,
-                    message_id AS messageId,
-                    tool_owner_message_id AS toolOwnerMessageId,
-                    type,
-                    status,
-                    byte_size AS byteSize,
-                    reasoning_byte_size AS reasoningByteSize,
-                    input_byte_size AS inputByteSize,
-                    token_count AS tokenCount,
-                    input_token_count AS inputTokenCount,
-                    reasoning_token_count AS reasoningTokenCount
-             FROM tags
+            `${PI_FALLBACK_FOLD_TAG_PROJECTION}
              WHERE session_id = ?
                AND message_id = ?
                AND type = 'message'
@@ -2045,29 +2030,6 @@ export function pickNearestPriorOwner(
         }
     }
     return best?.id ?? null;
-}
-
-/**
- * Legacy alias kept for the rare runtime call site that hasn't been
- * migrated to the split lookup-then-pick form. Always returns null
- * (no message-time data available without a DB handle the function
- * itself can't reach). New call sites should use `getCandidateToolOwners`
- * + `getMessageTimesFromOpenCodeDb` + `pickNearestPriorOwner` directly.
- *
- * Why we keep this name: the v3.3.1 plan documents this as the public
- * entry point for the result-only-window fallback. Removing it would
- * require touching `.alfonso/plans/tag-owner-fix-plan.md` and migrating
- * the test fixtures that exercise it. Leaving the symbol present with
- * a noop body keeps existing test scaffolds working while the actual
- * pick happens in the hooks-tree caller.
- */
-export function getPersistedToolOwnerNearestPrior(
-    _db: Database,
-    _sessionId: string,
-    _callId: string,
-    _currentMessageId: string,
-): string | null {
-    return null;
 }
 
 function getDeleteToolTagsByOwnerStatement(db: Database): PreparedStatement {

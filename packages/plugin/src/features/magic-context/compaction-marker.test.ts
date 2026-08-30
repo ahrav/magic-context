@@ -12,6 +12,7 @@ import {
     generateMessageId,
     injectCompactionMarker,
 } from "./compaction-marker";
+import { createOpenCodeTestDb } from "./test-database";
 
 const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
@@ -22,18 +23,6 @@ function useTempDataHome(prefix: string): string {
     process.env.XDG_DATA_HOME = dir;
     mkdirSync(join(dir, "opencode"), { recursive: true });
     return dir;
-}
-
-function createOpenCodeDb(dataHome: string): Database {
-    const db = new Database(join(dataHome, "opencode", "opencode.db"));
-    db.exec("PRAGMA journal_mode=WAL");
-    db.exec(
-        "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
-    );
-    db.exec(
-        "CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
-    );
-    return db;
 }
 
 function insertMessage(
@@ -60,7 +49,7 @@ afterEach(() => {
 describe("findBoundaryUserMessage", () => {
     it("anchors by endMessageId after rows before the target were deleted", () => {
         const dataHome = useTempDataHome("marker-boundary-deleted-before-");
-        const db = createOpenCodeDb(dataHome);
+        const db = createOpenCodeTestDb(dataHome);
         insertMessage(db, "msg_001_deleted_user", "user", 100);
         insertMessage(db, "msg_002_deleted_assistant", "assistant", 200);
         insertMessage(db, "msg_003_prior_user", "user", 300);
@@ -76,7 +65,7 @@ describe("findBoundaryUserMessage", () => {
 
     it("uses the canonical time_created/id tie-break at equal timestamps", () => {
         const dataHome = useTempDataHome("marker-boundary-tiebreak-");
-        const db = createOpenCodeDb(dataHome);
+        const db = createOpenCodeTestDb(dataHome);
         insertMessage(db, "msg_a_prior_user", "user", 1_000);
         insertMessage(db, "msg_b_target", "assistant", 1_000);
         insertMessage(db, "msg_c_after_user", "user", 1_000);
@@ -87,7 +76,7 @@ describe("findBoundaryUserMessage", () => {
 
     it("returns the target itself when the target message is a user", () => {
         const dataHome = useTempDataHome("marker-boundary-target-user-");
-        const db = createOpenCodeDb(dataHome);
+        const db = createOpenCodeTestDb(dataHome);
         insertMessage(db, "msg_001_prior_user", "user", 100);
         insertMessage(db, "msg_002_target_user", "user", 200);
         closeQuietly(db);
@@ -99,7 +88,7 @@ describe("findBoundaryUserMessage", () => {
 
     it("is unchanged by deleting rows after the target", () => {
         const dataHome = useTempDataHome("marker-boundary-deleted-after-");
-        const db = createOpenCodeDb(dataHome);
+        const db = createOpenCodeTestDb(dataHome);
         insertMessage(db, "msg_001_prior_user", "user", 100);
         insertMessage(db, "msg_002_target", "assistant", 200);
         insertMessage(db, "msg_003_after_user", "user", 300);
@@ -117,7 +106,7 @@ describe("findBoundaryUserMessage", () => {
 
     it("finds a prior user across a long assistant/tool span", () => {
         const dataHome = useTempDataHome("marker-boundary-long-span-");
-        const db = createOpenCodeDb(dataHome);
+        const db = createOpenCodeTestDb(dataHome);
         insertMessage(db, "msg_001_prior_user", "user", 100);
         for (let i = 0; i < 150; i++) {
             insertMessage(
@@ -137,7 +126,7 @@ describe("findBoundaryUserMessage", () => {
 describe("injectCompactionMarker", () => {
     it("keeps deterministic marker ids in OpenCode's lexicographic row order", () => {
         const dataHome = useTempDataHome("marker-inject-id-order-");
-        const db = createOpenCodeDb(dataHome);
+        const db = createOpenCodeTestDb(dataHome);
         const boundaryId = generateMessageId(1_000, 0n, "boundary");
         const retainedId = generateMessageId(1_002, 0n, "retained");
         insertMessage(db, boundaryId, "user", 1_000);
@@ -183,7 +172,7 @@ describe("injectCompactionMarker", () => {
 
     it("preserves the deterministic boundary in the healthy no-deletion case", () => {
         const dataHome = useTempDataHome("marker-inject-healthy-");
-        const db = createOpenCodeDb(dataHome);
+        const db = createOpenCodeTestDb(dataHome);
         insertMessage(db, "msg_001_user", "user", 100);
         insertMessage(db, "msg_002_assistant", "assistant", 200);
         insertMessage(db, "msg_003_target", "assistant", 300);

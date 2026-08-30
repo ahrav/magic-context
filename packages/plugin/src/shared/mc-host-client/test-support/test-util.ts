@@ -164,7 +164,7 @@ interface CandidateWaiter {
  * set `onFrame` to script activation, commit, and application responses;
  * `close` fails the client half like a lost channel.
  */
-export class FakeCandidateHost {
+class FakeCandidateHost {
     readonly frames: CandidateHostFrame[] = [];
     onFrame: ((frame: CandidateHostFrame, host: FakeCandidateHost) => void) | null = null;
     private channel: FakeCandidateChannel | null = null;

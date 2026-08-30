@@ -33,6 +33,7 @@
  * across passes.
  */
 
+import { CTX_REDUCE_KEEP } from "@magic-context/core/features/magic-context/reclaim-protection";
 import {
 	type ContextDatabase,
 	getActiveTagsBySession,
@@ -60,14 +61,18 @@ import { stripTagPrefix } from "@magic-context/core/hooks/magic-context/tag-part
 import { sessionLog } from "@magic-context/core/shared/logger";
 
 /**
- * Same DEDUP_SAFE_TOOLS list OpenCode uses. Read-only tools whose
- * outputs are deterministic given the same input — duplicate calls
- * are wasted context. Anything mutating (write/edit/bash/etc.) is
- * intentionally excluded because two identical calls may have
- * different semantics in different positions of the conversation.
+ * Keep budget for duplicate read-only tool outputs — one value shared with
+ * the OpenCode plugin (`CTX_REDUCE_KEEP`).
  */
-export const PI_CTX_REDUCE_KEEP = 3;
+export const PI_CTX_REDUCE_KEEP = CTX_REDUCE_KEEP;
 
+/**
+ * Dedup applies only to read-only tools whose outputs are deterministic given
+ * the same input — duplicate calls are wasted context. Anything mutating
+ * (write/edit/bash/etc.) is intentionally excluded because two identical
+ * calls may have different semantics in different positions of the
+ * conversation.
+ */
 const DEDUP_SAFE_TOOLS = new Set([
 	"mcp_grep",
 	"mcp_read",

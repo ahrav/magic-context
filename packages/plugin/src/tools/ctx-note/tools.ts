@@ -27,6 +27,7 @@ import {
 import type { Database } from "../../shared/sqlite";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import { CTX_NOTE_DESCRIPTION } from "./constants";
+import { anchorSuffix, DEFAULT_READ_LIMIT, paginateNewestFirst } from "./pagination";
 import type { CtxNoteArgs, CtxNoteReadFilter } from "./types";
 
 export { CTX_NOTE_LIGHT_DESCRIPTION } from "../light-descriptions";
@@ -57,10 +58,6 @@ function captureAnchorOrdinal(db: Database, sessionId: string): number | null {
     }
 }
 
-function anchorSuffix(note: Note): string {
-    return note.anchorOrdinal !== null ? ` ↳ @msg ${note.anchorOrdinal}` : "";
-}
-
 function formatNoteLine(note: Note): string {
     const statusSuffix = note.status === "active" ? "" : ` (${note.status})`;
 
@@ -78,27 +75,6 @@ function formatNoteLine(note: Note): string {
 }
 
 const DISMISS_FOOTER = '\n\nTo dismiss a stale note: ctx_note(action="dismiss", note_id=N)';
-
-/** Default page size for read. Long-running sessions accumulate hundreds of
- *  notes; dumping all of them burns output tokens and buries the recent ones,
- *  so read pages newest-first and tells the caller how to reach older pages. */
-const DEFAULT_READ_LIMIT = 25;
-
-function paginateNewestFirst(
-    notes: Note[],
-    limit: number,
-    offset: number,
-): { page: Note[]; total: number; footer: string | null } {
-    const total = notes.length;
-    const newestFirst = [...notes].reverse();
-    const page = newestFirst.slice(offset, offset + limit);
-    const remaining = total - offset - page.length;
-    const footer =
-        remaining > 0
-            ? `Showing ${page.length} of ${total} (newest first) — ${remaining} older: ctx_note(action="read", offset=${offset + page.length})`
-            : null;
-    return { page, total, footer };
-}
 
 function buildReadSections(args: {
     db: Database;

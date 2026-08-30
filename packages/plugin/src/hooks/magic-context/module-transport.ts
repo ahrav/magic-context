@@ -64,6 +64,8 @@ import {
     decodeClaimIntentStageResponse,
     decodeClaimMirrorReceiptResponse,
     decodeClaimMirrorSnapshotResponse,
+    type ModuleAuthorityMethod,
+    type ModuleMethod,
 } from "./module-wire";
 
 const DEFAULT_MODULE_ID = "magic-context";
@@ -719,50 +721,7 @@ export class McHostModuleTransport {
     async call(args: {
         sessionId: string;
         projectRoot: string;
-        method:
-            | "state_sync"
-            | "transform"
-            | "session.status"
-            | "session.delete"
-            | "session.flush"
-            | "session.recomp"
-            | "session.wrapup"
-            | "todo_state.set"
-            | "agent_drops.append"
-            | "authority.status"
-            | "authority.prepare"
-            | "authority.seed"
-            | "authority.drain.begin"
-            | "authority.drain.finish"
-            | "authority.drain_seed"
-            | "authority.drain_memories"
-            | "authority.drain_notes"
-            | "authority.drain_compartments"
-            | "authority.drain_reconcile"
-            | "authority.drain_verify"
-            | "authority.drain_flip"
-            | "authority.drain_finish"
-            | "mirror.pull"
-            | "ctx_note"
-            | "ctx_memory"
-            | "claim.intent.stage"
-            | "claim.intent.inspect"
-            | "claim.intent.ack"
-            | "claim.effects.apply"
-            | "claim.mirror.replace"
-            | "claim.mirror.apply"
-            | "note.evaluate"
-            | "note.evaluation.register"
-            | "note.evaluation.heartbeat"
-            | "note.evaluation.unregister"
-            | "note.evaluation.next"
-            | "note.evaluation.renew"
-            | "note.evaluation.complete"
-            | "note.evaluation.abandon"
-            | "transform.ack"
-            | "transform.nack"
-            | "dreamer.run_task"
-            | "memory.set_classification";
+        method: ModuleMethod;
         body: unknown;
         signal?: AbortSignal;
         /** Do not retry after reconnecting; let the caller rebuild for the new connection. */
@@ -931,20 +890,7 @@ export class McHostModuleTransport {
     private async authorityRequest(
         sessionId: string,
         projectRoot: string,
-        method:
-            | "authority.status"
-            | "authority.prepare"
-            | "authority.seed"
-            | "authority.drain.begin"
-            | "authority.drain.finish"
-            | "authority.drain_seed"
-            | "authority.drain_memories"
-            | "authority.drain_notes"
-            | "authority.drain_compartments"
-            | "authority.drain_reconcile"
-            | "authority.drain_verify"
-            | "authority.drain_finish"
-            | "mirror.pull",
+        method: ModuleAuthorityMethod,
         body: Record<string, unknown>,
     ): Promise<Record<string, unknown>> {
         // The transport serializes the body verbatim; the module dispatches on the

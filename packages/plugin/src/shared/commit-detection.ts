@@ -4,9 +4,8 @@
 //   - the OpenCode note-nudge `commit_detected` boundary (tag-messages.ts),
 //   - the Pi note-nudge detector (detect-recent-commit.ts).
 //
-// These three previously each carried their own hash/verb regexes that had
-// drifted (hash length 6 vs 7; verb sets {hash, sha} vs {merge, rebas}). Keeping
-// them here stops that drift: change the patterns once and every site follows.
+// Keeping the patterns here stops drift between the three sites: change them
+// once and every site follows.
 //
 // All three sites look for a short git hash AND a commit-related word in the
 // SAME assistant text part — the pairing is what keeps false positives low.
@@ -27,8 +26,8 @@ export const COMMIT_HASH_TEST_PATTERN = new RegExp(`\\b${HASH_HEX}\\b`, "i");
  *
  * Scope decision: this is the commit-action set the OpenCode + Pi note-nudge
  * detectors used and pin in tests ("commit/cherry-pick/merge/rebase"). It does
- * NOT include the bare nouns "hash"/"sha" that the historian's old hint regex
- * carried — a parity test asserts "hash <hex>" alone must NOT count as a commit,
+ * NOT include the bare nouns "hash"/"sha" — a parity test asserts
+ * "hash <hex>" alone must NOT count as a commit,
  * and those nouns only ever gated a cosmetic hash-strip in historian summaries
  * (never a trigger), so unifying to the action set is behavior-preserving where
  * it matters.

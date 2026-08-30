@@ -6,7 +6,7 @@ import {
 import { computeSyntheticCallId } from "@magic-context/core/hooks/magic-context/todo-view";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { injectSyntheticTodowriteForPi } from "./pi-todo-inject";
-import { assistantMessage, createTestDb } from "./test-utils.test";
+import { assistantMessage, createTestDb } from "./test-utils";
 
 /**
  * Replicates the function_call / function_call_output pairing the OpenAI

@@ -531,7 +531,7 @@ export interface TransformDeps {
      * One-shot signal that `<session-history>` injection cache is stale and
      * `prepareCompartmentInjection` should rebuild on this pass. Drained
      * after the rebuild so subsequent defer passes hit the fresh cache.
-     * See Oracle review 2026-04-26 for the three-set split rationale.
+     * The three-set split rationale is written out in `hook-handlers.ts`.
      */
     historyRefreshSessions: Set<string>;
     deferredHistoryRefreshSessions?: Set<string>;
@@ -553,7 +553,7 @@ export interface TransformDeps {
         injectionBudgetTokens: number;
         /** When true, historian/recomp auto-promote eligible session facts
          *  to project memories. When false, promotion is skipped — agents can
-         *  still write memories explicitly via `ctx_memory write`. Issue #44. */
+         *  still write memories explicitly via `ctx_memory write`. */
         autoPromote: boolean;
     };
     /** Defaults true. When false, m[0] omits the <project-docs> block and docs hash. */
@@ -575,7 +575,7 @@ export interface TransformDeps {
     /** False when historian.disable=true, blocking historian-backed child agents. */
     historianRunnable?: boolean;
     /**
-     * Compaction-off mode (issue #266), boot-resolved and process-stable.
+     * Compaction-off mode, boot-resolved and process-stable.
      * When true the transform runs additive-only: m[0]/m[1] memory/docs
      * injection, measurement and identity recording stay; every mutating
      * compaction gate (historian, drops, strips, nudges, emergency, markers,
@@ -860,7 +860,7 @@ export function createTransform(deps: TransformDeps) {
 
         const reducedMode = sessionMeta.isSubagent;
         const fullFeatureMode = !reducedMode;
-        // Compaction-off mode (issue #266) is a THIRD flag, orthogonal to the
+        // Compaction-off mode is a THIRD flag, orthogonal to the
         // subagent split above: every mutating gate below becomes
         // `existingGate && !compactionOff`, and the m[0]/m[1] injection gate
         // is re-expressed as identity-present AND (fullFeatureMode ||
@@ -1489,7 +1489,7 @@ export function createTransform(deps: TransformDeps) {
                 experimentalUserMemories: deps.experimentalUserMemories,
                 experimentalTemporalAwareness: deps.experimentalTemporalAwareness,
                 historianTwoPass: deps.historianTwoPass,
-                // Issue #44: gate historian-driven memory promotion so users
+                // Gate historian-driven memory promotion so users
                 // who disable the feature actually see no memories created.
                 memoryEnabled: deps.memoryConfig?.enabled,
                 autoPromote: deps.memoryConfig?.autoPromote,
@@ -1835,7 +1835,7 @@ export function createTransform(deps: TransformDeps) {
 
         let taggingSucceeded = false;
         // Compaction-off mode: the tagger writes ZERO tag rows and emits no
-        // §N§ prefixes (spec #266 decision #6). Every consumer of the tag
+        // §N§ prefixes (compaction-off spec). Every consumer of the tag
         // walk's outputs (drops, heuristics, nudges, caveman, flushed-status
         // replay) is itself gated off in this mode, so the whole walk is
         // skipped — no rows, no prefixes, no commit scan. Flip-back
@@ -2104,7 +2104,7 @@ export function createTransform(deps: TransformDeps) {
             experimentalUserMemories: deps.experimentalUserMemories,
             experimentalTemporalAwareness: deps.experimentalTemporalAwareness,
             historianTwoPass: deps.historianTwoPass,
-            // Issue #44: forward memory gating so the normal historian path
+            // Forward memory gating so the normal historian path
             // (not just the recovery path above) honors memory.enabled and
             // memory.auto_promote.
             memoryEnabled: deps.memoryConfig?.enabled,
@@ -2124,7 +2124,7 @@ export function createTransform(deps: TransformDeps) {
         sessionMeta = { ...sessionMeta, compartmentInProgress };
         logTransformTiming(sessionId, "compartmentPhase", tCompartmentPhase);
 
-        // Layer-B fallback (#264): the injection stayed degraded and no durable
+        // Layer-B fallback: the injection stayed degraded and no durable
         // compartment boundary is visible, so there was no safe re-anchor splice.
         // Queue a fresh materialization so the baseline is re-cut on the next
         // bust instead of the session silently looping in degraded mode.
@@ -2437,7 +2437,7 @@ export function createTransform(deps: TransformDeps) {
         logTransformTiming(sessionId, "postTransformPhase", tPostProcess);
 
         // Estimate the total token size of the transformed messages array so
-        // the sidebar / dashboard can attribute inputTokens between System
+        // the sidebar can attribute inputTokens between System
         // (from system.transform), Tool Definitions (inferred as the
         // remainder), and Conversation (actual messages minus injected
         // compartments/facts/memories).

@@ -1,7 +1,10 @@
 import { withContentLanguageDirective } from "../../../agents/language-directive";
 import { SIDEKICK_AGENT } from "../../../agents/sidekick";
 import type { SidekickConfig } from "../../../config/schema/magic-context";
-import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
+import {
+    childSessionMessagesFetcher,
+    createChildSessionWithFence,
+} from "../../../hooks/magic-context/child-session-spawn";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import { extractLatestAssistantText } from "../../../shared/assistant-message-extractor";
@@ -90,7 +93,7 @@ export async function runSidekick(deps: {
                     agent: SIDEKICK_AGENT,
                     system: systemPrompt,
                     // synthetic: true hides the sidekick prompt from the TUI subagent
-                    // pane while still delivering it to the model. See issue #50.
+                    // pane while still delivering it to the model.
                     parts: [{ type: "text", text: deps.userMessage, synthetic: true }],
                 },
             },
@@ -98,15 +101,12 @@ export async function runSidekick(deps: {
                 timeoutMs: deps.config.timeout_ms,
                 fallbackModels,
                 callContext: "sidekick",
-                fetchOutput: async () => {
-                    const messagesResponse = await deps.client.session.messages({
-                        path: { id: childSessionId },
-                        query: { directory: deps.sessionDirectory ?? deps.projectPath, limit: 50 },
-                    });
-                    return shared.normalizeSDKResponse(messagesResponse, [] as unknown[], {
-                        preferResponseOnMissingData: true,
-                    });
-                },
+                fetchOutput: childSessionMessagesFetcher(
+                    deps.client,
+                    childSessionId,
+                    deps.sessionDirectory ?? deps.projectPath,
+                    50,
+                ),
                 validateOutput: (messages) => {
                     const taskResult = extractLatestAssistantText(messages);
                     if (!taskResult) {

@@ -2,9 +2,11 @@
 
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { storageSubtreePath } from "../../plugin/src/shared/data-path";
 import { createDirectTestDatabase } from "../../plugin/src/features/magic-context/test-database";
 import { Database } from "../../plugin/src/shared/sqlite";
 import { ballastProse } from "./ballast";
+import { DEFAULT_MOCK_RESPONSE } from "./harness-primitives";
 import { initializeIsolatedContextDb as initializeContextDbFromRelease } from "./initialize-context-db";
 import { MockProvider, type MockResponse } from "./mock-provider/server";
 import { createPiIsolatedEnv, type PiIsolatedEnv, type PiRunResult } from "./pi-runner/spawn";
@@ -31,16 +33,6 @@ export interface PiTestHarnessOptions {
   releaseRoot?: VerifiedReleaseRoot;
 }
 
-const DEFAULT_MOCK_RESPONSE: MockResponse = {
-  text: "ok",
-  usage: {
-    input_tokens: 100,
-    output_tokens: 20,
-    cache_creation_input_tokens: 100,
-    cache_read_input_tokens: 0,
-  },
-};
-
 function initializeIsolatedContextDb(
   dataDir: string,
   releaseRoot?: VerifiedReleaseRoot,
@@ -49,7 +41,7 @@ function initializeIsolatedContextDb(
     initializeContextDbFromRelease(dataDir, releaseRoot);
     return;
   }
-  const path = join(dataDir, "cortexkit", "magic-context", "context.db");
+  const path = join(storageSubtreePath(dataDir), "context.db");
   if (existsSync(path)) return;
   mkdirSync(dirname(path), { recursive: true });
   createDirectTestDatabase({ path }).db.close();
@@ -196,7 +188,7 @@ export class PiTestHarness {
   }
 
   contextDbPath(): string {
-    return join(this.env.dataDir, "cortexkit", "magic-context", "context.db");
+    return join(storageSubtreePath(this.env.dataDir), "context.db");
   }
 
   contextDb(): Database {

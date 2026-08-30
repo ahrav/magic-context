@@ -10,6 +10,10 @@
  * Defaults to the ckdev-rig connection file.
  */
 import { homedir } from "node:os";
+import {
+    CONNECTION_FILE_NAME,
+    managedSubtreePath,
+} from "../src/shared/mc-host-lifecycle/paths";
 import { join } from "node:path";
 import { readFileSync } from "node:fs";
 import { McHostClient } from "../src/shared/mc-host-client";
@@ -24,7 +28,12 @@ const connIdx = args.indexOf("--conn");
 const connectionFile =
     connIdx >= 0
         ? args[connIdx + 1]
-        : join(homedir(), ".local", "share", "cortexkit", "ckdev-rig", "runtime", "subc-connection.json");
+        : join(
+              managedSubtreePath(join(homedir(), ".local", "share")),
+              "ckdev-rig",
+              "runtime",
+              CONNECTION_FILE_NAME,
+          );
 let payload: { compartments: unknown[] };
 const payloadPath = join(import.meta.dir, "drive-preseed-payload.json");
 try {

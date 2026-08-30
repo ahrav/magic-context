@@ -6,7 +6,7 @@ import {
 	applyDeferredPiCompactionMarker,
 	findLatestCompactionFirstKept,
 } from "./compaction-marker-manager-pi";
-import { createTestDb } from "./test-utils.test";
+import { createTestDb } from "./test-utils";
 
 function pending(
 	overrides: Partial<PendingPiCompactionMarker> = {},

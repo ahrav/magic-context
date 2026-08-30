@@ -2,26 +2,10 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { PiTestHarness } from "../src/pi-harness";
+import { isHistorianRequest } from "../src/cache-analysis";
 
-const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
 const CONTEXT_LIMIT = 50_000;
 const SPIKE_INPUT_TOKENS = 48_500;
-
-function isHistorianRequest(body: Record<string, unknown>): boolean {
-    const system = body.system;
-    if (typeof system === "string") return system.includes(HISTORIAN_SYSTEM_MARKER);
-    if (Array.isArray(system)) {
-        for (const block of system) {
-            if (block && typeof block === "object") {
-                const text = (block as { text?: unknown }).text;
-                if (typeof text === "string" && text.includes(HISTORIAN_SYSTEM_MARKER)) {
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
-}
 
 let h: PiTestHarness;
 

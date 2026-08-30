@@ -35,34 +35,62 @@ function createContextUsage(percentage: number): ContextUsage {
 }
 
 describe("createScheduler", () => {
-    it("returns execute when cache is expired", () => {
+    // Each row runs the default 65% scheduler against one session shape and
+    // asserts the decision. TTL rows move `lastResponseTime` (400s beats the
+    // 5m TTL; 10s stays warm); threshold rows move the usage percentage.
+    it.each([
+        [
+            "returns execute when cache is expired",
+            { lastResponseTime: BASE_TIME - 400_000 },
+            50,
+            "execute",
+        ],
+        [
+            "returns execute when context usage is at or above the configured threshold",
+            { lastResponseTime: BASE_TIME - 10_000 },
+            65,
+            "execute",
+        ],
+        [
+            "returns defer when cache is warm and context usage is below the configured threshold",
+            { lastResponseTime: BASE_TIME - 10_000 },
+            50,
+            "defer",
+        ],
+        // An unparseable TTL falls back to the 5m default in both directions.
+        [
+            "falls back to 5m default when cacheTtl is invalid",
+            { cacheTtl: "bad-format", lastResponseTime: BASE_TIME - 400_000 },
+            50,
+            "execute",
+        ],
+        [
+            "falls back to 5m default when cacheTtl is invalid and cache would be warm",
+            { cacheTtl: "not-a-ttl", lastResponseTime: BASE_TIME - 10_000 },
+            50,
+            "defer",
+        ],
+        // Last response 10 days ago, percentage below threshold: the only path
+        // to "execute" would be TTL expiry, which "never" disables.
+        [
+            "never executes from TTL idle when cacheTtl is 'never'",
+            { cacheTtl: "never", lastResponseTime: BASE_TIME - 10 * 24 * 60 * 60 * 1000 },
+            50,
+            "defer",
+        ],
+    ] as Array<
+        [string, Partial<SessionMeta>, number, string]
+    >)("%s", (_title, overrides, percentage, expected) => {
         const scheduler = createScheduler({ executeThresholdPercentage: 65 });
-        const sessionMeta = createSessionMeta({ lastResponseTime: BASE_TIME - 400_000 });
-        const contextUsage = createContextUsage(50);
+        const sessionMeta = createSessionMeta(overrides);
 
-        const decision = scheduler.shouldExecute(sessionMeta, contextUsage, BASE_TIME);
+        const decision = scheduler.shouldExecute(
+            sessionMeta,
+            createContextUsage(percentage),
+            BASE_TIME,
+        );
 
-        expect(decision).toBe("execute");
-    });
-
-    it("returns execute when context usage is at or above the configured threshold", () => {
-        const scheduler = createScheduler({ executeThresholdPercentage: 65 });
-        const sessionMeta = createSessionMeta({ lastResponseTime: BASE_TIME - 10_000 });
-        const contextUsage = createContextUsage(65);
-
-        const decision = scheduler.shouldExecute(sessionMeta, contextUsage, BASE_TIME);
-
-        expect(decision).toBe("execute");
-    });
-
-    it("returns defer when cache is warm and context usage is below the configured threshold", () => {
-        const scheduler = createScheduler({ executeThresholdPercentage: 65 });
-        const sessionMeta = createSessionMeta({ lastResponseTime: BASE_TIME - 10_000 });
-        const contextUsage = createContextUsage(50);
-
-        const decision = scheduler.shouldExecute(sessionMeta, contextUsage, BASE_TIME);
-
-        expect(decision).toBe("defer");
+        expect(decision).toBe(expected);
     });
 
     it("uses a custom execute threshold", () => {
@@ -92,48 +120,6 @@ describe("createScheduler", () => {
                 "openai/gpt-4o",
             ),
         ).toBe("execute");
-    });
-
-    it("falls back to 5m default when cacheTtl is invalid", () => {
-        const scheduler = createScheduler({ executeThresholdPercentage: 65 });
-        const sessionMeta = createSessionMeta({
-            cacheTtl: "bad-format",
-            lastResponseTime: BASE_TIME - 400_000,
-        });
-        const contextUsage = createContextUsage(50);
-
-        const decision = scheduler.shouldExecute(sessionMeta, contextUsage, BASE_TIME);
-
-        expect(decision).toBe("execute");
-    });
-
-    it("falls back to 5m default when cacheTtl is invalid and cache would be warm", () => {
-        const scheduler = createScheduler({ executeThresholdPercentage: 65 });
-        const sessionMeta = createSessionMeta({
-            cacheTtl: "not-a-ttl",
-            lastResponseTime: BASE_TIME - 10_000,
-        });
-        const contextUsage = createContextUsage(50);
-
-        const decision = scheduler.shouldExecute(sessionMeta, contextUsage, BASE_TIME);
-
-        expect(decision).toBe("defer");
-    });
-
-    it("never executes from TTL idle when cacheTtl is 'never'", () => {
-        const scheduler = createScheduler({ executeThresholdPercentage: 65 });
-        // Last response was 10 days ago — well past any normal TTL.
-        const tenDaysAgo = BASE_TIME - 10 * 24 * 60 * 60 * 1000;
-        const sessionMeta = createSessionMeta({
-            cacheTtl: "never",
-            lastResponseTime: tenDaysAgo,
-        });
-        // Percentage is below threshold, so the only path to "execute" is TTL expiry.
-        const contextUsage = createContextUsage(50);
-
-        const decision = scheduler.shouldExecute(sessionMeta, contextUsage, BASE_TIME);
-
-        expect(decision).toBe("defer");
     });
 
     it("still executes on threshold when cacheTtl is 'never'", () => {

@@ -19,7 +19,8 @@ use crate::compartment_coverage::{fold_m0_content_epoch, resolve_coverage, M0Con
 use crate::config::{
     CacheTtlProvenance, DEFAULT_AUTO_SEARCH_MIN_PROMPT_CHARS, DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD,
 };
-use crate::divergence::{self, FirstDivergence};
+use crate::divergence;
+pub use crate::divergence::FirstDivergence;
 use crate::healing::{self, quirk_residual, SerializerProfile};
 use crate::injection::{
     advance_injection_from_meta, capture_todo_state_on_bust, injection_pending_after_capture,
@@ -36,7 +37,8 @@ use crate::memory_render::{
     render_claim_memory_block, render_m0, M0Inputs, MirroredClaimMemory, M1_PLACEHOLDER,
 };
 use crate::project_docs::read_project_docs_canonical;
-use crate::prompt_surface::{PromptSurfacePreset, PromptSurfaceSelection};
+pub use crate::prompt_surface::PromptSurfacePreset;
+use crate::prompt_surface::PromptSurfaceSelection;
 use crate::scheduler::{
     self, BoundaryBypass, ContextUsage, DeferredExecute, ExecuteThresholdConfig, LatchState,
     SchedulerConfig, SchedulerInputs, SessionMeta, TailState,
@@ -504,17 +506,6 @@ fn log_pending_m1_delta(session_id: &str, now_ms: i64, pending_since_ms: Option<
 #[cfg(test)]
 thread_local! {
     static USER_HINT_LEXICAL_QUERY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// The m1 delta content + its byte-affecting digest. `revision` is a digest over ALL
-/// byte-affecting m1 render inputs such that `render` is a pure function of what the
-/// digest covers: if the rendered bytes would differ, `revision` differs. NEVER a
-/// max-id counter (a same-id update changes bytes without raising a max id).
-/// `revision == 0` is the placeholder (no delta).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct M1Content {
-    pub revision: u64,
-    pub body: String,
 }
 
 /// One tail-reduction decision: the target tail item and the byte-complete reduced
@@ -1573,13 +1564,16 @@ impl TransformResponse {
         self.ck_messages.as_deref().unwrap_or(&[])
     }
 
-    pub fn need_full_sync(full_array_fingerprint: Option<String>) -> Self {
+    /// The single exhaustive literal for the wire response: both public
+    /// constructors delegate here, so adding a field forces exactly one edit
+    /// while keeping the compiler's exhaustive-literal check.
+    fn base(status: TransformStatus, action: &str, full_array_fingerprint: Option<String>) -> Self {
         Self {
-            status: TransformStatus::NeedFullSync,
+            status,
             served_from: ServedFrom::Transform,
             full_array_fingerprint,
-            action: "NEED_FULL_SYNC".to_string(),
-            decision: "NEED_FULL_SYNC".to_string(),
+            action: action.to_string(),
+            decision: action.to_string(),
             materialize_reason: None,
             first_divergence: None,
             timings: None,
@@ -1606,44 +1600,26 @@ impl TransformResponse {
         }
     }
 
+    pub fn need_full_sync(full_array_fingerprint: Option<String>) -> Self {
+        Self::base(
+            TransformStatus::NeedFullSync,
+            "NEED_FULL_SYNC",
+            full_array_fingerprint,
+        )
+    }
+
     pub fn passthrough(
         ck_messages: Vec<CkWireMessage>,
         full_array_fingerprint: Option<String>,
     ) -> Self {
         Self {
-            status: TransformStatus::Ok,
-            served_from: ServedFrom::Transform,
-            full_array_fingerprint,
-            action: "PASSTHROUGH".to_string(),
-            decision: "PASSTHROUGH".to_string(),
-            materialize_reason: None,
-            first_divergence: None,
-            timings: None,
-            boundary_id: String::new(),
-            reconcile_pending: false,
-            version: 0,
-            row_version: 0,
-            surface_state: SurfaceState::Inactive,
-            committed: false,
-            coverage_ordinal: None,
-            rendered_revision_locators: None,
-            memory_snapshot_vector: None,
-            lineage_switch_consumed_id: None,
-            lineage_descent_disposition: None,
-            cache_ttl: None,
-            ordinal_continuation_base: None,
-            historian: None,
             ck_messages: Some(
                 ck_messages
                     .into_iter()
                     .map(ServedMessage::from_message)
                     .collect(),
             ),
-            native_messages: None,
-            native_messages_delta: None,
-            host_directives: None,
-            channel2_directive: None,
-            note_deliveries: None,
+            ..Self::base(TransformStatus::Ok, "PASSTHROUGH", full_array_fingerprint)
         }
     }
 }
@@ -1913,14 +1889,6 @@ impl std::fmt::Display for TransformError {
 }
 impl std::error::Error for TransformError {}
 
-impl TransformError {
-    /// These failures are deterministic for the same request, while store and search failures
-    /// remain retryable because their cause may be transient.
-    pub fn is_deterministic_reject(&self) -> bool {
-        !matches!(self, Self::Store(_) | Self::Search(_))
-    }
-}
-
 impl From<CkWireError> for TransformError {
     fn from(e: CkWireError) -> Self {
         TransformError::CkWire(e)
@@ -2122,7 +2090,10 @@ fn compose_m1_for_context(
 /// only change bytes during an intentional HARD rematerialization; determinism (the same
 /// text always counts identically, via the vendored+pinned vocab) is what preserves
 /// byte-identical replay between HARDs.
-pub fn transform(
+/// Test entry point; production enters the pipeline only through
+/// `transform_with_projection_cached`.
+#[cfg(test)]
+pub(crate) fn transform(
     store: &McStore,
     req: &TransformRequest,
     ctx: &ProducerContext<'_>,
@@ -2130,7 +2101,10 @@ pub fn transform(
     transform_with_projection(store, req, ctx).map(|result| result.response)
 }
 
-pub fn transform_with_projection(
+/// Test entry point; production enters the pipeline only through
+/// `transform_with_projection_cached`.
+#[cfg(test)]
+pub(crate) fn transform_with_projection(
     store: &McStore,
     req: &TransformRequest,
     ctx: &ProducerContext<'_>,
@@ -2209,6 +2183,7 @@ fn pass_scheduler_observation(
 /// The retry wrapper around [`apply_once`], parameterized by the token estimator so tests
 /// can inject a panicking/counting one to prove the estimator is HARD-only (never called
 /// on SOFT/defer). Production always passes [`crate::token_cache::cached_estimate_tokens`]. commentlint: allow(JUDGE)
+#[cfg(test)]
 fn apply_once_with_estimator(
     store: &McStore,
     req: &TransformRequest,
@@ -3543,7 +3518,7 @@ fn apply_once(
         && serializer_profile == Some(SerializerProfile::ClaudeCodeAnthropic);
     let tagging_active =
         tagging_surface_requested && (persisted_tagging_surface_active || bootstrap_tagging_active);
-    // Previously stored overlay rows may still replay when boundary-lineage validation
+    // Stored overlay rows from earlier passes may still replay when boundary-lineage validation
     // later forces pass-through. Decisions from this request stay in memory until the
     // final cache-state compare-and-swap accepts the pass.
     // Tags are also the durable token-accounting source for host directives. Keeping them
@@ -5437,6 +5412,7 @@ fn apply_once(
         transition_committed,
         output_cache_snapshot.as_ref(),
         is_bust_pass,
+        true,
     )?;
     let new_merged_reasoning_units = new_merged_reasoning_strip_units(
         &core,
@@ -5459,6 +5435,7 @@ fn apply_once(
                 .max(meta.reasoning_cleared_through_ordinal),
             transition_committed,
             output_cache_snapshot.as_ref(),
+            true,
             true,
         )?;
     }
@@ -5489,6 +5466,7 @@ fn apply_once(
             transition_committed,
             output_cache_snapshot.as_ref(),
             true,
+            true,
         )?;
     }
     #[cfg(test)]
@@ -5506,6 +5484,7 @@ fn apply_once(
                 .max(meta.reasoning_cleared_through_ordinal),
             transition_committed,
             None,
+            true,
             true,
         )?;
         let cached_bytes = built_output
@@ -11641,6 +11620,7 @@ fn build_output(
         transition_renderer_active(core),
         None,
         true,
+        true,
     )
     .map(|built| {
         built
@@ -11651,75 +11631,10 @@ fn build_output(
     })
 }
 
-// Keep the provider and durable-watermark arguments explicit in this builder: they affect cache
-// identity and differ across replay paths, so grouping them would make those inputs less visible.
+// Provider and durable-watermark arguments stay explicit: they affect cache
+// identity and differ across replay paths.
 #[allow(clippy::too_many_arguments)]
 fn build_output_with_tags(
-    core: &CoreState,
-    meta: &ModuleMeta,
-    projection: &FlatProjection,
-    req: &TransformRequest,
-    tag_overlay: Option<&TagOverlayState>,
-    synthetic_todo_enabled: bool,
-    mutation_exempt_mid: Option<&str>,
-    tag_numbers: &BTreeMap<String, u64>,
-    reasoning_watermark: u64,
-    renderer_transition_active: bool,
-    cache_snapshot: Option<&SerializedOutputCacheSnapshot>,
-    prefix_dirty: bool,
-) -> Result<BuiltOutput, TransformError> {
-    build_output_with_tags_inner(
-        core,
-        meta,
-        projection,
-        req,
-        tag_overlay,
-        synthetic_todo_enabled,
-        mutation_exempt_mid,
-        tag_numbers,
-        reasoning_watermark,
-        renderer_transition_active,
-        cache_snapshot,
-        prefix_dirty,
-        true,
-    )
-}
-
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-fn build_output_with_tags_unindexed(
-    core: &CoreState,
-    meta: &ModuleMeta,
-    projection: &FlatProjection,
-    req: &TransformRequest,
-    tag_overlay: Option<&TagOverlayState>,
-    synthetic_todo_enabled: bool,
-    mutation_exempt_mid: Option<&str>,
-    tag_numbers: &BTreeMap<String, u64>,
-    reasoning_watermark: u64,
-    renderer_transition_active: bool,
-    cache_snapshot: Option<&SerializedOutputCacheSnapshot>,
-    prefix_dirty: bool,
-) -> Result<BuiltOutput, TransformError> {
-    build_output_with_tags_inner(
-        core,
-        meta,
-        projection,
-        req,
-        tag_overlay,
-        synthetic_todo_enabled,
-        mutation_exempt_mid,
-        tag_numbers,
-        reasoning_watermark,
-        renderer_transition_active,
-        cache_snapshot,
-        prefix_dirty,
-        false,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_output_with_tags_inner(
     core: &CoreState,
     meta: &ModuleMeta,
     projection: &FlatProjection,
@@ -12674,6 +12589,56 @@ pub(crate) mod tests {
     use mc_store::{
         McTagRow, ModuleDropSeedRow, ModuleStateSyncRequest, ModuleUsage, StoredCompartment,
     };
+
+    fn tag_baseline_test_entry() -> TagBaselineCacheEntry {
+        let tags = vec![McTagRow {
+            tag_number: 1,
+            block_id: "b1".to_string(),
+            kind: "message".to_string(),
+            token_count: 1,
+            created_at_ms: 0,
+            source_bytes: Vec::new(),
+        }];
+        // Charge through the production sizing function so the pinned budgets
+        // track the real retention envelope.
+        let retained_bytes = tag_baseline_retained_bytes(&tags);
+        TagBaselineCacheEntry {
+            store_namespace: 1,
+            generation: 1,
+            count: 1,
+            max_tag_number: 1,
+            tags: Arc::new(tags),
+            retained_bytes,
+        }
+    }
+
+    #[test]
+    fn tag_baseline_cache_refuses_an_insert_larger_than_its_budget() {
+        let entry = tag_baseline_test_entry();
+        let mut cache = TagBaselineCache::new(entry.retained_bytes - 1);
+        cache.replace("s1", entry);
+        assert!(cache.sessions.is_empty());
+        assert_eq!(cache.retained_bytes, 0);
+        assert!(cache.lru.is_empty());
+    }
+
+    #[test]
+    fn tag_baseline_cache_evicts_older_sessions_but_never_the_just_inserted_one() {
+        // Budget holds one entry but not two: an over-budget insert must
+        // evict the OLDEST session and keep the newcomer. The pre-insert
+        // budget guard makes a self-evicting insert unreachable (the newcomer
+        // alone always fits), so the newest session must always survive.
+        let entry = tag_baseline_test_entry();
+        let charge = entry.retained_bytes;
+        let mut cache = TagBaselineCache::new(charge + charge / 2);
+        cache.replace("s1", entry);
+        assert!(cache.sessions.contains_key("s1"));
+        cache.replace("s2", tag_baseline_test_entry());
+        assert!(!cache.sessions.contains_key("s1"));
+        assert!(cache.sessions.contains_key("s2"));
+        assert_eq!(cache.retained_bytes, charge);
+        assert_eq!(cache.lru.len(), 1);
+    }
 
     fn resolve_test_cache_ttl(
         ctx: &mut ProducerContext<'_>,
@@ -18932,6 +18897,7 @@ pub(crate) mod tests {
             u64::MAX,
             false,
             None,
+            true,
             true,
         )
         .unwrap();
@@ -25283,12 +25249,11 @@ pub(crate) mod tests {
         )
     }
 
-    /// Claude Code is a full-array consumer since the Thalamus peer retired the
-    /// byte-splice at U0: every pass rebuilds the provider request from the transformed
-    /// array, so tail mutations round-trip into the real context instead of being lost to
-    /// a splice (the old "phantom reclaim" hazard). This is the inverse of the retired
-    /// verbatim-tail guarantee — a tool-absent CC session now selects reclaim candidates
-    /// under pressure, where it selected none before U0. Drives execute- and emergency-class
+    /// Claude Code is a full-array consumer: every pass rebuilds the provider request
+    /// from the transformed array, so tail mutations round-trip into the real context
+    /// instead of being lost to a splice (the "phantom reclaim" hazard). A tool-absent
+    /// CC session therefore selects reclaim candidates
+    /// under pressure. Drives execute- and emergency-class
     /// passes over reclaim-eligible content with a queued agent drop and asserts the tail is
     /// mutated and the drop drains.
     #[test]
@@ -27219,6 +27184,7 @@ pub(crate) mod tests {
             false,
             None,
             true,
+            true,
         )
         .unwrap();
         let first_bytes = serde_json::to_vec(&first.messages).unwrap();
@@ -27249,6 +27215,7 @@ pub(crate) mod tests {
             false,
             Some(&snapshot),
             false,
+            true,
         )
         .unwrap();
         assert!(replay.cache_stats.reused_items > 0);
@@ -27352,6 +27319,7 @@ pub(crate) mod tests {
             false,
             None,
             true,
+            true,
         )
         .unwrap();
         let first_bytes = canonical_output(&first.messages);
@@ -27371,6 +27339,7 @@ pub(crate) mod tests {
             false,
             Some(&snapshot),
             false,
+            true,
         )
         .unwrap();
         assert!(replay.cache_stats.reused_items > 0);
@@ -28284,6 +28253,7 @@ pub(crate) mod tests {
             transition_consumed(core),
             snapshot,
             prefix_dirty,
+            true,
         )
         .unwrap()
     }
@@ -28543,7 +28513,7 @@ pub(crate) mod tests {
         );
 
         let first = build_cached_fixture(&core, &meta, &request, &projection, None, None, true);
-        let unindexed = build_output_with_tags_unindexed(
+        let unindexed = build_output_with_tags(
             &core,
             &meta,
             &projection,
@@ -28556,6 +28526,7 @@ pub(crate) mod tests {
             transition_consumed(&core),
             None,
             true,
+            false,
         )
         .unwrap();
         assert_eq!(

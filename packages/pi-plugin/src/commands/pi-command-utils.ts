@@ -68,7 +68,7 @@ function statusTitleColor(level: CtxStatusLevel | undefined) {
 	}
 }
 
-export const renderCtxStatusEntry: CtxStatusEntryRenderer = (
+const renderCtxStatusEntry: CtxStatusEntryRenderer = (
 	entry,
 	_options,
 	theme,

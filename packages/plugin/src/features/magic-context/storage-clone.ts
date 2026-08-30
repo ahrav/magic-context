@@ -1,5 +1,7 @@
 import { getHarness } from "../../shared/harness";
 import type { Database } from "../../shared/sqlite";
+import { runImmediate } from "../../shared/sqlite";
+import { tableExists } from "./storage-project-identities";
 
 export interface CloneCompartmentRow {
     sequence: number;
@@ -97,25 +99,6 @@ type RawSessionMetaRow = {
     todo_synthetic_state_json: string | null;
 };
 
-function runImmediate<T>(db: Database, body: () => T): T {
-    db.exec("BEGIN IMMEDIATE");
-    let committed = false;
-    try {
-        const result = body();
-        db.exec("COMMIT");
-        committed = true;
-        return result;
-    } finally {
-        if (!committed) {
-            try {
-                db.exec("ROLLBACK");
-            } catch {
-                // The transaction may already have been rolled back by SQLite.
-            }
-        }
-    }
-}
-
 function countRows(db: Database, table: string, sessionId: string): number {
     const row = db
         .prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE session_id = ?`)
@@ -126,13 +109,6 @@ function countRows(db: Database, table: string, sessionId: string): number {
 function mapMessageId(filter: CloneSessionStateFilter, messageId: string | null): string | null {
     if (messageId === null) return null;
     return filter.mapMessageId?.(messageId) ?? messageId;
-}
-
-function tableExists(db: Database, table: string): boolean {
-    const row = db
-        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
-        .get(table);
-    return row !== null && row !== undefined;
 }
 
 function insertDynamicRow(db: Database, table: string, row: Record<string, unknown>): void {
