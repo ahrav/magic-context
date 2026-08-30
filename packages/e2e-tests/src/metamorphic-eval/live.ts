@@ -4,7 +4,7 @@ import { canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canon
 import { getErrorMessage } from "../../../plugin/src/shared/error-message";
 import { lintScenario, type HistorianEvalScenario } from "../historian-eval/contract";
 import { runMutationBattery } from "../historian-eval/mutations";
-import { runScenario, type LiveHistorianMode } from "../historian-eval/runner";
+import { runScenario, type LiveHistorianMode, type SystemVersionTuple } from "../historian-eval/runner";
 import {
     expectationGoldMatchPredicates,
     scoreRunRecord,
@@ -45,6 +45,7 @@ export interface LiveMetamorphicOptions {
     mode: LiveHistorianMode;
     artifactRoot: string;
     opencodeVersion: string;
+    system?: SystemVersionTuple | null;
     transforms?: readonly Transform[];
     seeds?: readonly number[];
     admit?: (derivatives: readonly HistorianEvalScenario[]) => string[];
@@ -140,12 +141,14 @@ function canaryHit(
     role: LiveRole,
     key: PairKey | null,
 ): InjectionCanaryHit {
+    /** Only the derivative ran a transform, so any other role's coordinates would name a transform that never touched it. commentlint: allow(JUDGE) */
+    const coordinates = role === "derivative" ? key : null;
     return {
         scenarioId,
         role,
-        transformId: role === "baseline" || role === "derivative" ? key?.transformId ?? null : null,
-        transformVersion: role === "baseline" || role === "derivative" ? key?.transformVersion ?? null : null,
-        seed: role === "baseline" || role === "derivative" ? key?.seed ?? null : null,
+        transformId: coordinates?.transformId ?? null,
+        transformVersion: coordinates?.transformVersion ?? null,
+        seed: coordinates?.seed ?? null,
     };
 }
 
@@ -213,6 +216,7 @@ export async function runLiveMetamorphicEval(
             entries,
             coverage: prepared.coverage,
             injectionCanaryHits,
+            system: options.system ?? null,
             ...(tierInvalidReason === undefined ? {} : { tierInvalidReason }),
         });
     const observe = (
@@ -274,7 +278,7 @@ export async function runLiveMetamorphicEval(
         );
         collectCanary(injectionCanaryHits, controlScenario.id, "control-a", controlA, null);
         if (injectionCanaryHits.length > 0) {
-            return finish();
+            return observe();
         }
         if (deadlineReached()) return deadlineReport("control-b");
         const controlB = await execute(
@@ -285,6 +289,18 @@ export async function runLiveMetamorphicEval(
         collectCanary(injectionCanaryHits, controlScenario.id, "control-b", controlB, null);
         if (injectionCanaryHits.length > 0) {
             return observe();
+        }
+        if (controlA.score.verdict === "ERROR" || controlB.score.verdict === "ERROR") {
+            entries.push({
+                ...controlKey,
+                kind: "error",
+                error: "tier-invalid: a baseline control run errored; product pairs skipped",
+            });
+            return observe({
+                kind: "control-error",
+                controlAErrorReason: controlA.score.errorReason,
+                controlBErrorReason: controlB.score.errorReason,
+            });
         }
         const controlInvariants = compareLivePair(controlA, controlB);
         const systemMismatch = !sameSystem(controlA.score, controlB.score);
@@ -312,25 +328,42 @@ export async function runLiveMetamorphicEval(
         return observe();
     }
 
+    /** Keyed by base scenario alone: the executor takes no seed, so every pair sharing a base would re-run identical paid traffic. commentlint: allow(JUDGE) */
+    const baselines = new Map<string, LiveObservation | Error>();
+
     for (const pair of prepared.pairs) {
         try {
-            const artifactScenarioId = pair.derivative.scenario.id;
             const canaryScenarioId = pair.base.id;
-            if (deadlineReached()) return deadlineReport("baseline");
-            const baseline = await execute(
-                pair.base,
-                "baseline",
-                liveArtifactDir(options.artifactRoot, artifactScenarioId, "baseline"),
-            );
-            collectCanary(injectionCanaryHits, canaryScenarioId, "baseline", baseline, pair.key);
-            if (injectionCanaryHits.length > 0) {
-                return finish();
+            let baseline = baselines.get(pair.base.id);
+            if (baseline === undefined) {
+                if (deadlineReached()) return deadlineReport("baseline");
+                try {
+                    baseline = await execute(
+                        pair.base,
+                        "baseline",
+                        liveArtifactDir(options.artifactRoot, pair.base.id, "baseline"),
+                    );
+                } catch (error) {
+                    baseline = error instanceof Error ? error : new Error(getErrorMessage(error));
+                }
+                baselines.set(pair.base.id, baseline);
+                if (!(baseline instanceof Error)) {
+                    collectCanary(injectionCanaryHits, canaryScenarioId, "baseline", baseline, pair.key);
+                    if (injectionCanaryHits.length > 0) {
+                        return observe();
+                    }
+                }
+            }
+            if (baseline instanceof Error) {
+                entries.push({ ...pair.key, kind: "error", error: getErrorMessage(baseline) });
+                observe();
+                continue;
             }
             if (deadlineReached()) return deadlineReport("derivative");
             const derivative = await execute(
                 pair.derivative.scenario,
                 "derivative",
-                liveArtifactDir(options.artifactRoot, artifactScenarioId, "derivative"),
+                liveArtifactDir(options.artifactRoot, pair.derivative.scenario.id, "derivative"),
             );
             collectCanary(injectionCanaryHits, canaryScenarioId, "derivative", derivative, pair.key);
             if (injectionCanaryHits.length > 0) {

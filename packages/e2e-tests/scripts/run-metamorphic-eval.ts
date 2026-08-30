@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { parseScenario, type HistorianEvalScenario } from "../src/historian-eval/contract";
@@ -10,7 +10,7 @@ import {
     liveModeFromEnv,
     opencodeVersion,
 } from "./run-historian-eval";
-import { runSystemTuple } from "../src/historian-eval/runner";
+import { runSystemTuple, type SystemVersionTuple } from "../src/historian-eval/runner";
 import {
     runLiveMetamorphicEval,
     type LiveMetamorphicOptions,
@@ -32,7 +32,7 @@ interface LivePreambleDependencies {
 export function prepareLivePreamble(
     corpus: readonly HistorianEvalScenario[],
     overrides: Partial<LivePreambleDependencies> = {},
-): { mode: LiveMetamorphicOptions["mode"]; opencodeVersion: string } | null {
+): { mode: LiveMetamorphicOptions["mode"]; opencodeVersion: string; system: SystemVersionTuple } | null {
     const dependencies: LivePreambleDependencies = {
         liveModeFromEnv,
         liveAdmissionGate,
@@ -49,13 +49,14 @@ export function prepareLivePreamble(
         console.error("live admission: `opencode --version` did not resolve");
         return null;
     }
-    if (dependencies.runSystemTuple({ mode, opencodeVersion: opencode }).repoCommitSha === "unknown") {
+    const system = dependencies.runSystemTuple({ mode, opencodeVersion: opencode });
+    if (system.repoCommitSha === "unknown") {
         console.error(
             "live admission: the checkout commit could not be resolved, so the report could not identify the code it ran",
         );
         return null;
     }
-    return { mode, opencodeVersion: opencode };
+    return { mode, opencodeVersion: opencode, system };
 }
 
 export interface CliArgs {
@@ -151,11 +152,23 @@ export function selectInputs(
     return { scenarios, transforms };
 }
 
+export function stagingReportPath(destination: string): string {
+    return `${destination}.tmp`;
+}
+
 function writeReportFile(destination: string, report: MetamorphicReport): void {
     mkdirSync(dirname(destination), { recursive: true });
-    const staging = `${destination}.tmp`;
+    const staging = stagingReportPath(destination);
+    /** lstat, not existsSync: writeFileSync would follow a symlink here and overwrite its target, then renameSync would publish the link. commentlint: allow(JUDGE) */
+    const occupant = lstatSync(staging, { throwIfNoEntry: false });
+    if (occupant !== undefined) {
+        if (!occupant.isFile() && !occupant.isSymbolicLink()) {
+            throw new Error(`report staging path is not a regular file: ${staging}`);
+        }
+        rmSync(staging, { force: true });
+    }
     try {
-        writeFileSync(staging, `${JSON.stringify(report, null, 2)}\n`);
+        writeFileSync(staging, `${JSON.stringify(report, null, 2)}\n`, { flag: "wx" });
         renameSync(staging, destination);
     } catch (error) {
         rmSync(staging, { force: true });
@@ -169,13 +182,53 @@ export function partialReportPath(destination: string): string {
         : `${destination}.partial.json`;
 }
 
+/** Walks to the nearest existing ancestor and realpaths it, because a lexical resolve treats a symlinked corpus and its target as unrelated. commentlint: allow(JUDGE) */
+function canonicalPath(path: string): string {
+    const absolute = resolve(path);
+    let existing = absolute;
+    const missing: string[] = [];
+    while (!existsSync(existing)) {
+        const parent = dirname(existing);
+        if (parent === existing) return absolute;
+        missing.unshift(basename(existing));
+        existing = parent;
+    }
+    return join(realpathSync(existing), ...missing);
+}
+
 function containsPath(parent: string, candidate: string): boolean {
-    const path = relative(resolve(parent), resolve(candidate));
+    const path = relative(canonicalPath(parent), canonicalPath(candidate));
     return path === "" || (!path.startsWith(`..${sep}`) && path !== ".." && !isAbsolute(path));
 }
 
 function removeRegularFile(path: string): void {
     if (existsSync(path) && lstatSync(path).isFile()) rmSync(path);
+}
+
+/** Every path the runner itself writes, so preflight covers the staging files that publication touches only at the very end. commentlint: allow(JUDGE) */
+function reportDestinations(reportPath: string): string[] {
+    const partialPath = partialReportPath(reportPath);
+    return [reportPath, stagingReportPath(reportPath), partialPath, stagingReportPath(partialPath)];
+}
+
+function requireReplaceableReportPath(label: string, path: string): void {
+    const occupant = lstatSync(path, { throwIfNoEntry: false });
+    if (occupant === undefined) return;
+    if (occupant.isSymbolicLink()) {
+        throw new Error(`${label} is a symlink; refusing to write through it: ${path}`);
+    }
+    if (!occupant.isFile()) {
+        throw new Error(`${label} exists and is not a regular file: ${path}`);
+    }
+}
+
+export function prepareDeterministicOutputPaths(reportPath: string, corpusDirectory: string): void {
+    const outputs = reportDestinations(reportPath);
+    if (outputs.some((path) => containsPath(corpusDirectory, path))) {
+        throw new Error("report and staging paths must not overlap the scenario corpus");
+    }
+    for (const path of outputs) requireReplaceableReportPath("report path", path);
+    for (const path of outputs) removeRegularFile(path);
 }
 
 export function prepareLiveOutputPaths(
@@ -184,14 +237,19 @@ export function prepareLiveOutputPaths(
 ): { artifactNamespace: string; partialPath: string } {
     const partialPath = partialReportPath(reportPath);
     const artifactNamespace = join(dirname(reportPath), "metamorphic-eval-artifacts");
-    const overlapsCorpus = [reportPath, partialPath, artifactNamespace].some((path) =>
+    const outputs = reportDestinations(reportPath);
+    const overlapsCorpus = [...outputs, artifactNamespace].some((path) =>
         containsPath(corpusDirectory, path),
     ) || containsPath(artifactNamespace, corpusDirectory);
     if (overlapsCorpus) {
-        throw new Error("live report, partial report, and artifact paths must not overlap the scenario corpus");
+        throw new Error("live report, partial report, staging, and artifact paths must not overlap the scenario corpus");
     }
-    removeRegularFile(reportPath);
-    removeRegularFile(partialPath);
+    /** The control run creates the namespace as a directory, so renameSync could never publish a report that lives inside it. commentlint: allow(JUDGE) */
+    if (outputs.some((path) => containsPath(artifactNamespace, path))) {
+        throw new Error(`live report paths must stay outside the artifact namespace: ${artifactNamespace}`);
+    }
+    for (const path of outputs) requireReplaceableReportPath("live report path", path);
+    for (const path of outputs) removeRegularFile(path);
     return { artifactNamespace, partialPath };
 }
 
@@ -202,6 +260,9 @@ function tierInvalidMessage(destination: string, report: MetamorphicReport): str
     if (reason.kind === "selection-empty") return `metamorphic selection invalid: ${reason.reason}`;
     if (reason.kind === "deadline-exhausted") {
         return `metamorphic deadline reached before ${reason.nextRole}; inspect final report ${destination}`;
+    }
+    if (reason.kind === "control-error") {
+        return `metamorphic tier invalid: a baseline control run errored (control-a=${reason.controlAErrorReason ?? "none"}, control-b=${reason.controlBErrorReason ?? "none"}); product pairs were not evaluated`;
     }
     return "metamorphic tier invalid: control runs disagreed; product pairs were not evaluated";
 }
@@ -282,16 +343,22 @@ export async function runLiveAndWriteReport(
 
 export async function main(args: readonly string[] = Bun.argv.slice(2)): Promise<0 | 1 | 2> {
     const parsed = parseArgs(args);
-    const corpus = loadCorpus(parsed.corpusDirectory);
-    const selected = selectInputs(corpus, parsed);
+    /** Output preflight precedes corpus loading and selection, whose throws would otherwise leave a previous green report at the destination. commentlint: allow(JUDGE) */
     if (!parsed.live) {
+        prepareDeterministicOutputPaths(parsed.reportPath, parsed.corpusDirectory);
+        const deterministicCorpus = loadCorpus(parsed.corpusDirectory);
+        const deterministicSelection = selectInputs(deterministicCorpus, parsed);
         return writeReport(
             parsed.reportPath,
-            runDeterministicMetamorphicEval(selected.scenarios, { transforms: selected.transforms }),
+            runDeterministicMetamorphicEval(deterministicSelection.scenarios, {
+                transforms: deterministicSelection.transforms,
+            }),
         );
     }
 
     const outputPaths = prepareLiveOutputPaths(parsed.reportPath, parsed.corpusDirectory);
+    const corpus = loadCorpus(parsed.corpusDirectory);
+    const selected = selectInputs(corpus, parsed);
     const prepared = prepareLivePreamble(corpus);
     if (prepared === null) return 1;
     const artifactRoot = join(
@@ -302,6 +369,7 @@ export async function main(args: readonly string[] = Bun.argv.slice(2)): Promise
         mode: prepared.mode,
         artifactRoot,
         opencodeVersion: prepared.opencodeVersion,
+        system: prepared.system,
         transforms: selected.transforms,
         deadlineAtMs: parsed.deadlineMinutes === null ? null : Date.now() + parsed.deadlineMinutes * 60_000,
     });

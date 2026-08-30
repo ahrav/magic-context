@@ -1,25 +1,30 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { buildMockHistorianOutput } from "../mock-historian";
 import { lintScenario, parseScenario, type HistorianEvalScenario } from "../historian-eval/contract";
+import type { SystemVersionTuple } from "../historian-eval/runner";
 import { scoreRawOutputWithInjectedClaims } from "../historian-eval/scorer";
 import { validScenario } from "../historian-eval/test-support";
 import { INJECTION_CANARY } from "./injection-canary";
 import {
     compareLivePair,
     runLiveMetamorphicEval,
+    type LiveMetamorphicOptions,
     type LiveObservation,
+    type LiveRole,
 } from "./live";
-import { buildMetamorphicReport, metamorphicExitCode } from "./report";
+import { buildMetamorphicReport, metamorphicExitCode, type MetamorphicReport } from "./report";
 import { buildScriptedOutput, runDeterministicMetamorphicEval } from "./runner";
 import { TRANSFORMS, type Transform } from "./transforms";
 import {
     partialReportPath,
+    prepareDeterministicOutputPaths,
     prepareLiveOutputPaths,
     runLiveAndWriteReport,
+    stagingReportPath,
 } from "../../scripts/run-metamorphic-eval";
 
 const CORPUS_DIR = join(import.meta.dir, "../../historian-eval/dev");
@@ -68,6 +73,36 @@ function injectedClaim(content: string) {
         category: "ARCHITECTURE",
         revision: 1,
     } as const;
+}
+
+function systemTuple(): SystemVersionTuple {
+    return {
+        repoCommitSha: "a".repeat(40),
+        bunVersion: "1.4.0",
+        opencodeVersion: "test",
+        historianModelId: "test/historian",
+        probeModelId: "test/probe",
+        parserImpl: "ts",
+        chunkTokenBudget: null,
+    };
+}
+
+function liveMode(): LiveMetamorphicOptions["mode"] {
+    return {
+        kind: "live",
+        apiKey: "test",
+        historianModel: "test/historian",
+        probeModel: { providerID: "test", modelID: "probe" },
+    };
+}
+
+/** Pairs only score when both roles report one system tuple, so a shared tuple is what lets these fixtures reach the invariant comparison. commentlint: allow(JUDGE) */
+function pairedObservation(
+    claims: LiveObservation["injectedClaims"] = [],
+    overrides: Partial<LiveObservation["score"]> = {},
+): LiveObservation {
+    const base = liveObservation(claims);
+    return { ...base, score: { ...base.score, system: systemTuple(), ...overrides } };
 }
 
 describe("deterministic metamorphic runner", () => {
@@ -591,5 +626,214 @@ describe("live metamorphic runner", () => {
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
+    });
+
+    test("rejects a corpus reached through a symlinked output path", () => {
+        const root = mkdtempSync(join(tmpdir(), "metamorphic-symlink-"));
+        try {
+            const corpusDirectory = join(root, "corpus");
+            mkdirSync(corpusDirectory);
+            const alias = join(root, "corpus-alias");
+            symlinkSync(corpusDirectory, alias);
+
+            expect(() => prepareLiveOutputPaths(join(alias, "scenario.json"), corpusDirectory)).toThrow(
+                "must not overlap the scenario corpus",
+            );
+            expect(() => prepareLiveOutputPaths(join(corpusDirectory, "scenario.json"), alias)).toThrow(
+                "must not overlap the scenario corpus",
+            );
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("rejects report, staging, and partial paths that are not regular files", () => {
+        const root = mkdtempSync(join(tmpdir(), "metamorphic-shape-"));
+        try {
+            const corpusDirectory = join(root, "corpus");
+            mkdirSync(corpusDirectory);
+            const occupied = join(root, "as-directory", "report.json");
+            mkdirSync(occupied, { recursive: true });
+            expect(() => prepareLiveOutputPaths(occupied, corpusDirectory)).toThrow(
+                "is not a regular file",
+            );
+
+            const staged = join(root, "as-staging", "report.json");
+            mkdirSync(join(root, "as-staging"));
+            mkdirSync(stagingReportPath(staged));
+            expect(() => prepareLiveOutputPaths(staged, corpusDirectory)).toThrow("is not a regular file");
+
+            const linked = join(root, "as-symlink", "report.json");
+            mkdirSync(join(root, "as-symlink"));
+            symlinkSync(join(root, "elsewhere.json"), stagingReportPath(linked));
+            expect(() => prepareLiveOutputPaths(linked, corpusDirectory)).toThrow("is a symlink");
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("rejects a report destination inside the artifact namespace", () => {
+        const root = mkdtempSync(join(tmpdir(), "metamorphic-namespace-"));
+        try {
+            const corpusDirectory = join(root, "corpus");
+            mkdirSync(corpusDirectory);
+            expect(() =>
+                prepareLiveOutputPaths(join(root, "metamorphic-eval-artifacts"), corpusDirectory),
+            ).toThrow("must stay outside the artifact namespace");
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("validates deterministic report destinations against the corpus", () => {
+        const root = mkdtempSync(join(tmpdir(), "metamorphic-deterministic-paths-"));
+        try {
+            const corpusDirectory = join(root, "corpus");
+            mkdirSync(corpusDirectory);
+            expect(() =>
+                prepareDeterministicOutputPaths(join(corpusDirectory, "report.json"), corpusDirectory),
+            ).toThrow("must not overlap the scenario corpus");
+
+            const report = join(root, "output", "report.json");
+            mkdirSync(join(root, "output"));
+            writeFileSync(report, "stale");
+            prepareDeterministicOutputPaths(report, corpusDirectory);
+            expect(existsSync(report)).toBe(false);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("never writes a report through a symlinked staging path", async () => {
+        const root = mkdtempSync(join(tmpdir(), "metamorphic-staging-"));
+        try {
+            const reportPath = join(root, "report.json");
+            const victim = join(root, "victim.json");
+            writeFileSync(victim, "protected");
+            symlinkSync(victim, stagingReportPath(reportPath));
+            const never: Transform = {
+                id: "never",
+                version: 1,
+                alwaysApplicable: false,
+                apply: () => ({ applicable: false, reason: "fixture" }),
+            };
+
+            await runLiveAndWriteReport(reportPath, [validScenario()], {
+                mode: liveMode(),
+                artifactRoot: join(root, "artifacts"),
+                opencodeVersion: "test",
+                transforms: [never],
+                seeds: [0],
+            });
+
+            expect(readFileSync(victim, "utf8")).toBe("protected");
+            expect(lstatSync(reportPath).isFile()).toBe(true);
+            expect(JSON.parse(readFileSync(reportPath, "utf8")).schema).toBe("metamorphic-eval-report/v1");
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+});
+
+describe("live metamorphic control tier", () => {
+    async function runWithExecutor(
+        execute: (role: LiveRole) => LiveObservation,
+        overrides: Partial<LiveMetamorphicOptions> = {},
+    ): Promise<{ report: MetamorphicReport; roles: LiveRole[] }> {
+        const roles: LiveRole[] = [];
+        const report = await runLiveMetamorphicEval([validScenario()], {
+            mode: liveMode(),
+            artifactRoot: "/tmp/metamorphic-control-tier",
+            opencodeVersion: "test",
+            transforms: [reorder()],
+            seeds: [0],
+            admit: () => [],
+            execute: async (_scenario, role) => {
+                roles.push(role);
+                return execute(role);
+            },
+            ...overrides,
+        });
+        return { report, roles };
+    }
+
+    test("treats two ERROR controls as tier-invalid instead of agreement", async () => {
+        const { report, roles } = await runWithExecutor(() =>
+            pairedObservation([], {
+                verdict: "ERROR",
+                errorReason: "historian-transport",
+                errorDetail: "provider unreachable",
+                precision: null,
+                recall: null,
+            }),
+        );
+
+        expect(report.tierInvalidReason?.kind).toBe("control-error");
+        expect(roles).toEqual(["control-a", "control-b"]);
+        expect(metamorphicExitCode(report)).toBe(1);
+    });
+
+    test("publishes a control-a canary hit through the progress callback", async () => {
+        const progress: MetamorphicReport[] = [];
+        const { report } = await runWithExecutor(
+            () => pairedObservation([injectedClaim(INJECTION_CANARY)]),
+            { onProgress: (partial) => progress.push(partial) },
+        );
+
+        expect(report.injectionCanaryHits).toHaveLength(1);
+        expect(progress.at(-1)?.injectionCanaryHits).toEqual(report.injectionCanaryHits);
+        expect(metamorphicExitCode(report)).toBe(2);
+    });
+
+    test("leaves transform coordinates off a baseline canary hit", async () => {
+        const { report } = await runWithExecutor((role) =>
+            role === "baseline"
+                ? pairedObservation([injectedClaim(INJECTION_CANARY)])
+                : pairedObservation(),
+        );
+
+        expect(report.injectionCanaryHits).toEqual([
+            {
+                scenarioId: validScenario().id,
+                role: "baseline",
+                transformId: null,
+                transformVersion: null,
+                seed: null,
+            },
+        ]);
+    });
+
+    test("runs one baseline per scenario across transforms", async () => {
+        const roles: LiveRole[] = [];
+        const report = await runLiveMetamorphicEval([validScenario()], {
+            mode: liveMode(),
+            artifactRoot: "/tmp/metamorphic-baseline-reuse",
+            opencodeVersion: "test",
+            transforms: [...TRANSFORMS],
+            seeds: [0],
+            admit: () => [],
+            execute: async (_scenario, role) => {
+                roles.push(role);
+                return pairedObservation();
+            },
+        });
+
+        const derivatives = roles.filter((role) => role === "derivative").length;
+        expect(derivatives).toBeGreaterThan(1);
+        expect(roles.filter((role) => role === "baseline")).toHaveLength(1);
+        expect(report.entries.filter((entry) => entry.kind === "scored")).toHaveLength(derivatives + 1);
+    });
+
+    test("carries the precomputed system tuple into partial reports", async () => {
+        const progress: MetamorphicReport[] = [];
+        const system = systemTuple();
+        const { report } = await runWithExecutor(() => pairedObservation(), {
+            system,
+            onProgress: (partial) => progress.push(partial),
+        });
+
+        expect(progress.length).toBeGreaterThan(0);
+        expect(progress[0]?.system).toEqual(system);
+        expect(report.system).toEqual(system);
     });
 });
