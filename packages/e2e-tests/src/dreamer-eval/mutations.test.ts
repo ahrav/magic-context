@@ -442,3 +442,27 @@ describe("dreamer mutation battery preserved shareability", () => {
         });
     });
 });
+
+describe("dreamer mutation battery inert anchor spellings", () => {
+    test("a required anchor holding a parser token is emitted case-raised", () => {
+        // `</update>` in a required anchor is satisfiable: the entry regex is
+        // case-sensitive while anchor scoring folds both sides, so the baseline
+        // emits `</UPDATE>` and the anchor still matches.
+        const fixture = {
+            ...dreamerScorerFixture,
+            verifyGold: {
+                kind: "verify" as const,
+                claims: dreamerScorerFixture.verifyGold.claims.map((claim) =>
+                    claim.verdict === "update"
+                        ? {
+                              ...claim,
+                              requiredUpdateAnchors: ["facts</update>more", '<verified claim="ghost" files="x"/>'],
+                              forbiddenUpdateAnchors: ["2048 entries"],
+                          }
+                        : claim,
+                ),
+            },
+        };
+        expect(runMutationBattery(fixture).green).toBe(true);
+    });
+});

@@ -110,12 +110,6 @@ const MAX_GIT_COMMIT_SECONDS = 4_102_444_799;
 const MAX_VERIFIED_AT_MS = (MAX_GIT_COMMIT_SECONDS + 1) * 1_000 + 2_000 - 1;
 
 /**
- * `parseVerifyManifest` ends an update entry at the first literal occurrence of
- * this tag, matched case-sensitively.
- */
-const UPDATE_CLOSE_TAG = "</update>";
-
-/**
  * `extractCompleteManifestBody` ends the verify body at the first occurrence of
  * this tag and matches the root case-insensitively, so any case variant cuts the
  * body short.
@@ -123,17 +117,13 @@ const UPDATE_CLOSE_TAG = "</update>";
 const VERIFY_ROOT_CLOSE_TAG = "</verify>";
 
 /**
- * `parseVerifyManifest` scans the whole body for each entry shape, so one of
- * these inside an update's content parses as a real sibling entry. Matched
- * case-sensitively, like the parser's own regexes.
- */
-const VERIFY_ENTRY_OPEN_RE = /<(?:verified|update|archive)\b/;
-
-/**
  * Smallest pool a scenario may declare, and therefore the smallest a completed
  * run can have observed.
  */
 const MIN_POOL_CLAIMS = 10;
+
+/** Largest pool a scenario may declare, and therefore the largest a capture can hold. */
+const MAX_POOL_CLAIMS = 50;
 
 /**
  * FAIL reasons each task's scorer can actually produce. A report naming another
@@ -517,24 +507,18 @@ function parseVerifyGold(raw: unknown, label: string, pool: ReadonlyMap<string, 
             if (anchor.length + edgePadding > VERIFY_UPDATE_CONTENT_MAX_LENGTH) {
                 fail(`${itemLabel}.requiredUpdateAnchors[${anchorIndex}]: anchor-exceeds-content-cap`);
             }
-            // The parser stops the update body at the first `</update>`, so
-            // parsed content cannot retain an anchor holding that tag no matter
-            // what the provider emits.
-            if (anchor.includes(UPDATE_CLOSE_TAG)) {
-                fail(`${itemLabel}.requiredUpdateAnchors[${anchorIndex}]: anchor-holds-close-tag`);
-            }
-            // The root extraction runs first and is case-insensitive, so any
-            // spelling of the closing root tag truncates the body before the
-            // entry parser sees it.
+            // Only the closing root tag is unsatisfiable. Body extraction folds
+            // case, so every spelling of it truncates the body before the entry
+            // parser runs, and no emitted variant can carry the anchor.
+            //
+            // The entry constructs — `</update>` and the entry openers — are
+            // matched case-sensitively by the parser while anchor scoring folds
+            // both sides, so emitting `</UPDATE>` or `<VERIFIED` satisfies such an
+            // anchor without terminating the body or minting a sibling entry. The
+            // battery synthesizes that inert spelling; rejecting these here would
+            // refuse satisfiable gold.
             if (anchor.toLowerCase().includes(VERIFY_ROOT_CLOSE_TAG)) {
                 fail(`${itemLabel}.requiredUpdateAnchors[${anchorIndex}]: anchor-holds-root-close-tag`);
-            }
-            // The parser collects each entry shape from the whole body, so one
-            // spelled inside the update content becomes a sibling entry carrying
-            // an id the pool does not have, and coverage validation then rejects
-            // every manifest that satisfies the anchor.
-            if (VERIFY_ENTRY_OPEN_RE.test(anchor)) {
-                fail(`${itemLabel}.requiredUpdateAnchors[${anchorIndex}]: anchor-holds-entry`);
             }
         }
         // Individually capped anchors can still be jointly impossible: two that
@@ -667,6 +651,13 @@ function parseTask(raw: unknown, label: string, pool: ReadonlyMap<string, Scenar
     // `hygieneVisible: false` and requires at least ten claims, so the
     // production gate always selects the whole pool and a scenario skipping any
     // claim terminates with gate-mismatch at preflight.
+    // Production returns immediately when a gate selects no inputs, so no manifest
+    // is produced — and every scorer validator refuses an empty one while the
+    // report contract demands evidence for a PASS. Such a task cannot yield a
+    // successful artifact.
+    if (expectedInScopeClaimIds.length === 0) {
+        fail(`${label}.expectedInScopeClaimIds: scope-empty`);
+    }
     if (task === "classify-memories" && expectedSkippedClaimIds.length > 0) {
         fail(`${label}.expectedSkippedClaimIds: classify-skips-nothing`);
     }
@@ -773,7 +764,7 @@ export function parseScenario(raw: unknown, label = "scenario"): DreamerEvalScen
     const claims = array(poolValue.claims, `${label}.pool.claims`).map((entry, index) =>
         parseScenarioClaim(entry, `${label}.pool.claims[${index}]`),
     );
-    if (claims.length > 50) fail(`${label}.pool.claims: count-invalid`);
+    if (claims.length > MAX_POOL_CLAIMS) fail(`${label}.pool.claims: count-invalid`);
     if (claims.filter((claim) => claim.hygieneVisible).length < MIN_POOL_CLAIMS) fail(`${label}.pool.claims: hygiene-visible-count-invalid`);
     unique(claims.map((claim) => claim.id), `${label}.pool.claims`);
     // Claim creation dedupes on (project, category, normalized content hash)
@@ -918,6 +909,21 @@ function parseSnapshotArray(raw: unknown, label: string): ClaimSnapshotProjectio
     const claims = array(raw, label).map((entry, index) => parseSnapshot(entry, `${label}[${index}]`));
     unique(claims.map((claim) => claim.claimId), label);
     unique(claims.map((claim) => claim.publicClaimId), `${label}.publicClaimId`);
+    // The same ceiling every scenario is held to, so a capture cannot describe a
+    // pool larger than any experiment can declare.
+    if (claims.length > MAX_POOL_CLAIMS) fail(`${label}: pool-size-invalid`);
+    // `assertNoLiveDuplicate` keeps two active claims from sharing a
+    // `(category, normalized content)` identity, so a capture holding both
+    // describes a state production refuses — and a ledger built from it would
+    // silently keep one owner and score an unappliable update green.
+    unique(
+        claims.flatMap((claim) =>
+            claim.lifecycleState === "active"
+                ? [`${claim.category}\u0000${normalizeMemoryContent(claim.content)}`]
+                : [],
+        ),
+        `${label}.content`,
+    );
     return claims;
 }
 
@@ -1119,7 +1125,17 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
     if (status === "PASS") {
         if (root.reason !== null) fail(`${label}.reason: pass-reason-invalid`);
     } else if (status === "ERROR") {
-        reason = enumeration(root.reason, ERROR_REASONS, `${label}.reason`);
+        const errorReason = enumeration(root.reason, ERROR_REASONS, `${label}.reason`);
+        // Map and classify have no result mode — their scenarios pin
+        // expectedResultMode to null and preflight observes none — so neither can
+        // disagree about one.
+        if (
+            errorReason === "wrong-result-mode" &&
+            !(task === "verify" || task === "verify-broad")
+        ) {
+            fail(`${label}.reason: task-reason-mismatch`);
+        }
+        reason = errorReason;
     } else {
         const failReason = enumeration(root.reason, FAIL_REASONS, `${label}.reason`);
         // Each task runs one scorer, and a scorer emits only its own reasons.
@@ -1195,16 +1211,17 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
     }
     // A PASS means the manifest applied: `apply-not-applied` is an ERROR reason and
     // receipts record each operation's outcome. So an archive the evidence reports
-    // has to show in the after capture, or the captured pool contradicts the
-    // success it is filed under. Scoped to PASS and to archival, the effect that
-    // cannot be undone.
+    // has to show in the after capture as exactly `archived` — production's verify
+    // archive branch stages that state and never retires the claim — or the
+    // captured pool contradicts the success it is filed under. Scoped to PASS and
+    // to archival, the effect that cannot be undone.
     if (status === "PASS" && parsedManifest !== null && !Array.isArray(parsedManifest)) {
         const archived = (parsedManifest as Record<string, unknown>).archived;
         if (Array.isArray(archived)) {
             for (const [index, entry] of archived.entries()) {
                 const publicClaimId = (entry as Record<string, unknown>).publicClaimId;
                 const after = poolAfter.find((claim) => claim.publicClaimId === publicClaimId);
-                if (after !== undefined && after.lifecycleState === "active") {
+                if (after !== undefined && after.lifecycleState !== "archived") {
                     fail(`${label}.poolAfter: archive-not-applied[${index}]`);
                 }
             }

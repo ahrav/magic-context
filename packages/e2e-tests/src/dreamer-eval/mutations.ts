@@ -224,13 +224,14 @@ function buildUpdateContent(gold: VerifyGoldClaim): string {
             "a filler character absent from every forbidden update anchor",
         ).repeat(3);
     }
-    const joined = gold.requiredUpdateAnchors.join("; ");
+    const spellings = gold.requiredUpdateAnchors.map(inertAnchorSpelling);
+    const joined = spellings.join("; ");
     if (!containsAny(joined, gold.forbiddenUpdateAnchors)) return padEdgeWhitespace(joined, gold);
     const filler = fillerAbsentFrom(
         gold.forbiddenUpdateAnchors,
         "a separator absent from every forbidden update anchor",
     );
-    const spaced = gold.requiredUpdateAnchors.join(` ${filler} `);
+    const spaced = spellings.join(` ${filler} `);
     if (containsAny(spaced, gold.forbiddenUpdateAnchors)) {
         throw new Error("mutation fixture needs update anchors joinable without a forbidden phrase");
     }
@@ -356,6 +357,19 @@ function replaceMapFiles(manifest: string, publicClaimId: string, files: readonl
 const PARSER_ACTIVE_RE = /<\/?(?:verified|update|archive)\b/;
 
 /**
+ * A spelling of `anchor` that can sit inside an update body, raising the case of
+ * any entry construct so the parser ignores it while the folded anchor still
+ * matches. Throws when no spelling survives, which is only the closing root tag.
+ */
+function inertAnchorSpelling(anchor: string): string {
+    const spelling = embeddableForbiddenAnchor(anchor);
+    if (spelling === null) {
+        throw new Error("mutation fixture needs update anchors that can appear in an update body");
+    }
+    return spelling;
+}
+
+/**
  * A spelling of `anchor` that can sit inside an update body, or null when none
  * can.
  *
@@ -438,7 +452,7 @@ function mutationManifest(
             const forbidden = target.forbiddenUpdateAnchors
                 .map((anchor) => embeddableForbiddenAnchor(anchor))
                 .find((anchor): anchor is string => anchor !== null)!;
-            const content = [...target.requiredUpdateAnchors, forbidden].join("; ");
+            const content = [...target.requiredUpdateAnchors.map(inertAnchorSpelling), forbidden].join("; ");
             return { task: "verify", manifest: replaceEntry(verify, claim.publicClaimId, `<update claim="${claim.publicClaimId}" files="${target.expectedFiles.join(",")}">${content}</update>`) };
         }
         case "wrong-independence": {

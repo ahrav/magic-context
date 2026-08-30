@@ -433,16 +433,24 @@ describe("dreamer eval scenario contract", () => {
         expect(() => parseScenario(onVerify)).not.toThrow();
     });
 
-    test("a required update anchor cannot hold the parser's closing tag", () => {
-        // The parser ends the update body at the first `</update>`, so parsed
-        // content can never retain such an anchor.
-        expectDiagnostic((raw) => {
-            const tasks = raw.tasks as Array<{
-                gold: { claims: Array<{ verdict: string; requiredUpdateAnchors: string[] }> };
-            }>;
-            tasks[0]!.gold.claims[0]!.verdict = "update";
-            tasks[0]!.gold.claims[0]!.requiredUpdateAnchors = ["facts</update>more"];
-        }, "scenario.tasks[0].gold.claims[0].requiredUpdateAnchors[0]: anchor-holds-close-tag");
+    test("a required update anchor cannot hold the root closing tag", () => {
+        // Only the root tag is unsatisfiable: body extraction folds case, so every
+        // spelling truncates the body. The entry constructs are matched
+        // case-sensitively, so an inert spelling carries them.
+        const inert = validScenarioRaw();
+        const inertTasks = inert.tasks as Array<{
+            gold: { claims: Array<{ verdict: string; requiredUpdateAnchors: string[] }> };
+        }>;
+        inertTasks[0]!.gold.claims[0]!.verdict = "update";
+        inertTasks[0]!.gold.claims[0]!.requiredUpdateAnchors = ["facts</update>more"];
+        expect(() => parseScenario(inert)).not.toThrow();
+        const opener = validScenarioRaw();
+        const openerTasks = opener.tasks as Array<{
+            gold: { claims: Array<{ verdict: string; requiredUpdateAnchors: string[] }> };
+        }>;
+        openerTasks[0]!.gold.claims[0]!.verdict = "update";
+        openerTasks[0]!.gold.claims[0]!.requiredUpdateAnchors = ['<verified claim="ghost" files="x"/>'];
+        expect(() => parseScenario(opener)).not.toThrow();
         // The root extraction runs first and matches case-insensitively, so any
         // spelling of the root close tag truncates the body.
         for (const anchor of ["facts</verify>more", "facts</VERIFY>more", "facts</Verify>more"]) {
@@ -502,24 +510,6 @@ describe("dreamer eval scenario contract", () => {
             { claimId: "claim-1", files: [] },
         ];
         expect(() => parseScenario(sentinel)).not.toThrow();
-    });
-
-    test("a required update anchor cannot spell a verify entry", () => {
-        // The parser collects entries from the whole body, so one inside the
-        // update content becomes a sibling entry with an unknown id.
-        for (const anchor of [
-            '<verified claim="ghost" files="x"/>',
-            '<archive claim="ghost"/>',
-            '<update claim="ghost" files="x">y',
-        ]) {
-            expectDiagnostic((raw) => {
-                const tasks = raw.tasks as Array<{
-                    gold: { claims: Array<{ verdict: string; requiredUpdateAnchors: string[] }> };
-                }>;
-                tasks[0]!.gold.claims[0]!.verdict = "update";
-                tasks[0]!.gold.claims[0]!.requiredUpdateAnchors = [anchor];
-            }, "scenario.tasks[0].gold.claims[0].requiredUpdateAnchors[0]: anchor-holds-entry");
-        }
     });
 
     test("a verify task must declare the one result mode the seeder can produce", () => {
@@ -1165,6 +1155,76 @@ describe("dreamer eval report contract", () => {
                 poolAfter: captureWithFirst({ lifecycleState: "archived" }),
             }).status,
         ).toBe("PASS");
+    });
+
+    test("a capture cannot hold two active claims with one identity", () => {
+        // Content that normalizes onto the second claim's, with the locator digest
+        // moved to match the new bytes.
+        const collidingFirst = () => {
+            const content = `  ${POOL_CAPTURE[1]!.content as string}  `;
+            return { content, revisionLocator: locatorFor(OBSERVED_ID, content) };
+        };
+        // assertNoLiveDuplicate keeps that state out of production, and a ledger
+        // built from such a capture would silently keep one owner.
+        expect(() =>
+            parseRunReport({
+                ...baseReport,
+                poolBefore: captureWithFirst(collidingFirst()),
+                poolAfter: captureWithFirst(collidingFirst()),
+            }),
+        ).toThrow(/poolBefore.content: duplicate/);
+        // Archived rows are outside the assertion's `active` filter.
+        expect(
+            parseRunReport({
+                ...baseReport,
+                poolBefore: captureWithFirst({ ...collidingFirst(), lifecycleState: "archived" }),
+                poolAfter: captureWithFirst({ ...collidingFirst(), lifecycleState: "archived" }),
+            }).poolBefore,
+        ).toHaveLength(POOL_CAPTURE.length);
+    });
+
+    test("a wrong-result-mode error belongs only to a verify task", () => {
+        // Map and classify pin expectedResultMode to null and preflight observes
+        // none, so neither can disagree about one.
+        for (const task of ["map-memories", "classify-memories"]) {
+            expect(() =>
+                parseRunReport({
+                    ...baseReport,
+                    task,
+                    status: "ERROR",
+                    reason: "wrong-result-mode",
+                    rawManifest: null,
+                    parsedManifest: null,
+                }),
+            ).toThrow(/reason: task-reason-mismatch/);
+        }
+        expect(
+            parseRunReport({
+                ...baseReport,
+                status: "ERROR",
+                reason: "wrong-result-mode",
+                rawManifest: null,
+                parsedManifest: null,
+            }).reason,
+        ).toBe("wrong-result-mode");
+    });
+
+    test("a task that selects nothing cannot produce an artifact", () => {
+        // Production returns immediately when a gate selects no inputs, so no
+        // manifest exists to score.
+        expectDiagnostic((raw) => {
+            const tasks = raw.tasks as Array<{
+                preconditions: { mappings: unknown[] };
+                expectedInScopeClaimIds: string[];
+                expectedSkippedClaimIds: string[];
+                gold: { claims: unknown[] };
+            }>;
+            const verify = tasks[0]!;
+            verify.preconditions.mappings = [];
+            verify.expectedSkippedClaimIds = [...verify.expectedInScopeClaimIds, ...verify.expectedSkippedClaimIds];
+            verify.expectedInScopeClaimIds = [];
+            verify.gold.claims = [];
+        }, "scenario.tasks[0].expectedInScopeClaimIds: scope-empty");
     });
 
     test("a completed report must capture the scenario pool", () => {
