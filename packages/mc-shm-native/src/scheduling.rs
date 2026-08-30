@@ -353,9 +353,11 @@ mod tests {
         let mut events = Vec::with_capacity(1);
         epoll::wait(&reactor, spare_capacity(&mut events), None).unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].data.u64(), 17);
-        assert!(events[0]
-            .flags
+        let event = events[0];
+        let data = event.data;
+        let flags = event.flags;
+        assert_eq!(data.u64(), 17);
+        assert!(flags
             .intersects(epoll::EventFlags::IN | epoll::EventFlags::HUP | epoll::EventFlags::RDHUP));
     }
 
