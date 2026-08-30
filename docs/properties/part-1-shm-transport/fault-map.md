@@ -25,7 +25,7 @@ nothing. That is the failure mode this file exists to prevent.
 
 | Class | Description | Available today |
 | --- | --- | --- |
-| F1 process kill | `SIGKILL` at a chosen point, signal-9 wait status required, observation window anchored to reap | **Yes** — `crates/mc-host/tests/support/shm_process.rs` implements exactly this |
+| F1 process kill | `SIGKILL` at a chosen point, signal-9 wait status required, observation window anchored to reap | **Was yes at `9c1eb4d1`** — `crates/mc-host/tests/support/shm_process.rs` implemented exactly this; `ed487e11` deleted that harness with the provider it drove, so F1 has no implementation at `e447c927` |
 | F2 hostile peer writes | A peer that writes shared control pages: the quarantine byte, cursors, slot fields, a pending descriptor | **No** — all three fuzz targets model immutable byte decoders; nothing models a mutating peer |
 | F3 deterministic failpoints | Forced failure at a named internal point: lease construction, span materialization, accounting overflow, alias detach, charge release | **Partial** — an external-view creation failpoint exists in the addon; no failpoint exists for lease or span construction, accounting arithmetic, or charge release |
 | F4 true concurrency | Producer and receiver progressing independently, not in lockstep | **No** — the only cross-process test is lockstep with a sleep |
@@ -82,7 +82,7 @@ classes the original map did not name.
 | F10 macOS ring execution | A macOS host that actually constructs a `Ring` | **No** — the macOS CI step names two integration files and excludes the lib target, so no macOS job reaches `Ring::create` |
 | F11 non-4096 page host | A kernel page size other than 4096, or an injectable page size in the layout and prefault paths | **No** — and note CI already provisions a 16 KiB host every run, which is precisely the one that constructs no `Ring` |
 | F12 duplex-capable peer | A peer harness able to hold frames outstanding in both directions at once | **No** — the test peer's send and receive are both synchronous and thread-confined |
-| F13 iceoryx cross-process pairing | Two processes sharing one iceoryx service | **No, and not constructible** — the service name is random, private, and has no accessor; the port bounds are consumed by the creator. Requires an API change |
+| F13 iceoryx cross-process pairing (moot: `0f336d3c` deleted the iceoryx backend) | Two processes sharing one iceoryx service | **No, and not constructible** — the service name is random, private, and has no accessor; the port bounds are consumed by the creator. Requires an API change |
 
 | Property | Required faults and enabling state | Non-vacuous today |
 | --- | --- | --- |
@@ -96,11 +96,11 @@ classes the original map did not name.
 | macos-object-creation-leaks-no-shm-name | F10 plus F3 on `shm_unlink`, or a kill in the open-to-unlink window, plus an oracle over the Darwin shm namespace | No |
 | layout-region-offsets-are-real-page-aligned | F11 | No |
 | page-size-dependent-setup-runs-on-a-non-4096-page-host | F11 | No |
-| iceoryx-descriptor-rejection-is-terminal-or-declared | A sequence or identity mismatch in a delivered sample: either an external config setting the discard strategy, or F2 against the provider segment | No |
-| iceoryx-receive-expectation-tracks-the-delivered-stream | A delivered-versus-expected sequence divergence: a restart (blocked by F13), a malformed sample (F2), or a discard-strategy config plus a full buffer | No |
-| iceoryx-cross-process-pairing-is-reachable-or-declared | F13 | No, and not constructible without an API change |
-| iceoryx-completion-is-observable-to-the-host | None; the gap is visible in the public surface | No — there is no observation to assert against |
-| iceoryx-saturation-is-bounded-non-blocking-backpressure | None; count operations past each cap. Publish arm hangs, so needs a terminating timeout in the harness | No |
+| iceoryx-descriptor-rejection-is-terminal-or-declared (moot: backend deleted by `0f336d3c`) | A sequence or identity mismatch in a delivered sample: either an external config setting the discard strategy, or F2 against the provider segment | No |
+| iceoryx-receive-expectation-tracks-the-delivered-stream (moot: backend deleted by `0f336d3c`) | A delivered-versus-expected sequence divergence: a restart (blocked by F13), a malformed sample (F2), or a discard-strategy config plus a full buffer | No |
+| iceoryx-cross-process-pairing-is-reachable-or-declared (moot: backend deleted by `0f336d3c`) | F13 | No, and not constructible without an API change |
+| iceoryx-completion-is-observable-to-the-host (moot: backend deleted by `0f336d3c`) | None; the gap is visible in the public surface | No — there is no observation to assert against |
+| iceoryx-saturation-is-bounded-non-blocking-backpressure (moot: backend deleted by `0f336d3c`) | None; count operations past each cap. Publish arm hangs, so needs a terminating timeout in the harness | No |
 | wire-header-fully-validated-before-any-consumer-acts | A peer-authored header satisfying the transport's two checks and violating one host rule | Partial — one such header exists in a test, but only the downstream quarantine is asserted |
 | ingress-charge-matches-the-bytes-copied-from-shared-storage | None to pin it; F2 writing the descriptor page to demonstrate impact | No |
 | every-shm-header-consumer-applies-its-role-gate | A role-invalid publish into each direction; the peer arm needs the frame to originate host-side | Partial — host arm only, one type |
@@ -201,3 +201,17 @@ Ranked by how many catalog records it unblocks:
    caught the one defect in this area that already shipped.
 5. **F1 at new injection points** — the harness exists; only two new kill points
    are needed.
+
+## Citation sweep, 2026-08-30
+
+A citation sweep ran over this file against
+`/local/home/ahrav/scratch/magic-context` at `e447c927`. No fault class, required
+fault, or leverage ranking was re-derived; only references moved.
+
+What changed: F1's availability now records that
+`crates/mc-host/tests/support/shm_process.rs`, the harness that implemented it,
+was deleted by `ed487e11` along with the provider it drove, so the kill harness
+this file assumed no longer exists. F13 and the five iceoryx property rows are
+marked moot, because `0f336d3c` deleted the iceoryx backend, its tests, and its
+Cargo feature. Everything else, including the transport-side fault classes and
+the leverage ranking, is unchanged.

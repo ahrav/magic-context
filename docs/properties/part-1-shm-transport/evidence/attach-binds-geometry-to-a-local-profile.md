@@ -24,39 +24,40 @@ maps whatever the grant declares, with no step that compares the two.
 
 ## Evidence trail
 
-- `crates/mc-shm-transport/src/backend/ring.rs:593-611` — `Ring::attach(fd:
+- `crates/mc-shm-transport/src/backend/ring.rs:598-616` — `Ring::attach(fd:
   OwnedFd, grant: RingGrant, scheduling: SchedulingMode)`. Three parameters, none
-  of them a profile. The whole body is: `grant.checked_layout()` (`:598`),
-  `Mapping::attach` (`:600`), `validate_lifecycle` (`:601`), `prefault_read`
-  (`:602`).
+  of them a profile. The whole body is: `grant.checked_layout()` (`:603`),
+  `Mapping::attach` (`:605`), `validate_lifecycle` (`:606`), `prefault_read`
+  (`:607`).
 - `crates/mc-shm-transport/src/backend/ring.rs:544-558` — the contrast.
   `Ring::create_in` rejects a profile whose backend, memory layout, or `max_spans`
   disagrees (`:552-557`) before deriving `Layout::new(profile.descriptor_depth(),
-  profile.arena_bytes())` (`:558`). All of that is skipped on attach.
-- `crates/mc-shm-transport/src/backend/ring.rs:465-482` — `checked_layout`, the
+  profile.arena_bytes())` (`:563`). All of that is skipped on attach.
+- `crates/mc-shm-transport/src/backend/ring.rs:461-478` — `checked_layout`, the
   only bound on attach geometry. It rejects `layout_version != LAYOUT_VERSION`,
   `descriptor_depth == 0`, `arena_bytes < MAX_FRAME_BYTES`, `max_leases == 0`,
-  and `max_leases > descriptor_depth` (`:466-473`), then requires `layout.total ==
-  total` (`:478-480`). Depth has a floor of 1 and no ceiling; the only thing
+  and `max_leases > descriptor_depth` (`:462-469`), then requires `layout.total ==
+  total` (`:474-476`). Depth has a floor of 1 and no ceiling; the only thing
   stopping a huge depth is that the resulting `total` must be arithmetically
   consistent, and `Layout::new` returns `ArithmeticOverflow` only at `usize`
   overflow.
-- `crates/mc-shm-transport/src/backend/ring.rs:1637-1668` — `validate_lifecycle`.
+- `crates/mc-shm-transport/src/backend/ring.rs:1639-1670` — `validate_lifecycle`.
   It compares the mapped lifecycle page against the *grant*: magic, layout
   version, depth, arena bytes, max leases, total bytes, incarnation, and lane
-  (`:1656-1666`). Every comparison is grant-versus-mapping. None is
+  (`:1658-1668`). Every comparison is grant-versus-mapping. None is
   profile-versus-grant, so a self-consistent object plus a matching grant passes
   regardless of what the local profile charged.
-- `crates/mc-shm-transport/src/backend/ring.rs:599-600` — the mapping size comes
+- `crates/mc-shm-transport/src/backend/ring.rs:604-605` — the mapping size comes
   straight from `grant.total_bytes`, so the grant chooses the `mmap` length.
 - Every `Ring::attach` call site in the tree passes `(fd, grant, scheduling)` and
-  no profile: `ring.rs:508` (`RingAttachment::attach`),
-  `packages/mc-shm-native/src/lib.rs:244` (the addon's `attach_ring`),
-  former `crates/mc-host/src/shm_provider.rs:787` (the Rust test peer's `attach_ring`),
-  and `crates/mc-shm-transport/tests/ring.rs:437`, `:464`, `:615`.
-- `packages/mc-shm-native/src/lib.rs:491-494` — the addon does check a profile,
+  no profile: `ring.rs:512` (`RingAttachment::attach`),
+  `packages/mc-shm-native/src/lib.rs:250` (the addon's `attach_ring`, which no
+  longer opens `/proc/{pid}/fd/{fd}` and no longer takes a pid),
+  the Rust test peer's `attach_ring`, deleted with `shm_provider.rs` in `ed487e11`,
+  and `crates/mc-shm-transport/tests/ring.rs:437`, `:459`, `:631`.
+- `packages/mc-shm-native/src/lib.rs:503-506` — the addon does check a profile,
   but only as a string: `profile != PROFILE` rejects. `PROFILE` is
-  `"mc-host-test-ring-v1"` (`:32`). A name match is not a geometry match.
+  `"mc-host-test-ring-v1"` (`:27`). A name match is not a geometry match.
 - `crates/mc-host/src/ring_transport.rs:822-827` —
   `qualified_test_profile_pins_client_grant_geometry` asserts
   `descriptor_depth() == 8`, `max_leases() == 8`, and `arena_bytes() ==
@@ -110,26 +111,27 @@ fails and pins the gap.
 The record carries no open question. This log records the check that had to be
 run before accepting the claim, since a single missed call site would refute it.
 
-- Sources examined: `crates/mc-shm-transport/src/backend/ring.rs:593-611` and
-  `:465-482` and `:1637-1668` read in full; every `Ring::attach` and
+- Sources examined: `crates/mc-shm-transport/src/backend/ring.rs:598-616` and
+  `:461-478` and `:1639-1670` read in full; every `Ring::attach` and
   `attachment().attach()` call site found by grep across `crates/` and
   `packages/`, excluding `target/`, `node_modules/`, and `dist/`;
-  `packages/mc-shm-native/src/lib.rs:240-247` and
-  former `crates/mc-host/src/shm_provider.rs:779-788` for the two `attach_ring` wrappers;
+  `packages/mc-shm-native/src/lib.rs:240-252` and, at `9c1eb4d1`,
+  `crates/mc-host/src/shm_provider.rs:779-788` for the two `attach_ring`
+  wrappers, the host-side one since deleted by `ed487e11`;
   `packages/plugin/src/shared/mc-host-client/shm-grant.ts:146-174` for the
   TypeScript geometry pin.
 - Findings: the claim holds. Six call sites, none passing a profile. The two
-  `attach_ring` wrappers do carry a `pid` and `fd` and open
+  `attach_ring` wrappers carried, at `9c1eb4d1`, a `pid` and `fd` and opened
   `/proc/{pid}/fd/{fd}`, so they authenticate the object's provenance, but they
   pass the decoded grant straight through. `create_test_pair`
-  (`packages/mc-shm-native/src/lib.rs:563-580`) is the one path that does use a
+  (`packages/mc-shm-native/src/lib.rs:633-650`) is the one path that does use a
   profile on both sides, and only because it creates both rings locally and
   attaches via `RingAttachment`, so the grant it attaches with was derived from
   that same profile moments earlier.
-- Missing evidence: none. The catalog's citations `ring.rs:593` and `:465` both
+- Missing evidence: none. The catalog's citations `ring.rs:593` and `:461` both
   resolve, and its statement that `checked_layout` "bounds depth only by `!= 0`
   plus layout arithmetic" is accurate; it omits the related
-  `max_leases <= descriptor_depth` constraint at `:470`, which bounds leases
+  `max_leases <= descriptor_depth` constraint at `:466`, which bounds leases
   relative to depth but places no absolute ceiling on either.
 - Conclusion: resolved with answer. No attach path anywhere in the tree binds
   grant geometry to a local profile, and the only geometry ceiling in the system

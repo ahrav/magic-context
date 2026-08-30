@@ -29,14 +29,14 @@ copies of the same geometry found seven artifacts naming one profile string,
 
 ## The arithmetic, computed rather than asserted
 
-`Layout::new` (`crates/mc-shm-transport/src/backend/ring.rs:141-185`) is
+`Layout::new` (`crates/mc-shm-transport/src/backend/ring.rs:140-184`) is
 deterministic in `(depth, arena_bytes)`. The inputs it depends on:
-`CACHELINE = 128` and `PAGE_SIZE = 4096` (`:28-29`); `ProducerPage`,
+`CACHELINE = 128` and `PAGE_SIZE = 4096` (`:27-28`); `ProducerPage`,
 `ConsumerPage`, and `ReclaimPage`, each `#[repr(C, align(128))]` holding two
-`AtomicU64` (`:39-55`), so `size_of` is 128 each; and `DescriptorSlot`,
+`AtomicU64` (`:38-54`), so `size_of` is 128 each; and `DescriptorSlot`,
 `#[repr(C, align(128))]` holding `AtomicU8`, two `AtomicU64`, and
-`UnsafeCell<SharedDescriptor>` (`:109-115`), where `SharedDescriptor` is
-`#[repr(C)]` (`:57-71`).
+`UnsafeCell<SharedDescriptor>` (`:108-114`), where `SharedDescriptor` is
+`#[repr(C)]` (`:56-70`).
 
 I compiled those exact declarations and evaluated the arithmetic rather than
 computing it by hand. Results: `size_of::<SharedDescriptor>() == 120` and
@@ -56,11 +56,11 @@ The overhead is the arena's page-aligned offset plus the trailing lifecycle page
 (`:172-174`), which is why depth 8 yields two pages and depth 32 yields four.
 
 The TypeScript constant `GRANT_LAYOUT_OVERHEAD_BYTES` in
-`packages/mc-shm-native/tests/mechanism.ts:99` is `16_384n`. It is **correct for
+`packages/mc-shm-native/tests/mechanism.ts:110` is `16_384n`. It is **correct for
 depth 32 and wrong for depth 8**, understating nothing and overstating the
 depth-8 overhead by 8,192 bytes. It is internally consistent, because the same
-file declares `GRANT_DESCRIPTOR_DEPTH = 32n` (`:81`) and
-`GRANT_MAX_LEASES = 32n` (`:84`). This also confirms the `daf6e244` story
+file declares `GRANT_DESCRIPTOR_DEPTH = 32n` (`:92`) and
+`GRANT_MAX_LEASES = 32n` (`:95`). This also confirms the `daf6e244` story
 arithmetically: the old value `12_288` is exactly the depth-32 overhead one page
 short, matching "assumed the control region ahead of the arena fit in two pages.
 It now needs three."
@@ -84,14 +84,14 @@ Depth 8, overhead 8,192:
 
 Depth 32, overhead 16,384:
 
-- `crates/mc-shm-transport/src/profile.rs:682-685` — `ring_profile`:
+- `crates/mc-shm-transport/src/profile.rs:706-709` — `ring_profile`:
   `descriptor_depth: 32`, `arena_bytes: MIN_ARENA_BYTES`, `max_leases: 32`.
-- `packages/mc-shm-native/tests/mechanism.ts:81-99` — `GRANT_DESCRIPTOR_DEPTH =
+- `packages/mc-shm-native/tests/mechanism.ts:92-110` — `GRANT_DESCRIPTOR_DEPTH =
   32n`, `GRANT_MAX_LEASES = 32n`, `GRANT_LAYOUT_OVERHEAD_BYTES = 16_384n`,
-  assembled at `:113-119`. Its comment at `:80` states the intent explicitly:
+  assembled at `:124-130`. Its comment at `:91` states the intent explicitly:
   "Geometry of the `mc-host-test-ring-v1` profile (`ring_profile`)."
 - `crates/mc-shm-transport/fuzz/corpus/provider_grant/valid` — the golden grant
-  fixture, pinned as a hex literal at `crates/mc-shm-transport/tests/ring.rs:504-505`.
+  fixture, pinned as a hex literal at `crates/mc-shm-transport/tests/ring.rs:513-514`.
   Decoding it gives layout version 2, lane 0, depth 32, arena 67,108,864, leases
   32, total 67,125,248, reserved 0 — overhead 16,384. This fixture doubles as the
   fuzz `provider_grant` seed asserted to be *accepted*.
@@ -104,8 +104,8 @@ name.
 ## Failure scenario
 
 The name is the only thing a caller matches on: the addon's attach checks
-`profile != PROFILE` (`packages/mc-shm-native/src/lib.rs:492-494`) and nothing
-more, and `PROFILE` is `"mc-host-test-ring-v1"` (`:32`). Because
+`profile != PROFILE` (`packages/mc-shm-native/src/lib.rs:504-506`) and nothing
+more, and `PROFILE` is `"mc-host-test-ring-v1"` (`:27`). Because
 `attach-binds-geometry-to-a-local-profile` holds — no attach path compares grant
 geometry to a local profile — a depth-32 grant carrying that name is accepted
 natively while the host's admission charged for depth 8. The concrete recurrence
@@ -137,13 +137,13 @@ the two geometries the name means.
 ### Q: Is the depth-32 fixture a deliberate model of `create_test_pair` (which uses `ring_profile`), in which case the profile string is knowingly overloaded across two geometries?
 
 - Sources examined: `packages/mc-shm-native/tests/mechanism.ts:64-135` for the
-  fixture and its `loadRawAddon` path; `packages/mc-shm-native/src/lib.rs:552-580`
-  for `create_test_pair`; `crates/mc-shm-transport/src/profile.rs:661-696` for
+  fixture and its `loadRawAddon` path; `packages/mc-shm-native/src/lib.rs:640-722`
+  for `create_test_pair`; `crates/mc-shm-transport/src/profile.rs:698-720` for
   `ring_profile`; `git log -1 --format=%B daf6e244`;
   `crates/mc-shm-transport/tests/ring.rs:500-527` for the golden fixture.
 - Findings: the fixture is deliberate. `create_test_pair` calls
   `ring_profile(HardwareProfileId::new(PROFILE)?, ColdParkWake)`
-  (`lib.rs:563-566`) where `PROFILE` is the same string the host uses, so the
+  (`lib.rs:633-636`) where `PROFILE` is the same string the host uses, so the
   addon really does create depth-32 rings under that name, and the fixture's own
   comment at `:80` names `ring_profile` as its source. The golden fuzz seed is a
   third depth-32 artifact, so this is a family, not a one-off. What the sources do

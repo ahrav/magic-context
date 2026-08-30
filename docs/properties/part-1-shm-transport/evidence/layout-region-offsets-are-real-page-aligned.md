@@ -10,14 +10,14 @@ granularity are two different numbers on any host whose page is not 4096.
 
 ## Evidence trail
 
-`crates/mc-shm-transport/src/backend/ring.rs:29` declares
-`const PAGE_SIZE: usize = 4096`. `Layout::new` (`:142-183`) uses `CACHELINE`
+`crates/mc-shm-transport/src/backend/ring.rs:28` declares
+`const PAGE_SIZE: usize = 4096`. `Layout::new` (`:141-182`) uses `CACHELINE`
 (128) for the three control pages and `PAGE_SIZE` for the rest: `arena =
-align_up(slots + slot_bytes, PAGE_SIZE)` (`:159-164`), `lifecycle =
-align_up(arena + arena_bytes, PAGE_SIZE)` (`:165-170`), and `total =
-lifecycle.checked_add(PAGE_SIZE)` (`:171-173`). `system_page_size()`
-(`:195-201`) exists and falls back to `PAGE_SIZE`, but its only caller is
-`verify_prefaulted` (`:1007`), which uses it to size the `mincore` residency
+align_up(slots + slot_bytes, PAGE_SIZE)` (`:158-163`), `lifecycle =
+align_up(arena + arena_bytes, PAGE_SIZE)` (`:164-169`), and `total =
+lifecycle.checked_add(PAGE_SIZE)` (`:170-172`). `system_page_size()`
+(`:194-200`) exists and falls back to `PAGE_SIZE`, but its only caller is
+`verify_prefaulted` (`:1009`), which uses it to size the `mincore` residency
 vector. No layout arithmetic consults it.
 
 `total` is what leaves the crate. `Ring::create_in` passes it to
@@ -30,7 +30,7 @@ from a constant neither of them checks against the kernel.
 
 I computed the layout for the three profiles that exist in the tree —
 `lease_limited_profile` depth 2 (`tests/ring.rs:43`), `qualified_test_profile`
-depth 8 (`crates/mc-host/src/shm_provider.rs:853`), and `ring_profile` depth 32
+depth 8 (`crates/mc-host/src/ring_transport.rs:824`), and `ring_profile` depth 32
 (`src/profile.rs:681`) — all with `arena_bytes = MIN_ARENA_BYTES = 67_108_864`
 (`src/arena.rs:4-6`), using `size_of::<DescriptorSlot>() = 256` and 128 for each
 of the three control pages. Depth 2 and depth 8 produce identical offsets because
@@ -107,10 +107,10 @@ addressable bytes past `len`.
 
 ### Q: Is the layout total required to be a multiple of the real page size, or only of 4096?
 
-- Sources examined: `ring.rs:28-29`, `:117-183`, `:187-205`, `:215-245`,
-  `:283-306`, `:465-482`, `:544-590`, `:1007`, `:1670-1675`, `:1734`, `:1784`,
-  `:1790-1800`; `src/arena.rs:4-6`, `:225-236`; `src/profile.rs:681-684`;
-  `tests/ring.rs:20-55`; `crates/mc-host/src/shm_provider.rs:851-856`; the diff
+- Sources examined: `ring.rs:27-28`, `:116-182`, `:186-204`, `:215-245`,
+  `:266-289`, `:461-478`, `:544-590`, `:1009`, `:1672-1677`, `:1729`, `:1779`,
+  `:1785-1795`; `src/arena.rs:4-6`, `:225-236`; `src/profile.rs:681-684`;
+  `tests/ring.rs:20-55`; `crates/mc-host/src/ring_transport.rs:821-827`; the diff
   of `a5568707` restricted to the page-size change. The offsets in the table were
   computed by replicating `Layout::new` with verified struct sizes
   (`size_of::<DescriptorSlot>() = 256`, 128 for each control page,

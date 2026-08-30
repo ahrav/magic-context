@@ -38,7 +38,7 @@ All references are to `crates/mc-shm-transport/src/descriptor.rs`,
 - `crates/mc-shm-transport/src/harness.rs:76-89` — the accept-path assertions:
   body bound, span count, per-span `end <= MAX_FRAME_BYTES`, and `summed ==
   body_len`. No pairwise comparison.
-- `crates/mc-shm-transport/tests/contract.rs:63` and `:643` — the two tabled
+- `crates/mc-shm-transport/tests/contract.rs:82` and `:703` — the two tabled
   negative tests. Neither constructs an overlapping pair.
 
 ## The derivation
@@ -83,16 +83,16 @@ with span 0 still bounded by `:384`.
 
 A peer writes a descriptor whose two spans cover the same arena bytes. If the
 conjunction above were ever weakened, `try_receive` would build two `LeaseSpan`s
-over one range (`ring.rs:816-823`), the addon would expose two writable external
+over one range (`ring.rs:818-825`), the addon would expose two writable external
 ArrayBuffers aliasing the same memory
-(`packages/mc-shm-native/src/lib.rs:865-868`), and `to_vec` would produce a body
+(`packages/mc-shm-native/src/lib.rs:986-989`), and `to_vec` would produce a body
 whose two halves are the same bytes. No guard downstream re-checks disjointness:
-`lease_span` (`ring.rs:1088-1104`) bounds each span independently.
+`lease_span` (`ring.rs:1090-1106`) bounds each span independently.
 
 ## Timing windows and dependencies
 
 None. This is a pure decoding property over one snapshot read
-(`ring.rs:801`, `:1125`). The exposure is structural rather than temporal: the
+(`ring.rs:803`, `:1127`). The exposure is structural rather than temporal: the
 guarantee is an emergent consequence of guards written for other purposes, so any
 refactor that reorders, merges, or relaxes one of them silently removes it.
 Related to `reclaim-advance-bounded-by-the-producer-reservation`, which consumes
@@ -118,20 +118,22 @@ implementation.
 The record carries no open question, so this log records the one thing that had
 to be settled to accept the record's claim as written.
 
-- Sources examined: `descriptor.rs:332-433` in full;
+- Sources examined: `descriptor.rs:207-308` in full;
   `crates/mc-shm-transport/src/arena.rs:88-115` for whether the producer's
   `SpanPlan::reserve` could be the real source of disjointness;
-  `harness.rs:56-100`; `tests/contract.rs:63` and `:643`.
+  `harness.rs:56-100`; `tests/contract.rs:82` and `:703`.
 - Findings: the catalog names three conditions and says "relaxing any one
   re-opens overlap". That is correct, and the derivation above supplies the
   counterexamples it did not. The catalog's line citations `:367`, `:387-393`,
-  and `:401-409` all resolve; `:401-409` is the two-span arm whose closing brace
-  is at `:410`, so the arm is `:401-410`. `SpanPlan::reserve` does produce
+  and `:401-409` all resolved at `9c1eb4d1`; at `e447c927` the latter two are
+  `:450-456` and `:467-475`, and `:367` no longer matches the code it named.
+  `:467-475` is the two-span arm whose closing brace is at `:476`, so the arm is
+  `:467-476`. `SpanPlan::reserve` does produce
   disjoint spans, but it runs on the producer only and its output is re-read from
   peer-writable memory before validation, so it cannot be the source of the
   guarantee.
 - Missing evidence: none for the derivation. What is missing is any assertion of
   it — no test, fuzz oracle, or production guard states disjointness.
 - Conclusion: resolved with answer. Disjointness holds at HEAD as a derived
-  consequence; `:405` is the single condition whose relaxation also breaks the
+  consequence; `:471` is the single condition whose relaxation also breaks the
   in-arena claim, because it is the only bound on span 1's offset.

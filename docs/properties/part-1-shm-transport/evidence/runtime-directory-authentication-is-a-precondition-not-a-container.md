@@ -2,7 +2,7 @@
 
 ## Discovery trigger
 
-`RuntimeDir` (`crates/mc-shm-transport/src/backend/ring.rs:308-394`) reads like a
+`RuntimeDir` (`crates/mc-shm-transport/src/backend/ring.rs:291-377`) reads like a
 security-load-bearing component: a 128-bit random name, `mkdir` at `0o700`, an
 `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC` descriptor held open, an inode cross-check
 between the by-path and by-fd views, an owner check, a file-type check, a mode
@@ -121,22 +121,22 @@ have.
 
 ### Q: Is the validated runtime directory used on Linux at all, or is the validation load-bearing only on macOS?
 
-- Sources examined: `ring.rs:308-394` for the whole `RuntimeDir` type and its
-  public surface; `:534-541` and `:1416-1426` for both creation sites;
-  `:543-549` for the `validate()` call; `:216-247` for `Mapping::create`;
-  `:1717-1741` for `create_linux_memfd`; `:1753-1788` for `create_macos_shm`;
+- Sources examined: `ring.rs:291-377` for the whole `RuntimeDir` type and its
+  public surface; `:542-549` and `:1418-1428` for both creation sites;
+  `:551-557` for the `validate()` call; `:216-247` for `Mapping::create`;
+  `:1712-1736` for `create_linux_memfd`; `:1748-1783` for `create_macos_shm`;
   `:1677-1702` for `validate_object`; a repository-wide grep for `RuntimeDir`,
   which returns only the definition, the two creation sites, the `Ring` field at
-  `:530`, and the `DuplexRing` field at `:1412`, and nothing in
+  `:538`, and the `DuplexRing` field at `:1414`, and nothing in
   `crates/mc-shm-transport/tests/`.
 - Findings: it is not used on Linux, and it is not used on macOS either. Linux
-  objects are anonymous memfds with no filesystem name (`:1720-1726`); macOS
+  objects are anonymous memfds with no filesystem name (`:1715-1721`); macOS
   objects live in the global `shm_open` namespace under a `/`-prefixed name and
-  are unlinked immediately (`:1757-1779`). `Mapping::create` takes only a length.
+  are unlinked immediately (`:1752-1774`). `Mapping::create` takes only a length.
   `RuntimeDir` exposes no path or fd, so nothing can be placed inside it. Its
-  entire observable effect is the fail-closed precondition at `:549`, an empty
+  entire observable effect is the fail-closed precondition at `:557`, an empty
   `0o700` directory in `temp_dir()` for the ring's lifetime, and `remove_dir` at
-  `:392` — consistent with `remove_dir` succeeding, which requires the directory
+  `:375` — consistent with `remove_dir` succeeding, which requires the directory
   to be empty.
 - Missing evidence: the intent. The type is named and shaped as though it were a
   container, and the macOS branch could plausibly have been meant to create the

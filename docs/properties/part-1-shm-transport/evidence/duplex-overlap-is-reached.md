@@ -16,17 +16,17 @@ alternation the comment describes is never exercised and
   direction when its slot is past `SLOT_PRODUCER_RESERVED` and not yet reclaimed —
   `SLOT_PUBLISHED`, `SLOT_RECEIVER_HELD`, `SLOT_RECEIVER_LEASED`, or
   `SLOT_RELEASE_PENDING`. `conservation()` counts exactly these
-  (`crates/mc-shm-transport/src/backend/ring.rs:946-985`), separately per ring, so the
+  (`crates/mc-shm-transport/src/backend/ring.rs:948-987`), separately per ring, so the
   overlap is one snapshot of each of `rings.first` and `rings.second` with no new
   instrumentation.
 - The two rings are independent objects with independent cursors and independent random
-  incarnations, created together by `DuplexRing::create` (`ring.rs:559`). Nothing
+  incarnations, created together by `DuplexRing::create` (`ring.rs:564`). Nothing
   couples their progress except the single endpoint task that drives both.
-- `crates/mc-host/src/shm_provider.rs:319-324` and `:351-361` — that task: one
+- `crates/mc-host/src/ring_transport.rs:254-259` and `:279-290` — that task: one
   `new_current_thread` runtime on one dedicated thread running `run_endpoint`.
   `:473-544` is the loop; `:476-486` is the one receive per iteration; `:538` is the one
   publish per iteration.
-- The paths whose behaviour only differs under overlap. `:507-513` takes at most one
+- The paths whose behaviour only differs under overlap. `:409-415` takes at most one
   outbound frame with a non-blocking `queue.try_recv()` after each successful receive —
   a no-op unless an outbound frame is already queued while an inbound frame arrives.
   `:592-602` services outbound frames inside the ingress-budget wait — unreachable
@@ -39,12 +39,13 @@ alternation the comment describes is never exercised and
   `:250-260`, then a goodbye at `:265`. At no point are two frames outstanding in
   opposite directions.
 - The peer harness cannot express the situation. `TestShmPeer::send`
-  (`shm_provider.rs:747-759`) reserves, writes, and commits in one blocking call with a
+  (`ring_transport.rs:659-673`) reserves, writes, and commits in one blocking call
+  with a
   two-second deadline, and `recv` (`:762-776`) polls to a deadline. Both are
   synchronous and thread-confined, so a single-threaded peer alternates by construction.
 - The transport-level two-process test is single-direction:
   `two_process_zero_copy_exchange_uses_authenticated_grant`
-  (`crates/mc-shm-transport/tests/ring.rs:565-602`) shares one ring, with the parent
+  (`crates/mc-shm-transport/tests/ring.rs:581-618`) shares one ring, with the parent
   producing and the child consuming.
 
 ## Failure scenario
@@ -82,7 +83,8 @@ stale pair into a claim about an interval during which both were non-zero.
 Dependencies. A peer that can hold frames outstanding in both directions at once, which
 today means either two threads or a non-blocking send and receive pair. Enough
 descriptor depth that both lanes can hold a frame — depth is 8 per direction
-(`shm_provider.rs:54`, `:91-94`), so this is not a constraint. No fault injection: this
+(`ring_transport.rs:32`, `:47-50`), so this is not a constraint. No fault
+injection: this
 is a normal-operation situation, and every state it observes is one a healthy duplex
 channel occupies constantly.
 
@@ -112,9 +114,9 @@ test should record which intensity it saw.
 ### Q: Has any existing test ever had frames in flight in both directions simultaneously?
 
 - Sources examined: `crates/mc-host/tests/shm_transport.rs:189-271`;
-  `crates/mc-host/src/shm_provider.rs:319-324`, `:351-361`, `:459-544`, `:546-619`,
-  `:711-777`; `crates/mc-shm-transport/tests/ring.rs:565-631`;
-  `crates/mc-shm-transport/src/backend/ring.rs:536-562`, `:911-995`;
+  `crates/mc-host/src/ring_transport.rs:254-259`, `:279-290`, `:363-453`, `:455-534`,
+  `:711-777`; `crates/mc-shm-transport/tests/ring.rs:581-647`;
+  `crates/mc-shm-transport/src/backend/ring.rs:536-562`, `:913-997`;
   `crates/mc-host/tests/shm_soak.rs` role and cycle structure.
 - Findings: no. The host tests are uniformly lockstep, the transport's only two-process
   test is single-direction, and the soak harness measures operating-system resource

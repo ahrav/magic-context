@@ -11,46 +11,46 @@ emptiness cannot prove that saturation ends.
 
 ## Evidence trail
 
-- `crates/mc-shm-transport/src/backend/ring.rs:771-777` — the saturation gate. It
+- `crates/mc-shm-transport/src/backend/ring.rs:773-779` — the saturation gate. It
   loads `active_leases` and returns `Ok(None)` when `active >= self.grant.max_leases`,
-  **before** reading `consumed` or `published`. The comment at `:773-775` states the
+  **before** reading `consumed` or `published`. The comment at `:775-777` states the
   intent: a full lease set is backpressure, not a fault, and published frames stay
   queued until a lease is released and the caller polls again.
-- `ring.rs:779-784` — the emptiness gate. It loads `consumed` and `published` and
+- `ring.rs:781-786` — the emptiness gate. It loads `consumed` and `published` and
   returns `Ok(None)` when they are equal. Same return value, unrelated cause, and
   reached only when the first gate did not fire.
-- `ring.rs:823-826` — the lease accounting the first gate reads:
+- `ring.rs:825-828` — the lease accounting the first gate reads:
   `state = SLOT_RECEIVER_LEASED`, `consumed = sequence` with `Release`, and
   `active_leases.fetch_add(1, Relaxed)`. The counter lives on the consumer page and is
   touched only by the receiver.
-- `ring.rs:902-906` — the only decrement: `release` stores `completion_sequence` with
+- `ring.rs:904-908` — the only decrement: `release` stores `completion_sequence` with
   `Release`, then `active_leases.fetch_sub(1, Relaxed)`. It runs after the
-  `SLOT_RECEIVER_LEASED → SLOT_RELEASE_PENDING` compare-exchange at `:884-891`, so a
+  `SLOT_RECEIVER_LEASED → SLOT_RELEASE_PENDING` compare-exchange at `:886-893`, so a
   duplicate release cannot decrement twice.
 - `crates/mc-shm-transport/src/lease.rs:173-175`, `:198-206`, `:215-221` — release
   reaches the ring through `release_once`, guarded by a local `released` flag, from
   either the explicit `release()` or `Drop`. Either path clears one lease.
-- The available witness for "frames were queued": `ring.rs:911-995` `conservation()`
+- The available witness for "frames were queued": `ring.rs:913-997` `conservation()`
   counts each slot by state, including `SLOT_PUBLISHED` into `descriptors.published`
-  (`:946-955`) and `SLOT_RECEIVER_LEASED` into `descriptors.receiver_leased`
-  (`:966-975`). So `published >= 1` at the moment of the `None` is observable, which is
+  (`:948-957`) and `SLOT_RECEIVER_LEASED` into `descriptors.receiver_leased`
+  (`:968-977`). So `published >= 1` at the moment of the `None` is observable, which is
   precisely the fact the current test does not check. Caveat carried from
   `reservation-charge-visible-with-non-free-state`: `conservation()` may be test-only,
-  and its `bytes.free` is derived rather than observed (`:989-993`).
+  and its `bytes.free` is derived rather than observed (`:991-995`).
 - Existing check: `lease_limit_reports_backpressure_then_recovers_after_release`
-  (`crates/mc-shm-transport/tests/ring.rs:288-303`), against
+  (`crates/mc-shm-transport/tests/ring.rs:278-293`), against
   `lease_limited_profile()` with `descriptor_depth: 2` and `max_leases: 1`
   (`tests/ring.rs:28-55`). It publishes two frames, takes one lease, asserts
-  `ring.try_receive().unwrap().is_none()` (`:295-298`), releases, and asserts the next
-  receive yields the byte `2` (`:300-301`). The recovery half is real. The saturation
+  `ring.try_receive().unwrap().is_none()` (`:285-288`), releases, and asserts the next
+  receive yields the byte `2` (`:290-291`). The recovery half is real. The saturation
   half is not: at that assertion nothing pins that a frame was pending, so an
   implementation that had lost the second publication entirely would satisfy it up to
   the recovery line.
 - The shipped host cannot reach saturation at all. `receive_one` acquires at most one
   lease per call and releases it before returning, on every path: the oversized-control
-  rejection at `crates/mc-host/src/shm_provider.rs:566-568`, the normal path at
+  rejection at `crates/mc-host/src/ring_transport.rs:475-477`, the normal path at
   `:604-609`, and `Drop` on every error return. `max_leases` is `DESCRIPTOR_DEPTH`,
-  which is 8 (`shm_provider.rs:54`, `:91-94`), so the endpoint loop holds at most one
+  which is 8 (`ring_transport.rs:32`, `:47-50`), so the endpoint loop holds at most one
   of eight. Saturation is reachable only through a synthetic profile or a caller that
   retains leases.
 
@@ -67,7 +67,7 @@ emptiness cannot prove that saturation ends.
    `active_leases` at or above `max_leases` permanently.
 5. Every later `try_receive` returns `Ok(None)`. The channel is dead and its only
    signal is the value that also means "idle". In the host, `receive_one` returns
-   `Ok(false)` (`shm_provider.rs:559-561`), the endpoint loop keeps polling
+   `Ok(false)` (`ring_transport.rs:468-470`), the endpoint loop keeps polling
    (`:520-534`), no error is raised, no quarantine occurs, and no counter moves. This is
    the same silent-capacity-loss signature as
    `attach-reconciles-or-refuses-stale-shared-cursors`, reached without any crash.
@@ -110,9 +110,9 @@ vacuously in a configuration that can never saturate.
 
 ### Q: Can the two `Ok(None)` causes be distinguished by any current caller, and is saturation reachable in the shipped topology?
 
-- Sources examined: `ring.rs:764-844`, `:846-909`, `:911-995`; `lease.rs:170-221`;
-  `crates/mc-host/src/shm_provider.rs:54`, `:75-100`, `:546-619`, `:473-544`;
-  `tests/ring.rs:28-55`, `:288-303`.
+- Sources examined: `ring.rs:766-846`, `:848-911`, `:913-997`; `lease.rs:170-221`;
+  `crates/mc-host/src/ring_transport.rs:32`, `:41-58`, `:455-534`, `:378-452`;
+  `tests/ring.rs:28-55`, `:278-293`.
 - Findings: no caller can distinguish the two causes from the return value; the only
   distinguishing evidence is `conservation()`, and no existing test uses it at the
   point of a `None`. Saturation is reachable in-crate only through

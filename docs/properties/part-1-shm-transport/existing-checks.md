@@ -49,7 +49,9 @@ runtime invariant guards belong to
 
 ### `crates/mc-shm-transport/tests/iceoryx.rs` — 7 tests, requires the `iceoryx` feature
 
-Covers allocation slack never reaching the decoder, stale-node observation
+**Gone at `e447c927`.** `0f336d3c` deleted this suite, the `iceoryx` backend, and
+the `iceoryx` Cargo feature. The entry is kept as a record of what used to be
+checked; everything in it resolves against `9c1eb4d1`. Covered allocation slack never reaching the decoder, stale-node observation
 without disturbing a live backend, exact sequence progression, producer
 rejection of oversized and underfilled commits, decoder rejection of truncation
 and stale identity, schema and overflow extremes, and redaction. All unaudited.
@@ -185,8 +187,8 @@ Code with no executed check:
 8. The wire-header setter has no test, though a mismatch is exactly what commit
    validation rejects.
 9. Runtime-directory revalidation is never negative-tested.
-10. The iceoryx segment-growth path never executes; every test writes tiny
-    payloads.
+10. The iceoryx segment-growth path never executed; every test wrote tiny
+    payloads. Moot at `e447c927`: `0f336d3c` deleted the backend.
 11. Fuzzing never runs in normal CI.
 12. Three hand-synchronised copies of the ring geometry with no cross-check.
 13. `docs/AUDIT-KNOWN-ISSUES.md` contains no shared-memory entries. The only
@@ -198,3 +200,18 @@ Code with no executed check:
 **None found.** No loom, shuttle, Miri, or ThreadSanitizer configuration exists
 anywhere in the repository. Every memory-ordering choice in the ring backend is
 currently unvalidated by any tool, and the only cross-process test is lockstep.
+
+## Citation sweep, 2026-08-30
+
+A citation sweep ran over this file against
+`/local/home/ahrav/scratch/magic-context` at `e447c927`. The inventory itself was
+written against `9c1eb4d1` and its per-check verdicts are unchanged; only
+references moved.
+
+What changed: transport-crate line numbers were re-derived, because
+`crates/mc-shm-transport/src/backend/ring.rs`, `descriptor.rs`, `profile.rs`,
+`tests/ring.rs`, `tests/contract.rs`, and `packages/mc-shm-native/src/lib.rs` were
+all edited after Part 1 was written; the `tests/iceoryx.rs` entry is marked gone,
+because `0f336d3c` deleted that suite, the iceoryx backend, and the `iceoryx`
+Cargo feature. No check was added, removed, or re-audited. Statuses remain
+`unaudited`.

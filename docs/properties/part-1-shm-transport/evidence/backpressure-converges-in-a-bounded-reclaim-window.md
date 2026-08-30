@@ -12,14 +12,15 @@ what it must achieve.
 
 ## Evidence trail
 
-- `crates/mc-shm-transport/src/backend/ring.rs:743-756` `reserve_until`. The loop
+- `crates/mc-shm-transport/src/backend/ring.rs:745-758` `reserve_until`. The loop
   retries only `Err(ProducerError::Exhausted)` and only while `Instant::now() <
-  deadline` (`:745`); a sustained `Exhausted` becomes `ProducerError::Deadline`
-  (`:753`); every other outcome, success or error, returns immediately (`:754`).
+  deadline` (`:747`); a sustained `Exhausted` becomes `ProducerError::Deadline`
+  (`:755`); every other outcome, success or error, returns immediately (`:756`).
   Retry spacing is `std::hint::spin_loop()` under `HotPinnedPoll` and
   `std::thread::sleep(Duration::from_micros(50))` under `ColdParkWake`
-  (`:747-750`). The shipped host profile selects `ColdParkWake`
-  (`crates/mc-host/src/shm_provider.rs:81`), so the polling quantum is 50 microseconds.
+  (`:749-752`). The shipped host profile selects `ColdParkWake`
+  (`crates/mc-host/src/ring_transport.rs:44`), so the polling quantum is 50
+  microseconds.
 - Three distinct conditions all surface as `Exhausted`, so all three are retried:
   descriptor depth full, `outstanding >= descriptor_depth` (`:683-684`); a lost
   `SLOT_FREE → SLOT_PRODUCER_RESERVED` compare-exchange (`:700`); and arena
@@ -27,23 +28,23 @@ what it must achieve.
   before returning (`:708-712`). `ArenaError::Exhausted` is produced when `len >
   capacity - used` with `used = write - reclaimed`
   (`crates/mc-shm-transport/src/arena.rs:103-111`).
-- `ring.rs:673` — the mechanism that makes retrying useful:
+- `ring.rs:675` — the mechanism that makes retrying useful:
   `try_reserve` calls `self.reclaim_completed()` before reading any cursor. This is
   the **only** call site of `reclaim_completed` in the repository, confirmed by search.
   Reclamation is therefore producer-driven and lazy: a retry is not a passive wait, it
   is the act that recovers capacity.
-- `ring.rs:1106-1152` `reclaim_completed` drains the whole contiguous completed prefix
+- `ring.rs:1108-1154` `reclaim_completed` drains the whole contiguous completed prefix
   in one call. The loop advances while `completion_sequence == completed + 1`
-  (`:1111-1117`) and breaks at the first gap (`:1117-1118`), advancing
-  `arena_reclaimed` (`:1140-1143`) and `completed` (`:1147`) once per reclaimed
+  (`:1113-1119`) and breaks at the first gap (`:1119-1120`), advancing
+  `arena_reclaimed` (`:1142-1145`) and `completed` (`:1149`) once per reclaimed
   sequence. One call is enough; a second adds nothing unless a new completion landed.
-- `ring.rs:902-906` — the receiver end of the edge. `release` stores
+- `ring.rs:904-908` — the receiver end of the edge. `release` stores
   `completion_sequence` with `Release` and decrements `active_leases`. The producer's
-  matching `Acquire` load is `ring.rs:1116`.
+  matching `Acquire` load is `ring.rs:1118`.
 - Existing check, partial: `two_process_zero_copy_exchange_uses_authenticated_grant`
-  (`crates/mc-shm-transport/tests/ring.rs:565-602`). The parent fills the arena with
+  (`crates/mc-shm-transport/tests/ring.rs:581-618`). The parent fills the arena with
   one `MAX_FRAME_BYTES` frame, then calls `reserve_until(1, .., now + 5s)` while the
-  child holds the lease and sleeps 50 ms (`:584-591`, child at `:625-627`). The
+  child holds the lease and sleeps 50 ms (`:600-607`, child at `:641-643`). The
   `.unwrap()` at `:591` is a genuine convergence assertion, and
   `assert!(waiting_since.elapsed() >= Duration::from_millis(25))` at `:592` keeps it
   from passing vacuously. What it does not do: exercise descriptor-depth exhaustion,
@@ -51,7 +52,7 @@ what it must achieve.
   full.
 - Existing check, negative direction:
   `retained_oldest_lease_enforces_fifo_reclamation_and_release_validation`
-  (`tests/ring.rs:202-206`) asserts `reserve_until(.., Instant::now())` returns
+  (`tests/ring.rs:192-196`) asserts `reserve_until(.., Instant::now())` returns
   `Deadline`. That pins the give-up path, not the converge path.
 
 ## Failure scenario
@@ -68,7 +69,10 @@ what it must achieve.
    `ProducerError::Deadline`. In the host that is an outbound publish failure:
    `publish_one` returns `Err`, the endpoint cancels the generation and returns
    `false`, and the close is unclean, so the candidate's charges are reported as a
-   suspect (`crates/mc-host/src/shm_provider.rs:538-542`, `:364-371`).
+   suspect. That suspect branch is gone: `ed487e11` replaced it with the
+   unconditional `admission.release()` at
+   `crates/mc-host/src/ring_transport.rs:291`, reached after the publish failure
+   at `:447-451`.
 5. The operator-visible symptom is a retired generation attributed to a transport
    fault, on a channel where the peer was draining correctly the entire time.
 
@@ -112,9 +116,9 @@ descriptor saturation without receipt is trivially reachable.
 
 ### Q: Is `reserve_until` convergence guaranteed by construction, or is there a state where retrying cannot help?
 
-- Sources examined: `ring.rs:662-757`, `:1070-1084`, `:1106-1152`; `arena.rs:88-128`;
-  `crates/mc-host/src/shm_provider.rs:55`, `:81`, `:538-542`, `:665-691`;
-  `tests/ring.rs:148-219`, `:565-631`.
+- Sources examined: `ring.rs:664-759`, `:1072-1086`, `:1108-1154`; `arena.rs:88-128`;
+  `crates/mc-host/src/ring_transport.rs:33`, `:44`, `:447-451`, `:580-606`;
+  `tests/ring.rs:138-209`, `:581-647`.
 - Findings: the retry set is exactly right for the fault-free case. All three
   exhaustion causes map to the one retried variant, and the slot rollback at `:710`
   and `:715` means a failed arena plan does not leak the descriptor slot it had already

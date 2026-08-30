@@ -38,13 +38,13 @@ reference to memory a trusted peer could still address." `checksum` creates one.
 - `crates/mc-shm-transport/src/lib.rs:26` — `pub use lease::{LeaseSpan,
   ReceiveLease};`. Both the slice-building method and `as_mut_ptr` are crate
   public API, not internal helpers.
-- `packages/mc-shm-native/src/lib.rs:865-868` — the receive path calls
+- `packages/mc-shm-native/src/lib.rs:986-989` — the receive path calls
   `lease.segment(index)` then `napi_buffers::create_external_view(env,
   span.as_mut_ptr(), span.len())`.
 - `packages/mc-shm-native/src/napi_buffers.rs:63-100` — that helper calls
   `napi_create_external_arraybuffer` over the raw pointer. The result is an
   ordinary writable ArrayBuffer; nothing marks it read-only.
-- `packages/mc-shm-native/src/lib.rs:669` and `:743` — the same helper on the two
+- `packages/mc-shm-native/src/lib.rs:741` and `:817` — the same helper on the two
   produce paths, where a writable view is intended.
 
 ## Failure scenario
@@ -70,9 +70,9 @@ The `checksum` window is the duration of one fold over `len` bytes, up to
 `MAX_FRAME_BYTES` (64 MiB), so it is wide. The JavaScript window spans from view
 creation until the view is detached. Both windows are only reachable because
 `Mapping::create` and `Mapping::attach` map the whole object
-`PROT_READ | PROT_WRITE` (`ring.rs:229`, `:258`) and the required seals are
+`PROT_READ | PROT_WRITE` (`ring.rs:227`, `:249`) and the required seals are
 `F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL` with no `F_SEAL_WRITE`
-(`ring.rs:1709`). This is the same root decision behind
+(`ring.rs:1704`). This is the same root decision behind
 `quarantine-authority-survives-peer-writes` and
 `reclaim-advance-bounded-by-the-producer-reservation`.
 
@@ -98,7 +98,7 @@ second thread writes it, under `-Zsanitizer=thread`.
   excluding `node_modules`, `dist`, and `target`;
   `crates/mc-shm-transport/src/lib.rs` for the export surface.
 - Findings: exactly one call site exists in the entire tree —
-  `crates/mc-shm-transport/benches/hardware_envelope.rs:444`,
+  `crates/mc-shm-transport/benches/hardware_envelope.rs:406`,
   `black_box(span.checksum())`. There are no callers in
   `crates/mc-shm-transport/src`, no callers in any `tests/` directory, no callers
   in `packages/mc-shm-native`, and no callers in any other crate. The other

@@ -3,15 +3,23 @@
 ## Discovery trigger
 
 The ring derives both sequence cursors from shared memory. The producer reads
-`published` out of the shared producer page (`ring.rs:677`, `:686-688`) and the
-receiver reads `consumed` out of the shared consumer page (`ring.rs:779`,
-`:785-787`), so the two sides cannot hold different opinions about where the
+`published` out of the shared producer page (`ring.rs:679`, `:688-690`) and the
+receiver reads `consumed` out of the shared consumer page (`ring.rs:781`,
+`:787-789`), so the two sides cannot hold different opinions about where the
 stream is. The iceoryx backend keeps both cursors in process-local `Cell<u64>`
 fields (`backend/iceoryx.rs:43-44`), initialized to zero at construction
 (`:114-115`). Nothing writes them to shared memory and nothing reads a peer's
 copy, so the question is what happens when the two counters disagree.
 
 ## Evidence trail
+
+- **The cited mechanism is gone.** `0f336d3c` ("refactor(shm): collapse to fixed
+  ring transport") deleted `crates/mc-shm-transport/src/backend/iceoryx.rs`,
+  `crates/mc-shm-transport/tests/iceoryx.rs`, and the `iceoryx` Cargo feature, so
+  `backend/mod.rs` now declares only `ring` and `sample`. Every `iceoryx.rs`
+  citation below is kept as a record of what the removed backend did and did not
+  guarantee, and resolves against `9c1eb4d1`, not HEAD. No successor backend
+  exists in the tree.
 
 - `backend/iceoryx.rs:150-176` `try_receive`. The order matters. `:151-157`
   calls `subscriber.receive()`, which **dequeues** the sample; the binding owns
@@ -46,8 +54,8 @@ copy, so the question is what happens when the two counters disagree.
   lifecycle flag, no terminal state, and no `is_quarantined` equivalent. The ring
   raises exactly this state on exactly this failure: a descriptor that fails
   `validate` calls `enter_quarantine()` before returning the error
-  (`ring.rs:806-809`), and every later operation then fails closed
-  (`ring.rs:670-672`, `:765-767`, `:848-849`).
+  (`ring.rs:808-811`), and every later operation then fails closed
+  (`ring.rs:672-674`, `:767-769`, `:850-851`).
 - `backend/iceoryx.rs:349` — `release(self)` cannot resynchronize either. It
   takes no identity and returns nothing; see
   `iceoryx-completion-is-observable-to-the-host`.
@@ -113,7 +121,7 @@ and `shm_iceoryx_send_reported_zero_recipients`.
 
 - Sources examined: `backend/iceoryx.rs:36-46`, `:107-118`, `:150-176`,
   `:247-303`, `:319-355`, `:365-376`; `backend/sample.rs:41-127`;
-  `backend/ring.rs:677-688`, `:759-844`, `:806-809`, `:1033-1048`;
+  `backend/ring.rs:679-690`, `:761-846`, `:808-811`, `:1035-1050`;
   `tests/iceoryx.rs:122-137`; and in the vendored iceoryx2 0.9.3 sources,
   `src/port/publisher.rs:304-321` and `src/port/details/sender.rs:191-280`.
 - Findings: yes to the first half, no to the second. The dequeue at `:151-157`

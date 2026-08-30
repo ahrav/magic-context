@@ -14,10 +14,10 @@ third accepts a prefix plus declared body and deliberately ignores the rest.
 
 Three different length contracts, all in `crates/mc-shm-transport`:
 
-- `RingGrant::decode_slice` (`backend/ring.rs:460-463`) converts the slice with
+- `RingGrant::decode_slice` (`backend/ring.rs:456-459`) converts the slice with
   `bytes.try_into()`, so anything other than 58 bytes is `InvalidGrant`.
   Truncation and suffix are both rejected. The four reserved bytes must be zero
-  (`:430-432`) and `encode` writes them as zero (`:419`).
+  (`:426-428`) and `encode` writes them as zero (`:415`).
 - `harness::frame_descriptor` (`harness.rs:31-33`) rejects any length other than
   `FRAME_DESCRIPTOR_BYTES`. Exact width, both directions.
 - `SamplePrefix::snapshot` (`backend/sample.rs:41-45`) accepts any payload at
@@ -29,7 +29,7 @@ Three different length contracts, all in `crates/mc-shm-transport`:
 
 What the round-trip assertion at `harness.rs:112-116` proves. `decode` reads all
 54 non-reserved bytes into seven fields with no lossy transform, and `encode`
-(`ring.rs:410-421`) writes exactly those seven fields back plus four zero bytes.
+(`ring.rs:406-417`) writes exactly those seven fields back plus four zero bytes.
 So the assertion establishes two things as a tripwire: every one of the 58 input
 bytes is either bound to a decoded field or pinned to a constant, and no byte is
 read-and-discarded or defaulted on the way out. It also catches a widened length
@@ -38,22 +38,23 @@ input slice — a decoder that accepted 59 bytes and ignored the last would fail
 the length half of `assert_eq!`.
 
 What it does not cover. It says nothing about whether the decoded values are
-legal; that is `checked_layout` (`ring.rs:465-482`), a separate concern with its
+legal; that is `checked_layout` (`ring.rs:461-478`), a separate concern with its
 own tests. It never evaluates on a short input, because `try_into` rejects
 before the assertion — truncation is covered instead by
-`tests/ring.rs:478-483`. It cannot detect a *reordering* of two same-width
+`tests/ring.rs:487-492`. It cannot detect a *reordering* of two same-width
 fields, since encode and decode would move together. And it has no counterpart
 for the other two decoders: `FrameDescriptor` has no encoder anywhere in the
 library, so the 108-byte encoding exists only as read offsets inside
 `harness.rs`, and `SamplePrefix` cannot have a byte-exact oracle at all because
 its contract permits trailing slack.
 
-Existing checks. `tests/ring.rs:470-500`
+Existing checks. `tests/ring.rs:479-509`
 `grant_slice_rejects_every_truncation_point_and_one_byte_suffix` sweeps every
-`cut in 0..58` (`:478-483`), a one-byte suffix (`:485-490`), and empty (`:491-495`).
-`tests/ring.rs:503` `golden_grant_fixture_matches_the_frozen_ring_profile_encoding`
-re-asserts the round-trip on one fixture (`:521-525`).
-`tests/iceoryx.rs:164` covers the sample policy properly: every truncation point
+`cut in 0..58` (`:487-492`), a one-byte suffix (`:494-499`), and empty (`:500-504`).
+`tests/ring.rs:512` `golden_grant_fixture_matches_the_frozen_ring_profile_encoding`
+re-asserts the round-trip on one fixture (`:529-533`).
+`tests/iceoryx.rs:164`, deleted with the backend by `0f336d3c` and resolving
+against `9c1eb4d1`, covered the sample policy properly: every truncation point
 below the prefix yields `Truncated` (`:180-186`), every truncation inside the
 declared body yields `InvalidAllocation` (`:187-194`), and a one-byte suffix is
 asserted *accepted* with `body_range()` unchanged (`:196-206`). Nothing asserts
@@ -77,14 +78,14 @@ The sample decoder has the mirror risk. If `validate` stopped bounding
 would extend past the allocation and `body_range()` would name bytes outside it.
 `harness.rs:136-139` does assert `range.end <= bytes.len()`, so the fuzz target
 covers this; the production caller's equivalent is
-`tests/iceoryx.rs:78-106`.
+`tests/iceoryx.rs:78-106`, deleted by `0f336d3c`.
 
 ## Timing windows and dependencies
 
 No timing window; all three are pure byte decoders. The dependency is on the
 width constants and on which of them is derived: `SAMPLE_PREFIX_BYTES`
 (`sample.rs:24`) and `FRAME_DESCRIPTOR_BYTES` (`harness.rs:16-17`) are computed
-from `WIRE_V2_HEADER_BYTES`, while `GRANT_BYTES` (`ring.rs:30`) is an
+from `WIRE_V2_HEADER_BYTES`, while `GRANT_BYTES` (`ring.rs:29`) is an
 independent literal. This record depends on
 `decoder-totality-over-arbitrary-bytes`: exact consumption is only meaningful
 for inputs that terminate. It is distinct from
@@ -101,7 +102,7 @@ position where neither happens is an ignored region. That is the property the
 grant gets for free from its encoder and the descriptor cannot get any other
 way. Second, extend the same oracle to the grant's 58 positions, which
 strengthens the current one-fixture round-trip into a per-byte claim and covers
-reserved bytes 55 through 57 that `tests/ring.rs:413-414` leaves untouched.
+reserved bytes 55 through 57 that `tests/ring.rs:402-403` leaves untouched.
 Third, a policy assertion per decoder stating which of exact-width or
 prefix-plus-slack it implements, so a future change from one to the other fails
 a test instead of silently widening acceptance. Coverage check to emit:
@@ -112,9 +113,10 @@ decoder and must never fire for the other two.
 
 ### Q: Can the grant round-trip assertion ever fail on an accepted input at HEAD?
 
-- Sources examined: `harness.rs:110-121`; `backend/ring.rs:410-421`, `:429-463`,
-  `:465-482`, `:30`; `tests/ring.rs:470-544`; `backend/sample.rs:41-126`;
-  `tests/iceoryx.rs:164-229`, `:78-106`; `tests/contract.rs:488-536`.
+- Sources examined: `harness.rs:110-121`; `backend/ring.rs:406-417`, `:425-459`,
+  `:461-478`, `:29`; `tests/ring.rs:470-544`; `backend/sample.rs:41-126`;
+  `tests/iceoryx.rs:164-229`, `:78-106` (deleted by `0f336d3c`, resolving against
+  `9c1eb4d1`); `tests/contract.rs:548-596`.
 - Findings: no. `encode` and `decode` are exact inverses over the seven fields
   at HEAD, and the reserved region is constrained to the one value `encode`
   emits, so the assertion is a tautology on every accepted input. That is not a

@@ -32,9 +32,9 @@ Existing checks are real and narrower than they look.
 
 - `tests/ring.rs:392` `attach_rejects_unsealed_objects_and_tampered_grants`
   builds nine tampered grants and asserts each decodes to
-  `Err(RingError::InvalidGrant)` at `:426`. One of them is the reserved case:
-  `reserved[54] = 1` at `:413-414`. Bytes 55, 56, and 57 are never perturbed.
-  This case genuinely pins the guard — with `:430-432` removed, that input would
+  `Err(RingError::InvalidGrant)` at `:415`. One of them is the reserved case:
+  `reserved[54] = 1` at `:402-403`. Bytes 55, 56, and 57 are never perturbed.
+  This case genuinely pins the guard — with `:419-421` removed, that input would
   decode successfully because its `0..54` region is untouched and its geometry is
   valid — but it pins only one of the four bytes, and it asserts the shared
   category rather than a reason.
@@ -114,13 +114,15 @@ campaign can show the guard was reached.
 
 ### Q: Does anything today pin the reserved-byte guard, and to what precision?
 
-- Sources examined: `backend/ring.rs:27`, `:30`, `:410-421`, `:429-463`,
-  `:465-482`, `:57-71`, `:88-106`, `:1183-1204`; `harness.rs:110-121`;
-  `tests/ring.rs:392-467`, `:470-500`, `:503-544`; `tests/fuzz_corpus.rs` in
+- Sources examined: `backend/ring.rs:26`, `:29`, `:406-417`, `:425-459`,
+  `:461-478`, `:56-70`, `:87-105`, `:1185-1206`; `harness.rs:110-121`;
+  `tests/ring.rs:380-466` (renamed to
+  `artifact_mismatch_fails_before_mapping_and_unsealed_objects_are_rejected` by
+  `0f336d3c`), `:479-509`, `:503-544`; `tests/fuzz_corpus.rs` in
   full; both `fuzz/corpus/provider_grant/valid` and `near-valid` compared byte by
   byte.
-- Findings: yes, at one-byte precision. `tests/ring.rs:413-414` is a genuine
-  pin — removing `:430-432` makes that assertion fail — but it exercises only
+- Findings: yes, at one-byte precision. `tests/ring.rs:402-403` is a genuine
+  pin — removing `:419-421` makes that assertion fail — but it exercises only
   index 54, and it asserts the category `InvalidGrant` that eight other tampered
   cases in the same loop also expect. The corpus `near-valid` seed is the same
   case in byte form and is unasserted. I also confirmed the descriptor-side
@@ -129,7 +131,7 @@ campaign can show the guard was reached.
   inference.
 - Missing evidence: nothing for the guard's current behaviour. What is missing is
   any statement of the forward-compatibility intent. The doc comment at
-  `:423-428` says decode "rejects reserved-byte tampering", which frames the
+  `:412-417` says decode "rejects reserved-byte tampering", which frames the
   guard as an adversarial control; the re-encode stripping hazard is the more
   likely way the four bytes cause trouble, and nothing addresses it.
 - Conclusion: resolved with answer. The guard holds and is pinned at one byte out

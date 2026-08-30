@@ -3,7 +3,7 @@
 ## Discovery trigger
 
 The transport hands the same 21 header bytes to more than one consumer, and it
-validates only five of them (`crates/mc-shm-transport/src/descriptor.rs:414-422`).
+validates only five of them (`crates/mc-shm-transport/src/descriptor.rs:289-297`).
 That makes the role gate a per-consumer obligation rather than a property of the
 transport. Checking the consumers against each other found the Rust host applies
 its gate and the TypeScript peer, over shared memory only, does not — while the
@@ -19,10 +19,11 @@ close the generation rather than extend this profile implicitly."
 role-invalid on a consumer connection.
 
 Consumer one, the host. `receive_one` calls `validate_inbound_header`
-(`crates/mc-host/src/shm_provider.rs:564`), which restricts the type to
+(`crates/mc-host/src/ring_transport.rs:473`), which restricts the type to
 `Request`, `Cancel`, `Pong`, `Goodbye` and returns `ReadClose::Corrupt` otherwise
 (`frame_channel.rs:69-74`). `Corrupt` is outside the clean set
-(`shm_provider.rs:498`), so the generation closes unclean and the custody record
+(the `clean` classification formerly at `shm_provider.rs:498`, deleted by
+`ed487e11`), so the generation closes and the custody record
 goes to `recovery.report_suspect` (`:364-371`). This arm is exercised end to end
 by `crates/mc-host/tests/shm_failure_modes.rs:195-241`, which publishes a
 `Response` from a live peer and asserts the charges end up quarantined and
@@ -59,7 +60,8 @@ passes the range check at `:165`, reaches `dispatch`, and is silently released.
 which is a deliberate profile decision, not the role gate.
 
 Consumer three, the Rust test peer. `TestShmPeer::recv`
-(`shm_provider.rs:762-776`) calls `decode_header` at `:766` and no role gate. It
+(`ring_transport.rs:676-687`, whose body now sits in `try_recv_with`) calls
+`decode_header` at `:701` and no role gate. It
 is test-only surface, but it is a third reader of `ValidatedFrame::wire_header()`
 and it demonstrates that the transport's lease API invites decode-only use.
 

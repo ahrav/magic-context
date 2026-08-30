@@ -40,7 +40,7 @@ test rather than a paragraph.
   former `:498`.
 - `crates/mc-host/src/ring_transport.rs:464-470` — `receive_one` calls
   `rings.second.try_receive()` and returns `Ok(false)` on `None`.
-- `crates/mc-shm-transport/src/backend/ring.rs:781-783` — `try_receive` returns
+- `crates/mc-shm-transport/src/backend/ring.rs:783-785` — `try_receive` returns
   `Ok(None)` when `consumed == published`. A dead producer publishes nothing, so
   this is the steady state forever. It is not an error, so nothing quarantines.
 - `crates/mc-host/src/config.rs:282` and `:296` — `pub liveness:
@@ -74,7 +74,7 @@ candidate.
 The retention window is unbounded: it closes only when the daemon closes.
 Nothing polls for peer liveness, and the ring carries no holder count, attach
 epoch, heartbeat, or peer pid that a reaper could read
-(`ring.rs:117-128`). The outcome is configuration-dependent, not
+(`ring.rs:116-127`). The outcome is configuration-dependent, not
 fault-dependent: the same kill retains charges under the default
 `liveness = None`, and quarantines them under a configured policy once the ring
 fills and `publish_one` fails at `ring_transport.rs:447-450`. Depends on

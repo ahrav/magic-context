@@ -10,11 +10,11 @@ object behind with no retained way to remove it.
 
 ## Evidence trail
 
-`crates/mc-shm-transport/src/backend/ring.rs:1753-1788` runs, in order:
-`getrandom` (`:1756`), name construction (`:1757-1764`), `shm_open` with
-`O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC` and mode `0o600` (`:1766-1772`),
-`OwnedFd::from_raw_fd` (`:1777`), `shm_unlink(name.as_ptr())` (`:1779`), and
-`ftruncate` (`:1784`). The failure exits are:
+`crates/mc-shm-transport/src/backend/ring.rs:1748-1783` runs, in order:
+`getrandom` (`:1751`), name construction (`:1752-1759`), `shm_open` with
+`O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC` and mode `0o600` (`:1761-1767`),
+`OwnedFd::from_raw_fd` (`:1772`), `shm_unlink(name.as_ptr())` (`:1774`), and
+`ftruncate` (`:1779`). The failure exits are:
 
 - `shm_open` fails (`:1773-1775`) — no object, nothing to clean up.
 - `shm_unlink` fails (`:1779-1781`) — the object exists **and** its name is still
@@ -35,10 +35,14 @@ Nothing else in the tree unlinks a shm name. `shm_unlink` appears exactly once i
 owns its filesystem artifact and removes it in `Drop`
 (`:388-392`, `std::fs::remove_dir`), and which also unwinds its own partial
 construction on both validation failures (`:339-343`, `:348-352`). The shm object
-has no equivalent owner: `Mapping` holds no `fd` field on macOS at all
-(`:207-212`), and both constructors `drop(fd)` right after `mmap`
-(`:238-239`, `:268-269`), so by the time `Mapping::create` returns there is no
-descriptor and no name from which a cleanup could be driven.
+had no equivalent owner at `9c1eb4d1`: `Mapping` held no `fd` field on macOS at
+all, and both constructors called `drop(fd)` right after `mmap` (`:238-239`,
+`:268-269`), so by the time `Mapping::create` returned there was no descriptor and
+no name from which a cleanup could be driven. That mechanism is gone. `0f336d3c`
+removed both `#[cfg(target_os = "macos")]` drops and made `Mapping` retain the
+descriptor on both platforms (`:206-211`, `:237`, `:259`), so this paragraph's
+premise no longer holds and the record needs re-review rather than re-citation.
+The name-leak window itself is unaffected: it is inside `create_macos_shm`.
 
 The Linux path has no analogous exposure. `create_linux_memfd` (`:1716-1741`) uses
 `memfd_create`, which produces an anonymous object with no namespace entry, so its
@@ -92,11 +96,13 @@ window.
 ### Q: Did `a5568707` remove the name-leak window, or relocate it?
 
 - Sources examined: `git show a5568707 -- crates/mc-shm-transport/src/backend/ring.rs`
-  restricted to `create_macos_shm`; `ring.rs:1753-1788` at HEAD; `ring.rs:1716-1741`
-  for the Linux comparison; `ring.rs:207-212`, `:238-239`, `:268-269` for
-  descriptor retention; `ring.rs:316-392` for `RuntimeDir`'s ownership and unwind
+  restricted to `create_macos_shm`; `ring.rs:1748-1783` at HEAD; `ring.rs:1711-1736`
+  for the Linux comparison; `ring.rs:206-211` for
+  descriptor retention, where the two macOS-only `drop(fd)` sites at `9c1eb4d1`'s
+  `:238-239` and `:268-269` were removed by `0f336d3c`; `ring.rs:299-375` for
+  `RuntimeDir`'s ownership and unwind
   as the in-repo precedent; every occurrence of `shm_unlink` in the crate;
-  `.github/workflows/ci.yml:159-176`.
+  `.github/workflows/ci.yml:158-175`.
 - Findings: relocated. The pre-`a5568707` order left the name after an `ftruncate`
   failure; the post-`a5568707` order leaves it after an `shm_unlink` failure. The
   new window is narrower — one call instead of one call plus a conversion — but it

@@ -19,7 +19,7 @@ replicates the struct definitions:
 - `harness.rs:16-17` defines `FRAME_DESCRIPTOR_BYTES = 2 + WIRE_V2_HEADER_BYTES
   + 16 + 4 + 8 + 8 + 8 + 8 + 1 + 32`. With `WIRE_V2_HEADER_BYTES = 21`
   (`descriptor.rs:10`) that is 108.
-- `size_of::<SharedDescriptor>()` (`backend/ring.rs:57-71`) is **120**, alignment
+- `size_of::<SharedDescriptor>()` (`backend/ring.rs:56-70`) is **120**, alignment
   8, so 12 bytes are padding: one byte at offset 39, four at `44..48`, seven at
   `81..88`.
 - Production field offsets inside that struct: `schema_version` 0,
@@ -38,9 +38,9 @@ the struct groups it as `span_offsets: [u64; 2]` then `span_lengths: [u64; 2]`
 (`:69-70`).
 
 None of that is a defect, because no production reader ever sees either byte
-shape as bytes. `SharedDescriptor::snapshot()` (`ring.rs:88-106`) converts named
+shape as bytes. `SharedDescriptor::snapshot()` (`ring.rs:87-105`) converts named
 fields into a `FrameDescriptor`, and its two call sites are the typed reads at
-`ring.rs:802-804` and `ring.rs:1125-1128`. What matters is coverage of the field
+`ring.rs:804-806` and `ring.rs:1127-1130`. What matters is coverage of the field
 tuple, and there the map is exact: the ten field widths total
 `16 + 168 + 128 + 32 + 4 * 64 + 8 + 256 = 864` bits, and 108 bytes is 864 bits.
 Every field's full domain is reachable and no input bit is wasted, so fuzzing the
@@ -48,16 +48,16 @@ Every field's full domain is reachable and no input bit is wasted, so fuzzing th
 fields.
 
 The call convention is where coverage is lost. `validate` takes three inputs —
-`self`, `expected`, and `arena_bytes` (`descriptor.rs:332-336`) — and in
+`self`, `expected`, and `arena_bytes` (`descriptor.rs:207-211`) — and in
 production all three are independent: the descriptor is peer-controlled, while
-`expected` is built from the grant and the local cursor (`ring.rs:803`,
-`:1126`) and `arena_bytes` comes from the grant. The harness collapses two of
+`expected` is built from the grant and the local cursor (`ring.rs:805`,
+`:1128`) and `arena_bytes` comes from the grant. The harness collapses two of
 them. `harness.rs:76` passes `identity`, which is the *decoded* identity built at
 `:63`, so on the accept path the three identity comparisons at
-`descriptor.rs:354-362` are satisfied by construction. The reject path at
-`:98-102` supplies one foreign identity, differing only in `lane ^ 1`, which
-reaches the lane guard at `descriptor.rs:357-359` and therefore never reaches the
-incarnation guard at `:354-356` or the expected-sequence guard at `:360-362`. The
+`descriptor.rs:229-237` are satisfied by construction. The reject path at
+`:28-32` supplies one foreign identity, differing only in `lane ^ 1`, which
+reaches the lane guard at `descriptor.rs:232-234` and therefore never reaches the
+incarnation guard at `:229-231` or the expected-sequence guard at `:235-237`. The
 same collapse is in `provider_sample`: `harness.rs:132` passes
 `prefix.identity()` and `:149-153` flips only the lane. `arena_bytes` is pinned
 to `MAX_FRAME_BYTES` at `harness.rs:76`, which is the gap
@@ -66,7 +66,7 @@ to `MAX_FRAME_BYTES` at `harness.rs:76`, which is the gap
 Existing checks. The width constant is derived from `WIRE_V2_HEADER_BYTES`, and
 `MAX_SPANS` is coupled by type: the two-element array literal at `harness.rs:53`
 would fail to compile if `MAX_SPANS` changed, as would `from_untrusted`'s
-argument list if a field were added. `tests/contract.rs:683-708` sweeps
+argument list if a field were added. `tests/contract.rs:743-768` sweeps
 `FRAME_DESCRIPTOR_BYTES` and `FRAME_DESCRIPTOR_BYTES + 1`. Nothing asserts that
 the sum of the read regions equals the constant, and nothing asserts the
 incarnation and sequence guards are reachable from the fuzz target.
@@ -76,12 +76,12 @@ incarnation and sequence guards are reachable from the fuzz target.
 The 12 padding bytes are the shape the encoding cannot represent, and they are
 the one part of the shared descriptor with no decode contract at all.
 `commit_reservation` builds a `SharedDescriptor` as a struct literal
-(`ring.rs:1183-1195`) and writes it whole with `write_volatile` at `:1204`, so
+(`ring.rs:1185-1197`) and writes it whole with `write_volatile` at `:1206`, so
 the padding bytes in the mapping take whatever the source location held.
 `snapshot()` reads only named fields, so no reader can be influenced by them.
 That makes the padding harmless today and structurally unlike the grant's four
 reserved bytes, which `decode` requires to be zero
-(`ring.rs:430-432`). The failure shape is a future layout version that starts
+(`ring.rs:426-428`). The failure shape is a future layout version that starts
 using one of the three padding runs: the fuzz corpus has no bit for it, the
 harness constant would not change, and the new field would be exercised by
 nothing.
@@ -101,8 +101,8 @@ not.
 No timing window; this is a static agreement between a constant, a set of read
 offsets, and a struct definition. Dependencies are `WIRE_V2_HEADER_BYTES` and
 `MAX_SPANS` (`descriptor.rs:10`, `:12`), the argument list of
-`FrameDescriptor::from_untrusted` (`:309-318`), and the field list of
-`SharedDescriptor` (`ring.rs:57-71`). This record sits with
+`FrameDescriptor::from_untrusted` (`:184-193`), and the field list of
+`SharedDescriptor` (`ring.rs:56-70`). This record sits with
 `one-profile-name-denotes-one-geometry` and
 `negative-tests-fail-for-their-stated-reason` in the cluster where one value is
 maintained in several places and a stale copy silently weakens a test. It is
@@ -120,10 +120,10 @@ the input to be rejected, which pins the offsets against reordering in a way no
 seed-dependent check can. Decouple the identity input: derive `expected` from
 part of the fuzz input rather than from the decoded descriptor, so the
 incarnation and expected-sequence guards become reachable — today they are
-covered only by the tabled unit cases at `tests/contract.rs:63`. And state the
+covered only by the tabled unit cases at `tests/contract.rs:82`. And state the
 padding's status, either as a declared reserved region that must be zero, in
 which case the encoding needs 120 bytes and the corpus needs regenerating, or as
-explicitly meaningless, in which case a comment at `ring.rs:1204` should say so.
+explicitly meaningless, in which case a comment at `ring.rs:1206` should say so.
 Coverage checks to emit: `shm_fuzz_expected_identity_differed_in_incarnation` and
 `shm_fuzz_expected_identity_differed_in_sequence`, both of which are independent
 preconditions rather than violations, so they fire on a correct decoder and
@@ -133,10 +133,10 @@ witness that the campaign is exploring the two-input space.
 
 ### Q: Is the 108-byte encoding coverage-equivalent to the 120-byte struct?
 
-- Sources examined: `harness.rs` in full; `backend/ring.rs:57-71`, `:88-106`,
-  `:109-115`, `:142-184`, `:802-804`, `:1125-1130`, `:1183-1204`,
-  `:1598-1618`; `descriptor.rs:8-12`, `:291-301`, `:309-336`;
-  `tests/contract.rs:46-59`, `:63`, `:683-708`; `tests/fuzz_corpus.rs` in full;
+- Sources examined: `harness.rs` in full; `backend/ring.rs:56-70`, `:87-105`,
+  `:108-114`, `:141-183`, `:804-806`, `:1127-1132`, `:1185-1206`,
+  `:1600-1620`; `descriptor.rs:8-12`, `:166-176`, `:184-211`;
+  `tests/contract.rs:46-59`, `:82`, `:743-768`; `tests/fuzz_corpus.rs` in full;
   `fuzz/corpus/frame_descriptor/valid` decoded field by field.
 - Findings: yes for the field tuple, no for the call convention. The bit count is
   exactly 864 either way, so the byte-to-field map is a bijection and no field

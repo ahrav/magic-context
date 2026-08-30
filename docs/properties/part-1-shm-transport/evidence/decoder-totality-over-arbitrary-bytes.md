@@ -20,26 +20,26 @@ Three decode entry points, all in `crates/mc-shm-transport`:
   hand-written offsets (`:34-62`) and calls `FrameDescriptor::validate`
   (`:76`).
 - `harness.rs:110-121` `provider_grant` — `RingGrant::decode_slice`
-  (`backend/ring.rs:460-463`).
+  (`backend/ring.rs:456-459`).
 - `harness.rs:127-159` `provider_sample` — `SamplePrefix::snapshot`
   (`backend/sample.rs:41-71`) then `validate` (`:83-126`).
 
 No accepted value escapes a partially checked state. `ValidatedFrame` is
-constructed once, at `descriptor.rs:424-432`, after all fourteen guards
-(`:348-422`). `ValidatedSample` is constructed once, at `sample.rs:122-125`,
+constructed once, at `descriptor.rs:299-307`, after all fourteen guards
+(`:223-297`). `ValidatedSample` is constructed once, at `sample.rs:122-125`,
 after all nine (`:88-121`). Both have private fields and no other constructor.
 `RingGrant` differs in shape but not in effect: the value is materialized at
-`ring.rs:438-454` *before* `checked_layout()?` runs at `:455`, so a
+`ring.rs:434-450` *before* `checked_layout()?` runs at `:451`, so a
 geometry-invalid grant briefly exists as a value — it just cannot reach the
 `Ok(grant)` at `:456`.
 
 Panic sites reachable from a decode call:
 
-- `ring.rs:436`, `:443`, `:448` — three `.expect()` calls, and the constant
-  range indexes at `:430`, `:441`, `:445` that precede them. All operate on
-  `[u8; GRANT_BYTES]` where `GRANT_BYTES` is the literal `58` at `ring.rs:30`.
+- `ring.rs:432`, `:439`, `:444` — three `.expect()` calls, and the constant
+  range indexes at `:426`, `:441`, `:441` that precede them. All operate on
+  `[u8; GRANT_BYTES]` where `GRANT_BYTES` is the literal `58` at `ring.rs:29`.
   The field widths sum to `2 + 16 + 4 + 8 + 8 + 8 + 8 = 54`, plus four reserved
-  bytes at `:419` and `:430`, for 58. Nothing asserts that relationship.
+  bytes at `:415` and `:426`, for 58. Nothing asserts that relationship.
 - `harness.rs:19-23` `read_u64` — `bytes[offset..offset + 8]`, a panicking
   index. Its only bound is the exact-length gate at `:31-33`. I computed the
   offsets: the last read is `spans_offset + 24 = 100`, ending at exactly 108,
@@ -54,7 +54,7 @@ Allocation: none of the three decoders allocates. Every intermediate is a
 fixed-size array or a `Copy` struct. The first allocation driven by an
 attacker-declared length is `lease.rs:178-179`, `vec![0u8; self.body_len]`, and
 its bound is entirely the decoder's `body_len > MAX_FRAME_BYTES` rejection
-(`descriptor.rs:363-365`, `sample.rs:103-105`) against `MAX_FRAME_BYTES` = 64
+(`descriptor.rs:238-240`, `sample.rs:103-105`) against `MAX_FRAME_BYTES` = 64
 MiB (`arena.rs:4`).
 
 ## Failure scenario
@@ -66,7 +66,7 @@ Three shapes, none of which the current tests would catch.
    panics on *every* 108-byte input, including the corpus `valid` seed. This
    one is loud, because the corpus replay would fail immediately.
 2. `GRANT_BYTES` is reduced — say a field is narrowed — without updating
-   `decode`. The range index at `ring.rs:430` panics on every call. The failure
+   `decode`. The range index at `ring.rs:426` panics on every call. The failure
    is not input-dependent, so a fuzz campaign reports it as a crash on the
    first execution rather than as a malformed-input finding.
 3. The `body_len <= MAX_FRAME_BYTES` guard is relaxed or reordered below the
@@ -80,7 +80,7 @@ No timing window: all three decoders are pure functions over one immutable byte
 slice, which is what `harness.rs:1-6` claims and what I confirmed — no file
 descriptor, mapping, or thread effect in any of them. The dependencies are
 compile-time constants: `WIRE_V2_HEADER_BYTES` and `MAX_SPANS`
-(`descriptor.rs:10`, `:12`), `GRANT_BYTES` (`ring.rs:30`), `MAX_FRAME_BYTES`
+(`descriptor.rs:10`, `:12`), `GRANT_BYTES` (`ring.rs:29`), `MAX_FRAME_BYTES`
 (`arena.rs:4`). Two of the three width constants are derived from those and one,
 `GRANT_BYTES`, is an independent literal. This record is the precondition for
 `accepted-decode-consumes-its-declared-width`: exact-consumption reasoning is
@@ -90,7 +90,7 @@ only meaningful once every input is known to terminate in accept or reject.
 
 No fault injection. Three additions to what exists. First, a length sweep over
 `0..=2 * width` for each decoder rather than the ten sampled lengths at
-`tests/contract.rs:683-708`, with several fill patterns and with structured
+`tests/contract.rs:743-768`, with several fill patterns and with structured
 mutation of an accepted seed — the current sweep uses only `0x00` and `0xff`,
 and neither reaches the arithmetic guards. Second, static assertions binding
 each width constant to the sum of its field widths, so a narrowed field is a
@@ -105,8 +105,8 @@ so a campaign that only ever rejects is visible as such.
 ### Q: Is any panic site reachable from arbitrary bytes at HEAD?
 
 - Sources examined: `harness.rs` in full; `backend/ring.rs:410-488`;
-  `backend/sample.rs:41-126`; `descriptor.rs:332-433`; `arena.rs:4`, `:44-70`;
-  `lease.rs:178-179`; `tests/contract.rs:683-708`; `tests/fuzz_corpus.rs` in
+  `backend/sample.rs:41-126`; `descriptor.rs:207-308`; `arena.rs:4`, `:44-70`;
+  `lease.rs:178-179`; `tests/contract.rs:743-768`; `tests/fuzz_corpus.rs` in
   full.
 - Findings: no, not at HEAD. I computed the harness offsets by hand and by
   program: schema `0..2`, wire header `2..23`, incarnation `23..39`, lane
@@ -117,10 +117,10 @@ so a campaign that only ever rejects is visible as such.
   eight-, sixteen-, and four-byte ranges of a 58-byte array and are infallible.
   The accept-path `.expect()` calls in `harness.rs:81-87` are guarded by
   `validate`: `span(index)` is `Some` for `index < span_count`
-  (`descriptor.rs:486-488`), and the two `checked_add`s cannot overflow because
+  (`descriptor.rs:361-363`), and the two `checked_add`s cannot overflow because
   `validate` already bounded `spans[0].offset + spans[0].len <= arena_bytes`
-  (`descriptor.rs:380-386`) and forced `spans[1].offset == 0` with
-  `spans[1].len <= arena_bytes` (`:401-410`).
+  (`descriptor.rs:255-261`) and forced `spans[1].offset == 0` with
+  `spans[1].len <= arena_bytes` (`:276-285`).
 - Missing evidence: nothing for the reachability question. What is missing is
   any statement of the invariants that keep it true. `GRANT_BYTES` is a literal
   with no static tie to its field widths, and the harness offsets have zero

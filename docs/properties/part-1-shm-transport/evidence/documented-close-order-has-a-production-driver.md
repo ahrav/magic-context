@@ -34,15 +34,15 @@ No production caller exists. `Lifecycle` is constructed only by the test.
 
 The two real close paths each implement their own ordering:
 
-- **Addon.** `close` (`packages/mc-shm-native/src/lib.rs:934`) calls
+- **Addon.** `close` (`packages/mc-shm-native/src/lib.rs:1055`) calls
   `close_channel` (`:334-346`), which sets `channel.closed = true`, aborts every
   registered producer reservation via `detach_producer(...)?.abort()`, detaches
-  every active lease, then detaches stranded references. `force_close` (`:958`)
-  calls `quarantine_channel` (`:348`), which additionally calls
-  `enter_quarantine()` on both rings (`:350-351`) before the same detach
+  every active lease, then detaches stranded references. `force_close` (`:1079`)
+  calls `quarantine_channel` (`:357`), which additionally calls
+  `enter_quarantine()` on both rings (`:359-360`) before the same detach
   sequence. Neither calls `Lifecycle::advance`.
 - **Host.** The endpoint thread wraps `run_endpoint` in `catch_unwind`
-  (`crates/mc-host/src/shm_provider.rs:351-362`) and then takes a two-way branch
+  (`crates/mc-host/src/ring_transport.rs:279-290`) and then takes no branch at all
   on the resulting boolean at `:364-370`: clean closes call `custody.release()`,
   unclean closes and the `quarantine_next_close` test hook call
   `recovery.report_suspect(custody)`. This is a disposition decision, not an
@@ -97,9 +97,9 @@ A reachability assertion, not a state construction:
 - Sources examined: `crates/mc-shm-transport/src/lifecycle.rs` in full;
   repository-wide search for `CloseState`, `Lifecycle::new`, `mark_prepared`,
   `must_fail_closed` excluding `docs/` and `target/`;
-  `crates/mc-shm-transport/tests/contract.rs:262-325`;
-  `packages/mc-shm-native/src/lib.rs:330-360` and `:933-976`;
-  `crates/mc-host/src/shm_provider.rs:336-378`;
+  `crates/mc-shm-transport/tests/contract.rs:281-344`;
+  `packages/mc-shm-native/src/lib.rs:330-360` and `:1054-1097`;
+  `crates/mc-host/src/ring_transport.rs:271-297`;
   `docs/mc-host-shm-transport.md:59-65`.
 - Findings: the machine is a complete and internally consistent encoding of the
   documented ordering, with per-edge validation and correct terminality. It has

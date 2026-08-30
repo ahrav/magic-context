@@ -30,28 +30,36 @@ property to catalog, because the ring's release does all four.
 
 ## Evidence trail
 
+- **The cited mechanism is gone.** `0f336d3c` ("refactor(shm): collapse to fixed
+  ring transport") deleted `crates/mc-shm-transport/src/backend/iceoryx.rs`,
+  `crates/mc-shm-transport/tests/iceoryx.rs`, and the `iceoryx` Cargo feature, so
+  `backend/mod.rs` now declares only `ring` and `sample`. Every `iceoryx.rs`
+  citation below is kept as a record of what the removed backend did and did not
+  guarantee, and resolves against `9c1eb4d1`, not HEAD. No successor backend
+  exists in the tree.
+
 - `backend/iceoryx.rs:319-355` — the whole lease. There is **no** `impl Drop`
   anywhere in the file, so `release(self)` and simply letting the lease fall out
   of scope are the same operation, byte for byte. Nothing distinguishes a
   completed lease from an abandoned one, and there is no second release to
   reject, because the move consumed the value.
-- `backend/ring.rs:847-909` — the counterpart, for the difference. It takes an
-  identity, then checks quarantine (`:848`), incarnation (`:851`), lane (`:854`),
-  a zero sequence (`:858`), `sequence <= consumed` (`:865-868`), and three
-  descriptor fields re-read from shared memory (`:873-882`), before the
-  arbitrating compare-exchange at `:884-891` maps a second attempt to
-  `DuplicateRelease` (`:892-900`). Only then does it store
-  `completion_sequence` and decrement `active_leases` (`:902-906`).
+- `backend/ring.rs:849-911` — the counterpart, for the difference. It takes an
+  identity, then checks quarantine (`:850`), incarnation (`:853`), lane (`:856`),
+  a zero sequence (`:860`), `sequence <= consumed` (`:867-870`), and three
+  descriptor fields re-read from shared memory (`:875-884`), before the
+  arbitrating compare-exchange at `:886-893` maps a second attempt to
+  `DuplicateRelease` (`:894-902`). Only then does it store
+  `completion_sequence` and decrement `active_leases` (`:904-908`).
 - `crates/mc-shm-transport/src/lease.rs:198-206`, `:215-221` — the ring lease
   also carries a local `released` flag and a `Drop` that calls `release_once`, so
   an abandoned ring lease still completes and a duplicate is still named. The
   iceoryx lease has neither, so those two obligations are met by move semantics
   rather than by a check, which is sound but silent.
-- `backend/ring.rs:912-995` `conservation` and `:998-1003` `probe` — the ring's
+- `backend/ring.rs:914-997` `conservation` and `:1000-1005` `probe` — the ring's
   entire reporting surface: per-slot descriptor counts across six states and
   per-state byte charges. `backend/iceoryx.rs` has no equivalent. It exposes
   `try_reserve`, `try_receive`, and the associated `stale_node_observed`
-  (`:178-189`), and nothing else. A caller cannot ask it how many samples are
+  (`:177-188`), and nothing else. A caller cannot ask it how many samples are
   outstanding, how many bytes are charged, or whether it is healthy.
 - former `crates/mc-host/src/provider_recovery.rs:530` — readiness is decided by
   `shared.backend.probe() && shared.backend.admission_fits()`. There is no
@@ -103,7 +111,7 @@ No window and no fault. The absent surface is a static fact about the module, an
 the hardcoded counters are a static fact about the bench. The only dependency is
 the `iceoryx` feature, which is **on by default** for the transport crate
 (`crates/mc-shm-transport/Cargo.toml:9-10`) and off for both consumers, since
-`crates/mc-host/Cargo.toml:25` and `packages/mc-shm-native/Cargo.toml:13` both
+`crates/mc-host/Cargo.toml:25` and `packages/mc-shm-native/Cargo.toml:16` both
 set `default-features = false`. So the backend and this bench arm compile
 whenever the transport crate is built or tested on its own, and are absent from
 every artifact the host or the addon ships.
@@ -129,7 +137,7 @@ emit: `shm_iceoryx_lease_abandoned_without_release`.
 
 - Sources examined: `backend/iceoryx.rs:319-355`, `:178-189`, and the whole file
   searched for `impl Drop`, `conservation`, `probe`, and `quarantine`, all
-  absent; `backend/ring.rs:847-909`, `:912-1003`;
+  absent; `backend/ring.rs:849-911`, `:914-1005`;
   `crates/mc-shm-transport/src/lease.rs:198-221`;
   former `crates/mc-host/src/provider_recovery.rs:530`;
   `benches/hardware_envelope.rs:141`, `:177`, `:186-260`, `:531-598`;

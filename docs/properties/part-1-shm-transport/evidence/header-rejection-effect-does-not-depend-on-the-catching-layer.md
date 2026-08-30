@@ -18,7 +18,7 @@ no successor. See the refresh note in [../catalog.md](../catalog.md).
 ## Discovery trigger
 
 `ver` is the one header field both layers check: `wire_header[4] != 2` in the
-transport (`crates/mc-shm-transport/src/descriptor.rs:420`) and
+transport (`crates/mc-shm-transport/src/descriptor.rs:295`) and
 `header_len_for_version` in the host (`crates/mc-host/src/wire.rs:292-297`,
 `:311`). Tracing what each rejection actually does shows the two paths do not
 converge. One sets the ring's shared quarantine byte and leaves the slot claimed;
@@ -29,12 +29,12 @@ visible only to the peer.
 ## Evidence trail
 
 **Transport-caught.** `try_receive` compare-exchanges the slot `PUBLISHED →
-RECEIVER_HELD` (`backend/ring.rs:790-799`), snapshots the descriptor (`:802`),
-and calls `validate` (`:804`). On any `DescriptorError`, including
-`WireHeaderMismatch` from either of the two header checks, the arm at `:806-809`
+RECEIVER_HELD` (`backend/ring.rs:792-801`), snapshots the descriptor (`:804`),
+and calls `validate` (`:806`). On any `DescriptorError`, including
+`WireHeaderMismatch` from either of the two header checks, the arm at `:808-811`
 calls `self.enter_quarantine()` and returns `RingError::Descriptor`.
 `enter_quarantine` writes the `quarantined` byte in the shared lifecycle page.
-`consumed` is never advanced — the advance is at `:825`, past the error — so the
+`consumed` is never advanced — the advance is at `:827`, past the error — so the
 slot stays `RECEIVER_HELD` and every later `try_receive` on that lane fails its
 CAS. The host maps this to `ReadClose::Corrupt("shared-memory receive failed")`
 (former `shm_provider.rs:558`), a reason shared with every other `RingError`.
@@ -46,7 +46,7 @@ cap"`, `"invalid pure-header flags"`, or `"role-invalid frame type"`
 (`frame_channel.rs:59-74`). Both propagate with `?`, which drops the local
 `lease`; `ReceiveLease::Drop` calls `release_once` and discards the result
 (`lease.rs:215-221`). The slot therefore moves to `RELEASE_PENDING`, `consumed`
-has already advanced at `ring.rs:825`, and the ring's `quarantined` byte is never
+has already advanced at `ring.rs:827`, and the ring's `quarantined` byte is never
 touched.
 
 **Where they rejoin.** The endpoint loop computes `clean = matches!(close,
@@ -135,11 +135,11 @@ and states the gap rather than proving it closed.
 
 ### Q: Do the two origins really diverge, or does the host path also quarantine the ring indirectly?
 
-- Sources examined: `backend/ring.rs:760-844` for both exits;
+- Sources examined: `backend/ring.rs:762-846` for both exits;
   `lease.rs:198-221`; former `shm_provider.rs:473-505`, former `:546-619`, former `:138-152`,
   former `:364-371`; former `provider_recovery.rs:450-500`; `connection.rs:392-415`.
 - Findings: they diverge. `enter_quarantine` is called from exactly one place
-  inside `try_receive`, the descriptor-validation arm at `ring.rs:807`. No host
+  inside `try_receive`, the descriptor-validation arm at `ring.rs:809`. No host
   code path reaches it — the host never calls a quarantine method on the ring, it
   only stops reading and lets the mapping drop. The admission-side quarantine at
   former `provider_recovery.rs:494` is a different mechanism on a different object: it

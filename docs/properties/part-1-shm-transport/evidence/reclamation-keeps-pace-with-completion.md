@@ -12,17 +12,17 @@ one reclaimed sequence out of two satisfies.
 
 ## Evidence trail
 
-- `crates/mc-shm-transport/src/backend/ring.rs:1106-1152` `reclaim_completed`. It reads
-  `completed` (`:1109`), then loops: for `next = completed + 1` it loads
-  `completion_sequence` with `Acquire` (`:1116`) and **breaks at the first gap**
-  (`:1117-1118`). That break is the head-of-line mechanism. When the sequence is
-  contiguous it requires `SLOT_RELEASE_PENDING` (`:1121-1123`), revalidates the
-  descriptor (`:1125-1130`), requires `allocation_start == arena_reclaimed`
-  (`:1133-1135`), then advances `arena_reclaimed` (`:1136-1143`), clears
+- `crates/mc-shm-transport/src/backend/ring.rs:1108-1154` `reclaim_completed`. It reads
+  `completed` (`:1111`), then loops: for `next = completed + 1` it loads
+  `completion_sequence` with `Acquire` (`:1118`) and **breaks at the first gap**
+  (`:1119-1120`). That break is the head-of-line mechanism. When the sequence is
+  contiguous it requires `SLOT_RELEASE_PENDING` (`:1123-1125`), revalidates the
+  descriptor (`:1127-1132`), requires `allocation_start == arena_reclaimed`
+  (`:1135-1137`), then advances `arena_reclaimed` (`:1138-1145`), clears
   `reservation_len` and `completion_sequence`, frees the slot, and stores `completed`
-  (`:1144-1147`). The loop continues, so **one call drains the entire contiguous
+  (`:1146-1149`). The loop continues, so **one call drains the entire contiguous
   completed prefix**, not one sequence.
-- `ring.rs:673` — the only call site of `reclaim_completed` in the repository, confirmed
+- `ring.rs:675` — the only call site of `reclaim_completed` in the repository, confirmed
   by search: the first statement of `try_reserve`. Reclamation is producer-driven and
   lazy. A receiver that releases everything while the producer never reserves again
   leaves every byte and every slot charged indefinitely, and that is by design rather
@@ -30,34 +30,34 @@ one reclaimed sequence out of two satisfies.
   reserve attempts, not in wall-clock time.
 - The two capacities reclamation feeds. Descriptors: `try_reserve` computes
   `outstanding = published - completed` and refuses at `outstanding >=
-  descriptor_depth` (`:677-684`). Bytes: `SpanPlan::reserve` computes `used = write -
+  descriptor_depth` (`:679-686`). Bytes: `SpanPlan::reserve` computes `used = write -
   reclaimed` and returns `ArenaError::Exhausted` when `len > capacity - used`
   (`crates/mc-shm-transport/src/arena.rs:103-111`). Both cursors advance only in
   `reclaim_completed`, at `:1147` and `:1140-1143`.
-- `ring.rs:902-906` — the receiver's half of the edge: `completion_sequence` stored with
+- `ring.rs:904-908` — the receiver's half of the edge: `completion_sequence` stored with
   `Release` after the `SLOT_RECEIVER_LEASED → SLOT_RELEASE_PENDING` compare-exchange at
-  `:884-891`. `Release` at `:905` pairs with `Acquire` at `:1116`.
-- The observable healthy state: `conservation()` (`:911-995`) counts `SLOT_FREE` into
-  `descriptors.free` (`:935`) and derives `bytes.free = arena_bytes - charged`
-  (`:989-993`). Full recovery is `descriptors.free == descriptor_depth` and
+  `:886-893`. `Release` at `:907` pairs with `Acquire` at `:1118`.
+- The observable healthy state: `conservation()` (`:913-997`) counts `SLOT_FREE` into
+  `descriptors.free` (`:937`) and derives `bytes.free = arena_bytes - charged`
+  (`:991-995`). Full recovery is `descriptors.free == descriptor_depth` and
   `bytes.free == arena_bytes`. Caveat carried from
   `reservation-charge-visible-with-non-free-state`: `bytes.free` is derived, so
   `ArenaCounts::conserves` is arithmetically self-satisfying and only
   `descriptors.free` plus a successful full-size reserve are independent evidence.
 - Existing check, and the exact gap:
   `retained_oldest_lease_enforces_fifo_reclamation_and_release_validation`
-  (`crates/mc-shm-transport/tests/ring.rs:148-219`). It publishes 40 MiB at sequence 1
-  and holds its lease (`:154-162`), publishes the remaining 24 MiB at sequence 2 and
-  releases it immediately (`:164-171`), and asserts the head-of-line consequence:
-  `try_reserve(1)` is `Exhausted` (`:198-201`), `bytes.free == 0` (`:210`),
-  `receiver_leased == 1` and `release_pending == 1` (`:208-209`). That half is good. Then
-  it releases the retained lease (`:212`) and asserts `try_reserve(1)` succeeds
-  (`:213-215`). With `arena_bytes == MAX_FRAME_BYTES == 64 MiB` fully charged, a
+  (`crates/mc-shm-transport/tests/ring.rs:138-209`). It publishes 40 MiB at sequence 1
+  and holds its lease (`:144-152`), publishes the remaining 24 MiB at sequence 2 and
+  releases it immediately (`:154-161`), and asserts the head-of-line consequence:
+  `try_reserve(1)` is `Exhausted` (`:188-191`), `bytes.free == 0` (`:200`),
+  `receiver_leased == 1` and `release_pending == 1` (`:198-199`). That half is good. Then
+  it releases the retained lease (`:202`) and asserts `try_reserve(1)` succeeds
+  (`:203-205`). With `arena_bytes == MAX_FRAME_BYTES == 64 MiB` fully charged, a
   reclaimer that advanced only sequence 1 would leave 40 MiB free — and a one-byte
   request succeeds against 40 MiB exactly as it succeeds against 64 MiB. The test cannot
   see the difference.
-- `boundary_round_trips_include_wrap_and_exact_maximum` (`tests/ring.rs:66-146`) does
-  assert full recovery at `:141-145`, but only after a strictly serial
+- `boundary_round_trips_include_wrap_and_exact_maximum` (`tests/ring.rs:56-136`) does
+  assert full recovery at `:131-135`, but only after a strictly serial
   publish-receive-release cycle where the prefix is never non-contiguous, so it never
   exercises catch-up across more than one sequence.
 
@@ -79,7 +79,8 @@ one reclaimed sequence out of two satisfies.
    is another pass, so the defect is invisible to any test with a loose deadline. What
    breaks is the size class: a producer asking for a large frame is refused while the
    arena is mostly reclaimable, and reports `Deadline` on a healthy channel. In the host
-   that is an unclean close (`crates/mc-host/src/shm_provider.rs:538-542`). The
+   that is a publish failure that cancels the generation
+   (`crates/mc-host/src/ring_transport.rs:447-451`). The
    accounting stays self-consistent throughout, so nothing else signals it.
 
 ## Timing windows and dependencies
@@ -117,10 +118,11 @@ its retry loop performs additional reclaim passes and destroys the one-pass boun
 
 ### Q: Does one `reclaim_completed` call recover the whole contiguous prefix, and is that anywhere asserted?
 
-- Sources examined: `ring.rs:662-734`, `:736-757`, `:846-909`, `:911-995`,
-  `:1106-1152`; `arena.rs:88-128`, `:202-219`; `tests/ring.rs:66-146`, `:148-219`;
-  `crates/mc-host/src/shm_provider.rs:538-542`.
-- Findings: yes to the first, no to the second. The loop structure at `:1110-1150` is
+- Sources examined: `ring.rs:664-736`, `:738-759`, `:848-911`, `:913-997`,
+  `:1108-1154`; `arena.rs:88-128`, `:202-219`; `tests/ring.rs:56-136`, `:138-209`;
+  `crates/mc-host/src/ring_transport.rs:447-451`.
+- Findings: yes to the first, no to the second. The loop structure at
+  `backend/ring.rs:1112-1152` is
   unambiguous — the only exits are the gap `break`, an error, or exhausting the prefix —
   so one call drains everything contiguous. Nothing asserts it. The FIFO test asserts
   the blocking half well and the recovery half with a one-byte request against a 64 MiB

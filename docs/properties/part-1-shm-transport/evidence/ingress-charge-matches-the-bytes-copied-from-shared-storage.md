@@ -24,16 +24,16 @@ usize)`) and then copies the body from the descriptor
 places: `header.len` is bytes 0..4 of the peer-authored wire header, and
 `to_vec` allocates and fills `self.body_len`
 (`crates/mc-shm-transport/src/lease.rs:178-196`), which came from the
-descriptor's `body_len` field (`backend/ring.rs:828-835`). The host never
+descriptor's `body_len` field (`backend/ring.rs:830-837`). The host never
 compares them. The equality is supplied entirely by a check in the other crate.
 
 ## Evidence trail
 
 The only place the two are tied together is `FrameDescriptor::validate`
-(`descriptor.rs:414-422`): `declared_len` is decoded from `wire_header[0..4]` and
+(`descriptor.rs:289-297`): `declared_len` is decoded from `wire_header[0..4]` and
 compared with `body_len`, and disagreement returns
 `DescriptorError::WireHeaderMismatch`. `Ring::try_receive` calls that validation
-at `backend/ring.rs:804` and refuses to produce a lease otherwise (`:806-809`).
+at `backend/ring.rs:806` and refuses to produce a lease otherwise (`:808-811`).
 So by the time `ring_transport.rs:471` decodes the header, `header.len ==
 body_len` is already true — proved in `mc-shm-transport`, consumed in `mc-host`,
 with no assertion, comment, or type linking the two.
@@ -46,13 +46,13 @@ accounting error rather than a transient one.
 
 The producer path cannot create a divergence: `commit_reservation` applies the
 same equality to the header it is about to publish
-(`backend/ring.rs:1172-1180`), and `set_wire_header` (`:1326-1333`) only replaces
+(`backend/ring.rs:1174-1182`), and `set_wire_header` (`:1328-1335`) only replaces
 the bytes that `commit_reservation` then re-checks. `TestShmPeer::send`
 (`ring_transport.rs:659-673`) goes through exactly that path. The divergence is
 reachable only by a peer writing the shared descriptor page directly, which the
 mapping permits: both `Mapping::create` and `Mapping::attach` map
-`PROT_READ|PROT_WRITE` (`backend/ring.rs:229`, `:258`) and the required seals are
-`F_SEAL_GROW|SHRINK|SEAL` with no `F_SEAL_WRITE` (`:1709`).
+`PROT_READ|PROT_WRITE` (`backend/ring.rs:227`, `:249`) and the required seals are
+`F_SEAL_GROW|SHRINK|SEAL` with no `F_SEAL_WRITE` (`:1704`).
 
 The peer-side consumer shows what not delegating looks like. In
 `packages/plugin/src/shared/mc-host-client/transport-provider.ts:406-426` the
@@ -65,7 +65,7 @@ host takes on trust is re-established locally there, twice.
 
 A peer writes a descriptor whose `body_len` and span lengths describe 64 bytes
 while `wire_header[0..4]` declares 64 MiB, then publishes. If
-`descriptor.rs:420` were relaxed, weakened to a `<=`, or moved behind a feature
+`descriptor.rs:295` were relaxed, weakened to a `<=`, or moved behind a feature
 gate, the host would charge 64 MiB of ingress budget and copy 64 bytes. The
 `ByteCharge` travels with the frame and releases 64 MiB, so the arithmetic still
 balances — the damage is that a peer sets the host's admission accounting from a
@@ -95,7 +95,7 @@ premise.
 An assertion at the point of admission is enough and needs no hostile peer: for
 every `InboundEvent::Frame` the shared-memory read path emits, the charged byte
 count equals `body.len()`. That check passes today, and it is the check that
-fails the moment `descriptor.rs:420` is relaxed — which makes it the pin the gap
+fails the moment `descriptor.rs:295` is relaxed — which makes it the pin the gap
 asks for. Pair it with a direct descriptor-page write that lies about the
 declared length, asserting the close is `Corrupt` and that the ingress budget's
 used count is unchanged, so the transport-side gate has an executed negative case

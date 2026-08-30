@@ -6,7 +6,7 @@
 `ReceiveLease::wire_header` (`crates/mc-shm-transport/src/lease.rs:163-165`)
 hands out 21 bytes with no qualification. But the transport's `validate` reads
 only two of those bytes' worth of meaning
-(`crates/mc-shm-transport/src/descriptor.rs:414-422`): the little-endian `len`
+(`crates/mc-shm-transport/src/descriptor.rs:289-297`): the little-endian `len`
 at offsets 0..4 must equal `body_len`, and `wire_header[4]` must be 2. Bytes 5
 through 20 — type, flags, channel, epoch, correlation — pass through the trust
 boundary untouched inside a type whose name says otherwise. The property is
@@ -16,36 +16,39 @@ two gates have run".
 
 ## Evidence trail
 
-One receive is `receive_one` (`crates/mc-host/src/shm_provider.rs:546-619`). Its
+One receive is `receive_one` (`crates/mc-host/src/ring_transport.rs:455-534`,
+renamed from `shm_provider.rs` by `ed487e11`). Its
 ordering, read directly:
 
-1. `:555-561` `rings.second.try_receive()` yields a lease or `Ok(false)`. Inside
+1. `:464-470` `rings.second.try_receive()` yields a lease or `Ok(false)`. Inside
    the transport, `try_receive` compare-exchanges the slot `PUBLISHED →
-   RECEIVER_HELD` (`backend/ring.rs:790-799`), takes one
-   `std::ptr::read_volatile` snapshot of the entire descriptor (`:802`),
-   validates it (`:804`), and on success copies `validated.wire_header()` into
-   the lease (`:836`). The snapshot matters: every later reader sees that local
+   RECEIVER_HELD` (`backend/ring.rs:792-801`), takes one
+   `std::ptr::read_volatile` snapshot of the entire descriptor (`:804`),
+   validates it (`:806`), and on success copies `validated.wire_header()` into
+   the lease (`:838`). The snapshot matters: every later reader sees that local
    copy, not shared memory, so there is no time-of-check window between the
    transport's two checks and the host's.
-2. `:562-563` `decode_header(&lease.wire_header())`, mapped to
+2. `:471-472` `decode_header(&lease.wire_header())`, mapped to
    `ReadClose::Corrupt("invalid shared-memory header")`.
-3. `:564` `validate_inbound_header(header)?`
+3. `:473` `validate_inbound_header(header)?`
    (`crates/mc-host/src/frame_channel.rs:58-76`).
-4. `:565-576` the control-channel body cap. This is the first place a header
+4. `:474-485` the control-channel body cap. This is the first place a header
    field crosses into the connection engine: it sends
    `InboundEvent::Rejected { corr: header.corr }`.
-5. `:578-603` the ingress admission loop, charging `header.len as usize`
-   (`:580`).
-6. `:604-606` `lease.to_vec()`, the body copy.
-7. `:607-609` release, then `:612-617` `inbound.send(InboundEvent::Frame(...))`.
+5. `:487-518` the ingress admission loop, charging `header.len as usize`
+   (`:489`).
+6. `:519-521` `lease.to_vec()`, the body copy.
+7. `:522-524` release, then `:527-532` `inbound.send(InboundEvent::Frame(...))`.
 
 Steps 2 and 3 strictly precede 4 through 7 in straight-line code with `?` on
 each. The `validate_inbound_header` doc comment (`frame_channel.rs:54-57`) states
 the intent explicitly: classification uses the header alone, before any body
 admission, so a role-invalid type with a large declared body cannot hold ingress
 budget through the frame deadline. The shared-memory path honors that; the TCP
-path places the same two calls in the same order
-(`crates/mc-host/src/tcp_frame_channel.rs:188`, `:196`, `:198`).
+path that placed the same two calls in the same order
+(`crates/mc-host/src/tcp_frame_channel.rs:188`, `:196`, `:198` at `9c1eb4d1`) is
+gone: `ed487e11` deleted `tcp_frame_channel.rs`, so `receive_one` is now the only
+consumer read path in `crates/mc-host/src`.
 
 Two of `decode_header`'s gates are dead on this path. `WIRE_V2_HEADER_BYTES` is
 21 (`descriptor.rs:10`) and `HEADER_LEN` is 21 (`wire.rs:28`), so
@@ -69,14 +72,14 @@ channel have already been validated by then.
 
 ## Timing windows and dependencies
 
-No concurrency window. The descriptor snapshot at `ring.rs:802` is one volatile
+No concurrency window. The descriptor snapshot at `ring.rs:804` is one volatile
 read of the whole struct, so the 21 header bytes are frozen locally before the
 transport's own checks and cannot change under either layer. That is what makes
 this a pure ordering property rather than a race.
 
 Scope note on the other consumer of the same accessor: the addon publishes
 `lease.wire_header()` straight to JavaScript as a `Buffer`
-(`packages/mc-shm-native/src/lib.rs:859`) with no native validation at all, and
+(`packages/mc-shm-native/src/lib.rs:980`) with no native validation at all, and
 the decode happens in TypeScript at
 `packages/plugin/src/shared/mc-host-client/shm-frame-channel.ts:305` through
 `decodeHeader` (`.../protocol.ts:266-294`, which calls `validateHeader`,
@@ -106,9 +109,9 @@ asserting the ingress budget never dips is the discriminating case.
 
 ### Q: Does any code between `try_receive` and the two gates read a header field?
 
-- Sources examined: `shm_provider.rs:546-619` in full; `backend/ring.rs:760-844`;
+- Sources examined: `ring_transport.rs:455-534` in full; `backend/ring.rs:762-846`;
   `lease.rs:94-197`.
-- Findings: no. Between the lease returning and `:562` the only operations are
+- Findings: no. Between the lease returning and `:471` the only operations are
   the `else { return Ok(false) }` on an empty ring and the borrow of
   `lease.wire_header()` itself. Inside the transport, the fields read after the
   snapshot are the descriptor's own — identity, spans, `body_len` — never

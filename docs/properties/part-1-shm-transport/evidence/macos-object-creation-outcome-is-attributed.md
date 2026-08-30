@@ -25,12 +25,12 @@ nothing in the tree names which of the four fallible steps inside
 
 ## Evidence trail
 
-`create_macos_shm` (`crates/mc-shm-transport/src/backend/ring.rs:1753-1788`) has
+`create_macos_shm` (`crates/mc-shm-transport/src/backend/ring.rs:1748-1783`) has
 exactly four failure exits, three of which return `ObjectSetupFailed`:
-`getrandom` (`:1756`), `shm_open` (`:1773-1775`), `shm_unlink` (`:1779-1781`),
-and `ftruncate` (`:1784-1786`). The fourth conversion failure returns
-`ArithmeticOverflow` (`:1782`). The caller `Mapping::create` (`:215-245`) then
-runs `validate_object` (`:222`), which returns `ObjectValidationFailed`, not
+`getrandom` (`:1751`), `shm_open` (`:1768-1770`), `shm_unlink` (`:1774-1776`),
+and `ftruncate` (`:1779-1781`). The fourth conversion failure returns
+`ArithmeticOverflow` (`:1777`). The caller `Mapping::create` (`:215-245`) then
+runs `validate_object` (`:220`), which returns `ObjectValidationFailed`, not
 `ObjectSetupFailed`. The documented error therefore points inside
 `create_macos_shm`, not at validation — a discriminator the platform-status note
 does not use.
@@ -96,7 +96,7 @@ way to reach any of this; today that file is not in the macOS command.
 
 ### Q: Which of the three `ObjectSetupFailed` exits in `create_macos_shm` produces the documented macOS failure?
 
-- Sources examined: `ring.rs:1753-1788` line by line; `ring.rs:215-245` for the
+- Sources examined: `ring.rs:1748-1783` line by line; `ring.rs:215-245` for the
   caller and the error it maps; `ring.rs:1677-1703` to confirm validation returns
   a different variant; `docs/mc-host-shm-transport.md:110-125`;
   `docs/evidence/mc-shm-traceability-v1.json:48`, `:157`, `:195`;

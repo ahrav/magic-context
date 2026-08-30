@@ -31,7 +31,7 @@ Totals at `9c1eb4d1`:
 
 | Cited fragment | Real name at HEAD | Cited by |
 | --- | --- | --- |
-| `crates/mc-shm-transport/tests/ring.rs#lease_limit_rejects_then_recovers_after_release` | `lease_limit_reports_backpressure_then_recovers_after_release` (`tests/ring.rs:289`) | R11 (PASS) |
+| `crates/mc-shm-transport/tests/ring.rs#lease_limit_rejects_then_recovers_after_release` | `lease_limit_reports_backpressure_then_recovers_after_release` (`tests/ring.rs:279`) | R11 (PASS) |
 | `crates/mc-host/tests/shm_transport.rs#omitted_and_unqualified_profiles_fall_back_without_side_effects` | `omitted_and_unqualified_profiles_fall_back_reasonless_without_side_effects` (`tests/shm_transport.rs:117`) | R3 (PASS), R14 (PASS), AE2 (PASS) |
 
 Both files exist; only the test names are wrong. Each real name is a strict

@@ -2,7 +2,7 @@
 
 ## Discovery trigger
 
-`RuntimeDir` (`crates/mc-shm-transport/src/backend/ring.rs:308-394`) is
+`RuntimeDir` (`crates/mc-shm-transport/src/backend/ring.rs:291-377`) is
 security-shaped: a random 128-bit name, `mkdir` at 0700, an open with
 `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`, a five-way conjunction comparing the
 by-path view against the by-descriptor view, and a `validate` method that
@@ -76,7 +76,8 @@ What the gate does not do is protect the shared object, because the object is no
 in it on either platform. So the consequence of the gate being wrong is bounded
 by what a wrong answer costs: a false rejection fails `Ring::create` or
 `DuplexRing::create` with `ObjectValidationFailed`, which surfaces as
-`ProviderFailure::Unavailable` at `crates/mc-host/src/shm_provider.rs:329` and
+`RingUnavailable` at `crates/mc-host/src/ring_transport.rs:263` (`ProviderFailure`
+was removed with `shm_provider.rs` in `ed487e11`) and
 falls back to TCP. A false acceptance admits a directory the process then never
 writes to. Because `create_in` reads its root from `std::env::temp_dir()`, a
 hostile `TMPDIR` chooses where the empty directory is created and removed, and
@@ -114,22 +115,22 @@ and that `Drop` removes it on the success path (`:392`).
 ### Q: Is the validated runtime directory load-bearing on Linux, or only on macOS?
 
 - Sources examined: `ring.rs:216-247` (`Mapping::create`), `:249-276`
-  (`Mapping::attach`), `:316-394` (`RuntimeDir`), `:536-590`
-  (`Ring::create`, `Ring::create_in`), `:1417-1426` (`DuplexRing::create`),
-  `:1677-1703` (`validate_object`), `:1706-1714` (`validate_seals`),
-  `:1716-1741` (`create_linux_memfd`), `:1753-1788` (`create_macos_shm`); a
+  (`Mapping::attach`), `:299-377` (`RuntimeDir`), `:536-590`
+  (`Ring::create`, `Ring::create_in`), `:1419-1428` (`DuplexRing::create`),
+  `:1677-1703` (`validate_object`), `:1701-1709` (`validate_seals`),
+  `:1711-1736` (`create_linux_memfd`), `:1748-1783` (`create_macos_shm`); a
   repository-wide search for `RuntimeDir`.
 - Findings: it is load-bearing on **neither** platform. On Linux the object is an
   anonymous memfd with a fixed name and no path, so nothing can be placed in the
   directory. On macOS the object is a POSIX shared-memory segment named
-  `/mc-shm-<hex>` in the shm namespace and `shm_unlink`ed at `:1779` before it is
+  `/mc-shm-<hex>` in the shm namespace and `shm_unlink`ed at `:1774` before it is
   mapped, so the filesystem directory is equally irrelevant there. The directory
   is created, validated, held for the lifetime of the rings, and removed. It is
   a precondition gate on the process's ability to own a private 0700 directory,
   not a container for anything.
 - Missing evidence: none for the platform question. What is unresolved is
   intent — whether the directory is a remnant of an earlier file-backed design,
-  or a deliberate environment sanity check. The doc comment at `:535` says
+  or a deliberate environment sanity check. The doc comment at `:543` says
   "Creates sealed, prefaulted active ring under fresh owner-only runtime
   directory", which reads as though the object is under the directory; it is not.
 - Conclusion: resolved as a scoping fact. The record stands as an untested gate

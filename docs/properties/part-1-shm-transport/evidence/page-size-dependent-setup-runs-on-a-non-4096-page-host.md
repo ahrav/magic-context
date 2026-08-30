@@ -13,14 +13,14 @@ size while leaving the producers on a constant.
 
 The three notions, in `crates/mc-shm-transport`:
 
-1. `const PAGE_SIZE: usize = 4096` (`src/backend/ring.rs:29`), used by
-   `Layout::new` at `:164`, `:170`, `:173`, and by `prefault_read` at `:1671`.
+1. `const PAGE_SIZE: usize = 4096` (`src/backend/ring.rs:28`), used by
+   `Layout::new` at `:164`, `:170`, `:172`, and by `prefault_read` at `:1673`.
 2. A bare literal `let page = 4096usize` (`src/arena.rs:229`), used by the
    `prefault` write walk at `:230`. This one does not even reference the constant,
    so a change to `PAGE_SIZE` would not reach it.
-3. `system_page_size()` (`src/backend/ring.rs:195-201`), which reads
+3. `system_page_size()` (`src/backend/ring.rs:194-200`), which reads
    `sysconf(_SC_PAGESIZE)` and falls back to `PAGE_SIZE`. Its sole caller is
-   `verify_prefaulted` at `:1007`.
+   `verify_prefaulted` at `:1009`.
 
 `verify_prefaulted` is a hard gate on creation, not a diagnostic:
 `Ring::create_in` returns `PrefaultFailed` if it reports false (`:586-588`). That
@@ -48,10 +48,10 @@ No host in CI exercises any of this. `.github/workflows/ci.yml:132` builds
 `[ubuntu-latest, macos-latest]`. The Linux step (`:159-166`) runs
 `cargo nextest run -p mc-shm-native -p mc-shm-transport` with no target filter, so
 it runs the lib target and therefore
-`residency_vector_tracks_runtime_page_size` (`src/backend/ring.rs:1790-1800`) —
+`residency_vector_tracks_runtime_page_size` (`src/backend/ring.rs:1785-1795`) —
 but on an x86-64 runner whose page size is 4096, where the assertion about 16384
 is a property of the pure function and not of any mapping. The macOS step
-(`:169-176`) runs `cargo nextest run -p mc-shm-transport --test contract --test
+(`:168-175`) runs `cargo nextest run -p mc-shm-transport --test contract --test
 fuzz_corpus`; `--test` selects integration targets, so the lib target is excluded
 and even that pure test does not run on macOS. Neither step runs `tests/ring.rs`
 on macOS, and `tests/contract.rs` and `tests/fuzz_corpus.rs` construct no `Ring`.
@@ -105,8 +105,8 @@ executed and its own probe passed. It must not assert a page-size violation.
 ### Q: Did `a5568707` leave any page-size-dependent code on the constant, and does any of it under-cover pages rather than over-cover them?
 
 - Sources examined: `git show a5568707 -- crates/mc-shm-transport/src/backend/ring.rs`
-  in full; `src/backend/ring.rs:29`, `:142-183`, `:195-205`, `:569-588`,
-  `:1006-1020`, `:1670-1675`, `:1790-1800`; `src/arena.rs:221-236`; every
+  in full; `src/backend/ring.rs:28`, `:141-182`, `:194-204`, `:574-593`,
+  `:1008-1022`, `:1672-1677`, `:1785-1795`; `src/arena.rs:221-236`; every
   occurrence of `PAGE_SIZE`, `system_page_size`, `residency_vector_len`, and
   `4096` in the crate; `.github/workflows/ci.yml:126-177`; the import lists of
   `tests/contract.rs` and `tests/fuzz_corpus.rs`. Residency-vector and offset

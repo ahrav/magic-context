@@ -3,19 +3,29 @@
 ## Discovery trigger
 
 The ring backend answers every capacity limit with a bounded, non-terminal code.
-A full descriptor set is `ProducerError::Exhausted` (`ring.rs:683-685`), which
+A full descriptor set is `ProducerError::Exhausted` (`ring.rs:685-687`), which
 `reserve_until` converts to `Deadline` after the profile's scheduling budget
-(`ring.rs:753`). A full lease set is `Ok(None)`, and the doc comment states the
+(`ring.rs:755`). A full lease set is `Ok(None)`, and the doc comment states the
 rule explicitly: "A full lease set is backpressure, not a fault" and "Errors are
-reserved for faults that end the channel" (`ring.rs:761-777`). The iceoryx
+reserved for faults that end the channel" (`ring.rs:763-779`). The iceoryx
 backend has no descriptor set, no lease counter, and no deadline parameter, so
 the question is what it returns instead when the same two limits bind.
 
 ## Evidence trail
 
-- `crates/mc-shm-transport/src/backend/mod.rs:1-9` — there is **no shared
-  backend trait**. The module is four declarations. Line 1 asserts in prose that
-  "Backends use same direct producer and scoped receive ownership", and nothing
+- **The cited mechanism is gone.** `0f336d3c` ("refactor(shm): collapse to fixed
+  ring transport") deleted `crates/mc-shm-transport/src/backend/iceoryx.rs`,
+  `crates/mc-shm-transport/tests/iceoryx.rs`, and the `iceoryx` Cargo feature, so
+  `backend/mod.rs` now declares only `ring` and `sample`. Every `iceoryx.rs`
+  citation below is kept as a record of what the removed backend did and did not
+  guarantee, and resolves against `9c1eb4d1`, not HEAD. No successor backend
+  exists in the tree.
+
+- `crates/mc-shm-transport/src/backend/mod.rs:1-6` — there is **no shared
+  backend trait**. At `9c1eb4d1` the module was four declarations whose line 1
+  asserted in prose that "Backends use same direct producer and scoped receive
+  ownership"; `0f336d3c` cut it to `ring` and `sample` and rewrote that line.
+  Nothing
   in the type system holds either backend to it, so every parity claim below is
   a prose claim only.
 - `backend/iceoryx.rs:78-80` — the service is built with
@@ -79,7 +89,7 @@ leases, then publish one more. `try_receive` now sees a channel with data whose
 borrow count is at the cap and returns `Err(ReceiveFailed)`. The ring answers
 the same state with `Ok(None)` and has a test pinning it,
 `lease_limit_reports_backpressure_then_recovers_after_release`
-(`tests/ring.rs:289`).
+(`tests/ring.rs:279`).
 
 ## Timing windows and dependencies
 
@@ -115,7 +125,7 @@ to emit, both preconditions rather than violations:
 ### Q: When the two configured caps bind, does the iceoryx backend return a bounded backpressure code the way the ring does?
 
 - Sources examined: `backend/iceoryx.rs:50-118`, `:121-144`, `:150-176`,
-  `:247-303`; `backend/ring.rs:662-734`, `:737-757`, `:759-777`;
+  `:247-303`; `backend/ring.rs:664-736`, `:739-759`, `:761-779`;
   `backend/mod.rs:1-9`; `tests/iceoryx.rs:16-43`, `:122-137`;
   `benches/hardware_envelope.rs:531-598`; and in the vendored iceoryx2 0.9.3
   and iceoryx2-cal 0.9.3 sources, `src/config.rs:300-350`,

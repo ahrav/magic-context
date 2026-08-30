@@ -46,15 +46,15 @@ at once.
   (`:680-691`), both of which call `Ring::reserve_until` (`:669`, `:685`) with a
   deadline of `now + frame_deadline` (`:644`). `reserve_until` busy-retries in the
   calling thread, sleeping 50 microseconds per attempt under `ColdParkWake`
-  (`crates/mc-shm-transport/src/backend/ring.rs:745-751`), which is the profile the
-  host selects (`:81`). There is no `.await` anywhere in that path, so while the
+  (`crates/mc-shm-transport/src/backend/ring.rs:747-753`), which is the profile the
+  host selects (`:80`). There is no `.await` anywhere in that path, so while the
   outbound ring is full no `try_receive` runs at all. The stall is bounded by
   `frame_deadline` per frame, and on expiry `publish_one` returns `Err`, the loop
-  cancels and returns `false` (`:538-542`), and the close is unclean and reports a
-  suspect (`:364-371`).
+  cancels and returns `false` (`:546-550`), and the close is unclean and reports a
+  suspect (`:347-354`).
 - **Second starvation path, inbound blocks outbound.** `receive_one` ends with
-  `inbound.send(Ok(InboundEvent::Frame(..))).await` (`:612-617`) on the bounded channel
-  created at `:308` with `mpsc::channel(ctx.queue_frames)`. That await has no timeout
+  `inbound.send(Ok(InboundEvent::Frame(..))).await` (`:617-622`) on the bounded channel
+  created at `:291` with `mpsc::channel(ctx.queue_frames)`. That await has no timeout
   and is not inside a `select!`, so it parks until the application drains the channel or
   the receiver is dropped. While parked, the endpoint publishes nothing. The bound comes
   from the far side instead: a sender whose queue stays full past its deadline retires
@@ -79,7 +79,7 @@ at once.
   lockstep shape: `send` reserves, writes, and commits in one call
   (`ring_transport.rs:659-673`) and `recv` polls to a deadline (`:762-776`). The transport
   test `two_process_zero_copy_exchange_uses_authenticated_grant`
-  (`crates/mc-shm-transport/tests/ring.rs:565-602`) uses a single ring in a single
+  (`crates/mc-shm-transport/tests/ring.rs:581-618`) uses a single ring in a single
   direction.
 
 ## Failure scenario
@@ -142,7 +142,7 @@ emit: `shm_both_directions_in_flight`.
 - Sources examined: `crates/mc-host/src/ring_transport.rs:33`, `:75-100`, `:287-397`,
   `:459-544`, `:455-534`, `:536-578`, `:665-691`, `:711-777`;
   `crates/mc-host/src/frame_channel.rs:770-826`, `:838-880`;
-  `crates/mc-shm-transport/src/backend/ring.rs:736-757`, `:764-844`;
+  `crates/mc-shm-transport/src/backend/ring.rs:738-759`, `:766-846`;
   `crates/mc-host/tests/shm_transport.rs:189-271`.
 - Findings: yes, and the two directions are not symmetric. Inbound cannot starve
   outbound through the receive path, because every received frame is followed by one

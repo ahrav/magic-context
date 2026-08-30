@@ -28,7 +28,7 @@ constant against the layout it mirrors.
 
 ### Current state of the boundary suite
 
-`packages/mc-shm-native/tests/mechanism.ts:138` opens
+`packages/mc-shm-native/tests/mechanism.ts:148` opens
 `describe("raw N-API descriptor boundary")` with
 `DESCRIPTOR_ERROR = /invalid shared-memory descriptor/` at line 139 and a helper
 `expectRejectedWithoutEffects` (lines 141-153) that defaults to that pattern.
@@ -45,11 +45,11 @@ Six cases follow:
 
 The four generic cases cannot distinguish the rejection they name from a
 grant-layout rejection, because `RingGrant::decode` failure maps to
-`descriptor_error()` — the same message (`packages/mc-shm-native/src/lib.rs:500-512`).
+`descriptor_error()` — the same message (`packages/mc-shm-native/src/lib.rs:511-530`).
 
 Ordering matters here and refines the catalog's count. In `attach`, the profile
-comparison is at `src/lib.rs:492`, before the two `RingGrant::decode` calls at
-`:500` and `:507`. The wrong-profile case at line 278 therefore returns before
+comparison is at `src/lib.rs:504`, before the two `RingGrant::decode` calls at
+`:511` and `:521`. The wrong-profile case at line 278 therefore returns before
 grant decode is ever reached and could not have been masked by a stale grant.
 Of the six cases, four are maskable, one short-circuits earlier, and one — line
 288, the only case that needs the grant to be *valid* — is the case that
@@ -134,8 +134,8 @@ during the trail is logged so the count in the catalog can be re-derived.
 
 - Sources examined: `git show daf6e244` message and its diff against
   `packages/mc-shm-native/tests/mechanism.ts`; the current
-  `raw N-API descriptor boundary` block (`mechanism.ts:138-299`); the `attach`
-  validation order (`packages/mc-shm-native/src/lib.rs:470-548`);
+  `raw N-API descriptor boundary` block (`mechanism.ts:148-287`); the `attach`
+  validation order (`packages/mc-shm-native/src/lib.rs:490-568`);
   `crates/mc-shm-transport/tests/fuzz_corpus.rs` in full;
   `crates/mc-shm-transport/src/harness.rs:30-40` and `:110-135`; the corpus
   directory listings and file sizes.

@@ -18,8 +18,8 @@ no successor. See the refresh note in [../catalog.md](../catalog.md).
 ## Discovery trigger
 
 `FrameDescriptor::validate` carries a 21-byte `wire_header`
-(`crates/mc-shm-transport/src/descriptor.rs:294`, length constant at `:10`) and
-inspects exactly five of those bytes (`:414-422`). The other sixteen are copied
+(`crates/mc-shm-transport/src/descriptor.rs:169`, length constant at `:10`) and
+inspects exactly five of those bytes (`:289-297`). The other sixteen are copied
 into `ValidatedFrame` (`:425`) and handed to a consumer untouched. The transport
 crate cannot inspect them even in principle: `crates/mc-shm-transport/Cargo.toml`
 depends on `getrandom`, `libc`, `serde`, and `iceoryx2`, while
@@ -32,15 +32,16 @@ whether the owed check runs before anything acts on the frame.
 ## Evidence trail
 
 Transport side, receiver direction. `Ring::try_receive` snapshots the shared
-descriptor with one `read_volatile` (`backend/ring.rs:802`), validates it
-(`:804`), and on failure quarantines the ring and returns
-`RingError::Descriptor` (`:806-809`). Inside `validate`, the only header checks
+descriptor with one `read_volatile` (`backend/ring.rs:804`), validates it
+(`:806`), and on failure quarantines the ring and returns
+`RingError::Descriptor` (`:808-811`). Inside `validate`, the only header checks
 are `declared_len` from bytes 0..4 against `body_len`, and `wire_header[4] != 2`,
-both yielding `DescriptorError::WireHeaderMismatch` (`descriptor.rs:414-422`,
-variant documented at `:565`). Bytes 5 through 20 — type, flags, channel, epoch,
+both yielding `DescriptorError::WireHeaderMismatch` (`descriptor.rs:289-297`,
+variant documented at `:440`). Bytes 5 through 20 — type, flags, channel, epoch,
 correlation — are never read. The same two checks appear on the producer side in
-`commit_reservation` (`ring.rs:1172-1180`, `ProducerError::WireHeaderMismatch`)
-and a third time in the iceoryx backend (`backend/iceoryx.rs:257-262`). The
+`commit_reservation` (`ring.rs:1174-1182`, `ProducerError::WireHeaderMismatch`)
+and, at `9c1eb4d1`, a third time in the iceoryx backend
+(`backend/iceoryx.rs:257-262`), which `0f336d3c` deleted. The
 literal `2` in all three places mirrors `PROTOCOL_VERSION` (`wire.rs:25`) with no
 shared definition, and `MAX_FRAME_BYTES` (`arena.rs:4`) mirrors
 `MAX_FRAME_BODY_LEN` (`wire.rs:35`); both pairs are 64 MiB today and neither pair
@@ -92,7 +93,7 @@ Second, a consumer that reads `ValidatedFrame::wire_header()` without running
 both host gates acts on sixteen unvalidated bytes; the transport's success return
 is not evidence about them. Third, a version 3 that relocates `len` or `ver`
 inside the header — the extension point at `wire.rs:292-297` exists precisely to
-allow this — leaves `descriptor.rs:414-419` validating whatever now occupies
+allow this — leaves `descriptor.rs:289-294` validating whatever now occupies
 offsets 0..5, silently, since the transport cannot see the version registry.
 
 ## Timing windows and dependencies
@@ -104,7 +105,7 @@ above it inherits that hold time. Depends on
 `receive-failure-leaves-no-wedged-slot` for the slot state after a rejection, and
 on `quarantine-authority-survives-peer-writes` for the premise that a peer can
 author descriptor bytes at all — both mappings are `PROT_READ|PROT_WRITE`
-(`ring.rs:229`, `:258`).
+(`ring.rs:227`, `:249`).
 
 ## What a test must construct
 

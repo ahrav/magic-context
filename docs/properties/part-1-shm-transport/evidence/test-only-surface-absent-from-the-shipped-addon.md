@@ -155,7 +155,7 @@ there is no build-profile distinction anywhere in this package.
   `packages/mc-shm-native/package.json` in full;
   `packages/mc-shm-native/index.ts:386-518` for the re-export surface;
   `packages/mc-shm-native/src/napi_buffers.rs:55-90`, `:223-225`, `:271-286`;
-  `packages/mc-shm-native/src/lib.rs:248-269` and `:334-360`;
+  `packages/mc-shm-native/src/lib.rs:254-275` and `:334-360`;
   `crates/mc-shm-transport/src/lib.rs:1-26`;
   `packages/mc-shm-native/tests/mechanism.ts:38-60`.
 - Findings: no gating mechanism exists to be intended or unintended — the

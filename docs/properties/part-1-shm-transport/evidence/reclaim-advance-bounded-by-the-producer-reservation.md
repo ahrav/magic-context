@@ -95,21 +95,21 @@ case is actually reached.
 
 ## Investigation log
 
-### Q: Was the atomic `reservation_len` (`ring.rs:113`) intended to be the producer's trusted record? It is written but never read by `reclaim_completed`. A producer-local table would be trustworthy; is that feasible given `Ring` is thread-confined?
+### Q: Was the atomic `reservation_len` (`ring.rs:112`) intended to be the producer's trusted record? It is written but never read by `reclaim_completed`. A producer-local table would be trustworthy; is that feasible given `Ring` is thread-confined?
 
 - Sources examined: `git log -S "reservation_len" -- crates/mc-shm-transport/src/backend/ring.rs`,
   which returns exactly one commit, `6f504bf2` "feat(mc-shm-transport): U9/U4
   bounded shared-memory transport core" — the field's introducing commit, with no
-  later change; `ring.rs:912-996` for `conservation()`, its only reader; the
-  SAFETY comment at `:932`, "reservation length is atomic and assigned before
+  later change; `ring.rs:914-998` for `conservation()`, its only reader; the
+  SAFETY comment at `:934`, "reservation length is atomic and assigned before
   non-free state is observed", which describes an observation contract for a
-  *reader of the snapshot*, not a trust contract; `ring.rs:525-532` for `Ring`'s
+  *reader of the snapshot*, not a trust contract; `ring.rs:533-540` for `Ring`'s
   `PhantomData<Rc<()>>` marker.
 - Findings: the field's single documented purpose is the conservation snapshot.
   Nothing in the introducing commit, the field's comments, or
   `docs/mc-host-shm-transport.md` describes it as an authoritative record for
   reclamation. On feasibility: `Ring` carries `_not_send_or_sync:
-  PhantomData<Rc<()>>` (`:531`) and takes `&self` on every operation, so it is
+  PhantomData<Rc<()>>` (`:539`) and takes `&self` on every operation, so it is
   thread-confined by construction. A `RefCell<[u64; depth]>` or equivalent held in
   the `Ring` value would be private, process-local, and unreachable by the peer,
   so a producer-local table is structurally possible. Whether the producer and the
@@ -117,8 +117,8 @@ case is actually reached.
   established: `reclaim_completed` is called from the producer path, but I did not
   trace every caller.
 - Missing evidence: any statement of design intent for `reservation_len`. Also
-  unestablished: whether a peer rewrite can actually get past `:1127-1130` and
-  `:1133` together while remaining internally consistent. I constructed the
+  unestablished: whether a peer rewrite can actually get past `:1129-1132` and
+  `:1135` together while remaining internally consistent. I constructed the
   requirements above by reading the guards but did not build a concrete accepted
   tuple, which is why the catalog confidence is medium rather than high.
 - Conclusion: unresolved, needs an exploitability construction. Specifically:

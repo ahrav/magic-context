@@ -27,15 +27,15 @@ inbound channel.
 
 ## Evidence trail
 
-- `crates/mc-shm-transport/src/backend/ring.rs:823-826` — the commit point for
+- `crates/mc-shm-transport/src/backend/ring.rs:825-828` — the commit point for
   acquisition. Inside one `unsafe` block, `try_receive` stores
-  `SLOT_RECEIVER_LEASED` (`:824`), stores `consumed = sequence` with `Release`
-  (`:825`), and increments `active_leases` (`:826`). All three happen before the
-  lease value is constructed at `:833-845` and returned.
+  `SLOT_RECEIVER_LEASED` (`:826`), stores `consumed = sequence` with `Release`
+  (`:827`), and increments `active_leases` (`:828`). All three happen before the
+  lease value is constructed at `:835-847` and returned.
 - `crates/mc-shm-transport/src/lease.rs:215-221` — `impl Drop for ReceiveLease`
   calls `release_once()` if `!self.released`, discarding the result with
   `let _ =`. Dropping a lease is a full release, not an abandonment.
-- `crates/mc-shm-transport/src/backend/ring.rs:901-908` — `release` stores the
+- `crates/mc-shm-transport/src/backend/ring.rs:903-910` — `release` stores the
   `completion_sequence` and decrements `active_leases`, which makes the slot
   eligible for `reclaim_completed`. Nothing records that the body was never read.
 - `crates/mc-host/src/ring_transport.rs:464-470` — `receive_one` binds the lease.
@@ -74,7 +74,7 @@ indistinguishable from a cancellation that arrived before the frame existed.
 
 ## Timing windows and dependencies
 
-The window opens at `ring.rs:825` when `consumed` advances and closes at
+The window opens at `ring.rs:827` when `consumed` advances and closes at
 `ring_transport.rs:520` when `to_vec` runs. Its width is the duration of the
 ingress-charge loop, which is bounded above by `frame_deadline` but is not
 bounded below and is zero-width on an uncontended budget. That is why the window

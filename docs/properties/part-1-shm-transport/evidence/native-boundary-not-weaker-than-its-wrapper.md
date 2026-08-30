@@ -31,20 +31,22 @@ The wrapper, `decodeShmGrant` in
 - `:283-287` — `aliased_lanes` on equal fds, equal grant text, **or equal
   incarnations**.
 
-The native boundary, `attach` in `packages/mc-shm-native/src/lib.rs:470-550`:
+The native boundary, `attach` in `packages/mc-shm-native/src/lib.rs:490-568`:
 
-- `:486-490` — argument must be an `Object`.
-- `:491-494` — `profile != PROFILE`, where `PROFILE` is `"mc-host-test-ring-v1"`
-  (`:32`). Present.
-- `:495-499` — `pid` in `1..=u32::MAX`, both fds in `0..=i32::MAX`. Present.
-- `:500-513` — both grant strings are read with a `256`-byte length cap and
-  decoded by `decode_hex` (`:216-236`), which requires exact length and strict
-  lowercase hex, then by `RingGrant::decode`
-  (`crates/mc-shm-transport/src/backend/ring.rs:430-457`), which rejects nonzero
-  reserved bytes at `:430-432` and runs `checked_layout` at `:455`.
-- `:516-518` — `host_to_peer_fd == peer_to_host_fd || host_to_peer_grant ==
+- `:498-502` — argument must be an `Object`.
+- `:503-506` — `profile != PROFILE`, where `PROFILE` is `"mc-host-test-ring-v1"`
+  (`:27`). Present.
+- `:507-510` — both fds in `0..=i32::MAX`. Present. The `pid` bound is gone with
+  the descriptor field: `0f336d3c` moved attachment onto descriptors transferred
+  by the setup socket, so `attach_ring` no longer takes a pid.
+- `:511-530` — both grant strings are read with a `GRANT_HEX_LEN` length cap and
+  decoded by `strict_hex` (`:224-238`, which replaced `decode_hex`), requiring
+  exact length and strict lowercase hex, then by `RingGrant::decode`
+  (`crates/mc-shm-transport/src/backend/ring.rs:426-453`), which rejects nonzero
+  reserved bytes at `:426-428` and runs `checked_layout` at `:451`.
+- `:533-535` — `host_to_peer_fd == peer_to_host_fd || host_to_peer_grant ==
   peer_to_host_grant` rejects. Two of the wrapper's three aliasing conditions.
-- `:523-526` — `GrantReservation::claim` refuses a grant already live in this
+- `:540-543` — `GrantReservation::claim` refuses a grant already live in this
   process.
 
 What the native boundary does **not** do, checked against the list above:
@@ -57,15 +59,15 @@ What the native boundary does **not** do, checked against the list above:
    type contract before it can be dropped by the implementation.
 3. No `stale_candidate` monotonicity, following from 2.
 4. No lane binding. `RingGrant::decode` reads `lane` and `validate_lifecycle`
-   confirms it matches the mapped object (`ring.rs:1663`), but nothing requires
+   confirms it matches the mapped object (`ring.rs:1665`), but nothing requires
    `host_to_peer` to carry lane 0.
-5. No aliasing-by-incarnation. `:516` compares fds and encoded grants, not
+5. No aliasing-by-incarnation. `:533` compares fds and encoded grants, not
    incarnations.
-6. No geometry pin. `checked_layout` (`ring.rs:465-482`) accepts any nonzero
+6. No geometry pin. `checked_layout` (`ring.rs:461-478`) accepts any nonzero
    depth with `max_leases <= depth` and an arena at or above the floor, so depth
    32 passes where the wrapper demands 8.
 7. No absolute total-bytes ceiling. Native instead requires `layout.total ==
-   total` exactly (`ring.rs:478-480`), which is *stronger* for internal
+   total` exactly (`ring.rs:474-476`), which is *stronger* for internal
    consistency and *weaker* as a cap, since it admits any consistent total.
 
 `GrantReservation` (`packages/mc-shm-native/src/lib.rs:552-580` for `claim`, and
@@ -86,11 +88,11 @@ The wrapper's `stale_candidate` fence exists precisely to stop this.
 
 Role confusion. Field *position* is the only thing assigning a direction: `attach`
 passes `host_to_peer_grant` to the `from_host` slot and `peer_to_host_grant` to
-`to_host` (`:527-528`, `:540-541`). If both grants carry the same lane, nothing
+`to_host` (`:544-545`, `:557-558`). If both grants carry the same lane, nothing
 native objects, and two producers end up on one single-producer lane. The
 single-producer assumption is load-bearing: `try_reserve` derives the next
 sequence from `published + 1` and claims the slot with a
-`FREE → PRODUCER_RESERVED` compare-exchange (`ring.rs:687-701`), which is only
+`FREE → PRODUCER_RESERVED` compare-exchange (`ring.rs:689-703`), which is only
 race-free with one producer.
 
 ## Timing windows and dependencies
@@ -114,7 +116,7 @@ addon's own test already has. For each of `unexpected_field`, `stale_candidate`,
 `out_of_range`, build the descriptor that triggers it and assert the native
 `attach` rejects, with `activeChannelCount()`, `activeExternalRefCount()`, and
 `nativeLeakDiagnostics()` unchanged across the throw — the pattern
-`expectRejectedWithoutEffects` (`mechanism.ts:139-145`) already uses. Six of these
+`expectRejectedWithoutEffects` (`mechanism.ts:149-155`) already uses. Six of these
 are expected to fail today; that is the point. The replay case needs a full
 attach, close, and re-attach with the same grant, so it needs a real host-created
 object rather than the synthetic fixture.
@@ -126,14 +128,14 @@ object rather than the synthetic fixture.
 - Sources examined:
   `packages/plugin/src/shared/mc-host-client/shm-transport-provider.ts:41-71`,
   the only production construction of a `NativeDescriptor`;
-  `packages/mc-shm-native/index.ts:43` and `:394-399`, where `NativeChannel.attach`
+  `packages/mc-shm-native/index.ts:76` and `:394-399`, where `NativeChannel.attach`
   forwards a `NativeDescriptor` to `native.attach`;
   `packages/mc-shm-native/tests/mechanism.ts:64-135` for the direct-require path
   and its synthetic grants; `packages/mc-shm-native/src/lib.rs:470-550` and
-  `:527-528` for how the two grants are bound to `from_host` and `to_host`.
+  `:544-545` for how the two grants are bound to `from_host` and `to_host`.
 - Findings: no *attacker*-ordered path exists today. The single production caller
   copies the wrapper's already-validated, already-lane-checked fields into the
-  descriptor by name (`:57-64`), so a hostile provider cannot swap them there —
+  descriptor by name (`:63-70`), so a hostile provider cannot swap them there —
   the wrapper has already bound lane 0 to `host_to_peer` and lane 1 to
   `peer_to_host`. A *bug*-ordered path is fully reachable: `NativeDescriptor` is a
   TypeScript interface, erased at runtime, and the two grant fields are both
@@ -141,11 +143,11 @@ object rather than the synthetic fixture.
   accepted mistake. The mechanism test proves an unvalidated caller can reach
   `attach` at all.
 - Missing evidence: whether the ring's own incarnation and lane checks would
-  catch a transposition in practice. `validate_lifecycle` (`ring.rs:1637-1668`)
+  catch a transposition in practice. `validate_lifecycle` (`ring.rs:1639-1670`)
   compares the grant's lane against the mapped object's lane, so a transposed
   *pair of grants together with their matching fds* would still attach
   successfully with both directions inverted; a transposition of grants without
-  fds would fail at `:1663`. I did not construct either case, so the exact
+  fds would fail at `:1665`. I did not construct either case, so the exact
   survivable transpositions are unestablished.
 - Conclusion: unresolved, needs the transposition matrix. Concretely: enumerate
   the four combinations of swapped and unswapped `(fd, grant)` pairs and record

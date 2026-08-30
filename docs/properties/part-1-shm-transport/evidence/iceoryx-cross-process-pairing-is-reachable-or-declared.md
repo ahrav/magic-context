@@ -12,6 +12,14 @@ creates both ports itself, under a service name it never discloses.
 
 ## Evidence trail
 
+- **The cited mechanism is gone.** `0f336d3c` ("refactor(shm): collapse to fixed
+  ring transport") deleted `crates/mc-shm-transport/src/backend/iceoryx.rs`,
+  `crates/mc-shm-transport/tests/iceoryx.rs`, and the `iceoryx` Cargo feature, so
+  `backend/mod.rs` now declares only `ring` and `sample`. Every `iceoryx.rs`
+  citation below is kept as a record of what the removed backend did and did not
+  guarantee, and resolves against `9c1eb4d1`, not HEAD. No successor backend
+  exists in the tree.
+
 - `backend/iceoryx.rs:57-69` — the service name is built from 16 bytes of
   `getrandom` output formatted as `mc-shm-` plus 32 hex characters, inside
   `create`. It is not a parameter, it is not stored on the struct
@@ -29,37 +37,37 @@ creates both ports itself, under a service name it never discloses.
   `IceoryxBackend::create` builds one of each, a second process that somehow
   guessed the name could not construct a backend against a live pair at all.
 - `backend/iceoryx.rs:56` and `:163` — the incarnation is minted locally by
-  `Incarnation::random()` (`descriptor.rs:227-231`), and `try_receive` builds the
+  `Incarnation::random()` (`descriptor.rs:102-106`), and `try_receive` builds the
   expected identity from `self.incarnation`. There is no accessor for it, no
   constructor that accepts one, and no encode or decode path. Compare
   `backend/sample.rs:94-96`: a sample whose prefix carries any other incarnation
   is rejected as `WrongIncarnation`. So even a hypothetical second participant
   would have every one of its samples refused.
-- `backend/ring.rs:398-488` `RingGrant` with `encode` (`:410`), `decode`
-  (`:429`), and `decode_slice` (`:460`); `:614-616` `grant()`; `:620-622`
-  `raw_fd()`; `:626-639` `attachment()` duplicating the descriptor with
+- `backend/ring.rs:398-488` `RingGrant` with `encode` (`:406`), `decode`
+  (`:425`), and `decode_slice` (`:456`); `:619-621` `grant()`; `:624-626`
+  `raw_fd()`; `:629-642` `attachment()` duplicating the descriptor with
   `F_DUPFD_CLOEXEC`. That is the transfer channel the iceoryx backend lacks.
-- `backend/ring.rs:601` calls `validate_lifecycle`, which at `:1637-1668` reads
+- `backend/ring.rs:606` calls `validate_lifecycle`, which at `:1639-1670` reads
   eight fields from the shared page and compares all eight against the grant,
-  including the incarnation (`snapshot.6` at `:1653`, compared at `:1663`). On
-  Linux `create_in` also seals the object (`:575-576`) and
-  `validate_seals` (`:1706-1713`) requires `F_SEAL_GROW|SHRINK|SEAL`. None of
+  including the incarnation (`snapshot.6` at `:1655`, compared at `:1665`). On
+  Linux `create_in` also seals the object (`:580-581`) and
+  `validate_seals` (`:1701-1708`) requires `F_SEAL_GROW|SHRINK|SEAL`. None of
   these three mechanisms — grant equality, incarnation equality against shared
   state, or seals — exists on the iceoryx path.
 - `crates/mc-shm-transport/tests/iceoryx.rs` — all seven tests construct exactly
-  one `IceoryxBackend` and use it as both producer and receiver (`:79`, `:109`,
-  `:124`, `:141`, `:289`; the two decoder tests at `:164` and `:233` call
+  one `IceoryxBackend` and use it as both producer and receiver (`:79`, `:108`,
+  `:123`, `:141`, `:289`; the two decoder tests at `:164` and `:233` call
   `SamplePrefix` directly and touch no backend at all).
   `benches/hardware_envelope.rs:564` does the same, and the bench report
   classifies the arm accordingly: `loopback_smoke_arms: ["iceoryx_0_9_3"]`
   (`:141`), against nine `paired_process_arms` at `:140` that include `ring`.
-- `crates/mc-shm-transport/tests/ring.rs:565`
+- `crates/mc-shm-transport/tests/ring.rs:581`
   `two_process_zero_copy_exchange_uses_authenticated_grant` is the ring's
   two-process test. There is no iceoryx analogue, and none can be written against
   this API.
 - `crates/mc-shm-transport/Cargo.toml:9-10` — `default = ["iceoryx"]`. The
   backend is compiled by default *for the transport crate*.
-  `crates/mc-host/Cargo.toml:25` and `packages/mc-shm-native/Cargo.toml:13` both
+  `crates/mc-host/Cargo.toml:25` and `packages/mc-shm-native/Cargo.toml:16` both
   depend with `default-features = false`, so neither the host nor the shipped
   addon contains it.
 
@@ -121,10 +129,10 @@ the evidence.
 ### Q: Given no grant, no descriptor, no seals, and no lifecycle page, what authenticates a peer on the iceoryx path?
 
 - Sources examined: `backend/iceoryx.rs:48-118`, `:150-176`, `:36-46`;
-  `crates/mc-shm-transport/src/descriptor.rs:225-242`;
+  `crates/mc-shm-transport/src/descriptor.rs:100-117`;
   `backend/sample.rs:83-127`; `backend/ring.rs:398-488`, `:534-611`,
-  `:613-639`, `:1637-1668`, `:1706-1713`; `tests/iceoryx.rs` in full;
-  `tests/ring.rs:565`; `benches/hardware_envelope.rs:140-141`, `:531-598`;
+  `:613-639`, `:1639-1670`, `:1701-1708`; `tests/iceoryx.rs` in full;
+  `tests/ring.rs:581`; `benches/hardware_envelope.rs:140-141`, `:531-598`;
   `benches/manifests/v1.json:100-155`; the three `Cargo.toml` files;
   `.github/workflows/ci.yml:154-176`; and in iceoryx2 0.9.3,
   `src/port/publisher.rs:560-570` and `src/port/subscriber.rs:320-332`.

@@ -18,10 +18,10 @@ to it.
 
 Every write to any of the six fields, repository-wide, is one of:
 
-- `crates/mc-shm-transport/tests/contract.rs:422-427` — a literal `1` per field
+- `crates/mc-shm-transport/tests/contract.rs:488-493` — a literal `1` per field
   in the `purity_gate_rejects_injected_copy_allocation_queue_and_wake` fixture
   (`#[test]` at line 420, `fn` at line 421).
-- `crates/mc-shm-transport/benches/hardware_envelope.rs:183-188` — construction
+- `crates/mc-shm-transport/benches/hardware_envelope.rs:162-167` — construction
   from the `measure` tuple; `generic_queue_hops: 0` and `scheduler_handoffs: 0`
   are literals here.
 - `benches/hardware_envelope.rs:191-196` — all six overwritten with `1` under
@@ -108,7 +108,7 @@ counts across the fork boundary rather than having them inferred after
   repository-wide search for each of the six field names and for
   `OperationCounters` and `disqualifications`;
   `benches/hardware_envelope.rs` in full; `benches/manifests/v1.json`
-  `selection_gate`; `tests/contract.rs:420-443`;
+  `selection_gate`; `tests/contract.rs:486-509`;
   `docs/mc-host-shm-transport.md:25`.
 - Findings: the type has no constructor that observes anything and no
   production caller. Its doc comment calls it "Operation counters used to

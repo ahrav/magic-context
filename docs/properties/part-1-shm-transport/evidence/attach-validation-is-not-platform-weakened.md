@@ -42,15 +42,21 @@ and the macOS CI step does not run the file that would (see
 What compensates on macOS is not a check but an absence of handles. The `Mapping`
 struct carries `fd: OwnedFd` only under `#[cfg(target_os = "linux")]`
 (`:207-212`), and both constructors `drop(fd)` immediately after `mmap` under
-`#[cfg(target_os = "macos")]` (`:238-239`, `:268-269`). `create_macos_shm` also
+`#[cfg(target_os = "macos")]`. Those two macOS-only `drop(fd)` sites are gone:
+`0f336d3c` made `Mapping` retain the descriptor on both platforms
+(`:237`, `:259`). `create_macos_shm` also
 `shm_unlink`s the name before returning (`:1779`). So a macOS ring object has no
-name and, after construction, no descriptor: `Ring::raw_fd` (`:619-622`),
-`Ring::attachment` (`:625-640`), `Ring::set_inheritable` (`:642`), and the whole
-`RingAttachment` type (`:497-518`) are `#[cfg(target_os = "linux")]`. Both
+name. It no longer follows that macOS has no descriptor after construction:
+`Ring::raw_fd` (`:623-626`), `Ring::attachment` (`:628-642`),
+`Ring::set_inheritable` (`:644`), and the `RingAttachment` type (`:502-530`) all
+lost their `#[cfg(target_os = "linux")]` gate in `0f336d3c`, so the premise this
+record rests on has changed and needs re-review rather than re-citation. At
+`9c1eb4d1`, both
 `attach_ring` helpers that would supply a descriptor go through
 `/proc/{pid}/fd/{fd}` and are Linux-gated
 (`packages/mc-shm-native/src/lib.rs:237-246`,
-`crates/mc-host/src/shm_provider.rs:779-789`), and `create_test_pair` returns an
+and the host-side `attach_ring` deleted with `shm_provider.rs` in `ed487e11`), and
+`create_test_pair` returned an
 error on non-Linux (`packages/mc-shm-native/src/lib.rs:552-560`). macOS thus gets
 size immutability by unreachability, not by sealing.
 
@@ -97,11 +103,12 @@ attributable to the missing checks and not to the test setup.
 
 ### Q: Is the macOS attach genuinely reachable, or is the missing seal check harmless because no descriptor can exist?
 
-- Sources examined: `ring.rs:207-212`, `:215-245`, `:249-274`, `:278-281`,
-  `:497-518`, `:544-590`, `:593-611`, `:619-640`, `:642`, `:1677-1703`,
-  `:1705-1714`, `:1743-1751`, `:1753-1788`; every `target_os` occurrence in
+- Sources examined: `ring.rs:206-211`, `:213-238`, `:240-259`, `:262-264`,
+  `:502-530`, `:544-590`, `:598-616`, `:623-642`, `:644`, `:1677-1703`,
+  `:1700-1709`, `:1738-1746`, `:1748-1783`; every `target_os` occurrence in
   `crates/mc-shm-transport/src`, `packages/mc-shm-native/src`, and
-  `crates/mc-host/src/shm_provider.rs`; both `attach_ring` helpers;
+  `crates/mc-host/src/ring_transport.rs`, which replaced `shm_provider.rs` in
+  `ed487e11`; both `attach_ring` helpers as they stood at `9c1eb4d1`;
   `create_test_pair`; `docs/mc-host-shm-transport.md:117` for the trusted-peer
   boundary; `docs/evidence/mc-shm-traceability-v1.json:48`.
 - Findings: unreachable in-tree today. No macOS code path produces an `OwnedFd`

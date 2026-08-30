@@ -73,7 +73,7 @@ sets `cleanupHooks: false`. A caller that trusts `available` proceeds to attach 
 channel. N-API asynchronous cleanup never runs at environment teardown, so the
 mapping and any attached external references are never revoked on the
 environment thread — the exact condition the documented close ordering exists to
-prevent. `mechanism.ts:31` would catch it, but only if the test runs on that
+prevent. `mechanism.ts:41` would catch it, but only if the test runs on that
 runtime.
 
 ## Timing windows and dependencies
@@ -104,7 +104,7 @@ non-vacuous, so the property and its check share a single enabling condition.
 
 - Sources examined: `docs/mc-host-shm-transport.md:29-42`;
   `packages/mc-shm-native/index.ts:108-218` line by line;
-  `packages/mc-shm-native/src/lib.rs:431-433` for the `registerCleanupProbe`
+  `packages/mc-shm-native/src/lib.rs:451-453` for the `registerCleanupProbe`
   export; `packages/mc-shm-native/tests/mechanism.ts:19-36`;
   `packages/mc-shm-native/tests/capability.ts:1-41`.
 - Findings: on membership, the code adds one gate the list does not contain

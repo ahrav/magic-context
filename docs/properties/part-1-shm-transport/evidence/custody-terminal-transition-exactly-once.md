@@ -121,7 +121,7 @@ clean close, so it interacts with
 `HostConfig.liveness = None` the endpoint never becomes a suspect and the race is
 unreachable. It also interacts with `charge-release-never-silently-strands`,
 because `release()` returning `true` says the phase transition won, not that
-`AdmissionController::release` (`crates/mc-shm-transport/src/profile.rs:482-490`)
+`AdmissionController::release` (`crates/mc-shm-transport/src/profile.rs:512-520`)
 actually moved any counter.
 
 ## What a test must construct
@@ -154,10 +154,10 @@ module, as former `:811` does.
   reach custody), former `provider_recovery.rs:323-342`
   (`admit_candidate_while_ready` returns the `Arc` and retains no copy), a grep
   confirming **no `impl Drop for CandidateCustody` exists**, and
-  `crates/mc-shm-transport/src/profile.rs:550-557` (`Admission`'s `Drop`).
+  `crates/mc-shm-transport/src/profile.rs:581-588` (`Admission`'s `Drop`).
 - Findings: the premise is confirmed. On each of the three early returns the
   closure ends without touching custody, the last `Arc` drops, `CustodyState::
-  Active(Admission)` drops, and `Admission::drop` at `profile.rs:553` returns the
+  Active(Admission)` drops, and `Admission::drop` at `profile.rs:584` returns the
   charges. The phase is never observed as `Released`, and the record is gone, so
   nothing can observe it afterwards. `CandidateCustody` deliberately has no
   `Drop`, so the return depends entirely on `Admission`'s.

@@ -26,35 +26,35 @@ early return between them.
 
 - `crates/mc-shm-transport/src/profile.rs:492-511` is
   `AdmissionController::quarantine`. The sequence is: acquire the accounting lock
-  at `:493-496`; assign `accounting.active = accounting.active.checked_sub(
-  charges).ok_or(AdmissionError::AccountingUnavailable)?` at `:497-500`; call
-  `accounting.release_spans(charges.spans_per_frame)` at `:501`; build `retained`
+  at `:523-526`; assign `accounting.active = accounting.active.checked_sub(
+  charges).ok_or(AdmissionError::AccountingUnavailable)?` at `:527-530`; call
+  `accounting.release_spans(charges.spans_per_frame)` at `:531`; build `retained`
   with `pinned_workers: 0` at `:502-505`; assign `accounting.quarantined =
   accounting.quarantined.checked_add(retained).ok_or(
-  AdmissionError::ChargeOverflow)?` at `:506-509`. The catalog's line citations
+  AdmissionError::ChargeOverflow)?` at `:537-540`. The catalog's line citations
   for both assignments are exact.
-- The mutation at `:497-500` writes through the `MutexGuard`, so it is committed
-  to the shared `Accounting` before the fallible add at `:506-509` runs. When the
+- The mutation at `:527-530` writes through the `MutexGuard`, so it is committed
+  to the shared `Accounting` before the fallible add at `:537-540` runs. When the
   add fails, `?` returns `Err(ChargeOverflow)` with `active` already reduced and
   `quarantined` never raised.
-- `profile.rs:501` also matters and the catalog does not mention it.
-  `release_spans` (`profile.rs:353-362`) does
+- `profile.rs:531` also matters and the catalog does not mention it.
+  `release_spans` (`profile.rs:374-383`) does
   `saturating_sub(1)` on the per-span count slot and then recomputes
   `active.spans_per_frame` as the maximum over surviving slots. That side effect
   is committed before the failure too.
-- `profile.rs:537-541` is `Admission::quarantine(mut self)`. It calls
-  `self.controller.quarantine(self.charges)?` at `:538` and sets
-  `self.state = AdmissionState::Quarantined` at `:539`. On the error path `:539`
+- `profile.rs:568-572` is `Admission::quarantine(mut self)`. It calls
+  `self.controller.quarantine(self.charges)?` at `:569` and sets
+  `self.state = AdmissionState::Quarantined` at `:570`. On the error path `:570`
   never runs, so `state` remains `AdmissionState::Active`.
-- `profile.rs:550-557` is `impl Drop for Admission`. Because `quarantine` takes
+- `profile.rs:581-588` is `impl Drop for Admission`. Because `quarantine` takes
   `self` by value, the failing call drops the `Admission` on return. `Drop` sees
-  `state == Active` at `:552` and calls `self.controller.release(self.charges)`
-  at `:553`. So a failed quarantine is followed immediately by a release attempt
+  `state == Active` at `:583` and calls `self.controller.release(self.charges)`
+  at `:584`. So a failed quarantine is followed immediately by a release attempt
   for the same charges. **This second-order effect is not in the catalog and it
   changes the failure shape.**
-- `profile.rs:482-490` is `release`. It returns silently on a poisoned lock at
-  `:483-485` and performs the subtraction inside
-  `if let Some(active) = accounting.active.checked_sub(charges)` at `:486-489`
+- `profile.rs:512-520` is `release`. It returns silently on a poisoned lock at
+  `:513-515` and performs the subtraction inside
+  `if let Some(active) = accounting.active.checked_sub(charges)` at `:516-519`
   with no `else`. So the follow-on release either double-subtracts or silently
   no-ops, depending on whether other admissions still hold enough charge.
 - `profile.rs:84-93` is `ResourceCharges::checked_sub`. Every one of
@@ -76,13 +76,13 @@ early return between them.
 - former `provider_recovery.rs:377-378` and former `:544-546` show the intent the failure
   breaks: both comments say charges "stay visible" when readiness goes
   `Quarantined`, matching `docs/mc-host-shm-transport.md:90` and former `:112`.
-- Existing check: `crates/mc-shm-transport/tests/contract.rs:330`
+- Existing check: `crates/mc-shm-transport/tests/contract.rs:349`
   `host_admission_retains_quarantined_commitments` asserts the success path only.
 
 ## Failure scenario
 
 1. Accounting reaches a state where `quarantined + retained` overflows in at
-   least one field. Because `checked_add` on `ResourceCharges` (`profile.rs:73`)
+   least one field. Because `checked_add` on `ResourceCharges` (`profile.rs:79`)
    sums `descriptors`, `arena_bytes`, `leases`, and `mappings`, any of those near
    `u64::MAX` suffices.
 2. A suspect resolves as `Uncertain` or `StaleRetry`, or the deadline fires, so
@@ -90,13 +90,13 @@ early return between them.
    former `:552`, former `:571`, former `:381`, or former `:390`).
 3. `CandidateCustody::quarantine` replaces the state with `Quarantined` at
    former `:185` and calls `admission.quarantine()` at former `:188`.
-4. Inside, `active` is reduced at `profile.rs:497-500` and the span census is
-   updated at `:501`. The add at `:506-509` fails and returns
+4. Inside, `active` is reduced at `profile.rs:527-530` and the span census is
+   updated at `:531`. The add at `:537-540` fails and returns
    `Err(ChargeOverflow)`.
 5. `.ok()` at former `provider_recovery.rs:188` discards it. `_retained` becomes `None`
    and the phase stays `Quarantined`, so the record is terminal.
 6. The `Admission` drops with `state == Active`, so `Drop` calls `release` again
-   (`profile.rs:553`). If other admissions still hold at least `charges` in every
+   (`profile.rs:584`). If other admissions still hold at least `charges` in every
    field, the subtraction succeeds and `active` is reduced a second time. If not,
    `checked_sub` returns `None` and the release silently no-ops.
 
@@ -109,12 +109,12 @@ maximum.
 ## Timing windows and dependencies
 
 No concurrency is required. The whole sequence runs under one `MutexGuard` on
-`profile.rs:377`'s `Mutex<Accounting>`, and the failure is arithmetic. The
+`profile.rs:398`'s `Mutex<Accounting>`, and the failure is arithmetic. The
 enabling state is the only hard dependency: `quarantined` must be high enough
 that adding `retained` overflows. That state is not reachable through ordinary
 admission, because `admit` bounds `active + quarantined` against the frozen
-limits at `profile.rs:445-459`, so it needs either a seeded accounting pre-state
-(fault class F9 in the fault map) or an injected failure at `:506-509`. This
+limits at `profile.rs:466-480`, so it needs either a seeded accounting pre-state
+(fault class F9 in the fault map) or an injected failure at `:537-540`. This
 property is the upstream half of
 `charge-release-never-silently-strands`: the failed quarantine is a verified
 construction of the charge mismatch that record's open question asks for.
@@ -124,14 +124,14 @@ construction of the charge mismatch that record's open question asks for.
 Construct an `AdmissionController` whose `quarantined` bucket is already near
 `u64::MAX` in one field, admit one candidate, snapshot
 `active + quarantined` per field through `AdmissionController::snapshot`
-(`profile.rs:471-480`), then call `Admission::quarantine()` and assert it returns
+(`profile.rs:501-510`), then call `Admission::quarantine()` and assert it returns
 `Err(AdmissionError::ChargeOverflow)`. Then snapshot again and assert the
 per-field sum `active + quarantined` is unchanged. Because `quarantined` is
 private and `admit` refuses to overshoot the limits, seeding requires either a
 test-only constructor for `Accounting` or a limits configuration high enough that
 repeated admit-then-quarantine cycles walk `quarantined` up to the boundary. A
 second case should hold a second live admission across the failing quarantine so
-the `Drop`-driven `release` at `profile.rs:553` succeeds, and assert `active`
+the `Drop`-driven `release` at `profile.rs:584` succeeds, and assert `active`
 was not reduced twice.
 
 ## Investigation log
@@ -142,11 +142,11 @@ implicit.
 
 ### Q: Is the `Drop`-driven second release after a failed `Admission::quarantine` intended?
 
-- Sources examined: `profile.rs:537-541` (`Admission::quarantine` signature and
-  body), `:550-557` (`Drop`), `:482-490` (`release`), `:84-93`
-  (`ResourceCharges::checked_sub`), `:353-362` (`release_spans`).
-- Findings: `quarantine` takes `mut self`, and the `?` at `:538` returns before
-  `state` is updated at `:539`, so `Drop` unavoidably runs with
+- Sources examined: `profile.rs:568-572` (`Admission::quarantine` signature and
+  body), `:581-588` (`Drop`), `:512-520` (`release`), `:84-93`
+  (`ResourceCharges::checked_sub`), `:374-383` (`release_spans`).
+- Findings: `quarantine` takes `mut self`, and the `?` at `:569` returns before
+  `state` is updated at `:570`, so `Drop` unavoidably runs with
   `state == Active`. There is no `ManuallyDrop`, no `mem::forget`, and no
   compensating branch. The behaviour follows directly from the ownership and the
   early return.
@@ -155,12 +155,12 @@ implicit.
 - Conclusion: resolved as a mechanism, unresolved as intent. The second release
   is certain to occur; whether it was considered needs the author.
 
-### Q: Is the `AccountingUnavailable` variant at `profile.rs:500` the right classification for a `checked_sub` shortfall?
+### Q: Is the `AccountingUnavailable` variant at `profile.rs:530` the right classification for a `checked_sub` shortfall?
 
-- Sources examined: `profile.rs:497-500`, the variant list at `:633-635`, and
-  the descriptions at `:653-654` ("host admission accounting unavailable").
-- Findings: `:500` maps an arithmetic shortfall in `active` to
-  `AccountingUnavailable`, while the structurally similar failure at `:509` maps
+- Sources examined: `profile.rs:527-530`, the variant list at `:667-669`, and
+  the descriptions at `:690-691` ("host admission accounting unavailable").
+- Findings: `:530` maps an arithmetic shortfall in `active` to
+  `AccountingUnavailable`, while the structurally similar failure at `:540` maps
   to `ChargeOverflow`. A caller cannot distinguish "the lock was unusable" from
   "the charges did not match" from the error alone.
 - Missing evidence: none needed for the property; this is an observability
@@ -180,8 +180,10 @@ discarded the error, `admission.quarantine().ok()` at the former
 
 Verified at `e447c927`: `Admission::quarantine` has no non-test caller anywhere in
 the tree. A search for `.quarantine()` across `crates/` and `packages/` returns
-exactly two call sites, `crates/mc-shm-transport/tests/contract.rs:368` and
-`:479`. The `quarantine` identifiers remaining in `crates/mc-host` are unrelated:
+exactly two call sites, which at `9c1eb4d1` were
+`crates/mc-shm-transport/tests/contract.rs:368` (the `OwnershipMode::DirectLeased`
+field, removed from the descriptor by `0f336d3c`) and
+`:539`. The `quarantine` identifiers remaining in `crates/mc-host` are unrelated:
 `LeaseTracker`'s lease quarantine in `frame_channel.rs:417-433`, and the
 lifecycle-record and manifest quarantines in `lifecycle.rs` and `generation.rs`.
 
