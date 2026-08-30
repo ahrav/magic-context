@@ -28,7 +28,6 @@ use crate::wire::{ByteBudget, MAX_CONTROL_BODY_LEN};
 
 /// Current ring profile accepted by every process in one release.
 pub const RING_PROFILE: &str = mc_shm_transport::profile::MC_HOST_RING_PROFILE;
-const POLL_INTERVAL: Duration = Duration::from_micros(50);
 
 /// Test-only observer invoked after each successful frame publication with
 /// the published frame's type and channel. It receives no descriptors,
@@ -240,6 +239,7 @@ impl RingTransport {
             .name("mc-host-shm-endpoint".to_owned())
             .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_io()
                     .enable_time()
                     .build();
                 let rings = runtime
@@ -368,6 +368,17 @@ async fn run_endpoint(
 ) {
     let discard = queue.discard.clone();
     let finish = queue.finish.clone();
+    let readiness = match rings.second.duplicate_data_ready().and_then(|fd| {
+        tokio::io::unix::AsyncFd::new(fd)
+            .map_err(|_| mc_shm_transport::backend::ring::RingError::ObjectSetupFailed)
+    }) {
+        Ok(readiness) => readiness,
+        Err(_) => {
+            queue.retired.cancel();
+            root.cancel();
+            return;
+        }
+    };
     let mut inbound = Some(inbound);
     let mut finishing = false;
     loop {
@@ -414,6 +425,19 @@ async fn run_endpoint(
                 Err(_) => return,
             }
         } else {
+            let data_armed = if inbound.is_some() {
+                match rings.second.arm_data_wait() {
+                    Ok(false) => continue,
+                    Ok(true) => true,
+                    Err(_) => {
+                        queue.retired.cancel();
+                        root.cancel();
+                        return;
+                    }
+                }
+            } else {
+                false
+            };
             tokio::select! {
                 biased;
                 () = discard.cancelled() => return,
@@ -432,8 +456,21 @@ async fn run_endpoint(
                     Some(frame) => Some(frame),
                     None => return,
                 },
+                ready = readiness.readable(), if data_armed => {
+                    let Ok(mut guard) = ready else {
+                        queue.retired.cancel();
+                        root.cancel();
+                        return;
+                    };
+                    guard.clear_ready();
+                    if rings.second.complete_data_wait().is_err() {
+                        queue.retired.cancel();
+                        root.cancel();
+                        return;
+                    }
+                    None
+                },
                 () = root.cancelled() => return,
-                () = tokio::time::sleep(POLL_INTERVAL) => None,
             }
         };
         let Some(queued) = queued else {
@@ -479,35 +516,27 @@ async fn receive_one(
         return Ok(true);
     }
 
-    let deadline = StdInstant::now() + frame_deadline;
+    let deadline = Instant::now() + frame_deadline;
+    let charge = ingress.charge(header.len);
+    tokio::pin!(charge);
     let charge = loop {
-        if let Some(charge) = ingress.try_charge(header.len as usize) {
-            break charge;
-        }
-        if read_cancel.is_cancelled() {
-            return Err(ReadClose::Cancelled);
-        }
-        if StdInstant::now() >= deadline {
-            // The peer and transport are healthy; only the ingress budget is
-            // saturated. Overloaded retires the generation without branding
-            // it corrupt, so the admission charge releases cleanly.
-            return Err(ReadClose::Overloaded);
-        }
-        // The budget wait services queued outbound frames: a slow ingress
-        // drain holds only this receive, not the connection's sends, which
-        // would otherwise miss their deadlines behind it.
-        match queue.try_recv() {
-            Ok(queued) => {
-                if publish_one(&rings.first, queued, frame_deadline, publish_hook).is_err() {
-                    return Err(ReadClose::Corrupt("shared-memory publish failed"));
-                }
+        tokio::select! {
+            biased;
+            () = read_cancel.cancelled() => return Err(ReadClose::Cancelled),
+            charge = &mut charge => break charge,
+            () = tokio::time::sleep_until(deadline) => {
+                // The peer and transport are healthy; only the ingress budget is
+                // saturated. Overloaded retires the generation without branding
+                // it corrupt, so the admission charge releases cleanly.
+                return Err(ReadClose::Overloaded);
             }
-            Err(_) => {
-                tokio::select! {
-                    biased;
-                    () = read_cancel.cancelled() => return Err(ReadClose::Cancelled),
-                    () = tokio::time::sleep(POLL_INTERVAL) => {}
+            queued = queue.recv() => match queued {
+                Some(queued) => {
+                    if publish_one(&rings.first, queued, frame_deadline, publish_hook).is_err() {
+                        return Err(ReadClose::Corrupt("shared-memory publish failed"));
+                    }
                 }
+                None => return Err(ReadClose::Cancelled),
             }
         }
     };
@@ -676,10 +705,13 @@ impl RingClientEndpoint {
             if let Some(frame) = self.try_recv()? {
                 return Ok(frame);
             }
-            if StdInstant::now() >= deadline {
+            if !self
+                .from_host
+                .wait_for_data(deadline)
+                .map_err(|_| RingClientError)?
+            {
                 return Err(RingClientError);
             }
-            std::thread::sleep(POLL_INTERVAL);
         }
     }
 
@@ -761,6 +793,57 @@ mod tests {
         fn drop(&mut self) {
             self.used.fetch_sub(self.bytes, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn shared_memory_workers_have_no_periodic_polling() {
+        let endpoint = include_str!("ring_transport.rs");
+        let client = include_str!("client.rs");
+        let micro_poll = concat!("Duration::from_micros(", "50)");
+        assert!(!endpoint.contains(micro_poll));
+        assert!(!client.contains(micro_poll));
+        assert!(!endpoint.contains(concat!("POLL_", "INTERVAL")));
+    }
+
+    #[tokio::test]
+    async fn finish_wakes_after_read_cancellation_with_unread_peer_data() {
+        let transport = RingTransport::for_ring_profile(per_connection_limits());
+        let PreparedRing {
+            descriptor,
+            descriptors,
+            sender,
+            mut receiver,
+            io,
+            read_cancel,
+            ..
+        } = transport
+            .prepare(ByteBudget::new(1 << 20), 8, Duration::from_secs(1))
+            .expect("ring prepares");
+        let peer = RingClientEndpoint::attach_with_descriptors(&descriptor, descriptors)
+            .expect("peer attaches");
+        let io = tokio::spawn(io);
+
+        read_cancel.cancel();
+        assert!(matches!(receiver.recv().await, Err(ReadClose::Cancelled)));
+        peer.send(
+            EnvelopeHeader {
+                len: 0,
+                ver: PROTOCOL_VERSION,
+                ty: FrameType::Goodbye,
+                flags: crate::wire::pure_header_flags(),
+                channel: 0,
+                epoch: 0,
+                corr: 0,
+            },
+            &[],
+        )
+        .expect("peer publishes late Goodbye");
+        sender.finish();
+
+        tokio::time::timeout(Duration::from_secs(1), io)
+            .await
+            .expect("finished endpoint wakes despite unread peer data")
+            .expect("endpoint task joins");
     }
 
     #[test]

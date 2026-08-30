@@ -81,7 +81,7 @@ function reservationBlockMs(deadline?: Deadline): number {
 export class ShmFrameChannel implements SetupFrameChannel {
     private native: NativeChannel | null;
     private readonly copies = new CopyCounter();
-    private timer: ReturnType<typeof setInterval> | null = null;
+    private readinessStarted = false;
     private closed = false;
     private readonly receiveLeases = new Set<ReceiveLease>();
     private quarantinedBytes = 0;
@@ -104,16 +104,22 @@ export class ShmFrameChannel implements SetupFrameChannel {
             if (deadline.remainingMs() <= 0) {
                 throw new McHostCallError("not_sent", "shared-memory setup deadline expired");
             }
-            this.native = NativeChannel.connectSetup({
+            this.native = await NativeChannel.connectSetup({
                 ...setup,
                 timeoutMs: Math.max(1, Math.ceil(deadline.remainingMs())),
             });
+            if (this.closed) {
+                this.native.close();
+                this.native = null;
+                throw new McHostCallError("not_sent", "shared-memory channel closed");
+            }
         }
     }
 
     beginFrames(): void {
-        if (this.timer !== null) return;
-        this.timer = setInterval(() => this.poll(), 0);
+        if (this.readinessStarted) return;
+        this.readinessStarted = true;
+        this.attached().startReadiness(() => this.drainReady());
     }
 
     produce(
@@ -233,8 +239,6 @@ export class ShmFrameChannel implements SetupFrameChannel {
     close(): void {
         if (this.closed) return;
         this.closed = true;
-        if (this.timer !== null) clearInterval(this.timer);
-        this.timer = null;
         let quarantineError: unknown;
         for (const lease of [...this.receiveLeases]) {
             try {
@@ -264,7 +268,7 @@ export class ShmFrameChannel implements SetupFrameChannel {
             queuedDataFrames: 0,
             queuedControlFrames: 0,
             readPaused: false,
-            activeTimers: this.timer === null ? 0 : 1,
+            activeTimers: 0,
             activeReceiveLeases: this.receiveLeases.size,
             quarantinedBytes: this.quarantinedBytes,
             ownedAdapterCopies: this.copies.copies,
@@ -346,16 +350,11 @@ export class ShmFrameChannel implements SetupFrameChannel {
         this.options.budget.release(bytes);
     }
 
-    private poll(): void {
+    private drainReady(): void {
         if (this.closed) return;
         try {
-            // Drains until the native side reports no progress. Consumer
-            // backpressure (retained leases at the ring's lease bound) is
-            // reported by `native.poll()` as `false`, not an error, so the
-            // drain pauses at the bound and the interval resumes delivery
-            // after a lease release; only genuine failures reach the catch.
-            while (
-                this.attached().poll((nativeLease: NativeReceiveLease) => {
+            for (let frames = 0; frames < 64; frames += 1) {
+                if (!this.attached().drainOne((nativeLease: NativeReceiveLease) => {
                     const header = decodeHeader(nativeLease.header);
                     const violation = headerViolation(header);
                     const structuralError =
@@ -397,16 +396,15 @@ export class ShmFrameChannel implements SetupFrameChannel {
                         lease.release();
                         throw error;
                     }
-                })
-            ) {}
-            // The loop checks peerClosed() after draining so a graceful Goodbye reaches the dispatcher before the connection retires. Rings cannot express peer death on their own: a host that exits without a Goodbye leaves them looking idle, so every later poll would return no frames while the generation stayed live. commentlint: allow(JUDGE)
+                })) break;
+            }
+            // Readiness includes setup-socket closure. Check after draining so graceful Goodbye reaches dispatcher first. commentlint: allow(JUDGE)
             if (this.attached().peerClosed()) {
                 this.options.handlers.onClosed("eof", undefined);
                 try {
                     this.close();
                 } catch {
-                    // close() rethrows on quarantined leases; an interval
-                    // callback has no caller to observe the throw.
+                    // close() rethrows on quarantined leases; readiness callback has no caller.
                 }
             }
         } catch (error) {
@@ -417,9 +415,8 @@ export class ShmFrameChannel implements SetupFrameChannel {
             try {
                 this.close();
             } catch {
-                // close() rethrows on quarantined leases and has already
-                // reported that outcome; an interval callback has no caller
-                // to observe the throw, so it must not escape here.
+                // close() already reported a quarantined lease. Readiness
+                // callbacks have no caller to observe the repeated throw.
             }
         }
     }
