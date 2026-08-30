@@ -865,6 +865,7 @@ fn fragment() -> impl Strategy<Value = String> {
         ),
         Just("please review this, thanks, kind of a bit urgent".to_string()),
         Just("thank you kindly if possible".to_string()),
+        Just("adjust justly contexts thanksgiving unreally".to_string()),
         Just(
             "the historian will be summarized because of the compartment context message"
                 .to_string()
@@ -905,6 +906,7 @@ fn fragment() -> impl Strategy<Value = String> {
         Just("src/some_dir/file_name.rs and ../rel/path.txt".to_string()),
         Just("src/really/file_name.rs".to_string()),
         Just("   \t  ".to_string()),
+        Just("alpha\u{00A0}beta\u{2028}gamma\u{3000}delta".to_string()),
         Just("\n\n\n\n".to_string()),
         Just("".to_string()),
         Just("ünïcödé √ text — with; emoji 🚀 and 中文".to_string()),

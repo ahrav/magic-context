@@ -2170,6 +2170,38 @@ proptest! {
     }
 }
 
+#[test]
+fn optimized_matches_frozen_reference_at_age_reclaim_threshold() {
+    let spec = |msg: u8, kind: u8, token_count: Option<u16>| ItemSpec {
+        msg,
+        ordinal_slot: msg + 1,
+        role: ROLE_ASSISTANT,
+        kind,
+        tool: 8,
+        input: 0,
+        provider_executed: false,
+        byte_size: 800,
+        token_count,
+        arc: Some(msg),
+        frozen: false,
+        agent_drop: false,
+        tag_protected: false,
+        exempt_protected: false,
+    };
+    let specs = vec![
+        spec(0, KIND_TOOL_CALL, Some(249)),
+        spec(0, KIND_TOOL_RESULT, None),
+        spec(1, KIND_TOOL_CALL, Some(250)),
+        spec(1, KIND_TOOL_RESULT, None),
+    ];
+    let bits: CtxBits = (0, 1_000.0, 1_000.0, 0, 4, true, 0, true, true, true);
+
+    let (optimized, expected, _, _) = outcome_pair!(specs, bits);
+    assert_eq!(optimized, expected);
+    assert_eq!(optimized.0.len(), 2);
+    assert!(optimized.0.iter().all(|(id, _, _)| id.starts_with("m1#")));
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(192))]
     #[test]
