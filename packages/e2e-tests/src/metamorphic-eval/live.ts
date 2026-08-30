@@ -51,6 +51,8 @@ export interface LiveMetamorphicOptions {
     admit?: (derivatives: readonly HistorianEvalScenario[]) => string[];
     execute?: LiveScenarioExecutor;
     deadlineAtMs?: number | null;
+    /** Headroom one role may consume, reserved before starting it so the deadline is not overshot mid-call. commentlint: allow(JUDGE) */
+    roleBudgetMs?: number;
     nowMs?: () => number;
     onProgress?: (report: MetamorphicReport) => void;
 }
@@ -266,7 +268,9 @@ export async function runLiveMetamorphicEval(
     };
     const deadlineAtMs = options.deadlineAtMs ?? null;
     const nowMs = options.nowMs ?? Date.now;
-    const deadlineReached = (): boolean => deadlineAtMs !== null && nowMs() >= deadlineAtMs;
+    const roleBudgetMs = options.roleBudgetMs ?? 0;
+    /** Reserves the role's budget rather than asking whether the deadline passed, because a role started just under it runs past it. commentlint: allow(JUDGE) */
+    const deadlineReached = (): boolean => deadlineAtMs !== null && nowMs() + roleBudgetMs >= deadlineAtMs;
     const deadlineReport = (nextRole: LiveRole): MetamorphicReport =>
         observe({ kind: "deadline-exhausted", nextRole });
     let controlA: LiveObservation | null = null;
@@ -367,6 +371,16 @@ export async function runLiveMetamorphicEval(
             }
             if (baseline instanceof Error) {
                 entries.push({ ...pair.key, kind: "error", error: getErrorMessage(baseline) });
+                observe();
+                continue;
+            }
+            /** An ERROR score already forces exit 1 through the baseline verdict, so its derivatives would be paid-for and unusable. commentlint: allow(JUDGE) */
+            if (baseline.score.verdict === "ERROR") {
+                entries.push({
+                    ...pair.key,
+                    kind: "error",
+                    error: `baseline run errored: ${baseline.score.errorReason ?? "unknown"}`,
+                });
                 observe();
                 continue;
             }

@@ -963,7 +963,57 @@ describe("live metamorphic control tier", () => {
         expect(progress.slice(0, -1).every((partial) => partial.tierInvalidReason !== null)).toBe(true);
     });
 
-    test("reports a thrown control failure as a control error, not an incomplete run", async () => {        for (const failing of ["control-a", "control-b"] as const) {
+    test("skips paid derivatives after a baseline scores ERROR", async () => {
+        const roles: LiveRole[] = [];
+        const report = await runLiveMetamorphicEval([validScenario()], {
+            mode: liveMode(),
+            artifactRoot: "/tmp/metamorphic-error-baseline",
+            opencodeVersion: "test",
+            transforms: [...TRANSFORMS],
+            seeds: [0],
+            admit: () => [],
+            execute: async (_scenario, role) => {
+                roles.push(role);
+                return role === "baseline"
+                    ? pairedObservation([], { verdict: "ERROR", errorReason: "historian-transport" })
+                    : pairedObservation();
+            },
+        });
+
+        // An ERROR baseline already forces exit 1, so every derivative would be
+        // paid for and unusable.
+        expect(roles).toEqual(["control-a", "control-b", "baseline"]);
+        expect(roles).not.toContain("derivative");
+        expect(report.entries.filter((entry) => entry.kind === "error").length).toBeGreaterThan(0);
+        expect(metamorphicExitCode(report)).toBe(1);
+    });
+
+    test("reserves a role budget before starting paid work", async () => {
+        const roles: LiveRole[] = [];
+        let clock = 0;
+        const report = await runLiveMetamorphicEval([validScenario()], {
+            mode: liveMode(),
+            artifactRoot: "/tmp/metamorphic-role-budget",
+            opencodeVersion: "test",
+            transforms: [reorder()],
+            seeds: [0],
+            admit: () => [],
+            // Deadline has not passed, but one role cannot finish inside what is left.
+            deadlineAtMs: 100,
+            roleBudgetMs: 60,
+            nowMs: () => (clock += 50),
+            execute: async (_scenario, role) => {
+                roles.push(role);
+                return pairedObservation();
+            },
+        });
+
+        expect(roles).toEqual([]);
+        expect(report.tierInvalidReason).toEqual({ kind: "deadline-exhausted", nextRole: "control-a" });
+    });
+
+    test("reports a thrown control failure as a control error, not an incomplete run", async () => {
+        for (const failing of ["control-a", "control-b"] as const) {
             const { report } = await runWithExecutor((role) => {
                 if (role === failing) throw new Error(`${failing} artifact setup failed`);
                 return pairedObservation();

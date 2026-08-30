@@ -10,7 +10,7 @@ import {
     liveModeFromEnv,
     opencodeVersion,
 } from "./run-historian-eval";
-import { runSystemTuple, type SystemVersionTuple } from "../src/historian-eval/runner";
+import { historianWaitBudgetMs, runSystemTuple, type SystemVersionTuple } from "../src/historian-eval/runner";
 import {
     runLiveMetamorphicEval,
     type LiveMetamorphicOptions,
@@ -410,6 +410,14 @@ export async function main(args: readonly string[] = Bun.argv.slice(2)): Promise
     const selected = selectInputs(corpus, parsed);
     const prepared = prepareLivePreamble(corpus);
     if (prepared === null) return 1;
+    const roleBudgetMs = historianWaitBudgetMs(prepared.mode);
+    /** Refused up front rather than silently declining every role, which would spend the invocation to publish an empty deadline report. commentlint: allow(JUDGE) */
+    if (parsed.deadlineMinutes !== null && parsed.deadlineMinutes * 60_000 < roleBudgetMs) {
+        console.error(
+            `--deadline-minutes ${parsed.deadlineMinutes} is below one role's budget of ${Math.ceil(roleBudgetMs / 60_000)} minutes; no scenario role could start`,
+        );
+        return 1;
+    }
     const artifactRoot = join(
         outputPaths.artifactNamespace,
         `${basename(parsed.reportPath)}-${Date.now()}`,
@@ -420,6 +428,7 @@ export async function main(args: readonly string[] = Bun.argv.slice(2)): Promise
         opencodeVersion: prepared.opencodeVersion,
         system: prepared.system,
         transforms: selected.transforms,
+        roleBudgetMs,
         deadlineAtMs: parsed.deadlineMinutes === null ? null : Date.now() + parsed.deadlineMinutes * 60_000,
     });
     return metamorphicExitCode(report);
