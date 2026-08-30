@@ -1,6 +1,6 @@
 //! Managed Rust consumer for one authenticated mc-host generation.
 //!
-//! This module owns discovery, authentication, mandatory negotiation,
+//! This module owns discovery, authentication, mandatory ring setup,
 //! correlation allocation, framing, liveness, route epochs, bounded queues,
 //! cancellation, and cleanup. Raw frame types never cross the public API.
 
@@ -39,7 +39,7 @@ use crate::{
     },
 };
 
-/// Total deadline for dial, authentication, and mandatory negotiation.
+/// Total deadline for discovery, authentication, and mandatory ring setup.
 pub const CLIENT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Deadline for a frame after its first header byte. Idle header waits are unbounded.
 pub const CLIENT_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
@@ -209,7 +209,7 @@ impl fmt::Display for CallError {
 
 impl Error for CallError {}
 
-/// Discovery, authentication, negotiation, or owner-lifecycle failure.
+/// Discovery, authentication, ring setup, or owner-lifecycle failure.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ClientError {
     code: &'static str,
@@ -300,12 +300,12 @@ impl fmt::Debug for Client {
 }
 
 impl Client {
-    /// Securely discovers, authenticates, and negotiates one TCP generation.
+    /// Securely discovers, authenticates, and attaches one ring generation.
     ///
     /// Discovery validates one descriptor-anchored snapshot before any dial.
     pub async fn connect(path: impl AsRef<Path>) -> Result<Self, ClientError> {
         // The deadline starts before discovery, not after it. §11.2 spends one
-        // 2-second budget on discovery, dial, authentication, and negotiation
+        // 2-second budget on discovery, setup-socket authentication, and ring attachment
         // together, so starting the clock after the snapshot would give a
         // stalled filesystem unbounded time and then hand the handshake a fresh
         // budget. The snapshot also runs on a blocking pool: it is synchronous
@@ -411,7 +411,7 @@ impl Client {
         *inner.reader.lock().await = Some(reader);
         // The reader runs on another worker and can retire this generation
         // before the constructor returns — a peer that closes or sends
-        // connection `Goodbye` right after negotiation does exactly that.
+        // connection `Goodbye` right after setup does exactly that.
         // Returning a "ready" client then defers the failure to the first
         // operation, which reports `connection_retired` as `NotSent`; the
         // historian does not reconnect on that path, so a daemon reload race

@@ -7,7 +7,6 @@ mod support;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
-use support::raw_client;
 use support::{TestHandler, TestHost};
 
 const UMASK_CHILD_ENV: &str = "MC_HOST_RESTRICTIVE_UMASK_CHILD";
@@ -57,7 +56,7 @@ async fn restrictive_umask_subprocess_child() {
         & 0o7777;
     assert_eq!(dir_mode, 0o700);
     assert_eq!(file_mode, 0o600);
-    raw_client::discover(&host.publication_path()).expect("publication stays readable");
+    mc_host::read_connection_file(host.publication_path()).expect("publication stays readable");
 
     host.shutdown_gracefully().await;
 }
@@ -85,14 +84,13 @@ async fn discovery_validates_the_publication_the_way_a_client_must() {
     assert_eq!(owned.wire_version, 2);
     assert_eq!(owned.key.len(), 32);
 
-    let info = raw_client::discover(&host.publication_path()).expect("valid publication");
+    let info = mc_host::read_connection_file(host.publication_path()).expect("valid publication");
     assert_eq!(info.schema, 1);
     assert_eq!(info.wire_version, 2);
-    assert_eq!(info.host, "127.0.0.1");
-    assert_ne!(info.port, 0);
+    assert!(!info.setup_socket.is_empty());
     assert_eq!(info.key.len(), 32);
     assert_eq!(info.daemon_id.len(), 16);
-    assert_eq!(info.pid, u64::from(std::process::id()));
+    assert_eq!(info.pid, std::process::id());
     assert_eq!(info.daemon_ver, "mc-host/test");
 
     // A mode-0644 copy of the same file must be refused.
@@ -100,7 +98,7 @@ async fn discovery_validates_the_publication_the_way_a_client_must() {
     std::fs::copy(host.publication_path(), &loose).expect("copy");
     std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).expect("chmod");
     assert!(
-        raw_client::discover(&loose).is_err(),
+        mc_host::read_connection_file(&loose).is_err(),
         "an insecure mode must fail client validation"
     );
     assert!(mc_host::read_connection_file(&loose).is_err());

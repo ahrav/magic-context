@@ -1157,8 +1157,6 @@ mod tests {
             unfiltered["subc_ops"],
             serde_json::json!(["route.open", "catalog.list", "host.shutdown", "host.status"])
         );
-        assert!(!unfiltered.to_string().contains("transport.activate"));
-        assert!(!unfiltered.to_string().contains("transport.commit"));
         // wake.create must stay absent until implemented (protocol AE10).
         assert!(!unfiltered.to_string().contains("wake.create"));
 

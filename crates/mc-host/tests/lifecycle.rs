@@ -414,7 +414,7 @@ async fn ping_and_consumer_correlations_do_not_cross_settle() {
         .expect("route");
 
     let corr = client.next_corr();
-    assert_eq!(corr, 3);
+    assert_eq!(corr, 2);
     client
         .send_frame(
             TY_REQUEST,
@@ -1379,8 +1379,8 @@ async fn a_publication_failure_runs_the_shutdown_callback_before_lock_release() 
     let result = task.await.expect("run task joins");
 
     assert!(
-        matches!(result, Err(HostError::Instance(_))),
-        "a removed runtime directory fails publication, got {result:?}"
+        matches!(result, Err(HostError::Io(ref error)) if error.kind() == std::io::ErrorKind::NotFound),
+        "a removed runtime directory fails setup before publication, got {result:?}"
     );
     assert!(
         handler.events().contains(&Event::Initialized),
@@ -1619,7 +1619,7 @@ async fn shutdown_requires_authentication_and_a_valid_shape() {
     // Unauthenticated socket: no envelope is ever read or written back.
     let mut raw = raw_client::connect_unauthenticated(&host.info)
         .await
-        .expect("tcp connect");
+        .expect("setup socket connect");
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let frame = {
         let body = br#"{"op":"host.shutdown"}"#;
@@ -1638,9 +1638,12 @@ async fn shutdown_requires_authentication_and_a_valid_shape() {
     let mut byte = [0u8; 1];
     let read = tokio::time::timeout(BUDGET, raw.read(&mut byte))
         .await
-        .expect("the failed handshake closes within its deadline")
-        .expect("read");
-    assert_eq!(read, 0, "no byte may reach an unauthenticated socket");
+        .expect("the failed handshake closes within its deadline");
+    assert!(
+        matches!(read, Ok(0))
+            || matches!(read, Err(ref error) if error.kind() == std::io::ErrorKind::ConnectionReset),
+        "no byte may reach an unauthenticated socket: {read:?}"
+    );
     drop(raw);
 
     // Authenticated but malformed: binary flag on channel 0.

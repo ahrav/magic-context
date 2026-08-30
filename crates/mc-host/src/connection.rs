@@ -558,10 +558,9 @@ async fn read_loop<H: McHostHandler, C: FrameReceiver>(
     }
 }
 
-/// Runs `decode` over the frame's body as one contiguous byte slice. TCP
-/// frames arrive contiguous; a ring backend delivers a body as two spans
-/// when it wraps the arena end, so that shape flattens through the explicit
-/// copying adapter first. Only decoded values leave the lease scope.
+/// Runs `decode` over the frame's body as one contiguous byte slice. A body
+/// that wraps the ring arena end flattens through the explicit copying adapter
+/// first. Only decoded values leave the lease scope.
 fn decode_contiguous<T>(
     frame: &crate::frame_channel::InboundFrame,
     decode: impl FnOnce(&[u8]) -> T,

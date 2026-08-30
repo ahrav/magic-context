@@ -1,5 +1,5 @@
 //! Echo host support: one handler that echoes every request body, plus an
-//! in-process host runner for tests that need a live wire endpoint without
+//! in-process host runner for tests that need a live ring endpoint without
 //! a child process.
 
 #![allow(dead_code)]

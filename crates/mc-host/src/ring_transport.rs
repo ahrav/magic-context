@@ -385,14 +385,15 @@ async fn run_endpoint(
 ) -> bool {
     let discard = queue.discard.clone();
     let finish = queue.finish.clone();
+    let mut inbound = Some(inbound);
     let mut finishing = false;
     loop {
         let mut received = false;
-        if !read_cancel.is_cancelled() {
+        if let Some(inbound_sender) = inbound.as_ref() {
             match receive_one(
                 &rings,
                 &mut queue,
-                &inbound,
+                inbound_sender,
                 &ingress,
                 frame_deadline,
                 &read_cancel,
@@ -401,7 +402,13 @@ async fn run_endpoint(
             .await
             {
                 Ok(true) => received = true,
-                Ok(false) => {}
+                Ok(false) => {
+                    if read_cancel.is_cancelled() {
+                        if let Some(inbound) = inbound.take() {
+                            let _ = inbound.send(Err(ReadClose::Cancelled)).await;
+                        }
+                    }
+                }
                 Err(close) => {
                     // Cancellation and budget-timeout closes are ordinary
                     // backpressure or retirement — the read side was told to
@@ -412,7 +419,7 @@ async fn run_endpoint(
                     // block every later shared-memory candidate. Only
                     // structural faults are unclean.
                     let clean = matches!(close, ReadClose::Cancelled | ReadClose::Overloaded);
-                    let _ = inbound.send(Err(close)).await;
+                    let _ = inbound_sender.send(Err(close)).await;
                     queue.retired.cancel();
                     root.cancel();
                     return clean;
@@ -440,11 +447,18 @@ async fn run_endpoint(
                     finishing = true;
                     None
                 }
-                () = root.cancelled() => return true,
+                () = read_cancel.cancelled(), if inbound.is_some() => {
+                    // Re-enter the receive path once after observing
+                    // cancellation. It drains frames committed before the
+                    // cancellation edge, then reports `Cancelled` after the
+                    // first empty observation.
+                    None
+                }
                 frame = queue.recv() => match frame {
                     Some(frame) => Some(frame),
                     None => return true,
                 },
+                () = root.cancelled() => return true,
                 () = tokio::time::sleep(POLL_INTERVAL) => None,
             }
         };

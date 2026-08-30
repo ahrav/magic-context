@@ -5,9 +5,6 @@
 
 #![allow(clippy::duplicate_mod)]
 
-#[path = "support/raw_client.rs"]
-mod raw_client;
-
 #[path = "support/perf_measurement.rs"]
 mod perf_measurement;
 

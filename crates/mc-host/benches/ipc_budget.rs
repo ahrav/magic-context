@@ -15,9 +15,6 @@
 //! - `MC_IPC_BUDGET_MODE=finalize-interrupted`: move leftover running
 //!   manifests to the `interrupted` terminal state.
 
-#[path = "../tests/support/raw_client.rs"]
-mod raw_client;
-
 #[path = "../tests/support/perf_measurement.rs"]
 mod perf_measurement;
 

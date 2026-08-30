@@ -1,3 +1,5 @@
+#[path = "../src/file_mode.rs"]
+mod file_mode;
 #[path = "../src/harness_closure.rs"]
 mod harness_closure;
 

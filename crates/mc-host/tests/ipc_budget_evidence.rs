@@ -3,9 +3,6 @@
 //! counterbalanced scheduling, and a tiny in-process serial ring run whose
 //! attempt finalizes complete.
 
-#[path = "support/raw_client.rs"]
-mod raw_client;
-
 #[path = "support/perf_measurement.rs"]
 mod perf_measurement;
 

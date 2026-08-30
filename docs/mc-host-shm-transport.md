@@ -4,6 +4,8 @@
 
 The fixed ring is the only application transport. Linux and macOS clients use the owner-only Unix setup socket to authenticate, receive two mapping descriptors, validate the current release identity, attach, and commit activation. Application frames never use the setup socket.
 
+There is no runtime transport selector, alternate shared-memory backend, compatibility reader, or degraded data path. A transport failure is terminal for the affected connection.
+
 The accepted identity is fixed by the release:
 
 - profile: `mc-host-test-ring-v1`
@@ -19,6 +21,19 @@ Each connection owns two bounded single-producer/single-consumer rings, one per 
 The process-wide admission controller charges descriptors, arena bytes, receive leases, mappings, mapping file descriptors, endpoint workers, client instances, and pinned workers before creating ring resources. Active and quarantined charges are reported separately. Every configured limit is finite and validated at startup.
 
 ## Connection lifecycle
+
+```mermaid
+stateDiagram-v2
+  [*] --> Setup
+  Setup --> Attached: authenticated descriptors validate
+  Attached --> Active: activation commits
+  Setup --> Failed: authentication or transfer fails
+  Attached --> Failed: validation, attach, or commit fails
+  Active --> Closed: clean Goodbye and joined teardown
+  Active --> Failed: ring failure or unexpected peer EOF
+  Failed --> [*]
+  Closed --> [*]
+```
 
 Setup proceeds through these phases:
 
@@ -66,3 +81,5 @@ Exact-capacity admission succeeds. Capacity plus one fails without creating anot
 ## Platform contract
 
 Release packages include the native addon for each claimed Linux and macOS Bun and Node target. The package manifest and addon checksum are verified before loading. Build profile and target identity are checked before setup. Managed Rust clients use the same setup protocol, ring profile, wire version, and descriptor schema.
+
+Clean-install gates must complete one cross-process application round trip. A missing package, addon, manifest, checksum, or platform capability fails the gate; unsupported or omitted results are not success states.
