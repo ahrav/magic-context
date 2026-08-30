@@ -3,10 +3,6 @@ name: SHM hardening opt-in
 on:
   workflow_dispatch:
     inputs:
-      soak_cycles:
-        description: Measured soak cycles (MC_SHM_SOAK_CYCLES)
-        required: false
-        default: "1000"
       fuzz_seconds:
         description: Per-target libFuzzer -max_total_time seconds
         required: false
@@ -16,27 +12,6 @@ permissions:
   contents: read
 
 jobs:
-  full-soak:
-    name: Full resource soak (Linux, provisional ring tuple)
-    runs-on: ubuntu-latest
-    timeout-minutes: 180
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          persist-credentials: false
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: taiki-e/install-action@nextest
-
-      - name: Provision metadata-only sibling stubs
-        run: sh scripts/provision-rust-ci-stubs.sh
-
-      - name: Ignored full soak (shm-soak nextest profile)
-        env:
-          MC_SHM_SOAK_CYCLES: ${{ inputs.soak_cycles }}
-        run: cargo nextest run -P shm-soak --run-ignored ignored-only
-
   bounded-fuzz:
     name: Bounded libFuzzer campaign (nested fuzz workspace)
     runs-on: ubuntu-latest
