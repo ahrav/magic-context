@@ -498,8 +498,8 @@ impl ChannelFactory for RingFactory {
 
     async fn connect(&self, cfg: ContractConfig) -> Harness<Self::Channel, Self::Peer> {
         let budget = ByteBudget::new(cfg.budget_bytes);
-        let transport = crate::ring_transport::RingTransport::for_qualified_test_profile(
-            crate::ring_transport::single_candidate_limits(),
+        let transport = crate::ring_transport::RingTransport::for_ring_profile(
+            crate::ring_transport::per_connection_limits(),
         );
         let prepared = transport
             .prepare(budget.clone(), cfg.queue_frames, cfg.write_deadline)

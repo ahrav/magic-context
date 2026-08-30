@@ -46,6 +46,7 @@ import {
     type RouteHandle,
     StaleRouteHandleError,
 } from "./route-handle";
+import { classifySharedMemoryFailure } from "./shared-memory-failure";
 import type {
     AuthenticatedPeer,
     BindIdentity,
@@ -444,6 +445,11 @@ export class McHostClient {
         return { daemonVer: active.snapshot.daemonVer, pid: active.snapshot.pid };
     }
 
+    /** True after irreversible owner close begins. */
+    get isClosed(): boolean {
+        return this.closeStarted;
+    }
+
     /**
      * Open a route and return its connection-bound immutable handle. One
      * attempt under one bounded deadline; retry policy belongs to owners
@@ -559,8 +565,8 @@ export class McHostClient {
     }
 
     /** List catalog entries through a validated tagged `catalog.list`. */
-    async catalogList(): Promise<CatalogEntry[]> {
-        return (await this.catalogSnapshot()).modules;
+    async catalogList(options: { timeoutMs?: number } = {}): Promise<CatalogEntry[]> {
+        return (await this.catalogSnapshot(options)).modules;
     }
 
     /**
@@ -574,8 +580,8 @@ export class McHostClient {
      * must not strand an older client. The negotiation family (§7.7.1) is the
      * one closed-shape exception and is validated elsewhere.
      */
-    async catalogSnapshot(): Promise<CatalogSnapshot> {
-        const deadline = Deadline.start(this.requestTimeoutMs, this.clock);
+    async catalogSnapshot(options: { timeoutMs?: number } = {}): Promise<CatalogSnapshot> {
+        const deadline = Deadline.start(options.timeoutMs ?? this.requestTimeoutMs, this.clock);
         const active = await this.ensureConnection(deadline);
         const bodyText = JSON.stringify({ op: "catalog.list" });
         const parsed = await this.controlRequest(active, bodyText, "catalog.list", deadline);
@@ -1647,26 +1653,6 @@ export function parseSharedMemoryDiagnostics(value: unknown): SharedMemoryDiagno
 
 function isPeerDeath(reason: RetirementReason): boolean {
     return reason === "eof" || reason === "socket_closed" || reason === "socket_error";
-}
-
-export function classifySharedMemoryFailure(error: unknown): SharedMemoryTerminalClass {
-    const message = error instanceof Error ? error.message : "";
-    const code = errorCode(error);
-    if (/native addon.*(?:missing|unavailable)|cannot find module/i.test(message)) {
-        return "missing_addon";
-    }
-    if (/identity mismatch/i.test(message)) return "identity_mismatch";
-    if (code === "memory_cap" || /(?:capacity|resource).*(?:exhaust|limit)/i.test(message)) {
-        return "resource_exhaustion";
-    }
-    if (
-        code === "ECONNRESET" ||
-        code === "EPIPE" ||
-        /unexpected eof|peer.*(?:died|closed)/i.test(message)
-    ) {
-        return "peer_death";
-    }
-    return "setup_failure";
 }
 
 /**

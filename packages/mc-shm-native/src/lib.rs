@@ -214,25 +214,25 @@ fn string_field(env: &Env, object: &Object<'_>, name: &str, max_len: usize) -> R
     unsafe { value.cast::<String>() }.map_err(|_| cleared_descriptor_error(env))
 }
 
-fn decode_hex<const N: usize>(text: &str) -> Result<[u8; N]> {
+fn strict_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
     let ascii = text.as_bytes();
     if ascii.len() != N * 2 {
-        return Err(descriptor_error());
+        return None;
     }
     // Strict lowercase hexadecimal only, matching the host encoder;
     // `from_str_radix` would also admit uppercase and sign prefixes.
-    fn nibble(byte: u8) -> Result<u8> {
+    fn nibble(byte: u8) -> Option<u8> {
         match byte {
-            b'0'..=b'9' => Ok(byte - b'0'),
-            b'a'..=b'f' => Ok(byte - b'a' + 10),
-            _ => Err(descriptor_error()),
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
         }
     }
     let mut bytes = [0u8; N];
     for (index, byte) in bytes.iter_mut().enumerate() {
         *byte = nibble(ascii[index * 2])? << 4 | nibble(ascii[index * 2 + 1])?;
     }
-    Ok(bytes)
+    Some(bytes)
 }
 
 fn attach_ring(fd: i32, grant: RingGrant) -> Result<Ring> {
@@ -506,19 +506,25 @@ pub fn attach(env: &Env, descriptor: Unknown<'_>) -> Result<u32> {
             integer_field(env, &object, "hostToPeerFd", 0.0, f64::from(i32::MAX))? as i32;
         let peer_to_host_fd =
             integer_field(env, &object, "peerToHostFd", 0.0, f64::from(i32::MAX))? as i32;
-        let host_to_peer_grant = RingGrant::decode(decode_hex(&string_field(
-            env,
-            &object,
-            "hostToPeerGrant",
-            GRANT_HEX_LEN,
-        )?)?)
+        let host_to_peer_grant = RingGrant::decode(
+            strict_hex(&string_field(
+                env,
+                &object,
+                "hostToPeerGrant",
+                GRANT_HEX_LEN,
+            )?)
+            .ok_or_else(descriptor_error)?,
+        )
         .map_err(|_| descriptor_error())?;
-        let peer_to_host_grant = RingGrant::decode(decode_hex(&string_field(
-            env,
-            &object,
-            "peerToHostGrant",
-            GRANT_HEX_LEN,
-        )?)?)
+        let peer_to_host_grant = RingGrant::decode(
+            strict_hex(&string_field(
+                env,
+                &object,
+                "peerToHostGrant",
+                GRANT_HEX_LEN,
+            )?)
+            .ok_or_else(descriptor_error)?,
+        )
         .map_err(|_| descriptor_error())?;
         // Both directions form one duplex pair over two distinct backing
         // objects; an aliased fd or grant collapses them onto one ring.

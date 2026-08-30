@@ -28,9 +28,7 @@ use crate::frame_channel::{
 use crate::wire::{ByteBudget, MAX_CONTROL_BODY_LEN};
 
 /// Current ring profile accepted by every process in one release.
-pub const QUALIFIED_TEST_PROFILE: &str = "mc-host-test-ring-v1";
-
-const HARDWARE_PROFILE: &str = "mc-host-test-ring-v1";
+pub const RING_PROFILE: &str = "mc-host-test-ring-v1";
 const DESCRIPTOR_DEPTH: usize = 8;
 const POLL_INTERVAL: Duration = Duration::from_micros(50);
 
@@ -40,11 +38,11 @@ const POLL_INTERVAL: Duration = Duration::from_micros(50);
 #[doc(hidden)]
 pub type PublishHook = Arc<dyn Fn(FrameType, u16) + Send + Sync>;
 
-pub fn qualified_test_profile() -> TargetProfile {
+pub fn ring_profile() -> TargetProfile {
     TargetProfile::new(ProfileConfig {
         descriptor: TransportDescriptor::new(
             SchedulingMode::ColdParkWake,
-            HardwareProfileId::new(HARDWARE_PROFILE).expect("static hardware profile is valid"),
+            HardwareProfileId::new(RING_PROFILE).expect("static hardware profile is valid"),
         ),
         descriptor_depth: DESCRIPTOR_DEPTH,
         arena_bytes: mc_shm_transport::MIN_ARENA_BYTES,
@@ -59,9 +57,9 @@ pub fn qualified_test_profile() -> TargetProfile {
     .expect("static shared-memory profile is valid")
 }
 
-/// Admission limits sufficient for one qualified candidate.
-pub fn single_candidate_limits() -> ShmHostLimits {
-    let charges = qualified_test_profile().charges();
+/// Admission limits sufficient for one connection.
+pub fn per_connection_limits() -> ShmHostLimits {
+    let charges = ring_profile().charges();
     ShmHostLimits {
         descriptors: charges.descriptors,
         arena_bytes: charges.arena_bytes,
@@ -76,7 +74,7 @@ pub fn single_candidate_limits() -> ShmHostLimits {
 
 pub fn process_limits(connections: usize) -> Option<ShmHostLimits> {
     let count = u64::try_from(connections).ok()?;
-    let one = single_candidate_limits();
+    let one = per_connection_limits();
     Some(ShmHostLimits {
         descriptors: one.descriptors.checked_mul(count)?,
         arena_bytes: one.arena_bytes.checked_mul(count)?,
@@ -125,8 +123,8 @@ impl std::error::Error for RingUnavailable {}
 
 impl RingTransport {
     /// Builds the process-wide transport with finite admission limits.
-    pub fn for_qualified_test_profile(limits: ShmHostLimits) -> Self {
-        let profile = Arc::new(qualified_test_profile());
+    pub fn for_ring_profile(limits: ShmHostLimits) -> Self {
+        let profile = Arc::new(ring_profile());
         let admission = Arc::new(AdmissionController::new(limits));
         Self {
             profile,
@@ -204,7 +202,7 @@ impl RingTransport {
             "state": state,
             "error_class": error_class,
             "artifact": {
-                "profile": QUALIFIED_TEST_PROFILE,
+                "profile": RING_PROFILE,
                 "wire_version": crate::wire::PROTOCOL_VERSION,
                 "descriptor_schema": mc_shm_transport::descriptor::DESCRIPTOR_SCHEMA_VERSION,
             },
@@ -234,7 +232,7 @@ impl RingTransport {
         self.reclamations.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Test hook: install a publication observer for candidates prepared
+    /// Test hook: install a publication observer for connections prepared
     /// after this call. The hook runs on the endpoint thread after the ring
     /// commit. commentlint: allow(JUDGE)
     #[doc(hidden)]
@@ -335,7 +333,7 @@ struct WireDescriptor {
 
 fn worker_descriptor(rings: &DuplexRing) -> Result<(serde_json::Value, [OwnedFd; 2]), ()> {
     let descriptor = WireDescriptor {
-        profile: QUALIFIED_TEST_PROFILE.to_owned(),
+        profile: RING_PROFILE.to_owned(),
         host_to_peer_grant: encode_hex(&rings.first.grant().encode()),
         peer_to_host_grant: encode_hex(&rings.second.grant().encode()),
     };
@@ -415,8 +413,8 @@ async fn run_endpoint(
                     // stop (or the inbound consumer is gone, or ingress is
                     // saturated) and the local lease releases safely on drop
                     // — so they must not quarantine the admission charges:
-                    // with single-candidate limits that would permanently
-                    // block every later shared-memory candidate. Only
+                    // with per-connection limits that would permanently
+                    // block every later shared-memory connection. Only
                     // structural faults are unclean.
                     let clean = matches!(close, ReadClose::Cancelled | ReadClose::Overloaded);
                     let _ = inbound_sender.send(Err(close)).await;
@@ -647,26 +645,14 @@ pub struct RingClientEndpoint {
 }
 
 impl RingClientEndpoint {
-    /// Rejects descriptor-only attachment because setup transfers ring
-    /// ownership through `SCM_RIGHTS` rather than process-local descriptor
-    /// numbers embedded in JSON.
-    pub fn attach(_descriptor: &serde_json::Value) -> Result<Self, RingClientError> {
-        Err(RingClientError)
-    }
-
     /// Attaches a descriptor and its setup-socket file descriptors.
     pub fn attach_with_descriptors(
         descriptor: &serde_json::Value,
         descriptors: [OwnedFd; 2],
     ) -> Result<Self, RingClientError> {
-        let mut descriptor = descriptor.clone();
-        descriptor
-            .as_object_mut()
-            .ok_or(RingClientError)?
-            .remove("candidate_id");
         let descriptor: WireDescriptor =
-            serde_json::from_value(descriptor).map_err(|_| RingClientError)?;
-        if descriptor.profile != QUALIFIED_TEST_PROFILE {
+            serde_json::from_value(descriptor.clone()).map_err(|_| RingClientError)?;
+        if descriptor.profile != RING_PROFILE {
             return Err(RingClientError);
         }
         let [from_host_fd, to_host_fd] = descriptors;
@@ -703,11 +689,8 @@ impl RingClientEndpoint {
     pub fn recv(&self, timeout: Duration) -> Result<(EnvelopeHeader, Vec<u8>), RingClientError> {
         let deadline = StdInstant::now() + timeout;
         loop {
-            if let Some(lease) = self.from_host.try_receive().map_err(|_| RingClientError)? {
-                let header = decode_header(&lease.wire_header()).map_err(|_| RingClientError)?;
-                let body = lease.to_vec().map_err(|_| RingClientError)?;
-                lease.release().map_err(|_| RingClientError)?;
-                return Ok((header, body));
+            if let Some(frame) = self.try_recv()? {
+                return Ok(frame);
             }
             if StdInstant::now() >= deadline {
                 return Err(RingClientError);
@@ -768,7 +751,7 @@ mod tests {
 
     #[test]
     fn construction_has_no_ring_side_effects() {
-        let transport = RingTransport::for_qualified_test_profile(single_candidate_limits());
+        let transport = RingTransport::for_ring_profile(per_connection_limits());
         assert_eq!(transport.preparation_count(), 0);
         let accounting = transport.accounting().unwrap();
         assert_eq!(accounting.active, ResourceCharges::ZERO);
@@ -777,8 +760,8 @@ mod tests {
 
     #[test]
     fn diagnostics_report_fixed_identity_bounds_accounting_and_lifecycle_counts() {
-        let limits = single_candidate_limits();
-        let transport = RingTransport::for_qualified_test_profile(limits);
+        let limits = per_connection_limits();
+        let transport = RingTransport::for_ring_profile(limits);
         transport.record_attachment();
         transport.record_activation();
         transport.record_peer_death();
@@ -787,7 +770,7 @@ mod tests {
         let diagnostics = transport.diagnostics();
         assert_eq!(diagnostics["state"], "healthy");
         assert_eq!(diagnostics["error_class"], serde_json::Value::Null);
-        assert_eq!(diagnostics["artifact"]["profile"], QUALIFIED_TEST_PROFILE);
+        assert_eq!(diagnostics["artifact"]["profile"], RING_PROFILE);
         assert_eq!(
             diagnostics["artifact"]["wire_version"],
             crate::wire::PROTOCOL_VERSION
@@ -820,8 +803,8 @@ mod tests {
     }
 
     #[test]
-    fn qualified_test_profile_pins_client_grant_geometry() {
-        let profile = qualified_test_profile();
+    fn ring_profile_pins_per_connection_grant_geometry() {
+        let profile = ring_profile();
         assert_eq!(profile.descriptor_depth(), 8);
         assert_eq!(profile.max_leases(), 8);
         assert_eq!(profile.arena_bytes(), mc_shm_transport::MIN_ARENA_BYTES);
@@ -829,7 +812,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn copied_control_frame_records_one_host_adapter_copy() {
-        let rings = DuplexRing::create(&qualified_test_profile()).unwrap();
+        let rings = DuplexRing::create(&ring_profile()).unwrap();
         let geometry = rings.first.grant().geometry();
         assert_eq!(geometry.descriptor_depth, 8);
         assert_eq!(geometry.max_leases, 8);

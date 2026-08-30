@@ -19,6 +19,25 @@ export interface NativeCapabilities {
     reason?: string;
 }
 
+export type NativeStartupFailureReason =
+    | "missing_addon"
+    | "unsupported_platform"
+    | "missing_manifest"
+    | "wrong_platform_payload"
+    | "missing_checksum"
+    | "checksum_mismatch"
+    | "debug_build"
+    | "wrong_platform_binary"
+    | "capability_unavailable";
+
+/** Bounded startup failure safe for cross-package classification. */
+export class NativeStartupError extends Error {
+    constructor(readonly reason: NativeStartupFailureReason) {
+        super(`shared-memory native startup failed: ${reason}`);
+        this.name = "NativeStartupError";
+    }
+}
+
 export interface NativeDescriptor {
     profile: string;
     hostToPeerFd: number;
@@ -99,6 +118,7 @@ interface NativeAddon {
 
 let loaded: NativeAddon | null | undefined;
 let loadError: Error | undefined;
+let constructorCapability: NativeCapabilities | undefined;
 
 const PLATFORM_PACKAGES = {
     "darwin-arm64": {
@@ -120,20 +140,26 @@ const PLATFORM_PACKAGES = {
 
 const ADDON_PAYLOAD_PATH = "payload/native/mc_shm_native.node";
 
-function packageAddonPath(): string {
+type PlatformPackage = (typeof PLATFORM_PACKAGES)[keyof typeof PLATFORM_PACKAGES];
+
+function platformPackage(): PlatformPackage {
     const platform = PLATFORM_PACKAGES[`${process.platform}-${process.arch}` as keyof typeof PLATFORM_PACKAGES];
-    if (!platform) throw new Error("shared-memory native addon: unsupported platform");
+    if (!platform) throw new NativeStartupError("unsupported_platform");
+    return platform;
+}
+
+function packageAddonPath(platform: PlatformPackage): string {
     const require = createRequire(import.meta.url);
     let packageJsonPath: string;
     try {
         packageJsonPath = require.resolve(`${platform.package}/package.json`);
     } catch {
-        throw new Error(`shared-memory native addon: missing ${platform.package}`);
+        throw new NativeStartupError("missing_addon");
     }
     const packageDir = dirname(packageJsonPath);
     const manifestPath = join(packageDir, "payload-manifest.json");
     if (!existsSync(manifestPath)) {
-        throw new Error("shared-memory native addon: payload manifest is missing");
+        throw new NativeStartupError("missing_manifest");
     }
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
         package?: { name?: string; target?: string };
@@ -143,19 +169,19 @@ function packageAddonPath(): string {
         manifest.package?.name !== platform.package ||
         manifest.package.target !== platform.target
     ) {
-        throw new Error("shared-memory native addon: wrong-platform payload");
+        throw new NativeStartupError("wrong_platform_payload");
     }
     const entry = manifest.files?.find(({ path }) => path === ADDON_PAYLOAD_PATH);
     if (!entry || !/^[0-9a-f]{64}$/.test(entry.sha256 ?? "")) {
-        throw new Error("shared-memory native addon: payload manifest lacks addon checksum");
+        throw new NativeStartupError("missing_checksum");
     }
     const addonPath = join(packageDir, ADDON_PAYLOAD_PATH);
     if (!existsSync(addonPath)) {
-        throw new Error("shared-memory native addon: addon is missing");
+        throw new NativeStartupError("missing_addon");
     }
     const actual = createHash("sha256").update(readFileSync(addonPath)).digest("hex");
     if (actual !== entry.sha256) {
-        throw new Error("shared-memory native addon: checksum mismatch");
+        throw new NativeStartupError("checksum_mismatch");
     }
     return addonPath;
 }
@@ -164,16 +190,17 @@ function requireAddon(): NativeAddon {
     if (loaded) return loaded;
     if (loadError) throw loadError;
     try {
+        const platform = platformPackage();
         const localPath = new URL("./mc_shm_native.node", import.meta.url);
-        const addonPath = existsSync(localPath) ? fileURLToPath(localPath) : packageAddonPath();
+        const addonPath = existsSync(localPath)
+            ? fileURLToPath(localPath)
+            : packageAddonPath(platform);
         const native = createRequire(import.meta.url)(addonPath) as NativeAddon;
         if (native.buildProfile() !== "release") {
-            throw new Error("shared-memory native addon: debug build rejected");
+            throw new NativeStartupError("debug_build");
         }
-        const nativeArch = process.arch === "arm64" ? "aarch64" : process.arch === "x64" ? "x86_64" : process.arch;
-        const nativeOs = process.platform === "darwin" ? "macos" : process.platform;
-        if (native.buildTarget() !== `${nativeOs}-${nativeArch}`) {
-            throw new Error("shared-memory native addon: wrong-platform binary");
+        if (native.buildTarget() !== platform.nativeTarget) {
+            throw new NativeStartupError("wrong_platform_binary");
         }
         loaded = native;
         return native;
@@ -182,6 +209,13 @@ function requireAddon(): NativeAddon {
         loaded = null;
         throw loadError;
     }
+}
+
+function capableAddon(): NativeAddon {
+    const native = requireAddon();
+    const capability = (constructorCapability ??= probeCapabilities());
+    if (!capability.available) throw new NativeStartupError("capability_unavailable");
+    return native;
 }
 
 function addon(): NativeAddon | null {
@@ -490,29 +524,17 @@ export class NativeChannel {
     ) {}
 
     static attach(descriptor: NativeDescriptor): NativeChannel {
-        const native = requireAddon();
-        const capability = probeCapabilities();
-        if (!capability.available) {
-            throw new Error(`shared-memory native startup failed: ${capability.reason}`);
-        }
+        const native = capableAddon();
         return new NativeChannel(native, native.attach(descriptor));
     }
 
     static connectSetup(options: NativeSetupOptions): NativeChannel {
-        const native = requireAddon();
-        const capability = probeCapabilities();
-        if (!capability.available) {
-            throw new Error(`shared-memory native startup failed: ${capability.reason}`);
-        }
+        const native = capableAddon();
         return new NativeChannel(native, native.connectSetup(options));
     }
 
     static createTestPair(): NativeTestPair {
-        const native = requireAddon();
-        const capability = probeCapabilities();
-        if (!capability.available) {
-            throw new Error(`shared-memory native startup failed: ${capability.reason}`);
-        }
+        const native = capableAddon();
         const pair = native.createTestPair();
         return {
             first: new NativeChannel(native, pair.first),

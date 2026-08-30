@@ -49,24 +49,13 @@ pub(crate) fn bind_owner_only(path: &Path) -> io::Result<tokio::net::UnixListene
     Ok(listener)
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename = "grant")]
-pub struct GrantMessage<'a> {
+pub struct GrantMessage {
     pub wire_version: u8,
     pub descriptor_schema: u16,
-    pub activation_token: &'a str,
-    pub descriptor: &'a serde_json::Value,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum OwnedGrantMessage {
-    Grant {
-        wire_version: u8,
-        descriptor_schema: u16,
-        activation_token: String,
-        descriptor: serde_json::Value,
-    },
+    pub activation_token: String,
+    pub descriptor: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -142,7 +131,7 @@ impl std::error::Error for SetupError {
 /// Sends the grant and exactly two ring descriptors in one `SCM_RIGHTS` message.
 pub async fn send_grant(
     stream: &mut UnixStream,
-    grant: &GrantMessage<'_>,
+    grant: &GrantMessage,
     descriptors: &[OwnedFd; RING_DESCRIPTOR_COUNT],
     deadline: Instant,
 ) -> Result<(), SetupError> {
@@ -262,8 +251,8 @@ pub async fn activate_server(
         &GrantMessage {
             wire_version,
             descriptor_schema,
-            activation_token,
-            descriptor,
+            activation_token: activation_token.to_owned(),
+            descriptor: descriptor.clone(),
         },
         descriptors,
         deadline,
@@ -304,7 +293,7 @@ pub async fn activate_client(
         .checked_add(timeout)
         .ok_or(SetupError::Timeout)?;
     let (value, descriptors) = receive_grant(stream, deadline).await?;
-    let OwnedGrantMessage::Grant {
+    let GrantMessage {
         wire_version,
         descriptor_schema,
         activation_token,
@@ -465,8 +454,8 @@ mod tests {
                 &GrantMessage {
                     wire_version: 2,
                     descriptor_schema: 1,
-                    activation_token: "token",
-                    descriptor: &serde_json::json!({"ring": "v1"}),
+                    activation_token: "token".to_owned(),
+                    descriptor: serde_json::json!({"ring": "v1"}),
                 },
                 &descriptors,
                 deadline,

@@ -352,25 +352,8 @@ fn set_timeout(stream: &UnixStream, deadline: Instant) -> io::Result<()> {
 }
 
 fn decode_grant(text: &str) -> io::Result<RingGrant> {
-    const N: usize = RingGrant::encoded_len();
-    if text.len() != N * 2 {
-        return Err(invalid());
-    }
-    let mut bytes = [0u8; N];
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        let high = nibble(text.as_bytes()[index * 2])?;
-        let low = nibble(text.as_bytes()[index * 2 + 1])?;
-        *byte = high << 4 | low;
-    }
+    let bytes = super::strict_hex(text).ok_or_else(invalid)?;
     RingGrant::decode(bytes).map_err(|_| invalid())
-}
-
-fn nibble(byte: u8) -> io::Result<u8> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        _ => Err(invalid()),
-    }
 }
 
 fn invalid() -> io::Error {
@@ -393,7 +376,7 @@ fn timed_out() -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::GrantMessage;
+    use super::{proof, GrantMessage, CLIENT_AUTH_DOMAIN, SERVER_PROOF_DOMAIN};
 
     #[test]
     fn grant_message_accepts_tagged_setup_envelope() {
@@ -412,5 +395,39 @@ mod tests {
 
         let GrantMessage::Grant { wire_version, .. } = message;
         assert_eq!(wire_version, 2);
+    }
+
+    #[test]
+    fn auth_proofs_match_committed_wire_vectors() {
+        let key = std::array::from_fn::<_, 32, _>(|index| index as u8);
+        let client_nonce = std::array::from_fn::<_, 32, _>(|index| index as u8 + 0x20);
+        let server_nonce = std::array::from_fn::<_, 32, _>(|index| index as u8 + 0x40);
+        let daemon_id = std::array::from_fn::<_, 16, _>(|index| index as u8 + 0x60);
+        assert_eq!(
+            proof(
+                &key,
+                SERVER_PROOF_DOMAIN,
+                &client_nonce,
+                &server_nonce,
+                &daemon_id,
+            ),
+            [
+                234, 174, 245, 201, 145, 181, 54, 105, 225, 195, 92, 24, 185, 58, 79, 43, 27, 172,
+                41, 84, 85, 12, 15, 144, 129, 65, 174, 41, 163, 57, 206, 192,
+            ],
+        );
+        assert_eq!(
+            proof(
+                &key,
+                CLIENT_AUTH_DOMAIN,
+                &client_nonce,
+                &server_nonce,
+                &daemon_id,
+            ),
+            [
+                168, 51, 199, 61, 160, 183, 32, 109, 223, 82, 6, 97, 222, 1, 81, 240, 135, 27, 140,
+                91, 196, 171, 21, 161, 69, 59, 214, 117, 64, 99, 228, 205,
+            ],
+        );
     }
 }

@@ -321,8 +321,7 @@ export class ConnectionGeneration {
     authenticatedDaemonId: Uint8Array | null = null;
 
     private readonly channel: SetupFrameChannel;
-    private readonly credentials: AuthCredentials;
-    private readonly inheritedIdentity: { daemonVer: string; daemonId: Uint8Array | null } | null;
+    private readonly identity: { daemonVer: string; daemonId: Uint8Array | null };
     /**
      * The same channel as {@link channel} when this generation dials and
      * authenticates for itself, and the only source of a proven identity.
@@ -353,17 +352,10 @@ export class ConnectionGeneration {
     private pendingHeld = 0;
 
     constructor(options: ConnectionGenerationOptions) {
-        this.credentials = {
-            key: options.credentials.key.slice(),
-            daemonId: options.credentials.daemonId.slice(),
+        this.identity = options.inheritedIdentity ?? {
             daemonVer: options.credentials.daemonVer,
+            daemonId: options.credentials.daemonId,
         };
-        this.inheritedIdentity = options.inheritedIdentity
-            ? {
-                  daemonVer: options.inheritedIdentity.daemonVer,
-                  daemonId: options.inheritedIdentity.daemonId?.slice() ?? null,
-              }
-            : null;
         const maxBodyLen = options.maxBodyLen ?? MAX_FRAME_BODY_LEN;
         this.budget = new ByteBudget(
             options.memoryCapBytes ?? maxBodyLen + DEFAULT_MEMORY_OVERHEAD_BYTES,
@@ -759,9 +751,8 @@ export class ConnectionGeneration {
             }
             // Identity comes from the ring channel's authenticated setup or
             // from the test-only pre-attached channel seam.
-            const identity = this.inheritedIdentity ?? this.credentials;
-            this.daemonVer = identity.daemonVer;
-            this.authenticatedDaemonId = identity.daemonId?.slice() ?? null;
+            this.daemonVer = this.identity.daemonVer;
+            this.authenticatedDaemonId = this.identity.daemonId;
             this.phase = "frames";
         } finally {
             cancelSetupTimer();

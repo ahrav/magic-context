@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { extname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -42,9 +42,9 @@ export interface ArchitectureViolation {
 function sourceFiles(root: string): string[] {
     if (!existsSync(root)) return [];
     const files: string[] = [];
-    for (const entry of readdirSync(root)) {
-        const path = join(root, entry);
-        if (statSync(path).isDirectory()) files.push(...sourceFiles(path));
+    for (const entry of readdirSync(root, { withFileTypes: true })) {
+        const path = join(root, entry.name);
+        if (entry.isDirectory()) files.push(...sourceFiles(path));
         else if ([".rs", ".ts", ".tsx"].includes(extname(path)) && !path.endsWith(".test.ts")) {
             files.push(path);
         }

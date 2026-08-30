@@ -873,9 +873,9 @@ pub async fn run<H: McHostHandler>(
             detail: None,
             metrics: Some(serde_json::json!({"components": {}})),
         }),
-        ring: Arc::new(
-            crate::ring_transport::RingTransport::for_qualified_test_profile(ring_limits),
-        ),
+        ring: Arc::new(crate::ring_transport::RingTransport::for_ring_profile(
+            ring_limits,
+        )),
         registry: RouteRegistry::new(config.limits.max_routes),
         ingress_budget: ByteBudget::new(
             config.limits.max_resident_bytes

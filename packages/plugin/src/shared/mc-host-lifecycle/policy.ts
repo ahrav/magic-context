@@ -15,7 +15,7 @@
  * path, stderr text, or native error chain rides on any result.
  */
 
-import { classifySharedMemoryFailure } from "../mc-host-client/client";
+import { classifySharedMemoryFailure } from "../mc-host-client/shared-memory-failure";
 import type {
     AuthenticatedPeer,
     SharedMemoryDiagnostics,

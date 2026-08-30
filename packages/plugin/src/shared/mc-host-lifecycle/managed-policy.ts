@@ -41,8 +41,6 @@ async function probeManagedStorage(
     try {
         const client = await processMcHostClient({
             connectionFile: connectionFilePath(root),
-            handshakeTimeoutMs: Math.max(1, budgetMs),
-            requestTimeoutMs: Math.max(1, budgetMs),
         });
         for (;;) {
             const state = storageState(
@@ -69,8 +67,6 @@ async function probeManagedReadiness(root: string, budgetMs: number): Promise<Ob
     const deadline = Date.now() + budgetMs;
     const client = await processMcHostClient({
         connectionFile: connectionFilePath(root),
-        handshakeTimeoutMs: Math.max(1, budgetMs),
-        requestTimeoutMs: Math.max(1, budgetMs),
     });
     const authenticated = client.authenticated;
     if (authenticated === null) throw new Error("authenticated peer disappeared");

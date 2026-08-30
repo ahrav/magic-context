@@ -67,7 +67,6 @@ import {
 const DEFAULT_MODULE_ID = "magic-context";
 const CONNECT_BACKOFF_INITIAL_MS = 1_000;
 const CONNECT_BACKOFF_MAX_MS = 30_000;
-const HANDSHAKE_TIMEOUT_MS = 2_000;
 const MODULE_SEND_TIMEOUT_MS = 15_000;
 const TRANSFORM_SEND_TIMEOUT_MS = 5_000;
 /** Consumer deadline for the module's exported historian::MAX_WRAPUP_REQUEST_BUDGET. */
@@ -1271,25 +1270,9 @@ export class McHostModuleTransport {
         return resolved;
     }
 
-    private connectClient(deadline?: Deadline): Promise<McHostClient> {
-        // Derive the handshake stage from the operation deadline without ever
-        // extending the preserved 2-second handshake budget (plan KTD5).
-        const handshakeTimeoutMs = deadline
-            ? Math.max(1, deadline.stageBudgetMs(HANDSHAKE_TIMEOUT_MS))
-            : HANDSHAKE_TIMEOUT_MS;
+    private connectClient(_deadline?: Deadline): Promise<McHostClient> {
         return processMcHostClient({
             connectionFile: this.connectionFile,
-            handshakeTimeoutMs,
-            // Credentials are presented on every real connection, not only the
-            // one this transport is allowed to start. Lifecycle ownership and
-            // route authentication are independent: an explicit
-            // `subc.connection_file` can point at a shared daemon that another
-            // managed harness started with a credential envelope, and that
-            // daemon installs `CredentialVerifier`, which fails every Broca send
-            // with `credential_snapshot_mismatch` when the route presents no
-            // fingerprint. Gating this on `managed-default` let such a client
-            // complete its handshake and then fail every provider call.
-            credentialSource: process.env,
         });
     }
 
