@@ -529,3 +529,56 @@ fn a_reused_candidate_id_does_not_collide_with_deleted_redaction_rows() {
         1
     );
 }
+
+#[test]
+fn two_payloads_differing_only_in_secret_bytes_are_not_the_same_replay() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let other = "sk-ant-api03-ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ";
+    let mut first = shared_run_candidate("candidate-alias", 1);
+    first.payload = format!("payload {SECRET}");
+    let mut second = shared_run_candidate("candidate-alias", 1);
+    second.payload = format!("payload {other}");
+    // Both redact to the same text, so a redacted comparison would alias them.
+    store.stage_candidate(first).unwrap();
+    assert_eq!(
+        store.stage_candidate(second).unwrap_err(),
+        KernelError::Conflict
+    );
+}
+
+#[test]
+fn an_identical_restage_renews_the_candidate_lease_with_its_run() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    store
+        .stage_candidate(shared_run_candidate("candidate-a", 1))
+        .unwrap();
+    store
+        .stage_candidate(shared_run_candidate("candidate-a", 5))
+        .unwrap();
+
+    let connection = Connection::open_with_flags(
+        directory.path().join("core.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let candidate: (i64, i64) = connection
+        .query_row(
+            "SELECT heartbeat_at,lease_expires_at FROM candidates",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let run: (i64, i64) = connection
+        .query_row(
+            "SELECT heartbeat_at,lease_expires_at FROM extraction_runs",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        candidate, run,
+        "a replayed candidate must not keep an older lease than its run"
+    );
+}

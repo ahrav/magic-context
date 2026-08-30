@@ -14,6 +14,7 @@ const EXPECTED_COMPONENTS: &[&str] = &[
     "outbox",
     "operation_receipts",
     "durable_text_redactions",
+    "alignment_projection_state",
     "writer_fence",
     "outbox_consumers",
     "consumer_abandonments",
@@ -137,7 +138,7 @@ fn kernel_schema_has_one_ordered_full_shape() {
 const INCARNATION: &str = "0123456789abcdef0123456789abcdef";
 
 const PINNED_SCHEMA_DIGEST: &str =
-    "9fc412b52dcb9dcc4dac5a7efbe4a5a9a6306c7367cbb8c74a490003233523ec";
+    "3c9c70b174f642cc812cda25e226e66085e859b288a3460995e8c3785f2d893e";
 
 #[test]
 fn kernel_schema_digest_is_pinned_to_the_frozen_v1_shape() {

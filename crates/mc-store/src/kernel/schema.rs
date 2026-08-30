@@ -13,6 +13,7 @@ pub const KERNEL_SCHEMA_COMPONENT_NAMES: &[&str] = &[
     "outbox",
     "operation_receipts",
     "durable_text_redactions",
+    "alignment_projection_state",
     "writer_fence",
     "outbox_consumers",
     "consumer_abandonments",
@@ -62,6 +63,10 @@ const COMPONENTS: &[(&str, &str)] = &[
     (
         "durable_text_redactions",
         r#"CREATE TABLE durable_text_redactions(owner_kind TEXT NOT NULL,owner_id TEXT NOT NULL,field_name TEXT NOT NULL,detection_ordinal INTEGER NOT NULL,detector_id TEXT NOT NULL,secret_type TEXT NOT NULL,source_utf8_offset INTEGER NOT NULL,source_utf8_length INTEGER NOT NULL,commit_seq INTEGER REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,PRIMARY KEY(owner_kind,owner_id,field_name,detection_ordinal)) STRICT; CREATE INDEX idx_text_redactions_commit_fk ON durable_text_redactions(commit_seq);"#,
+    ),
+    (
+        "alignment_projection_state",
+        r#"CREATE TABLE alignment_projection_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1),built_through_commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq) ON DELETE RESTRICT) STRICT;"#,
     ),
     (
         "writer_fence",
