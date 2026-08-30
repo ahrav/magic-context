@@ -516,12 +516,26 @@ impl RawClient {
             }))
             .await
             .map_err(|err| err.to_string())?;
-        let frame = self.expect_frame().await.map_err(|err| err.to_string())?;
-        if frame.corr != corr {
-            return Err(format!("correlation {} did not match {corr}", frame.corr));
+        let (skipped, frame) = self.frames_until_corr(corr, Duration::from_secs(5)).await?;
+        for ping in skipped {
+            if ping.ty != TY_PING {
+                return Err(format!(
+                    "unexpected frame type {} before route response",
+                    ping.ty
+                ));
+            }
+            if let Some(violation) = connection_frame_violation(&ping) {
+                return Err(violation);
+            }
+            self.send_frame(TY_PONG, ping.flags, 0, 0, ping.corr, &[])
+                .await
+                .map_err(|err| err.to_string())?;
         }
         if frame.ty == TY_ERROR {
             return Err(frame.error_code());
+        }
+        if frame.ty != TY_RESPONSE {
+            return Err(format!("unexpected route response type {}", frame.ty));
         }
         let json = frame.json();
         if json["op"] != "route.open" {

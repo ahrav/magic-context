@@ -380,7 +380,7 @@ async fn run_endpoint(
     root: CancellationToken,
     read_cancel: CancellationToken,
     publish_hook: Option<PublishHook>,
-) -> bool {
+) {
     let discard = queue.discard.clone();
     let finish = queue.finish.clone();
     let mut inbound = Some(inbound);
@@ -408,19 +408,10 @@ async fn run_endpoint(
                     }
                 }
                 Err(close) => {
-                    // Cancellation and budget-timeout closes are ordinary
-                    // backpressure or retirement — the read side was told to
-                    // stop (or the inbound consumer is gone, or ingress is
-                    // saturated) and the local lease releases safely on drop
-                    // — so they must not quarantine the admission charges:
-                    // with per-connection limits that would permanently
-                    // block every later shared-memory connection. Only
-                    // structural faults are unclean.
-                    let clean = matches!(close, ReadClose::Cancelled | ReadClose::Overloaded);
                     let _ = inbound_sender.send(Err(close)).await;
                     queue.retired.cancel();
                     root.cancel();
-                    return clean;
+                    return;
                 }
             }
         }
@@ -435,12 +426,12 @@ async fn run_endpoint(
         } else if finishing {
             match queue.try_recv() {
                 Ok(frame) => Some(frame),
-                Err(_) => return true,
+                Err(_) => return,
             }
         } else {
             tokio::select! {
                 biased;
-                () = discard.cancelled() => return true,
+                () = discard.cancelled() => return,
                 () = finish.cancelled() => {
                     finishing = true;
                     None
@@ -454,9 +445,9 @@ async fn run_endpoint(
                 }
                 frame = queue.recv() => match frame {
                     Some(frame) => Some(frame),
-                    None => return true,
+                    None => return,
                 },
-                () = root.cancelled() => return true,
+                () = root.cancelled() => return,
                 () = tokio::time::sleep(POLL_INTERVAL) => None,
             }
         };
@@ -466,7 +457,7 @@ async fn run_endpoint(
         if publish_one(&rings.first, queued, frame_deadline, publish_hook.as_ref()).is_err() {
             queue.retired.cancel();
             root.cancel();
-            return false;
+            return;
         }
     }
 }
@@ -526,7 +517,13 @@ async fn receive_one(
                     return Err(ReadClose::Corrupt("shared-memory publish failed"));
                 }
             }
-            Err(_) => std::thread::sleep(POLL_INTERVAL),
+            Err(_) => {
+                tokio::select! {
+                    biased;
+                    () = read_cancel.cancelled() => return Err(ReadClose::Cancelled),
+                    () = tokio::time::sleep(POLL_INTERVAL) => {}
+                }
+            }
         }
     };
     let body = lease
@@ -700,13 +697,25 @@ impl RingClientEndpoint {
     }
 
     pub fn try_recv(&self) -> Result<Option<(EnvelopeHeader, Vec<u8>)>, RingClientError> {
+        self.try_recv_with(|_| Some(()))
+            .map(|frame| frame.map(|(header, body, ())| (header, body)))
+    }
+
+    pub(crate) fn try_recv_with<T>(
+        &self,
+        charge: impl FnOnce(usize) -> Option<T>,
+    ) -> Result<Option<(EnvelopeHeader, Vec<u8>, T)>, RingClientError> {
         let Some(lease) = self.from_host.try_receive().map_err(|_| RingClientError)? else {
             return Ok(None);
         };
         let header = decode_header(&lease.wire_header()).map_err(|_| RingClientError)?;
+        let Some(charge) = charge(lease.len()) else {
+            lease.release().map_err(|_| RingClientError)?;
+            return Err(RingClientError);
+        };
         let body = lease.to_vec().map_err(|_| RingClientError)?;
         lease.release().map_err(|_| RingClientError)?;
-        Ok(Some((header, body)))
+        Ok(Some((header, body, charge)))
     }
 }
 
@@ -715,13 +724,20 @@ fn decode_grant(grant: &str) -> Result<RingGrant, RingClientError> {
 }
 
 fn decode_hex<const N: usize>(text: &str) -> Result<[u8; N], RingClientError> {
+    let text = text.as_bytes();
     if text.len() != N * 2 {
         return Err(RingClientError);
     }
+    fn nibble(byte: u8) -> Result<u8, RingClientError> {
+        match byte {
+            b'0'..=b'9' => Ok(byte - b'0'),
+            b'a'..=b'f' => Ok(byte - b'a' + 10),
+            _ => Err(RingClientError),
+        }
+    }
     let mut bytes = [0u8; N];
     for (index, byte) in bytes.iter_mut().enumerate() {
-        *byte =
-            u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).map_err(|_| RingClientError)?;
+        *byte = nibble(text[index * 2])? << 4 | nibble(text[index * 2 + 1])?;
     }
     Ok(bytes)
 }
@@ -748,6 +764,17 @@ impl std::error::Error for RingClientError {}
 mod tests {
     use super::*;
     use crate::wire::{Flags, Priority, PROTOCOL_VERSION};
+
+    struct TestCharge {
+        used: Arc<std::sync::atomic::AtomicUsize>,
+        bytes: usize,
+    }
+
+    impl Drop for TestCharge {
+        fn drop(&mut self) {
+            self.used.fetch_sub(self.bytes, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn construction_has_no_ring_side_effects() {
@@ -810,6 +837,58 @@ mod tests {
         assert_eq!(profile.arena_bytes(), mc_shm_transport::MIN_ARENA_BYTES);
     }
 
+    #[test]
+    fn grant_hex_is_strict_lowercase_ascii_without_panics() {
+        assert_eq!(decode_hex::<2>("00af").unwrap(), [0x00, 0xaf]);
+        assert!(decode_hex::<2>("00AF").is_err());
+        assert!(decode_hex::<1>("+0").is_err());
+        let non_ascii = std::panic::catch_unwind(|| decode_hex::<2>("0é0"));
+        assert!(matches!(non_ascii, Ok(Err(_))));
+    }
+
+    #[test]
+    fn inbound_materialization_cannot_exceed_its_byte_budget() {
+        let rings = DuplexRing::create(&ring_profile()).unwrap();
+        let from_host = rings.first.attachment().unwrap().attach().unwrap();
+        let to_host = rings.second.attachment().unwrap().attach().unwrap();
+        let endpoint = RingClientEndpoint { to_host, from_host };
+        let header = EnvelopeHeader {
+            len: 1,
+            ver: PROTOCOL_VERSION,
+            ty: FrameType::Response,
+            flags: Flags::new(false, Priority::Interactive, false),
+            channel: 0,
+            epoch: 0,
+            corr: 1,
+        };
+        for byte in [1, 2] {
+            let mut reservation = rings.first.try_reserve(1, header.encode()).unwrap();
+            reservation.write(&[byte]).unwrap();
+            reservation.commit(1).unwrap();
+        }
+        let used = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let charge = |bytes| {
+            let previous = used.fetch_add(bytes, Ordering::SeqCst);
+            if previous + bytes > 1 {
+                used.fetch_sub(bytes, Ordering::SeqCst);
+                None
+            } else {
+                Some(TestCharge {
+                    used: Arc::clone(&used),
+                    bytes,
+                })
+            }
+        };
+
+        let first = endpoint.try_recv_with(charge).unwrap().unwrap();
+        assert_eq!(first.1, [1]);
+        assert_eq!(used.load(Ordering::SeqCst), 1);
+        assert!(endpoint.try_recv_with(charge).is_err());
+        assert_eq!(used.load(Ordering::SeqCst), 1);
+        drop(first);
+        assert_eq!(used.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn copied_control_frame_records_one_host_adapter_copy() {
         let rings = DuplexRing::create(&ring_profile()).unwrap();
@@ -855,5 +934,44 @@ mod tests {
             panic!("expected copied frame");
         };
         assert_eq!(frame.copy_counter().copies(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn budget_wait_observes_read_cancellation() {
+        let rings = DuplexRing::create(&ring_profile()).unwrap();
+        let body = [7u8];
+        let header = EnvelopeHeader {
+            len: 1,
+            ver: PROTOCOL_VERSION,
+            ty: FrameType::Request,
+            flags: Flags::new(false, Priority::Interactive, false),
+            channel: 0,
+            epoch: 0,
+            corr: 1,
+        };
+        let mut reservation = rings.second.try_reserve(1, header.encode()).unwrap();
+        reservation.write(&body).unwrap();
+        reservation.commit(1).unwrap();
+        let (_sender, mut queue) =
+            frame_sender(1, CancellationToken::new(), Duration::from_secs(1));
+        let (inbound, _received) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let cancellation = cancel.clone();
+        let budget = ByteBudget::new(0);
+        let receive = receive_one(
+            &rings,
+            &mut queue,
+            &inbound,
+            &budget,
+            Duration::from_secs(1),
+            &cancellation,
+            None,
+        );
+        let cancel_after_poll = async move {
+            tokio::task::yield_now().await;
+            cancel.cancel();
+        };
+        let (result, ()) = tokio::join!(receive, cancel_after_poll);
+        assert!(matches!(result, Err(ReadClose::Cancelled)));
     }
 }

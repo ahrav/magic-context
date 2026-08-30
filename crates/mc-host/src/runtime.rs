@@ -629,8 +629,20 @@ fn build_target_index(
 /// releases when the guard drops at the end — after the handler.
 pub async fn run<H: McHostHandler>(
     handler: H,
+    config: HostConfig,
+    shutdown: CancellationToken,
+) -> Result<(), HostError> {
+    run_with_publish_hook(handler, config, shutdown, None).await
+}
+
+/// Runs a host with a frame-publication observer used by transport contract
+/// tests to hold a write before its completion hook fires.
+#[doc(hidden)]
+pub async fn run_with_publish_hook<H: McHostHandler>(
+    handler: H,
     mut config: HostConfig,
     shutdown: CancellationToken,
+    publish_hook: Option<crate::ring_transport::PublishHook>,
 ) -> Result<(), HostError> {
     crate::panic_boundary::install();
     config.validate().map_err(HostError::Config)?;
@@ -861,6 +873,12 @@ pub async fn run<H: McHostHandler>(
         .ok_or_else(|| {
             HostError::InitFailed("shared-memory resource limits overflow".to_owned())
         })?;
+    let ring = Arc::new(crate::ring_transport::RingTransport::for_ring_profile(
+        ring_limits,
+    ));
+    if let Some(hook) = publish_hook {
+        ring.set_publish_hook(hook);
+    }
     let shared = Arc::new(HostShared {
         handler,
         limits: config.limits.clone(),
@@ -873,9 +891,7 @@ pub async fn run<H: McHostHandler>(
             detail: None,
             metrics: Some(serde_json::json!({"components": {}})),
         }),
-        ring: Arc::new(crate::ring_transport::RingTransport::for_ring_profile(
-            ring_limits,
-        )),
+        ring,
         registry: RouteRegistry::new(config.limits.max_routes),
         ingress_budget: ByteBudget::new(
             config.limits.max_resident_bytes
@@ -1173,9 +1189,7 @@ async fn shutdown_sequence<H: McHostHandler>(
             gen.read_tasks.wait().await;
         }
 
-        for gen in &generations {
-            send_connection_goodbye(gen).await;
-        }
+        send_connection_goodbyes(&generations, deadline).await;
         for gen in &generations {
             gen.token.cancel();
         }
@@ -1229,6 +1243,15 @@ async fn shutdown_sequence<H: McHostHandler>(
     run_handler_shutdown(shared).await && drained_in_time
 }
 
+async fn send_connection_goodbyes(generations: &[Arc<GenerationCore>], deadline: Instant) {
+    let mut sends = tokio::task::JoinSet::new();
+    for gen in generations {
+        let gen = Arc::clone(gen);
+        sends.spawn(async move { send_connection_goodbye(gen, deadline).await });
+    }
+    while sends.join_next().await.is_some() {}
+}
+
 /// Runs the handler shutdown callback exactly once, after route cleanup.
 /// The callback is never aborted: a deadline overrun trips the fatal latch
 /// and returns non-graceful while the still-tracked task keeps running, so
@@ -1269,6 +1292,53 @@ async fn run_handler_shutdown<H: McHostHandler>(shared: &Arc<HostShared<H>>) -> 
                 "shutdown callback deadline expired".to_owned(),
             );
             false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame_channel::{frame_sender, SenderQueue};
+    use std::collections::HashMap;
+
+    fn stalled_generation(id: u64) -> (Arc<GenerationCore>, SenderQueue) {
+        let token = CancellationToken::new();
+        let (writer, queue) = frame_sender(1, token.clone(), Duration::from_secs(1));
+        (
+            Arc::new(GenerationCore {
+                id,
+                token: token.clone(),
+                read_cancel: token.child_token(),
+                read_tasks: TaskTracker::new(),
+                shutdown_complete: CancellationToken::new(),
+                writer,
+                membership: std::sync::Mutex::new(HashMap::new()),
+                pending: std::sync::Mutex::new(HashMap::new()),
+                pings: std::sync::Mutex::new(HashMap::new()),
+                busy_rejects: Arc::new(tokio::sync::Semaphore::new(1)),
+                next_ping_corr: std::sync::atomic::AtomicU64::new(1),
+            }),
+            queue,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_generations_share_one_shutdown_goodbye_deadline() {
+        let (first, mut first_queue) = stalled_generation(1);
+        let (second, mut second_queue) = stalled_generation(2);
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(250);
+
+        send_connection_goodbyes(&[first, second], deadline).await;
+
+        assert_eq!(
+            Instant::now().duration_since(started),
+            Duration::from_millis(250)
+        );
+        for queue in [&mut first_queue, &mut second_queue] {
+            let frame = queue.try_recv().expect("Goodbye was queued concurrently");
+            assert_eq!(frame.frame.bytes[5], crate::wire::FrameType::Goodbye as u8);
         }
     }
 }

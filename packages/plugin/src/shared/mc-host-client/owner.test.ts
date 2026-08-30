@@ -16,6 +16,32 @@ describe("processMcHostClient", () => {
         await expect(first).rejects.toThrow();
     });
 
+    test("keeps owners for distinct publication paths separate", async () => {
+        const firstClient = { isClosed: false, closeAsync: async () => {} } as McHostClient;
+        const secondClient = { isClosed: false, closeAsync: async () => {} } as McHostClient;
+        const connect = spyOn(McHostClient, "connect")
+            .mockResolvedValueOnce(firstClient)
+            .mockResolvedValueOnce(secondClient);
+        const firstPath = `/tmp/mc-host-${crypto.randomUUID()}.json`;
+        const secondPath = `/tmp/mc-host-${crypto.randomUUID()}.json`;
+
+        const first = processMcHostClient({ connectionFile: firstPath });
+        const second = processMcHostClient({ connectionFile: secondPath });
+
+        expect(first).not.toBe(second);
+        expect(await first).toBe(firstClient);
+        expect(await second).toBe(secondClient);
+        expect(connect).toHaveBeenNthCalledWith(
+            1,
+            expect.objectContaining({ connectionFile: firstPath }),
+        );
+        expect(connect).toHaveBeenNthCalledWith(
+            2,
+            expect.objectContaining({ connectionFile: secondPath }),
+        );
+        connect.mockRestore();
+    });
+
     test("forgets a connection attempt that fails before publication", async () => {
         const connectionFile = `/tmp/missing-mc-host-${crypto.randomUUID()}.json`;
         const first = processMcHostClient({ connectionFile });

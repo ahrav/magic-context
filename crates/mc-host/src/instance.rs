@@ -316,7 +316,13 @@ impl InstanceGuard {
         let info = ConnectionInfo {
             schema: SCHEMA_VERSION,
             wire_version: crate::wire::PROTOCOL_VERSION,
-            setup_socket: setup_socket.to_string_lossy().into_owned(),
+            setup_socket: setup_socket
+                .to_str()
+                .ok_or_else(|| InstanceError::Insecure {
+                    what: "non-UTF-8 setup socket path",
+                    path: setup_socket.to_path_buf(),
+                })?
+                .to_owned(),
             key: self.key.0.to_vec(),
             daemon_id: self.daemon_id,
             pid: std::process::id(),
@@ -883,6 +889,8 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 
     const TEST_DIGEST: &str = "3d7f9a1c5b2e8f0a6d4c7b9e1f3a5c8d2b4e6f0a1c3d5e7f9b0d2f4a6c8e0b1d";
@@ -981,6 +989,21 @@ mod tests {
         let meta = std::fs::symlink_metadata(&file).expect("stat file");
         assert!(meta.file_type().is_file());
         assert_eq!(meta.uid(), rustix::process::geteuid().as_raw());
+    }
+
+    #[test]
+    fn publication_rejects_non_utf8_setup_socket_path() {
+        let root = temp_root();
+        let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
+        let path = PathBuf::from(OsString::from_vec(b"/tmp/mc-host-\xff.sock".to_vec()));
+        assert!(matches!(
+            guard.publish(&path, "mc-host/test"),
+            Err(InstanceError::Insecure {
+                what: "non-UTF-8 setup socket path",
+                ..
+            })
+        ));
+        assert!(!published(&guard).exists());
     }
 
     #[test]

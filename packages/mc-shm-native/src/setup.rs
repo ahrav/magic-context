@@ -383,7 +383,7 @@ mod tests {
         let message: GrantMessage = serde_json::from_value(serde_json::json!({
             "type": "grant",
             "wire_version": 2,
-            "descriptor_schema": 1,
+            "descriptor_schema": mc_shm_transport::descriptor::DESCRIPTOR_SCHEMA_VERSION,
             "activation_token": "token",
             "descriptor": {
                 "profile": "mc-host-test-ring-v1",

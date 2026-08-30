@@ -242,12 +242,12 @@ describe("daemon command contract", () => {
                     shared_memory: { state: "ready", reason: "healthy" },
                 },
                 shared_memory: {
-                    state: "healthy",
-                    error_class: null,
+                    state: "quarantined",
+                    error_class: "peer_protocol",
                     artifact: {
                         profile: "mc-host-test-ring-v1",
                         wire_version: 2,
-                        descriptor_schema: 1,
+                        descriptor_schema: 2,
                     },
                     bounds: {
                         descriptors: 16,
@@ -271,29 +271,31 @@ describe("daemon command contract", () => {
                             pinned_workers: 0,
                         },
                         quarantined: {
-                            descriptors: 0,
-                            arena_bytes: 0,
-                            leases: 0,
-                            mappings: 0,
-                            file_descriptors: 0,
-                            workers: 0,
-                            client_instances: 0,
-                            pinned_workers: 0,
+                            descriptors: 7,
+                            arena_bytes: 8_388_608,
+                            leases: 6,
+                            mappings: 5,
+                            file_descriptors: 4,
+                            workers: 3,
+                            client_instances: 2,
+                            pinned_workers: 1,
                         },
                     },
-                    attachment: { completed: 4 },
-                    activation: { completed: 3 },
-                    peer_death: { observed: 1 },
-                    reclamation: { completed: 2 },
-                    exhaustion: { observed: 1 },
+                    attachment: { completed: 41 },
+                    activation: { completed: 37 },
+                    peer_death: { observed: 31 },
+                    reclamation: { completed: 29 },
+                    exhaustion: { observed: 23 },
                 },
             }),
         );
 
-        expect(rendered).toContain("Shared memory: healthy");
-        expect(rendered).toContain("profile=mc-host-test-ring-v1 wire=2 descriptor=1");
+        expect(rendered).toContain("Shared memory: quarantined (peer_protocol)");
+        expect(rendered).toContain("profile=mc-host-test-ring-v1 wire=2 descriptor=2");
         expect(rendered).toContain("active_bytes=134217728");
-        expect(rendered).toContain("peer_deaths=1 reclamations=2 exhaustions=1");
+        expect(rendered).toContain("quarantined_bytes=8388608");
+        expect(rendered).toContain("attachments=41 activations=37");
+        expect(rendered).toContain("peer_deaths=31 reclamations=29 exhaustions=23");
     });
 
     test("redacts lifecycle roots and secret-shaped native version text", async () => {

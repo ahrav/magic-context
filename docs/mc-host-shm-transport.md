@@ -2,7 +2,7 @@
 
 ## Status
 
-The fixed ring is the only application transport. Linux and macOS clients use the owner-only Unix setup socket to authenticate, receive two mapping descriptors, validate the current release identity, attach, and commit activation. Application frames never use the setup socket.
+The fixed ring is the only application transport. Linux clients use the owner-only Unix setup socket to authenticate, receive two mapping descriptors, validate the current release identity, attach, and commit activation. macOS uses the same protocol in source builds, but release qualification remains blocked by the designated-host resize test described below. Application frames never use the setup socket.
 
 There is no runtime transport selector, alternate shared-memory backend, compatibility reader, or degraded data path. A transport failure is terminal for the affected connection.
 
@@ -10,7 +10,7 @@ The accepted identity is fixed by the release:
 
 - profile: `mc-host-test-ring-v1`
 - wire version: `2`
-- descriptor schema: `1`
+- descriptor schema: `2`
 
 An install that cannot load the native addon or establish this identity fails before application traffic.
 
@@ -46,7 +46,7 @@ Setup proceeds through these phases:
 
 Any setup, attachment, activation, ring, or peer-lifetime failure terminates the affected connection. A caller may create a fresh connection.
 
-Clean `Goodbye` and unexpected setup-socket closure are distinct. Unexpected closure records peer death, cancels ring work, and tears down the exact connection. Joined endpoint teardown returns its admission charge. If alias state cannot be proved safe, the affected mapping charge remains quarantined and visible instead of being reused.
+Clean `Goodbye` and unexpected setup-socket closure are distinct. Unexpected closure records peer death, cancels ring work, and tears down the exact connection. Joined endpoint teardown returns its admission charge when the mapping is unmapped. Native aliases whose detachment fails keep their channel and mapping alive until cleanup succeeds.
 
 ## Doctor and diagnostics
 
@@ -80,6 +80,8 @@ Exact-capacity admission succeeds. Capacity plus one fails without creating anot
 
 ## Platform contract
 
-Release packages include the native addon for each claimed Linux and macOS Bun and Node target. The package manifest and addon checksum are verified before loading. Build profile and target identity are checked before setup. Managed Rust clients use the same setup protocol, ring profile, wire version, and descriptor schema.
+Release packages include the native addon for qualified targets. The package manifest and addon checksum are verified before loading. Build profile and target identity are checked before setup. Managed Rust clients use the same setup protocol, ring profile, wire version, and descriptor schema.
+
+Linux seals ring objects against size changes. macOS does not provide the same seal contract, so a same-user process that holds a shared-memory descriptor remains trusted not to resize it after validation. macOS release remains blocked until designated-host attachment tests prove the platform's resize behavior; generic builds do not establish that guarantee.
 
 Clean-install gates must complete one cross-process application round trip. A missing package, addon, manifest, checksum, or platform capability fails the gate; unsupported or omitted results are not success states.

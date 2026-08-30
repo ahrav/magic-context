@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       soak_hours:
-        description: Installed ring soak duration in hours
+        description: Source-tree ring soak duration in hours
         required: false
         default: "8"
       fuzz_seconds:
@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   full-soak:
-    name: Eight-hour installed ring resource soak (Linux)
+    name: Eight-hour source-tree ring resource soak (Linux)
     runs-on: ubuntu-latest
     timeout-minutes: 540
     steps:
@@ -32,7 +32,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
 
-      - name: Installed fixed-ring soak
+      - name: Source-tree fixed-ring soak
         working-directory: packages/e2e-tests
         run: bun scripts/run-shm-soak.ts --hours '${{ inputs.soak_hours }}'
 

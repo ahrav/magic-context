@@ -58,6 +58,8 @@ struct ActiveProducer {
 }
 
 struct Channel {
+    // Field order is load-bearing: Rust drops fields in declaration order, so
+    // every reservation that borrows `to_host` is dropped before `to_host`.
     producers: HashMap<u32, ActiveProducer>,
     active: HashMap<u32, ActiveLease>,
     // Aliases whose detachment failed; retained so the channel entry (and its
@@ -792,7 +794,9 @@ pub fn reserve(
             return Err(error("native channel is closed"));
         }
         let ring_ptr: *const Ring = channel.to_host.as_ref();
-        // SAFETY: `to_host` remains allocated until all `producers` are dropped.
+        // SAFETY: `to_host` is boxed, so moving `Channel` does not move the
+        // ring. `producers` is declared before `to_host`, so every stored
+        // reservation drops before the ring on every Channel destruction path.
         let ring: &'static Ring = unsafe { &*ring_ptr };
         let reservation = ring
             .reserve_until(
@@ -897,6 +901,53 @@ pub fn abort_reservation(env: &Env, channel_id: u32, token: u32) -> Result<()> {
         detach_producer(env, channel, token)?.abort();
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_drops_borrowing_reservations_before_the_ring() {
+        let profile = ring_profile(
+            HardwareProfileId::new(PROFILE).expect("static profile"),
+            SchedulingMode::ColdParkWake,
+        )
+        .expect("profile");
+        let to_host = Box::new(Ring::create(&profile, 1).expect("producer ring"));
+        let from_host = Ring::create(&profile, 2).expect("consumer ring");
+        let ring_ptr: *const Ring = to_host.as_ref();
+        // SAFETY: this mirrors `reserve`: `Channel` declares `producers` before
+        // `to_host`, so the stored reservation is destroyed first.
+        let ring: &'static Ring = unsafe { &*ring_ptr };
+        let reservation = ring
+            .reserve_until(
+                0,
+                [0; WIRE_V2_HEADER_BYTES],
+                Instant::now() + Duration::from_secs(1),
+            )
+            .expect("reservation");
+        let mut producers = HashMap::new();
+        producers.insert(
+            1,
+            ActiveProducer {
+                reservation,
+                buffers: Vec::new(),
+            },
+        );
+        drop(Channel {
+            producers,
+            active: HashMap::new(),
+            stranded: Vec::new(),
+            to_host,
+            from_host,
+            next_producer: 1,
+            next_lease: 0,
+            closed: false,
+            setup: None,
+            _reservation: None,
+        });
+    }
 }
 
 #[napi]

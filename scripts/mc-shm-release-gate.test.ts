@@ -39,6 +39,7 @@ function identity(role: "baseline" | "candidate", runtime: "bun" | "node") {
 }
 
 function evidence(role: "baseline" | "candidate", runtime: "bun" | "node" = "bun"): RunEvidence {
+    const candidate = role === "candidate";
     return {
         schema: "magic-context.mc-shm-installed-performance-run/v1",
         role,
@@ -52,24 +53,24 @@ function evidence(role: "baseline" | "candidate", runtime: "bun" | "node" = "bun
                 process_id: 101,
                 state: "complete",
                 completed_ops: 2,
-                elapsed_ns: 1_000,
-                latencies_ns: [100, 300],
-                body_copies: 2,
-                allocations: 4,
-                cpu_ns: 700,
-                wakeups: 6,
+                elapsed_ns: candidate ? 800 : 1_000,
+                latencies_ns: candidate ? [125, 375] : [100, 300],
+                body_copies: candidate ? 1 : 2,
+                allocations: candidate ? 3 : 4,
+                cpu_ns: candidate ? 560 : 700,
+                wakeups: candidate ? 4 : 6,
             },
             {
                 block: 2,
                 process_id: 102,
                 state: "complete",
                 completed_ops: 2,
-                elapsed_ns: 1_000,
-                latencies_ns: [200, 400],
-                body_copies: 2,
-                allocations: 4,
-                cpu_ns: 700,
-                wakeups: 6,
+                elapsed_ns: candidate ? 800 : 1_000,
+                latencies_ns: candidate ? [250, 500] : [200, 400],
+                body_copies: candidate ? 1 : 2,
+                allocations: candidate ? 3 : 4,
+                cpu_ns: candidate ? 560 : 700,
+                wakeups: candidate ? 4 : 6,
             },
         ],
     };
@@ -129,25 +130,59 @@ describe("installed shared-memory release gate", () => {
         const report = buildReleaseGateReport(config(), suite("baseline"), suite("candidate"));
         expect(report.verdict).toBe("evidence_complete");
         expect(report.runtime_results.map((result) => result.runtime)).toEqual(["bun", "node"]);
-        expect(report.runtime_results[0]!.baseline.metrics).toEqual({
-            p50_latency_ns: 200,
-            p99_latency_ns: 400,
-            throughput_ops_per_second: 2_000_000,
-            body_copies: 4,
-            allocations: 8,
-            cpu_ns: 1_400,
-            wakeups: 12,
-        });
-        expect(report.runtime_results[0]!.comparison.p99_ratio).toBe(1);
+        for (const result of report.runtime_results) {
+            expect(result.baseline.metrics).toEqual({
+                p50_latency_ns: 200,
+                p99_latency_ns: 400,
+                throughput_ops_per_second: 2_000_000,
+                body_copies: 4,
+                allocations: 8,
+                cpu_ns: 1_400,
+                wakeups: 12,
+            });
+            expect(result.candidate.metrics).toEqual({
+                p50_latency_ns: 250,
+                p99_latency_ns: 500,
+                throughput_ops_per_second: 2_500_000,
+                body_copies: 2,
+                allocations: 6,
+                cpu_ns: 1_120,
+                wakeups: 8,
+            });
+            expect(result.comparison).toEqual({
+                p50_ratio: 1.25,
+                p99_ratio: 1.25,
+                throughput_ratio: 1.25,
+                copies_delta: -2,
+                allocations_delta: -2,
+                cpu_ratio: 0.8,
+                wakeups_delta: -4,
+            });
+        }
         expect("pass" in report || "winner" in report).toBeFalse();
     });
 
     test("rejects mixed identities, interrupted runs, and missing blocks", () => {
-        const mixed = suite("candidate");
-        mixed.runs[0]!.identity.host.id_sha256 = "f".repeat(64);
-        expect(() => buildReleaseGateReport(config(), suite("baseline"), mixed)).toThrow(
-            /host identity/,
-        );
+        const mutations: Array<[string, (run: RunEvidence) => void]> = [
+            ["source commit", (run) => (run.identity.source_commit = "f".repeat(40))],
+            ["package name", (run) => (run.identity.package.name = "other-package")],
+            ["package version", (run) => (run.identity.package.version = "9.9.9")],
+            ["package digest", (run) => (run.identity.package.sha256 = "f".repeat(64))],
+            ["runtime name", (run) => (run.identity.runtime.name = "node")],
+            ["runtime version", (run) => (run.identity.runtime.version = "0.0.0")],
+            ["runtime executable", (run) => (run.identity.runtime.executable_sha256 = "f".repeat(64))],
+            ["host identity", (run) => (run.identity.host.id_sha256 = "f".repeat(64))],
+            ["host kernel", (run) => (run.identity.host.kernel = "Linux 0.0")],
+            ["host cpu", (run) => (run.identity.host.cpu = "other cpu")],
+            ["host topology", (run) => (run.identity.host.topology_sha256 = "f".repeat(64))],
+            ["harness", (run) => (run.identity.harness_sha256 = "f".repeat(64))],
+            ["workload", (run) => (run.identity.workload_sha256 = "f".repeat(64))],
+        ];
+        for (const [label, mutate] of mutations) {
+            const mixed = suite("candidate");
+            mutate(mixed.runs[0]!);
+            expect(() => buildReleaseGateReport(config(), suite("baseline"), mixed), label).toThrow();
+        }
 
         const interrupted = suite("candidate");
         interrupted.runs[0]!.state = "interrupted";
@@ -227,6 +262,9 @@ describe("installed shared-memory release gate", () => {
         const configPath = join(dir, "gate.json");
         writeFileSync(configPath, JSON.stringify(cfg));
         expect(readGateConfig(configPath).baseline?.sha256).toBe(hex(baselineBytes));
+        writeFileSync(packagePath, `${packageBytes} `);
+        expect(() => readGateConfig(configPath)).toThrow(/candidate package digest/);
+        writeFileSync(packagePath, packageBytes);
         writeFileSync(baselinePath, `${baselineBytes} `);
         expect(() => readGateConfig(configPath)).toThrow(/frozen baseline digest/);
     });

@@ -1685,14 +1685,7 @@ fn validate_object(fd: &OwnedFd, expected_len: usize) -> Result<(), RingError> {
     }
     // SAFETY: geteuid has no preconditions.
     let current_uid = unsafe { libc::geteuid() };
-    // Darwin populates st_mode for shm_open descriptors from the creation
-    // mode alone, without file-type bits, so the regular-file check applies
-    // only to Linux memfd objects.
-    let type_valid = if cfg!(target_os = "linux") {
-        stat.st_mode & libc::S_IFMT == libc::S_IFREG
-    } else {
-        true
-    };
+    let type_valid = stat.st_mode & libc::S_IFMT == libc::S_IFREG;
     if stat.st_uid != current_uid
         || stat.st_size < 0
         || stat.st_size as usize != expected_len

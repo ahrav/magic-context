@@ -162,7 +162,11 @@ pub async fn run_connection<H: McHostHandler>(
     else {
         return;
     };
-    let token = activation_token();
+    let Ok(token) = activation_token() else {
+        sender.discard();
+        root.cancel();
+        return;
+    };
     if crate::setup_socket::activate_server(
         &mut stream,
         &descriptors,
@@ -179,6 +183,7 @@ pub async fn run_connection<H: McHostHandler>(
         root.cancel();
         return;
     }
+    drop(descriptors);
     shared.ring.record_attachment();
     shared.ring.record_activation();
 
@@ -204,16 +209,20 @@ pub async fn run_connection<H: McHostHandler>(
     shared.ring.record_reclamation();
 }
 
-fn activation_token() -> String {
+fn activation_token() -> Result<String, ()> {
+    activation_token_with(|bytes| getrandom::getrandom(bytes).map_err(|_| ()))
+}
+
+fn activation_token_with(fill: impl FnOnce(&mut [u8; 32]) -> Result<(), ()>) -> Result<String, ()> {
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).expect("operating-system randomness is available");
-    bytes
+    fill(&mut bytes)?;
+    Ok(bytes
         .iter()
         .fold(String::with_capacity(64), |mut text, byte| {
             use std::fmt::Write;
             let _ = write!(text, "{byte:02x}");
             text
-        })
+        }))
 }
 
 fn new_generation<H: McHostHandler>(
@@ -262,11 +271,11 @@ async fn serve_generation<H: McHostHandler, C: FrameReceiver>(
         // sequence storing `draining`: a socket accepted just before the
         // commit must not register a new generation after it.
         if shared.draining.load(Ordering::SeqCst) || shared.shutdown.is_cancelled() {
+            discard_unregistered_generation(&gen);
             return;
         }
         connections.insert(gen.id, Arc::clone(&gen));
     }
-
     if let Some(policy) = shared.liveness.clone() {
         // A child of `read_cancel` so retirement still stops the loop; the
         // grant path cancels only this child to stop Pings alone.
@@ -336,6 +345,12 @@ async fn serve_generation<H: McHostHandler, C: FrameReceiver>(
     // shutdown promised to flush, while a stalled peer still cannot hold the
     // join beyond the writer's self-retirement.
     let _ = (&mut io_task).await;
+}
+
+fn discard_unregistered_generation(gen: &GenerationCore) {
+    gen.read_cancel.cancel();
+    gen.token.cancel();
+    gen.writer.discard();
 }
 
 /// Why the read side of a connection stopped. Only a host-cancelled read may
@@ -913,5 +928,48 @@ async fn liveness_loop(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame_channel::frame_sender;
+    use std::time::Duration;
+
+    #[test]
+    fn activation_entropy_failure_is_redacted_without_panicking() {
+        let result = std::panic::catch_unwind(|| activation_token_with(|_| Err(())));
+        assert!(matches!(result, Ok(Err(()))));
+    }
+
+    #[tokio::test]
+    async fn shutdown_registration_rejection_leaves_no_graceful_drain_work() {
+        let token = CancellationToken::new();
+        let read_cancel = token.child_token();
+        let (writer, queue) = frame_sender(1, token.clone(), Duration::from_secs(1));
+        let gen = GenerationCore {
+            id: 1,
+            token,
+            read_cancel,
+            read_tasks: TaskTracker::new(),
+            shutdown_complete: CancellationToken::new(),
+            writer,
+            membership: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+            pings: Mutex::new(HashMap::new()),
+            busy_rejects: Arc::new(tokio::sync::Semaphore::new(1)),
+            next_ping_corr: std::sync::atomic::AtomicU64::new(1),
+        };
+
+        discard_unregistered_generation(&gen);
+
+        assert!(gen.read_cancel.is_cancelled());
+        assert!(gen.token.is_cancelled());
+        assert!(queue.discard.is_cancelled());
+        gen.read_tasks.close();
+        tokio::time::timeout(Duration::from_millis(10), gen.read_tasks.wait())
+            .await
+            .expect("never-started read loop must not force shutdown");
     }
 }

@@ -1454,7 +1454,7 @@ pub async fn force_close_all_routes<H: McHostHandler>(shared: &Arc<HostShared<H>
 /// Best-effort connection `Goodbye` (0/0/0), queued after drain terminals so
 /// clients do not retire the generation before those terminals arrive
 /// (protocol §12 step 4).
-pub async fn send_connection_goodbye(gen: &GenerationCore) {
+pub async fn send_connection_goodbye(gen: Arc<GenerationCore>, deadline: tokio::time::Instant) {
     let bytes = encode_owned_frame(
         FrameType::Goodbye,
         pure_header_flags(),
@@ -1465,19 +1465,22 @@ pub async fn send_connection_goodbye(gen: &GenerationCore) {
     let (written, completed) = tokio::sync::oneshot::channel();
     if gen
         .writer
-        .send(OutboundFrame {
-            bytes,
-            tail: Vec::new(),
-            direct: None,
-            charge: crate::wire::ByteCharge::none(),
-            written: Some(Box::new(move |_| {
-                let _ = written.send(());
-            })),
-        })
+        .send_before(
+            OutboundFrame {
+                bytes,
+                tail: Vec::new(),
+                direct: None,
+                charge: crate::wire::ByteCharge::none(),
+                written: Some(Box::new(move |_| {
+                    let _ = written.send(());
+                })),
+            },
+            deadline,
+        )
         .await
         .is_ok()
     {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), completed).await;
+        let _ = tokio::time::timeout_at(deadline, completed).await;
     }
 }
 

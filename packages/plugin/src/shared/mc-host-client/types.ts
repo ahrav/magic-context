@@ -78,7 +78,7 @@ export interface SharedMemoryDiagnostics {
     artifact: {
         profile: "mc-host-test-ring-v1";
         wire_version: 2;
-        descriptor_schema: 1;
+        descriptor_schema: 2;
     };
     bounds: SharedMemoryResourceCounts;
     accounting: {

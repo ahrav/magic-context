@@ -459,6 +459,11 @@ async fn ping_and_consumer_correlations_do_not_cross_settle() {
         .frames_until_corr(corr, BUDGET)
         .await
         .expect("consumer terminal");
+    assert_eq!(
+        frame.ty,
+        support::raw_client::TY_ERROR,
+        "unexpected consumer frame: {frame:?}"
+    );
     assert_eq!(frame.error_code(), "cancelled");
 
     // An unmatched Pong is dropped without disturbing the generation.
@@ -1439,25 +1444,47 @@ async fn host_shutdown_commits_after_the_full_response_and_stops_gracefully() {
 /// once with a parseable response, and the host cancels once.
 #[tokio::test]
 async fn concurrent_shutdown_requests_each_settle_exactly_once() {
-    let host = TestHost::start().await;
+    // Hold the winning response between ring publication and its completion
+    // hook so both requests reach the shutdown latch before it commits.
+    let response_release = Arc::new((Mutex::new(false), Condvar::new()));
+    let hook_release = Arc::clone(&response_release);
+    let host = TestHost::start_with_publish_hook(Arc::new(move |ty, channel| {
+        if ty as u8 == TY_RESPONSE && channel == 0 {
+            let (released, changed) = &*hook_release;
+            let mut released = released.lock().expect("response gate lock");
+            while !*released {
+                released = changed.wait(released).expect("response gate wait");
+            }
+        }
+    }))
+    .await;
     let mut first = host.client().await;
     let mut second = host.client().await;
 
+    let shutdown_request = serde_json::json!({"op": "host.shutdown"});
     let first_corr = first
-        .control(&serde_json::json!({"op": "host.shutdown"}))
+        .control(&shutdown_request)
         .await
         .expect("first shutdown");
     let second_corr = second
-        .control(&serde_json::json!({"op": "host.shutdown"}))
+        .control(&shutdown_request)
         .await
         .expect("second shutdown");
+    {
+        let (released, changed) = &*response_release;
+        *released.lock().expect("response gate lock") = true;
+        changed.notify_all();
+    }
 
     // Each request correlation must receive exactly one non-ping terminal.
-    for (client, corr) in [(&mut first, first_corr), (&mut second, second_corr)] {
+    for (requester, client, corr) in [
+        ("first", &mut first, first_corr),
+        ("second", &mut second, second_corr),
+    ] {
         let (skipped, response) = client
             .frames_until_corr(corr, BUDGET)
             .await
-            .expect("each requester settles");
+            .unwrap_or_else(|error| panic!("{requester} requester settles: {error}"));
         assert_eq!(response.ty, TY_RESPONSE);
         assert_eq!(response.json()["op"], "host.shutdown");
         let trailing = client.drain_until_close(BUDGET).await;
