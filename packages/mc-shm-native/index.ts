@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { markAsUntransferable } from "node:worker_threads";
 
-export const QUALIFIED_TEST_PROFILE = "mc-host-eventfd-ring-v2";
+export const QUALIFIED_TEST_PROFILE = "mc-host-test-ring-v1";
 export const DESCRIPTOR_SCHEMA_VERSION = 3;
 
 export interface NativeCapabilities {

@@ -524,7 +524,7 @@ pub fn attach(env: &Env, descriptor: Unknown<'_>) -> Result<u32> {
         const GRANT_HEX_LEN: usize = RingGrant::encoded_len() * 2;
         // The argument is decoded as a RAW value — before any bindgen
         // numeric narrowing or property coercion — and every check below
-        // runs before the first fd open, mapping, prefault, or registry
+        // runs before the first fd open, mapping, page touch, or registry
         // insertion, so a rejected descriptor has zero side effects.
         if descriptor.get_type().map_err(|_| descriptor_error())? != ValueType::Object {
             return Err(descriptor_error());

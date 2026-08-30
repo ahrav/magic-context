@@ -1022,35 +1022,3 @@ export class McHostLifecyclePolicy {
         return localResult(command, false, state, "internal_error");
     }
 }
-
-const ZERO_RESOURCE_COUNTS: SharedMemoryResourceCounts = {
-    descriptors: 0,
-    arena_bytes: 0,
-    leases: 0,
-    mappings: 0,
-    file_descriptors: 0,
-    workers: 0,
-    client_instances: 0,
-    pinned_workers: 0,
-};
-
-function terminalSharedMemoryDiagnostics(
-    errorClass: SharedMemoryDiagnostics["error_class"],
-): SharedMemoryDiagnostics {
-    return {
-        state: "terminal",
-        error_class: errorClass,
-        artifact: {
-            profile: "mc-host-test-ring-v1",
-            wire_version: 2,
-            descriptor_schema: 3,
-        },
-        bounds: ZERO_RESOURCE_COUNTS,
-        accounting: null,
-        attachment: { completed: 0 },
-        activation: { completed: 0 },
-        peer_death: { observed: errorClass === "peer_death" ? 1 : 0 },
-        reclamation: { completed: 0 },
-        exhaustion: { observed: errorClass === "resource_exhaustion" ? 1 : 0 },
-    };
-}
