@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { createDirectTestDatabase } from "../../plugin/src/features/magic-context/test-database";
 import { Database } from "../../plugin/src/shared/sqlite";
 import { ballastProse } from "./ballast";
+import { DEFAULT_MOCK_RESPONSE } from "./harness-primitives";
 import { initializeIsolatedContextDb as initializeContextDbFromRelease } from "./initialize-context-db";
 import { MockProvider, type MockResponse } from "./mock-provider/server";
 import { createPiIsolatedEnv, type PiIsolatedEnv, type PiRunResult } from "./pi-runner/spawn";
@@ -30,16 +31,6 @@ export interface PiTestHarnessOptions {
   /** Verified immutable release root. Omitted keeps active-checkout behavior. */
   releaseRoot?: VerifiedReleaseRoot;
 }
-
-const DEFAULT_MOCK_RESPONSE: MockResponse = {
-  text: "ok",
-  usage: {
-    input_tokens: 100,
-    output_tokens: 20,
-    cache_creation_input_tokens: 100,
-    cache_read_input_tokens: 0,
-  },
-};
 
 function initializeIsolatedContextDb(
   dataDir: string,

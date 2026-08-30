@@ -19,25 +19,19 @@ import { Database } from "bun:sqlite";
 import { existsSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { ballastProse } from "./ballast";
-import { MockProvider, type MockResponse } from "./mock-provider/server";
+import {
+    DEFAULT_MOCK_RESPONSE,
+    type SdkClientCore,
+    type SharedHarnessOptions,
+} from "./harness-primitives";
+import { MockProvider } from "./mock-provider/server";
 import {
     spawnOpencode,
     type SpawnedOpencode,
     type SpawnOptions,
 } from "./opencode-runner/spawn";
 
-export interface TestHarnessOptions {
-    /** magic-context config overrides. Merged onto test defaults. */
-    magicContextConfig?: Record<string, unknown>;
-    /** Extra opencode.json config. Merged onto test defaults. */
-    openCodeConfigExtra?: Record<string, unknown>;
-    /** Override the mock model's context token limit. Default 200000. */
-    modelContextLimit?: number;
-    /**
-     * Default response used when the mock queue is empty. Lets tests send extra
-     * prompts without worrying about scripting every one.
-     */
-    mockDefault?: MockResponse;
+export interface TestHarnessOptions extends SharedHarnessOptions {
     /**
      * Extra environment for the `opencode serve` child. Merged last, so it can
      * restore a real API key over the fake default. Secret-bearing entries
@@ -49,34 +43,11 @@ export interface TestHarnessOptions {
     hostname?: SpawnOptions["hostname"];
 }
 
-export interface SdkClient {
-    session: {
-        create: (opts: {
-            query: { directory: string };
-            body?: { parentID?: string; title?: string };
-        }) => Promise<{ data?: { id: string } }>;
-        prompt: (opts: {
-            path: { id: string };
-            body: {
-                model: { providerID: string; modelID: string };
-                parts: Array<{ type: "text"; text: string }>;
-                agent?: string;
-            };
-        }) => Promise<{ data?: unknown }>;
-        messages: (opts: { path: { id: string } }) => Promise<{ data?: unknown }>;
+export interface SdkClient extends SdkClientCore {
+    session: SdkClientCore["session"] & {
         children: (opts: { path: { id: string } }) => Promise<{ data?: unknown }>;
     };
 }
-
-const DEFAULT_MOCK_RESPONSE: MockResponse = {
-    text: "ok",
-    usage: {
-        input_tokens: 100,
-        output_tokens: 20,
-        cache_creation_input_tokens: 100,
-        cache_read_input_tokens: 0,
-    },
-};
 
 export class TestHarness {
     readonly mock: MockProvider;

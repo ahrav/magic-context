@@ -503,92 +503,85 @@ describe("prospective holdout CLI", () => {
         }
     });
 
-    it("validates a cohort-closed epoch that carries no outcomes file", async () => {
-        const root = mkdtempSync(join(tmpdir(), "holdout-cli-cohort-closed-"));
-        try {
-            const recomputers = completeRepository(root, { lifecycleState: "cohort-closed" });
-            expect(await validateRepository(root, recomputers)).toEqual({
-                code: 0,
-                messages: ["prospective-holdout valid epochs=1"],
-            });
-        } finally {
-            rmSync(root, { recursive: true, force: true });
-        }
-    });
-
-    it("rejects a cohort-closed event stamped before the close manifest's closedAt", async () => {
-        const root = mkdtempSync(join(tmpdir(), "holdout-cli-close-before-manifest-"));
-        try {
-            // The event sits at the frozen intake cutoff while the manifest declares a later
-            // close, so the ledger reports a fixed cohort over a case set intake can still
-            // change, and every event after it inherits that claim.
-            const recomputers = completeRepository(root, {
-                lifecycleState: "cohort-closed",
-                closedAt: "2026-09-08T12:00:00Z",
-            });
-            expect(await validateRepository(root, recomputers)).toEqual({
-                code: 1,
-                messages: ["lifecycle.cohort-closed.occurredAt: before-cohort-close"],
-            });
-        } finally {
-            rmSync(root, { recursive: true, force: true });
-        }
-    });
-
-    it("validates a cohort-closed event stamped at the close manifest's closedAt", async () => {
-        const root = mkdtempSync(join(tmpdir(), "holdout-cli-close-at-manifest-"));
-        try {
-            // The cohort is fixed at that instant, so equality is the legal boundary.
-            const recomputers = completeRepository(root, {
-                lifecycleState: "cohort-closed",
-                closedAt: "2026-09-08T00:00:00Z",
-            });
-            expect(await validateRepository(root, recomputers)).toEqual({
-                code: 0,
-                messages: ["prospective-holdout valid epochs=1"],
-            });
-        } finally {
-            rmSync(root, { recursive: true, force: true });
-        }
-    });
-
-    it("rejects a running epoch whose coordinate arms sit under different attempt numbers", async () => {
-        const root = mkdtempSync(join(tmpdir(), "holdout-cli-attempt-pair-"));
-        try {
-            // Both release roles ran, so the matrix-completeness check is satisfied by the two
-            // arms between them. Neither attempt holds a pair, so no coordinate is comparable,
-            // and the epoch would otherwise be accepted until a report was produced.
-            const recomputers = completeRepository(root, {
-                lifecycleState: "running",
-                outcomes: "split-attempt",
-            });
-            expect(await validateRepository(root, recomputers)).toEqual({
-                code: 1,
-                messages: ["outcomes: attempt-pair-incomplete"],
-            });
-        } finally {
-            rmSync(root, { recursive: true, force: true });
-        }
-    });
-
-    it("validates a running epoch whose retried arm leaves one attempt holding the pair", async () => {
-        const root = mkdtempSync(join(tmpdir(), "holdout-cli-attempt-retry-"));
-        try {
-            // A second release-N run under attempt 1 sits beside a complete attempt-0 pair. One
-            // attempt holding both arms is the whole requirement, so a surplus unpaired arm
-            // under another attempt is legal.
-            const recomputers = completeRepository(root, {
-                lifecycleState: "running",
-                outcomes: "retried-arm",
-            });
-            expect(await validateRepository(root, recomputers)).toEqual({
-                code: 0,
-                messages: ["prospective-holdout valid epochs=1"],
-            });
-        } finally {
-            rmSync(root, { recursive: true, force: true });
-        }
-    });
+    // Each row builds one complete repository via `completeRepository(root, opts)`
+    // and asserts the validator's exact exit code and message list.
+    it.each([
+        [
+            "validates a cohort-closed epoch that carries no outcomes file",
+            "holdout-cli-cohort-closed-",
+            { lifecycleState: "cohort-closed" },
+            { code: 0, messages: ["prospective-holdout valid epochs=1"] },
+        ],
+        // The event sits at the frozen intake cutoff while the manifest declares a later
+        // close, so the ledger reports a fixed cohort over a case set intake can still
+        // change, and every event after it inherits that claim.
+        [
+            "rejects a cohort-closed event stamped before the close manifest's closedAt",
+            "holdout-cli-close-before-manifest-",
+            { lifecycleState: "cohort-closed", closedAt: "2026-09-08T12:00:00Z" },
+            { code: 1, messages: ["lifecycle.cohort-closed.occurredAt: before-cohort-close"] },
+        ],
+        // The cohort is fixed at that instant, so equality is the legal boundary.
+        [
+            "validates a cohort-closed event stamped at the close manifest's closedAt",
+            "holdout-cli-close-at-manifest-",
+            { lifecycleState: "cohort-closed", closedAt: "2026-09-08T00:00:00Z" },
+            { code: 0, messages: ["prospective-holdout valid epochs=1"] },
+        ],
+        // Both release roles ran, so the matrix-completeness check is satisfied by the two
+        // arms between them. Neither attempt holds a pair, so no coordinate is comparable,
+        // and the epoch would otherwise be accepted until a report was produced.
+        [
+            "rejects a running epoch whose coordinate arms sit under different attempt numbers",
+            "holdout-cli-attempt-pair-",
+            { lifecycleState: "running", outcomes: "split-attempt" },
+            { code: 1, messages: ["outcomes: attempt-pair-incomplete"] },
+        ],
+        // A second release-N run under attempt 1 sits beside a complete attempt-0 pair. One
+        // attempt holding both arms is the whole requirement, so a surplus unpaired arm
+        // under another attempt is legal.
+        [
+            "validates a running epoch whose retried arm leaves one attempt holding the pair",
+            "holdout-cli-attempt-retry-",
+            { lifecycleState: "running", outcomes: "retried-arm" },
+            { code: 0, messages: ["prospective-holdout valid epochs=1"] },
+        ],
+        // The adjudication close seals one second after the report event. The ledger holds
+        // no event for the seal, so lifecycle ordering cannot see it and the report passes
+        // every other binding while scoring verdicts that were still open.
+        [
+            "rejects a subjective report stamped before its adjudication close sealed",
+            "holdout-cli-report-before-adjudication-",
+            { subjective: true, adjudicationClosedAt: "2026-09-09T00:00:01Z" },
+            { code: 1, messages: ["lifecycle.report.occurredAt: before-adjudication-close"] },
+        ],
+        // The judgments are sealed at that instant, so equality is the legal boundary.
+        [
+            "validates a subjective report stamped at its adjudication close",
+            "holdout-cli-report-at-adjudication-",
+            { subjective: true, adjudicationClosedAt: "2026-09-09T00:00:00Z" },
+            { code: 0, messages: ["prospective-holdout valid epochs=1"] },
+        ],
+        // A subjective reported epoch owes every expected entry but the graduation
+        // directory: the freeze and close artifact directories plus four JSON or JSONL files.
+        [
+            "validates an epoch whose expected entries are all regular files and directories",
+            "holdout-cli-entry-regular-",
+            { subjective: true },
+            { code: 0, messages: ["prospective-holdout valid epochs=1"] },
+        ],
+    ] as Array<[string, string, Parameters<typeof completeRepository>[1], { code: number; messages: string[] }]>)(
+        "%s",
+        async (_title, prefix, opts, expected) => {
+            const root = mkdtempSync(join(tmpdir(), prefix));
+            try {
+                const recomputers = completeRepository(root, opts);
+                expect(await validateRepository(root, recomputers)).toEqual(expected);
+            } finally {
+                rmSync(root, { recursive: true, force: true });
+            }
+        },
+    );
 
     it("rejects a later epoch re-claiming an intake an earlier cohort already disposed of", async () => {
         const root = mkdtempSync(join(tmpdir(), "holdout-cli-intake-reused-"));
@@ -655,42 +648,6 @@ describe("prospective holdout CLI", () => {
         }
     });
 
-    it("rejects a subjective report stamped before its adjudication close sealed", async () => {
-        const root = mkdtempSync(join(tmpdir(), "holdout-cli-report-before-adjudication-"));
-        try {
-            // The adjudication close seals one second after the report event. The ledger holds
-            // no event for the seal, so lifecycle ordering cannot see it and the report passes
-            // every other binding while scoring verdicts that were still open.
-            const recomputers = completeRepository(root, {
-                subjective: true,
-                adjudicationClosedAt: "2026-09-09T00:00:01Z",
-            });
-            expect(await validateRepository(root, recomputers)).toEqual({
-                code: 1,
-                messages: ["lifecycle.report.occurredAt: before-adjudication-close"],
-            });
-        } finally {
-            rmSync(root, { recursive: true, force: true });
-        }
-    });
-
-    it("validates a subjective report stamped at its adjudication close", async () => {
-        const root = mkdtempSync(join(tmpdir(), "holdout-cli-report-at-adjudication-"));
-        try {
-            // The judgments are sealed at that instant, so equality is the legal boundary.
-            const recomputers = completeRepository(root, {
-                subjective: true,
-                adjudicationClosedAt: "2026-09-09T00:00:00Z",
-            });
-            expect(await validateRepository(root, recomputers)).toEqual({
-                code: 0,
-                messages: ["prospective-holdout valid epochs=1"],
-            });
-        } finally {
-            rmSync(root, { recursive: true, force: true });
-        }
-    });
-
     it("rejects a symlink standing in for an expected epoch entry", async () => {
         for (const entry of ["lifecycle.jsonl", "close"]) {
             const root = mkdtempSync(join(tmpdir(), "holdout-cli-entry-symlink-"));
@@ -711,21 +668,6 @@ describe("prospective holdout CLI", () => {
             } finally {
                 rmSync(root, { recursive: true, force: true });
             }
-        }
-    });
-
-    it("validates an epoch whose expected entries are all regular files and directories", async () => {
-        const root = mkdtempSync(join(tmpdir(), "holdout-cli-entry-regular-"));
-        try {
-            // A subjective reported epoch owes every expected entry but the graduation
-            // directory: the freeze and close artifact directories plus four JSON or JSONL files.
-            const recomputers = completeRepository(root, { subjective: true });
-            expect(await validateRepository(root, recomputers)).toEqual({
-                code: 0,
-                messages: ["prospective-holdout valid epochs=1"],
-            });
-        } finally {
-            rmSync(root, { recursive: true, force: true });
         }
     });
 

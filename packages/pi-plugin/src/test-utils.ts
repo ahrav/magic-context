@@ -1,4 +1,7 @@
-import type { ContextEvent } from "@earendil-works/pi-coding-agent";
+import type {
+	ContextEvent,
+	ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
 import { createDirectTestDatabase } from "@magic-context/core/features/magic-context/test-database";
 import { setHarness } from "@magic-context/core/shared/harness";
 import type { Database } from "@magic-context/core/shared/sqlite";
@@ -154,4 +157,41 @@ export function fakeContext(
 		},
 		getContextUsage: () => ({ tokens: 0, percent: 0, contextWindow: 100_000 }),
 	};
+}
+
+/**
+ * Registration-counting Pi fake: every register/emit surface records its
+ * name into a list, so a test can assert that a second init registered
+ * NOTHING (no duplicate tools, events, commands, timers, or watchers). The
+ * `on` recorder is the key seam for the init latch: a second init that no-ops
+ * must not register any event handlers, because those handlers would wire
+ * timers / background scans.
+ */
+export function createCountingPi() {
+	const events: string[] = [];
+	const tools: string[] = [];
+	const flags: string[] = [];
+	const commands: string[] = [];
+	const entryRenderers: string[] = [];
+	const pi = {
+		on: (event: string) => {
+			events.push(event);
+		},
+		registerTool: (tool: { name?: string }) => {
+			tools.push(tool.name ?? "<unnamed>");
+		},
+		registerFlag: (name: string) => {
+			flags.push(name);
+		},
+		registerCommand: (name: string) => {
+			commands.push(name);
+		},
+		registerEntryRenderer: (customType: string) => {
+			entryRenderers.push(customType);
+		},
+		appendEntry: () => undefined,
+		sendMessage: () => undefined,
+		sendUserMessage: () => undefined,
+	} as unknown as ExtensionAPI;
+	return { pi, events, tools, flags, commands, entryRenderers };
 }
