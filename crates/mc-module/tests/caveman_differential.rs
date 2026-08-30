@@ -951,6 +951,17 @@ fn document() -> impl Strategy<Value = String> {
         })
 }
 
+fn large_document() -> impl Strategy<Value = String> {
+    (fragment(), 32usize..65).prop_map(|(fragment, repeats)| {
+        let unit = format!(
+            "{} {}",
+            "I just really wanted to basically explain the implementation clearly. ".repeat(20),
+            fragment
+        );
+        unit.repeat(repeats)
+    })
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
     #[test]
@@ -960,6 +971,21 @@ proptest! {
                 compress(&doc, level),
                 reference::compress(&doc, ref_level),
                 "level {:?} diverged on {:?}", level, doc
+            );
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(24))]
+    #[test]
+    fn optimized_matches_frozen_reference_on_large_documents(doc in large_document()) {
+        prop_assert!(doc.len() > 32 * 1024);
+        for (level, ref_level) in levels() {
+            prop_assert_eq!(
+                compress(&doc, level),
+                reference::compress(&doc, ref_level),
+                "level {:?} diverged on a {}-byte document", level, doc.len()
             );
         }
     }

@@ -55,6 +55,7 @@ mod reference {
 }
 
 use mc_module::historian_chunk::truncate_historian_input_if_needed;
+use mc_tokenizer::estimate_tokens;
 use proptest::prelude::*;
 
 fn fragment() -> impl Strategy<Value = String> {
@@ -102,6 +103,22 @@ proptest! {
             reference::truncate_historian_input_if_needed(&doc, budget),
             "diverged on budget {} doc len {}", budget, doc.len()
         );
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+    #[test]
+    fn exact_token_budget_returns_original_input(
+        doc in document().prop_filter("nonempty tokenized document", |doc| {
+            !doc.is_empty() && estimate_tokens(doc) > 0
+        }),
+    ) {
+        let budget = estimate_tokens(&doc);
+        let optimized = truncate_historian_input_if_needed(&doc, budget);
+        let expected = reference::truncate_historian_input_if_needed(&doc, budget);
+        prop_assert_eq!(&optimized, &expected);
+        prop_assert_eq!(optimized, doc);
     }
 }
 

@@ -1517,7 +1517,7 @@ fn item_spec() -> impl Strategy<Value = ItemSpec> {
         (0u8..12, 0u8..32, 0u8..3, 0u8..7),
         (
             0u8..TOOL_COUNT,
-            0u8..10,
+            0u8..12,
             any::<bool>(),
             0u16..4096,
             proptest::option::of(0u16..2048),
@@ -1594,6 +1594,7 @@ const DEDUP_SAFE_TOOL_INDICES: [u8; 9] = [0, 1, 21, 22, 23, 24, 25, 26, 27];
 
 /// The rocket's UTF-16 surrogate pair crosses `EDIT_REGION_HINT_LEN`.
 const DIFF_ACROSS_HINT_BOUNDARY: &str = "012345678901234567890123456789012345678\u{1F680}tail";
+const DIFF_AT_HINT_BOUNDARY: &str = "0123456789012345678901234567890123456789";
 
 /// `large_input` exceeds 500 serialized bytes and exercises `clamp_object` truncation for
 /// strings, arrays, and objects.
@@ -1606,6 +1607,10 @@ fn large_input() -> serde_json::Value {
         "flag": true,
         "limit": 7,
     })
+}
+
+fn exact_skeleton_clamp_input() -> serde_json::Value {
+    serde_json::json!({"value": "x".repeat(488)})
 }
 
 fn input_value(variant: u8) -> serde_json::Value {
@@ -1629,6 +1634,11 @@ fn input_value(variant: u8) -> serde_json::Value {
             "content": DIFF_ACROSS_HINT_BOUNDARY,
             "old_string": DIFF_ACROSS_HINT_BOUNDARY,
             "new_string": DIFF_ACROSS_HINT_BOUNDARY,
+        }),
+        10 => exact_skeleton_clamp_input(),
+        11 => serde_json::json!({
+            "filePath": "src/a.rs",
+            "oldString": DIFF_AT_HINT_BOUNDARY,
         }),
         _ => serde_json::json!({}),
     }
@@ -2230,6 +2240,122 @@ fn optimized_matches_frozen_reference_at_age_reclaim_threshold() {
     assert_eq!(optimized, expected);
     assert_eq!(optimized.0.len(), 2);
     assert!(optimized.0.iter().all(|(id, _, _)| id.starts_with("m1#")));
+}
+
+#[test]
+fn optimized_matches_frozen_reference_at_payload_boundaries() {
+    assert_eq!(serde_json::to_string(&input_value(10)).unwrap().len(), 500);
+    assert_eq!(DIFF_AT_HINT_BOUNDARY.encode_utf16().count(), 40);
+
+    let spec = |msg: u8, kind: u8, tool: u8, input: u8, token_count: Option<u16>| ItemSpec {
+        msg,
+        ordinal_slot: msg + 1,
+        role: ROLE_ASSISTANT,
+        kind,
+        tool,
+        input,
+        provider_executed: false,
+        byte_size: 800,
+        token_count,
+        arc: Some(msg),
+        frozen: false,
+        agent_drop: false,
+        tag_protected: false,
+        exempt_protected: false,
+    };
+    let edit_specs = vec![
+        spec(0, KIND_TOOL_CALL, 3, 11, Some(300)),
+        spec(0, KIND_TOOL_RESULT, 3, 11, None),
+        spec(1, KIND_TOOL_CALL, 3, 0, Some(300)),
+        spec(1, KIND_TOOL_RESULT, 3, 0, None),
+    ];
+    let edit_bits: CtxBits = (0, 0.0, 1_000.0, 0, 0, false, 0, false, true, true);
+    let (optimized_edit, expected_edit, _, _) = outcome_pair!(edit_specs, edit_bits);
+    assert_eq!(optimized_edit, expected_edit);
+    assert!(optimized_edit.0.iter().any(|(_, kind, payload)| {
+        kind == "edit_marker" && payload.contains(DIFF_AT_HINT_BOUNDARY)
+    }));
+
+    let skeleton_specs = vec![
+        spec(2, KIND_TOOL_CALL, 8, 10, Some(300)),
+        spec(2, KIND_TOOL_RESULT, 8, 10, None),
+    ];
+    let skeleton_bits: CtxBits = (0, 1_000.0, 1_000.0, 0, 4, true, 0, true, false, true);
+    let (optimized_skeleton, expected_skeleton, _, _) =
+        outcome_pair!(skeleton_specs, skeleton_bits);
+    assert_eq!(optimized_skeleton, expected_skeleton);
+    assert!(optimized_skeleton.0.iter().any(|(_, kind, payload)| {
+        kind == "skeleton" && payload == &serde_json::to_string(&input_value(10)).unwrap()
+    }));
+}
+
+#[test]
+fn optimized_matches_frozen_reference_at_emergency_rearm_threshold() {
+    for (byte_size, expected_decisions) in [(11_420, 0), (11_428, 0), (11_432, 2)] {
+        let specs = vec![
+            ItemSpec {
+                msg: 0,
+                ordinal_slot: 1,
+                role: ROLE_ASSISTANT,
+                kind: KIND_TOOL_CALL,
+                tool: 8,
+                input: 0,
+                provider_executed: false,
+                byte_size,
+                token_count: None,
+                arc: Some(0),
+                frozen: false,
+                agent_drop: false,
+                tag_protected: false,
+                exempt_protected: false,
+            },
+            ItemSpec {
+                msg: 0,
+                ordinal_slot: 1,
+                role: ROLE_ASSISTANT,
+                kind: KIND_TOOL_RESULT,
+                tool: 8,
+                input: 0,
+                provider_executed: false,
+                byte_size: 0,
+                token_count: None,
+                arc: Some(0),
+                frozen: false,
+                agent_drop: false,
+                tag_protected: false,
+                exempt_protected: false,
+            },
+        ];
+        let bits: CtxBits = (1, 100_000.0, 100_000.0, 4, 0, false, 0, false, false, true);
+        let (optimized, expected, _, _) = outcome_pair!(specs, bits);
+        assert_eq!(optimized, expected);
+        assert_eq!(optimized.0.len(), expected_decisions);
+    }
+}
+
+#[test]
+fn optimized_matches_frozen_reference_for_agent_drop_at_exact_ceiling() {
+    let specs = vec![ItemSpec {
+        msg: 0,
+        ordinal_slot: 1,
+        role: ROLE_ASSISTANT,
+        kind: KIND_TEXT,
+        tool: 8,
+        input: 0,
+        provider_executed: false,
+        byte_size: 800,
+        token_count: None,
+        arc: None,
+        frozen: false,
+        agent_drop: true,
+        tag_protected: false,
+        exempt_protected: false,
+    }];
+    let bits: CtxBits = (0, 1_000.0, 1_000.0, 0, 0, false, 0, false, false, false);
+
+    let (optimized, expected, _, _) = outcome_pair!(specs, bits);
+    assert_eq!(optimized, expected);
+    assert_eq!(optimized.0.len(), 1);
 }
 
 proptest! {
