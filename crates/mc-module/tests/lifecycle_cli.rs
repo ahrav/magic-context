@@ -8,14 +8,29 @@
 #![cfg(unix)]
 
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
+// Two independent Linux dependencies bind the lifecycle proofs below.
+//
 // A published daemon requires Broca, whose crash-ownership records and sweeps
-// depend on `/proc` process identity, so Broca refuses to initialize anywhere
-// else and no spawned daemon can publish there. Every item carrying this gate
-// serves a proof that needs a published daemon; the CLI-contract tests fail
-// before any spawn and stay portable.
+// prove process identity through `/proc`, so Broca refuses to initialize
+// anywhere else and no spawned daemon can publish there.
+//
+// Separately, every lifecycle path walk opens each component with
+// `O_NOFOLLOW`, and each isolated data root here lives under the per-user
+// temporary directory. On macOS that directory resolves through `/var`, a
+// symlink to `private/var`, so the walk refuses the root itself: the
+// read-only probe reports the refusal as `wedged`/`wedged` and the
+// coordination-lock openers report it as `wedged`/`internal_error`, in place
+// of whatever state the root's contents describe.
+//
+// Every item carrying this gate serves a proof that needs a published daemon
+// or an observed lifecycle state. The argument-parsing and version-metadata
+// proofs resolve no data root and stay portable.
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
@@ -38,6 +53,7 @@ struct CliOutput {
     stderr: String,
 }
 
+#[cfg(target_os = "linux")]
 impl CliOutput {
     fn json(&self) -> Value {
         let mut lines = self.stdout.lines();
@@ -97,6 +113,7 @@ fn run_with_envelope_and_env(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn assert_result(value: &Value, command: &str, ok: bool, state: &str, reason: &str) {
     assert_eq!(value["schema"], "magic-context.daemon/v1");
     assert_eq!(value["command"], command);
@@ -114,6 +131,7 @@ fn assert_result(value: &Value, command: &str, ok: bool, state: &str, reason: &s
     assert_eq!(value["versions"]["release"], "0.38.0");
 }
 
+#[cfg(target_os = "linux")]
 fn effects(value: &Value) -> (bool, bool) {
     (
         value["effects"]["stop_committed"]
@@ -126,6 +144,7 @@ fn effects(value: &Value) -> (bool, bool) {
 }
 
 /// Writes a tiny dev payload: one executable, one data file, one nested file.
+#[cfg(target_os = "linux")]
 fn write_payload(dir: &Path) {
     std::fs::create_dir_all(dir.join("bin")).expect("payload bin dir");
     std::fs::write(dir.join("bin/tool"), b"#dev-binary-bytes").expect("payload tool");
@@ -134,6 +153,7 @@ fn write_payload(dir: &Path) {
     std::fs::write(dir.join("notices.txt"), b"dev notices").expect("payload notices");
 }
 
+#[cfg(target_os = "linux")]
 fn coordination_dir(root: &Path) -> PathBuf {
     root.join(".mc-host-coordination")
 }
@@ -236,6 +256,7 @@ fn version_and_release_info_are_side_effect_free() {
     assert!(!data.exists(), "metadata commands must not create the root");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn probe_on_empty_root_reports_stopped_without_mutation() {
     let root = tempfile::tempdir().expect("root");
@@ -253,6 +274,7 @@ fn probe_on_empty_root_reports_stopped_without_mutation() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn start_without_staged_payload_fails_closed_in_production_mode() {
     let root = tempfile::tempdir().expect("root");
@@ -267,6 +289,7 @@ fn start_without_staged_payload_fails_closed_in_production_mode() {
     assert!(!data.join("cortexkit").join("run").exists());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn restart_start_failure_from_stopped_reports_false_false() {
     let root = tempfile::tempdir().expect("root");
@@ -292,6 +315,7 @@ fn restart_start_failure_from_stopped_reports_false_false() {
     assert_eq!(effects(&value), (false, false));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn start_reports_lifecycle_busy_while_transaction_lock_is_held() {
     use std::os::fd::AsRawFd;
@@ -322,6 +346,7 @@ fn start_reports_lifecycle_busy_while_transaction_lock_is_held() {
     assert_eq!(value["remediation"], "wait_and_retry");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn stop_reports_wedged_when_lifetime_fence_is_held_without_a_runtime_dir() {
     use std::os::fd::AsRawFd;
@@ -352,6 +377,7 @@ fn stop_reports_wedged_when_lifetime_fence_is_held_without_a_runtime_dir() {
     assert!(lock_path.exists());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn dev_payload_without_explicit_test_self_exec_fails_closed() {
     let root = tempfile::tempdir().expect("root");
@@ -385,6 +411,7 @@ fn dev_payload_without_explicit_test_self_exec_fails_closed() {
 /// refuses, then report `startup_timeout`, and `stop` would report a clean
 /// `already_stopped`. All four must surface `unsupported_state_schema`, and
 /// none may touch the preserved bytes.
+#[cfg(target_os = "linux")]
 #[test]
 fn quarantined_record_is_classified_alike_by_every_command() {
     let root = tempfile::tempdir().expect("root");
