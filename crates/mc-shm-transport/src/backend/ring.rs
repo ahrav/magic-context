@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use crate::arena::{prefault, ArenaCounts, ArenaError, ArenaSpan, SpanPlan, MAX_FRAME_BYTES};
 use crate::descriptor::{
-    BackendId, DescriptorCounts, DescriptorError, FrameDescriptor, Incarnation, MemoryLayout,
-    ReleaseIdentity, SchedulingMode, DESCRIPTOR_SCHEMA_VERSION, MAX_SPANS, WIRE_V2_HEADER_BYTES,
+    DescriptorCounts, DescriptorError, FrameDescriptor, Incarnation, ReleaseIdentity,
+    SchedulingMode, DESCRIPTOR_SCHEMA_VERSION, MAX_SPANS, WIRE_V2_HEADER_BYTES,
 };
 use crate::lease::{LeaseError, LeaseSpan, ReceiveLease};
 use crate::profile::TargetProfile;
@@ -549,10 +549,7 @@ impl Ring {
         runtime.validate()?;
         // Reservations crossing the arena end wrap into two spans, so a
         // profile advertising fewer spans per frame cannot be honored.
-        if profile.descriptor().backend() != BackendId::Ring
-            || profile.descriptor().memory_layout() != MemoryLayout::TwoSpanWrap
-            || profile.max_spans() < MAX_SPANS
-        {
+        if profile.max_spans() < MAX_SPANS {
             return Err(RingError::ProfileMismatch);
         }
         let layout = Layout::new(profile.descriptor_depth(), profile.arena_bytes())?;

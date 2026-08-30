@@ -8,8 +8,7 @@ use std::time::Instant;
 
 use mc_shm_transport::backend::ring::{wire_v2_header, ProducerError, Ring, RingError, RingGrant};
 use mc_shm_transport::descriptor::{
-    BackendId, HardwareProfileId, Incarnation, MemoryLayout, OwnershipMode, PlatformKind,
-    ReleaseIdentity, RuntimeKind, SchedulingMode, TransportDescriptor, WorkloadClass,
+    HardwareProfileId, Incarnation, ReleaseIdentity, SchedulingMode, TransportDescriptor,
 };
 use mc_shm_transport::lease::LeaseError;
 use mc_shm_transport::profile::{
@@ -28,17 +27,7 @@ fn profile() -> TargetProfile {
 fn lease_limited_profile() -> TargetProfile {
     TargetProfile::new(ProfileConfig {
         descriptor: TransportDescriptor::new(
-            BackendId::Ring,
-            MemoryLayout::TwoSpanWrap,
-            OwnershipMode::DirectLeased,
             SchedulingMode::ColdParkWake,
-            WorkloadClass::MixedDuplex,
-            if cfg!(target_os = "macos") {
-                PlatformKind::Macos
-            } else {
-                PlatformKind::Linux
-            },
-            RuntimeKind::Rust,
             HardwareProfileId::new("ring-lease-limit").unwrap(),
         ),
         descriptor_depth: 2,
@@ -306,17 +295,7 @@ fn lease_limit_reports_backpressure_then_recovers_after_release() {
 fn one_span_profile_is_rejected_at_creation() {
     let profile = TargetProfile::new(ProfileConfig {
         descriptor: TransportDescriptor::new(
-            BackendId::Ring,
-            MemoryLayout::TwoSpanWrap,
-            OwnershipMode::DirectLeased,
             SchedulingMode::ColdParkWake,
-            WorkloadClass::MixedDuplex,
-            if cfg!(target_os = "macos") {
-                PlatformKind::Macos
-            } else {
-                PlatformKind::Linux
-            },
-            RuntimeKind::Rust,
             HardwareProfileId::new("ring-one-span").unwrap(),
         ),
         descriptor_depth: 2,
@@ -389,11 +368,12 @@ fn duplicate_fd(raw: i32) -> OwnedFd {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn attach_rejects_unsealed_objects_and_tampered_grants() {
+fn artifact_mismatch_fails_before_mapping_and_unsealed_objects_are_rejected() {
     let ring = Ring::create(&profile(), 21).unwrap();
     let base = ring.grant().encode();
 
-    // Geometry tampering fails closed inside the pure grant decoder.
+    // Layout-identity and geometry mismatches fail in the pure decoder before
+    // an object descriptor can reach mapping or attachment.
     let mut version = base;
     version[0..2].copy_from_slice(&1u16.to_le_bytes());
     let mut zero_depth = base;

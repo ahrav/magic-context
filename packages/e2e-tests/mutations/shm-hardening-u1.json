@@ -1,22 +1,22 @@
 {
   "drill": "SHM-HARDENING-U1",
-  "command": "cargo test -p mc-shm-transport --test iceoryx allocation_slack_never_reaches_the_frame_decoder",
+  "command": "cargo test -p mc-shm-transport --test contract fixed_ring_identity_survives_profile_validation",
   "mutations": [
     {
-      "name": "SHM_U1_ALLOCATION_SLACK_REACHES_DECODER",
+      "name": "SHM_U1_FIXED_RING_SCHEMA_DRIFTS",
       "applied_diff": {
-        "path": "crates/mc-shm-transport/src/backend/iceoryx.rs",
-        "before": "(index == 0).then_some(&self.sample.payload()[PREFIX_BYTES..PREFIX_BYTES + self.body_len])",
-        "after": "(index == 0).then_some(&self.sample.payload()[PREFIX_BYTES..])",
+        "path": "crates/mc-shm-transport/src/descriptor.rs",
+        "before": "            schema_version: DESCRIPTOR_SCHEMA_VERSION,",
+        "after": "            schema_version: DESCRIPTOR_SCHEMA_VERSION + 1,",
         "changed": true
       },
       "observed_failure": {
         "exit_status": 101,
-        "output": "\nrunning 1 test\ntest allocation_slack_never_reaches_the_frame_decoder ... FAILED\n\nfailures:\n\n---- allocation_slack_never_reaches_the_frame_decoder stdout ----\n\nthread 'allocation_slack_never_reaches_the_frame_decoder' (3920074) panicked at crates/mc-shm-transport/tests/iceoryx.rs:97:5:\nassertion `left == right` failed: decoder-visible slice must be the exact declared body range\n  left: 4096\n right: 8\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    allocation_slack_never_reaches_the_frame_decoder\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.01s\n\n   Compiling mc-shm-transport v0.1.0 (/local/home/ahrav/scratch/magic-context/crates/mc-shm-transport)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.50s\n     Running tests/iceoryx.rs (target/debug/deps/iceoryx-5045a6592a8fe389)\nerror: test failed, to rerun pass `-p mc-shm-transport --test iceoryx`\n"
+        "output": "\nrunning 1 test\ntest fixed_ring_identity_survives_profile_validation ... FAILED\n\nfailures:\n\n---- fixed_ring_identity_survives_profile_validation stdout ----\n\nthread 'fixed_ring_identity_survives_profile_validation' (3680500) panicked at crates/mc-shm-transport/tests/contract.rs:68:6:\ncalled `Result::unwrap()` on an `Err` value: target profile schema is unsupported\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    fixed_ring_identity_survives_profile_validation\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s\n\n   Compiling mc-shm-transport v0.1.0 (/local/home/ahrav/scratch/magic-context/crates/mc-shm-transport)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.61s\n     Running tests/contract.rs (target/debug/deps/contract-60e6e2d1fa3aae21)\nerror: test failed, to rerun pass `-p mc-shm-transport --test contract`\n"
       },
       "reverted_rerun": {
         "exit_status": 0,
-        "output": "\nrunning 1 test\ntest allocation_slack_never_reaches_the_frame_decoder ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.01s\n\n   Compiling mc-shm-transport v0.1.0 (/local/home/ahrav/scratch/magic-context/crates/mc-shm-transport)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.34s\n     Running tests/iceoryx.rs (target/debug/deps/iceoryx-5045a6592a8fe389)\n",
+        "output": "\nrunning 1 test\ntest fixed_ring_identity_survives_profile_validation ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s\n\n   Compiling mc-shm-transport v0.1.0 (/local/home/ahrav/scratch/magic-context/crates/mc-shm-transport)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.58s\n     Running tests/contract.rs (target/debug/deps/contract-60e6e2d1fa3aae21)\n",
         "status": "pass"
       },
       "adequacy_finding": null

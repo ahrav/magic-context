@@ -4,10 +4,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use crate::arena::MIN_ARENA_BYTES;
-use crate::descriptor::{
-    BackendId, HardwareProfileId, MemoryLayout, OwnershipMode, PlatformKind, RuntimeKind,
-    SchedulingMode, TransportDescriptor, WorkloadClass, MAX_SPANS,
-};
+use crate::descriptor::{HardwareProfileId, SchedulingMode, TransportDescriptor, MAX_SPANS};
 
 /// Producer arbitration topology.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,10 +159,6 @@ impl TargetProfile {
             }
             _ => {}
         }
-        if config.descriptor.ownership() != OwnershipMode::DirectLeased {
-            return Err(ProfileError::NonSelectableOwnership);
-        }
-
         let descriptors = u64::try_from(config.descriptor_depth)
             .ok()
             .and_then(|value| value.checked_mul(2))
@@ -584,8 +577,6 @@ pub enum ProfileError {
     InvalidMappingCharge,
     /// Worker charge disagrees with scheduling mode.
     InvalidWorkerCharge,
-    /// Copied ownership controls cannot become target profiles.
-    NonSelectableOwnership,
     /// Resource charge arithmetic overflowed.
     ChargeOverflow,
 }
@@ -606,7 +597,6 @@ impl fmt::Display for ProfileError {
             Self::InvalidLeaseLimit => "lease limit is invalid",
             Self::InvalidMappingCharge => "mapping charge is invalid",
             Self::InvalidWorkerCharge => "worker charge is invalid",
-            Self::NonSelectableOwnership => "ownership mode is a non-selectable control",
             Self::ChargeOverflow => "profile resource charge overflow",
         })
     }
@@ -658,27 +648,14 @@ impl fmt::Display for AdmissionError {
 
 impl std::error::Error for AdmissionError {}
 
-/// Builds common selectable ring profile for tests and local tools.
+/// Builds the fixed ring profile for tests and local tools.
 pub fn ring_profile(
     hardware: HardwareProfileId,
     scheduling: SchedulingMode,
 ) -> Result<TargetProfile, ProfileError> {
     let pinned_workers = usize::from(scheduling == SchedulingMode::HotPinnedPoll) * 2;
     TargetProfile::new(ProfileConfig {
-        descriptor: TransportDescriptor::new(
-            BackendId::Ring,
-            MemoryLayout::TwoSpanWrap,
-            OwnershipMode::DirectLeased,
-            scheduling,
-            WorkloadClass::MixedDuplex,
-            if cfg!(target_os = "macos") {
-                PlatformKind::Macos
-            } else {
-                PlatformKind::Linux
-            },
-            RuntimeKind::Rust,
-            hardware,
-        ),
+        descriptor: TransportDescriptor::new(scheduling, hardware),
         descriptor_depth: 32,
         arena_bytes: MIN_ARENA_BYTES,
         max_spans: 2,
