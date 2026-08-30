@@ -1,0 +1,114 @@
+{
+  "schema": "magic-context.redaction-vocabulary/v1",
+  "cases": [
+    {
+      "name": "anthropic api key",
+      "input": "prefix sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "expected_redacted": "prefix <ANTHROPIC_API_KEY_REDACTED>",
+      "detections": [{ "secret_type": "anthropic_api_key", "offset": 7, "length": 45 }]
+    },
+    {
+      "name": "openai api key after multibyte text",
+      "input": "é sk-proj-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      "expected_redacted": "é <OPENAI_API_KEY_REDACTED>",
+      "detections": [{ "secret_type": "openai_api_key", "offset": 3, "length": 40 }]
+    },
+    {
+      "name": "github fine-grained token",
+      "input": "github_pat_CCCCCCCCCCCCCCCCCCCC",
+      "expected_redacted": "<GITHUB_PAT_REDACTED>",
+      "detections": [{ "secret_type": "github_pat", "offset": 0, "length": 31 }]
+    },
+    {
+      "name": "github token",
+      "input": "gho_DDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+      "expected_redacted": "<GITHUB_TOKEN_REDACTED>",
+      "detections": [{ "secret_type": "github_token", "offset": 0, "length": 34 }]
+    },
+    {
+      "name": "huggingface token",
+      "input": "hf_EEEEEEEEEEEEEEEEEEEEEEEEEEEEEE",
+      "expected_redacted": "<HUGGINGFACE_TOKEN_REDACTED>",
+      "detections": [{ "secret_type": "huggingface_token", "offset": 0, "length": 33 }]
+    },
+    {
+      "name": "aws access key id",
+      "input": "AKIAFFFFFFFFFFFFFFFF",
+      "expected_redacted": "<AWS_ACCESS_KEY_ID_REDACTED>",
+      "detections": [{ "secret_type": "aws_access_key_id", "offset": 0, "length": 20 }]
+    },
+    {
+      "name": "slack token",
+      "input": "xoxb-GGGGGGGGGG",
+      "expected_redacted": "<SLACK_TOKEN_REDACTED>",
+      "detections": [{ "secret_type": "slack_token", "offset": 0, "length": 15 }]
+    },
+    {
+      "name": "google api key",
+      "input": "AIzaHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH",
+      "expected_redacted": "<GOOGLE_API_KEY_REDACTED>",
+      "detections": [{ "secret_type": "google_api_key", "offset": 0, "length": 39 }]
+    },
+    {
+      "name": "bearer authorization",
+      "input": "Authorization: Bearer abc123def456",
+      "expected_redacted": "Authorization: Bearer <REDACTED:bearer>",
+      "detections": [{ "secret_type": "bearer", "offset": 22, "length": 12 }]
+    },
+    {
+      "name": "jwt",
+      "input": "jwt=eyJabc.def.ghi",
+      "expected_redacted": "jwt=<JWT_REDACTED>",
+      "detections": [{ "secret_type": "jwt", "offset": 4, "length": 14 }]
+    },
+    {
+      "name": "double-quoted keyed secret",
+      "input": "\"api_key\": \"synthetic-value\"",
+      "expected_redacted": "\"api_key\": \"<REDACTED:api_key>\"",
+      "detections": [{ "secret_type": "api_key", "offset": 12, "length": 15 }]
+    },
+    {
+      "name": "single-quoted keyed secret",
+      "input": "{'auth_token':'tok_invalid_value'}",
+      "expected_redacted": "{'auth_token':'<REDACTED:auth_token>'}",
+      "detections": [{ "secret_type": "auth_token", "offset": 15, "length": 17 }]
+    },
+    {
+      "name": "double-quoted key with single-quoted value",
+      "input": "\"secret\":'mixed-value'",
+      "expected_redacted": "\"secret\":'<REDACTED:secret>'",
+      "detections": [{ "secret_type": "secret", "offset": 10, "length": 11 }]
+    },
+    {
+      "name": "single-quoted key with double-quoted value",
+      "input": "'password':\"other-value\"",
+      "expected_redacted": "'password':\"<REDACTED:password>\"",
+      "detections": [{ "secret_type": "password", "offset": 12, "length": 11 }]
+    },
+    {
+      "name": "assignment after multibyte text",
+      "input": "π password=hunter-two",
+      "expected_redacted": "π password=<REDACTED:password>",
+      "detections": [{ "secret_type": "password", "offset": 12, "length": 10 }]
+    },
+    {
+      "name": "keyed provider-shaped value",
+      "input": "api_key=sk-proj-IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII",
+      "expected_redacted": "api_key=<REDACTED:api_key>",
+      "detections": [{ "secret_type": "api_key", "offset": 8, "length": 40 }]
+    }
+  ],
+  "exemptions": [
+    "tokens.input=45000 cache.read=0 cache.write=0",
+    "hasUsageTokens=true",
+    "totalInputTokens=132000",
+    "max_tokens=4096",
+    "\"max_tokens\": \"4096\"",
+    "api_key=null"
+  ],
+  "known_misses": [
+    "opaque high entropy value abcdefghijklmnopqrstuvwxyz012345",
+    "Bearer abc123def456",
+    "short provider prefix sk-short"
+  ]
+}
