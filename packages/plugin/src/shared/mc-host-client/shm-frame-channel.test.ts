@@ -437,6 +437,7 @@ describe("mandatory shared-memory channel", () => {
             close: () => {
                 nativeCloseCalls++;
             },
+            peerClosed: () => false,
         } as unknown as NativeChannel;
         const channel = new ShmFrameChannel({
             nativeChannel: native,
@@ -469,6 +470,7 @@ describe("mandatory shared-memory channel", () => {
                 throw new Error("reserve must not be reached");
             },
             close: () => {},
+            peerClosed: () => false,
         } as unknown as NativeChannel;
         const channel = new ShmFrameChannel({
             nativeChannel: native,
@@ -501,6 +503,7 @@ describe("mandatory shared-memory channel", () => {
                 produceCalls++;
             },
             close: () => {},
+            peerClosed: () => false,
         } as unknown as NativeChannel;
         const channel = new ShmFrameChannel({
             nativeChannel: native,
@@ -514,6 +517,53 @@ describe("mandatory shared-memory channel", () => {
         channel.close();
         expect(() => channel.sendControl(responseHeader(FrameType.Pong, 1n, 0))).not.toThrow();
         expect(produceCalls).toBe(0);
+    });
+
+    test("a dropped setup socket retires the channel as eof after draining", async () => {
+        const closes: { reason: FrameChannelCloseReason; error: unknown }[] = [];
+        const frames: EnvelopeHeader[] = [];
+        let peerAlive = true;
+        let pending = true;
+        const nativeLease = {
+            header: encodeHeader(responseHeader(FrameType.Response, 7n, 4)),
+            byteLength: 4,
+            segmentCount: 1,
+            segment: () => new Uint8Array(Buffer.from("last")),
+            release: () => {},
+        } as unknown as NativeReceiveLease;
+        const native = {
+            poll: (deliver: (lease: NativeReceiveLease) => void) => {
+                if (!pending) return false;
+                pending = false;
+                deliver(nativeLease);
+                return true;
+            },
+            close: () => {},
+            peerClosed: () => !peerAlive,
+        } as unknown as NativeChannel;
+        const channel = new ShmFrameChannel({
+            nativeChannel: native,
+            budget: new ByteBudget(1024),
+            maxBodyLen: 1 << 20,
+            handlers: {
+                onFrame: (frame) => {
+                    frames.push(frame.header);
+                    frame.body.release();
+                },
+                onClosed: (reason, error) => closes.push({ reason, error }),
+            },
+        });
+        channel.beginFrames();
+        await waitUntil(() => frames.length === 1);
+        expect(closes).toEqual([]);
+
+        peerAlive = false;
+        await waitUntil(() => closes.length === 1);
+        // The frame that was already in the ring is delivered before the
+        // connection retires, so a graceful Goodbye is never lost.
+        expect(frames).toHaveLength(1);
+        expect(closes[0]?.reason).toBe("eof");
+        expect(channel.isClosed()).toBe(true);
     });
 
     test("handler throw releases JSON lease before fail-close", async () => {

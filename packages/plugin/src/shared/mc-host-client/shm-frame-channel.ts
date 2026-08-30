@@ -363,6 +363,16 @@ export class ShmFrameChannel implements SetupFrameChannel {
                     }
                 })
             ) {}
+            // The loop checks peerClosed() after draining so a graceful Goodbye reaches the dispatcher before the connection retires. Rings cannot express peer death on their own: a host that exits without a Goodbye leaves them looking idle, so every later poll would return no frames while the generation stayed live. commentlint: allow(JUDGE)
+            if (this.attached().peerClosed()) {
+                this.options.handlers.onClosed("eof", undefined);
+                try {
+                    this.close();
+                } catch {
+                    // close() rethrows on quarantined leases; an interval
+                    // callback has no caller to observe the throw.
+                }
+            }
         } catch (error) {
             this.options.handlers.onClosed(
                 error instanceof InboundFrameError ? error.reason : "protocol_violation",

@@ -51,6 +51,8 @@ export interface CatalogSnapshot {
 export interface HostStatusSnapshot {
     health: "ok" | "degraded" | "failing";
     metrics: Record<string, unknown>;
+    /** Ring diagnostics when the host reports them; absent on hosts that do not. */
+    sharedMemory?: Record<string, unknown>;
 }
 
 /**
