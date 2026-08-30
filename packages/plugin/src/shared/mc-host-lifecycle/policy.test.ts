@@ -23,6 +23,35 @@ function authenticatedPeerAt(daemonVer: string) {
     return { daemonVer, daemonId: new Uint8Array([7]), proof: "current" as const };
 }
 
+function healthySharedMemory() {
+    const zero = {
+        descriptors: 0,
+        arena_bytes: 0,
+        leases: 0,
+        mappings: 0,
+        file_descriptors: 0,
+        workers: 0,
+        client_instances: 0,
+        pinned_workers: 0,
+    };
+    return {
+        state: "healthy" as const,
+        error_class: null,
+        artifact: {
+            profile: "mc-host-test-ring-v1",
+            wire_version: 2,
+            descriptor_schema: 3,
+        },
+        bounds: zero,
+        accounting: { active: zero, quarantined: zero },
+        attachment: { completed: 1 },
+        activation: { completed: 1 },
+        peer_death: { observed: 0 },
+        reclamation: { completed: 0 },
+        exhaustion: { observed: 0 },
+    };
+}
+
 let counter = 0;
 
 function startResultJson(command: string): string {

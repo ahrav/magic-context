@@ -1920,6 +1920,10 @@ fn start_ring_bridge(
                 let _ = ready_tx.send(Err(()));
                 return;
             };
+            let Ok(data_ready) = endpoint.from_host.duplicate_data_ready() else {
+                let _ = ready_tx.send(Err(()));
+                return;
+            };
             if ready_tx.send(Ok(())).is_err() {
                 return;
             }
@@ -1976,10 +1980,6 @@ fn start_ring_bridge(
                     Ok(true) => {}
                     Err(_) => break,
                 }
-                let data_ready = match endpoint.from_host.duplicate_data_ready() {
-                    Ok(fd) => fd,
-                    Err(_) => break,
-                };
                 let mut fds = [
                     rustix::event::PollFd::new(&*worker_wake, rustix::event::PollFlags::IN),
                     rustix::event::PollFd::new(&data_ready, rustix::event::PollFlags::IN),

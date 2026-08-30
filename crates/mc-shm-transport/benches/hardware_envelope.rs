@@ -9,6 +9,8 @@ use mc_shm_transport::evidence::OperationCounters;
 use mc_shm_transport::profile::{ProfileConfig, TargetProfile, WorkerTopology};
 use serde::{Deserialize, Serialize};
 
+const PROFILE: &str = "eventfd_sparse_ring";
+
 const ARMS: &[&str] = &[
     "h0_metadata_cacheline_ping_pong",
     "h1_raw_descriptor_ring_payload_touch",
@@ -152,7 +154,7 @@ fn measure(arm: &str, iterations: u64, payload: usize) -> Measurement {
                 schema: 1,
                 state: "complete".to_owned(),
                 arm: arm.to_owned(),
-                profile: "eventfd_sparse_ring".to_owned(),
+                profile: PROFILE.to_owned(),
                 payload_bytes: payload,
                 iterations,
                 elapsed_ns: elapsed.as_nanos(),
@@ -175,7 +177,7 @@ fn failed(arm: &str, payload: usize, iterations: u64, reason: &str) -> Measureme
         schema: 1,
         state: "failed".to_owned(),
         arm: arm.to_owned(),
-        profile: "eventfd_sparse_ring".to_owned(),
+        profile: PROFILE.to_owned(),
         payload_bytes: payload,
         iterations,
         elapsed_ns: 0,
@@ -243,7 +245,7 @@ fn run_h0(iterations: u64) -> Result<(Duration, u64, u64, u64, u64, u64), &'stat
 fn ring_profile() -> Result<TargetProfile, &'static str> {
     TargetProfile::new(ProfileConfig {
         descriptor: TransportDescriptor::new(
-            HardwareProfileId::new("eventfd_sparse_ring").map_err(|_| "profile")?,
+            HardwareProfileId::new(PROFILE).map_err(|_| "profile")?,
         ),
         descriptor_depth: 32,
         arena_bytes: mc_shm_transport::MIN_ARENA_BYTES,
