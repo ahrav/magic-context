@@ -68,7 +68,13 @@ fn bench_projection(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{count}msgs_2KiB_mixed")),
             &messages,
-            |b, messages| b.iter(|| project_messages(black_box(messages)).expect("projection")),
+            |b, messages| {
+                b.iter_batched(
+                    || (),
+                    |()| project_messages(black_box(messages)).expect("projection"),
+                    criterion::BatchSize::PerIteration,
+                )
+            },
         );
     }
     group.finish();
@@ -242,7 +248,13 @@ fn bench_e2e_steady(c: &mut Criterion) {
         let ctx = producer_ctx(dir.path().to_str().expect("utf8 dir"));
         group.bench_function(
             BenchmarkId::from_parameter(format!("{count}msgs_2KiB_mixed")),
-            |b| b.iter(|| black_box(transform(&store, &req, &ctx).expect("steady pass").status)),
+            |b| {
+                b.iter_batched(
+                    || (),
+                    |()| transform(&store, &req, &ctx).expect("steady pass"),
+                    criterion::BatchSize::PerIteration,
+                )
+            },
         );
     }
     // Payload-class sensitivity at the production-shaped 1,400-message point.
@@ -256,7 +268,13 @@ fn bench_e2e_steady(c: &mut Criterion) {
         let ctx = producer_ctx(dir.path().to_str().expect("utf8 dir"));
         group.bench_function(
             BenchmarkId::from_parameter(format!("1400msgs_2KiB_{}", class.label())),
-            |b| b.iter(|| black_box(transform(&store, &req, &ctx).expect("steady pass").status)),
+            |b| {
+                b.iter_batched(
+                    || (),
+                    |()| transform(&store, &req, &ctx).expect("steady pass"),
+                    criterion::BatchSize::PerIteration,
+                )
+            },
         );
     }
     group.finish();
@@ -273,14 +291,14 @@ fn bench_e2e_steady_output_cache(c: &mut Criterion) {
     // Prime the cache so the measured loop is the warm-cache steady pass.
     bench_internals::transform_cached(&store, &req, &ctx, &cache).expect("prime pass");
     group.bench_function("1400msgs_2KiB_mixed", |b| {
-        b.iter(|| {
-            black_box(
+        b.iter_batched(
+            || (),
+            |()| {
                 bench_internals::transform_cached(&store, &req, &ctx, &cache)
                     .expect("cached steady pass")
-                    .response
-                    .status,
-            )
-        })
+            },
+            criterion::BatchSize::PerIteration,
+        )
     });
     group.finish();
 }
@@ -293,13 +311,11 @@ fn bench_e2e_steady_caveman(c: &mut Criterion) {
     let (dir, store, req) = steady_state(&messages, true);
     let ctx = producer_ctx(dir.path().to_str().expect("utf8 dir"));
     group.bench_function("1400msgs_2KiB_mixed", |b| {
-        b.iter(|| {
-            black_box(
-                transform(&store, &req, &ctx)
-                    .expect("caveman steady pass")
-                    .status,
-            )
-        })
+        b.iter_batched(
+            || (),
+            |()| transform(&store, &req, &ctx).expect("caveman steady pass"),
+            criterion::BatchSize::PerIteration,
+        )
     });
     group.finish();
 }

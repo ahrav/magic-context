@@ -117,14 +117,21 @@ the heavier IPC benches; the same hygiene applies here.
   boundary and are out of scope for this in-process suite.
 - **Stage counters**: `TransformTimings` isolates `tail_hygiene` and reports
   `tokenize_calls`, `tokenize_cache_hits`, `tokenize_cache_misses`,
-  `tokenize_cache_bypassed` (contents under the 64-byte cache threshold),
-  and `tokenize_bytes` per pass. These are deltas of thread-local counters,
-  and a pass holds one thread from its start snapshot to its end snapshot
-  (`apply_once_with_estimator_and_projection` is synchronous and spawns
-  nothing), so a delta counts that pass alone even when concurrent handler
-  tasks tokenize at the same time. `calls` therefore equals
-  `hits + misses + bypassed` exactly. Consumers must classify all five as
-  counters, not millisecond stage samples.
+  `tokenize_cache_bypassed`, and `tokenize_bytes` per pass. These are deltas
+  of thread-local counters, and a pass holds one thread from its start
+  snapshot to its end snapshot (`apply_once_with_estimator_and_projection` is
+  synchronous and spawns nothing), so a delta counts that pass alone even
+  when concurrent handler tasks tokenize at the same time. `calls` therefore
+  equals `hits + misses + bypassed` exactly. Consumers must classify all five
+  as counters, not millisecond stage samples.
+
+  `bypassed` counts calls that skipped the cache, which is narrower than "all
+  short content". Only the raw entry point applies the 64-byte threshold;
+  tail hygiene calls `count_with_digest` with a digest it already computed for
+  `content_hash`, so its short parts are cached and appear as hits or misses.
+  That is deliberate — the hash is already paid there, so a repeated short
+  part is worth a hit — but it means these counters describe cache behaviour,
+  not the size distribution of the content.
 
 ## Recorded comparison: token-count cache (2026-08-30)
 
