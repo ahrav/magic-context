@@ -65,7 +65,7 @@ export function stripJsonComments(content: string): string {
     return result;
 }
 
-function stripTrailingCommas(content: string): string {
+export function stripTrailingCommas(content: string): string {
     let result = "";
     let inString = false;
     let escaped = false;
