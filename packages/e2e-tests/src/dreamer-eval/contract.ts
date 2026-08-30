@@ -6,7 +6,9 @@ import {
 } from "../../../plugin/src/features/magic-context/memory/claim-operation-contract";
 import { normalizeMemoryContent } from "../../../plugin/src/features/magic-context/memory/normalize-hash";
 import { sha256Utf8Hex } from "../../../plugin/src/features/magic-context/memory/storage-claims";
-import { VERIFY_UPDATE_CONTENT_MAX_LENGTH } from "../../../plugin/src/features/magic-context/dreamer/verify";
+import { VERIFY_BATCH_SIZE, VERIFY_UPDATE_CONTENT_MAX_LENGTH } from "../../../plugin/src/features/magic-context/dreamer/verify";
+import { MAP_BATCH_SIZE } from "../../../plugin/src/features/magic-context/dreamer/map-memories";
+import { CLASSIFY_CHUNK_SIZE } from "../../../plugin/src/features/magic-context/dreamer/classify";
 import { parseVerifyManifest } from "../../../plugin/src/features/magic-context/dreamer/verify-prompt";
 import { parseMapMemoriesManifest } from "../../../plugin/src/features/magic-context/dreamer/map-memories-prompt";
 import { parseClassifyManifest } from "../../../plugin/src/features/magic-context/dreamer/classify-prompt";
@@ -81,6 +83,22 @@ const RUN_ID_RE = /^run-[a-z0-9]+(?:-[a-z0-9]+)*$/;
  * could not be checked out or verified.
  */
 const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const DIGEST_RE = /^[0-9a-f]{64}$/;
+
+/** The report contract's own identity predicates. A caller overriding either value
+ *  can reject it before a live run rather than after `parseRunReport` refuses the
+ *  artifact that run produced. */
+export function isValidRunId(value: string): boolean {
+    return RUN_ID_RE.test(value);
+}
+
+export function isValidRepoCommitSha(value: string): boolean {
+    return SHA_RE.test(value);
+}
+
+export function isValidNowMs(value: number): boolean {
+    return Number.isSafeInteger(value) && value >= 0;
+}
 
 /**
  * Lowest verification timestamp the seeder can build a fixture around.
@@ -123,7 +141,32 @@ const VERIFY_ROOT_CLOSE_TAG = "</verify>";
 const MIN_POOL_CLAIMS = 10;
 
 /** Largest pool a scenario may declare, and therefore the largest a capture can hold. */
-const MAX_POOL_CLAIMS = 50;
+export const MAX_POOL_CLAIMS = 50;
+
+/**
+ * Claims production dispatches to one child session per task. The runner
+ * captures a task's children by matching every in-scope public claim id in one
+ * transcript and compares the match count against `ceil(inScope / batchSize)`,
+ * so it can only score a task production sends as a single batch: with the pool
+ * partitioned, no child carries the whole id set, every child is rejected, and
+ * the run terminates as harness failure rather than a scored experiment.
+ *
+ * `MAX_POOL_CLAIMS` is at or below every size here, so a scenario the pool
+ * parser accepts is already single-batch. `partitionUnsupported` keeps that
+ * true if either side moves: raising the pool cap past a task's batch size, or
+ * production lowering one, fails the affected scenario here instead of
+ * producing runs that spend model credits and report harness failure.
+ *
+ * The classify chunker also splits on rendered prompt bytes, but only on the
+ * module route; the child route this lane drives passes an infinite byte budget
+ * and chunks by count alone.
+ */
+export const TASK_BATCH_SIZE: Record<DreamerTask, number> = {
+    verify: VERIFY_BATCH_SIZE,
+    "verify-broad": VERIFY_BATCH_SIZE,
+    "map-memories": MAP_BATCH_SIZE,
+    "classify-memories": CLASSIFY_CHUNK_SIZE,
+};
 
 /**
  * FAIL reasons each task's scorer can actually produce. A report naming another
@@ -291,6 +334,19 @@ const UNREPRESENTABLE_PATH_RE = /[,"<>\0]/;
 function parseFilePath(value: unknown, label: string): string {
     const path = string(value, label);
     if (path !== path.trim() || UNREPRESENTABLE_PATH_RE.test(path)) fail(`${label}: path-unrepresentable`);
+    return path;
+}
+
+/**
+ * An absolute host path, not a manifest path. The fixture worktree lives under the
+ * host temp directory, which may legitimately contain a comma, a quote, or edge
+ * whitespace — characters `parseFilePath` forbids because a manifest lists paths
+ * comma-separated inside an XML attribute. Applying that rule here would reject an
+ * otherwise valid report for the shape of the machine's temp directory.
+ */
+function parseHostDirectory(value: unknown, label: string): string {
+    const path = string(value, label);
+    if (!/^(?:[/\\]|[A-Za-z]:[/\\])/.test(path)) fail(`${label}: path-not-absolute`);
     return path;
 }
 
@@ -658,6 +714,9 @@ function parseTask(raw: unknown, label: string, pool: ReadonlyMap<string, Scenar
     if (expectedInScopeClaimIds.length === 0) {
         fail(`${label}.expectedInScopeClaimIds: scope-empty`);
     }
+    if (expectedInScopeClaimIds.length > TASK_BATCH_SIZE[task]) {
+        fail(`${label}.expectedInScopeClaimIds: partition-unsupported`);
+    }
     if (task === "classify-memories" && expectedSkippedClaimIds.length > 0) {
         fail(`${label}.expectedSkippedClaimIds: classify-skips-nothing`);
     }
@@ -814,12 +873,41 @@ export interface PoolDescriptor {
     claims: ClaimSnapshotProjection[];
 }
 
+export const PLUGIN_RUNTIME_SOURCES = ["dist", "src"] as const;
+export type PluginRuntimeSource = (typeof PLUGIN_RUNTIME_SOURCES)[number];
+
 export interface DreamerSystemTuple {
     repoCommitSha: string;
     bunVersion: string;
     opencodeVersion: string;
     modelId: string;
+    /**
+     * `process.platform`. `canonicalObservedPath` and production's own path
+     * handling are deliberately separator-aware, and a case-insensitive
+     * filesystem changes which paths production resolves, so the same manifest
+     * can score differently across platforms. Without this, reports from two
+     * platforms would read as one system and mix harness behaviour into model
+     * variance.
+     */
+    platform: string;
     parserImpl: "ts";
+    /**
+     * Which plugin entrypoint the harness loaded. `spawn.ts` prefers
+     * `packages/plugin/dist/index.js` when it exists and falls back to
+     * `packages/plugin/src/index.ts`, so the commit alone does not say which
+     * bytes ran.
+     */
+    pluginEntry: PluginRuntimeSource;
+    /**
+     * Digest of everything the run's outcome depends on that the commit does not
+     * pin: the loaded bundle's bytes when a bundle is loaded, plus every working-
+     * tree deviation from `repoCommitSha` — content included, so editing an
+     * untracked module changes it. `repoCommitSha` describes the checkout, not the
+     * runtime, and a dirty tree or a stale bundle makes two runs at one commit
+     * execute different plugin and evaluator code. Without this they would share a
+     * system tuple and aggregate as repeats of one experiment.
+     */
+    runtimeDigest: string;
 }
 
 export type DreamerRunStatus = "PASS" | "FAIL" | "ERROR";
@@ -850,6 +938,26 @@ export interface DreamerEvalRunReport {
     reason: ErrorReason | FailReason | null;
     runFatal: boolean;
     system: DreamerSystemTuple;
+    /**
+     * Every path the fixture repository tracks, read with `git ls-files` after
+     * seeding — the universe production's own lookup resolves an observed mapping
+     * path against, so it includes the seeder's `.dreamer-eval-fixture` marker.
+     *
+     * Recorded rather than rederived because a claim's projected files come from
+     * its seeded mapping: a task with no mapping preconditions projects none, and
+     * a consumer deriving the universe from `poolBefore` would resolve map runs
+     * against an empty set.
+     */
+    trackedFiles: string[];
+    /**
+     * Absolute path of that fixture repository. `normalizeVerificationFiles`
+     * resolves an observed path against the session directory before matching it,
+     * so an absolute path inside the fixture is accepted and stored relative —
+     * reproducing that needs the root, and it differs per run, so each report
+     * carries its own. Null when the run failed before the fixture existed, which
+     * is the same partial capture an ERROR report is already allowed to hold.
+     */
+    fixtureRoot: string | null;
     poolBefore: ClaimSnapshotProjection[];
     poolAfter: ClaimSnapshotProjection[];
     rawManifest: string | null;
@@ -940,13 +1048,29 @@ export function parsePoolDescriptor(raw: unknown, label = "pool"): PoolDescripto
 
 function parseSystem(raw: unknown, label: string): DreamerSystemTuple {
     const value = record(raw, label);
-    exact(value, ["repoCommitSha", "bunVersion", "opencodeVersion", "modelId", "parserImpl"], label);
+    exact(
+        value,
+        [
+            "repoCommitSha",
+            "bunVersion",
+            "opencodeVersion",
+            "modelId",
+            "platform",
+            "parserImpl",
+            "pluginEntry",
+            "runtimeDigest",
+        ],
+        label,
+    );
     return {
         repoCommitSha: staticId(value.repoCommitSha, `${label}.repoCommitSha`, SHA_RE),
         bunVersion: string(value.bunVersion, `${label}.bunVersion`),
         opencodeVersion: string(value.opencodeVersion, `${label}.opencodeVersion`),
         modelId: string(value.modelId, `${label}.modelId`),
+        platform: string(value.platform, `${label}.platform`),
         parserImpl: enumeration(value.parserImpl, ["ts"], `${label}.parserImpl`),
+        pluginEntry: enumeration(value.pluginEntry, PLUGIN_RUNTIME_SOURCES, `${label}.pluginEntry`),
+        runtimeDigest: staticId(value.runtimeDigest, `${label}.runtimeDigest`, DIGEST_RE),
     };
 }
 
@@ -1117,7 +1241,7 @@ function reparseManifest(task: DreamerTask, rawManifest: string): ParsedManifest
 
 export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunReport {
     const root = record(raw, label);
-    exact(root, ["schema", "scenarioId", "task", "runId", "nowMs", "status", "reason", "runFatal", "system", "poolBefore", "poolAfter", "rawManifest", "parsedManifest", "receiptOutcomes"], label);
+    exact(root, ["schema", "scenarioId", "task", "runId", "nowMs", "status", "reason", "runFatal", "system", "trackedFiles", "fixtureRoot", "poolBefore", "poolAfter", "rawManifest", "parsedManifest", "receiptOutcomes"], label);
     if (root.schema !== DREAMER_EVAL_REPORT_SCHEMA) fail(`${label}.schema: version-invalid`);
     const task = enumeration(root.task, DREAMER_TASKS, `${label}.task`);
     const status = enumeration(root.status, ["PASS", "FAIL", "ERROR"], `${label}.status`);
@@ -1268,6 +1392,8 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
         reason,
         runFatal,
         system: parseSystem(root.system, `${label}.system`),
+        trackedFiles: parseFilePathArray(root.trackedFiles, `${label}.trackedFiles`),
+        fixtureRoot: root.fixtureRoot === null ? null : parseHostDirectory(root.fixtureRoot, `${label}.fixtureRoot`),
         poolBefore,
         poolAfter,
         rawManifest,

@@ -41,7 +41,8 @@ import {
     providerOutputFailureFromInvalidManifest,
 } from "./provider-output-failure";
 
-const MAP_BATCH_SIZE = 80;
+export const MAP_BATCH_SIZE = 80;
+export const DREAM_MAP_MEMORIES_SESSION_TITLE = "magic-context-dream-map-memories";
 export const MAX_INDEPENDENT_REQUEUE_PER_RUN = MAP_BATCH_SIZE;
 
 export interface MapMemoriesArgs {
@@ -198,7 +199,7 @@ async function mapOneBatch(
             client: args.client,
             db: args.db,
             parentSessionId: args.parentSessionId,
-            title: "magic-context-dream-map-memories",
+            title: DREAM_MAP_MEMORIES_SESSION_TITLE,
             directory: args.sessionDirectory,
         });
         const created = shared.normalizeSDKResponse(

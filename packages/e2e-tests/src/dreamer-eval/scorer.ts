@@ -1,4 +1,4 @@
-import { sep } from "node:path";
+import { isAbsolute, relative as relativePath, sep } from "node:path";
 
 import { hasLengthCappedOutput } from "../../../plugin/src/shared/assistant-message-extractor";
 import { normalizeMemoryContent } from "../../../plugin/src/features/magic-context/memory/normalize-hash";
@@ -129,14 +129,86 @@ function canonicalObservedPath(value: string): string {
     return /^[\\/]/.test(value) ? `/${joined}` : joined;
 }
 
-function canonicalObservedPaths(values: readonly string[]): string[] {
+export function canonicalObservedPaths(values: readonly string[]): string[] {
     return values.map(canonicalObservedPath);
+}
+
+/**
+ * The paths production would actually store for an observed file list:
+ * canonicalized, resolved to the tracked spelling, and stripped of anything the
+ * host would refuse.
+ *
+ * `normalizeVerificationFiles` runs each path through `gitTrackedPath`, which takes
+ * an exact `git ls-files` match, falls back to a case-insensitive one, and yields
+ * the tracked spelling — then stores that spelling and SKIPS any path it cannot
+ * bind to a tracked file. So a manifest naming `SRC/CACHE.ts` applies
+ * `src/cache.ts`, and one naming the gold files plus an untracked extra applies
+ * exactly the gold files. Comparing the raw observed list against gold reports
+ * `wrong-mapping` for both even though the applied mapping matches.
+ *
+ * The casing fallback reaches a case-sensitive filesystem too: the variant does not
+ * exist there, so it skips the `existsSync` branch entirely and arrives at the git
+ * lookup with `safeRealpath` null, which also skips the `tracked !== repoRelative`
+ * guard below it.
+ *
+ * Ambiguity follows production: only a unique case-insensitive match is adopted. A
+ * path matching several tracked spellings, or none, is dropped, which is what
+ * `gitTrackedPath` returning null makes the host do.
+ *
+ * `tracked` is supplied by the caller rather than derived from the pool. A pool
+ * claim's `files` come from its seeded mapping, and a task with no mapping
+ * preconditions — map and classify — projects an empty set, so a pool-derived
+ * universe would leave the mapping scorer with nothing to resolve against.
+ */
+export interface FixtureWorktree {
+    /** Absolute path of the fixture repository the manifest was produced against. */
+    root: string;
+    /** Its tracked paths, repo-relative. */
+    files: readonly string[];
+}
+
+/**
+ * Bring an observed path into the repo-relative form gold is written in, the way
+ * `normalizeVerificationFiles` does: it resolves the value against the session
+ * directory and converts it back with `path.relative`, so an absolute path inside
+ * the fixture is accepted and stored relative. A path that resolves outside stays
+ * as observed, because production skips it rather than resolving it inward.
+ */
+function repoRelative(value: string, root: string): string {
+    if (!isAbsolute(value)) return value;
+    const relative = relativePath(root, value).split(sep).join("/");
+    // `startsWith("../")` and not `startsWith("..")`, matching production: a tracked
+    // file may legitimately be named `..config`, whose relative form begins with two
+    // dots without escaping anything.
+    const escapes = relative === ".." || relative.startsWith("../");
+    return relative.length > 0 && !escapes ? relative : value;
+}
+
+export function appliedTrackedPaths(values: readonly string[], tracked: FixtureWorktree): string[] {
+    const trackedSet = new Set(tracked.files.map(canonicalObservedPath));
+    const applied: string[] = [];
+    for (const value of values) {
+        const candidate = canonicalObservedPath(repoRelative(value, tracked.root));
+        if (trackedSet.has(candidate)) {
+            applied.push(candidate);
+            continue;
+        }
+        // `find`, not a uniqueness requirement, because `gitTrackedPath` takes the
+        // first case-insensitive match from `git ls-files` order — so on a fixture
+        // holding two paths that differ only by case, production applies one rather
+        // than skipping the path. `tracked.files` preserves that listing order.
+        const folded = candidate.toLowerCase();
+        const match = [...trackedSet].find((entry) => entry.toLowerCase() === folded);
+        if (match !== undefined) applied.push(match);
+    }
+    return applied;
 }
 
 export function scoreVerifyManifest(
     manifestText: string,
     pool: PoolDescriptor,
     gold: VerifyGold,
+    tracked: FixtureWorktree,
     evidence?: ManifestInfraEvidence,
 ): ManifestScore {
     const rejected = precheck(manifestText, evidence);
@@ -191,7 +263,10 @@ export function scoreVerifyManifest(
         }
         // Verification applies this attribute as the claim's new exact mapping,
         // so a narrowed set silently shrinks future incremental verify scope.
-        if (expected.verdict !== "archive" && !sameSet(canonicalObservedPaths(observed.files), expected.expectedFiles)) {
+        if (
+            expected.verdict !== "archive" &&
+            !sameSet(appliedTrackedPaths(observed.files, tracked), expected.expectedFiles)
+        ) {
             return score("FAIL", "wrong-mapping", "scored", parsed);
         }
         if (expected.verdict === "update") {
@@ -282,6 +357,7 @@ export function scoreMapManifest(
     manifestText: string,
     pool: PoolDescriptor,
     gold: MapGold,
+    tracked: FixtureWorktree,
     evidence?: ManifestInfraEvidence,
 ): ManifestScore {
     const rejected = precheck(manifestText, evidence);
@@ -305,7 +381,7 @@ export function scoreMapManifest(
     for (const expected of gold.claims) {
         const publicClaimId = context.byClaimId.get(expected.claimId)?.publicClaimId;
         const observed = publicClaimId === undefined ? undefined : actual.get(publicClaimId);
-        if (observed === undefined || !sameSet(canonicalObservedPaths(observed.files), expected.files)) {
+        if (observed === undefined || !sameSet(appliedTrackedPaths(observed.files, tracked), expected.files)) {
             return score("FAIL", "wrong-mapping", "scored", parsed);
         }
     }

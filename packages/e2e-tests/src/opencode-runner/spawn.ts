@@ -46,9 +46,14 @@ const PLUGIN_SRC_ENTRY = join(REPO_ROOT, "packages/plugin/src/index.ts");
  * Semantics are unchanged for every caller that does not create or remove the
  * bundle between import and spawn: the answer is the same, just computed later.
  */
-function pluginEntryPath(): string {
+export function pluginEntryPath(): string {
     return existsSync(PLUGIN_DIST_ENTRY) ? PLUGIN_DIST_ENTRY : PLUGIN_SRC_ENTRY;
 }
+
+/** Exported for provenance: a caller recording which plugin bytes ran needs the
+ *  same bundle path this module loads, not a second copy of the join. */
+export const PLUGIN_BUNDLE_ENTRY = PLUGIN_DIST_ENTRY;
+export const PLUGIN_REPO_ROOT = REPO_ROOT;
 
 function initializeIsolatedContextDb(
     dataDir: string,

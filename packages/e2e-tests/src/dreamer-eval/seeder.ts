@@ -87,7 +87,7 @@ function fixtureError(detail: string): never {
  * workdir. Neutralizing global and system config additionally keeps
  * `core.hooksPath` from running host scripts during the fixture commit.
  */
-function fixtureGitEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+export function fixtureGitEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     const inherited: NodeJS.ProcessEnv = {};
     for (const [key, value] of Object.entries(process.env)) {
         if (!key.startsWith("GIT_")) inherited[key] = value;
@@ -379,6 +379,43 @@ function projectionFiles(
     );
 }
 
+export function readDreamerEvalPoolDescriptor(args: {
+    db: Database;
+    scenario: DreamerEvalScenario;
+    publicClaimIds: Readonly<Record<string, string>>;
+}): PoolDescriptor {
+    const currentState = readProjectMemoryCurrentState(args.db, {
+        publicClaimIds: Object.values(args.publicClaimIds),
+        surface: "explicit_search",
+        lifecycleStates: ["active", "archived", "retired"],
+    });
+    if (currentState.status !== "ok") fixtureError("claims current-state projection is stale");
+    const snapshotByPublicId = new Map(
+        currentState.items.map((claim) => [claim.publicClaimId, claim]),
+    );
+    return {
+        schema: DREAMER_EVAL_POOL_SCHEMA,
+        scenarioId: args.scenario.id,
+        claims: args.scenario.pool.claims.map((row) => {
+            const snapshot = snapshotByPublicId.get(args.publicClaimIds[row.id]!);
+            if (!snapshot) return fixtureError(`seeded claim ${row.id} is absent from projection`);
+            return {
+                claimId: row.id,
+                publicClaimId: snapshot.publicClaimId,
+                revisionLocator: snapshot.revisionLocator,
+                content: snapshot.content,
+                category: snapshot.category,
+                importance: snapshot.importance,
+                memoryScope: snapshot.memoryScope,
+                sharing: snapshot.sharing,
+                lifecycleState: snapshot.lifecycleState,
+                files: projectionFiles(snapshot),
+                verificationOutcome: snapshot.verification.latestOutcome,
+            };
+        }),
+    };
+}
+
 export async function seedDreamerEvalTask(
     options: SeedDreamerEvalTaskOptions,
 ): Promise<SeededDreamerEvalTask> {
@@ -498,35 +535,11 @@ export async function seedDreamerEvalTask(
         writeTaskScheduleState(options.db, { ...state, lastBroadRunAt });
     }
 
-    const currentState = readProjectMemoryCurrentState(options.db, {
-        publicClaimIds: Object.values(publicClaimIds),
-        surface: "explicit_search",
+    const pool = readDreamerEvalPoolDescriptor({
+        db: options.db,
+        scenario: options.scenario,
+        publicClaimIds,
     });
-    if (currentState.status !== "ok") fixtureError("claims current-state projection is stale");
-    const snapshotByPublicId = new Map(
-        currentState.items.map((claim) => [claim.publicClaimId, claim]),
-    );
-    const pool: PoolDescriptor = {
-        schema: DREAMER_EVAL_POOL_SCHEMA,
-        scenarioId: options.scenario.id,
-        claims: options.scenario.pool.claims.map((row) => {
-            const snapshot = snapshotByPublicId.get(publicClaimIds[row.id]!);
-            if (!snapshot) return fixtureError(`seeded claim ${row.id} is absent from projection`);
-            return {
-                claimId: row.id,
-                publicClaimId: snapshot.publicClaimId,
-                revisionLocator: snapshot.revisionLocator,
-                content: snapshot.content,
-                category: snapshot.category,
-                importance: snapshot.importance,
-                memoryScope: snapshot.memoryScope,
-                sharing: snapshot.sharing,
-                lifecycleState: snapshot.lifecycleState,
-                files: projectionFiles(snapshot),
-                verificationOutcome: snapshot.verification.latestOutcome,
-            };
-        }),
-    };
     const preflight = await preflightDreamerEvalTask({
         db: options.db,
         projectIdentity,
