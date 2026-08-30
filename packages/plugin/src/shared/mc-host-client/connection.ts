@@ -154,6 +154,8 @@ export interface RequestParams {
      * Retained-item ceiling for a stream-mode request. The pending byte budget
      * counts wire bytes only, so a peer emitting many tiny items can retain
      * unbounded per-item decode overhead under it; this bounds item count too.
+     * Must be a non-negative safe integer; 0 retains nothing and refuses the
+     * first item.
      */
     maxStreamItems?: number;
     responseMode?: "json" | "binary";
@@ -526,6 +528,20 @@ export class ConnectionGeneration {
                 "deadline_expired",
             );
         }
+        // An empty StreamData frame charges zero pending bytes yet still retains
+        // one decoded item wrapper, so the retained-item ceiling is the only
+        // bound on that growth. A non-finite or fractional ceiling makes the
+        // `streamItems.length >= maxStreamItems` comparison in
+        // `dispatchToPending` unsatisfiable, leaving retention unbounded; refuse
+        // it before a pending entry exists or any byte reaches the peer.
+        const maxStreamItems = params.maxStreamItems ?? DEFAULT_MAX_STREAM_ITEMS;
+        if (!Number.isSafeInteger(maxStreamItems) || maxStreamItems < 0) {
+            throw new McHostCallError(
+                "not_sent",
+                `maxStreamItems must be a non-negative safe integer (got ${maxStreamItems})`,
+                "invalid_max_stream_items",
+            );
+        }
         const flags = buildFlags(
             params.binary ?? false,
             params.priority ?? Priority.Interactive,
@@ -560,7 +576,7 @@ export class ConnectionGeneration {
             epoch: params.epoch,
             corr,
             mode: params.mode ?? "unary",
-            maxStreamItems: params.maxStreamItems ?? DEFAULT_MAX_STREAM_ITEMS,
+            maxStreamItems,
             responseMode: params.responseMode ?? "json",
             writeInvoked: false,
             callerSettled: false,
