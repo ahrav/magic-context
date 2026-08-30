@@ -1,10 +1,7 @@
 //! Evidence-contract tests: transactional attempt lifecycle, structured
 //! skips, checksum verification, compatibility gating, gap pairing,
-//! counterbalanced scheduling, and a tiny in-process serial TCP run whose
+//! counterbalanced scheduling, and a tiny in-process serial ring run whose
 //! attempt finalizes complete.
-
-#[path = "support/raw_client.rs"]
-mod raw_client;
 
 #[path = "support/perf_measurement.rs"]
 mod perf_measurement;
@@ -12,8 +9,8 @@ mod perf_measurement;
 #[path = "../benches/support/evidence.rs"]
 mod evidence;
 
-#[path = "../benches/support/tcp.rs"]
-mod tcp;
+#[path = "../benches/support/ring.rs"]
+mod ring;
 
 #[path = "support/echo_host.rs"]
 mod echo_host;
@@ -22,7 +19,7 @@ use std::path::Path;
 
 use evidence::{
     counterbalanced_schedule, ArmId, Attempt, BuildId, HistogramConfig, HostId, Manifest, State,
-    ARM_ATOMIC, ARM_TCP_SERIAL,
+    ARM_ATOMIC, ARM_RING_SERIAL,
 };
 use perf_measurement::fixture_workload;
 
@@ -326,7 +323,7 @@ fn arm_mismatch_blocks_merge_but_gap_join_survives() {
     );
     write_complete(
         dir.path(),
-        ARM_TCP_SERIAL,
+        ARM_RING_SERIAL,
         1,
         (0, 1),
         "issue_to_terminal.hist",
@@ -346,7 +343,7 @@ fn arm_mismatch_blocks_merge_but_gap_join_survives() {
         evidence::merge_arm_histograms(&loaded, &atomic_arm, "batch_mean_rtt.hist").unwrap();
     assert_eq!(merged.len(), 1);
 
-    // The designated atomic-floor / serial-TCP pair joins by run block.
+    // The designated atomic-floor / serial-ring pair joins by run block.
     let p50 = serial_p50(&[20_000]);
     let gaps = evidence::paired_gaps(&loaded).unwrap();
     assert_eq!(gaps.len(), 1);
@@ -372,7 +369,7 @@ fn gap_join_requires_matching_block_and_pair() {
     // block: neither joins.
     write_complete(
         dir.path(),
-        ARM_TCP_SERIAL,
+        ARM_RING_SERIAL,
         2,
         (0, 1),
         "issue_to_terminal.hist",
@@ -381,7 +378,7 @@ fn gap_join_requires_matching_block_and_pair() {
     );
     write_complete(
         dir.path(),
-        ARM_TCP_SERIAL,
+        ARM_RING_SERIAL,
         1,
         (2, 3),
         "issue_to_terminal.hist",
@@ -392,14 +389,14 @@ fn gap_join_requires_matching_block_and_pair() {
     // physical pair can validate for both classes (nodes sharing an L3
     // under sub-NUMA clustering), and the two classes' observations are
     // not comparable.
-    let mut cross = manifest(ARM_TCP_SERIAL, 1, Some((0, 1)));
+    let mut cross = manifest(ARM_RING_SERIAL, 1, Some((0, 1)));
     cross.arm.class = Some("cross-numa".to_owned());
     let mut attempt = Attempt::begin(dir.path(), "serial-cross-b01", cross).unwrap();
     attempt
         .add_histogram("issue_to_terminal.hist", &small_histogram(&[20_000]))
         .unwrap();
     attempt.manifest_mut().histogram = Some(HistogramConfig::default());
-    attempt.manifest_mut().collection = Some(serde_json::json!({"fixture_arm": ARM_TCP_SERIAL}));
+    attempt.manifest_mut().collection = Some(serde_json::json!({"fixture_arm": ARM_RING_SERIAL}));
     attempt.manifest_mut().results = Some(serde_json::json!({"p50_ns": serial_p50(&[20_000])}));
     attempt.finalize(State::Complete).unwrap();
     let loaded = evidence::load_attempts(dir.path()).unwrap();
@@ -423,7 +420,7 @@ fn gap_scalar_disagreeing_with_sidecar_is_rejected() {
     );
     write_complete(
         dir.path(),
-        ARM_TCP_SERIAL,
+        ARM_RING_SERIAL,
         1,
         (0, 1),
         "issue_to_terminal.hist",
@@ -477,14 +474,18 @@ fn tiny_serial_run_finalizes_a_complete_manifest() {
     let data_dir = tempfile::tempdir().unwrap();
     let host = echo_host::InProcessHost::start(data_dir.path());
     let publication = host.publication.clone();
+    let descriptor: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&publication).unwrap()).unwrap();
+    assert!(descriptor.get("setup_socket").is_some());
+    assert!(descriptor.get("endpoints").is_none());
 
-    // One authenticated connection, one route, fixture echo round trips.
-    let cfg = tcp::SerialConfig {
+    // One authenticated setup socket, one ring, one route, fixture echo round trips.
+    let cfg = ring::SerialConfig {
         warmup_ops: 5,
         measured_ops: 50,
         histogram: HistogramConfig::default(),
     };
-    let result = tcp::run_serial(&publication, &cfg).unwrap();
+    let result = ring::run_serial(&publication, &cfg).unwrap();
     assert_eq!(result.outcomes.success, 50);
     assert!(result.outcomes.conserved(result.scheduled));
     assert_eq!(result.histogram.len(), 50);
@@ -493,8 +494,8 @@ fn tiny_serial_run_finalizes_a_complete_manifest() {
     let run_root = tempfile::tempdir().unwrap();
     let mut attempt = Attempt::begin(
         run_root.path(),
-        "tcp-serial-same-l3-b01",
-        manifest(ARM_TCP_SERIAL, 1, Some((0, 1))),
+        "ring-serial-same-l3-b01",
+        manifest(ARM_RING_SERIAL, 1, Some((0, 1))),
     )
     .unwrap();
     attempt
