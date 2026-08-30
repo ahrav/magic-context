@@ -12546,6 +12546,49 @@ pub(crate) mod tests {
         McTagRow, ModuleDropSeedRow, ModuleStateSyncRequest, ModuleUsage, StoredCompartment,
     };
 
+    fn tag_baseline_test_entry(retained_bytes: usize) -> TagBaselineCacheEntry {
+        TagBaselineCacheEntry {
+            store_namespace: 1,
+            generation: 1,
+            count: 1,
+            max_tag_number: 1,
+            tags: std::sync::Arc::new(vec![McTagRow {
+                tag_number: 1,
+                block_id: "b1".to_string(),
+                kind: "message".to_string(),
+                token_count: 1,
+                created_at_ms: 0,
+                source_bytes: Vec::new(),
+            }]),
+            retained_bytes,
+        }
+    }
+
+    #[test]
+    fn tag_baseline_cache_refuses_an_insert_larger_than_its_budget() {
+        let mut cache = TagBaselineCache::new(100);
+        cache.replace("s1", tag_baseline_test_entry(101));
+        assert!(cache.sessions.is_empty());
+        assert_eq!(cache.retained_bytes, 0);
+        assert!(cache.lru.is_empty());
+    }
+
+    #[test]
+    fn tag_baseline_cache_evicts_older_sessions_but_never_the_just_inserted_one() {
+        // Budget holds one entry but not two: an over-budget insert must
+        // evict the OLDEST session and keep the newcomer. The pre-insert
+        // budget guard makes a self-evicting insert unreachable (the newcomer
+        // alone always fits), so the newest session must always survive.
+        let mut cache = TagBaselineCache::new(150);
+        cache.replace("s1", tag_baseline_test_entry(100));
+        assert!(cache.sessions.contains_key("s1"));
+        cache.replace("s2", tag_baseline_test_entry(100));
+        assert!(!cache.sessions.contains_key("s1"));
+        assert!(cache.sessions.contains_key("s2"));
+        assert_eq!(cache.retained_bytes, 100);
+        assert_eq!(cache.lru.len(), 1);
+    }
+
     fn resolve_test_cache_ttl(
         ctx: &mut ProducerContext<'_>,
         config: &crate::config::McModuleConfig,

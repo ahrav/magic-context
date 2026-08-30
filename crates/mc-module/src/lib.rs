@@ -16012,6 +16012,56 @@ fn test_route(channel_id: u16) -> RouteHandle {
 mod tests {
     use super::*;
     use std::collections::{HashMap, VecDeque};
+
+    fn boundary_snapshot_with_entry(block_id: &str) -> BoundaryTokenCacheSnapshot {
+        let mut entry_updates = HashMap::new();
+        entry_updates.insert(
+            block_id.to_string(),
+            BoundaryTokenCacheEntry {
+                byte_size: 1,
+                content_hash: [0u8; 32],
+                token_count: 1,
+            },
+        );
+        BoundaryTokenCacheSnapshot {
+            entry_updates,
+            ..BoundaryTokenCacheSnapshot::default()
+        }
+    }
+
+    /// One boundary-token entry's byte charge for an `id_len`-byte block id.
+    fn boundary_entry_charge(id_len: usize) -> usize {
+        id_len + std::mem::size_of::<BoundaryTokenCacheEntry>() + 64
+    }
+
+    #[test]
+    fn boundary_token_cache_refuses_an_insert_larger_than_its_budget() {
+        let mut cache = BoundaryTokenCache::new(boundary_entry_charge(2) - 1);
+        cache.replace("s1", boundary_snapshot_with_entry("b1"));
+        assert!(cache.sessions.is_empty());
+        assert_eq!(cache.retained_bytes, 0);
+        assert!(cache.lru.is_empty());
+    }
+
+    #[test]
+    fn boundary_token_cache_evicts_older_sessions_but_never_the_just_inserted_one() {
+        // Budget holds one entry but not two: every insert over budget must
+        // evict the OLDEST session and keep the newcomer. The pre-insert
+        // budget guard makes a self-evicting insert unreachable (the newcomer
+        // alone always fits), so the newest session must always survive.
+        let mut cache = BoundaryTokenCache::new(boundary_entry_charge(2) + 1);
+        cache.replace("s1", boundary_snapshot_with_entry("b1"));
+        assert!(cache.sessions.contains_key("s1"));
+        cache.replace("s2", boundary_snapshot_with_entry("b2"));
+        assert!(!cache.sessions.contains_key("s1"));
+        assert!(cache.sessions.contains_key("s2"));
+        cache.replace("s3", boundary_snapshot_with_entry("b3"));
+        assert!(!cache.sessions.contains_key("s2"));
+        assert!(cache.sessions.contains_key("s3"));
+        assert_eq!(cache.retained_bytes, boundary_entry_charge(2));
+        assert_eq!(cache.lru.len(), 1);
+    }
+
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
