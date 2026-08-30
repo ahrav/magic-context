@@ -976,6 +976,16 @@ describe("dreamer eval report contract", () => {
         expect(() => parseRunReport({ ...failing, rawManifest: "  " })).toThrow(
             /rawManifest: fail-requires-evidence/,
         );
+        // A post-parse ERROR has no such rule, so the binding rule is what refuses
+        // evidence with no bytes behind it.
+        expect(() =>
+            parseRunReport({
+                ...baseReport,
+                status: "ERROR",
+                reason: "apply-not-applied",
+                rawManifest: null,
+            }),
+        ).toThrow(/rawManifest: evidence-without-bytes/);
         expect(() => parseRunReport({ ...failing, parsedManifest: null })).toThrow(
             /parsedManifest: fail-requires-evidence/,
         );
@@ -986,11 +996,12 @@ describe("dreamer eval report contract", () => {
         // And it cannot carry evidence: the reason is raised before any parse
         // result exists.
         expect(() => parseRunReport(rejected)).toThrow(/parsedManifest: invalid-output-has-evidence/);
-        // The bytes must actually be ones the parser refuses, or the reason is a
-        // claim the artifact contradicts.
-        expect(() => parseRunReport({ ...baseReport, status: "FAIL", reason: "invalid-output", parsedManifest: null })).toThrow(
-            /rawManifest: invalid-output-parses/,
-        );
+        // Structurally parseable bytes beside invalid-output are legitimate: the
+        // reason also covers a manifest the validator rejected for not covering
+        // the expected ids, and reproducing that needs a set the report lacks.
+        expect(
+            parseRunReport({ ...baseReport, status: "FAIL", reason: "invalid-output", parsedManifest: null }).reason,
+        ).toBe("invalid-output");
     });
 
     test("evidence entries must carry the fields their scorer emits", () => {
@@ -1110,6 +1121,48 @@ describe("dreamer eval report contract", () => {
                     updated: [],
                     verified: [{ files: ["src/a.ts"], publicClaimId: OBSERVED_ID }],
                 },
+            }).status,
+        ).toBe("PASS");
+    });
+
+    test("a receipt cannot name a claim the run never observed", () => {
+        const receipt = { claimId: "claim-1", operation: "verify", outcome: "applied" };
+        expect(parseRunReport({ ...baseReport, receiptOutcomes: [receipt] }).receiptOutcomes).toHaveLength(1);
+        expect(() =>
+            parseRunReport({ ...baseReport, receiptOutcomes: [{ ...receipt, claimId: "claim-999" }] }),
+        ).toThrow(/receiptOutcomes\[0\].claimId: unobserved-claim/);
+        // An ERROR run may hold a partial capture, so it keeps the exemption.
+        expect(
+            parseRunReport({
+                ...baseReport,
+                status: "ERROR",
+                reason: "gate-mismatch",
+                poolBefore: [],
+                poolAfter: [],
+                rawManifest: null,
+                parsedManifest: null,
+                receiptOutcomes: [{ ...receipt, claimId: "claim-999" }],
+            }).receiptOutcomes,
+        ).toHaveLength(1);
+    });
+
+    test("a passing report's archive must show in the after capture", () => {
+        // A PASS applied its manifest, so an archived claim cannot still be active.
+        const archiving = {
+            verified: [],
+            updated: [],
+            archived: [{ publicClaimId: OBSERVED_ID, reason: "queue removed" }],
+        };
+        const raw = `<verify>\n<archive claim="${OBSERVED_ID}" reason="queue removed"/>\n</verify>`;
+        expect(() =>
+            parseRunReport({ ...baseReport, rawManifest: raw, parsedManifest: archiving }),
+        ).toThrow(/poolAfter: archive-not-applied\[0\]/);
+        expect(
+            parseRunReport({
+                ...baseReport,
+                rawManifest: raw,
+                parsedManifest: archiving,
+                poolAfter: captureWithFirst({ lifecycleState: "archived" }),
             }).status,
         ).toBe("PASS");
     });

@@ -1151,8 +1151,15 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
         const itemLabel = `${label}.receiptOutcomes[${index}]`;
         const item = record(entry, itemLabel);
         exact(item, ["claimId", "operation", "outcome"], itemLabel);
+        const claimId = staticId(item.claimId, `${itemLabel}.claimId`, CLAIM_ID_RE);
+        // A receipt records applying this run's manifest, so it cannot name a
+        // claim the run never observed. An ERROR run may hold a partial capture,
+        // so the check follows the same exemption as the rest.
+        if (status !== "ERROR" && !poolBefore.some((claim) => claim.claimId === claimId)) {
+            fail(`${itemLabel}.claimId: unobserved-claim`);
+        }
         return {
-            claimId: staticId(item.claimId, `${itemLabel}.claimId`, CLAIM_ID_RE),
+            claimId,
             operation: string(item.operation, `${itemLabel}.operation`),
             outcome: string(item.outcome, `${itemLabel}.outcome`),
         };
@@ -1186,19 +1193,21 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
     ) {
         fail(`${label}.parsedManifest: prevalidation-error-has-evidence`);
     }
-    // Bind the evidence to the bytes it claims to come from. `invalid-output` says
-    // the parser refused the manifest, so the captured bytes must still refuse;
-    // every other outcome carrying evidence must reproduce it exactly from those
-    // bytes, or the two halves of the artifact describe different runs.
-    if (status === "FAIL" && reason === "invalid-output") {
-        if (rawManifest !== null && reparseManifest(task, rawManifest) !== null) {
-            fail(`${label}.rawManifest: invalid-output-parses`);
-        }
-    } else if (parsedManifest !== null && rawManifest !== null && rawManifest.trim().length > 0) {
-        const reparsed = reparseManifest(task, rawManifest);
-        if (reparsed === null) fail(`${label}.rawManifest: evidence-unparseable`);
-        if (canonicalJson(reparsed) !== canonicalJson(parsedManifest)) {
-            fail(`${label}.parsedManifest: evidence-mismatch`);
+    // A PASS means the manifest applied: `apply-not-applied` is an ERROR reason and
+    // receipts record each operation's outcome. So an archive the evidence reports
+    // has to show in the after capture, or the captured pool contradicts the
+    // success it is filed under. Scoped to PASS and to archival, the effect that
+    // cannot be undone.
+    if (status === "PASS" && parsedManifest !== null && !Array.isArray(parsedManifest)) {
+        const archived = (parsedManifest as Record<string, unknown>).archived;
+        if (Array.isArray(archived)) {
+            for (const [index, entry] of archived.entries()) {
+                const publicClaimId = (entry as Record<string, unknown>).publicClaimId;
+                const after = poolAfter.find((claim) => claim.publicClaimId === publicClaimId);
+                if (after !== undefined && after.lifecycleState === "active") {
+                    fail(`${label}.poolAfter: archive-not-applied[${index}]`);
+                }
+            }
         }
     }
     if (status === "FAIL") {
@@ -1212,6 +1221,24 @@ export function parseRunReport(raw: unknown, label = "report"): DreamerEvalRunRe
             if (parsedManifest !== null) fail(`${label}.parsedManifest: invalid-output-has-evidence`);
         } else if (parsedManifest === null) {
             fail(`${label}.parsedManifest: fail-requires-evidence`);
+        }
+    }
+    // Bind the evidence to the bytes it claims to come from: evidence exists only
+    // after a nonblank manifest parsed, so it must reproduce from those bytes.
+    //
+    // The inverse does not hold for `invalid-output`. That reason is raised from
+    // the catch around the validator, which fails for a structurally fine
+    // manifest whose ids do not cover the expected set — and reproducing that
+    // judgement needs the expected-id set, which the report does not carry. So
+    // parseable bytes beside `invalid-output` are legitimate.
+    if (parsedManifest !== null) {
+        if (rawManifest === null || rawManifest.trim().length === 0) {
+            fail(`${label}.rawManifest: evidence-without-bytes`);
+        }
+        const reparsed = reparseManifest(task, rawManifest as string);
+        if (reparsed === null) fail(`${label}.rawManifest: evidence-unparseable`);
+        if (canonicalJson(reparsed) !== canonicalJson(parsedManifest)) {
+            fail(`${label}.parsedManifest: evidence-mismatch`);
         }
     }
     return {

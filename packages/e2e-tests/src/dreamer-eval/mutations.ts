@@ -118,17 +118,22 @@ function containsAny(content: string, phrases: readonly string[]): boolean {
 }
 
 /**
- * A character present in none of `phrases`. Anchor checks are case-insensitive
- * substring tests, so a string built only from this character contains no
- * phrase, and any substring spanning it cannot match one either.
+ * A character whose folded form appears in none of `phrases`. Anchor checks are
+ * case-insensitive substring tests, so a string built only from this character
+ * contains no phrase, and any substring spanning it cannot match one.
+ *
+ * The candidate is tested as a complete folded string rather than looked up among
+ * the phrases' individual characters: folding can lengthen a character —
+ * `"İ".toLowerCase()` is `"i"` plus a combining dot — so a phrase equal to that
+ * two-unit sequence holds neither unit in a way a per-character set would catch.
  */
 function fillerAbsentFrom(phrases: readonly string[], description: string): string {
-    const used = new Set<string>();
-    for (const phrase of phrases) {
-        for (const character of phrase.toLowerCase()) used.add(character);
-    }
+    const lowered = phrases.map((phrase) => phrase.toLowerCase());
     for (const candidate of fillerCandidates()) {
-        if (!used.has(candidate.toLowerCase())) return candidate;
+        const folded = candidate.toLowerCase();
+        if (!lowered.some((phrase) => phrase.includes(folded) || folded.includes(phrase))) {
+            return candidate;
+        }
     }
     throw new Error(`mutation fixture needs ${description}`);
 }
