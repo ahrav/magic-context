@@ -1,0 +1,2585 @@
+# Part 1 property catalog: shared-memory transport
+
+Scope: `crates/mc-shm-transport`, `packages/mc-shm-native`. Boundary context
+from `crates/mc-host/src/{shm_provider,transport_negotiation,transport_provider,provider_recovery}.rs`
+is used where a transport property is only observable through the host.
+
+Provenance and the external-reference list are in [../README.md](../README.md).
+System `/local/home/ahrav/scratch/magic-context` at `9c1eb4d1`, 2026-08-29.
+
+## Product context, and what it does to priority
+
+Shared memory here is explicit, test-only, and non-default. Host and client
+production registries are empty, no backend or target profile has qualified on a
+designated host, and TCP remains the production transport
+(`docs/mc-host-shm-transport.md:5-7`). Two consequences run through every record
+below:
+
+1. Most of these properties are **latent** — they guard a path that no shipped
+   configuration selects. That lowers urgency, not validity: the release gate
+   (`benches/manifests/v1.json`) is what would make them live, and the catalog
+   exists so that gate has something to check against.
+2. A minority reach production through shared code — admission accounting in
+   `mc-shm-transport::profile`, the panic boundary, and the wire and frame-channel
+   validation in `mc-host`. Those are marked `Reaches production: yes`.
+
+The measurement-integrity group (G) is the exception to the latency argument. It
+does not guard the transport; it guards the *evidence* that would be used to
+decide whether to ship the transport. A defect there is live today.
+
+## Index
+
+| Slug | Type | Confidence | Reaches production |
+| --- | --- | --- | --- |
+| [quarantine-authority-survives-peer-writes](#quarantine-authority-survives-peer-writes) | safety | high | no |
+| [quarantine-gates-cover-every-storage-mutation](#quarantine-gates-cover-every-storage-mutation) | safety | high | no |
+| [attach-refuses-a-quarantined-object](#attach-refuses-a-quarantined-object) | safety | high | no |
+| [quarantine-charge-transition-is-atomic](#quarantine-charge-transition-is-atomic) | safety | high | yes |
+| [charge-release-never-silently-strands](#charge-release-never-silently-strands) | safety | medium | yes |
+| [custody-terminal-transition-exactly-once](#custody-terminal-transition-exactly-once) | safety | high | yes |
+| [reservation-charge-visible-with-non-free-state](#reservation-charge-visible-with-non-free-state) | safety | high | no |
+| [publication-visibility-derives-only-from-the-published-cursor](#publication-visibility-derives-only-from-the-published-cursor) | safety | high | no |
+| [no-frame-observable-before-commit](#no-frame-observable-before-commit) | safety | high | no |
+| [publish-signal-implies-committed-frame](#publish-signal-implies-committed-frame) | safety | medium | no |
+| [release-authority-bound-to-lease-ownership](#release-authority-bound-to-lease-ownership) | safety | high | no |
+| [release-exactly-once-per-sequence](#release-exactly-once-per-sequence) | safety | high | no |
+| [receive-failure-leaves-no-wedged-slot](#receive-failure-leaves-no-wedged-slot) | safety | high | no |
+| [release-failure-is-observable](#release-failure-is-observable) | liveness | medium | yes |
+| [attach-reconciles-or-refuses-stale-shared-cursors](#attach-reconciles-or-refuses-stale-shared-cursors) | safety | high | no |
+| [crashed-producer-does-not-wedge-the-sequence](#crashed-producer-does-not-wedge-the-sequence) | liveness | high | no |
+| [dead-peer-charges-are-reclaimed-or-declared](#dead-peer-charges-are-reclaimed-or-declared) | safety | high | no |
+| [cancelled-frame-disposition-is-declared](#cancelled-frame-disposition-is-declared) | safety | high | no |
+| [validated-spans-are-disjoint-and-inside-the-arena](#validated-spans-are-disjoint-and-inside-the-arena) | safety | high | no |
+| [no-rust-reference-over-peer-writable-payload](#no-rust-reference-over-peer-writable-payload) | safety | high | no |
+| [reclaim-advance-bounded-by-the-producer-reservation](#reclaim-advance-bounded-by-the-producer-reservation) | safety | medium | no |
+| [attach-binds-geometry-to-a-local-profile](#attach-binds-geometry-to-a-local-profile) | safety | high | no |
+| [one-profile-name-denotes-one-geometry](#one-profile-name-denotes-one-geometry) | safety | high | no |
+| [native-boundary-not-weaker-than-its-wrapper](#native-boundary-not-weaker-than-its-wrapper) | safety | high | no |
+| [operation-counters-are-observed-not-declared](#operation-counters-are-observed-not-declared) | safety | high | evidence |
+| [measured-transfer-is-witnessed-by-the-data](#measured-transfer-is-witnessed-by-the-data) | safety | high | evidence |
+| [traceability-pointers-resolve](#traceability-pointers-resolve) | safety | high | evidence |
+| [negative-tests-fail-for-their-stated-reason](#negative-tests-fail-for-their-stated-reason) | safety | high | evidence |
+| [documented-close-order-has-a-production-driver](#documented-close-order-has-a-production-driver) | reachability | high | no |
+| [capability-probe-gates-every-advertised-mechanism](#capability-probe-gates-every-advertised-mechanism) | safety | high | no |
+| [clean-reclamation-is-reachable](#clean-reclamation-is-reachable) | reachability | high | no |
+| [test-only-surface-absent-from-the-shipped-addon](#test-only-surface-absent-from-the-shipped-addon) | safety | high | yes |
+| [decoder-totality-over-arbitrary-bytes](#decoder-totality-over-arbitrary-bytes) | safety | high | no |
+| [accepted-decode-consumes-its-declared-width](#accepted-decode-consumes-its-declared-width) | safety | high | no |
+| [identity-and-schema-rejection-is-one-contract](#identity-and-schema-rejection-is-one-contract) | safety | high | no |
+| [grant-reserved-bytes-are-rejected-unless-zero](#grant-reserved-bytes-are-rejected-unless-zero) | safety | high | no |
+| [fuzz-harness-encoding-tracks-the-production-descriptor](#fuzz-harness-encoding-tracks-the-production-descriptor) | safety | high | evidence |
+| [macos-object-creation-outcome-is-attributed](#macos-object-creation-outcome-is-attributed) | reachability | medium | no |
+| [attach-validation-is-not-platform-weakened](#attach-validation-is-not-platform-weakened) | safety | high | no |
+| [macos-object-creation-leaks-no-shm-name](#macos-object-creation-leaks-no-shm-name) | safety | medium | no |
+| [layout-region-offsets-are-real-page-aligned](#layout-region-offsets-are-real-page-aligned) | safety | high | no |
+| [page-size-dependent-setup-runs-on-a-non-4096-page-host](#page-size-dependent-setup-runs-on-a-non-4096-page-host) | reachability | high | no |
+| [iceoryx-descriptor-rejection-is-terminal-or-declared](#iceoryx-descriptor-rejection-is-terminal-or-declared) | safety | high | no |
+| [iceoryx-receive-expectation-tracks-the-delivered-stream](#iceoryx-receive-expectation-tracks-the-delivered-stream) | safety | high | no |
+| [iceoryx-cross-process-pairing-is-reachable-or-declared](#iceoryx-cross-process-pairing-is-reachable-or-declared) | reachability | high | no |
+| [iceoryx-completion-is-observable-to-the-host](#iceoryx-completion-is-observable-to-the-host) | safety | high | no |
+| [iceoryx-saturation-is-bounded-non-blocking-backpressure](#iceoryx-saturation-is-bounded-non-blocking-backpressure) | liveness | high | no |
+| [wire-header-fully-validated-before-any-consumer-acts](#wire-header-fully-validated-before-any-consumer-acts) | safety | high | yes |
+| [ingress-charge-matches-the-bytes-copied-from-shared-storage](#ingress-charge-matches-the-bytes-copied-from-shared-storage) | safety | high | yes |
+| [every-shm-header-consumer-applies-its-role-gate](#every-shm-header-consumer-applies-its-role-gate) | safety | medium | yes |
+| [header-rejection-effect-does-not-depend-on-the-catching-layer](#header-rejection-effect-does-not-depend-on-the-catching-layer) | safety | high | no |
+| [runtime-directory-authentication-is-a-precondition-not-a-container](#runtime-directory-authentication-is-a-precondition-not-a-container) | safety | high | no |
+| [backpressure-converges-in-a-bounded-reclaim-window](#backpressure-converges-in-a-bounded-reclaim-window) | liveness | high | no |
+| [receive-resumes-when-lease-capacity-clears](#receive-resumes-when-lease-capacity-clears) | liveness | high | no |
+| [neither-direction-starves-the-other](#neither-direction-starves-the-other) | liveness | high | no |
+| [reclamation-keeps-pace-with-completion](#reclamation-keeps-pace-with-completion) | liveness | high | no |
+| [lease-saturation-is-reached-then-drains](#lease-saturation-is-reached-then-drains) | reachability | high | no |
+| [duplex-overlap-is-reached](#duplex-overlap-is-reached) | reachability | high | no |
+
+---
+
+## Group A: quarantine authority and terminality
+
+Quarantine is the transport's terminal state. It is what converts "storage whose
+alias state is unknown" into "storage that is never reused". Every claim about
+charge retention and about not recycling uncertain memory depends on it holding.
+
+### quarantine-authority-survives-peer-writes
+
+Type: safety
+Status: active
+Exercised: not yet — needs a peer that writes the lifecycle page directly; no
+harness models a peer mutating control pages.
+Guarantee: Once a direction is quarantined locally, no action by the peer can
+make it accept a reserve, receive, or release again.
+Check: `always` — after `enter_quarantine()`, for every peer-authored mutation
+of the shared object including a zero store to the `quarantined` byte,
+`try_reserve`, `try_receive`, `release`, and `probe` still return their
+`Quarantined` variant. `always` fits because this must hold at every evaluation
+for the lifetime of the mapping; there is no optional path and no eventual
+convergence involved.
+Fault/timing angle: the peer writes `0` to the flag between the host's
+`enter_quarantine()` and its next gate read. The window is unbounded, because
+the flag is re-read on every operation rather than latched.
+Required faults and enabling state: a quarantine trigger (corrupt descriptor, or
+a failed alias detach) **and** a peer that writes the shared lifecycle page
+after it. Without the second, the check passes without testing anything.
+Confidence: high — [evidence](evidence/quarantine-authority-survives-peer-writes.md).
+Verified by inspection: the only store is to `LifecyclePage.quarantined` in the
+shared mapping (`ring.rs:1033`), every gate re-reads it (`ring.rs:670`, `:765`,
+`:848`, `:913`, `:999`), the `Ring` struct carries no local mirror, and both
+`Mapping::create` and `Mapping::attach` map the whole object
+`PROT_READ|PROT_WRITE` (`ring.rs:229`, `:258`) with required seals of
+`F_SEAL_GROW|SHRINK|SEAL` only and no `F_SEAL_WRITE` (`ring.rs:1709`).
+Existing check: `crates/mc-shm-transport/tests/ring.rs:256`
+`quarantine_rejects_all_operations_and_reports_conservation` — covers
+self-quarantine only, never a peer clearing the flag. Status unaudited.
+Impact: a one-byte write by the peer un-terminates a channel the local side
+condemned, defeating "permanently prevents that record's storage from being
+reused" (`docs/mc-host-shm-transport.md:79`). Under the documented same-user
+trust model this may be in-contract; the point is that it is unstated and
+unchecked.
+Open questions:
+- Is the flag deliberately shared so the *peer* observes quarantine, and if so
+  what protects the local decision? A local `Cell<bool>` OR'd into
+  `is_quarantined()` would close this without a layout change.
+- Does `docs/mc-host-shm-transport.md:116`'s explicit non-guarantee about
+  malicious peers extend to control pages, or only to payload bytes? The text
+  says payload. (needs human input)
+
+### quarantine-gates-cover-every-storage-mutation
+
+Type: safety
+Status: active
+Exercised: not yet — needs a quarantine raised while a reservation is
+outstanding.
+Guarantee: Once a direction is quarantined, no further descriptor can be
+published into it, including from a reservation acquired before the quarantine.
+Check: `always` — hold a reservation, quarantine the ring, then assert
+`commit(...)` fails and `published` is unchanged. Scope narrowed after review:
+an earlier draft also required that an abort not restore `SLOT_FREE`. That
+clause is dropped, because restoring a slot to free does not by itself permit
+reuse while `try_reserve` remains gated on the quarantine flag
+(`ring.rs:670-671`), so no independent harm from the abort path was established.
+Fault/timing angle: the exact interleaving is producer-holds-reservation → peer
+publishes a corrupt frame → the receiver's `try_receive` quarantines
+(`ring.rs:807`) → producer commits. Also reachable in the addon when
+`quarantine_channel` fails partway and leaves producers registered.
+Required faults and enabling state: an outstanding `ProducerReservation`
+**and** a quarantine trigger from the other side during its lifetime.
+Confidence: high — [evidence](evidence/quarantine-gates-cover-every-storage-mutation.md).
+Verified by inspection: `try_reserve` (`ring.rs:670`), `try_receive`
+(`ring.rs:765`), `release` (`ring.rs:848`), and `probe` (`ring.rs:999`) gate on
+`is_quarantined()`; `commit_reservation` (`ring.rs:1164-1215`) and
+`abort_reservation` (`ring.rs:1150-1165`) have no gate.
+Existing check: none.
+Impact: publication into a ring whose storage is already considered
+unrecyclable, and an abort that hands quarantined storage back to the free pool.
+The abort path matters most where quarantine was raised *because* a JavaScript
+alias may still be attached to the aborted range
+(`packages/mc-shm-native/src/lib.rs:259-263`).
+Open questions:
+- Is "a reservation admitted before quarantine may still publish" the intended
+  contract? If so it belongs in the documented close ordering, which currently
+  reads as unconditional.
+
+### attach-refuses-a-quarantined-object
+
+Type: safety
+Status: active
+Exercised: not yet — needs an attach against an already-quarantined object.
+Guarantee: Attaching to a shared object whose lifecycle page is quarantined
+fails at attach, before a channel id is issued or a process-wide grant claim is
+consumed.
+Check: `always` — quarantine a ring, re-derive its grant, attach, and assert
+failure with `ACTIVE_GRANTS` unchanged and no registry entry created.
+Fault/timing angle: a peer crash or a failed alias cleanup sets the flag, then a
+reconnect or worker restart attaches. The channel looks usable and fails only at
+first reserve or receive.
+Required faults and enabling state: a quarantine trigger, then a fresh attach
+using the same grant.
+Confidence: high — [evidence](evidence/attach-refuses-a-quarantined-object.md).
+Raised from medium after direct verification: `validate_lifecycle`
+(`ring.rs:1637-1668`) reads exactly eight fields at `:1646-1653` — magic, layout
+version, depth, arena, leases, total, incarnation, and lane — and compares them
+at `:1656-1665`. It never reads `quarantined`. The per-operation gates are the
+only readers of that flag.
+Existing check: per-operation `is_quarantined()` guards only.
+Impact: a caller receives a channel id and a usable-looking channel that fails at
+first reserve or receive. The grant claim is held until the registry entry is
+removed; `close` and `force_close` do remove it once producers, active leases,
+and stranded aliases are all empty (`packages/mc-shm-native/src/lib.rs:949-952`,
+`:970-973`), so the claim is pinned indefinitely only when a detach has already
+stranded an alias. An earlier draft of this record overstated that as "for the
+process lifetime".
+Open questions: None. The question that opened this record — whether
+`validate_lifecycle` reads the flag — is resolved by direct read.
+
+---
+
+## Group B: charge conservation
+
+Admission charges are the transport's only backpressure against a host that
+cannot afford another candidate. The documented contract is that admission,
+cancellation, publication, completion, release, and quarantine conserve every
+descriptor and byte charge exactly once. This group reaches production because
+`profile.rs` accounting is shared code.
+
+### quarantine-charge-transition-is-atomic
+
+Type: safety
+Reaches production: yes
+Status: active
+Exercised: not yet — needs `quarantined` pre-seeded near `u64::MAX` so the
+`checked_add` fails.
+Guarantee: A `quarantine()` that returns an error leaves the charges in exactly
+one accounting bucket; charges never disappear from both `active` and
+`quarantined`.
+Check: `always-or-unreached` — force the `quarantined.checked_add` to overflow
+and assert `active + quarantined` is unchanged from before the call. Semantics
+revised from `always`: review established that a valid public execution cannot
+reach the overflow, because admission checks `active + requested + quarantined`
+against the host limits under the same mutex (`profile.rs:413-447`), so the sum
+cannot approach the bound. The ordering defect is real and worth pinning, but it
+is reachable only through a synthetic seam, and the record says so rather than
+implying a live path.
+Fault/timing angle: no concurrency needed. The transition decrements `active`
+first and then performs a fallible add, with an early return between them.
+Required faults and enabling state: an accounting state where
+`quarantined + retained` overflows, or an injected failure at that point.
+Confidence: high — [evidence](evidence/quarantine-charge-transition-is-atomic.md).
+Verified by direct read of `crates/mc-shm-transport/src/profile.rs:492-511`:
+line 497-500 sets `accounting.active = active.checked_sub(charges)?`, then line
+506-509 sets `accounting.quarantined = quarantined.checked_add(retained)?` with
+`.ok_or(AdmissionError::ChargeOverflow)?`. On that error path `active` has
+already been reduced and `quarantined` is never raised. The caller discards the
+error (`crates/mc-host/src/provider_recovery.rs:187`,
+`admission.quarantine().ok()`) and still marks the record terminal.
+Existing check: `crates/mc-shm-transport/tests/contract.rs:330`
+`host_admission_retains_quarantined_commitments` — asserts the success path
+only. Status unaudited.
+Impact: charges vanish from both counters, so the operator-visible snapshot
+under-reports and the admission budget silently over-admits later. Directly
+contradicts "quarantine retains the exact charges" and "charges stay visible"
+(`docs/mc-host-shm-transport.md:79`, `:90`, `:112`).
+Open questions: None.
+
+### charge-release-never-silently-strands
+
+Type: safety
+Reaches production: yes
+Status: active
+Exercised: not yet — needs a poisoned accounting mutex and an inconsistent
+`active` value.
+Guarantee: Every `Admission` that is dropped or released has its charges either
+subtracted from `active` or explicitly moved to `quarantined`; a silent no-op is
+a defect.
+Check: `always` — assert `active == ZERO` once all admissions are dropped,
+including under a poisoned mutex and under a deliberately inconsistent `active`.
+Fault/timing angle: a panic while holding the accounting lock poisons it; a
+mismatched or double release makes `checked_sub` fail.
+Required faults and enabling state: lock poisoning, or an arithmetic
+inconsistency in `active`.
+Confidence: medium — [evidence](evidence/charge-release-never-silently-strands.md).
+Reported basis: `profile.rs:481-491` returns early on a poisoned lock and
+performs the subtraction inside `if let Some(active) = ...checked_sub(charges)`,
+so both failures are silent, while `Drop` still marks the state `Released`
+(`profile.rs:550-557`). I verified the analogous pattern in `quarantine()` by
+direct read, but not the `release()` body itself.
+Existing check: none.
+Impact: `active` diverges permanently from the live set, so admission refuses
+candidates the host can afford, or accepts ones it cannot.
+Open questions:
+- Under what conditions can `checked_sub` actually fail here? If it is
+  unreachable, this becomes `always-or-unreached` plus a reachability check
+  rather than a live risk. (partial: the arithmetic is reachable only through a
+  charge mismatch, and no path constructing one has been identified)
+
+### custody-terminal-transition-exactly-once
+
+Type: safety
+Reaches production: yes
+Status: active
+Exercised: not yet — needs a release carrying a superseded provider incarnation.
+Guarantee: Each candidate's charges are released or quarantined exactly once,
+and a stale release is rejected without touching aggregate counters.
+Check: `always` — `release(); assert!(!release()); assert!(!quarantine())` and
+the reverse order; plus a release carrying an old provider incarnation is
+rejected while the phase is still `Active`.
+Fault/timing angle: the endpoint thread calling `custody.release()` concurrently
+with the deadline watcher calling `quarantine()`. The losing race is invisible
+because the return value is discarded at
+`crates/mc-host/src/shm_provider.rs:365`.
+Required faults and enabling state: two terminal transitions racing, or an
+incarnation bump between admission and release.
+Confidence: high — [evidence](evidence/custody-terminal-transition-exactly-once.md).
+The phase clause is enforced by `mem::replace` in
+`crates/mc-host/src/provider_recovery.rs:167-197`.
+The incarnation clause was revised after review. `CandidateCustody::release`
+takes no incarnation argument at all, so there is no input that could carry a
+stale one, and the recovery contract deliberately keeps existing committed
+candidates valid across readiness changes (`provider_recovery.rs:15-16`). The
+finding is therefore a **documentation-versus-API mismatch**, not an unenforced
+runtime check: `docs/mc-host-shm-transport.md:79` describes rejecting releases
+"carrying an old provider incarnation", and the API has no such concept.
+`admitted_incarnation()` is stored (`:143`) and exposed (`:153`) with tests as
+its only readers.
+Existing check: `crates/mc-host/src/provider_recovery.rs:811`
+`custody_releases_exactly_once_and_rejects_stale_releases` — covers repeat and
+opposite transitions. Status unaudited.
+Impact: the exactly-once phase guarantee holds. The documented incarnation
+guarantee describes a mechanism that does not exist, which will mislead anyone
+reasoning about fencing across a provider incarnation change.
+Open questions:
+- Does the documented sentence describe intended future behaviour, or is it
+  simply wrong and should be deleted? Adding an incarnation-bearing release
+  protocol would be a real design change, so this needs an owner's decision
+  rather than a code fix. (needs human input)
+
+### reservation-charge-visible-with-non-free-state
+
+Type: safety
+Status: active
+Exercised: not yet — needs a cross-process observer calling `conservation()`
+concurrently with a reservation.
+Guarantee: Whenever an observer sees a descriptor slot in a non-`FREE` state,
+the `reservation_len` it reads is that slot's current charge.
+Check: `always` — for every slot, `state != SLOT_FREE` implies
+`reservation_len` equals the `allocation_len` of the reservation that owns it.
+Instrument `conservation()` to cross-check the descriptor's `allocation_len` for
+published and leased slots.
+Fault/timing angle: the window is between the state CAS and the length store,
+with a fallible arena-planning step in between that can early-return.
+Required faults and enabling state: an observer reading slot state during an
+in-progress reservation. Single-threaded tests between operations cannot
+construct it.
+Confidence: high — [evidence](evidence/reservation-charge-visible-with-non-free-state.md).
+Verified by direct read. `try_reserve` performs the
+`SLOT_FREE → SLOT_PRODUCER_RESERVED` compare-exchange at
+`ring.rs:691-701`, then plans the arena at `:706-718` (which returns early at
+`:710` and `:715`), and only then stores `reservation_len` at `:720-724`. The
+SAFETY comment at `ring.rs:932` states the opposite: "reservation length is
+atomic and assigned before non-free state is observed." The comment and the code
+disagree.
+Existing check: the `conservation` byte assertions in
+`crates/mc-shm-transport/tests/ring.rs:141-143`, `:207-211`, `:241-244`. They
+run single-threaded between operations, and `bytes.free` is computed as
+`arena_bytes - charged` (`ring.rs:989-993`), which makes
+`ArenaCounts::conserves` arithmetically self-satisfying. Status unaudited, and
+the oracle is structurally weak.
+Impact: byte accounting only, not memory safety. A concurrent observer
+under-counts producer-reserved bytes. The larger finding is the contract-vs-code
+contradiction in a SAFETY comment, which is exactly the kind of statement a
+future reader will rely on.
+Open questions:
+- Which is wrong, the comment or the order? Either store `reservation_len`
+  before the CAS, or stop trusting it in `conservation()`.
+- Are `conservation()` and `probe()` test-only? If any cross-process production
+  path will call them, this moves from latent to live.
+
+---
+
+## Group C: publication and visibility
+
+The transport's core claim is that a receiver never acts on a frame the producer
+has not finished writing. One release-acquire edge carries it.
+
+### publication-visibility-derives-only-from-the-published-cursor
+
+Type: safety
+Status: active
+Exercised: not yet — needs a true cross-process race on weakly-ordered
+hardware, or a model checker. No loom, shuttle, Miri, or ThreadSanitizer
+configuration exists anywhere in the repository.
+Guarantee: No reader derives the visibility of descriptor fields or payload
+bytes from `DescriptorSlot::state` alone; the only publication edges are
+`published` (producer to receiver) and `completion_sequence` (receiver to
+producer).
+Check: `always` — every load of `(*slot).state` is either preceded on the same
+thread by an acquire load of `published` or `completion_sequence` covering that
+sequence, or is followed by no read of the descriptor or arena bytes.
+Fault/timing angle: `conservation()` or `probe()` invoked from the peer process
+concurrently with a commit.
+Required faults and enabling state: a concurrent cross-process reader, and
+ideally a weakly-ordered target (aarch64 or Graviton) where the reordering is
+observable rather than merely permitted.
+Confidence: high — [evidence](evidence/publication-visibility-derives-only-from-the-published-cursor.md).
+`commit_reservation` publishes in the order descriptor `write_volatile`, then
+`state.store(SLOT_PUBLISHED, Relaxed)`, then `arena_write.store(Relaxed)`, then
+`published.store(Release)` (`ring.rs:1202-1208`). A relaxed store forms no
+release sequence, so the acquire load of `state` at `ring.rs:931` synchronizes
+with nothing. `reclaim_completed` does it correctly, gating on an acquire load of
+`completion_sequence` (`ring.rs:1116`) before reading state (`:1121`) and the
+descriptor (`:1125`).
+Existing check: none. `two_process_zero_copy_exchange_uses_authenticated_grant`
+(`tests/ring.rs:565`) is lockstep with a sleep and one frame; it cannot observe
+a reordering window.
+Impact: today `conservation()` never reads the descriptor, so this is a latent
+hazard plus an accounting-accuracy bug rather than undefined behaviour. It
+becomes unsoundness the moment any reader reaches descriptor or arena bytes from
+slot state.
+Open questions:
+- Is the relaxed state store intentional, given `abort_reservation` and
+  `reclaim_completed` use `Release` for the same field (`ring.rs:1146`, `:1159`)?
+  If intentional, the reasoning belongs in the code.
+
+### no-frame-observable-before-commit
+
+Type: safety
+Status: active
+Exercised: not yet — needs an assertion that the receiver observes nothing
+mid-reservation.
+Guarantee: A receiver cannot acquire, validate, or lease any frame whose
+producer has not committed.
+Check: `always` — with a reservation open and payload bytes already written,
+assert `try_receive()` returns `Ok(None)` and that no slot in
+`PRODUCER_RESERVED` can win the `PUBLISHED → RECEIVER_HELD` compare-exchange.
+Fault/timing angle: the producer writes payload bytes at reservation time,
+before commit. So the property is "no descriptor path reaches those bytes", not
+"the bytes are unwritten".
+Required faults and enabling state: an open reservation with bytes written and a
+receiver polling concurrently.
+Confidence: high — [evidence](evidence/no-frame-observable-before-commit.md).
+The only receive gate is `consumed != published` with `published` loaded acquire
+(`ring.rs:781-784`), and `published.store(Release)` is the last write of commit.
+A reserved-but-uncommitted slot is in `PRODUCER_RESERVED`, so the receive CAS
+fails (`ring.rs:790-800`).
+Existing check: partial — round-trip tests cover the positive direction; no test
+asserts the negative.
+Impact: this is the property the whole zero-copy design rests on. It looks sound
+by construction; it is cataloged because nothing currently asserts the negative
+case, and a future change to the receive gate would not fail any test.
+Open questions: None.
+
+### publish-signal-implies-committed-frame
+
+Type: safety
+Status: active
+Exercised: not yet — needs a commit failure injected after `before_publish` has
+run.
+Guarantee: A publication signal delivered to a sender implies the frame was
+actually committed and is receivable.
+Check: `always` — make `commit` fail after `before_publish` ran (underfill, wire
+header mismatch, or an arena error) and assert the sender was not told the frame
+published and the peer sees no frame.
+Fault/timing angle: `before_publish` is invoked before `reservation.commit` on
+both native paths, and the client sets `published = true` inside that hook. The
+host instead stores `COMPLETE` after commit succeeds, so the two sides disagree
+exactly on commit failure.
+Required faults and enabling state: a commit that fails after the hook fires.
+Confidence: medium — [evidence](evidence/publish-signal-implies-committed-frame.md).
+The ordering is confirmed by the reported line references
+(`packages/mc-shm-native/src/lib.rs:697-700`, `:809-812`;
+`packages/plugin/src/shared/mc-host-client/shm-frame-channel.ts:255-276`;
+`crates/mc-host/src/shm_provider.rs:645-652`). What "published" is contractually
+supposed to mean to a client is not settled, which is why this is medium.
+Existing check: `packages/mc-shm-native/tests/runtime.ts:101-120` asserts
+producer aliases are detached *at* `before_publish`, pinning the hook's position
+rather than commit success. Status unaudited.
+Impact: a sender that believes a frame was published when it was not, with no
+retry, on a transport whose failure mode is otherwise fail-closed.
+Open questions:
+- Does the client's `FrameSendTicket.cancel()`/`onPublish` contract mean "handed
+  to the transport" or "committed"? The two differ only on commit failure.
+  (needs human input)
+
+---
+
+## Group D: receive, release, and exactly-once completion
+
+### release-authority-bound-to-lease-ownership
+
+Type: safety
+Status: active
+Exercised: not yet — needs a release issued by a party other than the lease
+holder.
+Guarantee: Only the holder of a receive lease can complete it; possession of a
+frame's release identity does not by itself authorize completing that frame.
+Check: `always` — with a live `ReceiveLease` over sequence N, a release of
+identity N issued by any other party fails, the slot stays `RECEIVER_LEASED`,
+and the arena bytes under the lease do not become reservable.
+Fault/timing angle: the producer holds the identity of every frame it published,
+because `commit` returns it. If it releases while the receiver's lease is live,
+the slot moves to `RELEASE_PENDING`, the next `try_reserve` reclaims those bytes,
+and the producer may write them while the receiver's `LeaseSpan` still points
+there. The receiver's own `Drop` then gets `DuplicateRelease`, which is silently
+discarded.
+Required faults and enabling state: a live lease **and** a release from the
+producer side using the identity returned by `commit`.
+Confidence: high on the API shape, and the reachability question is now settled
+as latent — [evidence](evidence/release-authority-bound-to-lease-ownership.md).
+Verified by direct read of both signatures:
+`pub fn release(&self, identity: ReleaseIdentity) -> Result<(), LeaseError>`
+(`ring.rs:847`) validates identity and slot state only, and
+`pub fn commit(mut self, body_len: usize) -> Result<ReleaseIdentity, ProducerError>`
+(`ring.rs:1352`) hands that identity to the producer. No role, owner, or
+lease-token check exists on the release path.
+Reachability verdict: **not reachable in the shipped two-process topology.**
+Three independent facts establish this. Every non-test `commit` caller discards
+the returned identity (`shm_provider.rs:676`, `:689`, `:757`;
+`packages/mc-shm-native/src/lib.rs:699-700`, `:811-812`). The only non-test
+direct `Ring::release` is a receiver completing its own lease
+(`lib.rs:303-307`, on the receive ring with an identity from `lease.identity()`
+held in the addon's table because `poll` forgets the lease). And the two
+directions are separate objects with independent random incarnations
+(`DuplexRing::create`, `ring.rs:559`), so a cross-ring release fails the
+incarnation check at `:851-856`. The violating composition is reachable only in
+a same-process, single-`Ring` arrangement, which today means the transport's own
+tests.
+Existing check: none. The identity-validation tests
+(`tests/ring.rs:173-197`, `:222`) all issue releases from the legitimate holder.
+Impact: a latent API-shape hazard rather than a live defect. What keeps it worth
+a record is that the composition is available rather than prevented, and in
+`tests/ring.rs` the violating call sits one unmutated argument away from an
+existing assertion. If a future caller retains a committed identity — for
+instance to implement producer-side reclamation — this becomes a
+read-after-recycle on leased bytes with no malformed input required.
+Open questions:
+- Should `Ring::release` remain public? There is a real constraint behind it:
+  the addon needs lease-independent completion because `poll` forgets the lease
+  and tracks the identity in its own table. So this is a design trade-off, not
+  an oversight, and the answer belongs to whoever owns that seam.
+  (needs human input)
+
+### release-exactly-once-per-sequence
+
+Type: safety
+Status: active
+Exercised: not yet — needs concurrent release attempts rather than sequential
+ones.
+Guarantee: Given a live lease, a correct identity, and a ring that is not
+quarantined, exactly one release per `(incarnation, lane, sequence)` succeeds and
+every later one fails.
+Check: `always` — for any multiset of release calls carrying one identity, at
+most one returns `Ok`, and `active_leases` is decremented at most once. The
+preconditions are stated in the guarantee because "exactly one succeeds" is
+false without them: zero succeed if the ring is quarantined, if the identity is
+wrong, or if no lease was ever taken (`ring.rs:848-900`). The at-most-once half
+is the invariant; the exactly-once half holds only under those preconditions.
+Fault/timing angle: interleave `ReceiveLease::release()`, a direct
+`Ring::release()`, and `Drop`. The compare-exchange
+`RECEIVER_LEASED → RELEASE_PENDING` is the arbiter; the identity comparison
+alone is not, because a stale identity can match a recycled slot's residual
+descriptor bytes.
+Required faults and enabling state: at least two release attempts for one
+sequence, ideally concurrent.
+Confidence: high — [evidence](evidence/release-exactly-once-per-sequence.md).
+The CAS at `ring.rs:884-891` is the single mutation point, and
+`DuplicateRelease` is mapped from observing `RELEASE_PENDING` or `FREE`
+(`:892-900`).
+Existing check: good coverage of the sequential cases —
+`tests/ring.rs:174-199` (wrong incarnation, wrong lane, wrong sequence,
+duplicate) and `tests/ring.rs:222`
+`stale_lap_release_cannot_complete_recycled_slot`, a genuine full-lap test.
+Status unaudited for the read-then-CAS window.
+Impact: this is the load-bearing exactly-once guarantee for storage reuse. It is
+cataloged as well-covered so that the *gap* — concurrency and the descriptor
+re-read at `:873` not being atomic with the CAS at `:884` — is explicit rather
+than assumed.
+Open questions: None.
+
+### receive-failure-leaves-no-wedged-slot
+
+Type: safety
+Status: active
+Exercised: not yet — needs a failpoint on lease or span construction.
+Guarantee: The error paths that follow the receive commit point are unreachable,
+so no receive can leave a slot claimed but un-leased and un-quarantined.
+Check: `unreachable` — assert the three post-commit-point failure branches in
+`try_receive` are never entered. Semantics revised from `always-or-unreached`
+after direct analysis: all three branches are provably unreachable given that
+`validate` already succeeded on a 64-bit target, so the honest check is that the
+forbidden points are never entered, not a conditional invariant over a state the
+code cannot construct. If any branch ever becomes reachable, the wedge scenario
+below is what happens, and the property should be re-derived as `always` at that
+point.
+Fault/timing angle: `try_receive` compare-exchanges
+`PUBLISHED → RECEIVER_HELD` before validating. Descriptor-validation failure
+quarantines; three later paths propagate with `?` and do not — span
+materialization, the `body_len` usize conversion (`ring.rs:828-829`), and
+`ReceiveLease::new`. Were the first reachable, it would leave the slot in
+`RECEIVER_HELD` with `consumed` un-advanced, so every later `try_receive` would
+fail its CAS with `InvalidSharedState` forever, un-quarantined. Were the third
+reachable, it would fire after `state = RECEIVER_LEASED`, `consumed`, and
+`active_leases += 1` are already committed, yielding a lease nobody can release.
+Required faults and enabling state: none, because the property is now that the
+branches are not entered. A synthetic failpoint would prove nothing about
+production, since it would construct a state `validate` excludes.
+Confidence: high — [evidence](evidence/receive-failure-leaves-no-wedged-slot.md).
+Verified by inspection: `enter_quarantine` is called exactly once inside
+`try_receive`, at `ring.rs:807`, on the validation path only. Two independent
+analyses then agreed that an accepted descriptor guarantees the span count and
+bounds that both constructors check, so all three branches are dead given
+`validate` on a 64-bit target.
+Existing check: none.
+Impact: as written, none in production — this is a correctness argument the code
+does not state. The value of the record is that three `Result` paths exist for
+conditions that cannot arise, and nothing marks them as such. A future change to
+`validate` silently converts them from dead code into the wedge described above,
+with no test covering the transition.
+Open questions: None. The reachability question that opened this record is
+resolved: all three branches are unreachable, which is why the semantics
+changed.
+
+### release-failure-is-observable
+
+Type: liveness
+Reaches production: yes
+Status: active
+Exercised: not yet — needs an injected release failure on an otherwise clean
+path.
+Guarantee: A release or completion that fails is retried, reported, or surfaced;
+never dropped silently.
+Check: `always` — inject a release failure on the drop path and on the clean
+close path, and assert that some counter, diagnostic, or suspect record fires.
+Fault/timing angle: `ReceiveLease::Drop` calls `release_once()` and discards the
+result, so a drop-time `WrongIncarnation`, `Quarantined`, or `DuplicateRelease`
+is unobservable. On the host side `let _ = custody.release()` discards a
+clean-path charge-release failure, and the suspect path is the `else` branch, so
+no recovery record is created either.
+Required faults and enabling state: a release that fails while the surrounding
+operation is otherwise clean.
+Confidence: medium — [evidence](evidence/release-failure-is-observable.md).
+The discard sites are explicit (`crates/mc-shm-transport/src/lease.rs:215-221`;
+`crates/mc-host/src/shm_provider.rs:365`). Whether `release()` can actually fail
+on a clean close depends on `AdmissionError` reachability that was not fully
+traced, which is why this is medium.
+Existing check: `recovery.report_suspect(custody)` on the unclean branch only.
+Impact: a stranded charge or an unreclaimed frame with no counter, no log, and
+no suspect record. The operator learns nothing, and the arena bytes stay
+unreclaimable.
+Open questions:
+- Is silent loss on the drop path intended, given the addon `mem::forget`s
+  leases and releases through its own table instead?
+
+---
+
+## Group E: crash and cancellation
+
+All receiver-side and producer-side cursors live in shared memory. Nothing
+resets or reconciles them, so a crash is not a clean slate.
+
+### attach-reconciles-or-refuses-stale-shared-cursors
+
+Type: safety — revised from liveness after review. The check is evaluated at
+attach time, and attach ignores the stale cursors immediately rather than failing
+to converge later. The wedge that follows is the consequence, not the property.
+Status: active
+Exercised: not yet — needs a receiver killed while holding leases, then a fresh
+attach.
+Guarantee: A process attaching to a shared object either reconciles stale
+receiver state or refuses to attach; it never silently inherits leases and
+descriptor slots that no live process owns.
+Check: `always` — kill a receiver holding K leases, attach fresh, and assert
+either the attach fails, or `active_leases == 0` and no slot remains in
+`RECEIVER_LEASED`.
+Fault/timing angle: kill with `K == max_leases` for the worst case: the channel
+is dead and every symptom is a normal backpressure code.
+Required faults and enabling state: an actual process termination while leases
+are held — not a clean shutdown — followed by an attach.
+Confidence: high — [evidence](evidence/attach-reconciles-or-refuses-stale-shared-cursors.md).
+`Ring::attach` validates identity and geometry and prefaults
+(`ring.rs:593-611`, `:1637-1667`); it never inspects `published`, `consumed`,
+`completed`, `arena_write`, `arena_reclaimed`, or `quarantined`. Reclamation
+head-of-line blocks at the lowest stale sequence (`ring.rs:1116-1119`),
+`try_receive` returns `Ok(None)` (`:771-776`), and `try_reserve` eventually
+returns `Exhausted` (`:683-685`). None of these is an error, so no quarantine
+and no recovery episode occurs.
+Existing check: none.
+Impact: permanent, silent loss of lease and descriptor capacity, reported as
+ordinary backpressure. The `LifecyclePage` has no holder count, attach epoch,
+heartbeat, or peer pid, so there is no field a reconciliation could read.
+Open questions:
+- Is a peer crash meant to be recoverable at all? If yes, something must reset
+  the cursors or force quarantine; today it does neither. (needs human input)
+
+### crashed-producer-does-not-wedge-the-sequence
+
+Type: liveness
+Status: active
+Exercised: not yet — needs a producer killed between reserve and commit.
+Guarantee: A producer crash inside a reservation does not permanently prevent
+any later producer from publishing.
+Check: `always` — crash between `try_reserve` and `commit`, then assert a
+replacement producer can eventually publish, or that the failure is reported as
+a distinguishable fault rather than as backpressure.
+Fault/timing angle: the next sequence is derived from `published + 1`, so a
+replacement producer re-derives the same sequence, and its
+`FREE → PRODUCER_RESERVED` CAS fails against the stranded
+`PRODUCER_RESERVED` slot forever. The symptom is `ProducerError::Exhausted`
+followed by `Deadline` — both backpressure codes.
+Required faults and enabling state: termination during an open reservation.
+Confidence: high — [evidence](evidence/crashed-producer-does-not-wedge-the-sequence.md).
+`ring.rs:687-701` derives the sequence and performs the CAS; `abort_reservation`
+(`:1154-1162`) is the only path that restores `SLOT_FREE` and it runs in `Drop`,
+which a killed process never executes. `conservation()` still reports
+`producer_reserved == 1` and conserves, so the accounting looks healthy.
+Existing check: none.
+Impact: a permanently unusable direction whose only signal is a code that means
+"try again later".
+Open questions: None.
+
+### dead-peer-charges-are-reclaimed-or-declared
+
+Type: safety
+Status: active
+Exercised: yes — `crates/mc-host/tests/shm_failure_modes.rs:150`
+`killed_victim_holding_active_charges_is_never_reclaimed` constructs the fault
+(SIGKILL, signal-9 wait status, post-reap observation window) and pins the
+current behaviour.
+Guarantee: A peer that dies without a `Goodbye` either has its candidate's
+charges reclaimed, or the retention is a declared, bounded exception rather than
+an unqualified accounting claim.
+Check: `always` — after killing and reaping a committed peer, either the
+charges return, or the accounting snapshot exposes them as a distinct
+"unreclaimable" class that the admission contract accounts for.
+Fault/timing angle: with the default `HostConfig.liveness = None` the endpoint
+loop polls `try_receive → Ok(false)` forever and never becomes a suspect. With a
+liveness policy configured the ring eventually fills, `publish_one` fails, and
+the close is unclean, which quarantines instead — a different outcome for the
+same fault.
+Required faults and enabling state: an actual kill without `Goodbye`, plus a
+committed candidate.
+Confidence: high — [evidence](evidence/dead-peer-charges-are-reclaimed-or-declared.md).
+The gap is documented at `docs/mc-host-shm-transport.md:106-108` and tracked as
+`magic-context-ymc.12`; the release-gate plan makes it a blocker. It follows
+from `shm_provider.rs:363-370`, where only a returned `run_endpoint` triggers
+release or suspect reporting.
+Existing check: the test above pins the gap, which is the right shape for a
+known limitation. Status unaudited as an oracle for the *desired* behaviour.
+Impact: with single-candidate limits, one dead peer permanently ends
+shared-memory eligibility for the process. The catalog entry exists because
+`docs/mc-host-shm-transport.md:57` states the accounting claim without this
+exception.
+Open questions:
+- Which behaviour is normative when a liveness policy is configured — retention,
+  or quarantine via a failed publish? Both are currently reachable for the same
+  fault.
+
+### cancelled-frame-disposition-is-declared
+
+Type: safety
+Status: active
+Exercised: not yet — needs cancellation injected exactly between a successful
+`try_receive` and the delivery of its body.
+Guarantee: Cancellation and overload have a declared disposition for an
+already-acquired frame; a frame is not silently destroyed while the channel is
+reported as closing cleanly.
+Check: `always` — cancel between `try_receive` success and the ingress charge,
+and assert the outcome matches the declared contract: either the frame is
+delivered, or its loss is reported, or the contract explicitly permits the loss.
+Fault/timing angle: `try_receive` advances `consumed` and marks
+`RECEIVER_LEASED` before returning, so acquisition — not delivery — is the point
+of no return. If the ingress wait then observes cancellation, the lease drops,
+the slot is released and reclaimed, and the body never reaches `inbound`. The
+sequence is permanently consumed with no replay path, and the close is
+classified clean.
+Required faults and enabling state: cancellation or overload arriving in that
+exact window, with a frame already acquired.
+Confidence: high — [evidence](evidence/cancelled-frame-disposition-is-declared.md).
+`ring.rs:824-826` advances `consumed` before the lease is returned;
+`lease.rs:215-221` releases on drop; `crates/mc-host/src/shm_provider.rs:583-585`
+and `:498` map the cancellation to a clean close. Commit `3bf6c22b` deliberately
+made cancellation clean, which settles the charge question but not the frame's
+disposition.
+Existing check: none. Commit `3bf6c22b` asserts charges release cleanly, not
+that the frame was accounted for.
+Impact: silent single-frame loss on a channel whose documented failure posture is
+fail-closed. If the channel is meant to be lossless up to close, `consumed`
+advancing before delivery is the wrong commit point.
+Open questions:
+- Is losing one acquired-but-undelivered frame on cancel or overload an accepted
+  contract term? (needs human input)
+
+---
+
+## Group F: hostile and buggy peer
+
+The peer maps the entire object read-write, and the required seals are
+`F_SEAL_GROW|SHRINK|SEAL` with no `F_SEAL_WRITE`. Every field below is
+peer-writable at any time, including all control pages. The documentation
+disclaims protection against a peer that mutates payload after publication; it
+does not address control pages.
+
+### validated-spans-are-disjoint-and-inside-the-arena
+
+Type: safety
+Status: active
+Exercised: not yet — needs fuzzing with `arena_bytes > MAX_FRAME_BYTES`.
+Guarantee: For any accepted frame, the spans are pairwise disjoint, both lie
+inside the arena, and their lengths sum to the body length.
+Check: `always` — for arbitrary untrusted field tuples and arbitrary
+`arena_bytes >= MAX_FRAME_BYTES`, every accepted descriptor satisfies
+`span0 ∩ span1 == ∅`.
+Fault/timing angle: none; this is a pure decoding property. The exposure is that
+disjointness is *derived*, not asserted.
+Required faults and enabling state: attacker-controlled descriptor fields, and
+an arena larger than the minimum so the derivation is actually exercised.
+Confidence: high — [evidence](evidence/validated-spans-are-disjoint-and-inside-the-arena.md).
+Disjointness follows only from three separate conditions holding together:
+`spans[0]` ending exactly at `arena_bytes`, `spans[1].offset == 0`, and
+`len0 + len1 == body_len <= allocation_len <= arena_bytes`
+(`descriptor.rs:367`, `:387-393`, `:401-409`). Relaxing any one re-opens
+overlap. The fuzz harness asserts per-span bounds and the sum but never pairwise
+disjointness, and it only ever passes `arena_bytes == MAX_FRAME_BYTES`
+(`harness.rs:76-89`).
+Existing check: partial — `descriptor_rejects_every_untrusted_identity_and_span_failure`
+(`tests/contract.rs:63`) and the `frame_descriptor` fuzz target. Status
+unaudited; neither asserts disjointness.
+Impact: two spans over the same bytes would pass validation, so a frame could
+alias itself. Currently prevented by the conjunction, with nothing pinning it.
+Open questions: None.
+
+### no-rust-reference-over-peer-writable-payload
+
+Type: safety
+Status: active
+Exercised: not yet — needs a peer that mutates payload bytes after publication.
+Guarantee: No lease API constructs a Rust reference or slice over arena bytes
+the peer can still write; reads go through raw volatile access or raw copies.
+Check: `always` — audit that every read path uses `read_volatile` or
+`copy_nonoverlapping`, and assert no lease method creates a `&[u8]` over shared
+arena memory.
+Fault/timing angle: the peer rewrites body bytes during the read. Under Rust's
+rules that is a data race and undefined behaviour, not merely a wrong value.
+Required faults and enabling state: a concurrent peer write to leased bytes. The
+property is violated statically, so the audit form needs no fault; the *impact*
+demonstration does.
+Confidence: high — [evidence](evidence/no-rust-reference-over-peer-writable-payload.md).
+Verified by direct read of `crates/mc-shm-transport/src/lease.rs`:
+`checksum` builds a slice with
+`std::slice::from_raw_parts(self.base.as_ptr(), self.len)` at line 71, while
+`copy_to` correctly uses `copy_nonoverlapping` at line 63 and `read_byte` uses
+`read_volatile`. The SAFETY argument for the slice cites the peer *contract*,
+and `docs/mc-host-shm-transport.md:116` explicitly declines to guarantee that
+contract against a misbehaving peer.
+Existing check: none.
+Impact: one method's soundness rests on a premise the documentation disclaims,
+while its siblings in the same file avoid the issue. Additionally
+`LeaseSpan::as_mut_ptr` hands a mutable pointer out of a by-value receiver, and
+the addon wires it into external buffers for *receive* segments too, so
+JavaScript can write memory the host is concurrently reading.
+Open questions:
+- Is `checksum` reachable from any non-bench caller? If it is bench-only,
+  gating it removes the finding; if it is part of the intended read API, the
+  slice needs to go. (partial: the only observed call sites are the bench and
+  tests)
+
+### reclaim-advance-bounded-by-the-producer-reservation
+
+Type: safety
+Status: active
+Exercised: not yet — needs a peer rewriting the descriptor of a pending slot.
+Guarantee: The producer's `arena_reclaimed` advances by exactly the length the
+producer itself reserved for that sequence, never by a peer-chosen value.
+Check: `always` — after the receiver releases, have the peer rewrite
+`allocation_len` in the pending slot, then assert reclaim either rejects or
+advances by the original reservation.
+Fault/timing angle: the window between commit and `reclaim_completed` reading
+the slot is unbounded. The only guard is `allocation_start == arena_reclaimed`,
+which pins *where* the advance starts but not *how far* it goes.
+Required faults and enabling state: a peer write to a `RELEASE_PENDING` slot's
+descriptor between release and reclaim.
+Confidence: medium — [evidence](evidence/reclaim-advance-bounded-by-the-producer-reservation.md).
+Reclaim consumes the re-read `allocation_len` (`ring.rs:1136-1143`) with only
+the FIFO start check (`:1133`). Both candidate records — the descriptor and the
+atomic `reservation_len` — live in peer-writable memory, so neither is
+trustworthy. Exploitability past the start check was not established, hence
+medium.
+Existing check: none.
+Impact: the reclaim cursor can be pushed past bytes still under a live lease.
+Later underflow is caught (`arena.rs:104-108`), so this is corruption and
+denial of service rather than an out-of-bounds access.
+Open questions:
+- Was the atomic `reservation_len` (`ring.rs:113`) intended to be the producer's
+  trusted record? It is written but never read by `reclaim_completed`. A
+  producer-local table would be trustworthy; is that feasible given `Ring` is
+  thread-confined?
+
+### attach-binds-geometry-to-a-local-profile
+
+Type: safety
+Status: active
+Exercised: not yet — needs an attach whose grant geometry differs from the
+admitted profile.
+Guarantee: A peer only maps a shared object whose declared geometry equals the
+geometry its own admitted profile charged for.
+Check: `always` — at attach, assert grant depth, arena bytes, and lease cap all
+equal the local profile's values, and assert an upper bound on depth and total
+bytes exists inside Rust.
+Fault/timing angle: no fault needed. `Ring::attach` takes no `TargetProfile`, so
+geometry is only checked for self-consistency and against the mapped lifecycle
+page — never against what admission charged.
+Required faults and enabling state: a grant declaring a geometry the local
+profile did not charge for.
+Confidence: high — [evidence](evidence/attach-binds-geometry-to-a-local-profile.md).
+`Ring::attach` (`ring.rs:593`) has no profile parameter, and `checked_layout`
+(`:465`) bounds depth only by `!= 0` plus layout arithmetic.
+Existing check: `crates/mc-host/src/shm_provider.rs:851` pins the *host*
+profile's geometry; nothing pins the attaching side's. Status unaudited.
+Impact: admission accounting describes an object that was never mapped. It also
+means a self-consistent grant with a very large depth reaches `mmap` with only a
+TypeScript-side cap in the way.
+Open questions: None.
+
+### one-profile-name-denotes-one-geometry
+
+Type: safety
+Status: active
+Exercised: not yet — needs a cross-artifact equality assertion; the
+contradiction is present today.
+Guarantee: Every artifact naming profile `mc-host-test-ring-v1` derives its
+geometry from one source, so the name uniquely determines depth, arena bytes,
+lease cap, and layout overhead.
+Check: `always` — assert the TypeScript grant constants, the addon test
+fixture's constants, and the Rust qualified profile are pairwise equal, and that
+the TypeScript layout overhead equals `Layout::new(depth, arena).total - arena`.
+Fault/timing angle: no fault needed. The disagreement is live and masked because
+the addon enforces no geometry (see the previous property) and because the
+total-bytes cap is loose enough to admit both overheads.
+Required faults and enabling state: none; this is a static consistency property.
+Confidence: high — [evidence](evidence/one-profile-name-denotes-one-geometry.md).
+Four artifacts name one profile with two geometries: the host issues depth 8 and
+8 leases (`shm_provider.rs:91-94`), the addon's own `ring_profile` is depth 32
+and 32 leases (`profile.rs:682`, `:685`), the TypeScript validator hard-rejects
+anything but 8 (`shm-grant.ts:66-69`), and the addon test fixture encodes 32
+(`packages/mc-shm-native/tests/mechanism.ts:80-84`). Each is internally
+consistent; together they contradict.
+Existing check: `qualified_test_profile_pins_client_grant_geometry`
+(`shm_provider.rs:851`) pins Rust only. Status unaudited.
+Impact: this is the mechanism behind defect `daf6e244`, where a stale hardcoded
+layout total silently weakened five hardening tests for over a day. The
+arrangement guarantees recurrence.
+Open questions:
+- Is the depth-32 fixture a deliberate model of `create_test_pair` (which uses
+  `ring_profile`), in which case the profile string is knowingly overloaded
+  across two geometries? (needs human input)
+
+### native-boundary-not-weaker-than-its-wrapper
+
+Type: safety
+Status: active
+Exercised: not yet — needs each wrapper-level rejection driven against the
+native boundary directly.
+Guarantee: Every rejection the TypeScript grant decoder performs is also
+performed by the directly-callable native `attach`, so bypassing the wrapper
+cannot admit a descriptor the wrapper would reject.
+Check: `always` — for each wrapper error code (unexpected field, stale
+candidate, lane mismatch, aliased lanes by incarnation, geometry mismatch,
+out-of-range total), construct a descriptor triggering it and assert the native
+`attach` also rejects.
+Fault/timing angle: a caller reaching the addon without the wrapper — exactly
+what the addon's own mechanism test does via `createRequire`. Replay of a
+previously released grant is admitted natively because the process-wide claim
+covers only concurrently live grants and the native descriptor type has no
+candidate-id field at all.
+Required faults and enabling state: a direct native call with a descriptor the
+wrapper would reject.
+Confidence: high — [evidence](evidence/native-boundary-not-weaker-than-its-wrapper.md).
+The native field reads are enumerable at
+`packages/mc-shm-native/src/lib.rs:491-512` and contain none of these checks;
+`NativeDescriptor` (`packages/mc-shm-native/index.ts:17-24`) structurally omits
+`candidateId`, so the replay fence is dropped by the type contract.
+Existing check: none at the native boundary; the TypeScript tests exercise the
+wrapper.
+Impact: the permissive layer is the inner, directly-requirable one. A related
+gap: nothing binds a grant to its direction — field *position* is the only role
+assignment, so swapped fields would put two producers on one single-producer
+lane.
+Open questions:
+- Can any caller reach native `attach` with attacker-ordered or
+  bug-ordered lane fields, making the role confusion reachable rather than
+  latent?
+
+---
+
+## Group G: evidence and measurement integrity
+
+These properties do not guard the transport. They guard the artifacts that would
+be used to decide whether to ship it, and to prove the other properties hold.
+A defect here is live today, regardless of the transport being non-default.
+
+### operation-counters-are-observed-not-declared
+
+Type: safety
+Reaches production: evidence path
+Status: active
+Exercised: not yet — needs negative controls that remove a real operation and
+assert the counter drops.
+Guarantee: Each gate counter is incremented at the site where the operation
+occurs, by the process that performs it, and cannot be produced by a path that
+did not perform it.
+Check: `always` — for each counter, assert no assignment is derived solely from
+an arm label, a boolean flag, a scheduling mode, or an iteration count. Negative
+control: remove the receiver's copy and assert `body_copies` drops; remove the
+cold-path sleep and assert `park_wakes` drops.
+Fault/timing angle: none needed; the counters are computed rather than observed.
+Required faults and enabling state: none. This is a static property of the
+harness, and it currently fails.
+Confidence: high — [evidence](evidence/operation-counters-are-observed-not-declared.md).
+Verified by repository-wide search: `body_copies` is written only in a test
+fixture (`tests/contract.rs:422`), in the bench where it is derived rather than
+observed (`benches/hardware_envelope.rs:183`, `:191`, `:212`, `:249`), and as a
+field declaration plus a read in `evidence.rs:9`, `:30`. `OperationCounters` is
+referenced by exactly three files — `evidence.rs`, `tests/contract.rs`, and the
+bench — none of them production. No production path increments any counter. The
+receiver's copy happens in a forked child while the count is added in the parent
+after `waitpid`; `syscalls` and `allocations` are hardcoded per arm; and the gate
+control overwrites all six counters after running the *same* body as the
+selectable arm.
+Existing check: `injected_gate_control_must_be_disqualified`
+(`benches/manifests/v1.json:155`) and
+`purity_gate_rejects_injected_copy_allocation_queue_and_wake`
+(`tests/contract.rs:420`). Both test the gate's arithmetic over values they
+supply themselves. Status unaudited, and circular as an oracle.
+Impact: the zero-copy selection gate cannot detect a copy. A body copy added to
+a nominally zero-copy arm would report `body_copies == 0` and pass. This is the
+gate that decides whether a shared-memory provider may ship.
+Open questions:
+- Is `OperationCounters` intended to be wired to real instrumentation, or is it
+  permanently a report-schema type? If the latter, the "counts copies" language
+  in `docs/mc-host-shm-transport.md:25` overstates what any artifact can prove.
+  (needs human input)
+
+### measured-transfer-is-witnessed-by-the-data
+
+Type: safety
+Reaches production: evidence path
+Status: active
+Exercised: not yet — needs a corruption injection that the checksum must catch.
+Guarantee: Every arm's reported checksum is a function of the bytes actually
+delivered, so a corrupted or skipped transfer cannot produce the same value as a
+correct one.
+Check: `always` — assert the checksum is computed from received bytes on every
+arm; corrupt one delivered byte and assert the reported value changes.
+Fault/timing angle: silently dropped or corrupted frames on the selectable arm.
+Required faults and enabling state: none to demonstrate the gap; a byte
+corruption to demonstrate the impact.
+Confidence: high — [evidence](evidence/measured-transfer-is-witnessed-by-the-data.md).
+The ring arm's checksum is a closed form over the *parameters*
+(`benches/hardware_envelope.rs:401-403`), while the consumer's real
+`span.checksum()` is computed into a black box and discarded (`:444`). The
+stream arms do checksum real bytes (`:516`), so the field is not even comparable
+across arms.
+Existing check: none.
+Impact: a fully corrupted ring transfer yields a bit-identical checksum, so the
+benchmark cannot distinguish a working transport from a broken one.
+Open questions: None.
+
+### traceability-pointers-resolve
+
+Type: safety
+Reaches production: evidence path
+Status: active
+Exercised: yes — checked mechanically at `9c1eb4d1` and re-run independently.
+Of 51 citation instances, 29 are distinct and contain a fragment; 18 resolve and
+11 do not.
+Guarantee: Every evidence pointer in the traceability record names an artifact
+that exists and a test that is present in it.
+Check: `always` — for each evidence string containing a fragment, assert the
+file exists and the named test appears in it, under the citation convention that
+artifact class actually uses.
+Fault/timing angle: none; a rename silently detaches a requirement from its
+proof.
+Required faults and enabling state: none.
+Confidence: high — [evidence](evidence/traceability-pointers-resolve.md).
+The 11 unresolved pointers classify into three groups, and only the first is a
+defect:
+- **Definitively stale, 2 distinct across 5 citation instances.** The record
+  cites `tests/ring.rs#lease_limit_rejects_then_recovers_after_release` where the
+  test is `lease_limit_reports_backpressure_then_recovers_after_release`
+  (`ring.rs:289`), and
+  `tests/shm_transport.rs#omitted_and_unqualified_profiles_fall_back_without_side_effects`
+  where the test is
+  `omitted_and_unqualified_profiles_fall_back_reasonless_without_side_effects`
+  (`shm_transport.rs:117`). The second is cited by three separate requirement
+  rows.
+- **Markdown anchors, 2 distinct.** Both resolve under standard anchor
+  derivation. Not stale; a naive substring check simply cannot see them.
+- **TypeScript naming convention, 7 distinct across 2 files.** Each maps
+  one-to-one to a real declaration under a single transform, spaces to
+  underscores with commas dropped. A literal substring check can never match
+  these, because the sources spell the names with spaces.
+Existing check: none. Nothing validates the traceability record against the tree.
+Impact: two requirement citations, one of them load-bearing for three rows,
+point at tests that do not exist under those names. This is the audit trail for a
+release gate, and it has no validator.
+Open questions: None. The classification question that opened this record is
+resolved; the correct check normalizes per artifact class rather than doing a
+literal substring match.
+
+### negative-tests-fail-for-their-stated-reason
+
+Type: safety
+Reaches production: evidence path
+Status: active
+Exercised: not yet — needs each negative case asserted against its specific
+rejection reason.
+Guarantee: Every test that expects a rejection asserts the specific rejection
+reason, and no fixture duplicates production geometry without a cross-check.
+Check: `always` — each negative case pins a distinct expected error; and for
+each corpus target, assert at least one seed is accepted and at least one is
+rejected.
+Fault/timing angle: none; the failure mode is a test passing for the wrong
+reason.
+Required faults and enabling state: none.
+Confidence: high — [evidence](evidence/negative-tests-fail-for-their-stated-reason.md).
+This property is derived from an actual incident, not a hypothesis. Defect
+`daf6e244` left a hardcoded layout total stale after the control region grew by
+a page, so four of the six boundary tests were rejecting inputs on grant-layout
+mismatch rather than on the hostile input under test. The wrong-profile case is
+not maskable, because it returns before grant decode. Only the one case that
+asserted a specific message noticed. The fix added a comment, not a check.
+Separately, `tests/fuzz_corpus.rs:33-36` asserts only that the seed named
+`valid` is accepted; no seed is asserted to be rejected, so a decoder that
+widened acceptance would leave all three replay tests green.
+Existing check: partial — one message-specific case in the addon mechanism
+tests, and panic-freedom plus one positive in the corpus replays. Status
+unaudited.
+Impact: a whole class of negative tests can silently stop testing what they
+name. This already happened once for over a day.
+Open questions: None.
+
+---
+
+## Group H: documented surface versus implemented surface
+
+Each of these is a documented guarantee whose implementing code is absent,
+unreachable, or narrower than the text. The documentation establishes the
+obligation; these records exist because the implementation does not obviously
+discharge it.
+
+### documented-close-order-has-a-production-driver
+
+Type: reachability
+Status: active
+Exercised: not yet.
+Guarantee: The documented close ordering is driven by production code, so the
+ordering the tests prove is the ordering that ships.
+Check: `reachable` — assert the close state machine is advanced from at least
+one non-test caller. `reachable` fits because this is about a code location
+being executed, not about a state being constructed.
+Fault/timing angle: none; a static reachability question.
+Required faults and enabling state: none.
+Confidence: high — [evidence](evidence/documented-close-order-has-a-production-driver.md).
+Verified by repository-wide search: `CloseState`, `Lifecycle::new`,
+`mark_prepared`, and `must_fail_closed` are referenced by exactly two files —
+their own module `crates/mc-shm-transport/src/lifecycle.rs` and
+`crates/mc-shm-transport/tests/contract.rs`. The host close path and the addon
+close path each implement their own ordering, and neither advances this machine.
+Existing check: `lifecycle_accepts_only_diagram_edges_and_quarantine_is_terminal`
+(`tests/contract.rs:262`) proves the model's edges. Status unaudited as evidence
+for the shipping paths.
+Impact: `docs/mc-host-shm-transport.md:63` describes the close ordering as the
+implemented contract and the traceability record marks the corresponding
+requirement PASS, but the PASS rests on a type nothing in production drives. The
+documented "drains published data" stage has no counterpart in either real close
+path.
+Open questions:
+- Is the state machine intended to become the driver, or is it a specification
+  artifact? If specification-only, which code is normative for close ordering?
+  (needs human input)
+
+### capability-probe-gates-every-advertised-mechanism
+
+Type: safety
+Status: active
+Exercised: not yet — needs a runtime lacking the cleanup hook.
+Guarantee: Capability is advertised only when every mechanism the documentation
+enumerates is actually present.
+Check: `always` — for each enumerated mechanism, a runtime lacking it yields
+`available: false` with a bounded reason.
+Fault/timing angle: a runtime that is neither Bun nor reports as Node, or one
+without the cleanup-hook export.
+Required faults and enabling state: a runtime missing one enumerated mechanism.
+Confidence: high — [evidence](evidence/capability-probe-gates-every-advertised-mechanism.md).
+Verified by direct read of `packages/mc-shm-native/index.ts`: steps one through
+seven each gate with an `available: false` return (lines 118, 122, 129, 134,
+149, 169, 193), but the eighth is only *reported* — line 203 returns
+`available: true` and line 209 sets
+`cleanupHooks: typeof native.registerCleanupProbe === "function"` inside the
+same object. A runtime without the hook is advertised as capable.
+Existing check: the capability suite asserts channel counts around the probe,
+not the gating itself. Status unaudited.
+Impact: `docs/mc-host-shm-transport.md:42` states "any failure returns
+`available: false` with a bounded reason", which is falsified for one of the
+eight enumerated steps.
+Open questions:
+- An earlier draft asserted that the code's step order differs from the
+  document's numbering. That is **not supported**: steps one through eight appear
+  in documented order. Two real divergences replace it. There is an undocumented
+  gate before step one, `node_detachment_unavailable`, and the eight documented
+  steps are implemented as five gates plus a catch-all, because steps three and
+  five have no dedicated reason of their own. Whether the enumeration is meant to
+  be one gate per step is the open question. (needs human input)
+
+### clean-reclamation-is-reachable
+
+Type: reachability
+Status: active
+Exercised: not yet — reachable only through a fake backend today.
+Guarantee: For the shipped provider, the clean-reclamation outcome — charges
+returned exactly once and a new incarnation minted — actually occurs at least
+once under conditions that should produce it.
+Check: `sometimes` — across a campaign, at least one recovery episode on the
+real backend ends in clean reclamation with charges returned and the incarnation
+advanced. Semantics revised from `reachable`: this is a situation, not a code
+location. A campaign can execute the branch's lines through a fake backend while
+never producing the operational state — cleanup proving the stale resources are
+gone — that the outcome is supposed to represent. If the decision is instead
+that the shipped backend will never produce it, the correct resolution is to
+scope the documentation to a quarantine-only outcome and mark this record
+invalidated with that reason.
+Fault/timing angle: none; the shipped cleanup returns the uncertain outcome
+unconditionally.
+Required faults and enabling state: none to observe the gap.
+Confidence: high — [evidence](evidence/clean-reclamation-is-reachable.md).
+`ShmRecoveryBackend::cleanup` returns `CleanupOutcome::Uncertain` for every
+input and `probe()` returns `true` unconditionally
+(`crates/mc-host/src/shm_provider.rs:137-152`). The clean-reclamation branch and
+the incarnation mint (`provider_recovery.rs:481-490`) are exercised only through
+the fake backend (`provider_recovery.rs:889`).
+Existing check: fake-backend test only. Status unaudited as evidence for the
+shipped provider.
+Impact: `docs/mc-host-shm-transport.md:87-90` presents clean reclamation and
+quarantine as two distinct outcomes with distinct experiments. Only quarantine is
+reachable on production code, so every suspect quarantines and charges never
+return.
+Open questions: None.
+
+### test-only-surface-absent-from-the-shipped-addon
+
+Type: safety
+Reaches production: yes
+Status: active
+Exercised: not yet — needs an export inventory of the built artifact.
+Guarantee: Fault injectors, probes, and test constructors are absent from the
+addon's exported surface in a shipping build.
+Check: `always` — enumerate exported names from the built artifact and assert
+the set excludes the failpoint setter, the arbitrary-buffer detach, the external
+probe, the cleanup-probe registrar, the test-pair constructor, and the forced
+close.
+Fault/timing angle: none; any JavaScript in the host process can call them.
+Required faults and enabling state: none.
+Confidence: high — [evidence](evidence/test-only-surface-absent-from-the-shipped-addon.md).
+The addon source contains no `cfg(test)`, `cfg(feature)`, or
+`cfg(debug_assertions)` gates at all, and exports the failpoint setter, an
+arbitrary `ArrayBuffer` detach, the external probe, an arbitrary-path cleanup
+probe, the test-pair constructor, and a forced close
+(`packages/mc-shm-native/src/lib.rs:409-454`, `:553`, `:958`). The fuzz harness
+module is likewise ungated in the library (`crates/mc-shm-transport/src/lib.rs:16`).
+Existing check: none.
+Impact: the external-view failpoint can drive both directions into quarantine
+from JavaScript, the cleanup probe is an arbitrary-path file write at teardown,
+and the buffer detach operates on buffers the addon never created. The addon is
+also shipped from a debug build, so release behaviour is never exercised.
+Open questions:
+- Is a `cfg`- or feature-gated split intended before this transport becomes
+  selectable, or is the surface considered acceptable because the transport is
+  test-only? (needs human input)
+
+---
+
+## Group I: the decode contract
+
+The decode surface is the best-tested code in the crate. It is cataloged anyway,
+because an existing check never removes a property: these records state the
+contract the fuzz targets and tables are approximating, and each one names a
+condition no current check pins.
+
+### decoder-totality-over-arbitrary-bytes
+
+Type: safety
+Status: active
+Exercised: not yet — the only totality evidence sweeps ten lengths and two fill
+bytes; no exhaustive-length sweep, no structured mutation of an accepted seed,
+and no allocation oracle exist.
+Guarantee: For every byte sequence, each decoder returns either a value
+satisfying its accept-postcondition or an error; no input panics, drives an
+unbounded allocation, or yields a partially checked value.
+Check: `always` — for arbitrary input the call returns, and either the accept
+type's postconditions hold or an error variant is returned. A panic is a
+forbidden state with no dedicated detection point, so it is expressed as
+`always(!panic)`; `unreachable` would be wrong because no code point must never
+execute.
+Fault/timing angle: none. All three decoders are pure functions over one
+immutable slice. The exposure is structural: panic-freedom rests on
+`GRANT_BYTES` being the literal `58` (`ring.rs:30`) with no static tie to its 54
+bytes of fields, and on the harness's last `read_u64` ending at exactly the
+length gate with zero margin.
+Required faults and enabling state: none. Arbitrary bytes are the whole enabling
+state. The property holds at HEAD and is under-evidenced rather than violated.
+Confidence: high — [evidence](evidence/decoder-totality-over-arbitrary-bytes.md).
+Accept types are constructed once, after every guard (`descriptor.rs:424-432`,
+`sample.rs:122-125`), both with private fields and no other constructor.
+`RingGrant` materializes at `ring.rs:438-454` before `checked_layout()?` at
+`:455` but cannot escape it. Panic sites enumerated: three `.expect()` calls
+(`ring.rs:436`, `:443`, `:448`) plus constant range indexes, all infallible on a
+58-byte array; and `harness.rs:19-23` `read_u64`, whose last read ends at index
+107 against a gate admitting exactly 108. No decoder allocates; the first
+length-driven allocation is `lease.rs:178-179`, bounded solely by the decoder's
+`body_len > MAX_FRAME_BYTES` rejection against 64 MiB.
+Existing check: `tests/contract.rs:683-706`
+`harness_replays_terminate_on_arbitrary_lengths` (ten lengths, fills `0x00` and
+`0xff`) and `tests/fuzz_corpus.rs:44-57` (five seeds each, panic-freedom only).
+Status unaudited, and both are smoke tests for the claim they are taken to
+support: neither fill reaches any arithmetic guard.
+Impact: none today. The value is that the reasoning keeping totality true lives
+nowhere in the tree. Narrowing `GRANT_BYTES` turns `ring.rs:430` into an
+unconditional panic on every call, and a harness offset edit does the same to
+`read_u64`; no property currently forbids either.
+Open questions:
+- Should `GRANT_BYTES` be derived from its field widths, as `SAMPLE_PREFIX_BYTES`
+  is (`sample.rs:24`), rather than written as a literal?
+- Is the harness's zero-margin offset arithmetic deliberate? (needs human input)
+
+### accepted-decode-consumes-its-declared-width
+
+Type: safety
+Status: active
+Exercised: not yet — needs a per-byte influence oracle; the one round-trip
+assertion that exists cannot fail without a source edit.
+Guarantee: For every accepted input, each byte of the declared width either
+influences a decoded field or is pinned to a constant, and no region beyond the
+declared width is consumed except where the decoder's contract declares trailing
+slack.
+Check: `always` — for every accepted decode, flipping any single input bit within
+the declared width changes the decoded value or causes rejection, and the
+consumed width equals the declared width. The per-decoder slack policy is part
+of the condition rather than an exception to it.
+Fault/timing angle: none. The interesting axis is that the three decoders do not
+share a policy: `RingGrant::decode_slice` (`ring.rs:460-463`) and
+`harness::frame_descriptor` (`harness.rs:31-33`) demand an exact width, while
+`SamplePrefix::snapshot` (`sample.rs:41-45`) accepts a prefix plus declared body
+and deliberately ignores documented capacity slack.
+Required faults and enabling state: none. Any accepted input suffices; what is
+missing is the oracle.
+Confidence: high — [evidence](evidence/accepted-decode-consumes-its-declared-width.md).
+What the `provider_grant` round-trip at `harness.rs:112-116` actually proves:
+`decode` maps all 54 non-reserved bytes into seven fields with no lossy
+transform, and `encode` (`ring.rs:410-421`) writes exactly those back plus four
+zero bytes, so no byte is read-and-discarded or defaulted, and acceptance cannot
+silently widen. It does not cover value legality, never evaluates a short input,
+cannot detect a reordering of two same-width fields, and has no counterpart for
+the other two decoders: `FrameDescriptor` has no encoder anywhere in the library,
+and `SamplePrefix` cannot have a byte-exact oracle because its contract permits
+slack. On this commit the assertion is a tautology over accepted inputs, so it is
+a regression tripwire rather than a campaign-time detector.
+Existing check: partial. `tests/ring.rs:470-497` sweeps every cut in `0..58`, a
+one-byte suffix, and empty; `:503` re-asserts the round-trip on one fixture.
+`tests/iceoryx.rs:164` covers the sample slack policy properly. Nothing asserts
+the frame-descriptor encoding consumes its declared width. Status unaudited.
+Impact: the 108-byte frame-descriptor encoding is the one with no consumption
+oracle and the one whose offsets are hand-written literals. A change making a
+region inert leaves the length gate satisfied and every read in bounds, so
+whether any test notices depends on which seeds happen to distinguish the fields.
+Open questions:
+- Is `SamplePrefix`'s prefix-plus-slack policy permanent, or an accommodation for
+  iceoryx loan granularity that another backend would not need? (needs human
+  input)
+
+### identity-and-schema-rejection-is-one-contract
+
+Type: safety
+Status: active
+Exercised: not yet — needs one shared case table driven against every reader,
+and for the disposition half, a peer write to a slot descriptor between the
+receive read and the reclaim read.
+Guarantee: Every path that admits a shared descriptor as authentic enforces the
+same schema-and-identity condition set, and a rejection from any of them has one
+declared disposition.
+Check: `always` — for every reader that accepts a descriptor, acceptance implies
+schema equals `DESCRIPTOR_SCHEMA_VERSION`, sequence is non-zero, and incarnation,
+lane, and sequence equal the locally derived expectation; and every rejection
+produces the declared disposition. The divergence is a live state of the code,
+not a code point, so `unreachable` does not apply.
+Fault/timing angle: the enforcement half is static. The disposition half has an
+unbounded window, because the descriptor is read twice from peer-writable memory
+— `ring.rs:802` on receive and `:1125` on reclaim — with the whole lease lifetime
+between, so "validated at receive" does not imply "valid at reclaim".
+Required faults and enabling state: none for enforcement. For disposition, a live
+lease plus a peer write to that slot's `schema_version`, then a release followed
+by a `try_reserve`.
+Confidence: high on enforcement; the second failure shape's reachability is
+unresolved — [evidence](evidence/identity-and-schema-rejection-is-one-contract.md).
+The five conditions appear in identical order at `descriptor.rs:348-362` and
+`sample.rs:88-102`. `Ring::release` (`ring.rs:847-909`) enforces three: it checks
+incarnation and lane against the grant (`:851-856`), non-zero sequence
+(`:858-860`), and `sequence > consumed` (`:866-868`), then compares only
+incarnation, lane, and sequence against the raw struct (`:874-882`). It never
+calls `snapshot()` or `validate`, so `schema_version` is not read. Dispositions
+diverge for the same `validate` call: `try_receive` quarantines at `:807`, while
+`reclaim_completed` maps the error through at `:1127-1130` to `try_reserve`; both
+consumers of that error were searched and neither quarantines.
+Existing check: partial, and none cross-cutting. `tests/contract.rs:63` tables
+the descriptor cases; `tests/iceoryx.rs:208-229` and `tests/contract.rs:538`
+cover the sample prefix; `tests/ring.rs:173-197` covers release identity. Each
+table is written against its own reader. Status unaudited.
+Impact: two shapes. Adding a condition to one decoder and not the other leaves
+both tables green while the backends admit different identity classes. And a
+`schema_version` rewritten under a live lease is accepted by `release`, rejected
+by `reclaim_completed`, and head-of-line blocks the reclaim loop — a direction
+that stops progressing with no terminal state and no operator-visible fault, the
+same end state `crashed-producer-does-not-wedge-the-sequence` reaches by another
+route.
+Open questions:
+- Is omitting the schema check in `Ring::release` intentional, on the grounds
+  that the release path builds no body view? If so it belongs in a comment,
+  because the field is read from peer-writable memory by the next reader.
+  (needs human input)
+- Which disposition is normative for a reclaim-path `validate` failure? Both
+  reachable behaviours exist today for the same rejection. (needs human input)
+
+### grant-reserved-bytes-are-rejected-unless-zero
+
+Type: safety
+Status: active
+Exercised: not yet — one of the four bytes is perturbed by a test, and the corpus
+seed that encodes the case has its outcome unasserted.
+Guarantee: A grant is accepted only if all four reserved bytes are zero, and
+`encode` reproduces them as zero, so the region stays reserved in fact rather
+than only in intent.
+Check: `always` — acceptance implies `bytes[54..58] == [0; 4]`, and for every
+accepted grant `encode()` writes those positions as zero.
+Fault/timing angle: none. The forward-compatibility angle is the real one: the
+guard is checked at `:430-432` before the layout-version read at `:439`, and
+every grant rejection collapses to `RingError::InvalidGrant`, so "peer speaks a
+newer layout" and "peer sent garbage" are indistinguishable.
+Required faults and enabling state: none. A nonzero reserved byte is the whole
+input. For the re-encode direction, a component that decodes and re-encodes a
+grant, which does not exist in-tree today.
+Confidence: high — [evidence](evidence/grant-reserved-bytes-are-rejected-unless-zero.md).
+`GRANT_BYTES` is the literal `58` (`ring.rs:30`); the seven fields occupy 54
+bytes; `encode` writes `0u32.to_le_bytes()` into `54..58` unconditionally at
+`:419`; `decode` rejects a nonzero region at `:430-432`. The corpus seeds
+`provider_grant/valid` and `near-valid` were compared byte by byte: they differ
+only at index 54 (`0x00` versus `0x01`), so `near-valid` is the reserved-byte
+case. The descriptor-side contrast was also measured: `SharedDescriptor` is 120
+bytes with 12 of padding, written whole by `write_volatile` and read only by name
+in `snapshot()`, so the shared descriptor has an unconstrained equivalent region
+while the grant's four bytes are enforced.
+Existing check: `tests/ring.rs:392`
+`attach_rejects_unsealed_objects_and_tampered_grants` sets `reserved[54] = 1` and
+asserts `Err(RingError::InvalidGrant)`. A genuine pin, but it covers one byte of
+four and asserts a category eight other tampered cases share. The corpus
+`near-valid` seed runs with its outcome unchecked. Status unaudited.
+Impact: the guard makes a version-2 reader fail closed against a version-3 grant,
+which is correct. The uncovered direction is `encode`: it zeroes the region
+unconditionally, so any decode-then-re-encode silently strips a future field
+rather than rejecting it. The only thing standing against that is the fuzz
+round-trip assertion, which is doing forward-compatibility work its comment does
+not claim.
+Open questions:
+- Is `encode`'s unconditional zeroing intended to make the type version-2-only,
+  or should a relay preserve unknown reserved bytes? (needs human input)
+- Should the descriptor's 12 padding bytes get the same declared-and-enforced
+  treatment, or be documented as meaningless? They are the only region of the
+  decode surface with neither. (needs human input)
+
+### fuzz-harness-encoding-tracks-the-production-descriptor
+
+Type: safety
+Reaches production: evidence path
+Status: active
+Exercised: not yet — needs a static width assertion, a per-byte influence
+assertion, and a decoupled `expected` identity.
+Guarantee: The fuzz harness's byte encoding reaches the field-tuple space the
+production reader can present, so the corpus explores the real descriptor shape
+rather than a stale approximation.
+Check: `always` — `FRAME_DESCRIPTOR_BYTES` equals the sum of the field widths
+`FrameDescriptor::from_untrusted` accepts, and the byte-to-field map is a
+bijection onto that space, so no field domain is unreachable and no input byte is
+inert. This is a static agreement evaluated on every build, not a situation to
+reach.
+Fault/timing angle: none. The exposure is that `validate` takes three independent
+inputs in production — the peer-controlled descriptor, an `expected` identity
+derived from the grant and local cursor, and `arena_bytes` from the grant — and
+the harness pins two of them. `harness.rs:76` passes the decoded identity, so the
+accept path satisfies the three identity comparisons by construction, and the
+reject path at `:98-102` differs only in `lane ^ 1`.
+Required faults and enabling state: none for the static half. For coverage, an
+`expected` identity differing from the decoded one in incarnation or sequence,
+which neither fuzz target supplies, so the guards at `descriptor.rs:354-356` and
+`:360-362` are reached by no campaign execution.
+Confidence: high — [evidence](evidence/fuzz-harness-encoding-tracks-the-production-descriptor.md).
+Measured: `FRAME_DESCRIPTOR_BYTES` is 108 (`harness.rs:16-17`) while
+`size_of::<SharedDescriptor>()` is 120 with 12 bytes of padding; every field from
+`lane` onward sits at a different offset, and the span region is interleaved in
+the harness but grouped in the struct. That is not a defect, because production
+reads typed fields via `snapshot()` and never sees bytes. The 108-byte map is
+exactly a bijection: ten field widths total 864 bits, and 108 bytes is 864 bits.
+The 120-byte figure was confirmed twice: by a layout program, and through the
+corpus, since the `provider_grant/valid` seed's `total_bytes` of 67,125,248 is
+reproduced by `Layout::new(32, 64 MiB)` only if `DescriptorSlot` is 256 bytes,
+which requires the 120-byte descriptor, and that seed is accepted by a passing
+test.
+Existing check: partial and type-level only. `MAX_SPANS` is coupled by a
+two-element array literal, and `from_untrusted`'s argument list makes an added
+field a compile error. `tests/contract.rs:683-706` sweeps the constant and the
+constant plus one. Nothing asserts the read regions sum to the constant, and
+nothing asserts the incarnation and sequence guards are reachable from fuzzing.
+Status unaudited.
+Impact: the offsets are independent literals, so a reordering preserving the
+total keeps the length gate satisfied and the bit count at 864. And two of the
+five identity conditions in the load-bearing `validate` function are covered only
+by tabled unit cases, never by fuzzing.
+Open questions:
+- Should the harness encode the shared struct's 120-byte image rather than a
+  packed 108-byte private shape? Keeping them different is defensible and
+  cheaper; unifying them would give the padding a decode contract and force
+  corpus regeneration. (needs human input)
+- Was passing the decoded identity as `expected` deliberate, or did the two-input
+  nature of `validate` go unnoticed? (needs human input)
+
+---
+
+## Group J: platform and layout
+
+Two gaps join here because they share a root: constants and `cfg` gates chosen
+for one platform and one page size, on a code path CI never executes under the
+other.
+
+### macos-object-creation-outcome-is-attributed
+
+Type: reachability
+Status: active
+Exercised: not yet — no macOS CI job reaches `Ring::create`, so
+`create_macos_shm` has never executed under observation and the documented
+failure has no attributed step or errno.
+Guarantee: On macOS the ring object-creation path is executed, and its outcome is
+attributed to a named step and error code rather than recorded as a bare variant.
+Check: `reachable` — assert `create_macos_shm` is entered on a macOS host and its
+result is recorded with the failing step and `errno` distinguished. This is
+code-location and environment coverage: the location exists and is never
+executed.
+Fault/timing angle: none. The blocker is environmental — a macOS host that
+actually runs the file.
+Required faults and enabling state: none. A macOS runner executing
+`tests/ring.rs` suffices.
+Confidence: medium — [evidence](evidence/macos-object-creation-outcome-is-attributed.md).
+`create_macos_shm` (`ring.rs:1753-1788`) has three `ObjectSetupFailed` exits and
+`validate_object` returns a different variant, so the documented error originates
+inside the create function. The shm name is 40 characters, computed by
+replicating the fold at `:1755-1764` rather than assumed. Medium because nothing
+could be executed on macOS and Darwin's `PSHMNAMLEN` is external to the
+repository and unverified.
+Existing check: none. `platform_preflight_is_side_effect_free`
+(`shm_provider.rs:827-848`) asserts `StaticallyOmitted` on non-Linux, but that is
+a `cfg!` decision and never calls `Ring::create`.
+Impact: `docs/mc-host-shm-transport.md:121` presents the macOS omission as
+resting on an observed runtime failure that no check observes. If the cause is
+the 40-character name, fixing it silently activates the whole untested macOS path
+at once: creation without seals, attach without a type check, and a mapping whose
+descriptor was dropped.
+Open questions:
+- Which step fails, and with which errno? Needs one macOS run. (needs human
+  input)
+- Is the macOS ring intended to become functional, or is `ObjectSetupFailed` the
+  permanent state? If permanent, the dependent records below become invalidated
+  rather than latent. (needs human input)
+
+### attach-validation-is-not-platform-weakened
+
+Type: safety
+Status: active
+Exercised: not yet — needs a macOS execution of `Mapping::attach`, which no
+in-tree macOS path can currently produce a descriptor for.
+Guarantee: On every platform where attach is reachable, an admitted descriptor's
+object type is established and its size is immutable for the mapping's lifetime.
+Check: `always` — at every attach, the descriptor is refused unless its object
+type is established and its size cannot subsequently shrink. `always` rather than
+`unreachable` because this is a per-operation admission predicate; today macOS
+satisfies it only vacuously, so the check must also assert the premise that no
+macOS path yields a ring descriptor.
+Fault/timing angle: the shrink half has a window spanning the whole mapping
+lifetime, from `validate_object`'s `fstat` (`ring.rs:1681`) to any later access,
+because nothing re-checks. The type half has no window.
+Required faults and enabling state: a macOS descriptor source such as
+`SCM_RIGHTS`, plus either a wrong-type descriptor of exact size, uid, and mode,
+or a retained second descriptor used to `ftruncate` after validation.
+Confidence: high — [evidence](evidence/attach-validation-is-not-platform-weakened.md).
+Verified from `cfg` attributes: `validate_seals` (`:1705-1714`) and `seal_object`
+(`:1743-1751`) are both Linux-gated, the attach-side call is gated at `:251-252`,
+the create-side pair at `:573-577`, and `validate_object` sets
+`type_valid = true` on non-Linux at `:1689-1693`. Also verified that macOS
+retains no descriptor: `Mapping` has no `fd` field there, both constructors
+`drop(fd)`, and `raw_fd`, `attachment`, `set_inheritable`, `RingAttachment`, and
+both `attach_ring` helpers are Linux-gated.
+Existing check: `attach_rejects_unsealed_objects_and_tampered_grants`
+(`tests/ring.rs:392`) covers the Linux seal path only and is itself Linux-gated,
+with no macOS counterpart. Status unaudited as evidence for the type check.
+Impact: `docs/mc-host-shm-transport.md:117` rests the trusted-peer boundary on
+owner-only attachment. On macOS that boundary is uid plus exact size plus mode
+bits, with no object-type check and no shrink immunity, and the compensating
+property is that attach is unreachable rather than that it is safe. A regular
+file of matching size, mode `0600`, owned by the euid would be mapped
+`MAP_SHARED | PROT_READ | PROT_WRITE`.
+Open questions:
+- Is the Darwin `st_mode` premise at `ring.rs:1686-1688` correct? If not, an
+  `S_IFMT == 0 || S_IFMT == S_IFREG` form would have covered both platforms and
+  the carve-out discarded a working check. (needs human input)
+- If a macOS descriptor-passing path is added, what substitutes for
+  `F_SEAL_SHRINK`? Darwin has no seals. (needs human input)
+
+### macos-object-creation-leaks-no-shm-name
+
+Type: safety
+Status: active
+Exercised: not yet — needs a failpoint on `shm_unlink`, or a crash between open
+and unlink, on macOS, plus an oracle over the Darwin shm namespace.
+Guarantee: A failed or interrupted macOS object creation leaves no name in the
+Darwin shared-memory namespace.
+Check: `always` — after any `create_macos_shm` invocation that does not return
+`Ok`, the generated name is absent from the shm namespace. The forbidden state is
+residue after an operation with a defined completion point, and there is no
+dedicated detector, so `unreachable` does not apply.
+Fault/timing angle: a one-statement error window at `ring.rs:1779`, between a
+successful `shm_open` and a successful `shm_unlink`. No concurrency needed. The
+crash variant is wider, spanning `OwnedFd::from_raw_fd` at `:1777`.
+Required faults and enabling state: an `shm_unlink` failure after a successful
+`O_EXCL` `shm_open`, or a process kill in that window. Both require macOS and a
+seam into `create_macos_shm`.
+Confidence: medium — [evidence](evidence/macos-object-creation-leaks-no-shm-name.md).
+Verified from the `a5568707` diff and HEAD that the step order is `shm_open`
+(`:1766-1772`), `shm_unlink` (`:1779`), `ftruncate` (`:1784`), so the pre-fix
+`ftruncate` leak window is closed and the `shm_unlink` exit is now the one
+returning with the name present and no retained handle. `shm_unlink` appears
+exactly once in the crate. Medium because whether Darwin names survive the last
+descriptor close, and whether `shm_unlink` can fail after `O_EXCL` success, are
+external facts that could not be tested.
+Existing check: none. `RuntimeDir` has the analogous cleanup — `Drop` plus unwind
+on two early returns — and the shm object has no equivalent.
+Impact: each occurrence permanently consumes one Darwin shm namespace slot and
+its backing pages, since nothing in the tree will ever unlink the name. Repeated
+provider preparation attempts convert one transient error into monotone
+exhaustion, after which `shm_open` with `O_EXCL` fails for unrelated reasons and
+reports the same `ObjectSetupFailed` from a different line, which would also
+corrupt the attribution the sibling record establishes. Linux is unaffected:
+`memfd_create` objects are anonymous.
+Open questions:
+- Can `shm_unlink` fail after a successful `O_EXCL` `shm_open` on Darwin? If
+  provably not, mark this record invalidated with that reason. (needs human
+  input)
+- Should `create_macos_shm` own an unwind matching `RuntimeDir`, or should the
+  name never be unlinked before `ftruncate`? (needs human input)
+
+### layout-region-offsets-are-real-page-aligned
+
+Type: safety
+Status: active
+Exercised: not yet — no test asserts any layout offset against the runtime page
+size, and no CI host has a non-4096 page executing this code.
+Guarantee: Every layout offset the code page-aligns is a multiple of the running
+kernel's page size, so each region the layout separates occupies its own real
+pages.
+Check: `always` — for every constructed layout, `arena`, `lifecycle`, and `total`
+are each multiples of `system_page_size()`. A per-construction structural
+invariant, not a location to reach or a situation to encounter.
+Fault/timing angle: none; fixed at construction and held for the mapping's
+lifetime.
+Required faults and enabling state: none beyond a host whose
+`sysconf(_SC_PAGESIZE)` is not 4096, or an injectable page size in the layout
+computation.
+Confidence: high — [evidence](evidence/layout-region-offsets-are-real-page-aligned.md).
+`Layout::new` (`ring.rs:142-183`) uses the 4096 constant at `:159-164`,
+`:165-170`, and `:171-173`, while `system_page_size()` (`:195-201`) has exactly
+one caller, `verify_prefaulted` (`:1007`). The divergence was computed, not
+estimated: at depth 8 under a 16384-byte page, `arena % 16384 = 4096`,
+`lifecycle % 16384 = 4096`, and `total % 16384 = 8192`; at depth 32 the figures
+are 12288, 12288, and 0. Depth 32 passes the total condition only because
+67,125,248 is 4097 x 16384.
+Existing check: `residency_vector_tracks_runtime_page_size` (`ring.rs:1790-1800`)
+asserts the pure `residency_vector_len` helper at 16 KiB and 64 KiB. It touches
+no layout offset and no mapping.
+Impact: on a 16 KiB-page host the lifecycle page — magic, layout version,
+geometry, incarnation, lane, and the `quarantined` flag — shares one real page
+with the arena's final 4096 bytes (12288 at depth 32), which are peer-writable
+payload. Any page-granular mechanism, including `mprotect` to make the control
+page read-only to one role, can no longer separate control state from payload.
+The arena start is likewise off a real page boundary, and at depth 2 and 8 the
+mapping carries 8192 addressable, never-initialised bytes past `mapping.len`.
+Open questions:
+- Are `arena` and `lifecycle` contractually page-separated, or is 4096 standing
+  in for cacheline separation? Nothing records the intent, and the answer decides
+  whether this is a defect or over-alignment. (needs human input)
+- Should `total` be rounded to the runtime page size so the mapping carries no
+  addressable slack past `len`? (needs human input)
+
+### page-size-dependent-setup-runs-on-a-non-4096-page-host
+
+Type: reachability
+Status: active
+Exercised: not yet — the only page-size assertion in the tree is a pure-function
+unit test, and it runs only on a 4096-page x86-64 runner.
+Guarantee: The full setup path that depends on page size — layout, `ftruncate`,
+`mmap`, both prefault walks, `mincore`, and the `PrefaultFailed` gate — executes
+on a host whose kernel page size is not 4096.
+Check: `reachable` — assert `Ring::create` runs to completion where
+`sysconf(_SC_PAGESIZE) != 4096`, and that `verify_prefaulted()` returns true
+rather than merely that creation did not error. Location and environment
+coverage: the code exists and is never executed under the condition that matters.
+It must not assert a page-size violation.
+Fault/timing angle: none; the condition is environmental and constant per host.
+Required faults and enabling state: a runner whose page size is not 4096 — an
+aarch64 Linux kernel with 16 KiB or 64 KiB pages — or an injectable page size.
+Confidence: high — [evidence](evidence/page-size-dependent-setup-runs-on-a-non-4096-page-host.md).
+The `a5568707` diff touched only `verify_prefaulted`, adding `system_page_size`
+and `residency_vector_len`, and left `Layout::new` plus both prefault walks on
+4096 — including `arena.rs:229`, a bare literal that does not reference the
+constant. CI was read directly: Linux runs all targets while macOS runs
+`--test contract --test fuzz_corpus`, which excludes both `ring.rs` and the lib
+target. The `mincore` mismatch the fix repaired reproduces exactly in arithmetic:
+16386 entries sized against 4097 written, leaving 12289 zero.
+Existing check: `residency_vector_tracks_runtime_page_size` (`ring.rs:1790-1800`),
+a pure-function assertion with no mapping. On macOS it does not run at all, since
+`--test` excludes the lib target.
+Impact: the configuration in which the previous defect lived has never been
+executed end to end, so the residual defects in
+`layout-region-offsets-are-real-page-aligned` are invisible to CI, as is any
+future change reintroducing a 4096 assumption into the residency path.
+`macos-latest` maps to Apple Silicon with a 16384-byte page, so CI already
+provisions a 16 KiB host every run, and it is precisely the host on which no
+`Ring` is constructed.
+Open questions:
+- Add an aarch64 Linux job with a large-page kernel, or make the page size
+  injectable so the path can be driven on any host? (needs human input)
+- The claim that `macos-latest` provisions arm64 with a 16384-byte page is
+  external to this repository; the workflow pins only the label. Worth
+  confirming, though if the label resolved to x86-64 the gap is wider.
+
+---
+
+## Group K: the second backend
+
+The iceoryx backend is a second implementation of the same contract. All 32
+original records were derived from the ring backend, so this group exists to
+state which guarantees iceoryx also owes and which it structurally cannot
+provide. The distinction between untested and unprovable is the point.
+
+One correction carried into this group: an earlier pass called the iceoryx
+release a no-op. It is not. `release(self)` takes `self` by value, so the closing
+brace runs drop glue that returns the chunk to the publisher's retrieve channel.
+The reclamation is real and exactly-once by move semantics. What it does not do
+is anything else: no identity argument, no validation, no counter, no completion
+publication, and no `Result`.
+
+### iceoryx-descriptor-rejection-is-terminal-or-declared
+
+Type: safety
+Status: active
+Exercised: not yet — no test makes `try_receive` return `Err`; the seven tests in
+`tests/iceoryx.rs` are same-instance and the loopback publisher always writes the
+sequence the receiver expects, so the rejection at `iceoryx.rs:167` never fires.
+Guarantee: A sample the backend rejects as an invalid descriptor either leaves
+the channel in a terminal state that fails every later operation closed, or the
+rejection point is never reached.
+Check: `always-or-unreached` — after `try_receive` returns
+`Err(InvalidDescriptor)`, assert every later `try_reserve` and `try_receive`
+reports a terminal state; the disjunct that currently holds is that the rejection
+point is unreached. `always-or-unreached` rather than `always` because the
+loopback topology cannot construct a mismatched sample under the compiled
+provider configuration. Not `unreachable`: the forbidden thing is a backend state
+after a rejection, not a code point, and there is no gate site to mark, which is
+itself the finding.
+Fault/timing angle: none needed once the trigger fires. The post-rejection state
+is absorbing, because the only writer of `next_receive` (`iceoryx.rs:168`) sits
+after the `?` on the failing call.
+Required faults and enabling state: a sequence or identity mismatch in a
+delivered sample. Either an external `iceoryx2.toml` setting
+`backpressure_strategy` to `DiscardData` so a full-buffer send returns `Ok(0)`
+while `iceoryx.rs:301` still advances `next_publish`, or a peer rewriting a
+published prefix in the provider's segment. Neither is available today.
+Confidence: high — [evidence](evidence/iceoryx-descriptor-rejection-is-terminal-or-declared.md).
+`backend/mod.rs` was read in full: nine lines, and no trait, which is why none of
+the missing parity is a compile error. `backend/iceoryx.rs` was searched for
+`quarantine`, `conservation`, `completion`, `active_leases`, and `Drop`; all zero
+hits, against the ring's gate set at `ring.rs:670-672`, `:765-767`, `:848-850`,
+`:999-1001`, and `:913-924`, and its quarantine raise at `:807`.
+Existing check: none. No test drives a rejection through the backend and then
+probes what it accepts.
+Impact: the ring's terminal state is what converts storage of unknown state into
+storage never reused. On iceoryx a rejected frame leaves a channel that keeps
+accepting reservations and publishing, with one opaque error variant over nine
+causes as the only signal. The parity ledger behind this record: sequence
+monotonicity is provided but on process-local `Cell<u64>` rather than shared
+pages; release identity validation is absent and soundly so, because the move
+makes a wrong or duplicate identity unpresentable; incarnation fencing compares
+against a locally minted value that is never exchanged, so it discriminates
+nothing; quarantine and conservation reporting are absent with no substitute.
+Open questions:
+- Is the loopback shape intended to be permanent? The ledger reads differently
+  under each answer and no repository file states one. (needs human input)
+- If iceoryx is meant to reach a designated host, does it owe a terminal state at
+  all, or does the provider layer above it own condemnation? (needs human input)
+
+### iceoryx-receive-expectation-tracks-the-delivered-stream
+
+Type: safety
+Status: active
+Exercised: not yet — `sequences_progress_exactly_and_wrap_attempts_fail_closed`
+(`tests/iceoryx.rs:123`) commits and receives one frame per iteration, so both
+cursors advance in lockstep and never diverge.
+Guarantee: The receiver's local sequence expectation never falls permanently
+behind the delivered stream while the publisher keeps publishing successfully.
+Check: `always` — after any rejected receive, assert either that `next_receive`
+advanced past the rejected sequence, or that the backend reports the stream as
+broken on every later call. A permanently stranded expectation is a forbidden
+state with no dedicated detection point.
+Fault/timing angle: no window and no concurrency. The dequeue at
+`iceoryx.rs:151-157` is unconditional and the advance at `:168` is conditional,
+so any rejection consumes a sequence from the stream without consuming one from
+the expectation. The state is absorbing.
+Required faults and enabling state: a divergence between delivered and expected
+sequence. Three constructors: a restart on either side, blocked today by the
+undisclosed random service name; a malformed sample, needing a peer write to the
+provider segment; or a `DiscardData` global config plus a full subscriber buffer.
+None available today.
+Confidence: high — [evidence](evidence/iceoryx-receive-expectation-tracks-the-delivered-stream.md).
+Verified the dequeue-before-validate-before-advance order at `iceoryx.rs:150-176`,
+the incarnation, lane, and exact-sequence comparisons at `sample.rs:94-102`, and
+the `Cell<u64>` cursors initialized to zero at `iceoryx.rs:43-44` and `:114-115`,
+against the ring's shared-page cursors. The concrete restart consequence: a fresh
+`create` sets `next_receive` to 0 so a restarted receiver expects sequence 1,
+while a live publisher holding `next_publish == N` sends N+1;
+`sample.rs:100-102` compares N+1 against 1 and returns `InvalidSequence`, the
+sample is dropped, the expectation stays at 1, and every later frame carries a
+larger sequence, so every later receive fails identically and forever.
+Existing check: `tests/iceoryx.rs:123` covers exact progression on the happy path
+and the empty-queue case. It never constructs divergence. Status unaudited.
+Impact: a permanently unreadable stream on which the producer keeps consuming
+loan capacity for frames the receiver will never accept, with no shared cursor to
+reconcile against, no terminal state, and one opaque error variant. This record
+and the previous one share a code point from two sides: this one owns the cursor
+obligation, that one owns the fail-closed obligation.
+Open questions:
+- Was the `Cell<u64>` pair intended as a same-instance smoke-test device rather
+  than a transport cursor? If so the record scopes down to a documentation
+  obligation. (needs human input)
+
+### iceoryx-cross-process-pairing-is-reachable-or-declared
+
+Type: reachability
+Status: active
+Exercised: not yet, and not constructible without an API change;
+`IceoryxBackend::create(profile, lane)` accepts neither an inbound service name
+nor an inbound incarnation.
+Guarantee: For a backend advertised as a candidate transport between two
+processes, a frame actually crosses a process boundary at least once, or the
+loopback-only basis of its evidence is declared where the release gate reads it.
+Check: `sometimes` — across a campaign, at least one iceoryx frame is published
+by one process and received by a different process. `sometimes` rather than
+`reachable` because this is a situation spanning two address spaces, not a code
+location: a same-instance test executes every line on the path while never
+producing the operational state the arm represents. The check cannot fire today,
+and its not firing is the evidence.
+Fault/timing angle: none. This is a static property of the constructor.
+Required faults and enabling state: none to observe the gap. To close it, an API
+accepting a service name and incarnation from an authenticated setup channel, the
+way `Ring::attach` takes a `RingGrant`.
+Confidence: high — [evidence](evidence/iceoryx-cross-process-pairing-is-reachable-or-declared.md).
+Three independent facts, each sufficient alone: the service name is built from 16
+`getrandom` bytes inside `create` (`iceoryx.rs:57-69`), is not stored on the
+struct, has no accessor, and appears nowhere else, so nothing can learn or supply
+it and `open_or_create` always creates; `max_publishers(1)` and
+`max_subscribers(1)` (`:76-77`) are both consumed by the creator, and iceoryx2
+fails a port beyond the bound at creation; and the expected incarnation is minted
+locally and read from `self.incarnation` at `:163`, with `sample.rs:94-96`
+rejecting any other. All seven tests and the bench arm construct exactly one
+backend used as both producer and receiver.
+Existing check: none for pairing. `tests/iceoryx.rs` is same-instance throughout.
+Impact: nothing authenticates the peer because the design admits no peer. The
+consequence is evidential: the arm is `selectable` in the release-gate manifest
+(`benches/manifests/v1.json:107-110`) as one of two candidate providers for a
+transport whose purpose is moving frames between processes, while the same bench
+report classifies it as a loopback smoke arm against nine paired-process arms. A
+same-instance test structurally cannot prove any property whose predicate ranges
+over two address spaces or two incarnations: publication visibility across a real
+release-acquire edge, peer authentication at attach, geometry binding, restart
+reconciliation, stale-cursor handling. Those are not untested; they are
+unprovable on this backend as constructed.
+Open questions:
+- Is `selectable: true` for this arm deliberate, given the same report calls it a
+  loopback smoke arm? (needs human input)
+- Should the gate require that the loopback-smoke list and the `selectable` list
+  be disjoint? They overlap on this arm today. (needs human input)
+
+### iceoryx-completion-is-observable-to-the-host
+
+Type: safety
+Status: active
+Exercised: not yet — needs leases disposed both ways with an assertion that some
+observation distinguishes outstanding from reclaimed; no such observation exists
+to assert against.
+Guarantee: The number of outstanding iceoryx samples is derivable from an
+observation the backend exposes, and an explicitly released lease is
+distinguishable from an abandoned one.
+Check: `always` — at every point, assert an observation exists on the backend
+reporting outstanding versus reclaimed samples, and that a readiness answer
+shaped like the one `provider_recovery.rs:530` consumes is available. There is no
+gate site so `unreachable` does not apply, and no convergence so this is not a
+liveness form. The check fails by construction today, which the record states
+rather than implies.
+Fault/timing angle: none, and no window. The absent surface is a static fact
+about the module.
+Required faults and enabling state: none. The gap is observable by reading the
+public surface.
+Confidence: high — [evidence](evidence/iceoryx-completion-is-observable-to-the-host.md).
+`iceoryx.rs:319-355` was read in full and searched for `impl Drop`,
+`conservation`, `probe`, `quarantine`, `completion`, and `active_leases`; all zero
+hits, against the ring's `release` (`ring.rs:847-909`, whose successful path
+stores `completion_sequence` and decrements `active_leases` at `:902-906`),
+`conservation` (`:912-995`), and `probe` (`:998-1003`). The iceoryx lease meets
+exactly-once completion by move semantics rather than by a check: sound, but
+silent. `provider_recovery.rs:530` decides readiness from
+`backend.probe() && backend.admission_fits()` and has no iceoryx path in.
+Existing check: none on the backend. The bench arm's counters are constants,
+which is a downstream instance of `operation-counters-are-observed-not-declared`
+rather than new coverage.
+Impact: a host adopting this backend could not observe reclamation. A lease
+dropped on a cancellation path reclaims correctly and produces no record,
+indistinguishable from one leaked into a long-lived collection, up to the borrow
+cap, where the symptom surfaces on the other side as `ReceiveFailed` attributed
+to the receive mechanism rather than to retained leases. Combined with the
+constant counters, a body copy added anywhere in `run_iceoryx` would change none
+of the six fields the gate names as required.
+Open questions:
+- Is `stale_node_observed` (`iceoryx.rs:178-189`) intended as the readiness
+  surface? It is an associated function over global dead-node entries, keyed to
+  nothing about a given instance's samples. (needs human input)
+
+### iceoryx-saturation-is-bounded-non-blocking-backpressure
+
+Type: liveness
+Status: active
+Exercised: not yet — every test receives and releases immediately after each
+commit, so neither configured cap is ever reached.
+Guarantee: When a configured capacity limit binds, the backend returns control to
+the caller with a bounded, non-terminal code rather than blocking indefinitely or
+reporting a channel-ending fault.
+Check: `always` — reserve and commit past the subscriber buffer bound with no
+intervening receive and assert the final `commit` returns within a deadline as
+some bounded error; separately, retain `max_leases` leases and assert
+`try_receive` returns `Ok(None)` rather than `Err`, then release one and assert
+the queued frame arrives. `always` in the bounded-liveness sense used by
+`crashed-producer-does-not-wedge-the-sequence`: the obligation holds whenever the
+state is entered, checked in a fault-free window after it is established.
+Fault/timing angle: no window; both are state conditions reached by counting
+operations and permanent while the state holds. The publish-side block is
+unbounded in wall-clock time and unbreakable on one thread, because the backend
+pins both ports to one thread via `_not_send: PhantomData<Rc<()>>`
+(`iceoryx.rs:45`), so the only party that could drain the queue is the thread
+blocked inside `send()`.
+Required faults and enabling state: none; no fault class and no concurrency.
+Publish side: `descriptor_depth + 1` commits with no receive. Receive side:
+publish to the buffer bound, retain `max_leases` leases, publish once more. A
+plain test on the publish side hangs, so the harness needs a terminating timeout.
+Confidence: high — [evidence](evidence/iceoryx-saturation-is-bounded-non-blocking-backpressure.md).
+The compiled default was traced: the publisher builder (`iceoryx.rs:89-106`)
+never sets a backpressure strategy, so it inherits `RetryUntilDelivered`; with
+`enable_safe_overflow(false)` (`:80`) the send routes to a blocking path that
+spins while the submission queue is full. On the receive side the library returns
+an exceeds-max-borrows error when every channel with data sits at the borrow cap,
+and `iceoryx.rs:151-157` collapses every receive error into
+`IceoryxError::ReceiveFailed`, indistinguishable from a connection failure.
+Existing check: none on iceoryx. The ring's counterpart is pinned at
+`tests/ring.rs:289`. Status unaudited.
+Impact: the ring answers a full descriptor set with `Exhausted`, which
+`reserve_until` converts to `Deadline`, and a full lease set with `Ok(None)` under
+the stated rule that a full lease set is backpressure and errors are reserved for
+channel-ending faults. The iceoryx path violates both halves: the publisher can
+hang forever with no deadline parameter, and normal receive backpressure is
+reported as a fault. Both caps are handed to the provider and never consulted
+locally, so the backend cannot report saturation in its own vocabulary.
+Open questions:
+- Does any designated host's global config override the backpressure strategy? No
+  repository file sets it and no test asserts it, and the two possible values give
+  opposite uncontracted outcomes: unbounded blocking, or silent frame loss.
+  (needs human input)
+- Should the backend pin the strategy explicitly rather than inherit it from an
+  external file? (needs human input)
+
+---
+
+## Group L: boundary composition
+
+These records are about the division of responsibility between the transport and
+the host, not about either layer's individual checks. The transport validates two
+header fields; the host validates the rest. The ordering is correct at HEAD, and
+nothing pins it. The dependency edge runs host-to-transport, so the validating
+crate cannot import the types it is validating, which is why the composition has
+to be a property rather than a shared function.
+
+Field-by-field, the transport checks only `len` (equal to `body_len`, and within
+`MAX_FRAME_BYTES`) and `ver` (equal to 2). The host's `decode_header` checks the
+frame type, reserved flag bits, reserved priority and admission class, illegal
+sheddable, and the channel-and-epoch pairing rules; `validate_inbound_header`
+adds the body-length cap, pure-header flag pairing, and the consumer role gate.
+The correlation field is unvalidated by design.
+
+### wire-header-fully-validated-before-any-consumer-acts
+
+Type: safety
+Reaches production: yes
+Status: active
+Exercised: partial — `crates/mc-host/tests/shm_failure_modes.rs:195` publishes one
+header the transport accepts and the host rejects, but asserts only the
+downstream quarantine, so it cannot distinguish rejection before the charge from
+rejection after it. Missing: any assertion that no ingress permit was taken and no
+inbound event emitted.
+Guarantee: No consumer of a shared-memory frame acts on any header field, or on
+the body it describes, before both host header gates have accepted it.
+Check: `always` — on every receive that yields a lease, `decode_header` and
+`validate_inbound_header` both return `Ok` before the ingress charge
+(`shm_provider.rs:580`), the body copy (`:604`), and any send on `inbound`
+(`:569`, `:612`). An ordering invariant evaluated at every receive, with no
+optional path and no convergence to wait for.
+Fault/timing angle: none required. The descriptor is snapshotted by one
+`read_volatile` (`ring.rs:802`), so the 21 header bytes are frozen locally before
+either layer inspects them, and there is no time-of-check window between the two
+layers. The window that makes the ordering load-bearing is the ingress wait loop
+(`:578-603`), bounded by `frame_deadline`: that is the resource an out-of-order
+gate would let an illegal frame hold.
+Required faults and enabling state: a peer-authored header satisfying exactly the
+transport's two checks and violating one host rule. No concurrency, no timing.
+Confidence: high — [evidence](evidence/wire-header-fully-validated-before-any-consumer-acts.md).
+`descriptor.rs:414-422` is the transport's only header inspection; `receive_one`
+runs its seven steps in the order above with `?` on each, and nothing between
+`:555` and `:564` reads a header field or a payload byte. `WIRE_V2_HEADER_BYTES`
+equals `HEADER_LEN` at 21, so `decode_header`'s truncation gates
+(`wire.rs:307-317`) are statically dead on this path.
+Existing check: `shm_failure_modes.rs:195`
+`corrupt_peer_frame_quarantines_exact_charges_and_returns_ready`; one role-invalid
+type, quarantine outcome only. Status unaudited as an ordering oracle.
+Impact: this is the ordering the trust boundary rests on, and it is correct at
+HEAD. Cataloged because nothing fails if it stops being correct. Moving the charge
+or the copy above `:562` lets a peer hold up to 64 MiB of ingress budget for a
+frame deadline on a frame already known illegal, and the transport cannot
+compensate, because `mc-host` depends on `mc-shm-transport` and so `FrameType`,
+`Flags`, and the protocol version are unreachable from the validating crate.
+Open questions:
+- The control-cap branch (`shm_provider.rs:565-576`) releases the lease and
+  answers `Rejected` rather than closing, a fourth disposition. Is a per-channel
+  body cap a header rule or an admission rule? (needs human input)
+- A version 3 relocating `len` or `ver` is permitted by the extension point at
+  `wire.rs:292-297` and would leave `descriptor.rs:414-419` silently validating
+  offsets 0..5 of a different layout. Should the transport's two checks be
+  versioned, or replaced by a host-supplied predicate? (needs human input)
+
+### ingress-charge-matches-the-bytes-copied-from-shared-storage
+
+Type: safety
+Reaches production: yes
+Status: active
+Exercised: not yet — needs the per-frame equality assertion at admission. The
+transport's two checks are exercised only in isolation, never against a host that
+consumes their guarantee.
+Guarantee: The ingress budget a shared-memory frame charges equals the number of
+body bytes later copied out of shared storage for it.
+Check: `always` — for every inbound frame the shared-memory read path emits, the
+charged byte count equals the body length. `always` rather than `unreachable`: the
+forbidden state is a delivered frame whose charge and body disagree, and the
+divergence would arise at an ordinary, always-executed statement pair.
+Fault/timing angle: no interleaving; the charge (`shm_provider.rs:580`) and the
+copy (`:604`) are consecutive. The exposure window is the drift interval between
+two crates: `header.len` is bytes 0..4 of the peer-authored header, `to_vec` fills
+the descriptor's `body_len` (`lease.rs:178-196`), and the host never compares them.
+Required faults and enabling state: none to pin the property. To demonstrate the
+impact, a peer writing the descriptor page directly, which the mapping permits.
+Confidence: high — [evidence](evidence/ingress-charge-matches-the-bytes-copied-from-shared-storage.md).
+The sole enforcement point is `descriptor.rs:414-422`, called from
+`Ring::try_receive` at `ring.rs:804`, which refuses a lease otherwise.
+Downstream, nothing re-derives it: `InboundFrame::owned`
+(`frame_channel.rs:478-490`) stores header, body, and byte charge side by side
+without comparing them. The bounding constants are independently defined 64 MiB
+values, `MAX_FRAME_BYTES` (`arena.rs:4`) and `MAX_FRAME_BODY_LEN` (`wire.rs:35`),
+and the dependency edge runs host-to-transport, so the transport can import
+neither the constant nor the header type it validates.
+Existing check: none for the composition. The transport's two checks are covered
+alone at `tests/contract.rs:163`, `:604`, and `:613`; the wire-header setter has
+no test at all. Status unaudited.
+Impact: `descriptor.rs:420` is the only thing making the host's ingress accounting
+mean anything. Relax it, weaken it to a bound, or feature-gate it, and a peer sets
+host admission accounting from a field unrelated to the bytes moved. The
+balanced-but-wrong case, charge 64 MiB and copy 64 bytes, is a cheap
+budget-exhaustion primitive, because the ingress wait loop is what other receives
+block on and the resulting overload close is classified clean.
+Open questions:
+- Should the equality also be asserted host-side, given the host owns the header
+  format while the transport owns the only check? (needs human input)
+- Whether any consumer above the inbound event compares the header length to the
+  body it receives is Part 2 surface and was not read. (partial)
+
+### every-shm-header-consumer-applies-its-role-gate
+
+Type: safety
+Reaches production: yes
+Status: active
+Exercised: partial — the host arm is exercised end to end for one illegal type.
+The peer arm has no test, and the oracle it needs does not exist: today the frame
+is released and nothing observable changes.
+Guarantee: Every consumer that receives the transport's 21 header bytes applies
+its own role gate, so a role-invalid frame retires the generation on whichever
+side receives it.
+Check: `always` — for each illegal type in the receiving side's role set, the
+consumer closes the generation: a corrupt-read close on the host, and a
+role-violation close on the peer. The obligation is per-frame and normative, and
+the forbidden state, a role-invalid frame silently released with the generation
+open, has no dedicated detection point.
+Fault/timing angle: none; static per-consumer coverage, both branches present at
+HEAD.
+Required faults and enabling state: a role-invalid publish into each direction.
+The peer arm needs the frame to come from the host side, so the fault is a
+compromised or regressed host, inside a trust model that already grants a
+same-user peer write access to mapped payload.
+Confidence: medium — [evidence](evidence/every-shm-header-consumer-applies-its-role-gate.md).
+The omission is verified by direct read and a repository-wide search for the
+header-violation helper, whose only call sites are its definition, the TCP frame
+channel, and the transport provider. The shared-memory channel's poll decodes the
+header and passes straight to the frame handler, and the shared validator has no
+role rule, while the dispatch default releases the body quietly with the
+role-restricted types all inside the range check. Medium because reachability is
+unresolved, which is what sets the urgency.
+Existing check: host arm only, one type. Nothing on the peer arm. Status
+unaudited.
+Impact: over TCP a role-invalid frame retires the generation with an explicit
+reason; over shared memory the identical frame is released and the generation
+stays open, with no diagnostic, counter, or close reason, which is the implicit
+profile extension the wire document forbids. The record straddles the part
+boundary, since the peer consumer lives in `packages/plugin`, assigned to Part 5.
+Open questions:
+- Is the shared-memory frame channel reachable in any shipped configuration, or
+  only through an injected factory? Empty registries are reported for Part 1 as a
+  whole and were not re-derived for the client package. (partial)
+- Should the role gate move inside the shared header decoder so no consumer can
+  forget it, given the provider-lease path already pairs validation with the
+  violation call? (needs human input)
+
+### header-rejection-effect-does-not-depend-on-the-catching-layer
+
+Type: safety
+Status: active
+Exercised: not yet — one host-caught rejection is constructed but only the
+admission side is observed; nothing constructs a transport-caught header rejection
+end to end, and nothing observes the ring or the peer after either.
+Guarantee: A malformed header field produces one declared terminal effect,
+independent of which layer's check rejected it.
+Check: `always` — for every peer-authored header rejected on the receive path, the
+ring's `quarantined` byte, the descriptor slot state, and the admission-charge
+disposition match one declared contract. `always`, not `unreachable`: the
+forbidden state is two different terminal effects for one input class, and no
+single code point must never execute.
+Fault/timing angle: no window on the rejection; both paths are straight-line. One
+on observability: the peer can read the quarantine byte only while it holds a
+mapping, so its window to notice is bounded by its own lifetime rather than the
+host's, and that byte is peer-writable, so the signal the transport path emits is
+one a peer can erase.
+Required faults and enabling state: two rejections of the same class caught at
+different layers. The transport-caught one requires a direct descriptor-page
+write, because `commit_reservation` re-checks both fields (`ring.rs:1172-1180`),
+so the producer API cannot express it.
+Confidence: high — [evidence](evidence/header-rejection-effect-does-not-depend-on-the-catching-layer.md).
+`enter_quarantine` has exactly one caller, the descriptor-validation arm at
+`ring.rs:807`; no host path reaches it. There `consumed` is never advanced, since
+the advance is at `:825` past the error, so the slot stays `RECEIVER_HELD`. On the
+host paths the dropped lease releases and `consumed` has already advanced. Both
+converge at the clean-close classification (`shm_provider.rs:498`) into
+`report_suspect`, and cleanup answers `Uncertain` for every input, quarantining
+the charges, so the admission outcome is identical. The reason is then discarded:
+`connection.rs:411-414` folds clean EOF, corrupt, I/O, and overloaded into one
+peer-exit variant.
+Existing check: none for the disposition. One host-caught case asserts the
+quarantined charge tuple and the return to ready. Peer-originated quarantine is
+untested, and no check distinguishes self-quarantine from peer-quarantine. Status
+unaudited.
+Impact: two adjacent malformed headers yield one accounting outcome and two
+peer-visible outcomes. A transport-caught field gives the peer an unambiguous
+quarantined terminal; a host-caught field gives it nothing, so it keeps publishing
+and sees `Exhausted` then `Deadline`, codes meaning try again later. In neither
+case is the failing field recorded anywhere, and `enter_quarantine` is itself
+best-effort, no-oping if the lifecycle pointer computation fails.
+Open questions:
+- Is the transport path's ring quarantine intended for all header rejections, or
+  an artifact of descriptor validation sitting below the trust boundary? The
+  documented close ordering covers unknown alias state, not a protocol rejection.
+  (needs human input)
+- Should a header rejection be distinguishable from a clean EOF outside the
+  endpoint thread? Today only a boolean survives, and it carries no reason.
+  (needs human input)
+
+### runtime-directory-authentication-is-a-precondition-not-a-container
+
+Type: safety
+Status: active
+Exercised: not yet — no test references the runtime directory at all, and
+revalidation is never negative-tested.
+Guarantee: The runtime directory is admitted only when its by-path and
+by-descriptor views name one inode that is a directory owned by the effective user
+at mode 0700, and that conjunction is re-established before every ring creation.
+Check: `always` — for each divergence an adversary can present (path replaced by a
+symlink, by a different real directory, by a non-directory; mode widened; owner
+changed), both `create_in` and `validate` return `ObjectValidationFailed`
+specifically, and `Ring::create_in` refuses. A per-call invariant over
+adversary-chosen filesystem state.
+Fault/timing angle: two narrow windows. From `mkdir` (`ring.rs:330`) to the open
+(`:333-337`), closed after the fact by the inode equality check at `:351`, which
+detects a swap rather than preventing it; and between any `validate()` and the
+operation that follows, which is object creation that does not use the directory.
+`O_NOFOLLOW` covers only the final component, and the root is the process
+temporary directory.
+Required faults and enabling state: filesystem tampering between creation and use.
+Four of the five cases are constructible unprivileged in a temporary root; the
+owner-change case needs a second user or a container and may have to be recorded
+as unconstructible in CI rather than skipped silently.
+Confidence: high — [evidence](evidence/runtime-directory-authentication-is-a-precondition-not-a-container.md).
+A repository-wide search returns only the definition (`ring.rs:308-394`), the two
+creation sites (`:537`, `:1418`), and two struct fields, with nothing in the test
+directory. `create_in` and `validate` each evaluate the same five clauses. The
+directory holds nothing on either platform: `Mapping::create` takes a length and
+no path; Linux uses an anonymous memfd; macOS uses `shm_open` in the global POSIX
+namespace and unlinks the name before mapping. Object authentication is
+descriptor-based and independent.
+Existing check: none. Object and runtime-directory authentication are listed as
+one unaudited guard cluster, and revalidation is never negative-tested. The happy
+path runs on every `Ring::create` in the ring tests.
+Impact: low, for a specific reason: defeating the checks gains nothing, because no
+object is inside the directory on any supported platform. The reachable
+consequence of tampering is a refusal, so the candidate fails to prepare and the
+host falls back to TCP. The residual is teardown: `Drop` (`:390-394`) calls
+`remove_dir` by path with no `validate()` first, so with the temporary root naming
+an attacker-writable directory lacking the sticky bit, they can substitute their
+own directory under our name and have our `Drop` remove theirs, a narrow same-user
+denial primitive. What is actually worth guarding is a belief: a future change
+storing something real here would inherit an authentication covering only the
+container.
+Open questions:
+- Is the directory a remnant of an earlier file-backed design, or a deliberate
+  environment sanity check? The doc comment at `ring.rs:535` implies the object is
+  under it; it is not. Git archaeology was not performed. (needs human input)
+- Should `Drop` revalidate before removing, that being the one unauthenticated use
+  of the path? (needs human input)
+
+---
+
+## Group M: normal-operation liveness
+
+Every liveness record before this group concerns a failure. A transport that never
+wedges but also never makes progress satisfied the earlier catalog. This group
+states what progress means, and it carries the portfolio's first situation-coverage
+records, because the liveness properties here are vacuous unless a campaign proves
+it reached the states they range over.
+
+Bounded windows are mandatory in this group. An unbounded "eventually" cannot be
+refuted by a finite test, and a generous deadline cannot distinguish one reclaim
+pass from a thousand, so each record states its bound in producer attempts or in
+an explicit interval.
+
+### backpressure-converges-in-a-bounded-reclaim-window
+
+Type: liveness
+Status: active
+Exercised: not yet — the one convergence assertion that exists is cross-process,
+covers arena exhaustion only, and bounds nothing tighter than five seconds.
+Guarantee: While a receiver keeps draining and releasing, a producer that hits
+descriptor or arena exhaustion reserves successfully inside its deadline.
+Check: `always` — run under real exhaustion, stop the pressure by releasing every
+lease, then require the next single `try_reserve` to succeed, and require
+`reserve_until` with a deadline set beyond the release to return `Ok` strictly
+inside it. The bounded fault-free window is one `try_reserve` after the release
+becomes visible, because `reclaim_completed` drains the whole contiguous completed
+prefix per call and is invoked at the head of `try_reserve` (`ring.rs:673`).
+Fault/timing angle: three independent conditions all surface as
+`ProducerError::Exhausted` — depth full (`:683-684`), a lost reservation
+compare-exchange (`:700`), and arena exhaustion (`:708-712`) — and only that
+variant is retried (`:745-754`). Under the cold park-wake mode the host selects,
+retries are 50 microseconds apart, so one quantum is the floor on any asserted
+bound.
+Required faults and enabling state: genuine exhaustion of either capacity, then
+removal of the pressure. Two arms, because only the arena arm is covered today.
+Enabling situation `shm_arena_wrap_with_live_lease`; the descriptor arm needs no
+marker.
+Confidence: high — [evidence](evidence/backpressure-converges-in-a-bounded-reclaim-window.md).
+`reclaim_completed`'s sole call site in the repository is `try_reserve`, so
+reclamation is producer-driven and a retry is the act that recovers capacity; the
+reclaim loop exits only at the first gap, an error, or an exhausted prefix; and
+the compare-exchange at `:700` cannot lose fault-free, because `slot_ptr` maps
+sequence to `(sequence - 1) % descriptor_depth` and the depth gate already puts
+that slot's previous user at or below `completed`, hence freed.
+Existing check: partial —
+`two_process_zero_copy_exchange_uses_authenticated_grant`
+(`tests/ring.rs:565-602`). A `reserve_until` with a five-second deadline converges
+after the child releases, and an elapsed-time assertion keeps it from passing
+vacuously. Status unaudited. The give-up path is pinned separately at `:202-206`.
+Impact: this is the only statement in the catalog that the transport makes forward
+progress in normal operation. A recovery-chain defect presents as
+`ProducerError::Deadline`, which the host converts into a failed publish, a
+cancelled generation, and a suspect record: a transport fault reported on a
+channel whose peer was draining correctly.
+Open questions:
+- What inner bound should the cross-process arm assert? The existing test pairs a
+  50 ms sleep with a five-second deadline, three orders of magnitude of slack, so
+  it measures no latency and a per-pass reclaimer would pass it.
+
+### receive-resumes-when-lease-capacity-clears
+
+Type: liveness
+Status: active
+Exercised: not yet — the existing test asserts absence without pinning that a
+frame was pending, and the shipped host cannot reach saturation at all.
+Guarantee: When `try_receive` declines because every lease is held, the queued
+frames are still deliverable, and releasing a lease makes the oldest one available
+again without loss or reordering.
+Check: `always-or-unreached` — at the declining return, require `conservation()`
+to report `receiver_leased == max_leases` and `published >= 1`; then release one
+lease and require the immediately following `try_receive` to return the frame
+whose sequence equals the pre-saturation `consumed + 1`. The window is exactly one
+call, because both gates are pure reads of state the release already updated.
+`always-or-unreached` because the saturation state is unreachable in the shipped
+host: `receive_one` holds at most one of eight leases and releases it on every
+path.
+Fault/timing angle: no race — the counter is incremented and decremented by the
+same thread-confined receiver. The hazard is representational: the declining
+return is used both for saturation (`ring.rs:772-776`) and for an empty ring
+(`:782-783`), and the saturation gate is taken before `consumed` or `published` is
+read at all, so the value carries no reason.
+Required faults and enabling state: a profile whose `max_leases` is reachable and
+strictly greater than one, plus at least one frame published beyond the leased
+set, which requires `descriptor_depth > max_leases`. Without the second, the
+emptiness gate fires first and the check proves nothing. Coverage marker
+`shm_lease_saturation_observed_then_drained`.
+Confidence: high — [evidence](evidence/receive-resumes-when-lease-capacity-clears.md).
+Both gates and the single decrement site were read directly, and every
+`receive_one` return path in the host was traced to confirm one lease per call.
+Existing check: `lease_limit_reports_backpressure_then_recovers_after_release`
+(`tests/ring.rs:288-303`) against a profile with depth 2 and one lease. The
+recovery half is real; the saturation half asserts only absence. Status unaudited,
+and the oracle cannot distinguish saturation from an empty ring, which is the gap
+this record closes.
+Impact: a release-path defect leaves the lease counter pinned at the cap and every
+later receive returns what an idle channel returns. The endpoint keeps polling and
+no error, quarantine, or counter fires: the silent capacity-loss signature of
+`attach-reconciles-or-refuses-stale-shared-cursors`, reached with no crash.
+Open questions:
+- Does the addon receive path saturate where the Rust host cannot? It retains
+  leases deliberately, per the reachability analysis in
+  `release-authority-bound-to-lease-ownership`, so it is the one shipped consumer
+  that plausibly reaches the cap. Whether the property is latent or live depends
+  on that answer. (needs human input)
+
+### neither-direction-starves-the-other
+
+Type: liveness
+Status: active
+Exercised: not yet — no test has ever had frames in flight in both directions at
+once, so the alternation machinery is dead code under the existing traffic shape.
+Guarantee: Under simultaneous load in both directions, each direction keeps making
+progress, and once the offered load stops both directions drain.
+Check: `always`, in two arms. Ratio: while both directions are offered
+continuously, neither may complete fewer than one frame per K completions of the
+other, with K derived from `frame_deadline / POLL_INTERVAL` and recorded in the
+test. Bounded drain: stop offering both ways, poll until stable within an explicit
+bound, then require both queues empty, all descriptors free on both rings, and no
+close reported, strictly inside the bound. The stalls below are bounded rather
+than deadlocks, so an unbounded formulation would be both weaker and unrefutable.
+Fault/timing angle: two asymmetric mechanisms, both on one task on one dedicated
+thread with its own current-thread runtime. Outbound blocks inbound: `publish_one`
+is synchronous and spins inside `Ring::reserve_until` with no await point, for up
+to `frame_deadline`, during which no receive runs. Inbound blocks outbound: the
+inbound send is awaited with no timeout and no enclosing select, so it parks until
+the application drains. Neither is infinite: the first ends in an unclean close,
+the second in the sender's own admission timeout.
+Required faults and enabling state: genuine overlap, plus capacity pressure on one
+lane. The peer harness cannot produce overlap today, because its send and receive
+are both synchronous and thread-confined. Coverage marker
+`shm_both_directions_in_flight`, recorded as `duplex-overlap-is-reached`.
+Confidence: high — [evidence](evidence/neither-direction-starves-the-other.md).
+The comment at `shm_provider.rs:508-512` claims the directions alternate so a peer
+refilling the inbound ring cannot starve responses and close frames. That claim is
+accurate for the case it describes, since every received frame is followed by one
+non-blocking outbound poll and the ingress-budget wait also services outbound, and
+it does not cover either blocking path above.
+Existing check: none. Every shared-memory host test is lockstep: each peer send is
+immediately followed by a peer receive, five times in the main negotiation test.
+The transport's own two-process test is one ring in one direction.
+Impact: one direction's pressure ends the other's progress, and the symptom is a
+retired generation or an unclean close attributed to the transport. Because the
+endpoint owns its thread and runtime, the damage is confined to the opposite lane
+rather than other host tasks, which is also why no existing test would notice.
+Open questions:
+- What is the normative service ratio? `frame_deadline` is caller-supplied, so the
+  worst case cannot be derived from this crate and a test must pin it from its own
+  configuration. (needs human input)
+- Should the inbound send be bounded, or is the sender-side admission timeout the
+  intended backstop? The two give different failure attributions for one cause.
+  (needs human input)
+
+### reclamation-keeps-pace-with-completion
+
+Type: liveness
+Status: active
+Exercised: not yet — the existing FIFO test recovers with a one-byte request,
+which one reclaimed sequence out of two satisfies.
+Guarantee: With no lease retained, one producer reserve attempt returns every
+completed sequence's descriptor slot and arena bytes, not one sequence at a time.
+Check: `always` — build a non-contiguous completed prefix of length at least two
+behind a retained lease, witness the shape by asserting `release_pending == 2` and
+`receiver_leased == 1`, release the retained lease, then perform exactly one
+`try_reserve` and require `free == descriptor_depth` and
+`bytes.free == arena_bytes`. Request a frame that only fits if every sequence was
+reclaimed, so the assertion has a witness independent of the derived `bytes.free`.
+The obligation applies whenever the prefix is contiguous; head-of-line blocking
+under a retained lease is documented behaviour rather than a violation. The window
+is counted in producer reserve attempts, not wall-clock, because `try_reserve` is
+the only caller of `reclaim_completed`.
+Fault/timing angle: no race; both cursors are producer-owned and written only in
+`reclaim_completed`. The break at the first gap is the head-of-line mechanism, and
+`reserve_until` masks a per-pass reclaimer entirely because each retry is another
+pass, so the check must use a bare `try_reserve`.
+Required faults and enabling state: a retained lease with at least two released
+sequences behind it, situation `shm_arena_wrap_with_live_lease`, then the release.
+Confidence: high — [evidence](evidence/reclamation-keeps-pace-with-completion.md).
+The loop at `ring.rs:1110-1150` has exactly three exits, so one call drains the
+whole contiguous prefix; both refusal gates it feeds are the outstanding-versus-depth
+comparison and insufficient contiguous arena capacity.
+Existing check: `retained_oldest_lease_enforces_fifo_reclamation_and_release_validation`
+(`tests/ring.rs:148-219`). The blocking half is good. The recovery half releases
+the retained lease and asserts a one-byte reserve succeeds; with a 64 MiB arena
+fully charged, a reclaimer advancing only the first sequence leaves 40 MiB, where
+one byte fits just as well. Status unaudited.
+Impact: capacity would return one sequence per producer attempt while accounting
+stays self-consistent. Convergence still happens under `reserve_until`, so only
+the size class breaks: a large-frame request is refused while the arena is mostly
+reclaimable, reporting `Deadline` on a healthy channel.
+Open questions: None. The question that opened this record, whether one call
+drains the whole prefix, is resolved by direct read of the loop's exits.
+
+### lease-saturation-is-reached-then-drains
+
+Type: reachability
+Status: active
+Exercised: not yet — reached once, in one synthetic profile, at a cap of one,
+which cannot distinguish being at the cap from holding one lease.
+Guarantee: A campaign actually reaches a state where every receive lease is held
+while at least one further frame is published and unacquired, and later observes
+that state clear.
+Check: `sometimes` — emit `shm_lease_saturation_observed_then_drained` where one
+`conservation()` snapshot shows `receiver_leased == max_leases` and
+`published >= 1`, and a later snapshot shows `receiver_leased < max_leases`. Both
+facts in the first snapshot are legal on a correct system, since a full lease set
+is backpressure rather than a fault, and the second is ordinary progress, so the
+marker fires without a defect. It is not the negation of any `always` check here:
+the violation it pairs with, receive never resuming, is a distinct predicate
+asserted separately. This refines the earlier `shm_lease_set_saturated` marker in
+`fault-map.md`, which does not witness that anything was waiting; treat the older
+name as superseded rather than emitting both.
+Fault/timing angle: no race, since one thread-confined receiver both mutates and
+reads the counter. What matters is ordering between the halves: the snapshot must
+be taken at the declining return, not before the last acquire and not after the
+first release.
+Required faults and enabling state: none. A profile whose `max_leases` is
+reachable and strictly greater than one, with `descriptor_depth > max_leases` so
+the extra publication has a slot. The existing lease-limited profile satisfies the
+second but not the first, so a new profile is required rather than a reuse.
+Confidence: high — [evidence](evidence/lease-saturation-is-reached-then-drains.md).
+Both halves are observable in one existing `conservation()` snapshot, so the
+marker needs no new instrumentation, and the shipped host cannot reach the state
+at all: `max_leases` is 8 while `receive_one` holds at most one lease per call,
+releasing it on every path.
+Existing check: none as a coverage marker. The lease-limit test constructs and
+drains the state at a cap of one, so the situation is reached but not witnessed.
+Impact: without this marker,
+`receive-resumes-when-lease-capacity-clears` reports a pass that means the gate
+declined for the other reason, an empty ring, which is exactly the ambiguity that
+made the existing assertion weak. A never-fired marker is itself the finding: it
+reports that the shipped host configuration cannot exercise lease backpressure at
+all.
+Open questions:
+- Should a second profile with a cap above one be added purely to make this
+  situation reachable, or should the eight-lease cap be reconsidered given that no
+  shipped consumer can approach it? (needs human input)
+
+### duplex-overlap-is-reached
+
+Type: reachability
+Status: active
+Exercised: not yet — zero coverage in the Rust suites, and the peer harness cannot
+construct the situation at all.
+Guarantee: A campaign actually reaches an interval in which both directions of the
+duplex pair have a frame in flight simultaneously.
+Check: `sometimes` — emit `shm_both_directions_in_flight` where a monotone
+triple-sample (sample the first ring, then the second, then the first again,
+accepting only if the first ring's in-flight count was non-zero in both of its
+samples) shows a non-zero in-flight count on each ring for the same interval.
+In-flight means a slot past producer-reserved and not yet reclaimed, counted per
+ring by `conservation()`. Both facts are ordinary states of a working duplex
+channel, so the marker fires on a correct implementation. It is not the negation
+of any `always` check here: the violation it enables observing, one direction
+making no progress, is asserted separately in
+`neither-direction-starves-the-other`.
+Fault/timing angle: the situation is instantaneous overlap, and the two rings are
+independent objects with no shared cursor, so there is no atomic way to sample
+both. A naive sequential pair can report overlap that never existed if a frame
+completes between the reads, which is why the monotone construction is part of the
+check rather than an implementation note.
+Required faults and enabling state: none; every state observed is one a healthy
+duplex channel occupies constantly. What is required is a peer that can hold
+frames outstanding both ways, which today means independent send and receive
+threads or non-blocking variants.
+Confidence: high — [evidence](evidence/duplex-overlap-is-reached.md).
+Every shared-memory host test, the transport's two-process test, and the soak
+harness were read: all are lockstep, single-direction, or resource-counter based.
+That also established that two endpoint-loop paths, the post-receive outbound poll
+and the outbound service inside the ingress-budget wait, are unreachable under the
+existing traffic shape.
+Existing check: none. In the main negotiation test each peer send is immediately
+followed by a peer receive, so two frames are never outstanding in opposite
+directions.
+Impact: without this marker, `neither-direction-starves-the-other` is vacuous: its
+ratio arm evaluates a condition over an empty set and its drain arm degrades into
+a plain round-trip test the suite already performs. A never-fired marker reports a
+harness gap rather than an implementation defect, which is the honest reading.
+Open questions:
+- Do the addon or TypeScript client suites already drive both directions
+  concurrently? They were not examined, so the harness gap may be narrower than
+  stated.
+- Should the marker distinguish overlap below capacity, which exercises the
+  alternation, from overlap with the outbound lane at capacity, which is the only
+  state making the starvation property refutable?
+
+---
+
+## Relationship map
+
+Grouped by shared mechanism, with suspected dominance noted where one property
+holding would make another likely to hold. Dominance is a hypothesis, not proof.
+
+- **Shared peer-writable control pages.** `quarantine-authority-survives-peer-writes`,
+  `reclaim-advance-bounded-by-the-producer-reservation`,
+  `attach-reconciles-or-refuses-stale-shared-cursors`,
+  `reservation-charge-visible-with-non-free-state`. All four trace to one
+  decision: a single object mapped read-write by both roles with no
+  `F_SEAL_WRITE` and no per-role read-only region. A control-page write-protection
+  split would likely dominate the first and third.
+- **Quarantine as the terminal state.** `quarantine-gates-cover-every-storage-mutation`,
+  `attach-refuses-a-quarantined-object`, `quarantine-authority-survives-peer-writes`.
+  If quarantine authority is not peer-clearable, the other two still stand
+  independently; the reverse is not true.
+- **Charge conservation.** `quarantine-charge-transition-is-atomic`,
+  `charge-release-never-silently-strands`, `custody-terminal-transition-exactly-once`,
+  `release-failure-is-observable`. The first three are the three distinct ways an
+  accounting transition can lose a charge; the fourth is why none of them would
+  be noticed.
+- **Exactly-once completion.** `release-exactly-once-per-sequence` dominates
+  `release-authority-bound-to-lease-ownership` only for *duplicate* releases; it
+  says nothing about a *first* release by the wrong party, which is the actual
+  gap.
+- **Crash leaves shared state behind.** `attach-reconciles-or-refuses-stale-shared-cursors`,
+  `crashed-producer-does-not-wedge-the-sequence`,
+  `dead-peer-charges-are-reclaimed-or-declared`. Same root: no liveness signal
+  and no reconciliation path. All three surface as backpressure codes rather
+  than faults.
+- **One value, several hand-maintained copies.** `one-profile-name-denotes-one-geometry`,
+  `attach-binds-geometry-to-a-local-profile`,
+  `negative-tests-fail-for-their-stated-reason`. Defect `daf6e244` is the worked
+  example of this cluster causing a silent test degradation.
+- **Evidence that cannot detect its own failure.** `operation-counters-are-observed-not-declared`,
+  `measured-transfer-is-witnessed-by-the-data`, `traceability-pointers-resolve`,
+  `negative-tests-fail-for-their-stated-reason`. These share a shape: an artifact
+  that reports success without observing the thing it claims to measure.
+- **Documented but not driven.** `documented-close-order-has-a-production-driver`,
+  `clean-reclamation-is-reachable`, `capability-probe-gates-every-advertised-mechanism`.
+  Each has a passing or partial traceability status attached to a mechanism that
+  production does not reach or does not gate.
