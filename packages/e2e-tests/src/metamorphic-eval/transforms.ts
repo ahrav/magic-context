@@ -7,7 +7,7 @@ import {
     normalizeContent,
     normalizedEvidenceMessages,
     parseScenario,
-    predicateMatches,
+    type ContentPredicate,
     type GoldExpectations,
     type HistorianEvalScenario,
     type TranscriptTurn,
@@ -183,8 +183,8 @@ function messageKey(turnIndex: number, role: "user" | "assistant"): string {
  * the messages the occurrence actually crosses rather than an approximation from
  * turn boundaries.
  */
-function absentMatchSpans(
-    expectedAbsent: HistorianEvalScenario["gold"]["expectedAbsent"],
+function matchSpans(
+    entries: readonly { id: string; predicate: ContentPredicate }[],
     turns: readonly TranscriptTurn[],
 ): string[] {
     const messages = normalizedEvidenceMessages(turns);
@@ -201,15 +201,15 @@ function absentMatchSpans(
     }
     const evidence = messages.map((message) => message.text).join(" ");
     const matches: string[] = [];
-    for (const absent of expectedAbsent) {
-        const needle = normalizeContent(absent.predicate.value);
+    for (const entry of entries) {
+        const needle = normalizeContent(entry.predicate.value);
         if (needle.length === 0) continue;
         for (let at = evidence.indexOf(needle); at !== -1; at = evidence.indexOf(needle, at + 1)) {
             const matchEnd = at + needle.length;
             const crossed = spans
                 .filter((span) => span.start < matchEnd && at < span.end)
                 .map((span) => span.key);
-            matches.push(`${absent.id}|${crossed.join(",")}`);
+            matches.push(`${entry.id}|${crossed.join(",")}`);
         }
     }
     return matches;
@@ -218,7 +218,7 @@ function absentMatchSpans(
 /** Messages that authored negative evidence runs through. */
 function absentEvidenceMessages(scenario: HistorianEvalScenario): Set<string> {
     return new Set(
-        absentMatchSpans(scenario.gold.expectedAbsent, scenario.transcript.turns).flatMap((match) =>
+        matchSpans(scenario.gold.expectedAbsent, scenario.transcript.turns).flatMap((match) =>
             match.slice(match.indexOf("|") + 1).split(","),
         ),
     );
@@ -229,6 +229,13 @@ function absentEvidenceTurnIndexes(scenario: HistorianEvalScenario): Set<number>
     return new Set(
         [...absentEvidenceMessages(scenario)].map((key) => Number(key.slice(0, key.indexOf(":")))),
     );
+}
+
+/** One turn reduced to what the historian receives from it. */
+function visibleTurnPayload(turn: TranscriptTurn): string {
+    return normalizedEvidenceMessages([turn])
+        .map((message) => `${message.role}:${message.text}`)
+        .join("\n");
 }
 
 function eligibleMessages(scenario: HistorianEvalScenario): EligibleMessage[] {
@@ -310,10 +317,10 @@ function preservesAbsentEvidence(
     turnMap: readonly number[],
 ): boolean {
     const remaining = new Map<string, number>();
-    for (const match of absentMatchSpans(scenario.gold.expectedAbsent, turns)) {
+    for (const match of matchSpans(scenario.gold.expectedAbsent, turns)) {
         remaining.set(match, (remaining.get(match) ?? 0) + 1);
     }
-    for (const match of absentMatchSpans(scenario.gold.expectedAbsent, scenario.transcript.turns)) {
+    for (const match of matchSpans(scenario.gold.expectedAbsent, scenario.transcript.turns)) {
         const separator = match.indexOf("|");
         const expected = `${match.slice(0, separator)}|${match
             .slice(separator + 1)
@@ -366,7 +373,7 @@ const paraphraseIrrelevant: Transform = {
     apply(scenario, rawSeed) {
         const seed = normalizedSeed(rawSeed);
         const rewrites = [
-            (text: string) => `For context, ${text.charAt(0).toLowerCase()}${text.slice(1)}`,
+            (text: string) => `For context, ${text}`,
             (text: string) => `${text} This is background context only.`,
             (text: string) => `As background: ${text}`,
         ];
@@ -402,13 +409,15 @@ const paraphraseIrrelevant: Transform = {
 /**
  * Whether rewriting `message` to `text` leaves the scenario's evidence intact.
  *
- * Three ways a framing rewrite can invalidate the comparison: it can outgrow the
- * per-message ceiling, it can insert framing between the halves of a forbidden
- * formation authored across a message boundary, and its own wording can state a
- * probe's gold answer. The last one is the quiet failure — the answer then sits
- * in raw history the probe still sees, so the probe can copy it without the
- * injected claim and a passing run overstates accuracy on a source that was
- * leakage-free.
+ * Four ways framing can invalidate the comparison. It can outgrow the per-message
+ * ceiling. It can separate the halves of a forbidden formation authored across a
+ * message boundary. Its own wording can state a probe's gold answer, which is the
+ * quiet one — the answer then sits in raw history the probe still reads, so the
+ * probe can copy it without the injected claim and a passing run overstates
+ * accuracy on a source that was leakage-free. And its wording can satisfy an
+ * expected-claim predicate, which authors gold evidence outside the range that
+ * declares it and changes what the historian may legitimately promote; a
+ * `claim-id` probe has no answer to collide with, so only this check catches it.
  */
 function safeParaphrase(
     scenario: HistorianEvalScenario,
@@ -418,6 +427,12 @@ function safeParaphrase(
     if (text.length > MAX_TURN_TEXT_CHARS) return false;
     const turns = replaceMessage(scenario.transcript.turns, message, text);
     if (!preservesAbsentEvidence(scenario, turns, scenario.transcript.turns.map((_, index) => index))) {
+        return false;
+    }
+    if (
+        matchSpans(scenario.gold.expectedClaims, turns).length >
+        matchSpans(scenario.gold.expectedClaims, scenario.transcript.turns).length
+    ) {
         return false;
     }
     return scenario.probes.every((probe) => {
@@ -441,13 +456,16 @@ const reorderIndependentTurns: Transform = {
             { length: scenario.transcript.epilogueStartIndex - 1 },
             (_, index) => [index, index + 1] as const,
         ).flatMap(([left, right]) => {
-            // Swapping two byte-identical turns yields the source transcript
-            // back. The derivative would differ only by its generated ID, so the
-            // comparison would score the baseline against itself and report
-            // metamorphic evidence it never gathered.
-            const leftTurn = scenario.transcript.turns[left]!;
-            const rightTurn = scenario.transcript.turns[right]!;
-            if (leftTurn.user === rightTurn.user && leftTurn.assistant === rightTurn.assistant) {
+            // Swapping two turns the historian receives identically produces the
+            // same model input, so the derivative would differ only in bytes the
+            // historian never sees and the comparison would score the baseline
+            // against itself. Compared on the cleaned view rather than the raw
+            // strings: two turns can differ only in a reminder block that
+            // production strips.
+            if (
+                visibleTurnPayload(scenario.transcript.turns[left]!) ===
+                visibleTurnPayload(scenario.transcript.turns[right]!)
+            ) {
                 return [];
             }
             const crossesProposalDecision =
@@ -561,12 +579,25 @@ const duplicateRejectedProposal: Transform = {
         const rejected = scenario.gold.expectedAbsent.filter(
             (absent) => absent.family === "proposed-but-rejected",
         );
+        // Turns the rejection evidence actually runs through in the text the
+        // historian receives. Matching the raw strings instead would select a
+        // turn whose only occurrence sits in a reminder block or directive
+        // production discards, duplicating a turn that carries no rejection at
+        // all — and `preservesAbsentEvidence` would still pass on the occurrence
+        // that lives elsewhere.
+        const rejectedTurns = new Set(
+            matchSpans(rejected, scenario.transcript.turns).flatMap((match) =>
+                match
+                    .slice(match.indexOf("|") + 1)
+                    .split(",")
+                    .map((key) => Number(key.slice(0, key.indexOf(":")))),
+            ),
+        );
         const protectedIndexes = protectedTurnIndexes(scenario);
         const candidates = scenario.transcript.turns.flatMap((turn, turnIndex) => {
             if (turnIndex >= scenario.transcript.epilogueStartIndex) return [];
             if (protectedIndexes.has(turnIndex)) return [];
-            const text = `${turn.user}\n${turn.assistant}`;
-            if (!rejected.some((absent) => predicateMatches(absent.predicate, text))) return [];
+            if (!rejectedTurns.has(turnIndex)) return [];
             const insertion = turnIndex + 1;
             const turnMap = scenario.transcript.turns.map((_, index) =>
                 index < insertion ? index : index + 1,
@@ -603,6 +634,21 @@ const duplicateRejectedProposal: Transform = {
 // commentlint: allow(JUDGE)
 const SYMBOL_RE = /`([^`]+)`|\b(?:[A-Za-z][A-Za-z0-9]*(?:[_./-][A-Za-z0-9]+)+|[a-z]+[A-Z][A-Za-z0-9]*|[A-Z]{2,})\b/g;
 
+// Inline code is not necessarily a name: a backtick span can hold a command or
+// an expression, and replacing the whole span would rewrite the instruction
+// rather than rename an entity. Admitted backtick contents must therefore
+// satisfy the same shape the unquoted alternatives accept.
+const QUOTED_SYMBOL_RE = /^(?:[A-Za-z][A-Za-z0-9]*(?:[_./-][A-Za-z0-9]+)+|[a-z]+[A-Z][A-Za-z0-9]*|[A-Z]{2,})$/;
+
+/** The renameable symbols of `text`, in match order. */
+function symbolsIn(text: string): string[] {
+    return [...text.matchAll(SYMBOL_RE)].flatMap((match) => {
+        const quoted = match[1];
+        if (quoted === undefined) return [match[0]];
+        return QUOTED_SYMBOL_RE.test(quoted) ? [quoted] : [];
+    });
+}
+
 const renameUnrelatedSymbols: Transform = {
     id: "rename-unrelated-symbols",
     version: 1,
@@ -611,33 +657,40 @@ const renameUnrelatedSymbols: Transform = {
         const seed = normalizedSeed(rawSeed);
         const messages = eligibleMessages(scenario);
         const eligibleKeys = new Set(messages.map((message) => `${message.turnIndex}:${message.role}`));
-        // Symbols that also occur in a message the rename cannot touch stay
-        // out of the candidate pool: renaming only some occurrences would name
-        // one entity two ways within the derivative transcript.
-        const blocked = new Set(
-            scenario.transcript.turns.flatMap((turn, turnIndex) =>
+        // Symbols that also occur in text the rename cannot touch stay out of the
+        // candidate pool: renaming only some occurrences would name one entity
+        // two ways. Probes count as untouchable text — a probe asking what
+        // `buildAPI` returns against a history that now says `aux_symbol_N`
+        // measures a broken query, not naming robustness.
+        const blocked = new Set([
+            ...scenario.transcript.turns.flatMap((turn, turnIndex) =>
                 (["user", "assistant"] as const).flatMap((role) =>
                     eligibleKeys.has(`${turnIndex}:${role}`)
                         ? []
-                        : [...turn[role].matchAll(SYMBOL_RE)].map((match) => match[1] ?? match[0]),
+                        : symbolsIn(turn[role]),
                 ),
             ),
+            ...scenario.probes.flatMap((probe) =>
+                [
+                    probe.question,
+                    probe.answerType === "claim-id" ? "" : probe.goldAnswer,
+                    ...(probe.answerType === "multiple-choice" ? probe.choices : []),
+                ].flatMap((text) => symbolsIn(text)),
+            ),
+        ]);
+        const candidates = [...new Set(messages.flatMap((message) => symbolsIn(message.text)))].filter(
+            (symbol) => !blocked.has(symbol),
         );
-        const candidates = [
-            ...new Set(messages.flatMap((message) =>
-                [...message.text.matchAll(SYMBOL_RE)].map((match) => match[1] ?? match[0])
-            )),
-        ].filter((symbol) => !blocked.has(symbol));
         if (candidates.length === 0) {
             return { applicable: false, reason: "no unrelated symbol to rename" };
         }
         const next = splitmix32(seed);
         const original = pick(candidates, next);
-        const existing = new Set(scenario.transcript.turns.flatMap((turn) =>
-            [turn.user, turn.assistant].flatMap((text) =>
-                [...text.matchAll(SYMBOL_RE)].map((match) => match[1] ?? match[0])
-            )
-        ));
+        const existing = new Set(
+            scenario.transcript.turns.flatMap((turn) =>
+                [turn.user, turn.assistant].flatMap((text) => symbolsIn(text)),
+            ),
+        );
         const replacementStart = Math.floor(next() * 10_000);
         let replacement: string | undefined;
         for (let offset = 0; offset < 10_000; offset += 1) {

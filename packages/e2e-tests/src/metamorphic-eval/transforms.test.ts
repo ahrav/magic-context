@@ -446,15 +446,131 @@ describe("metamorphic transforms", () => {
         });
     });
 
-    test("reorder refuses a pair of byte-identical turns", () => {
+    test("paraphrase never frames a message into expected-claim evidence", () => {
+        const raw = validScenarioRaw();
+        const gold = raw.gold as {
+            expectedClaims: Array<Record<string, unknown>>;
+        };
+        // The framing wording itself satisfies a gold predicate, so an unframed
+        // unprotected message would gain authoritative evidence. No probe
+        // references this claim, so no answer check can stand in for the claim
+        // check — which is also the case for a `claim-id` probe.
+        gold.expectedClaims.push({
+            id: "exp-background",
+            category: "ARCHITECTURE",
+            predicate: { kind: "normalized-substring", value: "background context" },
+            sourceTurnRange: [2, 2],
+        });
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[2]!.assistant = "Done: cache capacity is 4096 entries, recorded as background context.";
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "paraphrase-irrelevant")!;
+        const occurrences = (candidate: HistorianEvalScenario) =>
+            normalizeContent(authoredEvidenceText(candidate.transcript.turns)).split(
+                "background context",
+            ).length - 1;
+
+        for (let seed = 0; seed < 30; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            expect(occurrences(result.scenario), `seed ${seed}`).toBe(occurrences(scenario));
+        }
+    });
+
+    test("paraphrase framing does not recase a leading identifier", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[3]!.user = "MyFile.ts contains the helper.";
+        const scenario = parseScenario(raw);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "paraphrase-irrelevant")!;
+
+        for (let seed = 0; seed < 30; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            const rewritten = result.scenario.transcript.turns[3]!.user;
+            if (rewritten === scenario.transcript.turns[3]!.user) continue;
+            expect(rewritten, `seed ${seed}`).toContain("MyFile.ts");
+            expect(rewritten, `seed ${seed}`).not.toContain("myFile.ts");
+        }
+    });
+
+    test("duplication selects a turn whose rejection the historian receives", () => {
         const raw = validScenarioRaw();
         const transcript = raw.transcript as {
             turns: Array<{ user: string; assistant: string }>;
             epilogueStartIndex: number;
         };
+        // The rejection is authored in a protected turn; the only other raw
+        // occurrence sits in a reminder block production strips, so that turn
+        // carries no rejection the historian can see.
+        transcript.turns.unshift({
+            user: "<system-reminder>should we use Redis for the session cache</system-reminder> Unrelated background.",
+            assistant: "Noted.",
+        });
+        transcript.epilogueStartIndex += 1;
+        const gold = raw.gold as {
+            expectedClaims: Array<{ sourceTurnRange: [number, number] }>;
+        };
+        for (const claim of gold.expectedClaims) {
+            claim.sourceTurnRange = [claim.sourceTurnRange[0] + 1, claim.sourceTurnRange[1] + 1];
+        }
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "duplicate-rejected-proposal")!;
+
+        for (let seed = 0; seed < 20; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            expect(result.scenario.transcript.turns[1]!.user, `seed ${seed}`).not.toContain(
+                "system-reminder",
+            );
+        }
+    });
+
+    test("rename leaves inline commands and probe-referenced symbols alone", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[0]!.assistant = "We could consider it.";
+        turns[3] = {
+            user: "Wrapping up: run `npm test -- --watch` and check buildAPI plus aux_worker.ts.",
+            assistant: "Summary recorded.",
+        };
+        (raw.probes as Array<Record<string, unknown>>)[0] = {
+            id: "probe-capacity",
+            question: "What status does buildAPI return?",
+            answerType: "exact",
+            goldAnswer: "4096",
+            sourceClaimRef: "exp-cache-capacity",
+        };
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
+
+        let renamed = 0;
+        for (let seed = 0; seed < 40; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            const rewritten = result.scenario.transcript.turns[3]!.user;
+            expect(rewritten, `seed ${seed}`).toContain("`npm test -- --watch`");
+            expect(rewritten, `seed ${seed}`).toContain("buildAPI");
+            if (!rewritten.includes("aux_worker.ts")) renamed += 1;
+        }
+        // The one symbol neither a probe nor inline code claims is still renameable.
+        expect(renamed).toBeGreaterThan(0);
+    });
+
+    test("reorder refuses a pair the historian receives identically", () => {
+        const raw = validScenarioRaw();
+        const transcript = raw.transcript as {
+            turns: Array<{ user: string; assistant: string }>;
+            epilogueStartIndex: number;
+        };
+        // The two turns differ only inside a reminder block production strips,
+        // so the historian receives them identically.
         transcript.turns.unshift(
-            { user: "Background note.", assistant: "Noted." },
-            { user: "Background note.", assistant: "Noted." },
+            { user: "<system-reminder>first</system-reminder> Background note.", assistant: "Noted." },
+            { user: "<system-reminder>second</system-reminder> Background note.", assistant: "Noted." },
         );
         transcript.epilogueStartIndex += 2;
         const gold = raw.gold as { expectedClaims: Array<{ sourceTurnRange: [number, number] }> };
@@ -468,9 +584,11 @@ describe("metamorphic transforms", () => {
         for (let seed = 0; seed < 40; seed += 1) {
             const result = transform.apply(scenario, seed);
             if (!result.applicable) continue;
-            expect(result.scenario.transcript.turns, `seed ${seed}`).not.toEqual(
-                scenario.transcript.turns,
-            );
+            const visible = (candidate: HistorianEvalScenario) =>
+                normalizedEvidenceMessages(candidate.transcript.turns)
+                    .map((message) => message.text)
+                    .join("|");
+            expect(visible(result.scenario), `seed ${seed}`).not.toBe(visible(scenario));
         }
     });
 
