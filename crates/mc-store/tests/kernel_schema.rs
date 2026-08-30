@@ -11,6 +11,7 @@ const EXPECTED_COMPONENTS: &[&str] = &[
     "commit_log",
     "change_event",
     "outbox",
+    "outbox_publication",
     "operation_receipts",
     "durable_text_redactions",
     "writer_fence",
@@ -485,4 +486,53 @@ fn durable_text_redactions_is_digest_covered_normalized_metadata_with_restricted
         .unwrap(),
         1
     );
+}
+
+#[test]
+fn the_domains_ddl_spells_the_same_placeholder_the_code_compares_against() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, TEST_INCARNATION, 1_000).expect("bootstrap");
+
+    // The index and the trigger carry the placeholder as SQL text, so a change to the
+    // constant that missed the DDL would leave remediation exempt from neither.
+    let sites = conn
+        .prepare(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE tbl_name='domains' AND sql LIKE '%' || ?1 || '%'",
+        )
+        .unwrap()
+        .query_row([mc_store::kernel::OPERATOR_REDACTION_PLACEHOLDER], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+    assert_eq!(sites, 2);
+}
+
+#[test]
+fn staging_terminal_state_columns_reject_values_outside_the_vocabulary() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, TEST_INCARNATION, 1_000).expect("bootstrap");
+    conn.execute_batch(
+        "INSERT INTO commit_log(commit_seq,transaction_id,writer_epoch,recorded_at,actor,cause)
+         VALUES(1,'t1',1,1,'test','proof');
+         INSERT INTO extraction_runs(
+             extraction_run_id,extractor,sensitivity_class,provenance_witness,
+             redaction_metadata,started_at,heartbeat_at,lease_expires_at
+         ) VALUES('run','fixture','normal',x'00',x'00',1,1,2);",
+    )
+    .unwrap();
+
+    for state in ["completed", "failed", "canceled", "abandoned"] {
+        conn.execute(
+            "UPDATE extraction_runs SET terminal_state=?1,terminal_at=5",
+            [state],
+        )
+        .unwrap();
+    }
+    assert!(conn
+        .execute(
+            "UPDATE extraction_runs SET terminal_state='done',terminal_at=5",
+            [],
+        )
+        .is_err());
 }

@@ -1,16 +1,24 @@
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, OptionalExtension, Transaction};
 
-use super::envelope::{check_fence, Envelope, ObjectRow, PendingChange, Sensitivity};
+use super::envelope::{Envelope, ObjectRow, PendingChange, Sensitivity};
 use super::redaction::{redact, RedactedField};
+use super::retention::begin_fenced_write;
 use super::{KernelError, KernelStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutboxPruneResult {
+    /// Rows at or below this `commit_seq` were deleted; the bound is inclusive.
     pub horizon: i64,
     pub deleted: usize,
 }
 
 impl Envelope<'_> {
+    /// `consumer_id` is the primary key of `outbox_consumers`, so redaction has to leave it unchanged. Two ids differing only inside a redacted span would collapse onto one row, and one consumer's acknowledgement would then advance the other's prune horizon.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [`KernelError::InvalidInput`] when `recorded_at` is negative, `consumer_id` is empty, or redaction rewrites `consumer_id`.
+    /// - Returns [`KernelError::Conflict`] when the consumer is already registered.
     pub fn register_outbox_consumer(
         &mut self,
         consumer_id: &str,
@@ -19,7 +27,11 @@ impl Envelope<'_> {
         if recorded_at < 0 || consumer_id.trim().is_empty() {
             return Err(KernelError::InvalidInput);
         }
-        let consumer_id = redact(consumer_id);
+        let redacted = redact(consumer_id);
+        if redacted.text != consumer_id {
+            return Err(KernelError::InvalidInput);
+        }
+        let consumer_id = redacted;
         let oldest_commit = self
             .tx
             .query_row("SELECT MIN(commit_seq) FROM outbox", [], |row| {
@@ -27,7 +39,7 @@ impl Envelope<'_> {
             })
             .map_err(|_| KernelError::Io)?;
         let checkpoint = match oldest_commit {
-            Some(commit_seq) => commit_seq.saturating_sub(1).max(0),
+            Some(commit_seq) => commit_seq.saturating_sub(1),
             None => self.pre_operation_tip()?,
         };
         self.tx
@@ -37,23 +49,32 @@ impl Envelope<'_> {
                 params![consumer_id.text, checkpoint, recorded_at],
             )
             .map_err(|error| match error {
-                rusqlite::Error::SqliteFailure(_, _) => KernelError::Conflict,
+                rusqlite::Error::SqliteFailure(code, _)
+                    if code.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    KernelError::Conflict
+                }
                 _ => KernelError::Io,
             })?;
-        let audit_owner_id = consumer_id.text.clone();
+        let audit = serde_json::json!({
+            "consumer_id": consumer_id.text.clone(),
+            "checkpoint_commit_seq": checkpoint,
+            "recorded_at": recorded_at,
+        });
         self.push_control_change(
-            &audit_owner_id,
+            consumer_id.text.clone(),
             "consumer_register",
-            serde_json::json!({
-                "consumer_id": consumer_id.text.clone(),
-                "checkpoint_commit_seq": checkpoint,
-                "recorded_at": recorded_at,
-            }),
+            audit,
             vec![("consumer_id".to_string(), consumer_id)],
         );
         Ok(checkpoint)
     }
 
+    /// # Errors
+    ///
+    /// - Returns [`KernelError::InvalidInput`] when `recorded_at` is negative or `consumer_id` is empty.
+    /// - Returns [`KernelError::NotFound`] when the consumer is not registered.
+    /// - Returns [`KernelError::ConsumerPending`] when the consumer checkpoint is below the pre-operation tip.
     pub fn deregister_outbox_consumer(
         &mut self,
         consumer_id: &str,
@@ -69,20 +90,24 @@ impl Envelope<'_> {
                 [consumer_id.text.as_str()],
             )
             .map_err(|_| KernelError::Io)?;
-        let audit_owner_id = consumer_id.text.clone();
+        let audit = serde_json::json!({
+            "consumer_id": consumer_id.text.clone(),
+            "checkpoint_commit_seq": checkpoint,
+            "recorded_at": recorded_at,
+        });
         self.push_control_change(
-            &audit_owner_id,
+            consumer_id.text.clone(),
             "consumer_deregister",
-            serde_json::json!({
-                "consumer_id": consumer_id.text.clone(),
-                "checkpoint_commit_seq": checkpoint,
-                "recorded_at": recorded_at,
-            }),
+            audit,
             vec![("consumer_id".to_string(), consumer_id)],
         );
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// - Returns [`KernelError::InvalidInput`] when `abandoned_at` is negative, or when `consumer_id`, `operator_id`, or `reason` is empty.
+    /// - Returns [`KernelError::NotFound`] when the consumer is not registered.
     pub fn abandon_outbox_consumer(
         &mut self,
         consumer_id: &str,
@@ -90,10 +115,10 @@ impl Envelope<'_> {
         reason: &str,
         abandoned_at: i64,
     ) -> Result<(), KernelError> {
-        let (consumer_id, checkpoint) = self.consumer_checkpoint(consumer_id, abandoned_at)?;
         if operator_id.trim().is_empty() || reason.trim().is_empty() {
             return Err(KernelError::InvalidInput);
         }
+        let (consumer_id, checkpoint) = self.consumer_checkpoint(consumer_id, abandoned_at)?;
         let operator_id = redact(operator_id);
         let reason = redact(reason);
         let abandonment_id = format!("{}:{}", self.commit_seq, consumer_id.text);
@@ -120,17 +145,17 @@ impl Envelope<'_> {
                 [consumer_id.text.as_str()],
             )
             .map_err(|_| KernelError::Io)?;
-        let audit_owner_id = consumer_id.text.clone();
+        let audit = serde_json::json!({
+            "consumer_id": consumer_id.text.clone(),
+            "checkpoint_commit_seq": checkpoint,
+            "operator_id": operator_id.text.clone(),
+            "reason": reason.text.clone(),
+            "abandoned_at": abandoned_at,
+        });
         self.push_control_change(
-            &audit_owner_id,
+            consumer_id.text.clone(),
             "consumer_abandon",
-            serde_json::json!({
-                "consumer_id": consumer_id.text.clone(),
-                "checkpoint_commit_seq": checkpoint,
-                "operator_id": operator_id.text.clone(),
-                "reason": reason.text.clone(),
-                "abandoned_at": abandoned_at,
-            }),
+            audit,
             vec![
                 ("consumer_id".to_string(), consumer_id),
                 ("operator_id".to_string(), operator_id),
@@ -174,18 +199,18 @@ impl Envelope<'_> {
 
     fn push_control_change(
         &mut self,
-        object_id: &str,
+        object_id: String,
         kind: &'static str,
         audit: serde_json::Value,
         redactions: Vec<(String, RedactedField)>,
     ) {
         self.changes.push(PendingChange {
             object: ObjectRow {
-                object_id: object_id.to_string(),
+                source_id: object_id.clone(),
+                object_id,
                 object_kind: "outbox_consumer".to_string(),
                 domain_id: "kernel-control".to_string(),
                 source_kind: "kernel-control".to_string(),
-                source_id: object_id.to_string(),
                 source_revision: 0,
                 created_commit_seq: self.commit_seq,
                 invalidated_commit_seq: None,
@@ -201,31 +226,51 @@ impl Envelope<'_> {
 }
 
 impl KernelStore {
+    /// The watermark lives in `outbox_publication` rather than being derived from surviving `outbox` rows, so a publisher whose acknowledgement round trip was lost can repeat the same position after those rows are pruned.
+    ///
+    /// A position at or below the stored watermark counts as already published and skips the commit-boundary check.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [`KernelError::InvalidInput`] when `outbox_position` is below 1 or `published_at` is negative.
+    /// - Returns [`KernelError::InvalidCheckpoint`] when the position is above the watermark and is not the last row of its commit.
     pub fn mark_outbox_published_through(
         &self,
         outbox_position: i64,
         published_at: i64,
     ) -> Result<(), KernelError> {
         if outbox_position < 1 || published_at < 0 {
-            return Err(KernelError::InvalidCheckpoint);
+            return Err(KernelError::InvalidInput);
         }
         let mut writer = self.lock_writer()?;
-        let tx = writer
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|_| KernelError::Io)?;
-        check_fence(&tx, self.lease_epoch())?;
-        if !is_outbox_commit_boundary(&tx, outbox_position)? {
+        let tx = begin_fenced_write(&mut writer, self.lease_epoch())?;
+        let watermark = published_watermark(&tx)?;
+        if outbox_position > watermark && !is_outbox_commit_boundary(&tx, outbox_position)? {
             return Err(KernelError::InvalidCheckpoint);
         }
         tx.execute(
-            "UPDATE outbox SET published_at=COALESCE(published_at,?1)
-             WHERE outbox_position<=?2",
+            "UPDATE outbox SET published_at=?1
+             WHERE outbox_position<=?2 AND published_at IS NULL",
             params![published_at, outbox_position],
+        )
+        .map_err(|_| KernelError::Io)?;
+        tx.execute(
+            "INSERT INTO outbox_publication(id,published_through_position,published_at)
+             VALUES (0,?1,?2)
+             ON CONFLICT(id) DO UPDATE SET
+                 published_through_position=MAX(published_through_position,?1),
+                 published_at=MAX(published_at,?2)",
+            params![outbox_position, published_at],
         )
         .map_err(|_| KernelError::Io)?;
         tx.commit().map_err(|_| KernelError::Io)
     }
 
+    /// # Errors
+    ///
+    /// - Returns [`KernelError::InvalidInput`] when `consumer_id` is empty or a timestamp is negative.
+    /// - Returns [`KernelError::NotFound`] when the consumer is not registered.
+    /// - Returns [`KernelError::InvalidCheckpoint`] when the checkpoint moves backwards or names no committed sequence.
     pub fn acknowledge_outbox(
         &self,
         consumer_id: &str,
@@ -233,14 +278,11 @@ impl KernelStore {
         updated_at: i64,
     ) -> Result<(), KernelError> {
         if consumer_id.trim().is_empty() || checkpoint_commit_seq < 0 || updated_at < 0 {
-            return Err(KernelError::InvalidCheckpoint);
+            return Err(KernelError::InvalidInput);
         }
         let consumer_id = redact(consumer_id);
         let mut writer = self.lock_writer()?;
-        let tx = writer
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|_| KernelError::Io)?;
-        check_fence(&tx, self.lease_epoch())?;
+        let tx = begin_fenced_write(&mut writer, self.lease_epoch())?;
         let current = tx
             .query_row(
                 "SELECT checkpoint_commit_seq FROM outbox_consumers WHERE consumer_id=?1",
@@ -250,13 +292,6 @@ impl KernelStore {
             .optional()
             .map_err(|_| KernelError::Io)?
             .ok_or(KernelError::NotFound)?;
-        let tip = tx
-            .query_row(
-                "SELECT COALESCE(MAX(commit_seq),0) FROM commit_log",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(|_| KernelError::Io)?;
         let is_existing_commit = checkpoint_commit_seq == current
             || tx
                 .query_row(
@@ -265,7 +300,7 @@ impl KernelStore {
                     |row| row.get::<_, bool>(0),
                 )
                 .map_err(|_| KernelError::Io)?;
-        if checkpoint_commit_seq < current || checkpoint_commit_seq > tip || !is_existing_commit {
+        if checkpoint_commit_seq < current || !is_existing_commit {
             return Err(KernelError::InvalidCheckpoint);
         }
         tx.execute(
@@ -278,12 +313,14 @@ impl KernelStore {
         tx.commit().map_err(|_| KernelError::Io)
     }
 
+    /// Registered consumers bound the horizon; publication does not. A publisher that needs its own rows retained registers as a consumer, because `published_at` records progress without holding rows back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::NoRequiredConsumers`] when no consumer is registered, since an empty consumer set names no safe horizon.
     pub fn prune_outbox(&self) -> Result<OutboxPruneResult, KernelError> {
         let mut writer = self.lock_writer()?;
-        let tx = writer
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|_| KernelError::Io)?;
-        check_fence(&tx, self.lease_epoch())?;
+        let tx = begin_fenced_write(&mut writer, self.lease_epoch())?;
         let horizon = tx
             .query_row(
                 "SELECT MIN(checkpoint_commit_seq) FROM outbox_consumers",
@@ -308,8 +345,19 @@ impl KernelStore {
     }
 }
 
+fn published_watermark(tx: &Transaction<'_>) -> Result<i64, KernelError> {
+    tx.query_row(
+        "SELECT published_through_position FROM outbox_publication WHERE id=0",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .map(|value| value.unwrap_or(0))
+    .map_err(|_| KernelError::Io)
+}
+
 fn is_outbox_commit_boundary(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Transaction<'_>,
     outbox_position: i64,
 ) -> Result<bool, KernelError> {
     tx.query_row(

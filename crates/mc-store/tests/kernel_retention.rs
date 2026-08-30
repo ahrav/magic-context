@@ -3,7 +3,7 @@
 use mc_store::kernel::{
     CommitIntent, DomainSpec, KernelErrorKind, KernelStore, RemediationTarget,
     RepositoryProvenance, Sensitivity, StagingCandidateSpec, StagingTerminalState,
-    OPERATOR_REDACTION_PLACEHOLDER,
+    OPERATOR_REDACTION_PLACEHOLDER, STAGING_RETENTION_MS,
 };
 use rusqlite::{Connection, OpenFlags};
 
@@ -59,17 +59,9 @@ fn first_day_31_sweep_abandons_incomplete_run_without_deleting_it() {
     store
         .stage_candidate(candidate("run", "candidate", 0))
         .unwrap();
-    assert_eq!(
-        store
-            .renew_staging_run("run", 2, 2 + HOUR_MS + 1)
-            .unwrap_err()
-            .kind(),
-        KernelErrorKind::InvalidInput
-    );
-
     let now = 31 * DAY_MS;
     let result = store.run_staging_maintenance(now).unwrap();
-    assert_eq!(result.abandoned, 1);
+    assert_eq!(result.abandoned_runs, 1);
     assert_eq!(result.deleted_runs, 0);
     let connection = inspect(directory.path());
     let run: (String, i64) = connection
@@ -146,9 +138,11 @@ fn completed_staging_survives_day_29_and_is_deleted_day_31() {
             .kind(),
         KernelErrorKind::Conflict
     );
+    // One millisecond short of the cutoff, so a retention window longer or shorter than
+    // STAGING_RETENTION_MS fails one of the two assertions.
     assert_eq!(
         store
-            .run_staging_maintenance(30 * DAY_MS)
+            .run_staging_maintenance(DAY_MS + STAGING_RETENTION_MS - 1)
             .unwrap()
             .deleted_runs,
         0
@@ -163,13 +157,18 @@ fn completed_staging_survives_day_29_and_is_deleted_day_31() {
     );
     assert_eq!(
         store
-            .run_staging_maintenance(32 * DAY_MS)
+            .run_staging_maintenance(DAY_MS + STAGING_RETENTION_MS)
             .unwrap()
             .deleted_runs,
         1
     );
     let connection = inspect(directory.path());
-    for table in ["extraction_runs", "candidates", "candidate_scores"] {
+    for table in [
+        "extraction_runs",
+        "candidates",
+        "candidate_scores",
+        "durable_text_redactions",
+    ] {
         assert_eq!(
             connection
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -207,7 +206,14 @@ fn staging_cleanup_preserves_exact_denormalized_admission_facts() {
         .unwrap();
     drop(connection);
 
-    let _store = KernelStore::open(directory.path()).unwrap();
+    // Deletion is caller-driven, so drive it past the retention cutoff rather than relying on open.
+    let store = KernelStore::open(directory.path()).unwrap();
+    assert_eq!(
+        store
+            .delete_aged_staging_runs(DAY_MS + STAGING_RETENTION_MS)
+            .unwrap(),
+        1
+    );
     let connection = inspect(directory.path());
     let source_facts: (Option<String>, String, String, i64, String, String) = connection
         .query_row(
@@ -416,5 +422,385 @@ fn remediation_supports_two_live_domains_and_keeps_receipt_as_caller_result() {
             )
             .unwrap(),
         "remediated"
+    );
+}
+
+const AWS_KEY: &str = "AKIAFFFFFFFFFFFFFFFF";
+
+fn secret_candidate(recorded_at: i64) -> StagingCandidateSpec {
+    let mut spec = candidate(
+        &format!("run-{AWS_KEY}"),
+        &format!("cand-{AWS_KEY}"),
+        recorded_at,
+    );
+    spec.payload = format!("payload-{AWS_KEY}");
+    spec
+}
+
+#[test]
+fn renew_advances_the_lease_for_a_run_whose_id_carries_a_secret() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let run = format!("run-{AWS_KEY}");
+    store.stage_candidate(secret_candidate(0)).unwrap();
+
+    store.renew_staging_run(&run, 10, 10 + HOUR_MS).unwrap();
+    let connection = inspect(directory.path());
+    let leases: (i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT r.heartbeat_at,r.lease_expires_at,c.heartbeat_at,c.lease_expires_at
+             FROM extraction_runs r JOIN candidates c USING(extraction_run_id)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(leases, (10, 10 + HOUR_MS, 10, 10 + HOUR_MS));
+
+    // A shorter lease must not pull the expiry back into the sweep's reach.
+    store.renew_staging_run(&run, 20, 20).unwrap();
+    let after: (i64, i64) = connection
+        .query_row(
+            "SELECT heartbeat_at,lease_expires_at FROM extraction_runs",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(after, (20, 10 + HOUR_MS));
+}
+
+#[test]
+fn renew_rejects_an_unknown_run_a_backwards_heartbeat_and_an_expired_lease() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    store
+        .stage_candidate(candidate("run", "candidate", 100))
+        .unwrap();
+
+    assert_eq!(
+        store
+            .renew_staging_run("absent", 100, 100)
+            .unwrap_err()
+            .kind(),
+        KernelErrorKind::NotFound
+    );
+    assert_eq!(
+        store
+            .renew_staging_run("run", 50, 50 + HOUR_MS)
+            .unwrap_err()
+            .kind(),
+        KernelErrorKind::Conflict
+    );
+    assert_eq!(
+        store
+            .renew_staging_run("run", 2, 2 + HOUR_MS + 1)
+            .unwrap_err()
+            .kind(),
+        KernelErrorKind::InvalidInput
+    );
+    // The stored lease ends at 100 + HOUR_MS, so a heartbeat at that instant is too late.
+    assert_eq!(
+        store
+            .renew_staging_run("run", 100 + HOUR_MS, 100 + HOUR_MS)
+            .unwrap_err()
+            .kind(),
+        KernelErrorKind::Conflict
+    );
+}
+
+#[test]
+fn finish_rejects_a_terminal_time_before_the_run_lifecycle() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    store
+        .stage_candidate(candidate("run", "candidate", DAY_MS))
+        .unwrap();
+
+    // Backdating terminal_at would expire the retention window on a run that just finished.
+    assert_eq!(
+        store
+            .finish_staging_run("run", StagingTerminalState::Completed, 0)
+            .unwrap_err()
+            .kind(),
+        KernelErrorKind::InvalidInput
+    );
+    assert_eq!(
+        store
+            .finish_staging_run("absent", StagingTerminalState::Completed, DAY_MS)
+            .unwrap_err()
+            .kind(),
+        KernelErrorKind::NotFound
+    );
+    store
+        .finish_staging_run("run", StagingTerminalState::Failed, DAY_MS)
+        .unwrap();
+    assert_eq!(
+        store
+            .finish_staging_run("run", StagingTerminalState::Canceled, DAY_MS)
+            .unwrap_err()
+            .kind(),
+        KernelErrorKind::Conflict
+    );
+    assert_eq!(
+        inspect(directory.path())
+            .query_row(
+                "SELECT terminal_state FROM extraction_runs WHERE extraction_run_id='run'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "failed"
+    );
+}
+
+#[test]
+fn finish_terminates_a_run_whose_id_carries_a_secret() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    store.stage_candidate(secret_candidate(0)).unwrap();
+    store
+        .finish_staging_run(
+            &format!("run-{AWS_KEY}"),
+            StagingTerminalState::Canceled,
+            DAY_MS,
+        )
+        .unwrap();
+    let states: (String, String) = inspect(directory.path())
+        .query_row(
+            "SELECT r.terminal_state,c.terminal_state
+             FROM extraction_runs r JOIN candidates c USING(extraction_run_id)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(states, ("canceled".to_string(), "canceled".to_string()));
+}
+
+#[test]
+fn deleting_aged_runs_removes_their_secret_location_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    store.stage_candidate(secret_candidate(0)).unwrap();
+    store
+        .finish_staging_run(
+            &format!("run-{AWS_KEY}"),
+            StagingTerminalState::Completed,
+            0,
+        )
+        .unwrap();
+
+    let connection = inspect(directory.path());
+    let staged_redactions = |connection: &Connection| -> i64 {
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM durable_text_redactions
+                 WHERE owner_kind IN ('extraction_run','staging_candidate')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    assert!(staged_redactions(&connection) > 0);
+
+    assert_eq!(
+        store
+            .delete_aged_staging_runs(STAGING_RETENTION_MS)
+            .unwrap(),
+        1
+    );
+    assert_eq!(staged_redactions(&connection), 0);
+    // Nothing is left to delete, so a second pass reports an empty batch.
+    assert_eq!(
+        store
+            .delete_aged_staging_runs(STAGING_RETENTION_MS)
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn maintenance_rejects_a_negative_clock_reading() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    for kind in [
+        store.run_staging_maintenance(-1).unwrap_err().kind(),
+        store.abandon_expired_staging_runs(-1).unwrap_err().kind(),
+        store.delete_aged_staging_runs(-1).unwrap_err().kind(),
+    ] {
+        assert_eq!(kind, KernelErrorKind::InvalidInput);
+    }
+}
+
+#[test]
+fn opening_the_store_reclaims_leases_without_deleting_aged_runs() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    store
+        .stage_candidate(candidate("run", "candidate", 0))
+        .unwrap();
+    store
+        .finish_staging_run("run", StagingTerminalState::Completed, 0)
+        .unwrap();
+    drop(store);
+
+    // The wall clock is far past the cutoff, so a deleting sweep at open would drop the run.
+    let reopened = KernelStore::open(directory.path()).unwrap();
+    assert_eq!(
+        inspect(directory.path())
+            .query_row("SELECT COUNT(*) FROM extraction_runs", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(reopened.delete_aged_staging_runs(now_ms()).unwrap(), 1);
+}
+
+#[test]
+fn the_operator_placeholder_is_not_an_insertable_domain_name() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let spec = |name: &str, index: i64| DomainSpec {
+        domain_id: format!("domain-{index}"),
+        object_id: format!("object-{index}"),
+        name: name.to_string(),
+        source_kind: "fixture".to_string(),
+        source_id: format!("source-{index}"),
+        source_revision: index,
+        sensitivity: Sensitivity::Normal,
+    };
+
+    assert_eq!(
+        store
+            .commit(intent("reserved"), |envelope| {
+                envelope.insert_domain(spec(OPERATOR_REDACTION_PLACEHOLDER, 1))?;
+                Ok("inserted".to_string())
+            })
+            .unwrap_err()
+            .kind(),
+        KernelErrorKind::InvalidInput
+    );
+    // The uniqueness index still binds ordinary names.
+    store
+        .commit(intent("first"), |envelope| {
+            envelope.insert_domain(spec("payments", 1))?;
+            Ok("inserted".to_string())
+        })
+        .unwrap();
+    assert!(store
+        .commit(intent("duplicate"), |envelope| {
+            envelope.insert_domain(spec("payments", 2))?;
+            Ok("inserted".to_string())
+        })
+        .is_err());
+}
+
+#[test]
+fn remediation_reaches_retired_domains_and_repeats_without_failing() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    store
+        .commit(intent("insert"), |envelope| {
+            envelope.insert_domain(DomainSpec {
+                domain_id: "domain-1".to_string(),
+                object_id: "object-1".to_string(),
+                name: "later-discovered-secret".to_string(),
+                source_kind: "fixture".to_string(),
+                source_id: "source-1".to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Sensitive,
+            })?;
+            Ok("inserted".to_string())
+        })
+        .unwrap();
+    store
+        .commit(intent("retire"), |envelope| {
+            envelope.retire_domain("object-1")?;
+            Ok("retired".to_string())
+        })
+        .unwrap();
+
+    // A retired domain still stores its plaintext name, so remediation has to reach it.
+    store
+        .commit(intent("remediate"), |envelope| {
+            envelope.remediate_text(
+                RemediationTarget::CanonicalDomainName {
+                    object_id: "object-1".to_string(),
+                },
+                "operator-1",
+                42,
+            )?;
+            Ok("remediated".to_string())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect(directory.path())
+            .query_row(
+                "SELECT name FROM domains WHERE object_id='object-1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        OPERATOR_REDACTION_PLACEHOLDER
+    );
+
+    // Repeating the remediation records a second audit entry instead of aborting.
+    store
+        .commit(intent("remediate-again"), |envelope| {
+            envelope.remediate_text(
+                RemediationTarget::CanonicalDomainName {
+                    object_id: "object-1".to_string(),
+                },
+                "operator-1",
+                43,
+            )?;
+            Ok("remediated".to_string())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect(directory.path())
+            .query_row(
+                "SELECT COUNT(*) FROM change_event WHERE change_kind='operator_remediation'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn remediation_rejects_an_unknown_object_and_a_non_domain_kind() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    assert_eq!(
+        store
+            .commit(intent("missing"), |envelope| {
+                envelope.remediate_text(
+                    RemediationTarget::CanonicalDomainName {
+                        object_id: "absent".to_string(),
+                    },
+                    "operator-1",
+                    1,
+                )?;
+                Ok("remediated".to_string())
+            })
+            .unwrap_err()
+            .kind(),
+        KernelErrorKind::NotFound
+    );
+    assert_eq!(
+        store
+            .commit(intent("empty-operator"), |envelope| {
+                envelope.remediate_text(
+                    RemediationTarget::CanonicalDomainName {
+                        object_id: "absent".to_string(),
+                    },
+                    "   ",
+                    1,
+                )?;
+                Ok("remediated".to_string())
+            })
+            .unwrap_err()
+            .kind(),
+        KernelErrorKind::InvalidInput
     );
 }

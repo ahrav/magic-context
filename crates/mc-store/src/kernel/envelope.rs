@@ -119,9 +119,10 @@ pub struct ProjectionReplaceResult {
     pub rows: usize,
 }
 
-pub const OPERATOR_REDACTION_PLACEHOLDER: &str = "[redacted:operator]";
+pub const OPERATOR_REDACTION_PLACEHOLDER: &str = super::schema::operator_redaction_placeholder!();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RemediationTarget {
     CanonicalDomainName { object_id: String },
 }
@@ -279,17 +280,21 @@ impl Envelope<'_> {
         match target {
             RemediationTarget::CanonicalDomainName { object_id } => {
                 let object_id = redact(&object_id);
-                let object = load_object(self.tx, &object_id.text)?.ok_or(KernelError::NotFound)?;
-                if object.object_kind != "domain"
-                    || self
-                        .tx
-                        .execute(
-                            "UPDATE domains SET name=?1 WHERE object_id=?2",
-                            params![OPERATOR_REDACTION_PLACEHOLDER, object_id.text],
-                        )
-                        .map_err(|_| KernelError::Io)?
-                        != 1
-                {
+                // A retired or corrected domain keeps its plaintext name, so remediation must reach invalidated rows.
+                let object = load_object_any_generation(self.tx, &object_id.text)?
+                    .ok_or(KernelError::NotFound)?;
+                if object.object_kind != "domain" {
+                    return Err(KernelError::InvalidInput);
+                }
+                // `name<>?1` skips already-redacted domains; repeat remediation appends only an audit record.
+                let rewritten = self
+                    .tx
+                    .execute(
+                        "UPDATE domains SET name=?1 WHERE object_id=?2 AND name<>?1",
+                        params![OPERATOR_REDACTION_PLACEHOLDER, object_id.text],
+                    )
+                    .map_err(|_| KernelError::Io)?;
+                if rewritten == 0 && !domain_name_is_redacted(self.tx, &object_id.text)? {
                     return Err(KernelError::NotFound);
                 }
                 let audit = serde_json::json!({
@@ -305,9 +310,9 @@ impl Envelope<'_> {
                     replaced_object_id: None,
                     redactions: vec![
                         ("object_id".to_string(), object_id),
-                        ("operator_id".to_string(), operator_id.clone()),
+                        ("operator_id".to_string(), operator_id),
                     ],
-                    audit: Some(audit.clone()),
+                    audit: Some(audit),
                 });
             }
         }
@@ -842,10 +847,15 @@ impl RedactedDomain {
         if spec.source_revision < 0 {
             return Err(KernelError::InvalidInput);
         }
+        let name = redact(&spec.name);
+        // `idx_domains_current_name` exempts the placeholder so remediated rows stop competing for the name. Accepting it as caller input would let unlimited live domains share one canonical name.
+        if name.text == OPERATOR_REDACTION_PLACEHOLDER {
+            return Err(KernelError::InvalidInput);
+        }
         Ok(Self {
             domain_id: redact(&spec.domain_id),
             object_id: redact(&spec.object_id),
-            name: redact(&spec.name),
+            name,
             source_kind: redact(&spec.source_kind),
             source_id: redact(&spec.source_id),
             source_revision: spec.source_revision,
@@ -958,6 +968,46 @@ fn load_object(tx: &Transaction<'_>, object_id: &str) -> Result<Option<ObjectRow
     .map_err(|_| KernelError::Io)
 }
 
+fn load_object_any_generation(
+    tx: &Transaction<'_>,
+    object_id: &str,
+) -> Result<Option<ObjectRow>, KernelError> {
+    tx.query_row(
+        "SELECT object_id,object_kind,domain_id,source_kind,source_id,source_revision,
+                created_commit_seq,sensitivity_class,invalidated_commit_seq,superseded_by
+         FROM object_registry WHERE object_id=?1",
+        [object_id],
+        |row| {
+            let sensitivity: String = row.get(7)?;
+            Ok(ObjectRow {
+                object_id: row.get(0)?,
+                object_kind: row.get(1)?,
+                domain_id: row.get(2)?,
+                source_kind: row.get(3)?,
+                source_id: row.get(4)?,
+                source_revision: row.get(5)?,
+                created_commit_seq: row.get(6)?,
+                invalidated_commit_seq: row.get(8)?,
+                superseded_by: row.get(9)?,
+                sensitivity: Sensitivity::from_stored(&sensitivity),
+            })
+        },
+    )
+    .optional()
+    .map_err(|_| KernelError::Io)
+}
+
+fn domain_name_is_redacted(tx: &Transaction<'_>, object_id: &str) -> Result<bool, KernelError> {
+    tx.query_row(
+        "SELECT name FROM domains WHERE object_id=?1",
+        [object_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map(|name| name.is_some_and(|name| name == OPERATOR_REDACTION_PLACEHOLDER))
+    .map_err(|_| KernelError::Io)
+}
+
 struct RedactedCandidate {
     extraction_run_id: RedactedField,
     candidate_id: RedactedField,
@@ -977,7 +1027,7 @@ impl RedactedCandidate {
         if spec.source_revision < 0
             || spec.recorded_at < 0
             || spec.lease_expires_at < spec.recorded_at
-            || spec.lease_expires_at > spec.recorded_at.saturating_add(60 * 60 * 1_000)
+            || spec.lease_expires_at > spec.recorded_at.saturating_add(super::retention::HOUR_MS)
         {
             return Err(KernelError::InvalidInput);
         }

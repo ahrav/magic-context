@@ -14,4 +14,4 @@ pub use envelope::{
 };
 pub use open::{KernelError, KernelErrorKind, KernelStore};
 pub use outbox::OutboxPruneResult;
-pub use retention::{StagingMaintenanceResult, StagingTerminalState};
+pub use retention::{StagingMaintenanceResult, StagingTerminalState, STAGING_RETENTION_MS};

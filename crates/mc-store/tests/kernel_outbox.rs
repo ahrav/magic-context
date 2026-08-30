@@ -392,3 +392,160 @@ fn publication_boundary_and_fence_checks_remain_enforced() {
         KernelErrorKind::FenceLost
     );
 }
+
+#[test]
+fn publication_marks_rows_through_the_position_and_leaves_later_rows_unpublished() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    store
+        .commit(intent("multi"), |envelope| {
+            envelope.insert_domain(domain(1))?;
+            envelope.insert_domain(domain(2))?;
+            Ok("two".to_string())
+        })
+        .unwrap();
+    commit_domain(&store, 3);
+
+    store.mark_outbox_published_through(2, 7).unwrap();
+    let connection = inspect(directory.path());
+    let published = |connection: &Connection| -> Vec<(i64, Option<i64>)> {
+        connection
+            .prepare("SELECT outbox_position,published_at FROM outbox ORDER BY outbox_position")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(
+        published(&connection),
+        vec![(1, Some(7)), (2, Some(7)), (3, None)]
+    );
+
+    // A later timestamp must not rewrite an already published row.
+    store.mark_outbox_published_through(3, 9).unwrap();
+    assert_eq!(
+        published(&connection),
+        vec![(1, Some(7)), (2, Some(7)), (3, Some(9))]
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT published_through_position FROM outbox_publication WHERE id=0",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        3
+    );
+}
+
+#[test]
+fn publication_stays_idempotent_after_the_rows_are_pruned() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let first = store
+        .commit(intent("multi"), |envelope| {
+            envelope.insert_domain(domain(1))?;
+            envelope.insert_domain(domain(2))?;
+            Ok("two".to_string())
+        })
+        .unwrap()
+        .commit_seq;
+    let second = commit_domain(&store, 3);
+    store
+        .commit(intent("register"), |envelope| {
+            envelope.register_outbox_consumer("search", 10)?;
+            Ok("registered".to_string())
+        })
+        .unwrap();
+
+    store.mark_outbox_published_through(2, 7).unwrap();
+    store.acknowledge_outbox("search", first, 11).unwrap();
+    assert_eq!(store.prune_outbox().unwrap().deleted, 2);
+
+    // The publisher lost its acknowledgement round trip and repeats a position whose rows are gone.
+    store.mark_outbox_published_through(2, 7).unwrap();
+    assert_eq!(
+        inspect(directory.path())
+            .query_row("SELECT MIN(commit_seq) FROM outbox", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        second
+    );
+}
+
+#[test]
+fn a_consumer_id_that_redaction_rewrites_is_rejected() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    assert_eq!(
+        store
+            .commit(intent("register-secret"), |envelope| {
+                envelope.register_outbox_consumer(&format!("search-{SECRET}"), 10)?;
+                Ok("registered".to_string())
+            })
+            .unwrap_err()
+            .kind(),
+        KernelErrorKind::InvalidInput
+    );
+}
+
+#[test]
+fn argument_validation_is_separate_from_checkpoint_rejection() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    commit_domain(&store, 1);
+    for kind in [
+        store.acknowledge_outbox("", 0, 0).unwrap_err().kind(),
+        store
+            .acknowledge_outbox("search", 0, -1)
+            .unwrap_err()
+            .kind(),
+        store
+            .mark_outbox_published_through(0, 1)
+            .unwrap_err()
+            .kind(),
+        store
+            .mark_outbox_published_through(1, -1)
+            .unwrap_err()
+            .kind(),
+    ] {
+        assert_eq!(kind, KernelErrorKind::InvalidInput);
+    }
+    assert_eq!(
+        store.acknowledge_outbox("absent", 0, 1).unwrap_err().kind(),
+        KernelErrorKind::NotFound
+    );
+}
+
+#[test]
+fn every_outbox_and_retention_entry_point_checks_the_writer_fence() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    commit_domain(&store, 1);
+    store
+        .commit(intent("register"), |envelope| {
+            envelope.register_outbox_consumer("search", 10)?;
+            Ok("registered".to_string())
+        })
+        .unwrap();
+    store.invalidate_writer_fence_for_test().unwrap();
+
+    for kind in [
+        store.prune_outbox().unwrap_err().kind(),
+        store
+            .acknowledge_outbox("search", 1, 11)
+            .unwrap_err()
+            .kind(),
+        store
+            .mark_outbox_published_through(1, 1)
+            .unwrap_err()
+            .kind(),
+        store.run_staging_maintenance(1).unwrap_err().kind(),
+        store.abandon_expired_staging_runs(1).unwrap_err().kind(),
+        store.delete_aged_staging_runs(1).unwrap_err().kind(),
+    ] {
+        assert_eq!(kind, KernelErrorKind::FenceLost);
+    }
+}

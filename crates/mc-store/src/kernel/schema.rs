@@ -4,12 +4,22 @@ use std::collections::BTreeSet;
 
 use crate::sqlite_runtime::compute_marker_digest_for_application_id;
 
+// A macro, not a `const`, because the `domains` DDL needs the value as a literal.
+// One definition keeps the schema digest moving with any edit to it.
+macro_rules! operator_redaction_placeholder {
+    () => {
+        "[redacted:operator]"
+    };
+}
+pub(super) use operator_redaction_placeholder;
+
 pub const KERNEL_APPLICATION_ID: u32 = 0x4D43_4B52;
 pub const KERNEL_FORMAT_EPOCH: i64 = 1;
 pub const KERNEL_SCHEMA_COMPONENT_NAMES: &[&str] = &[
     "commit_log",
     "change_event",
     "outbox",
+    "outbox_publication",
     "operation_receipts",
     "durable_text_redactions",
     "writer_fence",
@@ -55,6 +65,10 @@ const COMPONENTS: &[(&str, &str)] = &[
         r#"CREATE TABLE outbox(outbox_position INTEGER PRIMARY KEY AUTOINCREMENT,commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,ordinal INTEGER NOT NULL,object_id TEXT NOT NULL,object_kind TEXT NOT NULL,source_kind TEXT NOT NULL,source_id TEXT NOT NULL,source_revision INTEGER NOT NULL,sensitivity_class TEXT NOT NULL,payload BLOB NOT NULL,created_at INTEGER NOT NULL,published_at INTEGER,UNIQUE(commit_seq,ordinal)) STRICT; CREATE INDEX idx_outbox_poll ON outbox(published_at,outbox_position); CREATE INDEX idx_outbox_prune ON outbox(published_at,created_at,outbox_position); CREATE INDEX idx_outbox_commit_fk ON outbox(commit_seq);"#,
     ),
     (
+        "outbox_publication",
+        r#"CREATE TABLE outbox_publication(id INTEGER PRIMARY KEY CHECK(id=0),published_through_position INTEGER NOT NULL CHECK(published_through_position>=0),published_at INTEGER NOT NULL CHECK(published_at>=0)) STRICT;"#,
+    ),
+    (
         "operation_receipts",
         r#"CREATE TABLE operation_receipts(receipt_id TEXT PRIMARY KEY,producer TEXT NOT NULL,operation_key TEXT NOT NULL,request_digest TEXT NOT NULL,commit_seq INTEGER REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,result_payload TEXT NOT NULL,created_at INTEGER NOT NULL,UNIQUE(producer,operation_key)) STRICT; CREATE INDEX idx_receipts_commit_fk ON operation_receipts(commit_seq);"#,
     ),
@@ -88,7 +102,15 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "domains",
-        r#"CREATE TABLE domains(domain_id TEXT PRIMARY KEY,object_id TEXT NOT NULL UNIQUE REFERENCES object_registry(object_id) DEFERRABLE INITIALLY DEFERRED,name TEXT NOT NULL,created_commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq),invalidated_commit_seq INTEGER REFERENCES commit_log(commit_seq),superseded_by TEXT REFERENCES object_registry(object_id),sensitivity_class TEXT NOT NULL) STRICT; CREATE UNIQUE INDEX idx_domains_current_name ON domains(name) WHERE invalidated_commit_seq IS NULL AND name<>'[redacted:operator]'; CREATE INDEX idx_domains_known_as_of ON domains(created_commit_seq,invalidated_commit_seq,domain_id); CREATE INDEX idx_domains_superseded_fk ON domains(superseded_by); CREATE TRIGGER domains_append_only_update BEFORE UPDATE ON domains WHEN NOT (((OLD.invalidated_commit_seq IS NULL AND NEW.invalidated_commit_seq IS NOT NULL) AND NEW.superseded_by IS OLD.superseded_by AND NEW.domain_id IS OLD.domain_id AND NEW.object_id IS OLD.object_id AND NEW.name IS OLD.name AND NEW.created_commit_seq IS OLD.created_commit_seq AND NEW.sensitivity_class IS OLD.sensitivity_class) OR ((OLD.superseded_by IS NULL AND NEW.superseded_by IS NOT NULL) AND NEW.invalidated_commit_seq IS OLD.invalidated_commit_seq AND NEW.domain_id IS OLD.domain_id AND NEW.object_id IS OLD.object_id AND NEW.name IS OLD.name AND NEW.created_commit_seq IS OLD.created_commit_seq AND NEW.sensitivity_class IS OLD.sensitivity_class) OR (NEW.name='[redacted:operator]' AND OLD.name<>'[redacted:operator]' AND NEW.domain_id IS OLD.domain_id AND NEW.object_id IS OLD.object_id AND NEW.created_commit_seq IS OLD.created_commit_seq AND NEW.invalidated_commit_seq IS OLD.invalidated_commit_seq AND NEW.superseded_by IS OLD.superseded_by AND NEW.sensitivity_class IS OLD.sensitivity_class)) BEGIN SELECT RAISE(ABORT,'domains is append-only'); END; CREATE TRIGGER domains_append_only_delete BEFORE DELETE ON domains BEGIN SELECT RAISE(ABORT,'domains is append-only'); END;"#,
+        concat!(
+            r#"CREATE TABLE domains(domain_id TEXT PRIMARY KEY,object_id TEXT NOT NULL UNIQUE REFERENCES object_registry(object_id) DEFERRABLE INITIALLY DEFERRED,name TEXT NOT NULL,created_commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq),invalidated_commit_seq INTEGER REFERENCES commit_log(commit_seq),superseded_by TEXT REFERENCES object_registry(object_id),sensitivity_class TEXT NOT NULL) STRICT; CREATE UNIQUE INDEX idx_domains_current_name ON domains(name) WHERE invalidated_commit_seq IS NULL AND name<>'"#,
+            operator_redaction_placeholder!(),
+            r#"'; CREATE INDEX idx_domains_known_as_of ON domains(created_commit_seq,invalidated_commit_seq,domain_id); CREATE INDEX idx_domains_superseded_fk ON domains(superseded_by); CREATE TRIGGER domains_append_only_update BEFORE UPDATE ON domains WHEN NOT (((OLD.invalidated_commit_seq IS NULL AND NEW.invalidated_commit_seq IS NOT NULL) AND NEW.superseded_by IS OLD.superseded_by AND NEW.domain_id IS OLD.domain_id AND NEW.object_id IS OLD.object_id AND NEW.name IS OLD.name AND NEW.created_commit_seq IS OLD.created_commit_seq AND NEW.sensitivity_class IS OLD.sensitivity_class) OR ((OLD.superseded_by IS NULL AND NEW.superseded_by IS NOT NULL) AND NEW.invalidated_commit_seq IS OLD.invalidated_commit_seq AND NEW.domain_id IS OLD.domain_id AND NEW.object_id IS OLD.object_id AND NEW.name IS OLD.name AND NEW.created_commit_seq IS OLD.created_commit_seq AND NEW.sensitivity_class IS OLD.sensitivity_class) OR (NEW.name='"#,
+            operator_redaction_placeholder!(),
+            r#"' AND OLD.name<>'"#,
+            operator_redaction_placeholder!(),
+            r#"' AND NEW.domain_id IS OLD.domain_id AND NEW.object_id IS OLD.object_id AND NEW.created_commit_seq IS OLD.created_commit_seq AND NEW.invalidated_commit_seq IS OLD.invalidated_commit_seq AND NEW.superseded_by IS OLD.superseded_by AND NEW.sensitivity_class IS OLD.sensitivity_class)) BEGIN SELECT RAISE(ABORT,'domains is append-only'); END; CREATE TRIGGER domains_append_only_delete BEFORE DELETE ON domains BEGIN SELECT RAISE(ABORT,'domains is append-only'); END;"#
+        ),
     ),
     (
         "entities",
@@ -132,11 +154,11 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "extraction_runs",
-        r#"CREATE TABLE extraction_runs(extraction_run_id TEXT PRIMARY KEY,extractor TEXT NOT NULL,source_kind TEXT,source_id TEXT,source_revision INTEGER,sensitivity_class TEXT NOT NULL,provenance_witness BLOB NOT NULL,redaction_metadata BLOB NOT NULL,detector_id TEXT,secret_type TEXT,utf8_offset INTEGER,utf8_length INTEGER,started_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,lease_expires_at INTEGER NOT NULL,terminal_state TEXT,terminal_at INTEGER) STRICT; CREATE INDEX idx_runs_ttl ON extraction_runs(terminal_at,lease_expires_at,extraction_run_id); CREATE INDEX idx_runs_heartbeat ON extraction_runs(terminal_at,heartbeat_at,extraction_run_id);"#,
+        r#"CREATE TABLE extraction_runs(extraction_run_id TEXT PRIMARY KEY,extractor TEXT NOT NULL,source_kind TEXT,source_id TEXT,source_revision INTEGER,sensitivity_class TEXT NOT NULL,provenance_witness BLOB NOT NULL,redaction_metadata BLOB NOT NULL,detector_id TEXT,secret_type TEXT,utf8_offset INTEGER,utf8_length INTEGER,started_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,lease_expires_at INTEGER NOT NULL,terminal_state TEXT CHECK(terminal_state IS NULL OR terminal_state IN ('completed','failed','canceled','abandoned')),terminal_at INTEGER) STRICT; CREATE INDEX idx_runs_active_lease ON extraction_runs(lease_expires_at,extraction_run_id) WHERE terminal_state IS NULL; CREATE INDEX idx_runs_ttl ON extraction_runs(terminal_at,lease_expires_at,extraction_run_id); CREATE INDEX idx_runs_heartbeat ON extraction_runs(terminal_at,heartbeat_at,extraction_run_id);"#,
     ),
     (
         "candidates",
-        r#"CREATE TABLE candidates(candidate_id TEXT PRIMARY KEY,extraction_run_id TEXT NOT NULL REFERENCES extraction_runs(extraction_run_id) ON DELETE CASCADE,candidate_kind TEXT NOT NULL,payload TEXT NOT NULL,sensitivity_class TEXT NOT NULL,provenance_witness BLOB NOT NULL,redaction_metadata BLOB NOT NULL,detector_id TEXT,secret_type TEXT,utf8_offset INTEGER,utf8_length INTEGER,created_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,lease_expires_at INTEGER NOT NULL,terminal_state TEXT,terminal_at INTEGER) STRICT; CREATE INDEX idx_candidates_run_fk ON candidates(extraction_run_id,candidate_id); CREATE INDEX idx_candidates_ttl ON candidates(terminal_at,lease_expires_at,candidate_id);"#,
+        r#"CREATE TABLE candidates(candidate_id TEXT PRIMARY KEY,extraction_run_id TEXT NOT NULL REFERENCES extraction_runs(extraction_run_id) ON DELETE CASCADE,candidate_kind TEXT NOT NULL,payload TEXT NOT NULL,sensitivity_class TEXT NOT NULL,provenance_witness BLOB NOT NULL,redaction_metadata BLOB NOT NULL,detector_id TEXT,secret_type TEXT,utf8_offset INTEGER,utf8_length INTEGER,created_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,lease_expires_at INTEGER NOT NULL,terminal_state TEXT CHECK(terminal_state IS NULL OR terminal_state IN ('completed','failed','canceled','abandoned')),terminal_at INTEGER) STRICT; CREATE INDEX idx_candidates_run_fk ON candidates(extraction_run_id,candidate_id); CREATE INDEX idx_candidates_ttl ON candidates(terminal_at,lease_expires_at,candidate_id);"#,
     ),
     (
         "candidate_scores",

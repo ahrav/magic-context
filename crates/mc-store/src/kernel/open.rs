@@ -203,7 +203,7 @@ impl KernelStore {
             lease_epoch,
             _lease: lease,
         };
-        store.run_staging_maintenance(current_time_ms())?;
+        store.abandon_expired_staging_runs(current_time_ms())?;
         Ok(store)
     }
 
@@ -680,7 +680,7 @@ fn sync_directory(path: &Path) -> Result<(), KernelError> {
 fn current_time_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(0))
         .unwrap_or(0)
 }
 
