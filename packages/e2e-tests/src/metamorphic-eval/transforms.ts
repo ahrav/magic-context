@@ -696,13 +696,11 @@ function safeParaphrase(
     ) {
         return false;
     }
-    return scenario.probes.every((probe) => {
-        if (probe.answerType === "claim-id") return true;
-        return (
-            !containsCompleteValue(text, probe.goldAnswer) ||
-            containsCompleteValue(message.text, probe.goldAnswer)
-        );
-    });
+    // Counted over the historian-visible transcript, not the raw message: an
+    // answer sitting inside a stripped reminder is not something the probe can
+    // copy, so treating it as pre-existing would let the framing add the first
+    // occurrence the historian actually receives.
+    return preservesProbeAnswers(probeAnswers(scenario), scenario, turns);
 }
 
 const reorderIndependentTurns: Transform = {
@@ -714,6 +712,7 @@ const reorderIndependentTurns: Transform = {
         const expectedIndexes = protectedTurnIndexes(scenario);
         const absentIndexes = absentEvidenceTurnIndexes(scenario);
         const baselines = evidenceBaselines(scenario);
+        const answers = probeAnswers(scenario);
         const candidates = Array.from(
             { length: scenario.transcript.epilogueStartIndex - 1 },
             (_, index) => [index, index + 1] as const,
@@ -740,6 +739,7 @@ const reorderIndependentTurns: Transform = {
             const reordered = reorderedTurns(scenario, order);
             if (
                 !preservesEvidenceExactly(baselines, reordered, mapForOrder(order)) ||
+                !preservesProbeAnswers(answers, scenario, reordered) ||
                 !changesVisibleTranscript(scenario, reordered)
             ) {
                 return { applicable: false, reason: exhausted };
@@ -764,6 +764,7 @@ const moveAcceptedDecision: Transform = {
         const seed = normalizedSeed(rawSeed);
         const absentIndexes = absentEvidenceTurnIndexes(scenario);
         const baselines = evidenceBaselines(scenario);
+        const answers = probeAnswers(scenario);
         // A multi-turn claim range declares an evidence chronology. Sorting the
         // mapped indices lets a rotation of that range look contiguous, so the
         // decision could be moved through it and reverse the order the range
@@ -830,6 +831,7 @@ const moveAcceptedDecision: Transform = {
             const reordered = reorderedTurns(scenario, order);
             if (
                 !preservesEvidenceExactly(baselines, reordered, mapForOrder(order)) ||
+                !preservesProbeAnswers(answers, scenario, reordered) ||
                 !changesVisibleTranscript(scenario, reordered)
             ) {
                 return { applicable: false, reason: exhausted };
@@ -931,6 +933,17 @@ const SYMBOL_RE =
 // satisfy the same shape the unquoted alternatives accept.
 const QUOTED_SYMBOL_RE =
     /^(?:[A-Za-z][A-Za-z0-9]*(?:[_./-][A-Za-z0-9]+)+|[a-z]+[A-Z][A-Za-z0-9]*|[A-Z]{2,})$/;
+
+/**
+ * The symbol and the parts a separator divides it into.
+ *
+ * A probe naming one part refers to the whole entity — a question about the `api`
+ * endpoint is about `api/v2` — so each part is checked against probe text as well
+ * as the full spelling.
+ */
+function symbolSegments(symbol: string): string[] {
+    return [...new Set([symbol, ...symbol.split(/[_./-]/).filter((part) => part.length > 0)])];
+}
 
 /** The renameable symbols of `text`, in match order. */
 function symbolsIn(text: string): string[] {
@@ -1140,6 +1153,25 @@ const renameUnrelatedSymbols: Transform = {
             return {
                 applicable: false,
                 reason: "rename leaves the historian input unchanged",
+            };
+        }
+        // A probe can name an entity by one part of a symbol — a question about the
+        // `api` endpoint refers to `api/v2` — and renaming it would leave the
+        // question asking about something the history no longer mentions. Checked
+        // against the derivative rather than by blocking the candidate outright,
+        // because a part is often an ordinary word: `webhook` is a part of
+        // `webhook_setup`, and a scenario about webhooks says it in many places, so
+        // blocking on mention alone would freeze symbols the probe is not naming.
+        const orphanedTerm = symbolSegments(original).some(
+            (segment) =>
+                probeText.some((text) => containsCompleteValue(text, segment)) &&
+                countCompleteValues(authoredEvidenceText(scenario.transcript.turns), segment) > 0 &&
+                countCompleteValues(authoredEvidenceText(turns), segment) === 0,
+        );
+        if (orphanedTerm) {
+            return {
+                applicable: false,
+                reason: "rename would leave a probe naming an absent entity",
             };
         }
         return derivative(

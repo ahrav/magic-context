@@ -1396,6 +1396,118 @@ describe("metamorphic transforms", () => {
         expect(lintScenario(result.scenario)).toEqual([]);
     });
 
+    test("paraphrase counts probe answers in the text the historian receives", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[2]!.assistant = "Done: cache capacity is 4096 entries in the background tier.";
+        // The answer sits inside a stripped reminder, so the historian never sees
+        // it here and a raw-text check would wrongly read it as pre-existing.
+        turns[3] = {
+            user: "<system-reminder>background</system-reminder> Status note.",
+            assistant: "Summary recorded.",
+        };
+        const gold = raw.gold as { expectedClaims: Array<{ predicate: { value: string } }> };
+        gold.expectedClaims[1]!.predicate.value = "4096 entries in the background tier";
+        (raw.probes as Array<Record<string, unknown>>)[0] = {
+            id: "probe-capacity",
+            question: "Which tier holds the capacity record?",
+            answerType: "exact",
+            goldAnswer: "background",
+            sourceClaimRef: "exp-cache-capacity",
+        };
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "paraphrase-irrelevant")!;
+        const visibleAnswers = (candidate: HistorianEvalScenario) =>
+            normalizedEvidenceMessages(candidate.transcript.turns)
+                .map((message) => message.text)
+                .join(" ")
+                .split("background").length - 1;
+
+        for (let seed = 0; seed < 30; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            expect(visibleAnswers(result.scenario), `seed ${seed}`).toBe(visibleAnswers(scenario));
+        }
+    });
+
+    test("rename refuses to orphan an entity a probe question names", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[0]!.assistant = "We could consider it.";
+        // `api` is named only by the question and appears in history only inside
+        // `api/v2`, so renaming that leaves the question pointing at nothing.
+        turns[3] = {
+            user: "Background note about api/v2 and aux_worker.ts.",
+            assistant: "Summary recorded.",
+        };
+        (raw.probes as Array<Record<string, unknown>>)[0] = {
+            id: "probe-capacity",
+            question: "Which api endpoint fronts the capacity record?",
+            answerType: "exact",
+            goldAnswer: "4096",
+            sourceClaimRef: "exp-cache-capacity",
+        };
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
+
+        let renamed = 0;
+        for (let seed = 0; seed < 30; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            const rewritten = result.scenario.transcript.turns[3]!.user;
+            expect(rewritten, `seed ${seed}`).toContain("api/v2");
+            if (!rewritten.includes("aux_worker.ts")) renamed += 1;
+        }
+        expect(renamed).toBeGreaterThan(0);
+    });
+
+    test("reorder refuses a swap that creates a probe answer", () => {
+        const raw = validScenarioRaw();
+        const transcript = raw.transcript as {
+            turns: Array<{ user: string; assistant: string }>;
+            epilogueStartIndex: number;
+        };
+        // Swapping these two puts `blue` at the end of one turn immediately before
+        // `green` at the start of the next, authoring the answer a second time.
+        transcript.turns.unshift(
+            { user: "green light is confirmed.", assistant: "Noted." },
+            { user: "Palette note.", assistant: "The swatch is blue" },
+        );
+        transcript.epilogueStartIndex += 2;
+        const gold = raw.gold as {
+            expectedClaims: Array<{ sourceTurnRange: [number, number]; predicate: { value: string } }>;
+        };
+        for (const claim of gold.expectedClaims) {
+            claim.sourceTurnRange = [claim.sourceTurnRange[0] + 2, claim.sourceTurnRange[1] + 2];
+        }
+        transcript.turns[4]!.assistant =
+            "Done: cache capacity is 4096 entries for the blue green rollout.";
+        gold.expectedClaims[1]!.predicate.value = "4096 entries for the blue green rollout";
+        (raw.probes as Array<Record<string, unknown>>)[0] = {
+            id: "probe-capacity",
+            question: "Which rollout owns the capacity record?",
+            answerType: "exact",
+            goldAnswer: "blue green",
+            sourceClaimRef: "exp-cache-capacity",
+        };
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "reorder-independent-turns")!;
+        const answers = (candidate: HistorianEvalScenario) =>
+            normalizedEvidenceMessages(candidate.transcript.turns)
+                .map((message) => message.text)
+                .join(" ")
+                .split("blue green").length - 1;
+
+        for (let seed = 0; seed < 40; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            expect(answers(result.scenario), `seed ${seed}`).toBe(answers(scenario));
+        }
+    });
+
     test("paraphrase never frames a message with a probe gold answer", () => {
         const raw = validScenarioRaw();
         const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
@@ -1568,8 +1680,10 @@ describe("metamorphic transforms", () => {
     test("whole corpus has anti-vacuous coverage and lint-clean derivatives", () => {
         const contentTransformIds = ["paraphrase-irrelevant", "rename-unrelated-symbols"];
         const preEpilogueRewrites = new Set<string>();
+        const coveredIds = new Set<string>();
         for (const scenario of corpus()) {
             let applied = 0;
+            const appliedIds: string[] = [];
             for (const transform of TRANSFORMS) {
                 const result = transform.apply(scenario, 20_260_830);
                 if (!result.applicable) {
@@ -1584,6 +1698,7 @@ describe("metamorphic transforms", () => {
                     continue;
                 }
                 applied += 1;
+                appliedIds.push(transform.id);
                 expect(lintScenario(result.scenario), `${scenario.id}/${transform.id}`).toEqual([]);
                 if (contentTransformIds.includes(transform.id)) {
                     for (let seed = 0; seed < 10; seed += 1) {
@@ -1600,6 +1715,7 @@ describe("metamorphic transforms", () => {
                 }
             }
             expect(applied, scenario.id).toBeGreaterThan(0);
+            for (const id of appliedIds) coveredIds.add(id);
             // Applicability of the framing rewrite is a property of THIS corpus,
             // not of every contract-valid scenario — a scenario whose only
             // rewritable messages sit at the length ceiling admits no additive
@@ -1614,6 +1730,10 @@ describe("metamorphic transforms", () => {
             ).toBe(true);
         }
         expect([...preEpilogueRewrites].sort()).toEqual([...contentTransformIds].sort());
+        // Per-scenario coverage is not enough: a registered transform can be
+        // inapplicable across the entire corpus while every scenario still admits
+        // some other one, leaving that transform with no frozen pair exercising it.
+        expect([...coveredIds].sort()).toEqual(TRANSFORMS.map((transform) => transform.id).sort());
     });
 
     test("injection canary text and non-binding claim budget survive every derivative", () => {
