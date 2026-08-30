@@ -25,6 +25,10 @@ export function stripJsonComments(content: string): string {
             if (char === "*" && next === "/") {
                 inBlockComment = false;
                 index += 1;
+                // A block comment is a token separator in the JSONC grammar:
+                // emit one space so adjacent tokens ("1/*c*/2") cannot fuse
+                // into a different token ("12") once the comment is removed.
+                result += " ";
             }
             continue;
         }

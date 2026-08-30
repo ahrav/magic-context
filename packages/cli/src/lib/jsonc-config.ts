@@ -50,8 +50,13 @@ function parseErrorLocation(content: string, error: unknown): { line: number; co
 export function readJsoncConfig(path: string): JsoncReadResult {
     if (!existsSync(path)) return { kind: "missing" };
 
-    const content = readFileSync(path, "utf-8");
+    // The read stays inside the failure boundary: a path that exists but
+    // cannot be read (permissions, a directory, deleted between the existsSync
+    // probe and the read) reports as parse-error instead of throwing, so
+    // lenient diagnostic callers can explain the bad file rather than abort.
+    let content = "";
     try {
+        content = readFileSync(path, "utf-8");
         const rejectedKeyPaths: string[] = [];
         const parsed = parseConfigJsonc(content, {
             onRejectedKey: (keyPath) => rejectedKeyPaths.push(keyPath.join(".")),

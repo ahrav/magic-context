@@ -92,6 +92,8 @@ const CORPUS: string[] = [
     }`,
     '{"a": 1} // comment at EOF without newline',
     '{"a": 1} /* unterminated block comment',
+    '{"x": 1/*comment*/2}',
+    '{"x": 1/*comment*/, "y": 2}',
     '{"url": "https://example.com/path", "glob": "src/**/*.ts"}',
     '{"s": "not // a comment", "t": "not /* a comment */"}',
     '{"esc": "quote \\" backslash \\\\ slash \\/ newline \\n"}',
