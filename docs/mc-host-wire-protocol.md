@@ -19,23 +19,27 @@ Canonical version-2 literals remain part of this contract even when they retain 
 
 Actors:
 
-- **Host:** `mc-host`; owns credentials, connection generations, negotiation, channels, epochs, correlations, and component lifecycle.
-- **Managed TypeScript client:** `McHostClient` and `McHostModuleTransport`; own secure discovery, authentication, mandatory negotiation, route epochs, deadlines, cancellation, Ping/Pong, and cleanup for plugin, Synapse, wake-plane, CLI, and fixture callers.
+- **Host:** `mc-host`; owns credentials, connection generations, ring setup, channels, epochs, correlations, and component lifecycle.
+- **Managed TypeScript client:** `McHostClient` and `McHostModuleTransport`; own secure discovery, authentication, mandatory ring attachment, route epochs, deadlines, cancellation, Ping/Pong, and cleanup for plugin, Synapse, wake-plane, CLI, and fixture callers.
 - **Managed Rust client:** `mc_host::Client`; owns the same boundary for `HistorianProducer` and Rust fixtures, including typed send outcomes, streaming, checked correlation allocation, reserved control admission, and deterministic close.
 - **Handler:** the directly linked static composite; receives initialization, target-aware bind, request, route-gone, internal health, and shutdown callbacks and dispatches each to `magic-context`, `synapse`, or `broca`.
 
 The 32-byte connection key is a bearer capability. Possession grants every direct-profile operation — including host-global `host.shutdown` (Section 7.6) — and permits any `BindIdentity`. Client `role`, `consumer_identity`, `project_root`, `harness`, and `session` are claims or scoping metadata; none grants authority. A key reader MUST therefore be trusted as the same local security principal as the host, and every key reader is stop-capable: a diagnostic or proxy principal that holds the bearer is not read-only, whatever its role label or mount permissions claim.
 
-Production transport is unencrypted TCP on numeric IPv4 loopback only. It provides no secrecy or per-frame MAC after authentication. The drive rig's read-only credential mount plus authenticated loopback proxy is a trusted diagnostic exception; it does not make remote transport supported.
+Production application transport is the local shared-memory ring. The owner-only Unix setup socket carries authentication and descriptor transfer only, remains open as a peer-lifetime sentinel, and cannot carry application frames. Remote transport is unsupported.
 
 Initial secure publication support is Unix-like systems. Windows support is deferred until atomic replacement, ACL validation, instance locking, link handling, and ownership-fenced cleanup have a reviewed contract.
 
 ```mermaid
 flowchart TB
-  CF[Owner-only connection file] -->|endpoint, key, daemon ID| TS[TypeScript clients]
+  CF[Owner-only connection file] -->|setup socket, key, daemon ID| TS[TypeScript clients]
   CF --> RC[Managed Rust clients]
-  TS <-->|authenticated v2 frames| H[mc-host]
-  RC <-->|authenticated v2 frames| H
+  TS <-->|authenticate and receive descriptors| US[Owner-only Unix setup socket]
+  RC <-->|authenticate and receive descriptors| US
+  TS <-->|v2 application frames| R[Shared-memory ring]
+  RC <-->|v2 application frames| R
+  US --> H[mc-host]
+  R --> H
   H -->|initialize, bind, handle, route-gone, health| M[Linked McHandler]
   M --> S[Project and session state]
   ID[Caller-supplied identity] -.->|scope, never authority| H
@@ -45,7 +49,7 @@ flowchart TB
 ## 3. Terms
 
 - **Host incarnation:** one process lifetime with one fresh key and daemon ID.
-- **Connection generation:** client-local identity for one authenticated TCP connection. It is not sent on wire.
+- **Connection generation:** client-local identity for one authenticated ring connection. It is not sent on wire.
 - **Catalog generation:** `u64` catalog-state version returned by `catalog.list`; unrelated to connection generation.
 - **Route handle:** `(channel, epoch)` created by the host before invoking handler bind and published to the client only after bind succeeds. A rejected bind still observed the handle, which is why route-gone fires exactly once on rejection (Section 8.2).
 - **Live channel:** nonzero `u16` route slot from one host-global namespace across all consumer connections.
@@ -53,10 +57,10 @@ flowchart TB
 - **Correlation:** nonzero `u64` request identity allocated monotonically within one connection generation. Each direction owns an independent correlation namespace: host-originated correlations (`Ping`) and consumer-originated correlations never collide even when numerically equal.
 - **Full request identity:** `(connection generation, direction, channel, epoch, correlation)`. Direction is implied on wire by frame type, never encoded as bytes.
 - **Terminal frame:** first matching `Response`, `Error`, or `StreamEnd` for a correlation.
-- **`not_sent`:** sender proves zero bytes of the request frame reached the socket.
+- **`not_sent`:** sender proves the request frame was not published to the ring.
 - **`outcome_unknown`:** any request with a partial, completed, or uncertain write whose terminal frame was not observed.
 - **`terminal`:** matching terminal frame was observed; its success or failure applies only to that correlation.
-- **Transport-ready:** listener bound, handler initialized, and connection file published.
+- **Transport-ready:** setup socket bound, handler initialized, and connection file published.
 - **Storage-ready:** linked handler can serve storage-dependent operations. Transport readiness does not imply it.
 
 ## 4. Discovery and credential publication
@@ -69,7 +73,7 @@ Clients MUST read `${dataDir}/cortexkit/run/subc-connection.json`. Host and clie
 {
   "schema": 1,
   "wire_version": 2,
-  "endpoints": [{ "host": "127.0.0.1", "port": 43123 }],
+  "setup_socket": "/run/user/1000/cortexkit/mc-host.sock",
   "key": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],
   "daemon_id": [96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111],
   "pid": 4242,
@@ -79,19 +83,17 @@ Clients MUST read `${dataDir}/cortexkit/run/subc-connection.json`. Host and clie
 
 Example bytes are deterministic and non-secret. Real key and daemon-ID bytes MUST come from the OS CSPRNG.
 
-Writers MUST include numeric `wire_version: 2`. Clients MUST reject an absent, null, string, fractional, or non-2 value before endpoint selection or TCP dial. There is no omission default and no version downgrade.
+Writers MUST include numeric `wire_version: 2`. Clients MUST reject an absent, null, string, fractional, or non-2 value before opening the setup socket. There is no omission default and no version downgrade.
 
 A client MUST:
 
 1. open the parent and connection file without following links, then take one descriptor-anchored regular-file snapshot capped at 65,536 bytes;
 2. reject a larger file before JSON parsing;
-3. require schema 1, numeric wire version 2, at least one endpoint, exactly 32 key bytes, exactly 16 daemon-ID bytes, a numeric PID, and a nonempty daemon version;
+3. require schema 1, numeric wire version 2, one nonempty absolute `setup_socket`, exactly 32 key bytes, exactly 16 daemon-ID bytes, a numeric PID, and a nonempty daemon version;
 4. verify owner-only regular-file metadata before and after the read and verify the directory entry still names the same file;
-5. select `endpoints[0]` only;
-6. require host exactly `127.0.0.1` and port `1..=65535`;
-7. reject wildcard addresses, IPv6, hostnames, malformed arrays, replacement, and insecure ownership or permissions.
+5. reject relative or empty setup-socket paths, replacement, and insecure ownership or permissions.
 
-The validated descriptor snapshot is the sole source of credentials and endpoint authority. A client MUST NOT validate by pathname and then reopen that pathname for the key, daemon ID, or endpoint.
+The validated descriptor snapshot is the sole source of credentials and setup-socket authority. A client MUST NOT validate by pathname and then reopen that pathname for the key, daemon ID, or socket path.
 
 Publication and acceptance require exactly 32 key bytes so all direct implementations use one credential shape.
 
@@ -165,7 +167,7 @@ Neither the runtime-directory inode nor a lock on the managed `${dataDir}/cortex
 
 ### 5.1 Admission and framing
 
-Authentication starts at TCP accept and uses one absolute deadline across every length read, body read, write, comparison, and failed-handshake shutdown. Recommended host default is 2 seconds, matching current clients; deployment MAY shorten it but MUST publish a client-compatible value operationally.
+Authentication starts when the owner-only setup socket accepts a peer and uses one absolute deadline across every length read, body read, write, comparison, descriptor transfer, and failed-handshake shutdown. Recommended host default is 2 seconds, matching current clients; deployment MAY shorten it but MUST publish a client-compatible value operationally.
 
 The host MUST bound unauthenticated handshake slots separately from authenticated connections. Excess accepts MUST be closed immediately without reading client bytes. Every success, parse failure, proof failure, timeout, EOF, or shutdown MUST release its slot. Slot count is finite deployment policy, not a wire constant.
 
@@ -196,7 +198,8 @@ sequenceDiagram
   Note over C: verify server proof, then daemon ID, then daemon version
   C->>H: ClientAuth {client_auth}
   Note over H: constant-time verify
-  H-->>C: v2 envelope traffic enabled
+  H-->>C: two ring descriptors + activation data
+  Note over C,H: validate current identity, attach, commit; v2 ring traffic enabled
 ```
 
 Canonical JSON shapes:
@@ -302,11 +305,11 @@ The interoperability body maximum is exactly 64 MiB (`67,108,864` bytes). A conf
 
 Aggregate resource policy takes effect between frames, before admitting more connections/work, or after a complete frame reaches a profile/application limit. For example, `McHandler` may return terminal `invalid_params` for its 1 MiB facade or 32 MiB transform limits after transport framing accepts the body. Local limits never change header bytes.
 
-Waiting for the next frame on an idle connection is unbounded at the framing layer; idle lifetime is governed separately by liveness policy (Section 9.3). Once the first header byte arrives, the remaining header and body bytes MUST complete within one finite operation-owned absolute deadline. Duration is deployment policy, not a wire constant. A peer that declares 64 MiB and stalls partway consumes its bounded slot only until that deadline. A deadline that instead started at read-loop entry would close healthy idle connections: cached routes and clients waiting on long-running requests send no frames while they wait.
+Waiting for the next frame on an idle connection is unbounded at the framing layer; idle lifetime is governed separately by liveness policy (Section 9.3). A published ring descriptor names one complete header and body. The receiver MUST validate all offsets, lengths, sequence metadata, header fields, and descriptor identity before exposing a scoped receive lease.
 
-Clean EOF before any byte of the next header is orderly connection close. EOF after the first header byte, truncated header/body, unsupported version, unknown type, invalid flags, nonzero channel-0 epoch, zero epoch on a routed channel, pure-header body, or body declaration above 64 MiB corrupts stream alignment. Receiver MUST close the connection generation without resynchronization and without sending an `Error` on that stream.
+Clean `Goodbye` followed by joined teardown is orderly connection close. Unexpected setup-socket EOF, an invalid ring descriptor, truncated declared frame, unsupported version, unknown type, invalid flags, nonzero channel-0 epoch, zero epoch on a routed channel, pure-header body, or body declaration above 64 MiB retires the connection without resynchronization or reuse of uncertain storage.
 
-Writers MUST verify header `len` equals body length and SHOULD submit header plus body as one logical write. This is an efficiency requirement from published transport behavior, not an atomicity guarantee: partial socket writes remain possible and drive outcome classification. Each connection additionally has exactly one logical writer: implementations MUST serialize fully encoded frames so every byte of one frame (header then body) reaches the socket before any byte of another frame on that connection. Concurrent requests, stream emissions, and Ping/Pong traffic share the socket, and interleaved frame bytes make the peer read body bytes as the next header — stream-alignment corruption. Socket-write atomicity is neither assumed nor sufficient: after a partial write, the writer MUST continue that same frame's remaining bytes before emitting any other frame.
+Writers MUST verify header `len` equals body length, reserve enough bounded ring capacity for the complete frame, fill the reservation, and publish exactly once. Each direction has one logical writer and FIFO publication order. A failed or underfilled reservation aborts without publication. Once publication begins, a missing terminal leaves the request outcome unknown.
 
 ### 6.4 Byte examples
 
@@ -389,7 +392,7 @@ Requests MAY omit `module_id` to list all entries or supply a filter. Unknown fi
 ```
 
 ```json
-{"op":"catalog.list","generation":1,"modules":[],"subc_ops":["route.open","catalog.list","host.shutdown","host.status","transport.negotiate"]}
+{"op":"catalog.list","generation":1,"modules":[],"subc_ops":["route.open","catalog.list","host.shutdown","host.status"]}
 ```
 
 An unfiltered request MUST return exactly three entries — `magic-context`, then `synapse`, then `broca`, in that deterministic order — and an exact-module filter MUST return that one entry, each derived without lossy rewriting from its startup manifest:
@@ -402,15 +405,13 @@ An unfiltered request MUST return exactly three entries — `magic-context`, the
 | `modules[i].module_version` | that manifest's exact build version |
 | `modules[i].roles` | that manifest's complete `provides` array, including tool schemas |
 | `modules[i].control_ops` | implemented module control operations only; the direct profile never includes `wake.create` |
-| `subc_ops` | `route.open`, `catalog.list`, `host.shutdown`, `host.status`, `transport.negotiate` |
-
-`transport.activate` and `transport.commit` (Section 7.7) are candidate-channel-only operations and MUST NOT appear in `subc_ops`: the catalog advertises bootstrap channel-0 capabilities, and those two operations are never valid on a bootstrap connection.
+| `subc_ops` | `route.open`, `catalog.list`, `host.shutdown`, `host.status` |
 
 The Synapse and Broca entries are immutable identity, not readiness: each stays in the catalog even when its component cannot currently serve a bind (Section 7.5.1). The direct host is final-decision unsupported for `wake.create`: an advertised `wake.create` entry is an ownership certificate for the complete scheduled-wake lifecycle (durable scheduling, agent-callable lifecycle operations, backlog adoption, and readiness withdrawal), not a readiness hint, and the direct profile owns none of it. Wake-plane probing therefore remains fail-open against this profile; only a future host that owns the complete lifecycle may advertise the capability. `generation` changes only when catalog content changes and is unrelated to connection generation.
 
 ### 7.4 Operation classification
 
-`route.open`, `catalog.list`, `host.shutdown` (Section 7.6), `host.status` (Section 7.6), and `transport.negotiate` (Section 7.7) are the only required channel-0 operations. Every other operation receives terminal `unsupported_operation`; host stays connected if framing remains valid. `transport.activate` and `transport.commit` are candidate-channel-only (Section 7.7): on a bootstrap connection they are unrecognized operations and receive terminal `unsupported_operation` like any other. `host.status` reads the last completed host-owned health snapshot; it never invokes a handler callback on the requesting connection and exposes only closed component states and sanitized metrics, never handler detail text.
+`route.open`, `catalog.list`, `host.shutdown` (Section 7.6), and `host.status` are the only required channel-0 operations. Every other operation receives terminal `unsupported_operation`; host stays connected if framing remains valid. `host.status` reads the last completed host-owned health snapshot; it never invokes a handler callback on the requesting connection and exposes only closed component states and sanitized metrics, never handler detail text.
 
 Canonical error body:
 
@@ -601,127 +602,32 @@ Authorization is the bearer key alone. `role` and every other claim MUST NOT gra
 The host owns one shutdown commit latch per incarnation with phases `open -> response_in_flight -> committed`:
 
 1. The first requester to find the latch `open` owns the attempt and enqueues its correlated success response on its own connection's single writer.
-2. Full-frame write acknowledgement of that response — every byte handed to the socket — commits the latch. Only then does the host cancel admission and begin the normal graceful shutdown order of Section 12. The requester therefore observes the complete response before Goodbye or EOF on that connection.
+2. Full-frame publication acknowledgement of that response commits the latch. Only then does the host cancel admission and begin the normal graceful shutdown order of Section 12. The requester therefore observes the complete response before Goodbye or EOF on that connection.
 3. Any failure before acknowledgement — enqueue rejection, writer retirement, partial write, write deadline expiry, requester disconnect or cancellation — reopens the latch so a later authenticated requester can commit. The reopen is unconditional; when the host is already tearing down for an independent reason, the reopened latch is moot because admission is refused.
 4. Concurrent requesters wait for the active attempt's outcome. After a commit, each waiting or later `host.shutdown` request settles with its own correlated success response while its generation is still live to emit it — a generation already retiring during the drain settles nothing further — and no second commit occurs; cancellation fires at most once per incarnation.
 
 Commit runs inside retained host work (the connection writer task), so cancelling the requester's task after enqueue cannot lose an acknowledged shutdown. `host.shutdown` performs no PID signaling and no publication cleanup of its own: stop-side effects are exactly the Section 12 sequence, and stop verification (publication removal, instance-lock release) is observed through Section 4.3 evidence.
 
-### 7.7 Transport negotiation and candidate activation
+### 7.7 Mandatory ring setup
 
-Negotiation selects one connection-scoped frame transport for the authenticated generation. It is mandatory and versioned independently of the base wire: this section defines **negotiation version 1**. Authentication creates a setup-only generation. Its first post-authentication request MUST be a valid channel-0 `transport.negotiate` request using negotiation version 1. No application or other control traffic is permitted until a valid selection commits the transport.
+Transport setup is complete before the application wire becomes active. The owner-only Unix setup socket authenticates the peer, transfers exactly two ring mapping descriptors, validates the fixed release identity and one-use activation token, and commits the ring. It has no application-envelope decoder or router. The ring is the only application frame channel.
 
-A first application request, routed request, other control operation, `Cancel`, `Pong`, or `Goodbye` retires the setup generation without dispatch or same-generation TCP continuation. A client that receives `unsupported_operation`, `connection_in_use`, a malformed response, a mismatched version, or an unoffered selection while negotiating MUST retire the generation and MUST NOT continue on TCP.
-
-#### 7.7.1 Bounds and strict decoding
-
-Negotiation-family bodies (`transport.negotiate`, `transport.activate`, `transport.commit`, requests and responses) are UTF-8 JSON channel-0 control bodies under the Section 7.1 cap, with these additional rules:
-
-| Field | Limit and validation |
-| --- | --- |
-| `negotiation_version` | JSON integer in `1..=4,294,967,295` (`u32`). Zero, fractions, exponents, and larger values are malformed |
-| `offers` | ordered array of 1 to 8 offer objects; MUST contain at least one `tcp` entry; duplicate `(transport, capability_version)` identities are malformed |
-| `offers[i].transport` | 1-32 ASCII bytes matching `^[a-z][a-z0-9._-]{0,31}$` |
-| `offers[i].capability_version` | JSON integer in `1..=4,294,967,295` (`u32`) |
-| `offers[i].parameters`, `descriptor` | optional / grant-only opaque JSON **objects**; each at most 8,192 bytes of compact UTF-8 JSON serialization and at most 8 nesting levels, counted as in Section 7.1 (1 at the subtree root, +1 per nested object/array) |
-| `activation_token` | exactly 32 lowercase hexadecimal ASCII characters |
-| `reason` | one of the closed fallback values in Section 7.7.3 |
-
-Decoding is strict, as an explicit exception to the Section 7.1 unknown-field rule: every negotiation-family object has a closed field set and an unrecognized or repeated field is malformed. Forward compatibility is owned by `negotiation_version`, never by ignored fields. A duplicate object key at **any** depth — including inside the opaque `parameters` and `descriptor` values — is rejected before any typed or opaque value is materialized, so provider code can never observe an ambiguous document.
-
-Malformed negotiation content — invalid JSON, recursive duplicate keys, type or bound violations, a missing `tcp` offer, an unoffered selection, or a grant/selection field mix from Section 7.7.3 — receives terminal `Error{code:"invalid_control_request"}` and the host then retires the generation. It is never fallback evidence and MUST NOT select or retain TCP (R12 in the owning plan).
-
-#### 7.7.2 Offer and selection grammar
-
-The client sends one `transport.negotiate` request before any other operation. Offers are ordered by client preference. A `tcp` offer is required so an explicit fallback always has an exact entry to select:
-
-```json
-{"op":"transport.negotiate","negotiation_version":1,"offers":[{"transport":"shm","capability_version":1,"parameters":{}},{"transport":"tcp","capability_version":1}]}
-```
-
-The host MUST select exactly one offered `(transport, capability_version)` entry; it never invents a transport, version, or parameter shape. A TCP selection names the exact offered entry. `reason` is omitted for a direct selection and carries one Section 7.7.3 value for a fallback:
-
-```json
-{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"tcp","capability_version":1}}
-```
-
-```json
-{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"tcp","capability_version":1},"reason":"capability_version_mismatch"}
-```
-
-A non-TCP grant adds a one-use activation token and a bounded opaque provider descriptor. Both fields are required together on a non-TCP selection, and both are malformed on a TCP selection. `reason` is malformed on a grant:
-
-```json
-{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"shm","capability_version":1},"activation_token":"00000000000000000000000000000000","descriptor":{}}
-```
-
-The all-zero example token is a documentation-only placeholder. A real token MUST be freshly generated from the OS CSPRNG for each grant, is bound to the granting generation, and is consumed by exactly one activation. Descriptors and activation tokens are binding data, not authority: the authenticated bootstrap remains the sole authorization boundary, and every non-TCP provider MUST enforce owner-only endpoint access, exclusive peer attachment, provider-incarnation fencing, and stale-descriptor rejection before it yields a candidate channel.
-
-A response whose `negotiation_version` differs from the request's grammar version, or whose `selected` entry was not offered, is malformed on the client side and retires the setup; the client MUST NOT treat it as fallback evidence. Tokens, descriptors, and offer parameters MUST stay absent from events, errors, cause chains, stacks, `Debug`/`Display` formatting, and panic output on both sides.
-
-#### 7.7.3 Fallback reasons
-
-The fallback vocabulary is closed. Fallback always selects the exact offered `tcp` entry:
-
-| `reason` | Meaning |
-| --- | --- |
-| `unavailable` | an installed, statically eligible non-TCP offer is dynamically unavailable: provider readiness (`Recovering`/`Quarantined`) or admission pressure. Permanent absence of a provider and statically ineligible offer parameters are NOT `unavailable`; they select TCP with no `reason` |
-| `capability_version_mismatch` | an offered transport is installed but no offered `capability_version` intersects the host's |
-
-A direct TCP selection or a valid TCP selection carrying one of these reasons commits TCP. This preserves explicit negotiated fallback when an optional candidate is unavailable. Negotiation-version mismatch, `unsupported_operation`, `connection_in_use`, timeout, malformed content, an unoffered selection, token mismatch, provider attachment failure, activation or commit failure, channel failure, and base-wire or authentication failure are not fallback evidence and MUST fail closed without same-generation TCP continuation.
-
-Exact `unavailable` is the only selection that authorizes an automatic client re-upgrade probe: the client keeps the committed TCP generation primary and MAY retry a fresh shadow setup (discovery, authentication, negotiation, activation, commit) under one immutable bounded episode deadline, moving only new managed work after a successful commit. A reasonless TCP selection, every other fallback reason, the legacy terminal, and any post-grant failure MUST NOT start or extend that probe window.
-
-#### 7.7.4 Candidate activation and commit
-
-A non-TCP grant creates a setup-only, non-routable candidate channel. The candidate owns a fresh pair of correlation namespaces (Section 8.3): consumer correlation 1 is reserved for `transport.activate`, consumer correlation 2 for `transport.commit`, and the application allocator starts at 3. On a TCP-committed generation the bootstrap namespaces simply continue; negotiation consumed one ordinary correlation.
-
-Candidate `Request` correlation 1 and its `Response`:
-
-```json
-{"op":"transport.activate","negotiation_version":1,"activation_token":"00000000000000000000000000000000"}
-```
-
-```json
-{"op":"transport.activate","negotiation_version":1}
-```
-
-Candidate `Request` correlation 2 and its `Response`:
-
-```json
-{"op":"transport.commit","negotiation_version":1}
-```
-
-```json
-{"op":"transport.commit","negotiation_version":1}
-```
-
-Both responses are tagged and carry no provider data; under Section 7.7.1 strictness any additional field is malformed. The host compares the activation token in constant time and atomically consumes the one-use grant record. The candidate becomes routable only after the exact commit response reaches per-frame local completion on the host and validates on the client. Any uncertainty — wrong or reused token, wrong correlation, an application frame before commit, timeout, or channel loss — closes both candidate and bootstrap without TCP continuation.
-
-#### 7.7.5 Setup states
-
-Selection is sticky for the generation: a direct TCP selection, a negotiated TCP fallback, or a committed non-TCP grant remains fixed until retirement. Reconnect rereads discovery data, reauthenticates, and negotiates from a fresh setup-only state. At most one candidate may be prepared. Any late or repeated negotiation, or any application-bearing operation while a candidate is being set up, retires the generation.
+Setup accepts only the release's current wire version, descriptor schema, and ring profile. Missing native support, malformed ancillary data, duplicate or extra descriptors, identity mismatch, token mismatch, admission failure, attachment failure, timeout, or setup-socket loss retires the connection before application traffic. Runtime ring corruption or unexpected setup-socket EOF also retires the connection. No setup or runtime failure changes transport or replays an uncertain request.
 
 ```mermaid
 stateDiagram-v2
   [*] --> Authenticating
-  Authenticating --> SetupOnly: auth succeeds
-  Authenticating --> Retired: auth or base-wire failure
-  SetupOnly --> TcpCommitted: valid direct or fallback TCP selection
-  SetupOnly --> CandidatePrepared: valid optional candidate grant
-  SetupOnly --> Retired: application traffic, wrong version, malformed exchange, or timeout
-  CandidatePrepared --> Activating: grant sent
-  CandidatePrepared --> Retired: provider failure
-  Activating --> AwaitingCommit: activation corr 1 acknowledged
-  Activating --> Retired: token, timeout, or channel failure
-  AwaitingCommit --> ProviderActive: commit corr 2 complete and valid
-  AwaitingCommit --> Retired: commit or promotion failure
-  TcpCommitted --> Retired: late negotiation or retirement
-  ProviderActive --> Retired: late negotiation or channel retirement
-  Retired --> [*]
+  Authenticating --> Attaching: peer proof succeeds
+  Authenticating --> Failed: proof, deadline, or socket failure
+  Attaching --> Active: descriptors and identity validate; activation commits
+  Attaching --> Failed: admission, transfer, validation, attach, or commit failure
+  Active --> Closed: clean Goodbye and joined teardown
+  Active --> Failed: ring failure or unexpected setup-socket EOF
+  Failed --> [*]
+  Closed --> [*]
 ```
 
-`Retired` is terminal; no provider choice, descriptor, token, correlation, or route survives into a later generation.
+`Failed` and `Closed` are terminal for that connection. A caller may establish a fresh connection, which reruns discovery, authentication, descriptor transfer, validation, and attachment from the beginning.
 
 ## 8. Host and handler lifecycle
 
@@ -733,13 +639,13 @@ Host startup order is normative:
 2. mint a fresh key and daemon ID;
 3. construct trusted `HostInit` storage and capability configuration;
 4. invoke linked component initialization exactly once and wait for it to return;
-5. bind `127.0.0.1` on a nonzero port;
+5. bind the owner-only Unix setup socket;
 6. atomically publish the connection file;
 7. accept clients and routes.
 
-There is no provider registration socket or synthetic compatibility handshake. `Hello` and `HelloAck` remain role-invalid on consumer connections.
+There is no provider registration socket or transport-selection handshake. `Hello` and `HelloAck` remain role-invalid on consumer connections.
 
-`McHandler::initialize` may begin asynchronous store opening. Publication therefore means transport-ready, not storage-ready. Discovery, authentication, negotiation, catalog, and route bind MUST work while storage opens. A storage-dependent request during that window receives terminal application error `store_unavailable`; the client MUST NOT classify it as a transport disconnect.
+`McHandler::initialize` may begin asynchronous store opening. Publication therefore means transport-ready, not storage-ready. Discovery, authentication, ring attachment, catalog, and route bind MUST work while storage opens. A storage-dependent request during that window receives terminal application error `store_unavailable`; the client MUST NOT classify it as a transport disconnect.
 
 ```mermaid
 sequenceDiagram
@@ -749,13 +655,13 @@ sequenceDiagram
   participant C as Client
   H->>H: lock, fresh key and daemon ID
   H->>M: HostInit; initialize once
-  H->>H: bind numeric loopback
+  H->>H: bind owner-only setup socket
   H->>F: atomic owner-only publish
   C->>F: bounded validate/read
-  C->>H: TCP + three-message authentication
-  C->>H: first Request transport.negotiate v1
-  H-->>C: valid transport selection
-  C->>H: application v2 envelope traffic
+  C->>H: setup socket + three-message authentication
+  H-->>C: two descriptors + fixed identity + activation
+  C->>H: commit attachment
+  C->>H: application v2 frames through ring
 ```
 
 ### 8.2 Route allocation and bind
@@ -797,7 +703,7 @@ An abandoned `route.open` reaches the same state by a different route: a caller 
 
 ### 8.3 Request identity and allocation
 
-Each sender allocates correlations monotonically from 1 within a connection generation. The two directions are independent namespaces: a host `Ping` correlation MAY be numerically equal to a pending consumer correlation on the same connection, and neither affects the other. Matching is direction-scoped by frame type — `Response`, `Error`, `StreamData`, and `StreamEnd` settle only consumer-originated requests; `Pong` settles only host-originated `Ping`. The no-reuse rule applies within one sender's namespace. A correlation MUST NOT be reused, even after terminal completion. `u64::MAX` may identify one final request; before another request, sender MUST retire the generation and reconnect. Published `HistorianProducer` currently saturates at `u64::MAX`; compatibility work in `magic-context-c50.4` MUST replace saturation with checked exhaustion and generation retirement.
+Each sender allocates correlations monotonically from 1 within a connection generation. The two directions are independent namespaces: a host `Ping` correlation MAY be numerically equal to a pending consumer correlation on the same connection, and neither affects the other. Matching is direction-scoped by frame type — `Response`, `Error`, `StreamData`, and `StreamEnd` settle only consumer-originated requests; `Pong` settles only host-originated `Ping`. The no-reuse rule applies within one sender's namespace. A correlation MUST NOT be reused, even after terminal completion. `u64::MAX` may identify one final request; before another request, sender MUST retire the generation and reconnect.
 
 Host pending state is keyed by full request identity. Sender-side no-reuse alone cannot stop a buggy client: a reused correlation on a different route keys a distinct pending entry and would dispatch a mutating handler operation twice. The host therefore enforces the monotonic allocation rule on ingress with a per-generation watermark: it MUST track the highest consumer `Request` correlation seen on the generation and treat any consumer `Request` (control or routed) whose correlation is not strictly greater than that watermark as a protocol violation that closes the generation before any dispatch. One `u64` per generation makes the check exact and bounded; it also obligates the sender to write `Request` frames in allocation order. `Cancel`, `Pong`, and `Goodbye` reference existing identities and are exempt. For ingress, a routed `Request` to an absent or stale route gets terminal `unknown_channel` and never reaches handler; stale or unknown `Cancel`/`Goodbye` is an idempotent no-op. For client ingress, unmatched or stale response/stream frames are dropped with redacted rate-limited diagnostics. First terminal wins; duplicate or late terminals are dropped. No frame from an old generation, wrong channel/epoch, unknown correlation, or terminal correlation may affect current work.
 
@@ -834,7 +740,7 @@ Handler health is host-internal. Host invokes `McHandler::health` on a dedicated
 
 Route close is pure-header `Goodbye` on nonzero channel and current epoch with correlation 0. Host stops new dispatch, settles/cancels route work within its close budget, calls route-gone exactly once, then permits cleanup-gated channel reuse. Duplicate route Goodbye is idempotent.
 
-Connection close is Goodbye on channel 0, epoch 0, correlation 0, followed by socket shutdown. Clean EOF has equivalent state effect but no peer drain guarantee. Any sent request lacking an observed terminal at close is `outcome_unknown`; queued requests proven unwritten are `not_sent`.
+Connection close is Goodbye on channel 0, epoch 0, correlation 0, followed by joined ring teardown and setup-socket close. Unexpected setup-socket EOF has equivalent retirement effect but no peer drain guarantee. Any published request lacking an observed terminal at close is `outcome_unknown`; queued requests proven unpublished are `not_sent`.
 
 ## 10. Send outcomes, errors, and retry ownership
 
@@ -844,12 +750,12 @@ Connection close is Goodbye on channel 0, epoch 0, correlation 0, followed by so
 | --- | --- | --- |
 | encode/admission/queue/deadline fails before frame write | `not_sent` | policy may issue fresh RPC |
 | local stale handle/generation detected before write | `not_sent` | open fresh route then retry within owner deadline |
-| socket writer proves zero request-frame bytes written | `not_sent` | policy may retry |
+| ring writer proves request frame was not published | `not_sent` | policy may retry |
 | host returns `unknown_channel` before handler dispatch | terminal no-dispatch proof | one fresh-route retry allowed |
-| any request byte may have reached socket, no terminal observed | `outcome_unknown` | **no** generic replay |
+| request may have been published to the ring, no terminal observed | `outcome_unknown` | **no** generic replay |
 | matching `Response`, `Error`, or `StreamEnd` observed | `terminal` | only operation-specific policy may issue new RPC |
 
-A completed socket write is not proof of handler dispatch, but absence of proof is insufficient for replay. Partial and uncertain writes are always `outcome_unknown`.
+A completed ring publication is not proof of handler dispatch, but absence of proof is insufficient for replay. Uncertain publication is always `outcome_unknown`.
 
 Managed Rust and TypeScript clients retry only proven pre-send failures and the host's no-dispatch stale-route response unless an application contract explicitly owns idempotent replay. Any request that may have reached the socket without a terminal returns `outcome_unknown`. Outer caller policy MUST NOT silently multiply client retries.
 
@@ -880,7 +786,7 @@ Managed Rust and TypeScript client defaults:
 
 | Owner | Default / bound |
 | --- | --- |
-| discovery, dial, authentication, and mandatory negotiation | one 2 s absolute handshake deadline |
+| discovery, setup-socket authentication, descriptor transfer, and ring attachment | one 2 s absolute handshake deadline |
 | frame completion after first header byte | one 30 s absolute deadline; idle first-header wait is unbounded |
 | route open, including retries and backoff | one 30 s absolute deadline |
 | request | one caller-overridable 30 s absolute deadline |
@@ -890,13 +796,13 @@ Managed Rust and TypeScript client defaults:
 
 Data and reserved-control frames share one queued-byte budget; reserved admission is not a byte-budget bypass. Data traffic cannot consume control slots. Exhausting control reserve retires the generation and deterministically settles pending work. Backoff counts the first attempt, and retry delay or a later stage never resets the owning deadline.
 
-The 2-second handshake deadline spans discovery, dial, authentication, and negotiation together, while Section 5.1's recommended host authentication deadline is also 2 seconds. The client therefore retires the generation at or before the end of the host's permitted authentication window, and negotiation receives only the remainder. A deployment that shortens the host authentication deadline keeps the two compatible; one that needs the full host window for authentication MUST raise the client handshake deadline above it, because these two values are not independent.
+The 2-second handshake deadline spans discovery, setup-socket authentication, descriptor transfer, validation, and ring attachment together, while Section 5.1's recommended host authentication deadline is also 2 seconds. A deployment that needs the full host window for authentication MUST raise the client handshake deadline above it, because these two values are not independent.
 
 ## 12. Reconnect, restart, and shutdown
 
 Any EOF, authentication failure, framing corruption, liveness failure, or explicit connection close retires the connection generation. Client MUST immediately invalidate its routes, pending correlations, capability/catalog caches, and late responses. The host has the mirror obligation for every handler-visible route on the retired generation: stop new dispatch, settle or cancel route work within a finite close budget, invoke `on_route_gone` exactly once, and release each global channel only after that callback completes — otherwise a reconnect finds handler bindings and channels still held by the dead generation. Reconnect MUST reread the connection file and rerun authentication; credentials MUST NOT be cached across host incarnations.
 
-Host restart MUST close old listener/generations, mint fresh key and daemon ID, bind and publish under lock, and reject mixed-generation authentication. Reopened routes receive new connection-fenced handles. Route-only module restart uses new channels or strictly higher epochs and preserves the same connection only if host can prove route cleanup.
+Host restart MUST close the old setup socket and generations, mint a fresh key and daemon ID, bind and publish under lock, and reject mixed-generation authentication. Reopened routes receive new connection-fenced handles. Route-only module restart uses new channels or strictly higher epochs and preserves the same connection only if host can prove route cleanup.
 
 ```mermaid
 stateDiagram-v2
@@ -921,7 +827,7 @@ Graceful host shutdown order:
 5. invoke route-gone exactly once for every handler-visible route;
 6. invoke the handler shutdown callback exactly once, after route cleanup and health-probe quiescence; the callback must not be aborted — a deadline overrun or panic marks the shutdown non-graceful, but the handler, host state, and instance lock remain owned until every native call and lifecycle callback has actually stopped. Inside that single callback the static composite drains its children in fixed order — `broca`, then `synapse`, then `magic-context` — and a child's panic or returned shutdown error MUST NOT skip a later child's drain: failures are collected as typed, redacted diagnostics and surfaced as one deterministic non-graceful failure only after every child has drained, with the instance fence still held. On the forced path (the drain deadline already expired) the callback still runs exactly once, but residual route-gone callbacks that themselves overran their deadline may still be in flight beside it; that incarnation is already fatal;
 7. drop handler only after all route-gone callbacks and the shutdown callback complete;
-8. sockets and the listener close as their owning tasks exit (no later than this step);
+8. ring mappings and setup sockets close as their owning tasks exit (no later than this step);
 9. release instance lock.
 
 Work without an observed terminal remains `outcome_unknown`. Forced shutdown may skip wire Goodbyes but MUST preserve local exactly-once route-gone and handler-drop ordering.
@@ -932,19 +838,18 @@ An authenticated `host.shutdown` (Section 7.6) initiates this same graceful orde
 
 ### 13.1 Startup, route, call, close
 
-1. Host locks runtime state, creates fresh credentials, initializes directly linked components, binds loopback, and publishes schema 1 with `wire_version: 2`.
-2. Client validates one descriptor-anchored snapshot and completes all three auth messages.
-3. Client sends `transport.negotiate` version 1 as correlation 1 and validates the selected transport.
-4. Client sends channel-0 `route.open` correlation 2.
+1. Host locks runtime state, creates fresh credentials, initializes directly linked components, binds the owner-only setup socket, and publishes schema 1 with `wire_version: 2`.
+2. Client validates one descriptor-anchored snapshot, authenticates, receives two ring descriptors, validates the fixed identity, attaches, and commits activation.
+3. Client sends channel-0 `route.open` correlation 1 through the ring.
 5. Host allocates global channel 7, epoch 77, binds the component, and returns the tagged response.
-6. Client sends an opaque request on `(7,77,3)`.
-7. Host dispatches once and returns one terminal on `(7,77,3)`.
+6. Client sends an opaque request on `(7,77,2)`.
+7. Host dispatches once and returns one terminal on `(7,77,2)`.
 8. Client sends route Goodbye `(7,77,0)`.
 9. Host blocks reuse until task settlement and exactly one route-gone callback complete; any reuse of channel 7 has epoch greater than 77.
 
 ### 13.2 Storage opening
 
-Host may publish after `McHandler::initialize` starts asynchronous storage acquisition. A client can authenticate, negotiate, list catalog, and bind a route. A storage-dependent request returns terminal `store_unavailable`. A later fresh request succeeds after storage opens; no reconnect is required.
+Host may publish after `McHandler::initialize` starts asynchronous storage acquisition. A client can authenticate, attach the ring, list catalog, and bind a route. A storage-dependent request returns terminal `store_unavailable`. A later fresh request succeeds after storage opens; no reconnect is required.
 
 ### 13.3 Temporary target absence
 
@@ -952,7 +857,7 @@ A `route.open` correlation receiving `unknown_module` is complete. Managed SDK m
 
 ### 13.4 Managed Rust streaming client
 
-`HistorianProducer` uses `mc_host::Client` to discover, authenticate, negotiate, open separate command and subscription routes for one identity, send unary commands, and consume matching `StreamData` until its application run terminal. Transport `StreamEnd` before that event is failure. The managed reader answers Ping while the stream is pending. Every terminal path closes both route handles.
+`HistorianProducer` uses `mc_host::Client` to discover, authenticate, attach the ring, open separate command and subscription routes for one identity, send unary commands, and consume matching `StreamData` until its application run terminal. Transport `StreamEnd` before that event is failure. The managed reader answers Ping while the stream is pending. Every terminal path closes both route handles.
 
 For `session.send`, the producer freezes exact request bytes, authenticated daemon ID, and `(project, harness, session)` identity. After `outcome_unknown`, it may reconnect and resend those bytes once only if daemon ID and identity are unchanged. Daemon or identity change preserves the typed unknown outcome and performs no resend; the durable driver applies backoff and stops that firing before another model.
 
@@ -970,8 +875,8 @@ Every scenario has one required outcome. These are review vectors; executable fi
 
 | ID | Scenario | Expected result |
 | --- | --- | --- |
-| AE1 | Fresh authenticated call | Valid version-2 file, three-message auth, mandatory negotiation, tagged route response, and matching terminal succeed |
-| AE2 | Malformed envelope or setup | Unsupported frame version, type, flags, oversize, truncation, application-before-negotiation, or invalid negotiation closes the generation; no application dispatch or TCP continuation |
+| AE1 | Fresh authenticated call | Valid version-2 file, three-message auth, fixed ring attachment, tagged route response, and matching terminal succeed |
+| AE2 | Malformed envelope or setup | Unsupported frame version, type, flags, oversize, truncation, invalid descriptor, identity mismatch, or attachment failure closes the generation; no application dispatch or alternate transport |
 | AE3 | Caller-supplied identity | Key holder may select identity; fields scope handler state and add no authority |
 | AE4 | Temporarily unavailable module | Each `unknown_module` terminates one correlation; policy retry uses a new correlation and never sends body early |
 | AE5 | Unknown routed channel | Host dispatch count stays zero; client may reopen and retry body exactly once on fresh route |
@@ -983,11 +888,11 @@ Every scenario has one required outcome. These are review vectors; executable fi
 | AE11 | Concurrent client routes | Distinct host-global channels; reuse only after cleanup at higher epoch |
 | AE12 | Transport-ready while storage opens | Auth/catalog/bind work; storage call returns terminal `store_unavailable` |
 | AE13 | Host shutdown | Stop admission, fenced unlink, bounded drain/cancel, route-gone once, drop handler, unlock |
-| V1 | Valid JSON file padded with whitespace to exactly 65,536 bytes | Pass size/JSON validation and attempt endpoint connection |
+| V1 | Valid JSON file padded with whitespace to exactly 65,536 bytes | Pass size/JSON validation and attempt setup-socket connection |
 | V2 | File 65,537 bytes | Reject before JSON parsing or key logging |
 | V3 | Connection file mode `0644` | Reject as insecure; do not connect |
-| V4 | Hostname, wildcard, IPv6, or port zero | Reject endpoint before connect |
-| V5 | Symlinked connection file or unsafe ancestor | Reject before dialing; do not follow the link |
+| V4 | Empty or relative setup-socket path | Reject before connect |
+| V5 | Symlinked connection file or unsafe ancestor | Reject before opening the setup socket; do not follow the link |
 | V6 | Link target swapped during read | Fail closed; do not combine snapshots |
 | V7 | Old cleanup after new publish | Daemon-ID mismatch prevents unlink |
 | V8 | Valid auth JSON padded with whitespace to exactly 4,096 bytes | Pass size/JSON validation and advance to next handshake stage |
@@ -1033,11 +938,11 @@ Every scenario has one required outcome. These are review vectors; executable fi
 | V48 | Reserved-class saturation | Every reserved pending/task permit held through blocked settlement rejects the next reserved-class request `server_busy` while a general request still dispatches and settles; saturating the general class never consumes a reserved permit |
 | V49 | Declarations exceed configured limits | A reservation that leaves zero general pending slots, zero general task slots, or less than one maximum ingress body fails startup before publication |
 | V50 | Child shutdown failure | A Broca shutdown panic or returned error still drains Synapse and Magic Context; the incarnation reports one deterministic redacted non-graceful failure |
-| V51 | Missing, null, string, fractional, or non-2 `wire_version` | Client rejects before endpoint dial |
-| V52 | First post-auth request is application traffic or another control operation | Host retires setup generation; zero application dispatch and no TCP continuation |
-| V53 | Negotiation receives `unsupported_operation`, `connection_in_use`, malformed response, version mismatch, or unoffered selection | Client retires generation; no application request continues on TCP |
-| V54 | Optional candidate unavailable or capability version mismatched | Valid negotiation explicitly selects offered TCP with the matching fallback reason; generation may continue |
-| V55 | Authenticated `host.status` during post-publication activation | One route-free response reports separate closed component states; no routed application body is sent, handler detail is omitted, and starting storage refreshes until ready or unavailable |
+| V51 | Missing, null, string, fractional, or non-2 `wire_version` | Client rejects before setup-socket dial |
+| V52 | Setup socket receives an application envelope | Host retires setup; zero application dispatch |
+| V53 | Descriptor count, identity, token, or ring geometry is invalid | Client retires setup before mapping or application traffic |
+| V54 | Native addon, attachment, or ring operation fails | Connection fails terminally; no alternate transport or frame replay |
+| V55 | Authenticated `host.status` | One route-free response reports separate closed component states; no routed application body is sent and handler detail is omitted |
 
 ### 14.1 Fixture oracle
 
@@ -1047,9 +952,9 @@ Fixtures MUST use committed literal bytes and an independent decoder/oracle; imp
 
 | Consumer | Required contract | Verification owner |
 | --- | --- | --- |
-| `McHostModuleTransport` | strict version-2 discovery, mandatory negotiation, generation and epoch route cache, opaque bodies, close races, outcome-safe retry | direct host-client tests |
+| `McHostModuleTransport` | strict version-2 discovery, mandatory ring attachment, generation and epoch route cache, opaque bodies, close races, outcome-safe retry | direct host-client tests |
 | Synapse and wake-plane callers | managed calls, typed send outcomes, truthful catalog, and absent `wake.create` fail-open behavior | direct TypeScript caller tests |
-| `HistorianProducer` | `mc_host::Client`, mandatory negotiation, full route handles, streaming, Ping/Pong, same-incarnation exact-byte replay fence, and both-route cleanup | module historian and managed-client tests |
+| `HistorianProducer` | `mc_host::Client`, mandatory ring attachment, full route handles, streaming, Ping/Pong, same-incarnation exact-byte replay fence, and both-route cleanup | module historian and managed-client tests |
 | session resolver | local typed `session_unresolved` absence with zero resolver route attempts when no session is proven | module resolver tests |
 | `McHandler` | direct `PrimaryComponent`, initialize once, bind before response, full-handle route-gone, atomics-only health, and tracked shutdown | module adapter tests |
 | direct-host fixtures | owner-only bounded Unix controls and host-owned clients; no provider process or sibling workspace | focused fixture tests; broad qualification in `magic-context-c50.9` |
@@ -1062,14 +967,14 @@ Fixtures MUST use committed literal bytes and an independent decoder/oracle; imp
 | strict descriptor version and secure snapshot | 4 | V1-V7, V51 |
 | authentication and secret handling | 5 | V8-V11, V23-V24, V39 |
 | framing, control, and canonical literals | 6-7 | V12-V17, V40-V42 |
-| mandatory first negotiation and fail-closed setup | 7.7 | AE1-AE2, V52-V54 |
+| mandatory fixed-ring attachment and fail-closed setup | 7.7 | AE1-AE2, V52-V54 |
 | full route handles, correlation, and terminal ownership | 8-10 | V18-V22, V27-V38, V43-V44 |
 | managed-client deadlines, control reserve, cancellation, and liveness | 9-11 | AE4-AE9, V23, V29-V30, V33-V37 |
 | restart and shutdown cleanup | 12-13 | AE7, AE13, V45-V50 |
 
 ## 17. Scope boundaries
 
-This direct-boundary migration owns host/client secure connection-file primitives, version-2 wire and authentication, mandatory negotiation, host-owned Rust and TypeScript API names, static composition, route epochs, managed-client behavior, and focused direct-host fixture proof.
+This direct boundary owns secure connection-file primitives, version-2 wire and authentication, mandatory fixed-ring attachment, host-owned Rust and TypeScript API names, static composition, route epochs, managed-client behavior, and focused direct-host fixture proof.
 
 `magic-context-c50.8` owns the production host executable and launcher, production connection-file orchestration during startup and teardown, user-facing configuration and doctor behavior, packaging, and distribution. This contract does not claim those lifecycle flows are delivered here.
 

@@ -38,6 +38,25 @@ permissions:
 # gauntlet.
 
 jobs:
+  mandatory-ring-architecture:
+    name: Mandatory ring architecture
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Architecture audit unit tests
+        run: bun test scripts/check-mc-shm-architecture.test.ts
+
+      - name: Reject obsolete application transports and dependencies
+        run: bun run check:shm-architecture
+
   shm-hardening-gate:
     name: SHM failure-hardening matrix gate
     runs-on: ubuntu-latest
@@ -109,7 +128,11 @@ jobs:
         run: sh scripts/provision-rust-ci-stubs.sh
 
       - name: Mandatory ring client suite
-        run: cargo nextest run -p mc-host --test client
+        run: |
+          cargo nextest run -p mc-host --test client
+          cargo test -p mc-host --test shm_failure_modes -- --test-threads=1
+          cargo test -p mc-host --test shm_soak \
+            short_soak_keeps_fd_mapping_thread_and_rss_envelopes_bounded -- --exact
 
   shm-source-build:
     name: Shared memory source build (${{ matrix.os }})
@@ -171,9 +194,13 @@ jobs:
         run: bun run --cwd packages/mc-shm-native build:source
 
       - name: Native behavior (Bun)
+        env:
+          MC_SHM_NATIVE_CLAIMED_TARGET: "1"
         run: bun run --cwd packages/mc-shm-native test:bun
 
       - name: Native behavior (Node 24)
+        env:
+          MC_SHM_NATIVE_CLAIMED_TARGET: "1"
         run: bun run --cwd packages/mc-shm-native test:node
 
       - name: Mandatory capability activation (Bun and Node 24)

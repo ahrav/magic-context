@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, readFileSync, writeFileSync } from "node:fs";
+import { lstatSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -11,6 +11,7 @@ const CONFIG_SCHEMA = "magic-context.mc-shm-release-gate-config/v1" as const;
 const RUN_SCHEMA = "magic-context.mc-shm-installed-performance-run/v1" as const;
 const SUITE_SCHEMA = "magic-context.mc-shm-installed-performance-suite/v1" as const;
 const REPORT_SCHEMA = "magic-context.mc-shm-release-gate-report/v1" as const;
+const baselineInputs = new WeakMap<GateConfig, unknown>();
 
 type Role = "baseline" | "candidate";
 
@@ -164,17 +165,23 @@ function stringArray(value: unknown, label: string): string[] {
     return value.map((entry, index) => string(entry, `${label}[${index}]`));
 }
 
-function sha256File(path: string, label: string): string {
-    if (!existsSync(path)) fail(`${label} missing at ${path}`);
-    const stat = lstatSync(path);
+function readRegularFile(path: string, label: string): Buffer {
+    let stat: ReturnType<typeof lstatSync>;
+    try {
+        stat = lstatSync(path);
+    } catch {
+        fail(`${label} missing at ${path}`);
+    }
     if (!stat.isFile() || stat.isSymbolicLink()) fail(`${label} must be a regular non-symlink file`);
-    return createHash("sha256").update(readFileSync(path)).digest("hex");
+    return readFileSync(path);
 }
 
-function resolveBoundPath(configPath: string, path: string, label: string): string {
-    const resolved = isAbsolute(path) ? path : resolve(dirname(configPath), path);
-    if (!existsSync(resolved)) fail(`${label} missing at ${resolved}`);
-    return resolved;
+function sha256File(path: string, label: string): string {
+    return createHash("sha256").update(readRegularFile(path, label)).digest("hex");
+}
+
+function resolveBoundPath(configPath: string, path: string): string {
+    return isAbsolute(path) ? path : resolve(dirname(configPath), path);
 }
 
 function parseConfig(input: unknown): GateConfig {
@@ -257,13 +264,19 @@ export function readGateConfig(path: string): GateConfig {
     }
     const config = parseConfig(parsed);
     if (config.state === "blocked") return config;
-    const baselinePath = resolveBoundPath(path, config.baseline!.path, "frozen baseline");
-    if (sha256File(baselinePath, "frozen baseline") !== config.baseline!.sha256) fail("frozen baseline digest does not match current bytes");
-    const packagePath = resolveBoundPath(path, config.candidate!.package_path!, "candidate package");
+    const baselinePath = resolveBoundPath(path, config.baseline!.path);
+    const baselineBytes = readRegularFile(baselinePath, "frozen baseline");
+    if (createHash("sha256").update(baselineBytes).digest("hex") !== config.baseline!.sha256) fail("frozen baseline digest does not match current bytes");
+    try {
+        baselineInputs.set(config, JSON.parse(baselineBytes.toString("utf8")));
+    } catch (error) {
+        fail(`frozen baseline is unreadable: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const packagePath = resolveBoundPath(path, config.candidate!.package_path!);
     if (sha256File(packagePath, "candidate package") !== config.candidate!.package_sha256) fail("candidate package digest does not match current bytes");
     if (config.candidate!.collector_path !== undefined) {
         if (config.candidate!.collector_sha256 === undefined) fail("collector path requires collector_sha256");
-        const collectorPath = resolveBoundPath(path, config.candidate!.collector_path, "installed-path collector");
+        const collectorPath = resolveBoundPath(path, config.candidate!.collector_path);
         if (sha256File(collectorPath, "installed-path collector") !== config.candidate!.collector_sha256) fail("collector digest does not match current bytes");
     }
     return config;
@@ -359,13 +372,12 @@ function assertIdentity(config: GateConfig, matched: MatchedIdentity, baseline: 
     if (baseline.host.kernel !== candidate.host.kernel || baseline.host.cpu !== candidate.host.cpu) fail("baseline and candidate host description mismatch");
 }
 
-function percentile(values: number[], percentile: number): number {
-    const sorted = [...values].sort((a, b) => a - b);
+function percentile(sorted: readonly number[], percentile: number): number {
     return sorted[Math.ceil(percentile * sorted.length) - 1]!;
 }
 
 function metrics(run: RunEvidence): Metrics {
-    const latencies = run.blocks.flatMap((block) => block.latencies_ns);
+    const latencies = run.blocks.flatMap((block) => block.latencies_ns).sort((a, b) => a - b);
     const sum = (field: keyof Pick<RunBlock, "completed_ops" | "elapsed_ns" | "body_copies" | "allocations" | "cpu_ns" | "wakeups">) =>
         run.blocks.reduce((total, block) => total + block[field], 0);
     return {
@@ -435,11 +447,18 @@ function blockedReport(config: GateConfig) {
     return { schema: REPORT_SCHEMA, verdict: "blocked", blockers: config.blockers, baseline: null, candidate: null, comparison: null };
 }
 
-function complete(configPath: string, config: GateConfig, candidateInput: unknown, outPath: string): void {
-    const baselinePath = resolveBoundPath(configPath, config.baseline!.path, "frozen baseline");
-    const report = buildReleaseGateReport(config, readJson(baselinePath, "frozen baseline"), candidateInput);
-    if (existsSync(outPath)) fail(`refusing to overwrite report ${outPath}`);
-    writeFileSync(outPath, `${JSON.stringify(report, null, 2)}\n`, { flag: "wx" });
+function complete(config: GateConfig, candidateInput: unknown, outPath: string): void {
+    const baselineInput = baselineInputs.get(config);
+    if (!baselineInputs.has(config)) fail("frozen baseline is unreadable: validated bytes unavailable");
+    const report = buildReleaseGateReport(config, baselineInput, candidateInput);
+    try {
+        writeFileSync(outPath, `${JSON.stringify(report, null, 2)}\n`, { flag: "wx" });
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+            fail(`refusing to overwrite report ${outPath}`);
+        }
+        throw error;
+    }
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
 }
 
@@ -459,15 +478,15 @@ function main(): void {
     }
     if (commandName === "verify") {
         if (!evidenceArg || !outArg) fail("verify requires candidate evidence and report paths");
-        complete(configPath, config, readJson(resolve(evidenceArg), "candidate evidence"), resolve(outArg));
+        complete(config, readJson(resolve(evidenceArg), "candidate evidence"), resolve(outArg));
         return;
     }
     if (commandName === "run") {
         if (!evidenceArg || outArg) fail("run requires one report path");
         const candidate = config.candidate!;
         if (!candidate.package_path || !candidate.collector_path || !candidate.collector_sha256) fail("run requires package_path and digest-bound collector fields");
-        const collectorPath = resolveBoundPath(configPath, candidate.collector_path, "installed-path collector");
-        const packagePath = resolveBoundPath(configPath, candidate.package_path, "candidate package");
+        const collectorPath = resolveBoundPath(configPath, candidate.collector_path);
+        const packagePath = resolveBoundPath(configPath, candidate.package_path);
         const result = Bun.spawnSync([collectorPath, ...(candidate.collector_args ?? [])], {
             cwd: dirname(packagePath),
             env: { ...process.env, MC_SHM_PERF_PACKAGE: packagePath },
@@ -481,7 +500,7 @@ function main(): void {
         } catch {
             fail("installed-path collector emitted malformed JSON");
         }
-        complete(configPath, config, candidateInput, resolve(evidenceArg));
+        complete(config, candidateInput, resolve(evidenceArg));
         return;
     }
     fail(`unknown command ${commandName}`);

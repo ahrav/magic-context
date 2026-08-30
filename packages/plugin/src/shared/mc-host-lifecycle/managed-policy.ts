@@ -105,8 +105,6 @@ async function probeManagedStorage(
     try {
         const client = await processMcHostClient({
             connectionFile: connectionFilePath(root),
-            handshakeTimeoutMs: Math.max(1, budgetMs),
-            requestTimeoutMs: Math.max(1, budgetMs),
         });
         assertStorageProbePeer(client, expectedDaemonId);
         for (;;) {
@@ -269,13 +267,6 @@ async function probeManagedReadiness(root: string, budgetMs: number): Promise<Ob
     const deadline = Date.now() + budgetMs;
     const client = await processMcHostClient({
         connectionFile: connectionFilePath(root),
-        handshakeTimeoutMs: Math.max(1, budgetMs),
-        requestTimeoutMs: Math.max(1, budgetMs),
-        identity: {
-            project_root: root,
-            harness: "mc-host-lifecycle",
-            session: "compatibility",
-        },
     });
     const { snapshot: compatibility, status } = await readCompatibilityProbe(client, deadline);
     if (status === null) {

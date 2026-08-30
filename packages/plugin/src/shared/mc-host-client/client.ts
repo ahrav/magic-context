@@ -47,6 +47,7 @@ import {
     type RouteHandle,
     StaleRouteHandleError,
 } from "./route-handle";
+import { classifySharedMemoryFailure } from "./shared-memory-failure";
 import type {
     AuthenticatedPeer,
     BindIdentity,
@@ -67,7 +68,7 @@ import type {
 import { sameDaemonId } from "./types";
 
 const QUALIFIED_TEST_PROFILE = "mc-host-test-ring-v1" as const;
-const DESCRIPTOR_SCHEMA_VERSION = 1 as const;
+const DESCRIPTOR_SCHEMA_VERSION = 2 as const;
 
 /** Preserves the repo's current 2-second TypeScript handshake budget. */
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 2_000;
@@ -447,6 +448,11 @@ export class McHostClient {
         const active = this.active;
         if (!active) return null;
         return { daemonVer: active.snapshot.daemonVer, pid: active.snapshot.pid };
+    }
+
+    /** True after irreversible owner close begins. */
+    get isClosed(): boolean {
+        return this.closeStarted;
     }
 
     /**
@@ -1741,26 +1747,6 @@ export function parseSharedMemoryDiagnostics(value: unknown): SharedMemoryDiagno
 
 function isPeerDeath(reason: RetirementReason): boolean {
     return reason === "eof" || reason === "socket_closed" || reason === "socket_error";
-}
-
-export function classifySharedMemoryFailure(error: unknown): SharedMemoryTerminalClass {
-    const message = error instanceof Error ? error.message : "";
-    const code = errorCode(error);
-    if (/native addon.*(?:missing|unavailable)|cannot find module/i.test(message)) {
-        return "missing_addon";
-    }
-    if (/identity mismatch/i.test(message)) return "identity_mismatch";
-    if (code === "memory_cap" || /(?:capacity|resource).*(?:exhaust|limit)/i.test(message)) {
-        return "resource_exhaustion";
-    }
-    if (
-        code === "ECONNRESET" ||
-        code === "EPIPE" ||
-        /unexpected eof|peer.*(?:died|closed)/i.test(message)
-    ) {
-        return "peer_death";
-    }
-    return "setup_failure";
 }
 
 /**

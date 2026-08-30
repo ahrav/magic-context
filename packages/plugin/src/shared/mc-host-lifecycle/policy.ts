@@ -15,7 +15,7 @@
  * path, stderr text, or native error chain rides on any result.
  */
 
-import { classifySharedMemoryFailure } from "../mc-host-client/client";
+import { classifySharedMemoryFailure } from "../mc-host-client/shared-memory-failure";
 import type {
     AuthenticatedPeer,
     CatalogEntry,
@@ -1043,7 +1043,7 @@ function terminalSharedMemoryDiagnostics(
         artifact: {
             profile: "mc-host-test-ring-v1",
             wire_version: 2,
-            descriptor_schema: 1,
+            descriptor_schema: 2,
         },
         bounds: ZERO_RESOURCE_COUNTS,
         accounting: null,

@@ -119,8 +119,8 @@ async fn short_soak_keeps_fd_mapping_thread_and_rss_envelopes_bounded() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "eight-hour installed-artifact resource soak"]
-async fn installed_eight_hour_soak() {
+#[ignore = "eight-hour source-tree resource soak"]
+async fn release_eight_hour_source_tree_soak() {
     let seconds = std::env::var("MC_SHM_SOAK_SECONDS")
         .map(|value| {
             value

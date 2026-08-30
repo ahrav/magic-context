@@ -63,7 +63,7 @@ function healthySharedMemory(): Record<string, unknown> {
         artifact: {
             profile: "mc-host-test-ring-v1",
             wire_version: 2,
-            descriptor_schema: 1,
+            descriptor_schema: 2,
         },
         bounds: { ...zero, arena_bytes: 134_217_728 },
         accounting: { active: zero, quarantined: zero },
