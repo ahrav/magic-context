@@ -30,19 +30,60 @@ describe("dreamer eval dev corpus", () => {
     test("core pool covers every required maintenance pressure", () => {
         const core = parseCorpus().find((scenario) => scenario.id === "dme-core-pool");
         expect(core).toBeDefined();
+        const pressureClaims = Object.fromEntries(core!.pressureRoles.map((entry) => [entry.role, entry.claimIds]));
+        expect(pressureClaims).toEqual({
+            "semantic-duplicate-pair": ["claim-cache-primary", "claim-cache-duplicate"],
+            "near-duplicate-pair": ["claim-retry-attempts", "claim-retry-backoff"],
+            stale: ["claim-worker-stale"],
+            "contradiction-pair": ["claim-feature-enabled", "claim-feature-disabled"],
+            "false-fluent": ["claim-legacy-queue"],
+            "high-value-file-independent": ["claim-tls-constraint"],
+            "rejected-alternative": ["claim-rejected-redis"],
+            "branch-specific": ["claim-release-branch"],
+        });
+
+        const claims = new Map(core!.pool.claims.map((claim) => [claim.id, claim]));
+        const verify = core!.tasks.find((task) => task.task === "verify")!;
+        if (verify.gold.kind !== "verify") throw new Error("verify task has non-verify gold");
+        const verdicts = new Map(verify.gold.claims.map((claim) => [claim.claimId, claim]));
+
+        const semanticPair = pressureClaims["semantic-duplicate-pair"]!.map((claimId) => claims.get(claimId)!);
+        expect(semanticPair[0]!.fixtureFiles).toEqual(semanticPair[1]!.fixtureFiles);
+        expect(semanticPair.map((claim) => verdicts.get(claim.id)?.verdict)).toEqual(["verified", "verified"]);
+        const nearPair = pressureClaims["near-duplicate-pair"]!.map((claimId) => claims.get(claimId)!);
+        expect(nearPair[0]!.fixtureFiles).toEqual(nearPair[1]!.fixtureFiles);
+        expect(nearPair[0]!.content).not.toBe(nearPair[1]!.content);
+        expect(nearPair.map((claim) => verdicts.get(claim.id)?.verdict)).toEqual(["verified", "verified"]);
+        const contradictionPair = pressureClaims["contradiction-pair"]!;
+        expect(claims.get(contradictionPair[1]!)!.fixtureFiles).toEqual(
+            claims.get(contradictionPair[0]!)!.fixtureFiles,
+        );
+        expect(contradictionPair.map((claimId) => verdicts.get(claimId)?.verdict).sort()).toEqual(["archive", "verified"]);
+
+        const stale = claims.get("claim-worker-stale")!;
+        const staleGold = verdicts.get(stale.id)!;
+        expect(staleGold).toMatchObject({ verdict: "update" });
+        expect(staleGold.requiredUpdateAnchors.some((anchor) => {
+            const value = anchor.match(/\d+/)?.[0];
+            return value !== undefined && stale.fixtureFiles.some((file) => file.content.includes(value));
+        })).toBe(true);
+        expect(staleGold.forbiddenUpdateAnchors.some((anchor) => stale.content.includes(anchor))).toBe(true);
+        expect(verdicts.get("claim-feature-disabled")?.verdict).toBe("archive");
+        expect(verdicts.get("claim-legacy-queue")?.verdict).toBe("archive");
+        expect(claims.get("claim-tls-constraint")).toMatchObject({
+            fileIndependent: true,
+            fixtureFiles: [],
+        });
+        const classify = core!.tasks.find((task) => task.task === "classify-memories")!;
+        if (classify.gold.kind !== "classify") throw new Error("classify task has non-classify gold");
+        expect(classify.gold.claims.find((claim) => claim.claimId === "claim-tls-constraint")?.importance.min).toBe(85);
+        expect(verdicts.get("claim-rejected-redis")?.verdict).toBe("verified");
+        expect(verdicts.get("claim-release-branch")?.verdict).toBe("verified");
+
         const contents = core!.pool.claims.map((claim) => claim.content.toLowerCase()).join("\n");
-        for (const marker of [
-            "semantic duplicate",
-            "near duplicate",
-            "stale fixture",
-            "contradiction",
-            "false but fluent",
-            "file-independent",
-            "rejected alternative",
-            "branch-specific",
-        ]) {
-            expect(contents).toContain(marker);
-        }
+        expect(contents).not.toContain("control");
+        expect(contents).not.toContain("false side");
+        expect(contents).not.toContain("stale fixture");
         expect(core!.tasks.map((task) => task.task).sort()).toEqual(["classify-memories", "map-memories", "verify"]);
     });
 

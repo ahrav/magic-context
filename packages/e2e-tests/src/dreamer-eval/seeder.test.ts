@@ -112,6 +112,7 @@ function scenario(taskName: DreamerTask): DreamerEvalScenario {
         schema: DREAMER_EVAL_SCENARIO_SCHEMA,
         id: `dme-${taskName.replaceAll("-", "")}`,
         title: `${taskName} fixture`,
+        pressureRoles: [],
         pool: {
             claims: Array.from({ length: 10 }, (_, index) => ({
                 id: `claim-${index}`,
@@ -253,6 +254,18 @@ describe("dreamer eval seeder", () => {
         expect(() => assertFixtureFilesCommitted(result.workdir, ["src/current.ts"])).toThrow(
             "ERROR:fixture-drift: fixture file is not committed: src/current.ts",
         );
+    });
+
+    test("ignores unrelated untracked harness files", async () => {
+        const selectedScenario = scenario("map-memories");
+        const result = await seedDreamerEvalTask({
+            db: database(),
+            scenario: selectedScenario,
+            task: selectedScenario.tasks[0]!,
+            workdir: workdir(),
+        });
+        writeFileSync(join(result.workdir, "harness-output.log"), "unrelated\n");
+        expect(() => assertFixtureFilesCommitted(result.workdir, ["src/current.ts"])).not.toThrow();
     });
 
     test("refuses fixture paths that target the git control directory", async () => {

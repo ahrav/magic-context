@@ -48,7 +48,37 @@ Each task repeat gets a fresh harness database and fixture repository. The
 command runs in its own Bun process so the runner's temporary keep-subagents
 setting cannot leak into a shared test process. Output is grouped under
 `<output-dir>/<scenario>/<task>/`: one versioned run report per repeat and one
-`variance.json` artifact for the set.
+`variance.json` artifact for the set. A run that produced no verdict for a
+claim counts in that claim's histogram under the `missing` bucket, so sparse
+outputs stay visible; `repeatCount` counts the reports actually aggregated.
+
+`<output-dir>/coverage.json` records what the invocation set out to observe: every
+selected scenario/task group with its `requestedRuns`, the `archivedRuns` written
+under it, and whether its `variance.json` exists. It is written for every outcome,
+so the archive alone distinguishes a group a filter excluded — absent — from one
+selected and then skipped, which appears with `archivedRuns: 0`, and shows a group
+truncated after one of three repeats as `requestedRuns: 3, archivedRuns: 1` rather
+than as a complete one-repeat experiment. `complete` is false whenever a requested
+run or a variance file is missing. It is a separate artifact because the report and
+variance contracts are archived evidence older tooling must keep parsing, and
+because a wholly skipped group has no report to aggregate and so can carry no
+variance artifact at all.
+
+`--output-dir` must be empty or absent, and the run refuses before spending model
+credits when it is not. Run ids are per-run UUIDs, so a reused directory
+accumulates reports instead of replacing them: `archivedRuns` would count only the
+newest invocation's reports while the directory held an earlier one's,
+`variance.json` would be rewritten as an aggregate of just those newest reports,
+and a group directory left by an earlier filtered run would sit beside a
+`coverage.json` that does not list it. Keeping one invocation's evidence per tree
+is what makes `archivedRuns` checkable by counting files. Remove the directory or
+pass a fresh path to rerun.
+
+There is no deadline by default. `--deadline-minutes <n>` bounds the live loop
+for callers running under an external timeout: before each run after the
+first, the script checks that the longest completed run still fits in the
+remaining budget, so a run is never started that the enclosing workflow
+timeout would kill mid-flight. Deadline truncation exits `1`.
 
 Every report records the plugin entrypoint and a digest of everything the run's
 outcome depends on that the commit does not pin: the loaded bundle's bytes when a
@@ -73,7 +103,8 @@ which paths the host would actually store.
 
 Exit codes are `0` when every run passes, `1` for any ordinary FAIL or ERROR,
 and `2` when any run archives a gold-true claim. Missing credentials, invalid
-filters, malformed scenarios, and artifact failures exit `1`.
+filters, malformed scenarios, a non-empty output directory, deadline truncation,
+and artifact failures exit `1`.
 
 ## Authoring scenarios
 
@@ -83,6 +114,22 @@ ids from the pool, while the runner resolves production public ids after
 seeding. Verify gold excludes file-independent claims. Map and classify gold
 include them. Every task declares the exact in-scope and skipped partition that
 the production gate must return before a model request is allowed.
+
+Every scenario also declares `pressureRoles`. Valid roles are
+`semantic-duplicate-pair`, `near-duplicate-pair`, `stale`,
+`contradiction-pair`, `false-fluent`, `high-value-file-independent`,
+`rejected-alternative`, and `branch-specific`. Pair roles name exactly two claim
+ids; other roles name one. Use an empty array when no pressure role applies.
+
+Scenarios are checked-in source, not archived evidence: the runner parses them
+only from this `dev/` directory, so every instance travels in the same commit as
+the parser and a rerun of an older scenario checks out its own contract. That is
+why the scenario parser requires each field exactly rather than defaulting a
+missing one, and why adding a required field needs no schema bump — an omitted
+`pressureRoles` is an authoring mistake to reject, and `[]` is how a scenario
+says it has no pressure role. Run reports and variance artifacts are the
+opposite: they leave the repository as uploaded artifacts, so their schemas are
+versioned and their field sets change only with a version.
 
 `dme-core-pool` covers semantic duplicates, load-bearing near duplicates,
 stale and contradictory claims, false-but-fluent text, a file-independent

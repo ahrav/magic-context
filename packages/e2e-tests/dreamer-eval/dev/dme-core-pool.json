@@ -2,11 +2,21 @@
   "schema": "dreamer-eval-scenario/v1",
   "id": "dme-core-pool",
   "title": "Core dreamer maintenance pressures",
+  "pressureRoles": [
+    { "role": "semantic-duplicate-pair", "claimIds": ["claim-cache-primary", "claim-cache-duplicate"] },
+    { "role": "near-duplicate-pair", "claimIds": ["claim-retry-attempts", "claim-retry-backoff"] },
+    { "role": "stale", "claimIds": ["claim-worker-stale"] },
+    { "role": "contradiction-pair", "claimIds": ["claim-feature-enabled", "claim-feature-disabled"] },
+    { "role": "false-fluent", "claimIds": ["claim-legacy-queue"] },
+    { "role": "high-value-file-independent", "claimIds": ["claim-tls-constraint"] },
+    { "role": "rejected-alternative", "claimIds": ["claim-rejected-redis"] },
+    { "role": "branch-specific", "claimIds": ["claim-release-branch"] }
+  ],
   "pool": {
     "claims": [
       {
         "id": "claim-cache-primary",
-        "content": "Semantic duplicate control: the cache is bounded to 4096 entries.",
+        "content": "The cache retains at most 4096 entries.",
         "category": "CONFIG_VALUES",
         "importance": 40,
         "memoryScope": "ecosystem",
@@ -22,7 +32,7 @@
       },
       {
         "id": "claim-cache-duplicate",
-        "content": "Semantic duplicate control phrased differently: at most 4096 cache entries are retained.",
+        "content": "Cache capacity is capped at 4096 entries.",
         "category": "CONFIG_VALUES",
         "importance": 38,
         "memoryScope": "ecosystem",
@@ -38,7 +48,7 @@
       },
       {
         "id": "claim-retry-attempts",
-        "content": "Near duplicate control: foreground requests allow 3 total attempts, including the first call.",
+        "content": "Foreground requests allow 3 total attempts, including the first call.",
         "category": "CONFIG_VALUES",
         "importance": 35,
         "memoryScope": "ecosystem",
@@ -54,7 +64,7 @@
       },
       {
         "id": "claim-retry-backoff",
-        "content": "Near duplicate control with a distinct load-bearing detail: retry backoff starts at 250 ms.",
+        "content": "Retry backoff starts at 250 ms.",
         "category": "CONFIG_VALUES",
         "importance": 30,
         "memoryScope": "ecosystem",
@@ -70,7 +80,7 @@
       },
       {
         "id": "claim-worker-stale",
-        "content": "Stale fixture control: the worker pool has 4 threads.",
+        "content": "The worker pool has 4 threads.",
         "category": "CONFIG_VALUES",
         "importance": 25,
         "memoryScope": "ecosystem",
@@ -86,7 +96,7 @@
       },
       {
         "id": "claim-feature-enabled",
-        "content": "Contradiction control, true side: streaming uploads are enabled.",
+        "content": "Streaming uploads are enabled.",
         "category": "ARCHITECTURE",
         "importance": 45,
         "memoryScope": "ecosystem",
@@ -102,7 +112,7 @@
       },
       {
         "id": "claim-feature-disabled",
-        "content": "Contradiction control, false side: streaming uploads are disabled.",
+        "content": "Streaming uploads are disabled.",
         "category": "ARCHITECTURE",
         "importance": 20,
         "memoryScope": "ecosystem",
@@ -118,7 +128,7 @@
       },
       {
         "id": "claim-legacy-queue",
-        "content": "False but fluent control: the legacy delivery queue remains the authoritative write path.",
+        "content": "The legacy delivery queue remains the authoritative write path.",
         "category": "ARCHITECTURE",
         "importance": 22,
         "memoryScope": "ecosystem",
@@ -134,7 +144,7 @@
       },
       {
         "id": "claim-tls-constraint",
-        "content": "High-value file-independent constraint: provider traffic must use TLS 1.3 or newer.",
+        "content": "Provider traffic must use TLS 1.3 or newer.",
         "category": "CONSTRAINTS",
         "importance": 50,
         "memoryScope": "project",
@@ -145,7 +155,7 @@
       },
       {
         "id": "claim-rejected-redis",
-        "content": "Rejected alternative control: Redis was rejected; SQLite remains authoritative, so Redis must not be presented as the selected store.",
+        "content": "Redis was rejected; SQLite remains the authoritative store.",
         "category": "CONSTRAINTS",
         "importance": 42,
         "memoryScope": "ecosystem",
@@ -161,7 +171,7 @@
       },
       {
         "id": "claim-release-branch",
-        "content": "Branch-specific control: on the release branch only, uploads use the conservative 2 MiB chunk size.",
+        "content": "On the release branch, uploads use a 2 MiB chunk size.",
         "category": "CONFIG_VALUES",
         "importance": 18,
         "memoryScope": "ecosystem",

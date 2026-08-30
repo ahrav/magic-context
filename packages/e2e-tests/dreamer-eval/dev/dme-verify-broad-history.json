@@ -2,11 +2,12 @@
   "schema": "dreamer-eval-scenario/v1",
   "id": "dme-verify-broad-history",
   "title": "Broad verification revisits seeded history",
+  "pressureRoles": [],
   "pool": {
     "claims": [
       {
         "id": "claim-history-1",
-        "content": "Broad history control 1: API requests use version v2.",
+        "content": "API requests use version v2.",
         "category": "ARCHITECTURE",
         "importance": 60,
         "memoryScope": "project",
@@ -22,7 +23,7 @@
       },
       {
         "id": "claim-history-2",
-        "content": "Broad history control 2: the primary region is us-east-1.",
+        "content": "The primary region is us-east-1.",
         "category": "CONFIG_VALUES",
         "importance": 60,
         "memoryScope": "project",
@@ -38,7 +39,7 @@
       },
       {
         "id": "claim-history-3",
-        "content": "Broad history control 3: the service listens on port 8443.",
+        "content": "The service listens on port 8443.",
         "category": "CONFIG_VALUES",
         "importance": 60,
         "memoryScope": "project",
@@ -54,7 +55,7 @@
       },
       {
         "id": "claim-history-4",
-        "content": "Broad history control 4: release artifacts are immutable.",
+        "content": "Release artifacts are immutable.",
         "category": "CONSTRAINTS",
         "importance": 70,
         "memoryScope": "project",
@@ -70,7 +71,7 @@
       },
       {
         "id": "claim-history-5",
-        "content": "Broad history control 5: release artifacts are signed.",
+        "content": "Release artifacts are signed.",
         "category": "CONSTRAINTS",
         "importance": 70,
         "memoryScope": "project",
@@ -86,7 +87,7 @@
       },
       {
         "id": "claim-history-6",
-        "content": "Broad history control 6: rollback keeps the prior artifact.",
+        "content": "Rollback keeps the prior artifact.",
         "category": "ARCHITECTURE",
         "importance": 65,
         "memoryScope": "project",
@@ -102,7 +103,7 @@
       },
       {
         "id": "claim-history-7",
-        "content": "Broad history control 7: database migrations run before traffic shift.",
+        "content": "Database migrations run before traffic shifts.",
         "category": "PROJECT_RULES",
         "importance": 75,
         "memoryScope": "project",
@@ -118,7 +119,7 @@
       },
       {
         "id": "claim-history-8",
-        "content": "Broad history control 8: deployment bake time is 15 minutes.",
+        "content": "Deployment bake time is 15 minutes.",
         "category": "CONFIG_VALUES",
         "importance": 55,
         "memoryScope": "project",
@@ -134,7 +135,7 @@
       },
       {
         "id": "claim-history-9",
-        "content": "Broad history control 9: health checks use the ready endpoint.",
+        "content": "Health checks use the ready endpoint.",
         "category": "PROJECT_RULES",
         "importance": 65,
         "memoryScope": "project",
@@ -150,7 +151,7 @@
       },
       {
         "id": "claim-history-independent",
-        "content": "Broad history file-independent control: credentials must never be committed.",
+        "content": "Credentials must never be committed.",
         "category": "CONSTRAINTS",
         "importance": 95,
         "memoryScope": "universe",

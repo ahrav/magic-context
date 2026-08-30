@@ -70,6 +70,18 @@ export type ClaimScope = (typeof CLAIM_SCOPES)[number];
 export const VERIFY_VERDICTS = ["verified", "update", "archive"] as const;
 export type VerifyVerdict = (typeof VERIFY_VERDICTS)[number];
 
+export const PRESSURE_ROLES = [
+    "semantic-duplicate-pair",
+    "near-duplicate-pair",
+    "stale",
+    "contradiction-pair",
+    "false-fluent",
+    "high-value-file-independent",
+    "rejected-alternative",
+    "branch-specific",
+] as const;
+export type PressureRole = (typeof PRESSURE_ROLES)[number];
+
 export const VERIFICATION_OUTCOMES = ["verified", "update", "archive", "stale", "flagged"] as const;
 export type VerificationOutcome = (typeof VERIFICATION_OUTCOMES)[number];
 
@@ -305,12 +317,36 @@ export interface DreamerTaskScenario {
     gold: ParsedLayerGold;
 }
 
+export interface ScenarioPressureRole {
+    role: PressureRole;
+    claimIds: string[];
+}
+
 export interface DreamerEvalScenario {
     schema: typeof DREAMER_EVAL_SCENARIO_SCHEMA;
     id: string;
     title: string;
+    pressureRoles: ScenarioPressureRole[];
     pool: { claims: ScenarioClaim[] };
     tasks: DreamerTaskScenario[];
+}
+
+function parsePressureRoles(raw: unknown, label: string, poolIds: ReadonlySet<string>): ScenarioPressureRole[] {
+    const roles = array(raw, label).map((entry, index) => {
+        const itemLabel = `${label}[${index}]`;
+        const item = record(entry, itemLabel);
+        exact(item, ["role", "claimIds"], itemLabel);
+        const role = enumeration(item.role, PRESSURE_ROLES, `${itemLabel}.role`);
+        const claimIds = parseClaimIdArray(item.claimIds, `${itemLabel}.claimIds`);
+        const expectedCardinality = role.endsWith("-pair") ? 2 : 1;
+        if (claimIds.length !== expectedCardinality) fail(`${itemLabel}.claimIds: role-cardinality-invalid`);
+        for (const [claimIndex, claimId] of claimIds.entries()) {
+            assertKnownClaim(claimId, poolIds, `${itemLabel}.claimIds[${claimIndex}]`);
+        }
+        return { role, claimIds };
+    });
+    unique(roles.map((entry) => entry.role), label);
+    return roles;
 }
 
 function parseStringArray(raw: unknown, label: string): string[] {
@@ -816,7 +852,7 @@ function parseTask(raw: unknown, label: string, pool: ReadonlyMap<string, Scenar
 
 export function parseScenario(raw: unknown, label = "scenario"): DreamerEvalScenario {
     const root = record(raw, label);
-    exact(root, ["schema", "id", "title", "pool", "tasks"], label);
+    exact(root, ["schema", "id", "title", "pressureRoles", "pool", "tasks"], label);
     if (root.schema !== DREAMER_EVAL_SCENARIO_SCHEMA) fail(`${label}.schema: version-invalid`);
     const poolValue = record(root.pool, `${label}.pool`);
     exact(poolValue, ["claims"], `${label}.pool`);
@@ -836,6 +872,7 @@ export function parseScenario(raw: unknown, label = "scenario"): DreamerEvalScen
         `${label}.pool.claims.content`,
     );
     const pool = new Map(claims.map((claim) => [claim.id, claim]));
+    const pressureRoles = parsePressureRoles(root.pressureRoles, `${label}.pressureRoles`, new Set(pool.keys()));
     const tasks = array(root.tasks, `${label}.tasks`).map((entry, index) => parseTask(entry, `${label}.tasks[${index}]`, pool));
     if (tasks.length === 0) fail(`${label}.tasks: empty`);
     unique(tasks.map((task) => task.task), `${label}.tasks`);
@@ -843,6 +880,7 @@ export function parseScenario(raw: unknown, label = "scenario"): DreamerEvalScen
         schema: DREAMER_EVAL_SCENARIO_SCHEMA,
         id: staticId(root.id, `${label}.id`, SCENARIO_ID_RE),
         title: string(root.title, `${label}.title`),
+        pressureRoles,
         pool: { claims },
         tasks,
     };
