@@ -1,5 +1,6 @@
 import { splitmix32 } from "../../../plugin/scripts/retrieval-benchmark/synthetic";
 import {
+    MAX_TRANSCRIPT_TURNS,
     normalizeContent,
     parseScenario,
     predicateMatches,
@@ -104,12 +105,13 @@ function eligibleMessages(scenario: HistorianEvalScenario): EligibleMessage[] {
     const absentPredicates = scenario.gold.expectedAbsent.map((absent) => absent.predicate);
     return scenario.transcript.turns.flatMap((turn, turnIndex) => {
         if (protectedIndexes.has(turnIndex)) return [];
-        return (["user", "assistant"] as const).flatMap((role) => {
-            const text = turn[role];
-            return absentPredicates.some((predicate) => predicateMatches(predicate, text))
-                ? []
-                : [{ turnIndex, role, text }];
-        });
+        const turnText = `${turn.user}\n${turn.assistant}`;
+        if (absentPredicates.some((predicate) => predicateMatches(predicate, turnText))) return [];
+        return (["user", "assistant"] as const).map((role) => ({
+            turnIndex,
+            role,
+            text: turn[role],
+        }));
     });
 }
 
@@ -274,11 +276,16 @@ const duplicateRejectedProposal: Transform = {
     alwaysApplicable: false,
     apply(scenario, rawSeed) {
         const seed = normalizedSeed(rawSeed);
+        if (scenario.transcript.turns.length >= MAX_TRANSCRIPT_TURNS) {
+            return { applicable: false, reason: "transcript is already at the turn limit" };
+        }
         const rejected = scenario.gold.expectedAbsent.filter(
             (absent) => absent.family === "proposed-but-rejected",
         );
+        const protectedIndexes = protectedTurnIndexes(scenario);
         const candidates = scenario.transcript.turns.flatMap((turn, turnIndex) => {
             if (turnIndex >= scenario.transcript.epilogueStartIndex) return [];
+            if (protectedIndexes.has(turnIndex)) return [];
             const text = `${turn.user}\n${turn.assistant}`;
             if (!rejected.some((absent) => predicateMatches(absent.predicate, text))) return [];
             const insertion = turnIndex + 1;
@@ -322,30 +329,50 @@ const renameUnrelatedSymbols: Transform = {
     alwaysApplicable: false,
     apply(scenario, rawSeed) {
         const seed = normalizedSeed(rawSeed);
-        const candidates = eligibleMessages(scenario).flatMap((message) => {
-            const matches = [...message.text.matchAll(SYMBOL_RE)];
-            return matches.map((match) => ({ message, match }));
-        });
+        const messages = eligibleMessages(scenario);
+        const candidates = [
+            ...new Set(messages.flatMap((message) =>
+                [...message.text.matchAll(SYMBOL_RE)].map((match) => match[1] ?? match[0])
+            )),
+        ];
         if (candidates.length === 0) {
             return { applicable: false, reason: "no unrelated symbol to rename" };
         }
         const next = splitmix32(seed);
-        const { message, match } = pick(candidates, next);
-        const original = match[0];
-        const replacement = original.startsWith("`")
-            ? `\`aux_symbol_${Math.floor(next() * 10_000)}\``
-            : `aux_symbol_${Math.floor(next() * 10_000)}`;
-        const start = match.index!;
-        const text =
-            message.text.slice(0, start) +
-            replacement +
-            message.text.slice(start + original.length);
+        const original = pick(candidates, next);
+        const existing = new Set(scenario.transcript.turns.flatMap((turn) =>
+            [turn.user, turn.assistant].flatMap((text) =>
+                [...text.matchAll(SYMBOL_RE)].map((match) => match[1] ?? match[0])
+            )
+        ));
+        const replacementStart = Math.floor(next() * 10_000);
+        let replacement: string | undefined;
+        for (let offset = 0; offset < 10_000; offset += 1) {
+            const candidate = `aux_symbol_${(replacementStart + offset) % 10_000}`;
+            if (candidate !== original && !existing.has(candidate)) {
+                replacement = candidate;
+                break;
+            }
+        }
+        if (replacement === undefined) {
+            return { applicable: false, reason: "no unused replacement symbol" };
+        }
+        const turns = scenario.transcript.turns.map((turn) => ({ ...turn }));
+        for (const message of messages) {
+            turns[message.turnIndex]![message.role] = message.text.replace(
+                SYMBOL_RE,
+                (matched, quoted: string | undefined) => {
+                    if ((quoted ?? matched) !== original) return matched;
+                    return quoted === undefined ? replacement : `\`${replacement}\``;
+                },
+            );
+        }
         const turnMap = scenario.transcript.turns.map((_, index) => index);
         return derivative(
             scenario,
             this,
             seed,
-            replaceMessage(scenario.transcript.turns, message, text),
+            turns,
             scenario.transcript.epilogueStartIndex,
             turnMap,
         );

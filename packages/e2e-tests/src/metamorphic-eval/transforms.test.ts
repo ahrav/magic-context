@@ -8,7 +8,6 @@ import {
     lintScenario,
     normalizeContent,
     parseScenario,
-    scenarioFingerprint,
     type HistorianEvalScenario,
 } from "../historian-eval/contract";
 import { validScenario, validScenarioRaw } from "../historian-eval/test-support";
@@ -68,7 +67,7 @@ describe("metamorphic transforms", () => {
             expect(result, transform.id).toBeDefined();
             expect(() => parseScenario(result!.scenario)).not.toThrow();
             expect(lintScenario(result!.scenario), transform.id).toEqual([]);
-            expect(scenarioFingerprint(result!.scenario)).not.toBe(scenarioFingerprint(scenario));
+            expect(result!.scenario.transcript).not.toEqual(scenario.transcript);
             expect(result!.scenario.id).toMatch(
                 new RegExp(`^${scenario.id}-d-${transform.id}-v${transform.version}-s\\d+$`),
             );
@@ -175,6 +174,77 @@ describe("metamorphic transforms", () => {
             applicable: false,
             reason: "no rejected proposal turn",
         });
+    });
+
+    test("role-local rewrites preserve turn-spanning negative evidence", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[3] = { user: "Keep the bridge", assistant: "token aux_worker.ts unchanged." };
+        const absent = (raw.gold as { expectedAbsent: Array<{ predicate: { value: string } }> })
+            .expectedAbsent[0]!;
+        absent.predicate.value = "bridge token";
+        const scenario = parseScenario(raw);
+
+        for (const id of ["paraphrase-irrelevant", "rename-unrelated-symbols"]) {
+            const transform = TRANSFORMS.find((candidate) => candidate.id === id)!;
+            const result = firstApplicable(transform, scenario)!;
+            expect(result.scenario.transcript.turns[3], id).toEqual(scenario.transcript.turns[3]);
+        }
+    });
+
+    test("duplicate rejection excludes turns containing accepted evidence", () => {
+        const raw = validScenarioRaw();
+        const absent = (raw.gold as { expectedAbsent: Array<{ predicate: { value: string } }> })
+            .expectedAbsent[0]!;
+        absent.predicate.value = "redis rejected for the operational dependency";
+        const scenario = parseScenario(raw);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "duplicate-rejected-proposal")!;
+
+        expect(transform.apply(scenario, 0)).toEqual({
+            applicable: false,
+            reason: "no rejected proposal insertion preserves contiguous gold ranges",
+        });
+    });
+
+    test("duplicate rejection is inapplicable at the transcript turn limit", () => {
+        const raw = validScenarioRaw();
+        const transcript = raw.transcript as {
+            turns: Array<{ user: string; assistant: string }>;
+            epilogueStartIndex: number;
+        };
+        while (transcript.turns.length < 100) {
+            transcript.turns.push({ user: "Background context.", assistant: "Noted." });
+        }
+        transcript.epilogueStartIndex = 99;
+        const scenario = parseScenario(raw);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "duplicate-rejected-proposal")!;
+
+        expect(transform.apply(scenario, 0)).toEqual({
+            applicable: false,
+            reason: "transcript is already at the turn limit",
+        });
+    });
+
+    test("rename changes every eligible occurrence without colliding", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[3] = {
+            user: "Close aux_worker.ts after aux_worker.ts and aux_symbol_1234 are checked.",
+            assistant: "Background only.",
+        };
+        const scenario = parseScenario(raw);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
+        const result = firstApplicable(transform, scenario)!;
+        const originalSymbols = new Set(["aux_worker.ts", "aux_symbol_1234"]);
+        const derivativeText = result.scenario.transcript.turns[3]!.user;
+        const derivativeSymbols = [...derivativeText.matchAll(/aux_(?:worker\.ts|symbol_\d+)/g)]
+            .map((match) => match[0]);
+        const introduced = derivativeSymbols.filter((symbol) => !originalSymbols.has(symbol));
+
+        expect(derivativeText).not.toContain("aux_worker.ts");
+        expect(introduced).toHaveLength(2);
+        expect(new Set(introduced).size).toBe(1);
+        expect(introduced[0]).not.toBe("aux_symbol_1234");
     });
 
     test("same input is byte-identical while different seeds select different rewrites", () => {

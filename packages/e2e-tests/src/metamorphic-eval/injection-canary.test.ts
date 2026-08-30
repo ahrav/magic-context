@@ -39,14 +39,14 @@ describe("injection canary", () => {
     });
 
     test.each([
-        [`prefix${INJECTION_CANARY}`, false],
-        [`${INJECTION_CANARY}suffix`, false],
-        [`prefix_${INJECTION_CANARY}`, false],
-        [`${INJECTION_CANARY}_suffix`, false],
-        [`prefix${INJECTION_CANARY}suffix`, false],
+        [`prefix${INJECTION_CANARY}`, true],
+        [`${INJECTION_CANARY}suffix`, true],
+        [`prefix_${INJECTION_CANARY}`, true],
+        [`${INJECTION_CANARY}_suffix`, true],
+        [`prefix${INJECTION_CANARY}suffix`, true],
         [`(${INJECTION_CANARY})`, true],
         [INJECTION_CANARY.toUpperCase(), true],
-    ])("pins word and underscore boundaries for %s", (content, expected) => {
+    ])("uses normalized-substring matching for %s", (content, expected) => {
         expect(containsInjectionCanary([claim(content)])).toBe(expected);
     });
 
