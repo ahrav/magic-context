@@ -51,6 +51,19 @@ setting cannot leak into a shared test process. Output is grouped under
 `variance.json` artifact for the set. A run that produced no verdict for a
 claim counts in that claim's histogram under the `missing` bucket, so sparse
 outputs stay visible; `repeatCount` counts the reports actually aggregated.
+
+`<output-dir>/coverage.json` records what the invocation set out to observe: every
+selected scenario/task group with its `requestedRuns`, the `archivedRuns` written
+under it, and whether its `variance.json` exists. It is written for every outcome,
+so the archive alone distinguishes a group a filter excluded — absent — from one
+selected and then skipped, which appears with `archivedRuns: 0`, and shows a group
+truncated after one of three repeats as `requestedRuns: 3, archivedRuns: 1` rather
+than as a complete one-repeat experiment. `complete` is false whenever a requested
+run or a variance file is missing. It is a separate artifact because the report and
+variance contracts are archived evidence older tooling must keep parsing, and
+because a wholly skipped group has no report to aggregate and so can carry no
+variance artifact at all.
+
 There is no deadline by default. `--deadline-minutes <n>` bounds the live loop
 for callers running under an external timeout: before each run after the
 first, the script checks that the longest completed run still fits in the
@@ -97,6 +110,16 @@ Every scenario also declares `pressureRoles`. Valid roles are
 `contradiction-pair`, `false-fluent`, `high-value-file-independent`,
 `rejected-alternative`, and `branch-specific`. Pair roles name exactly two claim
 ids; other roles name one. Use an empty array when no pressure role applies.
+
+Scenarios are checked-in source, not archived evidence: the runner parses them
+only from this `dev/` directory, so every instance travels in the same commit as
+the parser and a rerun of an older scenario checks out its own contract. That is
+why the scenario parser requires each field exactly rather than defaulting a
+missing one, and why adding a required field needs no schema bump — an omitted
+`pressureRoles` is an authoring mistake to reject, and `[]` is how a scenario
+says it has no pressure role. Run reports and variance artifacts are the
+opposite: they leave the repository as uploaded artifacts, so their schemas are
+versioned and their field sets change only with a version.
 
 `dme-core-pool` covers semantic duplicates, load-bearing near duplicates,
 stale and contradictory claims, false-but-fluent text, a file-independent
