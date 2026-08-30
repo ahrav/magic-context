@@ -59,7 +59,7 @@
       "version": "0.38.0"
     }
   ],
-  "production_inputs_lock_sha256": "3ad7c26f6da6a55d5364b8deba6e93c93a3b476a5b51af1f11020f981cfd2791",
+  "production_inputs_lock_sha256": "d637d8107ba9ed8207346bdc101d1b0af8e3e403490556669ca351deea9aa295",
   "production_qualified": false,
   "publication": {
     "order": [
@@ -77,6 +77,6 @@
     "id": "mc-host-release",
     "version": "0.38.0"
   },
-  "release_contract_sha256": "c319970e590357fc07d7fffae3a3bb874edd98411cc915e7e1c63ff971bb26f3",
+  "release_contract_sha256": "0d5e2af2b901424ac78a39ff8b674ac8ad8a7f343ba88368037f11a84dcf940d",
   "schema": "magic-context.mc-host-payload-index/v1"
 }

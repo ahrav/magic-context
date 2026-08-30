@@ -4,15 +4,14 @@
  * One `ConnectionGeneration` owns correlation allocation, pending entries,
  * terminal settlement, stream collection, route notifications, aggregate
  * memory policy, and one idempotent retirement path. Transport mechanics —
- * the `node:net` socket, dial, auth byte I/O, incremental framing, and the
+ * setup-socket auth, descriptor transfer, ring framing, and the
  * single bounded FIFO writer — live below the complete-frame channel
  * boundary in `ShmFrameChannel`; the generation owns no setup socket. It
  * owns no route cache and no reconnect policy; the facade layer above
  * reacts to retirement but is never imported here.
  *
  * Send-outcome boundary: a queued request is classified `not_sent` until
- * the channel begins publishing its bytes — the instant immediately before
- * `socket.write()` is invoked for any of them. After publication starts,
+ * the channel begins publishing its bytes. After publication starts,
  * only a matching terminal frame is authoritative; losing the terminal
  * (retirement, timeout, abort, EOF, error, close) classifies the request
  * `outcome_unknown`. Local write completion proves local handling only,
@@ -333,8 +332,7 @@ export class ConnectionGeneration {
     authenticatedDaemonId: Uint8Array | null = null;
 
     private readonly channel: SetupFrameChannel;
-    private readonly credentials: AuthCredentials;
-    private readonly inheritedIdentity: { daemonVer: string; daemonId: Uint8Array | null } | null;
+    private readonly identity: { daemonVer: string; daemonId: Uint8Array | null };
     /**
      * The same channel as {@link channel} when this generation dials and
      * authenticates for itself, and the only source of a proven identity.
@@ -365,17 +363,10 @@ export class ConnectionGeneration {
     private pendingHeld = 0;
 
     constructor(options: ConnectionGenerationOptions) {
-        this.credentials = {
-            key: options.credentials.key.slice(),
-            daemonId: options.credentials.daemonId.slice(),
+        this.identity = options.inheritedIdentity ?? {
             daemonVer: options.credentials.daemonVer,
+            daemonId: options.credentials.daemonId,
         };
-        this.inheritedIdentity = options.inheritedIdentity
-            ? {
-                  daemonVer: options.inheritedIdentity.daemonVer,
-                  daemonId: options.inheritedIdentity.daemonId?.slice() ?? null,
-              }
-            : null;
         const maxBodyLen = options.maxBodyLen ?? MAX_FRAME_BODY_LEN;
         this.budget = new ByteBudget(
             options.memoryCapBytes ?? maxBodyLen + DEFAULT_MEMORY_OVERHEAD_BYTES,
@@ -783,13 +774,10 @@ export class ConnectionGeneration {
                           `connection retired during setup: ${this.retiredInfo.reason}`,
                       );
             }
-            // Identity comes from whichever channel proved it: the TCP
-            // channel's own handshake, or — for a candidate channel, which
-            // runs none — the identity the negotiating generation
-            // authenticated and passed in.
-            const identity = this.inheritedIdentity ?? this.credentials;
-            this.daemonVer = identity.daemonVer;
-            this.authenticatedDaemonId = identity.daemonId?.slice() ?? null;
+            // Identity comes from the ring channel's authenticated setup or
+            // from the test-only pre-attached channel seam.
+            this.daemonVer = this.identity.daemonVer;
+            this.authenticatedDaemonId = this.identity.daemonId;
             this.phase = "frames";
         } finally {
             cancelSetupTimer();

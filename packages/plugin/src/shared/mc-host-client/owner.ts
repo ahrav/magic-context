@@ -1,6 +1,11 @@
 import { McHostClient, type McHostClientOptions } from "./client";
 
-const clients = new Map<string, Promise<McHostClient>>();
+interface ProcessClientEntry {
+    promise: Promise<McHostClient>;
+    client?: McHostClient;
+}
+
+const clients = new Map<string, ProcessClientEntry>();
 
 /** The cache keys `credentialSource` by identity, so callers sharing a client must pass the same object. commentlint: allow(JUDGE) */
 const referenceIds = new WeakMap<object, number>();
@@ -49,12 +54,20 @@ function ownerKey(options: McHostClientOptions): string {
 export function processMcHostClient(options: McHostClientOptions): Promise<McHostClient> {
     const key = ownerKey(options);
     const existing = clients.get(key);
-    if (existing) return existing;
+    // Do not return a closed client; closing is irreversible.
+    if (existing && !existing.client?.isClosed) return existing.promise;
+    if (existing) clients.delete(key);
     const created = McHostClient.connect(options);
-    clients.set(key, created);
-    void created.catch(() => {
-        if (clients.get(key) === created) clients.delete(key);
-    });
+    const entry: ProcessClientEntry = { promise: created };
+    clients.set(key, entry);
+    void created.then(
+        (client) => {
+            if (clients.get(key) === entry) entry.client = client;
+        },
+        () => {
+            if (clients.get(key) === entry) clients.delete(key);
+        },
+    );
     return created;
 }
 
@@ -66,7 +79,7 @@ export async function evictProcessMcHostClient(
     const key = ownerKey(options);
     const entry = clients.get(key);
     if (entry === undefined) return;
-    const resolved = await entry.then(
+    const resolved = await entry.promise.then(
         (value) => value,
         () => undefined,
     );
@@ -74,8 +87,8 @@ export async function evictProcessMcHostClient(
 }
 
 export function resetProcessMcHostClientsForTest(): void {
-    for (const client of clients.values()) {
-        void client.then((value) => value.closeAsync()).catch(() => undefined);
+    for (const { promise } of clients.values()) {
+        void promise.then((value) => value.closeAsync()).catch(() => undefined);
     }
     clients.clear();
 }

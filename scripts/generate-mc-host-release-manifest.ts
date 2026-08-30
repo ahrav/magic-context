@@ -251,7 +251,7 @@ const CONTRACT = {
         ],
         check_statuses: ["pass", "fail", "warn", "skip"],
         readiness_states: {
-            transport: ["ready", "starting", "unavailable"],
+            shared_memory: ["ready", "starting", "unavailable"],
             storage: ["ready", "starting", "unavailable"],
             synapse: ["ready", "starting", "degraded", "unsupported"],
         },
@@ -281,9 +281,9 @@ const CONTRACT = {
             "lifecycle.fences",
             "lifecycle.publication",
             "platform.support",
+            "readiness.shared_memory",
             "readiness.storage",
             "readiness.synapse",
-            "readiness.transport",
         ],
         // Closed remediation union.
         remediations: [
@@ -1064,10 +1064,10 @@ export function validateContractSchema(contract: any): void {
         fail("synapse_unsupported is a non-failing component reason");
     }
     if (
-        JSON.stringify(cli.readiness_states.transport) !==
+        JSON.stringify(cli.readiness_states.shared_memory) !==
         JSON.stringify(["ready", "starting", "unavailable"])
     ) {
-        fail("transport readiness states are fixed");
+        fail("shared-memory readiness states are fixed");
     }
     if (
         JSON.stringify(cli.readiness_states.storage) !==

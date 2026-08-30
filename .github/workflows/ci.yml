@@ -115,7 +115,11 @@ jobs:
         run: cargo nextest run -p mc-host -p mc-shm-transport --lib
 
       - name: Mandatory ring client suite
-        run: cargo nextest run -p mc-host --test client
+        run: |
+          cargo nextest run -p mc-host --test client
+          cargo test -p mc-host --test shm_failure_modes -- --test-threads=1
+          cargo test -p mc-host --test shm_soak \
+            short_soak_keeps_fd_mapping_thread_and_rss_envelopes_bounded -- --exact
 
       # The long soak has `#[ignore]`; this command excludes it without
       # `--run-ignored`.
@@ -184,9 +188,13 @@ jobs:
         run: bun run --cwd packages/mc-shm-native build:source
 
       - name: Native behavior (Bun)
+        env:
+          MC_SHM_NATIVE_CLAIMED_TARGET: "1"
         run: bun run --cwd packages/mc-shm-native test:bun
 
       - name: Native behavior (Node 24)
+        env:
+          MC_SHM_NATIVE_CLAIMED_TARGET: "1"
         run: bun run --cwd packages/mc-shm-native test:node
 
       - name: Mandatory capability activation (Bun and Node 24)
