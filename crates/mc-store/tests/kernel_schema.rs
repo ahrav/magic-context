@@ -17,9 +17,14 @@ const EXPECTED_COMPONENTS: &[&str] = &[
     "durable_text_redactions",
     "writer_fence",
     "outbox_consumers",
+    "deletion_backfill_barriers",
+    "deletion_backfill_barrier_consumers",
     "consumer_abandonments",
     "capture_pins",
     "capture_pin_refs",
+    "artifact_ingestion_reservations",
+    "artifact_purge_tombstones",
+    "artifact_pending_unlinks",
     "object_registry",
     "domains",
     "entities",
@@ -105,6 +110,267 @@ fn generated_schema_matches_pinned_format_vocabulary() {
         kernel_schema_inventory(&conn).unwrap()
     );
     assert_eq!(fixture.schema_digest, kernel_schema_digest(&conn).unwrap());
+}
+
+#[test]
+fn cas_control_tables_and_lookup_indexes_are_frozen_into_epoch_two() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, TEST_INCARNATION, 1_000).unwrap();
+
+    assert_eq!(KERNEL_FORMAT_EPOCH, 2);
+
+    for (table, expected_columns) in [
+        (
+            "artifact_ingestion_reservations",
+            &[
+                "reservation_id",
+                "artifact_digest",
+                "artifact_reference",
+                "state",
+                "writer_epoch",
+                "created_at",
+                "heartbeat_at",
+                "lease_expires_at",
+                "reclaim_started_at",
+            ][..],
+        ),
+        (
+            "artifact_purge_tombstones",
+            &[
+                "artifact_digest",
+                "artifact_reference",
+                "operator_id",
+                "reason",
+                "purged_at",
+                "commit_seq",
+            ][..],
+        ),
+        (
+            "artifact_pending_unlinks",
+            &[
+                "artifact_digest",
+                "artifact_reference",
+                "created_at",
+                "last_attempt_at",
+                "attempt_count",
+            ][..],
+        ),
+        (
+            "deletion_backfill_barriers",
+            &[
+                "barrier_id",
+                "artifact_digest",
+                "artifact_reference",
+                "delete_commit_seq",
+                "created_at",
+                "completed_at",
+            ][..],
+        ),
+        (
+            "deletion_backfill_barrier_consumers",
+            &[
+                "barrier_id",
+                "consumer_id",
+                "required_checkpoint_commit_seq",
+                "acknowledged_at",
+            ][..],
+        ),
+    ] {
+        let columns = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(columns, expected_columns, "unexpected columns for {table}");
+    }
+
+    let capture_pin_columns = conn
+        .prepare("PRAGMA table_info(capture_pins)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(capture_pin_columns.contains(&"purge_degraded_at".to_string()));
+    assert!(capture_pin_columns.contains(&"purge_barrier_id".to_string()));
+
+    let abandonment_columns = conn
+        .prepare("PRAGMA table_info(consumer_abandonments)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(abandonment_columns.contains(&"barrier_id".to_string()));
+
+    let indexes = conn
+        .prepare("SELECT name FROM sqlite_schema WHERE type='index' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    for index in [
+        "idx_evidence_artifact_digest",
+        "idx_evidence_artifact_reference",
+        "idx_reservations_digest",
+        "idx_reservations_reclaim",
+        "idx_pending_unlinks_created",
+        "idx_deletion_barriers_commit",
+        "idx_deletion_barrier_consumers_checkpoint",
+    ] {
+        assert!(indexes.iter().any(|name| name == index), "missing {index}");
+    }
+}
+
+#[test]
+fn cas_control_rows_preserve_reclaim_purge_and_backfill_state() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, TEST_INCARNATION, 1_000).unwrap();
+    conn.execute(
+        "INSERT INTO commit_log(transaction_id,writer_epoch,recorded_at,actor,cause)
+         VALUES ('purge-commit',7,1,'test','purge')",
+        [],
+    )
+    .unwrap();
+    let commit_seq = conn.last_insert_rowid();
+
+    assert!(conn
+        .execute(
+            "INSERT INTO artifact_ingestion_reservations(
+                 reservation_id,artifact_digest,artifact_reference,state,writer_epoch,
+                 created_at,heartbeat_at,lease_expires_at
+             ) VALUES ('bad','digest','ref','Expired',7,1,1,2)",
+            [],
+        )
+        .is_err());
+    conn.execute(
+        "INSERT INTO artifact_ingestion_reservations(
+             reservation_id,artifact_digest,artifact_reference,state,writer_epoch,
+             created_at,heartbeat_at,lease_expires_at
+         ) VALUES ('reservation-1','digest','ref','Live',7,1,1,2)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE artifact_ingestion_reservations
+         SET state='Reclaiming',reclaim_started_at=3 WHERE reservation_id='reservation-1'",
+        [],
+    )
+    .unwrap();
+
+    conn.execute(
+        "INSERT INTO artifact_purge_tombstones(
+             artifact_digest,artifact_reference,operator_id,reason,purged_at,commit_seq
+         ) VALUES ('digest','ref','operator-1','secret',4,?1)",
+        [commit_seq],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO artifact_pending_unlinks(
+             artifact_digest,artifact_reference,created_at
+         ) VALUES ('digest','ref',4)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO deletion_backfill_barriers(
+             barrier_id,artifact_digest,artifact_reference,delete_commit_seq,created_at
+         ) VALUES ('barrier-1','digest','ref',?1,4)",
+        [commit_seq],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO outbox_consumers(consumer_id,checkpoint_commit_seq,updated_at)
+         VALUES ('search',?1,5)",
+        [commit_seq],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO deletion_backfill_barrier_consumers(
+             barrier_id,consumer_id,required_checkpoint_commit_seq
+         ) VALUES ('barrier-1','search',?1)",
+        [commit_seq],
+    )
+    .unwrap();
+    conn.execute(
+        "DELETE FROM outbox_consumers WHERE consumer_id='search'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM deletion_backfill_barrier_consumers",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        1
+    );
+
+    conn.execute(
+        "INSERT INTO consumer_abandonments(
+             abandonment_id,consumer_id,barrier_id,operator_id,last_checkpoint_commit_seq,
+             reason,abandoned_at,commit_seq
+         ) VALUES ('abandon-1','search','barrier-1','operator-1',?1,'retired',6,?1)",
+        [commit_seq],
+    )
+    .unwrap();
+    assert!(conn
+        .execute(
+            "INSERT INTO capture_pins(
+                 capture_pin_id,pin_kind,owner_id,commit_seq,lease_epoch,writer_epoch,
+                 created_at,purge_degraded_at
+             ) VALUES ('bad-pin','backup','backup-1',?1,1,7,7,8)",
+            [commit_seq],
+        )
+        .is_err());
+    conn.execute(
+        "INSERT INTO capture_pins(
+             capture_pin_id,pin_kind,owner_id,commit_seq,lease_epoch,writer_epoch,
+             created_at,purge_degraded_at,purge_barrier_id
+         ) VALUES ('pin-1','backup','backup-1',?1,1,7,7,8,'barrier-1')",
+        [commit_seq],
+    )
+    .unwrap();
+    assert!(conn
+        .execute(
+            "DELETE FROM artifact_purge_tombstones WHERE artifact_digest='digest'",
+            [],
+        )
+        .is_err());
+}
+
+#[test]
+fn plain_delete_backfill_barrier_does_not_require_a_purge_tombstone() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, TEST_INCARNATION, 1_000).unwrap();
+    conn.execute(
+        "INSERT INTO commit_log(transaction_id,writer_epoch,recorded_at,actor,cause)
+         VALUES ('plain-delete',7,1,'test','delete')",
+        [],
+    )
+    .unwrap();
+    let commit_seq = conn.last_insert_rowid();
+
+    conn.execute(
+        "INSERT INTO deletion_backfill_barriers(
+             barrier_id,artifact_digest,artifact_reference,delete_commit_seq,created_at
+         ) VALUES ('plain-barrier','plain-digest','plain-ref',?1,2)",
+        [commit_seq],
+    )
+    .expect("plain deletion must create a barrier without a purge tombstone");
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM artifact_purge_tombstones",
+            [],
+            |row| { row.get::<_, i64>(0) }
+        )
+        .unwrap(),
+        0
+    );
 }
 
 #[test]

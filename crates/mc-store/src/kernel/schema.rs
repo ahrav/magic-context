@@ -5,8 +5,8 @@ use std::collections::BTreeSet;
 use crate::sqlite_runtime::compute_marker_digest_for_application_id;
 
 pub const KERNEL_APPLICATION_ID: u32 = 0x4D43_4B52;
-pub const KERNEL_FORMAT_EPOCH: i64 = 1;
-pub const KERNEL_SCHEMA_COMPONENT_NAMES: [&str; 32] = [
+pub const KERNEL_FORMAT_EPOCH: i64 = 2;
+pub const KERNEL_SCHEMA_COMPONENT_NAMES: [&str; 37] = [
     "commit_log",
     "change_event",
     "outbox",
@@ -14,9 +14,14 @@ pub const KERNEL_SCHEMA_COMPONENT_NAMES: [&str; 32] = [
     "durable_text_redactions",
     "writer_fence",
     "outbox_consumers",
+    "deletion_backfill_barriers",
+    "deletion_backfill_barrier_consumers",
     "consumer_abandonments",
     "capture_pins",
     "capture_pin_refs",
+    "artifact_ingestion_reservations",
+    "artifact_purge_tombstones",
+    "artifact_pending_unlinks",
     "object_registry",
     "domains",
     "entities",
@@ -71,16 +76,36 @@ const COMPONENTS: [(&str, &str); KERNEL_SCHEMA_COMPONENT_NAMES.len()] = [
         r#"CREATE TABLE outbox_consumers(consumer_id TEXT PRIMARY KEY,checkpoint_commit_seq INTEGER NOT NULL DEFAULT 0 CHECK(checkpoint_commit_seq>=0),updated_at INTEGER NOT NULL) STRICT; CREATE INDEX idx_consumers_checkpoint ON outbox_consumers(checkpoint_commit_seq,consumer_id);"#,
     ),
     (
+        "deletion_backfill_barriers",
+        r#"CREATE TABLE deletion_backfill_barriers(barrier_id TEXT PRIMARY KEY,artifact_digest TEXT NOT NULL,artifact_reference TEXT NOT NULL,delete_commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,created_at INTEGER NOT NULL,completed_at INTEGER,UNIQUE(artifact_digest)) STRICT; CREATE INDEX idx_deletion_barriers_commit ON deletion_backfill_barriers(delete_commit_seq,barrier_id); CREATE INDEX idx_deletion_barriers_incomplete ON deletion_backfill_barriers(completed_at,barrier_id);"#,
+    ),
+    (
+        "deletion_backfill_barrier_consumers",
+        r#"CREATE TABLE deletion_backfill_barrier_consumers(barrier_id TEXT NOT NULL REFERENCES deletion_backfill_barriers(barrier_id) ON DELETE RESTRICT,consumer_id TEXT NOT NULL,required_checkpoint_commit_seq INTEGER NOT NULL CHECK(required_checkpoint_commit_seq>=0),acknowledged_at INTEGER,PRIMARY KEY(barrier_id,consumer_id)) STRICT; CREATE INDEX idx_deletion_barrier_consumers_checkpoint ON deletion_backfill_barrier_consumers(consumer_id,required_checkpoint_commit_seq,barrier_id);"#,
+    ),
+    (
         "consumer_abandonments",
-        r#"CREATE TABLE consumer_abandonments(abandonment_id TEXT PRIMARY KEY,consumer_id TEXT NOT NULL,operator_id TEXT NOT NULL,last_checkpoint_commit_seq INTEGER NOT NULL CHECK(last_checkpoint_commit_seq>=0),reason TEXT NOT NULL,abandoned_at INTEGER NOT NULL,commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq) ON DELETE RESTRICT) STRICT; CREATE INDEX idx_abandonments_consumer ON consumer_abandonments(consumer_id,abandoned_at); CREATE INDEX idx_abandonments_commit_fk ON consumer_abandonments(commit_seq);"#,
+        r#"CREATE TABLE consumer_abandonments(abandonment_id TEXT PRIMARY KEY,consumer_id TEXT NOT NULL,barrier_id TEXT REFERENCES deletion_backfill_barriers(barrier_id) ON DELETE RESTRICT,operator_id TEXT NOT NULL,last_checkpoint_commit_seq INTEGER NOT NULL CHECK(last_checkpoint_commit_seq>=0),reason TEXT NOT NULL,abandoned_at INTEGER NOT NULL,commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq) ON DELETE RESTRICT) STRICT; CREATE INDEX idx_abandonments_consumer ON consumer_abandonments(consumer_id,abandoned_at); CREATE INDEX idx_abandonments_barrier_fk ON consumer_abandonments(barrier_id,consumer_id); CREATE INDEX idx_abandonments_commit_fk ON consumer_abandonments(commit_seq);"#,
     ),
     (
         "capture_pins",
-        r#"CREATE TABLE capture_pins(capture_pin_id TEXT PRIMARY KEY,pin_kind TEXT NOT NULL,owner_id TEXT NOT NULL,commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,lease_epoch INTEGER NOT NULL,writer_epoch INTEGER NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER,released_at INTEGER) STRICT; CREATE INDEX idx_capture_pins_commit_fk ON capture_pins(commit_seq); CREATE INDEX idx_capture_pins_ttl ON capture_pins(released_at,expires_at,capture_pin_id);"#,
+        r#"CREATE TABLE capture_pins(capture_pin_id TEXT PRIMARY KEY,pin_kind TEXT NOT NULL,owner_id TEXT NOT NULL,commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,lease_epoch INTEGER NOT NULL,writer_epoch INTEGER NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER,released_at INTEGER,purge_degraded_at INTEGER,purge_barrier_id TEXT REFERENCES deletion_backfill_barriers(barrier_id) ON DELETE RESTRICT,CHECK((purge_degraded_at IS NULL)=(purge_barrier_id IS NULL))) STRICT; CREATE INDEX idx_capture_pins_commit_fk ON capture_pins(commit_seq); CREATE INDEX idx_capture_pins_ttl ON capture_pins(released_at,expires_at,capture_pin_id); CREATE INDEX idx_capture_pins_purge_degraded ON capture_pins(purge_degraded_at,purge_barrier_id,capture_pin_id);"#,
     ),
     (
         "capture_pin_refs",
         r#"CREATE TABLE capture_pin_refs(capture_pin_id TEXT NOT NULL REFERENCES capture_pins(capture_pin_id) ON DELETE CASCADE,evidence_id TEXT NOT NULL REFERENCES evidence_meta(evidence_id) ON DELETE RESTRICT,expires_at INTEGER,released_at INTEGER,PRIMARY KEY(capture_pin_id,evidence_id)) STRICT; CREATE INDEX idx_capture_pin_refs_evidence_fk ON capture_pin_refs(evidence_id,capture_pin_id);"#,
+    ),
+    (
+        "artifact_ingestion_reservations",
+        r#"CREATE TABLE artifact_ingestion_reservations(reservation_id TEXT PRIMARY KEY,artifact_digest TEXT NOT NULL,artifact_reference TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('Live','Reclaiming')),writer_epoch INTEGER NOT NULL,created_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,lease_expires_at INTEGER NOT NULL,reclaim_started_at INTEGER,CHECK((state='Live' AND reclaim_started_at IS NULL) OR (state='Reclaiming' AND reclaim_started_at IS NOT NULL))) STRICT; CREATE INDEX idx_reservations_digest ON artifact_ingestion_reservations(artifact_digest,reservation_id); CREATE INDEX idx_reservations_reference ON artifact_ingestion_reservations(artifact_reference,reservation_id); CREATE INDEX idx_reservations_reclaim ON artifact_ingestion_reservations(state,lease_expires_at,reservation_id);"#,
+    ),
+    (
+        "artifact_purge_tombstones",
+        r#"CREATE TABLE artifact_purge_tombstones(artifact_digest TEXT PRIMARY KEY,artifact_reference TEXT NOT NULL,operator_id TEXT NOT NULL,reason TEXT NOT NULL,purged_at INTEGER NOT NULL,commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq) ON DELETE RESTRICT) STRICT; CREATE UNIQUE INDEX idx_purge_tombstones_reference ON artifact_purge_tombstones(artifact_reference); CREATE INDEX idx_purge_tombstones_commit_fk ON artifact_purge_tombstones(commit_seq); CREATE TRIGGER artifact_purge_tombstones_no_update BEFORE UPDATE ON artifact_purge_tombstones BEGIN SELECT RAISE(ABORT,'artifact purge tombstones are immutable'); END; CREATE TRIGGER artifact_purge_tombstones_no_delete BEFORE DELETE ON artifact_purge_tombstones BEGIN SELECT RAISE(ABORT,'artifact purge tombstones are permanent'); END;"#,
+    ),
+    (
+        "artifact_pending_unlinks",
+        r#"CREATE TABLE artifact_pending_unlinks(artifact_digest TEXT PRIMARY KEY REFERENCES artifact_purge_tombstones(artifact_digest) ON DELETE RESTRICT,artifact_reference TEXT NOT NULL,created_at INTEGER NOT NULL,last_attempt_at INTEGER,attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count>=0)) STRICT; CREATE INDEX idx_pending_unlinks_created ON artifact_pending_unlinks(created_at,artifact_digest);"#,
     ),
     (
         "object_registry",
@@ -120,7 +145,7 @@ const COMPONENTS: [(&str, &str); KERNEL_SCHEMA_COMPONENT_NAMES.len()] = [
     ),
     (
         "evidence_meta",
-        r#"CREATE TABLE evidence_meta(evidence_id TEXT PRIMARY KEY,object_id TEXT NOT NULL UNIQUE REFERENCES object_registry(object_id),artifact_reference TEXT NOT NULL,artifact_digest TEXT NOT NULL,byte_length INTEGER NOT NULL,media_type TEXT NOT NULL,retention_class TEXT NOT NULL,retain_until INTEGER,detector_kind TEXT,detector_version TEXT,detector_metadata BLOB,detector_id TEXT,secret_type TEXT,utf8_offset INTEGER,utf8_length INTEGER,provider_egress_class TEXT NOT NULL,redaction_metadata BLOB NOT NULL,created_commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq),invalidated_commit_seq INTEGER REFERENCES commit_log(commit_seq),superseded_by TEXT REFERENCES object_registry(object_id),sensitivity_class TEXT NOT NULL) STRICT; CREATE INDEX idx_evidence_retention ON evidence_meta(retain_until,evidence_id); CREATE INDEX idx_evidence_known_as_of ON evidence_meta(created_commit_seq,invalidated_commit_seq,evidence_id);"#,
+        r#"CREATE TABLE evidence_meta(evidence_id TEXT PRIMARY KEY,object_id TEXT NOT NULL UNIQUE REFERENCES object_registry(object_id),artifact_reference TEXT NOT NULL,artifact_digest TEXT NOT NULL,byte_length INTEGER NOT NULL,media_type TEXT NOT NULL,retention_class TEXT NOT NULL,retain_until INTEGER,detector_kind TEXT,detector_version TEXT,detector_metadata BLOB,detector_id TEXT,secret_type TEXT,utf8_offset INTEGER,utf8_length INTEGER,provider_egress_class TEXT NOT NULL,redaction_metadata BLOB NOT NULL,created_commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq),invalidated_commit_seq INTEGER REFERENCES commit_log(commit_seq),superseded_by TEXT REFERENCES object_registry(object_id),sensitivity_class TEXT NOT NULL) STRICT; CREATE INDEX idx_evidence_artifact_digest ON evidence_meta(artifact_digest,evidence_id); CREATE INDEX idx_evidence_artifact_reference ON evidence_meta(artifact_reference,evidence_id); CREATE INDEX idx_evidence_retention ON evidence_meta(retain_until,evidence_id); CREATE INDEX idx_evidence_known_as_of ON evidence_meta(created_commit_seq,invalidated_commit_seq,evidence_id);"#,
     ),
     (
         "asserted_edges",
