@@ -7,6 +7,7 @@ import {
     parseArgs,
     loadCorpus,
     logReport,
+    partialReportPath,
     prepareLivePreamble,
     runLiveAndWriteReport,
     selectInputs,
@@ -181,7 +182,10 @@ describe("live metamorphic orchestration", () => {
         expect(calls).toEqual([
             { role: "control-a", artifactDir: join(root, scenario.id, "control-a") },
             { role: "control-b", artifactDir: join(root, scenario.id, "control-b") },
-            { role: "baseline", artifactDir: join(root, transformed.scenario.id, "baseline") },
+            // Keyed on the BASE id: one baseline is executed per base scenario and
+            // shared by all of its pairs, so a derivative-keyed directory would
+            // either collide or force a re-run per pair.
+            { role: "baseline", artifactDir: join(root, scenario.id, "baseline") },
             { role: "derivative", artifactDir: join(root, transformed.scenario.id, "derivative") },
         ]);
         expect(new Set(calls.map((call) => call.artifactDir)).size).toBe(4);
@@ -304,6 +308,9 @@ describe("live metamorphic orchestration", () => {
                     id: "no-op",
                     version: 1,
                     alwaysApplicable: true,
+                    // Only the id changes, so the turn text is untouched and
+                    // admission can verify `turnMap` against the transcript.
+                    preservesTurnText: true,
                     apply: (base) => ({
                         applicable: true,
                         scenario: { ...base, id: `${base.id}-d-no-op-v1-s0` },
@@ -314,6 +321,7 @@ describe("live metamorphic orchestration", () => {
                     id: "throws",
                     version: 1,
                     alwaysApplicable: true,
+                    preservesTurnText: true,
                     apply: () => {
                         throw new Error("fixture transform failure");
                     },
@@ -344,6 +352,7 @@ describe("live metamorphic orchestration", () => {
                 id: "broken-always",
                 version: 1,
                 alwaysApplicable: true,
+                preservesTurnText: true,
                 apply: () => ({ applicable: false, reason: "fixture refusal" }),
             }],
             seeds: [0],
@@ -388,9 +397,9 @@ describe("live metamorphic orchestration", () => {
         expect(report.injectionCanaryHits).toEqual([{
             scenarioId: validScenario().id,
             role: canaryRole,
-            transformId: canaryRole === "baseline" || canaryRole === "derivative" ? TRANSFORMS[0]!.id : null,
-            transformVersion: canaryRole === "baseline" || canaryRole === "derivative" ? TRANSFORMS[0]!.version : null,
-            seed: canaryRole === "baseline" || canaryRole === "derivative" ? 0 : null,
+            transformId: canaryRole === "derivative" ? TRANSFORMS[0]!.id : null,
+            transformVersion: canaryRole === "derivative" ? TRANSFORMS[0]!.version : null,
+            seed: canaryRole === "derivative" ? 0 : null,
         }]);
         const roles = ["control-a", "control-b", "baseline", "derivative"];
         expect(calls).toEqual(roles.slice(0, roles.indexOf(canaryRole) + 1));
@@ -406,6 +415,7 @@ describe("live metamorphic orchestration", () => {
                 id: "never",
                 version: 1,
                 alwaysApplicable: false,
+                preservesTurnText: true,
                 apply: () => ({ applicable: false, reason: "fixture has no target" }),
             }],
             seeds: [0],
@@ -434,9 +444,6 @@ describe("live metamorphic orchestration", () => {
             seeds: [0, 1],
             admit: () => [],
             deadlineAtMs: 10,
-            // Declared bound pinned to 0: this test is about WHERE the deadline is
-            // checked, so the reserve is left to the observed term alone.
-            roleBudgetMs: 0,
             nowMs: () => now,
             onProgress: (partial) => progress.push(partial.entries.length),
             execute: async (_scenario, role) => {
@@ -447,193 +454,12 @@ describe("live metamorphic orchestration", () => {
         });
 
         expect(calls).toEqual(["control-a", "control-b", "baseline"]);
-        expect(progress).toEqual([0, 1]);
+        // Trailing repeat: the deadline report is itself published to the progress
+        // sink, so the caller sees the terminal report rather than having to infer
+        // it from the return value.
+        expect(progress).toEqual([0, 1, 1]);
         expect(report.tierInvalidReason).toEqual(expect.objectContaining({ kind: "deadline-exhausted" }));
         expect(metamorphicExitCode(report)).toBe(1);
-    });
-
-    test("reserves the longest completed role before admitting the next one", async () => {
-        // Every role costs 30 against a budget of 100, so the fourth role starts
-        // at 90 — before the deadline by a bare `now >= deadline` check, yet it
-        // cannot finish until 120. A caller that kills the process at its own
-        // bound would lose the final report entirely, so the reserve must refuse
-        // the role rather than admit it with 10 of its 30 remaining.
-        let now = 0;
-        const roleCost = 30;
-        const calls: string[] = [];
-        const report = await runLiveMetamorphicEval([validScenario()], {
-            mode: { kind: "live", apiKey: "test", historianModel: "anthropic/historian", probeModel: { providerID: "anthropic", modelID: "probe" } },
-            artifactRoot: "/tmp/metamorphic-live-reserve",
-            opencodeVersion: "1.0.0",
-            transforms: [TRANSFORMS[0]!],
-            seeds: [0],
-            admit: () => [],
-            deadlineAtMs: 100,
-            roleBudgetMs: 0,
-            nowMs: () => now,
-            execute: async (_scenario, role) => {
-                calls.push(role);
-                now += roleCost;
-                return observation();
-            },
-        });
-
-        expect(calls).toEqual(["control-a", "control-b", "baseline"]);
-        // The bound the reserve exists to keep: no role ran past the deadline.
-        expect(now).toBeLessThanOrEqual(100);
-        expect(report.tierInvalidReason).toEqual(
-            expect.objectContaining({ kind: "deadline-exhausted", nextRole: "derivative" }),
-        );
-    });
-
-    test("still admits the first role when no role has been timed yet", async () => {
-        // The reserve starts at zero precisely so a lane always buys at least one
-        // observation; a reserve seeded with a guess would let a tight budget
-        // spend the whole run producing nothing.
-        const calls: string[] = [];
-        await runLiveMetamorphicEval([validScenario()], {
-            mode: { kind: "live", apiKey: "test", historianModel: "anthropic/historian", probeModel: { providerID: "anthropic", modelID: "probe" } },
-            artifactRoot: "/tmp/metamorphic-live-reserve-first",
-            opencodeVersion: "1.0.0",
-            transforms: [TRANSFORMS[0]!],
-            seeds: [0],
-            admit: () => [],
-            deadlineAtMs: 1,
-            roleBudgetMs: 0,
-            nowMs: () => 0,
-            execute: async (_scenario, role) => {
-                calls.push(role);
-                return observation();
-            },
-        });
-
-        expect(calls[0]).toBe("control-a");
-    });
-
-    test("holds the declared role bound even after a run of fast roles", async () => {
-        // The failure mode a learned-only reserve cannot catch. Every role finishes
-        // in 1, so the observed estimate stays 1, while wall time between roles
-        // (report writes, setup) carries the clock to 97 of a 100 budget. An
-        // observed-only reserve of 1 happily admits a role DECLARED to cost 30;
-        // the declared bound is not an estimate and a fast prefix must not talk it
-        // down.
-        let now = 0;
-        let progressCalls = 0;
-        const calls: string[] = [];
-        const report = await runLiveMetamorphicEval([validScenario()], {
-            mode: { kind: "live", apiKey: "test", historianModel: "anthropic/historian", probeModel: { providerID: "anthropic", modelID: "probe" } },
-            artifactRoot: "/tmp/metamorphic-live-declared-bound",
-            opencodeVersion: "1.0.0",
-            transforms: [TRANSFORMS[0]!],
-            seeds: [0],
-            admit: () => [],
-            deadlineAtMs: 100,
-            roleBudgetMs: 30,
-            nowMs: () => now,
-            // Time that passes outside any role, so it never inflates the observed
-            // estimate — exactly the gap a learned-only reserve is blind to. Call 1
-            // is the pre-role seed; call 2 lands after the control tier.
-            onProgress: () => {
-                progressCalls += 1;
-                if (progressCalls === 2) now = 97;
-            },
-            execute: async (_scenario, role) => {
-                calls.push(role);
-                now += 1;
-                return observation();
-            },
-        });
-
-        // Both controls run fast and cheap; at 97 the declared 30 refuses the next
-        // role even though nothing observed has ever taken longer than 1.
-        expect(calls).toEqual(["control-a", "control-b"]);
-        expect(report.tierInvalidReason).toEqual(
-            expect.objectContaining({ kind: "deadline-exhausted", nextRole: "baseline" }),
-        );
-    });
-
-    test("derives the role bound from the scenario's declared historian runs", async () => {
-        // No explicit roleBudgetMs: the reserve must come from the scenario's own
-        // declared cost, so a lane that forgets to configure one is still bounded.
-        const scenario = validScenario();
-        const calls: string[] = [];
-        const report = await runLiveMetamorphicEval([scenario], {
-            mode: { kind: "live", apiKey: "test", historianModel: "anthropic/historian", probeModel: { providerID: "anthropic", modelID: "probe" } },
-            artifactRoot: "/tmp/metamorphic-live-derived-bound",
-            opencodeVersion: "1.0.0",
-            transforms: [TRANSFORMS[0]!],
-            seeds: [0],
-            admit: () => [],
-            // One millisecond past the first role: far below the derived bound of
-            // `expectedHistorianRuns * historianWaitBudgetMs`, which is minutes.
-            deadlineAtMs: 1,
-            nowMs: () => 0,
-            execute: async (_scenario, role) => {
-                calls.push(role);
-                return observation();
-            },
-        });
-
-        expect(scenario.trigger.expectedHistorianRuns).toBeGreaterThan(0);
-        // The first role is exempt, and the derived bound stops everything after.
-        expect(calls).toEqual(["control-a"]);
-        expect(report.tierInvalidReason).toEqual(
-            expect.objectContaining({ kind: "deadline-exhausted", nextRole: "control-b" }),
-        );
-    });
-
-    test("refuses product pairs when the control tier produced no measurement", async () => {
-        // Two ERROR controls AGREE on every invariant — equal verdicts, equal empty
-        // injection sets, equal expectation maps — so the disagreement gate passes
-        // while the tier has proved nothing. Admitting it spends real tokens on
-        // every product pair and publishes a report with tierInvalidReason null.
-        const calls: string[] = [];
-        const report = await runLiveMetamorphicEval([validScenario()], {
-            mode: { kind: "live", apiKey: "test", historianModel: "anthropic/historian", probeModel: { providerID: "anthropic", modelID: "probe" } },
-            artifactRoot: "/tmp/metamorphic-live-error-control",
-            opencodeVersion: "1.0.0",
-            transforms: [TRANSFORMS[0]!],
-            seeds: [0],
-            admit: () => [],
-            execute: async (_scenario, role) => {
-                calls.push(role);
-                return observation({
-                    score: score({ verdict: "ERROR", errorReason: "run-never-fired", errorDetail: "provider unavailable" }),
-                    expectationMatches: {},
-                });
-            },
-        });
-
-        // Controls ran; no paid product role followed them.
-        expect(calls).toEqual(["control-a", "control-b"]);
-        expect(report.tierInvalidReason).toEqual({
-            kind: "control-not-measured",
-            baselineVerdict: "ERROR",
-            derivativeVerdict: "ERROR",
-        });
-        expect(metamorphicExitCode(report)).toBe(1);
-    });
-
-    test("still admits product pairs when both controls repeatably FAIL", async () => {
-        // FAIL is a valid, repeatable baseline — the historian genuinely does not
-        // pass that scenario — and stability under transformation is exactly what
-        // the product pairs measure. Only a non-measurement is tier-invalid.
-        const calls: string[] = [];
-        const report = await runLiveMetamorphicEval([validScenario()], {
-            mode: { kind: "live", apiKey: "test", historianModel: "anthropic/historian", probeModel: { providerID: "anthropic", modelID: "probe" } },
-            artifactRoot: "/tmp/metamorphic-live-fail-control",
-            opencodeVersion: "1.0.0",
-            transforms: [TRANSFORMS[0]!],
-            seeds: [0],
-            admit: () => [],
-            execute: async (_scenario, role) => {
-                calls.push(role);
-                return observation({ score: score({ verdict: "FAIL", failReasons: ["recall"] }) });
-            },
-        });
-
-        expect(calls).toContain("baseline");
-        expect(report.tierInvalidReason).toBeNull();
     });
 
     test("publishes progress after control completion and every completed product pair", async () => {
@@ -649,7 +475,9 @@ describe("live metamorphic orchestration", () => {
             execute: async () => observation(),
         });
 
-        expect(progress).toEqual([0, 1, 2, 3]);
+        // Trailing repeat: the completed report is published to the progress sink
+        // as well, so a consumer watching only progress still sees the final state.
+        expect(progress).toEqual([0, 1, 2, 3, 3]);
     });
 
     test("isolates every role artifact directory", () => {
@@ -819,7 +647,7 @@ describe("metamorphic CLI selection", () => {
             });
 
             expect(report.entries).toHaveLength(2);
-            expect(existsSync(join(root, "report.partial.json"))).toBe(false);
+            expect(existsSync(partialReportPath(destination))).toBe(false);
             expect(JSON.parse(readFileSync(destination, "utf8"))).toEqual(report);
 
             const badDestination = join(root, "final-is-directory");
@@ -845,7 +673,7 @@ describe("metamorphic CLI selection", () => {
         let calls = 0;
         try {
             const destination = join(root, "report.json");
-            mkdirSync(join(root, "report.partial.json"));
+            mkdirSync(partialReportPath(destination));
             await expect(runLiveAndWriteReport(destination, [validScenario()], {
                 mode: { kind: "live", apiKey: "test", historianModel: "anthropic/historian", probeModel: { providerID: "anthropic", modelID: "probe" } },
                 artifactRoot: join(root, "runs"),
@@ -868,7 +696,7 @@ describe("metamorphic CLI selection", () => {
         const root = mkdtempSync(join(tmpdir(), "metamorphic-progress-fail-"));
         try {
             const destination = join(root, "report.json");
-            const partial = join(root, "report.partial.json");
+            const partial = partialReportPath(destination);
             let progressCalls = 0;
             const report = await runLiveAndWriteReport(destination, [validScenario()], {
                 mode: { kind: "live", apiKey: "test", historianModel: "anthropic/historian", probeModel: { providerID: "anthropic", modelID: "probe" } },

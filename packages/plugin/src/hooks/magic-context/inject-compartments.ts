@@ -82,7 +82,7 @@ export interface PreparedCompartmentInjection {
      * window) AND no durable compartment boundary is visible either, so no
      * safe re-anchor splice exists. The transform queues a fresh
      * materialization so the baseline is re-cut instead of silently looping
-     * (#264 layer-B fallback).
+     * (layer-B fallback).
      */
     needsFreshMaterialization?: boolean;
 }
@@ -126,15 +126,15 @@ export function clearInjectionCache(sessionId: string): void {
     // A cache clear means compartment state changed (historian publish / recomp /
     // flush), so any in-flight degraded-mode bookkeeping for the OLD boundary is
     // stale. Reset it so the re-anchor countdown restarts against the new state.
-    resetDegradedReanchorState(sessionId);
+    clearDegradedRebuild(sessionId);
 }
 
-// ── Degraded-mode re-anchor (#263/#264) ─────────────────────────
+// ── Degraded-mode re-anchor ─────────────────────────
 //
 // When the compartment boundary message is not in the visible window, the
 // splice is a no-op and zero drops are queued. If a NEWER compaction marker
-// (typically a fork-orphan, #263) cuts the window above our boundary, that
-// state repeats on every pass with no recovery path (#264). Two layers fix
+// (typically a fork-orphan) cuts the window above our boundary, that
+// state repeats on every pass with no recovery path. Two layers fix
 // it:
 //   - Layer A (root cause): on the first degraded detection we run the
 //     fork-orphan marker hygiene pass, which removes the foreign marker that
@@ -163,11 +163,6 @@ const reAnchorLoggedBySession = new BoundedSessionMap<boolean>(INJECTION_CACHE_M
  * single-pass transient (e.g. a marker-drain lag that heals next pass).
  */
 const REANCHOR_MIN_DEGRADED_PASSES = 2;
-
-export function resetDegradedReanchorState(sessionId: string): void {
-    degradedRebuildCountBySession.delete(sessionId);
-    reAnchorLoggedBySession.delete(sessionId);
-}
 
 function noteDegradedRebuild(sessionId: string): number {
     const next = (degradedRebuildCountBySession.get(sessionId) ?? 0) + 1;
@@ -246,10 +241,6 @@ export interface CompartmentInjectionResult {
     compartmentEndMessage: number;
     compartmentCount: number;
     skippedVisibleMessages: number;
-}
-
-export function renderMemoryBlock(memories: Memory[]): string | null {
-    return renderMemoryBlockV2(memories) || null;
 }
 
 /** Constraint keywords that signal a memory encodes a rule rather than a description. */
@@ -444,6 +435,17 @@ export function prepareCompartmentInjection(
         }
     }
 
+    const cachePopulated = (result: PreparedCompartmentInjection): void => {
+        if (!claimLaneStable) return;
+        injectionCache.set(sessionId, {
+            db,
+            kind: "populated",
+            injection: result,
+            claimSnapshotVector,
+            renderedRevisionLocators,
+        });
+    };
+
     if (compartments.length === 0 && facts.length === 0 && !memoryBlock) {
         if (claimLaneStable) {
             injectionCache.set(sessionId, {
@@ -508,15 +510,7 @@ export function prepareCompartmentInjection(
             memoryCount,
             rebuiltFromDb: true,
         };
-        if (claimLaneStable) {
-            injectionCache.set(sessionId, {
-                db,
-                kind: "populated",
-                injection: result,
-                claimSnapshotVector,
-                renderedRevisionLocators,
-            });
-        }
+        cachePopulated(result);
         return result;
     }
 
@@ -581,15 +575,7 @@ export function prepareCompartmentInjection(
             memoryCount,
             rebuiltFromDb: true,
         };
-        if (claimLaneStable) {
-            injectionCache.set(sessionId, {
-                db,
-                kind: "populated",
-                injection: result,
-                claimSnapshotVector,
-                renderedRevisionLocators,
-            });
-        }
+        cachePopulated(result);
         return result;
     }
 
@@ -609,7 +595,7 @@ export function prepareCompartmentInjection(
     } else {
         // Degraded: the natural boundary message is not in the visible window.
         const degradedCount = noteDegradedRebuild(sessionId);
-        // Layer A (#263): on the FIRST degraded detection of an episode, run the
+        // Layer A: on the FIRST degraded detection of an episode, run the
         // fork-orphan marker hygiene pass. If a foreign marker outranks ours this
         // removes it, so the next pass's window stops at our marker and we
         // recover. Gated to the degraded trigger so steady state pays nothing.
@@ -619,7 +605,7 @@ export function prepareCompartmentInjection(
 
         let reAnchored = false;
         if (degradedCount >= REANCHOR_MIN_DEGRADED_PASSES && isCacheBusting) {
-            // Layer B (#264): the boundary has stayed invisible for long enough;
+            // Layer B: the boundary has stayed invisible for long enough;
             // stop looping and re-anchor. This changes bytes, so it only runs on a
             // cache-busting pass (never first-applied on a defer pass).
             const visibleMessageIds = new Set<string>();
@@ -676,15 +662,7 @@ export function prepareCompartmentInjection(
     if (needsFreshMaterialization) {
         result.needsFreshMaterialization = true;
     }
-    if (claimLaneStable) {
-        injectionCache.set(sessionId, {
-            db,
-            kind: "populated",
-            injection: result,
-            claimSnapshotVector,
-            renderedRevisionLocators,
-        });
-    }
+    cachePopulated(result);
     return result;
 }
 
@@ -730,7 +708,7 @@ export function renderCompartmentInjection(
     if (!firstMessage || !textPart || isDroppedPlaceholder(textPart.text)) {
         prependedMessageCount = 1;
         // synthetic: true — injected context, not a real user turn. Keeps it out
-        // of OpenCode's auto-title gate (issue #129) while still reaching the
+        // of OpenCode's auto-title gate while still reaching the
         // model (toModelMessagesEffect filters `ignored`, not `synthetic`).
         messages.unshift({
             info: { role: "user", sessionID: sessionId },
@@ -877,7 +855,7 @@ export interface M0M1RenderOptions {
     muralEnabled?: boolean;
     isCacheBustingPass?: boolean;
     /**
-     * Compaction-off mode (issue #266): materialize through the
+     * Compaction-off mode: materialize through the
      * zero-compartment path — memory/docs/user-profile render into m[0], but
      * historical compartment rows never reach `<session-history>` (no render,
      * no raw-tail trim, no boundary splice, no marker write), and the
@@ -1293,6 +1271,41 @@ function readCurrentM0SnapshotMarkersUncached(args: M0SnapshotMarkerReadArgs): {
                 args.historyBudgetTokens,
             ),
         },
+    };
+}
+
+/** Argument slice for `readCurrentM0SnapshotMarkers` shared by the marker read sites. */
+function m0MarkerReadArgs(
+    options: Pick<
+        M0M1RenderOptions,
+        | "db"
+        | "sessionId"
+        | "injectDocs"
+        | "muralEnabled"
+        | "memoryInjectionBudgetTokens"
+        | "historyBudgetTokens"
+        | "hardSignals"
+    >,
+    workspace: { identities: string[]; namesByIdentity: Map<string, string> },
+    projectPath: string | undefined,
+    projectDirectory: string | undefined,
+    nowMs?: number,
+): M0SnapshotMarkerReadArgs {
+    return {
+        db: options.db,
+        sessionId: options.sessionId,
+        projectPath,
+        projectDirectory,
+        injectDocs: options.injectDocs,
+        muralEnabled: options.muralEnabled,
+        memoryInjectionBudgetTokens: options.memoryInjectionBudgetTokens,
+        historyBudgetTokens: options.historyBudgetTokens,
+        hardSignals: options.hardSignals,
+        workspaceIdentitySet: {
+            identities: workspace.identities,
+            namesByIdentity: workspace.namesByIdentity,
+        },
+        ...(nowMs !== undefined ? { nowMs } : {}),
     };
 }
 
@@ -2004,22 +2017,9 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
     }
     const memoryBudget = options.memoryInjectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS;
     const renderedClaims = trimClaimLane(claimLane, memoryBudget, workspace);
-    const snapshotMarkers = readCurrentM0SnapshotMarkers({
-        db: options.db,
-        sessionId: options.sessionId,
-        projectPath,
-        projectDirectory,
-        injectDocs: options.injectDocs,
-        muralEnabled: options.muralEnabled,
-        memoryInjectionBudgetTokens: options.memoryInjectionBudgetTokens,
-        historyBudgetTokens: options.historyBudgetTokens,
-        hardSignals: options.hardSignals,
-        workspaceIdentitySet: {
-            identities: workspace.identities,
-            namesByIdentity: workspace.namesByIdentity,
-        },
-        nowMs: foldMaterializedAt,
-    });
+    const snapshotMarkers = readCurrentM0SnapshotMarkers(
+        m0MarkerReadArgs(options, workspace, projectPath, projectDirectory, foldMaterializedAt),
+    );
     if (
         snapshotMarkers.claimSnapshotVector === undefined ||
         snapshotMarkers.renderedRevisionLocators === undefined ||
@@ -2431,33 +2431,16 @@ function applyCachedRowToState(state: M0M1State, row: CachedM0M1Row): void {
     if (!row.cached_m0_bytes || !row.cached_m1_bytes || !markers) {
         throw new RenderM1InvalidMarkersError(state.sessionId);
     }
-    state.cachedM0Bytes = toBuffer(row.cached_m0_bytes);
+    applyMarkersToState(
+        state,
+        toBuffer(row.cached_m0_bytes),
+        markers,
+        toBuffer(row.cached_m1_bytes),
+    );
+    // The row is the mural source on the cached-row path: markers carry no
+    // mural data URL, and the row's hash is the persisted truth.
     state.cachedM0MuralDataUrl = row.cached_m0_mural_data_url ?? null;
     state.cachedM0MuralHash = row.cached_m0_mural_hash ?? null;
-    state.cachedM1Bytes = toBuffer(row.cached_m1_bytes);
-    state.cachedM0ClaimFormatEpoch = markers.claimFormatEpoch ?? null;
-    state.cachedM0ClaimSnapshotVector = markers.claimSnapshotVector
-        ? canonicalSnapshotVector(markers.claimSnapshotVector)
-        : null;
-    state.cachedM0RenderedRevisionLocators = markers.renderedRevisionLocators
-        ? JSON.stringify([...markers.renderedRevisionLocators].sort())
-        : null;
-    state.cachedM0ProjectUserProfileVersion = markers.projectUserProfileVersion;
-    state.cachedM0MaxCompartmentSeq = markers.maxCompartmentSeq;
-    state.cachedM0MaxMutationId = markers.maxMutationId;
-    state.cachedM0ProjectDocsHash = markers.projectDocsHash;
-    state.cachedM0MaterializedAt = markers.materializedAt;
-    state.cachedM0SessionFactsVersion = markers.sessionFactsVersion;
-    state.cachedM0UpgradeState = encodeCachedM0UpgradeIdentity(
-        markers.upgradeState,
-        markers.compartmentRenderEpoch,
-        markers.muralEnabled,
-        markers.renderBudgetIdentity,
-    );
-    state.cachedM0SystemHash = markers.systemHash;
-    state.cachedM0ModelKey = markers.modelKey;
-    state.cachedM0ProjectIdentity = markers.projectIdentity;
-    state.snapshotMarkers = markers;
 }
 
 function replayCachedM1(state: M0M1State): string {
@@ -2549,7 +2532,7 @@ function prependM0M1Messages(
     // part is synthetic, and skips titling unless exactly one real user message
     // exists. Without the part-level `synthetic` flag, m[0]+m[1] add two
     // phantom user turns on the first message and permanently suppress the
-    // session's auto-title (issue #129). Must NOT use `ignored` here — that
+    // session's auto-title gate. Must NOT use `ignored` here — that
     // would strip the history
     // injection from the real model call.
     const muralImage =
@@ -2598,21 +2581,9 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
         projectPath,
         workspaceIdentitySet: options.workspaceIdentitySet,
     });
-    const snapshotMarkers = readCurrentM0SnapshotMarkers({
-        db: options.db,
-        sessionId: options.sessionId,
-        projectPath,
-        projectDirectory,
-        injectDocs: options.injectDocs,
-        muralEnabled: options.muralEnabled,
-        memoryInjectionBudgetTokens: options.memoryInjectionBudgetTokens,
-        historyBudgetTokens: options.historyBudgetTokens,
-        hardSignals: options.hardSignals,
-        workspaceIdentitySet: {
-            identities: workspace.identities,
-            namesByIdentity: workspace.namesByIdentity,
-        },
-    });
+    const snapshotMarkers = readCurrentM0SnapshotMarkers(
+        m0MarkerReadArgs(options, workspace, projectPath, projectDirectory),
+    );
     const claimLane = readClaimLaneSnapshot({ db: options.db, projectPath, workspace });
     const memoryBudget = options.memoryInjectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS;
     let renderedClaims =

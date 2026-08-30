@@ -50,7 +50,7 @@ describe("native mechanism gate", () => {
             `import { createRequire } from "node:module";\n` +
                 `const addon = createRequire(import.meta.url)(${JSON.stringify(addon)});\n` +
                 `addon.registerCleanupProbe(${JSON.stringify(marker)});\n` +
-                `if (process.platform === "linux") addon.createTestPair();\n`,
+                `addon.createTestPair();\n`,
         );
         const child = spawnSync(process.execPath, [script], {
             encoding: "utf8",
@@ -77,11 +77,11 @@ function loadRawAddon(): RawAttachAddon | null {
     return createRequire(import.meta.url)(path) as RawAttachAddon;
 }
 
-/** Geometry of the `mc-host-test-ring-v1` profile (`ring_profile`). */
-const GRANT_DESCRIPTOR_DEPTH = 32n;
+/** Geometry of the `mc-host-test-ring-v1` profile (`mc_host_ring_profile`). */
+const GRANT_DESCRIPTOR_DEPTH = 8n;
 /** `MIN_ARENA_BYTES` == `MAX_FRAME_BYTES` == 64 MiB. */
 const GRANT_ARENA_BYTES = 67_108_864n;
-const GRANT_MAX_LEASES = 32n;
+const GRANT_MAX_LEASES = 8n;
 /**
  * Bytes the ring layout adds around a page-aligned arena: the control
  * region that precedes it (producer, consumer, and reclaim cache lines
@@ -96,7 +96,7 @@ const GRANT_MAX_LEASES = 32n;
  * test needs the grant to be *valid* — see the unresolvable-descriptor
  * test below, which is the only case that gets past decoding.
  */
-const GRANT_LAYOUT_OVERHEAD_BYTES = 16_384n;
+const GRANT_LAYOUT_OVERHEAD_BYTES = 8_192n;
 
 /**
  * Encodes one RingGrant wire image (layout version 2) as lowercase hex:
@@ -127,7 +127,6 @@ function testGrantHex(lane: number, incarnation: number): string {
 function validRawDescriptor(): Record<string, unknown> {
     return {
         profile: "mc-host-test-ring-v1",
-        pid: 1234,
         hostToPeerFd: 10,
         hostToPeerGrant: testGrantHex(0, 0xab),
         peerToHostFd: 11,
@@ -154,7 +153,7 @@ describe("raw N-API descriptor boundary", () => {
 
     test("rejects non-object and structurally hostile arguments", () => {
         const addon = loadRawAddon();
-        if (!addon || process.platform !== "linux") return;
+        if (!addon || !["linux", "darwin"].includes(process.platform)) return;
         for (const hostile of [
             null,
             undefined,
@@ -167,37 +166,17 @@ describe("raw N-API descriptor boundary", () => {
             expectRejectedWithoutEffects(addon, hostile);
         }
         // A missing field and an explicit undefined are both absent.
-        const { pid: _pid, ...missingPid } = validRawDescriptor();
-        expectRejectedWithoutEffects(addon, missingPid);
+        const { hostToPeerFd: _fd, ...missingFd } = validRawDescriptor();
+        expectRejectedWithoutEffects(addon, missingFd);
         expectRejectedWithoutEffects(addon, {
             ...validRawDescriptor(),
-            pid: undefined,
+            hostToPeerFd: undefined,
         });
     });
 
     test("rejects every unsafe numeric representation before narrowing", () => {
         const addon = loadRawAddon();
-        if (!addon || process.platform !== "linux") return;
-        const hostilePids = [
-            Number.NaN,
-            Number.POSITIVE_INFINITY,
-            Number.NEGATIVE_INFINITY,
-            2.5,
-            -1,
-            0,
-            -0,
-            2 ** 32,
-            2 ** 53,
-            "1234",
-            1234n,
-            { valueOf: () => 1234 },
-        ];
-        for (const pid of hostilePids) {
-            expectRejectedWithoutEffects(addon, {
-                ...validRawDescriptor(),
-                pid,
-            });
-        }
+        if (!addon || !["linux", "darwin"].includes(process.platform)) return;
         const hostileFds = [-1, -0, 2 ** 31, 3.5, Number.NaN, "10"];
         for (const fd of hostileFds) {
             expectRejectedWithoutEffects(addon, {
@@ -213,7 +192,7 @@ describe("raw N-API descriptor boundary", () => {
 
     test("rejects malformed, non-ASCII, and aliased grant text", () => {
         const addon = loadRawAddon();
-        if (!addon || process.platform !== "linux") return;
+        if (!addon || !["linux", "darwin"].includes(process.platform)) return;
         const valid = validRawDescriptor();
         const hostileGrants = [
             "\u00e9".repeat(58), // UTF-8 length 116, non-ASCII
@@ -244,11 +223,11 @@ describe("raw N-API descriptor boundary", () => {
 
     test("accessor objects and proxies get one bounded redacted error", () => {
         const addon = loadRawAddon();
-        if (!addon || process.platform !== "linux") return;
+        if (!addon || !["linux", "darwin"].includes(process.platform)) return;
         let reads = 0;
         const accessor = {
             ...validRawDescriptor(),
-            get pid(): number {
+            get hostToPeerFd(): number {
                 reads += 1;
                 throw new Error("SENTINEL_ACCESSOR_THROW");
             },
@@ -268,7 +247,7 @@ describe("raw N-API descriptor boundary", () => {
 
         const flipping = new Proxy(validRawDescriptor(), {
             get(target, property, receiver) {
-                if (property === "pid") return Number.NaN;
+                if (property === "hostToPeerFd") return Number.NaN;
                 return Reflect.get(target, property, receiver);
             },
         });
@@ -277,7 +256,7 @@ describe("raw N-API descriptor boundary", () => {
 
     test("a wrong profile is refused before any attachment effect", () => {
         const addon = loadRawAddon();
-        if (!addon || process.platform !== "linux") return;
+        if (!addon || !["linux", "darwin"].includes(process.platform)) return;
         expectRejectedWithoutEffects(
             addon,
             { ...validRawDescriptor(), profile: "SENTINEL_PROFILE" },
@@ -287,12 +266,10 @@ describe("raw N-API descriptor boundary", () => {
 
     test("a well-formed but unresolvable descriptor fails without registry effects", () => {
         const addon = loadRawAddon();
-        if (!addon || process.platform !== "linux") return;
-        // pid 4294967295 is above the Linux pid_max ceiling: validation
-        // passes, the /proc open fails, and no channel is registered.
+        if (!addon || !["linux", "darwin"].includes(process.platform)) return;
         expectRejectedWithoutEffects(
             addon,
-            { ...validRawDescriptor(), pid: 4_294_967_295 },
+            validRawDescriptor(),
             /shared-memory attachment failed/,
         );
     });

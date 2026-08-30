@@ -2,11 +2,12 @@ import { describe, expect, test } from "bun:test";
 import {
     NativeChannel,
     type NativeReceiveLease,
+    type ProducerCursor,
     probeCapabilities,
-    QUALIFIED_TEST_PROFILE,
-} from "@magic-context/mc-shm-native";
+} from "@cortexkit/mc-shm-native";
 import { ConnectionGeneration } from "./connection";
 import { Deadline } from "./deadline";
+import { McHostCallError } from "./errors";
 import {
     ByteBudget,
     type FrameChannelCloseReason,
@@ -18,17 +19,17 @@ import {
     type EnvelopeHeader,
     encodeHeader,
     FrameType,
+    MAX_FRAME_BODY_LEN,
     PROTOCOL_VERSION,
 } from "./protocol";
 import { ShmFrameChannel } from "./shm-frame-channel";
-import { createExplicitShmTestProvider } from "./shm-transport-provider";
 import {
     type ContractPeerFrame,
     type FrameChannelContractFactory,
     frameChannelContractScenarios,
     runFrameChannelContractScenario,
+    waitUntil,
 } from "./test-support/frame-channel-contract";
-import { waitUntil } from "./test-support/test-util";
 
 function responseHeader(ty: FrameType, corr: bigint, length: number, flags = 0): EnvelopeHeader {
     return {
@@ -61,8 +62,6 @@ async function generationHarness(): Promise<{
     const pair = NativeChannel.createTestPair();
     let channel: ShmFrameChannel | undefined;
     const generation = new ConnectionGeneration({
-        host: "127.0.0.1",
-        port: 1,
         credentials: { key: new Uint8Array(32), daemonId: new Uint8Array(16), daemonVer: "test" },
         channelFactory: ({ budget, handlers }) => {
             channel = new ShmFrameChannel({
@@ -79,9 +78,9 @@ async function generationHarness(): Promise<{
     return { generation, channel, peer: pair.second };
 }
 
-const shmContractFactory: FrameChannelContractFactory = async () => {
+const shmContractFactory: FrameChannelContractFactory = async (overrides = {}) => {
     const pair = NativeChannel.createTestPair();
-    const budget = new ByteBudget(128 * 1024 * 1024);
+    const budget = new ByteBudget(overrides.memoryCapBytes ?? 128 * 1024 * 1024);
     const frames: ContractPeerFrame[] = [];
     const received: { header: EnvelopeHeader; body: Uint8Array }[] = [];
     const closes: { reason: FrameChannelCloseReason; error: unknown }[] = [];
@@ -93,7 +92,7 @@ const shmContractFactory: FrameChannelContractFactory = async () => {
     const channel = new ShmFrameChannel({
         nativeChannel: pair.first,
         budget,
-        maxBodyLen: 1 << 20,
+        maxBodyLen: overrides.maxBodyLen ?? MAX_FRAME_BODY_LEN,
         handlers: {
             onFrame: (frame) => {
                 if (hook.current?.(frame)) return;
@@ -193,16 +192,8 @@ const shmContractFactory: FrameChannelContractFactory = async () => {
     };
 };
 
-const SHM_CONTRACT_SCENARIOS = new Set([
-    "concurrent send and receive preserve FIFO order",
-    "publication and local completion fire exactly once, in order",
-    "underfill, overflow, and abort return reservations without publication",
-    "owned receive adapter copies once after transport lease release",
-]);
-
 describe("frame channel semantic contract (shared-memory factory)", () => {
     for (const scenario of frameChannelContractScenarios) {
-        if (!SHM_CONTRACT_SCENARIOS.has(scenario.name)) continue;
         test(scenario.name, async () => {
             if (!probeCapabilities().available) return;
             await runFrameChannelContractScenario(scenario, shmContractFactory);
@@ -210,17 +201,7 @@ describe("frame channel semantic contract (shared-memory factory)", () => {
     }
 });
 
-describe("explicit shared-memory provider", () => {
-    test("omits unsupported and non-qualified profiles without registration", () => {
-        expect(createExplicitShmTestProvider("production-default")).toBeUndefined();
-        const provider = createExplicitShmTestProvider(QUALIFIED_TEST_PROFILE);
-        expect(provider === undefined).toBe(!probeCapabilities().available);
-        if (provider) {
-            expect(provider.transport).toBe("shm");
-            expect(provider.capabilityVersion).toBe(1);
-        }
-    });
-
+describe("mandatory shared-memory channel", () => {
     test("propagates JSON and binary leases without owned-adapter copies", async () => {
         if (!probeCapabilities().available) return;
         const { generation, channel, peer } = await generationHarness();
@@ -429,6 +410,7 @@ describe("explicit shared-memory provider", () => {
         let nativeCloseCalls = 0;
         const nativeLease = {
             header: encodeHeader(responseHeader(FrameType.Response, 1n, 5)),
+            byteLength: 5,
             segmentCount: 1,
             segment: () => new Uint8Array(Buffer.from("maybe")),
             release: () => {
@@ -445,6 +427,7 @@ describe("explicit shared-memory provider", () => {
             close: () => {
                 nativeCloseCalls++;
             },
+            peerClosed: () => false,
         } as unknown as NativeChannel;
         const channel = new ShmFrameChannel({
             nativeChannel: native,
@@ -477,6 +460,7 @@ describe("explicit shared-memory provider", () => {
                 throw new Error("reserve must not be reached");
             },
             close: () => {},
+            peerClosed: () => false,
         } as unknown as NativeChannel;
         const channel = new ShmFrameChannel({
             nativeChannel: native,
@@ -509,6 +493,7 @@ describe("explicit shared-memory provider", () => {
                 produceCalls++;
             },
             close: () => {},
+            peerClosed: () => false,
         } as unknown as NativeChannel;
         const channel = new ShmFrameChannel({
             nativeChannel: native,
@@ -522,6 +507,106 @@ describe("explicit shared-memory provider", () => {
         channel.close();
         expect(() => channel.sendControl(responseHeader(FrameType.Pong, 1n, 0))).not.toThrow();
         expect(produceCalls).toBe(0);
+    });
+
+    test("a full ring is retryable backpressure, not a terminal failure", () => {
+        const budget = new ByteBudget(1 << 20);
+        let blockMs: number | undefined;
+        const native = {
+            produce: (
+                _header: Uint8Array,
+                _capacity: number,
+                _fill: unknown,
+                _beforePublish: unknown,
+                timeoutMs: number,
+            ) => {
+                blockMs = timeoutMs;
+                throw new Error("shared-memory ring is full");
+            },
+            reserve: () => {
+                throw new Error("shared-memory ring is full");
+            },
+            close: () => {},
+            peerClosed: () => false,
+        } as unknown as NativeChannel;
+        const channel = new ShmFrameChannel({
+            nativeChannel: native,
+            budget,
+            maxBodyLen: 1 << 20,
+            handlers: { onFrame: () => {}, onClosed: () => {} },
+        });
+        const header = responseHeader(FrameType.Request, 1n, 4);
+        const body = {
+            byteLength: 4,
+            fill: (cursor: ProducerCursor) => cursor.write(new Uint8Array(4)),
+        };
+
+        for (const attempt of [
+            () => channel.produce(header, body),
+            () => channel.reserve(header, 4),
+        ]) {
+            let caught: unknown;
+            try {
+                attempt();
+            } catch (error) {
+                caught = error;
+            }
+            expect(caught).toBeInstanceOf(McHostCallError);
+            expect((caught as McHostCallError).kind).toBe("not_sent");
+            expect((caught as McHostCallError).code).toBe("ring_full");
+        }
+        // A publication must not hold the event loop for a request deadline;
+        // the loop is also the only consumer draining the inbound ring.
+        expect(blockMs).toBeLessThanOrEqual(5);
+        // Every refused attempt returns its charge.
+        expect(budget.used).toBe(0);
+    });
+
+    test("a dropped setup socket retires the channel as eof after draining", async () => {
+        const closes: { reason: FrameChannelCloseReason; error: unknown }[] = [];
+        const frames: EnvelopeHeader[] = [];
+        let peerAlive = true;
+        let pending = true;
+        const nativeLease = {
+            header: encodeHeader(responseHeader(FrameType.Response, 7n, 4)),
+            byteLength: 4,
+            segmentCount: 1,
+            segment: () => new Uint8Array(Buffer.from("last")),
+            release: () => {},
+        } as unknown as NativeReceiveLease;
+        const native = {
+            poll: (deliver: (lease: NativeReceiveLease) => void) => {
+                if (!pending) return false;
+                pending = false;
+                deliver(nativeLease);
+                return true;
+            },
+            close: () => {},
+            peerClosed: () => !peerAlive,
+        } as unknown as NativeChannel;
+        const channel = new ShmFrameChannel({
+            nativeChannel: native,
+            budget: new ByteBudget(1024),
+            maxBodyLen: 1 << 20,
+            handlers: {
+                onFrame: (frame) => {
+                    frames.push(frame.header);
+                    frame.body.release();
+                },
+                onClosed: (reason, error) => closes.push({ reason, error }),
+            },
+        });
+        channel.beginFrames();
+        await waitUntil(() => frames.length === 1);
+        expect(closes).toEqual([]);
+
+        peerAlive = false;
+        await waitUntil(() => closes.length === 1);
+        // The frame that was already in the ring is delivered before the
+        // connection retires, so a graceful Goodbye is never lost.
+        expect(frames).toHaveLength(1);
+        expect(closes[0]?.reason).toBe("eof");
+        expect(channel.isClosed()).toBe(true);
     });
 
     test("handler throw releases JSON lease before fail-close", async () => {
@@ -546,5 +631,179 @@ describe("explicit shared-memory provider", () => {
         expect(channel.isClosed()).toBe(true);
         expect(alias?.byteLength).toBe(0);
         pair.second.close();
+    });
+
+    test("wrong version is rejected before publication and role-invalid input closes", async () => {
+        if (!probeCapabilities().available) return;
+        const pair = NativeChannel.createTestPair();
+        const encoded = encodeHeader(responseHeader(FrameType.Response, 1n, 0));
+        encoded[4] = PROTOCOL_VERSION + 1;
+        expect(() => pair.second.produce(encoded, 0, () => {})).toThrow();
+        expect(pair.first.poll(() => {})).toBe(false);
+        pair.first.close();
+        pair.second.close();
+
+        const rolePair = NativeChannel.createTestPair();
+        const closes: FrameChannelCloseReason[] = [];
+        const channel = new ShmFrameChannel({
+            nativeChannel: rolePair.first,
+            budget: new ByteBudget(1024),
+            maxBodyLen: 1 << 20,
+            handlers: {
+                onFrame: () => {},
+                onClosed: (reason) => closes.push(reason),
+            },
+        });
+        channel.beginFrames();
+        publish(rolePair.second, responseHeader(FrameType.Request, 1n, 0), new Uint8Array());
+        await waitUntil(() => closes.length === 1);
+        expect(closes).toEqual(["role_violation"]);
+        expect(channel.isClosed()).toBe(true);
+        rolePair.second.close();
+    });
+
+    test("correlations settle out of order without crossing requests", async () => {
+        if (!probeCapabilities().available) return;
+        const { generation, peer } = await generationHarness();
+        try {
+            const first = generation.request({
+                channel: 7,
+                epoch: 1,
+                body: Buffer.from("{}"),
+                deadline: Deadline.start(2_000),
+            });
+            const firstSent = take(peer);
+            firstSent.release();
+            const second = generation.request({
+                channel: 7,
+                epoch: 1,
+                body: Buffer.from("{}"),
+                deadline: Deadline.start(2_000),
+            });
+            const secondSent = take(peer);
+            secondSent.release();
+            expect(second.correlation).toBe(first.correlation + 1n);
+
+            publish(
+                peer,
+                responseHeader(FrameType.Response, second.correlation, 12),
+                Buffer.from('{"id":"two"}'),
+            );
+            publish(
+                peer,
+                responseHeader(FrameType.Response, first.correlation, 12),
+                Buffer.from('{"id":"one"}'),
+            );
+            expect((await first.result).body).toMatchObject({ value: { id: "one" } });
+            expect((await second.result).body).toMatchObject({ value: { id: "two" } });
+        } finally {
+            generation.retire("owner_close");
+            peer.close();
+        }
+    });
+
+    test("deadline after ring publication is outcome_unknown and late terminal is dropped", async () => {
+        if (!probeCapabilities().available) return;
+        const { generation, peer } = await generationHarness();
+        try {
+            const request = generation.request({
+                channel: 7,
+                epoch: 1,
+                body: Buffer.from("{}"),
+                deadline: Deadline.start(20),
+            });
+            take(peer).release();
+            await expect(request.result).rejects.toMatchObject({
+                kind: "outcome_unknown",
+                code: "deadline_expired",
+            });
+
+            publish(
+                peer,
+                responseHeader(FrameType.Response, request.correlation, 2),
+                Buffer.from("{}"),
+            );
+            await waitUntil(() => generation.stats().droppedFrames === 1);
+            expect(generation.isRetired()).toBe(false);
+        } finally {
+            generation.retire("owner_close");
+            peer.close();
+        }
+    });
+
+    test("abort after ring publication is outcome_unknown and cleanup waits for terminal", async () => {
+        if (!probeCapabilities().available) return;
+        const { generation, peer } = await generationHarness();
+        try {
+            const request = generation.request({
+                channel: 7,
+                epoch: 1,
+                body: Buffer.from("{}"),
+                deadline: Deadline.start(2_000),
+            });
+            take(peer).release();
+            const cleanup = request.abort().cleanup;
+            await expect(request.result).rejects.toMatchObject({ kind: "outcome_unknown" });
+            publish(
+                peer,
+                responseHeader(FrameType.Response, request.correlation, 2),
+                Buffer.from("{}"),
+            );
+            await cleanup;
+            expect(generation.stats().pendingRequests).toBe(0);
+        } finally {
+            generation.retire("owner_close");
+            peer.close();
+        }
+    });
+
+    test("connection Goodbye makes possible sends unknown and later sends not_sent", async () => {
+        if (!probeCapabilities().available) return;
+        const { generation, peer } = await generationHarness();
+        try {
+            const request = generation.request({
+                channel: 7,
+                epoch: 1,
+                body: Buffer.from("{}"),
+                deadline: Deadline.start(2_000),
+            });
+            take(peer).release();
+            publish(
+                peer,
+                {
+                    len: 0,
+                    ver: PROTOCOL_VERSION,
+                    ty: FrameType.Goodbye,
+                    flags: 0,
+                    channel: 0,
+                    epoch: 0,
+                    corr: 0n,
+                },
+                new Uint8Array(),
+            );
+            await expect(request.result).rejects.toMatchObject({ kind: "outcome_unknown" });
+            const info = await generation.retired;
+            expect(info.reason).toBe("connection_goodbye");
+            expect(() =>
+                generation.request({
+                    channel: 7,
+                    epoch: 1,
+                    body: Buffer.from("{}"),
+                    deadline: Deadline.start(2_000),
+                }),
+            ).toThrow(McHostCallError);
+            try {
+                generation.request({
+                    channel: 7,
+                    epoch: 1,
+                    body: Buffer.from("{}"),
+                    deadline: Deadline.start(2_000),
+                });
+            } catch (error) {
+                expect(error).toMatchObject({ kind: "not_sent", code: "connection_retired" });
+            }
+        } finally {
+            peer.close();
+        }
     });
 });

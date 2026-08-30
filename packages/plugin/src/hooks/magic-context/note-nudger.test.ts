@@ -7,7 +7,8 @@ import {
     setNoteLastReadAt,
 } from "../../features/magic-context/storage-meta-persisted";
 import { addNote } from "../../features/magic-context/storage-notes";
-import { Database } from "../../shared/sqlite";
+import { createDirectTestDatabase } from "../../features/magic-context/test-database";
+import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     clearNoteNudgeState,
@@ -29,58 +30,7 @@ afterEach(() => {
 });
 
 function makeDb(): Database {
-    const db = new Database(":memory:");
-    db.exec(`
-        CREATE TABLE session_meta (
-            session_id TEXT PRIMARY KEY,
-            last_response_time INTEGER DEFAULT 0,
-            cache_ttl TEXT DEFAULT '5m',
-            counter INTEGER DEFAULT 0,
-            last_nudge_tokens INTEGER DEFAULT 0,
-            last_nudge_band TEXT DEFAULT '',
-            last_transform_error TEXT DEFAULT '',
-            is_subagent INTEGER DEFAULT 0,
-            last_context_percentage REAL DEFAULT 0,
-            last_input_tokens INTEGER DEFAULT 0,
-            observed_safe_input_tokens INTEGER NOT NULL DEFAULT 0,
-            cache_alert_sent INTEGER NOT NULL DEFAULT 0,
-            times_execute_threshold_reached INTEGER DEFAULT 0,
-            compartment_in_progress INTEGER DEFAULT 0,
-            historian_failure_count INTEGER DEFAULT 0,
-            historian_last_error TEXT DEFAULT NULL,
-            historian_last_failure_at INTEGER DEFAULT NULL,
-            system_prompt_hash TEXT DEFAULT '',
-            system_prompt_tokens INTEGER DEFAULT 0,
-      conversation_tokens INTEGER DEFAULT 0,
-      tool_call_tokens INTEGER DEFAULT 0,
-            note_nudge_trigger_pending INTEGER DEFAULT 0,
-            note_nudge_trigger_message_id TEXT DEFAULT '',
-            note_nudge_sticky_text TEXT DEFAULT '',
-            note_nudge_sticky_message_id TEXT DEFAULT '',
-            note_nudge_anchors TEXT NOT NULL DEFAULT '[]',
-            auto_search_hint_decisions TEXT NOT NULL DEFAULT '[]',
-            note_last_read_at INTEGER DEFAULT 0,
-            cleared_reasoning_through_tag INTEGER DEFAULT 0,
-      harness TEXT NOT NULL DEFAULT 'opencode'
-    );
-
-        CREATE TABLE notes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            type TEXT NOT NULL DEFAULT 'session',
-            status TEXT NOT NULL DEFAULT 'active',
-            content TEXT NOT NULL,
-            session_id TEXT,
-            project_path TEXT,
-            surface_condition TEXT,
-            created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL,
-            last_checked_at INTEGER,
-            ready_at INTEGER,
-            ready_reason TEXT,
-      harness TEXT NOT NULL DEFAULT 'opencode',
-      anchor_ordinal INTEGER
-    );
-    `);
+    const db = createDirectTestDatabase().db;
     dbs.push(db);
     return db;
 }

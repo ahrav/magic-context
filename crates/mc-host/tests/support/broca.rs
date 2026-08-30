@@ -180,6 +180,9 @@ impl LlmExecutionBackend for ScriptedBackend {
 
 /// Real-loopback host whose tertiary is the supplied Broca component, with
 /// the fixed direct-profile catalog shape (magic-context, synapse, broca).
+///
+/// The host requires Linux because `support::synapse::EchoPrimary` is Linux-gated and Synapse ships only for `linux-x64-gnu`. commentlint: allow(JUDGE)
+#[cfg(target_os = "linux")]
 pub async fn start_broca_host(component: BrocaComponent) -> super::CompositeTestHost {
     let composite = StaticComposite::new(
         super::synapse::EchoPrimary,

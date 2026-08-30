@@ -7,14 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use mc_shm_transport::backend::ring::{wire_v2_header, Ring};
-use mc_shm_transport::descriptor::{
-    BackendId, HardwareProfileId, MemoryLayout, OwnershipMode, PlatformKind, RuntimeKind,
-    SchedulingMode, TransportDescriptor, WorkloadClass,
-};
+use mc_shm_transport::descriptor::{HardwareProfileId, SchedulingMode, TransportDescriptor};
 use mc_shm_transport::evidence::OperationCounters;
-use mc_shm_transport::profile::{
-    CompletionMode, ProducerTopology, ProfileConfig, TargetProfile, WorkerTopology,
-};
+use mc_shm_transport::profile::{ProfileConfig, TargetProfile, WorkerTopology};
 use serde::{Deserialize, Serialize};
 
 const ARMS: &[&str] = &[
@@ -29,7 +24,6 @@ const ARMS: &[&str] = &[
     "h2_rust_napi_runtime_crossing",
     "injected_avoidable_operations",
     "ring",
-    "iceoryx_0_9_3",
 ];
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -48,8 +42,6 @@ struct Measurement {
     generic_queue_hops: u64,
     scheduler_handoffs: u64,
     checksum: u64,
-    selectable: bool,
-    qualified: bool,
     reason: Option<String>,
 }
 
@@ -72,11 +64,7 @@ fn main() {
     }
 
     if args.iter().any(|arg| arg == "--designated-host") {
-        // The designated-host qualification campaign (manifest predicates,
-        // paired statistics, WINNER/HARDWARE_EQUIVALENT verdicts) is not
-        // implemented; refusing beats emitting unqualified-schedule
-        // evidence for a qualification request.
-        eprintln!("--designated-host refused: qualification campaign is not implemented");
+        eprintln!("--designated-host is not supported by the fixed ring smoke benchmark");
         std::process::exit(2);
     }
     let smoke = args.iter().any(|arg| arg == "--smoke");
@@ -134,23 +122,13 @@ fn main() {
     let report = serde_json::json!({
         "schema": 1,
         "state": "complete",
-        "campaign": if smoke { "smoke_non_selecting" } else { "manifest_schedule_unqualified" },
+        "campaign": if smoke { "smoke" } else { "manifest_schedule" },
         "manifest": "benches/manifests/v1.json",
         "period_unit": "fresh_arm_process",
         "paired_process_arms": ["h0_metadata_cacheline_ping_pong", "h1_raw_descriptor_ring_payload_touch", "copied_producer_copied_receiver", "copied_producer_leased_receiver", "direct_producer_copied_receiver", "direct_producer_leased_receiver", "unix_socket", "tcp", "ring"],
-        "loopback_smoke_arms": ["iceoryx_0_9_3"],
         "gate_control_arms": ["injected_avoidable_operations"],
         "order_blocks": ["ABBA", "BAAB"],
         "counter_fields": ["body_copies", "native_allocations", "syscalls", "park_wakes", "generic_queue_hops", "scheduler_handoffs"],
-        "verdict": "INCONCLUSIVE",
-        "selection": "NO_QUALIFYING_ARM",
-        "verdict_reasons": [
-            "designated_hosts_unset",
-            "paired_statistical_campaign_not_run",
-            "host_explicit_control_has_one_accounted_receive_copy",
-            "cold_native_wake_not_qualified",
-            "macos_not_run"
-        ],
         "attempts": attempts,
     });
     println!("{}", serde_json::to_string_pretty(&report).unwrap());
@@ -174,7 +152,6 @@ fn measure(arm: &str, scheduling: SchedulingMode, iterations: u64, payload: usiz
             Err("runtime mechanism tests exist; paired H2 campaign has not run")
         }
         "injected_avoidable_operations" => run_ring(scheduling, iterations, payload, false, false),
-        "iceoryx_0_9_3" => run_iceoryx(scheduling, iterations, payload),
         _ => Err("unknown arm"),
     };
     match result {
@@ -216,8 +193,6 @@ fn measure(arm: &str, scheduling: SchedulingMode, iterations: u64, payload: usiz
                 generic_queue_hops: counters.generic_queue_hops,
                 scheduler_handoffs: counters.scheduler_handoffs,
                 checksum,
-                selectable: matches!(arm, "ring" | "iceoryx_0_9_3"),
-                qualified: false,
                 reason: Some(reason),
             }
         }
@@ -253,8 +228,6 @@ fn failed(
         generic_queue_hops: 0,
         scheduler_handoffs: 0,
         checksum: 0,
-        selectable: matches!(arm, "ring" | "iceoryx_0_9_3"),
-        qualified: false,
         reason: Some(reason.to_owned()),
     }
 }
@@ -314,26 +287,13 @@ fn run_h0(iterations: u64) -> Result<(Duration, u64, u64, u64, u64, u64), &'stat
     Ok((start.elapsed(), 0, 0, 0, 0, checksum))
 }
 
-// Smoke-only ring shape: "smoke-unqualified" never names a qualified
-// candidate, so every record built from it stays `qualified: false`. It
-// deliberately diverges from the host's qualified profile (Fused workers,
-// depth 8, lease limit 8) — the caller thread drives both ends here and the
-// depth/lease limit of 32 keeps the smoke loop from stalling on backpressure.
+// Smoke-only ring geometry differs from the host profile because the caller
+// drives both ends; depth and lease limit 32 prevent benchmark backpressure.
 fn ring_profile(scheduling: SchedulingMode) -> Result<TargetProfile, &'static str> {
     TargetProfile::new(ProfileConfig {
         descriptor: TransportDescriptor::new(
-            BackendId::Ring,
-            MemoryLayout::TwoSpanWrap,
-            OwnershipMode::DirectLeased,
             scheduling,
-            WorkloadClass::SmallLatency,
-            if cfg!(target_os = "macos") {
-                PlatformKind::Macos
-            } else {
-                PlatformKind::Linux
-            },
-            RuntimeKind::Rust,
-            HardwareProfileId::new("smoke-unqualified").map_err(|_| "profile")?,
+            HardwareProfileId::new("smoke").map_err(|_| "profile")?,
         ),
         descriptor_depth: 32,
         arena_bytes: mc_shm_transport::MIN_ARENA_BYTES,
@@ -341,9 +301,7 @@ fn ring_profile(scheduling: SchedulingMode) -> Result<TargetProfile, &'static st
         max_leases: 32,
         mappings: 2,
         pinned_workers: usize::from(scheduling == SchedulingMode::HotPinnedPoll) * 2,
-        producer_topology: ProducerTopology::CallerConfined,
         worker_topology: WorkerTopology::CallerThread,
-        completion_mode: CompletionMode::SynchronousPull,
     })
     .map_err(|_| "profile")
 }
@@ -526,82 +484,4 @@ where
         0,
         checksum,
     ))
-}
-
-#[cfg(feature = "iceoryx")]
-fn run_iceoryx(
-    scheduling: SchedulingMode,
-    iterations: u64,
-    payload_len: usize,
-) -> Result<(Duration, u64, u64, u64, u64, u64), &'static str> {
-    use mc_shm_transport::backend::iceoryx::IceoryxBackend;
-    let profile = TargetProfile::new(ProfileConfig {
-        descriptor: TransportDescriptor::new(
-            BackendId::Iceoryx,
-            MemoryLayout::IceoryxSample,
-            OwnershipMode::DirectLeased,
-            scheduling,
-            WorkloadClass::SmallLatency,
-            if cfg!(target_os = "macos") {
-                PlatformKind::Macos
-            } else {
-                PlatformKind::Linux
-            },
-            RuntimeKind::Rust,
-            HardwareProfileId::new("smoke-unqualified").map_err(|_| "profile")?,
-        ),
-        descriptor_depth: 4,
-        arena_bytes: mc_shm_transport::MIN_ARENA_BYTES,
-        max_spans: 1,
-        max_leases: 4,
-        mappings: 2,
-        pinned_workers: usize::from(scheduling == SchedulingMode::HotPinnedPoll) * 2,
-        producer_topology: ProducerTopology::CallerConfined,
-        worker_topology: WorkerTopology::CallerThread,
-        completion_mode: CompletionMode::SynchronousPull,
-    })
-    .map_err(|_| "profile")?;
-    let backend = IceoryxBackend::create(&profile, 0).map_err(|_| "iceoryx setup")?;
-    let body = vec![0x5a; payload_len];
-    let mut checksum = 0u64;
-    let start = Instant::now();
-    for _ in 0..iterations {
-        let mut reservation = backend
-            .try_reserve(
-                payload_len,
-                wire_v2_header(payload_len).map_err(|_| "header")?,
-            )
-            .map_err(|_| "reserve")?;
-        reservation.write(&body).map_err(|_| "write")?;
-        reservation.commit(payload_len).map_err(|_| "commit")?;
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let lease = loop {
-            if let Some(lease) = backend.try_receive().map_err(|_| "receive")? {
-                break lease;
-            }
-            if Instant::now() >= deadline {
-                return Err("iceoryx receive deadline");
-            }
-            std::hint::spin_loop();
-        };
-        checksum = checksum.wrapping_add(
-            lease
-                .segment(0)
-                .ok_or("span")?
-                .iter()
-                .map(|byte| u64::from(*byte))
-                .sum::<u64>(),
-        );
-        lease.release();
-    }
-    Ok((start.elapsed(), 0, 0, 0, 0, checksum))
-}
-
-#[cfg(not(feature = "iceoryx"))]
-fn run_iceoryx(
-    _scheduling: SchedulingMode,
-    _iterations: u64,
-    _payload_len: usize,
-) -> Result<(Duration, u64, u64, u64, u64, u64), &'static str> {
-    Err("iceoryx feature disabled")
 }

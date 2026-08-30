@@ -198,7 +198,7 @@ export function processSystemPromptForCache(args: {
 		);
 	}
 
-	// Persist hash + token estimate so dashboard / status surfaces are
+	// Persist hash + token estimate so status surfaces are
 	// up-to-date and the next turn can compare against this value.
 	const systemPromptTokens = estimateTokens(frozenPrompt);
 	if (sessionMeta) {

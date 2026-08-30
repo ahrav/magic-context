@@ -60,12 +60,9 @@ jobs:
         working-directory: packages/e2e-tests
         run: bun test scripts/validate-shm-hardening-matrix.test.ts
 
-      # --allow-unresolved keeps an unresolved manifest loud but
-      # non-fatal; a FROZEN manifest is validated strictly with no
-      # workflow edit. commentlint: allow(JUDGE)
-      - name: Validate hardening matrix (strict when frozen)
+      - name: Validate fixed ring manifest
         working-directory: packages/e2e-tests
-        run: bun scripts/validate-shm-hardening-matrix.ts --allow-unresolved
+        run: bun scripts/validate-shm-hardening-matrix.ts
 
   release-contract-gate:
     name: mc-host release contract drift gate
@@ -93,7 +90,7 @@ jobs:
         run: bun run release:contract:check
 
   shm-crash-recovery:
-    name: SHM crash isolation + recovery (Linux, provisional ring tuple)
+    name: Mandatory ring unit and client suites (Linux)
     runs-on: ubuntu-latest
     needs: [shm-hardening-gate]
     timeout-minutes: 45
@@ -111,15 +108,20 @@ jobs:
       - name: Provision metadata-only sibling stubs
         run: sh scripts/provision-rust-ci-stubs.sh
 
-      # Serialized shm-crash nextest group; the ignored full soak
-      # stays opt-in via shm-hardening-optin.yml; no artifact upload.
-      # The --lib pass runs the provider_recovery controller unit
-      # suite (stale retries, deadline isolation, wedged cleanup,
-      # late-result fencing, inbox bounds, custody accounting), which
-      # no integration binary exercises. commentlint: allow(JUDGE)
-      - name: Crash, recovery, and soak-smoke suites
+      # The unit suites carry the setup-socket handshake, ring transport, and
+      # control-response coverage. Without them a proof-transcript or
+      # response-shape change reaches the only supported transport unchecked.
+      - name: Mandatory ring unit suite
+        run: cargo nextest run -p mc-host -p mc-shm-transport --lib
+
+      - name: Mandatory ring client suite
+        run: cargo nextest run -p mc-host --test client
+
+      # The long soak has `#[ignore]`; this command excludes it without
+      # `--run-ignored`.
+      - name: Crash reclamation and bounded-resource suites
         run: |
-          cargo nextest run -p mc-host --lib \
+          cargo nextest run -p mc-host \
             --test shm_failure_modes --test shm_soak
 
   shm-source-build:
@@ -129,7 +131,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, macos-15-intel]
     steps:
       - uses: actions/checkout@v5
 
@@ -157,29 +159,23 @@ jobs:
       # mc-module fails to resolve those imports. The ck-mc-host binary build
       # and the lifecycle_cli contract run in the mc-host-lifecycle job, which
       # checks out the sibling sources instead of stubbing them.
-      - name: Source-build transport, host, addon, and iceoryx
-        run: |
-          cargo build -p mc-shm-transport -p mc-host -p mc-shm-native
-          cargo check -p mc-shm-transport --features iceoryx
+      - name: Source-build transport, host, and addon
+        run: cargo build -p mc-shm-transport -p mc-host -p mc-shm-native
 
       - name: Rust contracts and lifecycle (Linux)
         if: runner.os == 'Linux'
         run: |
           cargo nextest run -p mc-shm-native -p mc-shm-transport
           cargo nextest run -p mc-host \
-            --test shm_transport --test transport_negotiation
+            --test client --test lifecycle
 
-      # No retained macOS provider: Linux-gated crash/soak harnesses
-      # are absent by cfg, so this proves side-effect-free omission
-      # (R15), not active parity. commentlint: allow(JUDGE)
-      - name: Contracts, observer self-tests, and omission proof (macOS)
+      - name: Fixed-ring contracts (macOS)
         if: runner.os == 'macOS'
         run: |
+          cargo nextest run -p mc-shm-native
           cargo nextest run -p mc-shm-transport \
             --test contract --test fuzz_corpus
-          cargo nextest run -p mc-host --test shm_soak
-          cargo test -p mc-host --lib \
-            shm_provider::tests::platform_preflight_is_side_effect_free
+          cargo nextest run -p mc-host --test client --test lifecycle
 
       - name: Rust lease non-escape
         run: cargo test -p mc-host --doc
@@ -193,16 +189,13 @@ jobs:
       - name: Native behavior (Node 24)
         run: bun run --cwd packages/mc-shm-native test:node
 
-      - name: Capability activation or clean omission (Bun and Node 24)
+      - name: Mandatory capability activation (Bun and Node 24)
         run: |
           bun run --cwd packages/mc-shm-native test:capability:bun
           bun run --cwd packages/mc-shm-native test:capability:node
 
       - name: Plugin shared-memory contracts (Bun)
         run: bun test packages/plugin/src/shared/mc-host-client
-
-      - name: Plugin shared-memory lifetime (Node 24)
-        run: bun run --cwd packages/plugin test:mc-shm:node
 
       - name: Plugin typecheck
         run: bun run --cwd packages/plugin typecheck
@@ -233,11 +226,16 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: ahrav/commons
-          ref: d2208eda95d845193d84199dbfd0781a1f479291
+          ref: 77cd36b9cb8bde762d2b39d4807bb1c0338ed927
           path: commons
           persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@nextest
+
+      - name: Store tests against real commons
+        run: cargo test -p mc-store
 
       - name: Host lifecycle and closure proofs (Linux)
         if: runner.os == 'Linux'
@@ -247,6 +245,12 @@ jobs:
             --test broca_subprocess \
             --test harness_closure \
             --test protocol_vectors
+
+      # token_cache::test_cache_guard serializes the tests that share the
+      # process-global cache, so this suite is correct under either runner.
+      - name: Module transform and token-cache proofs (Linux)
+        if: runner.os == 'Linux'
+        run: cargo nextest run -p mc-module --lib
 
       - name: Native module adapter and CLI lifecycle (Linux)
         if: runner.os == 'Linux'
@@ -599,12 +603,17 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Adversarial scenarios (Bun)
-        working-directory: packages/plugin
-        run: bun scripts/run-mc-host-client-adversarial.ts
+      - name: Provision metadata-only sibling stubs
+        run: sh scripts/provision-rust-ci-stubs.sh
 
-      - name: Adversarial scenarios (Node 24)
-        run: bun run --cwd packages/plugin test:mc-host-client:node
+      - name: Build shared-memory addon from source
+        run: bun run --cwd packages/mc-shm-native build:source
+
+      - name: Shared-memory client smoke (Bun)
+        run: bun run --cwd packages/plugin smoke:mc-host-client:bun
+
+      - name: Shared-memory capability preflight (Node 24)
+        run: bun run --cwd packages/mc-shm-native test:capability:node
 
   check-rust:
     name: Check (Rust fmt + mc-core features)
@@ -712,6 +721,9 @@ jobs:
       - name: Install workspace deps
         run: bun install --frozen-lockfile
 
+      - name: Build shared-memory package loader
+        run: bun run --cwd packages/mc-shm-native build:js
+
       - name: Build OpenCode plugin
         run: bun run --cwd packages/plugin build
 
@@ -744,6 +756,9 @@ jobs:
 
       - name: Install workspace deps
         run: bun install --frozen-lockfile
+
+      - name: Build shared-memory package loader
+        run: bun run --cwd packages/mc-shm-native build:js
 
       - name: Build Pi plugin
         run: bun run --cwd packages/pi-plugin build
@@ -781,6 +796,9 @@ jobs:
 
       - name: Install workspace deps
         run: bun install --frozen-lockfile
+
+      - name: Build shared-memory package loader
+        run: bun run --cwd packages/mc-shm-native build:js
 
       - name: Build Pi-compatible plugin and OMP argv renderer
         run: |
@@ -903,6 +921,11 @@ jobs:
       - name: Verify opencode on PATH
         run: opencode --version
 
+      # The parent builds mark the addon --external, so its generated entry
+      # point must exist before any Node-runtime import resolves it.
+      - name: Build shared-memory addon entry point
+        run: bun run --cwd packages/mc-shm-native build:js
+
       - name: Build Pi plugin
         run: bun run --cwd packages/pi-plugin build
 
@@ -951,6 +974,11 @@ jobs:
         run: |
           curl -fsSL https://opencode.ai/install | bash
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      # The parent builds mark the addon --external, so its generated entry
+      # point must exist before any Node-runtime import resolves it.
+      - name: Build shared-memory addon entry point
+        run: bun run --cwd packages/mc-shm-native build:js
 
       - name: Build supported TS harness plugins
         run: |

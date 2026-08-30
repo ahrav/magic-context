@@ -24,7 +24,7 @@ import {
 	insertTag,
 	updateTagStatus,
 } from "@magic-context/core/features/magic-context/storage-tags";
-import { createTestDb, fakeContext } from "../test-utils.test";
+import { createTestDb, fakeContext } from "../test-utils";
 import { createCtxReduceTool } from "./ctx-reduce";
 
 function seedTags(

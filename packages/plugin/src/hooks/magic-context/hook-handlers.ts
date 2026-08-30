@@ -59,10 +59,10 @@ export type AgentBySession = Map<string, string>;
 /**
  * Cache-busting signal sets — replaces the old monolithic `flushedSessions`.
  *
- * The old `Set<string>` conflated three independent lifetimes into one flag,
- * which caused defer passes blocked by an in-progress historian to keep
- * re-firing the same flush signal across multiple turns (Oracle review,
- * 2026-04-26). Each set now has exactly one consumer and one lifetime.
+ * Three separate sets keep three independent lifetimes apart; one shared
+ * flag would let defer passes blocked by an in-progress historian keep
+ * re-firing the same flush signal across multiple turns. Each set has
+ * exactly one consumer and one lifetime.
  *
  * Design rule: every producer that wants to refresh state should `add` to
  * EVERY set whose consumer needs to react. Consumers are responsible for
@@ -121,14 +121,6 @@ export type PendingMaterializationSessions = Set<string>;
 
 /** Persistent deferred drop-materialization signal from background historian publication. */
 export type DeferredMaterializationSessions = Set<string>;
-
-/**
- * @deprecated Use `HistoryRefreshSessions`, `SystemPromptRefreshSessions`,
- * or `PendingMaterializationSessions` directly. Kept as a type alias only
- * for any external consumers that may still import it. Will be removed in
- * a future major.
- */
-export type FlushedSessions = Set<string>;
 
 export type LastHeuristicsTurnId = Map<string, string>;
 

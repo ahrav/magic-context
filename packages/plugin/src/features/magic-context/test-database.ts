@@ -9,6 +9,8 @@
  * can load this module under Node's type-stripping loader.
  */
 
+import { join } from "node:path";
+
 import { Database } from "../../shared/sqlite.ts";
 import {
     buildSchemaComponentManifest,
@@ -70,4 +72,22 @@ export function createDirectTestDatabase(
         db.close();
         throw error;
     }
+}
+
+/**
+ * Minimal fake of the OpenCode host database (`opencode/opencode.db` under
+ * the given data home): just the `message` and `part` tables the plugin
+ * reads. Distinct from the direct-format context database above. The
+ * `opencode/` directory must already exist.
+ */
+export function createOpenCodeTestDb(dataHome: string): Database {
+    const db = new Database(join(dataHome, "opencode", "opencode.db"));
+    db.exec("PRAGMA journal_mode=WAL");
+    db.exec(
+        "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+    );
+    db.exec(
+        "CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+    );
+    return db;
 }

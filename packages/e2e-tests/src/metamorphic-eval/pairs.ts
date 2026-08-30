@@ -29,6 +29,11 @@ export function pairKey(
     };
 }
 
+function authoredSemanticsOutsideTranscript(scenario: HistorianEvalScenario): string {
+    const { id, title, transcript, gold, ...rest } = scenario;
+    return canonicalJson(rest);
+}
+
 export function admitPair(
     base: HistorianEvalScenario,
     transform: Transform,
@@ -57,6 +62,15 @@ export function admitPair(
             diagnostics.push("derivative turn map is not a complete one-to-one mapping of baseline turns");
         } else if (canonicalJson(remapGold(base.gold, derivative.turnMap)) !== canonicalJson(derivative.scenario.gold)) {
             diagnostics.push("derivative gold does not match its declared turn map");
+        } else if (transform.preservesTurnText) {
+            const misplaced = base.transcript.turns.findIndex((turn, index) =>
+                canonicalJson(turn) !== canonicalJson(derivative.scenario.transcript.turns[derivative.turnMap[index]!])
+            );
+            if (misplaced !== -1) {
+                diagnostics.push(
+                    `derivative turn map does not match the transcript at baseline turn ${misplaced}`,
+                );
+            }
         }
         const contentFingerprint = scenarioFingerprint({
             ...derivative.scenario,
@@ -65,6 +79,12 @@ export function admitPair(
         });
         if (contentFingerprint === scenarioFingerprint(base)) {
             diagnostics.push("derivative semantic fingerprint equals baseline");
+        }
+        if (
+            authoredSemanticsOutsideTranscript(derivative.scenario) !==
+                authoredSemanticsOutsideTranscript(base)
+        ) {
+            diagnostics.push("derivative changed authored fields outside the transcript and gold");
         }
         if (diagnostics.length > 0) {
             return {

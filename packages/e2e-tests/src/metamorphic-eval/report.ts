@@ -1,7 +1,8 @@
+import type { SystemVersionTuple } from "../historian-eval/runner";
 import type { ScenarioScore } from "../historian-eval/scorer";
 import type { InvariantVerdict } from "./invariants";
 
-export const METAMORPHIC_REPORT_SCHEMA = "metamorphic-eval-report/v1";
+export const METAMORPHIC_REPORT_SCHEMA = "metamorphic-eval-report/v2";
 
 export interface PairKey {
     scenarioId: string;
@@ -73,6 +74,8 @@ export interface InjectionCanaryHit {
 
 export interface MetamorphicReport {
     schema: typeof METAMORPHIC_REPORT_SCHEMA;
+    /** Resolved pre-run, because a partial report can hold no scored entry to carry it; null for the deterministic runner. commentlint: allow(JUDGE) */
+    system: SystemVersionTuple | null;
     entries: MetamorphicReportEntry[];
     coverage: ScenarioCoverage[];
     injectionCanaryHits: InjectionCanaryHit[];
@@ -86,12 +89,13 @@ export type TierInvalidReason =
           systemMismatch: boolean;
           failedInvariants: MetamorphicInvariantVerdict["invariant"][];
       }
-    | { kind: "selection-empty"; reason: string }
     | {
-          kind: "control-not-measured";
-          baselineVerdict: ScenarioScore["verdict"];
-          derivativeVerdict: ScenarioScore["verdict"];
+          /** Two ERROR controls satisfy every equality invariant trivially, so agreement proves nothing here. commentlint: allow(JUDGE) */
+          kind: "control-error";
+          controlAErrorReason: string | null;
+          controlBErrorReason: string | null;
       }
+    | { kind: "selection-empty"; reason: string }
     | { kind: "deadline-exhausted"; nextRole: "control-a" | "control-b" | "baseline" | "derivative" };
 
 function key(entry: PairKey): string {
@@ -103,9 +107,11 @@ export function buildMetamorphicReport(args: {
     coverage: ScenarioCoverage[];
     injectionCanaryHits: InjectionCanaryHit[];
     tierInvalidReason?: TierInvalidReason | null;
+    system?: SystemVersionTuple | null;
 }): MetamorphicReport {
     return {
         schema: METAMORPHIC_REPORT_SCHEMA,
+        system: args.system ?? null,
         entries: [...args.entries].sort((left, right) => key(left).localeCompare(key(right))),
         coverage: [...args.coverage].sort((left, right) => left.scenarioId.localeCompare(right.scenarioId)),
         injectionCanaryHits: [...args.injectionCanaryHits].sort((left, right) =>

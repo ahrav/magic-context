@@ -14,17 +14,13 @@ import {
 } from "../../features/magic-context/compartment-storage";
 import { clearCompressionDepthRange } from "../../features/magic-context/compression-depth-storage";
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
-import {
-    clearPendingCompactionMarkerStateIf,
-    getPendingCompactionMarkerState,
-    updateSessionMeta,
-} from "../../features/magic-context/storage-meta";
-import { normalizeSDKResponse } from "../../shared";
+import { updateSessionMeta } from "../../features/magic-context/storage-meta";
 import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
-import { updateCompactionMarkerAfterPublication } from "./compaction-marker-manager";
+import { advanceCompactionMarkerAndClearStalePending } from "./compaction-marker-manager";
 import { buildCompartmentAgentPrompt } from "./compartment-prompt";
 import { runValidatedHistorianPass } from "./compartment-runner-historian";
+import { resolveSessionDirectory } from "./compartment-runner-mapping";
 import { promoteRecompStagingWithM0Mutation } from "./compartment-runner-recomp";
 import type { CandidateCompartment, CompartmentRunnerDeps } from "./compartment-runner-types";
 import {
@@ -198,16 +194,7 @@ export async function executePartialRecompInternal(
         const stagedFacts: { category: string; content: string }[] = [];
 
         // ── Resolve project memories for historian fact dedup context ─────
-        // Intentional: session.get failure is non-fatal — we fall back to deps.directory
-        const parentSessionResponse = await client.session
-            .get({ path: { id: sessionId } })
-            .catch(() => null);
-        const parentSession = normalizeSDKResponse(
-            parentSessionResponse,
-            null as { directory?: string } | null,
-            { preferResponseOnMissingData: true },
-        );
-        const sessionDirectory = parentSession?.directory ?? directory;
+        const sessionDirectory = await resolveSessionDirectory(client, sessionId, directory);
 
         // v2: partial-recomp keeps existing facts untouched (no promote, no
         // dedup block) — reference blocks (seeds + recency) carry calibration.
@@ -297,10 +284,10 @@ export async function executePartialRecompInternal(
             // prior + new + tail. `validateStoredCompartments` then passes because
             // the full set is contiguous from message 1.
             // Sequences are 0-indexed (continuing from candidateCompartments.length).
-            // The `+ 1` off-by-one here previously created a gap between "prior + new"
-            // and "tail" that broke the invariant MAX(sequence) = count - 1 and
-            // caused incremental historian's sequenceOffset to collide with an
-            // existing sequence — producing UNIQUE constraint failures.
+            // Starting exactly at candidateCompartments.length keeps the set
+            // gapless, preserving the invariant MAX(sequence) = count - 1 that
+            // incremental historian's sequenceOffset relies on; a gap would
+            // collide sequences and produce UNIQUE constraint failures.
             const merged: CompartmentInput[] = [
                 ...candidateCompartments,
                 ...tailCompartments.map((c, idx) =>
@@ -367,20 +354,7 @@ export async function executePartialRecompInternal(
             // prior in-flight incremental publish may have left behind — partial
             // recomp now owns the boundary up to lastEnd.
             if (lastEnd > 0) {
-                const markerUpdated = updateCompactionMarkerAfterPublication(
-                    db,
-                    sessionId,
-                    lastEnd,
-                    deps.directory,
-                );
-                // Only clear the stale pending blob when the boundary actually
-                // advanced — preserve it for the deferred-drain retry on failure.
-                if (markerUpdated) {
-                    const stalePending = getPendingCompactionMarkerState(db, sessionId);
-                    if (stalePending) {
-                        clearPendingCompactionMarkerStateIf(db, sessionId, stalePending);
-                    }
-                }
+                advanceCompactionMarkerAndClearStalePending(db, sessionId, lastEnd, deps.directory);
             }
             return { compartmentCount: merged.length, lastEndMessage: lastEnd };
         }

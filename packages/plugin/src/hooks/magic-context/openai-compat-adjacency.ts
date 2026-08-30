@@ -6,7 +6,8 @@
  * declared on that assistant message (order among tool messages may vary).
  *
  * Copilot re-translates this shape to Bedrock/Claude server-side; violating
- * adjacency here reproduces issue #135 (`tool_use` without adjacent `tool_result`).
+ * adjacency here reproduces the orphan-tool wire failure (`tool_use` without
+ * adjacent `tool_result`).
  */
 
 export type OpenAiCompatWireMessage = {
@@ -123,29 +124,4 @@ export function assertOpenAiCompatAdjacency(messages: OpenAiCompatWireMessage[])
     }
 
     return { ok: violations.length === 0, violations };
-}
-
-export function formatWireSlice(
-    messages: OpenAiCompatWireMessage[],
-    centerIndex: number,
-    radius = 2,
-): string {
-    const start = Math.max(0, centerIndex - radius);
-    const end = Math.min(messages.length, centerIndex + radius + 1);
-    return JSON.stringify(
-        messages.slice(start, end).map((m, idx) => ({
-            at: start + idx,
-            role: m.role,
-            content:
-                typeof m.content === "string"
-                    ? m.content.length > 80
-                        ? `${m.content.slice(0, 80)}…`
-                        : m.content
-                    : m.content,
-            tool_calls: m.tool_calls?.map((tc) => tc.id),
-            tool_call_id: m.tool_call_id,
-        })),
-        null,
-        2,
-    );
 }

@@ -45,16 +45,16 @@ export interface DeterministicRunnerOptions {
 }
 
 function shuffledImportances(count: number, seed: number): number[] {
-    if (count > MAX_DISTINCT_IMPORTANCE_VALUES) {
-        throw new Error(`scripted output supports at most ${MAX_DISTINCT_IMPORTANCE_VALUES} transcript turns`);
-    }
     const values = Array.from({ length: MAX_DISTINCT_IMPORTANCE_VALUES }, (_, index) => index + 1);
     const next = splitmix32(seed);
     for (let index = values.length - 1; index > 0; index -= 1) {
         const other = Math.floor(next() * (index + 1));
         [values[index], values[other]] = [values[other]!, values[index]!];
     }
-    return values.slice(0, count);
+    return Array.from(
+        { length: count },
+        (_, index) => values[index % MAX_DISTINCT_IMPORTANCE_VALUES]!,
+    );
 }
 
 export function buildScriptedOutput(
@@ -94,16 +94,13 @@ function scoringOptions(scenario: HistorianEvalScenario): RawOutputScoringOption
     };
 }
 
-function canaryHit(
-    key: PairKey,
-    role: "baseline" | "derivative",
-): InjectionCanaryHit {
+function canaryHit(key: PairKey): InjectionCanaryHit {
     return {
         scenarioId: key.scenarioId,
-        role,
-        transformId: role === "baseline" ? null : key.transformId,
-        transformVersion: role === "baseline" ? null : key.transformVersion,
-        seed: role === "baseline" ? null : key.seed,
+        role: "derivative",
+        transformId: key.transformId,
+        transformVersion: key.transformVersion,
+        seed: key.seed,
     };
 }
 
@@ -129,15 +126,15 @@ export function runDeterministicMetamorphicEval(
                 baselines.set(seed, error instanceof Error ? error : new Error(getErrorMessage(error)));
             }
         }
-        if ([...baselines.values()].some(
-            (baseline) => !(baseline instanceof Error) && containsInjectionCanary(baseline.injectedClaims),
-        )) {
+        for (const [seed, baseline] of baselines) {
+            if (baseline instanceof Error) continue;
+            if (!containsInjectionCanary(baseline.injectedClaims)) continue;
             injectionCanaryHits.push({
                 scenarioId: scenario.id,
                 role: "baseline",
                 transformId: null,
                 transformVersion: null,
-                seed: null,
+                seed,
             });
         }
 
@@ -179,7 +176,7 @@ export function runDeterministicMetamorphicEval(
                         scoringOptions(admission.derivative.scenario),
                     );
                     if (containsInjectionCanary(derivative.injectedClaims)) {
-                        injectionCanaryHits.push(canaryHit(key, "derivative"));
+                        injectionCanaryHits.push(canaryHit(key));
                     }
                     if (derivative.result.stage !== "scored") {
                         entries.push({ ...key, kind: "stage-not-scored", role: "derivative", ...derivative.result });

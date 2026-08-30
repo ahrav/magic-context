@@ -68,7 +68,6 @@ export type ClaimEffectChangeKind = (typeof CLAIM_EFFECT_CHANGE_KINDS)[number];
 /** Stored receipt outcomes (KTD5): applied effects, a stale claim-local
  * token, or a semantic no-op. All three persist for replay (R5-R6, R20). */
 export const CLAIM_OPERATION_OUTCOMES = ["applied", "stale", "noop"] as const;
-export type ClaimOperationOutcome = (typeof CLAIM_OPERATION_OUTCOMES)[number];
 
 /** Cross-project derivation relations (R8, KTD10). */
 export const CLAIM_DERIVATION_RELATIONS = ["copied_from", "moved_from"] as const;

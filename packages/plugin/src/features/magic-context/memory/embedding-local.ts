@@ -17,7 +17,7 @@ import type { EmbeddingProvider, EmbeddingPurpose } from "./embedding-provider";
 /** The dtype enum values accepted by @huggingface/transformers' feature-extraction
  *  pipeline (keyof typeof DATA_TYPES in transformers/types/utils/dtypes.d.ts).
  *  Kept as a literal union so the config schema, identity fold, and pipeline
- *  call share one source of truth. See issue #259. */
+ *  call share one source of truth. */
 export type LocalEmbeddingDtype =
     | "auto"
     | "fp32"
@@ -122,7 +122,7 @@ async function acquireModelLoadLock(lockPath: string): Promise<() => Promise<voi
                 // branch means a LEGITIMATE slow model load is still running in
                 // another process — exactly when an unsynchronized
                 // createPipeline() here would reintroduce the onnxruntime
-                // double-free native crash (issue #21) the lock exists to
+                // double-free native crash the lock exists to
                 // prevent. Fail this init attempt instead; the caller catches,
                 // sets pipeline=null, and the lazy fallback retries on a later
                 // pass once the holder finishes.
@@ -191,7 +191,7 @@ async function injectWasmOrtForElectron(): Promise<boolean> {
         // Non-literal specifier — same trick we use for `@huggingface/transformers`
         // to keep Bun's static analyzer from eagerly probing the package at plugin
         // load time. We need lazy resolution because non-Electron runtimes never
-        // need onnxruntime-web at all. See issue #4.
+        // need onnxruntime-web at all.
         const ortWebSpec = `onnxruntime-${"web"}`;
         const ortWeb = (await import(ortWebSpec)) as {
             env?: { wasm?: { wasmPaths?: string | Record<string, string> } };
@@ -209,8 +209,7 @@ async function injectWasmOrtForElectron(): Promise<boolean> {
             // package.json: onnxruntime-web ships an `exports` map that does NOT
             // expose './package.json' (resolving it throws ERR_PACKAGE_PATH_NOT_
             // EXPORTED), whereas '.' is always exported and lands inside dist/.
-            // Its dirname is the dist/ dir that holds the .wasm/.mjs assets. See
-            // issue #195.
+            // Its dirname is the dist/ dir that holds the .wasm/.mjs assets.
             const mainEntry = requireFn.resolve("onnxruntime-web");
             const distDir = dirname(mainEntry);
             const wasmPathsPrefix = `${pathToFileURL(distDir).href}/`;
@@ -273,7 +272,7 @@ type CreateEmbeddingPipeline = (
  *  user does not configure one. This MUST stay "fp32" to preserve today's
  *  behavior exactly — existing installs see zero change on upgrade, and the
  *  default identity string stays byte-identical (local_dtype is only folded
- *  into identity when the user actually sets it). See issue #259. */
+ *  into identity when the user actually sets it). */
 const DEFAULT_LOCAL_DTYPE: LocalEmbeddingDtype = "fp32";
 
 /**
@@ -308,7 +307,7 @@ async function withQuietConsole<T>(fn: () => Promise<T>): Promise<T> {
  * Recognizes the PERMANENT "native runtime not installed" failure: the plugin's
  * `@huggingface/transformers` Node entry does a static `import "onnxruntime-node"`,
  * so when that package is missing/broken in the install tree (seen on Windows
- * when its platform binary fails to install, issue #128), the import throws
+ * when its platform binary fails to install), the import throws
  * `Cannot find package 'onnxruntime-node'` / `ERR_MODULE_NOT_FOUND` before
  * transformers' own WASM-fallback hook is even reachable. This is environmental,
  * not transient — retrying just re-spams the cryptic resolver error every time an
@@ -455,7 +454,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
             model: normalizedModel,
             // Only fold non-default dtype into identity so the default config
             // produces the byte-identical identity string as before this field
-            // existed (no forced re-embed on upgrade). See issue #259.
+            // existed (no forced re-embed on upgrade).
             ...(dtype && dtype !== DEFAULT_LOCAL_DTYPE ? { local_dtype: dtype } : {}),
         });
     }
@@ -470,7 +469,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
         }
 
         // Native runtime confirmed missing earlier this process — don't re-import
-        // transformers just to re-fail and re-spam the resolver error (issue #128).
+        // transformers just to re-fail and re-spam the resolver error.
         if (nativeRuntimeMissing) {
             return false;
         }
@@ -545,7 +544,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
 
                 // Cross-process lock — serializes InferenceSession::LoadModel
                 // across concurrently-starting OpenCode processes. See the
-                // doc block on `acquireModelLoadLock` and issue #21.
+                // doc block on `acquireModelLoadLock`.
                 const lockPath = join(modelCacheDir, ".load.lock");
                 const releaseLock = await acquireModelLoadLock(lockPath);
                 const stopHeartbeat = startLockHeartbeat(lockPath);
@@ -566,7 +565,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                             // `this.dtype` defaults to "fp32" to preserve the prior
                             // behavior exactly; a user-configured `embedding.local_dtype`
                             // (e.g. "q8" for a quantized multilingual model) flows through
-                            // here. See issue #259.
+                            // here.
                             //
                             // device: "auto" is REQUIRED when we injected our own ORT
                             // via Symbol.for("onnxruntime") (the Electron WASM path):
@@ -577,7 +576,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                             // `Unsupported device: "cpu"`. "auto" returns supportedDevices
                             // verbatim ([]) without that check, so onnxruntime-web uses its
                             // own default (wasm) execution provider. Native Node/Bun keeps
-                            // the default selection (no device option). See issue #195.
+                            // the default selection (no device option).
                             const pipeline = await withQuietConsole(() =>
                                 createPipeline("feature-extraction", this.model, {
                                     dtype: this.dtype,

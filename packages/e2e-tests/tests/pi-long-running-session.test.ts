@@ -10,10 +10,9 @@ import { PiTestHarness } from "../src/pi-harness";
 import { buildMockHistorianPayload } from "../src/mock-historian";
 import type { MockUsage } from "../src/mock-provider/server";
 import { openTestDb } from "../src/test-db";
+import { isHistorianRequest } from "../src/cache-analysis";
 
 type Database = ReturnType<typeof openTestDb>;
-
-const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
 
 const LOW_USAGE: MockUsage = {
     input_tokens: 1_000,
@@ -74,10 +73,6 @@ function serialize(value: unknown): string {
 
 function isMagicContextRequest(body: Record<string, unknown>): boolean {
     return JSON.stringify(body.system ?? "").includes("## Magic Context");
-}
-
-function isHistorianRequest(body: Record<string, unknown>): boolean {
-    return JSON.stringify(body.system ?? "").includes(HISTORIAN_SYSTEM_MARKER);
 }
 
 function requestMessages(body: Record<string, unknown>): WireMessage[] {

@@ -4,7 +4,7 @@ import { canonicalJson } from "../../../plugin/scripts/retrieval-benchmark/canon
 import { getErrorMessage } from "../../../plugin/src/shared/error-message";
 import { lintScenario, type HistorianEvalScenario } from "../historian-eval/contract";
 import { runMutationBattery } from "../historian-eval/mutations";
-import { historianWaitBudgetMs, runScenario, type LiveHistorianMode } from "../historian-eval/runner";
+import { runScenario, type LiveHistorianMode, type SystemVersionTuple } from "../historian-eval/runner";
 import {
     expectationGoldMatchPredicates,
     scoreRunRecord,
@@ -45,19 +45,13 @@ export interface LiveMetamorphicOptions {
     mode: LiveHistorianMode;
     artifactRoot: string;
     opencodeVersion: string;
+    system?: SystemVersionTuple | null;
     transforms?: readonly Transform[];
     seeds?: readonly number[];
     admit?: (derivatives: readonly HistorianEvalScenario[]) => string[];
     execute?: LiveScenarioExecutor;
     deadlineAtMs?: number | null;
-    /**
-     * Upper bound on ONE role's wall time, used as the deadline reserve.
-     *
-     * Defaults to the scenario's declared cost — `trigger.expectedHistorianRuns`
-     * times the mode's enforced per-run historian wait. Supplied explicitly by
-     * tests that drive a synthetic clock, where the real bound would dwarf the
-     * fixture's budget and refuse every role.
-     */
+    /** Headroom one role may consume, reserved before starting it so the deadline is not overshot mid-call. commentlint: allow(JUDGE) */
     roleBudgetMs?: number;
     nowMs?: () => number;
     onProgress?: (report: MetamorphicReport) => void;
@@ -149,12 +143,14 @@ function canaryHit(
     role: LiveRole,
     key: PairKey | null,
 ): InjectionCanaryHit {
+    /** Only the derivative ran a transform, so any other role's coordinates would name a transform that never touched it. commentlint: allow(JUDGE) */
+    const coordinates = role === "derivative" ? key : null;
     return {
         scenarioId,
         role,
-        transformId: role === "baseline" || role === "derivative" ? key?.transformId ?? null : null,
-        transformVersion: role === "baseline" || role === "derivative" ? key?.transformVersion ?? null : null,
-        seed: role === "baseline" || role === "derivative" ? key?.seed ?? null : null,
+        transformId: coordinates?.transformId ?? null,
+        transformVersion: coordinates?.transformVersion ?? null,
+        seed: coordinates?.seed ?? null,
     };
 }
 
@@ -188,11 +184,11 @@ function buildPairs(
                     if (admission.violation !== null) violations.push(admission.violation);
                     continue;
                 }
-                applied += 1;
                 if (admission.kind === "rejected") {
                     entries.push(admission.entry);
                     continue;
                 }
+                applied += 1;
                 pairs.push({ key: admission.key, base, derivative: admission.derivative });
             }
         }
@@ -222,6 +218,7 @@ export async function runLiveMetamorphicEval(
             entries,
             coverage: prepared.coverage,
             injectionCanaryHits,
+            system: options.system ?? null,
             ...(tierInvalidReason === undefined ? {} : { tierInvalidReason }),
         });
     const observe = (
@@ -271,73 +268,26 @@ export async function runLiveMetamorphicEval(
     };
     const deadlineAtMs = options.deadlineAtMs ?? null;
     const nowMs = options.nowMs ?? Date.now;
-    // Reserve before admitting a role, so a role is never started that cannot
-    // finish inside the caller's own kill bound (the workflow step timeout). A
-    // role is not cheap: it drives `trigger.expectedHistorianRuns` historian
-    // runs, each bounded by the live `historianWaitBudgetMs`, so one role can
-    // legitimately need tens of minutes. Admitted with minutes left it overruns
-    // the step timeout and the process dies before the final report is written —
-    // losing the whole artifact the deadline exists to protect.
-    //
-    // Two terms, and the MAXIMUM of them, because neither alone is safe:
-    //   * the declared upper bound — `expectedHistorianRuns` times the enforced
-    //     per-run wait. This is the dominant term and it is a real bound, not an
-    //     estimate, so a run of fast roles cannot talk it down. `run-historian-
-    //     eval.ts` cannot do this (a scenario's true bound is unusable there);
-    //     one metamorphic role can, because its cost is one scenario's declared
-    //     run count.
-    //   * the longest role actually observed, which covers what the declared
-    //     bound omits — probe answers, harness and child-session setup,
-    //     persistence.
-    // Taking the max means a fast-role prefix cannot shrink the reserve below
-    // the declared bound, and unmodelled overhead cannot hide under it either.
-    let longestRoleMs = 0;
-    let rolesStarted = 0;
-    const declaredRoleBudgetMs = (scenario: HistorianEvalScenario): number =>
-        options.roleBudgetMs ??
-        scenario.trigger.expectedHistorianRuns * historianWaitBudgetMs(options.mode);
-    // The first role is exempt, mirroring `run-historian-eval.ts`'s `index > 0`:
-    // a reserve applied before anything has run makes a tight budget spend the
-    // whole lane producing no observation at all. An already-exhausted deadline
-    // still refuses it, because the reserve is additive to `nowMs()`.
-    const deadlineReached = (nextScenario: HistorianEvalScenario): boolean => {
-        if (deadlineAtMs === null) return false;
-        const reserve = rolesStarted === 0
-            ? 0
-            : Math.max(declaredRoleBudgetMs(nextScenario), longestRoleMs);
-        return nowMs() + reserve >= deadlineAtMs;
-    };
-    // Timed in `finally`, so a role that threw still teaches the reserve: the
-    // wall time it burned is spent either way, and a slow failure predicts a slow
-    // successor exactly as well as a slow success does.
-    const runRole = async (
-        scenario: HistorianEvalScenario,
-        role: LiveRole,
-        artifactDir: string,
-    ): Promise<LiveObservation> => {
-        const startedAt = nowMs();
-        rolesStarted += 1;
-        try {
-            return await execute(scenario, role, artifactDir);
-        } finally {
-            longestRoleMs = Math.max(longestRoleMs, nowMs() - startedAt);
-        }
-    };
+    const roleBudgetMs = options.roleBudgetMs ?? 0;
+    /** Reserves the role's budget rather than asking whether the deadline passed, because a role started just under it runs past it. commentlint: allow(JUDGE) */
+    const deadlineReached = (): boolean => deadlineAtMs !== null && nowMs() + roleBudgetMs >= deadlineAtMs;
     const deadlineReport = (nextRole: LiveRole): MetamorphicReport =>
-        finish({ kind: "deadline-exhausted", nextRole });
+        observe({ kind: "deadline-exhausted", nextRole });
+    let controlA: LiveObservation | null = null;
+    let controlB: LiveObservation | null = null;
     try {
-        if (deadlineReached(controlScenario)) return deadlineReport("control-a");
-        const controlA = await runRole(
+        if (deadlineReached()) return deadlineReport("control-a");
+        controlA = await execute(
             controlScenario,
             "control-a",
             liveArtifactDir(options.artifactRoot, controlScenario.id, "control-a"),
         );
         collectCanary(injectionCanaryHits, controlScenario.id, "control-a", controlA, null);
         if (injectionCanaryHits.length > 0) {
-            return finish();
+            return observe();
         }
-        if (deadlineReached(controlScenario)) return deadlineReport("control-b");
-        const controlB = await runRole(
+        if (deadlineReached()) return deadlineReport("control-b");
+        controlB = await execute(
             controlScenario,
             "control-b",
             liveArtifactDir(options.artifactRoot, controlScenario.id, "control-b"),
@@ -345,6 +295,18 @@ export async function runLiveMetamorphicEval(
         collectCanary(injectionCanaryHits, controlScenario.id, "control-b", controlB, null);
         if (injectionCanaryHits.length > 0) {
             return observe();
+        }
+        if (controlA.score.verdict === "ERROR" || controlB.score.verdict === "ERROR") {
+            entries.push({
+                ...controlKey,
+                kind: "error",
+                error: "tier-invalid: a baseline control run errored; product pairs skipped",
+            });
+            return observe({
+                kind: "control-error",
+                controlAErrorReason: controlA.score.errorReason,
+                controlBErrorReason: controlB.score.errorReason,
+            });
         }
         const controlInvariants = compareLivePair(controlA, controlB);
         const systemMismatch = !sameSystem(controlA.score, controlB.score);
@@ -359,29 +321,6 @@ export async function runLiveMetamorphicEval(
             });
             return observe({ kind: "control-disagreement", systemMismatch, failedInvariants });
         }
-        // Agreement is not a measurement. Two ERROR controls agree on every
-        // invariant — equal verdicts, equal (empty) injection sets, equal
-        // expectation maps — so the checks above pass while the control tier has
-        // proved nothing about the harness. A provider outage, an unresolved
-        // `opencode`, or a run-never-fired scores ERROR repeatably, and admitting
-        // that tier sends the lane on to spend real tokens on every product pair
-        // and publish a report whose `tierInvalidReason` is null. FAIL is left
-        // admissible on purpose: a scenario the historian genuinely fails is a
-        // valid, repeatable baseline, and stability under transformation is what
-        // the product pairs measure.
-        const controlVerdicts = [controlA.score.verdict, controlB.score.verdict] as const;
-        if (controlVerdicts.includes("ERROR")) {
-            entries.push({
-                ...controlKey,
-                kind: "error",
-                error: `tier-invalid: baseline control did not produce a measurement (${controlVerdicts.join(", ")}); product pairs skipped`,
-            });
-            return observe({
-                kind: "control-not-measured",
-                baselineVerdict: controlA.score.verdict,
-                derivativeVerdict: controlB.score.verdict,
-            });
-        }
         entries.push({
             ...controlKey,
             kind: "scored",
@@ -391,29 +330,65 @@ export async function runLiveMetamorphicEval(
         });
         observe();
     } catch (error) {
-        entries.push({ ...controlKey, kind: "error", error: getErrorMessage(error) });
+        const reason = getErrorMessage(error);
+        entries.push({ ...controlKey, kind: "error", error: reason });
+        /** Attributed to the control that produced no observation; a throw after both ran is a runner fault, not a control-tier outcome. commentlint: allow(JUDGE) */
+        if (controlA === null || controlB === null) {
+            return observe({
+                kind: "control-error",
+                controlAErrorReason: controlA === null ? reason : null,
+                controlBErrorReason: controlA === null ? null : reason,
+            });
+        }
         return observe();
     }
 
+    /** Keyed by base scenario alone: the executor takes no seed, so every pair sharing a base would re-run identical paid traffic. commentlint: allow(JUDGE) */
+    const baselines = new Map<string, LiveObservation | Error>();
+
     for (const pair of prepared.pairs) {
         try {
-            const artifactScenarioId = pair.derivative.scenario.id;
             const canaryScenarioId = pair.base.id;
-            if (deadlineReached(pair.base)) return deadlineReport("baseline");
-            const baseline = await runRole(
-                pair.base,
-                "baseline",
-                liveArtifactDir(options.artifactRoot, artifactScenarioId, "baseline"),
-            );
-            collectCanary(injectionCanaryHits, canaryScenarioId, "baseline", baseline, pair.key);
-            if (injectionCanaryHits.length > 0) {
-                return finish();
+            let baseline = baselines.get(pair.base.id);
+            if (baseline === undefined) {
+                if (deadlineReached()) return deadlineReport("baseline");
+                try {
+                    baseline = await execute(
+                        pair.base,
+                        "baseline",
+                        liveArtifactDir(options.artifactRoot, pair.base.id, "baseline"),
+                    );
+                } catch (error) {
+                    baseline = error instanceof Error ? error : new Error(getErrorMessage(error));
+                }
+                baselines.set(pair.base.id, baseline);
+                if (!(baseline instanceof Error)) {
+                    collectCanary(injectionCanaryHits, canaryScenarioId, "baseline", baseline, pair.key);
+                    if (injectionCanaryHits.length > 0) {
+                        return observe();
+                    }
+                }
             }
-            if (deadlineReached(pair.derivative.scenario)) return deadlineReport("derivative");
-            const derivative = await runRole(
+            if (baseline instanceof Error) {
+                entries.push({ ...pair.key, kind: "error", error: getErrorMessage(baseline) });
+                observe();
+                continue;
+            }
+            /** An ERROR score already forces exit 1 through the baseline verdict, so its derivatives would be paid-for and unusable. commentlint: allow(JUDGE) */
+            if (baseline.score.verdict === "ERROR") {
+                entries.push({
+                    ...pair.key,
+                    kind: "error",
+                    error: `baseline run errored: ${baseline.score.errorReason ?? "unknown"}`,
+                });
+                observe();
+                continue;
+            }
+            if (deadlineReached()) return deadlineReport("derivative");
+            const derivative = await execute(
                 pair.derivative.scenario,
                 "derivative",
-                liveArtifactDir(options.artifactRoot, artifactScenarioId, "derivative"),
+                liveArtifactDir(options.artifactRoot, pair.derivative.scenario.id, "derivative"),
             );
             collectCanary(injectionCanaryHits, canaryScenarioId, "derivative", derivative, pair.key);
             if (injectionCanaryHits.length > 0) {
@@ -436,5 +411,5 @@ export async function runLiveMetamorphicEval(
         observe();
     }
 
-    return finish();
+    return observe(null);
 }

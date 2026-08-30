@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import * as subagentModule from "../subagent-runner";
-import { createFakePi, fakeContext } from "../test-utils.test";
+import { createFakePi, fakeContext } from "../test-utils";
 import { registerCtxAugCommand } from "./ctx-aug";
 
 function installRunner(result: unknown) {

@@ -12,7 +12,7 @@ import {
     getOmpAgentDir,
     getOmpNonGlobalConfigSources,
     getOmpPluginsLockPath,
-    getOmpUserConfigPath,
+    getSharedUserConfigPath,
 } from "../lib/paths";
 import {
     type PiCompatibleSetupHost,
@@ -27,7 +27,7 @@ const OMP_ENV: SetupEnvironment = {
     getAvailableModels: getOmpAvailableModels,
     paths: {
         getPiAgentConfigDir: getOmpAgentDir,
-        getPiUserConfigPath: getOmpUserConfigPath,
+        getPiUserConfigPath: getSharedUserConfigPath,
         getPiUserExtensionsPath: getOmpPluginsLockPath,
     },
 };

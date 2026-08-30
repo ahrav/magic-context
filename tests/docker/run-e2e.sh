@@ -53,6 +53,10 @@ run_target() {
 # inside the image. This is intentional: keeps the image small, makes
 # iteration fast, and tests the same artifact CI publishes.
 echo "Pre-building local dist artifacts..."
+# The addon is marked --external by every parent build, so it is resolved at
+# runtime from its own index.js. That file is generated, untracked, and COPYed
+# by all three Dockerfiles, so docker build fails on a clean tree without it.
+bun run --cwd "$REPO_ROOT/packages/mc-shm-native" build:js
 bun run --cwd "$REPO_ROOT/packages/plugin" build
 bun run --cwd "$REPO_ROOT/packages/pi-plugin" build
 bun run --cwd "$REPO_ROOT/packages/pi-plugin" build:e2e-argv

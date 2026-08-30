@@ -53,16 +53,7 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { TestHarness } from "../src/harness";
 import { buildMockHistorianPayload } from "../src/mock-historian";
 import { FOLD_SKIP_REASON } from "../src/rust-scenario-support";
-
-const HISTORIAN_MARKER = "the hippocampus of a long-running coding agent";
-
-function isHistorian(body: Record<string, unknown>): boolean {
-    if (JSON.stringify(body.messages ?? "").includes("<new_messages>")) return true;
-    const sys = body.system;
-    if (sys === undefined || sys === null) return false;
-    const asString = typeof sys === "string" ? sys : JSON.stringify(sys);
-    return asString.includes(HISTORIAN_MARKER);
-}
+import { isHistorianRequest } from "../src/cache-analysis";
 
 interface SessionMetaRow {
     needs_emergency_recovery: number | null;
@@ -100,7 +91,7 @@ describe("context overflow recovery", () => {
             let mainShouldOverflow = false;
             let historianCalls = 0;
             h.mock.addMatcher((body) => {
-                if (isHistorian(body)) return null;
+                if (isHistorianRequest(body)) return null;
                 mainCalls++;
 
                 // On the Nth main request, return a context-overflow error
@@ -135,7 +126,7 @@ describe("context overflow recovery", () => {
             });
 
             h.mock.addMatcher((body) => {
-                if (!isHistorian(body)) return null;
+                if (!isHistorianRequest(body)) return null;
                 historianCalls++;
                 const msgs = body.messages as Array<{ content?: unknown }> | undefined;
                 const flat = JSON.stringify(msgs ?? []);
@@ -327,7 +318,7 @@ describe("context overflow recovery", () => {
             h.mock.reset();
 
             h.mock.addMatcher((body) => {
-                if (isHistorian(body)) return null;
+                if (isHistorianRequest(body)) return null;
                 return {
                     error: {
                         status: 429,
