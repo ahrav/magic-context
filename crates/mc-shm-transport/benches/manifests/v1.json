@@ -13,17 +13,6 @@
       "runtime_versions": "UNSET",
       "compiler": "UNSET",
       "power_settings": "UNSET"
-    },
-    "macos": {
-      "status": "UNSET_REQUIRES_DESIGNATED_HOST",
-      "redacted_identity": "UNSET",
-      "cpu_topology": "UNSET",
-      "memory_topology": "UNSET",
-      "clock_policy": "UNSET",
-      "kernel": "UNSET",
-      "runtime_versions": "UNSET",
-      "compiler": "UNSET",
-      "power_settings": "UNSET"
     }
   },
   "workload_classes": [
@@ -79,10 +68,10 @@
     "mixed_size_full_duplex",
     "oldest_lease_retention"
   ],
-  "scheduling_families": [
-    "hot_pinned_poll",
-    "cold_park_wake"
-  ],
+  "fixed_profile": "eventfd_sparse_ring",
+  "connection_counts": [1, 8, 64],
+  "callback_budget": "UNSET_REQUIRES_REACTOR_SWEEP",
+  "supported_tmpfs_cgroup_envelope": "UNSET_REQUIRES_DESIGNATED_HOST",
   "arms": {
     "hardware_controls": [
       "h0_metadata_cacheline_ping_pong",
@@ -96,10 +85,6 @@
       "copied_producer_leased_receiver",
       "direct_producer_copied_receiver",
       "direct_producer_leased_receiver"
-    ],
-    "context_controls": [
-      "unix_socket",
-      "tcp"
     ],
     "gate_controls": [
       "injected_avoidable_operations"
@@ -127,7 +112,7 @@
       "ABBA",
       "BAAB"
     ],
-    "simultaneous_family": "metric_by_workload_by_scheduling",
+    "simultaneous_family": "metric_by_workload_by_connection_count",
     "early_stopping": false,
     "unfavorable_extension": false
   }

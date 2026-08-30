@@ -612,9 +612,9 @@ Commit runs inside retained host work (the connection writer task), so cancellin
 
 ### 7.7 Mandatory ring setup
 
-Transport setup is complete before the application wire becomes active. The owner-only Unix setup socket authenticates the peer, transfers exactly two ring mapping descriptors, validates the fixed release identity and one-use activation token, and commits the ring. It has no application-envelope decoder or router. The ring is the only application frame channel.
+Transport setup is complete before the application wire becomes active. The owner-only Unix setup socket authenticates the peer and transfers exactly two memfds plus four nonblocking eventfds, profile `mc-host-test-ring-v1`, wire version 2, descriptor schema 3, grants, and a one-use activation token. The client validates and attaches both directions, then commits activation. Memfds carry ring metadata and application bytes. Eventfds carry coalesced data-ready and capacity-ready notifications only. The ring is the only application frame channel.
 
-Setup accepts only the release's current wire version, descriptor schema, and ring profile. Missing native support, malformed ancillary data, duplicate or extra descriptors, identity mismatch, token mismatch, admission failure, attachment failure, timeout, or setup-socket loss retires the connection before application traffic. Runtime ring corruption or unexpected setup-socket EOF also retires the connection. No setup or runtime failure changes transport or replays an uncertain request.
+Missing native support, malformed ancillary data, duplicate or extra descriptors, identity mismatch, token mismatch, admission failure, attachment failure, timeout, or setup-socket loss retires the connection before application traffic. Runtime ring corruption or unexpected setup-socket EOF also retires the connection. No setup or runtime failure changes transport or replays an uncertain request.
 
 ```mermaid
 stateDiagram-v2
@@ -630,6 +630,8 @@ stateDiagram-v2
 ```
 
 `Failed` and `Closed` are terminal for that connection. A caller may establish a fresh connection, which reruns discovery, authentication, descriptor transfer, validation, and attachment from the beginning.
+
+Producers publish before signaling readiness. Consumers arm by generation, recheck after arming, block only when still empty, drain the coalesced token, and recheck the ring. Capacity readiness uses the same lost-wake-safe order. No timed ring poll, prefault, runtime scheduling selector, or fallback path exists.
 
 `transport.negotiate`, `transport.activate`, and `transport.commit` are not operations of this protocol. A host advertises exactly four channel-0 operations in `subc_ops`: `route.open`, `catalog.list`, `host.shutdown`, and `host.status`. Any other operation receives terminal `unsupported_operation` while the host stays connected if framing remains valid.
 
@@ -843,13 +845,14 @@ An authenticated `host.shutdown` (Section 7.6) initiates this same graceful orde
 ### 13.1 Startup, route, call, close
 
 1. Host locks runtime state, creates fresh credentials, initializes directly linked components, binds the owner-only setup socket, and publishes schema 2 with `wire_version: 2`.
-2. Client validates one descriptor-anchored snapshot, authenticates, receives two ring descriptors, validates the fixed identity, attaches, and commits activation.
-3. Client sends channel-0 `route.open` correlation 1 through the ring.
-4. Host allocates global channel 7, epoch 77, binds the component, and returns the tagged response.
-5. Client sends an opaque request on `(7,77,2)`.
-6. Host dispatches once and returns one terminal on `(7,77,2)`.
-7. Client sends route Goodbye `(7,77,0)`.
-8. Host blocks reuse until task settlement and exactly one route-gone callback complete; any reuse of channel 7 has epoch greater than 77.
+2. Client validates one descriptor-anchored snapshot and completes all three auth messages.
+3. Client receives two memfds and four eventfds, validates both grants, attaches, and commits activation.
+4. Client sends channel-0 `route.open` correlation 1 through the ring.
+5. Host allocates global channel 7, epoch 77, binds the component, and returns the tagged response.
+6. Client sends an opaque request on `(7,77,3)`.
+7. Host dispatches once and returns one terminal on `(7,77,3)`.
+8. Client sends route Goodbye `(7,77,0)`.
+9. Host blocks reuse until task settlement and exactly one route-gone callback complete; any reuse of channel 7 has epoch greater than 77.
 
 ### 13.2 Storage opening
 

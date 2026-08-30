@@ -129,13 +129,9 @@ jobs:
             --test shm_failure_modes --test shm_soak
 
   shm-source-build:
-    name: Shared memory source build (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: Shared memory source build (Linux x64)
+    runs-on: ubuntu-latest
     timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, macos-15-intel]
     steps:
       - uses: actions/checkout@v5
 
@@ -166,20 +162,14 @@ jobs:
       - name: Source-build transport, host, and addon
         run: cargo build -p mc-shm-transport -p mc-host -p mc-shm-native
 
-      - name: Rust contracts and lifecycle (Linux)
-        if: runner.os == 'Linux'
+      - name: Rust contracts and lifecycle
         run: |
           cargo nextest run -p mc-shm-native -p mc-shm-transport
           cargo nextest run -p mc-host \
             --test client --test lifecycle
 
-      - name: Fixed-ring contracts (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          cargo nextest run -p mc-shm-native
-          cargo nextest run -p mc-shm-transport \
-            --test contract --test fuzz_corpus
-          cargo nextest run -p mc-host --test client --test lifecycle
+      - name: Linux package selection and unsupported-platform contract
+        run: bun run --cwd packages/mc-shm-native test:capability:bun
 
       - name: Rust lease non-escape
         run: cargo test -p mc-host --doc

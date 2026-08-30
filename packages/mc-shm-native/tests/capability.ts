@@ -3,8 +3,12 @@ import {
         activeNativeChannels,
         NativeChannel,
         probeCapabilities,
+        supportsNativePlatform,
 } from "../index.ts";
 
+assert.equal(supportsNativePlatform("linux", "x64"), true);
+assert.equal(supportsNativePlatform("darwin", "x64"), false);
+assert.equal(supportsNativePlatform("darwin", "arm64"), false);
 assert.equal(activeNativeChannels(), 0);
 const capability = probeCapabilities();
 assert.equal(
