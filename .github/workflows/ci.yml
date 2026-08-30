@@ -250,7 +250,12 @@ jobs:
       # process-global cache, so this suite is correct under either runner.
       - name: Module transform and token-cache proofs (Linux)
         if: runner.os == 'Linux'
-        run: cargo nextest run -p mc-module --lib
+        run: |
+          cargo nextest run -p mc-module --lib
+          cargo nextest run -p mc-module \
+            --test historian_truncate_differential \
+            --test caveman_differential \
+            --test selection_differential
 
       - name: Module differential contracts (Linux)
         if: runner.os == 'Linux'

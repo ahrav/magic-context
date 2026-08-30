@@ -790,20 +790,20 @@ pub fn truncate_historian_input_if_needed(input: &str, token_budget: usize) -> S
         return input.to_string();
     }
 
-    // TypeScript slices by UTF-16 code units. Keep the same search space rather than
-    // treating an astral character as one scalar; a cut through a surrogate pair is
-    // represented by the replacement scalar Rust can safely emit for that lone unit.
-    let input_units: Vec<u16> = input.encode_utf16().collect();
+    // The reference implementation counts UTF-16 code units.
+    // A cut inside a surrogate pair rounds down to the character start:
+    // `utf16_prefix` never emits a partial scalar.
+    let unit_len = input.chars().map(char::len_utf16).sum::<usize>();
+
+    let mut candidate = String::with_capacity(input.len() + HISTORIAN_TRUNCATION_MARKER.len());
     let mut lo = 0usize;
-    let mut hi = input_units.len();
+    let mut hi = unit_len;
     let mut best = 0usize;
     while lo <= hi {
         let mid = (lo + hi) >> 1;
-        let candidate = format!(
-            "{}{}",
-            utf16_prefix(&input_units, mid),
-            HISTORIAN_TRUNCATION_MARKER
-        );
+        candidate.clear();
+        candidate.push_str(crate::transform::utf16_prefix(input, mid));
+        candidate.push_str(HISTORIAN_TRUNCATION_MARKER);
         if estimate_tokens(&candidate) <= token_budget {
             best = mid;
             lo = mid + 1;
@@ -816,17 +816,9 @@ pub fn truncate_historian_input_if_needed(input: &str, token_budget: usize) -> S
 
     format!(
         "{}{}",
-        utf16_prefix(&input_units, best),
+        crate::transform::utf16_prefix(input, best),
         HISTORIAN_TRUNCATION_MARKER
     )
-}
-
-fn utf16_prefix(units: &[u16], requested: usize) -> String {
-    let mut end = requested.min(units.len());
-    if end > 0 && (0xD800..=0xDBFF).contains(&units[end - 1]) {
-        end -= 1;
-    }
-    String::from_utf16_lossy(&units[..end])
 }
 
 fn end_placeholder(start: u64) -> u64 {
