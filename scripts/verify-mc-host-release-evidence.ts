@@ -1,8 +1,10 @@
 /**
  * Validates the installed non-GA release evidence that gates mc-host GA tags.
  *
- * `--check` requires complete qualified evidence. `--write-template` refreshes
- * the fail-closed repository template from the current release artifacts.
+ * `--check` requires complete qualified evidence. `--check-schema` validates the
+ * schema against a contract-derived reference document, so it runs before any
+ * evidence exists. `--write-template` refreshes the fail-closed repository
+ * template from the current release artifacts.
  */
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
@@ -1350,35 +1352,31 @@ function readJson(rootDir: string, relative: string): unknown {
     return JSON.parse(readFileSync(join(rootDir, relative), "utf8")) as unknown;
 }
 
-function buildTemplate(rootDir: string): InstalledReleaseEvidence {
+interface CitedArtifactDigests {
+    productionInputsSha256: string;
+    qualificationSha256: string;
+    payloadIndexSha256: string;
+    stopProvenanceSha256: string;
+}
+
+/**
+ * Fail-closed evidence citing `digests`, with every proof recorded as unverified.
+ *
+ * The registry, target, and flow identity sets come from the release contract
+ * rather than a literal here, because the validator requires them to be exactly
+ * the contract's sets and a second hand-maintained copy would drift out of them.
+ */
+function buildFailClosedEvidence(
+    digests: CitedArtifactDigests,
+    blockers: string[],
+): InstalledReleaseEvidence {
     const contract = buildContract();
-    const qualification = record(
-        readJson(rootDir, QUALIFICATION_PATH),
-        "qualification",
-    );
-    const qualificationBlockers = Array.isArray(qualification.unqualified)
-        ? qualification.unqualified.filter(
-              (value): value is string =>
-                  typeof value === "string" && value.length > 0,
-          )
-        : [];
-    const blockers = [
-        ...(qualification.production_qualified === true
-            ? []
-            : [
-                  `production inputs are not qualified: ${
-                      qualificationBlockers.join("; ") || "reason unavailable"
-                  }`,
-              ]),
-        "npm publication intentionally skipped; registry provenance and installed package flows are unavailable",
-        "macOS targets and an exact kernel 4.18 canary have not run",
-    ];
     return buildInstalledReleaseEvidence({
         contract,
-        productionInputsSha256: sha256File(rootDir, INPUT_LOCK_PATH),
-        qualificationSha256: sha256File(rootDir, QUALIFICATION_PATH),
-        payloadIndexSha256: sha256File(rootDir, PAYLOAD_INDEX_PATH),
-        stopProvenanceSha256: sha256File(rootDir, STOP_PROVENANCE_PATH),
+        productionInputsSha256: digests.productionInputsSha256,
+        qualificationSha256: digests.qualificationSha256,
+        payloadIndexSha256: digests.payloadIndexSha256,
+        stopProvenanceSha256: digests.stopProvenanceSha256,
         registryPackages: [
             ...contract.packages.payloads,
             ...contract.packages.parents,
@@ -1412,6 +1410,63 @@ function buildTemplate(rootDir: string): InstalledReleaseEvidence {
     });
 }
 
+function buildTemplate(rootDir: string): InstalledReleaseEvidence {
+    const qualification = record(
+        readJson(rootDir, QUALIFICATION_PATH),
+        "qualification",
+    );
+    const qualificationBlockers = Array.isArray(qualification.unqualified)
+        ? qualification.unqualified.filter(
+              (value): value is string =>
+                  typeof value === "string" && value.length > 0,
+          )
+        : [];
+    return buildFailClosedEvidence(
+        {
+            productionInputsSha256: sha256File(rootDir, INPUT_LOCK_PATH),
+            qualificationSha256: sha256File(rootDir, QUALIFICATION_PATH),
+            payloadIndexSha256: sha256File(rootDir, PAYLOAD_INDEX_PATH),
+            stopProvenanceSha256: sha256File(rootDir, STOP_PROVENANCE_PATH),
+        },
+        [
+            ...(qualification.production_qualified === true
+                ? []
+                : [
+                      `production inputs are not qualified: ${
+                          qualificationBlockers.join("; ") || "reason unavailable"
+                      }`,
+                  ]),
+            "npm publication intentionally skipped; registry provenance and installed package flows are unavailable",
+            "macOS targets and an exact kernel 4.18 canary have not run",
+        ],
+    );
+}
+
+/**
+ * The document the installed-release schema describes, derived from the release
+ * contract alone.
+ *
+ * The schema gate precedes evidence production: a release run writes
+ * `EVIDENCE_PATH`, and every artifact this schema cites is a digest of bytes a
+ * later stage emits. Reading any of them here would make the gate report a
+ * missing input rather than a schema defect. Every cited digest is therefore a
+ * self-evident placeholder — it satisfies the digest shape the schema demands
+ * while never resembling a real citation — and `qualified` stays false, so the
+ * validator's placeholder ban on GA evidence still holds for real documents.
+ */
+export function schemaReferenceEvidence(): InstalledReleaseEvidence {
+    const placeholder = "0".repeat(64);
+    return buildFailClosedEvidence(
+        {
+            productionInputsSha256: placeholder,
+            qualificationSha256: placeholder,
+            payloadIndexSha256: placeholder,
+            stopProvenanceSha256: placeholder,
+        },
+        ["schema reference document cites no release artifact"],
+    );
+}
+
 function main(): void {
     const rootDir = join(dirname(fileURLToPath(import.meta.url)), "..");
     const flag = process.argv[2] ?? "--check";
@@ -1427,15 +1482,19 @@ function main(): void {
         );
         process.exit(2);
     }
+    // The schema gate validates the reference document instead of the installed
+    // artifact, because it runs ahead of the stage that writes `EVIDENCE_PATH`
+    // and that path is not tracked between releases. Schema drift still fails
+    // here: the reference is built by this file's builder and checked by its
+    // validator, so the two disagreeing is a failure with nothing on disk.
+    if (flag === "--check-schema") {
+        validateInstalledReleaseEvidence(schemaReferenceEvidence());
+        console.log("checked mc-host installed release evidence (schema only)");
+        return;
+    }
     const evidence = readJson(rootDir, EVIDENCE_PATH);
-    validateInstalledReleaseEvidenceAgainstArtifacts(
-        rootDir,
-        evidence,
-        flag === "--check",
-    );
-    console.log(
-        `checked mc-host installed release evidence (${flag === "--check" ? "GA-qualified" : "schema only"})`,
-    );
+    validateInstalledReleaseEvidenceAgainstArtifacts(rootDir, evidence, true);
+    console.log("checked mc-host installed release evidence (GA-qualified)");
 }
 
 if (import.meta.main) main();

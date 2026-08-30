@@ -1,5 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import {
+    copyFileSync,
+    mkdirSync,
+    mkdtempSync,
+    readFileSync,
+    rmSync,
+    symlinkSync,
+    writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,6 +17,7 @@ import {
     attestationMatchesWorkflowSource,
     buildInstalledReleaseEvidence,
     QUALIFICATION_WORKFLOW_PATH,
+    schemaReferenceEvidence,
     validateInstalledReleaseEvidence,
     validateInstalledReleaseEvidenceAgainstArtifacts,
     workflowRunApiPath,
@@ -395,6 +405,42 @@ function installReleaseArtifacts(
     const workflowPath = join(root, QUALIFICATION_WORKFLOW_PATH);
     mkdirSync(dirname(workflowPath), { recursive: true });
     writeFileSync(workflowPath, "name: qualification stub\n");
+}
+
+/** The verifier plus every sibling module it imports. */
+const VERIFIER_MODULES = [
+    "verify-mc-host-release-evidence",
+    "build-mc-host-payload",
+    "generate-mc-host-release-manifest",
+    "qualify-mc-host-production-inputs",
+] as const;
+
+/**
+ * Path to a verifier copy whose root carries no release artifacts at all.
+ *
+ * The verifier resolves its root from its own module path, so isolating it from
+ * this checkout's `tmp/` means running a copy rather than passing a directory.
+ * `node_modules` is linked in because one sibling module imports `typescript`.
+ */
+function isolatedVerifier(): string {
+    const root = mkdtempSync(join(tmpdir(), "mc-host-evidence-clean-"));
+    mkdirSync(join(root, "scripts"));
+    for (const name of VERIFIER_MODULES) {
+        copyFileSync(
+            join(repoRoot, "scripts", `${name}.ts`),
+            join(root, "scripts", `${name}.ts`),
+        );
+    }
+    symlinkSync(join(repoRoot, "node_modules"), join(root, "node_modules"));
+    return join(root, "scripts", "verify-mc-host-release-evidence.ts");
+}
+
+function runVerifier(script: string, flag: string): { status: number; output: string } {
+    const result = spawnSync("bun", [script, flag], { encoding: "utf8" });
+    return {
+        status: result.status ?? 1,
+        output: `${result.stdout}${result.stderr}`,
+    };
 }
 
 describe("installed release evidence", () => {
@@ -1465,5 +1511,60 @@ describe("installed release evidence", () => {
         expect(sha256Hex(canonicalJson(evidence))).toBe(
             sha256Hex(canonicalJson(JSON.parse(canonicalJson(evidence)))),
         );
+    });
+
+    test("the schema gate passes with no installed evidence on disk", () => {
+        const script = isolatedVerifier();
+        const result = runVerifier(script, "--check-schema");
+        expect(result.output).not.toMatch(/ENOENT/);
+        expect(result.status, result.output).toBe(0);
+        expect(result.output).toMatch(/schema only/);
+    });
+
+    test("the GA gate still requires the installed evidence", () => {
+        const script = isolatedVerifier();
+        const result = runVerifier(script, "--check");
+        expect(result.status).not.toBe(0);
+        expect(result.output).toMatch(/tmp\/mc-host-installed-release-evidence\.json/);
+    });
+
+    test("the schema gate rejects a malformed reference document", () => {
+        expect(() => validateInstalledReleaseEvidence(schemaReferenceEvidence())).not.toThrow();
+        for (const [label, mutate, pattern] of [
+            [
+                "an unqualified document naming no blocker",
+                (reference: Record<string, unknown>) => {
+                    reference.blockers = [];
+                },
+                /must name at least one blocker/,
+            ],
+            [
+                "a digest that is not lowercase SHA-256",
+                (reference: Record<string, unknown>) => {
+                    reference.qualification_sha256 = "not-a-digest";
+                },
+                /qualification_sha256 must be lowercase SHA-256/,
+            ],
+            [
+                "a target the release contract does not name",
+                (reference: Record<string, unknown>) => {
+                    (reference.targets as { target: string }[])[0].target = "sunos-sparc";
+                },
+                /targets must contain the exact release set/,
+            ],
+            [
+                "a field the schema does not declare",
+                (reference: Record<string, unknown>) => {
+                    reference.extra = true;
+                },
+                /evidence keys must be exactly/,
+            ],
+        ] as [string, (reference: Record<string, unknown>) => void, RegExp][]) {
+            const reference = JSON.parse(
+                canonicalJson(schemaReferenceEvidence()),
+            ) as Record<string, unknown>;
+            mutate(reference);
+            expect(() => validateInstalledReleaseEvidence(reference), label).toThrow(pattern);
+        }
     });
 });
