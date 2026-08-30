@@ -7,7 +7,6 @@ pub mod broca;
 pub mod echo_host;
 pub mod process_resources;
 pub mod raw_client;
-#[cfg(target_os = "linux")]
 pub mod synapse;
 
 use std::path::{Path, PathBuf};

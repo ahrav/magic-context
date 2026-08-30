@@ -190,6 +190,39 @@ describe("parseDaemonResult", () => {
         expect(legal.readiness?.synapse?.reason).toBe("synapse_unsupported");
     });
 
+    test("an unhealthy ring parses with the reason both emitters produce", () => {
+        // `probeManagedReadiness` and `policy.ts` emit `native_probe_unavailable`
+        // for an unavailable ring, so rejecting the pair here would make CLI
+        // status and doctor output unparseable.
+        const parsed = parseDaemonResult(
+            JSON.stringify(
+                validResult({
+                    command: "status",
+                    ok: false,
+                    state: "running",
+                    reason: "native_probe_unavailable",
+                    remediation: "run_daemon_restart",
+                    readiness: {
+                        shared_memory: {
+                            state: "unavailable",
+                            reason: "native_probe_unavailable",
+                        },
+                    },
+                    checks: [
+                        {
+                            id: "readiness.shared_memory",
+                            status: "fail",
+                            reason: "native_probe_unavailable",
+                            remediation: "run_daemon_restart",
+                        },
+                    ],
+                }),
+            ),
+        );
+        expect(parsed.readiness?.shared_memory?.state).toBe("unavailable");
+        expect(parsed.readiness?.shared_memory?.reason).toBe("native_probe_unavailable");
+    });
+
     test("binds pass and fail checks to their reason classes, leaving warn and skip free", () => {
         const withCheck = (status: string, reason: string, remediation: string | null) =>
             JSON.stringify(

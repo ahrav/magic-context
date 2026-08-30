@@ -29,6 +29,7 @@ import {
     type LifecyclePolicyOptions,
     McHostLifecyclePolicy,
     type ObservationalHealth,
+    ReadinessProbeControlError,
 } from "./policy";
 
 const MAX_PARENT_WALK = 8;
@@ -268,7 +269,13 @@ async function probeManagedReadiness(root: string, budgetMs: number): Promise<Ob
     const client = await processMcHostClient({
         connectionFile: connectionFilePath(root),
     });
-    const { snapshot: compatibility, status } = await readCompatibilityProbe(client, deadline);
+    let probe: CompatibilityProbeResult;
+    try {
+        probe = await readCompatibilityProbe(client, deadline);
+    } catch (error) {
+        throw new ReadinessProbeControlError(error);
+    }
+    const { snapshot: compatibility, status } = probe;
     if (status === null) {
         // The probe short-circuited at the daemon or module stage, so
         // `host.status` never ran and storage and Synapse were never

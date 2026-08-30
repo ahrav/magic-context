@@ -17,10 +17,7 @@
 
 import type { AuthenticatedPeer, CatalogEntry } from "../mc-host-client";
 import { classifySharedMemoryFailure } from "../mc-host-client/shared-memory-failure";
-import type {
-    SharedMemoryDiagnostics,
-    SharedMemoryResourceCounts,
-} from "../mc-host-client/types";
+import type { SharedMemoryDiagnostics, SharedMemoryResourceCounts } from "../mc-host-client/types";
 import { checkPlatform, type LifecycleFailureReason, type PlatformReaders } from "./bootstrap";
 import {
     COMPATIBILITY_STAGES,
@@ -101,6 +98,14 @@ export interface ObservationalHealth extends CompatibilitySnapshot {
     readiness: DaemonReadiness;
     /** Present when `host.status` completed and returned ring diagnostics. */
     sharedMemory?: SharedMemoryDiagnostics;
+}
+
+/** Thrown after ring attachment and authentication when a control probe fails. */
+export class ReadinessProbeControlError extends Error {
+    constructor(cause: unknown) {
+        super("readiness control probe failed", { cause });
+        this.name = "ReadinessProbeControlError";
+    }
 }
 
 function compatibilityInput(snapshot: CompatibilitySnapshot): CompatibilityInput {
@@ -794,6 +799,7 @@ export class McHostLifecyclePolicy {
             try {
                 observed = await this.readinessProbe(remaining);
             } catch (error) {
+                if (error instanceof ReadinessProbeControlError) return relabeled;
                 const failed: DaemonCheck = {
                     id: "readiness.shared_memory",
                     status: "fail",

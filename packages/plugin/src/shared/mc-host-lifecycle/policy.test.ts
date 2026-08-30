@@ -11,6 +11,7 @@ import {
     McHostLifecyclePolicy,
     OUTER_AGGREGATE_MS,
     OUTER_AGGREGATE_MS_DARWIN,
+    ReadinessProbeControlError,
     type WaiterDetachedError,
 } from "./policy";
 
@@ -673,6 +674,34 @@ describe("native invocation mapping", () => {
                 expect(result.shared_memory?.state).toBe("terminal");
                 expect(result.shared_memory?.error_class).toBe("setup_failure");
                 expect(JSON.stringify(result)).not.toContain("route collapsed mid-probe");
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("a control-probe failure leaves the ring diagnostics unstated", async () => {
+        // Control-probe failures do not diagnose ring health.
+        const root = tempDir("mc-policy-readiness-control-");
+        const { binary } = fakeBinary(root);
+        try {
+            const policy = policyFor({
+                env: { XDG_DATA_HOME: root },
+                launchTarget: { kind: "test-binary", path: binary },
+                readinessProbe: async () => {
+                    throw new ReadinessProbeControlError(
+                        new Error("compatibility probe deadline expired"),
+                    );
+                },
+            });
+            for (const result of [await policy.status(), await policy.doctor()]) {
+                expect(result.state).toBe("running");
+                expect(result.reason).not.toBe("native_probe_unavailable");
+                expect(result.shared_memory).toBeNull();
+                expect(result.checks.some((check) => check.id === "readiness.shared_memory")).toBe(
+                    false,
+                );
+                expect(JSON.stringify(result)).not.toContain("deadline expired");
             }
         } finally {
             rmSync(root, { recursive: true, force: true });

@@ -200,7 +200,12 @@ function parseReadinessRecord(value: unknown, component: string): ReadinessRecor
         shared_memory: {
             ready: ["healthy"],
             starting: ["starting", "lifecycle_busy"],
-            unavailable: ["startup_timeout", "publication_missing", "authentication_failed"],
+            unavailable: [
+                "startup_timeout",
+                "publication_missing",
+                "authentication_failed",
+                "native_probe_unavailable",
+            ],
         },
         storage: {
             ready: ["healthy"],
