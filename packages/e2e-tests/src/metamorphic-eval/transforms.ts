@@ -1,6 +1,10 @@
 import { splitmix32 } from "../../../plugin/scripts/retrieval-benchmark/synthetic";
 import {
     MAX_TRANSCRIPT_TURNS,
+    MAX_TURN_TEXT_CHARS,
+    authoredEvidenceText,
+    normalizeContent,
+    normalizedEvidenceMessages,
     parseScenario,
     predicateMatches,
     type GoldExpectations,
@@ -99,26 +103,57 @@ function protectedTurnIndexes(scenario: HistorianEvalScenario): Set<number> {
     return protectedIndexes;
 }
 
+/**
+ * Messages that authored negative evidence spans, keyed `turnIndex:role`.
+ *
+ * The expected-absent authorship rule searches the whole evidence range, so a
+ * forbidden formation can be authored across a role or a turn boundary and match
+ * no single message: one turn's assistant ends with `use` while the next turn's
+ * user opens with `API/v2`. Rewriting either side deletes the authored evidence
+ * and the derivative then fails lint with `not-authored-before-epilogue`, so
+ * every message a match overlaps is off limits — not only the messages that
+ * match on their own.
+ *
+ * Offsets come from the same normalized view the matcher compares, so the spans
+ * name the messages the match actually crosses instead of approximating them
+ * from turn boundaries.
+ */
+function absentEvidenceMessages(scenario: HistorianEvalScenario): Set<string> {
+    const messages = normalizedEvidenceMessages(scenario.transcript.turns);
+    const spans: Array<{ key: string; start: number; end: number }> = [];
+    let offset = 0;
+    for (const message of messages) {
+        spans.push({
+            key: `${message.turnIndex}:${message.role}`,
+            start: offset,
+            end: offset + message.text.length,
+        });
+        // The join separator sits between messages and belongs to neither.
+        offset += message.text.length + 1;
+    }
+    const evidence = messages.map((message) => message.text).join(" ");
+    const spanned = new Set<string>();
+    for (const absent of scenario.gold.expectedAbsent) {
+        const needle = normalizeContent(absent.predicate.value);
+        if (needle.length === 0) continue;
+        for (let at = evidence.indexOf(needle); at !== -1; at = evidence.indexOf(needle, at + 1)) {
+            const matchEnd = at + needle.length;
+            for (const span of spans) {
+                if (span.start < matchEnd && at < span.end) spanned.add(span.key);
+            }
+        }
+    }
+    return spanned;
+}
+
 function eligibleMessages(scenario: HistorianEvalScenario): EligibleMessage[] {
     const protectedIndexes = protectedTurnIndexes(scenario);
-    const absentPredicates = scenario.gold.expectedAbsent.map((absent) => absent.predicate);
+    const evidenceMessages = absentEvidenceMessages(scenario);
     return scenario.transcript.turns.flatMap((turn, turnIndex) => {
         if (protectedIndexes.has(turnIndex)) return [];
-        // Do not rewrite either message when only their combined text matches:
-        // changing either message can make the combined text stop matching.
-        const spansRoles = absentPredicates.some(
-            (predicate) =>
-                predicateMatches(predicate, `${turn.user}\n${turn.assistant}`) &&
-                !predicateMatches(predicate, turn.user) &&
-                !predicateMatches(predicate, turn.assistant),
+        return (["user", "assistant"] as const).flatMap((role) =>
+            evidenceMessages.has(`${turnIndex}:${role}`) ? [] : [{ turnIndex, role, text: turn[role] }],
         );
-        if (spansRoles) return [];
-        return (["user", "assistant"] as const).flatMap((role) => {
-            const text = turn[role];
-            return absentPredicates.some((predicate) => predicateMatches(predicate, text))
-                ? []
-                : [{ turnIndex, role, text }];
-        });
     });
 }
 
@@ -149,24 +184,98 @@ function preservesContiguousGold(scenario: HistorianEvalScenario, turnMap: reado
     }
 }
 
+/**
+ * Whether `turns` still authors every forbidden formation the source authored.
+ *
+ * A predicate can be authored across a turn boundary, so moving, inserting, or
+ * duplicating a turn can separate the two halves of a match that no single turn
+ * contains. The authorship rule then reports the formation as never authored and
+ * the derivative fails lint, so a candidate that loses a match is not a
+ * candidate. Both windows are checked because the authorship rule looks at the
+ * pre-epilogue evidence while the scorer sees the whole transcript.
+ */
+function preservesAbsentEvidence(
+    scenario: HistorianEvalScenario,
+    turns: readonly TranscriptTurn[],
+    epilogueStartIndex: number,
+): boolean {
+    const windows: Array<readonly [readonly TranscriptTurn[], readonly TranscriptTurn[]]> = [
+        [scenario.transcript.turns, turns],
+        [
+            scenario.transcript.turns.slice(0, scenario.transcript.epilogueStartIndex),
+            turns.slice(0, epilogueStartIndex),
+        ],
+    ];
+    return windows.every(([before, after]) => {
+        const authored = authoredEvidenceText(before);
+        const derived = authoredEvidenceText(after);
+        return scenario.gold.expectedAbsent.every(
+            (absent) =>
+                !predicateMatches(absent.predicate, authored) ||
+                predicateMatches(absent.predicate, derived),
+        );
+    });
+}
+
+/** The turn list a candidate order produces, without copying gold. */
+function reorderedTurns(
+    scenario: HistorianEvalScenario,
+    order: readonly number[],
+): TranscriptTurn[] {
+    return order.map((index) => ({ ...scenario.transcript.turns[index]! }));
+}
+
+/** The turn list produced by copying `source` to `insertion`. */
+function duplicatedTurns(
+    scenario: HistorianEvalScenario,
+    source: number,
+    insertion: number,
+): TranscriptTurn[] {
+    const turns = scenario.transcript.turns.map((turn) => ({ ...turn }));
+    turns.splice(insertion, 0, { ...scenario.transcript.turns[source]! });
+    return turns;
+}
+
+function epilogueStartIndexAfter(scenario: HistorianEvalScenario, insertion: number): number {
+    return (
+        scenario.transcript.epilogueStartIndex +
+        (insertion <= scenario.transcript.epilogueStartIndex ? 1 : 0)
+    );
+}
+
 const paraphraseIrrelevant: Transform = {
     id: "paraphrase-irrelevant",
     version: 1,
     alwaysApplicable: true,
     apply(scenario, rawSeed) {
         const seed = normalizedSeed(rawSeed);
-        const candidates = eligibleMessages(scenario);
-        if (candidates.length === 0) {
+        const eligible = eligibleMessages(scenario);
+        if (eligible.length === 0) {
             return { applicable: false, reason: "no irrelevant message to paraphrase" };
         }
-        const next = splitmix32(seed);
-        const message = pick(candidates, next);
         const rewrites = [
             (text: string) => `For context, ${text.charAt(0).toLowerCase()}${text.slice(1)}`,
             (text: string) => `${text} This is background context only.`,
             (text: string) => `As background: ${text}`,
         ];
-        const text = pick(rewrites, next)(message.text);
+        // Every rewrite lengthens the message, and `derivative()` re-parses,
+        // where an over-limit message throws rather than returning a result. A
+        // message already at the limit is therefore not a candidate at all:
+        // throwing would abort enumeration for the whole scenario over one
+        // unrewritable message.
+        const fits = (text: string) => text.length <= MAX_TURN_TEXT_CHARS;
+        const candidates = eligible.filter((message) =>
+            rewrites.some((rewrite) => fits(rewrite(message.text))),
+        );
+        if (candidates.length === 0) {
+            return { applicable: false, reason: "no paraphrase fits the turn text limit" };
+        }
+        const next = splitmix32(seed);
+        const message = pick(candidates, next);
+        const text = pick(
+            rewrites.filter((rewrite) => fits(rewrite(message.text))),
+            next,
+        )(message.text);
         const turnMap = scenario.transcript.turns.map((_, index) => index);
         return derivative(
             scenario,
@@ -211,7 +320,14 @@ const reorderIndependentTurns: Transform = {
             if (!rangeSafe) return [];
             const order = scenario.transcript.turns.map((_, index) => index);
             [order[left], order[right]] = [order[right]!, order[left]!];
-            return preservesContiguousGold(scenario, mapForOrder(order)) ? [order] : [];
+            if (!preservesContiguousGold(scenario, mapForOrder(order))) return [];
+            return preservesAbsentEvidence(
+                scenario,
+                reorderedTurns(scenario, order),
+                scenario.transcript.epilogueStartIndex,
+            )
+                ? [order]
+                : [];
         });
         if (candidates.length === 0) {
             return { applicable: false, reason: "no independent adjacent turns before epilogue" };
@@ -221,7 +337,7 @@ const reorderIndependentTurns: Transform = {
             scenario,
             this,
             seed,
-            order.map((index) => ({ ...scenario.transcript.turns[index]! })),
+            reorderedTurns(scenario, order),
             scenario.transcript.epilogueStartIndex,
             mapForOrder(order),
         );
@@ -259,7 +375,15 @@ const moveAcceptedDecision: Transform = {
                     order.splice(source + index + 2, 0, moved!);
                     return { source, order };
                 },
-            ).filter(({ order }) => preservesContiguousGold(scenario, mapForOrder(order))),
+            ).filter(
+                ({ order }) =>
+                    preservesContiguousGold(scenario, mapForOrder(order)) &&
+                    preservesAbsentEvidence(
+                        scenario,
+                        reorderedTurns(scenario, order),
+                        scenario.transcript.epilogueStartIndex,
+                    ),
+            ),
         );
         if (candidates.length === 0) {
             return {
@@ -273,7 +397,7 @@ const moveAcceptedDecision: Transform = {
             scenario,
             this,
             seed,
-            order.map((index) => ({ ...scenario.transcript.turns[index]! })),
+            reorderedTurns(scenario, order),
             scenario.transcript.epilogueStartIndex,
             mapForOrder(order),
         );
@@ -302,7 +426,11 @@ const duplicateRejectedProposal: Transform = {
             const turnMap = scenario.transcript.turns.map((_, index) =>
                 index < insertion ? index : index + 1,
             );
-            return preservesContiguousGold(scenario, turnMap) ? [{ source: turnIndex, insertion, turnMap }] : [];
+            if (!preservesContiguousGold(scenario, turnMap)) return [];
+            const turns = duplicatedTurns(scenario, turnIndex, insertion);
+            return preservesAbsentEvidence(scenario, turns, epilogueStartIndexAfter(scenario, insertion))
+                ? [{ source: turnIndex, insertion, turnMap }]
+                : [];
         });
         if (candidates.length === 0) {
             return {
@@ -313,15 +441,12 @@ const duplicateRejectedProposal: Transform = {
             };
         }
         const { source, insertion, turnMap } = pick(candidates, splitmix32(seed));
-        const turns = scenario.transcript.turns.map((turn) => ({ ...turn }));
-        turns.splice(insertion, 0, { ...scenario.transcript.turns[source]! });
         return derivative(
             scenario,
             this,
             seed,
-            turns,
-            scenario.transcript.epilogueStartIndex +
-                (insertion <= scenario.transcript.epilogueStartIndex ? 1 : 0),
+            duplicatedTurns(scenario, source, insertion),
+            epilogueStartIndexAfter(scenario, insertion),
             turnMap,
         );
     },
@@ -389,6 +514,18 @@ const renameUnrelatedSymbols: Transform = {
                     return quoted === undefined ? replacement : `\`${replacement}\``;
                 },
             );
+        }
+        // A replacement longer than the symbol it displaces can push a message
+        // past the contract limit, which `derivative()` reports by throwing
+        // instead of returning; enumeration must see an inapplicable transform.
+        if (
+            turns.some(
+                (turn) =>
+                    turn.user.length > MAX_TURN_TEXT_CHARS ||
+                    turn.assistant.length > MAX_TURN_TEXT_CHARS,
+            )
+        ) {
+            return { applicable: false, reason: "rename does not fit the turn text limit" };
         }
         const turnMap = scenario.transcript.turns.map((_, index) => index);
         return derivative(

@@ -6,6 +6,7 @@ import { splitmix32 } from "../../../plugin/scripts/retrieval-benchmark/syntheti
 import { estimateTokens } from "../../../plugin/src/shared/token-estimator";
 import {
     lintScenario,
+    MAX_TURN_TEXT_CHARS,
     normalizeContent,
     parseScenario,
     type HistorianEvalScenario,
@@ -47,6 +48,37 @@ function movableScenarioRaw(): Record<string, unknown> {
         assistant: "Noted; standup time recorded informally.",
     });
     transcript.epilogueStartIndex = 4;
+    return raw;
+}
+
+/**
+ * Authors a forbidden formation across the turn-0 assistant / turn-1 user
+ * boundary: the freeze lint accepts it because it searches the whole
+ * pre-epilogue evidence, and no single turn contains it.
+ */
+function crossTurnEvidenceRaw(): Record<string, unknown> {
+    const raw = validScenarioRaw();
+    const transcript = raw.transcript as {
+        turns: Array<{ user: string; assistant: string }>;
+        epilogueStartIndex: number;
+    };
+    transcript.turns.unshift(
+        { user: "Quick planning note.", assistant: "Noted; we keep the legacy" },
+        { user: "bridge alive for now.", assistant: "Understood." },
+    );
+    transcript.epilogueStartIndex += 2;
+    const gold = raw.gold as {
+        expectedClaims: Array<{ sourceTurnRange: [number, number] }>;
+        expectedAbsent: Array<Record<string, unknown>>;
+    };
+    for (const claim of gold.expectedClaims) {
+        claim.sourceTurnRange = [claim.sourceTurnRange[0] + 2, claim.sourceTurnRange[1] + 2];
+    }
+    gold.expectedAbsent.push({
+        id: "abs-legacy-bridge",
+        family: "proposed-but-rejected",
+        predicate: { kind: "normalized-substring", value: "legacy bridge" },
+    });
     return raw;
 }
 
@@ -246,6 +278,63 @@ describe("metamorphic transforms", () => {
         expect(transform.apply(scenario, 0)).toEqual({
             applicable: false,
             reason: "transcript is already at the turn limit",
+        });
+    });
+
+    test("every transform preserves negative evidence spanning adjacent turns", () => {
+        const scenario = parseScenario(crossTurnEvidenceRaw());
+        // The forbidden formation is authored only across the turn-0 assistant
+        // and turn-1 user boundary, so neither turn carries it alone.
+        expect(lintScenario(scenario)).toEqual([]);
+        for (const index of [0, 1]) {
+            const turn = scenario.transcript.turns[index]!;
+            expect(normalizeContent(`${turn.user} ${turn.assistant}`)).not.toContain("legacy bridge");
+        }
+
+        for (const transform of TRANSFORMS) {
+            for (let seed = 0; seed < 40; seed += 1) {
+                const result = transform.apply(scenario, seed);
+                if (!result.applicable) continue;
+                expect(lintScenario(result.scenario), `${transform.id}/s${seed}`).toEqual([]);
+            }
+        }
+    });
+
+    test("paraphrase reports inapplicability instead of throwing at the turn text limit", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string }> }).turns;
+        turns[3]!.user = `Background: ${"a ".repeat(MAX_TURN_TEXT_CHARS)}`.slice(0, MAX_TURN_TEXT_CHARS);
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "paraphrase-irrelevant")!;
+
+        for (let seed = 0; seed < 30; seed += 1) {
+            const result = transform.apply(scenario, seed);
+            if (!result.applicable) continue;
+            for (const turn of result.scenario.transcript.turns) {
+                expect(turn.user.length, `s${seed}`).toBeLessThanOrEqual(MAX_TURN_TEXT_CHARS);
+            }
+        }
+        // The over-limit message is never the rewrite target, so the transform
+        // still applies to another eligible message rather than aborting.
+        expect(firstApplicable(transform, scenario)).toBeDefined();
+    });
+
+    test("rename reports inapplicability when the replacement exceeds the turn text limit", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[0]!.assistant = "We could; that would give us eviction out of the box.";
+        turns[3]!.user = `Wrapping up aux.ts. ${"a ".repeat(MAX_TURN_TEXT_CHARS)}`.slice(
+            0,
+            MAX_TURN_TEXT_CHARS,
+        );
+        const scenario = parseScenario(raw);
+        expect(lintScenario(scenario)).toEqual([]);
+        const transform = TRANSFORMS.find((candidate) => candidate.id === "rename-unrelated-symbols")!;
+
+        expect(transform.apply(scenario, 0)).toEqual({
+            applicable: false,
+            reason: "rename does not fit the turn text limit",
         });
     });
 

@@ -6,6 +6,8 @@ import {
     SCENARIO_SCHEMA,
     assertReleaseSuccession,
     assertTombstonesRetired,
+    authoredEvidenceText,
+    normalizedEvidenceMessages,
     parseReleaseLineage,
     MAX_EXPECTATION_ENTRIES,
     MAX_PROBE_CHOICES,
@@ -1255,6 +1257,54 @@ describe("predicate matching", () => {
             predicateMatches({ kind: "normalized-substring", value: "In-Process   LRU" }, "the in-process lru cache"),
         ).toBe(true);
         expect(predicateMatches({ kind: "normalized-substring", value: "redis" }, "no cache named")).toBe(false);
+    });
+});
+
+describe("authored evidence views", () => {
+    test("the normalized messages join back to the evidence text a predicate is matched against", () => {
+        const scenario = validScenario();
+        const messages = normalizedEvidenceMessages(scenario.transcript.turns);
+        expect(messages.map((message) => message.text).join(" ")).toBe(
+            normalizeContent(authoredEvidenceText(scenario.transcript.turns)),
+        );
+    });
+
+    test("a match no single message contains is spanned by both of its messages", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[0] = { user: "Should we keep the legacy", assistant: "bridge alive for now?" };
+        const scenario = parseScenario(raw);
+        const predicate = { kind: "normalized-substring", value: "legacy bridge" } as const;
+
+        expect(predicateMatches(predicate, authoredEvidenceText(scenario.transcript.turns))).toBe(true);
+        expect(predicateMatches(predicate, turns[0]!.user)).toBe(false);
+        expect(predicateMatches(predicate, turns[0]!.assistant)).toBe(false);
+
+        const messages = normalizedEvidenceMessages(scenario.transcript.turns);
+        const evidence = messages.map((message) => message.text).join(" ");
+        const at = evidence.indexOf(normalizeContent(predicate.value));
+        let offset = 0;
+        const spanned = messages.flatMap((message) => {
+            const start = offset;
+            offset += message.text.length + 1;
+            return start < at + predicate.value.length && at < start + message.text.length
+                ? [`${message.turnIndex}:${message.role}`]
+                : [];
+        });
+        expect(spanned).toEqual(["0:user", "0:assistant"]);
+    });
+
+    test("messages production discards carry no evidence", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[3]!.user = "<system-reminder>internal directive</system-reminder>";
+        const scenario = parseScenario(raw);
+
+        expect(
+            normalizedEvidenceMessages(scenario.transcript.turns).some(
+                (message) => message.turnIndex === 3 && message.role === "user",
+            ),
+        ).toBe(false);
     });
 });
 

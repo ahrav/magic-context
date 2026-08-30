@@ -1041,19 +1041,53 @@ function messageAsHistorianSeesIt(role: "user" | "assistant", text: string): str
 }
 
 /**
- * Authored evidence text for a half-open turn range: both messages of every
- * turn as the historian receives them, ballast excluded. Ballast is
- * harness-owned filler that never carries authored evidence, so including it
- * could only let a predicate match by accident against generated prose.
+ * Authored evidence text for a turn list: both messages of every turn as the
+ * historian receives them, ballast excluded. Ballast is harness-owned filler
+ * that never carries authored evidence, so including it could only let a
+ * predicate match by accident against generated prose.
  */
-function evidenceText(scenario: HistorianEvalScenario, startTurn: number, endTurnExclusive: number): string {
-    return scenario.transcript.turns
-        .slice(startTurn, endTurnExclusive)
+export function authoredEvidenceText(turns: readonly TranscriptTurn[]): string {
+    return turns
         .map(
             (turn) =>
                 `${messageAsHistorianSeesIt("user", turn.user)} ${messageAsHistorianSeesIt("assistant", turn.assistant)}`,
         )
         .join(" ");
+}
+
+export interface NormalizedEvidenceMessage {
+    turnIndex: number;
+    role: "user" | "assistant";
+    /** The message as `predicateMatches` compares it. */
+    text: string;
+}
+
+/**
+ * The historian-visible messages of `turns` in evidence order, each normalized
+ * the way `predicateMatches` compares, with the messages production discards
+ * omitted.
+ *
+ * Joining these with a single space reproduces
+ * `normalizeContent(authoredEvidenceText(turns))`, so a caller can map a
+ * predicate match back to the exact messages it spans. Evidence rules that
+ * search the whole range — the expected-absent authorship check, for one —
+ * accept matches no single message contains, and a per-turn or per-role
+ * approximation of this view silently misses them.
+ */
+export function normalizedEvidenceMessages(
+    turns: readonly TranscriptTurn[],
+): NormalizedEvidenceMessage[] {
+    return turns.flatMap((turn, turnIndex) =>
+        (["user", "assistant"] as const).flatMap((role) => {
+            const text = normalizeContent(messageAsHistorianSeesIt(role, turn[role]));
+            return text.length === 0 ? [] : [{ turnIndex, role, text }];
+        }),
+    );
+}
+
+/** Authored evidence text for a half-open turn range. */
+function evidenceText(scenario: HistorianEvalScenario, startTurn: number, endTurnExclusive: number): string {
+    return authoredEvidenceText(scenario.transcript.turns.slice(startTurn, endTurnExclusive));
 }
 
 /**
