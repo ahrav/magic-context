@@ -3,6 +3,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
+import { createDirectTestDatabase } from "../test-database";
 import { OpenCodeRetrospectiveRawProvider } from "./retrospective-raw-provider";
 
 const dbs: Database[] = [];
@@ -18,20 +19,7 @@ function memoryDb(): Database {
 }
 
 function setupContextDb(): Database {
-    const db = memoryDb();
-    db.exec(`
-        CREATE TABLE session_projects (
-            session_id TEXT NOT NULL,
-            harness TEXT NOT NULL,
-            project_path TEXT NOT NULL,
-            updated_at INTEGER NOT NULL
-        );
-        CREATE TABLE session_meta (
-            session_id TEXT PRIMARY KEY,
-            is_subagent INTEGER DEFAULT 0
-        );
-    `);
-    return db;
+    return createDirectTestDatabase().db;
 }
 
 function markSubagent(db: Database, sessionId: string): void {
