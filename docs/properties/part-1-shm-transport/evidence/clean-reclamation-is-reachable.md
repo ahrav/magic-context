@@ -1,5 +1,20 @@
 # clean-reclamation-is-reachable
 
+## Citation refresh, 2026-08-30
+
+The ring-transport refactor (`0f336d3c`, `d8bde128`, `793a973e`, `ed487e11`)
+renamed `crates/mc-host/src/shm_provider.rs` to
+`crates/mc-host/src/ring_transport.rs` and deleted `provider_recovery.rs`,
+`transport_negotiation.rs`, and `transport_provider.rs`. Host-side citations below
+were re-anchored against `ring_transport.rs` at `e447c927`.
+
+Where the cited construct survives, the citation names `ring_transport.rs` and a
+line re-verified against that commit. Where it does not, the original reference is
+kept and prefixed `former`, so it reads as pre-refactor evidence rather than a
+current location. A `former` line number is never a claim about the tree today.
+Every `provider_recovery.rs` reference is `former` by definition: that module has
+no successor. See the refresh note in [../catalog.md](../catalog.md).
+
 ## Discovery trigger
 
 `docs/mc-host-shm-transport.md:87` states "These are distinct outcomes and
@@ -10,7 +25,7 @@ which branches it can select.
 
 ## Evidence trail
 
-`crates/mc-host/src/shm_provider.rs:137-152` is the only production
+former `crates/mc-host/src/shm_provider.rs:137-152` is the only production
 `RecoveryBackend` implementation:
 
 ```rust
@@ -32,7 +47,7 @@ uncertain: cleanup isolates instead of reclaiming." The `probe` body carries the
 matching rationale: "No shared state outlives the endpoint thread, so isolation
 alone proves the provider side is clean."
 
-The consumer of that outcome is `crates/mc-host/src/provider_recovery.rs`, at the
+The consumer of that outcome is former `crates/mc-host/src/provider_recovery.rs`, at the
 `match outcome` beginning line 482:
 
 - `CleanupOutcome::Reclaimed` (arm at lines 483-490) calls `record.release()` and,
@@ -49,12 +64,12 @@ There are three `impl RecoveryBackend` blocks in all:
 
 | Impl | Location | Nature |
 | --- | --- | --- |
-| `ShmRecoveryBackend` | `shm_provider.rs:137` | production; returns `Uncertain` only |
-| `FakeBackend` | `provider_recovery.rs:684`, inside `#[cfg(test)]` at line 578 | unit-test double, scripted |
+| `ShmRecoveryBackend` | former `shm_provider.rs:137` | production; returns `Uncertain` only |
+| `FakeBackend` | former `provider_recovery.rs:684`, inside `#[cfg(test)]` at line 578 | unit-test double, scripted |
 | `MatrixBackend` | `crates/mc-host/tests/shm_transport.rs:450` | integration-test double |
 
 `CleanupOutcome::Reclaimed` appears as a value at lines 876, 894, 926, 1015,
-1054, and 1103 of `provider_recovery.rs`, all inside the `#[cfg(test)]` module.
+1054, and 1103 of former `provider_recovery.rs`, all inside the `#[cfg(test)]` module.
 `clean_reclamation_returns_charges_once_and_mints_a_new_incarnation` (line 889)
 reaches the branch by pushing `Scripted::Return(CleanupOutcome::Reclaimed)` at
 line 894.
@@ -62,7 +77,7 @@ line 894.
 A second documented branch is unreachable for the same reason.
 `docs:90` names two triggers for provider-wide `Quarantined` readiness: "failed
 probe" and "admission-cap exhaustion". `resolve_readiness`
-(`provider_recovery.rs:524-534`) computes `ready = probe() && admission_fits()`
+(former `provider_recovery.rs:524-534`) computes `ready = probe() && admission_fits()`
 at line 530 under a panic boundary. Since `ShmRecoveryBackend::probe()` returns
 `true` and does not panic, only admission-cap exhaustion can set that readiness
 on the shipped backend.
@@ -96,7 +111,7 @@ A reachability assertion, and it is expected to fail or to be recorded as
 scoped:
 
 1. Assert that some production path reaches
-   `provider_recovery.rs:483-490`. With `ShmRecoveryBackend` as the only
+   former `provider_recovery.rs:483-490`. With `ShmRecoveryBackend` as the only
    production backend, no construction achieves this.
 2. Failing that, the property is discharged by scoping the documentation:
    assert that `docs:89` names the backends for which clean reclamation is
@@ -118,12 +133,12 @@ scoping gap.
 
 ### Q: Is the unconditional `Uncertain` return a gap in the shipped backend, or the intended behaviour of a thread-confined ring endpoint?
 
-- Sources examined: `crates/mc-host/src/shm_provider.rs:121-152`, including the
+- Sources examined: former `crates/mc-host/src/shm_provider.rs:121-152`, including the
   struct doc comment and the `probe` rationale comment;
-  `crates/mc-host/src/provider_recovery.rs:96-103` (`CleanupOutcome`),
-  `:478-496` (the outcome match), `:508-545` (`after_record_resolved` and
+  former `crates/mc-host/src/provider_recovery.rs:96-103` (`CleanupOutcome`),
+  former `:478-496` (the outcome match), former `:508-545` (`after_record_resolved` and
   `resolve_readiness`); repository-wide search for `impl RecoveryBackend` and
-  `CleanupOutcome::Reclaimed`; `provider_recovery.rs:889-901`;
+  `CleanupOutcome::Reclaimed`; former `provider_recovery.rs:889-901`;
   `docs/mc-host-shm-transport.md:85-90`.
 - Findings: the intent is recorded in code, not merely inferable. The struct doc
   comment states that cleanup isolates instead of reclaiming because the rings
@@ -138,8 +153,31 @@ scoping gap.
   provider it documents.
 - Conclusion: resolved with answer. Clean reclamation is unreachable on
   production code and is unreachable by design, per the rationale recorded at
-  `shm_provider.rs:128-130`. The residual defect is one of documentation scope:
+  former `shm_provider.rs:128-130`. The residual defect is one of documentation scope:
   `docs:87` calls the two outcomes "distinct test experiments" without noting
   that only one has a production experiment. A second instance of the same shape
   was found independently — of the two `Quarantined` triggers at `docs:90`, only
   admission-cap exhaustion is reachable, because `probe()` is constant.
+
+## Refresh outcome, 2026-08-30
+
+Status moved to `superseded-by-refactor`. The record asked whether the shipped
+backend could ever reach clean reclamation. The refactor answered it by deleting
+both outcomes. `0f336d3c` removed `ShmRecoveryBackend` and `ed487e11` removed
+`crates/mc-host/src/provider_recovery.rs`, so `RecoveryBackend`, `CleanupOutcome`,
+`ProviderReadiness`, recovery episodes, provider incarnations, and the fake-backend
+test that was this record's only evidence are all gone. None has a successor at
+`e447c927`.
+
+What now owns the obligation: nothing. `crates/mc-host/src/ring_transport.rs:291`
+calls `admission.release()` unconditionally once the endpoint thread's
+`catch_unwind` returns, with no cleanup probe, no reclaim-versus-isolate decision,
+and no proof that stale resources are gone. That is neither of the two documented
+outcomes. It is strictly weaker than the quarantine path the record found to be
+the only reachable one, because charges are now returned as clean capacity even
+after an unclean close.
+
+`docs/mc-host-shm-transport.md:87-90` still presents clean reclamation and
+quarantine as two distinct outcomes with distinct test experiments. As of this
+commit it describes no code at all, which is a larger documentation defect than
+the scoping problem this record originally recorded.

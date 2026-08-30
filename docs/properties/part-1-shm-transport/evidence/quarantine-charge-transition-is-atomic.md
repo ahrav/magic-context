@@ -1,5 +1,20 @@
 # quarantine-charge-transition-is-atomic
 
+## Citation refresh, 2026-08-30
+
+The ring-transport refactor (`0f336d3c`, `d8bde128`, `793a973e`, `ed487e11`)
+renamed `crates/mc-host/src/shm_provider.rs` to
+`crates/mc-host/src/ring_transport.rs` and deleted `provider_recovery.rs`,
+`transport_negotiation.rs`, and `transport_provider.rs`. Host-side citations below
+were re-anchored against `ring_transport.rs` at `e447c927`.
+
+Where the cited construct survives, the citation names `ring_transport.rs` and a
+line re-verified against that commit. Where it does not, the original reference is
+kept and prefixed `former`, so it reads as pre-refactor evidence rather than a
+current location. A `former` line number is never a claim about the tree today.
+Every `provider_recovery.rs` reference is `former` by definition: that module has
+no successor. See the refresh note in [../catalog.md](../catalog.md).
+
 ## Discovery trigger
 
 A fallible-step lens over the accounting transitions: for each function that
@@ -48,19 +63,19 @@ early return between them.
   subtraction `None`. `spans_per_frame` is passed through unchanged, with the
   comment "A maximum, not a sum: release paths recompute it from the
   per-admission span counts in `Accounting`."
-- `crates/mc-host/src/provider_recovery.rs:183-197` is
-  `CandidateCustody::quarantine`. The discard is at `:188`:
+- former `crates/mc-host/src/provider_recovery.rs:183-197` is
+  `CandidateCustody::quarantine`. The discard is at former `:188`:
   `_retained: admission.quarantine().ok()`. **Correction:** the catalog cites
-  `:187`, which is the `*state = CustodyState::Quarantined {` line.
-- `provider_recovery.rs:127-134` declares `CustodyState`, and the comment at
-  `:130-133` states: "The retained record proves the charges stay
+  former `:187`, which is the `*state = CustodyState::Quarantined {` line.
+- former `provider_recovery.rs:127-134` declares `CustodyState`, and the comment at
+  former `:130-133` states: "The retained record proves the charges stay
   host-accounted. `None` only when aggregate accounting itself failed; the phase
   is still terminal and storage is never reused." So the code knowingly tolerates
   the accounting failure. It addresses terminality and storage reuse. It does not
   address where the charges went.
-- `provider_recovery.rs:377-378` and `:544-546` show the intent the failure
+- former `provider_recovery.rs:377-378` and former `:544-546` show the intent the failure
   breaks: both comments say charges "stay visible" when readiness goes
-  `Quarantined`, matching `docs/mc-host-shm-transport.md:90` and `:112`.
+  `Quarantined`, matching `docs/mc-host-shm-transport.md:90` and former `:112`.
 - Existing check: `crates/mc-shm-transport/tests/contract.rs:330`
   `host_admission_retains_quarantined_commitments` asserts the success path only.
 
@@ -71,14 +86,14 @@ early return between them.
    sums `descriptors`, `arena_bytes`, `leases`, and `mappings`, any of those near
    `u64::MAX` suffices.
 2. A suspect resolves as `Uncertain` or `StaleRetry`, or the deadline fires, so
-   the recovery path calls `record.quarantine()` (`provider_recovery.rs:494`,
-   `:552`, `:571`, `:381`, or `:390`).
+   the recovery path calls `record.quarantine()` (former `provider_recovery.rs:494`,
+   former `:552`, former `:571`, former `:381`, or former `:390`).
 3. `CandidateCustody::quarantine` replaces the state with `Quarantined` at
-   `:185` and calls `admission.quarantine()` at `:188`.
+   former `:185` and calls `admission.quarantine()` at former `:188`.
 4. Inside, `active` is reduced at `profile.rs:497-500` and the span census is
    updated at `:501`. The add at `:506-509` fails and returns
    `Err(ChargeOverflow)`.
-5. `.ok()` at `provider_recovery.rs:188` discards it. `_retained` becomes `None`
+5. `.ok()` at former `provider_recovery.rs:188` discards it. `_retained` becomes `None`
    and the phase stays `Quarantined`, so the record is terminal.
 6. The `Admission` drops with `state == Active`, so `Drop` calls `release` again
    (`profile.rs:553`). If other admissions still hold at least `charges` in every
@@ -153,3 +168,23 @@ implicit.
   the observability angle.
 - Conclusion: resolved as an observation. It does not change this property's
   check, and it is recorded so the shared cause is not rediscovered.
+
+## Refresh outcome, 2026-08-30
+
+`Reaches production:` moved from `yes` to `no`; `Status:` stays `active`. The
+ordering defect this record is about is untouched: `AdmissionController::quarantine`
+still decrements `active` before the fallible `checked_add` on `quarantined`, with
+an early return between them. Only its driver is gone. The host caller that
+discarded the error, `admission.quarantine().ok()` at the former
+`crates/mc-host/src/provider_recovery.rs:188`, was deleted by `ed487e11`.
+
+Verified at `e447c927`: `Admission::quarantine` has no non-test caller anywhere in
+the tree. A search for `.quarantine()` across `crates/` and `packages/` returns
+exactly two call sites, `crates/mc-shm-transport/tests/contract.rs:368` and
+`:479`. The `quarantine` identifiers remaining in `crates/mc-host` are unrelated:
+`LeaseTracker`'s lease quarantine in `frame_channel.rs:417-433`, and the
+lifecycle-record and manifest quarantines in `lifecycle.rs` and `generation.rs`.
+
+This is a reachability change rather than a supersession because the guarded code
+survives and is still defective. A future host path that quarantines charges
+re-exposes it with no further change.

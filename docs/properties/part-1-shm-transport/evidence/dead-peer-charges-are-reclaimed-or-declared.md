@@ -1,5 +1,20 @@
 # dead-peer-charges-are-reclaimed-or-declared
 
+## Citation refresh, 2026-08-30
+
+The ring-transport refactor (`0f336d3c`, `d8bde128`, `793a973e`, `ed487e11`)
+renamed `crates/mc-host/src/shm_provider.rs` to
+`crates/mc-host/src/ring_transport.rs` and deleted `provider_recovery.rs`,
+`transport_negotiation.rs`, and `transport_provider.rs`. Host-side citations below
+were re-anchored against `ring_transport.rs` at `e447c927`.
+
+Where the cited construct survives, the citation names `ring_transport.rs` and a
+line re-verified against that commit. Where it does not, the original reference is
+kept and prefixed `former`, so it reads as pre-refactor evidence rather than a
+current location. A `former` line number is never a claim about the tree today.
+Every `provider_recovery.rs` reference is `former` by definition: that module has
+no successor. See the refresh note in [../catalog.md](../catalog.md).
+
 ## Discovery trigger
 
 `docs/mc-host-shm-transport.md:57` states the accounting claim without
@@ -12,18 +27,18 @@ test rather than a paragraph.
 
 ## Evidence trail
 
-- `crates/mc-host/src/shm_provider.rs:351-363` — the owner thread runs
+- former `crates/mc-host/src/shm_provider.rs:351-363` — the owner thread runs
   `run_endpoint` inside `catch_unwind` and reduces the whole endpoint lifetime to
   one boolean: `.unwrap_or(false)`.
-- `crates/mc-host/src/shm_provider.rs:364-371` — the only two dispositions.
-  `clean` plus no forced hook calls `custody.release()` (`:365`); anything else
-  calls `recovery.report_suspect(custody)` (`:370`). There is no third branch
+- former `crates/mc-host/src/shm_provider.rs:364-371` — the only two dispositions.
+  `clean` plus no forced hook calls `custody.release()` (former `:365`); anything else
+  calls `recovery.report_suspect(custody)` (former `:370`). There is no third branch
   for "the peer is gone".
-- `crates/mc-host/src/shm_provider.rs:475-503` — the endpoint loop. A dead peer
+- former `crates/mc-host/src/shm_provider.rs:475-503` — the endpoint loop. A dead peer
   makes `receive_one` return `Ok(false)`, which falls into `Ok(false) => {}`
-  (`:477`) and loops again. Only an `Err(close)` reaches the classification at
-  `:498`.
-- `crates/mc-host/src/shm_provider.rs:555-560` — `receive_one` calls
+  (former `:477`) and loops again. Only an `Err(close)` reaches the classification at
+  former `:498`.
+- `crates/mc-host/src/ring_transport.rs:464-470` — `receive_one` calls
   `rings.second.try_receive()` and returns `Ok(false)` on `None`.
 - `crates/mc-shm-transport/src/backend/ring.rs:781-783` — `try_receive` returns
   `Ok(None)` when `consumed == published`. A dead producer publishes nothing, so
@@ -31,7 +46,7 @@ test rather than a paragraph.
 - `crates/mc-host/src/config.rs:282` and `:296` — `pub liveness:
   Option<LivenessPolicy>` defaults to `None`, so by default nothing on the host
   side ever writes to the ring on a timer.
-- `crates/mc-host/src/shm_provider.rs:538-541` — the other reachable outcome. If
+- `crates/mc-host/src/ring_transport.rs:447-450` — the other reachable outcome. If
   something does queue an outbound frame, `publish_one` failure returns `false`,
   which is an unclean close and quarantines instead of retaining.
 - `crates/mc-host/tests/shm_failure_modes.rs:150-187` —
@@ -48,7 +63,7 @@ test rather than a paragraph.
 
 A peer commits a candidate, holds it idle, and is killed. Its exact admission
 charges stay in `active` for the daemon's remaining lifetime. With
-`single_candidate_limits` (`shm_provider.rs:103-113`), the descriptor, arena,
+`single_candidate_limits` (former `shm_provider.rs:103-113`), the descriptor, arena,
 lease, and mapping caps equal one candidate's charges, so the next admit is
 refused and shared-memory eligibility ends for the process. Readiness still
 reports `Ready`, so no operator signal distinguishes this from an idle healthy
@@ -62,7 +77,7 @@ epoch, heartbeat, or peer pid that a reaper could read
 (`ring.rs:117-128`). The outcome is configuration-dependent, not
 fault-dependent: the same kill retains charges under the default
 `liveness = None`, and quarantines them under a configured policy once the ring
-fills and `publish_one` fails at `shm_provider.rs:538-541`. Depends on
+fills and `publish_one` fails at `ring_transport.rs:447-450`. Depends on
 `custody-terminal-transition-exactly-once` for release being correct at all, and
 shares its root cause with `attach-reconciles-or-refuses-stale-shared-cursors`
 and `crashed-producer-does-not-wedge-the-sequence`.
@@ -87,7 +102,7 @@ outcomes for the same fault.
 - Sources examined: `crates/mc-host/src/config.rs:234-296` and `:370-381` for
   the policy shape and its default; `crates/mc-host/src/connection.rs:291-301`
   for where a liveness loop is spawned per generation;
-  `crates/mc-host/src/shm_provider.rs:475-503` and `:538-541` for both close
+  former `crates/mc-host/src/shm_provider.rs:475-503` and former `:538-541` for both close
   classifications; `docs/mc-host-shm-transport.md:96-112` for the documented
   failure and close contract; `bd show magic-context-ymc.12`.
 - Findings: both outcomes are reachable and neither is written down. The

@@ -1,5 +1,20 @@
 # header-rejection-effect-does-not-depend-on-the-catching-layer
 
+## Citation refresh, 2026-08-30
+
+The ring-transport refactor (`0f336d3c`, `d8bde128`, `793a973e`, `ed487e11`)
+renamed `crates/mc-host/src/shm_provider.rs` to
+`crates/mc-host/src/ring_transport.rs` and deleted `provider_recovery.rs`,
+`transport_negotiation.rs`, and `transport_provider.rs`. Host-side citations below
+were re-anchored against `ring_transport.rs` at `e447c927`.
+
+Where the cited construct survives, the citation names `ring_transport.rs` and a
+line re-verified against that commit. Where it does not, the original reference is
+kept and prefixed `former`, so it reads as pre-refactor evidence rather than a
+current location. A `former` line number is never a claim about the tree today.
+Every `provider_recovery.rs` reference is `former` by definition: that module has
+no successor. See the refresh note in [../catalog.md](../catalog.md).
+
 ## Discovery trigger
 
 `ver` is the one header field both layers check: `wire_header[4] != 2` in the
@@ -22,10 +37,10 @@ calls `self.enter_quarantine()` and returns `RingError::Descriptor`.
 `consumed` is never advanced — the advance is at `:825`, past the error — so the
 slot stays `RECEIVER_HELD` and every later `try_receive` on that lane fails its
 CAS. The host maps this to `ReadClose::Corrupt("shared-memory receive failed")`
-(`shm_provider.rs:558`), a reason shared with every other `RingError`.
+(former `shm_provider.rs:558`), a reason shared with every other `RingError`.
 
 **Host-caught.** `decode_header` failure gives
-`ReadClose::Corrupt("invalid shared-memory header")` (`shm_provider.rs:562-563`)
+`ReadClose::Corrupt("invalid shared-memory header")` (`ring_transport.rs:471-472`)
 and `validate_inbound_header` failure gives one of `"body over interoperability
 cap"`, `"invalid pure-header flags"`, or `"role-invalid frame type"`
 (`frame_channel.rs:59-74`). Both propagate with `?`, which drops the local
@@ -35,15 +50,15 @@ has already advanced at `ring.rs:825`, and the ring's `quarantined` byte is neve
 touched.
 
 **Where they rejoin.** The endpoint loop computes `clean = matches!(close,
-ReadClose::Cancelled | ReadClose::Overloaded)` (`shm_provider.rs:498`), so every
+ReadClose::Cancelled | ReadClose::Overloaded)` (former `shm_provider.rs:498`), so every
 `Corrupt` variant is unclean regardless of origin. It sends `Err(close)` on
-`inbound` (`:499`), cancels, and returns `false` (`:500-502`). The spawning
-thread then takes the suspect branch (`:364-371`,
+`inbound` (former `:499`), cancels, and returns `false` (former `:500-502`). The spawning
+thread then takes the suspect branch (former `:364-371`,
 `recovery.report_suspect(custody)`). The recovery controller calls
-`backend.cleanup` (`provider_recovery.rs:450-458`), which for this provider
-returns `CleanupOutcome::Uncertain` for every input (`shm_provider.rs:138-141`),
+`backend.cleanup` (former `provider_recovery.rs:450-458`), which for this provider
+returns `CleanupOutcome::Uncertain` for every input (former `shm_provider.rs:138-141`),
 and `Uncertain` isolates the record with its exact charges
-(`provider_recovery.rs:493-495`). So the admission outcome is identical for both
+(former `provider_recovery.rs:493-495`). So the admission outcome is identical for both
 origins.
 
 **Where the reason dies.** `connection.rs:411-414` matches `ReadClose::CleanEof`,
@@ -52,7 +67,7 @@ The `&'static str` is bound to `_`. `ReadClose` itself carries
 `#[allow(dead_code)]` (`frame_channel.rs:31-33`), consistent with payloads that
 no consumer reads. The four reason strings, plus the clean-EOF case, are one
 observation at the connection engine; the corrupt-versus-clean distinction
-survives only through the separate boolean at `shm_provider.rs:498`.
+survives only through the separate boolean at former `shm_provider.rs:498`.
 
 ## Failure scenario
 
@@ -121,13 +136,13 @@ and states the gap rather than proving it closed.
 ### Q: Do the two origins really diverge, or does the host path also quarantine the ring indirectly?
 
 - Sources examined: `backend/ring.rs:760-844` for both exits;
-  `lease.rs:198-221`; `shm_provider.rs:473-505`, `:546-619`, `:138-152`,
-  `:364-371`; `provider_recovery.rs:450-500`; `connection.rs:392-415`.
+  `lease.rs:198-221`; former `shm_provider.rs:473-505`, former `:546-619`, former `:138-152`,
+  former `:364-371`; former `provider_recovery.rs:450-500`; `connection.rs:392-415`.
 - Findings: they diverge. `enter_quarantine` is called from exactly one place
   inside `try_receive`, the descriptor-validation arm at `ring.rs:807`. No host
   code path reaches it — the host never calls a quarantine method on the ring, it
   only stops reading and lets the mapping drop. The admission-side quarantine at
-  `provider_recovery.rs:494` is a different mechanism on a different object: it
+  former `provider_recovery.rs:494` is a different mechanism on a different object: it
   isolates the custody record's charges, not the ring.
 - Missing evidence: whether the peer-visible difference is intentional. The
   documented close ordering (`docs/mc-host-shm-transport.md:63`) says unknown

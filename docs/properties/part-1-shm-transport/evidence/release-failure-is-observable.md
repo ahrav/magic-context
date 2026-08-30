@@ -1,5 +1,20 @@
 # release-failure-is-observable
 
+## Citation refresh, 2026-08-30
+
+The ring-transport refactor (`0f336d3c`, `d8bde128`, `793a973e`, `ed487e11`)
+renamed `crates/mc-host/src/shm_provider.rs` to
+`crates/mc-host/src/ring_transport.rs` and deleted `provider_recovery.rs`,
+`transport_negotiation.rs`, and `transport_provider.rs`. Host-side citations below
+were re-anchored against `ring_transport.rs` at `e447c927`.
+
+Where the cited construct survives, the citation names `ring_transport.rs` and a
+line re-verified against that commit. Where it does not, the original reference is
+kept and prefixed `former`, so it reads as pre-refactor evidence rather than a
+current location. A `former` line number is never a claim about the tree today.
+Every `provider_recovery.rs` reference is `former` by definition: that module has
+no successor. See the refresh note in [../catalog.md](../catalog.md).
+
 ## Discovery trigger
 
 Two `let _ =` sites on completion paths. `ReceiveLease::Drop` discards whatever
@@ -25,18 +40,18 @@ anything else.
   (`ring.rs:849`), `WrongIncarnation` (`:852`), `WrongLane` (`:855`),
   `InvalidSequence` (`:859`, `:867`, `:881`, `:897`), `DuplicateRelease` (`:895`) —
   is silently dropped here.
-- `crates/mc-host/src/shm_provider.rs:363-371` — the clean-close branch:
+- former `crates/mc-host/src/shm_provider.rs:363-371` — the clean-close branch:
   `if clean && !quarantine_next_close.swap(false, Ordering::AcqRel) { let _ = custody.release(); } else { recovery.report_suspect(custody); }`. The suspect path
   is the `else`, so on a clean close no recovery record is created regardless of what
   `release()` reported.
-- **Correction to the catalog record.** The catalog describes `:365` as discarding "a
+- **Correction to the catalog record.** The catalog describes former `:365` as discarding "a
   clean-path charge-release failure" whose reachability "depends on `AdmissionError`".
   Verified against the code, that is the wrong mechanism. `custody` is a
-  `CandidateCustody` (`crates/mc-host/src/provider_recovery.rs:141`) and
-  `CandidateCustody::release(&self) -> bool` (`:167-179`) returns a **`bool`**, not a
+  `CandidateCustody` (former `crates/mc-host/src/provider_recovery.rs:141`) and
+  `CandidateCustody::release(&self) -> bool` (former `:167-179`) returns a **`bool`**, not a
   `Result`: `true` when the record was `Active` and the charges were returned,
   `false` when the state was already `Released` or `Quarantined`, in which case the
-  previous state is restored and aggregate counters are untouched (`:174-177`).
+  previous state is restored and aggregate counters are untouched (former `:174-177`).
   `AdmissionError` does not appear on this path at all — it is produced by
   `quarantine`, not `release` (`crates/mc-shm-transport/src/profile.rs:492`,
   `:537-538`). So the discarded signal is real, but it is "this record was not in a
@@ -49,7 +64,7 @@ anything else.
   `else`, so a charge set larger than `active` leaves the counters unchanged with no
   report. Both are relevant to `charge-release-never-silently-strands` as well.
 - **Where release failure *is* observable.** The host's explicit receive-path
-  releases propagate: `shm_provider.rs:566-568` and `:607-609` both use
+  releases propagate: `ring_transport.rs:475-477` and `:522-524` both use
   `lease.release().map_err(|_| ReadClose::Corrupt("shared-memory completion failed"))?`,
   and `ReadClose::Corrupt` is classified unclean at `:498`, which routes to
   `report_suspect`. On the TypeScript surface the addon path also reports: a failed
@@ -66,11 +81,11 @@ anything else.
 
 The drop path is reachable in the shipped host topology without any injected fault:
 
-1. `receive_one` acquires a lease at `shm_provider.rs:555-557`. The lease is alive
+1. `receive_one` acquires a lease at `ring_transport.rs:464-466`. The lease is alive
    and the slot is `RECEIVER_LEASED`.
-2. The ingress budget is saturated, so control enters the wait loop at `:579-603`.
+2. The ingress budget is saturated, so control enters the wait loop at `:488-518`.
 3. Either `read_cancel.is_cancelled()` is true and the function returns
-   `Err(ReadClose::Cancelled)` (`:583-585`), or the frame deadline elapses and it
+   `Err(ReadClose::Cancelled)` (`:492-494`), or the frame deadline elapses and it
    returns `Err(ReadClose::Overloaded)` (`:586-591`). In both cases `lease` is still
    in scope and is dropped on the way out.
 4. `Drop` calls `release_once`, which calls `Ring::release`. If the ring was
@@ -91,8 +106,8 @@ The drop path is reachable in the shipped host topology without any injected fau
 ## Timing windows and dependencies
 
 The drop-path window is the interval between `try_receive` returning a lease and the
-explicit `lease.release()` at `shm_provider.rs:607-609`. In the shipped host that
-interval contains the whole ingress-budget wait loop (`:579-603`), so it is not
+explicit `lease.release()` at `ring_transport.rs:522-524`. In the shipped host that
+interval contains the whole ingress-budget wait loop (`:488-518`), so it is not
 narrow — it is as long as ingress is saturated, bounded by `frame_deadline`. The
 custody-bool window is a single call at close. Configuration dependencies: none for
 the drop path itself, but the *reachability* of step 2 depends on ingress budget
@@ -128,8 +143,8 @@ this the cheapest of the group to make non-vacuous.
   (`poll`, with `std::mem::forget(lease)` at `:878`);
   `packages/mc-shm-native/index.ts:366-379`;
   `packages/plugin/src/shared/mc-host-client/shm-frame-channel.ts:184-205` and
-  `:295-343`; `crates/mc-host/src/shm_provider.rs:363-371`, `:546-619`;
-  `crates/mc-host/src/provider_recovery.rs:137-179`;
+  `:295-343`; former `crates/mc-host/src/shm_provider.rs:363-371`, former `:546-619`;
+  former `crates/mc-host/src/provider_recovery.rs:137-179`;
   `crates/mc-shm-transport/src/profile.rs:482-490`, `:528-541`.
 - Findings: the addon genuinely does not use the drop path — `poll` forgets the
   lease at `lib.rs:878` and completes through its own `active` table at `:303-307`,
@@ -152,3 +167,26 @@ this the cheapest of the group to make non-vacuous.
   needs human input, because the fix shape differs: returning the error is
   impossible in `Drop`, but emitting a counter is not, and choosing between them is
   a design decision rather than something the code reveals.
+
+## Refresh outcome, 2026-08-30
+
+`Reaches production:` moved from `yes` to `no`; `Status:` stays `active`. This
+record had two discard sites and the refactor removed one of them.
+
+The transport-side site is unchanged and verified at `e447c927`:
+`ReceiveLease::Drop` calls `release_once()` and discards the result
+(`crates/mc-shm-transport/src/lease.rs:215-221`).
+
+The host-side site is gone. `let _ = custody.release()` at the former
+`crates/mc-host/src/shm_provider.rs:365` is now `admission.release()` at
+`crates/mc-host/src/ring_transport.rs:291`, and `Admission::release`
+(`crates/mc-shm-transport/src/profile.rs:562`) takes `self` and returns `()`.
+There is therefore no host-side result to discard and no clean-path host release
+failure to observe. The silent-no-op risk inside `AdmissionController::release`
+did not disappear; it is now wholly owned by
+`charge-release-never-silently-strands`, which cites the transport crate directly.
+The `recovery.report_suspect(custody)` branch named as the existing check was
+deleted with `provider_recovery.rs`, so the record's existing check is now none.
+
+Reachability moved to `no` because the surviving discard is on the transport-side
+lease drop path, and no shipped configuration selects the shared-memory transport.

@@ -1,9 +1,24 @@
 # neither-direction-starves-the-other
 
+## Citation refresh, 2026-08-30
+
+The ring-transport refactor (`0f336d3c`, `d8bde128`, `793a973e`, `ed487e11`)
+renamed `crates/mc-host/src/shm_provider.rs` to
+`crates/mc-host/src/ring_transport.rs` and deleted `provider_recovery.rs`,
+`transport_negotiation.rs`, and `transport_provider.rs`. Host-side citations below
+were re-anchored against `ring_transport.rs` at `e447c927`.
+
+Where the cited construct survives, the citation names `ring_transport.rs` and a
+line re-verified against that commit. Where it does not, the original reference is
+kept and prefixed `former`, so it reads as pre-refactor evidence rather than a
+current location. A `former` line number is never a claim about the tree today.
+Every `provider_recovery.rs` reference is `former` by definition: that module has
+no successor. See the refresh note in [../catalog.md](../catalog.md).
+
 ## Discovery trigger
 
 The host drives both directions of a duplex ring pair from one task on one thread. The
-code says so, and it says why: a comment at `shm_provider.rs:508-512` claims
+code says so, and it says why: a comment at `ring_transport.rs:410-414` claims
 "directions alternate under sustained inbound traffic ... so a peer that refills the
 inbound ring as slots release cannot starve responses, Pings, and close frames while
 host-to-peer capacity is free". That is a liveness claim about a single-threaded loop,
@@ -13,7 +28,7 @@ at once.
 
 ## Evidence trail
 
-- `crates/mc-host/src/shm_provider.rs:319-324` — the endpoint runs on a dedicated OS
+- `crates/mc-host/src/ring_transport.rs:254-259` — the endpoint runs on a dedicated OS
   thread named `mc-host-shm-endpoint` carrying a `new_current_thread` Tokio runtime.
   `:351-361` runs `run_endpoint` under `block_on` inside `catch_unwind`. One task, one
   thread, both directions.
@@ -25,7 +40,7 @@ at once.
   always followed by an outbound attempt.
 - `:520-534` — when nothing was received, a `biased` `select!` waits on discard,
   finish, root, `queue.recv()`, and a `POLL_INTERVAL` sleep. `POLL_INTERVAL` is 50
-  microseconds (`:55`).
+  microseconds (`:33`).
 - **First starvation path, outbound blocks inbound.** `publish_one` at `:538` is a
   synchronous function. It calls `publish_direct` (`:665-678`) or `publish_owned`
   (`:680-691`), both of which call `Ring::reserve_until` (`:669`, `:685`) with a
@@ -62,7 +77,7 @@ at once.
   (`crates/mc-host/tests/shm_transport.rs:189-271`) each `peer.send` is immediately
   followed by `peer.recv(BUDGET)`, five times. `TestShmPeer` itself only offers the
   lockstep shape: `send` reserves, writes, and commits in one call
-  (`shm_provider.rs:747-759`) and `recv` polls to a deadline (`:762-776`). The transport
+  (`ring_transport.rs:659-673`) and `recv` polls to a deadline (`:762-776`). The transport
   test `two_process_zero_copy_exchange_uses_authenticated_grant`
   (`crates/mc-shm-transport/tests/ring.rs:565-602`) uses a single ring in a single
   direction.
@@ -124,8 +139,8 @@ emit: `shm_both_directions_in_flight`.
 
 ### Q: Can a single-threaded endpoint loop starve one direction, and if so which one?
 
-- Sources examined: `crates/mc-host/src/shm_provider.rs:55`, `:75-100`, `:287-397`,
-  `:459-544`, `:546-619`, `:621-663`, `:665-691`, `:711-777`;
+- Sources examined: `crates/mc-host/src/ring_transport.rs:33`, `:75-100`, `:287-397`,
+  `:459-544`, `:455-534`, `:536-578`, `:665-691`, `:711-777`;
   `crates/mc-host/src/frame_channel.rs:770-826`, `:838-880`;
   `crates/mc-shm-transport/src/backend/ring.rs:736-757`, `:764-844`;
   `crates/mc-host/tests/shm_transport.rs:189-271`.

@@ -1,11 +1,26 @@
 # ingress-charge-matches-the-bytes-copied-from-shared-storage
 
+## Citation refresh, 2026-08-30
+
+The ring-transport refactor (`0f336d3c`, `d8bde128`, `793a973e`, `ed487e11`)
+renamed `crates/mc-host/src/shm_provider.rs` to
+`crates/mc-host/src/ring_transport.rs` and deleted `provider_recovery.rs`,
+`transport_negotiation.rs`, and `transport_provider.rs`. Host-side citations below
+were re-anchored against `ring_transport.rs` at `e447c927`.
+
+Where the cited construct survives, the citation names `ring_transport.rs` and a
+line re-verified against that commit. Where it does not, the original reference is
+kept and prefixed `former`, so it reads as pre-refactor evidence rather than a
+current location. A `former` line number is never a claim about the tree today.
+Every `provider_recovery.rs` reference is `former` by definition: that module has
+no successor. See the refresh note in [../catalog.md](../catalog.md).
+
 ## Discovery trigger
 
 `receive_one` charges the ingress budget from the header
-(`crates/mc-host/src/shm_provider.rs:580`, `ingress.try_charge(header.len as
+(`crates/mc-host/src/ring_transport.rs:489`, `ingress.try_charge(header.len as
 usize)`) and then copies the body from the descriptor
-(`:604`, `lease.to_vec()`). Those are two different numbers from two different
+(`:520`, `lease.to_vec()`). Those are two different numbers from two different
 places: `header.len` is bytes 0..4 of the peer-authored wire header, and
 `to_vec` allocates and fills `self.body_len`
 (`crates/mc-shm-transport/src/lease.rs:178-196`), which came from the
@@ -19,7 +34,7 @@ The only place the two are tied together is `FrameDescriptor::validate`
 compared with `body_len`, and disagreement returns
 `DescriptorError::WireHeaderMismatch`. `Ring::try_receive` calls that validation
 at `backend/ring.rs:804` and refuses to produce a lease otherwise (`:806-809`).
-So by the time `shm_provider.rs:562` decodes the header, `header.len ==
+So by the time `ring_transport.rs:471` decodes the header, `header.len ==
 body_len` is already true — proved in `mc-shm-transport`, consumed in `mc-host`,
 with no assertion, comment, or type linking the two.
 
@@ -33,7 +48,7 @@ The producer path cannot create a divergence: `commit_reservation` applies the
 same equality to the header it is about to publish
 (`backend/ring.rs:1172-1180`), and `set_wire_header` (`:1326-1333`) only replaces
 the bytes that `commit_reservation` then re-checks. `TestShmPeer::send`
-(`shm_provider.rs:747-759`) goes through exactly that path. The divergence is
+(`ring_transport.rs:659-673`) goes through exactly that path. The divergence is
 reachable only by a peer writing the shared descriptor page directly, which the
 mapping permits: both `Mapping::create` and `Mapping::attach` map
 `PROT_READ|PROT_WRITE` (`backend/ring.rs:229`, `:258`) and the required seals are
@@ -56,7 +71,7 @@ gate, the host would charge 64 MiB of ingress budget and copy 64 bytes. The
 balances — the damage is that a peer sets the host's admission accounting from a
 field with no relation to the bytes it moved. Sustained, that is a
 budget-exhaustion primitive costing the attacker almost nothing: the ingress wait
-loop (`shm_provider.rs:579-603`) is what other receives block on, and the
+loop (`ring_transport.rs:488-518`) is what other receives block on, and the
 `Overloaded` close it produces (`:590`) is classified clean (`:498`), so the
 pressure looks like honest backpressure rather than an attack. The mirror-image
 relaxation is equally available: declaring a small length and describing a large
@@ -92,7 +107,7 @@ equality is currently exercised negatively.
 
 ### Q: Does anything downstream of the charge re-derive `header.len` from the body, so that a divergence would still be caught?
 
-- Sources examined: `shm_provider.rs:604-618`, `frame_channel.rs:478-490` for
+- Sources examined: `ring_transport.rs:519-532`, `frame_channel.rs:478-490` for
   `InboundFrame::owned`, `lease.rs:178-196` for `to_vec`, and the `segmented`
   constructor at `frame_channel.rs:493-501`.
 - Findings: no. `to_vec` checks its own internal consistency — the spans must sum

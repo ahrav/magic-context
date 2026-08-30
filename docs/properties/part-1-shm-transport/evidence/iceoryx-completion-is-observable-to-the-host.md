@@ -1,5 +1,20 @@
 # iceoryx-completion-is-observable-to-the-host
 
+## Citation refresh, 2026-08-30
+
+The ring-transport refactor (`0f336d3c`, `d8bde128`, `793a973e`, `ed487e11`)
+renamed `crates/mc-host/src/shm_provider.rs` to
+`crates/mc-host/src/ring_transport.rs` and deleted `provider_recovery.rs`,
+`transport_negotiation.rs`, and `transport_provider.rs`. Host-side citations below
+were re-anchored against `ring_transport.rs` at `e447c927`.
+
+Where the cited construct survives, the citation names `ring_transport.rs` and a
+line re-verified against that commit. Where it does not, the original reference is
+kept and prefixed `former`, so it reads as pre-refactor evidence rather than a
+current location. A `former` line number is never a claim about the tree today.
+Every `provider_recovery.rs` reference is `former` by definition: that module has
+no successor. See the refresh note in [../catalog.md](../catalog.md).
+
 ## Discovery trigger
 
 An earlier pass characterized the iceoryx lease's `release` as a no-op. It is
@@ -38,7 +53,7 @@ property to catalog, because the ring's release does all four.
   `try_reserve`, `try_receive`, and the associated `stale_node_observed`
   (`:178-189`), and nothing else. A caller cannot ask it how many samples are
   outstanding, how many bytes are charged, or whether it is healthy.
-- `crates/mc-host/src/provider_recovery.rs:530` — readiness is decided by
+- former `crates/mc-host/src/provider_recovery.rs:530` — readiness is decided by
   `shared.backend.probe() && shared.backend.admission_fits()`. There is no
   iceoryx path into that predicate, because there is no iceoryx `probe`.
 - `backend/iceoryx.rs:178-189` `stale_node_observed` is the only observation the
@@ -100,7 +115,7 @@ the bench report that every arm marked `selectable` produced its counters from a
 observation on its own path — the negative control is to add a body copy inside
 `run_iceoryx` and require `body_copies` to rise; today it stays zero. Second,
 assert the iceoryx backend exposes a readiness and conservation observation with
-the same shape the recovery predicate at `provider_recovery.rs:530` consumes, or
+the same shape the recovery predicate at former `provider_recovery.rs:530` consumes, or
 assert the arm is not selectable without one. Third, for the completion half:
 take `max_leases` leases, drop half by scope exit and release the rest
 explicitly, and assert the two disposals are equivalent *and* that some
@@ -116,7 +131,7 @@ emit: `shm_iceoryx_lease_abandoned_without_release`.
   searched for `impl Drop`, `conservation`, `probe`, and `quarantine`, all
   absent; `backend/ring.rs:847-909`, `:912-1003`;
   `crates/mc-shm-transport/src/lease.rs:198-221`;
-  `crates/mc-host/src/provider_recovery.rs:530`;
+  former `crates/mc-host/src/provider_recovery.rs:530`;
   `benches/hardware_envelope.rs:141`, `:177`, `:186-260`, `:531-598`;
   `benches/manifests/v1.json:100-155`; and
   `iceoryx2-0.9.3/src/sample.rs:105-113`.

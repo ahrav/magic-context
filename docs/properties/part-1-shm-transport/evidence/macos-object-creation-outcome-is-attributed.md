@@ -1,5 +1,20 @@
 # macos-object-creation-outcome-is-attributed
 
+## Citation refresh, 2026-08-30
+
+The ring-transport refactor (`0f336d3c`, `d8bde128`, `793a973e`, `ed487e11`)
+renamed `crates/mc-host/src/shm_provider.rs` to
+`crates/mc-host/src/ring_transport.rs` and deleted `provider_recovery.rs`,
+`transport_negotiation.rs`, and `transport_provider.rs`. Host-side citations below
+were re-anchored against `ring_transport.rs` at `e447c927`.
+
+Where the cited construct survives, the citation names `ring_transport.rs` and a
+line re-verified against that commit. Where it does not, the original reference is
+kept and prefixed `former`, so it reads as pre-refactor evidence rather than a
+current location. A `former` line number is never a claim about the tree today.
+Every `provider_recovery.rs` reference is `former` by definition: that module has
+no successor. See the refresh note in [../catalog.md](../catalog.md).
+
 ## Discovery trigger
 
 `docs/mc-host-shm-transport.md:121` states that on macOS "hosted `Ring::create`
@@ -39,9 +54,9 @@ work on `#[cfg(target_os = "linux")]` (`:252`, `:259`, `:267`, `:287`). So no
 macOS job reaches `Ring::create`.
 
 The provider does not reach it either: `ShmProvider::preflight`
-(`crates/mc-host/src/shm_provider.rs:276-278`) and `prepare` (`:288-290`) both
+(former `crates/mc-host/src/shm_provider.rs:276-278`) and `prepare` (former `:288-290`) both
 return early on `!cfg!(target_os = "linux")`, and
-`platform_preflight_is_side_effect_free` (`:827-848`) asserts
+`platform_preflight_is_side_effect_free` (former `:827-848`) asserts
 `StaticallyOmitted` on non-Linux. The omission is a compile-time decision, so the
 documented runtime error is never observed by any check.
 
@@ -87,7 +102,7 @@ way to reach any of this; today that file is not in the macOS command.
   `docs/evidence/mc-shm-traceability-v1.json:48`, `:157`, `:195`;
   `.github/workflows/ci.yml:126-177`; `tests/contract.rs` and
   `tests/fuzz_corpus.rs` import lists; `crates/mc-host/tests/shm_soak.rs` cfg
-  gates; `crates/mc-host/src/shm_provider.rs:275-290`, `:827-848`; the diff of
+  gates; former `crates/mc-host/src/shm_provider.rs:275-290`, former `:827-848`; the diff of
   `a5568707` restricted to this function.
 - Findings: the error is raised inside `create_macos_shm`, since
   `validate_object` uses `ObjectValidationFailed`. The name is 40 characters,
@@ -98,7 +113,7 @@ way to reach any of this; today that file is not in the macOS command.
   this repository. XNU's `PSHMNAMLEN` is 31 bytes including the terminator in the
   sources I can recall, which a 41-byte name would exceed, but I did not verify
   that constant against a Darwin header or a live `shm_open`, and I am not
-  stating it as fact. Whether Darwin's `shm_open` accepts `O_CLOEXEC` (`:1769`)
+  stating it as fact. Whether Darwin's `shm_open` accepts `O_CLOEXEC` (former `:1769`)
   is a second unverified candidate, and whether `ftruncate` on an unlinked shm
   object is permitted on Darwin is a third.
 - Conclusion: unresolved. The failing step is not determined. The name-length

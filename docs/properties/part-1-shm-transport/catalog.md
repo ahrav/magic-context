@@ -1,11 +1,76 @@
 # Part 1 property catalog: shared-memory transport
 
 Scope: `crates/mc-shm-transport`, `packages/mc-shm-native`. Boundary context
-from `crates/mc-host/src/{shm_provider,transport_negotiation,transport_provider,provider_recovery}.rs`
-is used where a transport property is only observable through the host.
+from `crates/mc-host/src/ring_transport.rs` is used where a transport property is
+only observable through the host. The original scope line named
+`crates/mc-host/src/{shm_provider,transport_negotiation,transport_provider,provider_recovery}.rs`;
+`shm_provider.rs` was renamed to `ring_transport.rs` and the other three were
+deleted.
 
 Provenance and the external-reference list are in [../README.md](../README.md).
 System `/local/home/ahrav/scratch/magic-context` at `9c1eb4d1`, 2026-08-29.
+
+## Citation refresh pass, 2026-08-30
+
+A targeted refresh re-anchored this catalog's host-side citations after the
+ring-transport refactor landed in `0f336d3c`, `d8bde128`, `793a973e`, and
+`ed487e11`. Those commits renamed `crates/mc-host/src/shm_provider.rs` to
+`crates/mc-host/src/ring_transport.rs` and deleted `provider_recovery.rs`,
+`transport_negotiation.rs`, and `transport_provider.rs` outright. Host-side line
+numbers were re-derived against `ring_transport.rs` at `e447c927`; no stale line
+number was carried across.
+
+Blast radius, verified by scanning for every reference to the four filenames in
+both their fully-qualified and bare forms: **16 of 58 records** carry **24
+path-bearing citations** to a removed or renamed file, plus at least 9 bare
+`` `:NNN` `` continuation references inside those same records. The earlier
+estimate of 7 records and 9 citations counted only the fully-qualified
+`crates/mc-host/src/` form and missed every bare-filename citation.
+
+Disposition of the 16 records:
+
+- **12 re-pathed.** The cited construct survives inside `ring_transport.rs`, or
+  the clause naming a deleted comparator was withdrawn, and every citation now
+  names the current file and a re-verified line.
+- **2 superseded.** `custody-terminal-transition-exactly-once` and
+  `clean-reclamation-is-reachable` cite mechanisms with no successor anywhere in
+  the tree: `CandidateCustody` and its phase machine, `ShmRecoveryBackend`,
+  `CleanupOutcome`, `ProviderReadiness`, and provider incarnations are all gone.
+  Both keep `Status: superseded-by-refactor` and an `Impact:` sentence naming the
+  commit and the current owner of the obligation, if any.
+- **2 reachability changes without a status change.**
+  `quarantine-charge-transition-is-atomic` and `release-failure-is-observable`
+  guard code that still exists in `crates/mc-shm-transport`, so the property
+  remains valid; only its host driver is gone. Both move to
+  `Reaches production: no` with the evidence stated in the record.
+
+Two of the 12 re-pathed records changed substance rather than only line numbers,
+because the refactor removed a branch the record described:
+`dead-peer-charges-are-reclaimed-or-declared` and
+`header-rejection-effect-does-not-depend-on-the-catching-layer` both used to
+converge on `report_suspect` and quarantine; charges are now released
+unconditionally at `crates/mc-host/src/ring_transport.rs:291`. Each record states
+that.
+
+`release-authority-bound-to-lease-ownership` was re-checked in substance, not just
+re-pathed, because its `latent, not reachable` verdict rested on caller behaviour
+the refactor rewrote. The verdict holds; see that record.
+
+The remaining 42 records were checked and cite only live paths
+(`crates/mc-shm-transport`, `packages/mc-shm-native`, `packages/plugin`,
+`crates/mc-host/tests/`, and `docs/`); they were not modified.
+
+`Status: superseded-by-refactor` is outside the `active | invalidated` vocabulary
+declared in [../METHOD.md](../METHOD.md). It is used deliberately here and
+`part-2a-host-lifecycle` already uses it, but the schema question is open and
+belongs to a human.
+
+Not audited by this pass, and reported rather than fixed: citations into
+`crates/mc-shm-transport` have also drifted a small number of lines
+(`ring.rs:847` for `Ring::release` is now `:849`, `ring.rs:1352` for
+`ProducerReservation::commit` is now `:1354`, and `profile.rs:492-511` for the
+quarantine ordering is now `:522-542`). Those paths are live, so this refresh
+left them alone.
 
 ## Product context, and what it does to priority
 
@@ -222,7 +287,7 @@ descriptor and byte charge exactly once. This group reaches production because
 ### quarantine-charge-transition-is-atomic
 
 Type: safety
-Reaches production: yes
+Reaches production: no
 Status: active
 Exercised: not yet — needs `quarantined` pre-seeded near `u64::MAX` so the
 `checked_add` fails.
@@ -246,9 +311,13 @@ Verified by direct read of `crates/mc-shm-transport/src/profile.rs:492-511`:
 line 497-500 sets `accounting.active = active.checked_sub(charges)?`, then line
 506-509 sets `accounting.quarantined = quarantined.checked_add(retained)?` with
 `.ok_or(AdmissionError::ChargeOverflow)?`. On that error path `active` has
-already been reduced and `quarantined` is never raised. The caller discards the
-error (`crates/mc-host/src/provider_recovery.rs:187`,
-`admission.quarantine().ok()`) and still marks the record terminal.
+already been reduced and `quarantined` is never raised. The host caller that
+discarded the error, `provider_recovery.rs:187`'s `admission.quarantine().ok()`,
+was deleted by the ring-transport refactor. `Admission::quarantine` now has no
+non-test caller anywhere in the tree; the only two call sites are
+`crates/mc-shm-transport/tests/contract.rs:368` and `:479`. The ordering defect
+is unchanged, so the record stays active, but it moved from
+`Reaches production: yes` to `no`.
 Existing check: `crates/mc-shm-transport/tests/contract.rs:330`
 `host_admission_retains_quarantined_commitments` — asserts the success path
 only. Status unaudited.
@@ -292,8 +361,8 @@ Open questions:
 ### custody-terminal-transition-exactly-once
 
 Type: safety
-Reaches production: yes
-Status: active
+Reaches production: no
+Status: superseded-by-refactor
 Exercised: not yet — needs a release carrying a superseded provider incarnation.
 Guarantee: Each candidate's charges are released or quarantined exactly once,
 and a stale release is rejected without touching aggregate counters.
@@ -301,34 +370,45 @@ Check: `always` — `release(); assert!(!release()); assert!(!quarantine())` and
 the reverse order; plus a release carrying an old provider incarnation is
 rejected while the phase is still `Active`.
 Fault/timing angle: the endpoint thread calling `custody.release()` concurrently
-with the deadline watcher calling `quarantine()`. The losing race is invisible
-because the return value is discarded at
-`crates/mc-host/src/shm_provider.rs:365`.
+with the deadline watcher calling `quarantine()`. The losing race was invisible
+because the return value was discarded at the former
+`crates/mc-host/src/shm_provider.rs:365`. Both sides of that race are gone: there
+is no deadline watcher and no second terminal transition.
 Required faults and enabling state: two terminal transitions racing, or an
-incarnation bump between admission and release.
+incarnation bump between admission and release. Neither is constructible now.
 Confidence: high — [evidence](evidence/custody-terminal-transition-exactly-once.md).
-The phase clause is enforced by `mem::replace` in
+The phase clause was enforced by `mem::replace` in the former
 `crates/mc-host/src/provider_recovery.rs:167-197`.
 The incarnation clause was revised after review. `CandidateCustody::release`
-takes no incarnation argument at all, so there is no input that could carry a
-stale one, and the recovery contract deliberately keeps existing committed
-candidates valid across readiness changes (`provider_recovery.rs:15-16`). The
-finding is therefore a **documentation-versus-API mismatch**, not an unenforced
-runtime check: `docs/mc-host-shm-transport.md:79` describes rejecting releases
-"carrying an old provider incarnation", and the API has no such concept.
-`admitted_incarnation()` is stored (`:143`) and exposed (`:153`) with tests as
-its only readers.
-Existing check: `crates/mc-host/src/provider_recovery.rs:811`
-`custody_releases_exactly_once_and_rejects_stale_releases` — covers repeat and
-opposite transitions. Status unaudited.
-Impact: the exactly-once phase guarantee holds. The documented incarnation
-guarantee describes a mechanism that does not exist, which will mislead anyone
-reasoning about fencing across a provider incarnation change.
+took no incarnation argument at all, so there was no input that could carry a
+stale one, and the recovery contract deliberately kept existing committed
+candidates valid across readiness changes (former `provider_recovery.rs:15-16`).
+The finding was therefore a **documentation-versus-API mismatch**, not an
+unenforced runtime check: `docs/mc-host-shm-transport.md:79` describes rejecting
+releases "carrying an old provider incarnation", and the API had no such concept.
+`admitted_incarnation()` was stored (former `:143`) and exposed (former `:153`)
+with tests as its only readers.
+Existing check: none. The covering test was
+`custody_releases_exactly_once_and_rejects_stale_releases` at the former
+`crates/mc-host/src/provider_recovery.rs:811`, deleted with its module.
+Impact: `ed487e11` deleted `provider_recovery.rs` and with it `CandidateCustody`,
+its `Active`/`Released`/`Quarantined` phase machine, and every caller, so no
+construct now owns the exactly-once terminal-transition obligation; the surviving
+host path holds one `Admission` and calls the infallible
+`Admission::release` once on the endpoint thread
+(`crates/mc-host/src/ring_transport.rs:291`), which removes the race rather than
+arbitrating it. The documentation half of the finding still stands and is now
+strictly a doc defect: `docs/mc-host-shm-transport.md:79` describes an
+incarnation-bearing release protocol that never existed and whose surrounding
+machinery has since been removed.
 Open questions:
 - Does the documented sentence describe intended future behaviour, or is it
   simply wrong and should be deleted? Adding an incarnation-bearing release
   protocol would be a real design change, so this needs an owner's decision
   rather than a code fix. (needs human input)
+- Should a record whose mechanism no longer exists stay in the catalog as
+  `superseded-by-refactor`, or be marked `invalidated` per the METHOD schema?
+  (needs human input)
 
 ### reservation-charge-visible-with-non-free-state
 
@@ -465,7 +545,7 @@ Confidence: medium — [evidence](evidence/publish-signal-implies-committed-fram
 The ordering is confirmed by the reported line references
 (`packages/mc-shm-native/src/lib.rs:697-700`, `:809-812`;
 `packages/plugin/src/shared/mc-host-client/shm-frame-channel.ts:255-276`;
-`crates/mc-host/src/shm_provider.rs:645-652`). What "published" is contractually
+`crates/mc-host/src/ring_transport.rs:560-567`). What "published" is contractually
 supposed to mean to a client is not settled, which is why this is medium.
 Existing check: `packages/mc-shm-native/tests/runtime.ts:101-120` asserts
 producer aliases are detached *at* `before_publish`, pinning the hook's position
@@ -509,10 +589,14 @@ Verified by direct read of both signatures:
 (`ring.rs:1352`) hands that identity to the producer. No role, owner, or
 lease-token check exists on the release path.
 Reachability verdict: **not reachable in the shipped two-process topology.**
-Three independent facts establish this. Every non-test `commit` caller discards
-the returned identity (`shm_provider.rs:676`, `:689`, `:757`;
-`packages/mc-shm-native/src/lib.rs:699-700`, `:811-812`). The only non-test
-direct `Ring::release` is a receiver completing its own lease
+Re-verified against `ring_transport.rs` at `e447c927` after the refactor rewrote
+every host-side producer path, because the verdict rests on caller behaviour that
+the refactor could have changed. It did not. Every non-test `commit` caller still
+discards the returned identity: all three host call sites put `commit` in
+statement position under `?` (`ring_transport.rs:591` in `publish_direct`, `:604`
+in `publish_owned`, `:670` in `RingClientEndpoint::send`), and the addon's two
+call sites do the same (`packages/mc-shm-native/src/lib.rs:699-700`, `:811-812`).
+The only non-test direct `Ring::release` is a receiver completing its own lease
 (`lib.rs:303-307`, on the receive ring with an identity from `lease.identity()`
 held in the addon's table because `poll` forgets the lease). And the two
 directions are separate objects with independent random incarnations
@@ -618,7 +702,7 @@ changed.
 ### release-failure-is-observable
 
 Type: liveness
-Reaches production: yes
+Reaches production: no
 Status: active
 Exercised: not yet — needs an injected release failure on an otherwise clean
 path.
@@ -628,17 +712,27 @@ Check: `always` — inject a release failure on the drop path and on the clean
 close path, and assert that some counter, diagnostic, or suspect record fires.
 Fault/timing angle: `ReceiveLease::Drop` calls `release_once()` and discards the
 result, so a drop-time `WrongIncarnation`, `Quarantined`, or `DuplicateRelease`
-is unobservable. On the host side `let _ = custody.release()` discards a
-clean-path charge-release failure, and the suspect path is the `else` branch, so
-no recovery record is created either.
+is unobservable. The host half of this record is gone: `let _ =
+custody.release()` no longer exists, and the suspect path it fell through to no
+longer exists either.
 Required faults and enabling state: a release that fails while the surrounding
 operation is otherwise clean.
 Confidence: medium — [evidence](evidence/release-failure-is-observable.md).
-The discard sites are explicit (`crates/mc-shm-transport/src/lease.rs:215-221`;
-`crates/mc-host/src/shm_provider.rs:365`). Whether `release()` can actually fail
-on a clean close depends on `AdmissionError` reachability that was not fully
-traced, which is why this is medium.
-Existing check: `recovery.report_suspect(custody)` on the unclean branch only.
+The surviving discard site is explicit
+(`crates/mc-shm-transport/src/lease.rs:215-221`, verified unchanged). The former
+host discard site `crates/mc-host/src/shm_provider.rs:365` was replaced by
+`crates/mc-host/src/ring_transport.rs:291`, which calls
+`Admission::release(mut self)` (`crates/mc-shm-transport/src/profile.rs:562`).
+That signature returns `()`, so there is no longer a host-side result to discard
+and no host-side clean-path release failure to observe; the silent-no-op risk
+inside `AdmissionController::release` moved wholly into
+`charge-release-never-silently-strands`. Whether `release()` can actually fail on
+a clean close depends on `AdmissionError` reachability that was not fully traced,
+which is why this is medium. Reachability moved to `no` because the remaining
+discard is on the transport-side lease drop path, which no shipped configuration
+selects.
+Existing check: none. `recovery.report_suspect(custody)` was deleted with
+`provider_recovery.rs`.
 Impact: a stranded charge or an unreclaimed frame with no counter, no log, and
 no suspect record. The operator learns nothing, and the arena bytes stay
 unreclaimable.
@@ -736,9 +830,14 @@ Required faults and enabling state: an actual kill without `Goodbye`, plus a
 committed candidate.
 Confidence: high — [evidence](evidence/dead-peer-charges-are-reclaimed-or-declared.md).
 The gap is documented at `docs/mc-host-shm-transport.md:106-108` and tracked as
-`magic-context-ymc.12`; the release-gate plan makes it a blocker. It follows
-from `shm_provider.rs:363-370`, where only a returned `run_endpoint` triggers
-release or suspect reporting.
+`magic-context-ymc.12`; the release-gate plan makes it a blocker. It followed
+from the former `shm_provider.rs:363-370`, where only a returned `run_endpoint`
+triggered release or suspect reporting. The refactor removed the branch entirely:
+`crates/mc-host/src/ring_transport.rs:279-291` catches an endpoint panic and then
+calls `admission.release()` unconditionally, so there is no longer a
+release-versus-suspect decision and a dead peer's charges are returned as clean
+capacity rather than declared. The gap the record names is therefore wider than
+when it was written, not narrower.
 Existing check: the test above pins the gap, which is the right shape for a
 known limitation. Status unaudited as an oracle for the *desired* behaviour.
 Impact: with single-candidate limits, one dead peer permanently ends
@@ -772,8 +871,12 @@ Required faults and enabling state: cancellation or overload arriving in that
 exact window, with a frame already acquired.
 Confidence: high — [evidence](evidence/cancelled-frame-disposition-is-declared.md).
 `ring.rs:824-826` advances `consumed` before the lease is returned;
-`lease.rs:215-221` releases on drop; `crates/mc-host/src/shm_provider.rs:583-585`
-and `:498` map the cancellation to a clean close. Commit `3bf6c22b` deliberately
+`lease.rs:215-221` releases on drop; `crates/mc-host/src/ring_transport.rs:492-494`
+maps read cancellation inside the ingress-charge wait to `ReadClose::Cancelled`.
+The former `shm_provider.rs:498` clean-versus-unclean classification is gone:
+`run_endpoint` now returns `()` and every `ReadClose` takes the same path
+(`ring_transport.rs:400-405`), so cancellation is still not branded corrupt but
+the close is no longer classified at all. Commit `3bf6c22b` deliberately
 made cancellation clean, which settles the charge question but not the frame's
 disposition.
 Existing check: none. Commit `3bf6c22b` asserts charges release cleanly, not
@@ -909,7 +1012,8 @@ profile did not charge for.
 Confidence: high — [evidence](evidence/attach-binds-geometry-to-a-local-profile.md).
 `Ring::attach` (`ring.rs:593`) has no profile parameter, and `checked_layout`
 (`:465`) bounds depth only by `!= 0` plus layout arithmetic.
-Existing check: `crates/mc-host/src/shm_provider.rs:851` pins the *host*
+Existing check: `crates/mc-host/src/ring_transport.rs:822`
+`ring_profile_pins_per_connection_grant_geometry` pins the *host*
 profile's geometry; nothing pins the attaching side's. Status unaudited.
 Impact: admission accounting describes an object that was never mapped. It also
 means a self-consistent grant with a very large depth reaches `mmap` with only a
@@ -934,13 +1038,13 @@ total-bytes cap is loose enough to admit both overheads.
 Required faults and enabling state: none; this is a static consistency property.
 Confidence: high — [evidence](evidence/one-profile-name-denotes-one-geometry.md).
 Four artifacts name one profile with two geometries: the host issues depth 8 and
-8 leases (`shm_provider.rs:91-94`), the addon's own `ring_profile` is depth 32
+8 leases (`ring_transport.rs:47-50`), the addon's own `ring_profile` is depth 32
 and 32 leases (`profile.rs:682`, `:685`), the TypeScript validator hard-rejects
 anything but 8 (`shm-grant.ts:66-69`), and the addon test fixture encodes 32
 (`packages/mc-shm-native/tests/mechanism.ts:80-84`). Each is internally
 consistent; together they contradict.
-Existing check: `qualified_test_profile_pins_client_grant_geometry`
-(`shm_provider.rs:851`) pins Rust only. Status unaudited.
+Existing check: `ring_profile_pins_per_connection_grant_geometry`
+(`ring_transport.rs:822`) pins Rust only. Status unaudited.
 Impact: this is the mechanism behind defect `daf6e244`, where a stale hardcoded
 layout total silently weakened five hardening tests for over a day. The
 arrangement guarantees recurrence.
@@ -1210,7 +1314,7 @@ Open questions:
 ### clean-reclamation-is-reachable
 
 Type: reachability
-Status: active
+Status: superseded-by-refactor
 Exercised: not yet — reachable only through a fake backend today.
 Guarantee: For the shipped provider, the clean-reclamation outcome — charges
 returned exactly once and a new incarnation minted — actually occurs at least
@@ -1228,18 +1332,28 @@ Fault/timing angle: none; the shipped cleanup returns the uncertain outcome
 unconditionally.
 Required faults and enabling state: none to observe the gap.
 Confidence: high — [evidence](evidence/clean-reclamation-is-reachable.md).
-`ShmRecoveryBackend::cleanup` returns `CleanupOutcome::Uncertain` for every
-input and `probe()` returns `true` unconditionally
-(`crates/mc-host/src/shm_provider.rs:137-152`). The clean-reclamation branch and
-the incarnation mint (`provider_recovery.rs:481-490`) are exercised only through
-the fake backend (`provider_recovery.rs:889`).
-Existing check: fake-backend test only. Status unaudited as evidence for the
-shipped provider.
-Impact: `docs/mc-host-shm-transport.md:87-90` presents clean reclamation and
-quarantine as two distinct outcomes with distinct experiments. Only quarantine is
-reachable on production code, so every suspect quarantines and charges never
-return.
-Open questions: None.
+`ShmRecoveryBackend::cleanup` returned `CleanupOutcome::Uncertain` for every
+input and `probe()` returned `true` unconditionally (former
+`crates/mc-host/src/shm_provider.rs:137-152`). The clean-reclamation branch and
+the incarnation mint (former `provider_recovery.rs:481-490`) were exercised only
+through the fake backend (former `provider_recovery.rs:889`).
+Existing check: none. The fake-backend test was deleted with
+`provider_recovery.rs`.
+Impact: `ed487e11` deleted `provider_recovery.rs` and `0f336d3c` removed
+`ShmRecoveryBackend`, so `CleanupOutcome`, `ProviderReadiness`, recovery
+episodes, and provider incarnations no longer exist anywhere in the tree and
+nothing now owns the reclaim-versus-isolate obligation. The question the record
+asked — whether the shipped backend can ever reach clean reclamation — is
+answered by deletion rather than by evidence: `crates/mc-host/src/ring_transport.rs:291`
+returns charges unconditionally, with neither a quarantine outcome nor a
+reclamation proof. `docs/mc-host-shm-transport.md:87-90` still presents clean
+reclamation and quarantine as two distinct outcomes with distinct experiments,
+and now describes no code at all.
+Open questions:
+- The documentation at `docs/mc-host-shm-transport.md:87-90` now describes a
+  two-outcome recovery model that no longer exists. Should it be rewritten to the
+  unconditional-release behaviour, or is the recovery model intended to return?
+  (needs human input)
 
 ### test-only-surface-absent-from-the-shipped-addon
 
@@ -1557,9 +1671,12 @@ inside the create function. The shm name is 40 characters, computed by
 replicating the fold at `:1755-1764` rather than assumed. Medium because nothing
 could be executed on macOS and Darwin's `PSHMNAMLEN` is external to the
 repository and unverified.
-Existing check: none. `platform_preflight_is_side_effect_free`
-(`shm_provider.rs:827-848`) asserts `StaticallyOmitted` on non-Linux, but that is
-a `cfg!` decision and never calls `Ring::create`.
+Existing check: none, and the former partial one is gone.
+`platform_preflight_is_side_effect_free` (former `shm_provider.rs:827-848`)
+asserted `StaticallyOmitted` on non-Linux, but that was a `cfg!` decision and
+never called `Ring::create`. `ed487e11` made the ring mandatory and removed
+`preflight` and `PreflightEligibility` entirely, so no check now records a
+platform decision on this path at all.
 Impact: `docs/mc-host-shm-transport.md:121` presents the macOS omission as
 resting on an observed runtime failure that no check observes. If the cause is
 the 40-character name, fixing it silently activates the whole untested macOS path
@@ -1908,8 +2025,10 @@ Guarantee: The number of outstanding iceoryx samples is derivable from an
 observation the backend exposes, and an explicitly released lease is
 distinguishable from an abandoned one.
 Check: `always` — at every point, assert an observation exists on the backend
-reporting outstanding versus reclaimed samples, and that a readiness answer
-shaped like the one `provider_recovery.rs:530` consumes is available. There is no
+reporting outstanding versus reclaimed samples. The clause requiring "a readiness
+answer shaped like the one `provider_recovery.rs:530` consumes" is withdrawn:
+`ed487e11` deleted that consumer and the whole `ProviderReadiness` model, so no
+host surface now defines the shape. There is no
 gate site so `unreachable` does not apply, and no convergence so this is not a
 liveness form. The check fails by construction today, which the record states
 rather than implies.
@@ -1924,8 +2043,10 @@ hits, against the ring's `release` (`ring.rs:847-909`, whose successful path
 stores `completion_sequence` and decrements `active_leases` at `:902-906`),
 `conservation` (`:912-995`), and `probe` (`:998-1003`). The iceoryx lease meets
 exactly-once completion by move semantics rather than by a check: sound, but
-silent. `provider_recovery.rs:530` decides readiness from
-`backend.probe() && backend.admission_fits()` and has no iceoryx path in.
+silent. The host-side comparator is gone: the former `provider_recovery.rs:530`
+decided readiness from `backend.probe() && backend.admission_fits()` and had no
+iceoryx path in, and `ed487e11` deleted it. The gap on the iceoryx backend itself
+is unchanged, so the record stays active with the readiness clause withdrawn.
 Existing check: none on the backend. The bench arm's counters are constants,
 which is a downstream instance of `operation-counters-are-observed-not-declared`
 rather than new coverage.
@@ -2024,21 +2145,22 @@ Guarantee: No consumer of a shared-memory frame acts on any header field, or on
 the body it describes, before both host header gates have accepted it.
 Check: `always` — on every receive that yields a lease, `decode_header` and
 `validate_inbound_header` both return `Ok` before the ingress charge
-(`shm_provider.rs:580`), the body copy (`:604`), and any send on `inbound`
-(`:569`, `:612`). An ordering invariant evaluated at every receive, with no
+(`ring_transport.rs:489`), the body copy (`:520`), and any send on `inbound`
+(`:478`, `:527`). An ordering invariant evaluated at every receive, with no
 optional path and no convergence to wait for.
 Fault/timing angle: none required. The descriptor is snapshotted by one
 `read_volatile` (`ring.rs:802`), so the 21 header bytes are frozen locally before
 either layer inspects them, and there is no time-of-check window between the two
 layers. The window that makes the ordering load-bearing is the ingress wait loop
-(`:578-603`), bounded by `frame_deadline`: that is the resource an out-of-order
-gate would let an illegal frame hold.
+(`ring_transport.rs:487-518`), bounded by `frame_deadline`: that is the resource
+an out-of-order gate would let an illegal frame hold.
 Required faults and enabling state: a peer-authored header satisfying exactly the
 transport's two checks and violating one host rule. No concurrency, no timing.
 Confidence: high — [evidence](evidence/wire-header-fully-validated-before-any-consumer-acts.md).
 `descriptor.rs:414-422` is the transport's only header inspection; `receive_one`
 runs its seven steps in the order above with `?` on each, and nothing between
-`:555` and `:564` reads a header field or a payload byte. `WIRE_V2_HEADER_BYTES`
+`ring_transport.rs:464` and `:473` reads a header field or a payload byte.
+`WIRE_V2_HEADER_BYTES`
 equals `HEADER_LEN` at 21, so `decode_header`'s truncation gates
 (`wire.rs:307-317`) are statically dead on this path.
 Existing check: `shm_failure_modes.rs:195`
@@ -2046,12 +2168,13 @@ Existing check: `shm_failure_modes.rs:195`
 type, quarantine outcome only. Status unaudited as an ordering oracle.
 Impact: this is the ordering the trust boundary rests on, and it is correct at
 HEAD. Cataloged because nothing fails if it stops being correct. Moving the charge
-or the copy above `:562` lets a peer hold up to 64 MiB of ingress budget for a
+or the copy above `ring_transport.rs:471` lets a peer hold up to 64 MiB of ingress
+budget for a
 frame deadline on a frame already known illegal, and the transport cannot
 compensate, because `mc-host` depends on `mc-shm-transport` and so `FrameType`,
 `Flags`, and the protocol version are unreachable from the validating crate.
 Open questions:
-- The control-cap branch (`shm_provider.rs:565-576`) releases the lease and
+- The control-cap branch (`ring_transport.rs:474-485`) releases the lease and
   answers `Rejected` rather than closing, a fourth disposition. Is a per-channel
   body cap a header rule or an admission rule? (needs human input)
 - A version 3 relocating `len` or `ver` is permitted by the extension point at
@@ -2073,8 +2196,8 @@ Check: `always` — for every inbound frame the shared-memory read path emits, t
 charged byte count equals the body length. `always` rather than `unreachable`: the
 forbidden state is a delivered frame whose charge and body disagree, and the
 divergence would arise at an ordinary, always-executed statement pair.
-Fault/timing angle: no interleaving; the charge (`shm_provider.rs:580`) and the
-copy (`:604`) are consecutive. The exposure window is the drift interval between
+Fault/timing angle: no interleaving; the charge (`ring_transport.rs:489`) and the
+copy (`:520`) are consecutive. The exposure window is the drift interval between
 two crates: `header.len` is bytes 0..4 of the peer-authored header, `to_vec` fills
 the descriptor's `body_len` (`lease.rs:178-196`), and the host never compares them.
 Required faults and enabling state: none to pin the property. To demonstrate the
@@ -2175,10 +2298,16 @@ Confidence: high — [evidence](evidence/header-rejection-effect-does-not-depend
 `enter_quarantine` has exactly one caller, the descriptor-validation arm at
 `ring.rs:807`; no host path reaches it. There `consumed` is never advanced, since
 the advance is at `:825` past the error, so the slot stays `RECEIVER_HELD`. On the
-host paths the dropped lease releases and `consumed` has already advanced. Both
-converge at the clean-close classification (`shm_provider.rs:498`) into
-`report_suspect`, and cleanup answers `Uncertain` for every input, quarantining
-the charges, so the admission outcome is identical. The reason is then discarded:
+host paths the dropped lease releases and `consumed` has already advanced. The
+convergence point changed: both used to meet the clean-close classification at the
+former `shm_provider.rs:498` and fall into `report_suspect`, where cleanup answered
+`Uncertain` for every input and quarantined the charges. `ed487e11` deleted that
+classification and the whole suspect path, so both now converge at
+`crates/mc-host/src/ring_transport.rs:400-405`, which sends the `ReadClose`
+inbound and cancels without branching on it, and then at `:291`, which releases the
+charges unconditionally. The admission outcome is still identical across the two
+layers, which is what the record asserts, but it is now unconditional release
+rather than quarantine. The reason is then discarded:
 `connection.rs:411-414` folds clean EOF, corrupt, I/O, and overloaded into one
 peer-exit variant.
 Existing check: none for the disposition. One host-caught case asserts the
@@ -2386,7 +2515,7 @@ lane. The peer harness cannot produce overlap today, because its send and receiv
 are both synchronous and thread-confined. Coverage marker
 `shm_both_directions_in_flight`, recorded as `duplex-overlap-is-reached`.
 Confidence: high — [evidence](evidence/neither-direction-starves-the-other.md).
-The comment at `shm_provider.rs:508-512` claims the directions alternate so a peer
+The comment at `ring_transport.rs:410-414` claims the directions alternate so a peer
 refilling the inbound ring cannot starve responses and close frames. That claim is
 accurate for the case it describes, since every received frame is followed by one
 non-blocking outbound poll and the ingress-budget wait also services outbound, and

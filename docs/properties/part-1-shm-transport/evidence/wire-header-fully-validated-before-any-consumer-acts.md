@@ -1,5 +1,20 @@
 # wire-header-fully-validated-before-any-consumer-acts
 
+## Citation refresh, 2026-08-30
+
+The ring-transport refactor (`0f336d3c`, `d8bde128`, `793a973e`, `ed487e11`)
+renamed `crates/mc-host/src/shm_provider.rs` to
+`crates/mc-host/src/ring_transport.rs` and deleted `provider_recovery.rs`,
+`transport_negotiation.rs`, and `transport_provider.rs`. Host-side citations below
+were re-anchored against `ring_transport.rs` at `e447c927`.
+
+Where the cited construct survives, the citation names `ring_transport.rs` and a
+line re-verified against that commit. Where it does not, the original reference is
+kept and prefixed `former`, so it reads as pre-refactor evidence rather than a
+current location. A `former` line number is never a claim about the tree today.
+Every `provider_recovery.rs` reference is `former` by definition: that module has
+no successor. See the refresh note in [../catalog.md](../catalog.md).
+
 ## Discovery trigger
 
 `FrameDescriptor::validate` carries a 21-byte `wire_header`
@@ -41,11 +56,11 @@ cross-rules (`:345-354`). Correlation (`:355-357`) is accepted unconditionally.
 `validate_inbound_header` (`frame_channel.rs:58-76`) then adds the 64 MiB body
 cap, the pure-header flag rule, and the consumer-role type whitelist.
 
-Ordering. `receive_one` (`shm_provider.rs:546-619`) runs `try_receive` (`:555`),
-`decode_header` (`:562`), `validate_inbound_header` (`:564`), the channel-0
-control cap (`:565`), the ingress charge loop (`:579-603`), the body copy
-(`:604`), the completion (`:607`), and the send to the consumer (`:612-617`), in
-that order. Nothing between `:555` and `:564` reads payload bytes, so both header
+Ordering. `receive_one` (`ring_transport.rs:455-534`) runs `try_receive` (`:464`),
+`decode_header` (`:471`), `validate_inbound_header` (`:473`), the channel-0
+control cap (`:565`), the ingress charge loop (`:488-518`), the body copy
+(`:520`), the completion (`:607`), and the send to the consumer (`:527-532`), in
+that order. Nothing between `:464` and `:473` reads payload bytes, so both header
 gates precede every charge, copy, and dispatch. The obligation is stated in the
 doc comment on `validate_inbound_header` (`frame_channel.rs:53-57`): a
 role-invalid type with a large declared body must not hold ingress budget or an
@@ -53,12 +68,12 @@ allocation through the frame deadline. That deadline is real — the charge loop
 `:579-603` can spin until `frame_deadline`.
 
 Rejection consequence. Both gates map to `ReadClose::Corrupt`
-(`shm_provider.rs:563-564`, variant at `frame_channel.rs:37`). `Corrupt` is not
-in the clean set (`shm_provider.rs:498`), so `run_endpoint` returns `false` and
+(`ring_transport.rs:472-473`, variant at `frame_channel.rs:37`). `Corrupt` is not
+in the clean set (former `shm_provider.rs:498`), so `run_endpoint` returns `false` and
 the spawn wrapper takes `recovery.report_suspect(custody)` instead of
-`custody.release()` (`:364-371`). `report_suspect`
-(`provider_recovery.rs:360-397`) starts a recovery episode whose `cleanup` may
-answer `Reclaimed`, `StaleRetry`, or `Uncertain` (`:94-103`); only `Uncertain`
+`custody.release()` (former `:364-371`). `report_suspect`
+(former `provider_recovery.rs:360-397`) starts a recovery episode whose `cleanup` may
+answer `Reclaimed`, `StaleRetry`, or `Uncertain` (former `:94-103`); only `Uncertain`
 isolates. A header rejection therefore does not quarantine directly — it closes
 the generation and hands the decision to the controller. The receive lease drops
 unreleased and releases itself (`lease.rs:215-221`).
@@ -84,7 +99,7 @@ offsets 0..5, silently, since the transport cannot see the version registry.
 
 No interleaving is required; the property is an ordering over one synchronous
 path, and it holds at HEAD. The window that makes it load-bearing is the charge
-loop (`shm_provider.rs:579-603`), bounded by `frame_deadline`: anything moved
+loop (`ring_transport.rs:488-518`), bounded by `frame_deadline`: anything moved
 above it inherits that hold time. Depends on
 `receive-failure-leaves-no-wedged-slot` for the slot state after a rejection, and
 on `quarantine-authority-survives-peer-writes` for the premise that a peer can
@@ -95,7 +110,7 @@ author descriptor bytes at all — both mappings are `PROT_READ|PROT_WRITE`
 
 A hostile producer that writes the shared descriptor page directly, because the
 producer API cannot express these frames: `TestShmPeer::send`
-(`shm_provider.rs:747-759`) builds the header with `EnvelopeHeader::encode`
+(`ring_transport.rs:659-673`) builds the header with `EnvelopeHeader::encode`
 (`wire.rs:205-215`) and commits `body.len()`, so `commit_reservation` rejects any
 length disagreement before publication. With direct page authorship, one frame
 per field class — unknown type byte, reserved flag bit 6 or 7, reserved priority
@@ -115,8 +130,8 @@ that every reader of `ValidatedFrame::wire_header()` outside a test reaches
 
 ### Q: Can a rejected header hold ingress budget or a receive lease past the rejection?
 
-- Sources examined: `shm_provider.rs:555-618` for the full order,
-  `:579-603` for the charge loop, `lease.rs:215-221` for lease drop,
+- Sources examined: former `shm_provider.rs:555-618` for the full order,
+  `ring_transport.rs:488-518` for the charge loop, `lease.rs:215-221` for lease drop,
   `frame_channel.rs:53-57` for the documented obligation.
 - Findings: no. The charge is acquired at `:580`, strictly after both gates, and
   the only earlier resource is the receive lease itself, which `Drop` releases.

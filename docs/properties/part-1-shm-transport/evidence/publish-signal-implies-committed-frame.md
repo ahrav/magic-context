@@ -1,5 +1,20 @@
 # publish-signal-implies-committed-frame
 
+## Citation refresh, 2026-08-30
+
+The ring-transport refactor (`0f336d3c`, `d8bde128`, `793a973e`, `ed487e11`)
+renamed `crates/mc-host/src/shm_provider.rs` to
+`crates/mc-host/src/ring_transport.rs` and deleted `provider_recovery.rs`,
+`transport_negotiation.rs`, and `transport_provider.rs`. Host-side citations below
+were re-anchored against `ring_transport.rs` at `e447c927`.
+
+Where the cited construct survives, the citation names `ring_transport.rs` and a
+line re-verified against that commit. Where it does not, the original reference is
+kept and prefixed `former`, so it reads as pre-refactor evidence rather than a
+current location. A `former` line number is never a claim about the tree today.
+Every `provider_recovery.rs` reference is `former` by definition: that module has
+no successor. See the refresh note in [../catalog.md](../catalog.md).
+
 ## Discovery trigger
 
 Comparing the two sides of the publish hook. The host stores its completion marker *after* commit returns; the
@@ -24,8 +39,8 @@ input where the orderings differ: a commit that fails after the hook has already
   `let published = false;` (`:255`), and the callback passed as the native before-publish hook sets
   `published = true;` (`:261`) then invokes `hooks?.onPublish?.()` (`:263`). The ticket returned at `:275` is
   `{ cancel: () => !published }`, so once the hook has run the frame is uncancellable by contract.
-- `crates/mc-host/src/shm_provider.rs:621-663` `publish_one` — the host's ordering is the opposite: the publish
-  attempt is wrapped at `:645-648`, then `if !matches!(result, Ok(Ok(()))) { return Err(()); }` (`:649-651`), and
+- `crates/mc-host/src/ring_transport.rs:536-578` `publish_one` — the host's ordering is the opposite: the publish
+  attempt is wrapped at `:560-563`, then `if !matches!(result, Ok(Ok(()))) { return Err(()); }` (`:564-566`), and
   only then `completion.store(COMPLETE, Ordering::Release)` (`:652`) followed by the hook at `:653-657`. The host
   never marks a failed commit complete.
 - `crates/mc-shm-transport/src/backend/ring.rs:1352-1380` `commit` — five failure branches, all aborting the
@@ -66,7 +81,7 @@ The window is the interval between `before_publish.call(())` and `commit`'s retu
 `:809-812`. It contains one JavaScript callback invocation and one commit, so it is short but entirely
 deterministic: it is entered on every publish and the outcome depends only on whether commit succeeds. No
 configuration dependency, no platform gating. This is a client-side property: the host path
-(`shm_provider.rs:649-652`) is ordered correctly, so a host-only test cannot observe it. It interacts with
+(`ring_transport.rs:564-567`) is ordered correctly, so a host-only test cannot observe it. It interacts with
 `no-frame-observable-before-commit`, which establishes the other half — the peer really does see nothing — and
 that is what makes the client's signal wrong rather than merely early.
 
@@ -86,7 +101,7 @@ the same fault, so the test documents the asymmetry rather than the symptom. Cov
 ### Q: Does the client's `FrameSendTicket.cancel()`/`onPublish` contract mean "handed to the transport" or "committed"?
 
 - Sources examined: `packages/plugin/src/shared/mc-host-client/shm-frame-channel.ts:248-276`;
-  `packages/mc-shm-native/src/lib.rs:636-703` and `:790-815`; `crates/mc-host/src/shm_provider.rs:621-663`;
+  `packages/mc-shm-native/src/lib.rs:636-703` and `:790-815`; `crates/mc-host/src/ring_transport.rs:536-578`;
   `crates/mc-shm-transport/src/backend/ring.rs:1352-1380`, `:1164-1210`;
   `packages/mc-shm-native/tests/runtime.ts:102-121`.
 - Findings: the *mechanics* are settled and verified — the hook precedes commit on both native paths, the

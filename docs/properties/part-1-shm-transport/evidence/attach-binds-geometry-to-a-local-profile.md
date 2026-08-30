@@ -1,5 +1,20 @@
 # attach-binds-geometry-to-a-local-profile
 
+## Citation refresh, 2026-08-30
+
+The ring-transport refactor (`0f336d3c`, `d8bde128`, `793a973e`, `ed487e11`)
+renamed `crates/mc-host/src/shm_provider.rs` to
+`crates/mc-host/src/ring_transport.rs` and deleted `provider_recovery.rs`,
+`transport_negotiation.rs`, and `transport_provider.rs`. Host-side citations below
+were re-anchored against `ring_transport.rs` at `e447c927`.
+
+Where the cited construct survives, the citation names `ring_transport.rs` and a
+line re-verified against that commit. Where it does not, the original reference is
+kept and prefixed `former`, so it reads as pre-refactor evidence rather than a
+current location. A `former` line number is never a claim about the tree today.
+Every `provider_recovery.rs` reference is `former` by definition: that module has
+no successor. See the refresh note in [../catalog.md](../catalog.md).
+
 ## Discovery trigger
 
 `Ring::create_in` takes a `&TargetProfile` and derives the layout from it.
@@ -37,12 +52,12 @@ maps whatever the grant declares, with no step that compares the two.
 - Every `Ring::attach` call site in the tree passes `(fd, grant, scheduling)` and
   no profile: `ring.rs:508` (`RingAttachment::attach`),
   `packages/mc-shm-native/src/lib.rs:244` (the addon's `attach_ring`),
-  `crates/mc-host/src/shm_provider.rs:787` (the Rust test peer's `attach_ring`),
+  former `crates/mc-host/src/shm_provider.rs:787` (the Rust test peer's `attach_ring`),
   and `crates/mc-shm-transport/tests/ring.rs:437`, `:464`, `:615`.
 - `packages/mc-shm-native/src/lib.rs:491-494` — the addon does check a profile,
   but only as a string: `profile != PROFILE` rejects. `PROFILE` is
   `"mc-host-test-ring-v1"` (`:32`). A name match is not a geometry match.
-- `crates/mc-host/src/shm_provider.rs:851-856` —
+- `crates/mc-host/src/ring_transport.rs:822-827` —
   `qualified_test_profile_pins_client_grant_geometry` asserts
   `descriptor_depth() == 8`, `max_leases() == 8`, and `arena_bytes() ==
   MIN_ARENA_BYTES`. This pins the host's own profile object, on the creating side.
@@ -100,7 +115,7 @@ run before accepting the claim, since a single missed call site would refute it.
   `attachment().attach()` call site found by grep across `crates/` and
   `packages/`, excluding `target/`, `node_modules/`, and `dist/`;
   `packages/mc-shm-native/src/lib.rs:240-247` and
-  `crates/mc-host/src/shm_provider.rs:779-788` for the two `attach_ring` wrappers;
+  former `crates/mc-host/src/shm_provider.rs:779-788` for the two `attach_ring` wrappers;
   `packages/plugin/src/shared/mc-host-client/shm-grant.ts:146-174` for the
   TypeScript geometry pin.
 - Findings: the claim holds. Six call sites, none passing a profile. The two

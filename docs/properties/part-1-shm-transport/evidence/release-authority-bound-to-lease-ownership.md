@@ -1,5 +1,20 @@
 # release-authority-bound-to-lease-ownership
 
+## Citation refresh, 2026-08-30
+
+The ring-transport refactor (`0f336d3c`, `d8bde128`, `793a973e`, `ed487e11`)
+renamed `crates/mc-host/src/shm_provider.rs` to
+`crates/mc-host/src/ring_transport.rs` and deleted `provider_recovery.rs`,
+`transport_negotiation.rs`, and `transport_provider.rs`. Host-side citations below
+were re-anchored against `ring_transport.rs` at `e447c927`.
+
+Where the cited construct survives, the citation names `ring_transport.rs` and a
+line re-verified against that commit. Where it does not, the original reference is
+kept and prefixed `former`, so it reads as pre-refactor evidence rather than a
+current location. A `former` line number is never a claim about the tree today.
+Every `provider_recovery.rs` reference is `former` by definition: that module has
+no successor. See the refresh note in [../catalog.md](../catalog.md).
+
 ## Discovery trigger
 
 Reading the two signatures next to each other. `ProducerReservation::commit`
@@ -102,11 +117,11 @@ serves as both producer and receiver, which today means the transport's own test
 Three independent facts establish this:
 
 1. **No non-test caller retains the identity `commit` returns.** Every non-test
-   `commit` call site discards it: `crates/mc-host/src/shm_provider.rs:676` and
-   `:689` (`reservation.commit(body_len).map_err(|_| ())?;`),
+   `commit` call site discards it: `crates/mc-host/src/ring_transport.rs:591` and
+   `:604` (`reservation.commit(body_len).map_err(|_| ())?;`),
    `packages/mc-shm-native/src/lib.rs:699-700` and `:811-812`
    (`.map_err(|_| error(...))?;` followed by `Ok(())`), and the public-but-test-only
-   `TestShmPeer::send` at `shm_provider.rs:757`.
+   `TestShmPeer::send` at `ring_transport.rs:670`.
 2. **The only non-test direct `Ring::release` call is a receiver's own.** A search
    of `crates/` and `packages/` for `Ring::release` call sites yields exactly two
    outside tests and benches: `ring.rs:1259` inside `ring_release_callback`
@@ -125,7 +140,7 @@ Three independent facts establish this:
    retain an identity from `commit` on its send ring would be rejected on its
    receive ring by `ring.rs:851-856` with `WrongIncarnation` or `WrongLane`. The
    addon's `to_host`/`from_host` (`lib.rs:62-63`) and the host's
-   `rings.first`/`rings.second` (`shm_provider.rs:597`, `:555-557`) both follow this
+   `rings.first`/`rings.second` (former `shm_provider.rs:597`, former `:555-557`) both follow this
    split, and no non-test path reserves and receives on the same `Ring`.
 
 Severity therefore: a latent API-shape hazard, not a live defect in the shipped
@@ -160,7 +175,7 @@ should not be public, the test becomes a compile-fail assertion instead.
   incarnation); `crates/mc-shm-transport/src/lease.rs:173-221`
   (`ReceiveLease::release`, `release_once`, `Drop`);
   `packages/mc-shm-native/src/lib.rs:62-63`, `:290-310`, `:833-890`;
-  `crates/mc-host/src/shm_provider.rs:546-619`, `:665-691`, `:711-777`; a
+  `crates/mc-host/src/ring_transport.rs:455-534`, `:665-691`, `:711-777`; a
   repository-wide search of `crates/` and `packages/` for `.release(` call sites.
 - Findings: the reachability half is resolved — see the section above. The
   *reason* the method is public is also established: the addon needs a

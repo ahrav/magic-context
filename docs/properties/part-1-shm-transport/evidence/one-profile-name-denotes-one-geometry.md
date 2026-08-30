@@ -1,5 +1,20 @@
 # one-profile-name-denotes-one-geometry
 
+## Citation refresh, 2026-08-30
+
+The ring-transport refactor (`0f336d3c`, `d8bde128`, `793a973e`, `ed487e11`)
+renamed `crates/mc-host/src/shm_provider.rs` to
+`crates/mc-host/src/ring_transport.rs` and deleted `provider_recovery.rs`,
+`transport_negotiation.rs`, and `transport_provider.rs`. Host-side citations below
+were re-anchored against `ring_transport.rs` at `e447c927`.
+
+Where the cited construct survives, the citation names `ring_transport.rs` and a
+line re-verified against that commit. Where it does not, the original reference is
+kept and prefixed `former`, so it reads as pre-refactor evidence rather than a
+current location. A `former` line number is never a claim about the tree today.
+Every `provider_recovery.rs` reference is `former` by definition: that module has
+no successor. See the refresh note in [../catalog.md](../catalog.md).
+
 ## Discovery trigger
 
 Commit `daf6e244`, "fix(shm): track the ring layout total in the raw descriptor
@@ -54,10 +69,10 @@ It now needs three."
 
 Depth 8, overhead 8,192:
 
-- `crates/mc-host/src/shm_provider.rs:91-94` — `qualified_test_profile`:
-  `descriptor_depth: DESCRIPTOR_DEPTH` where `DESCRIPTOR_DEPTH = 8` (`:54`),
+- `crates/mc-host/src/ring_transport.rs:47-50` — `qualified_test_profile`:
+  `descriptor_depth: DESCRIPTOR_DEPTH` where `DESCRIPTOR_DEPTH = 8` (`:32`),
   `arena_bytes: MIN_ARENA_BYTES`, `max_leases: DESCRIPTOR_DEPTH`.
-- `crates/mc-host/src/shm_provider.rs:864-867` — an existing assertion that the
+- `crates/mc-host/src/ring_transport.rs:887-890` — an existing assertion that the
   encoded grant's total equals `(mc_shm_transport::MIN_ARENA_BYTES + 8_192) as
   u64`. Independent confirmation of the depth-8 row above.
 - `packages/plugin/src/shared/mc-host-client/shm-grant.ts:67-69` —

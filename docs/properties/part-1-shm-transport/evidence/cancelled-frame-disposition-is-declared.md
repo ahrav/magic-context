@@ -1,5 +1,20 @@
 # cancelled-frame-disposition-is-declared
 
+## Citation refresh, 2026-08-30
+
+The ring-transport refactor (`0f336d3c`, `d8bde128`, `793a973e`, `ed487e11`)
+renamed `crates/mc-host/src/shm_provider.rs` to
+`crates/mc-host/src/ring_transport.rs` and deleted `provider_recovery.rs`,
+`transport_negotiation.rs`, and `transport_provider.rs`. Host-side citations below
+were re-anchored against `ring_transport.rs` at `e447c927`.
+
+Where the cited construct survives, the citation names `ring_transport.rs` and a
+line re-verified against that commit. Where it does not, the original reference is
+kept and prefixed `former`, so it reads as pre-refactor evidence rather than a
+current location. A `former` line number is never a claim about the tree today.
+Every `provider_recovery.rs` reference is `former` by definition: that module has
+no successor. See the refresh note in [../catalog.md](../catalog.md).
+
 ## Discovery trigger
 
 Commit `3bf6c22b` changed endpoint cancellation during the ingress-budget wait
@@ -23,23 +38,23 @@ inbound channel.
 - `crates/mc-shm-transport/src/backend/ring.rs:901-908` — `release` stores the
   `completion_sequence` and decrements `active_leases`, which makes the slot
   eligible for `reclaim_completed`. Nothing records that the body was never read.
-- `crates/mc-host/src/shm_provider.rs:555-560` — `receive_one` binds the lease.
+- `crates/mc-host/src/ring_transport.rs:464-470` — `receive_one` binds the lease.
   From here the lease is a local whose scope ends at every `return`.
-- `crates/mc-host/src/shm_provider.rs:578-602` — the ingress-charge loop, entered
+- `crates/mc-host/src/ring_transport.rs:487-518` — the ingress-charge loop, entered
   with the lease still live. `:583-584` returns `Err(ReadClose::Cancelled)` when
   `read_cancel.is_cancelled()`; `:588-590` returns `Err(ReadClose::Overloaded)`
   on the frame deadline. Both drop the lease.
-- `crates/mc-host/src/shm_provider.rs:604-609` — the only path that reads the
+- `crates/mc-host/src/ring_transport.rs:519-524` — the only path that reads the
   body: `lease.to_vec()` then an explicit `lease.release()`. Reaching it requires
   the charge loop to have broken with a charge.
-- `crates/mc-host/src/shm_provider.rs:498` — `let clean = matches!(close,
+- former `crates/mc-host/src/shm_provider.rs:498` — `let clean = matches!(close,
   ReadClose::Cancelled | ReadClose::Overloaded);` classifies exactly these two
   as clean.
-- `crates/mc-host/src/shm_provider.rs:499-502` — the close is reported as
+- former `crates/mc-host/src/shm_provider.rs:499-502` — the close is reported as
   `inbound.send(Err(close))`, then `queue.retired.cancel()` and `root.cancel()`.
   The consumer learns the generation retired; it learns nothing about a specific
   lost sequence.
-- `crates/mc-host/src/shm_provider.rs:364-365` — `clean` reaches
+- former `crates/mc-host/src/shm_provider.rs:364-365` — `clean` reaches
   `custody.release()`, so the charges return and the channel's close is recorded
   as ordinary retirement.
 - `docs/mc-host-shm-transport.md:96-104` — the documented failure and close
@@ -60,7 +75,7 @@ indistinguishable from a cancellation that arrived before the frame existed.
 ## Timing windows and dependencies
 
 The window opens at `ring.rs:825` when `consumed` advances and closes at
-`shm_provider.rs:604` when `to_vec` runs. Its width is the duration of the
+`ring_transport.rs:520` when `to_vec` runs. Its width is the duration of the
 ingress-charge loop, which is bounded above by `frame_deadline` but is not
 bounded below and is zero-width on an uncontended budget. That is why the window
 needs deterministic injection rather than load. `Overloaded` widens it to the
@@ -87,7 +102,7 @@ precondition, since both events are legal individually.
 - Sources examined: `git log -1 --format=%B 3bf6c22b`, which states the
   cancellation change in terms of admission charges only;
   `docs/mc-host-shm-transport.md:96-112` for the documented failure, fallback,
-  and close contract; `crates/mc-host/src/shm_provider.rs:475-503` for the
+  and close contract; former `crates/mc-host/src/shm_provider.rs:475-503` for the
   classification; the three failure-hardening and release-gate plans listed in
   `../README.md` for a lossless-until-close requirement.
 - Findings: the commit reasoning is entirely about charges. The document
