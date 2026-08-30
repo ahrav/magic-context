@@ -238,7 +238,7 @@ feature.
 | --- | --- | --- | --- |
 | 2 | CLI or config-file exposure of these knobs belongs to `magic-context-c50.8`, not this crate | `config.rs:5-6` | **Nothing, and nothing should.** A negative claim; it is what makes doc comments the only contract |
 | 9 | `subc_capabilities` is a host-to-handler capability channel | `config.rs:250` (field, undocumented) | **Nothing. Zero readers repo-wide** |
-| 11 | Signal acquisition stays outside this crate; `magic-context-c50.4` will map SIGINT/SIGTERM | `runtime.rs:3-5` | **Nothing. No signal mapping exists**; the caller supplies a `CancellationToken` |
+| 11 | Signal acquisition stays outside this crate; `magic-context-c50.4` will map SIGINT/SIGTERM | `runtime.rs:3-5` | **First clause holds, second clause is stale, and this row previously said "Nothing. No signal mapping exists".** The caller does supply a `CancellationToken` and the crate does not acquire signals. But the production wiring exists today, outside the crate: `serve.rs:617-622` installs `SignalKind::terminate` and `SignalKind::interrupt` streams and fails startup if either installation fails, `:623-631` spawns the task that cancels the token on the first signal to arrive, and all of it precedes `mc_host::run` at `:632`. The comment at `serve.rs:604-616` states why the ordering is mandatory. So the register row is reclassified from "no implementing code" to "implemented by the caller, and the crate's own comment has not been updated to say so" |
 | 20, in-crate half | `HarnessClosureStore` is public host API | `lib.rs:18` (`pub mod`, no `#[doc(hidden)]`) | **Never constructed in-crate**; its only two production constructions discard the error |
 
 Two register rows are actively **contradicted** by code rather than merely
@@ -274,15 +274,24 @@ names any deleted module, and its `unsafe_code` comment (`:3-7`) describes the
 Broca `pre_exec` hook, which exists.
 
 **Two residuals of the opposite shape, recorded so a later pass does not miscount
-them as stale.** Both are forward references to unbuilt work rather than
-descriptions of removed work:
+them as stale.** Neither describes removed work. **One was recorded here as a
+forward reference to unbuilt work and that was wrong**; the correction is applied
+rather than footnoted, because register row 11 and the catalog's construction
+conditionality map both leaned on it.
 
-1. `runtime.rs:3-5` — future production wiring in `magic-context-c50.4` "will map
-   SIGINT/SIGTERM, while tests inject deterministic shutdown". No signal handling
-   was deleted; none has been written. Register row 11.
+1. `runtime.rs:3-5` — signal acquisition "stays outside this crate" and "future
+   production wiring in `magic-context-c50.4` will map SIGINT/SIGTERM, while tests
+   inject deterministic shutdown". The first clause is true. The second is
+   **stale, not forward-looking**: `serve.rs:617-622` already installs both a
+   `SIGTERM` and a `SIGINT` stream, `:623-631` cancels the token `run` receives on
+   the first of the two, and all of it runs before `run` is entered at `:632`,
+   with `serve.rs:604-616` explaining why that ordering is mandatory. So the crate
+   comment describes as future a mapping its sole production caller performs
+   today. Register row 11, reclassified there.
 2. `config.rs:5-6` — CLI and config-file exposure "belongs to the spawn/doctor
-   integration (`magic-context-c50.8`), not this crate." Register row 2, and the
-   reason the configuration contract is doc comments.
+   integration (`magic-context-c50.8`), not this crate." A genuine forward
+   reference, and it stands. Register row 2, and the reason the configuration
+   contract is doc comments.
 
 ## Claims stated somewhere and checked mechanically nowhere
 
@@ -341,7 +350,8 @@ socket path is bounded by `AF_UNIX` `sun_path` at roughly 108 bytes, enforced by
 
 ## Suspiciously quiet areas
 
-Three, ranked by the gap between what the code decides and what any check proves.
+Four, ranked by the gap between what the code decides and what any check proves.
+The fourth was added by a disposition pass; the first three are as synthesized.
 
 1. **`harness_closure.rs` is 1,122 lines of untrusted-manifest filesystem code
    with zero in-crate tests.** It validates untrusted manifests
@@ -383,21 +393,42 @@ Three, ranked by the gap between what the code decides and what any check proves
    [rt-a-every-published-configuration-field-changes-host-behaviour](catalog.md#rt-a-every-published-configuration-field-changes-host-behaviour).
 
 3. **`shutdown_sequence`'s forced path makes five unbounded or re-armed decisions
-   and the sub-part has one shutdown test, about a different deadline.**
-   `runtime.rs:1144-1244` calls `force_close_all_routes` twice (`:1206`, `:1216`)
-   with no enclosing timeout, re-arms a doubled deadline after the original
-   expired (`:1223`), trips the fatal latch on one branch (`:1234`), and runs the
-   handler callback on another (`:1240`), returning `false` from three separate
-   places. The comments are unusually careful and each argues its own ordering
-   correctly. What is quiet is that the *composition* of those stages, which is
-   what an operator experiences as "shutdown took a hundred seconds", is argued
-   nowhere and tested nowhere. The one in-crate test (`:1326`) covers the shared
-   Goodbye deadline, and `tests/lifecycle.rs`, the only CI-named binary that
-   reaches this file, tests lifecycle records rather than drain composition. Owned
-   by
+   across three distinct exits, and the sub-part has one shutdown test, about a
+   different deadline.** `runtime.rs:1144-1244` calls `force_close_all_routes`
+   twice (`:1206`, `:1216`) with no enclosing timeout, re-arms a doubled deadline
+   after the original expired (`:1223`), trips the fatal latch on one branch
+   (`:1234`), and runs the handler callback on another (`:1240`), returning `false`
+   from three separate places. The comments are unusually careful and each argues
+   its own ordering correctly. What is quiet is that the *composition* of those
+   stages, which is what an operator experiences as a shutdown whose longest exit
+   admits about ten times the configured deadline, is argued nowhere and tested
+   nowhere. The three exits carry three different bounds and the one that trips the
+   fatal latch (`:1238`) never calls the handler shutdown callback at all, which no
+   test distinguishes. The one in-crate test (`:1326`) covers the shared Goodbye
+   deadline, and `tests/lifecycle.rs`, the only CI-named binary that reaches this
+   file, tests lifecycle records rather than drain composition. Owned by
    [rt-a-forced-shutdown-outlives-the-configured-shutdown-deadline](catalog.md#rt-a-forced-shutdown-outlives-the-configured-shutdown-deadline),
    and it is also where sub-part 2e's unresolved question about un-swept pending
    entries after `force_close_all_routes` has to be answered.
+
+4. **`AbandonGuard::drop` is a second teardown path, and this inventory did not
+   have it.** Added by a disposition pass, because the construction conditionality
+   map's claim that `shutdown_sequence` is unconditional was refuted.
+   `runtime.rs:419-476` runs when the `run` future is *dropped* rather than polled
+   to completion: it cancels the shutdown token and every generation's three
+   tokens (`:424-434`), calls `abort_all` (`:435`), demotes the phase (`:442`), and
+   then spawns a detached task that runs `force_close_all_routes` (`:450`), closes
+   the tracker, and performs two **explicitly unbounded** `tracker.wait()` calls
+   (`:457` and `:471`) around `run_handler_shutdown` (`:467`) before releasing the
+   lock. The comment at `:452-456` states the unboundedness deliberately. No
+   graceful drain, no connection Goodbyes, no `shutdown_deadline`, and no bound of
+   any kind. It is checked by nothing: zero in-crate tests, and no CI-named binary
+   drops a `run` future. The evidence that this path is a live concern rather than
+   a theoretical one is inside the crate — `run_handler_shutdown`'s once-latch
+   comment at `:1260-1264` describes exactly this interleaving, "the abandon-path
+   cleanup can fire after a `run` future was dropped mid-shutdown-sequence". No
+   record owns it; it is queued as a gap in
+   [portfolio-evaluation.md](portfolio-evaluation.md).
 
 ## Sampling limits on this inventory
 

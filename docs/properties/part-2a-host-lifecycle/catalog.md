@@ -407,7 +407,17 @@ Open questions: None.
 ### promoted-generation-refuses-the-setup-correlations
 
 Type: safety
-Status: active
+Reachability: default-production when live — at `ed487e11^`
+`HostConfig::default` injected the candidate provider itself
+(`crates/mc-host/src/config.rs:297-303`), so reaching a promoted generation
+needed no explicit host config, only a client that drove the candidate exchange;
+the read-loop watermark it seeded is on the unconditional path
+(`crates/mc-host/src/connection.rs:381`, reached from
+`crates/mc-host/src/runtime.rs:1043`). Superseded rather than live: the
+ring-transport refactor removed the promotion and candidate-handoff path, so no
+promoted generation exists at HEAD and the subject of this record is unreachable
+by any configuration.
+Status: superseded-by-refactor
 Exercised: partial — the pre-commit case is covered; the post-promotion case is
 not.
 Guarantee: On a promoted candidate, correlations 1 and 2 are permanently spent, so
@@ -422,11 +432,30 @@ loop, which is exactly where this watermark applies.
 Required faults and enabling state: a client that pipelines a correlation-1 or
 correlation-2 request behind its commit request.
 Confidence: high — the seed value and the comparison were both read.
-Existing check: `tests/transport_negotiation.rs:1268` covers the pre-promotion
-case. Nothing asserts a post-promotion low-correlation request is rejected.
+Existing check: none. The cited pre-promotion test,
+`application_frame_before_promotion_fails_setup_instead_of_dispatching` at
+`crates/mc-host/tests/transport_negotiation.rs:1268`, lived in a file `ed487e11`
+deleted, so that citation resolves only at the commit the lens pass read.
 Impact: a single wrong constant silently permits replay of the activation and
-commit correlations.
-Open questions: None.
+commit correlations. `ed487e11 refactor(host): make ring transport mandatory`
+removed the promotion path and the `ConnectionSetup::initial_watermark` field it
+seeded, so `crates/mc-host/src/connection.rs:381` now seeds the watermark to 0
+unconditionally, correlations 1 and 2 are not spent, and the guarantee is vacuous
+rather than violated.
+Open questions:
+- `crates/mc-host/src/connection.rs:379-380` still tells a reader that "A
+  promoted candidate starts at 2 so application correlations begin at 3
+  (§7.7.4)" immediately above the unconditional `= 0` seed, and two further
+  comments describe the removed mechanism as present: `:250-251` says
+  `serve_generation` "Returns the candidate handoff", though it returns unit, and
+  `:333-335` describes taking a handoff from "the promotion slot". All three are
+  live misleading comments in shipped code. Whether §7.7.4 still reserves
+  correlations 1 and 2 for a setup exchange the ring transport no longer
+  performs, and therefore whether the comments or the constant are the defect, is
+  a protocol-ownership question (needs human input). Note also that
+  `provider_active()` already seeded `initial_watermark: 0` at `ed487e11^`
+  (`crates/mc-host/src/connection.rs:804`) while its own doc comment claimed 3,
+  so the comment-versus-constant disagreement predates the refactor.
 
 ### ping-and-consumer-correlations-cannot-cross-settle
 

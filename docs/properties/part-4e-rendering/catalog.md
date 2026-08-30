@@ -73,9 +73,13 @@ reference used in this catalog's own prose was read back individually at
 ### Reachability provenance
 
 Both record-proposing lenses labelled 11 of their 12 records
-`default-production`, so 22 of 24 carry that label and 2 carry
-`explicit-config-only`. Per METHOD.md rule 4 no preamble below repeats the claim;
-each record carries its own label and its own derivation.
+`default-production`, so 22 of the original 24 carried that label and 2 carried
+`explicit-config-only`. The `R3` split raises the count to 26: the Channel-1
+removal record inherits `default-production` from its parent and the Channel-2
+lease record inherits `explicit-config-only` from its parent, giving **23
+`default-production` and 3 `explicit-config-only`**. Per METHOD.md rule 4 no
+preamble below repeats the claim; each record carries its own label and its own
+derivation.
 
 The `default-production` derivation is a single dispatch fact plus a default.
 `build_output_with_tags_inner` is the only byte-producing splice, it carries no
@@ -92,7 +96,7 @@ to `true` on the wire (`default_auto_search_enabled`, `:865-867`), in the shippe
 producer (`rust-mode-transform.ts:2010`) and in the schema
 (`assets/magic-context.schema.json:1607-1612`, `CONFIGURATION.md:682`).
 
-The two `explicit-config-only` labels rest on a configuration that the shipped
+The three `explicit-config-only` labels rest on a configuration that the shipped
 producer does not emit, and they are not equally solid.
 `render-a-light-surface-fallback-notice-never-served` needs
 `PromptSurfacePreset::Light`, which is not the serde default (`Full` is,
@@ -103,7 +107,9 @@ repository emits that string; `ARCHITECTURE.md:125` describes a Claude Code leg
 as a real deployment, so the arm is presumably reached from a proxy outside this
 tree. If that leg is not live the label is closer to `test-only`. Lens B recorded
 that as an open question needing deployment knowledge, and it is not resolved
-here.
+here. `nudge-b-channel2-pending-directive-rearms-within-the-lease-ttl` is the
+liveness half split out of that same record by `R3`, so it inherits the label and
+the unresolved question with it.
 
 ## Reachability under the Rust-first decision
 
@@ -129,7 +135,7 @@ opposite, that 4e cataloged a path ordinary users do not execute and its
 reachability labels needed revisiting; that inference is withdrawn in
 [../README.md](../README.md).
 
-The labels below stand as written: 22 `default-production` and 2
+The labels below stand as written: 23 `default-production` and 3
 `explicit-config-only`, as [Reachability provenance](#reachability-provenance)
 records. What changes is only what the `default-production` labels rest on. Each
 was derived from a fact internal to this crate, that
@@ -213,9 +219,10 @@ State the coverage figure carefully, because its natural reading is wrong twice
 over.
 
 There are **277 in-crate checks** attributable to 4e: 237 of the 280 tests in
-`transform.rs`'s flat `mod tests` reach 4e production code, of which 25 name a
-4e-owned symbol in their own body, plus the 5 tests in `mod nudge_formula_tests`,
-plus 35 file-local tests in the six other 4e units. **None of them runs in CI.**
+`transform.rs`'s flat `mod tests` are static reach candidates for 4e production
+code, of which 25 name a 4e-owned symbol in their own body, plus the 5 tests in
+`mod nudge_formula_tests`, plus 35 file-local tests in the six other 4e units.
+**None of them runs in CI.**
 
 The first misreading is to treat 277 as executions. These are **static reach
 candidates, not measured executions**: the attribution enumerates test
@@ -241,8 +248,14 @@ exists on a developer's machine.
 
 ### Refinements applied after the portfolio evaluation
 
-Two refinements are applied in the records below and are named here so a reader
-can tell reconstructed text from evaluated text.
+All nine of the evaluation's refinements are now applied. The first two were
+applied during the reconstruction; the other seven were recovered from
+[portfolio-evaluation.md](portfolio-evaluation.md), where they are numbered `R1`
+through `R7`, and applied afterwards. They are named here so a reader can tell
+reconstructed text from evaluated text. Every premise was re-verified against the
+source at `HEAD` before the change was made, and the two line-reference
+corrections that verification produced are recorded with the refinements that
+carried them.
 
 1. **`render-a-light-surface-fallback-notice-never-served` is retyped from
    reachability to safety, and its semantics change from `unreachable` to
@@ -260,30 +273,88 @@ can tell reconstructed text from evaluated text.
    `:9123-9127` is entered only by falling through it, and the arithmetic says
    that cannot happen. The `Check:` line now says the truncating body is never
    entered, rather than naming the branch by its condition.
+3. **`R2`: both `sometimes` records now name a marker constant.**
+   `render-a-hint-fragment-cap-binds-in-a-served-render` takes
+   `USER_HINT_FRAGMENT_TRUNCATION_SERVED` and
+   `nudge-b-one-block-carries-several-overlay-kinds` takes
+   `OVERLAY_KINDS_COLLIDED_ON_ONE_BLOCK`. Both are the names
+   [fault-map.md](fault-map.md) had already proposed, so the two files now agree.
+   METHOD.md's coverage-check rules require marker names to be constant and
+   globally unique; both are, and both assert independent legal preconditions
+   rather than the violation, so neither acquires the forbidden
+   `always(!X)`-with-`sometimes(X)` pairing.
+4. **`R3`: two records that mixed safety with bounded progress are split into
+   four.** `nudge-b-channel1-append-rows-have-no-reaper` keeps the count bound as
+   `always` safety and hands eventual removal to
+   [nudge-b-channel1-append-row-removal-has-no-bounded-window](#nudge-b-channel1-append-row-removal-has-no-bounded-window).
+   `nudge-b-channel2-retirement-is-caller-asserted` keeps the permitted-transition
+   set as `always` safety and hands the bounded re-arm to
+   [nudge-b-channel2-pending-directive-rearms-within-the-lease-ttl](#nudge-b-channel2-pending-directive-rearms-within-the-lease-ttl).
+   Both new records are written to METHOD.md's liveness rules: the Channel-2 one
+   states its bound in the unit the code bounds,
+   `CHANNEL2_DIRECTIVE_LEASE_TTL_MS` at `transform.rs:111`, enforced at
+   `:9450-9458`; the Channel-1 one records that **no removal bound exists in the
+   code** and proposes one rather than writing an unbounded "eventually". This is
+   the part's first liveness pair and it takes the record count from 24 to 26.
+5. **`R4`: `render-a-hygiene-metric-ignores-surface-strips` now states the
+   severity error as bidirectional.** Its `Impact` previously said `t` and
+   possibly `u` "overstate the served tail" so the gates fire on a smaller tail
+   than measured, which is one direction only.
+   `TailHygienePartMeasurement` sets `u_tokens: if active && !protected { tokens }
+   else { 0 }` (`tail_hygiene.rs:265-270`), so a stripped block whose tag is
+   active inflates both `t` and `u` while a stripped block that is untagged or
+   protected inflates `t` alone, and `severity = u as f64 / t.max(1)`
+   (`:709`, laddered `:710-716`) therefore moves either way.
+   [What this part is about](#what-this-part-is-about) already stated the
+   bidirectional form; the record now agrees with it.
+6. **`R5`: `nudge-b-injected-todo-pair-carries-no-provider-visible-provenance`
+   now claims only that there is no explicit model-facing provenance field.** The
+   wide form, that injected content is indistinguishable at the consuming layer,
+   is withdrawn: provenance survives in both encodings and the OpenCode encoder
+   emits a native marker, `"syntheticTodoMarker": true` inside
+   `render_synthetic_todo_pair` (`codec/opencode.rs:916-947`, the marker at
+   `:946`). The chain breaks one hop later, because the consumer's serializer
+   reads the call id and ignores the marker (`todo-view.ts:117-126`) and the id
+   format is deliberately distinctive (`:185-196`). The slug is left unchanged:
+   renaming it would break the links from the index, the relationship map, the
+   evidence file and `fault-map.md` for no gain in accuracy that the restated
+   `Guarantee` does not already deliver.
+7. **`R6`: the 237 figure is labelled static reach candidates wherever it
+   appears.** [Coverage](#coverage-277-in-crate-tests-and-what-the-number-is-not)
+   already carried the relabel in full and now carries it in the sentence that
+   states the number as well. The headline and the tier table in
+   [existing-checks.md](existing-checks.md) carried the unlabelled number and are
+   corrected there.
 
-Two limits on this list, both recorded rather than papered over. The part's
-`portfolio-evaluation.md` did not survive the clean, so the seven further
-refinements it recorded cannot be reproduced from the remaining artifacts; the
-two above are reproduced from the disposition summary carried in the
-reconstruction brief and are independently supported by the surviving
-check-semantics audit below. And the disposition also recorded that two records
-mixing safety with bounded progress were split into a safety half and a bounded
-liveness half. That split is **not** applied here: it requires two new slugs and
-two new evidence files, neither of which exists in `evidence/`, and inventing them
-would fabricate records rather than reassemble them. The part therefore still
-carries 24 records and no liveness record, and closing that gap needs the
-evaluation file or a fresh pass over the two records concerned.
+Two refinements are applied outside this file and are named for completeness.
+`R1` splits the fault map's frozen-unit seeding class, because the splice reads
+frozen units from `core.frozen_units` (`transform.rs:11699-11703`) while the
+synthetic pair is read from `meta.synthetic_todo` (`:11805-11808`), a distinct
+field on `ModuleMeta` (`mc-store/src/lib.rs:2295-2299`), and clears both of that
+file's `Partial` verdicts. `R7` records in `existing-checks.md` that four driver
+detectors disagree rather than two.
+
+One limit remains, and it is a limit on provenance rather than on content. The
+evaluation's own `portfolio-evaluation.md` did not survive the clean. Its
+findings were recovered from a report of it, so the substance of all nine
+refinements is present and independently re-verified while the evaluator's
+reasoning, its finding order and its per-finding lens attribution are gone. `R1`
+through `R7` are therefore not the evaluator's `F1` through `F7`.
 
 ### Check-semantics audit, and the disposition of the two `unreachable` records
 
-Semantics distribution across the 24 records, after the refinements above:
-`always` 18, `always(!X)` 2 (written `always(!orphan)` and `always(!fallback)`),
-`always-or-unreached` 1, `sometimes` 2, `unreachable` 1. No `reachable` and no
-liveness record. Lens A produced both of the original `unreachable` records, and
-METHOD.md reserves that form for a code location that must not execute, requiring
-`always(!X)` for a forbidden **state** with no dedicated detection point. Each was
-checked against the source, the two did not come out the same way, and the
-evaluation kept one and retyped the other.
+Semantics distribution across the 26 records, after the refinements above:
+`always` 20, `always(!X)` 2 (written `always(!orphan)` and `always(!fallback)`),
+`always-or-unreached` 1, `sometimes` 2, `unreachable` 1. No `reachable`. Types are
+**21 safety, 3 reachability, 2 liveness**. The two liveness records are the `R3`
+split and both take `always` evaluated once at the end of an explicit bounded
+window, which is the form METHOD.md's liveness rules require and the form Parts
+4b and 4c used; neither is written as an unbounded "eventually". Lens A produced
+both of the original `unreachable` records, and METHOD.md reserves that form for a
+code location that must not execute, requiring `always(!X)` for a forbidden
+**state** with no dedicated detection point. Each was checked against the source,
+the two did not come out the same way, and the evaluation kept one and retyped the
+other.
 
 **`render-a-user-hint-total-cap-cannot-bind` is a genuine forbidden code point.**
 Its `Check:` line instruments the truncating body of `truncate_hint_to_total_cap`.
@@ -342,7 +413,9 @@ a branch in source.
 | [nudge-b-channel1-append-first-applies-without-a-frontier-gate](#nudge-b-channel1-append-first-applies-without-a-frontier-gate) | safety | high |
 | [nudge-b-opencode-channel2-arm-has-no-module-side-latch](#nudge-b-opencode-channel2-arm-has-no-module-side-latch) | safety | high |
 | [nudge-b-channel2-retirement-is-caller-asserted](#nudge-b-channel2-retirement-is-caller-asserted) | safety | medium |
+| [nudge-b-channel2-pending-directive-rearms-within-the-lease-ttl](#nudge-b-channel2-pending-directive-rearms-within-the-lease-ttl) | liveness | high |
 | [nudge-b-channel1-append-rows-have-no-reaper](#nudge-b-channel1-append-rows-have-no-reaper) | safety | high |
+| [nudge-b-channel1-append-row-removal-has-no-bounded-window](#nudge-b-channel1-append-row-removal-has-no-bounded-window) | liveness | high |
 | [nudge-b-injected-todo-pair-carries-no-provider-visible-provenance](#nudge-b-injected-todo-pair-carries-no-provider-visible-provenance) | safety | high |
 | [nudge-b-auto-search-hint-injects-unauthored-text-into-a-user-block](#nudge-b-auto-search-hint-injects-unauthored-text-into-a-user-block) | safety | high |
 | [nudge-b-channel1-suppression-flag-is-never-set](#nudge-b-channel1-suppression-flag-is-never-set) | safety | high |
@@ -876,14 +949,17 @@ Open questions:
 
 ## Group E: overlay lifecycle and retirement
 
-Four records on when an injected thing stops. The synthetic todo pair is the
+Five records on when an injected thing stops. The synthetic todo pair is the
 control: it has a retirement rule that actually holds, and it is the only injected
 thing whose absent placement is a hard error rather than an absorbed skip. Against
 it sit a Channel-1 insert with no first-apply gate, an OpenCode Channel-2 arm that
 writes no module state at all so the two module rearm helpers clear fields it
 never reads, and a Claude Code arm whose retirement is asserted by the caller
 echoing an id the response already handed it. The arm with the protocol is the arm
-nothing in this tree exercises.
+nothing in this tree exercises. The fifth record is the bounded half of that last
+one, split out under `R3`: the lease TTL is the only retirement cause the module
+can reach on its own, which makes it the one bounded-progress obligation in this
+group and the load-bearing safety mechanism on the arm.
 
 ### nudge-b-frozen-todo-pair-retires-only-on-a-bust
 
@@ -1042,15 +1118,19 @@ Status: active
 Exercised: not yet — no test drives `claude_code_channel2_directive` with a
 `channel2_delivered_id`.
 Guarantee: A pending Channel-2 directive is retired only when it was actually
-delivered, or else the retirement is bounded so a lost directive is re-armed.
+delivered, or by one of two other causes the module itself can name.
 Check: `always` — assert that `meta.pending_channel2_directive` transitions to
 `None` only via a matching `channel2_delivered_id`, the lease TTL, or a
 pressure collapse, and that no other input clears it. `always` because a
-directive retired without delivery is silently lost every time it happens.
-Fault/timing angle: The retirement is a same-pass decision, but the interesting
-window is the 10 minutes of `CHANNEL2_DIRECTIVE_LEASE_TTL_MS` (`:111`): inside
-it, only the caller's word retires the directive; outside it, the TTL re-arms
-regardless of what the caller said.
+directive retired without delivery is silently lost every time it happens. The
+TTL appears here only as a permitted cause of the transition; that it *fires*
+within a bound is bounded progress and belongs to
+[nudge-b-channel2-pending-directive-rearms-within-the-lease-ttl](#nudge-b-channel2-pending-directive-rearms-within-the-lease-ttl),
+split out under `R3` so this check carries no liveness half.
+Fault/timing angle: The retirement is a same-pass decision. Inside the lease
+window only the caller's word retires the directive, which is what makes the
+corroboration gap this record's subject; what happens at the window's edge is the
+liveness record's subject.
 Required faults and enabling state:
 `serializer_profile == "claude-code-anthropic"`. This is the reason for the
 `explicit-config-only` label: the string appears in `crates/mc-module` tests,
@@ -1082,15 +1162,87 @@ Open questions:
   could be predicted before it is issued? Not from the transform response,
   which only carries the id itself. Recorded as resolved in the evidence file.
 
+### nudge-b-channel2-pending-directive-rearms-within-the-lease-ttl
+
+Type: liveness
+Reachability: explicit-config-only
+Status: active
+Exercised: not yet — no test advances `now_ms` past the lease and asserts the
+re-arm. Step 4 of the parent record's evidence file names the construction and
+nothing implements it.
+Guarantee: A pending Channel-2 directive that the caller never acknowledges stops
+being pending within one lease interval, so a lost directive costs at most that
+interval plus one arming cycle rather than wedging the arm forever.
+Check: `always` evaluated once at the end of an explicit bounded window — arm a
+directive, supply no `channel2_delivered_id` and no pressure change, advance
+`ctx.now_ms` to `armed_at_ms + CHANNEL2_DIRECTIVE_LEASE_TTL_MS`, call
+`channel2_directives` once more, then assert `meta.pending_channel2_directive` is
+`None` and `meta.channel2_pressure_latched` is `false`. The bound is
+`CHANNEL2_DIRECTIVE_LEASE_TTL_MS`, 10 minutes at `transform.rs:111`, which is the
+unit the code actually bounds: the predicate is
+`now_ms.saturating_sub(pending.armed_at_ms) >= CHANNEL2_DIRECTIVE_LEASE_TTL_MS`
+(`:9454`) and the only action on it is `rearm_channel2_cycle(meta)` (`:9457`).
+Stating it in milliseconds of the caller-supplied clock rather than as an
+"eventually" is what METHOD.md's liveness rules require, and a generous timeout
+would not distinguish one re-arm from a thousand.
+Fault/timing angle: The window is the lease. The fault is the absence of an
+acknowledgement, and the fault-free part of the window is that nothing else
+touches the directive: the pressure aggregate must stay above the gates, or the
+collapse arm at `:9479` retires it for a different reason and the test proves
+nothing about the TTL.
+Required faults and enabling state:
+`serializer_profile == "claude-code-anthropic"`, a pending directive armed on an
+earlier pass, no `channel2_delivered_id` on the pass under test, and a `ctx.now_ms`
+the fixture controls. All four are reachable from a direct call to
+`channel2_directives`, which is a free function over borrowed inputs and a
+`&mut ModuleMeta`. The profile is the reason for the `explicit-config-only` label
+and it is inherited from the parent record, along with the unresolved question
+about whether the leg is live.
+Confidence: high —
+[evidence](evidence/nudge-b-channel2-pending-directive-rearms-within-the-lease-ttl.md).
+The mechanism is verified from source: the TTL arm at `:9450-9458`, its predicate
+at `:9454`, `rearm_channel2_cycle` at `:9457` (defined `:9407-9410`, clearing both
+`pending_channel2_directive` and `channel2_pressure_latched`), the constant at
+`:111`, and the `armed_at_ms` the comparison reads, written once as
+`armed_at_ms: now_ms` where the directive is armed (`:9492`, inside `:9488-9497`)
+and returned unchanged by both replay arms (`:9463-9466`, `:9473-9476`). The
+delivered-id comparison that precedes it is at `:9442-9448`, so a caller
+acknowledgement and a TTL expiry cannot both be credited for one retirement in the
+same pass.
+Existing check: none. `nudge_formula_tests` (`transform.rs:9629-9783`) covers the
+Channel-1 band arithmetic only.
+Impact: This is the load-bearing safety mechanism on the arm, which is why it is
+worth a record of its own. The parent record's finding is that the primary
+retirement path has no corroboration; the TTL is the only retirement cause the
+module can reach without trusting the caller, so if it failed to fire the arm
+would stay pending on a caller that simply never implements the acknowledgement,
+replaying one directive text for the life of the session while pressure stayed
+high. Nothing counts arms or retirements
+([nudge-b-overlay-suppression-and-firing-are-unreportable](#nudge-b-overlay-suppression-and-firing-are-unreportable)),
+so the wedge would be invisible.
+Open questions:
+- Is the CC leg live? Inherited from the parent record and unresolved for the same
+  reason: no TypeScript sender in this repository emits the profile. (needs human
+  input)
+- Does any caller-reachable path reset `armed_at_ms` on a replay pass, which would
+  slide the deadline forward indefinitely? No. The replay block at `:9460-9481`
+  returns the pending directive with its existing `armed_at_ms` in both arms, and
+  the field is written only at `:9492` where a new directive is armed, so the
+  deadline is fixed at arming. Recorded as resolved in the evidence file.
+
 ## Group F: unbounded overlay growth
 
-One record, kept separate because it is a resource property rather than a
-correctness one and it is deliberately outside the dominance chains above. Two of
-the three overlay tables have no reaper, no count cap and no byte cap, while the
-third in the same family does, which makes the omission local rather than a
-uniform design decision. The interesting failure is not size: a stale row is inert
-only while its block is out of the projection, so the hazard is a reminder
-resurfacing and quoting a token count from a session state that no longer exists.
+Two records, kept in their own group because they are resource properties rather
+than correctness ones and they are deliberately outside the dominance chains
+above. Two of the three overlay tables have no reaper, no count cap and no byte
+cap, while the third in the same family does, which makes the omission local
+rather than a uniform design decision. The interesting failure is not size: a
+stale row is inert only while its block is out of the projection, so the hazard is
+a reminder resurfacing and quoting a token count from a session state that no
+longer exists. The two records are the two halves `R3` separated. The first is the
+`always` count bound, which is assertable today against a bound nobody has stated.
+The second is the removal obligation, which is bounded progress and is the reason
+this part now has a liveness record at all.
 
 ### nudge-b-channel1-append-rows-have-no-reaper
 
@@ -1099,20 +1251,27 @@ Reachability: default-production
 Status: active
 Exercised: not yet — no test asserts a bound on the row count, and none
 observes the table across a long session.
-Guarantee: The durable overlay tables are bounded, and something removes a row
-whose purpose is spent.
-Check: `always` — assert `count(mc_channel1_appends WHERE session_id = ?)`
-stays at or below an explicit documented bound across a session, and that a row
-whose target block has left the projection is eventually removed within a
-stated number of passes. `always` on the bound because exceeding it is wrong
-whenever it happens; the removal half needs the bound stated in passes, per the
-liveness rule, and no such bound exists in the code today.
+Guarantee: The durable overlay tables are bounded, so the row count for a session
+stays at or below an explicit documented ceiling.
+Check: `always` — assert `count(mc_channel1_appends WHERE session_id = ?)` stays
+at or below an explicit documented bound across a session. `always` because
+exceeding a stated ceiling is wrong whenever it happens. The removal obligation
+that this check previously carried in the same conjunction is bounded progress and
+is now
+[nudge-b-channel1-append-row-removal-has-no-bounded-window](#nudge-b-channel1-append-row-removal-has-no-bounded-window),
+split out under `R3`, so nothing here asserts an "eventually". The bound this
+check compares against does not exist in the code either; the difference is that a
+missing ceiling makes the safety check unwritable until a number is stated, while a
+missing removal window makes the liveness check unwritable until a *window* is
+stated, and those are two different product decisions.
 Fault/timing angle: None. This is accumulation over a long session, not a race.
 Required faults and enabling state: `tagging_active`, and a session long enough
 for `decide_channel1` to clear the escalation-or-cadence gate repeatedly. The
 cadence step is `max(25_000, 0.08 * tail_tokens)` tokens of newly unreduced
-tool output (`transform.rs:9624-9627`), so each additional row costs the agent
-that much unreduced growth.
+tool output (`channel1_refire_tokens`, `transform.rs:9623-9626`, gate at
+`:9608-9610`), so each additional row costs the agent that much unreduced growth.
+The cited range was `:9624-9627` before this pass; the function opens at `:9623`
+and closes at `:9626`, and the reference is corrected here per METHOD.md rule 1.
 Confidence: high —
 [evidence](evidence/nudge-b-channel1-append-rows-have-no-reaper.md). Verified
 by grepping every statement touching the three overlay tables in
@@ -1136,7 +1295,86 @@ Open questions:
   happens depends on the projection cache and lineage handling, which is 4b
   scope. Unresolved, needs 4b.
 - Should the reaper key on the overlay frontier, on tag retirement, or on
-  compartment coverage? A design decision. (needs human input)
+  compartment coverage? A design decision. (needs human input) The same decision
+  fixes the window in
+  [nudge-b-channel1-append-row-removal-has-no-bounded-window](#nudge-b-channel1-append-row-removal-has-no-bounded-window),
+  which is why neither half of the original check can be written today.
+
+### nudge-b-channel1-append-row-removal-has-no-bounded-window
+
+Type: liveness
+Reachability: default-production
+Status: active
+Exercised: not yet — no test observes a row after its target block leaves the
+projection, and no bound exists to observe it against. This is the stronger of the
+two reasons: the construction is cheap and the oracle is undefined.
+Guarantee: A `mc_channel1_appends` or `mc_temporal_marks` row whose target block
+has left the projection is removed within a bounded number of subsequent passes,
+so a spent row cannot outlive the state it describes.
+Check: `always` evaluated once at the end of an explicit bounded window — drive a
+session until a Channel-1 row exists, advance the projection past that row's target
+block so the block is no longer selectable, stop adding tool output, drive N
+further `tagging_active` passes, then assert
+`load_channel1_appends(session)` no longer contains that `block_id`. **The bound N
+does not exist in the code**, and per METHOD.md's liveness rules this record does
+not substitute an unbounded "eventually" or a generous timeout for it: as written
+the check is unwritable until a bound is stated, and that is the finding rather
+than a gap in the record. The proposed bound, offered so the shape is concrete and
+labelled as a proposal rather than a citation, is **one pass**: the module already
+computes whether a block is below coverage on every pass, so a coverage-keyed
+reaper has no reason to need a second one. `is_tail(ordinal, coverage)`
+(`transform.rs:6471-6473`) is `coverage.is_none_or(|c| ordinal > c)`, and a block at
+or below `meta.coverage_ordinal` (`mc-store/src/lib.rs:2250`) can never be selected
+for a new append again, so the removable set is already decidable at commit time.
+Fault/timing angle: The window is the quiescent period after the target block
+leaves the projection. The fault-free requirement is that nothing re-presents the
+block during it, because a reappearance would make a surviving row correct rather
+than stale, and that reappearance is the parent record's hazard.
+Required faults and enabling state: `tagging_active`, one Channel-1 firing, then
+a projection advance past the fired block, then N passes and silence. All of it is
+request sequencing plus store state and none of it is a fault. A row can also be
+placed directly with `seed_channel1_append_for_test`
+(`mc-store/src/lib.rs:6664`, behind the `test-support` feature), which removes the
+need to drive a real firing first.
+Confidence: high —
+[evidence](evidence/nudge-b-channel1-append-row-removal-has-no-bounded-window.md).
+Verified that no removal path exists to be bounded: grepping every statement
+touching the three overlay tables in `mc-store/src/lib.rs` returns exactly two
+`DELETE`s, the host-driven `user_hints_replace_session` replace-delete
+(`:7754-7759`) and the lineage-descent wipe of the *target* key (`:8642-8654`),
+which is immediately undone by a copy from the source key (`:8736-8751`). Verified
+that the row type cannot express the natural bound: `Channel1AppendRow`
+(`:2617-2621`) carries `block_id`, `reminder_text` and `fired_at_ms` and no
+ordinal, so a coverage-keyed reaper would have to resolve ordinals from the
+projection at commit time or the row type would have to change. Verified that
+`fired_at_ms` exists, so an age-keyed reaper is expressible today while a
+coverage-keyed one is not, which is a fact about the schema rather than a
+recommendation. A row can be placed directly with `seed_channel1_append_for_test`
+(`:6664`), which is gated `#[cfg(feature = "test-support")]` (`:6663`).
+Existing check: none. `channel1_hygiene_ratio_nudge_replays_and_suppresses_refire`
+(`transform.rs:23551-23590`) asserts `len() == 1` three times (`:23570`, `:23574`,
+`:23588`) and never advances past the block it fired on, so it observes
+persistence rather than removal.
+Impact: Unbounded retention is the parent record's cost. This record's cost is the
+one that is not about size: because nothing removes a spent row, a row survives to
+the moment its `block_id` is reconstructed, and the reminder is then re-applied
+quoting `approx_thousands(reclaimable_tokens)` from a session state that no longer
+exists. A bounded removal window would close that hazard whatever the ceiling on
+the table turned out to be, which is why the two halves needed separating: fixing
+the count bound does not fix this, and fixing this bounds the count as a
+side-effect.
+Open questions:
+- What is N, and in what unit? Passes is the unit this record proposes because the
+  module's own removability test is evaluated per pass, but a wall-clock TTL keyed
+  on `fired_at_ms` is the cheaper implementation and the schema already supports
+  it. The choice is the same product decision the parent record's second open
+  question names. (needs human input)
+- Does a lineage descent reset the window? The descent copies every row forward
+  (`mc-store/src/lib.rs:8736-8751`), so a descended session inherits rows whose
+  target blocks may never re-enter its projection. Whether the window should be
+  measured from the original `fired_at_ms` or restarted at the descent depends on
+  the projection cache's mid-stability contract, which is 4b scope. Unresolved,
+  needs 4b.
 
 ## Group G: provenance of injected content
 
@@ -1159,9 +1397,18 @@ asserts `meta.synthetic` is set on both halves, and
 `serve_native_golden_preserves_ingress_and_pins_synthetic_shapes`
 (`codec/mod.rs:93-127`) pins the encoded shape. Neither asserts anything about
 what the model can distinguish.
-Guarantee: Content the module injects into the served conversation is
-distinguishable from content the user or the agent authored, at the layer that
-consumes it.
+Guarantee: Content the module injects into the served conversation carries an
+explicit model-facing provenance field on the surface its consumer reads, rather
+than only an identifier convention. State it that way and not as
+"indistinguishable": the distinction survives every hop the module controls, and
+what is missing is a field that declares it. `HarnessMeta::synthetic` is serialized
+on the CK wire (`mc-store/src/lib.rs:64-65`) and the OpenCode encoder emits a
+native marker, `"syntheticTodoMarker": true` in `render_synthetic_todo_pair`
+(`codec/opencode.rs:916-947`, the marker at `:946`). The chain breaks at the
+consumer, whose wire serializer reads `part.state.*`, `part.callID`, `part.tool`
+and `part.metadata` and therefore ignores the marker (`todo-view.ts:117-126`),
+leaving a deliberately distinctive call-id format (`:185-196`) as the only
+surviving signal.
 Check: `always` — for every emitted message, assert that either it corresponds
 to an ingress message, or it carries a provenance marker on the surface its
 consumer reads. `always` because an unmarked injection misattributes authorship
@@ -1375,9 +1622,22 @@ Verified `measure_tail_hygiene`'s exclusion set at `:499-512` and its per-kind
 arms at `:522-587`, and verified by grep that `tail_hygiene.rs` contains no
 `strip:` literal anywhere.
 Existing check: `tail_hygiene.rs:1211` and its neighbours; none run in CI.
-Impact: `t` and possibly `u` overstate the served tail, so `hygiene_band`
-(`:704`) and both nudge gates fire on a tail that is smaller than measured. The
-agent is told about tokens that are not there.
+Impact: `t`, and `u` as well when the stripped block carried an active
+non-protected tag, diverge from the served tail, and the divergence is
+**bidirectional**. `TailHygienePartMeasurement` sets `tokens` and then
+`u_tokens: if active && !protected { tokens } else { 0 }`
+(`tail_hygiene.rs:265-270`), so a stripped block whose tag is active inflates both
+`t` and `u` while a stripped block that is untagged or protected inflates `t`
+alone. `hygiene_band` computes `severity = u as f64 / t.max(1)` (`:709`) and
+ladders on it (`:710-716`), so the ratio moves **up or down** according to which
+case the strip was: the gates can fire on a tail smaller than measured, or stay
+quiet on a tail that has crossed a threshold. The agent is told about tokens that
+are not there, in either direction. A one-directional bias could be absorbed by
+moving a threshold; a bidirectional error cannot, and that matters more here than
+it would elsewhere because the bands were calibrated on a post-strip measurement
+the code does not make
+(`docs/nudge-hygiene-calibration-2026-08-16.md:10`, cited in
+[fault-map.md](fault-map.md)).
 Open questions:
 - Is the divergence bounded? A whole-message strip replaces every block, so the
   overstatement is the whole message. Whether any strip class can dominate the
@@ -1404,14 +1664,17 @@ array.
 Guarantee: A campaign reaches a render in which the user-hint fragment cap
 actually binds, and the served bytes are still a balanced `<ctx-search-hint>`
 element with no broken scalar.
-Check: `sometimes` — at least once per campaign, observe a served array
-containing a `<ctx-search-hint>` block whose body has a line ending in `…`, and
-assert on that same render that the element is balanced, that every fragment
-line is at most `USER_HINT_FRAGMENT_CHAR_CAP + 2` UTF-16 units, and that the
-whole message is valid UTF-8 with no lone surrogate. `sometimes` and not
-`reachable`, because executing `one_line_fragment`'s truncation branch in a
-unit test proves nothing about a render that actually carried a truncated hint
-into the provider array.
+Check: `sometimes` — marker `USER_HINT_FRAGMENT_TRUNCATION_SERVED`. At least once
+per campaign, observe a served array containing a `<ctx-search-hint>` block whose
+body has a line ending in `…`, and assert on that same render that the element is
+balanced, that every fragment line is at most `USER_HINT_FRAGMENT_CHAR_CAP + 2`
+UTF-16 units, and that the whole message is valid UTF-8 with no lone surrogate.
+`sometimes` and not `reachable`, because executing `one_line_fragment`'s truncation
+branch in a unit test proves nothing about a render that actually carried a
+truncated hint into the provider array. The marker name is a constant and is
+globally unique across this catalog; it witnesses a served truncation, which is a
+legal state of a correct implementation, so it does not pair with any `always(!X)`
+and cannot fire only by observing a defect.
 Fault/timing angle: None.
 Required faults and enabling state: `auto_search_active` (default true, see the
 record above), an authored user tail that is the last message (`:8776-8780`),
@@ -1442,14 +1705,20 @@ overlay kind at a time. No test constructs a block carrying three.
 Guarantee: A campaign reaches the state where one block carries more than one
 overlay kind at once, so the fixed mutator order and the interaction between
 envelopes is actually exercised.
-Check: `sometimes` — assert that at least once per campaign a single `block_id`
-appears in two or more of `tag_by_block_id`, `temporal_by_block_id`,
-`user_hint_by_block_id`, `channel1_by_block_id` on the same accepted pass, and
-separately at least once in three of them. `sometimes` and not `reachable`
-because `apply_tag_overlay_to_message`'s lines execute on every tagging pass;
-what a campaign can easily miss is the operational *situation* of a
-multiply-overlaid block, which is where the ordering and the envelope
-interactions live.
+Check: `sometimes` — marker `OVERLAY_KINDS_COLLIDED_ON_ONE_BLOCK`. Assert that at
+least once per campaign a single `block_id` appears in two or more of
+`tag_by_block_id`, `temporal_by_block_id`, `user_hint_by_block_id`,
+`channel1_by_block_id` on the same accepted pass, and separately at least once in
+three of them. Three is the maximum by construction, not four, so the three-way arm
+is a reachable target rather than an unreachable one: a tool result is ineligible
+for the temporal marker (`transform.rs:8642-8647` requires an authored user
+message) and for the user hint (`:8789` requires `role == "user"`). `sometimes` and
+not `reachable` because `apply_tag_overlay_to_message`'s lines execute on every
+tagging pass; what a campaign can easily miss is the operational *situation* of a
+multiply-overlaid block, which is where the ordering and the envelope interactions
+live. The marker name is a constant and is globally unique across this catalog; a
+multiply-overlaid block is an ordinary legal state, so the marker asserts a
+precondition rather than a violation and pairs with no `always(!X)`.
 Fault/timing angle: None. This is situation coverage, not a race.
 Required faults and enabling state: Two reachable combinations. On an authored
 user text block: a minted tag, a gap above 5 minutes since the previous
@@ -1565,25 +1834,32 @@ dominance statement is a hypothesis, not a finding.
 - **An overlay that stops, and one that does not.**
   [nudge-b-frozen-todo-pair-retires-only-on-a-bust](#nudge-b-frozen-todo-pair-retires-only-on-a-bust),
   [nudge-b-channel1-append-first-applies-without-a-frontier-gate](#nudge-b-channel1-append-first-applies-without-a-frontier-gate),
-  [nudge-b-channel1-append-rows-have-no-reaper](#nudge-b-channel1-append-rows-have-no-reaper).
-  Three points on one axis: an overlay with a strict retirement rule, an overlay
-  with no first-apply gate, and the same overlay with no retirement at all.
+  [nudge-b-channel1-append-rows-have-no-reaper](#nudge-b-channel1-append-rows-have-no-reaper),
+  [nudge-b-channel1-append-row-removal-has-no-bounded-window](#nudge-b-channel1-append-row-removal-has-no-bounded-window).
+  Three points on one axis plus the bounded-progress half of the third: an overlay
+  with a strict retirement rule, an overlay with no first-apply gate, the same
+  overlay with no ceiling, and the same overlay with no removal window.
   Hypothesis: the frontier-gate record dominates the reaper record's *first* cost
   and not its second. A check asserting that every newly inserted overlay row's
   `block_id` is absent from `served_output_fingerprint` also bounds how often a row
   can be created against a served block, but it says nothing about accumulation
   over a long session, and nothing at all about a stale row resurfacing on a
-  reconstructed block id. The todo-pair record is the control in this cluster: it
-  is the one injected thing with a retirement rule that actually holds, and it is
+  reconstructed block id. That second cost is what the liveness record owns, and it
+  is why the split under `R3` was not cosmetic: the frontier gate constrains
+  *creation*, the count bound constrains *size*, and neither can be satisfied in a
+  way that bounds *retention*. The todo-pair record is the control in this cluster:
+  it is the one injected thing with a retirement rule that actually holds, and it is
   the only one whose absent placement is a hard error
   (`SyntheticTodoAnchorMissing`, `transform.rs:12125-12133`) rather than an
   absorbed skip.
 - **Idempotence delegated to the caller.**
   [nudge-b-opencode-channel2-arm-has-no-module-side-latch](#nudge-b-opencode-channel2-arm-has-no-module-side-latch),
-  [nudge-b-channel2-retirement-is-caller-asserted](#nudge-b-channel2-retirement-is-caller-asserted).
-  The two Channel-2 arms, and they are opposites rather than variants: one keeps a
-  durable directive id, an arming watermark and a 10-minute lease
-  (`transform.rs:9435-9513`), the other writes nothing at all (`:9347-9365`).
+  [nudge-b-channel2-retirement-is-caller-asserted](#nudge-b-channel2-retirement-is-caller-asserted),
+  [nudge-b-channel2-pending-directive-rearms-within-the-lease-ttl](#nudge-b-channel2-pending-directive-rearms-within-the-lease-ttl).
+  The two Channel-2 arms plus the bound that separates them, and the arms are
+  opposites rather than variants: one keeps a durable directive id, an arming
+  watermark and a 10-minute lease (`transform.rs:9435-9513`), the other writes
+  nothing at all (`:9347-9365`).
   Hypothesis: the OpenCode record is the more urgent by a wide margin, because it
   is the profile the shipped host sends (`rust-mode-transform.ts:1339`) and its
   failure mode is a `<system-reminder>` on every pass while pressure is high,
@@ -1591,7 +1867,11 @@ dominance statement is a hypothesis, not a finding.
   Neither dominates the other as a check, since they need different profiles, and
   the pair is what makes the finding legible: the arm with the protocol is the arm
   nothing in this tree exercises, and the two module rearm helpers
-  (`:9412-9433`) clear state the live arm never reads.
+  (`:9412-9433`) clear state the live arm never reads. The liveness record is the
+  hinge of that comparison rather than a third variant: the OpenCode arm's damage is
+  unbounded *because* it has no analogue of the lease, so proving the lease fires
+  within its bound is what licenses the claim that one arm is bounded and the other
+  is not.
 - **Unmarked authorship.**
   [nudge-b-injected-todo-pair-carries-no-provider-visible-provenance](#nudge-b-injected-todo-pair-carries-no-provider-visible-provenance),
   [nudge-b-auto-search-hint-injects-unauthored-text-into-a-user-block](#nudge-b-auto-search-hint-injects-unauthored-text-into-a-user-block).

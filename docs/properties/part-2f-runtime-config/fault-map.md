@@ -63,7 +63,7 @@ is not a fault either; the row says so.
 | **F4** the default configuration | `HostConfig::default()` with no overrides, which is what production uses apart from `max_resident_bytes` (`serve.rs:582-593`, `..HostConfig::default()` at `:593`) | **Yes, and it is not a fault.** It is the production configuration, and it is already the subject of the sub-part's one `Exercised: yes` record: `tests/lifecycle.rs:496` `liveness_is_disabled_by_default` asserts no Ping arrives within 500 ms on a default host |
 | **F5** a handler-authored activation report | A handler or composite whose `health` report carries `metrics.components.<id>.metrics.storage_state == "starting"` or `synapse_state == "starting"`, so `activation_in_progress` (`runtime.rs:1051-1071`) returns true and `:1130` selects the fixed 50 ms | **Yes in principle, and built nowhere. This is the cheapest missing fixture in the sub-part.** `McHostHandler::health` returns a `HealthReport` (`handler.rs:591`) whose `metrics` field is `Option<serde_json::Value>` (`:194`), entirely handler-authored, so the report is a value a test writes. Two things are needed together: the report, and a `health_interval` distinguishable from 50 ms, because `tests/lifecycle.rs:165` currently sets exactly 50 ms and therefore cannot separate the branches. `tests/activation.rs` (4 tests, 412 lines) is the natural home |
 | **F6** a blocking first health callback | A handler whose first `health` call blocks, so the seeded `Degraded` snapshot (`runtime.rs:889-893`) is what an authenticated `host.status` reads (`connection.rs:691-695`) for up to `lifecycle_callback_deadline` | **Yes.** `tests/lifecycle.rs:579` already builds a slow-callback handler, and the window is genuinely client-visible by construction: the health task is spawned at `runtime.rs:933` and `accept_loop` starts one line later at `:934`. A client that authenticates and issues `host.status` inside the window is ordinary harness work |
-| **F7** a non-yielding tracked task at shutdown | A tracked task that survives `shutdown_deadline`, so `timeout_at(deadline, tracker.wait())` fails at `runtime.rs:1214` and the doubled chain at `:1223-1224` is armed | **Yes.** `tests/lifecycle.rs:678` and `:714-715` build the non-yielding-callback shape and set both `lifecycle_callback_deadline` and `shutdown_deadline`, so the forced path is already reachable. What no test does is measure the elapsed total, which is a stopwatch rather than a capability |
+| **F7** a non-yielding tracked task at shutdown | A tracked task that survives `shutdown_deadline`, so `timeout_at(deadline, tracker.wait())` fails at `runtime.rs:1214` and the doubled chain at `:1223-1224` is armed | **Partial, and the split is the finding rather than the count.** *Reaching the forced path: yes.* `tests/lifecycle.rs:678` and `:714-715` build the non-yielding-callback shape and set both `lifecycle_callback_deadline` and `shutdown_deadline`. *Bounding it: no, and the same fixture is why.* A `tokio::time::timeout` cannot preempt a future that never yields, and `run_handler_shutdown`'s own doc comment states the callback "is never aborted" (`:1256-1258`), so against a non-yielding callback every finite ceiling in the record is void. Bounding the path needs a callback that is slow **and** yielding, and separating the two forced exits — `:1238`, which never calls `run_handler_shutdown`, from `:1241`, which does — needs a second variant that drains inside the doubled chain. Neither exists. What no test does is measure the elapsed total, and that is a stopwatch; what no test *builds* is the input against which the total is bounded at all |
 | **F8** a peer that stalls across two setup stages | A peer that stalls inside authentication (`connection.rs:125`), then inside descriptor transfer (`:158`), then inside ring activation (`:177`), so the serial pre-service budget can be measured against `auth_deadline + 2 * transport_setup_deadline` | **No.** Part 2c's `fault-map.md:52` describes this fixture and records that it does not exist, and Part 2c's `fault-map.md:180` reaches only one of the two `transport_setup_deadline` sites. The blockage is a missing harness rather than a missing seam: nothing prevents writing a peer that stalls, but no peer fixture in the tree stalls at a chosen stage |
 | **F9** a hostile closure-root path | A `${dataDir}/cortexkit/mc-host-harness-closures` path that is a symlink, group-writable, a non-directory, or owned by another uid, so `HarnessClosureStore::open` fails with one of its distinct `&'static str` causes (`harness_closure.rs:1044`, `:1052`, `:1067`, `:1074`, `:1076`, and `verify_owned_directory` at `:923`) | **Partial, and the split matters.** *Producing the failure: yes.* `tests/instance_security.rs` already builds hostile-path fixtures for the sibling walk in `instance.rs`, and `tests/harness_closure.rs` constructs the store at 11 sites, so `open` can be driven to each of its failure causes directly. *Observing a classified reason: no.* Both production call sites are `HarnessClosureStore::open(&closure_root).ok()` (`serve.rs:162`, `:349`), so every distinct cause collapses to `None` before anything could report it. The record's oracle as written cannot pass, and the honest oracle is the enumeration that the discard happens |
 | **F10** a pre-publication drain trigger | One of the three entries into `PrePublicationCleanup::finish` (`runtime.rs:351`) with initialization having returned `Ok`: the shutdown token already cancelled at `:831`, `bind_owner_only` failing at `:836`, or `publish` failing at `:843` | **Yes, and the cheapest form is deterministic rather than racy.** The shutdown token is caller-supplied and `initialize` is handler-supplied, so a test handler that cancels the token inside its own `initialize` makes the `is_cancelled` check at `:831` deterministically true and returns `Ok(None)`, draining through `:856`. The bind form needs the `setup.sock` path occupied or unwritable inside the guard's directory; the publish form needs a connection-file write failure. Neither of those two is built today |
@@ -115,9 +115,9 @@ its row notes the consequence.
 
 | Property | Required faults and enabling state | Non-vacuous today |
 | --- | --- | --- |
-| rt-a-a-fixed-probe-interval-preempts-the-configured-health-interval | **`F5`, plus a fixture value change.** A handler whose `health` report carries `storage_state: "starting"` or `synapse_state: "starting"`, so `activation_in_progress` (`:1051-1071`) returns true, **and** a `health_interval` distinguishable from 50 ms. `tests/lifecycle.rs:165` currently sets exactly 50 ms, which makes the two branches of `:1129` inseparable | **Yes** — the report is a `serde_json::Value` a test writes, and the interval is a config field. Both halves are fixture work with no seam. The record's second clause, recording how many consecutive iterations selected 50 ms so a campaign can bound it, is what turns an override into a measurement |
+| rt-a-a-fixed-probe-interval-preempts-the-configured-health-interval | **`F5`, plus a fixture value change.** A handler whose `health` report carries `storage_state: "starting"` or `synapse_state: "starting"`, so `activation_in_progress` (`:1051-1071`) returns true, **and** a `health_interval` distinguishable from 50 ms. `tests/lifecycle.rs:165` currently sets exactly 50 ms, which makes the two branches of `:1129` inseparable | **Partial, and the split is per conjunct rather than per fault.** The state construction is fully available: the report is a `serde_json::Value` a test writes and the interval is a config field, so both halves are fixture work with no seam. What is *not* available is a bound for the fast path. The record's first conjunct — selected interval equals `health_interval` whenever the predicate is false — is a pass/fail assertion and is non-vacuous today with only the `tests/lifecycle.rs:165` value change. The second has no bound in the code to assert: the earlier text asked an oracle to "record the number of consecutive iterations that selected 50 ms so a campaign can bound it", which every observation satisfies, so it can only pass. Nothing in `HostTiming` supplies a `K`, and no reading of `config.rs:216-232` makes an existing knob govern activation. So the fast-path half is blocked on a product decision, not on a harness, and the record's open question is the blocker |
 | rt-a-the-serial-setup-budget-triples-the-configured-transport-deadline | **`F8`.** A peer that stalls maximally inside authentication (`connection.rs:125`), then descriptor transfer (`:158`), then ring activation (`:177`), measured from `run_connection` entry (`:115`) to `activate_server`'s return | **No** — Part 2c's `fault-map.md:52` describes the fixture and records that it does not exist, and `:180` reaches one of the two `transport_setup_deadline` sites. The **static** half is settled by reading: both sites arm the deadline fresh, which is why the correct figure is 6 s and not 2c's recorded 4 s. What is unconstructible is the wall-clock measurement |
-| rt-a-forced-shutdown-outlives-the-configured-shutdown-deadline | **`F7`.** A tracked task that survives `shutdown_deadline`, so `:1214`'s `timeout_at` fails and `:1223-1224` arms the doubled chain. `tests/lifecycle.rs:678` and `:714-715` already build the shape and set both deadlines | **Yes**, with one caution that belongs on the record rather than in the fixture. The state is reachable and the measurement is a stopwatch. But the check as stated bounds the total at `shutdown_deadline + 2 * lifecycle_callback_deadline`, which is 70 s at defaults, while lens B's composition of all six stages gives a floor of about **100 s** and about **160 s** counting one untimed `force_close_all_routes`. `run_handler_shutdown`'s own 30 s (`:1240`, bounded at `:1276`) is outside the two terms, so an oracle written to the check verbatim would fail on a correct build. Carried as a synthesis note on the record |
+| rt-a-forced-shutdown-outlives-the-configured-shutdown-deadline | **`F7`, and it must now be built in two shapes rather than one.** A tracked task that survives `shutdown_deadline` so `:1214`'s `timeout_at` fails and `:1223-1224` arms the doubled chain, **and then either drains inside that chain or does not**, because those are the two forced exits and they carry different bounds. `tests/lifecycle.rs:678` and `:714-715` already build a shape that reaches the forced path and set both deadlines | **Partial, and the earlier `Yes` rested on a check that could not pass.** Three corrections, all applied to the record. First, `shutdown_sequence` has three exits, not one: `:1243` graceful at `shutdown_deadline + lifecycle_callback_deadline`, `:1238` fatal-latch at `shutdown_deadline + 2 x lifecycle_callback_deadline` and **never calling `run_handler_shutdown`**, and `:1241` forced-with-callback at `shutdown_deadline + 3 x lifecycle_callback_deadline`. The old single bound, `shutdown_deadline + 2 x lifecycle_callback_deadline`, was the bound of the exit that does the least work, so an oracle written to it failed on a correct build the moment the handler callback took any time — which the pre-disposition text noticed, recorded as a synthesis note, and declined to fix. Second, the composed figures are per-branch **ceilings**, not floors: every stage returns as soon as its awaited future resolves, so a forced shutdown whose surviving task drains immediately exits in milliseconds past the drain deadline. Third and load-bearing for the fixture: **the existing `tests/lifecycle.rs:678` shape is non-yielding, and a non-yielding callback defeats every finite ceiling here**, because `tokio::time::timeout` cannot preempt a future that never yields and `run_handler_shutdown`'s own comment at `:1256-1258` says the callback is never aborted. So the fixture that reaches the forced path is the fixture that cannot bound it, and a slow-but-yielding callback is what no test builds. The measurement is a stopwatch; the *fixture* is not free |
 
 ### The detection the default configuration does not arm
 
@@ -142,22 +142,46 @@ its row notes the consequence.
 | rt-a-a-closure-store-open-failure-is-classified-not-swallowed | **`F9`.** A hostile closure root — symlinked or non-owner-only ancestor, wrong mode, non-directory, or a creation failure — each of which `harness_closure.rs` maps to a distinct `&'static str` (`:1044`, `:1052`, `:1067`, `:1074`, `:1076`, `:923`). `tests/instance_security.rs` already builds hostile-path fixtures for the sibling walk in `instance.rs`, and `tests/harness_closure.rs` constructs the store at 11 sites | **Partial, and the split is the finding.** Driving `open` to each failure cause is constructible today. Asserting that "the resulting host startup carries a classified unavailability reason naming that cause" is not, because no such reason exists: `serve.rs:162` and `:349` are each `HarnessClosureStore::open(&closure_root).ok()`, so every cause collapses to `None` before anything could report it. The honest oracle today is the enumeration that the discard happens; the record's oracle needs a mechanism that does not exist, in a file this sub-part does not own |
 | rt-a-an-initialized-handler-drains-without-publishing | **`F10`.** Any of three entries into `PrePublicationCleanup::finish` (`:351`) with initialization having returned `Ok`: the shutdown token already cancelled at `:831` (which returns `Ok(None)` and drains through `:856`), `bind_owner_only` failing at `:836`, or `publish` failing at `:843` | **Yes**, via the cheapest entry, and it is deterministic rather than racy. The shutdown token is caller-supplied and `initialize` is handler-supplied, so a test handler that cancels the token inside its own `initialize` makes `:831` deterministically true. The two failure entries are unbuilt: the bind form needs `setup.sock` occupied or unwritable inside the guard's directory, the publish form needs a connection-file write failure |
 
-**Totals: 11 fully non-vacuous today, 2 partial, 1 not constructible.** The eleven
-are all three of Group A, the fixed-probe and forced-shutdown records, both
-default-configuration detection records, the activation-fast-probe reachability
-record, both surface enumerations, and the pre-publication drain. The two partial
-ones are the reserved-pools record, where one conjunct needs acquisition-site
-observation, and the closure-store record, whose oracle needs a mechanism outside
-the footprint. The one blocked record is the serial-setup-budget record, blocked
-on Part 2c's missing stalling-peer fixture.
+**Totals: 9 fully non-vacuous today, 4 partial, 1 not constructible**, against a
+pre-disposition 11/2/1. Two rows moved from `Yes` to `Partial` and both moves are
+pessimistic, which is the honest direction: the fixed-probe record, whose
+fast-path conjunct has no bound in the code to assert and is blocked on a product
+decision rather than on a harness, and the forced-shutdown record, whose single
+stated bound was the bound of the exit that does the least work and whose one
+existing fixture shape is non-yielding and therefore cannot bound anything. The
+nine are all three of Group A, both default-configuration detection records, the
+activation-fast-probe reachability record, both surface enumerations, and the
+pre-publication drain. The four partial ones are the reserved-pools record, where
+one conjunct needs acquisition-site observation; the closure-store record, whose
+oracle needs a mechanism outside the footprint; and the two just demoted. The one
+blocked record is the serial-setup-budget record, blocked on Part 2c's missing
+stalling-peer fixture.
 
-Note the shape of that eleven: **six of them need no fault at all**, because six
-of the fourteen records are statements about construction order, arithmetic
+Note the shape of that nine: **six of them need no fault at all**, because six of
+the fourteen records are statements about construction order, arithmetic
 coupling, or the presence or absence of a consumer, rather than about code
 misbehaving under stress. Two more need only a configuration value, and two more
 need only a handler-authored report. That is what cataloging an assembly and
-configuration surface produces, and it is a stronger position than either sibling
-had, offset entirely by `F0`.
+configuration surface produces, and it remains a stronger position than either
+sibling had, offset entirely by `F0`.
+
+**One capability claim in `F7` needs correcting rather than recounting, because it
+is what the forced-shutdown demotion turns on.** `F7`'s row says
+`tests/lifecycle.rs:678` and `:714-715` "build the non-yielding-callback shape",
+and reports that as availability. It is availability of the *state* and
+unavailability of the *oracle*: a non-yielding callback is precisely the input
+against which `tokio::time::timeout` provides no bound, so the fixture that
+reaches the forced path is the one that cannot measure it. The fixture the record
+now needs is a callback that is slow **and** yielding, plus a second variant that
+drains inside the doubled chain so the `:1241` exit is separable from the `:1238`
+one. Neither exists. `F7` is therefore `Partial`, not `Yes`, and the row above
+says so.
+
+**And one class is missing from this table entirely, which the gap section
+records.** `AbandonGuard::drop` (`runtime.rs:419-476`) is a second teardown path
+with no fault class, no record, and no row here. Reaching it needs the `run`
+future dropped rather than polled, which is a capability nothing in the table
+describes and which `tests/lifecycle.rs` does not exercise.
 
 ## Coverage checks to add
 
@@ -177,11 +201,14 @@ requires the host to stay usable while storage opens. The one pairing to be
 careful about is with
 [rt-a-a-fixed-probe-interval-preempts-the-configured-health-interval](catalog.md#rt-a-a-fixed-probe-interval-preempts-the-configured-health-interval),
 which is `always(selected interval == health_interval whenever
-activation_in_progress is false)`. The marker fires when the predicate is
-**true**, so it is not the negation of that `always` and the pair is not the
-forbidden `always(!X)`/`sometimes(X)` shape. Recorded explicitly because this is
-the one place in the sub-part where the illegal pairing would be easy to write by
-accident.
+activation_in_progress is false)` — that record's first conjunct, and the only one
+of its two that is a pass/fail assertion at all. The marker fires when the
+predicate is **true**, so it is not the negation of that `always` and the pair is
+not the forbidden `always(!X)`/`sometimes(X)` shape. Recorded explicitly because
+this is the one place in the sub-part where the illegal pairing would be easy to
+write by accident. The disposition that split that record into an assertable
+conjunct and a measured one does not change this argument: the marker pairs with
+the assertable conjunct, and the measured one asserts nothing to be paired with.
 
 [rt-a-an-initialized-handler-drains-without-publishing](catalog.md#rt-a-an-initialized-handler-drains-without-publishing)
 is a marker inside `PrePublicationCleanup::finish` (`:351`), fired only when

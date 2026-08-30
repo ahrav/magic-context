@@ -234,8 +234,12 @@ under `--exact`. Details are in
 
 ## Index
 
-Fourteen records, in the order lens A proposed them. Lens B proposed none by
-design; it built the claim register and the check inventory.
+Fourteen records from this sub-part's own lens passes, in the order lens A
+proposed them. Lens B proposed none by design; it built the claim register and
+the check inventory. **Four further records were carried into this sub-part in a
+later pass**, from the superseded pre-refactor `part-2b-wire-and-channels`; they
+are the last four rows and they live in
+[Group G](#group-g-the-wire-header-decode-contract). Eighteen records in total.
 
 | Slug | Type | Confidence |
 | --- | --- | --- |
@@ -253,6 +257,14 @@ design; it built the claim register and the check inventory.
 | [ring-a-segmented-inbound-body-has-no-production-producer](#ring-a-segmented-inbound-body-has-no-production-producer) | reachability | high |
 | [ring-a-cancellation-close-requires-an-empty-inbound-observation](#ring-a-cancellation-close-requires-an-empty-inbound-observation) | liveness | medium |
 | [ring-a-ingress-wait-holds-a-lease-while-servicing-egress](#ring-a-ingress-wait-holds-a-lease-while-servicing-egress) | reachability | high |
+| [decode-header-is-total-over-arbitrary-bytes](#decode-header-is-total-over-arbitrary-bytes) | safety | high |
+| [accepted-header-decode-is-a-bijection-on-twenty-one-bytes](#accepted-header-decode-is-a-bijection-on-twenty-one-bytes) | safety | high |
+| [reserved-encodings-and-identity-pairings-reject-at-decode](#reserved-encodings-and-identity-pairings-reject-at-decode) | safety | high |
+| [encoder-never-emits-a-frame-its-own-decoder-rejects](#encoder-never-emits-a-frame-its-own-decoder-rejects) | safety | high |
+
+The last four rows are the carried records. They keep their original unprefixed
+slugs so the carry stays visible against the fourteen `ring-a-` records this
+sub-part derived itself.
 
 The six group headings below are this synthesis's own, chosen by shared
 mechanism rather than by the order records were proposed. Grouping reorders the
@@ -265,6 +277,13 @@ Distribution after the portfolio disposition in
 Two records changed under that disposition and both are recorded at the record:
 the release-identity record moved from `reachability`/`unreachable` to
 `safety`/`always`, and the doctor record moved from `reachable` to `sometimes`.
+
+The four carried records add **4 safety** and semantics **4 `always`**, none of
+which passed through that disposition, so the eighteen-record totals are
+**12 safety, 5 reachability, 1 liveness** and **12 `always`, 1
+`always-or-unreached`, 2 `sometimes`, 2 `reachable`, 1 `unreachable`**.
+Reachability: all four carried records are `default-production`, verified per
+record at carry time. Confidence: four high.
 
 ---
 
@@ -1394,3 +1413,389 @@ these records.
   what that means for their `Exercised` lines: a census proves the absence, and
   **no campaign can satisfy their `reachable` checks at all**, which is why their
   fault-map rows moved from `Yes` to `No` under the portfolio disposition.
+
+---
+
+## Group G: the wire header decode contract
+
+Four records on `crates/mc-host/src/wire.rs`, the 21-byte envelope header, its
+decoder and its encoders. **All four were carried into this sub-part from the
+superseded pre-refactor sub-part `part-2b-wire-and-channels`**, where they were
+records 1, 2, 3 and 6 of `_lenses/lens-a-wire-format.md`. See
+[../part-2b-wire-and-channels/README.md](../part-2b-wire-and-channels/README.md)
+for that directory's disposition.
+
+They were orphaned rather than retired, and the mechanism was a scope move that
+no lens followed. The re-scope retired the `wire-and-channels` label, moved
+`wire.rs` into this sub-part's declared scope, and routed these four forward
+expecting them to be carried unmodified. This sub-part's two lens passes then
+looked at the ring transport: all fourteen records above carry the `ring-a-`
+prefix and every one of their `Guarantee:` lines is about endpoint-thread
+ownership, release identities, admission charges, publication failure, leases,
+reclamation counts or close classification. Not one is about the codec.
+`wire.rs` appears in the rest of this catalog only twice, in the scope sentence
+and in the test inventory that counts its 14 in-file tests. So the codec was in
+scope and uncataloged, and the absorbing sub-part's lenses never re-derived
+these properties.
+
+**This group sits after the relationship map because it was carried in a later
+pass, and the relationship map above does not cover it.** No dominance relation
+is claimed between these four and the fourteen. Within the group, the first
+three are readings of one function and the fourth is the encode-side mirror
+that nothing enforces.
+
+**Why these four and not the other eight lens A records.** `wire.rs` is
+byte-identical between the lens-era commit and `HEAD`: `git rev-parse` returns
+blob `fd0bb178` for `crates/mc-host/src/wire.rs` at `1c193ae0`, `793a973e` and
+`e447c927` alike, and `wc -l` gives 973 at all three. These four cite nothing
+outside `wire.rs`, `tests/protocol_vectors.rs`, and the encoder call graph. The
+other eight lens A records each enumerate a consumer set the ring-transport
+refactor rewrote, and they stay salvage.
+
+**These are not Part 1's decode records, and the distinction is load-bearing.**
+`part-1-shm-transport` holds `decoder-totality-over-arbitrary-bytes` and
+`accepted-decode-consumes-its-declared-width`, and both are scoped by their own
+`Confidence:` and `Fault/timing angle:` lines to the `crates/mc-shm-transport`
+decoders: `descriptor.rs`, `sample.rs`, `ring.rs` and `harness.rs`. That family
+guards the ring's own metadata, the descriptors and samples the transport reads
+before it hands anything to the host. `wire::decode_header` (`wire.rs:306`) is a
+different function in a different crate over a different byte layout: the 21-byte
+envelope header two hosts exchange, whose frozen prefix is specified at
+`wire.rs:16-18` and whose eleven gates are listed in the first record below. The
+two families meet at exactly one line, `ring_transport.rs:471`, where
+`decode_header` is handed the `[u8; 21]` that `Lease::wire_header`
+(`crates/mc-shm-transport/src/lease.rs:163`) returns *after* the transport's own
+decoder has already validated the descriptor. Verified at carry time:
+`WIRE_V2_HEADER_BYTES` is 21 (`crates/mc-shm-transport/src/descriptor.rs:10`)
+and `wire::HEADER_LEN` is 21 (`wire.rs:28`), so the two layouts are the same
+width and still different content. Part 1's records end where this group begins.
+Lens A excluded Part 1's records from its own scope on exactly this ground in
+its "Not re-reported here" preamble, and counting either family as cover for the
+other would double-count in the wrong direction.
+
+**Reachability for all four rests on one chain, re-verified at carry time
+rather than inherited.** `decode_header` has three production call sites and one
+behind a test-only hook. Production: `ring_transport.rs:471` in `receive_one`,
+paired with `validate_inbound_header` at `:473`; `ring_transport.rs:701` in
+`RingClientEndpoint::try_recv_with`; and `client.rs:1908` in `decode_outbound`.
+The fourth, `ring_transport.rs:569`, is inside the `if let Some(hook)` branch at
+`:568` and so is reached only through the test-only `PublishHook` this catalog
+already labels. The ungated chain under the first of those is the one this
+sub-part established against three misleading signals, in
+[Reachability is `default-production`, and three signals argued
+otherwise](#what-this-part-is-about): the profile literal containing "test", the
+wrong `RingClientEndpoint` doc comment, and `#[doc(hidden)]` on the module. Its
+anchors were re-printed here: `RingTransport` is constructed unconditionally at
+`runtime.rs:876` and stored non-optionally as `HostShared.ring` (`:104`), and
+every authenticated connection calls `ring.prepare(...)` at `connection.rs:148`.
+`wire.rs` contains exactly two `#[cfg]` attributes, `:541` and `:646`, and
+neither is on the decode path; `:541` gates the test-only `encode_frame`, which
+matters to the fourth record and is recorded there.
+
+**Citations repaired at carry time, per METHOD rule 1.** Six, across three of
+the four records; the bijection record needed none. They are listed at each
+record and collected here: the `reject_unknown_frame_type_and_reserved_flag_encodings`
+span is `:745-774` and not `:745-773` (two records cited the short form, the
+closing brace is at 774); `structural_corruption_closes_silently` was renamed to
+`structural_corruption_is_rejected_before_dispatch` and moved from
+`tests/protocol_vectors.rs:512` to `:351`; `pure_header_frames_accept_any_valid_priority`
+moved from `:656` to `:504`; the count of production `decode_header` callers is
+three and not two; `wire.rs:548` is inside a `#[cfg(test)]` encoder rather than a
+production one; and the wire protocol's retirement clause is
+`docs/mc-host-wire-protocol.md:296`, not `:293`. Two cited files changed and
+neither is a subject file: `tests/protocol_vectors.rs` went from 976 lines at
+`1c193ae0` to 762 at `e447c927` under `63c4d277` ("refactor(shm): enforce
+ring-only architecture"), which is what the earlier triage predicted for the
+third record; and `docs/mc-host-wire-protocol.md` went from 1,031 lines to 936,
+which the triage did not predict and which the fourth record cited. One open
+question was also resolved rather than repaired, in the fourth record: the route
+allocator cannot mint an epoch-0 handle.
+
+### decode-header-is-total-over-arbitrary-bytes
+
+Type: safety
+Reachability: default-production — `decode_header` (`wire.rs:306`) has three
+production call sites, all on ungated paths: `ring_transport.rs:471` in
+`receive_one`, `ring_transport.rs:701` in `RingClientEndpoint::try_recv_with`,
+and `client.rs:1908` in `decode_outbound`. The first is under the chain this
+catalog established against three misleading signals: `RingTransport` built
+unconditionally at `runtime.rs:876`, stored non-optionally at `:104`,
+`ring.prepare` called by every authenticated connection at `connection.rs:148`.
+A fourth call site, `ring_transport.rs:569`, is inside the test-only
+`PublishHook` branch at `:568` and is not counted. Neither `#[cfg]` in the file
+(`:541`, `:646`) is on this path.
+Status: active
+Exercised: partial — `wire.rs:722-742` covers three specific short and
+bad-version inputs, and `wire.rs:745-774` covers four bad flag or type bytes.
+Missing: any sweep over arbitrary bytes, any exhaustive length sweep from 0 to
+21, and any structured mutation of an accepted seed. There is no fuzz target for
+this decoder anywhere in the repository (`crates/mc-shm-transport/fuzz` is the
+only fuzz directory; its three targets are `frame_descriptor.rs`,
+`provider_grant.rs` and `provider_sample.rs`, all transport decoders).
+Guarantee: For every byte slice, `decode_header` returns either an
+`EnvelopeHeader` satisfying all eleven gate postconditions or a typed
+`DecodeError`; it never panics and never allocates.
+Check: `always` — call `decode_header` on arbitrary bytes of arbitrary length;
+assert the call returns, and that on `Ok` every one of the eleven gate
+conditions holds on the returned value. A panic is a forbidden state with no
+dedicated detection point, so this is `always(!panic)`; `unreachable` is wrong
+because no code location must never execute.
+Fault/timing angle: none. The function is pure over one immutable slice. The
+structural exposure is that every index past the first is a constant index
+(`bytes[4]`, `bytes[5]`, `bytes[6]`, `bytes[7..9]`, `bytes[9..13]`,
+`bytes[13..21]`) whose in-bounds-ness rests entirely on the single
+`bytes.len() < need` gate at [wire.rs:312] and on `header_len_for_version`
+returning 21 [wire.rs:294]. Narrowing that constant, or adding a version whose
+`header_len_for_version` value is smaller than the largest constant index,
+converts [wire.rs:355-357] into a panic.
+Required faults and enabling state: none. Arbitrary bytes are the entire
+enabling state. The property holds at `HEAD` and is under-evidenced, not
+violated.
+Confidence: high — [evidence](evidence/decode-header-is-total-over-arbitrary-bytes.md).
+Every gate and every index was read directly, and re-read at carry time: the
+eleven gates are `:307`, `:311`, `:312`, `:321`, `:323`, `:326`, `:329-331`,
+`:332-339`, `:340`, `:345` and `:352`. `EnvelopeHeader` is constructed once,
+after all eleven, at [wire.rs:359-367], and its fields are public but the value
+cannot escape a rejected path. No allocation occurs: the function returns a
+`Copy` struct.
+Existing check: `wire.rs:722` `reject_truncated_headers_and_unsupported_versions`
+and `wire.rs:745` `reject_unknown_frame_type_and_reserved_flag_encodings`, both
+table-driven over single hand-picked inputs. Neither runs in CI, under this
+sub-part's `R0`. Status unaudited. **One citation repaired at carry time:** the
+second test's span is `:745-774`, not `:745-773`; the closing brace is at 774
+and the lens range truncated it by one line.
+Impact: today, none observable, and the reason was refreshed at carry time. All
+three production callers pass an exactly-21-byte array, not a variable-length
+slice: `ring_transport.rs:471` and `:701` pass `&lease.wire_header()`, typed
+`[u8; WIRE_V2_HEADER_BYTES]` at `crates/mc-shm-transport/src/lease.rs:163` with
+that constant equal to 21 at `descriptor.rs:10`, and `client.rs:1908` passes
+`header_bytes: &[u8; HEADER_LEN]` narrowed at `:1907`. **The lens said "both
+production callers" and there are three; the count is repaired and the
+conclusion is unchanged.** The value of the record is that the reasoning keeping
+totality true lives nowhere in the tree, and the moment a caller passes a
+variable-length slice — a coalescing reader, a batched shared-memory descriptor,
+a future version with a shorter header — the constant indexes become the only
+thing between a peer and a panic in the read loop.
+Open questions:
+- Should `header_len_for_version` be required to return at least the largest
+  constant index used by the parse body, so a future version cannot silently
+  make the parse out of bounds? (needs human input)
+
+### accepted-header-decode-is-a-bijection-on-twenty-one-bytes
+
+Type: safety
+Reachability: default-production — the decode direction is the three production
+`decode_header` call sites named in the record above. The encode direction is
+`EnvelopeHeader::encode` (`wire.rs:205-216`), reached from both production
+encoders: `encode_owned_frame`, whose `EnvelopeHeader { .. }.encode()` chain is `:584-593`,
+and `encode_split_frame`, whose chain is `:622-631` and which also delegates
+small bodies to `encode_owned_frame` at `:615`. Those
+encoders are called from `dispatch.rs:292`, `:329`, `:723`, `:802`, `:1458`,
+`connection.rs:779`, `:866`, and `client.rs:1329`, `:2092`, none `cfg`-gated.
+Status: active
+Exercised: partial — `wire.rs:703-719` pins all seven field offsets with
+distinctive byte values, and `wire.rs:680-690` round-trips one header. Missing:
+a per-bit influence oracle, and any assertion that `decode_header` reads nothing
+past `HEADER_LEN`.
+Guarantee: For every accepted header, `encode` and `decode_header` are mutually
+inverse, every one of the 21 bytes influences exactly one decoded field, and no
+byte at or beyond offset 21 is consumed.
+Check: `always` — for every accepted 21-byte input, `decode_header(bytes)` then
+`.encode()` reproduces `bytes` exactly; flipping any single bit inside the 21
+bytes either changes the decoded value or causes rejection; and appending
+arbitrary trailing bytes changes nothing about the result. `always` rather than
+`reachable`: the condition is evaluated on every accepted decode, and the
+forbidden state is an accepted header with an inert or aliased byte, which has
+no dedicated detection point.
+Fault/timing angle: none. The interesting axis is that `encode` writes its seven
+fields by hand-written literal ranges [wire.rs:207-213] and `decode_header`
+reads them back by independently hand-written literal ranges
+[wire.rs:319], [:343], [:344], [:355-357]. Nothing ties the two sets of offsets
+together, and a same-width transposition — `channel` against the low half of
+`epoch`, or two bytes inside `corr` — is invisible to a round-trip test whose
+fixture uses non-distinctive values.
+Required faults and enabling state: none. Any accepted input suffices; what is
+missing is the oracle.
+Confidence: high — [evidence](evidence/accepted-header-decode-is-a-bijection-on-twenty-one-bytes.md).
+`encode` covers `0..4`, `4`, `5`, `6`, `7..9`, `9..13`, `13..21` with no gaps and
+no overlaps, and the decode side reads the identical seven ranges. Both sides
+were re-printed at carry time and every citation in this record verified
+unchanged; this is the one carried record that needed no repair. The
+`little_endian_and_frozen_prefix_layout` test at `wire.rs:703` does use
+distinctive ascending values, so it would catch a transposition today; nothing
+forbids a future fixture from losing that property, and the test asserts on
+`encode` only, never on the decode direction's offsets.
+Existing check: `wire.rs:703` `little_endian_and_frozen_prefix_layout` (encode
+direction, distinctive values, plus `buf.len() == HEADER_LEN` at `:718`);
+`wire.rs:680` `round_trip_request`; `wire.rs:693` `round_trip_all_frame_types`.
+None runs in CI, under this sub-part's `R0`. Status unaudited.
+Impact: this bijection is what makes the frozen-prefix promise in the module
+header [wire.rs:16-18] mean anything, and it is the only reason a peer's
+independently written codec can interoperate. A drifted offset that still
+satisfies the eleven gates produces a frame both sides accept and interpret
+differently.
+Open questions:
+- Should `encode` and `decode_header` be generated from one offset table so a
+  transposition is impossible by construction? (needs human input)
+
+### reserved-encodings-and-identity-pairings-reject-at-decode
+
+Type: safety
+Reachability: default-production — same three production `decode_header` call
+sites as the two records above. The reserved-encoding gates are unconditional
+statements inside `decode_header`, at `:323`, `:326`, `:329-331`, `:332-339`,
+`:345` and `:352`, with no `cfg`, no feature and no config branch between the
+call site and any of them.
+Status: active
+Exercised: partial — `wire.rs:745-774` covers reserved flag bit 7, reserved
+priority, reserved admission, and type byte 99; `wire.rs:836-862` covers
+Sheddable on all ten illegal types and both legal ones; `wire.rs:795-833` covers
+both halves of the channel-and-epoch pairing. Missing: an exhaustive sweep of
+all 256 flag bytes and all 256 type bytes, and any check that a rejected
+encoding is never masked, defaulted, or silently normalized.
+Guarantee: A header carrying a reserved flag bit, a reserved priority or
+admission value, an unassigned type byte, Sheddable on a delivery-required type,
+or a mismatched channel-and-epoch pairing is rejected, never accepted with the
+offending field cleared or defaulted.
+Check: `always` — sweep all 256 values of the flags byte crossed with all 256
+values of the type byte and both channel-and-epoch classes; assert every
+combination the protocol calls invalid returns the specific `DecodeError`
+variant for it, and that no accepted result has reserved bits set or a reserved
+enum value. `always` because the obligation is per-frame and the forbidden
+state — an accepted header whose reserved region was normalized rather than
+refused — has no dedicated detection point.
+Fault/timing angle: none. The exposure is that `Flags::priority` and
+`Flags::admission_class` return `Option` [wire.rs:169-176] while
+`Flags::is_binary` and `Flags::is_last` return `bool` [wire.rs:159-166]. A
+future accessor written in the `bool` style over a widened bit field would mask
+rather than reject, and the only thing forcing rejection today is that
+`decode_header` propagates the `None` at [wire.rs:326] and [wire.rs:329-331].
+Required faults and enabling state: a peer-authored header, which is the
+baseline trust model. No concurrency, no timing.
+Confidence: high — [evidence](evidence/reserved-encodings-and-identity-pairings-reject-at-decode.md).
+Every gate read directly and re-read at carry time. The channel-and-epoch
+pairing is a true biconditional: `channel == 0 && epoch != 0` at [wire.rs:345]
+and `channel != 0 && epoch == 0` at [wire.rs:352], matching protocol section
+6.1's "0 on channel 0; routed epochs are nonzero".
+Existing check: `wire.rs:745` `reject_unknown_frame_type_and_reserved_flag_encodings`,
+`wire.rs:836` `sheddable_rejected_on_every_illegal_frame_type`, `wire.rs:795`
+`epoch_boundaries_round_trip_and_control_channel_epoch_is_reserved`, plus the
+end-to-end `tests/protocol_vectors.rs:351`
+`structural_corruption_is_rejected_before_dispatch` and `:504`
+`pure_header_frames_accept_any_valid_priority`. None runs in CI. Status
+unaudited. **Three citations repaired at carry time**, and this is the record the
+earlier triage predicted would need a refresh because
+`tests/protocol_vectors.rs` changed (976 lines at `1c193ae0`, 762 at `HEAD`,
+under `63c4d277`). First, the in-file span is `:745-774`, not `:745-773`.
+Second, `structural_corruption_closes_silently` at `:512` no longer exists: it
+was **renamed** to `structural_corruption_is_rejected_before_dispatch` and moved
+to `:351`. The rename is not a rewrite — the doc comment above it is unchanged
+("Each structurally illegal frame retires the generation with no `Error` frame
+and no resynchronization (protocol §6.3, AE2, V13-V15, V17, V42)") and so is the
+`Case { name, bytes }` table that follows, so the check the record cited is the
+check that still exists. Third, `pure_header_frames_accept_any_valid_priority`
+kept its name and moved from `:656` to `:504`.
+Impact: the reserved regions are the whole forward-compatibility budget. Any
+implementation that masks instead of rejecting spends that budget silently: a
+version-3 field placed in bits 6-7 would be ignored by a version-2 peer that
+should have closed the generation.
+Open questions: None.
+
+### encoder-never-emits-a-frame-its-own-decoder-rejects
+
+Type: safety
+Reachability: default-production — the two production encoders are
+`encode_owned_frame` (`wire.rs:571`) and `encode_split_frame` (`:608`), called
+from `dispatch.rs:292`, `:329`, `:723`, `:802`, `:1458`, `connection.rs:779`,
+`:866`, and `client.rs:1329`, `:2092`, none of them `cfg`-gated and all on the
+terminal-emission path this catalog's siblings in 2e describe. The illegal
+argument region is reachable from outside the crate: `pub mod wire` (`lib.rs:39`)
+exposes both encoders and `FrameId::routed`, and `pub mod handler` (`:17`)
+exposes `RouteHandle` with both fields `pub` (`handler.rs:36-40`).
+Status: active
+Exercised: not yet — no test feeds encoder output back through
+`decode_header` plus `validate_inbound_header` over anything but hand-chosen
+legal inputs. The existing round-trips at `wire.rs:680` and `:693` construct
+`EnvelopeHeader` directly, and `hdr` derives a legal epoch from the channel
+(`wire.rs:650-652`, `u32::from(channel != 0)`), so they cannot reach the illegal
+region.
+Guarantee: For every argument tuple the production encoders accept, the emitted
+bytes decode successfully and pass inbound validation on a conforming peer.
+Check: `always` — for arbitrary `(ty, flags, id, body)`, either
+`encode_owned_frame` returns `Err`, or `decode_header` on its output returns
+`Ok` and the result satisfies the pure-header, Sheddable, channel-and-epoch, and
+reserved-bit rules. `always` because it must hold on every emission, and the
+forbidden state — a frame the local decoder would reject — has no detection
+point on the emitting side.
+Fault/timing angle: none; this is a static contract gap. Four concrete holes,
+all re-verified at carry time and all reachable from the crate's public surface
+(O7): `Flags(0b1100_0000)` sets reserved bits, which [wire.rs:323] rejects;
+`Flags(0b0000_0110)` sets reserved priority, which [wire.rs:326] rejects;
+`encode_owned_frame(FrameType::Ping, .., body)` with a nonempty body emits
+`len != 0` on a pure-header type, since `Ping` is in `is_pure_header`'s set
+[wire.rs:86-88] and `encode_owned_frame` [wire.rs:571-602] tests only
+`body.len() > MAX_BODY_LEN` at [:577], which [wire.rs:340] rejects; and
+`FrameId::routed` [wire.rs:525-531] copies `RouteHandle`'s channel and epoch
+without checking that a nonzero channel carries a nonzero epoch, which
+[wire.rs:352] rejects.
+Required faults and enabling state: none beyond a caller passing an
+out-of-contract value. For the `FrameId::routed` hole specifically, a
+`RouteHandle` with a nonzero channel and epoch 0. **The lens left whether the
+route allocator can mint one open, and it is resolved here: it cannot.**
+`RouteRegistry::reserve` (`routing.rs:113-156`) skips channel 0 with
+`if candidate != 0` at `:123`, initializes a fresh slot with `last_epoch: 0` at
+`:125`, and mints `epoch = slot.last_epoch + 1` at `:129-130`, so the least epoch
+it can produce is 1 and the least channel is 1. That is pinned by
+`reserved_channels_are_nonzero_distinct_and_start_at_epoch_one`
+(`routing.rs:512`), whose asserts at `:522-526` require both channels nonzero and
+both epochs equal to 1. So the enabling state is a **hand-constructed**
+`RouteHandle`, which the public fields at `handler.rs:36-40` permit. Hand-building
+a handle the allocator would never mint is already established practice in-tree,
+though not with epoch 0: `routing.rs:715-718` builds a stale-epoch handle and
+`:750-753` builds `epoch: handle.epoch + 1`, both to drive registry rejection
+paths.
+Confidence: high — [evidence](evidence/encoder-never-emits-a-frame-its-own-decoder-rejects.md).
+The gap is high confidence and unchanged: all encoders were read end to end and
+the only rejection in either production encoder is the body-length cap, at
+[wire.rs:577] and [:618]. `Flags::new` [wire.rs:146-156] cannot produce the
+illegal flag values, and the two host flag helpers `response_flags`
+[wire.rs:636-638] and `pure_header_flags` [wire.rs:642-644] both go through it,
+so the in-tree host emission paths are safe today by construction rather than by
+enforcement. **Two things the lens recorded are corrected here.** First, the
+lens counted three production encoders and cited a third cap at [wire.rs:548];
+that cap is inside `encode_frame`, which carries `#[cfg(test)]` at
+[wire.rs:541] and whose only two callers are
+`frame_channel/contract_tests.rs:93` and `:163`. So there are two production
+encoders and one test-only one, and the guarantee is stated over the two.
+Second, the lens's `medium on reachability` rested on not having audited route
+allocation; that audit is done above and the allocator is closed, which leaves
+the hole reachable only through a hand-built handle. The finding survives both
+corrections: nothing on either production encoder checks the pure-header,
+Sheddable, reserved-bit or channel-and-epoch rules its own decoder enforces.
+Existing check: none. `tests/protocol_vectors.rs:143`
+`committed_header_vectors_decode_to_their_documented_fields` asserts the
+document's byte vectors against the independent `raw_client::decode_header`
+oracle (`tests/support/raw_client.rs:286`), which is the decode direction over
+fixed inputs and not encoder refusal. Status: none found.
+Impact: this is the encode side of the framing contract, and it is entirely
+unenforced. A host that emits a frame its own decoder would reject produces
+stream-alignment corruption at the peer, which the protocol requires the peer to
+answer by retiring the connection without resynchronization and with no error
+frame (`docs/mc-host-wire-protocol.md:296`, which lists "unsupported version,
+unknown type, invalid flags, nonzero channel-0 epoch, zero epoch on a routed
+channel, pure-header body" — three of this record's four holes by name) — an
+unattributable connection drop. **One citation repaired at carry time:** the lens
+cited `:293`, which was correct at `1c193ae0`, where that line began "Clean EOF
+before any byte of the next header is orderly connection close. EOF after the
+first header byte, truncated header/body, unsupported version, unknown t...".
+The document shrank from 1,031 lines to 936 and that sentence was rewritten;
+both its clean-close and its retirement clauses now sit in `:296`. `:293` is
+blank at `HEAD`.
+Open questions:
+- Should the encoders validate, or should the illegal region be made
+  unconstructible by removing the public field from `Flags` and by giving
+  pure-header types a body-free encoder? (needs human input)
+- Should `encode_frame`'s `#[cfg(test)]` gate be reconsidered? It is the only
+  encoder that takes `&[u8]` rather than an owned body, and its existence means
+  the contract-test suite exercises an encoder the production path never uses.
+  (needs human input)

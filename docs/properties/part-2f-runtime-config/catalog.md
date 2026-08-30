@@ -41,12 +41,31 @@ the refactor:
 | `ed487e11` | `refactor(host): make ring transport mandatory` |
 
 Two residuals of the opposite shape, recorded so a later pass does not miscount
-them as stale. Both are **forward** references to unbuilt work:
-`runtime.rs:3-5` says future wiring in `magic-context-c50.4` will map
-SIGINT/SIGTERM, and no signal handling was deleted because none has been
-written; and `config.rs:5-6` says CLI and config-file exposure belongs to
-`magic-context-c50.8`, which is the reason the configuration contract is doc
-comments.
+them as stale. Neither describes deleted work. **One of the two was described
+here as a forward reference to unbuilt work and that was wrong**, and the
+correction is applied rather than footnoted, because the construction
+conditionality map below leaned on it.
+
+1. `runtime.rs:3-5` says signal acquisition stays outside the crate and that
+   "future production wiring in `magic-context-c50.4` will map SIGINT/SIGTERM".
+   The first clause is true and the second is **stale**: the production wiring
+   already exists, outside this crate. `serve.rs:617-622` installs a `SIGTERM`
+   stream and a `SIGINT` stream, failing startup if either installation fails,
+   and `:623-631` spawns a task that cancels the caller-supplied
+   `CancellationToken` on the first of the two to arrive. All of that is
+   **before** `mc_host::run` is entered at `:632`, and the comment at
+   `serve.rs:604-616` states the ordering requirement explicitly: creating the
+   stream inside the spawned task would race `run`, and a signal arriving before
+   registration would take the default disposition and kill the daemon outright.
+   So the correct statement is that the crate does not acquire signals and its
+   sole production caller does, for both `SIGINT` and `SIGTERM`. What this
+   changes for the catalog is not a label but a *producer*: shutdown-token
+   cancellation at an arbitrary point in `run` is an operator-reachable
+   production event, not a test-only injection. Consequences are worked through
+   at the end of the construction conditionality map.
+2. `config.rs:5-6` says CLI and config-file exposure belongs to
+   `magic-context-c50.8`, which is the reason the configuration contract is doc
+   comments. This one is a genuine forward reference and stands.
 
 Provenance in [../README.md](../README.md). System
 `/local/home/ahrav/scratch/magic-context`, branch
@@ -59,19 +78,29 @@ commit. Scope and CI findings come from
 figures win.** Three differences, all verified again by this synthesis by
 printing the lines, plus one cross-part correction of its own.
 
-- **The forced-shutdown floor is about 100 seconds, not about 70.** Lens A's
+- **The forced-shutdown total is a per-branch ceiling of about 100 seconds, not a
+  floor, and the word "floor" was wrong wherever this catalog used it.** Lens A's
   observation O3 states the mechanism correctly — `runtime.rs:1148` computes one
   absolute deadline, `:1214`'s `timeout_at` is entered only when it has already
   expired, and `:1223` then arms a *fresh* `lifecycle_callback_deadline
   .saturating_mul(2)` awaited at `:1224` — and then reads the total as 60 s
-  added after 10 s. Lens B composed the whole sequence and found the floor is
-  about **100 seconds** counting only the drain (`:1200`, 10 s), the doubled
-  chain (`:1223-1224`, 60 s), and `run_handler_shutdown` (`:1240`, 30 s at
-  `:1276`), and about **160 seconds** counting one of the two
-  `force_close_all_routes` calls (`:1206`, `:1216`) that no timeout wraps.
-  Lens B's figures are used below and in the record's surrounding prose; the
-  record body itself is verbatim from lens A and states the bound in the units
-  the code bounds, which is unaffected.
+  added after 10 s. Lens B composed the whole sequence and reported about
+  **100 seconds** counting the drain (`:1200`, 10 s), the doubled chain
+  (`:1223-1224`, 60 s), and `run_handler_shutdown` (`:1240`, 30 s at `:1276`),
+  and about **160 seconds** counting one of the two `force_close_all_routes`
+  calls (`:1206`, `:1216`) that no timeout wraps. **Lens B's arithmetic is
+  right and its label is wrong.** Each term is that stage's *maximum*, and each
+  stage returns as soon as its awaited future resolves: `timeout(lifecycle_chain,
+  tracker.wait())` at `:1224` returns the instant the tracker drains, and
+  `run_handler_shutdown` returns the instant the callback task joins. A sum of
+  selected per-stage maxima is a **ceiling on the branch that visits every one of
+  those stages**, and the true floor of the forced path is the drain deadline
+  plus however long the surviving work actually takes, which can be
+  milliseconds. Calling 100 s a floor claims every forced shutdown takes at least
+  that long, which is false and is the opposite of the defect: the defect is that
+  a *ceiling* the operator was told is 10 s can reach roughly ten times that. The
+  corrected figures and terminology are used below, per branch, and the record's
+  `Check:` line is rewritten to match rather than left verbatim.
 - **`activation_in_progress` is `runtime.rs:1051-1071`, not `:1051-1074`.**
   Lens A cited the wider span in two places.
 - **`config.rs` carries 10 in-crate tests and `runtime.rs` 1, for 11 in the
@@ -97,10 +126,17 @@ three sub-parts.
 ### The construction conditionality map
 
 Reproduced in full, because sibling sub-parts depend on it for their reachability
-labels and because the answer is short: **only three things are conditional, and
-nothing is `cfg`-gated.** `run` (`runtime.rs:630`) delegates to
-`run_with_publish_hook` (`:641`). "Unconditional" means reached on every path
-that gets that far, with no config key, feature flag, or `cfg` gating it.
+labels. **This map was rebuilt after an independent evaluation refuted two of its
+rows, and the headline it previously carried — "only three things are conditional"
+— was one of the casualties.** The corrected answer is that four things are
+conditional on a config key, a `#[doc(hidden)]` entry point, or a cancelled
+token, **and one whole tail of the sequence is conditional on something none of
+those categories covers: whether the `run` future is still being polled.**
+Nothing is `cfg`-gated, which was the map's other headline and which survives.
+`run` (`runtime.rs:630`) delegates to `run_with_publish_hook` (`:641`).
+"Unconditional" means reached on every path that gets that far, with no config
+key, feature flag, or `cfg` gating it, **and, for every row from 19 onward, on
+the additional condition that the caller keeps polling `run`.**
 
 | # | Component or step | Site | Condition |
 | --- | --- | --- | --- |
@@ -130,27 +166,89 @@ that gets that far, with no config key, feature flag, or `cfg` gating it.
 | 18e | `health_snapshot` | `:889-893` | Unconditional. Seeded `Degraded` with `components: {}` |
 | 18f | `liveness` | `:886` | Unconditional **copy**; the subsystem it feeds is conditional (see 22) |
 | 18g | `shutdown_latch`, `tracker`, `AbortRegistry` | `:915-919` | Unconditional |
-| 19 | `AbandonGuard` | `:929-931` | Unconditional |
+| 19 | `AbandonGuard` | `:929-931` | Unconditional **construction**, and it is the switch every row below depends on. Armed with `Arc::clone(&shared)` and the `InstanceGuard`; `disarm` at `:937` is reached only if `:936` returned |
 | 20 | Activation task | `:932` | **Unconditional.** Tracked, abort-exempt, not awaited by startup |
 | 21 | Health task | `:933` | **Unconditional.** No config key disables it. `liveness: None` does not suppress it |
 | 22 | Liveness loop | `connection.rs:279-284` | **Conditional on `shared.liveness.is_some()`**, which is `None` by default (`config.rs:294`) and `None` in production (`serve.rs:593`) |
 | 23 | Accept loop | `:934` | Unconditional. 100 ms fixed `ACCEPT_ERROR_BACKOFF` (`:965`), not configurable |
-| 24 | Setup-socket unlink | `:935` | Unconditional, result discarded |
-| 25 | `shutdown_sequence` | `:936` | Unconditional |
+| 24 | Setup-socket unlink | `:935` | **Conditional on `accept_loop` returning to a live poller**, result discarded |
+| 25 | `shutdown_sequence` | `:936` | **Conditional, and this row previously said "Unconditional", which was wrong.** It is reached only if the caller polls `run` past `:934`. If the `run` future is *dropped* at any point after `:929` — a supervisor aborting the task, or a `select!` arm losing — the guard's `Drop` (`:419-476`) runs the teardown instead and `shutdown_sequence` never executes. The two paths are not equivalent: the drop path cancels the token and every generation's three tokens (`:424-434`), calls `abort_all` (`:435`), demotes the phase (`:442`), and then spawns a task that runs `force_close_all_routes`, `tracker.close()`, an **explicitly unbounded** `tracker.wait()` (`:457`, comment at `:452-456`), `run_handler_shutdown` (`:467`), and a **second** unbounded `tracker.wait()` (`:471`) before dropping the lock. So it performs no graceful drain, sends no connection Goodbyes, honours no `shutdown_deadline`, and is bounded by nothing at all. `run_handler_shutdown`'s once-latch (`:1265-1270`) is what keeps the two paths from double-running the handler callback, and its own comment at `:1260-1264` names this exact interleaving, which is direct evidence the drop path is a live concern rather than a theoretical one |
+| 26 | `abandon_guard.disarm` and the ordered handler-then-lock drop | `:937-951` | Same condition as 25. On the graceful branch `shared` and `guard` drop in order (`:944-945`); on the non-graceful branch `retain_lock_until_drained` (`:951`) takes both |
 | — | `HarnessClosureStore` | — | **Never constructed by this crate.** Zero Rust references to `HarnessClosureStore`, `ClosureCandidate`, or `HarnessClosureStore::open` anywhere under `crates/mc-host/src`. Its production constructor is `serve.rs:162` and `:349`, in `mc-module`, and both discard the error with `.ok()` |
 
-Three conclusions siblings can rely on, quoted from lens A because they are what
-the map is for.
+Four conclusions siblings can rely on. The first three are the map's original
+three, two of which survive verification unchanged and one of which is narrowed.
+The fourth is new and is the reason this map was rebuilt.
 
-1. **Nothing in the host runtime is feature-gated or `cfg`-gated.** The only
-   conditional construction in the entire sequence is `set_publish_hook`
-   (test-only), the setup-socket bind and publish pair (skipped on an
-   already-cancelled token), and the per-connection liveness loop.
-2. **The activation task and the health task are unconditional.** A record about
-   either is `default-production` regardless of configuration.
-3. **The liveness loop is not reached in production.** Not merely
+1. **Nothing in the host runtime is feature-gated or `cfg`-gated.** Verified
+   again and unchanged. The conditional construction in the sequence is
+   `set_publish_hook` (test-only), the setup-socket bind and publish pair
+   (skipped on an already-cancelled token), the per-connection liveness loop, and
+   the polled-future tail described in conclusion 4. None of those is a `cfg`.
+2. **The activation task and the health task are unconditional.** Unchanged. A
+   record about either is `default-production` regardless of configuration. Both
+   are spawned at `:932-933`, above the abandon window's practical effect, and
+   neither is gated.
+3. **The liveness loop is not reached in production.** Unchanged. Not merely
    `explicit-config-only`: the sole non-test caller of `run` never sets the
    policy.
+4. **The graceful shutdown sequence is conditional on the `run` future being
+   polled to the end, and the alternative path is unbounded.** New. Rows 24
+   through 26 are reachable only if nothing drops the future, and
+   `AbandonGuard::drop` is a second, structurally different teardown that no
+   record in this catalog describes. This is queued as a gap rather than mined
+   here.
+
+**Which dependent labels this rebuild puts back in question, and whether any
+actually changes.** Stated explicitly because METHOD rule 4 exists precisely
+because a blanket reachability claim in a preamble has already cost one revision,
+and this map *is* that preamble for four sub-parts. Each dependent claim was
+re-derived rather than assumed:
+
+- **Part 2a's three `explicit-config-only` liveness records: unchanged.** They
+  rest on conclusion 3, which is untouched by either error. Re-verified:
+  `config.rs:294`, `connection.rs:279`, `serve.rs:593`.
+- **2b's and 2d's citation of `RingTransport` at `:876` as unconditional:
+  unchanged.** Row 17 is above the abandon window and carries no condition.
+- **2e's citation of the map for "nothing is `cfg`-gated"
+  (`../part-2e-request-path/catalog.md:406-407`): unchanged.** That is
+  conclusion 1, which survives.
+- **2e's citation of the shutdown-sequence composition
+  (`../part-2e-request-path/catalog.md:690-698`): still true, now incomplete.**
+  It cites `shutdown_sequence` calling `force_close_all_routes` twice and `run`
+  returning after `run_handler_shutdown`, to argue its own open question is
+  answerable only from `runtime.rs:1144-1244`. Every fact it cites is correct.
+  What it did not know is that there is a *second* call site of
+  `force_close_all_routes`, at `:450` on the drop path, so the census that
+  question needs is three sites rather than two. Its `medium` confidence and its
+  open question both stand, which is why this is an addition and not a
+  correction.
+- **This sub-part's own fourteen labels: all unchanged, and two are strengthened
+  rather than moved.** No record in this catalog is labelled on the ground that
+  signals do not exist or that shutdown is unconditional, which is why the
+  thirteen `default-production` and one `explicit-config-only` survive intact.
+  The strengthening is in the justification, not the label:
+  [rt-a-an-initialized-handler-drains-without-publishing](#rt-a-an-initialized-handler-drains-without-publishing)
+  gives its cheapest entry as "cancel the shutdown token between the return of
+  `initialize` and the `is_cancelled` check at `:831`", and the corrected residual
+  above supplies a production producer for exactly that — an operator `SIGINT`
+  during startup — where before it read as a test-only injection. The same
+  applies to
+  [rt-a-forced-shutdown-outlives-the-configured-shutdown-deadline](#rt-a-forced-shutdown-outlives-the-configured-shutdown-deadline),
+  whose enabling state now has a production trigger rather than only
+  `tests/lifecycle.rs`. Both were already `default-production`, so **the net
+  effect on the reachability distribution is zero.**
+
+**So the answer to "did rebuilding the map move a label" is no.** Two of the
+map's rows were wrong, one of its three headline conclusions was wrong, and a
+whole teardown path was invisible; and none of that reaches a
+`Reachability:` line, in this sub-part or in the three that cite the map. That is
+worth stating rather than leaving implicit, because the natural assumption on
+being told the map is unreliable is that the labels resting on it must move. They
+do not, and the reason is structural: the labels depend on the map's `cfg` and
+config-key conclusions, and both errors were about *control flow* — who calls,
+and who keeps polling — which no reachability class in METHOD's three-way
+vocabulary encodes.
 
 `RingTransport` at `:876` deserves separate emphasis because three sibling
 sub-parts cite it: it is built **unconditionally**, printed and confirmed here as
@@ -246,42 +344,81 @@ untrusted input from the component being probed, and the knob is silently
 overridden rather than clamped.
 
 **Second, a doubled callback deadline is armed after the shutdown deadline
-already expired, so 10 seconds configured allows a floor of about 100 seconds,
-or about 160 with two untimed route closes.** `runtime.rs:1223`, printed and
-confirmed as
+already expired, so 10 seconds configured admits a ceiling of about 100 seconds
+on one branch, and no finite ceiling at all against a callback that never
+yields.** `runtime.rs:1223`, printed and confirmed as
 `let lifecycle_chain = shared.timing.lifecycle_callback_deadline.saturating_mul(2);`,
 armed at `:1224` with a fresh `timeout(...)` rather than a
 `timeout_at(deadline, ...)`. The ordering is what makes it a finding: `deadline`
 is computed once at `:1148` as `Instant::now() + shutdown_deadline`, the drain at
 `:1200` consumes it, and the `timeout_at` at `:1214` is entered only when the
-deadline is already in the past. Composing the stages at defaults
+deadline is already in the past.
+
+`shutdown_sequence` has **three exits, not one**, and they carry three different
+bounds. Reading them separately is what the earlier single-figure account missed,
+and it is what the record's `Check:` line now asserts. At defaults
 (`shutdown_deadline` 10 s, `config.rs:228`; `lifecycle_callback_deadline` 30 s,
 `:225`):
 
-| Stage | Site | Bound |
+| Stage | Site | Maximum |
 | --- | --- | --- |
 | Graceful drain | `:1200` | 10 s (`shutdown_deadline`) |
-| `abort_all` + `force_close_all_routes` | `:1205-1206` | **unbounded by `deadline`**; internally 30 s (`dispatch.rs:1434`) then 30 s in `run_route_gone` |
-| `timeout_at(deadline, tracker.wait())` | `:1214` | about 0, deadline already passed |
+| `abort_all` + `force_close_all_routes` | `:1205-1206` | **unbounded by `deadline`**; internally 30 s (`dispatch.rs:1434`) then 30 s in `run_route_gone`. Entered only when the drain timed out |
+| `timeout_at(deadline, tracker.wait())` | `:1214` | the remainder of `deadline`, so about 0 whenever the drain already consumed it |
 | `abort_all` + `force_close_all_routes` again | `:1215-1216` | same shape |
-| Doubled lifecycle chain | `:1223-1224` | 60 s |
-| `run_handler_shutdown` | `:1240` | 30 s (`:1276`) |
+| Doubled lifecycle chain | `:1223-1224` | 60 s (`2 x lifecycle_callback_deadline`) |
+| `run_handler_shutdown` | `:1240` or `:1243` | 30 s (`lifecycle_callback_deadline`, applied at `:1276`) |
 
-**Floor: about 100 seconds for a configured 10**, counting only the drain, the
-doubled chain, and the handler callback; about **160** counting one untimed
-`force_close_all_routes`. Two secondary consequences.
+| Exit | Reached when | Ceiling in configured units | At defaults |
+| --- | --- | --- | --- |
+| `:1243`, graceful | drain finished inside `deadline`, or the tracker drained inside the remainder | `shutdown_deadline + lifecycle_callback_deadline` | 40 s |
+| `:1238`, fatal latch | tracker still busy after the doubled chain. **`run_handler_shutdown` is never called on this exit** | `shutdown_deadline + 2 x lifecycle_callback_deadline`, plus two untimed `force_close_all_routes` | 70 s |
+| `:1241`, forced with callback | tracker drained inside the doubled chain | `shutdown_deadline + 3 x lifecycle_callback_deadline`, plus two untimed `force_close_all_routes` | 100 s |
+
+Three things follow, and the first is the correction. **The check's previous bound,
+`shutdown_deadline + 2 * lifecycle_callback_deadline`, is the bound of the exit
+that does the *least* work.** It omits `run_handler_shutdown` entirely, and
+`run_handler_shutdown` runs on two of the three exits, at `:1240` on the forced
+path and at `:1243` on the graceful one, each time under its own fresh
+`timeout(lifecycle_callback_deadline, ...)` at `:1276`. So an oracle written to
+the old bound fails on a correct build the moment the handler callback takes any
+appreciable time, and it fails for a reason that has nothing to do with the
+defect. The bound is now stated per exit.
+
+**Second, no finite ceiling in that table is a real guarantee, and the reason is
+mechanical rather than a matter of degree.** Every bound above is a
+`tokio::time::timeout` over a future, and a timeout cannot preempt a future that
+does not yield. `run_handler_shutdown` calls the handler's `shutdown()` through
+`redact_sync` at `:1273` and then awaits the result at `:1274`; a callback that
+blocks its worker thread rather than awaiting is never interrupted by the
+`timeout` at `:1276`, which is exactly what the function's own doc comment at
+`:1256-1258` says — "The callback is never aborted: a deadline overrun trips the
+fatal latch and returns non-graceful while the still-tracked task keeps running".
+The same applies to the two `tracker.wait()` calls. So the honest statement is
+that the configured deadlines bound the *host's own waiting*, not the host's
+lifetime, and the 40/70/100 second figures are ceilings **conditional on every
+awaited future being cooperatively cancellable**. That condition is unstated
+anywhere in `config.rs`.
+
+**Third, the word "floor" is wrong for all of these and was used three times in
+this catalog.** Each figure is a sum of stage maxima on one branch. Every stage
+returns as soon as its future resolves, so a forced shutdown whose surviving task
+drains immediately after the abort exits in milliseconds past `shutdown_deadline`.
+The defect is a ceiling ten times the configured knob, not a floor.
+
+Two secondary consequences, both unchanged by the correction.
 `HostError::ShutdownDeadlineExpired`'s own doc comment (`runtime.rs:42-44`) says
 "Host tasks could not be reaped within the shutdown deadline even after aborts",
-and it is returned after roughly ten times that deadline. And the client gives up
-long before: `CLIENT_SHUTDOWN_TIMEOUT` is 5 s (`client.rs:51`, protocol `:741`),
-so a correct graceful shutdown presents to a conforming client as a timeout. The
-comments at `:1217-1222` and `:1228-1233` argue the trade explicitly and well —
-releasing the instance fence while a lifecycle callback still owns the handler
-would let a successor start against the predecessor's in-flight cleanup — and the
-finding is not that the choice is wrong. It is that the choice is unbounded by
-the knob the operator was told bounds it, and the rule it breaks is stated as
-`MUST NOT` at protocol `:731`: "Every operation owns one absolute deadline;
-per-stage timers MUST NOT multiply it."
+and it is returned from an exit whose ceiling is ten times that deadline. And the
+client gives up long before: `CLIENT_SHUTDOWN_TIMEOUT` is 5 s (`client.rs:51`,
+protocol `:741`), so a correct graceful shutdown presents to a conforming client
+as a timeout. The comments at `:1217-1222` and `:1228-1233` argue the trade
+explicitly and well — releasing the instance fence while a lifecycle callback
+still owns the handler would let a successor start against the predecessor's
+in-flight cleanup — and the finding is not that the choice is wrong. It is that
+the choice is unbounded by the knob the operator was told bounds it, and the rule
+it breaks is stated as `MUST NOT` at protocol `:731`: "Every operation owns one
+absolute deadline; per-stage timers MUST NOT multiply it."
 
 A third site multiplies in the same way and is a refinement of Part 2c's finding
 rather than a new one: `transport_setup_deadline` is armed twice, serially, at
@@ -447,7 +584,9 @@ configuration contract. Recorded so a later pass does not credit it as coverage
 for this sub-part's claims, and does not overlook that it is the one CI-executed
 path that touches these files at all.
 
-**Three quiet areas frame the fault map.** Carried in full in
+**Four quiet areas frame the fault map**, three synthesized here and a fourth
+added by a disposition pass once the construction conditionality map's
+shutdown-is-unconditional row was refuted. Carried in full in
 [existing-checks.md](existing-checks.md).
 
 1. **`harness_closure.rs` is 1,122 lines of untrusted-manifest filesystem code
@@ -468,30 +607,55 @@ path that touches these files at all.
    and for nothing else, so `shutdown_deadline` is proven nonzero and never
    proven to bound shutdown.
 3. **The forced shutdown path makes five unbounded or re-armed decisions and is
-   tested nowhere.** `runtime.rs:1144-1244` calls `force_close_all_routes` twice
-   (`:1206`, `:1216`) with no enclosing timeout, re-arms a doubled deadline after
-   the original expired (`:1223`), trips the fatal latch on one branch (`:1234`),
-   and runs the handler callback on another (`:1240`), returning `false` from
-   three separate places. The comments are unusually careful and each argues its
-   own ordering correctly. What is quiet is that the *composition* of those
-   stages, which is what an operator experiences as "shutdown took a hundred
-   seconds", is argued nowhere and tested nowhere.
+   tested nowhere, and there is a sixth teardown path that is not this one.**
+   `runtime.rs:1144-1244` calls `force_close_all_routes` twice (`:1206`, `:1216`)
+   with no enclosing timeout, re-arms a doubled deadline after the original
+   expired (`:1223`), trips the fatal latch on one branch (`:1234`), and runs the
+   handler callback on another (`:1240`), returning `false` from three separate
+   places. The comments are unusually careful and each argues its own ordering
+   correctly. What is quiet is that the *composition* of those stages, which is
+   what an operator experiences as a shutdown that can take up to ten times the
+   configured deadline on its longest exit, is argued nowhere and tested nowhere.
+   Quieter still is `AbandonGuard::drop` (`:419-476`), which replaces the whole
+   sequence when the `run` future is dropped, performs two **explicitly
+   unbounded** `tracker.wait()` calls (`:457`, `:471`), and honours no configured
+   deadline at all. Nothing in this catalog covers it; it is queued as a gap.
+
+4. **`AbandonGuard::drop` is a second teardown path that no record and no test
+   reaches.** Split out of area 3 rather than left as its aside, because the two
+   have different shapes: the forced path is bounded badly, and this one is not
+   bounded at all. `runtime.rs:419-476` is entered on a dropped `run` future
+   rather than on a cancelled token, performs no graceful drain and sends no
+   connection Goodbyes, and its own comment at `:452-456` states the unbounded
+   wait deliberately. The proof that the interleaving is real is in the crate:
+   `run_handler_shutdown`'s once-latch comment (`:1260-1264`) exists to stop this
+   path and `shutdown_sequence` from both running the handler callback. Full
+   entry in [existing-checks.md](existing-checks.md).
 
 ## Reachability
 
 **Thirteen records are `default-production` and one is `explicit-config-only`.**
 No record here is `test-only`. The labels rest on the construction conditionality
-map above plus three facts, per METHOD rule 4.
+map above plus three facts, per METHOD rule 4. **The map was rebuilt after an
+independent evaluation refuted two of its rows and one of its conclusions, and
+every one of these fourteen labels was re-derived against the corrected map
+rather than carried forward. None moved.** The reasoning is recorded in full at
+the end of the map, under "Which dependent labels this rebuild puts back in
+question".
 
 1. **`runtime::run` is production and has exactly one non-test caller.**
    `crates/mc-module/src/bin/ck_mc_host/serve.rs` builds the composite at `:575`
    and calls `mc_host::run` at `:632`, and that binary is described by its own
-   manifest as the production lifecycle and serve executable.
-2. **Nothing in the sequence is `cfg`-gated.** The map's three conditional steps
-   are `set_publish_hook` (test-only, reachable only through the `#[doc(hidden)]`
+   manifest as the production lifecycle and serve executable. It also installs the
+   `SIGINT` and `SIGTERM` handlers that cancel the token `run` receives
+   (`:617-631`), so operator-initiated shutdown is a production event.
+2. **Nothing in the sequence is `cfg`-gated.** The map's conditional steps are
+   `set_publish_hook` (test-only, reachable only through the `#[doc(hidden)]`
    `run_with_publish_hook`), the setup-socket bind and publish pair (skipped on an
-   already-cancelled token, which is itself a `default-production` state), and the
-   per-connection liveness loop.
+   already-cancelled token, which is itself a `default-production` state), the
+   per-connection liveness loop, and the shutdown tail from map row 24 onward,
+   which is conditional on the `run` future still being polled. None of the four
+   is a `cfg`, which is the property these labels actually need.
 3. **The one `explicit-config-only` label is
    [rt-a-every-published-configuration-field-changes-host-behaviour](#rt-a-every-published-configuration-field-changes-host-behaviour),
    and lens A's reasoning is that the property is about what an *embedder* can
@@ -546,13 +710,20 @@ medium.
 **The five group headings below are this synthesis's own**, chosen by shared
 mechanism rather than by the order records were proposed. Grouping reorders the
 records relative to the index; the index is the record-order artifact. Record
-bodies are verbatim from lens A. Two formatting-only changes were applied
-uniformly: fields are wrapped to about 80 columns, since lens A's 2f records were
-written on single long lines, and evidence links are rewritten from the lens
-file's `../evidence/` form to `evidence/<slug>.md` so they resolve from this
-directory. No wording was changed. Where a record's prose says "per the map
-above", the map it means is the construction conditionality map in the leading
-section of this file.
+bodies were verbatim from lens A at synthesis. Two formatting-only changes were
+applied uniformly: fields are wrapped to about 80 columns, since lens A's 2f
+records were written on single long lines, and evidence links are rewritten from
+the lens file's `../evidence/` form to `evidence/<slug>.md` so they resolve from
+this directory. **Two records are no longer verbatim, because a disposition pass
+edited them:**
+[rt-a-a-fixed-probe-interval-preempts-the-configured-health-interval](#rt-a-a-fixed-probe-interval-preempts-the-configured-health-interval)
+and
+[rt-a-forced-shutdown-outlives-the-configured-shutdown-deadline](#rt-a-forced-shutdown-outlives-the-configured-shutdown-deadline),
+both in Group B, whose `Check:` lines asserted conditions that could not fail and
+could not pass respectively. The changes and their justification are in
+[portfolio-evaluation.md](portfolio-evaluation.md). Where a record's prose says
+"per the map above", the map it means is the construction conditionality map in
+the leading section of this file, which the same pass rebuilt.
 
 ---
 
@@ -690,22 +861,48 @@ Guarantee: The health probe cadence is either the configured `health_interval` o
 the fixed 50 ms activation cadence, and which one applies is a stated function of
 the component-reported activation state rather than an unbounded override of
 operator configuration.
-Check: `always` — at `runtime.rs:1129`, assert that the selected interval equals
-`health_interval` whenever `activation_in_progress` is false, and record the
-number of consecutive iterations that selected 50 ms so a campaign can bound it.
-`always` because the selection happens on every loop iteration.
-Fault/timing angle: the window is unbounded. The predicate at `:1051-1074` is
-driven entirely by handler-authored strings in the previous report's metrics, so
-nothing in the host limits how long the fixed cadence persists. A handler that
-never leaves `starting` holds it forever.
+Check: `always` — over one of two conjuncts, and the split is the point.
+**Conjunct 1, which carries the `always` semantics:** at `runtime.rs:1129`,
+whenever `activation_in_progress` is false the selected interval equals
+`shared.timing.health_interval` exactly. That is a pass/fail bound, it holds on
+every loop iteration, and `always` is correct because the selection is
+unconditional within the loop. **Conjunct 2 has no assertable semantics and is
+`partial` pending a product decision, having previously masqueraded as a check.**
+The fast path has *no pass/fail bound in the code to assert*: the earlier text
+asked an oracle to "record the number of consecutive iterations that selected
+50 ms so a campaign can bound it", which measures without deciding — every
+observation passes, so it cannot fail and is therefore not a check. The two
+candidate bounds a campaign could assert instead are stated here so the decision
+is a choice between named options rather than an open-ended design question, and
+neither can be adopted without the open question below being answered, because
+both invent a limit the code does not contain:
+
+- **A count bound**, `consecutive_fast_probes <= K`, which needs a `K`. Nothing
+  in `HostTiming` supplies one and no constant in `runtime.rs` is a candidate.
+- **A duration bound**, `time_in_fast_cadence <= lifecycle_callback_deadline` or
+  some other configured span, which needs a decision about which existing knob
+  ought to govern activation, and there is no reading of `config.rs:216-232`
+  under which any of them does.
+
+Until one is chosen, the honest oracle is conjunct 1 plus an instrumented count
+reported as a **measurement**, not asserted. Recording that distinction is what
+keeps this record from shipping a check that can only pass.
+Fault/timing angle: the window is unbounded and that is the finding rather than
+an accident of the fixture. The predicate at `:1051-1071` is driven entirely by
+handler-authored strings in the previous report's metrics, so nothing in the host
+limits how long the fixed cadence persists. A handler that never leaves
+`starting` holds it forever.
 Required faults and enabling state: a handler whose `health` report carries
 `metrics.components.<id>.metrics.storage_state == "starting"` or
 `synapse_state == "starting"`, plus a `health_interval` distinguishable from
 50 ms. `tests/lifecycle.rs:165` must change its value to make the two branches
-separable.
+separable. Conjunct 1 needs only the second half, since it asserts the `else`
+branch; conjunct 2 needs both.
 Confidence: high — [evidence](evidence/rt-a-a-fixed-probe-interval-preempts-the-configured-health-interval.md).
 Verified the branch, the predicate, the single `health_interval` consumer, and
-that `MAX_CONFIG_DURATION` admits 365 days.
+that `MAX_CONFIG_DURATION` admits 365 days. Confidence is about the mechanism,
+which is fully verified; it is not a claim that the record's second conjunct is
+implementable today, and the `Check:` line says so.
 Existing check: none that separates the branches. Status `unaudited`.
 Impact: an operator who raises `health_interval` to reduce probe load gets no
 relief while any component reports `starting`, and 20 handler callbacks per
@@ -715,11 +912,14 @@ direction.
 > Synthesis note on one citation inside this record, carried here rather than
 > edited into it. The predicate's span is `runtime.rs:1051-1071`, which lens B
 > re-derived and this synthesis confirmed. The record's `Fault/timing angle:`
-> says `:1051-1074`. The finding is unaffected; only the span moves.
+> said `:1051-1074` before this disposition and now says `:1051-1071`. The
+> finding is unaffected; only the span moved.
 
 Open questions:
-- Should the fast cadence carry its own bound, or is an unbounded
-  handler-controlled override intended? (needs human input)
+- Should the fast cadence carry its own bound, and if so which of the two forms
+  above? Until this is answered the record has one assertable conjunct and one
+  measured one, which is why its `Exercised:` line cannot reach `yes` by fixture
+  work alone. (needs human input)
 
 ### rt-a-the-serial-setup-budget-triples-the-configured-transport-deadline
 
@@ -762,46 +962,95 @@ Exercised: partial — `tests/lifecycle.rs:714-715` sets both
 `lifecycle_callback_deadline` and `shutdown_deadline`, so the forced path is
 reachable; no assertion bounds the total
 Guarantee: `run` returns within a stated function of the configured deadlines,
-and that function is documented wherever `shutdown_deadline` is described.
-Check: `always` — from the shutdown token's cancellation to `run`'s return on the
-forced path, assert elapsed time is at most
-`shutdown_deadline + 2 * lifecycle_callback_deadline`. `always` because it must
-hold on every forced shutdown, and stated in the units the code bounds
-(`runtime.rs:1148` and `:1223`).
+that function is stated per exit rather than as one figure, and it is documented
+wherever `shutdown_deadline` is described.
+Check: `always`, per exit, because `shutdown_sequence` has three and they do
+different amounts of work. From the shutdown token's cancellation to `run`'s
+return, assert elapsed time is at most:
+
+- `shutdown_deadline + lifecycle_callback_deadline` on the graceful exit at
+  `runtime.rs:1243`, where the drain or the tracker wait finished inside
+  `deadline` and `run_handler_shutdown` then ran under its own budget (`:1276`);
+- `shutdown_deadline + 2 * lifecycle_callback_deadline` on the fatal-latch exit at
+  `:1238`, which is the *only* exit that never calls `run_handler_shutdown`
+  (`:1234-1238` returns before `:1240`);
+- `shutdown_deadline + 3 * lifecycle_callback_deadline` on the forced exit at
+  `:1241`, which pays the drain (`:1148`, `:1200`), the doubled chain (`:1223`,
+  `:1224`), **and** the handler callback (`:1240`, bounded at `:1276`).
+
+Each bound also admits the two `force_close_all_routes` calls at `:1206` and
+`:1216`, which no `timeout` wraps and which are internally bounded at 30 s
+(`dispatch.rs:1434`) plus 30 s in `run_route_gone`; an oracle should either
+measure them separately or state that its bound is the sum plus those.
+`always` because each bound must hold on every shutdown that takes its exit, and
+the bounds are in the units the code bounds.
+
+**Every bound above is conditional, and the condition is not a detail.** These
+are `tokio::time::timeout` and `timeout_at` budgets over awaited futures, and a
+timeout cannot preempt a future that never yields. A handler whose `shutdown()`
+blocks its worker thread instead of awaiting is not interrupted by `:1276`; the
+function's own doc comment at `:1256-1258` states that the callback "is never
+aborted" and that an overrun "trips the fatal latch and returns non-graceful
+while the still-tracked task keeps running". The same holds for both
+`tracker.wait()` calls. So the check is `elapsed <= bound` **given cooperatively
+cancellable callbacks**, and an oracle must construct a yielding slow callback,
+not a blocking one, or it will time out rather than fail an assertion. A
+non-yielding callback defeats every finite ceiling here, which is why the previous
+single-figure framing was not merely imprecise but the wrong shape.
 Fault/timing angle: `:1214` fails, then `:1224` awaits a second, fresh budget
 computed at `:1223` as `lifecycle_callback_deadline.saturating_mul(2)`. At
-defaults, 60 s added after a 10 s deadline expired. `saturating_mul` means a
+defaults, 60 s armed after a 10 s deadline expired, and then either the fatal
+latch at `:1234` or 30 s more at `:1240`. `saturating_mul` means a
 `lifecycle_callback_deadline` above half of `MAX_CONFIG_DURATION` yields a budget
 the validator would itself reject.
 Required faults and enabling state: a tracked task that survives the shutdown
-deadline. `tests/lifecycle.rs:678` and `:714` build the non-yielding-callback
-shape.
+deadline and then *does* drain, for the `:1241` exit; one that never drains, for
+the `:1238` exit. `tests/lifecycle.rs:678` and `:714` build the non-yielding
+callback shape, which reaches the forced path but which, being non-yielding, is
+the shape that cannot bound anything. Distinguishing the two forced exits is
+fixture work nothing currently does.
 Confidence: high — [evidence](evidence/rt-a-forced-shutdown-outlives-the-configured-shutdown-deadline.md).
-Verified both deadline sites and read the justifying comment at `:1217-1222`.
-Existing check: none bounding the total. Status `unaudited`.
+Verified both deadline sites, read the justifying comment at `:1217-1222`, and
+re-read `:1234-1243` and `run_handler_shutdown` (`:1259-1297`) end to end for
+this disposition to separate the three exits.
+Existing check: none bounding any of the three totals. Status `unaudited`.
 Impact: a supervisor that budgets `shutdown_deadline` for a stop, plus the
 documented client 5 s, kills the host during a cleanup phase the host considers
 in-budget, which is precisely the window `:1217-1222` says must not be
-interrupted.
+interrupted. The exit that omits `run_handler_shutdown` has a second consequence:
+on that path the handler's `shutdown()` never runs at all from
+`shutdown_sequence`, so component-owned drain work is left to whichever of
+`retain_lock_until_drained` (`:951`) or `AbandonGuard`'s drop path (`:467`) gets
+there, mediated by the once-latch at `:1265-1270`.
 Open questions:
 - `saturating_mul(2)` can produce a duration the validator rejects as an input.
   Whether the derived budget should be clamped to `MAX_CONFIG_DURATION` is
   unresolved. It cannot overflow, so this is a coherence question rather than a
   defect.
+- Should the fatal-latch exit at `:1238` run the handler shutdown callback? The
+  comment at `:1228-1233` argues it must not, to avoid overlapping two handler
+  callbacks, and that argument is sound. The consequence it does not state is
+  that a host taking this exit returns `false` having never invoked `shutdown()`
+  on this path, which is a different contract from the other two exits.
+  (needs human input)
 
-> Synthesis note on the figure this record's check implies, carried here rather
-> than edited into it. The check's bound,
-> `shutdown_deadline + 2 * lifecycle_callback_deadline`, is 70 s at defaults and
-> is the right bound to assert because it is stated in the units the code bounds.
-> The *observed* floor is higher. Lens B composed all six stages and found about
-> **100 seconds** counting the drain (`:1200`), the doubled chain
-> (`:1223-1224`), and `run_handler_shutdown` (`:1240`, 30 s at `:1276`), and
-> about **160** counting one of the two `force_close_all_routes` calls (`:1206`,
-> `:1216`) that no timeout wraps. Both figures exceed the record's bound, which
-> means an oracle written to the check as stated would **fail** on a correct
-> build: `run_handler_shutdown`'s own 30 s is outside the two terms. That is a
-> refinement a later pass should apply to the check line, and it is recorded here
-> rather than applied because the record text is preserved verbatim.
+> Disposition note replacing the synthesis note that stood here. The earlier note
+> said the check's single bound,
+> `shutdown_deadline + 2 * lifecycle_callback_deadline`, was "the right bound to
+> assert", observed that lens B's composed total of about 100 s exceeds it, and
+> concluded that "an oracle written to the check as stated would **fail** on a
+> correct build", then declined to fix the check because the record text was
+> preserved verbatim. An independent evaluation refuted the framing rather than
+> the arithmetic: a check known to fail on a correct build is not a bound with a
+> caveat, it is a wrong bound, and the reason it was wrong is that
+> `shutdown_sequence` has three exits and the figure describes one of them.
+> `run_handler_shutdown` at `:1240` was omitted, and it runs on two of the three.
+> The check is now stated per exit, at 40 s, 70 s, and 100 s of configured units,
+> the `:1238` exit is identified as the one that omits the handler callback, and
+> the ceiling-versus-floor confusion in the earlier figures is corrected in the
+> "Two fixed bounds" section above. The verbatim-preservation rule that blocked
+> the earlier fix is a synthesis convention, not a METHOD rule, and a disposition
+> pass is where it yields.
 
 ---
 

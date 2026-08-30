@@ -496,3 +496,94 @@ Stated so a later pass knows what was and was not looked at.
   only spawn in this sub-part the host's task tracker does not observe, so a
   shutdown can complete while it is live holding an `Arc<GenerationCore>`. Is
   that deliberate? (unresolved, needs the `run` teardown order from sub-part 2f)
+
+---
+
+## Checks cited by the two records carried from `part-2b-wire-and-channels`
+
+Appended when the two composite records were carried into this sub-part; see
+[catalog.md](catalog.md#group-f-composite-route-ownership-and-panic-containment)
+for the carry and
+[../part-2b-wire-and-channels/README.md](../part-2b-wire-and-channels/README.md)
+for the superseded directory. Nothing above changes. This section adds only the
+named checks those two records cite, so every check they name is in the
+inventory.
+
+**No new check was discovered, and no new binary.**
+`tests/composite_routing.rs` is already in the integration table above at 16
+tests, 1,049 lines, **unnamed** in CI, and all seven sites below are inside it.
+What was missing is which record each serves. Re-verified at carry time: still 16
+tests and still 1,049 lines. The file is byte-identical to the lens-era commits,
+blob `2201b830` at `1c193ae0`, `793a973e` and `e447c927`.
+
+### `tests/composite_routing.rs`, by the record it serves
+
+Spans are given attribute-line to closing-brace, which is the form the two
+records use. Every one was re-verified at carry time.
+
+| Site | Test | Record it serves |
+| --- | --- | --- |
+| `:485-531` | `rejected_broca_bind_gets_exactly_one_broca_route_gone` | route-entry removal: exactly one `route_gone` for a rejected bind, the only one of the three named bind outcomes with a test |
+| `:532-600` | `a_closed_route_handle_cannot_dispatch_to_stale_child_ownership` | route-entry removal: a closed handle cannot dispatch to stale child ownership |
+| `:851-885` | `a_panicking_broca_shutdown_still_drains_later_children_and_redacts` | panic containment: shutdown panic, contained category |
+| `:886-917` | `an_erroring_broca_shutdown_still_drains_later_children_and_redacts` | panic containment: shutdown error, contained category |
+| `:918-985` | `a_child_shutdown_failure_makes_the_host_incarnation_non_graceful` | panic containment: the non-graceful incarnation |
+| `:986-1027` | `a_panicking_broca_health_reports_failing_without_skipping_other_children` | panic containment: optional-child health panic, contained category |
+| `:1028-1049` | `a_panicking_synapse_health_reports_failing_without_unwinding` | panic containment: optional-child health panic on the tertiary child |
+
+Status unaudited for all seven. None runs in CI.
+
+**One location repaired.** The last span is `:1028-1049`, not `:1028-1060`. The
+file is 1,049 lines, so the lens's end bound overran it by eleven;
+`a_panicking_synapse_health_reports_failing_without_unwinding` has its attribute
+at `:1028`, its `fn` at `:1029`, and its final `}` at `:1049`, the last line of
+the file. This is the only citation drift in either composite record, and it was
+wrong when written rather than made wrong by a change: the file has not moved.
+
+### Two stub impls that make the panic cases cheap
+
+Recorded because they are the reason the uncovered half of the containment record
+is a fixture edit rather than new infrastructure. The binary already carries child
+stubs whose callbacks can be made to panic, with trait methods spanning
+`:825-846` and `:960-981`. The five containment tests above use them. Extending
+either to panic in one of the nine uncontained positions is a stub edit. Status
+unaudited.
+
+### Categories with nothing in them, stated explicitly
+
+**Escalation checks for the nine uncontained child call positions: none found.**
+No test asserts that a panic in `install_connection_key` (`composite.rs:194-196`),
+`manifest` (`:201-203`), `resources` (`:211-213`), `initialize` (`:223-225`),
+`activate` (`:235-237`), `bind` (`:271-273`), `handle` (`:279-281`), `route_gone`
+(`:292-294`), or the **primary's** `health` (`:312`) reaches the runtime's fatal
+cell rather than being contained. Verified by reading all 16 tests in the binary:
+the five containment tests assert the two contained categories, and the other
+eleven cover construction, manifest validation, health precedence, ordering and
+routing. The primary-health case is the notable absence, because
+`composite.rs:312` is uncontained while `:318` and `:321` are contained, and the
+comment at `:306-311` discusses only the optional children.
+
+**A census of the `catch_child_panic` call sites: none found, and it would be the
+cheapest check in the file.** The set is exactly `{:318, :321, :374, :378, :382}`,
+re-derived at carry time. Nothing asserts it. A census would catch a wrapper added
+to a callback the runtime treats as fatal, which is the containment record's first
+`Impact:` clause, without constructing any panic.
+
+**Coverage for the composite route map's size or per-handle balance: none found.**
+`routes` is a private field (`composite.rs:112`) and `child_of_route` (`:138`) a
+private method, and the file has no test module, so no in-crate oracle exists and
+no integration test can read the map. The two tests at `:485-531` and `:532-600`
+observe the `route_gone` callback and the stale-dispatch outcome instead, which are
+proxies for the removal rather than observations of it.
+
+### One production assertion already inventoried, cross-referenced
+
+`composite.rs:387` — `panic!("{}", failures.join("; "))` — is already in the
+deliberate-`panic!` table above, classified there as converting a child shutdown
+failure into a failed callback the runtime can classify. That is the same site the
+containment record cites as the aggregate re-raise at the end of
+`composite.rs:370-388`, and the two agree. Cross-referenced here so a later pass
+does not count it twice. The three lock sites already inventoried at
+`composite.rs:141`, `:268` and `:301` are likewise the same map operations the
+route-entry record cites: `:268` is inside the insert at `:266-269` and `:301` is
+inside the removal at `:299-302`.

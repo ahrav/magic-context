@@ -367,3 +367,93 @@ Stated so a later pass knows what was and was not looked at.
 - Does `wire.rs:418`'s label, "byte budget semaphore is never closed", hold? It
   is the one `.expect` in this sub-part with no covering check, and closing the
   semaphore is the only way to falsify it.
+
+---
+
+## Checks cited by the four records carried from `part-2b-wire-and-channels`
+
+Appended when the four wire-header records were carried into this sub-part; see
+[catalog.md](catalog.md#group-g-the-wire-header-decode-contract) for the carry
+and [../part-2b-wire-and-channels/README.md](../part-2b-wire-and-channels/README.md)
+for the superseded directory. Nothing above changes. This section adds only the
+named checks those four records cite, so every check they name is in the
+inventory. Every location was re-verified at carry time.
+
+**No new check was discovered.** All eight sites below are already counted in the
+inventory above, in the `wire.rs`, 14 tests entry and the `protocol_vectors.rs`
+row of the integration table. What was missing is which record each serves, and
+two locations that had drifted.
+
+### `wire.rs` tests, by the record they serve
+
+Eight of the 14 tests already counted at `:673`, `:679`, `:692`, `:702`, `:721`,
+`:744`, `:776`, `:794`, `:835`, `:864`, `:888`, `:906`, `:938`, `:954` are cited
+by a carried record. The rows below give the `fn` line rather than the
+attribute line, which is the form the records use.
+
+| Site | Test | Record it serves |
+| --- | --- | --- |
+| `wire.rs:722-742` | `reject_truncated_headers_and_unsupported_versions` | decode totality; three inputs across gates 1, 2 and 3 |
+| `wire.rs:745-774` | `reject_unknown_frame_type_and_reserved_flag_encodings` | decode totality and reserved encodings; four inputs across gates 4, 5, 6 and 7 |
+| `wire.rs:703-719` | `little_endian_and_frozen_prefix_layout` | the bijection, encode direction only, distinctive ascending values, plus `buf.len() == HEADER_LEN` at `:718` |
+| `wire.rs:680-690` | `round_trip_request` | the bijection, one fixture, encode-first |
+| `wire.rs:693-700` | `round_trip_all_frame_types` | the bijection, twelve fixtures varying only `ty`, encode-first |
+| `wire.rs:795-833` | `epoch_boundaries_round_trip_and_control_channel_epoch_is_reserved` | both halves of the channel-and-epoch pairing |
+| `wire.rs:836-862` | `sheddable_rejected_on_every_illegal_frame_type` | the Sheddable cross-product, ten illegal types plus both legal ones at `:858-861` |
+
+Status unaudited for all seven. None runs in CI, under `R0`.
+
+**One location repaired.** The span of
+`reject_unknown_frame_type_and_reserved_flag_encodings` is `:745-774`. Two of the
+carried records wrote `:745-773`; `:773` is the `);` of the last assertion and the
+closing brace is `:774`.
+
+### `tests/protocol_vectors.rs`, and the two checks that moved
+
+The binary is already in the integration table above at 15 tests, unnamed in CI.
+Re-verified at carry time: still 15 tests, and now **762 lines rather than 976**.
+`63c4d277` ("refactor(shm): enforce ring-only architecture") shrank it. Blob
+hashes: `21f03055` at both `1c193ae0` and `793a973e`, `0cbd259e` at `e447c927`.
+
+| Site | Test | Record it serves | Note |
+| --- | --- | --- | --- |
+| `:351` | `structural_corruption_is_rejected_before_dispatch` | reserved encodings, end to end | **Renamed and moved.** Was `structural_corruption_closes_silently` at `:512`. Verified a rename rather than a rewrite: the doc comment above it, the `struct Case { name, bytes }` declaration, and the first table entry `"unsupported version"` are all unchanged |
+| `:504` | `pure_header_frames_accept_any_valid_priority` | reserved encodings, end to end | **Moved.** Was `:656`; name unchanged |
+| `:143` | `committed_header_vectors_decode_to_their_documented_fields` | cited by the encoder record as what does *not* cover it | Asserts the document's committed byte vectors against the independent oracle `raw_client::decode_header` (`tests/support/raw_client.rs:286`), which is the decode direction over fixed inputs, not encoder refusal |
+
+Status unaudited for all three.
+
+### One category with nothing in it, stated explicitly
+
+**Encoder-refusal checks: none found.** No test anywhere in the tree feeds
+production encoder output back through `decode_header` plus
+`validate_inbound_header` (`frame_channel.rs:58`). Verified by grepping every
+`encode_owned_frame` and `encode_split_frame` call site
+(`dispatch.rs:292`, `:329`, `:723`, `:802`, `:1458`, `connection.rs:779`, `:866`,
+`client.rs:1329`, `:2092`, plus `wire.rs:615`) and every `decode_header` call site
+(`ring_transport.rs:471`, `:569`, `:701`, `client.rs:1908`, plus the test-side
+`raw_client.rs:286` and `:556`): no test composes one with the other. This is the
+`Existing check: none.` on
+[encoder-never-emits-a-frame-its-own-decoder-rejects](catalog.md#encoder-never-emits-a-frame-its-own-decoder-rejects).
+
+**Fuzz targets for `wire::decode_header`: none found.** `find -type d -name fuzz`
+over the repository returns one directory, `crates/mc-shm-transport/fuzz`, whose
+three targets are `frame_descriptor.rs`, `provider_grant.rs` and
+`provider_sample.rs`. All three are transport decoders and none reaches
+`mc-host`'s codec. This is consistent with the "no property tooling" finding
+above, which grepped the four scope files; this extends it to the fuzz
+directory, which is outside them.
+
+### One test-only encoder inside a production file
+
+Recorded here because it is a fidelity observation about the check inventory
+rather than about a record. `wire::encode_frame` carries `#[cfg(test)]` at
+`wire.rs:541`, and its only two callers are
+`frame_channel/contract_tests.rs:93` and `:163` — both already counted in the
+14-test `contract_tests.rs` entry above. So the semantic contract suite builds
+its frames with an encoder no production path uses, and the two differ on exactly
+the property the byte budget depends on: `encode_owned_frame` does exact-size
+growth (`:597-600`) under the comment at `:594-596` warning that amortized
+`reserve` would double a full-capacity body, while `encode_frame` allocates fresh
+with `Vec::with_capacity` at `:565`. Status unaudited. This corrects the carried
+encoder record's own count of three production encoders down to two.

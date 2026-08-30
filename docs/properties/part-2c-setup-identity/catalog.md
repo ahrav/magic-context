@@ -870,7 +870,7 @@ assertion on *when* the host gave up, not a new fixture. A shortened
 observe, and unlike the `prepare`-timeout exit this needs no race: the peer's
 silence, not a scheduling outcome, is what makes the deadline fire.
 Confidence: high — [evidence](evidence/setup-a-a-stalled-setup-is-torn-down-within-the-transport-setup-deadline.md).
-**That evidence file does not exist yet**: this record was added by the portfolio
+**Evidence file written**: this record was added by the portfolio
 disposition, which was scoped to `catalog.md`, `fault-map.md`, and
 `portfolio-evaluation.md` and forbidden from writing under `evidence/`. The link is
 written to the schema's target so it resolves once the file lands, and the gap is

@@ -411,10 +411,27 @@ failing host rather than by a configuration gate, and both are stated at the
 record rather than relabelled: `dispatch.rs:1164` and `:1174`, whose enabling
 state is the fatal latch inside `lifecycle_join` (`runtime.rs:186-207`).
 
+**The two records carried in later, in
+[Group F](#group-f-composite-route-ownership-and-panic-containment), are also
+`default-production`, and their label was verified at carry time rather than
+inherited from this section.** Fact 1 above already establishes the routed path;
+what those two additionally need is that the composite itself is on it, and it is:
+`serve.rs:575` constructs `StaticComposite::new(...)` and `:632` passes that value
+to `mc_host::run`, both re-printed at carry time. `composite.rs` contains **zero
+`#[cfg]` attributes** of any kind, which is the strongest form of the claim
+available for one file and is consistent with the inventory's note that the file
+has no test module. So all sixteen records in this sub-part are
+`default-production`, and none is `test-only` or `explicit-config-only`.
+
 ## Index
 
-Fourteen records, in the order lens A proposed them. Lens B proposed none by
-design; it built the 20-claim register and the check inventory.
+Fourteen records from this sub-part's own lens passes, in the order lens A
+proposed them. Lens B proposed none by design; it built the 20-claim register and
+the check inventory. **Two further records were carried into this sub-part in a
+later pass**, from the superseded pre-refactor `part-2b-wire-and-channels`; they
+are the last two rows and they live in
+[Group F](#group-f-composite-route-ownership-and-panic-containment). Sixteen
+records in total.
 
 | Slug | Type | Confidence |
 | --- | --- | --- |
@@ -432,11 +449,23 @@ design; it built the 20-claim register and the check inventory.
 | [req-a-three-control-rejection-paths-carry-three-different-bounds](#req-a-three-control-rejection-paths-carry-three-different-bounds) | safety | high |
 | [req-a-handler-authored-diagnostics-are-capped-before-any-egress-wait](#req-a-handler-authored-diagnostics-are-capped-before-any-egress-wait) | safety | high |
 | [req-a-both-admission-classes-and-the-rejection-bound-saturate](#req-a-both-admission-classes-and-the-rejection-bound-saturate) | reachability | high |
+| [composite-route-entry-is-removed-by-exactly-one-route-gone](#composite-route-entry-is-removed-by-exactly-one-route-gone) | safety | high |
+| [composite-panic-containment-covers-only-optional-health-and-shutdown](#composite-panic-containment-covers-only-optional-health-and-shutdown) | safety | high |
+
+The last two rows are the carried records. They keep their original unprefixed
+slugs so the carry stays visible against the fourteen `req-a-` records this
+sub-part derived itself.
 
 Semantics distribution: twelve `always`, two `sometimes`. No
 `always-or-unreached`, no `reachable`, no `unreachable`. Type distribution:
 twelve safety, two reachability, no liveness. Reachability distribution:
 fourteen `default-production`. Confidence: thirteen high, one medium.
+
+The two carried records add **2 safety** and semantics **2 `always`**, both
+`default-production` and both high confidence, so the sixteen-record totals are
+**fourteen safety, two reachability, no liveness**; semantics **fourteen
+`always`, two `sometimes`**; reachability **sixteen `default-production`**; and
+confidence **fifteen high, one medium**.
 
 **The five group headings below are this synthesis's own**, chosen by shared
 mechanism rather than by the order records were proposed. Grouping reorders the
@@ -445,6 +474,11 @@ bodies are verbatim from lens A. Two formatting-only changes were applied
 uniformly: fields are wrapped to about 80 columns, and evidence links are
 rewritten from the lens file's relative form to `evidence/<slug>.md` so they
 resolve from this directory. No wording was changed.
+
+A sixth group,
+[Group F](#group-f-composite-route-ownership-and-panic-containment), was appended
+in a later pass for the two carried records. It sits after the relationship map
+rather than in sequence with the five, for the reason given in its preamble.
 
 ---
 
@@ -1230,3 +1264,207 @@ something CI executes today.
   cheapest way to reach task saturation, since `tests/dispatch.rs:295` already
   parks a handler, so the two are cheapest to build together even though neither
   dominates the other.
+
+---
+
+## Group F: composite route ownership and panic containment
+
+Two records on `crates/mc-host/src/composite.rs`, the static three-child
+composition every production host runs. **Both were carried into this sub-part
+from the superseded pre-refactor sub-part `part-2b-wire-and-channels`**, where
+they were records 10 and 11 of `_lenses/lens-c-negotiation-provider.md`. See
+[../part-2b-wire-and-channels/README.md](../part-2b-wire-and-channels/README.md)
+for that directory's disposition.
+
+They were orphaned rather than retired, and the mechanism was a route that was
+recorded and then not walked. The re-scope retired the `wire-and-channels` label,
+moved `composite.rs` into this sub-part's scope, and named carrying these two
+forward as one of this sub-part's three attention focuses. That did not happen.
+This sub-part's two lens passes went to dispatch, control decode, routing and
+handler concurrency: all fourteen records above carry the `req-a-` prefix, and
+neither composite property appears among them. `composite.rs` appears in the rest
+of this catalog only in the scope sentence and in two test-inventory notes
+recording that the file has no test module of its own. So the scope moved, the
+absorbing sub-part's lenses did not re-derive these properties, and the two sat
+uncovered.
+
+**This group sits after the relationship map because it was carried in a later
+pass, and the relationship map above does not cover it.** No dominance relation
+is claimed between these two and the fourteen. One relationship is worth stating
+and is not a dominance claim: the first record's subject is the route map that
+`handle` consults, and `handle` is the composite's leg of the same dispatch path
+[req-a-an-admitted-routed-request-emits-at-most-one-terminal-frame](#req-a-an-admitted-routed-request-emits-at-most-one-terminal-frame)
+governs one layer up. A leaked map entry does not break that record's
+at-most-one guarantee; it routes a *reused* handle to a stale child, which is a
+different failure with the same input.
+
+**Why these two were the cheapest salvage in that directory.** `composite.rs` is
+byte-identical between the lens-era commit and `HEAD`: `git rev-parse` returns
+blob `6858246d` for `crates/mc-host/src/composite.rs` at `1c193ae0`, `793a973e`
+and `e447c927` alike, and `wc -l` gives 390 at all three. Their existing check,
+`tests/composite_routing.rs`, is likewise blob `2201b830` at all three commits at
+1,049 lines. Both records' `composite.rs` citations were re-verified line by line
+at carry time and **every one holds**.
+
+**Citations repaired at carry time, per METHOD rule 1.** One, in the second
+record. Its `Existing check:` cited
+`tests/composite_routing.rs:1028-1060` for the optional-child health panic on the
+tertiary child. The file is 1,049 lines, so `:1060` overruns the end of the file
+by eleven lines; the test is
+`a_panicking_synapse_health_reports_failing_without_unwinding`, whose
+`#[tokio::test]` is at `:1028`, whose `fn` is at `:1029`, and which ends at
+`:1049`, the last line of the file. The corrected span is `:1028-1049`. This is
+the one drift the earlier triage did not predict: it recorded that both records'
+subjects and both existing checks were byte-identical and concluded that "neither
+needs a citation refresh", which is true of the file contents and false of this
+one span, because the span was already wrong when the lens wrote it rather than
+made wrong by a change. Everything else in both records verified unchanged.
+
+**Reachability for both rests on one chain, re-verified at carry time rather
+than inherited.** The production binary is
+`crates/mc-module/src/bin/ck_mc_host/serve.rs`, which constructs
+`StaticComposite::new(...)` at `:575` and passes that value to `mc_host::run` at
+`:632`; both lines were re-printed here. `composite.rs` contains **zero `#[cfg]`
+attributes**, verified by grep, so no part of the file is gated. That is a
+stronger statement than the equivalent for most files in this sub-part, and it is
+consistent with the check inventory's note that `composite.rs` has no test module.
+Fact 1 of the [Reachability](#reachability) section establishes the routed path
+that reaches `handle` and `route_gone`. The one asymmetry worth naming is inside
+the surface rather than at its edge, and it is the second record's subject: the
+primary child's `health` at `:312` is *not* wrapped, while the two optional
+children's are at `:318` and `:321`.
+
+### composite-route-entry-is-removed-by-exactly-one-route-gone
+
+Type: safety
+Reachability: default-production — the composite is constructed at
+`serve.rs:575` and handed to `mc_host::run` at `:632`. Its `bind`, `handle` and
+`route_gone` are the composite's leg of the routed path Fact 1 of
+[Reachability](#reachability) establishes, and the route map they share
+(`composite.rs:112`, initialized at `:134`) is plain `Mutex<HashMap<..>>` state
+with no gate. `composite.rs` has zero `#[cfg]` attributes.
+Status: active
+Exercised: partial — one rejected-bind case is covered; panic and
+close-wins-bind are not.
+Guarantee: Every route-map entry the composite inserts is removed exactly once,
+so the map's size is bounded by the set of live plus closing routes.
+Check: `always` — for every `RouteHandle` the composite inserts, the number of
+removals is exactly one, and no removal precedes the owning child's `route_gone`
+returning. Per-handle accounting is the primary oracle; total map size is a
+cheap screen, since an insert and an unrelated remove cancel in the total.
+Fault/timing angle: the removal is deliberately after the child callback
+[composite.rs:297-303], so `handle` for a handle mid-`route_gone` still resolves
+to the correct child [277-287]. That window is intentional and already covered.
+Required faults and enabling state: the three non-success bind outcomes the
+comment at composite.rs:262-265 names — a `BindOutcome::Reject`, a panicking
+`bind`, and close-wins-bind — each of which must still produce exactly one
+`route_gone`. The insert at composite.rs:266-269 happens before the `await` at
+271-273, so a panicking `bind` leaves the entry behind and the host's route-gone
+obligation is the only thing that reclaims it.
+Confidence: high — [evidence](evidence/composite-route-entry-is-removed-by-exactly-one-route-gone.md).
+Read the insert, the removal, and the unmapped arms of `handle` [282-285] and
+`route_gone` [295]. The unmapped `route_gone` returns without touching the map,
+so a spurious callback cannot remove another handle's entry. Every citation in
+this record was re-verified line by line at carry time and none needed repair.
+Two additions from that pass, both strengthening the record rather than changing
+it. The **at-most-one** half now has a named enforcer on the runtime side:
+`run_route_gone` short-circuits at `dispatch.rs:1256-1258` when
+`registry.mark_gone_started` (`routing.rs:377-390`) reports the flag already set,
+returning without invoking the child callback at all, so the composite's removal
+returning without invoking the child callback at all, so the composite's removal
+statement at `:299-302` cannot run twice for one handle. **The at-least-one half
+has three
+exceptions, all fatal-latched, listed in the open questions below.
+Existing check: `tests/composite_routing.rs:485-531` pins exactly one
+`route_gone` for a rejected bind;
+`tests/composite_routing.rs:532-600` pins that a closed handle cannot dispatch
+to stale child ownership. Neither runs in CI: the binary is unnamed, per
+[existing-checks.md](existing-checks.md). Status unaudited. Both spans
+re-verified at carry time: `rejected_broca_bind_gets_exactly_one_broca_route_gone`
+has its attribute at `:485` and its `fn` at `:486`, and
+`a_closed_route_handle_cannot_dispatch_to_stale_child_ownership` has its attribute
+at `:532` and its `fn` at `:533`.
+Impact: a bind path that never yields `route_gone` leaks one map entry per
+connection for the host's lifetime, and the leaked entry keeps routing a reused
+handle to a stale child.
+Open questions:
+- Does the host guarantee `route_gone` after a panicking `bind`, or only after
+  `Reject` and close? The comment claims all three; the runtime side is outside
+  this lens. **Resolved at carry time, and the answer is yes.** The runtime side
+  is `dispatch.rs`, which is inside *this* sub-part's scope rather than outside
+  it, so the question was answerable here and was not asked. A panic in `bind`
+  propagates out of the spawned task, because `panic_boundary::redact_sync`
+  (`panic_boundary.rs:52-55`) only marks the panic-hook depth and does not
+  `catch_unwind`; `lifecycle_join` observes `is_panic()` at `runtime.rs:187`,
+  trips the fatal latch at `:192-193`, and returns
+  `Err(LifecycleFailure { stopped: true })` at `:194`; and `dispatch.rs:1164`
+  matches that arm and calls `run_route_gone` at `:1166`. All three outcomes the
+  comment at `composite.rs:262-265` names do produce exactly one `route_gone`.
+- **A new question, opened by that resolution.** There are three further bind or
+  close outcomes the composite's comment does not name, and on each the map entry
+  is never removed: `dispatch.rs:1174`, where the bind is still executing past
+  `lifecycle_callback_deadline` and the comment at `:1171-1173` deliberately
+  declines to run `route_gone`; `dispatch.rs:1440-1444`, where a dispatch task did
+  not stop before route-gone and the function returns before the `run_route_gone`
+  at `:1446`; and `run_route_gone` returning `false` at `:1276`, where the child's
+  own callback did not return. All three trip the fatal latch, so the leak is
+  bounded by a terminating incarnation rather than by the host's lifetime, which
+  is a weaker bound than this record's `Impact:` assumes but not an unbounded one.
+  Is that bound intended as the answer, or should the composite's map be dropped
+  wholesale on a fatal latch? (needs human input)
+
+### composite-panic-containment-covers-only-optional-health-and-shutdown
+
+Type: safety
+Reachability: default-production — same construction chain, `serve.rs:575` and
+`:632`. Every one of the eleven child call positions enumerated below is an
+unconditional statement in `composite.rs`, which has zero `#[cfg]` attributes, so
+none of the contained or uncontained sites is gated.
+Status: active
+Exercised: partial — both contained categories have dedicated tests; no test
+pins that the other categories deliberately escalate.
+Guarantee: A child panic is contained exactly where the composite can still
+serve the host without that child, and escalates to the runtime's fatal cell
+everywhere else; the set of contained call sites is closed.
+Check: `always` — a panic in an optional child's `health` yields a `Failing`
+report for that child and the primary's report still decides the aggregate; a
+panic in any child's `shutdown` still drains every remaining child; and a panic
+in any other child callback reaches the runtime.
+Fault/timing angle: `catch_child_panic` wraps each individual poll
+[composite.rs:160-171], so a child that panics after an `await` is still caught.
+`shutdown` collects notes and re-raises one aggregate panic only after all three
+drains [composite.rs:370-388], which is what keeps the instance fence held until
+every child's background work has stopped.
+Required faults and enabling state: a panicking child in each of the nine
+uncontained positions listed in O17, plus the two contained ones. The primary's
+`health` at composite.rs:312 is the one asymmetry a test should pin explicitly,
+because the surrounding comment [306-311] only discusses optional children.
+Confidence: high — [evidence](evidence/composite-panic-containment-covers-only-optional-health-and-shutdown.md).
+Enumerated every child call in the file and checked each for a
+`catch_child_panic` wrapper. This is deliberately a *containment* property and
+does not restate part 2a's
+`every-callback-invocation-is-inside-the-redaction-guard`, which is about the
+redaction hook rather than about unwinding. The enumeration was re-derived
+independently at carry time and O17's count of nine uncontained positions is
+confirmed exactly: `install_connection_key` (`:194-196`), `manifest`
+(`:201-203`), `resources` (`:211-213`), `initialize` (`:223-225`), `activate`
+(`:235-237`), `bind` (`:271-273`), `handle` (`:279-281`), `route_gone`
+(`:292-294`), and the primary's `health` (`:312`). The two contained positions are
+the optional children's `health` (`:318`, `:321`) and all three `shutdown` calls
+(`:374`, `:378`, `:382`).
+Existing check: `tests/composite_routing.rs:851-885` and `:886-917` cover
+shutdown panic and error; `tests/composite_routing.rs:986-1027` and `:1028-1049`
+cover optional-child health panics;
+`tests/composite_routing.rs:918-985` covers the non-graceful incarnation. None
+runs in CI: the binary is unnamed, per
+[existing-checks.md](existing-checks.md). Status unaudited. **One citation
+repaired at carry time:** the last of the health-panic spans is `:1028-1049`, not
+`:1028-1060`. The file is 1,049 lines, so the lens's end bound overran it by
+eleven; the test is `a_panicking_synapse_health_reports_failing_without_unwinding`
+(attribute `:1028`, `fn` `:1029`) and it ends on the file's final line. The other
+four spans verified exactly.
+Impact: adding a `catch_child_panic` to a callback the runtime treats as fatal
+would silently convert a host-fatal invariant break into a degraded mode;
+removing one from `shutdown` would release the instance fence with a child's
+work still live.
+Open questions: None.

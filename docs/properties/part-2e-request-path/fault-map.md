@@ -402,3 +402,105 @@ zero CI execution of it.
     `GenerationCore` immediately, making the leak unobservable and therefore
     harmless — is answerable from sub-part 2f's `runtime.rs:1144-1244` without any
     new capability, and that is still the cheaper thing to do first.
+
+---
+
+## Map addition: the two records carried from `part-2b-wire-and-channels`
+
+Appended when the two composite records were carried into this sub-part; see
+[catalog.md](catalog.md#group-f-composite-route-ownership-and-panic-containment).
+The 14-record map above is unchanged, and so are its totals. **"Non-vacuous
+today" carries the same meaning as above:** a developer can construct the required
+state with the current harness. It does not mean the check runs anywhere; under
+`C0` the binary that would hold these oracles, `tests/composite_routing.rs`, is
+unnamed in CI.
+
+**No new fault class is needed.** `C1` (a hostile handler callback) and `C3` (a
+bind callback that stops or overruns) cover everything both records need, and both
+are already `Yes` above. `C4` (a close that races an in-flight bind) is needed for
+one of three outcomes in the first record and is the one class above marked "No
+deterministically", so that record inherits exactly that limitation and no other.
+
+**Reachability is recorded per record in `catalog.md`.** Both are
+`default-production`, verified at carry time against `serve.rs:575`
+(`StaticComposite::new`) and `:632` (`mc_host::run`), plus the fact that
+`composite.rs` contains zero `#[cfg]` attributes. Neither row below infers a class
+from the absence of a gate.
+
+### Composite route ownership and panic containment
+
+| Property | Required faults and enabling state | Non-vacuous today |
+| --- | --- | --- |
+| composite-route-entry-is-removed-by-exactly-one-route-gone | **`C3` for two of three named outcomes, `C4` for the third.** The record names the three non-success bind outcomes from the comment at `composite.rs:262-265`: `BindOutcome::Reject`, a panicking `bind`, and close-wins-bind. `Reject` already has a test (`tests/composite_routing.rs:485-531`). A panicking `bind` is `C3` and is a stub edit, since the binary already carries child stubs whose trait methods span `:825-846` and `:960-981`. Close-wins-bind is `C4`'s `BindInstall::CloseWins` at `dispatch.rs:1195-1202`, with the silent exit at `:1199`, and `C4` has no deterministic seam. **Three further outcomes were traced at carry time and none is in the comment:** `dispatch.rs:1174` (bind still executing past `lifecycle_callback_deadline`), `:1440-1444` (a dispatch task did not stop before route-gone), and `run_route_gone` returning `false` at `:1276`. All three skip the removal and all three trip the fatal latch, so their oracle must be read from the latch or the client rather than from a later request | **Partial.** Construction: two of the three named outcomes are constructible today and the third is `C4`-blocked, exactly as the `route.open` record above is. **Observation is the sharper limit and it is separate from the fault question.** `routes` is a private field (`composite.rs:112`), `child_of_route` (`:138`) is private, and `composite.rs` has no test module, so no oracle can read the map. Two proxies work through the public trait surface: count `route_gone` invocations at the child stub (what `:485-531` already does), and dispatch to the removed handle and assert the `CODE_INTERNAL_ERROR` "route is not mapped to a component" from `:282-285` — the second is the strongest available oracle for the removal actually happening and **no existing test uses it**. The first proxy is valid only because `:299-302` is unconditional once the `match` at `:291-296` returns, and a test relying on it should say so |
+| composite-panic-containment-covers-only-optional-health-and-shutdown | **`C1` for a panicking child callback, in eleven positions.** Nine uncontained: `install_connection_key` (`:194-196`), `manifest` (`:201-203`), `resources` (`:211-213`), `initialize` (`:223-225`), `activate` (`:235-237`), `bind` (`:271-273`), `handle` (`:279-281`), `route_gone` (`:292-294`), and the **primary's** `health` (`:312`). Two contained categories covering five sites: optional-child `health` (`:318`, `:321`) and all three `shutdown` calls (`:374`, `:378`, `:382`). The two contained categories already have four tests (`:851-885`, `:886-917`, `:986-1027`, `:1028-1049`). The nine escalating cases each terminate the host, so each needs a test process or a `TestHost` teardown that tolerates a tripped latch — which `a_child_shutdown_failure_makes_the_host_incarnation_non_graceful` (`:918-985`) already demonstrates for the shutdown case | **Yes**, and the third clause of the check has a much cheaper oracle than the fault-per-position reading suggests. The check's first two clauses are covered. The third — "a panic in any other child callback reaches the runtime" — is a **universal over nine positions**, and a census discharges it: assert that the set of `catch_child_panic` call sites in `composite.rs` is exactly `{:318, :321, :374, :378, :382}`. That is enumeration over one file, needs no panic at all, and catches the record's first `Impact:` clause (a wrapper added where the runtime treats the callback as fatal). Of the nine, the primary's `health` at `:312` is the one that also wants a real panicking test, because it is the asymmetry a well-intentioned change would erase and the comment at `:306-311` discusses only the optional children |
+
+**Totals for the two: 1 fully non-vacuous today, 1 partial, 0 not
+constructible.** The sixteen-record totals are therefore **12 fully non-vacuous,
+4 partial, 0 not constructible.** Note that the partial row is partial for two
+independent reasons that the map's other rows keep separate: one outcome is
+fault-blocked on `C4`, and the map is unobservable through any public surface. The
+second is a *placement and visibility* limit rather than a fault limit, and it is
+the same shape as the constraint the pending-entry record above records (`mod
+connection` is private, so the oracle cannot live in an integration binary) — here
+the field is private rather than the module.
+
+## Coverage checks to add: the carried two
+
+Two markers, and the first is unusually cheap for what it buys.
+
+1. **`COMPOSITE_CONTAINMENT_SET_CHANGED`.** Not a runtime marker but a census
+   assertion, and it is the cheapest valid oracle either record admits. The
+   `catch_child_panic` call-site set in `composite.rs` is exactly
+   `{:318, :321, :374, :378, :382}`. Assert it. This does not assert the violation
+   (a contained callback that should escalate), it asserts the structural
+   precondition, so it fires on a correct implementation and fails the moment the
+   set changes in either direction. Marker name constant and globally unique, per
+   METHOD's coverage rules.
+2. **`COMPOSITE_ROUTE_ENTRY_RETAINED_WITHOUT_PENDING_REMOVAL`.** For the
+   route-entry record, asserting the independent preconditions of the leak window
+   rather than the leak: that a handle was inserted at `composite.rs:266-269`, and
+   that its `open_route` invocation reached one of the three latch-tripping exits
+   (`dispatch.rs:1174`, `:1440-1444`, or a `run_route_gone` returning `false` at
+   `:1276`). Both are observable without knowing whether the entry was ever
+   removed. This is the marker that makes the three unnamed outcomes visible; today
+   they are reachable and invisible.
+
+A third was considered and rejected. A `sometimes`-style marker on the
+intentional window at `composite.rs:291-302` — a `handle` arriving for a route
+mid-`route_gone` — would assert a situation the record explicitly calls
+intentional and already covered by `:532-600`. Per METHOD's coverage rules a
+marker needs an independent vulnerable window to observe, and this one has none.
+
+## Leverage addition: where the carried two sit
+
+**The census assertion is the single cheapest valid oracle anywhere in this
+sub-part's map**, above every row in the ranking already recorded. It needs no
+fault, no host, no handler, no timing, and no fixture: it reads one file and
+compares a set of line numbers. It discharges the third clause of the containment
+record's check, which is a universal over nine positions that would otherwise cost
+nine host-terminating tests. Everything else in this sub-part needs at least `C1`
+and a running host.
+
+**The primary-health test is the highest-value single fixture among the carried
+two.** One panicking stub, one assertion, and it pins the one asymmetry in
+`composite.rs` that a reader following the comment at `:306-311` would
+misunderstand and a well-intentioned change would erase. It composes with nothing
+and blocks nothing.
+
+**The route-entry record ranks with the `route.open` record above rather than on
+its own**, because they share `C4` as their blocker and they share a subject: the
+`route.open` record is about whether the *client* gets an answer on each exit, and
+this one is about whether the *composite's map* is reclaimed on each exit. The
+exits are the same exits. A campaign that drives `open_route` through all of
+`dispatch.rs:1164`, `:1174`, `:1199`, `:1220` and `:1440-1444` serves both, and
+neither dominates the other — a bind path can answer the client and leak the map
+entry, or reclaim the entry and answer nothing.
+
+**One relationship crosses into 2b's carried group and is worth recording.** The
+containment record is what establishes that a panicking `bind` *escapes* the
+composite, and the route-entry record's resolved open question depends on that
+escape: `dispatch.rs:1164` reaches the cleanup arm only because the panic
+propagated out of the spawned task. So a change to the containment set would
+silently invalidate the other record's premise. That is a genuine dependency
+between two records that arrived together and would not have been visible if only
+one had been carried.

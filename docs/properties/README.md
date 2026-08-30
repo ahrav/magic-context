@@ -212,16 +212,16 @@ field is `Type:`.
 | part-4b-transform | 24 | 24 | 0 |
 | part-4c-handlers | 25 | 25 | 0 |
 | part-4d-facade | 25 | 25 | 0 |
-| part-4e-rendering | 24 | 24 | 0 |
+| part-4e-rendering | 26 | 26 | 0 |
 | part-4f-decisions | 26 | 26 | 0 |
 | part-2b-wire-and-channels | 0 | 0 | 0 |
-| **Total** | **368** | **272** | **96** |
+| **Total** | **370** | **274** | **96** |
 
 The whole shortfall is in the two earliest parts. Part 1 has none of the labels,
 and Part 2a has them on 17 of 55 records, the 17 being later additions. Every part
 from 2b-ring-datapath onward labels every record. `part-2b-wire-and-channels`
 scores zero because it has no catalog and is owed none; its 36 unlabelled lens
-records are working material, not records, and are not counted in the 368.
+records are working material, not records, and are not counted in the 370.
 Backfilling those 96 labels is
 per-record work: rule 4 requires the evidence for each label at authoring time, so
 they cannot be assigned from a preamble.

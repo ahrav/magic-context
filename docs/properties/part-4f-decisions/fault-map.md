@@ -56,11 +56,17 @@ entry C1-30). It is ranked second below only because `F0` governs whether any te
 runs at all.
 
 **Fifth, this part has no `sometimes` and no liveness record, which changes what
-the coverage-check section has to do.** The 26 records are 25 `safety` and one
+the coverage-check section has to do.** The 27 records are 26 `safety` and one
 `reachability`; the catalog's own header already reports the semantics finding on
 that single `reachable` record and declines to apply it. So there is no
 `sometimes` marker to audit for the forbidden pairing, and every marker proposed
-below is new. The forbidden pairing is still the dominant hazard here, because in
+below is new. **The zero-liveness position was challenged by an independent
+evaluation and upheld**, on the ground that `scheduler::decide` is an immediate
+pure transition with no progress obligation to bound and the paging loop that
+would carry one belongs to another sub-part; the reasoning is in
+[portfolio-evaluation.md](portfolio-evaluation.md) and is recorded there rather
+than here because it is a verdict on this file's framing, not a fact about a
+fault class. The forbidden pairing is still the dominant hazard here, because in
 this part the defect is almost always easier to name than its precondition.
 
 ## Fault classes required
@@ -97,7 +103,7 @@ Three availability caveats that cut across classes.
 
 ## Map
 
-All 26 records, grouped as the catalog groups them, meaning by the thing a single
+All 27 records, grouped as the catalog groups them, meaning by the thing a single
 test fixture would have to build. "Non-vacuous today" means a developer can
 construct the required state with the current harness. It does **not** mean the
 check runs anywhere; under `F0` none of them do.
@@ -114,10 +120,10 @@ exactly the eight the catalog labels so.
 | --- | --- | --- |
 | dec-a-execute-threshold-lower-bound-is-documented-20-and-enforced-1 | A user or project `magic-context.jsonc` containing `execute_threshold_percentage` below `20`, for example `5` (F2) | **Yes, and it is one of the five records F2 unblocks on one fixture.** One resolution. The clamp is verified at `config.rs:568-570`, `.clamp(1.0, MAX_EXECUTE_THRESHOLD_PERCENTAGE)` with the ceiling `90.0` at `:28`, against a documented range of `20-90` (`CONFIGURATION.md:167`). The existing check covers the **upper** bound only: `project_threshold_may_only_raise` (`config.rs:829-835`). The oracle is the resolved value plus the warning vector, and the record adopts 4b's queued gap `portfolio-evaluation.md:390` (G4) |
 | dec-a-memory-injection-budget-documented-range-has-no-implementing-code | A project `.cortexkit/magic-context.jsonc` with `memory.injection_budget_tokens` above `20000`, or below `500` (F2) | **Yes.** Same fixture. Three assignment sites apply `.max(1.0)` and nothing else (`config.rs:442`, `:444`, `:527`) against a documented range of `500-20000` (`CONFIGURATION.md:591`). The nearest existing check proves the *user-profile* budget is user-tier-only (`config.rs:876-911`), which by contrast confirms the injection budget is deliberately project-writable. **The consequence composes with 4b's frozen `m0`**: an unbounded trim budget inflates a baseline every subsequent pass replays verbatim |
-| dec-a-commit-cluster-trigger-config-is-inert-in-this-crate | **None for the divergence itself; it holds on a default build.** A behavioural difference needs `commit_cluster_trigger.enabled: false` plus a tail with at least three commit clusters and one `trigger_budget` of tokens | **Yes for the wiring assertion, which is the cheap half.** The check is that the `TriggerContext` built at `lib.rs:4962-4964` carries the configured values; today it carries the hardwired `DEFAULT_COMMIT_CLUSTER_TRIGGER_ENABLED` (`lib.rs:605`) and `DEFAULT_MIN_COMMIT_CLUSTERS` (`lib.rs:607`), so the assertion fails with no fault at all. The behavioural half needs a tail fixture and is worth less, because the wiring is the defect. Note the call site is 4b/4c code reading a 4f contract, so the assertion crosses a sub-part boundary. `boundary.rs:2226-2227` pins the constant against a golden value, which pins the default and not the configurability |
+| dec-a-commit-cluster-trigger-config-is-inert-in-this-crate | **A non-default `commit_cluster_trigger` value, plus a trigger workload.** Neither alone. This cell previously read "None for the divergence itself; it holds on a default build", which is the claim a disposition pass retired | **Partial, and the wiring half is not the free win this row claimed.** The check is that the `TriggerContext` built at `lib.rs:4962-4963` carries the configured values. This row previously said "today it carries the hardwired `DEFAULT_COMMIT_CLUSTER_TRIGGER_ENABLED` (`lib.rs:605`) and `DEFAULT_MIN_COMMIT_CLUSTERS` (`lib.rs:607`), so the assertion fails with no fault at all". **It does not fail at defaults, because the documented defaults *are* those constants**: `CONFIGURATION.md:237-238` gives `true` and `3`, and the constants are `true` and `3`, both printed and confirmed. A context built from the constants satisfies "carries the configured value" whenever the configuration is default, so the assertion needs a non-default value to have any content. Set `min_clusters` to `2` — the value `lib.rs:16500-16501` already uses — and assert on the constructed context; that is the cheap half and it is not free. The behavioural half additionally needs a tail with at least the configured cluster count and one `trigger_budget` of tokens. Note the call site is 4b/4c code reading a 4f contract, so the assertion crosses a sub-part boundary. `boundary.rs:2226-2227` pins the constant against a golden value, which pins the default and not the configurability |
 | dec-a-project-tier-can-write-leaves-outside-the-documented-allow-list | A project `.cortexkit/magic-context.jsonc` setting `smart_drops: true`, accepted at `config.rs:541-543` (F2) | **Yes.** Same fixture. `warn_ignored_project_key` (`config.rs:575-581`) is called for **six** pointers only (`:520`, `:538`, `:539`, `:540`, `:556`, `:561`), and `config.rs:913-928` and `:1096-1117` prove specific keys are user-tier-only. Neither establishes that the remaining project-writable set is the documented one, which is what the check asserts. The consequence is concrete: `CONFIGURATION.md:767` describes `smart_drops` as intentionally off "while cache stability is being validated in the wild", and a repository can turn it on |
 | dec-a-config-value-clamps-and-zero-rejection-are-invisible-to-the-caller | A config with `memory.auto_search.score_threshold: 0.99`, `memory.auto_search.min_prompt_chars: 0`, or `caveman_text_compression.min_chars: 50` (F2) | **Yes, and the oracle is a comparison the merge path already materialises.** For every resolution where an input leaf differs from the resolved leaf, the warning vector should name that leaf; today no clamp reports itself. All three clamps verified: `clamp(0.3, 0.95)` at `config.rs:591`, `clamp(5, 500)` at `:595` with a `0` silently discarded by `positive_usize_at` (`:623-629`), and `clamp(100, 10_000)` at `:607`. **`min_prompt_chars: 0`, the natural spelling of "hint on every prompt", silently becomes `20`** |
-| dec-a-malformed-config-silently-resolves-to-defaults-and-stops-the-historian | A user `magic-context.jsonc` with a syntax error `strip_jsonc` does not repair, for example an unterminated string (F3) | **Yes, and it is the cheapest record outside Group C.** One bad file and one `effective_config` call. `config.rs:1181` already covers JSONC stripping and `:1191` the mtime cache, so the fixture pattern exists; only the malformed content is new. The observable surface today is a `no_models` no-fire reason, which points a reader at model configuration rather than at a parse failure. There is a separate same-mtime window the record names, and it is not needed for the primary check |
+| dec-a-malformed-config-silently-resolves-to-defaults-and-stops-the-historian | A user `magic-context.jsonc` with a syntax error `strip_jsonc` does not repair, for example an unterminated string (F3) | **Partial, and the fault is free while the record's original oracle was impossible.** Producing the state is the cheapest thing outside Group C: one bad file and one `effective_config` call, and `config.rs:1181` already covers JSONC stripping and `:1191` the mtime cache, so only the malformed content is new. **But the check as written asked for a warning naming the path, and no channel exists to carry one.** `read_tier_cached` (`config.rs:254-266`) is `fn(&mut TierConfig, PathBuf) -> Option<Value>`: no warnings sink, no `Result`, and `:261-264` collapses both the read error and the parse error to `None`. By the time `merge_tiers_with_warnings` builds its warning vector, an unparseable file and an absent file are the same `None`. And `emit_warnings` (`:275-279`) only `eprintln!`s, which a sibling record already flags as possibly discarded under the daemon host. The record now asserts the observable consequence instead — the resolved config equals `McModuleConfig::default()`, which it does, so the assertion fails on the current build — plus a static enumeration of the signature. The observable surface today is a `no_models` no-fire reason, which points a reader at model configuration rather than at a parse failure. There is a separate same-mtime window the record names, and it is not needed for the primary check |
 
 ### Group B: model-chain resolution
 
@@ -136,7 +142,8 @@ so a later change that drops a guard is visible.
 | Property | Required faults and enabling state | Non-vacuous today |
 | --- | --- | --- |
 | dec-a-cache-ttl-parse-is-total-over-arbitrary-strings | A `cache_ttl` string. `"0"`, `"5S"`, `"99999999999999999999h"` and `"5\u{20ac}"` are the interesting inputs, all accepted by `config.rs:486-491` as non-empty trimmed strings. No fault | **Yes, and it is the single cheapest oracle in the part.** One function call per input. `scheduler.rs:1417-1424` `parse_cache_ttl_never_returns_u64_max` and `:1427-1435` `never_ttl_predicates_are_always_false` already exist. **The finding is that the parse is sound and the hazard is downstream**: `"0"` parses to 0 ms and forces execution every pass, which no documentation mentions, and any unparseable string is swallowed into the `5m` default by `scheduler_ttl_ms` (`:810-812`) with no report |
-| dec-a-boundary-budget-derivation-is-total-over-non-finite-input | A `BoundaryContext` whose `context_limit`, `execute_threshold_percentage` or `usage_percentage` is `f64::INFINITY` or `f64::NAN`. No fault | **Yes by direct call; production reachability is a separate and narrower question.** A struct literal with `f64::NAN` is the whole enabling state, and no test targets non-finite input today. Reaching it *from production* needs a host-supplied usage reading, since `lib.rs:4950-4959` builds the context from request and store values, and the `trigger_budget` passthrough is the one place a caller could still inject a non-finite value. **This is the guarded analogue of Part 3's decay totality defect and the guard holds**: `boundary.rs:340-342` returns `TRIGGER_BUDGET_MIN` for non-finite and non-positive input, which `CONFIGURATION.md:238` does not mention |
+| dec-a-boundary-budget-derivation-is-total-over-non-finite-input | A `BoundaryContext` whose `context_limit`, `execute_threshold_percentage` or `usage_percentage` is `f64::INFINITY` or `f64::NAN`. No fault | **Yes by direct call; production reachability is a separate and narrower question.** A struct literal with `f64::NAN` is the whole enabling state, and no test targets non-finite input today. Reaching it *from production* needs a host-supplied usage reading, since `lib.rs:4950-4959` builds the context from request and store values. **This is the guarded analogue of Part 3's decay totality defect and, over the three fields it validates, the guard holds**: `boundary.rs:339-341` returns `TRIGGER_BUDGET_MIN` for non-finite and non-positive input, which `CONFIGURATION.md:238` does not mention. The `trigger_budget` passthrough that this cell used to fold in as "the one place a caller could still inject a non-finite value" is no longer part of this record; it is the row below |
+| dec-a-caller-supplied-trigger-budget-is-the-one-unvalidated-float-and-reaches-a-diagnostic | A `BoundaryContext` with `trigger_budget: Some(f64::NAN)` and a non-empty message set. No fault | **Yes, and it is the cheapest falsifying oracle in the part.** One struct literal and one call: `BoundaryContext.trigger_budget` is a `pub` field and both read sites are reachable in-crate. `boundary.rs:377-379` and `:756-761` read it through `unwrap_or_else` with no `is_finite` gate on the `Some` arm, unlike the three neighbouring fields. `derive_protected_tail_token_target`'s own postcondition survives, because `f64::min` at `:383` returns the non-NaN operand and `n` stays finite, but `:399` stores the raw NaN into the returned struct and `:802`'s `tail_size_bar: trigger_budget * TAIL_SIZE_TRIGGER_MULTIPLIER` is a bare multiply with nothing to absorb it. So `TriggerProgress.tail_size_bar` is NaN, and that struct is carried into the transform response at `lib.rs:4982` and divided at `:5002`. **Unlike every other row in this table, this oracle fails on the current build**, and the evidence was already written: the budget record's evidence file lists this exact case as test-plan item 4 and states it fails today |
 | dec-a-derive-historian-chunk-tokens-is-total-at-both-integer-extremes | `historian.context_limit_tokens` at an extreme. **A configured `0` is impossible**, because `positive_usize_at` (`config.rs:623-629`) discards it, so reaching the extremes needs a very large configured limit or a direct call | **Yes by direct call.** `config.rs:972-978` `historian_budget_derivation_clamps_at_both_bounds` already covers `1`, `32_000` and `128_000`. The value of the record is as the paired positive result to the Part 3 defect class: the rounding-then-clamp order cannot produce a value outside `[8000, 50000]`, and the saturating cast degrades an absurd configured limit to the documented maximum rather than wrapping to a tiny budget |
 | dec-a-escalation-bands-stay-ordered-for-every-threshold | **None.** A threshold of `f64::NAN`, a negative threshold, or a threshold above `90` are the interesting inputs | **Yes.** One call per threshold. `scheduler.rs:1238` and the golden constant assertions at `boundary.rs:2226-2227` are the existing checks. The consequence the record pins is precise: if a threshold could push the force band to or past `95`, the `Force85` arm at `scheduler.rs:525` would become unreachable and the emergency arm would absorb the whole force band, changing which passes bypass mid-turn deferral. The cap makes that impossible |
 | dec-a-selection-decision-order-is-total-under-hashmap-iteration | **None for the property.** Refuting it needs an input where one `target_id` receives two same-rank decisions with different payloads, which requires duplicate `SelItem` ids mapped to different `arc_id`s | **Yes, and the cheap form is a repeat-call equality plus a postcondition scan.** Both conjuncts are directly assertable: repeated calls on identical inputs return equal `Vec<ReductionDecision>`, and no two distinct arcs emit a decision for the same `target_id`. `selection.rs:2836` `drop_wins_over_edit_marker` plus the differential golden `selection.rs:32-33` names as the arbiter are the existing checks. **The cross-process form is also cheap** (two `cargo test` invocations give two `HashMap` seeds) and is the form that would catch a genuine iteration-order dependence, since both hash-iterating loops (`selection.rs:1305`, `:1397-1405`) are made order-insensitive downstream today. The header stakes the cache invariant on this: if it fails, a defer pass replays different bytes than the freeze produced |
@@ -146,7 +153,7 @@ so a later change that drops a guard is visible.
 
 | Property | Required faults and enabling state | Non-vacuous today |
 | --- | --- | --- |
-| codec-b-harness-decoders-accept-every-input-with-no-rejection-channel | **None.** An arbitrary `Vec<Value>` is the whole enabling state (F1). The interesting members are a bare string or number as an array element, a `parts` value that is an object rather than an array, and a part whose `type` is absent | **Yes, and it is the cheapest codec oracle in the part.** One call per input. `codec/mod.rs:78-89` and `:201-212` assert decode determinism over the goldens, which pins purity and not totality; all 31 hand-built decoder tests use well-formed fixtures. **This record differs from Part 1's equivalent in a way worth carrying**: Part 1's `decoder-totality-over-arbitrary-bytes` could say the property holds and is under-evidenced, whereas this one **is violated by design**, because there is no error variant to fall back on. The failure mode is not a crash but a fabricated message: a malformed element becomes a zero-block `"user"` message that occupies an ordinal, enters the sidecar, participates in boundary selection, and is re-encoded from its retained raw |
+| codec-b-harness-decoders-accept-every-input-with-no-rejection-channel | **None.** An arbitrary `Vec<Value>` is the whole enabling state (F1). The interesting members are a bare string or number as an array element, a `parts` value that is an object rather than an array, and a part whose `type` is absent | **Partial: the return and consistency clauses are the cheapest codec oracle in the part; the allocation clause is not observable at all.** One call per input for the first two clauses. The third clause, "allocation is bounded by a constant multiple of input size", cannot be witnessed by a decode call: both decoders return `DecodedHarnessMessages` and expose no allocation accounting, so proving a multiple of input size needs a counting `#[global_allocator]`, a `dhat`-style profiler, or a `Vec::capacity` sweep over the returned structure, and the tree has none of the three. That clause is discharged by reading — the largest allocations are `raw_message.clone()` at `codec/opencode.rs:232` and `raw_entry.clone()` at `codec/pi.rs:114`, one per input message — and must not be counted as an oracle a call satisfies. `codec/mod.rs:78-89` and `:201-212` assert decode determinism over the goldens, which pins purity and not totality; all 31 hand-built decoder tests use well-formed fixtures. **This record differs from Part 1's equivalent in a way worth carrying**: Part 1's `decoder-totality-over-arbitrary-bytes` could say the property holds and is under-evidenced, whereas this one **is violated by design**, because there is no error variant to fall back on. The failure mode is not a crash but a fabricated message: a malformed element becomes a zero-block `"user"` message that occupies an ordinal, enters the sidecar, participates in boundary selection, and is re-encoded from its retained raw |
 | codec-b-pi-decoder-drops-unrecognised-entry-types-without-a-record | One Pi session entry with an unrecognised `type` and no `role` key, for example `{"type": "tool_use_v2", "data": {}}`, or the degenerate `{"type": "message"}` with no `message` key (F5) | **Yes.** One hand-built entry. No golden case and no unit test supplies one: `codec/pi.rs:1078-1499` has 14 tests, and `:1479-1483` asserts `encode_pi(...).is_empty()` for an empty-content message, which is the encoder half of a different drop. The check is that every input entry is recoverable either from a `CkIngressMessage`'s meta or from `sidecar.messages`; today the entry is dropped from both (`codec/pi.rs:41-50`, `:661-669`, `:681-686`). **The unrecoverable consequence is the ordinal shift**: every later entry moves down by one, so a persisted boundary ordinal or a tag keyed to an ordinal now names a different message, and because Pi has no `absolute_ordinal` input there is no way for the harness to pin the numbering against it |
 | codec-b-opencode-hides-four-part-types-from-every-transform-decision | **None for the preservation direction**; one OpenCode message carrying any of `{snapshot, patch, agent, retry}` suffices (F5). For the interesting composition, that message must **also** have a decoded block deleted, so `remove_unretained_native_parts` runs with a non-empty removal set | **Yes for both halves.** The golden already supplies one `patch` part, so the preservation direction is pinned **by accident rather than by design**: `codec/mod.rs:59-76` lists `patch` as a required coverage class and the round trip covers it. `codec/mod.rs:216-252` `codec_conformance_removes_leading_native_blocks_without_reindex_drift` exercises the removal path but on a message with no immune parts, so the composition of the two is what is missing and it is one fixture away. **Correct today and fragile in one direction**: these four types are invisible to the CK view, so the transform's byte accounting, tag numbering and boundary selection never see them while the provider does |
 | codec-b-provenance-recovery-on-decode-is-all-or-nothing-and-opencode-only | For the mixed-parts hole, one OpenCode message with one synthetic part and one authored part. For the role hole, a synthetic assistant or tool message that is not the todo pair. **For Pi, any input at all** (F5) | **Yes, and the Pi half needs literally nothing.** `codec/mod.rs:128-175` covers the all-synthetic path and `:290-298` asserts `message["meta"]["synthetic"] == true` on the native fixtures; **neither covers a mixed message**. The consequence is that the module's own writes can come back classified as user-authored, and `meta.synthetic` gates `meta_for_ck`'s positional fallback (`codec/sidecar.rs:324-328`), so a misclassified module-authored message becomes eligible to inherit a native envelope by position. **Pi's hardcoded `false` means the Pi leg has no provenance in either direction**, which composes with 4e's finding to leave synthetic content indistinguishable from authentic content for that harness at every layer |
@@ -174,23 +181,78 @@ so a later change that drops a guard is visible.
 | codec-b-declared-missing-capture-classes-are-never-decoded | One OpenCode message with a `subtask` part; one Pi assistant entry with a `thinking` part carrying `redacted: true` (F5) | **Yes, and the blocker is that nobody added a case rather than that anyone cannot.** Both fixtures were read at `HEAD`: `opencode-golden.json` covers 11 of 12 required classes with `subtask` in `missing_capture_classes`, `pi-golden.json` covers 12 of 13 with `redacted_thinking`, and `assert_coverage_or_recorded_missing` (`codec/mod.rs:254-271`) passes on both because listing a required class clears it. Its own message, "codec golden neither covers nor records missing classes" (`:267-270`), is honest that it is a bookkeeping gate. **The two halves are not equally valuable**: deleting the `subtask` arm would not move the golden, since the part would fall to `:194-204` and still become an opaque block, whereas Pi's `:199-211` produces `CkKind::RedactedReasoning` against `:212-217`'s `CkKind::Reasoning` with a signature, and the two round-trip through different encoder arms (`:543-548` versus `:536-542`) |
 | codec-b-pi-encoder-can-return-a-shorter-array-than-it-was-given | For the `codec/pi.rs:371` drop, a message whose meta role is `toolResult` but whose CK content holds no `ToolResult` block, which the transform can produce by reducing a decoded tool-result message. For the `:396-397` drop, a CK message with empty `content` whose matched meta's raw is not a Pi message | **Yes via the `:371` drop; the `:396-397` half may be unreachable by construction.** The first drop is directly constructible and refutes `encode_pi(msgs, sidecar).len() == msgs.len()`, so the check is non-vacuous. The second may be unreachable, since only `decode_opaque_entry` produces such a raw and those messages carry exactly one opaque block; that half is recorded and not resolved. `codec/pi.rs:1469-1484` pins the cleared-content drop. **Reachability is the caveat, not constructibility**: there is no production caller, so the record exists because the function is a public export (`codec/mod.rs:10`, `lib.rs:12`) whose contract differs from its OpenCode twin, and 4e's lens already notes the Pi encode path is off-route |
 
-**Totals: 26 non-vacuous today, 0 partial, 0 blocked outright.**
+**Totals: 23 non-vacuous today, 4 partial, 0 blocked outright**, over 27 records.
+Against a pre-disposition **26 non-vacuous, 0 partial, 0 blocked** over 26 records.
 
-**That distribution is the finding, and it needs naming precisely rather than
-celebrating.** 4d reached 22 of 24 because its surface is request-shaped, and 4e
-reached 22 of 24 because its surface is fixture-shaped. **4f reaches 26 of 26
-because its surface is argument-shaped.** Fourteen of the 26 need nothing but a
-struct literal, a JSON string, or a `Vec<Value>` passed to a pure function, and
-none of the 26 needs a clock, a store mutation, a second process, a second pass,
-or a seam. Group C in particular is six records whose entire enabling state is a
-hand-written function argument.
+**The old 26-of-26 was the headline of this file and it was wrong, so the
+correction goes here rather than in a footnote.** An independent evaluation found
+that three of the twenty-six counted checks have no runtime observability at all,
+and re-reading each against the code confirms it. One record was added by a split,
+and it is non-vacuous, which is why the denominator moved by one and the numerator
+by three:
 
-**Three caveats keep the 26 honest, and they are about reachability rather than
+- **`dec-a-commit-cluster-trigger-config-is-inert-in-this-crate` → `Partial`.**
+  Its check is that the `TriggerContext` at `lib.rs:4962-4963` carries the
+  *configured* `enabled` and `min_clusters`. At defaults the configured and
+  hardwired values are identical — `CONFIGURATION.md:237-238` documents `true` and
+  `3`, `lib.rs:605` and `:607` hardwire `true` and `3` — so a context built from
+  the constants satisfies the assertion. This file's own row said the assertion
+  "fails with no fault at all", which is false at defaults. Non-vacuity needs a
+  non-default config value **and** a trigger workload, together, and the row now
+  says so.
+- **`dec-a-malformed-config-silently-resolves-to-defaults-and-stops-the-historian`
+  → `Partial`.** Its check was that a warning naming the path is emitted. There is
+  no channel for one: `read_tier_cached` (`config.rs:254-266`) takes
+  `(&mut TierConfig, PathBuf)`, returns `Option<Value>`, and maps both the read and
+  the parse error to `None` at `:261-264`. No warnings sink, no `Result`. The
+  observable substitute is the consequence — the resolved config equals
+  `McModuleConfig::default()` — plus a static enumeration of the signature, and the
+  record now asserts that instead.
+- **`codec-b-harness-decoders-accept-every-input-with-no-rejection-channel` →
+  `Partial`.** Its return and consistency clauses are non-vacuous over an arbitrary
+  `Vec<Value>` and stay so. Its third clause, "allocation is bounded by a constant
+  multiple of input size", is not observable from a decode call: the functions
+  return `DecodedHarnessMessages` and expose no allocation accounting, so proving
+  it needs a counting `#[global_allocator]`, a `dhat`-style profiler, or a
+  `Vec::capacity` sweep, none of which the tree has. That clause is now recorded as
+  discharged by reading rather than by assertion.
+- **`dec-a-caller-supplied-trigger-budget-is-the-one-unvalidated-float-and-reaches-a-diagnostic`
+  → `Yes`, and it is the cheapest falsifying oracle in the part.** New record, split
+  out of the budget-derivation record. One `BoundaryContext` literal with
+  `trigger_budget: Some(f64::NAN)`, one call, and `TriggerProgress.tail_size_bar`
+  (`boundary.rs:802`) is NaN. It fails on the current build, which none of the
+  guards cluster's oracles do.
+
+**The corrected distribution is still the finding, and it needs naming precisely
+rather than celebrating.** 4d reached 22 of 24 because its surface is
+request-shaped, and 4e reached 22 of 24 because its surface is fixture-shaped.
+**4f reaches 23 of 27 because its surface is argument-shaped.** Fifteen of the 27
+need nothing but a struct literal, a JSON string, or a `Vec<Value>` passed to a
+pure function, and none of the 27 needs a clock, a store mutation, a second
+process, a second pass, or a seam. Group C in particular is seven records whose
+entire enabling state is a hand-written function argument.
+
+**And the shape of the three demotions is worth stating, because it is one error
+repeated.** All three counted a check as observable when the observation channel
+does not exist: a value that is indistinguishable from its own default, a warning
+with no return path, and an allocation with no accounting. Constructibility of the
+*input* was verified in every case and mistaken for constructibility of the
+*oracle*. That is a different failure from the sibling parts' — 4d and 4e's
+demotions were about missing fixtures — and it is cheaper to catch, because the
+question is mechanical: name the value the oracle reads, and the code path that
+returns it to the test.
+
+**Three caveats keep the 23 honest, and they are about reachability rather than
 constructibility.** METHOD.md keeps those axes separate and so does this table.
 
 - `dec-a-model-key-lookup-walk-has-two-implementations-that-disagree`: the
   differential is writable, and the divergence it would demonstrate is latent
-  because no code in this crate constructs `ExecuteThresholdConfig::ByModel`.
+  because **nothing anywhere in the repository** constructs
+  `ExecuteThresholdConfig::ByModel`. `grep -rn 'ByModel' --include='*.rs'` returns
+  two hits, the variant declaration at `scheduler.rs:115` and the match arm at
+  `:456`. Not production, not a test. The catalog's label moved from
+  `explicit-config-only` to `test-only` for this reason, since `config.rs`'s
+  `number_at` (`:631-636`) discards an object form before any enum is chosen.
 - `codec-b-pi-decoder-drops-unrecognised-entry-types-without-a-record` and
   `codec-b-pi-encoder-can-return-a-shorter-array-than-it-was-given` are labelled
   `test-only` in the catalog, and the second has no production caller at all.
@@ -202,7 +264,7 @@ constructibility.** METHOD.md keeps those axes separate and so does this table.
 **But the binding constraint here is `F0`, not any fault class, and 4f's position
 is the worst of the three parts on that axis.** 4d had 22 constructible records
 against a suite no automation executes, with ten integration binaries as a
-fallback. 4e had 22 with no integration fallback. **4f has 26 constructible
+fallback. 4e had 22 with no integration fallback. **4f has 23 constructible
 records, no integration fallback, and the one integration binary the brief names
 would not cover this scope even if it ran**: `release_contract_conformance.rs`
 reaches no 4f file, while its own header at `:1-8` argues its drift "must fail the
@@ -252,7 +314,7 @@ duplicates an existing marker.
 
 **This part produced no `sometimes` record and no liveness record**, so there is no
 existing marker to audit for the forbidden pairing and nothing here duplicates one.
-The 26 records are 25 `safety` and one `reachability`.
+The 27 records are 26 `safety` and one `reachability`.
 
 `codec-b-declared-missing-capture-classes-are-never-decoded` uses `reachable`, and
 **the semantics are correct as written.** METHOD.md distinguishes location coverage

@@ -498,6 +498,23 @@ totality guards (`scheduler.rs:385-419`, `boundary.rs:340-342`,
 `selection.rs:1001-1009`) are unconditional expressions that behave identically in
 both profiles.
 
+**One qualification on that guard list, added by a disposition pass, because the
+list reads as complete and is not.** The guards enumerated above are unconditional
+and do behave identically in both profiles; that part stands. What the list does
+not say is that the guard set itself has a hole. `BoundaryContext::trigger_budget`
+is read at `boundary.rs:377-379` and again at `:756-761` through `unwrap_or_else`
+with **no `is_finite` gate on the `Some` arm**, unlike `context_limit`,
+`execute_threshold_percentage`, and `usage_percentage`, which are gated at
+`:339-341`, `:363-372`, and `:926-931`. A `Some(f64::NAN)` therefore reaches
+`:802`'s `tail_size_bar: trigger_budget * TAIL_SIZE_TRIGGER_MULTIPLIER`, a bare
+multiply with no `max` or `min` to absorb it, and the NaN lands in a struct whose
+own doc comment (`:322-324`) says it is surfaced through the transform response's
+historian diagnostics. So the profile-independence claim is correct and the
+completeness impression it creates is not: this is a missing guard rather than a
+conditional one, which is why it does not appear in a `debug_assertions` census at
+all. Owned by
+[dec-a-caller-supplied-trigger-budget-is-the-one-unvalidated-float-and-reaches-a-diagnostic](catalog.md#dec-a-caller-supplied-trigger-budget-is-the-one-unvalidated-float-and-reaches-a-diagnostic).
+
 **Zero unconditional runtime assertions in the 4f production halves.** Verified by
 matching `assert!`, `assert_eq!` and `assert_ne!` excluding `debug_assert` across
 every production half: no match in any of the eleven files. **Zero compile-time
@@ -698,6 +715,38 @@ Ranked by the gap between what the code decides and what any check proves.
     and 4d's ten. Two of the seven have names suggesting otherwise and do not
     deliver: `boundary_counter_durability.rs` tests a store counter, and
     `broca_roundtrip.rs` tests an RPC stream.
+
+## Registered claims that no record owns
+
+**Added by a disposition pass.** Two claims were registered in the claims lens
+with implementing code identified and a testable property spelled out, and then
+became no record in `catalog.md`. Neither is a synthesis oversight of the ordinary
+kind — a claim nobody noticed — because both were written up in full at
+[`_lenses/lens-c1-claims-and-config.md:360-384`](_lenses/lens-c1-claims-and-config.md),
+including the reason each one matters. They fell through an **ownership** gap, and
+the disposition's job is to close it by naming one owner rather than to mine them.
+
+**Both are assigned to 4f.** The ambiguity was real and worth stating so the next
+pass does not re-open it. `caveman.rs` is claimed by both 4e and 4f — this
+inventory's own scope resolution 3 says so — and the caveman claim's *mechanism*
+lives at `transform.rs:6339-6358`, which is 4b's file. The `smart_drops` claim's
+flag is parsed in `config.rs` (4f) and consumed in `transform.rs` (4b). So each
+claim straddles two sub-parts, which is precisely why neither got picked up. 4f
+takes both, for one reason that applies to both: **4f owns the decision, and the
+other part owns the application.** The caveman claim is a claim about what
+`caveman::compress` returns for a given depth, and `compress` is in 4f's
+brief-named file set. The `smart_drops` claim is a claim about what a flag resolved
+by `config.rs` does to output, and `config.rs` is 4f's. Each record will need a
+cross-part citation into `transform.rs`; that is a citation, not shared ownership.
+
+| # | Claim | Source | Implementing code | Why it never became a record, and what it needs |
+| --- | --- | --- | --- | --- |
+| C1-29 | Caveman tier shifts are path-independent: compressing the original at the final depth gives byte-identical output to shifting through intermediate depths | `CONFIGURATION.md:740` | Real, and outside 4f: `transform.rs:6339` reads `row.source_bytes` and `:6358` calls `caveman::compress(&source, level)` on the pristine text, and `:6352-6354` refuses a non-increasing depth | The property is asserted nowhere. `caveman.rs`'s only test (`:626`, extent `:626-650`) replays 42 single-shot cases from `caveman-golden.json` against `Lite`, `Full`, and `Ultra` independently; it never applies two compressions in sequence. **The claim is load-bearing exactly because `compress` is not idempotent by construction**: `apply_ultra_connectives` (`:472`) and `apply_ultra_abbreviations` (`:501`) rewrite words into symbols that a second pass would read as different input, so compressing an already-cavemaned string is not a no-op and the persisted-original design is what makes the claim true. A record needs one oracle over pairs of depths: `compress(compress(t, Lite), Ultra) != compress(t, Ultra)` is the interesting inequality, and the guarantee is that the *production path* never takes the left-hand form. That is a `safety` claim about `transform.rs`'s read of `source_bytes`, checkable by a direct call, no fault |
+| C1-30 | With `smart_drops` off, the messages sent to the model are byte-identical to the age-based-only behaviour, so the feature is inert | `CONFIGURATION.md:763` | `NOT FOUND` as a byte-equality check. The flag defaults `false` (`config.rs:135`) and is settable from either tier (`:467-469`, `:541-543`) | **This is the strongest testable statement in the entire configuration document and nothing takes it**, which is the reason it deserves a record more than most: a single flag flip gives a free differential oracle over the emitted message array, with no fixture beyond two resolutions of the same config. It never became a record because the flag is 4f's and the emitted array is 4b's, and neither part reached across. A record needs the flag off and on over one identical input, and byte equality of the served array in the off case against a build with the feature's code path removed or bypassed. Note the interaction with `dec-a-project-tier-can-write-leaves-outside-the-documented-allow-list`, which observes that a *project* config can turn `smart_drops` on against `CONFIGURATION.md:767`'s statement that it is intentionally off; that record covers who may set the flag and this one would cover what the flag does when unset |
+
+Neither is mined here, per METHOD rule 6 and the disposition's scope. Both are
+queued in [portfolio-evaluation.md](portfolio-evaluation.md) with the owner
+recorded, so the next pass has one place to look and one part to look in.
 
 ## Sampling limits on this inventory
 

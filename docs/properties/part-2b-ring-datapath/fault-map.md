@@ -395,3 +395,110 @@ They are not.
    with a lease held, call `endpoint.to_host.enter_quarantine()`, and the
    `Cancelled` and `Overloaded` release paths are exercised with their `Result`
    dropped. One fixture, two records.
+
+---
+
+## Map addition: the four records carried from `part-2b-wire-and-channels`
+
+Appended when the four wire-header records were carried into this sub-part; see
+[catalog.md](catalog.md#group-g-the-wire-header-decode-contract). The 14-record
+map above is unchanged, and so are its totals. **"Non-vacuous today" carries the
+same meaning as above:** a developer can construct the required state with the
+current harness. It does not mean the check runs anywhere; under `R0` none of
+these does either.
+
+**No new fault class is needed.** This is the notable thing about the group. All
+four records are pure-function properties over peer-authored or caller-authored
+bytes, so none of `R1` through `R6` applies to any of them, and the only class
+that touches them is `R0`, test execution in CI, which is a workflow change
+rather than a fault. That makes them the cheapest constructible records in the
+sub-part and the ones with the least excuse for being uncovered.
+
+**Reachability is recorded per record in `catalog.md`, not here.** All four are
+`default-production`, each verified at carry time against the three production
+`decode_header` call sites (`ring_transport.rs:471`, `:701`, `client.rs:1908`)
+and the two production encoders (`wire.rs:571`, `:608`), not inferred from the
+absence of a gate. One sub-surface named by a record is genuinely test-only and
+is labelled at the record rather than here: `wire::encode_frame`
+(`#[cfg(test)]` at `wire.rs:541`).
+
+### The wire header decode contract
+
+| Property | Required faults and enabling state | Non-vacuous today |
+| --- | --- | --- |
+| decode-header-is-total-over-arbitrary-bytes | **No fault. Arbitrary bytes are the entire enabling state.** A property test over `Vec<u8>` of arbitrary length, plus an exhaustive length sweep from 0 to 21 so gates 1 (`wire.rs:307`) and 3 (`:312`) are hit at both boundaries rather than at the two hand-picked points the existing tests use. On `Ok`, assert all eleven gate postconditions (`:307`, `:311`, `:312`, `:321`, `:323`, `:326`, `:329-331`, `:332-339`, `:340`, `:345`, `:352`). Under a harness that treats a panic as failure, the totality half needs no `catch_unwind` | **Yes** — the cheapest record in the sub-part. `decode_header` is `pub` on `pub mod wire` (`lib.rs:39`) and pure, so the oracle is a loop with no fixture host, no ring, and no peer. The one constraint is placement: the length sweep and the postcondition assertions want `wire.rs`'s own test module, which no CI job builds under `R0` |
+| accepted-header-decode-is-a-bijection-on-twenty-one-bytes | **No fault.** Three oracles, all pure: a **decode-first** round-trip (`decode_header(bytes).unwrap().encode() == bytes`), a per-bit influence sweep over the 168 bits of an accepted seed, and a trailing-byte independence check. Note the direction on the first: the three existing tests (`wire.rs:680`, `:693`, `:703`) all go encode-first from a constructed `EnvelopeHeader`, which cannot reach a byte pattern the struct cannot represent, and `:703` asserts on `encode` alone. Getting an accepted seed needs `hdr_with_epoch` (`:654-671`) or an equivalent, because the eleven gates reject almost all arbitrary 21-byte inputs | **Yes** — and it shares its bit space with the totality record's structured-mutation sweep, so the two are cheapest written together. Nothing here needs a fault, a host, or a seam |
+| reserved-encodings-and-identity-pairings-reject-at-decode | **A peer-authored header, which is the baseline trust model. No concurrency and no timing.** The oracle is a 256x256 sweep of the flags byte crossed with the type byte, crossed again with `(channel, epoch)` in `{(0,0), (0,1), (1,0), (1,1)}`, asserting the *specific* `DecodeError` variant per invalid combination rather than merely that it rejects. Two constraints the sweep must respect: the expectation has to be computed from the protocol tables (`docs/mc-host-wire-protocol.md:226-234`, `:240-246`, `:248`) rather than from `Flags`' own accessors, or the oracle is circular per METHOD's rule against a circular expected value; and it must model the **gate order**, since the flag and type gates precede the pairing gates, so a frame violating both reports the flag error | **Yes** — 65,536 pure calls is milliseconds, and the end-to-end half already exists in two forms (`tests/protocol_vectors.rs:351`, `:504`). The genuinely new assertion is the no-normalization one, stated over the *accepted* value: `!flags.has_reserved_bits()`, `priority().is_some()`, `admission_class().is_some()`. That is the assertion a masking regression would fail, and the existing four-input test would also catch it for its four inputs only |
+| encoder-never-emits-a-frame-its-own-decoder-rejects | **No fault. A caller passing an out-of-contract value, which is the whole enabling state, and the generator has to be built to reach it.** Four holes: `Flags(0b1100_0000)` and `Flags(0b0000_0110)` through the tuple constructor at `wire.rs:142` rather than `Flags::new` (`:146-156`), which cannot produce them; `encode_owned_frame(FrameType::Ping, .., nonempty_body)` since `Ping` is in `is_pure_header`'s set (`:86-88`); and `FrameId::routed` (`:525-531`) with a hand-built `RouteHandle`. **The last needs a hand-built handle specifically, and that is a resolution rather than a gap:** `RouteRegistry::reserve` (`routing.rs:113-156`) cannot mint epoch 0 or channel 0 (`:123`, `:125`, `:129-130`, pinned at `:522-526`), so the route allocator is closed and the public fields at `handler.rs:36-40` are the only door | **Yes for construction, and the test will fail, which is the point.** Every hole is reachable with no fault, no host and no seam; the oracle is `encode_owned_frame` output fed through `decode_header` plus `validate_inbound_header` (`frame_channel.rs:58`) in the order `ring_transport.rs:471-473` uses them. But the property does **not hold at `HEAD`**, so the check is a specification of the fix rather than a regression guard, which is why the record reads `Exercised: not yet` rather than `partial`. A generator restricted to the safe constructors proves nothing, and that restriction is exactly why the two existing round-trips cannot reach the holes: both build fixtures with `hdr` (`:650-652`), which derives the epoch as `u32::from(channel != 0)` |
+
+**Totals for the four: 4 fully non-vacuous today, 0 partial, 0 not
+constructible.** The eighteen-record totals are therefore **11 fully non-vacuous,
+5 partial, 2 not constructible**. Note the asymmetry the fourth row records: for
+the first three, "non-vacuous" means a passing check is available and absent; for
+the fourth it means a *failing* check is available and absent, because the
+property is a gap rather than a guarantee. The map above has no row of that shape
+and the distinction is worth keeping visible.
+
+## Coverage checks to add: the carried four
+
+Three entries: one thing a later pass should not do, and two markers. Both
+markers are cheap, because neither needs a fault.
+
+1. **A per-record marker on the decode path is not needed and should not be
+   added.** Stated so a later pass does not add one. All three of the passing
+   records' checks are `always` over a pure function, evaluated directly at the
+   call rather than observed through the running host, so there is no vulnerable
+   window whose preconditions a coverage marker would assert. Per METHOD's
+   coverage rules, a marker here would have nothing independent to observe.
+2. **`ENCODER_EMITTED_SELF_REJECTING_FRAME`.** For the encoder record only, and
+   the one place a coverage check earns its keep in this group. It must not assert
+   the violation, so it asserts the independent preconditions that jointly create
+   the window: an emission whose `flags` value did not come from `Flags::new`, or
+   whose `ty` satisfies `is_pure_header` while its body is nonempty, or whose
+   `FrameId` came from `routed` with a `RouteHandle` the registry did not mint.
+   Any one of those is observable at the encoder entry without knowing whether the
+   decoder would reject. The marker name is constant and globally unique, per
+   METHOD's coverage rules.
+3. **`WIRE_DECODE_REJECTED_RESERVED_ENCODING`.** For the reserved-encoding record,
+   asserting the precondition rather than the outcome: that a header carrying a
+   reserved flag bit, a reserved priority or admission encoding, an unassigned
+   type byte, or a mismatched pairing actually reached `decode_header` from a peer
+   during the campaign. This is a `sometimes`-shaped situation marker, distinct
+   from the record's own `always` check, and its value is that it distinguishes
+   "the gates held" from "no peer ever tested them". Today the second is what the
+   integration suite gives: `tests/protocol_vectors.rs:351` constructs the
+   situation deliberately and nothing else does.
+
+## Leverage addition: where the carried four sit
+
+Against the ranking above, the four carried records sit at the top on cost and
+near the bottom on urgency, and both halves of that should be said.
+
+**Cheapest valid oracle in the sub-part, by a wide margin.** The 14 records above
+all need at least a fixture host, and most need a fault from `R1` through `R6`,
+two of which have no seam. These four need a loop. There is no ring, no peer, no
+`TestHost`, no thread, and no timing. Three of the four could be written in an
+afternoon in `wire.rs`'s existing test module.
+
+**But three of the four guard properties that hold today**, and their value is
+the reasoning rather than the defect: the totality record's margin between
+`HEADER_LEN` and the largest constant index is exactly zero and written down
+nowhere, and the bijection record's two offset maps agree by textual coincidence.
+Both are regression guards for changes nobody has made.
+
+**The fourth is different and should be ranked with the sub-part's real
+findings.** `encoder-never-emits-a-frame-its-own-decoder-rejects` is a live gap,
+not a guard: four argument tuples reachable from the crate's public surface
+produce frames the host's own decoder refuses, and
+`docs/mc-host-wire-protocol.md:296` requires the receiving peer to answer by
+retiring the connection with no error frame. That failure mode composes with two
+records above rather than standing alone —
+[ring-a-publish-failure-is-reported-as-a-clean-peer-close](catalog.md#ring-a-publish-failure-is-reported-as-a-clean-peer-close)
+and
+[ring-a-endpoint-thread-panic-is-reported-as-orderly-completion](catalog.md#ring-a-endpoint-thread-panic-is-reported-as-orderly-completion)
+— both of which establish that the host reports such an outcome as an orderly or
+clean close. So an emit-side contract break surfaces as an unattributable peer
+drop, which is the same attribution hole those two records already name from the
+receive side. **That composition is the strongest reason to have carried this
+group, and it is a relationship the map above could not have found, because the
+codec was outside every lens that produced it.**

@@ -54,10 +54,15 @@ Four corrections to references handed to this synthesis, made per METHOD.md rule
   module. It changes no count in this file, and it is recorded because 4d hit the
   same class of discrepancy (117 versus 119) and a later pass comparing the
   inventories would otherwise see an unexplained gap.
-- **Lens C's whole-pass driver count is 207 where 4b reports 210.** Lens C
-  recorded this itself as a three-test detector edge on how the driver call is
-  written, not a scope disagreement. It is repeated here because the
-  reconciliation section below turns on the 210.
+- **Lens C's whole-pass driver count is 207 where 4b reports 210, and two further
+  detectors report 206 and 196.** Lens C recorded its own edge as a three-test
+  detector edge on how the driver call is written, not a scope disagreement
+  (`_lenses/lens-c-claims-and-checks.md:339-341`). Refinement `R7` widened this from
+  a two-way edge to a four-way spread, so the reconciliation section below is
+  computed on 4b's 210 and records the shared count as the bracket `196-210`. The
+  other two values are 4b's stated literal rule as reproduced in 4f, and a
+  transitive helper fixpoint; 4f lists all four at
+  `../part-4f-decisions/existing-checks.md:723-726`.
 - **`tail_hygiene.rs`'s test module is `:724`, not the file's first
   `#[cfg(test)]`.** The first `#[cfg(test)]` in the file is at `:38`, on the
   test-only `HygieneBand::as_str` helper. Lens C's `:724` is correct; the note
@@ -71,14 +76,31 @@ below is `unaudited`**: test adequacy belongs to
 
 ## The coverage fact that frames this inventory, and how the number was obtained
 
-**277 in-crate tests reach this scope: 237 of the 280 tests in `transform.rs`'s
-flat `mod tests`, plus the 5 in `mod nudge_formula_tests`, plus 35 file-local
-tests in the six other 4e units. Of the 237, only 25 name a 4e-owned symbol in
-their own body. There is no integration test in scope at all, and none of the
-277 runs in CI.**
+**277 in-crate tests are static reach candidates for this scope, not measured
+executions of it: 237 of the 280 tests in `transform.rs`'s flat `mod tests`, plus
+the 5 in `mod nudge_formula_tests`, plus 35 file-local tests in the six other 4e
+units. Of the 237, only 25 name a 4e-owned symbol in their own body. There is no
+integration test in scope at all, and none of the 277 runs in CI.**
 
-That is the headline. The attribution behind it is mechanical rather than
-asserted, and it is stated in full so a reader can reproduce it.
+That is the headline, and the label in it is load-bearing rather than cautious.
+Refinement `R6` of the portfolio evaluation found that this headline and the tier
+table below stated 237 as tests that reach 4e code, while the relabel lived only in
+the sampling-limits section at the end of the file and in `catalog.md`. A reader who
+trusted the headline and skipped the limits got an unlabelled number. Three
+independent reasons make the label necessary, each verified still true at `HEAD`:
+
+- **The method rests on an unpublished 62-symbol set**, so the number is not
+  reproducible from this file. See [Sampling limits](#sampling-limits-on-this-inventory).
+- **It disagrees with sibling detectors.** The helper population is 115 by the
+  fixpoint's own detector and 130 by an independent recount, and the whole-pass
+  driver count has **four** disagreeing values, not two. See
+  [Reconciling](#reconciling-sub-part-4bs-226-of-280-so-a-reader-does-not-think-one-is-wrong).
+- **There is no coverage instrumentation in this repository.** The attribution is
+  symbol matching plus a helper fixpoint over parsed test bodies. Nothing observed a
+  line executing.
+
+The attribution behind it is mechanical rather than asserted, and it is stated in
+full so a reader can reproduce it.
 
 `transform.rs` is 29,439 lines. Its test module is flat (`pub(crate) mod tests`
 at `:12626`, no inner `mod`) and is read as evidence by both 4b and 4e, so a
@@ -112,9 +134,9 @@ four-step method so the inventories are comparable
 The result is not one number but four tiers, and they **bracket** the truth
 rather than pin it:
 
-| Tier | Tests | What it measures |
+| Tier | Static reach candidates | What it measures |
 | --- | --- | --- |
-| **Reach** | **237** of 280 | Drives a whole pass, or names a 4e symbol transitively. Executes at least one line of 4e production code |
+| **Reach** | **237** of 280 | Drives a whole pass, or names a 4e symbol transitively. **Statically implies** at least one line of 4e production code is executed; no instrumentation observed it |
 | Op-specific, helper fixpoint | ***unusable*** (190) | See below |
 | **Op-specific, direct body match** | **25** | Names a 4e-owned render, tag, hygiene, overlay or hint symbol in its own body |
 | **Name rule** | **89** | Test name contains a 4e-distinctive term |
@@ -137,15 +159,20 @@ cheapest independent check on both.
 
 **Second, 25 op-specific tests over 9,304 production lines is the real coverage
 statement of this sub-part**, and the 237 must not be read as contradicting it.
-237 tests execute 4e lines; 25 were written about 4e behaviour. The gap is 212
-tests that render output incidentally while asserting something else.
+237 tests are statically attributed to 4e lines; 25 were written about 4e
+behaviour. The gap is 212 tests that render output incidentally while asserting
+something else.
 
 ### Reconciling sub-part 4b's "226 of 280", so a reader does not think one is wrong
 
 **Neither figure is wrong, and no correction is issued to 4b. The two numbers
-share 210 tests.** 4b's lens C partitioned the same 280 tests into five disjoint
-buckets (`../part-4b-transform/existing-checks.md:68-74`), and the partition sums
-to 280, which was re-verified arithmetically here:
+share their whole-pass driver set, which 4b counts as 210 and three other
+detectors count as 207, 206 and 196.** The reconciliation below is computed on
+4b's 210 because 4b's partition is the only one with bucket sizes; per refinement
+`R7` the shared count is a bracket rather than a number, and everything derived
+from it inherits that. 4b's lens C partitioned the same 280 tests into five
+disjoint buckets (`../part-4b-transform/existing-checks.md:68-74`), and the
+partition sums to 280, which was re-verified arithmetically here:
 
 | Bucket | Tests |
 | --- | --- |
@@ -164,20 +191,48 @@ above. 4b said so itself at `:73-74`: "Because a pass also renders output, the
 | --- | --- | --- |
 | 4b scope | 226 | 210 shared drivers + 16 4b-only |
 | 4e scope | **237** | 210 shared drivers + 22 4e-only + 5 both |
-| Shared | 210 | Counted by both parts, exclusive to neither |
-| Union | **253** | `226 + 237 - 210` |
+| Shared | **196-210** | Counted by both parts, exclusive to neither. 210 on 4b's detector; the bracket is the four-detector spread below |
+| Union | **253-267** | `226 + 237 - shared`. 253 at 210 shared, 267 at 196 shared |
 | Neither | 27 | 4b's unclassified bucket: small serde, timing, geometry and TTL unit tests |
 
-So the two inventories together account for 253 of `transform.rs`'s 280 tests,
-and the remaining 27 belong to neither part. **A reader adding 226 and 237 to get
-463 has double-counted the 210 drivers.**
+So on 4b's detector the two inventories together account for 253 of
+`transform.rs`'s 280 tests and the remaining 27 belong to neither part, and across
+the four detectors that account is a range rather than a figure. **A reader adding
+226 and 237 to get 463 has double-counted the drivers** whichever detector is
+used.
 
-One residual disagreement is recorded rather than resolved. Lens C's own
-whole-pass driver detector returned **207**, a three-test edge against 4b's 210,
-and lens C recorded it (`_lenses/lens-c-claims-and-checks.md:345-349`) rather
-than absorbing it. The edge is in how the driver call is written, not in what
-counts as a driver, and it changes no tier in this file: 237 decomposes as either
-`210 + 22 + 5` on 4b's partition or `207 + 30` on lens C's. Both arrive at 237.
+One residual disagreement is recorded rather than resolved, and refinement `R7` of
+the portfolio evaluation widened it from a two-way edge to a four-way spread. This
+file previously recorded only lens C's **207** against 4b's **210** and turned its
+reconciliation on the 210. **Four driver detectors disagree**, and
+`../part-4f-decisions/existing-checks.md:723-726` already states all four:
+
+| Value | Detector |
+| --- | --- |
+| 210 | 4b's |
+| 207 | 4e's lens C, a three-test edge on how the driver call is written, recorded by lens C itself (`_lenses/lens-c-claims-and-checks.md:339-341`) rather than absorbed |
+| 206 | 4b's stated literal rule, reproduced in 4f |
+| 196 | a transitive helper fixpoint |
+
+**So the shared driver count is a bracket, `196-210`, and the arithmetic above is
+exact only if 210 is exact.** 4f reached the same conclusion for its own reach tier
+and states it as the range `206-210` (`:152`, `:719-722`) rather than as a number.
+Two consequences for the figures in this section, both stated rather than
+propagated into a silent correction:
+
+- `210 + 22 + 5 = 237` holds on 4b's partition. On lens C's detector the same total
+  decomposes as `207 + 30`, which is why both arrive at 237: the buckets absorb the
+  edge. On the 206 or 196 detectors the decomposition does not close, because this
+  file does not have bucket sizes computed against those detectors.
+- `Union = 253` inherits the same dependency, since it is `226 + 237 - 210`. Under
+  the bracket the union is `226 + 237 - shared`, so it ranges from 253 at 210 shared
+  to 267 at 196 shared. 4f brackets the three-part union at 253 to 262 on its own
+  grounds (`:727-730`). **No correction is issued to 4b, to 4f, or to the 237 tier
+  here**; what is corrected is the claim that one number was reconciled when a range
+  was.
+
+The edge is in how a driver call is written, not in what counts as a driver, so it
+changes no tier in this file. It does change what a later pass may treat as pinned.
 
 The other place the two passes disagree is the size of the "4b-only" and
 "4e-only" buckets, and that is definitional rather than an error. Lens C's 4b
@@ -807,31 +862,38 @@ Ranked by the gap between what the code decides and what any check proves.
 
 Seven limits, stated so a later pass does not read absence as absence of risk.
 
-- **The four-tier attribution brackets rather than pins.** 237 / 190 / 25 / 89
-  comes from symbol matching plus a helper fixpoint over parsed test bodies, not
-  from coverage instrumentation, which this repository does not have. The 285
-  attribute count, the 280 + 5 split, the first and last `fn` lines, the six
-  per-file test counts, the seven scope line counts, the three `#[ignore]` sites,
-  the single `should_panic`, the four `debug_assert` sites, the zero panic sites,
-  the release-only block extent `:11251-11302`, and both `ci.yml` line numbers
-  were obtained directly at `HEAD`.
+- **The four-tier attribution brackets rather than pins, and every tier is static
+  reach rather than measured execution.** 237 / 190 / 25 / 89 comes from symbol
+  matching plus a helper fixpoint over parsed test bodies, not from coverage
+  instrumentation, which this repository does not have. Per refinement `R6` the
+  headline and the tier table now carry that label too, so a reader who skips this
+  section no longer gets an unlabelled number. The 285 attribute count, the 280 + 5
+  split, the first and last `fn` lines, the six per-file test counts, the seven
+  scope line counts, the three `#[ignore]` sites, the single `should_panic`, the
+  four `debug_assert` sites, the zero panic sites, the release-only block extent
+  `:11251-11302`, and both `ci.yml` line numbers were obtained directly at `HEAD`.
 - **The curated 62-identifier set is not reproducible from this file.** It is
   lens C's, and it is the input that decides the 25 and the 190. A later pass
   recomputing either number will get a different answer unless it uses the same
   list. This is the sharpest limit on the whole attribution and it is worse than
   4d's, because 4d's op-specific rule could be restated in a sentence.
-- **The 237 reach tier is shared evidence, not 4e evidence.** 210 of it is the
-  whole-pass driver set 4b also counts. A reader counting 4e coverage must not
-  mistake reach for claim in either direction: 25 tests were written about 4e
-  behaviour and 212 render output incidentally.
+- **The 237 reach tier is shared evidence, not 4e evidence, and the share is a
+  bracket.** 196 to 210 of it is the whole-pass driver set 4b also counts, depending
+  on the detector. A reader counting 4e coverage must not mistake reach for claim in
+  either direction: 25 tests were written about 4e behaviour and 212 render output
+  incidentally.
 - **The fixpoint tier is reported and then discarded.** 190 is stated so a later
   pass does not recompute it and treat it as a finding. It is an artifact of 4e
   being the terminal stage, exactly as 4d's 232 was an artifact of 4d owning the
   response vocabulary.
 - **The helper population is 115 by the fixpoint's own detector and 130 by an
-  independent recount**, and the driver count is 207 by lens C's detector and 210
-  by 4b's. Neither changes a count here. Both are recorded because the sibling
-  inventories report the other figure.
+  independent recount, and four driver detectors disagree: 210 (4b's), 207 (lens
+  C's), 206 (4b's stated literal rule as reproduced in 4f), and 196 (a transitive
+  helper fixpoint).** Per refinement `R7` the driver count is therefore recorded as
+  the bracket `196-210` and the reconciliation above is computed on 4b's 210 because
+  that is the only detector with bucket sizes. Neither figure changes a tier here.
+  Both are recorded because the sibling inventories report other values, and 4f
+  states all four at `../part-4f-decisions/existing-checks.md:723-726`.
 - **Every production-guard statement is a count over production halves, and the
   boundary between "production" and "test" in `transform.rs` is a line number.**
   The 4e production range is `:7511-12623` minus `mod nudge_formula_tests`

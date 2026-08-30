@@ -92,17 +92,51 @@ decision units are pure by their own headers and that claim survives inspection;
 the defects are almost all on the two boundaries, the configuration contract above
 and the harness wire below. Six facts frame the records.
 
-**The configuration contract is the part's largest defect surface.** The table
-below has 31 leaves. 26 are documented, 4 are undocumented but effective, and 1 is
-deprecated, absent from the documented table, and still honoured. Of the
-documented leaves, **6 are inert** (parsed nowhere, with the behaviour hardwired or
-missing) and **7 are divergent** (a bound, a tier policy, or a default disagrees
-with the documentation), so **13 documented keys either do nothing here or
-disagree with their own documentation**. A further 3 documented keys whose
-descriptions name module behaviour have zero occurrences anywhere in
-`crates/mc-module/src`. The sibling lens counted nine rather than thirteen at a
-coarser granularity; this catalog uses 13 and says so, because the two counts are
-one finding at two resolutions.
+**The configuration contract is the part's largest defect surface, and the
+headline that number belongs to is route-scoped rather than product-wide.** The
+table below has 31 leaves. **This section previously read "13 documented keys
+either do nothing here or disagree with their own documentation" and treated that
+as a product defect count. An independent evaluation refuted the framing and the
+membership, and the correction is applied below rather than footnoted, because the
+Rust-first scope decision makes the distinction decision-relevant rather than
+pedantic.** Two things were wrong. First, `protected_tags` and
+`clear_reasoning_age` are not inert: both are carried on the transform *request*
+and consumed as Rust request fields, so "does nothing here" is false for them.
+`rust-mode-transform.ts:1355` sends `protected_tags` and `:1398` sends
+`clear_reasoning_age` on one call path, `:2031` and `:2014` send the same pair on
+another, and `transform.rs:682-684` and `:693-697` declare them as
+`#[serde(default = ...)]` fields on the request struct. Second, three keys were
+filed as "absent everywhere", which is true of `crates/mc-module/src` and false of
+the workspace: `historian_timeout_ms` is read at `pi-plugin/src/index.ts:676` and
+threaded through `:1297`, `:1313`, `:1332`; `history_budget_percentage` at
+`pi-plugin/src/index.ts:693` and `:1229`; `output_reserve` at
+`pi-plugin/src/config/index.ts:427` and `:600`. "Absent" was a statement about one
+crate wearing the clothes of a statement about the product.
+
+The replacement is a **route-aware matrix**. The axis that matters is *which
+channel carries the key to the Rust reader*, because that is what the migration
+has to preserve:
+
+| Route | Count | Members | What a defect here means |
+| --- | --- | --- | --- |
+| **Parsed by the Rust config reader** | 24 | every row of the table below whose "Takes effect here?" is `Yes`, including the four undocumented-but-effective leaves and the deprecated `memory.budget_tokens` | `config.rs` is the authority. A bound or default that disagrees with `CONFIGURATION.md` is a real divergence in this crate, and 7 of these are divergent: `execute_threshold_percentage` scalar, `memory.injection_budget_tokens`, `memory.auto_search.min_prompt_chars`, `caveman_text_compression.min_chars`, the `review-user-memories` schedule, `historian.model` with `fallback_models`, and `cache_ttl` |
+| **Request-supplied** | 2 | `protected_tags`, `clear_reasoning_age` | Not inert. The value arrives per pass on the transform request (`transform.rs:682-697`) from the TypeScript sender (`rust-mode-transform.ts:1355`, `:1398`, `:2014`, `:2031`), and `config.rs` correctly does not parse it. **These are the keys the Rust-first migration must preserve**, because the sender is the thing being replaced. A hardwired Rust constant standing in for either — `DEFAULT_PROTECTED_TAGS` at `lib.rs:603` — is a fallback for a *missing request field*, not a config gap |
+| **TypeScript-only** | 6 | `execute_threshold_percentage` object form, `execute_threshold_tokens`, `commit_cluster_trigger.enabled`, `commit_cluster_trigger.min_clusters`, `historian_timeout_ms`, `history_budget_percentage`, `output_reserve` (7 leaf names, 6 documented keys, since the object form shares a key with the scalar) | The key is honoured, in TypeScript, by code the Rust reader never consults. Verified per key: the `commit_cluster_trigger` pair is parsed by `plugin/src/config/schema/magic-context.ts` and consumed by `pi-plugin/src/context-handler.ts`, while Rust hardwires `DEFAULT_COMMIT_CLUSTER_TRIGGER_ENABLED` and `DEFAULT_MIN_COMMIT_CLUSTERS` (`lib.rs:605`, `:607`) at `:4962-4963` and never reads either. **This is the class the Rust-first decision actually threatens**: a key that works today only because a TypeScript component is in the path |
+| **Truly absent from both** | 0 | none | Checked per key. Every leaf in the documented table has a consumer somewhere in the workspace, in Rust, in TypeScript, or on the request. The pre-disposition "absent everywhere: 3" bucket is empty once the search leaves `crates/mc-module/src` |
+
+So the corrected headline is: **7 divergences on the Rust-parsed route, 6
+documented keys honoured only in TypeScript, 2 keys carried on the request rather
+than in config, and nothing absent.** The old "13" was 7 real divergences plus 6
+keys misfiled as inert, of which 2 were request-supplied and 4 were
+TypeScript-only. The number was not inflated by carelessness — every cited line
+was correct — but it summed across three routes that a migration treats
+differently, which is the shape of error that matters when the decision on the
+table is which route survives. The per-route counts above supersede both the old
+13 and the sibling lens's 9.
+
+A further 9 documented keys have zero occurrences in `crates/mc-module/src` **and**
+describe behaviour outside the module, listed at the end of this section; those are
+correctly out of scope and unaffected.
 
 **13 of 30 claims have no implementing code.** The claims register holds 30
 entries: 13 are consistent with the code at `HEAD`, 13 are `NOT FOUND`, 3 are
@@ -139,15 +173,35 @@ unlike 4e's two-armed belt it has one arm, so the function becomes a no-op while
 test is debug-gated at `:2077`. Verified: no `cfg(not(debug_assertions))` exists
 anywhere in 4f, so no release-arm counterpart exists for any of them.
 
-**No totality defect was found, unlike the sibling crate in Part 3.** Part 3's
-analogue is an infinite input producing a NaN that broke a documented invariant.
-Here every `f64` entry point guards `is_finite` first, and where a NaN could still
-arrive it is absorbed rather than propagated, because `f64::max` and `f64::min`
-return the non-NaN operand; both expressions were executed to confirm. The defect
-class is present in shape and unreachable in fact, which is why four records in
-Group C are guards that hold rather than defects. The nearest live hazard is a
-different one: a `cache_ttl` of `"0"` parses to 0 ms and forces execution every
-pass, which no documentation mentions.
+**One totality defect was found, and this line previously said none was.** The
+claim mattered because of what it was compared against: Part 3's analogue is an
+infinite input producing a NaN that broke a documented invariant, and the sibling
+crate carries **three** such defects. Saying 4f had zero was therefore a
+substantive result about this crate, not a throwaway, which is exactly why it had
+to be checked rather than inherited. Most of it survives. Every `f64` entry point
+into `derive_trigger_budget` (`boundary.rs:339-345`),
+`derive_protected_tail_token_target`'s own context fields (`:363-372`), and
+`clamp_percentage` (`:926-931`) guards `is_finite` first, and where a NaN could
+still arrive it is absorbed rather than propagated, because `f64::max` and
+`f64::min` return the non-NaN operand; both expressions were executed to confirm.
+**The exception is `BoundaryContext::trigger_budget`, a caller-supplied
+`Option<f64>` that is read through `unwrap_or_else` at `:377-379` and again at
+`:756-761` with no validation on the `Some` arm.** A `Some(f64::NAN)` therefore
+reaches `:802`'s `tail_size_bar: trigger_budget * TAIL_SIZE_TRIGGER_MULTIPLIER`,
+which is a bare multiply with no `max` or `min` to absorb it, and the NaN lands in
+`TriggerProgress` — a struct whose own doc comment (`:322-324`) says it is
+"Surfaced through the transform response's historian diagnostics so a stalled rig
+drive is diagnosable per pass". It is carried out at `lib.rs:4982` and divided at
+`:5002`. So the defect class is present in shape, unreachable on the guarded
+derivations, and **reachable on the one unguarded passthrough**, which is a
+different sentence from the one this section used to carry. Group C's four guards
+still hold, and they are still worth recording for the reason given there. What
+changes is that the fifth thing in that neighbourhood is a defect and is now
+recorded as one. Production passes `None` (`lib.rs:4957`) and the only `Some` sites
+are `lib.rs:16495` and `:16760`, both tests, so the reachability is latent rather
+than default-production, and the split record says so. The nearest *reachable*
+hazard remains a different one: a `cache_ttl` of `"0"` parses to 0 ms and forces
+execution every pass, which no documentation mentions.
 
 **Coverage is 192 in-crate tests, none in CI, and the file that owns block
 identity has none.** 192 tests reach full scope-map 4f: 153 file-local across the
@@ -183,7 +237,7 @@ purity claim, not a restatement of it.
 | `selection::select_emergency` (`:995-1084`) | which arcs to evict under force pressure | active arcs, ctx, floor tokens | `HashSet<String>` of arc ids | Yes. Guards non-finite ceiling and usage at `:1001-1009` and refuses sub-`2000`-token reclaim at `:1018` |
 | `boundary::resolve_protected_tail_boundary` (`:410-416`) | where the compactable/protected split sits | messages, `BoundaryContext` | `BoundaryResolution` with ordinals and a reason string | Yes. `HashMap` at `:1001` is lookup-only, built from a `BTreeMap` at `:1027` |
 | `boundary::check_compartment_trigger*` (`:751-882`) | whether the historian fires, and why | messages, `TriggerContext`, token index, estimator | `TriggerDecision`, `reason` in a closed 4-variant enum | Yes given the caller-supplied estimator. `mc_tokenizer` determinism is Part 3's |
-| `boundary::derive_trigger_budget` (`:338-346`) + `derive_protected_tail_token_target` (`:362-401`) | the size-trigger budget and the protected-tail token target | `context_limit`, `execute_threshold_percentage`, usage, optional budget | budget always in `[5000, 50000]`; `n` always `>= 1` | Yes and total: see `dec-a-boundary-budget-derivation-is-total-over-non-finite-input` |
+| `boundary::derive_trigger_budget` (`:338-346`) + `derive_protected_tail_token_target` (`:362-401`) | the size-trigger budget and the protected-tail token target | `context_limit`, `execute_threshold_percentage`, usage, optional budget | budget always in `[5000, 50000]`; `n` always `>= 1` | Yes, and total **over the three fields it validates**: see `dec-a-boundary-budget-derivation-is-total-over-non-finite-input`. **Not total over `ctx.trigger_budget`**, which is read at `:377-379` with no `is_finite` gate: `n` stays finite because `f64::min` absorbs the NaN at `:383`, but the raw value is stored at `:399` and reaches `TriggerProgress.tail_size_bar` at `:802`. See `dec-a-caller-supplied-trigger-budget-is-the-one-unvalidated-float-and-reaches-a-diagnostic` |
 | `scheduler::decide` (`:706-800`) | the pass class, band, latch, and overflow verdict | `SchedulerInputs` (config, session, usage, `now_ms`, latch, error text) | `SchedulerOutcome`; `PassDecision` in a closed 4-variant enum | Yes. `now_ms` is a parameter, not a clock read. Regexes live behind `OnceLock` but are constant |
 | `scheduler::parse_cache_ttl` (`:385-419`) + `escalation_bands` (`:187-198`) | the idle TTL in ms, and the force/emergency bands | a TTL string; the effective threshold | `Result<u64, CacheTtlParseError>`; bands with force in `[85, 92]`, emergency fixed at `95` | Yes and total: `dec-a-cache-ttl-parse-is-total-over-arbitrary-strings`, `dec-a-escalation-bands-stay-ordered-for-every-threshold` |
 
@@ -251,13 +305,13 @@ a decision inside `mc-module`.
 | `cache_ttl` (string or object) | `"5m"` (`config.rs:136`) | `"5m"` (`:163`), **no user-only marker** | parse is total; invalid falls back to `DEFAULT_CACHE_TTL_MS` (`scheduler.rs:810-812`); `"never"` maps to `u64::MAX` (`:387-389`) | Yes, user tier only (`config.rs:486-511`). **Divergent**: project-tier value dropped with no warning, and `"0"` parses to `0` ms and forces execution every pass, undocumented |
 | `prompt_surface.guidance_override_path` | `None` | documented, user-only (`:75`, `:80-88`) | must be a readable section with exactly one marker (documented at `:88`) | Yes (`config.rs:281-358`); project warns (`:561-565`) |
 | `prompt_surface.guidance_override_text` | `None` | **undocumented** | none | Yes (`config.rs:479-485`), but a configured path resets it to `None` first (`:299`); project warns (`:556-560`) |
-| `commit_cluster_trigger.enabled` | not parsed | `true` (`:237`) | none | **No.** Hardwired `DEFAULT_COMMIT_CLUSTER_TRIGGER_ENABLED` (`lib.rs:605`) at `lib.rs:4963` |
-| `commit_cluster_trigger.min_clusters` | not parsed | `3`, **minimum `1`** (`:232`, `:238`) | none | **No.** Hardwired `DEFAULT_MIN_COMMIT_CLUSTERS` (`lib.rs:607`) at `lib.rs:4964` |
-| `protected_tags` | not parsed | `20`, range `1-100` (`:165`) | none from config; a separate hardwired `20` at `lib.rs:603` | **No.** 4b's `sel-protected-tags-not-read-from-module-config` |
-| `clear_reasoning_age` | not parsed | `50` (`:169`) | none | **No.** Present in `mc-module/src` only as a request field, never as a config pointer |
-| `historian_timeout_ms` | not parsed | `300_000` (`:170`) | none | **No.** Zero occurrences in `crates/mc-module/src`; `historian_producer.rs:209-227` carries private timeouts. 4a scope, lead only |
-| `history_budget_percentage` | not parsed | `0.15`, range `0.05-0.5` (`:171`) | none | **No.** Zero occurrences in `crates/mc-module/src` |
-| `output_reserve` | not parsed | automatic; `0` disables (`:164`, `:308-315`) | none in this crate, though `:315` names "the module's plausibility floor" | **No.** Zero occurrences in `crates/mc-module/src`; see C1-28 |
+| `commit_cluster_trigger.enabled` | not parsed | `true` (`:237`) | none | **Not in Rust; honoured in TypeScript.** Rust hardwires `DEFAULT_COMMIT_CLUSTER_TRIGGER_ENABLED` (`lib.rs:605`) at `lib.rs:4962`. `plugin/src/config/schema/magic-context.ts` parses it and `pi-plugin/src/context-handler.ts` consumes it |
+| `commit_cluster_trigger.min_clusters` | not parsed | `3`, **minimum `1`** (`:232`, `:238`) | none | **Not in Rust; honoured in TypeScript.** Rust hardwires `DEFAULT_MIN_COMMIT_CLUSTERS` (`lib.rs:607`) at `lib.rs:4963`. Same TypeScript parse and consumer as the flag |
+| `protected_tags` | not parsed by `config.rs` | `20`, range `1-100` (`:165`) | none from config; the request field defaults to a hardwired `20` at `lib.rs:603` | **Not through config; yes through the request.** `transform.rs:682-684` declares it `#[serde(default = "default_protected_tags")]`, and `rust-mode-transform.ts:1355` and `:2031` send it. 4b's `sel-protected-tags-not-read-from-module-config` is correct about the config route and is not a claim that the value never arrives |
+| `clear_reasoning_age` | not parsed by `config.rs` | `50` (`:169`) | none from config; the request field defaults at `default_clear_reasoning_age` | **Not through config; yes through the request.** `transform.rs:693-697` declares it and `rust-mode-transform.ts:1398` and `:2014` send it. This row already said "Present in `mc-module/src` only as a request field", so the fact was recorded and the column was wrong |
+| `historian_timeout_ms` | not parsed | `300_000` (`:170`) | none | **Not in Rust; honoured in TypeScript.** Zero occurrences in `crates/mc-module/src`; `pi-plugin/src/index.ts:676` reads it and `:1297`, `:1313`, `:1332` thread it. `historian_producer.rs:209-227` carries private Rust timeouts unrelated to the key. 4a scope, lead only |
+| `history_budget_percentage` | not parsed | `0.15`, range `0.05-0.5` (`:171`) | none | **Not in Rust; honoured in TypeScript.** Zero occurrences in `crates/mc-module/src`; `pi-plugin/src/index.ts:693` and `:1229` read it |
+| `output_reserve` | not parsed | automatic; `0` disables (`:164`, `:308-315`) | none in this crate, though `:315` names "the module's plausibility floor" | **Not in Rust; honoured in TypeScript.** Zero occurrences in `crates/mc-module/src`; `pi-plugin/src/config/index.ts:427` and `:600` call `setOutputReserveConfig` on it. See C1-28 |
 
 The table has 31 rows because `output_reserve` is promoted from the sibling's
 out-of-scope bucket by C1-28. Treat the leaf count as 31 and the sibling's 30
@@ -265,26 +319,44 @@ named leaves as a subset.
 
 ### Totals
 
+Two views. The first is the documentation-shaped one this catalog synthesized. The
+second is the route-aware one that supersedes it as the headline, restated here so
+the two are side by side and a reader can see which rows moved.
+
 | Category | Count | Members |
 | --- | --- | --- |
 | Documented leaves in the table | 26 | all rows except the four undocumented leaves and the deprecated `memory.budget_tokens` |
 | Undocumented but effective | 4 | `memory.user_profile_budget_tokens`, `historian.module_model` with `module_fallback_models`, `historian.context_limit_tokens`, `prompt_surface.guidance_override_text` |
-| Documented but **inert** (parsed nowhere; behaviour hardwired or missing) | 6 | `execute_threshold_percentage` object form, `execute_threshold_tokens`, `commit_cluster_trigger.enabled`, `commit_cluster_trigger.min_clusters`, `protected_tags`, `clear_reasoning_age` |
+| Documented and **not parsed by `config.rs`** | 6 | `execute_threshold_percentage` object form, `execute_threshold_tokens`, `commit_cluster_trigger.enabled`, `commit_cluster_trigger.min_clusters`, `protected_tags`, `clear_reasoning_age`. **Previously labelled "inert", which is wrong for the last two**: both are request-supplied and consumed at `transform.rs:682-697`. The label is now the literal fact — `config.rs` does not parse them — and the route matrix says what each one does instead |
 | Documented and effective but **divergent** (bound, tier policy, or default disagrees) | 7 | `execute_threshold_percentage` scalar, `memory.injection_budget_tokens`, `memory.auto_search.min_prompt_chars`, `caveman_text_compression.min_chars`, `review-user-memories` schedule, `historian.model` with `fallback_models`, `cache_ttl` |
-| Absent everywhere (documented, zero occurrences in `crates/mc-module/src`, description names module behaviour) | 3 | `historian_timeout_ms`, `history_budget_percentage`, `output_reserve` |
+| **Absent from `crates/mc-module/src`** and describing module behaviour | 3 | `historian_timeout_ms`, `history_budget_percentage`, `output_reserve`. **Previously labelled "absent everywhere", which is wrong**: all three have TypeScript consumers (`pi-plugin/src/index.ts:676`, `:693`; `pi-plugin/src/config/index.ts:427`). They are TypeScript-only, not absent |
 | Deprecated, absent from the documented table, still honoured | 1 | `memory.budget_tokens` |
 
-Inert plus divergent gives **13** keys that are documented but inert or
-divergent. This is a superset of the sibling's headline nine
-([lens-a-decision-units-and-config.md:119-129](_lenses/lens-a-decision-units-and-config.md)).
-The four this lens adds, and why the sibling did not count them:
-`clear_reasoning_age` (named inside a 4b evidence file but not among the
-headline keys), `memory.auto_search.min_prompt_chars` and
-`caveman_text_compression.min_chars` (the sibling recorded the clamps as
-invisible to the caller but not as documentation divergences), and the
-`review-user-memories` default (the sibling filed it as a lead rather than
-counting it). The sibling's nine and this thirteen are the same finding at two
-granularities; synthesis should pick one number and say which.
+Route-aware view, which is the one to cite:
+
+| Route | Count | Defect count on that route |
+| --- | --- | --- |
+| Parsed by the Rust config reader | 24 | **7 divergent** |
+| Request-supplied, consumed as a Rust request field | 2 | 0 divergent; both are correctly outside `config.rs` |
+| Honoured only in TypeScript | 6 documented keys (7 leaf names) | 6, in the sense that the Rust reader cannot honour any of them |
+| Truly absent from Rust and TypeScript alike | 0 | — |
+
+**The old "13 documented keys either do nothing here or disagree with their own
+documentation" is retired.** It summed 7 divergences, 4 TypeScript-only keys, and
+2 request-supplied keys into one product-wide figure, and the three routes have
+different consequences under the Rust-first decision. This is a superset of the
+sibling's headline nine
+([lens-a-decision-units-and-config.md:119-129](_lenses/lens-a-decision-units-and-config.md)),
+and both numbers are now superseded rather than reconciled. The four leaves this
+lens added over the sibling, and why the sibling did not count them, are still
+worth recording because two of them survive as genuine divergences:
+`clear_reasoning_age` (named inside a 4b evidence file but not among the headline
+keys, and now known to be request-supplied rather than inert),
+`memory.auto_search.min_prompt_chars` and `caveman_text_compression.min_chars` (the
+sibling recorded the clamps as invisible to the caller but not as documentation
+divergences, and both remain divergent on the Rust-parsed route), and the
+`review-user-memories` default (the sibling filed it as a lead rather than counting
+it, and it remains divergent). So of the four, three stay and one moves route.
 
 A further nine documented keys have zero occurrences in `crates/mc-module/src`
 and describe behaviour outside the module: `toast_duration_ms` (`:166`),
@@ -310,6 +382,7 @@ omission.
 | [dec-a-model-chain-dedup-is-adjacent-only](#dec-a-model-chain-dedup-is-adjacent-only) | safety | high |
 | [dec-a-cache-ttl-parse-is-total-over-arbitrary-strings](#dec-a-cache-ttl-parse-is-total-over-arbitrary-strings) | safety | high |
 | [dec-a-boundary-budget-derivation-is-total-over-non-finite-input](#dec-a-boundary-budget-derivation-is-total-over-non-finite-input) | safety | high |
+| [dec-a-caller-supplied-trigger-budget-is-the-one-unvalidated-float-and-reaches-a-diagnostic](#dec-a-caller-supplied-trigger-budget-is-the-one-unvalidated-float-and-reaches-a-diagnostic) | safety | high |
 | [dec-a-derive-historian-chunk-tokens-is-total-at-both-integer-extremes](#dec-a-derive-historian-chunk-tokens-is-total-at-both-integer-extremes) | safety | high |
 | [dec-a-escalation-bands-stay-ordered-for-every-threshold](#dec-a-escalation-bands-stay-ordered-for-every-threshold) | safety | high |
 | [dec-a-selection-decision-order-is-total-under-hashmap-iteration](#dec-a-selection-decision-order-is-total-under-hashmap-iteration) | safety | high |
@@ -326,6 +399,40 @@ omission.
 | [codec-b-round-trip-identity-is-claimed-in-one-direction-on-one-case-per-harness](#codec-b-round-trip-identity-is-claimed-in-one-direction-on-one-case-per-harness) | safety | high |
 | [codec-b-declared-missing-capture-classes-are-never-decoded](#codec-b-declared-missing-capture-classes-are-never-decoded) | reachability | high |
 | [codec-b-pi-encoder-can-return-a-shorter-array-than-it-was-given](#codec-b-pi-encoder-can-return-a-shorter-array-than-it-was-given) | safety | high |
+
+**Twenty-seven records**, against 26 before a disposition pass split
+`dec-a-boundary-budget-derivation-is-total-over-non-finite-input` in two. METHOD
+step 7 requires the distributions to be recorded here, and the synthesis omitted
+them, so they are stated for the first time rather than corrected.
+
+Semantics distribution: **twenty-six `always`** — twenty-three bare, plus
+`codec-b-wire-level-tool-use-uniqueness-guard-has-no-release-behaviour`'s
+`always(!duplicate)` and two `always(!X)`, on
+`dec-a-malformed-config-silently-resolves-to-defaults-and-stops-the-historian`
+and the new
+`dec-a-caller-supplied-trigger-budget-is-the-one-unvalidated-float-and-reaches-a-diagnostic`,
+all three of which are `always` over a forbidden state per METHOD's first
+check-semantics rule — plus **zero `always-or-unreached`**, **zero `sometimes`**,
+**one `reachable`**, **zero `unreachable`**. The absence of `sometimes` is worth
+naming rather than passing over: 4f's surface is argument-shaped, so almost every
+obligation is a statement about all inputs rather than about an operational state
+that must occur, and the one `reachable` record is the sole exception. It is also
+what makes 4f's zero-liveness position defensible; see
+[portfolio-evaluation.md](portfolio-evaluation.md).
+
+Type distribution: **twenty-six safety, one reachability, zero liveness**.
+
+Reachability distribution: **sixteen `default-production`, seven
+`explicit-config-only`, four `test-only`**, against 16/8/2 before. Two labels
+moved, both away from `explicit-config-only` and both because a configuration
+cannot in fact construct the state:
+`dec-a-model-key-lookup-walk-has-two-implementations-that-disagree`, whose
+differential needs `ExecuteThresholdConfig::ByModel` and where `number_at`
+(`config.rs:631-636`) discards an object form before any enum is chosen; and the
+new trigger-budget record, whose only `Some` sites are two test literals. Both
+relabels are recorded at the records.
+
+Confidence: twenty-seven high, zero medium, zero low.
 
 ---
 
@@ -422,28 +529,60 @@ decision, or the module reports that it cannot honour the key.
 Check: `always` — for every resolved configuration, the `TriggerContext` built
 at `lib.rs:4962-4963` carries the configured `enabled` and `min_clusters`.
 `always` because `prepare_historian_fire` constructs this context on every
-transform pass that evaluates a trigger.
+transform pass that evaluates a trigger. **This check is not observable at
+defaults and the record previously claimed it was.** At defaults the documented
+values and the hardwired constants are the same values —
+`CONFIGURATION.md:237-238` documents `enabled: true` and `min_clusters: 3`, and
+`lib.rs:605` and `:607` hardwire `true` and `3`, both printed and confirmed — so
+"the context carries the configured value" is satisfied by a context that reads
+the constant. The check can only fire against a **non-default configuration**, and
+even then only if the oracle can see the context: `TriggerContext` is built inline
+inside `prepare_historian_fire` and passed to `check_compartment_trigger_with_index`
+at `lib.rs:4964-4966`, so observing it means either an in-crate assertion at that
+site or inferring it from a behavioural difference, which needs the trigger
+workload below.
 Fault/timing angle: none.
-Required faults and enabling state: none for the divergence itself; it holds on
-a default build. Observing a behavioural difference needs
-`commit_cluster_trigger.enabled: false` plus a tail with at least three commit
-clusters and one `trigger_budget` of tokens.
+Required faults and enabling state: **a non-default `commit_cluster_trigger`
+value, and a trigger workload, together.** Neither alone suffices. This line
+previously read "none for the divergence itself; it holds on a default build",
+which is the claim the disposition retired: on a default build the configured and
+hardwired values coincide, so nothing distinguishes wiring from hardwiring. The
+cheap form is `commit_cluster_trigger.min_clusters` set to something other than
+`3` — `2` is what `lib.rs:16500-16501` and `:16573-16574` already use for the
+boundary logic — plus an in-crate assertion on the constructed context. The
+behavioural form additionally needs a tail with at least the configured number of
+commit clusters and one `trigger_budget` of tokens, so the trigger's verdict
+changes with the value.
 Confidence: high —
 [evidence](evidence/dec-a-commit-cluster-trigger-config-is-inert-in-this-crate.md).
 `CONFIGURATION.md:237-238` documents both keys. `config.rs` has zero
 occurrences of `commit_cluster` or `min_clusters`. `lib.rs:605` and `:607` are
 the hardwired constants, passed at `:4962-4963`; `boundary.rs:850-855` consumes
-them.
+them. Confidence is in the mechanism, which is fully verified, and not in the
+check's observability, which the `Check:` line now bounds. The key is
+TypeScript-honoured rather than inert product-wide:
+`plugin/src/config/schema/magic-context.ts` parses it and
+`pi-plugin/src/context-handler.ts` consumes it, so the slug's word "inert" is true
+of this crate and false of the product. The slug is left unchanged because
+renaming it would break the index, the evidence filename, and two sibling
+citations; the scope qualifier is in the guarantee.
 Existing check: none for the wiring. `boundary.rs:2226-2227` asserts the
 constant `DEFAULT_MIN_COMMIT_CLUSTERS_FOR_TRIGGER` against a golden value,
 which pins the default and not the configurability. Status `unaudited`.
 Impact: a user who disables the commit-cluster trigger still gets
 commit-cluster-driven historian fires, each of which spends a model call and
-replaces raw conversation with generated summary text.
+replaces raw conversation with generated summary text. Under the Rust-first
+decision the impact grows rather than shrinks, because the TypeScript component
+that does honour the key is the component being removed.
 Open questions:
 - Does any harness leg carry these controls in the transform request instead? I
-  found no request field for either. Unresolved, needs a sweep of the
-  TypeScript sender, which is outside 4f scope.
+  found no request field for either, and a disposition pass re-checked: `grep`
+  for `commit_cluster` and `min_clusters` across `crates/mc-module/src` returns
+  only `historian_chunk.rs`'s counting field, `lib.rs`'s two constants and their
+  one production use at `:4962-4963`, three test-only literals, and
+  `boundary.rs`'s context field. There is no request field. Resolved against
+  Rust; the TypeScript sender's own consumption is
+  `pi-plugin/src/context-handler.ts`, which is outside 4f scope.
 
 ### dec-a-project-tier-can-write-leaves-outside-the-documented-allow-list
 
@@ -523,10 +662,36 @@ well-formed files, and `:1181-1189` covers JSONC stripping of comment-like
 strings. No test writes a syntactically invalid file and asserts the outcome.
 Guarantee: A configuration file that exists but cannot be parsed produces a
 distinguishable signal rather than the same result as an absent file.
-Check: `always` — whenever `fs::read_to_string` succeeds and
-`serde_json::from_str` fails, the resolution emits a warning naming the path.
-`always` rather than `always-or-unreached` because the read path executes on
-every `effective_config` call.
+Check: `always(!X)` — and the check this record originally carried is not
+implementable, so the disposition states the implementable substitute rather than
+deleting the record. The original read: `always` — whenever `fs::read_to_string`
+succeeds and `serde_json::from_str` fails, the resolution emits a warning naming
+the path.
+There is no return channel for such a warning to travel on. `read_tier_cached`
+(`config.rs:254-266`) has the signature
+`fn read_tier_cached(cache: &mut TierConfig, path: PathBuf) -> Option<Value>`: no
+`warnings: &mut Vec<String>` parameter, no `Result`, and `:261-264` maps both the
+read error and the parse error to `None` with `.ok()` and a bare `Err(_) => None`.
+The warning vector that the sibling clamp records assert against is built inside
+`merge_tiers_with_warnings`, which runs on the parsed `Value` and therefore cannot
+distinguish "file absent" from "file unparseable" — by then both are `None`. And
+even if a warning existed, `emit_warnings` (`:275-279`) only `eprintln!`s it and
+returns `()`, which the sibling record
+[dec-a-config-value-clamps-and-zero-rejection-are-invisible-to-the-caller](#dec-a-config-value-clamps-and-zero-rejection-are-invisible-to-the-caller)
+already flags as possibly discarded by the daemon host.
+
+The implementable substitute, and what this record now asserts: `always(!X)` over
+the *observable consequence*, plus an enumeration for the mechanism.
+**Consequence half:** for a user config file that exists and does not parse, the
+resolved `McModuleConfig` is not equal to `McModuleConfig::default()` **or** some
+distinguishable signal exists. Today it is equal, which is the defect, so the
+assertion fails on the current build and that is the point of the record.
+`always` rather than `always-or-unreached` because the read path executes on every
+`effective_config` call. **Mechanism half:** the enumeration that
+`read_tier_cached`'s signature admits no diagnostic channel, which is a static
+fact and needs no fixture. The consequence half is the falsifiable one; the
+mechanism half is what makes the defect a design gap rather than a missing
+`eprintln!`.
 Fault/timing angle: none for the parse itself. There is a separate same-mtime
 window: `read_tier_cached` keys on `(path, mtime)` (`config.rs:256`), so an
 edit landing inside the filesystem's mtime granularity is not observed.
@@ -536,7 +701,8 @@ Confidence: high —
 [evidence](evidence/dec-a-malformed-config-silently-resolves-to-defaults-and-stops-the-historian.md).
 `config.rs:261-264` discards both the parse error and the read error. Traced
 the default `model_chain: Vec::new()` (`:121`) to `lib.rs:5020-5028`, which
-records `no_fire: "no_models"`.
+records `no_fire: "no_models"`. A disposition pass re-read `:254-266` and
+confirmed the absence of any warning parameter or `Result` on the function.
 Existing check: none. Status `unaudited`.
 Impact: a typo in the user config silently disables autonomous historian
 firing. The only surface is a `no_models` no-fire reason, which points at model
@@ -546,6 +712,11 @@ Open questions:
   here? An edit that changes bytes without changing mtime serves stale config
   until the next mtime change. Unresolved, needs a scoping decision at
   synthesis.
+- Where should the diagnostic channel live? `read_tier_cached` would have to
+  return a `Result` or take a warnings sink, and `effective_config`'s callers
+  would have to carry it. That is a signature change across the config module,
+  which is why the record's original check was not merely unwritten but
+  unwritable. (needs human input)
 
 ## Group B: model-chain resolution
 
@@ -560,11 +731,15 @@ constructed config and neither has a test.
 ### dec-a-model-key-lookup-walk-has-two-implementations-that-disagree
 
 Type: safety
-Reachability: explicit-config-only
+Reachability: test-only
 Status: active
-Exercised: partial — `config.rs:721-744` and `:760-785` exercise the
-`config.rs` walk, including a shared TypeScript vector set. The scheduler walk
-has no wildcard test because it has no wildcard.
+Exercised: not yet — for the differential this record actually asserts. The
+existing tests exercise **one** of the two walks: `config.rs:721-744` and
+`:760-785` drive the `config.rs` walk, including a shared TypeScript vector set.
+Neither compares it against the scheduler walk, and the scheduler walk has no
+wildcard test because it has no wildcard. This line previously read `partial —`
+against those two tests, which credited coverage of one implementation as partial
+coverage of a differential between two.
 Guarantee: Every consumer of a per-model configuration map resolves a given
 model key through the same documented walk.
 Check: `always` — for every model key and every map, `config.rs`'s walk and
@@ -573,8 +748,9 @@ each walk runs on every resolution for its own consumer.
 Fault/timing angle: none.
 Required faults and enabling state: a per-model map keyed only by a
 `provider/*` wildcard. On the `cache_ttl` side this resolves; on the scheduler
-side it would fall to `default`. Reaching the scheduler side additionally needs
-`ExecuteThresholdConfig::ByModel`, which no code in this crate constructs.
+side it would fall to `default`. **The scheduler side additionally needs
+`ExecuteThresholdConfig::ByModel`, and nothing constructs that variant anywhere
+in the repository**, which is what forces the reachability label below.
 Confidence: high —
 [evidence](evidence/dec-a-model-key-lookup-walk-has-two-implementations-that-disagree.md).
 `CONFIGURATION.md:70` states the walk and says `cache_ttl` shares it.
@@ -585,8 +761,8 @@ Existing check: `config.rs:760-785`
 `cache_ttl_resolution_matches_shared_typescript_vectors` pins one
 implementation against TypeScript vectors. No differential test between the two
 Rust implementations. Status `unaudited`.
-Impact: today the divergence is latent because `ByModel` is unreachable here
-(see 4b's `sel-per-model-and-token-thresholds-inert-in-module`). If the
+Impact: today the divergence is latent because `ByModel` is unconstructed
+everywhere (see 4b's `sel-per-model-and-token-thresholds-inert-in-module`). If the
 per-model threshold path is ever wired, a wildcard-keyed config will resolve
 differently from the same wildcard on `cache_ttl`, and the documentation says
 it will not.
@@ -594,6 +770,42 @@ Open questions:
 - Should the two walks be one function? They already agree on the exact, bare,
   and dash-stripped steps, which is the duplication the repository's own
   duplication policy targets. (needs human input)
+
+> Disposition note on this record's reachability label, and on the two halves the
+> label collapses. **The label was `explicit-config-only` and that was wrong: no
+> configuration can construct the state this record's check needs.** The check is a
+> differential between two walks, and reaching the scheduler walk with a per-model
+> map requires `ExecuteThresholdConfig::ByModel` (`scheduler.rs:456-458`).
+> `config.rs` cannot build that variant: `number_at` (`:631-636`) returns
+> `Option<f64>` from `Value::as_f64` and yields `None` for an object, and the one
+> assignment to `execute_threshold_percentage` (`:430-432`) takes that `f64`
+> directly, so an object-form `execute_threshold_percentage` in a config file is
+> discarded before any enum is chosen. So config cannot reach it, and
+> `explicit-config-only` asserts precisely that config can.
+>
+> **The relabel to `test-only` is the correct class and it overstates what exists,
+> so the overstatement is recorded here rather than hidden.**
+> `grep -rn 'ByModel' --include='*.rs'` over the whole tree returns exactly two
+> hits, both in `scheduler.rs`: the variant declaration at `:115` and the match arm
+> at `:456`. **Nothing constructs it — not production, not a test, not a fixture.**
+> `test-only` is nonetheless right under METHOD's three-way vocabulary, because the
+> class names the only route by which the state *can* be reached and that route is
+> a direct in-crate call: `ExecuteThresholdConfig` is `pub` at `:111` with
+> `#[serde(untagged)] Deserialize`, and `model_key_lookup_order` at `:849` is
+> private, so an in-crate `#[cfg(test)]` caller is the whole reachable set. The
+> label describes the class, not the census.
+>
+> **The split the evaluation offered as its alternative is recorded in prose rather
+> than as a second record, and here is the split.** The record bundles two claims
+> with different reachability: (a) the `config.rs` walk resolves a wildcard-keyed
+> `cache_ttl` map correctly, which *is* `explicit-config-only` and is the half
+> `config.rs:760-785` already pins against TypeScript vectors; and (b) the two
+> walks agree, which is `test-only` and unconstructed. The record's `Guarantee:`
+> and `Check:` are both (b), so (b) governs the label. A second record for (a) was
+> considered and rejected: it would assert that one implementation matches an
+> external vector set, which is what the existing test already does, so it would be
+> a record with no gap behind it. Splitting the record would raise the part's count
+> to 27 for no new obligation, and METHOD prefers reframing to proliferation.
 
 ### dec-a-model-chain-dedup-is-adjacent-only
 
@@ -626,18 +838,29 @@ Open questions:
   comment at `:384-389` suggests the author treats wasted advances as a cost,
   but it is about namespace mixing rather than duplication. (needs human input)
 
-## Group C: totality, determinism, and the one clamp with a bypass
+## Group C: totality, determinism, and the two exceptions
 
-Six records on the pure decision units. Four are guards that hold: a TTL parse
-total over arbitrary strings, a budget derivation total over non-finite input, a
-chunk-token derivation total at both integer extremes, and escalation bands that
-stay ordered for every threshold. They are recorded rather than assumed because
-each is the guarded analogue of a Part 3 defect, so the record fixes the boundary
-and makes a later change that drops a guard visible. The fifth is determinism of
-the selection decision under `HashMap` iteration, which holds because every result
-is a set or is totally sorted before it escapes. The sixth is the exception: a
-clamp whose idempotence guard doubles as a bypass, because a value already
-carrying the sentinel suffix is passed through unclamped.
+**Seven records on the pure decision units, after a disposition pass split one in
+two.** Four are guards that hold: a TTL parse total over arbitrary strings, a
+budget derivation total over the non-finite inputs it validates, a chunk-token
+derivation total at both integer extremes, and escalation bands that stay ordered
+for every threshold. They are recorded rather than assumed because each is the
+guarded analogue of a Part 3 defect, so the record fixes the boundary and makes a
+later change that drops a guard visible. The fifth is determinism of the selection
+decision under `HashMap` iteration, which holds because every result is a set or is
+totally sorted before it escapes.
+
+**Two are exceptions rather than guards, and the group heading used to name only
+one.** The first is a clamp whose idempotence guard doubles as a bypass, because a
+value already carrying the sentinel suffix is passed through unclamped. The second
+was carried inside the budget-derivation record as an open question and is now its
+own record: `BoundaryContext::trigger_budget` is the one float read without an
+`is_finite` gate, and a `Some(NaN)` reaches `TriggerProgress.tail_size_bar`
+(`boundary.rs:802`) and from there the transform response's historian diagnostics.
+Its evidence was already written — the budget record's own evidence file states
+that this test case fails today — so promoting it is applying a finding the part
+had rather than adding one. The group therefore reads: four guards, one determinism
+result, and two defects.
 
 ### dec-a-cache-ttl-parse-is-total-over-arbitrary-strings
 
@@ -688,13 +911,21 @@ Exercised: partial — `boundary.rs:2226-2227` pins the commit-cluster constant
 against a golden, and the golden fixture suite drives the boundary with
 realistic values. No test supplies a non-finite context limit, threshold, or
 usage percentage.
-Guarantee: The boundary and trigger derivations produce a finite, in-range
-result for every f64 input, including infinity and NaN, and never propagate a
-non-finite value into a decision or a serialized diagnostic.
+Guarantee: The **guarded** boundary and trigger derivations produce a finite,
+in-range result for every f64 input they validate, including infinity and NaN,
+and never propagate a non-finite value from a validated field into a decision or
+a serialized diagnostic. The scope word "guarded" is load-bearing and was added by
+a disposition pass: the unvalidated `trigger_budget` passthrough is now
+[dec-a-caller-supplied-trigger-budget-is-the-one-unvalidated-float-and-reaches-a-diagnostic](#dec-a-caller-supplied-trigger-budget-is-the-one-unvalidated-float-and-reaches-a-diagnostic),
+and it is a defect rather than a guard that holds.
 Check: `always` — for every `BoundaryContext`, `derive_trigger_budget` returns
 a value in `[5000, 50000]`, `derive_protected_tail_token_target().n >= 1.0` and
 is finite, and `clamp_percentage` returns a value in `[0, 100]`. `always`
-because every trigger evaluation runs all three.
+because every trigger evaluation runs all three. Each of the three has an
+`is_finite` gate on its own inputs — `boundary.rs:339-341` for `context_limit`,
+`:363-372` for the context limit and threshold, `:926-931` for the percentage —
+so the check is over inputs those gates cover. It does **not** cover
+`ctx.trigger_budget`, and the record no longer implies that it does.
 Fault/timing angle: none.
 Required faults and enabling state: a `BoundaryContext` whose `context_limit`,
 `execute_threshold_percentage`, or `usage_percentage` is `f64::INFINITY` or
@@ -706,17 +937,83 @@ Read every guard: `boundary.rs:339-341`, `:363-372`, `:926-931`. Executed
 `NAN.max(0.0) == 0.0` and `NAN.min(5.0) == 5.0` to confirm the absorption
 argument, which is what makes `:342` safe against a NaN threshold. Also
 confirmed that `ctx.trigger_budget` is the one unvalidated float (`:756-761`,
-`:380-382`) and that production always passes `None` (`lib.rs:4957`), with
-`Some` only at `lib.rs:16495` and `:16760`.
+`:377-379`) and that production always passes `None` (`lib.rs:4957`), with
+`Some` only at `lib.rs:16495` and `:16760`. The evidence file's test-plan item 4
+already states that the `trigger_budget` case "fails today"
+([evidence:184-187](evidence/dec-a-boundary-budget-derivation-is-total-over-non-finite-input.md)),
+which is what the split acts on.
 Existing check: none targeting non-finite input. Status `unaudited`.
-Impact: this is the guarded analogue of Part 3's decay totality defects, and
-the guard holds. Recording it fixes the boundary so a later change that drops a
-guard is visible. The `trigger_budget` passthrough is the one place where a
-caller could still inject a non-finite value.
+Impact: this is the guarded analogue of Part 3's decay totality defects, and for
+the three validated fields the guard holds. Recording it fixes the boundary so a
+later change that drops a guard is visible.
+Open questions: None. The `trigger_budget` question that stood here has been
+promoted to its own record, because the evidence file already recorded that its
+test case fails, which makes it a defect rather than an open question.
+
+### dec-a-caller-supplied-trigger-budget-is-the-one-unvalidated-float-and-reaches-a-diagnostic
+
+Type: safety
+Reachability: test-only
+Status: active
+Exercised: not yet — and the evidence for the sibling record already says the
+oracle fails. `boundary.rs`'s golden fixture suite never sets `trigger_budget` to
+a non-finite value; the two `Some` sites in the tree, `lib.rs:16495` and `:16760`,
+pass finite numbers.
+Guarantee: `BoundaryContext::trigger_budget`, being caller-supplied and read
+without validation, does not carry a non-finite value into a boundary
+computation or into a serialized diagnostic. **This guarantee does not hold
+today.**
+Check: `always(!X)` — for every `BoundaryContext`, if
+`derive_protected_tail_token_target` or `check_compartment_trigger_with_index` is
+called with `trigger_budget: Some(v)` where `!v.is_finite()`, then no field of the
+returned `ProtectedTailTokenTarget` or `TriggerProgress` is non-finite.
+`always(!X)` over a forbidden **state** with no dedicated detection point, per
+METHOD's first check-semantics rule; `unreachable` would be wrong because the
+`unwrap_or_else` at `:377-379` and `:756-761` must execute on every call and only
+its `Some` arm's *content* is at fault. The assertion fails on the current build,
+which is the record's purpose.
+Fault/timing angle: none. Pure function of one context value.
+Required faults and enabling state: one direct call with
+`trigger_budget: Some(f64::NAN)` and a non-empty message set.
+`BoundaryContext.trigger_budget` is a `pub` field and both entry points are
+reachable in-crate, so the fixture is a struct literal and one call. No harness
+work.
+Confidence: high —
+[evidence](evidence/dec-a-boundary-budget-derivation-is-total-over-non-finite-input.md).
+Shares the sibling's evidence file, which already carries the trail: item 4 of its
+test plan is exactly this case and states "That case fails today". Traced for this
+disposition: `:377-379` reads `ctx.trigger_budget` through `unwrap_or_else` with no
+`is_finite` gate on the `Some` arm, unlike every neighbouring field; `:383`'s
+`(trigger_budget + reserve).min((usable * 0.5).floor())` absorbs the NaN, because
+`f64::min` returns the non-NaN operand, so `headroom`, `ceiling_n`, and `n` stay
+finite and `derive_protected_tail_token_target`'s own postcondition survives — but
+`:399` stores the raw NaN into the returned struct's `trigger_budget` field. The
+propagating path is the trigger one: `:756-761` performs the same unguarded read,
+`:780-781`'s `MIN_PROACTIVE_TAIL_TOKEN_ESTIMATE.max(...)` absorbs it for
+`scan_budget`, and then `:802`'s
+`tail_size_bar: trigger_budget * TAIL_SIZE_TRIGGER_MULTIPLIER` is a bare multiply
+with nothing to absorb it. So `TriggerProgress.tail_size_bar` is NaN.
+Existing check: none. Status `unaudited`.
+Impact: `TriggerProgress`'s own doc comment (`boundary.rs:322-324`) says it is
+"Surfaced through the transform response's historian diagnostics so a stalled rig
+drive is diagnosable per pass", and `tail_size_bar` is described at `:329-330` as
+"The tail_size fire bar". It is carried out at `lib.rs:4982` and divided by 1000
+and rounded at `:5002`. A NaN there is the diagnostic field going quietly wrong in
+the response an operator reads to explain why the historian did not fire, and
+`serde_json` renders a NaN as `null`, so the wire form is an absent number rather
+than a visible error. This is the defect the sibling record's "no totality defect
+was found" framing concealed, and it is the same class as Part 3's three.
 Open questions:
-- Should `check_compartment_trigger_with_index` validate `ctx.trigger_budget`
-  the way it validates everything else? It is test-only today, so this is a
-  latent-hazard question, not a defect. (needs human input)
+- Should `derive_protected_tail_token_target` and
+  `check_compartment_trigger_with_index` validate `ctx.trigger_budget` the way
+  they validate `context_limit`, `execute_threshold_percentage`, and
+  `usage_percentage`, or should the field's type make a non-finite value
+  unrepresentable? The first is a two-line `is_finite` gate at each of the two
+  read sites; the second is a newtype and a constructor. (needs human input)
+- Production passes `None` (`lib.rs:4957`) so the reachability is `test-only`
+  today. Whether a future caller may supply the budget — the field exists for
+  someone — decides whether this is a latent defect or an active one. Unresolved;
+  the field's purpose is not documented at its declaration (`:222-224`).
 
 ### dec-a-derive-historian-chunk-tokens-is-total-at-both-integer-extremes
 
@@ -885,21 +1182,39 @@ postcondition holds, without panicking, without unbounded allocation, and
 without producing a message that silently misrepresents its input.
 Check: `always` — for arbitrary input, the call returns; `decoded.len()`,
 `sidecar.order.len()`, and the per-message block counts are consistent with the
-input; and allocation is bounded by a constant multiple of input size. A panic
-is a forbidden state with no dedicated detection point, so it is
+input. A panic is a forbidden state with no dedicated detection point, so it is
 `always(!panic)`; `unreachable` would be wrong because no code location must
 never execute. This reapplies Part 1's `decoder-totality-over-arbitrary-bytes`
 (`part-1-shm-transport/catalog.md:1284-1329`), with the postcondition
 strengthened because there is no error variant to fall back on.
+
+**The allocation clause is separated out and downgraded, because it is not
+observable from a decoder call.** The original check ended "and allocation is
+bounded by a constant multiple of input size", counted alongside the return and
+consistency clauses as though one `decode` call could witness it. It cannot: the
+functions return `DecodedHarnessMessages` and expose no allocation accounting, so
+proving a multiple of input size needs an allocation observer — a
+`#[global_allocator]` counting wrapper, a `dhat`-style profiler, or a
+`Vec::capacity` sweep over the returned structure — none of which exists in this
+tree and any of which is a harness of its own. Its honest status is
+**enumeration, not assertion**: the largest allocations in either decoder are
+`raw_message.clone()` at `codec/opencode.rs:232` and `raw_entry.clone()` at
+`codec/pi.rs:114`, each one input message, and no loop in either file allocates
+per iteration without a bound from the input. That is a static reading and it is
+already recorded in the `Confidence:` line below. If an allocation observer is ever
+built, the clause becomes assertable as stated; until then it is a claim discharged
+by reading and it must not be counted as an oracle a decode call satisfies.
 Fault/timing angle: none. Both decoders are pure functions over one immutable
 slice, exactly as Part 1's three were. The exposure is structural rather than
 temporal: totality is achieved by a default ladder (observations 2 and 3), not
 by validation, so every malformation is converted into a plausible-looking
 decoded message.
-Required faults and enabling state: none. An arbitrary `Vec<Value>` is the
-whole enabling state. The interesting members are a bare string or number as an
-array element, a `parts` value that is an object rather than an array, and a
-part whose `type` is absent.
+Required faults and enabling state: none for the return and consistency clauses.
+An arbitrary `Vec<Value>` is the whole enabling state. The interesting members are
+a bare string or number as an array element, a `parts` value that is an object
+rather than an array, and a part whose `type` is absent. **The allocation clause
+additionally needs an allocation-observing harness**, which the tree does not have,
+so that clause is the reason this record is `partial` on its own terms.
 Confidence: high —
 [evidence](evidence/codec-b-harness-decoders-accept-every-input-with-no-rejection-channel.md).
 Signatures read at `HEAD`: `codec/opencode.rs:23-25`, `:27-32`, `:37-41` and
@@ -1667,13 +1982,22 @@ claim; none of these records has an executing check.
   exactly here. The one live hazard sits inside the first: a `cache_ttl` of `"0"`
   parses to 0 ms and forces execution every pass, so the totality record and the
   configuration cluster meet on one key.
-- **A guard that is also a door.**
-  [dec-a-region-hint-clamp-bypassed-by-sentinel-suffix](#dec-a-region-hint-clamp-bypassed-by-sentinel-suffix).
-  Alone, because its shape is the inverse of the cluster above: the same
-  idempotence property that makes the clamp safe to re-apply is what lets a value
-  carrying the sentinel through unclamped. It is the one place in 4f where the
-  correct-looking guard is the defect, which is why it is not folded into the
-  totality cluster it superficially resembles.
+- **The two doors in the guard wall, and they are different shapes.**
+  [dec-a-region-hint-clamp-bypassed-by-sentinel-suffix](#dec-a-region-hint-clamp-bypassed-by-sentinel-suffix),
+  [dec-a-caller-supplied-trigger-budget-is-the-one-unvalidated-float-and-reaches-a-diagnostic](#dec-a-caller-supplied-trigger-budget-is-the-one-unvalidated-float-and-reaches-a-diagnostic).
+  This cluster was one record and is now two, and pairing them is what makes the
+  pattern legible. The region-hint clamp is a guard that *is* a door: the same
+  idempotence property that makes it safe to re-apply is what lets a value carrying
+  the sentinel through unclamped, so the defect is inside a correct-looking
+  mechanism. The `trigger_budget` passthrough is the opposite shape: it is a door
+  where the wall simply stops. Three neighbouring fields on the same struct are
+  `is_finite`-gated and this one is not, so there is no clever mechanism to
+  misunderstand, just a missing gate at `boundary.rs:377-379` and again at
+  `:756-761`. Hypothesis: no dominance between them, and neither belongs in the
+  guards cluster above, because a property test over the guarded domain passes
+  while both defects stand. The trigger-budget one is additionally the cheapest
+  falsifying oracle in the whole part — one struct literal and one call — and it
+  fails today, which the guards cluster's oracles by definition do not.
 - **What the decoder accepts, and who never learns.**
   [codec-b-harness-decoders-accept-every-input-with-no-rejection-channel](#codec-b-harness-decoders-accept-every-input-with-no-rejection-channel),
   [codec-b-pi-decoder-drops-unrecognised-entry-types-without-a-record](#codec-b-pi-decoder-drops-unrecognised-entry-types-without-a-record),
