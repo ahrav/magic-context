@@ -210,7 +210,7 @@ impl<'storage, C> ProducerReservation<'storage, C> {
         Ok(ProducedBody {
             spans: std::mem::take(&mut self.spans),
             len: body_len,
-            charge: self.charge.take(),
+            _charge: self.charge.take(),
         })
     }
 
@@ -231,7 +231,8 @@ impl<'storage, C> ProducerReservation<'storage, C> {
 pub struct ProducedBody<'storage, C> {
     spans: &'storage mut [&'storage mut [u8]],
     len: usize,
-    charge: Option<C>,
+    /// Held only for its drop: releasing the body returns the charge.
+    _charge: Option<C>,
 }
 
 impl<C> ProducedBody<'_, C> {
@@ -277,13 +278,6 @@ impl<C> ProducedBody<'_, C> {
             remaining -= take;
         }
         None
-    }
-
-    /// Releases storage and returns the backend charge guard to its owner.
-    pub fn into_charge(mut self) -> C {
-        self.charge
-            .take()
-            .expect("a committed body always owns its charge")
     }
 }
 

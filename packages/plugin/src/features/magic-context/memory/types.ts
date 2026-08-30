@@ -59,19 +59,3 @@ export interface Memory {
     mergedFrom: string | null; // JSON array
     metadataJson: string | null;
 }
-
-export interface MemoryInput {
-    projectPath: string;
-    category: MemoryCategory;
-    content: string;
-    importance?: number | null;
-    sourceSessionId?: string;
-    sourceType?: MemorySourceType;
-    expiresAt?: number | null;
-    metadataJson?: string | null;
-    /** Injected insert clock (defaults to the live clock). Deterministic
-     *  fixture seeding pins it so identical seeds produce identical row
-     *  bytes; the v80 telemetry freeze forbids rewriting these columns
-     *  after insert. */
-    nowMs?: number;
-}

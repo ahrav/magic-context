@@ -247,15 +247,3 @@ export interface Transcript {
      */
     commit(): void;
 }
-
-/**
- * Sentinel marker for transcript parts that should be ignored by all
- * downstream transform stages (tagging, drops, indexing). Adapters set
- * this on parts that exist only as structural artifacts (e.g. OpenCode's
- * `step-start`/`step-finish`).
- *
- * Exported so harness adapters can stamp it on synthetic parts they
- * create internally and so test fixtures can construct synthetic
- * transcripts without needing real OpenCode/Pi structures.
- */
-export const STRUCTURAL_SENTINEL_KIND: TranscriptPartKind = "structural";

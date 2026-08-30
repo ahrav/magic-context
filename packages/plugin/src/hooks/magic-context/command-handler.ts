@@ -944,8 +944,8 @@ export function createMagicContextCommandHandler(deps: {
                     }
                 } else if (isTuiConnected(sessionId)) {
                     // In TUI, push an RPC action so the TUI poller shows a confirmation dialog.
-                    // Partial-range args fall through to the full-recomp dialog for now — TUI
-                    // range UI is tracked as a phase-2 enhancement; typed args are ignored here.
+                    // Partial-range args fall through to the full-recomp dialog — the TUI
+                    // has no range UI; typed args are ignored here.
                     pushNotification("action", { action: "show-recomp-dialog" }, sessionId);
                     sessionLog(sessionId, "command ctx-recomp: pushed show-recomp-dialog to TUI");
                     throwSentinel(input.command);

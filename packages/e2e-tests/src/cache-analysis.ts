@@ -88,6 +88,25 @@ export function isInternalAgentRequest(request: MinimalRequest): boolean {
     return HIDDEN_AGENT_SIGNATURES.some((signature) => systemText.includes(signature));
 }
 
+/** Historian identity phrase; substring of the production signature above. */
+export const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
+
+/**
+ * Classify a provider request body as historian-originated. Union semantics:
+ * the historian identity marker can appear in the system prompt (any shape —
+ * string, block array, or object) OR only in the messages payload
+ * (`<new_messages>` is the historian chunk envelope), so both channels are
+ * checked — a system-only predicate misclassifies a marker-in-messages
+ * historian request as the main agent and silently changes what cache/pass
+ * assertions measure.
+ */
+export function isHistorianRequest(body: Record<string, unknown>): boolean {
+    if (JSON.stringify(body.messages ?? "").includes("<new_messages>")) return true;
+    const system = body.system;
+    if (typeof system === "string") return system.includes(HISTORIAN_SYSTEM_MARKER);
+    return system != null && JSON.stringify(system).includes(HISTORIAN_SYSTEM_MARKER);
+}
+
 function sha(s: string): string {
     return createHash("sha256").update(s).digest("hex").slice(0, 12);
 }

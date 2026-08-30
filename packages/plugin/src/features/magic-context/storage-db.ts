@@ -62,13 +62,6 @@ const persistenceByDatabase = new WeakMap<Database, boolean>();
 const persistenceErrorByDatabase = new WeakMap<Database, string>();
 const pathByDatabase = new WeakMap<Database, string>();
 
-/** Most recent runtime-gate refusal for diagnostics after a null open. */
-let lastRuntimeGateRefusal: SqliteRuntimeGateReport | null = null;
-
-export function consumeLastRuntimeGateRefusal(): SqliteRuntimeGateReport | null {
-    return lastRuntimeGateRefusal;
-}
-
 let lastSchemaFenceRejection: { persistedVersion: number; supportedVersion: number } | null = null;
 
 export interface DatabaseFormatRefusal {
@@ -90,7 +83,6 @@ export function getFormatRefusal(): DatabaseFormatRefusal | null {
 }
 
 export function __resetSchemaFenceStateForTests(): void {
-    lastRuntimeGateRefusal = null;
     lastSchemaFenceRejection = null;
     lastFormatRefusal = null;
 }
@@ -193,13 +185,6 @@ export function getPersistedSchemaVersion(db: Database): number {
         )
         .get(FORK_MIGRATION_VERSION_FLOOR) as { version: number } | undefined;
     return row?.version ?? 0;
-}
-
-export function schemaVersionIsSupported(
-    db: Database,
-    latestSupportedVersion = LATEST_SUPPORTED_VERSION,
-): boolean {
-    return getPersistedSchemaVersion(db) <= latestSupportedVersion;
 }
 
 /** Log the upstream-lane version so operators can compare it to this build's fence. */
@@ -736,10 +721,8 @@ function openDirectDatabase(
     // enable WAL, or write the direct format.
     const runtimeGate = probeSqliteRuntimeGate();
     if (!runtimeGate.ok) {
-        lastRuntimeGateRefusal = runtimeGate;
         return null;
     }
-    lastRuntimeGateRefusal = null;
     const preOpenRefusal = refusePreOpenFamily(dbPath);
     if (preOpenRefusal) {
         lastFormatRefusal = preOpenRefusal;

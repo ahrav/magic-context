@@ -35,6 +35,10 @@ impl From<McStoreError> for M1ComposeError {
     }
 }
 
+/// `revision` is a digest over ALL byte-affecting m1 render inputs such that the
+/// rendered bytes are a pure function of what the digest covers: if the bytes
+/// would differ, `revision` differs. NEVER a max-id counter (a same-id update
+/// changes bytes without raising a max id).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct M1RevisionSignal {
     pub revision: u64,

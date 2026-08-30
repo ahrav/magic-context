@@ -26,7 +26,6 @@ import {
     type RawMessageOrdinalEntry,
     type RawMessageParts,
     readRawSessionMessageByIdFromDb,
-    readRawSessionMessageIdOrdinalsFromDb,
     readRawSessionMessageOrdinalByIdFromDb,
     readRawSessionMessageOrdinalPageFromDb,
     readRawSessionMessagePageFromDb,
@@ -402,16 +401,6 @@ export function getRawSessionStoredMessageCount(sessionId: string): number {
     if (provider) return provider.readMessages().length;
     if (!openCodeDbExists()) return 0;
     return withReadOnlySessionDb((db) => countStoredRawSessionMessagesFromDb(db, sessionId));
-}
-
-export function readRawSessionMessageIdOrdinals(sessionId: string): Map<string, number> {
-    const provider = sessionProviders.get(sessionId);
-    if (provider?.readMessageIdOrdinals) return provider.readMessageIdOrdinals();
-    if (provider) {
-        return new Map(provider.readMessages().map((message) => [message.id, message.ordinal]));
-    }
-    if (!openCodeDbExists()) return new Map();
-    return withReadOnlySessionDb((db) => readRawSessionMessageIdOrdinalsFromDb(db, sessionId));
 }
 
 export function readRawSessionMessagePartsById(

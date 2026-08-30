@@ -24,7 +24,7 @@ import {
 	textOf,
 	toolResultMessage,
 	userMessage,
-} from "./test-utils.test";
+} from "./test-utils";
 import { createPiTranscript } from "./transcript-pi";
 
 function tagMessages(

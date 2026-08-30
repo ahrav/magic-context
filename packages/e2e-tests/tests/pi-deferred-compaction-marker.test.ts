@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { PiTestHarness } from "../src/pi-harness";
 import { buildMockHistorianPayload } from "../src/mock-historian";
 import { openTestDb } from "../src/test-db";
+import { isHistorianRequest } from "../src/cache-analysis";
 
 /**
  * Pi compaction marker behavior (Phase 2 deferred-marker design).
@@ -44,24 +45,10 @@ import { openTestDb } from "../src/test-db";
  * never called — the JSONL grew unbounded until provider overflow.
  */
 
-const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
-
 interface MarkerRow {
     pending_compaction_marker_state: string | null;
     pending_pi_compaction_marker_state: string | null;
     compaction_marker_state: string | null;
-}
-
-function isHistorianRequest(body: Record<string, unknown>): boolean {
-    const system = body.system;
-    if (typeof system === "string") return system.includes(HISTORIAN_SYSTEM_MARKER);
-    if (Array.isArray(system)) {
-        return system.some((block) => {
-            const text = (block as { text?: unknown } | null)?.text;
-            return typeof text === "string" && text.includes(HISTORIAN_SYSTEM_MARKER);
-        });
-    }
-    return false;
 }
 
 function findOrdinalRange(body: Record<string, unknown>): { start: number; end: number } | null {

@@ -10,7 +10,7 @@ import {
 	LIGHT_TOOL_DESCRIPTIONS,
 } from "@magic-context/core/shared/prompt-surface-runtime";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
-import { createTestDb } from "../test-utils.test";
+import { createTestDb } from "../test-utils";
 import { registerMagicContextTools } from "./index";
 
 describe("registerMagicContextTools", () => {

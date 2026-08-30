@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import * as os from "node:os";
 import * as path from "node:path";
 import { getHarness, type HarnessId } from "./harness";
+import { releaseContract } from "./mc-host-lifecycle/generated-contract";
 
 export function getDataDir(): string {
     return process.env.XDG_DATA_HOME ?? path.join(os.homedir(), ".local", "share");
@@ -32,7 +33,7 @@ export function getDataDir(): string {
  * which plugin is loaded). Production runtime callers should omit it so
  * the helper picks up the boot-time harness automatically.
  */
-export function getMagicContextTempDir(harness: HarnessId = getHarness()): string {
+function getMagicContextTempDir(harness: HarnessId = getHarness()): string {
     return path.join(os.tmpdir(), harness, "magic-context");
 }
 
@@ -199,13 +200,28 @@ export function getMagicContextStorageDir(): string {
     if (!process.env.XDG_DATA_HOME) {
         const testDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
         if (testDataDir) {
-            return path.join(testDataDir, "cortexkit", "magic-context");
+            return storageSubtreePath(testDataDir);
         }
         if (process.env.NODE_ENV === "test") {
             return getTestBackstopStorageDir();
         }
     }
-    return path.join(getDataDir(), "cortexkit", "magic-context");
+    return storageSubtreePath(getDataDir());
+}
+
+/**
+ * Magic Context's storage subtree under an explicit data root
+ * (`${dataRoot}/cortexkit/magic-context`), with the segment names taken from
+ * the release contract the Rust daemon conforms to. Root-parameterized so
+ * harnesses and scripts that manage their own data root name the same tree
+ * the daemon writes.
+ */
+export function storageSubtreePath(dataRoot: string): string {
+    return path.join(
+        dataRoot,
+        releaseContract.layout.managed_subtree,
+        releaseContract.layout.storage_subdirectory,
+    );
 }
 
 let testBackstopDataRoot: string | null = null;
@@ -240,7 +256,7 @@ export function getTestBackstopDataRoot(): string {
 }
 
 function getTestBackstopStorageDir(): string {
-    return path.join(getTestBackstopDataRoot(), "cortexkit", "magic-context");
+    return storageSubtreePath(getTestBackstopDataRoot());
 }
 
 /**

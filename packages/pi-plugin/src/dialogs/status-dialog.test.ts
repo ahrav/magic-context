@@ -6,11 +6,7 @@ import {
 	clearPiChannel1State,
 	setPiChannel1Baseline,
 } from "../ctx-reduce-nudge-pi";
-import {
-	assistantMessage,
-	createTestDb,
-	fakeContext,
-} from "../test-utils.test";
+import { assistantMessage, createTestDb, fakeContext } from "../test-utils";
 import { buildPiStatusDetail, showStatusDialog } from "./status-dialog";
 
 describe("Pi status dialog", () => {

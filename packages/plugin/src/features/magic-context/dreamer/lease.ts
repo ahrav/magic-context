@@ -1,4 +1,5 @@
 import type { Database } from "../../../shared/sqlite";
+import { runImmediate } from "../../../shared/sqlite";
 import { deleteDreamState, getDreamState, setDreamState } from "./storage-dream-state";
 
 const LEASE_DURATION_MS = 2 * 60 * 1000; // 2 minutes — renewed periodically during task execution
@@ -98,31 +99,10 @@ export function leaseOwnershipMatches(
 
 // The lease spans four dream_state rows (holder/heartbeat/expiry/generation), so it can't
 // be a single-statement CAS like compartment-lease.ts. Instead each mutation
-// runs under BEGIN IMMEDIATE: the write lock is taken at BEGIN time (not at the
-// first write, as the deferred BEGIN that db.transaction() emits would), so the
-// read-then-write is atomic across the OpenCode+Pi processes that share this
-// SQLite file. Without IMMEDIATE, two processes could both read isLeaseActive()
-// = false under WAL snapshot isolation and both write — double-acquiring the
-// lease and spawning duplicate dreamer workers. busy_timeout (set in
-// initializeDatabase) makes the loser wait rather than throw SQLITE_BUSY.
-function runImmediate<T>(db: Database, body: () => T): T {
-    db.exec("BEGIN IMMEDIATE");
-    let committed = false;
-    try {
-        const result = body();
-        db.exec("COMMIT");
-        committed = true;
-        return result;
-    } finally {
-        if (!committed) {
-            try {
-                db.exec("ROLLBACK");
-            } catch {
-                // already rolled back / no active transaction
-            }
-        }
-    }
-}
+// runs under `runImmediate` (shared/sqlite.ts): without IMMEDIATE, two
+// processes could both read isLeaseActive() = false under WAL snapshot
+// isolation and both write — double-acquiring the lease and spawning duplicate
+// dreamer workers.
 
 export interface LeaseAcquisition {
     acquiredAt: number;

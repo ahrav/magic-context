@@ -21,7 +21,7 @@ import {
 	clearPiSystemPromptSession,
 	processSystemPromptForCache,
 } from "./system-prompt";
-import { createTestDb } from "./test-utils.test";
+import { createTestDb } from "./test-utils";
 
 describe("processSystemPromptForCache", () => {
 	it("initializes hash on first pass without reporting hashChanged", () => {

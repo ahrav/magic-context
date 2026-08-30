@@ -166,6 +166,10 @@ pub fn data_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, Instan
 /// the tree behind.
 pub const MANAGED_DIR_NAME: &str = "cortexkit";
 
+/// The runtime-directory segment under the managed subtree, holding the
+/// publication and lock files.
+pub const RUNTIME_DIR_NAME: &str = "run";
+
 /// Resolves `${dataDir}/cortexkit`: the replaceable managed subtree that
 /// holds the runtime directory, the lifecycle root, and module storage.
 pub fn managed_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, InstanceError> {
@@ -176,7 +180,7 @@ pub fn managed_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, Ins
 /// absolute `$XDG_DATA_HOME`, or an absolute `$HOME/.local/share`, in that
 /// order.
 pub fn runtime_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, InstanceError> {
-    Ok(managed_dir_path(data_dir_override)?.join("run"))
+    Ok(managed_dir_path(data_dir_override)?.join(RUNTIME_DIR_NAME))
 }
 
 /// One secured host incarnation: validated directory descriptor, held lock,
@@ -723,6 +727,10 @@ const S_ISVTX: u32 = 0o1000;
 pub(crate) const S_IFDIR: u32 = 0o040000;
 pub(crate) const S_IFREG: u32 = 0o100000;
 pub(crate) const S_IFLNK: u32 = 0o120000;
+
+pub(crate) fn owner_uid() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
 
 #[cfg(target_os = "macos")]
 pub(crate) fn mode_bits(stat: &rustix::fs::Stat) -> u32 {

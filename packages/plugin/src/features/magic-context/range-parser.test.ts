@@ -2,78 +2,35 @@ import { describe, expect, it } from "bun:test";
 import { parseRangeString } from "./range-parser";
 
 describe("parseRangeString", () => {
-    it("parses a single number", () => {
-        //#given
-        const input = "5";
-        //#when
-        const result = parseRangeString(input);
-        //#then
-        expect(result).toEqual([5]);
+    // Each row parses one accepted input shape into its expanded id list.
+    it.each([
+        ["parses a single number", "5", [5]],
+        ["parses a range", "3-5", [3, 4, 5]],
+        ["parses comma-separated numbers", "1,2,9", [1, 2, 9]],
+        [
+            "parses mixed ranges and individual numbers",
+            "1-5,8,12-15",
+            [1, 2, 3, 4, 5, 8, 12, 13, 14, 15],
+        ],
+        ["deduplicates repeated numbers", "1,1,2,3,3", [1, 2, 3]],
+        ["handles whitespace around separators", " 3 - 5 , 8 ", [3, 4, 5, 8]],
+        // The agent often pastes transcript §N§ tag markers verbatim; they
+        // parse as their bare numbers instead of erroring.
+        ["tolerates §N§ tag markers in a range", "§302§-§305§", [302, 303, 304, 305]],
+        ["tolerates §N§ markers in a single id", "§5§", [5]],
+        ["tolerates §N§ markers in a comma list", "§1§,§2§,§9§", [1, 2, 9]],
+        ["tolerates mixed bare and marked ids", "1-3,§8§", [1, 2, 3, 8]],
+    ] as Array<[string, string, number[]]>)("%s", (_title, input, expected) => {
+        expect(parseRangeString(input)).toEqual(expected);
     });
 
-    it("parses a range", () => {
-        //#given
-        const input = "3-5";
-        //#when
-        const result = parseRangeString(input);
-        //#then
-        expect(result).toEqual([3, 4, 5]);
-    });
-
-    it("parses comma-separated numbers", () => {
-        //#given
-        const input = "1,2,9";
-        //#when
-        const result = parseRangeString(input);
-        //#then
-        expect(result).toEqual([1, 2, 9]);
-    });
-
-    it("parses mixed ranges and individual numbers", () => {
-        //#given
-        const input = "1-5,8,12-15";
-        //#when
-        const result = parseRangeString(input);
-        //#then
-        expect(result).toEqual([1, 2, 3, 4, 5, 8, 12, 13, 14, 15]);
-    });
-
-    it("deduplicates repeated numbers", () => {
-        //#given
-        const input = "1,1,2,3,3";
-        //#when
-        const result = parseRangeString(input);
-        //#then
-        expect(result).toEqual([1, 2, 3]);
-    });
-
-    it("handles whitespace around separators", () => {
-        //#given
-        const input = " 3 - 5 , 8 ";
-        //#when
-        const result = parseRangeString(input);
-        //#then
-        expect(result).toEqual([3, 4, 5, 8]);
-    });
-
-    it("throws on empty string", () => {
-        //#given
-        const input = "";
-        //#when + #then
-        expect(() => parseRangeString(input)).toThrow();
-    });
-
-    it("throws on non-numeric input", () => {
-        //#given
-        const input = "abc";
-        //#when + #then
-        expect(() => parseRangeString(input)).toThrow();
-    });
-
-    it("throws on reversed range", () => {
-        //#given
-        const input = "5-3";
-        //#when + #then
+    // Each row is one rejected input shape.
+    it.each([
+        ["throws on empty string", ""],
+        ["throws on non-numeric input", "abc"],
+        ["throws on reversed range", "5-3"],
+        ["throws on range of 1001 elements", "1-1001"],
+    ] as Array<[string, string]>)("%s", (_title, input) => {
         expect(() => parseRangeString(input)).toThrow();
     });
 
@@ -86,13 +43,6 @@ describe("parseRangeString", () => {
         );
     });
 
-    it("throws on range of 1001 elements", () => {
-        //#given
-        const input = "1-1001";
-        //#when + #then
-        expect(() => parseRangeString(input)).toThrow();
-    });
-
     it("allows max valid range of 1000 elements", () => {
         //#given
         const input = "1-1000";
@@ -102,21 +52,5 @@ describe("parseRangeString", () => {
         expect(result).toHaveLength(1000);
         expect(result[0]).toBe(1);
         expect(result[999]).toBe(1000);
-    });
-
-    it("tolerates §N§ tag markers in a range (the agent often pastes them verbatim)", () => {
-        //#given the agent copied the transcript markers into the range
-        const input = "§302§-§305§";
-        //#when
-        const result = parseRangeString(input);
-        //#then it parses as 302-305 instead of erroring
-        expect(result).toEqual([302, 303, 304, 305]);
-    });
-
-    it("tolerates §N§ markers in a single id and a comma list", () => {
-        expect(parseRangeString("§5§")).toEqual([5]);
-        expect(parseRangeString("§1§,§2§,§9§")).toEqual([1, 2, 9]);
-        // Mixed bare + marked is fine too.
-        expect(parseRangeString("1-3,§8§")).toEqual([1, 2, 3, 8]);
     });
 });

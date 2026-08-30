@@ -20,7 +20,7 @@ import {
 	reconcilePiCompactionMode,
 } from "./compaction-off-pi";
 import { handlePiSessionBeforeCompact } from "./index";
-import { createTestDb } from "./test-utils.test";
+import { createTestDb } from "./test-utils";
 
 describe("Pi compaction-off mode", () => {
 	it("allows native compaction only when compaction-off is selected", async () => {

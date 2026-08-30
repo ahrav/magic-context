@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-
+import type { LoadOutcome } from "../config/load-outcome";
 import type { EmbeddingConfig } from "../config/schema/magic-context";
 import {
     getProjectEmbeddingSnapshot,
@@ -9,13 +9,7 @@ import {
 import { log } from "../shared/logger";
 import type { Database } from "../shared/sqlite";
 
-export type LoadOutcome =
-    | "ok"
-    | "project-file-parse-error"
-    | "project-file-io-error"
-    | "legacy-config-unmigrated"
-    | "schema-recovery"
-    | "substitution-failure";
+export type { LoadOutcome };
 
 export interface EmbeddingLoadResultDetailed<TConfig extends { embedding: EmbeddingConfig }> {
     config: TConfig;
@@ -28,7 +22,7 @@ export interface EmbeddingLoadResultDetailed<TConfig extends { embedding: Embedd
     recoveredTopLevelKeys: string[];
 }
 
-export const EMBEDDING_AFFECTING_KEYS = new Set([
+const EMBEDDING_AFFECTING_KEYS = new Set([
     "embedding.api_key",
     "embedding.endpoint",
     "embedding.model",
@@ -67,7 +61,7 @@ function embeddingConfigHasLiteralTokens(embedding: EmbeddingConfig | undefined)
     return false;
 }
 
-export const EMBEDDING_AFFECTING_TOP_LEVEL_KEYS = new Set([
+const EMBEDDING_AFFECTING_TOP_LEVEL_KEYS = new Set([
     "embedding",
     "memory",
     "experimental",
@@ -137,7 +131,7 @@ export function isConfigLoadUntrusted(
     return false;
 }
 
-export function describeFailure(
+function describeFailure(
     detailed: EmbeddingLoadResultDetailed<{ embedding: EmbeddingConfig }>,
 ): string {
     const parts: string[] = [];
@@ -159,7 +153,7 @@ export function describeFailure(
     return parts.length > 0 ? parts.join("; ") : detailed.loadOutcome;
 }
 
-export function logConfigFailureOnce(
+function logConfigFailureOnce(
     projectIdentity: string,
     detailed: EmbeddingLoadResultDetailed<{ embedding: EmbeddingConfig }>,
 ): void {
@@ -208,8 +202,4 @@ export function handleUntrustedLoad(
         describeFailure(detailed),
     );
     return true;
-}
-
-export function _resetEmbeddingConfigFailureLogsForTests(): void {
-    loggedFailureSignatures.clear();
 }

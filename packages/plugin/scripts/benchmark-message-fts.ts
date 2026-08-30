@@ -252,6 +252,8 @@ const t19 = performance.now();
 const searchOnlyResults = await unifiedSearch(db, sessionId, process.cwd(), query, {
     memoryEnabled: false,
     embeddingEnabled: false,
+    embedQuery: async () => null,
+    isEmbeddingRuntimeEnabled: () => true,
     sources: ["message"],
     limit: 10,
 });

@@ -10,11 +10,7 @@ import { createDirectTestDatabase } from "../../features/magic-context/test-data
 import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { extractBoundedAutoSearchQuery } from "./auto-search-prompt";
-import {
-    _resetAutoSearchCache,
-    executeAutoSearchDelivery,
-    runAutoSearchHint,
-} from "./auto-search-runner";
+import { executeAutoSearchDelivery, runAutoSearchHint } from "./auto-search-runner";
 import type { MessageLike } from "./transform-operations";
 
 function makeUserMsg(id: string, text: string): MessageLike {
@@ -49,11 +45,9 @@ describe("auto-search-runner", () => {
 
     beforeEach(() => {
         db = createDirectTestDatabase().db;
-        _resetAutoSearchCache();
     });
 
     afterEach(() => {
-        _resetAutoSearchCache();
         closeQuietly(db);
     });
 
@@ -753,7 +747,11 @@ describe("executeAutoSearchDelivery", () => {
         sessionId: "s-delivery",
         projectPath: "git:test",
         prompt: "please explain how the historian decides when to run",
-        searchOptions: { limit: 3 },
+        searchOptions: {
+            limit: 3,
+            embedQuery: async () => null,
+            isEmbeddingRuntimeEnabled: () => true,
+        },
         scoreThreshold: 0.6,
         ...overrides,
     });

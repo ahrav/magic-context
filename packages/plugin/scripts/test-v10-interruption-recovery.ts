@@ -30,6 +30,7 @@ import { spawn } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { storageSubtreePath } from "../src/shared/data-path";
 import { Database } from "bun:sqlite";
 
 interface Args {
@@ -236,7 +237,7 @@ async function main() {
 
     // Set up playground
     const playground = join(tmpdir(), `v10-interrupt-${Date.now()}`);
-    const mcDir = join(playground, "cortexkit", "magic-context");
+    const mcDir = storageSubtreePath(playground);
     const ocDir = join(playground, "opencode");
     mkdirSync(mcDir, { recursive: true });
     mkdirSync(ocDir, { recursive: true });

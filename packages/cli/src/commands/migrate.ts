@@ -238,10 +238,6 @@ const PART_LOOKUP_CHUNK_SIZE = 900;
  */
 const MIGRATION_STAGE_DIRNAME = ".mc-migrations";
 
-function defaultOpenCodeDbPath(): string {
-    return getOpenCodeDatabasePath();
-}
-
 function defaultCortexkitDbPath(): string {
     return join(getMagicContextStorageDir(), "context.db");
 }
@@ -1345,7 +1341,7 @@ export function migrateOpenCodeSessionToPi(
 ): MigrationResult {
     const fs = opts.fs ?? defaultFs();
     const now = opts.now ?? new Date();
-    const opencodeDbPath = opts.opencodeDbPath ?? defaultOpenCodeDbPath();
+    const opencodeDbPath = opts.opencodeDbPath ?? getOpenCodeDatabasePath();
     const piSessionsRoot = opts.piSessionsRoot ?? defaultPiSessionsRoot();
     const ownsDb = !opts.db;
     const db = opts.db ?? openExistingDatabase(opencodeDbPath, { readonly: true });

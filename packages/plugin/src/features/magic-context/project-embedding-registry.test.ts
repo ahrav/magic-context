@@ -10,13 +10,13 @@ import {
     replaceCompartmentChunkEmbeddings,
 } from "./compartment-chunk-embedding";
 import { appendCompartments, getCompartments } from "./compartment-storage";
-import type { GitCommit } from "./git-commits/git-log-reader";
 import {
     countEmbeddedCommits,
     saveCommitEmbedding,
 } from "./git-commits/storage-git-commit-embeddings";
 import { upsertCommits } from "./git-commits/storage-git-commits";
 import { acquireGitSweepLease, releaseGitSweepLease } from "./git-commits/sweep-coordinator";
+import { makeSeededGitCommit } from "./git-commits/test-support";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-provider";
 import {
     getSynapseLaneIdentity,
@@ -96,17 +96,6 @@ function localConfig(model: string, maxInputTokens?: number): EmbeddingConfig {
         provider: "local",
         model,
         ...(maxInputTokens !== undefined ? { max_input_tokens: maxInputTokens } : {}),
-    };
-}
-
-function makeGitCommit(shaSeed: string, committedAtMs: number): GitCommit {
-    const sha = shaSeed.padEnd(40, shaSeed);
-    return {
-        sha,
-        shortSha: sha.slice(0, 7),
-        message: `commit ${shaSeed}`,
-        author: "dev@example.com",
-        committedAtMs,
     };
 }
 
@@ -901,8 +890,8 @@ describe("project embedding registry", () => {
         const db = useTempDb();
         const projectIdentity = "git:commit-backlog";
         upsertCommits(db, projectIdentity, [
-            makeGitCommit("backlog-a", 1000),
-            makeGitCommit("backlog-b", 2000),
+            makeSeededGitCommit("backlog-a", 1000),
+            makeSeededGitCommit("backlog-b", 2000),
         ]);
         registerProjectEmbedding(
             db,
@@ -929,7 +918,7 @@ describe("project embedding registry", () => {
         );
         const db = useTempDb();
         const projectIdentity = "git:commits-off";
-        upsertCommits(db, projectIdentity, [makeGitCommit("off-a", 1000)]);
+        upsertCommits(db, projectIdentity, [makeSeededGitCommit("off-a", 1000)]);
         registerProjectEmbedding(
             db,
             projectIdentity,
@@ -954,7 +943,7 @@ describe("project embedding registry", () => {
         );
         const db = useTempDb();
         const projectIdentity = "git:lease-block";
-        upsertCommits(db, projectIdentity, [makeGitCommit("lease-a", 1000)]);
+        upsertCommits(db, projectIdentity, [makeSeededGitCommit("lease-a", 1000)]);
         registerProjectEmbedding(
             db,
             projectIdentity,
@@ -1130,8 +1119,8 @@ describe("project embedding registry", () => {
     it("suppresses GC while a project's last config load was untrusted", () => {
         const db = useTempDb();
         const projectIdentity = "git:untrusted-gc";
-        upsertCommits(db, projectIdentity, [makeGitCommit("gc-a", 1000)]);
-        const sha = makeGitCommit("gc-a", 1000).sha;
+        upsertCommits(db, projectIdentity, [makeSeededGitCommit("gc-a", 1000)]);
+        const sha = makeSeededGitCommit("gc-a", 1000).sha;
         const now = Date.now();
 
         const first = registerProjectEmbedding(
@@ -1733,7 +1722,7 @@ describe("project embedding registry", () => {
             "/tmp/stop-drained",
         );
         // Seed a few primary commits so the shadow backfill has work to do.
-        const drainedCommits = [0, 1, 2].map((i) => makeGitCommit(`dr${i}x`, 1000 + i));
+        const drainedCommits = [0, 1, 2].map((i) => makeSeededGitCommit(`dr${i}x`, 1000 + i));
         upsertCommits(db, projectIdentity, drainedCommits);
         for (const commit of drainedCommits) {
             saveCommitEmbedding(
@@ -1779,7 +1768,7 @@ describe("project embedding registry", () => {
             { memoryEnabled: true, gitCommitEnabled: true },
             "/tmp/stop-stalled",
         );
-        const stalledCommits = [0, 1, 2].map((i) => makeGitCommit(`st${i}x`, 1000 + i));
+        const stalledCommits = [0, 1, 2].map((i) => makeSeededGitCommit(`st${i}x`, 1000 + i));
         upsertCommits(db, projectIdentity, stalledCommits);
         for (const commit of stalledCommits) {
             saveCommitEmbedding(
@@ -1826,7 +1815,7 @@ describe("project embedding registry", () => {
             { memoryEnabled: true, gitCommitEnabled: true },
             "/tmp/shadow-rearm",
         );
-        const rearmCommits = [0, 1, 2].map((i) => makeGitCommit(`re${i}x`, 1000 + i));
+        const rearmCommits = [0, 1, 2].map((i) => makeSeededGitCommit(`re${i}x`, 1000 + i));
         upsertCommits(db, projectIdentity, rearmCommits);
         for (const commit of rearmCommits) {
             saveCommitEmbedding(
@@ -1889,7 +1878,7 @@ describe("project embedding registry", () => {
         );
         if (!shadow) throw new Error("failed to register shadow provider");
         const queuedCommits = Array.from({ length: 70 }, (_, index) =>
-            makeGitCommit(`q${index}x`, 1000 + index),
+            makeSeededGitCommit(`q${index}x`, 1000 + index),
         );
         upsertCommits(db, projectIdentity, queuedCommits);
         const ids = queuedCommits.map((commit) => commit.sha);
@@ -2146,7 +2135,10 @@ describe("detailed synapse writers apply complete receipt groups atomically", ()
         const db = useTempDb();
         const projectIdentity = "git:detailed-commit";
         const host = new DetailedSynapseTestHost();
-        upsertCommits(db, projectIdentity, [makeGitCommit("d1", 1000), makeGitCommit("d2", 2000)]);
+        upsertCommits(db, projectIdentity, [
+            makeSeededGitCommit("d1", 1000),
+            makeSeededGitCommit("d2", 2000),
+        ]);
         registerDetailed(db, projectIdentity, host);
 
         const drained = await drainCommitBacklogForProject(db, projectIdentity, Date.now() + 5000);
@@ -2163,10 +2155,10 @@ describe("detailed synapse writers apply complete receipt groups atomically", ()
         const projectIdentity = "git:detailed-commit-oversized";
         const host = new DetailedSynapseTestHost();
         const oversized = {
-            ...makeGitCommit("oversized", 2000),
+            ...makeSeededGitCommit("oversized", 2000),
             message: "x".repeat(1024 * 1024 + 1),
         };
-        const valid = makeGitCommit("valid", 1000);
+        const valid = makeSeededGitCommit("valid", 1000);
         upsertCommits(db, projectIdentity, [oversized, valid]);
         registerDetailed(db, projectIdentity, host);
         host.resultPages = (_jobId, items) => {
