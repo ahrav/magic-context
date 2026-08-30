@@ -553,6 +553,182 @@ describe("McHostModuleTransport", () => {
         }
     });
 
+    it("reuses one passive connection across requests without a managed owner", async () => {
+        const peer = await startPeer();
+        const dataHome = join(tempDir, `passive-reuse-home-${++fileCounter}`);
+        const connectionFile = join(dataHome, "cortexkit", "run", "subc-connection.json");
+        mkdirSync(join(dataHome, "cortexkit", "run"), { recursive: true });
+        await writeConnectionFile(connectionFile, peer);
+        const oldDataHome = process.env.XDG_DATA_HOME;
+        process.env.XDG_DATA_HOME = dataHome;
+        try {
+            const transport = trackTransport(
+                new McHostModuleTransport({ requestTimeoutMs: 2_000 }),
+            );
+            const internals = transport as unknown as { client: McHostClient | null };
+            const args = {
+                sessionId: "passive-reuse",
+                projectRoot: "/workspace/project",
+                method: "transform" as const,
+                body: { method: "transform", v: 1 },
+            };
+
+            const first = transport.call(args);
+            const conn = await peer.waitForConnection();
+            await conn.authenticated;
+            const cursor = frameCursor(conn);
+            const firstOpen = await cursor.next(isRouteOpen);
+            await sendRouteOpenOk(conn, firstOpen.corr, 7, 77);
+            const firstRequest = await cursor.next(isRoutedRequest(7));
+            await sendResponse(conn, firstRequest.corr, { ok: true }, 7, 77);
+            await expect(first).resolves.toEqual({ ok: true });
+
+            const passiveClient = internals.client;
+            expect(passiveClient).not.toBeNull();
+            let closes = 0;
+            const closeClient = (passiveClient as McHostClient).close.bind(passiveClient);
+            (passiveClient as unknown as { close: () => void }).close = () => {
+                closes += 1;
+                closeClient();
+            };
+
+            const second = transport.call(args);
+            // Nothing about the peer changed, so the second request must ride the
+            // live connection. Watch for either outcome so a reconnect fails here
+            // instead of stalling on a connection this test never answers.
+            await waitUntil(
+                () =>
+                    conn.frames.filter(isRoutedRequest(7)).length >= 2 ||
+                    peer.connections.length > 1,
+            );
+            expect(peer.connections).toHaveLength(1);
+            const secondRequest = await cursor.next(isRoutedRequest(7));
+            await sendResponse(conn, secondRequest.corr, { ok: true }, 7, 77);
+            await expect(second).resolves.toEqual({ ok: true });
+
+            // A transport with no lifecycle owner certifies no daemon identity, so
+            // there is nothing to re-check between requests: one dial, one client,
+            // no close, and the cached route survives.
+            expect(internals.client).toBe(passiveClient);
+            expect(closes).toBe(0);
+            expect(conn.frames.filter(isRouteOpen)).toHaveLength(1);
+        } finally {
+            if (oldDataHome === undefined) delete process.env.XDG_DATA_HOME;
+            else process.env.XDG_DATA_HOME = oldDataHome;
+        }
+    });
+
+    it("a caller arriving mid-request never closes the shared client under it", async () => {
+        const peer = await startPeer();
+        const dataHome = join(tempDir, `inflight-home-${++fileCounter}`);
+        const connectionFile = join(dataHome, "cortexkit", "run", "subc-connection.json");
+        mkdirSync(join(dataHome, "cortexkit", "run"), { recursive: true });
+        await writeConnectionFile(connectionFile, peer);
+        const oldDataHome = process.env.XDG_DATA_HOME;
+        process.env.XDG_DATA_HOME = dataHome;
+        try {
+            const transport = trackTransport(
+                new McHostModuleTransport({ requestTimeoutMs: 5_000 }),
+            );
+            const shared = {
+                projectRoot: "/workspace/project",
+                method: "transform" as const,
+            };
+
+            const holder = transport.call({
+                ...shared,
+                sessionId: "inflight-holder",
+                body: { method: "transform", v: 1, page: "holder" },
+            });
+            const conn = await peer.waitForConnection();
+            await conn.authenticated;
+            const cursor = frameCursor(conn);
+            const holderOpen = await cursor.next(isRouteOpen);
+            await sendRouteOpenOk(conn, holderOpen.corr, 7, 77);
+            // Invoked and unanswered: this body is exactly the work a close of the
+            // shared client would retire as outcome_unknown.
+            const holderBody = await cursor.next(isRoutedRequest(7));
+
+            const arriver = transport.call({
+                ...shared,
+                sessionId: "inflight-arriver",
+                body: { method: "transform", v: 1, page: "arriver" },
+            });
+            await waitUntil(
+                () => conn.frames.filter(isRouteOpen).length >= 2 || peer.connections.length > 1,
+            );
+            expect(peer.connections).toHaveLength(1);
+            const arriverOpen = await cursor.next(isRouteOpen);
+            await sendRouteOpenOk(conn, arriverOpen.corr, 9, 1);
+            const arriverBody = await cursor.next(isRoutedRequest(9));
+            await sendResponse(conn, arriverBody.corr, { page: "arriver" }, 9, 1);
+            await expect(arriver).resolves.toEqual({ page: "arriver" });
+
+            // The daemon never changed, so the pending request keeps its own
+            // terminal instead of inheriting a connection-level unknown outcome.
+            await sendResponse(conn, holderBody.corr, { page: "holder" }, 7, 77);
+            await expect(holder).resolves.toEqual({ page: "holder" });
+        } finally {
+            if (oldDataHome === undefined) delete process.env.XDG_DATA_HOME;
+            else process.env.XDG_DATA_HOME = oldDataHome;
+        }
+    });
+
+    it("joins an in-flight dial instead of demanding managed readiness again", async () => {
+        const daemonId = Uint8Array.from([9, 8, 7, 6]);
+        let demands = 0;
+        const transport = trackTransport(
+            new McHostModuleTransport({
+                requestTimeoutMs: 5_000,
+                demandStart: async () => {
+                    demands += 1;
+                    return {
+                        ok: true,
+                        reason: "already_running",
+                        storage: "ready",
+                        authenticatedDaemonId: daemonId,
+                    };
+                },
+            }),
+        );
+        const route = { channel: 7, epoch: 77 } as RouteHandle;
+        const dial = deferred<McHostClient>();
+        let connects = 0;
+        const client = {
+            authenticated: { daemonId, daemonVer: "fake-peer/0.0.1", proof: "current" },
+            routeOpen: async () => route,
+            request: async () => ({ ok: true }),
+            close: () => undefined,
+        } as unknown as McHostClient;
+        const internals = transport as unknown as {
+            connectClient(deadline?: Deadline): Promise<McHostClient>;
+        };
+        internals.connectClient = () => {
+            connects += 1;
+            return dial.promise;
+        };
+        const shared = {
+            projectRoot: "/workspace/project",
+            method: "transform" as const,
+            body: { method: "transform", v: 1 },
+        };
+
+        const first = transport.call({ ...shared, sessionId: "dial-holder" });
+        await waitUntil(() => connects === 1);
+        expect(demands).toBe(1);
+        const second = transport.call({ ...shared, sessionId: "dial-joiner" });
+        // The joining caller lands on the held dial, so its own start transaction
+        // and compatibility probe would buy nothing but deadline and lock time.
+        await delay(30);
+        expect(demands).toBe(1);
+
+        dial.resolve(client);
+        await expect(first).resolves.toEqual({ ok: true });
+        await expect(second).resolves.toEqual({ ok: true });
+        expect(demands).toBe(1);
+        expect(connects).toBe(1);
+    });
+
     it("keeps an explicit connection lifecycle-neutral", async () => {
         const peer = await startPeer();
         const connectionFile = await writeConnFile(peer);

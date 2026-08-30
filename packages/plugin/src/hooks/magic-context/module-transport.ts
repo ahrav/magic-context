@@ -403,6 +403,23 @@ interface EnsuredRoute {
     expectedDaemonId?: Uint8Array;
 }
 
+/**
+ * What a managed lifecycle demand certified about one connection. An absent
+ * `expectedDaemonId` records that no lifecycle owner exists to certify an
+ * identity: a passive transport dials whatever daemon already published the
+ * default connection file, so it has nothing to fence against — the same
+ * contract an explicit connection file carries. That is distinct from `null`
+ * certification, which means no demand has settled for the live connection.
+ */
+interface ConnectionCertification {
+    expectedDaemonId?: Uint8Array;
+}
+
+/** A connection paired with the certification its dial validated it against. */
+interface CertifiedConnection extends ConnectionCertification {
+    client: McHostClient;
+}
+
 export interface ModuleTransportGenerationChangedResult {
     transport_status: "connection_generation_changed";
     previous_generation: number;
@@ -462,7 +479,9 @@ export class McHostModuleTransport {
     private queuedLaneWaiters = 0;
     private wrapupSessions = new Map<string, number>();
     private nextProbeMs = 0;
-    private connectionPromise: Promise<McHostClient> | null = null;
+    // The dial in flight carries its own certification so a caller that lands on
+    // it inherits what the demand behind it proved, instead of demanding again.
+    private connectionPromise: Promise<CertifiedConnection> | null = null;
     private authorityProjectRoot = "";
     /**
      * Filesystem root used to bind authority/mirror routes. Authority request
@@ -473,7 +492,13 @@ export class McHostModuleTransport {
     private authorityBindRoot = "";
     private backoffMs = CONNECT_BACKOFF_INITIAL_MS;
     private connectionGeneration = 0;
-    private compatibleDaemonId: Uint8Array | null = null;
+    /**
+     * Certification for the live connection, or `null` when no demand has
+     * settled for it. A record with no `expectedDaemonId` is a certified
+     * passive connection: no owner exists to name a daemon, so there is no
+     * identity to re-check and the connection stays reusable.
+     */
+    private connectionCertification: ConnectionCertification | null = null;
     private stateSyncCapabilityCache: {
         generation: number;
         capabilities: { state_sync_deltas?: boolean };
@@ -1356,31 +1381,52 @@ export class McHostModuleTransport {
     private async ensureConnected(
         deadline?: Deadline,
         signal?: AbortSignal,
-    ): Promise<{ client: McHostClient; expectedDaemonId?: Uint8Array }> {
+    ): Promise<CertifiedConnection> {
         const cached = this.client;
         if (cached) {
             if (this.connectionOrigin !== "managed-default") {
                 return { client: cached };
             }
-            const certified = this.compatibleDaemonId;
-            const actual = cached.authenticated?.daemonId;
-            // An unset peer identity is the facade's own generation recovery, not
-            // a rotation, so it reuses the certified identity and lets the facade
-            // reconnect; the per-request fence still asserts against that
-            // identity, so a reconnect onto a different daemon fails not_sent.
-            // Only an identity that is present and different is a real rotation.
-            if (
-                certified !== null &&
-                (actual === null || actual === undefined || sameDaemonId(actual, certified))
-            ) {
-                return { client: cached, expectedDaemonId: certified };
+            const certified = this.connectionCertification;
+            if (certified) {
+                const expected = certified.expectedDaemonId;
+                // A certification without an identity comes from a transport with
+                // no lifecycle owner: nothing ever named the daemon behind the
+                // default connection file, so there is no expectation to re-check
+                // and no fence to carry. Requiring one here would reopen the
+                // connection on every request.
+                if (expected === undefined) return { client: cached };
+                const actual = cached.authenticated?.daemonId;
+                // An unset peer identity is the facade's own generation recovery, not
+                // a rotation, so it reuses the certified identity and lets the facade
+                // reconnect; the per-request fence still asserts against that
+                // identity, so a reconnect onto a different daemon fails not_sent.
+                // Only an identity that is present and different is a real rotation.
+                if (actual === null || actual === undefined || sameDaemonId(actual, expected)) {
+                    return { client: cached, expectedDaemonId: expected };
+                }
             }
+            // Closing a shared client retires every request already invoked on it
+            // as outcome_unknown, so reaching here needs evidence about the peer —
+            // an uncertified connection, or an identity that replaced the
+            // certified one — never the arrival of another caller.
             this.invalidateConnection(cached);
         }
+        // A dial already in flight carries the certification the demand behind it
+        // produced, and every caller here lands on that same connection. Joining
+        // it before demanding again keeps a second caller from spending its
+        // deadline on a duplicate start transaction and compatibility probe, and
+        // from contending for the lifecycle lock the first caller already holds.
+        const joinable = this.connectionPromise;
+        if (joinable) {
+            if (signal?.aborted) {
+                throw signal.reason ?? new Error("module transport call aborted");
+            }
+            return await joinable;
+        }
         // Backoff gates the lifecycle demand as well as the dial: a rotated or
-        // unreachable daemon must not be re-probed at full request rate. An
-        // in-flight connection is joined below without a new attempt.
-        if (!this.connectionPromise && Date.now() < this.nextProbeMs) {
+        // unreachable daemon must not be re-probed at full request rate.
+        if (Date.now() < this.nextProbeMs) {
             throw this.connectionBackoffError();
         }
         let expectedDaemonId: Uint8Array | undefined;
@@ -1403,26 +1449,35 @@ export class McHostModuleTransport {
             }
             throw error;
         }
-        this.compatibleDaemonId =
-            expectedDaemonId === undefined ? null : Uint8Array.from(expectedDaemonId);
+        // The copy is what both this transport and every joining caller read, so
+        // the demand's own array can never be mutated underneath a live fence.
+        const certification: ConnectionCertification =
+            expectedDaemonId === undefined
+                ? {}
+                : { expectedDaemonId: Uint8Array.from(expectedDaemonId) };
+        this.connectionCertification = certification;
         if (signal?.aborted) {
             throw signal.reason ?? new Error("module transport call aborted");
         }
-        if (this.connectionPromise) {
-            const candidate = await this.connectionPromise;
+        // Another caller can have opened a dial while this demand was awaiting.
+        // Its connection is the one this transport keeps, so join it rather than
+        // dialing a second time, and hold it to this demand's own certification.
+        const raced = this.connectionPromise;
+        if (raced) {
+            const joined = await raced;
             if (
                 expectedDaemonId !== undefined &&
-                !sameDaemonId(candidate.authenticated?.daemonId, expectedDaemonId)
+                !sameDaemonId(joined.client.authenticated?.daemonId, expectedDaemonId)
             ) {
-                this.invalidateConnection(candidate);
+                this.invalidateConnection(joined.client);
                 throw this.connectionChangedError(
                     "daemon changed after lifecycle compatibility validation",
                 );
             }
-            return { client: candidate, expectedDaemonId };
+            return joined;
         }
         const generation = this.connectionGeneration;
-        const connecting = (async (): Promise<McHostClient> => {
+        const connecting = (async (): Promise<CertifiedConnection> => {
             let candidate: McHostClient | null = null;
             try {
                 candidate = await this.connectClient(deadline);
@@ -1443,7 +1498,7 @@ export class McHostModuleTransport {
                 this.routes.clear();
                 this.backoffMs = CONNECT_BACKOFF_INITIAL_MS;
                 this.nextProbeMs = 0;
-                return candidate;
+                return { client: candidate, ...certification };
             } catch (error) {
                 candidate?.close();
                 if (generation === this.connectionGeneration) this.invalidateConnection();
@@ -1454,7 +1509,7 @@ export class McHostModuleTransport {
         })();
         this.connectionPromise = connecting;
         try {
-            return { client: await connecting, expectedDaemonId };
+            return await connecting;
         } finally {
             if (this.connectionPromise === connecting) this.connectionPromise = null;
         }
@@ -1471,7 +1526,7 @@ export class McHostModuleTransport {
     private invalidateConnection(client: McHostClient | null = this.client): void {
         if (client && this.client !== client) return;
         this.connectionGeneration += 1;
-        this.compatibleDaemonId = null;
+        this.connectionCertification = null;
         this.invalidateStateSyncCapabilities();
         this.client = null;
         this.routes.clear();
