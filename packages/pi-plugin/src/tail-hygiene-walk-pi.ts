@@ -8,6 +8,8 @@ import {
 	type TailHygienePartKind,
 	type TailHygienePartMeasurement,
 } from "@magic-context/core/hooks/magic-context/tail-hygiene-walk";
+import { isRecord } from "@magic-context/core/shared/record-type-guard";
+import { stableStringify } from "@magic-context/core/shared/stable-json";
 import { PI_CTX_REDUCE_KEEP } from "./heuristic-cleanup-pi";
 
 const TAG_PREFIX = /^§(\d+)§\s*/;
@@ -50,10 +52,6 @@ interface DraftPart {
 	tag?: TagEntry;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return value !== null && typeof value === "object";
-}
-
 function fnv1a32(value: string): string {
 	let hash = FNV1A_32_OFFSET;
 	for (let index = 0; index < value.length; index += 1) {
@@ -64,22 +62,12 @@ function fnv1a32(value: string): string {
 }
 
 function safeStableStringify(value: unknown): string {
-	const seen = new Set<object>();
+	if (value === undefined || value === null) return "";
+	if (typeof value === "string") return value;
 	try {
-		return (
-			JSON.stringify(value, (_key, current) => {
-				if (!isRecord(current) || Array.isArray(current)) return current;
-				if (seen.has(current)) return "[Circular]";
-				seen.add(current);
-				return Object.fromEntries(
-					Object.entries(current).sort(([left], [right]) =>
-						left.localeCompare(right),
-					),
-				);
-			}) ?? ""
-		);
+		return stableStringify(value);
 	} catch {
-		return "";
+		return String(value);
 	}
 }
 
@@ -407,7 +395,7 @@ function excludedDraft(key: string, value: unknown): DraftPart {
 	return {
 		key,
 		kind: "excluded",
-		content: typeof value === "string" ? value : safeStableStringify(value),
+		content: safeStableStringify(value),
 		tokens: 0,
 	};
 }
@@ -604,10 +592,13 @@ export function measurePiTailHygiene(
 					drafts.push(excludedDraft(`${key}\0toolInput`, part));
 					continue;
 				}
-				const content = safeStableStringify(part.arguments);
-				if (!content) {
+				// Present-but-empty arguments still measure as a toolInput part
+				// (content ""), matching the core leg; only absent arguments are
+				// excluded from measurement.
+				if (part.arguments === undefined) {
 					drafts.push(excludedDraft(`${key}\0toolInput`, part));
 				} else {
+					const content = safeStableStringify(part.arguments);
 					drafts.push({
 						key: `${key}\0toolInput`,
 						kind: "toolInput",
