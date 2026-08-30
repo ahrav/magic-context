@@ -1,9 +1,12 @@
-use crate::sqlite_runtime::{DIRECT_FORMAT_EPOCH, MC_APPLICATION_ID};
+use crate::sqlite_runtime::{
+    compute_marker_digest_for_application_id, DIRECT_FORMAT_EPOCH, MC_APPLICATION_ID,
+};
 use rusqlite::{params, Connection, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 pub const KERNEL_APPLICATION_ID: u32 = MC_APPLICATION_ID;
+pub const KERNEL_FORMAT_EPOCH: i64 = DIRECT_FORMAT_EPOCH;
 pub const KERNEL_SCHEMA_COMPONENT_NAMES: &[&str] = &[
     "commit_log",
     "change_event",
@@ -161,7 +164,7 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "mc_kernel_format_marker",
-        r#"CREATE TABLE mc_kernel_format_marker(singleton INTEGER PRIMARY KEY CHECK(singleton=1),format_epoch INTEGER NOT NULL,database_incarnation_id TEXT NOT NULL CHECK(length(database_incarnation_id)=32),schema_digest TEXT NOT NULL CHECK(length(schema_digest)=64),created_at INTEGER NOT NULL) STRICT; CREATE TRIGGER mc_kernel_format_marker_no_update BEFORE UPDATE ON mc_kernel_format_marker BEGIN SELECT RAISE(ABORT,'mc_kernel_format_marker is immutable'); END; CREATE TRIGGER mc_kernel_format_marker_no_delete BEFORE DELETE ON mc_kernel_format_marker BEGIN SELECT RAISE(ABORT,'mc_kernel_format_marker is immutable'); END;"#,
+        r#"CREATE TABLE mc_kernel_format_marker(singleton INTEGER PRIMARY KEY CHECK(singleton=1),format_epoch INTEGER NOT NULL,database_incarnation_id TEXT NOT NULL CHECK(length(database_incarnation_id)=32),schema_digest TEXT NOT NULL CHECK(length(schema_digest)=64),created_at INTEGER NOT NULL,marker_digest TEXT NOT NULL CHECK(length(marker_digest)=64)) STRICT; CREATE TRIGGER mc_kernel_format_marker_no_update BEFORE UPDATE ON mc_kernel_format_marker BEGIN SELECT RAISE(ABORT, 'mc_kernel_format_marker is immutable'); END; CREATE TRIGGER mc_kernel_format_marker_no_delete BEFORE DELETE ON mc_kernel_format_marker BEGIN SELECT RAISE(ABORT, 'mc_kernel_format_marker is immutable'); END;"#,
     ),
 ];
 
@@ -291,14 +294,21 @@ fn apply_schema<F: FnOnce() -> rusqlite::Result<()>>(
         return Err(rusqlite::Error::InvalidQuery);
     }
     tx.pragma_update(None, "application_id", KERNEL_APPLICATION_ID)?;
-    tx.pragma_update(None, "user_version", DIRECT_FORMAT_EPOCH)?;
+    tx.pragma_update(None, "user_version", KERNEL_FORMAT_EPOCH)?;
     for (_, sql) in COMPONENTS {
         tx.execute_batch(sql)?;
     }
     tx.execute("INSERT INTO writer_fence(id) VALUES(0)", [])?;
     hook()?;
     let digest = kernel_schema_digest(&tx)?;
-    tx.execute("INSERT INTO mc_kernel_format_marker(singleton,format_epoch,database_incarnation_id,schema_digest,created_at) VALUES(1,1,?1,?2,?3)", params![incarnation,digest,created_at])?;
+    let marker_digest = compute_marker_digest_for_application_id(
+        KERNEL_APPLICATION_ID,
+        KERNEL_FORMAT_EPOCH,
+        incarnation,
+        &digest,
+        created_at,
+    );
+    tx.execute("INSERT INTO mc_kernel_format_marker(singleton,format_epoch,database_incarnation_id,schema_digest,created_at,marker_digest) VALUES(1,?1,?2,?3,?4,?5)", params![KERNEL_FORMAT_EPOCH,incarnation,digest,created_at,marker_digest])?;
     tx.commit()
 }
 
@@ -328,6 +338,20 @@ pub fn kernel_schema_inventory(conn: &Connection) -> rusqlite::Result<Vec<String
             .filter(|name| !KERNEL_SCHEMA_COMPONENT_NAMES.contains(&name.as_str())),
     );
     Ok(result)
+}
+
+pub fn kernel_schema_object_inventory(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT type,name FROM sqlite_schema
+         WHERE name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
+         ORDER BY type,name",
+    )?;
+    let inventory = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect();
+    inventory
 }
 
 pub fn kernel_schema_digest(conn: &Connection) -> rusqlite::Result<String> {

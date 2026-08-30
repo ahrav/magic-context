@@ -178,9 +178,25 @@ pub fn compute_marker_digest(
     component_manifest_digest: &str,
     created_at_ms: i64,
 ) -> String {
+    compute_marker_digest_for_application_id(
+        MC_APPLICATION_ID,
+        format_epoch,
+        database_incarnation_id,
+        component_manifest_digest,
+        created_at_ms,
+    )
+}
+
+pub fn compute_marker_digest_for_application_id(
+    application_id: u32,
+    format_epoch: i64,
+    database_incarnation_id: &str,
+    component_manifest_digest: &str,
+    created_at_ms: i64,
+) -> String {
     let lines = [
         FORMAT_MARKER_DIGEST_PROTOCOL.to_string(),
-        format!("application_id={MC_APPLICATION_ID}"),
+        format!("application_id={application_id}"),
         format!("format_epoch={format_epoch}"),
         format!("database_incarnation_id={database_incarnation_id}"),
         format!("component_manifest_digest={component_manifest_digest}"),
