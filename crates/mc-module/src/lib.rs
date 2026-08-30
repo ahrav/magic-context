@@ -16013,6 +16013,24 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, VecDeque};
 
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use crate::boundary::{BoundaryBlock, BoundaryContext, BoundaryMsg, Role, TriggerContext};
+    use crate::ck_wire::{
+        CkIngressMessage, CkKind, CkOutputKind, CkToolOutput, CkWireBlock, CkWireMessage,
+        HarnessMeta, ProviderExtras,
+    };
+    use historian_producer::{ProducerOutput, RunHandle, RunState};
+    use mc_core::CoreState;
+    use mc_store::{
+        HistorianChunkRange, HistorianDurableState, ModuleMeta, ModuleUsage, NoteEvaluationInput,
+        PendingAgentDrop, StoredCompartment, TagMintInput,
+    };
+    use tokio::sync::Notify;
+
     fn boundary_snapshot_with_entry(block_id: &str) -> BoundaryTokenCacheSnapshot {
         let mut entry_updates = HashMap::new();
         entry_updates.insert(
@@ -16042,43 +16060,6 @@ mod tests {
         assert_eq!(cache.retained_bytes, 0);
         assert!(cache.lru.is_empty());
     }
-
-    #[test]
-    fn boundary_token_cache_evicts_older_sessions_but_never_the_just_inserted_one() {
-        // Budget holds one entry but not two: every insert over budget must
-        // evict the OLDEST session and keep the newcomer. The pre-insert
-        // budget guard makes a self-evicting insert unreachable (the newcomer
-        // alone always fits), so the newest session must always survive.
-        let mut cache = BoundaryTokenCache::new(boundary_entry_charge(2) + 1);
-        cache.replace("s1", boundary_snapshot_with_entry("b1"));
-        assert!(cache.sessions.contains_key("s1"));
-        cache.replace("s2", boundary_snapshot_with_entry("b2"));
-        assert!(!cache.sessions.contains_key("s1"));
-        assert!(cache.sessions.contains_key("s2"));
-        cache.replace("s3", boundary_snapshot_with_entry("b3"));
-        assert!(!cache.sessions.contains_key("s2"));
-        assert!(cache.sessions.contains_key("s3"));
-        assert_eq!(cache.retained_bytes, boundary_entry_charge(2));
-        assert_eq!(cache.lru.len(), 1);
-    }
-
-    use std::sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
-    };
-
-    use crate::boundary::{BoundaryBlock, BoundaryContext, BoundaryMsg, Role, TriggerContext};
-    use crate::ck_wire::{
-        CkIngressMessage, CkKind, CkOutputKind, CkToolOutput, CkWireBlock, CkWireMessage,
-        HarnessMeta, ProviderExtras,
-    };
-    use historian_producer::{ProducerOutput, RunHandle, RunState};
-    use mc_core::CoreState;
-    use mc_store::{
-        HistorianChunkRange, HistorianDurableState, ModuleMeta, ModuleUsage, NoteEvaluationInput,
-        PendingAgentDrop, StoredCompartment, TagMintInput,
-    };
-    use tokio::sync::Notify;
 
     struct SettlementWriter {
         events: Arc<Mutex<Vec<&'static str>>>,

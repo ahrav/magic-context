@@ -12546,28 +12546,33 @@ pub(crate) mod tests {
         McTagRow, ModuleDropSeedRow, ModuleStateSyncRequest, ModuleUsage, StoredCompartment,
     };
 
-    fn tag_baseline_test_entry(retained_bytes: usize) -> TagBaselineCacheEntry {
+    fn tag_baseline_test_entry() -> TagBaselineCacheEntry {
+        let tags = vec![McTagRow {
+            tag_number: 1,
+            block_id: "b1".to_string(),
+            kind: "message".to_string(),
+            token_count: 1,
+            created_at_ms: 0,
+            source_bytes: Vec::new(),
+        }];
+        // Charge through the production sizing function so the pinned budgets
+        // track the real retention envelope.
+        let retained_bytes = tag_baseline_retained_bytes(&tags);
         TagBaselineCacheEntry {
             store_namespace: 1,
             generation: 1,
             count: 1,
             max_tag_number: 1,
-            tags: std::sync::Arc::new(vec![McTagRow {
-                tag_number: 1,
-                block_id: "b1".to_string(),
-                kind: "message".to_string(),
-                token_count: 1,
-                created_at_ms: 0,
-                source_bytes: Vec::new(),
-            }]),
+            tags: Arc::new(tags),
             retained_bytes,
         }
     }
 
     #[test]
     fn tag_baseline_cache_refuses_an_insert_larger_than_its_budget() {
-        let mut cache = TagBaselineCache::new(100);
-        cache.replace("s1", tag_baseline_test_entry(101));
+        let entry = tag_baseline_test_entry();
+        let mut cache = TagBaselineCache::new(entry.retained_bytes - 1);
+        cache.replace("s1", entry);
         assert!(cache.sessions.is_empty());
         assert_eq!(cache.retained_bytes, 0);
         assert!(cache.lru.is_empty());
@@ -12579,13 +12584,15 @@ pub(crate) mod tests {
         // evict the OLDEST session and keep the newcomer. The pre-insert
         // budget guard makes a self-evicting insert unreachable (the newcomer
         // alone always fits), so the newest session must always survive.
-        let mut cache = TagBaselineCache::new(150);
-        cache.replace("s1", tag_baseline_test_entry(100));
+        let entry = tag_baseline_test_entry();
+        let charge = entry.retained_bytes;
+        let mut cache = TagBaselineCache::new(charge + charge / 2);
+        cache.replace("s1", entry);
         assert!(cache.sessions.contains_key("s1"));
-        cache.replace("s2", tag_baseline_test_entry(100));
+        cache.replace("s2", tag_baseline_test_entry());
         assert!(!cache.sessions.contains_key("s1"));
         assert!(cache.sessions.contains_key("s2"));
-        assert_eq!(cache.retained_bytes, 100);
+        assert_eq!(cache.retained_bytes, charge);
         assert_eq!(cache.lru.len(), 1);
     }
 
