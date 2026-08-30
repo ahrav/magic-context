@@ -549,3 +549,51 @@ fn every_outbox_and_retention_entry_point_checks_the_writer_fence() {
         assert_eq!(kind, KernelErrorKind::FenceLost);
     }
 }
+
+#[test]
+fn a_lookup_id_that_redaction_rewrites_cannot_alias_onto_another_consumer() {
+    const AWS_KEY: &str = "AKIAFFFFFFFFFFFFFFFF";
+    const REPLACEMENT: &str = "<AWS_ACCESS_KEY_ID_REDACTED>";
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let first = commit_domain(&store, 1);
+    commit_domain(&store, 2);
+    // The literal replacement survives redaction unchanged, so registration accepts it.
+    store
+        .commit(intent("register-literal"), |envelope| {
+            envelope.register_outbox_consumer(REPLACEMENT, 10)?;
+            Ok("registered".to_string())
+        })
+        .unwrap();
+
+    // Redacting this id yields exactly the registered id, which would advance a consumer
+    // that has read nothing and let prune_outbox delete rows it never consumed.
+    assert_eq!(
+        store
+            .acknowledge_outbox(AWS_KEY, first, 11)
+            .unwrap_err()
+            .kind(),
+        KernelErrorKind::InvalidInput
+    );
+    assert_eq!(
+        store
+            .commit(intent("deregister-alias"), |envelope| {
+                envelope.deregister_outbox_consumer(AWS_KEY, 12)?;
+                Ok("deregistered".to_string())
+            })
+            .unwrap_err()
+            .kind(),
+        KernelErrorKind::InvalidInput
+    );
+    assert_eq!(
+        inspect(directory.path())
+            .query_row(
+                "SELECT checkpoint_commit_seq FROM outbox_consumers WHERE consumer_id=?1",
+                [REPLACEMENT],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+}

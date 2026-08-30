@@ -13,7 +13,7 @@ pub struct OutboxPruneResult {
 }
 
 impl Envelope<'_> {
-    /// `consumer_id` is the primary key of `outbox_consumers`, so redaction has to leave it unchanged. Two ids differing only inside a redacted span would collapse onto one row, and one consumer's acknowledgement would then advance the other's prune horizon.
+    /// Every entry point screens `consumer_id` through [`stable_consumer_id`], since the id is the primary key of `outbox_consumers`.
     ///
     /// # Errors
     ///
@@ -24,14 +24,10 @@ impl Envelope<'_> {
         consumer_id: &str,
         recorded_at: i64,
     ) -> Result<i64, KernelError> {
-        if recorded_at < 0 || consumer_id.trim().is_empty() {
+        if recorded_at < 0 {
             return Err(KernelError::InvalidInput);
         }
-        let redacted = redact(consumer_id);
-        if redacted.text != consumer_id {
-            return Err(KernelError::InvalidInput);
-        }
-        let consumer_id = redacted;
+        let consumer_id = stable_consumer_id(consumer_id)?;
         let oldest_commit = self
             .tx
             .query_row("SELECT MIN(commit_seq) FROM outbox", [], |row| {
@@ -170,10 +166,10 @@ impl Envelope<'_> {
         consumer_id: &str,
         recorded_at: i64,
     ) -> Result<(RedactedField, i64), KernelError> {
-        if recorded_at < 0 || consumer_id.trim().is_empty() {
+        if recorded_at < 0 {
             return Err(KernelError::InvalidInput);
         }
-        let consumer_id = redact(consumer_id);
+        let consumer_id = stable_consumer_id(consumer_id)?;
         let checkpoint = self
             .tx
             .query_row(
@@ -277,10 +273,10 @@ impl KernelStore {
         checkpoint_commit_seq: i64,
         updated_at: i64,
     ) -> Result<(), KernelError> {
-        if consumer_id.trim().is_empty() || checkpoint_commit_seq < 0 || updated_at < 0 {
+        if checkpoint_commit_seq < 0 || updated_at < 0 {
             return Err(KernelError::InvalidInput);
         }
-        let consumer_id = redact(consumer_id);
+        let consumer_id = stable_consumer_id(consumer_id)?;
         let mut writer = self.lock_writer()?;
         let tx = begin_fenced_write(&mut writer, self.lease_epoch())?;
         let current = tx
@@ -343,6 +339,18 @@ impl KernelStore {
         tx.commit().map_err(|_| KernelError::Io)?;
         Ok(OutboxPruneResult { horizon, deleted })
     }
+}
+
+/// Redaction is not injective, so an id it rewrites can alias onto a different registered consumer. Screening every entry point, not just registration, keeps one consumer's acknowledgement from advancing another's prune horizon.
+fn stable_consumer_id(consumer_id: &str) -> Result<RedactedField, KernelError> {
+    if consumer_id.trim().is_empty() {
+        return Err(KernelError::InvalidInput);
+    }
+    let redacted = redact(consumer_id);
+    if redacted.text != consumer_id {
+        return Err(KernelError::InvalidInput);
+    }
+    Ok(redacted)
 }
 
 fn published_watermark(tx: &Transaction<'_>) -> Result<i64, KernelError> {

@@ -804,3 +804,50 @@ fn remediation_rejects_an_unknown_object_and_a_non_domain_kind() {
         KernelErrorKind::InvalidInput
     );
 }
+
+#[test]
+fn staging_a_candidate_cannot_revive_a_run_whose_lease_expired() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    store
+        .stage_candidate(candidate("run", "first", 100))
+        .unwrap();
+
+    // The stored lease ends at 100 + HOUR_MS. A producer arriving at that instant is as
+    // stale as one calling renew_staging_run, so both paths refuse it.
+    assert_eq!(
+        store
+            .stage_candidate(candidate("run", "second", 100 + HOUR_MS))
+            .unwrap_err()
+            .kind(),
+        KernelErrorKind::Conflict
+    );
+    let connection = inspect(directory.path());
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM candidates", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT lease_expires_at FROM extraction_runs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        100 + HOUR_MS
+    );
+
+    // A producer still inside the lease keeps working.
+    store
+        .stage_candidate(candidate("run", "third", 100 + HOUR_MS - 1))
+        .unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM candidates", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+}
