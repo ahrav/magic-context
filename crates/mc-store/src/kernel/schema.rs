@@ -209,8 +209,7 @@ fn apply_schema<F: FnOnce() -> rusqlite::Result<()>>(
         KERNEL_SCHEMA_COMPONENT_NAMES,
         "kernel schema component names must stay aligned with their SQL"
     );
-    for (name, sql) in COMPONENTS {
-        assert!(KERNEL_SCHEMA_COMPONENT_NAMES.contains(&name));
+    for (_name, sql) in COMPONENTS {
         tx.execute_batch(sql)?;
     }
     tx.execute("INSERT INTO writer_fence(id) VALUES(0)", [])?;

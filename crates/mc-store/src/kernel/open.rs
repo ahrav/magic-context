@@ -187,11 +187,12 @@ impl KernelStore {
         let lease = lease_store.acquire(&lease_key).map_err(map_lease_error)?;
         let lease_epoch = lease.epoch();
 
-        if restore_marker_path(&db_path).exists() {
-            return Err(KernelError::Inconclusive);
+        // The lease excludes concurrent opens while either path moves the database family.
+        if marker_present(&restore_marker_path(&db_path))? {
+            super::backup::resume_restore(&db_path)?;
         }
 
-        if reset_marker_path(&db_path).exists() {
+        if marker_present(&reset_marker_path(&db_path))? {
             resume_quarantine(&db_path)?;
         }
 
@@ -286,6 +287,16 @@ impl KernelStore {
             )
             .map_err(|_| KernelError::Io)?;
         Ok(())
+    }
+}
+
+// `Path::exists` reports false for EACCES, EIO and ELOOP as well as for a
+// missing file, which would let an unreadable marker pass as absent.
+fn marker_present(path: &Path) -> Result<bool, KernelError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(KernelError::Inconclusive),
     }
 }
 
@@ -504,8 +515,13 @@ pub(super) fn apply_preclassification_profile(conn: &Connection) -> rusqlite::Re
 }
 
 pub(super) fn activate_wal(conn: &Connection) -> Result<(), KernelError> {
-    conn.pragma_update(None, "journal_mode", "WAL")
+    // A refused WAL conversion returns the original mode; verify the returned mode.
+    let mode: String = conn
+        .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
         .map_err(|_| KernelError::Io)?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        return Err(KernelError::Io);
+    }
     conn.pragma_update(None, "synchronous", "FULL")
         .map_err(|_| KernelError::Io)
 }
@@ -698,15 +714,19 @@ fn valid_quarantine_path(path: &Path, quarantine: &Path) -> bool {
 }
 
 fn reset_marker_path(path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}{}", path.display(), RESET_MARKER_SUFFIX))
+    suffix_path(path, RESET_MARKER_SUFFIX)
 }
 
 pub(super) fn restore_marker_path(path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}{}", path.display(), RESTORE_MARKER_SUFFIX))
+    suffix_path(path, RESTORE_MARKER_SUFFIX)
 }
 
-fn suffix_path(path: &Path, suffix: &str) -> PathBuf {
-    PathBuf::from(format!("{}{suffix}", path.display()))
+// `Path::display` is lossy, so a non-UTF-8 database path would yield a sidecar
+// path that names a different file.
+pub(super) fn suffix_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, KernelError> {

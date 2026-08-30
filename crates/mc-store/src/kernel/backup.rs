@@ -1,7 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -12,13 +11,14 @@ use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use rustix::fs::RenameFlags;
 use rustix::fs::{self as rfs, AtFlags, Mode, OFlags};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::envelope::check_fence;
 use super::open::{
     activate_wal, apply_preclassification_profile, current_time_ms, family_sidecars, harden_family,
-    open_reader, open_writer, restore_marker_path, stamp_writer_fence, sync_directory, sync_parent,
-    verify_exact_identity,
+    open_reader, open_writer, restore_marker_path, stamp_writer_fence, suffix_path, sync_directory,
+    sync_parent, verify_exact_identity,
 };
 use super::{KernelError, KernelStore, Sensitivity};
 
@@ -28,7 +28,7 @@ const BACKUP_PREFIX: &str = "core-backup-";
 const RESTORE_INFIX: &str = ".mc-restore-";
 const RESTORE_MARKER_PROTOCOL: &str = "mc-kernel-restore-marker-v1";
 #[cfg(target_os = "linux")]
-const LOCAL_FILESYSTEMS: &[i64] = &[
+const LOCAL_FILESYSTEMS: &[u64] = &[
     0x0000_ef53, // ext2, ext3, ext4
     0x5846_5342, // XFS
     0x9123_683e, // Btrfs
@@ -61,17 +61,6 @@ pub struct BackupManifest {
     pub destination_path: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackupResult {
-    pub manifest: BackupManifest,
-}
-
-#[cfg(feature = "test-support")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackupFault {
-    BeforeRename,
-}
-
 #[cfg(feature = "test-support")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestoreFault {
@@ -87,17 +76,16 @@ struct CaptureState {
 }
 
 impl KernelStore {
-    pub fn backup(&self, request: BackupRequest) -> Result<BackupResult, KernelError> {
+    pub fn backup(&self, request: BackupRequest) -> Result<BackupManifest, KernelError> {
         self.backup_inner(request, false, None, None)
     }
 
     #[cfg(feature = "test-support")]
-    pub fn backup_with_fault_for_test(
+    pub fn backup_with_fault_before_rename_for_test(
         &self,
         request: BackupRequest,
-        fault: BackupFault,
-    ) -> Result<BackupResult, KernelError> {
-        self.backup_inner(request, fault == BackupFault::BeforeRename, None, None)
+    ) -> Result<BackupManifest, KernelError> {
+        self.backup_inner(request, true, None, None)
     }
 
     #[cfg(feature = "test-support")]
@@ -105,7 +93,7 @@ impl KernelStore {
         &self,
         request: BackupRequest,
         mut hook: impl FnMut(),
-    ) -> Result<BackupResult, KernelError> {
+    ) -> Result<BackupManifest, KernelError> {
         self.backup_inner(request, false, Some(&mut hook), None)
     }
 
@@ -114,7 +102,7 @@ impl KernelStore {
         &self,
         request: BackupRequest,
         final_name: &str,
-    ) -> Result<BackupResult, KernelError> {
+    ) -> Result<BackupManifest, KernelError> {
         self.backup_inner(request, false, None, Some(final_name))
     }
 
@@ -124,7 +112,7 @@ impl KernelStore {
         fault_before_rename: bool,
         mut hook: Option<&mut dyn FnMut()>,
         final_name_override: Option<&str>,
-    ) -> Result<BackupResult, KernelError> {
+    ) -> Result<BackupManifest, KernelError> {
         let destination = secure_destination(&request.destination_directory)?;
         if Instant::now() >= request.deadline {
             return Err(KernelError::Deadline);
@@ -151,7 +139,7 @@ impl KernelStore {
             if let Some(callback) = hook.as_mut() {
                 callback();
             }
-            let sqlite_temp_path = fd_child_path(&destination, &temp_name);
+            let sqlite_temp_path = request.destination_directory.join(&temp_name);
             let mut target = Connection::open_with_flags(
                 &sqlite_temp_path,
                 OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -169,13 +157,13 @@ impl KernelStore {
                         .map_err(|_| KernelError::InvalidBackup)?
                     {
                         StepResult::Done => break,
-                        StepResult::More | StepResult::Busy | StepResult::Locked => {
-                            std::thread::yield_now();
-                        }
+                        StepResult::More => {}
+                        StepResult::Busy | StepResult::Locked => std::thread::yield_now(),
                         _ => return Err(KernelError::InvalidBackup),
                     }
                 }
             }
+            seal_artifact_journal(&target)?;
             drop(target);
             if Instant::now() >= request.deadline {
                 return Err(KernelError::Deadline);
@@ -189,6 +177,7 @@ impl KernelStore {
             if Instant::now() >= request.deadline {
                 return Err(KernelError::Deadline);
             }
+            cleanup_backup_sidecars(&destination, &temp_name)?;
             File::open(&sqlite_temp_path)
                 .and_then(|file| file.sync_all())
                 .map_err(|_| KernelError::Io)?;
@@ -200,22 +189,13 @@ impl KernelStore {
             }
             publish_noreplace(&destination, &temp_name, &final_name)?;
             published = true;
-            cleanup_backup_sidecars(&destination, &temp_name)?;
-            if Instant::now() >= request.deadline {
-                return Err(KernelError::Deadline);
-            }
             destination.sync_all().map_err(|_| KernelError::Io)?;
-            if Instant::now() >= request.deadline {
-                return Err(KernelError::Deadline);
-            }
-            Ok(BackupResult {
-                manifest: BackupManifest {
-                    captured_commit_seq: capture.commit_seq,
-                    evidence_refs: capture.evidence_refs.clone(),
-                    max_sensitivity: capture.max_sensitivity,
-                    capture_pin_id: capture.pin_id.clone(),
-                    destination_path: final_path.clone(),
-                },
+            Ok(BackupManifest {
+                captured_commit_seq: capture.commit_seq,
+                evidence_refs: capture.evidence_refs.clone(),
+                max_sensitivity: capture.max_sensitivity,
+                capture_pin_id: capture.pin_id.clone(),
+                destination_path: final_path.clone(),
             })
         })();
 
@@ -325,8 +305,7 @@ impl KernelStore {
         mut hook: Option<&mut dyn FnMut()>,
     ) -> Result<i64, KernelError> {
         let mut source = open_private_regular_nofollow(backup_path)?;
-        let source_seq =
-            verify_database(&fd_path(&source), None, KernelError::InvalidRestore, None)?;
+        let source_seq = verify_database(backup_path, None, KernelError::InvalidRestore, None)?;
 
         let mut writer = self.lock_writer()?;
         let mut readers = self
@@ -346,11 +325,11 @@ impl KernelStore {
             )
             .map_err(|_| KernelError::Io)?;
         fence_tx.commit().map_err(|_| KernelError::Io)?;
-        let recovery_dir = allocate_recovery_dir(&self.db_path)?;
-        let temp_path = restore_temp_path(&self.db_path);
         let mut temporary = (0..=readers.len())
             .map(|_| Connection::open_in_memory().map_err(|_| KernelError::Io))
             .collect::<Result<Vec<_>, _>>()?;
+        let recovery_dir = allocate_recovery_dir(&self.db_path)?;
+        let temp_path = restore_temp_path(&self.db_path);
         if let Err(error) = publish_restore_marker(&self.db_path, &recovery_dir) {
             let _ = fs::remove_dir(&recovery_dir);
             return Err(error);
@@ -451,7 +430,13 @@ fn secure_destination(path: &Path) -> Result<File, KernelError> {
     {
         return Err(KernelError::UnsafeDestination);
     }
-    let directory = File::open(path).map_err(|_| KernelError::UnsafeDestination)?;
+    let directory = rfs::open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|_| KernelError::UnsafeDestination)?;
     let opened = directory
         .metadata()
         .map_err(|_| KernelError::UnsafeDestination)?;
@@ -465,7 +450,8 @@ fn secure_destination(path: &Path) -> Result<File, KernelError> {
 #[cfg(target_os = "linux")]
 fn classify_destination_filesystem(directory: &File) -> Result<(), KernelError> {
     let filesystem = rfs::fstatfs(directory).map_err(|_| KernelError::UnsafeDestination)?;
-    if filesystem_is_unsafe(filesystem.f_type as i64) {
+    // `FsWord` is `c_long`; masking to 32 bits prevents sign extension from changing filesystem magic values above `i32::MAX` on 32-bit targets.
+    if filesystem_is_unsafe(filesystem.f_type as u64 & 0xffff_ffff) {
         return Err(KernelError::UnsafeDestination);
     }
     Ok(())
@@ -495,29 +481,22 @@ fn classify_destination_filesystem(_directory: &File) -> Result<(), KernelError>
     Err(KernelError::UnsafeDestination)
 }
 
-fn filesystem_is_unsafe(fs_type: i64) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        !LOCAL_FILESYSTEMS.contains(&fs_type)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = fs_type;
-        true
-    }
+#[cfg(target_os = "linux")]
+fn filesystem_is_unsafe(fs_type: u64) -> bool {
+    !LOCAL_FILESYSTEMS.contains(&fs_type)
 }
 
-#[cfg(any(target_os = "macos", feature = "test-support"))]
+#[cfg(target_os = "macos")]
 fn filesystem_name_is_unsafe(name: &str) -> bool {
     !matches!(name, "apfs" | "hfs" | "tmpfs")
 }
 
-#[cfg(feature = "test-support")]
-pub fn filesystem_is_unsafe_for_test(fs_type: i64) -> bool {
+#[cfg(all(target_os = "linux", feature = "test-support"))]
+pub fn filesystem_is_unsafe_for_test(fs_type: u64) -> bool {
     filesystem_is_unsafe(fs_type)
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(all(target_os = "macos", feature = "test-support"))]
 pub fn filesystem_name_is_unsafe_for_test(name: &str) -> bool {
     filesystem_name_is_unsafe(name)
 }
@@ -597,28 +576,7 @@ fn capture_state(
                 .collect::<rusqlite::Result<Vec<_>>>()
         })
         .map_err(|_| KernelError::Io)?;
-    let sensitive = tx
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM object_registry WHERE sensitivity_class<>'normal')
-                 OR EXISTS(SELECT 1 FROM domains WHERE sensitivity_class<>'normal')
-                 OR EXISTS(SELECT 1 FROM entities WHERE sensitivity_class<>'normal')
-                 OR EXISTS(SELECT 1 FROM entity_aliases WHERE sensitivity_class<>'normal')
-                 OR EXISTS(SELECT 1 FROM propositions WHERE sensitivity_class<>'normal')
-                 OR EXISTS(SELECT 1 FROM predicate_schemas WHERE sensitivity_class<>'normal')
-                 OR EXISTS(SELECT 1 FROM scopes WHERE sensitivity_class<>'normal')
-                 OR EXISTS(SELECT 1 FROM anchors WHERE sensitivity_class<>'normal')
-                 OR EXISTS(SELECT 1 FROM evidence_meta WHERE sensitivity_class<>'normal')
-                 OR EXISTS(SELECT 1 FROM asserted_edges WHERE sensitivity_class<>'normal')
-                 OR EXISTS(SELECT 1 FROM relation_registry WHERE sensitivity_class<>'normal')
-                 OR EXISTS(SELECT 1 FROM extraction_runs WHERE sensitivity_class<>'normal')
-                 OR EXISTS(SELECT 1 FROM candidates WHERE sensitivity_class<>'normal')
-                 OR EXISTS(SELECT 1 FROM decisions WHERE sensitivity_class<>'normal')
-                 OR EXISTS(SELECT 1 FROM observations WHERE sensitivity_class<>'normal')
-                 OR EXISTS(SELECT 1 FROM outbox WHERE sensitivity_class<>'normal')",
-            [],
-            |row| row.get::<_, bool>(0),
-        )
-        .map_err(|_| KernelError::Io)?;
+    let sensitive = any_sensitive_row(&tx)?;
     let created_at = current_time_ms();
     let expires_at =
         expires_at.unwrap_or_else(|| created_at.saturating_add(DEFAULT_CAPTURE_PIN_LIFETIME_MS));
@@ -700,6 +658,50 @@ fn cleanup_backup_family(directory: &File, name: &str) {
     }
 }
 
+fn sensitivity_bearing_tables(tx: &rusqlite::Transaction<'_>) -> Result<Vec<String>, KernelError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT m.name FROM sqlite_schema m, pragma_table_info(m.name) p
+             WHERE m.type='table' AND p.name='sensitivity_class'
+             ORDER BY m.name",
+        )
+        .map_err(|_| KernelError::Io)?;
+    let names = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+        .map_err(|_| KernelError::Io)?;
+    // Interpolating a name into SQL is safe only for a plain identifier.
+    if !names
+        .iter()
+        .all(|name| name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    {
+        return Err(KernelError::Io);
+    }
+    Ok(names)
+}
+
+fn any_sensitive_row(tx: &rusqlite::Transaction<'_>) -> Result<bool, KernelError> {
+    let names = sensitivity_bearing_tables(tx)?;
+    if names.is_empty() {
+        return Ok(false);
+    }
+    let clauses = names
+        .iter()
+        .map(|name| format!("EXISTS(SELECT 1 FROM {name} WHERE sensitivity_class<>'normal')"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    tx.query_row(&format!("SELECT {clauses}"), [], |row| {
+        row.get::<_, bool>(0)
+    })
+    .map_err(|_| KernelError::Io)
+}
+
+#[cfg(feature = "test-support")]
+pub fn sensitivity_bearing_tables_for_test(conn: &mut Connection) -> Vec<String> {
+    let tx = conn.transaction().expect("transaction");
+    sensitivity_bearing_tables(&tx).expect("schema scan")
+}
+
 fn cleanup_backup_sidecars(directory: &File, name: &str) -> Result<(), KernelError> {
     for candidate in [
         format!("{name}-journal"),
@@ -714,15 +716,24 @@ fn cleanup_backup_sidecars(directory: &File, name: &str) -> Result<(), KernelErr
     Ok(())
 }
 
+// SQLite refuses to open a read-only artifact whose header declares WAL but
+// lacks a `-wal` sidecar, which is the state the backup copy leaves behind.
+fn seal_artifact_journal(target: &Connection) -> Result<(), KernelError> {
+    let mode: String = target
+        .pragma_update_and_check(None, "journal_mode", "DELETE", |row| row.get(0))
+        .map_err(|_| KernelError::InvalidBackup)?;
+    if !mode.eq_ignore_ascii_case("delete") {
+        return Err(KernelError::InvalidBackup);
+    }
+    Ok(())
+}
+
 fn verify_database(
     path: &Path,
     expected_seq: Option<i64>,
     invalid_error: KernelError,
     deadline: Option<Instant>,
 ) -> Result<i64, KernelError> {
-    if deadline.is_some_and(|value| Instant::now() >= value) {
-        return Err(KernelError::Deadline);
-    }
     let mut connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -780,22 +791,88 @@ pub fn verify_backup_with_deadline_for_test(
     )
 }
 
-#[derive(Serialize)]
-struct RestoreMarker<'a> {
-    protocol: &'static str,
-    database_path: &'a Path,
-    recovery_directory: &'a Path,
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestoreMarker {
+    protocol: String,
+    database_path: PathBuf,
+    recovery_directory: PathBuf,
+    marker_digest: String,
+}
+
+fn restore_marker_digest(marker: &RestoreMarker) -> String {
+    let canonical = format!(
+        "{RESTORE_MARKER_PROTOCOL}\ndatabase_path={}\nrecovery_directory={}",
+        marker.database_path.display(),
+        marker.recovery_directory.display()
+    );
+    format!("{:x}", Sha256::digest(canonical.as_bytes()))
+}
+
+fn valid_recovery_path(path: &Path, recovery_dir: &Path) -> bool {
+    recovery_dir.parent() == path.parent()
+        && recovery_dir.file_name().is_some_and(|name| {
+            name.to_string_lossy().starts_with(&format!(
+                "{}{RESTORE_INFIX}",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ))
+        })
+}
+
+// Rolls back rather than rolling forward. A surviving marker pairs with a
+// `restore` that never returned to its caller, so the displaced family is the
+// authoritative copy and a half-installed replacement is discarded.
+pub(super) fn resume_restore(path: &Path) -> Result<(), KernelError> {
+    let bytes = fs::read(restore_marker_path(path)).map_err(|_| KernelError::Inconclusive)?;
+    let marker: RestoreMarker =
+        serde_json::from_slice(&bytes).map_err(|_| KernelError::Inconclusive)?;
+    if marker.protocol != RESTORE_MARKER_PROTOCOL
+        || marker.database_path != path
+        || marker.marker_digest != restore_marker_digest(&marker)
+        || !valid_recovery_path(path, &marker.recovery_directory)
+        || !marker.recovery_directory.is_dir()
+    {
+        return Err(KernelError::Inconclusive);
+    }
+    remove_restore_scratch(path)?;
+    remove_family(path).map_err(|_| KernelError::Inconclusive)?;
+    restore_displaced_family(path, &marker.recovery_directory)
+        .map_err(|_| KernelError::Inconclusive)?;
+    remove_restore_marker(path)?;
+    cleanup_recovery_dir(path, &marker.recovery_directory);
+    Ok(())
+}
+
+fn remove_restore_scratch(path: &Path) -> Result<(), KernelError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let Some(stem) = path.file_name() else {
+        return Ok(());
+    };
+    let prefix = format!("{}.restore-", stem.to_string_lossy());
+    let entries = fs::read_dir(parent).map_err(|_| KernelError::Inconclusive)?;
+    for entry in entries {
+        let entry = entry.map_err(|_| KernelError::Inconclusive)?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&prefix) && name.ends_with(".tmp") {
+            fs::remove_file(entry.path()).map_err(|_| KernelError::Inconclusive)?;
+        }
+    }
+    Ok(())
 }
 
 fn publish_restore_marker(path: &Path, recovery_dir: &Path) -> Result<(), KernelError> {
+    let mut marker = RestoreMarker {
+        protocol: RESTORE_MARKER_PROTOCOL.to_string(),
+        database_path: path.to_path_buf(),
+        recovery_directory: recovery_dir.to_path_buf(),
+        marker_digest: String::new(),
+    };
+    marker.marker_digest = restore_marker_digest(&marker);
     let marker_path = restore_marker_path(path);
-    let temp_path = PathBuf::from(format!("{}.{}.tmp", marker_path.display(), next_unique()));
-    let bytes = serde_json::to_vec(&RestoreMarker {
-        protocol: RESTORE_MARKER_PROTOCOL,
-        database_path: path,
-        recovery_directory: recovery_dir,
-    })
-    .map_err(|_| KernelError::Io)?;
+    let temp_path = suffix_path(&marker_path, &format!(".{}.tmp", next_unique()));
+    let bytes = serde_json::to_vec(&marker).map_err(|_| KernelError::Io)?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true).mode(0o600);
     let mut file = options.open(&temp_path).map_err(|_| KernelError::Io)?;
@@ -816,7 +893,11 @@ fn publish_restore_marker(path: &Path, recovery_dir: &Path) -> Result<(), Kernel
 }
 
 fn remove_restore_marker(path: &Path) -> Result<(), KernelError> {
-    fs::remove_file(restore_marker_path(path)).map_err(|_| KernelError::Io)?;
+    match fs::remove_file(restore_marker_path(path)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(KernelError::Io),
+    }
     sync_parent(path)
 }
 
@@ -827,9 +908,10 @@ fn cleanup_recovery_dir(path: &Path, recovery_dir: &Path) {
 }
 
 fn open_private_regular_nofollow(path: &Path) -> Result<File, KernelError> {
+    // `NONBLOCK` avoids blocking on a FIFO before the later type check; it is inert for regular files.
     let fd = rfs::open(
         path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map_err(|_| KernelError::InvalidRestore)?;
@@ -860,8 +942,8 @@ fn open_live_family(
     if actual_seq != expected_seq {
         return Err(KernelError::InvalidRestore);
     }
-    stamp_writer_fence(&mut writer, lease_epoch)?;
     activate_wal(&writer)?;
+    stamp_writer_fence(&mut writer, lease_epoch)?;
     harden_family(path)?;
     let readers = (0..reader_count)
         .map(|_| open_reader(path))
@@ -872,18 +954,10 @@ fn open_live_family(
 
 fn allocate_recovery_dir(path: &Path) -> Result<PathBuf, KernelError> {
     for _ in 0..10_000 {
-        let candidate = PathBuf::from(format!(
-            "{}{}{unique}",
-            path.display(),
-            RESTORE_INFIX,
-            unique = next_unique()
-        ));
-        match fs::create_dir(&candidate) {
-            Ok(()) => {
-                fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700))
-                    .map_err(|_| KernelError::Io)?;
-                return Ok(candidate);
-            }
+        let candidate = suffix_path(path, &format!("{RESTORE_INFIX}{}", next_unique()));
+        // Create the recovery directory with mode 0700 so displaced live files are never group- or world-accessible.
+        match std::fs::DirBuilder::new().mode(0o700).create(&candidate) {
+            Ok(()) => return Ok(candidate),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(_) => return Err(KernelError::Io),
         }
@@ -938,7 +1012,7 @@ fn remove_family(path: &Path) -> Result<(), KernelError> {
 }
 
 fn restore_temp_path(path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.restore-{}.tmp", path.display(), next_unique()))
+    suffix_path(path, &format!(".restore-{}.tmp", next_unique()))
 }
 
 fn copy_to_private_temp(source: &mut File, destination: &Path) -> Result<(), KernelError> {
@@ -959,34 +1033,21 @@ fn copy_to_private_temp(source: &mut File, destination: &Path) -> Result<(), Ker
     Ok(())
 }
 
-fn fd_path(file: &File) -> PathBuf {
-    PathBuf::from(format!("{}/{}", fd_directory(), file.as_raw_fd()))
-}
-
-fn fd_child_path(directory: &File, name: &str) -> PathBuf {
-    PathBuf::from(format!(
-        "{}/{}/{name}",
-        fd_directory(),
-        directory.as_raw_fd()
-    ))
-}
-
-#[cfg(target_os = "linux")]
-fn fd_directory() -> &'static str {
-    "/proc/self/fd"
-}
-
-#[cfg(target_os = "macos")]
-fn fd_directory() -> &'static str {
-    "/dev/fd"
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn fd_directory() -> &'static str {
-    "/unsupported-fd-path"
-}
-
 fn next_unique() -> u64 {
-    let counter = UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
-    (u64::from(std::process::id()) << 32) | counter
+    let counter = UNIQUE_ID.fetch_add(1, Ordering::Relaxed) & 0xffff_ffff;
+    (unique_prefix() << 32) | counter
+}
+
+// A PID alone repeats across restarts under namespace-local container PIDs, and a
+// repeated name makes `O_EXCL` creation and `RENAME_NOREPLACE` publication fail
+// with an opaque `EEXIST`.
+fn unique_prefix() -> u64 {
+    static PREFIX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PREFIX.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.subsec_nanos())
+            .unwrap_or(0);
+        u64::from(nanos) ^ u64::from(std::process::id())
+    })
 }
