@@ -313,27 +313,22 @@ pub fn render_decayed_compartments(
     }
     let mut tiers = compute_tiers(compartments, history_budget_tokens);
 
-    // `render_one_compartment` depends only on compartment and tier, so each
-    // cache slot is reusable across the demotion loop's re-renders.
-    let mut rendered_cache: Vec<std::collections::HashMap<u8, String>> =
-        vec![std::collections::HashMap::new(); compartments.len()];
-    let mut render = |tiers: &[u8]| -> String {
-        for (i, c) in compartments.iter().enumerate() {
-            rendered_cache[i]
-                .entry(tiers[i])
-                .or_insert_with(|| render_one_compartment(c, tiers[i]));
-        }
-        let mut parts: Vec<&str> = Vec::with_capacity(compartments.len());
-        for (i, _) in compartments.iter().enumerate() {
-            let rendered = &rendered_cache[i][&tiers[i]];
-            if !rendered.is_empty() {
-                parts.push(rendered);
-            }
-        }
+    // Each demotion changes one tier, so rerender only that compartment.
+    let mut rendered: Vec<String> = compartments
+        .iter()
+        .zip(&tiers)
+        .map(|(c, t)| render_one_compartment(c, *t))
+        .collect();
+    let join_body = |rendered: &[String]| -> String {
+        let parts: Vec<&str> = rendered
+            .iter()
+            .filter(|r| !r.is_empty())
+            .map(String::as_str)
+            .collect();
         parts.join("\n\n")
     };
 
-    let mut body = render(&tiers);
+    let mut body = join_body(&rendered);
     // Budget guard: the curve already targets the budget, but estimate drift or a very
     // tight budget can overshoot. Demote oldest-first until it fits.
     let mut guard = compartments.len() * 5;
@@ -341,18 +336,12 @@ pub fn render_decayed_compartments(
         && estimate_tokens(&body) as f64 > history_budget_tokens
         && guard > 0
     {
-        let mut demoted = false;
-        for t in tiers.iter_mut() {
-            if *t < 5 {
-                *t += 1;
-                demoted = true;
-                break;
-            }
-        }
-        if !demoted {
+        let Some(i) = tiers.iter().position(|t| *t < 5) else {
             break;
-        }
-        body = render(&tiers);
+        };
+        tiers[i] += 1;
+        rendered[i] = render_one_compartment(&compartments[i], tiers[i]);
+        body = join_body(&rendered);
         guard -= 1;
     }
     body

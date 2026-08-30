@@ -790,27 +790,10 @@ pub fn truncate_historian_input_if_needed(input: &str, token_budget: usize) -> S
         return input.to_string();
     }
 
-    // TypeScript slices by UTF-16 code units. Keep the same search space rather than
-    // treating an astral character as one scalar; a cut through a surrogate pair is
-    // represented by the replacement scalar Rust can safely emit for that lone unit.
-    const MID_PAIR: usize = usize::MAX;
-    let mut byte_at_unit = Vec::with_capacity(input.len() + 1);
-    for (byte_offset, ch) in input.char_indices() {
-        byte_at_unit.push(byte_offset);
-        if ch.len_utf16() == 2 {
-            byte_at_unit.push(MID_PAIR);
-        }
-    }
-    byte_at_unit.push(input.len());
-    let unit_len = byte_at_unit.len() - 1;
-
-    let byte_end_for = |requested: usize| -> usize {
-        let mut end = requested.min(unit_len);
-        if byte_at_unit[end] == MID_PAIR {
-            end -= 1;
-        }
-        byte_at_unit[end]
-    };
+    // The reference implementation counts UTF-16 code units.
+    // A cut inside a surrogate pair rounds down to the character start:
+    // `utf16_prefix` never emits a partial scalar.
+    let unit_len = input.chars().map(char::len_utf16).sum::<usize>();
 
     let mut candidate = String::with_capacity(input.len() + HISTORIAN_TRUNCATION_MARKER.len());
     let mut lo = 0usize;
@@ -819,7 +802,7 @@ pub fn truncate_historian_input_if_needed(input: &str, token_budget: usize) -> S
     while lo <= hi {
         let mid = (lo + hi) >> 1;
         candidate.clear();
-        candidate.push_str(&input[..byte_end_for(mid)]);
+        candidate.push_str(crate::transform::utf16_prefix(input, mid));
         candidate.push_str(HISTORIAN_TRUNCATION_MARKER);
         if estimate_tokens(&candidate) <= token_budget {
             best = mid;
@@ -831,11 +814,11 @@ pub fn truncate_historian_input_if_needed(input: &str, token_budget: usize) -> S
         }
     }
 
-    candidate.clear();
-    candidate.push_str(&input[..byte_end_for(best)]);
-    candidate.push_str(HISTORIAN_TRUNCATION_MARKER);
-    candidate.shrink_to_fit();
-    candidate
+    format!(
+        "{}{}",
+        crate::transform::utf16_prefix(input, best),
+        HISTORIAN_TRUNCATION_MARKER
+    )
 }
 
 fn end_placeholder(start: u64) -> u64 {
