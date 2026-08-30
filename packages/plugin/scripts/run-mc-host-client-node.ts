@@ -8,16 +8,15 @@ const ENTRIES = {
     synapse: "smoke-mc-host-synapse.ts",
 } as const;
 
-const mode = process.argv[2] ?? "all";
+const mode = process.argv[2] ?? "smoke";
 if (mode !== "smoke" && mode !== "synapse" && mode !== "all") {
     console.error(
         `usage: run-mc-host-client-node.ts [smoke|synapse|all] (got "${mode}")`,
     );
     process.exit(2);
 }
-// The synapse smoke needs a native ONNX Runtime library, so it runs only
-// when named explicitly.
-const selected = mode === "all" ? (["smoke"] as const) : ([mode] as const);
+// `synapse` requires a native ONNX Runtime library, so the default launcher runs only `smoke`. commentlint: allow(JUDGE)
+const selected = mode === "all" ? (["smoke", "synapse"] as const) : ([mode] as const);
 
 const here = dirname(fileURLToPath(import.meta.url));
 const outDir = mkdtempSync(join(here, ".mc-host-client-node-"));

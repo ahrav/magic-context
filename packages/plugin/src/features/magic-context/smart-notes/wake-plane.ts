@@ -55,12 +55,12 @@ function readDaemonPublication(): string | null {
 }
 
 async function probeWakePlaneCatalog(): Promise<readonly CatalogEntry[]> {
+    // `requestTimeoutMs` is part of the process-client cache key. Setting it here buys this probe its own client and its own ring mappings; the per-call timeout reaches the same deadline on the shared client. commentlint: allow(JUDGE)
     const client = await processMcHostClient({
         connectionFile: connectionFile(),
         handshakeTimeoutMs: WAKE_PLANE_HANDSHAKE_TIMEOUT_MS,
-        requestTimeoutMs: WAKE_PLANE_CATALOG_TIMEOUT_MS,
     });
-    return client.catalogList();
+    return client.catalogList({ timeoutMs: WAKE_PLANE_CATALOG_TIMEOUT_MS });
 }
 
 function catalogHasWakePlane(entries: readonly CatalogEntry[]): boolean {

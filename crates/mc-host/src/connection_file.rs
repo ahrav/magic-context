@@ -23,7 +23,7 @@ use crate::{
     wire::PROTOCOL_VERSION,
 };
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 pub const MIN_KEY_LEN: usize = 32;
 pub const KEY_LEN: usize = 32;
 pub const DAEMON_ID_LEN: usize = 16;

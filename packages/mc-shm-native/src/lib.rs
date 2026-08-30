@@ -577,9 +577,8 @@ pub fn connect_setup(env: &Env, options: NativeSetupOptions) -> Result<u32> {
         Duration::from_millis(u64::from(options.timeout_ms)),
     )
     .map_err(|failure| {
-        if failure.kind() == std::io::ErrorKind::PermissionDenied
-            && failure.to_string() == "shared-memory identity mismatch"
-        {
+        // `setup::connect` reports identity mismatch as its only `PermissionDenied` failure, so the kind alone selects the message. commentlint: allow(JUDGE)
+        if failure.kind() == std::io::ErrorKind::PermissionDenied {
             error("shared-memory identity mismatch")
         } else {
             error("shared-memory setup failed")

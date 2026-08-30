@@ -85,7 +85,7 @@ async fn discovery_validates_the_publication_the_way_a_client_must() {
     assert_eq!(owned.key.len(), 32);
 
     let info = mc_host::read_connection_file(host.publication_path()).expect("valid publication");
-    assert_eq!(info.schema, 1);
+    assert_eq!(info.schema, 2);
     assert_eq!(info.wire_version, 2);
     assert!(!info.setup_socket.is_empty());
     assert_eq!(info.key.len(), 32);

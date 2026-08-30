@@ -150,6 +150,11 @@ pub fn data_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, Instan
         path.is_absolute().then_some(path)
     }
     match data_dir_override {
+        // The setup socket path uses this directory; `ConnectionInfo::validate` rejects relative `setup_socket` paths. commentlint: allow(JUDGE)
+        Some(dir) if !dir.is_absolute() => Err(InstanceError::Insecure {
+            what: "data directory override is not absolute",
+            path: dir.to_path_buf(),
+        }),
         Some(dir) => Ok(dir.to_path_buf()),
         None => match std::env::var_os("XDG_DATA_HOME").and_then(absolute) {
             Some(dir) => Ok(dir),
@@ -1050,7 +1055,7 @@ mod tests {
     }
 
     #[test]
-    fn publication_matches_schema_1_shape() {
+    fn publication_matches_schema_2_shape() {
         let root = temp_root();
         let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
         guard
@@ -1059,7 +1064,7 @@ mod tests {
 
         let bytes = std::fs::read(published(&guard)).expect("read publication");
         let json: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
-        assert_eq!(json["schema"], 1);
+        assert_eq!(json["schema"], 2);
         assert_eq!(json["wire_version"], 2);
         assert_eq!(
             json["setup_socket"],

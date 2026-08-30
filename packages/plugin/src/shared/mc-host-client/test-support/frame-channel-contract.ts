@@ -9,7 +9,6 @@
 
 import assert from "node:assert/strict";
 import { setTimeout as delay } from "node:timers/promises";
-import { Deadline } from "../deadline";
 import { McHostCallError } from "../errors";
 import {
     type ByteBudget,
@@ -43,9 +42,6 @@ function expectMcHostCallError(
 
 const CHANNEL = 5;
 const EPOCH = 9;
-/** Large enough to park the writer pump on 'drain' behind a paused peer. */
-const WEDGE_BYTES = 8 * 1024 * 1024;
-
 /** One frame decoded by the remote end's own independent decoder. */
 export interface ContractPeerFrame {
     ty: number;
@@ -166,18 +162,6 @@ function producerHeader(corr: bigint): ProducerFrameHeader {
     };
 }
 
-function pongHeader(corr: bigint): OutboundFrame["header"] {
-    return {
-        len: 0,
-        ver: PROTOCOL_VERSION,
-        ty: FrameType.Pong,
-        flags: 0,
-        channel: 0,
-        epoch: 0,
-        corr,
-    };
-}
-
 function requestCorrs(peer: ContractPeer): bigint[] {
     return peer.frames.filter((frame) => frame.ty === FrameType.Request).map((frame) => frame.corr);
 }
@@ -242,8 +226,6 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
         },
     },
     {
-        // Byte saturation blocks at the queue-byte and aggregate-cap
-        // boundaries with distinct refusal codes.
         name: "byte saturation refuses admission at the aggregate cap",
         async run(create) {
             const capped = await create({ memoryCapBytes: 1_000 });

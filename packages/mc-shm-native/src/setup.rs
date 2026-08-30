@@ -349,12 +349,27 @@ fn write_message<T: Serialize>(
     stream.write_all(&frame)
 }
 
-fn read_exact(stream: &mut UnixStream, bytes: &mut [u8], deadline: Instant) -> io::Result<()> {
-    if bytes.is_empty() {
-        return Ok(());
+fn read_exact(stream: &mut UnixStream, mut bytes: &mut [u8], deadline: Instant) -> io::Result<()> {
+    // `std::io::Read::read_exact` grants each underlying recv the full
+    // remaining budget, so a trickling peer could stretch wall time to
+    // remaining × len. Re-arming the timeout per chunk caps the whole read
+    // at the deadline.
+    while !bytes.is_empty() {
+        set_timeout(stream, deadline)?;
+        match stream.read(bytes) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(read) => bytes = &mut bytes[read..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(error),
+        }
     }
-    set_timeout(stream, deadline)?;
-    stream.read_exact(bytes)
+    Ok(())
 }
 
 fn set_timeout(stream: &UnixStream, deadline: Instant) -> io::Result<()> {

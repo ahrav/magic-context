@@ -58,6 +58,21 @@ export function processMcHostClient(options: McHostClientOptions): Promise<McHos
     return created;
 }
 
+/** The cache retains resolved promises, so a caller that closes a shared client must first drop the entry or later callers receive the closed instance. Eviction is identity-scoped: a concurrently created replacement under the same key survives. commentlint: allow(JUDGE) */
+export async function evictProcessMcHostClient(
+    options: McHostClientOptions,
+    client: McHostClient,
+): Promise<void> {
+    const key = ownerKey(options);
+    const entry = clients.get(key);
+    if (entry === undefined) return;
+    const resolved = await entry.then(
+        (value) => value,
+        () => undefined,
+    );
+    if (resolved === client && clients.get(key) === entry) clients.delete(key);
+}
+
 export function resetProcessMcHostClientsForTest(): void {
     for (const client of clients.values()) {
         void client.then((value) => value.closeAsync()).catch(() => undefined);

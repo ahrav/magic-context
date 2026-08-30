@@ -28,7 +28,7 @@ import type { Deadline } from "./deadline";
 
 /** Snapshot cap from wire doc Section 4.1: 65,536 bytes. */
 export const MAX_CONNECTION_FILE_LEN = 65_536;
-export const CONNECTION_FILE_SCHEMA = 1;
+export const CONNECTION_FILE_SCHEMA = 2;
 export const KEY_LEN = 32;
 export const DAEMON_ID_LEN = 16;
 /** Required in every connection file; any value other than 2 fails closed. */
@@ -298,7 +298,7 @@ function invalid(code: ConnectionFileErrorCode, message: string): ConnectionFile
 }
 
 /**
- * Validate the decoded JSON against wire doc Section 4.1: schema 1,
+ * Validate the decoded JSON against wire doc Section 4.1: schema 2,
  * a required wire version of exactly 2, an absolute setup-socket path,
  * exactly 32 key bytes, exactly 16 daemon-ID bytes, a safe
  * integer PID, and a nonempty daemon version. No coercion anywhere.

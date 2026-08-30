@@ -806,11 +806,6 @@ export class McHostClient {
         }
         // A generation that retires during setup is never published.
         if (generation.isRetired()) return conn;
-        if (this.closeStarted) {
-            generation.retire("owner_close");
-            throw new McHostClientError("client closed", "client_closed");
-        }
-        if (generation.isRetired()) return conn;
         this.active = conn;
         this.emitConnected(conn);
         return conn;

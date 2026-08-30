@@ -3,16 +3,9 @@ import type { Deadline } from "./deadline";
 import { type EnvelopeHeader, FrameType, isLegalHostToConsumerType } from "./protocol";
 
 export type FrameChannelCloseReason =
-    | "socket_error"
     | "eof"
-    | "truncated_frame"
-    | "socket_closed"
-    | "socket_timeout"
     | "protocol_violation"
     | "role_violation"
-    | "frame_deadline"
-    | "write_failed"
-    | "control_capacity_exhausted"
     | "quarantined";
 
 export type ProducerFrameHeader = Omit<EnvelopeHeader, "len">;

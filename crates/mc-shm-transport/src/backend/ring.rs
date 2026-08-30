@@ -549,12 +549,18 @@ impl Ring {
     }
 
     /// Creates ring using already validated candidate runtime directory.
+    ///
+    /// Profile identity is enforced upstream by `TargetProfile::new`; only span geometry is re-checked here because it constrains this ring's wrap behavior. commentlint: allow(JUDGE)
     pub fn create_in(
         profile: &TargetProfile,
         lane: u32,
         runtime: &RuntimeDir,
     ) -> Result<Self, RingError> {
         runtime.validate()?;
+        debug_assert_eq!(
+            profile.descriptor().schema_version(),
+            DESCRIPTOR_SCHEMA_VERSION
+        );
         // Reservations crossing the arena end wrap into two spans, so a
         // profile advertising fewer spans per frame cannot be honored.
         if profile.max_spans() < MAX_SPANS {
@@ -1778,14 +1784,15 @@ fn create_macos_shm(len: usize) -> Result<OwnedFd, RingError> {
     }
     // SAFETY: successful shm_open returns newly owned descriptor.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-    // SAFETY: name.as_ptr() remains valid for the call; shm_unlink removes the name immediately.
-    if unsafe { libc::shm_unlink(name.as_ptr()) } != 0 {
-        return Err(RingError::ObjectSetupFailed);
-    }
-    // macOS rejects O_CLOEXEC in shm_open flags, so set descriptor inheritance
-    // after opening and unlinking the unique shared-memory name.
+    // macOS rejects O_CLOEXEC in shm_open flags, so a fork+exec racing
+    // fcntl can inherit the descriptor. Set FD_CLOEXEC immediately after
+    // shm_open to minimize that inheritance window.
     // SAFETY: fd is owned and F_SETFD changes only its descriptor flags.
     if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(RingError::ObjectSetupFailed);
+    }
+    // SAFETY: name.as_ptr() remains valid for the call; shm_unlink removes the name immediately.
+    if unsafe { libc::shm_unlink(name.as_ptr()) } != 0 {
         return Err(RingError::ObjectSetupFailed);
     }
     let len = libc::off_t::try_from(len).map_err(|_| RingError::ArithmeticOverflow)?;

@@ -16,10 +16,12 @@ import {
     BROCA_CREDENTIAL_VALUE_CAP_BYTES,
     DAEMON_GENERATION_CHANGED_CODE,
     Deadline,
+    evictProcessMcHostClient,
     isConsumerReconnectTransient,
     isMcHostCallError,
     McHostCallError,
     type McHostClient,
+    type McHostClientOptions,
     Priority,
     processMcHostClient,
     type RouteHandle,
@@ -1263,13 +1265,13 @@ export class McHostModuleTransport {
         return resolved;
     }
 
-    private connectClient(deadline?: Deadline): Promise<McHostClient> {
+    private clientOptions(deadline?: Deadline): McHostClientOptions {
         // Derive the handshake stage from the operation deadline without ever
         // extending the preserved 2-second handshake budget (plan KTD5).
         const handshakeTimeoutMs = deadline
             ? Math.max(1, deadline.stageBudgetMs(HANDSHAKE_TIMEOUT_MS))
             : HANDSHAKE_TIMEOUT_MS;
-        return processMcHostClient({
+        return {
             connectionFile: this.connectionFile,
             handshakeTimeoutMs,
             // Credentials are presented on every real connection, not only the
@@ -1282,7 +1284,7 @@ export class McHostModuleTransport {
             // fingerprint. Gating this on `managed-default` let such a client
             // complete its handshake and then fail every provider call.
             credentialSource: process.env,
-        });
+        };
     }
 
     private async demandManagedReadiness(
@@ -1427,11 +1429,14 @@ export class McHostModuleTransport {
         const connecting = (async (): Promise<CertifiedConnection> => {
             let candidate: McHostClient | null = null;
             try {
-                candidate = await this.connectClient(deadline);
+                const options = this.clientOptions(deadline);
+                candidate = await processMcHostClient(options);
                 if (
                     expectedDaemonId !== undefined &&
                     !sameDaemonId(candidate.authenticated?.daemonId, expectedDaemonId)
                 ) {
+                    // The owner cache retains this resolved client; closing it without eviction serves a closed instance to later callers under the same key. commentlint: allow(JUDGE)
+                    await evictProcessMcHostClient(options, candidate);
                     candidate.close();
                     throw this.connectionChangedError(
                         "daemon changed after lifecycle compatibility validation",

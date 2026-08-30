@@ -172,7 +172,7 @@ impl RawFrame {
 pub type Discovered = mc_host::ConnectionInfo;
 
 /// Validates and reads a publication the way a conforming client must
-/// (protocol §4.1): bounded snapshot, schema 1, exactly 32 key bytes, exactly
+/// (protocol §4.1): bounded snapshot, schema 2, exactly 32 key bytes, exactly
 /// 16 daemon-ID bytes, numeric loopback host, nonzero port.
 pub fn discover(path: &Path) -> Result<Discovered, String> {
     let meta = std::fs::symlink_metadata(path).map_err(|err| err.to_string())?;
@@ -195,7 +195,7 @@ pub fn discover(path: &Path) -> Result<Discovered, String> {
     let json: serde_json::Value = serde_json::from_slice(&bytes).map_err(|err| err.to_string())?;
 
     let schema = json["schema"].as_u64().ok_or("missing schema")?;
-    if schema != 1 {
+    if schema != 2 {
         return Err(format!("unsupported schema {schema}"));
     }
     let wire_version = json
@@ -239,7 +239,7 @@ pub fn discover(path: &Path) -> Result<Discovered, String> {
         pid: u32::try_from(json["pid"].as_u64().ok_or("missing pid")?)
             .map_err(|_| "pid out of range")?,
         daemon_ver,
-        schema: u32::try_from(schema).expect("schema is one"),
+        schema: u32::try_from(schema).expect("schema is two"),
         wire_version: u8::try_from(wire_version).expect("wire version is two"),
     })
 }

@@ -6,17 +6,6 @@ use std::sync::{Arc, Mutex};
 use crate::arena::MIN_ARENA_BYTES;
 use crate::descriptor::{HardwareProfileId, SchedulingMode, TransportDescriptor, MAX_SPANS};
 
-/// Producer arbitration topology.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProducerTopology {
-    /// Caller owns one SPSC producer lane.
-    CallerConfined,
-    /// Each producer owns one SPSC lane and receiver merges ordering.
-    ShardedSpsc,
-    /// Producers arbitrate access before one publication lane.
-    Arbitrated,
-}
-
 /// Worker ownership topology.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerTopology {
@@ -26,17 +15,6 @@ pub enum WorkerTopology {
     SplitDirection,
     /// One worker owns both directions.
     Fused,
-}
-
-/// Completion delivery topology.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CompletionMode {
-    /// Caller synchronously pulls completions.
-    SynchronousPull,
-    /// Caller polls completion batches.
-    BatchedPoll,
-    /// Runtime callback delivers promise completion.
-    TsfnPromise,
 }
 
 /// Resource charges retained for one admitted duplex candidate.
@@ -123,12 +101,8 @@ pub struct ProfileConfig {
     pub mappings: usize,
     /// Dedicated workers charged by hot profile.
     pub pinned_workers: usize,
-    /// Producer ownership topology.
-    pub producer_topology: ProducerTopology,
     /// Worker ownership topology.
     pub worker_topology: WorkerTopology,
-    /// Completion delivery topology.
-    pub completion_mode: CompletionMode,
 }
 
 /// Immutable admitted profile dimensions and bounds.
@@ -138,9 +112,7 @@ pub struct TargetProfile {
     arena_bytes: usize,
     max_spans: usize,
     max_leases: usize,
-    producer_topology: ProducerTopology,
     worker_topology: WorkerTopology,
-    completion_mode: CompletionMode,
     charges: ResourceCharges,
 }
 
@@ -208,9 +180,7 @@ impl TargetProfile {
             arena_bytes: config.arena_bytes,
             max_spans: config.max_spans,
             max_leases: config.max_leases,
-            producer_topology: config.producer_topology,
             worker_topology: config.worker_topology,
-            completion_mode: config.completion_mode,
             charges,
         })
     }
@@ -240,19 +210,9 @@ impl TargetProfile {
         self.max_leases
     }
 
-    /// Producer topology.
-    pub const fn producer_topology(&self) -> ProducerTopology {
-        self.producer_topology
-    }
-
     /// Worker topology.
     pub const fn worker_topology(&self) -> WorkerTopology {
         self.worker_topology
-    }
-
-    /// Completion topology.
-    pub const fn completion_mode(&self) -> CompletionMode {
-        self.completion_mode
     }
 
     /// Host-wide admission charge.
@@ -715,9 +675,7 @@ pub fn mc_host_ring_profile() -> Result<TargetProfile, ProfileError> {
         max_leases: MC_HOST_RING_DEPTH,
         mappings: 2,
         pinned_workers: 0,
-        producer_topology: ProducerTopology::Arbitrated,
         worker_topology: WorkerTopology::Fused,
-        completion_mode: CompletionMode::SynchronousPull,
     })
 }
 
@@ -735,12 +693,10 @@ pub fn ring_profile(
         max_leases: 32,
         mappings: 2,
         pinned_workers,
-        producer_topology: ProducerTopology::CallerConfined,
         worker_topology: if scheduling == SchedulingMode::HotPinnedPoll {
             WorkerTopology::SplitDirection
         } else {
             WorkerTopology::CallerThread
         },
-        completion_mode: CompletionMode::SynchronousPull,
     })
 }
