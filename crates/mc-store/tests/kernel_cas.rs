@@ -907,3 +907,51 @@ fn evidence_metadata_redactions_reach_the_ledger() {
         );
     }
 }
+
+#[test]
+fn replayed_intent_still_merges_a_stronger_policy() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let payload = b"policy escalation on replay".to_vec();
+
+    let first = store
+        .ingest_artifact(request("policy-replay", payload.clone()))
+        .unwrap();
+    assert_eq!(
+        store
+            .artifact_eligibility(&first, ArtifactDestination::Remote)
+            .unwrap(),
+        ArtifactEligibility::Allowed
+    );
+
+    let mut stronger = request("policy-replay", payload);
+    stronger.provider_egress = ProviderEgress::LocalOnly;
+    stronger.asserted_sensitivity = Sensitivity::Sensitive;
+    let replayed = store.ingest_artifact(stronger).unwrap();
+
+    assert_eq!(replayed.digest, first.digest);
+    assert_eq!(
+        store
+            .artifact_eligibility(&replayed, ArtifactDestination::Remote)
+            .unwrap(),
+        ArtifactEligibility::Denied(EligibilityDeniedReason::SensitiveRemote)
+    );
+}
+
+#[test]
+fn detection_dense_payload_is_rejected_before_staging() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let payload = "key=a ".repeat(5000).into_bytes();
+
+    let error = store
+        .ingest_artifact(request("detection-flood", payload))
+        .unwrap_err();
+
+    assert_eq!(error.kind(), ArtifactErrorKind::DetectionLimit);
+    assert_eq!(staged_entries(root.path()), 0);
+    assert_eq!(published_objects(root.path()), Vec::<String>::new());
+    assert_eq!(reservation_count(root.path()), 0);
+}
