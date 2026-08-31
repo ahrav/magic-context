@@ -148,6 +148,7 @@ struct Propagation<'a> {
     operator_id: &'a str,
     target_locator: &'a str,
     deleted_at: i64,
+    redactions: &'a [(String, RedactedField)],
 }
 
 impl KernelStore {
@@ -239,6 +240,19 @@ impl KernelStore {
         let operator_id = redacted.operator_id.text.clone();
         let reason = redacted.reason.text.clone();
         let target_locator = redacted.target_locator.text.clone();
+        let propagation_redactions = if kind == ArtifactDeletionKind::Purge {
+            [
+                ("operator_id", &redacted.operator_id),
+                ("target_locator", &redacted.target_locator),
+                ("reason", &redacted.reason),
+            ]
+            .into_iter()
+            .filter(|(_, field)| !field.detections.is_empty())
+            .map(|(name, field)| (name.to_string(), field.clone()))
+            .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let receipt = commit_with_writer(
             &mut writer,
             self.lease_epoch(),
@@ -318,6 +332,7 @@ impl KernelStore {
                     operator_id: &operator_id,
                     target_locator: &target_locator,
                     deleted_at,
+                    redactions: &propagation_redactions,
                 });
                 serde_json::to_string(&DeletionReceiptPayload {
                     barrier_id: barrier_id.clone(),
@@ -330,10 +345,9 @@ impl KernelStore {
         .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
 
         let committed = serde_json::from_str::<DeletionReceiptPayload>(&receipt.result)
-            .unwrap_or_else(|_| DeletionReceiptPayload {
-                barrier_id: state.barrier_id.clone(),
-                affected_object_ids: state.all_object_ids.clone(),
-            });
+            .ok()
+            .filter(|payload| payload.barrier_id == state.barrier_id)
+            .ok_or_else(|| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
         let result = ArtifactDeletionResult {
             kind,
             digest: state.digest.clone(),
@@ -472,9 +486,11 @@ impl KernelStore {
         let mut statement = tx
             .prepare(
                 "SELECT bc.consumer_id,bc.required_checkpoint_commit_seq,
-                        COALESCE(c.checkpoint_commit_seq,
-                                 CASE WHEN bc.acknowledged_at IS NOT NULL
-                                      THEN bc.required_checkpoint_commit_seq END),
+                        CASE WHEN bc.acknowledged_at IS NOT NULL
+                             THEN MAX(bc.required_checkpoint_commit_seq,
+                                      COALESCE(c.checkpoint_commit_seq,
+                                               bc.required_checkpoint_commit_seq))
+                             ELSE c.checkpoint_commit_seq END,
                         (SELECT a.operator_id FROM consumer_abandonments a
                           WHERE a.consumer_id=bc.consumer_id AND a.barrier_id=bc.barrier_id
                             AND a.commit_seq>=bc.required_checkpoint_commit_seq
@@ -749,7 +765,7 @@ fn push_propagation_events(envelope: &mut crate::kernel::Envelope<'_>, work: &Pr
             },
             kind: "artifact_deletion",
             replaced_object_id: None,
-            redactions: Vec::new(),
+            redactions: work.redactions.to_vec(),
             audit: Some(serde_json::json!({
                 "target_class": target_class,
                 "deletion_kind": work.kind.as_str(),
