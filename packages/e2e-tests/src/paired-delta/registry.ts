@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import manifestJson from "../../pools/paired-delta-manifest.json";
@@ -34,6 +34,19 @@ const fileByScenarioId = new Map(
         `src/paired-delta/scenarios/${scenarioId.replace(/^var-/, "")}.ts`,
     ]),
 );
+
+/** The path is derived from the id by slug convention, so a file moved into a subdirectory or renamed away from its id resolves to a path that does not exist. Checked here, where the scenario is still in hand, rather than left to surface as a bare `ENOENT` from the digest. commentlint: allow(JUDGE) */
+function assertImplementationFile(
+    scenarioId: string,
+    implementationFile: string,
+    root: string,
+): void {
+    if (existsSync(resolve(root, implementationFile))) return;
+    throw new Error(
+        `paired-delta scenario ${scenarioId} expects ${implementationFile}; ` +
+            "a scenario's file name must be its id without the `var-` prefix",
+    );
+}
 
 export function buildPairedDeltaRegistry(): PairedDeltaRegistry {
     return new Map(pairedDeltaScenarios.map((declaration) => [
@@ -89,12 +102,15 @@ export function computeManifestEntries(
     root = resolve(import.meta.dir, "../.."),
 ): PairedDeltaManifestEntry[] {
     return [...registry.values()]
-        .map(({ declaration, implementationFile, runModes }) => ({
+        .map(({ declaration, implementationFile, runModes }) => {
+            assertImplementationFile(declaration.scenarioId, implementationFile, root);
+            return {
             scenarioId: declaration.scenarioId,
             semanticFingerprint: canonicalFingerprint(semanticInput(declaration)),
             verifierBundleDigest: verifierBundleDigest(root, implementationFile),
             runModes,
-        }))
+            };
+        })
         .sort((a, b) => a.scenarioId.localeCompare(b.scenarioId));
 }
 
