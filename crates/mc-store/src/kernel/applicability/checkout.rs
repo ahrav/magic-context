@@ -249,7 +249,15 @@ impl CheckoutSnapshot {
         &self.repo
     }
 
-    /// Returns only paths contained by the worktree.
+    /// Joins `rela_path` onto the worktree, rejecting paths whose *ancestors*
+    /// leave it: absolute paths, `..` components, and symlinked parent
+    /// directories.
+    ///
+    /// The final component stays unresolved, so a returned path may itself be commentlint: allow(JUDGE)
+    /// a symlink pointing outside the worktree — `worktree_content_hash` needs commentlint: allow(JUDGE)
+    /// that in order to hash the link rather than its target. A caller that commentlint: allow(JUDGE)
+    /// opens the path with following enabled therefore has to resolve and commentlint: allow(JUDGE)
+    /// re-check it, or use no-follow access such as `symlink_metadata`. commentlint: allow(JUDGE)
     pub fn worktree_path(&self, rela_path: &str) -> Option<PathBuf> {
         contained_path(self.repo.workdir()?, Path::new(rela_path))
     }

@@ -125,11 +125,15 @@ impl<'s> ResolutionLadder<'s> {
         };
         let anchor = ObjectId::from_hex(oid_hex.as_bytes()).ok();
         let anchor_present = anchor.is_some_and(|oid| repo.find_commit(oid).is_ok());
+        // An undecided ancestry test still permits a positive fallback match. commentlint: allow(JUDGE)
+        // Every window candidate is reachable from HEAD, so a match proves commentlint: allow(JUDGE)
+        // reachability; it only bars the negative conclusion below. commentlint: allow(JUDGE)
+        let mut ancestry_undecided = false;
         if anchor_present {
             match self.is_ancestor_or_equal_oid(anchor.expect("present implies parsed"), head) {
                 Some(true) => return CommitResolution::Reachable,
                 Some(false) => {}
-                None => return CommitResolution::Uncertain,
+                None => ancestry_undecided = true,
             }
         }
         match self.match_in_window(capture) {
@@ -137,7 +141,9 @@ impl<'s> ResolutionLadder<'s> {
             WindowMatch::Ambiguous => CommitResolution::Uncertain,
             WindowMatch::Budget => CommitResolution::Uncertain,
             WindowMatch::Unreadable => CommitResolution::Uncertain,
-            WindowMatch::None if anchor_present && self.window_scan_complete(capture) => {
+            WindowMatch::None
+                if anchor_present && !ancestry_undecided && self.window_scan_complete(capture) =>
+            {
                 CommitResolution::NotReachable
             }
             WindowMatch::None => CommitResolution::Uncertain,

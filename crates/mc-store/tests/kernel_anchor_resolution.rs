@@ -1207,3 +1207,64 @@ fn sha256_length_anchors_stay_uncertain_on_a_sha1_build() {
         "an id this build cannot resolve is uncertain, never current"
     );
 }
+
+#[test]
+fn shallow_ancestry_still_reaches_the_fallback_rungs() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    let base = commit_snapshot(repo, "main", &[], &[("a.txt", "a\n")], "base", 1);
+    // The original anchor, kept in the odb on its own branch.
+    let anchored = commit_snapshot(
+        repo,
+        "topic",
+        &[base],
+        &[("a.txt", "a\nb\n")],
+        "anchored",
+        2,
+    );
+    let captures = captures_for(repo, &[anchored]);
+    let advanced = commit_snapshot(
+        repo,
+        "main",
+        &[base],
+        &[("a.txt", "a\n"), ("README.md", "readme\n")],
+        "advance",
+        3,
+    );
+    // Its rebased equivalent, reachable from HEAD.
+    let rebased = commit_snapshot(
+        repo,
+        "main",
+        &[advanced],
+        &[("a.txt", "a\nb\n"), ("README.md", "readme\n")],
+        "anchored",
+        4,
+    );
+
+    let budget = EvalBudget::unbounded();
+    let snapshot = checkout(&fixture, rebased);
+    assert_eq!(
+        ResolutionLadder::new(&snapshot, &budget)
+            .evaluate(&reachable_from(anchored, captures.clone())),
+        GitConditionOutcome::Holds
+    );
+
+    // A shallow boundary makes the ancestry test inconclusive, but the patch
+    // rung can still see the rewrite among HEAD's reachable commits.
+    std::fs::write(fixture.root.join(".git/shallow"), format!("{base}\n")).unwrap();
+    let shallow = snapshot_checkout(&fixture.root, &budget).expect("snapshot succeeds");
+    assert_eq!(
+        ResolutionLadder::new(&shallow, &budget).evaluate(&reachable_from(anchored, captures)),
+        GitConditionOutcome::Holds,
+        "an undecided ancestry test must not skip the fallback rungs"
+    );
+
+    // With no capture there is nothing for the rungs to match, and a shallow
+    // walk cannot prove the anchor absent from HEAD's history.
+    assert_eq!(
+        ResolutionLadder::new(&shallow, &budget)
+            .evaluate(&reachable_from(anchored, BTreeMap::new())),
+        GitConditionOutcome::Uncertain
+    );
+}
