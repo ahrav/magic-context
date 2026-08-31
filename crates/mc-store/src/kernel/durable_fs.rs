@@ -107,19 +107,6 @@ pub(super) fn create_secure_directory(parent: &File, name: &str) -> Result<File,
     Ok(directory)
 }
 
-pub(super) fn open_or_create_secure_directory(
-    parent: &File,
-    name: &str,
-) -> Result<File, StorageError> {
-    match create_secure_directory(parent, name) {
-        Ok(directory) => Ok(directory),
-        Err(StorageError::Other(source)) if source.kind() == io::ErrorKind::AlreadyExists => {
-            open_secure_directory(parent, name)
-        }
-        Err(error) => Err(error),
-    }
-}
-
 pub(super) fn open_secure_directory(parent: &File, name: &str) -> Result<File, StorageError> {
     validate_name(name)?;
     let descriptor = rfs::openat(
@@ -141,6 +128,19 @@ pub(super) fn open_secure_directory(parent: &File, name: &str) -> Result<File, S
         )));
     }
     Ok(directory)
+}
+
+pub(super) fn open_or_create_secure_directory(
+    parent: &File,
+    name: &str,
+) -> Result<File, StorageError> {
+    match create_secure_directory(parent, name) {
+        Ok(directory) => Ok(directory),
+        Err(StorageError::Other(source)) if source.kind() == io::ErrorKind::AlreadyExists => {
+            open_secure_directory(parent, name)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub(super) fn create_new_file(directory: &File, name: &str) -> Result<File, StorageError> {

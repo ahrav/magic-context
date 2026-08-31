@@ -168,6 +168,26 @@ fn staging_requires_affirmative_repository_provenance_for_normal() {
         .unwrap();
     assert_eq!(proven_secret.sensitivity, Sensitivity::Secret);
     assert!(!proven_secret.payload.contains(SECRET));
+
+    let leaking_provenance = store
+        .stage_candidate(StagingCandidateSpec {
+            extraction_run_id: "run-provenance-secret".to_string(),
+            candidate_id: "candidate-provenance-secret".to_string(),
+            extractor: "fixture".to_string(),
+            source_kind: "repository".to_string(),
+            source_id: "tracked-file".to_string(),
+            source_revision: 1,
+            candidate_kind: "observation".to_string(),
+            payload: "clean payload".to_string(),
+            provenance: Some(RepositoryProvenance {
+                repository_id: format!("repo key={SECRET}"),
+                revision: "abc123".to_string(),
+            }),
+            recorded_at: 1,
+            lease_expires_at: 2,
+        })
+        .unwrap();
+    assert_eq!(leaking_provenance.sensitivity, Sensitivity::Secret);
     let connection = Connection::open_with_flags(
         directory.path().join("core.sqlite"),
         OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -187,6 +207,10 @@ fn staging_requires_affirmative_repository_provenance_for_normal() {
         [
             ("candidate-proven".to_string(), "normal".to_string()),
             ("candidate-proven-secret".to_string(), "secret".to_string()),
+            (
+                "candidate-provenance-secret".to_string(),
+                "secret".to_string()
+            ),
             ("candidate-unknown".to_string(), "secret".to_string())
         ]
     );
@@ -207,6 +231,7 @@ fn staging_requires_affirmative_repository_provenance_for_normal() {
         [
             ("run-proven".to_string(), "normal".to_string()),
             ("run-proven-secret".to_string(), "secret".to_string()),
+            ("run-provenance-secret".to_string(), "secret".to_string()),
             ("run-unknown".to_string(), "secret".to_string())
         ]
     );

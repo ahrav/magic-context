@@ -1008,3 +1008,42 @@ fn symlinked_directory_under_objects_is_not_followed_when_totaling_usage() {
         b"usage after".to_vec()
     );
 }
+
+#[test]
+fn oversized_metadata_field_is_rejected_before_staging() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+
+    let mut flooded = request("metadata-flood", b"small payload".to_vec());
+    flooded.media_type = "key=a ".repeat(4000);
+    let error = store.ingest_artifact(flooded).unwrap_err();
+
+    assert_eq!(error.kind(), ArtifactErrorKind::TextFieldTooLong);
+    assert_eq!(staged_entries(root.path()), 0);
+    assert_eq!(published_objects(root.path()), Vec::<String>::new());
+    assert_eq!(reservation_count(root.path()), 0);
+}
+
+#[test]
+fn fifo_swapped_under_a_live_reference_does_not_block_reads() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = store
+        .ingest_artifact(request("swap", b"swap payload".to_vec()))
+        .unwrap();
+
+    let path = artifact_path(root.path(), &handle.digest);
+    fs::remove_file(&path).unwrap();
+    let made = std::process::Command::new("mkfifo")
+        .arg("-m")
+        .arg("600")
+        .arg(&path)
+        .status()
+        .unwrap();
+    assert!(made.success(), "mkfifo failed");
+
+    let error = store.read_artifact(&handle).unwrap_err();
+    assert_eq!(error.kind(), ArtifactErrorKind::MissingObject);
+}

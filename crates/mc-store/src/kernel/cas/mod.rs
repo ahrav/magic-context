@@ -16,6 +16,7 @@ use crate::kernel::{KernelError, KernelStore};
 pub(super) const DEFAULT_ARTIFACT_CAP: u64 = 4 * 1024 * 1024 * 1024;
 pub(super) const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 pub(super) const MAX_PAYLOAD_DETECTIONS: usize = 4096;
+pub(super) const MAX_TEXT_FIELD_BYTES: usize = 1024;
 
 #[cfg(feature = "test-support")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +115,7 @@ pub enum ArtifactErrorKind {
     ReclaimInProgress,
     UnredactableSecret,
     DetectionLimit,
+    TextFieldTooLong,
     InvalidInput,
     PurgeIntent,
     PurgeUnlinkPending,
@@ -225,6 +227,10 @@ impl fmt::Display for ArtifactError {
             }
             ArtifactErrorKind::UnredactableSecret => formatter
                 .write_str("artifact payload holds a recognized secret that cannot be redacted"),
+            ArtifactErrorKind::TextFieldTooLong => write!(
+                formatter,
+                "artifact text field exceeds {MAX_TEXT_FIELD_BYTES} bytes"
+            ),
             ArtifactErrorKind::DetectionLimit => write!(
                 formatter,
                 "artifact payload exceeds {MAX_PAYLOAD_DETECTIONS} recognized secrets"
