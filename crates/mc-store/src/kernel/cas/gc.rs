@@ -74,16 +74,18 @@ impl KernelStore {
             return Ok(None);
         }
         tx.commit().map_err(|_| KernelError::Io)?;
-        drop(writer);
 
         if fault_after_reclaiming {
             return Err(KernelError::Fault);
         }
+        // The writer guard is held across the unlink because `restore` acquires it to
+        // displace the database. Releasing it here would let an older backup with a
+        // live reference for this digest land between the eligibility decision and the
+        // unlink, leaving that reference pointing at absent bytes.
         let (removed, bytes) = self.unlink_artifact(&candidate.digest)?;
         self.sweep_digest_temps(&candidate.digest)
             .map_err(|error| self.map_gc_storage_error(error))?;
 
-        let mut writer = self.lock_writer()?;
         let tx = writer
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| KernelError::Io)?;

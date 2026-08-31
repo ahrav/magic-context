@@ -21,7 +21,7 @@ const PROPAGATION_TARGETS: [&str; 4] = [
 ];
 const MAX_AUDIT_FIELD_BYTES: usize = 1_024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactDeletionKind {
     Delete,
@@ -106,6 +106,7 @@ struct PurgeIntentLine<'a> {
 #[derive(Serialize, serde::Deserialize)]
 struct DeletionReceiptPayload {
     barrier_id: String,
+    kind: ArtifactDeletionKind,
     affected_object_ids: Vec<String>,
 }
 
@@ -336,6 +337,7 @@ impl KernelStore {
                 });
                 serde_json::to_string(&DeletionReceiptPayload {
                     barrier_id: barrier_id.clone(),
+                    kind,
                     affected_object_ids: event_object_ids.clone(),
                 })
                 .map_err(|_| KernelError::Io)
@@ -346,7 +348,7 @@ impl KernelStore {
 
         let committed = serde_json::from_str::<DeletionReceiptPayload>(&receipt.result)
             .ok()
-            .filter(|payload| payload.barrier_id == state.barrier_id)
+            .filter(|payload| payload.barrier_id == state.barrier_id && payload.kind == kind)
             .ok_or_else(|| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
         let result = ArtifactDeletionResult {
             kind,

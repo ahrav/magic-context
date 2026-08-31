@@ -1241,3 +1241,54 @@ fn purge_redactions_are_recorded_in_the_durable_ledger() {
         "redacted purge audit text left no ledger rows"
     );
 }
+
+#[test]
+fn a_delete_receipt_cannot_authorize_a_purge_unlink() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = ingest(&store, "kind-bind", b"kind-bind");
+    let delete = delete_request("kind-bind", &handle.digest, ArtifactDeletionKind::Delete);
+    store.delete_artifact(delete.clone()).unwrap();
+
+    // Same digest becomes live again.
+    let readmitted = ingest(&store, "kind-bind-again", b"kind-bind");
+    assert_eq!(readmitted.digest, handle.digest);
+    assert!(object_path(root.path(), &handle.digest).exists());
+
+    // Purge reusing the Delete operation's intent: the barrier id is digest-derived
+    // and therefore identical, so only the kind distinguishes them.
+    let mut purge = delete.clone();
+    purge.kind = ArtifactDeletionKind::Purge;
+    purge.operator_id = Some("operator-1".to_string());
+    purge.target_locator = Some("incident://secret-1".to_string());
+    purge.reason = Some("secret".to_string());
+
+    assert_eq!(
+        store.delete_artifact(purge).unwrap_err().kind(),
+        ArtifactErrorKind::ReferenceCommit
+    );
+
+    assert!(
+        object_path(root.path(), &handle.digest).exists(),
+        "a Delete receipt authorized a Purge unlink"
+    );
+    let connection = inspect(root.path());
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM artifact_purge_tombstones WHERE artifact_digest=?1",
+                [&handle.digest],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert!(connection
+        .query_row(
+            "SELECT invalidated_commit_seq IS NULL FROM evidence_meta WHERE object_id=?1",
+            ["object-kind-bind-again"],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap());
+}
