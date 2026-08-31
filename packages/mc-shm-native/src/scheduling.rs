@@ -261,6 +261,10 @@ impl Reactor {
         }
     }
 
+    pub(crate) fn is_registered(&self, channel_id: u32) -> bool {
+        self.registrations.contains_key(&channel_id)
+    }
+
     pub(crate) fn ensure_healthy(&self) -> Result<()> {
         if self.failed.load(Ordering::Acquire) {
             Err(Error::new(
