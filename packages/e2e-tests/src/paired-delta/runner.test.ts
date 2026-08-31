@@ -854,6 +854,20 @@ describe("paired-delta runner", () => {
                 .rejects.toThrow(/replicateCount must be a positive integer/);
         }
 
+        await expect(runPairedDelta({ ...options(), scenarios: [] }, dependencies()))
+            .rejects.toThrow(/scenarios must not be empty/);
+
+        // Every comparison against NaN is false, so the run would pay for the
+        // whole matrix instead of stopping at the cap.
+        for (const maxCostUsd of [Number.NaN, -1, Number.POSITIVE_INFINITY]) {
+            await expect(runPairedDelta({ ...options(), maxCostUsd }, dependencies()))
+                .rejects.toThrow(/maxCostUsd must be finite and non-negative/);
+        }
+
+        await expect(
+            runPairedDelta({ ...options(), deadlineEpochMs: Number.NaN }, dependencies()),
+        ).rejects.toThrow(/deadlineEpochMs must be finite/);
+
         // A negative price subtracts from `spentUsd`, so the cap would admit
         // calls after the real spend passed it.
         await expect(
@@ -870,6 +884,74 @@ describe("paired-delta runner", () => {
                 dependencies(),
             ),
         ).rejects.toThrow(/pricesPerMillionTokens must be finite and non-negative/);
+
+        // Finite on its own, but the worst-case estimate it prices is not.
+        await expect(
+            runPairedDelta(
+                {
+                    ...options(),
+                    pricesPerMillionTokens: {
+                        input: Number.MAX_VALUE,
+                        output: Number.MAX_VALUE,
+                        cacheCreation: 0,
+                        cacheRead: 0,
+                    },
+                },
+                dependencies(),
+            ),
+        ).rejects.toThrow(/overflow the worst-case estimate/);
+    });
+
+    it("validates options before claiming the records path", async () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-validate-"));
+        try {
+            const path = join(root, "records.json");
+
+            await expect(
+                runPairedDelta(
+                    { ...options(), replicateCount: 0, store: new FileRolloutStore(path) },
+                    dependencies(),
+                ),
+            ).rejects.toThrow(/replicateCount must be a positive integer/);
+
+            // The rejected call must not have left the path owned, or the
+            // corrected retry fails with RolloutStoreBusyError until exit.
+            const corrected = await runPairedDelta(
+                { ...options(), store: new FileRolloutStore(path) },
+                dependencies(),
+            );
+
+            expect(corrected.status).toBe("completed");
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("retries a stale non-completed record instead of abandoning the coordinate", async () => {
+        const store = new MemoryStore();
+        await runPairedDelta(
+            options(store),
+            dependencies((armId) =>
+                armId === "mc-off" ? new Error("first attempt failed") : observation(armId)),
+        );
+        const failed = store.records.find(({ armId }) => armId === "mc-off");
+        if (!failed) throw new Error("missing failed record");
+        // A checkout or model change since that attempt.
+        failed.repoCommit = "older-commit";
+        const events: string[] = [];
+
+        const result = await runPairedDelta(options(store), dependencies(undefined, events));
+
+        // `put` replaces a non-completed record, so the coordinate is re-run
+        // rather than left missing from the comparison.
+        expect(events).toContain("create:mc-off");
+        expect(result.status).toBe("completed");
+        expect(result.records.find(({ armId }) => armId === "mc-off")?.cell.runHealth)
+            .toBe("completed");
+        expect(result.invalidStoredCoordinates).toHaveLength(0);
+        // Spend from another binding is not charged to this run.
+        expect(result.records.find(({ armId }) => armId === "mc-off")?.priorAttemptsCostUsd)
+            .toBe(0);
     });
 
     it("classifies a malformed check vector as an exclusion and continues", async () => {

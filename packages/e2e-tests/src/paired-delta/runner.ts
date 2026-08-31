@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { linkSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { publishJsonAtomically } from "../atomic-publish";
@@ -414,7 +414,13 @@ export class FileRolloutStore implements RolloutStore {
         }
         const moved = this.readLockOwner(claimed);
         if (moved !== null && moved !== observed && this.ownerIsLive(moved)) {
-            renameSync(claimed, this.lockPath);
+            /** `link` refuses an existing destination, unlike `rename`: a third runner may have claimed the path while this one held the file aside, and replacing its lock would leave two owners. commentlint: allow(JUDGE) */
+            try {
+                linkSync(claimed, this.lockPath);
+            } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+            }
+            rmSync(claimed, { force: true });
             throw new RolloutStoreBusyError(
                 `rollout store ${this.path} is in use by pid ${moved}`,
             );
@@ -565,10 +571,56 @@ function isResumable(record: RolloutRecord, options: RunPairedDeltaOptions): boo
         completedIdentityMatches(record, options);
 }
 
+/** Every rejection here describes an experiment that cannot produce the measurements it would report: an empty matrix, a cap no comparison can trip, or a price that makes a cost unwritable. commentlint: allow(JUDGE) */
+function validateRunOptions(options: RunPairedDeltaOptions): void {
+    if (options.scenarios.length === 0) {
+        throw new Error("scenarios must not be empty");
+    }
+    const ids = new Set(options.scenarios.map(({ scenarioId }) => scenarioId));
+    /** The loop visits every declaration while the coordinate map is keyed by id, so a repeated id would pay for a coordinate the store already holds completed evidence for and then fail to record it. commentlint: allow(JUDGE) */
+    if (ids.size !== options.scenarios.length) {
+        throw new Error("scenarios contain a duplicate scenarioId");
+    }
+    /** A non-positive or fractional count silently produces a matrix with no measurements — or one the loop rounds up — and the run would still report `completed`. commentlint: allow(JUDGE) */
+    if (!Number.isSafeInteger(options.replicateCount) || options.replicateCount < 1) {
+        throw new Error("replicateCount must be a positive integer");
+    }
+    /** A negative price makes a rollout's cost negative, which subtracts from `spentUsd` and lets the cap admit calls after the real spend passed it. commentlint: allow(JUDGE) */
+    if (
+        Object.values(options.pricesPerMillionTokens).some(
+            (price) => !Number.isFinite(price) || price < 0,
+        )
+    ) {
+        throw new Error("pricesPerMillionTokens must be finite and non-negative");
+    }
+    /** Every cap comparison against `NaN` is false, so an unchecked cap pays for the whole matrix; the same holds for the deadline's remaining-time test. commentlint: allow(JUDGE) */
+    for (const [label, value] of [
+        ["maxCostUsd", options.maxCostUsd],
+        ["deskCostCeilingUsd", options.deskCostCeilingUsd],
+    ] as const) {
+        if (!Number.isFinite(value) || value < 0) {
+            throw new Error(`${label} must be finite and non-negative`);
+        }
+    }
+    if (!Number.isFinite(options.deadlineEpochMs)) {
+        throw new Error("deadlineEpochMs must be finite");
+    }
+    /** The failure estimate is priced from a scenario's context limit, so a price that is finite on its own can still make the fallback `Infinity`, which JSON writes as `null` and the next resume rejects. commentlint: allow(JUDGE) */
+    for (const scenario of options.scenarios) {
+        if (!Number.isFinite(worstCaseUsd(scenario, options.pricesPerMillionTokens))) {
+            throw new Error(
+                `pricesPerMillionTokens overflow the worst-case estimate for ${scenario.scenarioId}`,
+            );
+        }
+    }
+}
+
 export async function runPairedDelta(
     options: RunPairedDeltaOptions,
     dependencies: RunnerDependencies,
 ): Promise<PairedDeltaRunResult> {
+    /** Option-only validation runs before `store.list()`, which claims the records path for this process: a call rejected after that claim would leave the path owned until exit and fail the corrected retry with `RolloutStoreBusyError`. commentlint: allow(JUDGE) */
+    validateRunOptions(options);
     const stored = options.store.list();
     const storedByCoordinate = new Map(
         stored.map((record) => [coordinateKey(record), record]),
@@ -587,22 +639,6 @@ export async function runPairedDelta(
     /** A creation that lost its deadline race still yields a handle that owns a live harness. Its disposal is settled before the run returns so an unreclaimed one reaches the caller as `harness-unreclaimed` rather than as silence. commentlint: allow(JUDGE) */
     const lateDisposals: Promise<boolean>[] = [];
     const selectedScenarioIds = new Set(options.scenarios.map(({ scenarioId }) => scenarioId));
-    /** The loop visits every declaration while the coordinate map is keyed by id, so a repeated id would pay for a coordinate the store already holds completed evidence for and then fail to record it. commentlint: allow(JUDGE) */
-    if (selectedScenarioIds.size !== options.scenarios.length) {
-        throw new Error("scenarios contain a duplicate scenarioId");
-    }
-    /** A non-positive or fractional count silently produces a matrix with no measurements — or one the loop rounds up — and the run would still report `completed`. commentlint: allow(JUDGE) */
-    if (!Number.isSafeInteger(options.replicateCount) || options.replicateCount < 1) {
-        throw new Error("replicateCount must be a positive integer");
-    }
-    /** A negative price makes a rollout's cost negative, which subtracts from `spentUsd` and lets the cap admit calls after the real spend passed it. commentlint: allow(JUDGE) */
-    if (
-        Object.values(options.pricesPerMillionTokens).some(
-            (price) => !Number.isFinite(price) || price < 0,
-        )
-    ) {
-        throw new Error("pricesPerMillionTokens must be finite and non-negative");
-    }
     const inMatrix = (record: RolloutRecord): boolean =>
         record.poolManifestFingerprint === options.poolManifestFingerprint &&
         selectedScenarioIds.has(record.scenarioId) &&
@@ -653,23 +689,27 @@ export async function runPairedDelta(
                     replicateIndex,
                 };
                 const existing = storedByCoordinate.get(coordinateKey(coordinate));
+                const boundToRun = existing !== undefined && bindingMatches(existing, options);
                 if (existing) {
-                    if (
-                        !bindingMatches(existing, options) ||
-                        !completedIdentityMatches(existing, options)
-                    ) {
-                        invalidStoredCoordinates.push(coordinate);
-                        return null;
+                    if (!boundToRun || !completedIdentityMatches(existing, options)) {
+                        /** Only completed evidence is immutable: `put` replaces a non-completed record, so a failure left by another commit or model is re-run rather than abandoning the coordinate and leaving the comparison incomplete. commentlint: allow(JUDGE) */
+                        if (existing.cell.runHealth === "completed") {
+                            invalidStoredCoordinates.push(coordinate);
+                            return null;
+                        }
                     }
                     // Completed records are immutable evidence; re-executing
                     // one would pay for a rollout whose result the store must
                     // then discard.
                     /** A stored vector is only unique strings to the parser, which has no declaration; an id set that does not belong to this scenario would be rehydrated as evidence and can leave `score()` dividing by an empty selection. commentlint: allow(JUDGE) */
-                    if (isResumable(existing, options) && !resumableEvidence(existing, scenario)) {
+                    if (
+                        boundToRun && isResumable(existing, options) &&
+                        !resumableEvidence(existing, scenario)
+                    ) {
                         invalidStoredCoordinates.push(coordinate);
                         return null;
                     }
-                    if (isResumable(existing, options)) {
+                    if (boundToRun && isResumable(existing, options)) {
                         resumedRollouts++;
                         records.push(existing);
                         if (existing.costSource === "observed") observedCostRollouts++;
@@ -691,7 +731,8 @@ export async function runPairedDelta(
                 const intervention = interventionFor(scenario, armId);
                 const startedAt = dependencies.now();
                 /** The previous attempt's spend is retained on the replacement record because `put` keeps one record per coordinate, so the file a later resume reads would otherwise show only the last attempt. commentlint: allow(JUDGE) */
-                const priorAttemptsCostUsd = existing
+                /** Only spend on this run's own binding carries forward; an attempt priced under a different commit or model was never charged to this run's ledger. commentlint: allow(JUDGE) */
+                const priorAttemptsCostUsd = existing && boundToRun
                     ? existing.priorAttemptsCostUsd + existing.costUsd
                     : 0;
                 let handle: RolloutHandle | null = null;
