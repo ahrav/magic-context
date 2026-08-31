@@ -8,6 +8,7 @@ license = "MIT"
 description = "Private direct-text secret scanner for Magic Context"
 
 [dependencies]
+aho-corasick = "1"
 memchr = "2"
 regex = { workspace = true }
 serde = { workspace = true }

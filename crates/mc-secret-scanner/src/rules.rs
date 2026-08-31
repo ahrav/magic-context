@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use regex::bytes::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -9,7 +10,7 @@ use crate::{ConstructionError, RuleSource, ScanLimits, ScanProfile};
 pub const UPSTREAM_CORPUS_SHA256: &str =
     "2f1292b50148d38afe3ebdb7c489449d103b75b7df464e06da0d5d7c89ac2820";
 pub const CONSERVATIVE_OVERLAY_SHA256: &str =
-    "8d04fbe0c261ab42bb0370138a42e25437889e8048620b0601bfb9619da140a9";
+    "3166dc57a4020b90981871aa4df8e26dabbf2ef3ed92b1e41e1d6feaced628b5";
 
 const UPSTREAM_BYTES: &[u8] = include_bytes!("../default_rules.yaml");
 const OVERLAY_BYTES: &[u8] = include_bytes!("../conservative_overlay.yaml");
@@ -163,6 +164,8 @@ pub(crate) struct Rule {
 
 pub(crate) struct RuleSet {
     rules: Vec<Rule>,
+    anchors: AhoCorasick,
+    anchor_owners: Vec<usize>,
     context_safelist: RegexSet,
     value_safelist: RegexSet,
 }
@@ -207,10 +210,13 @@ impl RuleSet {
             (left.source, left.declaration.name.as_str())
                 .cmp(&(right.source, right.declaration.name.as_str()))
         });
+        let (anchors, anchor_owners) = build_anchor_index(&rules)?;
         let context_safelist = build_regex_set(CONTEXT_SAFELIST)?;
         let value_safelist = build_regex_set(VALUE_SAFELIST)?;
         Ok(Self {
             rules,
+            anchors,
+            anchor_owners,
             context_safelist,
             value_safelist,
         })
@@ -220,6 +226,29 @@ impl RuleSet {
         self.rules.iter().filter(move |rule| {
             profile == ScanProfile::Comprehensive || rule.source == RuleSource::ConservativeOverlay
         })
+    }
+
+    /// Returns the active rules whose declared anchors occur in `bytes`.
+    ///
+    /// A rule runs only after at least one declared anchor matches, compared
+    /// ASCII-case-insensitively. Anchors may overlap.
+    pub fn preselect(&self, profile: ScanProfile, bytes: &[u8]) -> Vec<&Rule> {
+        let mut anchored = vec![false; self.rules.len()];
+        for hit in self.anchors.find_overlapping_iter(bytes) {
+            if let Some(owner) = self.anchor_owners.get(hit.pattern().as_usize()) {
+                anchored[*owner] = true;
+            }
+        }
+        self.rules
+            .iter()
+            .enumerate()
+            .filter(|(index, rule)| {
+                anchored[*index]
+                    && (profile == ScanProfile::Comprehensive
+                        || rule.source == RuleSource::ConservativeOverlay)
+            })
+            .map(|(_, rule)| rule)
+            .collect()
     }
 
     pub fn context_is_safelisted(&self, bytes: &[u8]) -> bool {
@@ -272,6 +301,23 @@ impl RuleSet {
         }
         Ok(hash.finalize().into())
     }
+}
+
+fn build_anchor_index(rules: &[Rule]) -> Result<(AhoCorasick, Vec<usize>), ConstructionError> {
+    let mut patterns = Vec::new();
+    let mut owners = Vec::new();
+    for (index, rule) in rules.iter().enumerate() {
+        for anchor in &rule.declaration.anchors {
+            patterns.push(anchor.as_bytes().to_vec());
+            owners.push(index);
+        }
+    }
+    let automaton = AhoCorasickBuilder::new()
+        .match_kind(MatchKind::Standard)
+        .ascii_case_insensitive(true)
+        .build(&patterns)
+        .map_err(|_| ConstructionError::InvalidRulePolicy)?;
+    Ok((automaton, owners))
 }
 
 fn build_regex_set(patterns: &[&str]) -> Result<RegexSet, ConstructionError> {
@@ -442,6 +488,50 @@ fn encode_rule(hash: &mut Sha256, rule: &Rule) -> Result<(), ConstructionError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A matching rule must be preselected because unselected rules are not
+    /// evaluated.
+    #[test]
+    fn preselection_never_drops_a_rule_whose_pattern_matches() {
+        let rules = RuleSet::from_embedded().unwrap();
+        let corpus = [
+            "password=hunter2",
+            "AKIAIOSFODNN7EXAMPLE",
+            "A3-0A1B2C-3D4E5F6G7H8-9I0J1-2K3L4-5M6N7",
+            "AGE-SECRET-KEY-1QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7LQPZRY9X8GF2TVDW0S3JN54KHCE",
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----",
+            "-----begin rsa private key-----\nMIIEowIBAAKCAQEA\n-----end rsa private key-----",
+            "Netlify_Api_Key: Ab3fGh1jKlMnOpQrStUvWxYz79PqRs24Tv68Wt-Q",
+            "glsa_AbCdEfGhIjKlMnOpQrStUvWxYz012345_0a1b2c3d",
+            "github_pat_11ABCDEFG0abcdefghijkl_MnOpQrStUvWxYz0123456789AbCdEfGhIjKlMnOpQrStUvWx",
+            "pypi-AgEIcHlwaS5vcmcCJDAwMDAwMDAw",
+            "sntrys_eyJpYXQiOjE2OTk5OTk5OTl9_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789ab",
+            "zxlk ZXlKclpYbGZiM0J6SWpwY0lqRXlNelExTmpjNE9UQXhNak0wTlRZM09EazBNVEl6TkRVMg",
+            "'api_token': 'xy'",
+            r#"{"clientSecret":"hunter-two"}"#,
+            "é password=hunter2 é",
+            "the quick brown fox jumps over the lazy dog",
+        ];
+        for profile in [ScanProfile::Conservative, ScanProfile::Comprehensive] {
+            for input in corpus {
+                let bytes = input.as_bytes();
+                let selected: BTreeSet<&str> = rules
+                    .preselect(profile, bytes)
+                    .iter()
+                    .map(|rule| rule.declaration.name.as_str())
+                    .collect();
+                for rule in rules.active(profile) {
+                    if rule.regex.is_match(bytes) {
+                        assert!(
+                            selected.contains(rule.declaration.name.as_str()),
+                            "{} matches {input:?} but was not preselected",
+                            rule.declaration.name
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn embedded_sources_match_expected_digests() {

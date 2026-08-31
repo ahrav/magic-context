@@ -5,8 +5,8 @@ mod evaluator;
 mod rules;
 
 pub use api::{
-    ConstructionError, Finding, RuleSource, ScanError, ScanLimits, ScanProfile, ScanReport,
-    ScannerRevision, TextSpan, MAX_INPUT_BYTES,
+    ConstructionError, Finding, LimitExhausted, RuleSource, ScanError, ScanLimits, ScanProfile,
+    ScanReport, ScannerRevision, TextSpan, MAX_INPUT_BYTES,
 };
 pub use rules::{CONSERVATIVE_OVERLAY_SHA256, UPSTREAM_CORPUS_SHA256};
 

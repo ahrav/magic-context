@@ -1,4 +1,4 @@
-use mc_secret_scanner::{RuleSource, ScanError, ScanLimits, ScanProfile, Scanner};
+use mc_secret_scanner::{LimitExhausted, RuleSource, ScanError, ScanLimits, ScanProfile, Scanner};
 use proptest::prelude::*;
 use std::sync::OnceLock;
 
@@ -83,7 +83,7 @@ fn repeated_scans_are_deterministic_and_independent() {
 }
 
 #[test]
-fn every_limit_returns_a_typed_error() {
+fn oversized_input_is_rejected_and_bounds_report_truncation() {
     let input_limited = Scanner::with_limits(
         ScanProfile::Conservative,
         ScanLimits {
@@ -105,12 +105,10 @@ fn every_limit_returns_a_typed_error() {
         },
     )
     .unwrap();
-    assert_eq!(
-        candidate_limited
-            .scan("password=one password=two")
-            .unwrap_err(),
-        ScanError::CandidateLimitExceeded
-    );
+    let report = candidate_limited.scan("password=one password=two").unwrap();
+    assert_eq!(report.limits_hit, Some(LimitExhausted::Candidates));
+    assert!(!report.is_complete());
+    assert_eq!(report.candidates_evaluated, 1);
 
     let work_limited = Scanner::with_limits(
         ScanProfile::Conservative,
@@ -120,10 +118,36 @@ fn every_limit_returns_a_typed_error() {
         },
     )
     .unwrap();
-    assert_eq!(
-        work_limited.scan("password=secret").unwrap_err(),
-        ScanError::WorkLimitExceeded
+    let report = work_limited.scan("password=secret").unwrap();
+    assert_eq!(report.limits_hit, Some(LimitExhausted::Work));
+    assert!(!report.is_complete());
+}
+
+#[test]
+fn exhausting_a_limit_keeps_the_findings_already_collected() {
+    let scanner = Scanner::new(ScanProfile::Conservative).unwrap();
+    let secret = "auth_token=Ab3fGh1jKlMnOpQrStUvWxYz79PqRs24Tv68Wt-Q\n";
+    let mut padded = String::from(secret);
+    while padded.len() < mc_secret_scanner::MAX_INPUT_BYTES - 8 {
+        padded.push_str("key=aB ");
+    }
+    let report = scanner.scan(&padded).unwrap();
+    assert!(
+        !report.findings.is_empty(),
+        "padding must not suppress the secret ahead of it"
     );
+}
+
+#[test]
+fn a_complete_scan_of_dense_key_value_text_reports_no_truncation() {
+    let scanner = Scanner::new(ScanProfile::Conservative).unwrap();
+    let mut input = "key=aB ".repeat(mc_secret_scanner::MAX_INPUT_BYTES / 7 + 1);
+    input.truncate(mc_secret_scanner::MAX_INPUT_BYTES);
+    while !input.is_char_boundary(input.len()) {
+        input.pop();
+    }
+    let report = scanner.scan(&input).unwrap();
+    assert_eq!(report.limits_hit, None);
 }
 
 #[test]
@@ -132,7 +156,7 @@ fn diagnostics_do_not_include_scanned_text() {
     let scanner = Scanner::with_limits(
         ScanProfile::Conservative,
         ScanLimits {
-            max_work_bytes: 1,
+            max_input_bytes: 8,
             ..ScanLimits::default()
         },
     )
@@ -140,6 +164,135 @@ fn diagnostics_do_not_include_scanned_text() {
     let error = scanner.scan(sentinel).unwrap_err().to_string();
     assert!(!error.contains(sentinel));
     assert!(!error.contains("secret"));
+
+    let truncated = Scanner::with_limits(
+        ScanProfile::Conservative,
+        ScanLimits {
+            max_work_bytes: 1,
+            ..ScanLimits::default()
+        },
+    )
+    .unwrap();
+    let reason = truncated
+        .scan(sentinel)
+        .unwrap()
+        .limits_hit
+        .unwrap()
+        .to_string();
+    assert!(!reason.contains(sentinel));
+    assert!(!reason.contains("secret"));
+}
+
+#[test]
+fn non_ascii_text_does_not_discard_findings_elsewhere() {
+    let scanner = Scanner::new(ScanProfile::Comprehensive).unwrap();
+    let age = "AGE-SECRET-KEY-1QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7LQPZRY9X8GF2TVDW0S3JN54KHCE";
+    let onepassword = "A3-0A1B2C-3D4E5F6G7H8-9I0J1-2K3L4-5M6N7";
+    // A byte-class match can end inside a multi-byte UTF-8 character; later
+    // findings must still be reported.
+    let polluted =
+        format!("netlify_token: Ab3fGh1jKlMnOpQrStUvWxYz79PqRs24Tv68Wt-Qé\n{age}\n{onepassword}\n");
+    let report = scanner.scan(&polluted).unwrap();
+    let ids: Vec<&str> = report
+        .findings
+        .iter()
+        .map(|finding| finding.rule_id.as_str())
+        .collect();
+    assert!(ids.contains(&"age-secret-key"), "got {ids:?}");
+    assert!(ids.contains(&"1password-secret-key"), "got {ids:?}");
+}
+
+#[test]
+fn non_ascii_neighbours_do_not_change_findings() {
+    let scanner = Scanner::new(ScanProfile::Comprehensive).unwrap();
+    let cases = [
+        "password=hunter2",
+        "AGE-SECRET-KEY-1QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7LQPZRY9X8GF2TVDW0S3JN54KHCE",
+        "A3-0A1B2C-3D4E5F6G7H8-9I0J1-2K3L4-5M6N7",
+        "netlify_token: Ab3fGh1jKlMnOpQrStUvWxYz79PqRs24Tv68Wt-Q",
+    ];
+    for ascii in cases {
+        let baseline = scanner.scan(ascii).unwrap().findings.len();
+        assert!(baseline > 0, "{ascii} produced no baseline finding");
+        for decorated in [
+            format!("é\n{ascii}"),
+            format!("😀\n{ascii}"),
+            format!("{ascii} é"),
+            format!("日本語\n{ascii}\n日本語"),
+        ] {
+            assert_eq!(
+                scanner.scan(&decorated).unwrap().findings.len(),
+                baseline,
+                "non-ASCII around {ascii} changed the finding count"
+            );
+        }
+    }
+}
+
+/// Corpus patterns require a terminator after the value, so a trailing
+/// non-ASCII character must be treated like any other non-terminator byte.
+#[test]
+fn a_trailing_non_ascii_character_behaves_like_a_trailing_ascii_one() {
+    let scanner = Scanner::new(ScanProfile::Comprehensive).unwrap();
+    let keyed = "netlify_token: Ab3fGh1jKlMnOpQrStUvWxYz79PqRs24Tv68Wt-Q";
+    let ascii_non_terminator = scanner.scan(&format!("{keyed}#")).unwrap();
+    let non_ascii = scanner.scan(&format!("{keyed}é")).unwrap();
+    assert_eq!(
+        non_ascii.findings.len(),
+        ascii_non_terminator.findings.len()
+    );
+    assert!(non_ascii.is_complete());
+}
+
+#[test]
+fn reported_spans_stay_on_character_boundaries_around_non_ascii_text() {
+    let scanner = Scanner::new(ScanProfile::Comprehensive).unwrap();
+    let input = format!("é password=hunter2 é sha256~{}é", "a".repeat(43));
+    let report = scanner.scan(&input).unwrap();
+    assert!(!report.findings.is_empty());
+    for finding in &report.findings {
+        assert!(input
+            .get(finding.full_span.start()..finding.full_span.end())
+            .is_some());
+        assert!(input
+            .get(finding.value_span.start()..finding.value_span.end())
+            .is_some());
+    }
+}
+
+#[test]
+fn mixed_case_keys_are_gated_like_their_lowercase_spelling() {
+    let scanner = Scanner::new(ScanProfile::Comprehensive).unwrap();
+    let value = "Ab3fGh1jKlMnOpQrStUvWxYz79PqRs24Tv68Wt-Q";
+    let lowercase = scanner
+        .scan(&format!("netlify_token: {value}"))
+        .unwrap()
+        .findings
+        .len();
+    assert!(lowercase > 0);
+    for key in ["Netlify_Api_Key", "NETLIFY_TOKEN", "netlifyApiKey"] {
+        let report = scanner.scan(&format!("{key}: {value}")).unwrap();
+        assert!(
+            !report.findings.is_empty(),
+            "{key} produced no finding while netlify_token did"
+        );
+    }
+}
+
+#[test]
+fn value_span_covers_the_secret_for_multi_group_rules() {
+    let scanner = Scanner::new(ScanProfile::Comprehensive).unwrap();
+    let token = "ZXlKclpYbGZiM0J6SWpwY0lqRXlNelExTmpjNE9UQXhNak0wTlRZM09EazBNVEl6TkRVMg";
+    let input = format!("zxlk {token}");
+    for finding in scanner.scan(&input).unwrap().findings {
+        let value = &input[finding.value_span.start()..finding.value_span.end()];
+        let full = &input[finding.full_span.start()..finding.full_span.end()];
+        assert_eq!(
+            value, full,
+            "{} reported a fragment of its match as the secret",
+            finding.rule_id
+        );
+    }
 }
 
 #[test]

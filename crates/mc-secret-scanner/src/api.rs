@@ -35,9 +35,30 @@ impl TextSpan {
             return Err(ScanError::InvalidSpan);
         }
         if !input.is_char_boundary(start) || !input.is_char_boundary(end) {
-            return Err(ScanError::InvalidUtf8Boundary);
+            return Err(ScanError::InvalidSpan);
         }
         Ok(Self { start, end })
+    }
+
+    /// Widens `start` and `end` to the enclosing character boundaries.
+    ///
+    /// Byte-class matches can end inside a multi-byte character. Widening keeps
+    /// the span a valid `str` index pair and never reports fewer bytes than
+    /// matched, so a caller redacting the span cannot leave part of a secret
+    /// exposed.
+    pub(crate) fn snapped(input: &str, start: usize, end: usize) -> Result<Self, ScanError> {
+        if start > end || end > input.len() {
+            return Err(ScanError::InvalidSpan);
+        }
+        let mut start = start;
+        while start > 0 && !input.is_char_boundary(start) {
+            start -= 1;
+        }
+        let mut end = end;
+        while end < input.len() && !input.is_char_boundary(end) {
+            end += 1;
+        }
+        Self::new(input, start, end)
     }
 
     #[must_use]
@@ -81,6 +102,22 @@ pub struct ScannerRevision {
     pub upstream_commit: &'static str,
 }
 
+/// Which bound stopped a scan before the rule set was exhausted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LimitExhausted {
+    Candidates,
+    Work,
+}
+
+impl fmt::Display for LimitExhausted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Candidates => "scanner candidate limit reached",
+            Self::Work => "scanner work limit reached",
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanReport {
     pub findings: Vec<Finding>,
@@ -88,6 +125,18 @@ pub struct ScanReport {
     pub semantic_digest: [u8; 32],
     pub candidates_evaluated: usize,
     pub work_bytes: usize,
+    /// `Some` when a bound stopped the scan early, so `findings` is a prefix of
+    /// what a complete scan would report and absence of a finding proves
+    /// nothing.
+    pub limits_hit: Option<LimitExhausted>,
+}
+
+impl ScanReport {
+    /// Whether every active rule ran to completion.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.limits_hit.is_none()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,7 +150,7 @@ impl Default for ScanLimits {
     fn default() -> Self {
         Self {
             max_input_bytes: MAX_INPUT_BYTES,
-            max_candidates: 65_536,
+            max_candidates: 262_144,
             max_work_bytes: 512 * 1024 * 1024,
         }
     }
@@ -149,20 +198,14 @@ impl std::error::Error for ConstructionError {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanError {
     InputLimitExceeded,
-    CandidateLimitExceeded,
-    WorkLimitExceeded,
     InvalidSpan,
-    InvalidUtf8Boundary,
 }
 
 impl fmt::Display for ScanError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::InputLimitExceeded => "scanner input limit exceeded",
-            Self::CandidateLimitExceeded => "scanner candidate limit exceeded",
-            Self::WorkLimitExceeded => "scanner work limit exceeded",
             Self::InvalidSpan => "scanner produced an invalid span",
-            Self::InvalidUtf8Boundary => "scanner produced a non-UTF-8 span boundary",
         })
     }
 }
@@ -171,6 +214,39 @@ impl std::error::Error for ScanError {}
 
 pub(crate) const REVISION: ScannerRevision = ScannerRevision {
     crate_version: env!("CARGO_PKG_VERSION"),
-    semantic_digest_version: 2,
+    semantic_digest_version: 3,
     upstream_commit: "3d2869011138cd7812a12f893dc93635a961b0d7",
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapping_widens_interior_offsets_to_character_boundaries() {
+        let input = "aé";
+        assert!(!input.is_char_boundary(2));
+        let span = TextSpan::snapped(input, 0, 2).unwrap();
+        assert_eq!((span.start(), span.end()), (0, 3));
+        assert_eq!(input.get(span.start()..span.end()), Some("aé"));
+
+        let span = TextSpan::snapped(input, 2, 3).unwrap();
+        assert_eq!((span.start(), span.end()), (1, 3));
+        assert_eq!(input.get(span.start()..span.end()), Some("é"));
+    }
+
+    #[test]
+    fn snapping_keeps_boundary_offsets_and_rejects_out_of_range() {
+        let input = "abc";
+        let span = TextSpan::snapped(input, 1, 2).unwrap();
+        assert_eq!((span.start(), span.end()), (1, 2));
+        assert_eq!(
+            TextSpan::snapped(input, 0, 4).unwrap_err(),
+            ScanError::InvalidSpan
+        );
+        assert_eq!(
+            TextSpan::snapped(input, 2, 1).unwrap_err(),
+            ScanError::InvalidSpan
+        );
+    }
+}

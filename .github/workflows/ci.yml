@@ -661,6 +661,9 @@ jobs:
       - name: mc-core feature-off build
         run: cargo check -p mc-core --no-default-features
 
+      - name: mc-secret-scanner suite
+        run: cargo test -p mc-secret-scanner
+
   benchmark-retrieval-check:
     name: Benchmark (retrieval, deterministic CI profile)
     runs-on: ubuntu-latest

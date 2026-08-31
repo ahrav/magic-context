@@ -4,7 +4,20 @@ use crate::api::REVISION;
 use crate::rules::{
     EntropySpec, LocalContextSpec, OfflineValidationKind, OfflineValidationSpec, Rule, RuleSet,
 };
-use crate::{Finding, RuleSource, ScanError, ScanLimits, ScanProfile, ScanReport, TextSpan};
+use crate::{
+    Finding, LimitExhausted, RuleSource, ScanError, ScanLimits, ScanProfile, ScanReport, TextSpan,
+};
+
+enum Abort {
+    Work,
+    Invalid(ScanError),
+}
+
+impl From<ScanError> for Abort {
+    fn from(error: ScanError) -> Self {
+        Self::Invalid(error)
+    }
+}
 
 pub(crate) fn evaluate(
     rules: &RuleSet,
@@ -20,20 +33,27 @@ pub(crate) fn evaluate(
     let mut findings = Vec::new();
     let mut candidates = 0usize;
     let mut work = 0usize;
+    let mut limits_hit = None;
 
-    for rule in rules.active(profile) {
-        add_work(&mut work, bytes.len(), limits.max_work_bytes)?;
+    'rules: for rule in rules.preselect(profile, bytes) {
+        if add_work(&mut work, bytes.len(), limits.max_work_bytes).is_err() {
+            limits_hit = Some(LimitExhausted::Work);
+            break 'rules;
+        }
         for captures in rule.regex.captures_iter(bytes) {
-            candidates = candidates
-                .checked_add(1)
-                .ok_or(ScanError::CandidateLimitExceeded)?;
-            if candidates > limits.max_candidates {
-                return Err(ScanError::CandidateLimitExceeded);
+            if candidates >= limits.max_candidates {
+                limits_hit = Some(LimitExhausted::Candidates);
+                break 'rules;
             }
-            if let Some(finding) =
-                evaluate_candidate(rules, rule, &captures, input, &mut work, limits)?
-            {
-                findings.push(finding);
+            candidates += 1;
+            match evaluate_candidate(rules, rule, &captures, input, &mut work, limits) {
+                Ok(Some(finding)) => findings.push(finding),
+                Ok(None) => {}
+                Err(Abort::Work) => {
+                    limits_hit = Some(LimitExhausted::Work);
+                    break 'rules;
+                }
+                Err(Abort::Invalid(error)) => return Err(error),
             }
         }
     }
@@ -62,6 +82,7 @@ pub(crate) fn evaluate(
         semantic_digest,
         candidates_evaluated: candidates,
         work_bytes: work,
+        limits_hit,
     })
 }
 
@@ -72,7 +93,7 @@ fn evaluate_candidate(
     input: &str,
     work: &mut usize,
     limits: ScanLimits,
-) -> Result<Option<Finding>, ScanError> {
+) -> Result<Option<Finding>, Abort> {
     let full_match = captures.get(0).ok_or(ScanError::InvalidSpan)?;
     let value_match = if let Some(name) = rule.declaration.value_group.as_deref() {
         captures.name(name).ok_or(ScanError::InvalidSpan)?
@@ -80,24 +101,31 @@ fn evaluate_candidate(
         captures
             .get(usize::from(group))
             .filter(|value| !value.is_empty())
-            .or_else(|| first_nonempty_capture(captures))
+            .unwrap_or(full_match)
+    } else if captures.len() == 2 {
+        captures
+            .get(1)
+            .filter(|value| !value.is_empty())
             .unwrap_or(full_match)
     } else {
-        first_nonempty_capture(captures).unwrap_or(full_match)
+        full_match
     };
+    if value_match.is_empty() {
+        return Ok(None);
+    }
     let key_match = rule
         .declaration
         .key_group
         .as_deref()
         .and_then(|name| captures.name(name));
 
-    let full_span = TextSpan::new(input, full_match.start(), full_match.end())?;
-    let value_span = TextSpan::new(input, value_match.start(), value_match.end())?;
+    let full_span = TextSpan::snapped(input, full_match.start(), full_match.end())?;
+    let value_span = TextSpan::snapped(input, value_match.start(), value_match.end())?;
     let key_span = key_match
-        .map(|value| TextSpan::new(input, value.start(), value.end()))
+        .map(|value| TextSpan::snapped(input, value.start(), value.end()))
         .transpose()?;
     if !full_span.contains(value_span) || key_span.is_some_and(|span| !full_span.contains(span)) {
-        return Err(ScanError::InvalidSpan);
+        return Err(ScanError::InvalidSpan.into());
     }
     let value = input
         .as_bytes()
@@ -106,7 +134,7 @@ fn evaluate_candidate(
     if value.is_empty() {
         return Ok(None);
     }
-    if let Some(key) = key_match {
+    if let Some(key) = key_span {
         let key = input
             .as_bytes()
             .get(key.start()..key.end())
@@ -119,37 +147,7 @@ fn evaluate_candidate(
         return Ok(None);
     }
 
-    let radius = rule.declaration.radius;
-    let window_start = full_span.start().saturating_sub(radius);
-    let window_end = full_span.end().saturating_add(radius).min(input.len());
-    let window = input
-        .as_bytes()
-        .get(window_start..window_end)
-        .ok_or(ScanError::InvalidSpan)?;
-    add_work(work, window.len(), limits.max_work_bytes)?;
-
-    if let Some(needle) = &rule.declaration.must_contain {
-        if !contains_charged(window, needle.as_bytes(), work, limits)? {
-            return Ok(None);
-        }
-    }
-    if let Some(keywords) = &rule.declaration.keywords_any {
-        let mut matched = false;
-        for key in keywords {
-            matched |= contains_charged(window, key.as_bytes(), work, limits)?;
-        }
-        if !matched {
-            return Ok(None);
-        }
-    }
-    if let Some(values) = &rule.declaration.value_suppressors_any {
-        for item in values {
-            if contains_charged(value, item.as_bytes(), work, limits)? {
-                return Ok(None);
-            }
-        }
-    }
-
+    let mut radius = rule.declaration.radius;
     if let Some(two_phase) = &rule.declaration.two_phase {
         let seed_start = full_span.start().saturating_sub(two_phase.seed_radius);
         let seed_end = full_span
@@ -163,10 +161,47 @@ fn evaluate_candidate(
         add_work(work, seed.len(), limits.max_work_bytes)?;
         let mut confirmed = false;
         for item in &two_phase.confirm_any {
-            confirmed |= contains_charged(seed, item.as_bytes(), work, limits)?;
+            if contains_charged_ignore_case(seed, item.as_bytes(), work, limits)? {
+                confirmed = true;
+                break;
+            }
         }
         if !confirmed {
             return Ok(None);
+        }
+        radius = radius.max(two_phase.full_radius);
+    }
+
+    let window_start = full_span.start().saturating_sub(radius);
+    let window_end = full_span.end().saturating_add(radius).min(input.len());
+    let window = input
+        .as_bytes()
+        .get(window_start..window_end)
+        .ok_or(ScanError::InvalidSpan)?;
+    add_work(work, window.len(), limits.max_work_bytes)?;
+
+    if let Some(needle) = &rule.declaration.must_contain {
+        if !contains_charged_ignore_case(window, needle.as_bytes(), work, limits)? {
+            return Ok(None);
+        }
+    }
+    if let Some(keywords) = &rule.declaration.keywords_any {
+        let mut matched = false;
+        for key in keywords {
+            if contains_charged_ignore_case(window, key.as_bytes(), work, limits)? {
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            return Ok(None);
+        }
+    }
+    if let Some(values) = &rule.declaration.value_suppressors_any {
+        for item in values {
+            if contains_charged(value, item.as_bytes(), work, limits)? {
+                return Ok(None);
+            }
         }
     }
 
@@ -253,16 +288,10 @@ fn evaluate_candidate(
     }))
 }
 
-fn first_nonempty_capture<'a>(captures: &'a Captures<'a>) -> Option<regex::bytes::Match<'a>> {
-    (1..captures.len()).find_map(|index| captures.get(index).filter(|value| !value.is_empty()))
-}
-
-fn add_work(total: &mut usize, amount: usize, limit: usize) -> Result<(), ScanError> {
-    *total = total
-        .checked_add(amount)
-        .ok_or(ScanError::WorkLimitExceeded)?;
+fn add_work(total: &mut usize, amount: usize, limit: usize) -> Result<(), Abort> {
+    *total = total.checked_add(amount).ok_or(Abort::Work)?;
     if *total > limit {
-        return Err(ScanError::WorkLimitExceeded);
+        return Err(Abort::Work);
     }
     Ok(())
 }
@@ -272,9 +301,49 @@ fn contains_charged(
     needle: &[u8],
     work: &mut usize,
     limits: ScanLimits,
-) -> Result<bool, ScanError> {
+) -> Result<bool, Abort> {
     add_work(work, haystack.len(), limits.max_work_bytes)?;
     Ok(!needle.is_empty() && memchr::memmem::find(haystack, needle).is_some())
+}
+
+// Corpus rule patterns carry `(?i)`, so a case-sensitive keyword gate drops a
+// secret whose key is spelled in mixed case. Value suppressors stay
+// case-sensitive because widening them would suppress findings instead.
+// commentlint: allow(JUDGE)
+fn contains_charged_ignore_case(
+    haystack: &[u8],
+    needle: &[u8],
+    work: &mut usize,
+    limits: ScanLimits,
+) -> Result<bool, Abort> {
+    add_work(work, haystack.len(), limits.max_work_bytes)?;
+    Ok(find_ignore_ascii_case(haystack, needle))
+}
+
+fn find_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    let lower = needle[0].to_ascii_lowercase();
+    let upper = needle[0].to_ascii_uppercase();
+    let limit = haystack.len() - needle.len() + 1;
+    let mut offset = 0;
+    while offset < limit {
+        let found = if lower == upper {
+            memchr::memchr(lower, &haystack[offset..limit])
+        } else {
+            memchr::memchr2(lower, upper, &haystack[offset..limit])
+        };
+        let Some(position) = found else {
+            return false;
+        };
+        let start = offset + position;
+        if haystack[start..start + needle.len()].eq_ignore_ascii_case(needle) {
+            return true;
+        }
+        offset = start + 1;
+    }
+    false
 }
 
 fn has_secret_key_token(key: &[u8]) -> bool {
@@ -436,7 +505,7 @@ fn local_context_allows(
     value: TextSpan,
     work: &mut usize,
     limits: ScanLimits,
-) -> Result<bool, ScanError> {
+) -> Result<bool, Abort> {
     let start = value.start().saturating_sub(spec.lookbehind);
     let end = value.end().saturating_add(spec.lookahead).min(input.len());
     let Some(window) = input.get(start..end) else {
@@ -516,11 +585,7 @@ fn offline_verdict(spec: &OfflineValidationSpec, value: &[u8]) -> OfflineVerdict
             if value.len() < 46 || !value.starts_with(b"glsa_") || value.get(37) != Some(&b'_') {
                 OfflineVerdict::Indeterminate
             } else {
-                match parse_hex_u32(&value[38..46]) {
-                    Some(expected) if crc32(&value[..37]) == expected => OfflineVerdict::Valid,
-                    Some(_) => OfflineVerdict::Invalid,
-                    None => OfflineVerdict::Indeterminate,
-                }
+                checksum_verdict(&value[..37], parse_hex_u32(&value[38..46]))
             }
         }
         OfflineValidationKind::AwsAccessKey => validate_aws(value),
@@ -548,15 +613,15 @@ fn validate_crc32_base62(
     let Some(encoded) = value.get(skip + payload..required) else {
         return OfflineVerdict::Indeterminate;
     };
-    match base62_u32(encoded) {
-        Some(expected) if crc32(body) == expected => OfflineVerdict::Valid,
-        Some(_) => OfflineVerdict::Invalid,
-        None => OfflineVerdict::Indeterminate,
-    }
+    crc_verdict(body, encoded)
 }
 
 fn crc_verdict(body: &[u8], encoded: &[u8]) -> OfflineVerdict {
-    match base62_u32(encoded) {
+    checksum_verdict(body, base62_u32(encoded))
+}
+
+fn checksum_verdict(body: &[u8], expected: Option<u32>) -> OfflineVerdict {
+    match expected {
         Some(expected) if crc32(body) == expected => OfflineVerdict::Valid,
         Some(_) => OfflineVerdict::Invalid,
         None => OfflineVerdict::Indeterminate,
