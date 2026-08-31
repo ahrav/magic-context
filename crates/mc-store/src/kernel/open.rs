@@ -234,6 +234,7 @@ impl KernelStore {
         // Reclaiming an expired lease keeps every row; deleting aged runs is left to an
         // explicit call, so opening a store is not a destructive act.
         store.abandon_expired_staging_runs(crate::current_time_ms())?;
+        store.run_artifact_recovery(crate::current_time_ms())?;
         Ok(store)
     }
 

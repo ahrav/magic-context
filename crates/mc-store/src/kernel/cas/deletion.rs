@@ -137,6 +137,7 @@ struct ArtifactState {
     all_object_ids: Vec<String>,
     prior_commit_seq: Option<i64>,
     barrier_id: String,
+    prior_barrier_id: Option<String>,
     tombstoned: bool,
     pending_unlink: bool,
 }
@@ -415,8 +416,8 @@ impl KernelStore {
     }
 
     fn unlink_purged_artifact(&self, digest: &str) -> Result<(), ArtifactError> {
-        let objects = File::open(self.artifacts_path.join("objects")).map_err(|error| {
-            self.map_cas_storage_error(classify_io(error), ArtifactErrorKind::PurgeUnlinkPending)
+        let objects = self.open_objects_directory().map_err(|error| {
+            self.map_cas_storage_error(error, ArtifactErrorKind::PurgeUnlinkPending)
         })?;
         let shard = match open_secure_directory(&objects, &digest[..2]) {
             Ok(shard) => shard,
@@ -654,12 +655,14 @@ fn load_artifact_state(
         .optional()
         .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
     let prior_commit_seq = prior_barrier.as_ref().map(|(_, commit_seq)| *commit_seq);
+    let prior_barrier_id = prior_barrier
+        .as_ref()
+        .map(|(barrier_id, _)| barrier_id.clone());
     // `idx_deletion_barriers_open` admits one incomplete barrier per digest, and a
     // completed barrier stays as an audit record holding its primary key.
-    let barrier_id = match (open_barrier, &prior_barrier) {
-        (Some(barrier_id), _) => barrier_id,
-        (None, Some((barrier_id, _))) if live_object_ids.is_empty() => barrier_id.clone(),
-        (None, _) => format!(
+    let barrier_id = match open_barrier {
+        Some(barrier_id) => barrier_id,
+        None => format!(
             "artifact-deletion-{digest}-{}",
             crate::kernel::durable_fs::next_unique_id()
         ),
@@ -681,6 +684,7 @@ fn load_artifact_state(
         all_object_ids,
         prior_commit_seq,
         barrier_id,
+        prior_barrier_id,
         tombstoned,
         pending_unlink,
     })
@@ -734,7 +738,10 @@ fn result_from_state(
         digest: state.digest.clone(),
         affected_object_ids: state.all_object_ids.clone(),
         commit_seq: state.prior_commit_seq.unwrap_or(0),
-        barrier_id: state.barrier_id.clone(),
+        barrier_id: state
+            .prior_barrier_id
+            .clone()
+            .unwrap_or_else(|| state.barrier_id.clone()),
         already_applied,
     }
 }

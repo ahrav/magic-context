@@ -1369,3 +1369,53 @@ fn abandoning_two_colliding_consumer_ids_in_one_commit_succeeds() {
             .cleared
     );
 }
+
+#[test]
+fn purging_after_a_completed_delete_barrier_mints_a_new_barrier() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = ingest(&store, "purge-after-clear", b"purge-after-clear");
+    store
+        .commit(intent("register-search"), |envelope| {
+            envelope.register_outbox_consumer("search", 1)?;
+            Ok("registered".to_string())
+        })
+        .unwrap();
+    let deletion = store
+        .delete_artifact(delete_request(
+            "soft-delete",
+            &handle.digest,
+            ArtifactDeletionKind::Delete,
+        ))
+        .unwrap();
+    store
+        .acknowledge_outbox("search", deletion.commit_seq, 5)
+        .unwrap();
+    assert!(
+        store
+            .deletion_barrier(&deletion.barrier_id)
+            .unwrap()
+            .cleared,
+        "the soft deletion barrier must complete before the purge"
+    );
+
+    // The digest is never re-ingested, so the purge sees no live objects and the
+    // only barrier for the digest is the completed one.
+    let purge = store
+        .delete_artifact(delete_request(
+            "hard-purge",
+            &handle.digest,
+            ArtifactDeletionKind::Purge,
+        ))
+        .unwrap();
+
+    assert_ne!(
+        purge.barrier_id, deletion.barrier_id,
+        "a purge must not reuse the completed barrier's primary key"
+    );
+    assert!(
+        !object_path(root.path(), &handle.digest).exists(),
+        "the purge committed its intent but left the artifact bytes in place"
+    );
+}

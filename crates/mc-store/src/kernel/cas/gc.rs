@@ -123,6 +123,43 @@ impl KernelStore {
         Ok(removed.then_some(bytes))
     }
 
+    /// Resumes durable reclaim rows without scanning the object tree, using the
+    /// writer so opening a store takes no read-pool snapshot.
+    pub(in crate::kernel) fn run_artifact_recovery(&self, now: i64) -> Result<(), KernelError> {
+        let digests = {
+            let writer = self.lock_writer()?;
+            let mut statement = writer
+                .prepare(
+                    "SELECT artifact_digest FROM artifact_ingestion_reservations
+                       WHERE state='Reclaiming'
+                     UNION SELECT artifact_digest FROM artifact_pending_unlinks",
+                )
+                .map_err(|_| KernelError::Io)?;
+            let digests = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|_| KernelError::Io)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|_| KernelError::Io)?;
+            drop(statement);
+            digests
+        };
+        for digest in digests {
+            if !is_artifact_digest(&digest) {
+                continue;
+            }
+            let candidate = Candidate {
+                digest,
+                modified_at: None,
+            };
+            match self.reclaim_candidate(&candidate, now, false) {
+                Ok(_) => {}
+                Err(error @ (KernelError::FenceLost | KernelError::Fault)) => return Err(error),
+                Err(_) => {}
+            }
+        }
+        Ok(())
+    }
+
     fn snapshot_reclaim_state(&self) -> Result<Vec<Candidate>, KernelError> {
         let reader = self.lock_reader()?;
         let mut statement = reader

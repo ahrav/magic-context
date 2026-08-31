@@ -874,7 +874,12 @@ pub(super) fn regular_file_bytes(objects: &File) -> Result<u64, StorageError> {
         if is_dot_entry(name) {
             continue;
         }
-        let stat = rfs::statat(objects, name, AtFlags::SYMLINK_NOFOLLOW).map_err(storage_errno)?;
+        // Reclamation can unlink an entry between the directory read and this stat.
+        let stat = match rfs::statat(objects, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            Err(rustix::io::Errno::NOENT) => continue,
+            Err(error) => return Err(storage_errno(error)),
+        };
         let kind = rfs::FileType::from_raw_mode(stat.st_mode);
         if kind.is_file() {
             bytes = bytes.saturating_add(stat_bytes(&stat));
@@ -883,15 +888,24 @@ pub(super) fn regular_file_bytes(objects: &File) -> Result<u64, StorageError> {
         if !kind.is_dir() {
             continue;
         }
-        let shard = open_shard_nofollow(objects, name)?;
+        let shard = match open_shard_nofollow(objects, name) {
+            Ok(shard) => shard,
+            Err(StorageError::Other(source)) if source.kind() == std::io::ErrorKind::NotFound => {
+                continue
+            }
+            Err(error) => return Err(error),
+        };
         for shard_entry in rfs::Dir::read_from(&shard).map_err(storage_errno)? {
             let shard_entry = shard_entry.map_err(storage_errno)?;
             let shard_name = shard_entry.file_name();
             if is_dot_entry(shard_name) {
                 continue;
             }
-            let shard_stat = rfs::statat(&shard, shard_name, AtFlags::SYMLINK_NOFOLLOW)
-                .map_err(storage_errno)?;
+            let shard_stat = match rfs::statat(&shard, shard_name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(shard_stat) => shard_stat,
+                Err(rustix::io::Errno::NOENT) => continue,
+                Err(error) => return Err(storage_errno(error)),
+            };
             if rfs::FileType::from_raw_mode(shard_stat.st_mode).is_file() {
                 bytes = bytes.saturating_add(stat_bytes(&shard_stat));
             }
