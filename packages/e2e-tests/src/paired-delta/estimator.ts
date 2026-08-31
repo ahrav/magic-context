@@ -1,6 +1,7 @@
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { splitmix32 } from "../../../plugin/scripts/retrieval-benchmark/synthetic";
 import { compareCodeUnits } from "../code-unit-order";
+import { fnv1a32 } from "../fnv1a";
 import {
     completeFamilyCount,
     pairedFactsFingerprint,
@@ -141,14 +142,6 @@ function bootstrapInterval(
     };
 }
 
-function stringSeed(value: string): number {
-    let hash = 2166136261;
-    for (let index = 0; index < value.length; index += 1) {
-        hash = Math.imul(hash ^ value.charCodeAt(index), 16777619);
-    }
-    return hash >>> 0;
-}
-
 function includesZero(interval: Interval): boolean {
     return interval.lower <= 0 && interval.upper >= 0;
 }
@@ -174,7 +167,7 @@ function estimateEndpoint(
             const interval = bootstrapInterval(
                 values,
                 bootstrapResamples,
-                bootstrapSeed ^ stringSeed(`${endpoint}:${familyId}`),
+                bootstrapSeed ^ fnv1a32(`${endpoint}:${familyId}`),
             );
             const floor = noiseFloors.get(familyId) ?? null;
             return {
@@ -197,7 +190,7 @@ function estimateEndpoint(
     const interval = bootstrapInterval(
         familyMeans,
         bootstrapResamples,
-        bootstrapSeed ^ stringSeed(endpoint),
+        bootstrapSeed ^ fnv1a32(endpoint),
     );
     return {
         endpoint,

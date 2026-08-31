@@ -8,6 +8,8 @@
  * The server supports Anthropic Messages SSE streaming and single-shot JSON responses.
  */
 
+import { fnv1a32 } from "../fnv1a";
+
 export interface MockUsage {
     input_tokens: number;
     output_tokens: number;
@@ -83,11 +85,7 @@ export function deterministicEmbedding(text: string): number[] {
     }
     if (vector.every((component) => component === 0)) {
         for (const token of tokens) {
-            let hash = 2166136261;
-            for (let i = 0; i < token.length; i++) {
-                hash = Math.imul(hash ^ token.charCodeAt(i), 16777619);
-            }
-            vector[(hash >>> 0) % EMBEDDING_DIMENSIONS] += 1;
+            vector[fnv1a32(token) % EMBEDDING_DIMENSIONS] += 1;
         }
     }
     const norm = Math.hypot(...vector) || 1;
