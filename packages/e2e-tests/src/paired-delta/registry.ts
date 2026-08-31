@@ -2,8 +2,10 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import manifestJson from "../../pools/paired-delta-manifest.json";
 import {
     PAIRED_DELTA_MANIFEST_SCHEMA,
+    parsePairedDeltaManifest,
     type PairedDeltaManifest,
     type PairedDeltaManifestEntry,
     type RunMode,
@@ -19,13 +21,12 @@ export interface RegisteredPairedDeltaScenario {
 
 export type PairedDeltaRegistry = Map<string, RegisteredPairedDeltaScenario>;
 
-const CALIBRATION_IDS = new Set([
-    "var-compaction-deploy-region",
-    "var-compaction-schema-version",
-    "var-exact-symbol",
-    "var-superseded-timeout",
-    "var-rejected-database",
-]);
+/** The manifest is the sole source of run-mode membership. */
+const runModesByScenarioId = new Map(
+    parsePairedDeltaManifest(manifestJson).scenarios.map(
+        ({ scenarioId, runModes }) => [scenarioId, runModes],
+    ),
+);
 
 const fileByScenarioId = new Map(
     pairedDeltaScenarios.map(({ scenarioId }) => [
@@ -40,9 +41,7 @@ export function buildPairedDeltaRegistry(): PairedDeltaRegistry {
         {
             declaration,
             implementationFile: fileByScenarioId.get(declaration.scenarioId)!,
-            runModes: CALIBRATION_IDS.has(declaration.scenarioId)
-                ? ["calibration", "weekly", "release"]
-                : ["release"],
+            runModes: runModesByScenarioId.get(declaration.scenarioId) ?? ["release"],
         },
     ]));
 }
@@ -99,7 +98,11 @@ export function assertFrozenPool(
             actual.semanticFingerprint !== frozen.semanticFingerprint ||
             actual.verifierBundleDigest !== frozen.verifierBundleDigest
         ) {
-            throw new Error(`paired-delta frozen scenario drift: ${actual.scenarioId}`);
+            throw new Error(
+                `paired-delta frozen scenario drift: ${actual.scenarioId}; ` +
+                    "after an intentional change, regenerate with " +
+                    "`bun run --cwd packages/e2e-tests freeze:paired-delta`",
+            );
         }
     }
 }

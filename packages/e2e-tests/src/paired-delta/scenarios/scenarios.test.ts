@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { validateCheckVector } from "../contract";
+import { CHARS_PER_TOKEN } from "../../ballast";
 import { pairedDeltaScenarios } from "./index";
 
 describe("paired-delta authored scenarios", () => {
@@ -17,7 +18,7 @@ describe("paired-delta authored scenarios", () => {
             const root = mkdtempSync(join(tmpdir(), "paired-delta-scenario-"));
             try {
                 mkdirSync(join(root, "result"), { recursive: true });
-                const answer = scenario.interventions.r3.evidence;
+                const answer = scenario.expectedAnswer;
                 writeFileSync(join(root, "result", "answer.txt"), answer);
                 const passing = await scenario.verifier({
                     armId: "mc-on",
@@ -38,13 +39,13 @@ describe("paired-delta authored scenarios", () => {
         });
 
         it(`${scenario.scenarioId} enforces structural pressure and R1 wire checks`, async () => {
-            expect(scenario.absencePrecondition.minimumBallastBytes).toBeGreaterThan(
-                scenario.modelContextLimit,
-            );
+            expect(
+                scenario.absencePrecondition.minimumBallastBytes / CHARS_PER_TOKEN,
+            ).toBeGreaterThan(scenario.modelContextLimit);
             const root = mkdtempSync(join(tmpdir(), "paired-delta-scenario-"));
             try {
                 mkdirSync(join(root, "result"), { recursive: true });
-                writeFileSync(join(root, "result", "answer.txt"), scenario.interventions.r3.evidence);
+                writeFileSync(join(root, "result", "answer.txt"), scenario.expectedAnswer);
                 const checks = await scenario.verifier({
                     armId: "r1",
                     workspacePath: root,

@@ -1,3 +1,4 @@
+import { CHARS_PER_TOKEN } from "../ballast";
 import { makeContractPrimitives } from "../contract-primitives";
 
 export const ARM_IDS = ["mc-on", "mc-off", "compaction", "r1", "r2", "r3"] as const;
@@ -94,6 +95,7 @@ export interface ScenarioDeclaration {
     scenarioId: string;
     familyId: string;
     title: string;
+    expectedAnswer: string;
     checks: CheckDeclaration[];
     criticalCheckIds: string[];
     turnScript: TurnDeclaration[];
@@ -114,9 +116,6 @@ export interface ArmedCellResult {
     runHealth: RunHealth;
     reasonCode: ReasonCode | null;
 }
-
-export type PrimaryArmCells = Partial<Record<PrimaryArmId, ArmedCellResult>>;
-export type RegretLadder = Partial<Record<ArmId, ArmedCellResult>>;
 
 export interface PairedDeltaManifestEntry {
     scenarioId: string;
@@ -155,6 +154,7 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
         "scenarioId",
         "familyId",
         "title",
+        "expectedAnswer",
         "checks",
         "criticalCheckIds",
         "turnScript",
@@ -211,6 +211,12 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
     p.exact(interventions, ["r1", "r2", "r3"], "scenario.interventions");
     const r1 = p.record(interventions.r1, "scenario.interventions.r1");
     p.exact(r1, ["insertAfterTurnId", "query", "locatorIds"], "scenario.interventions.r1");
+    const expectedAnswer = p.string(root.expectedAnswer, "scenario.expectedAnswer");
+    const r1Query = p.string(r1.query, "scenario.interventions.r1.query");
+    /** `scriptedCtxSearchTurn` interpolates the query into the model-visible prompt, so a query containing the expected answer lets R1 pass its critical check with no retrieval. commentlint: allow(JUDGE) */
+    if (r1Query.includes(expectedAnswer)) {
+        p.fail("scenario.interventions.r1.query: contains-answer");
+    }
     const insertAfterTurnId = p.staticId(
         r1.insertAfterTurnId,
         "scenario.interventions.r1.insertAfterTurnId",
@@ -249,6 +255,20 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
     if (!turnIds.has(evidenceTurnId)) {
         p.fail("scenario.absencePrecondition.evidenceTurnId: unknown-turn");
     }
+    const minimumBallastBytes = p.integer(
+        absence.minimumBallastBytes,
+        "scenario.absencePrecondition.minimumBallastBytes",
+        1,
+    );
+    const modelContextLimit = p.integer(
+        root.modelContextLimit,
+        "scenario.modelContextLimit",
+        1,
+    );
+    /** `minimumBallastBytes` is byte-denominated while `modelContextLimit` is token-denominated; ballast below the window rendered at CHARS_PER_TOKEN cannot evict the evidence turn, leaving the absence precondition unsatisfiable. commentlint: allow(JUDGE) */
+    if (minimumBallastBytes < modelContextLimit * CHARS_PER_TOKEN) {
+        p.fail("scenario.absencePrecondition: ballast-below-context");
+    }
 
     const restartArms = p.array(root.restartArms, "scenario.restartArms").map(
         (entry, index) => p.enumeration(entry, ARM_IDS, `scenario.restartArms[${index}]`),
@@ -265,13 +285,14 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
         scenarioId: p.staticId(root.scenarioId, "scenario.scenarioId", SCENARIO_ID_RE),
         familyId: p.staticId(root.familyId, "scenario.familyId", FAMILY_ID_RE),
         title: p.string(root.title, "scenario.title"),
+        expectedAnswer,
         checks,
         criticalCheckIds,
         turnScript,
         interventions: {
             r1: {
                 insertAfterTurnId,
-                query: p.string(r1.query, "scenario.interventions.r1.query"),
+                query: r1Query,
                 locatorIds: parseStringArray(
                     r1.locatorIds,
                     MEMORY_ID_RE,
@@ -283,13 +304,9 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
         },
         absencePrecondition: {
             evidenceTurnId,
-            minimumBallastBytes: p.integer(
-                absence.minimumBallastBytes,
-                "scenario.absencePrecondition.minimumBallastBytes",
-                1,
-            ),
+            minimumBallastBytes,
         },
-        modelContextLimit: p.integer(root.modelContextLimit, "scenario.modelContextLimit", 1),
+        modelContextLimit,
         restartArms,
         verifier: root.verifier as ScenarioVerifier,
     };

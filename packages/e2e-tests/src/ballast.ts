@@ -17,6 +17,10 @@
  * variation is ever wanted, it has to arrive here and in the harnesses'
  * `ballast()` signatures together, or the divergence comes back.
  */
+
+/** Assumes four characters per token. */
+export const CHARS_PER_TOKEN = 4;
+
 export function ballastProse(tokens: number): string {
     if (tokens <= 0) return "";
     const words = [
@@ -44,7 +48,7 @@ export function ballastProse(tokens: number): string {
         "archive",
         "deliver",
     ];
-    const target = Math.max(0, Math.round(tokens * 4)); // ~4 chars/token
+    const target = Math.max(0, Math.round(tokens * CHARS_PER_TOKEN));
     const parts: string[] = [];
     let length = 0;
     let i = 0;

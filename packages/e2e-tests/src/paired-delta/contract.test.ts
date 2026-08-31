@@ -15,6 +15,7 @@ function scenario(overrides: Partial<ScenarioDeclaration> = {}): ScenarioDeclara
         scenarioId: "var-demo-one",
         familyId: "fam-demo",
         title: "Recall the buried identifier",
+        expectedAnswer: "alpha-17",
         checks: [
             {
                 id: "check-shared",
@@ -29,7 +30,7 @@ function scenario(overrides: Partial<ScenarioDeclaration> = {}): ScenarioDeclara
         interventions: {
             r1: {
                 insertAfterTurnId: "turn-evidence",
-                query: "alpha-17",
+                query: "mem-alpha",
                 locatorIds: ["mem-alpha"],
             },
             r2: {
@@ -39,7 +40,7 @@ function scenario(overrides: Partial<ScenarioDeclaration> = {}): ScenarioDeclara
         },
         absencePrecondition: {
             evidenceTurnId: "turn-evidence",
-            minimumBallastBytes: 1024,
+            minimumBallastBytes: 32_768,
         },
         modelContextLimit: 4096,
         restartArms: [],
@@ -103,6 +104,28 @@ describe("paired-delta scenario contract", () => {
         expect(() =>
             parseScenarioDeclaration(scenario({ restartArms: ["mc-off"] })),
         ).toThrow(/restartArms: unsupported-arm/);
+    });
+
+    it("rejects an R1 query that leaks the expected answer", () => {
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                interventions: {
+                    ...scenario().interventions,
+                    r1: { ...scenario().interventions.r1, query: "find alpha-17 now" },
+                },
+            })),
+        ).toThrow(/r1\.query: contains-answer/);
+    });
+
+    it("rejects ballast below the token-denominated context window", () => {
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                absencePrecondition: {
+                    evidenceTurnId: "turn-evidence",
+                    minimumBallastBytes: 1024,
+                },
+            })),
+        ).toThrow(/absencePrecondition: ballast-below-context/);
     });
 
     it("requires verifier output to match the arm's declared checks", () => {

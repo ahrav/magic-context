@@ -32,6 +32,7 @@ export function defineScenario(spec: ScenarioSpec): ScenarioDeclaration {
         scenarioId: spec.scenarioId,
         familyId: spec.familyId,
         title: spec.title,
+        expectedAnswer: spec.answer,
         checks: [
             {
                 id: "check-file",
@@ -60,17 +61,20 @@ export function defineScenario(spec: ScenarioSpec): ScenarioDeclaration {
         interventions: {
             r1: {
                 insertAfterTurnId: "turn-burial",
-                query: spec.answer,
+                /** The locator id, not the answer: R1 is "search result only; no injection", and the scripted-search prompt carries the query verbatim, so an answer-bearing query would leak the gold value into the transcript. commentlint: allow(JUDGE) */
+                query: spec.locatorId,
                 locatorIds: [spec.locatorId],
             },
             r2: {
                 memories: [{ claim: spec.answer, evidence: spec.evidence }],
             },
-            r3: { evidence: spec.answer },
+            /** Gold evidence verbatim, matching the R3 arm contract; injecting the bare answer would make the critical check trivially satisfiable and collapse the representation regret rung. commentlint: allow(JUDGE) */
+            r3: { evidence: spec.evidence },
         },
         absencePrecondition: {
             evidenceTurnId: "turn-evidence",
-            minimumBallastBytes: 16_384,
+            /** 16,384 tokens at CHARS_PER_TOKEN — twice the 8,192-token window, so honoring the minimum genuinely evicts the evidence turn. commentlint: allow(JUDGE) */
+            minimumBallastBytes: 65_536,
         },
         modelContextLimit: 8_192,
         restartArms: [],
