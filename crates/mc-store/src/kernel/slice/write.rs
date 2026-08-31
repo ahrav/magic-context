@@ -1,4 +1,5 @@
 use rusqlite::{params, OptionalExtension, Transaction};
+use serde::Serialize;
 
 use super::{
     DecisionEventOutcome, DecisionEventSpec, DecisionSpec, DecisionWriteOutcome,
@@ -81,8 +82,6 @@ struct RedactedEvent {
 struct StoredEventPayload<'a> {
     summary: &'a str,
 }
-
-use serde::Serialize;
 
 impl Envelope<'_> {
     pub fn insert_decision(
