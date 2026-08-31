@@ -9,8 +9,6 @@
  */
 
 import { lstatSync } from "node:fs";
-import { parseSharedMemoryDiagnostics } from "../mc-host-client/client";
-import type { SharedMemoryDiagnostics } from "../mc-host-client/types";
 import { releaseContract } from "./generated-contract";
 import { coordinationDirPath, runtimeDirPath } from "./paths";
 
@@ -23,8 +21,8 @@ export type FailingReason =
     (typeof releaseContract.cli.reasons.failing_by_precedence)[number]["id"];
 export type NonFailingReason = (typeof releaseContract.cli.reasons.non_failing)[number];
 export type DaemonReason = FailingReason | NonFailingReason;
-export type SharedMemoryReadinessState =
-    (typeof releaseContract.cli.readiness_states.shared_memory)[number];
+export type TransportReadinessState =
+    (typeof releaseContract.cli.readiness_states.transport)[number];
 export type StorageReadinessState = (typeof releaseContract.cli.readiness_states.storage)[number];
 export type SynapseReadinessState = (typeof releaseContract.cli.readiness_states.synapse)[number];
 
@@ -43,7 +41,7 @@ const FAILING_REASONS = new Map<string, { precedence: number; remediation: strin
 );
 const NON_FAILING_REASONS = new Set<string>(releaseContract.cli.reasons.non_failing);
 const READINESS_STATES: Record<string, ReadonlySet<string>> = {
-    shared_memory: new Set(releaseContract.cli.readiness_states.shared_memory),
+    transport: new Set(releaseContract.cli.readiness_states.transport),
     storage: new Set(releaseContract.cli.readiness_states.storage),
     synapse: new Set(releaseContract.cli.readiness_states.synapse),
 };
@@ -95,7 +93,7 @@ export interface ReadinessRecord {
 }
 
 export interface DaemonReadiness {
-    shared_memory?: ReadinessRecord;
+    transport?: ReadinessRecord;
     storage?: ReadinessRecord;
     synapse?: ReadinessRecord;
 }
@@ -131,7 +129,6 @@ export interface DaemonResultV1 {
     remediation: Remediation | null;
     effects: RestartEffects | null;
     readiness: DaemonReadiness | null;
-    shared_memory: SharedMemoryDiagnostics | null;
     checks: DaemonCheck[];
     versions: DaemonVersions;
 }
@@ -197,15 +194,10 @@ function parseReadinessRecord(value: unknown, component: string): ReadinessRecor
     // failing one, so "non-ready implies failing" would reject conforming
     // output. Only the exact pairings the daemon emits are accepted.
     const allowed = {
-        shared_memory: {
+        transport: {
             ready: ["healthy"],
             starting: ["starting", "lifecycle_busy"],
-            unavailable: [
-                "startup_timeout",
-                "publication_missing",
-                "authentication_failed",
-                "native_probe_unavailable",
-            ],
+            unavailable: ["startup_timeout", "publication_missing", "authentication_failed"],
         },
         storage: {
             ready: ["healthy"],
@@ -260,7 +252,6 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
             "remediation",
             "effects",
             "readiness",
-            "shared_memory",
             "checks",
             "versions",
         ],
@@ -389,35 +380,10 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
         const rawReadiness = requireObject(record.readiness, "readiness");
         readiness = {};
         for (const [component, value] of Object.entries(rawReadiness)) {
-            if (
-                component !== "shared_memory" &&
-                component !== "storage" &&
-                component !== "synapse"
-            ) {
+            if (component !== "transport" && component !== "storage" && component !== "synapse") {
                 fail("readiness carries an unknown component");
             }
             readiness[component] = parseReadinessRecord(value, component);
-        }
-    }
-    let sharedMemory: SharedMemoryDiagnostics | null = null;
-    if (record.shared_memory !== null) {
-        try {
-            sharedMemory = parseSharedMemoryDiagnostics(record.shared_memory);
-        } catch {
-            fail("shared_memory diagnostics violate the closed schema");
-        }
-    }
-    // The same coupling checks and reasons already get: a terminal ring is not a
-    // second opinion about the same connection, so a payload cannot report one
-    // while calling the component ready or the command successful. Accepting it
-    // lets the CLI exit 0 while rendering a ready component beside terminal ring
-    // diagnostics.
-    if (sharedMemory !== null && sharedMemory.state === "terminal") {
-        if (readiness?.shared_memory?.state === "ready") {
-            fail("terminal shared memory contradicts a ready shared-memory component");
-        }
-        if (record.ok === true) {
-            fail("terminal shared memory contradicts a successful result");
         }
     }
     if (!Array.isArray(record.checks) || record.checks.length > CHECK_IDS.size) {
@@ -520,7 +486,6 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
         remediation: (remediation as Remediation | null) ?? null,
         effects,
         readiness,
-        shared_memory: sharedMemory,
         checks,
         versions,
     };

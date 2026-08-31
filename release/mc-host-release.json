@@ -20,9 +20,9 @@
       "lifecycle.fences",
       "lifecycle.publication",
       "platform.support",
-      "readiness.shared_memory",
       "readiness.storage",
-      "readiness.synapse"
+      "readiness.synapse",
+      "readiness.transport"
     ],
     "check_statuses": [
       "pass",
@@ -50,11 +50,6 @@
       "usage": 2
     },
     "readiness_states": {
-      "shared_memory": [
-        "ready",
-        "starting",
-        "unavailable"
-      ],
       "storage": [
         "ready",
         "starting",
@@ -65,6 +60,11 @@
         "starting",
         "degraded",
         "unsupported"
+      ],
+      "transport": [
+        "ready",
+        "starting",
+        "unavailable"
       ]
     },
     "reasons": {

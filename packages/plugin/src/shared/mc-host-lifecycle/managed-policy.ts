@@ -305,7 +305,7 @@ async function probeManagedReadiness(root: string, budgetMs: number): Promise<Ob
         // would point remediation away from the version mismatch.
         return {
             ...compatibility,
-            readiness: { shared_memory: { state: "ready", reason: "healthy" } },
+            readiness: { transport: { state: "ready", reason: "healthy" } },
         };
     }
     const components = asRecord(status.metrics.components);
@@ -340,15 +340,8 @@ async function probeManagedReadiness(root: string, budgetMs: number): Promise<Ob
                   : { state: "degraded" as const, reason: "synapse_degraded" as const };
     return {
         ...compatibility,
-        sharedMemory: status.sharedMemory,
         readiness: {
-            shared_memory: {
-                state: status.sharedMemory.state === "healthy" ? "ready" : "unavailable",
-                reason:
-                    status.sharedMemory.state === "healthy"
-                        ? "healthy"
-                        : "native_probe_unavailable",
-            },
+            transport: { state: "ready", reason: "healthy" },
             storage: {
                 state: storage,
                 reason:

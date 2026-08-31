@@ -25,11 +25,10 @@ function validResult(overrides: Record<string, unknown> = {}): Record<string, un
         remediation: null,
         effects: null,
         readiness: {
-            shared_memory: { state: "ready", reason: "healthy" },
+            transport: { state: "ready", reason: "healthy" },
             storage: { state: "ready", reason: "healthy" },
             synapse: { state: "ready", reason: "healthy" },
         },
-        shared_memory: null,
         checks: [
             { id: "compatibility.daemon", status: "pass", reason: "healthy", remediation: null },
             { id: "lifecycle.publication", status: "pass", reason: "healthy", remediation: null },
@@ -47,99 +46,6 @@ function validResult(overrides: Record<string, unknown> = {}): Record<string, un
 }
 
 describe("parseDaemonResult", () => {
-    test("the accepted ring-diagnostics keys are exactly what the host emits", () => {
-        expect(Object.keys(healthySharedMemory()).sort()).toEqual([
-            "accounting",
-            "activation",
-            "artifact",
-            "bounds",
-            "error_class",
-            "exhaustion",
-            "peer_death",
-            "reclamation",
-            "state",
-        ]);
-        const parsed = parseDaemonResult(
-            JSON.stringify(validResult({ shared_memory: healthySharedMemory() })),
-        );
-        expect(parsed.shared_memory?.state).toBe("healthy");
-        expect(() =>
-            parseDaemonResult(
-                JSON.stringify(
-                    validResult({
-                        shared_memory: { ...healthySharedMemory(), attachment: { completed: 1 } },
-                    }),
-                ),
-            ),
-        ).toThrow(/shared_memory/);
-    });
-
-    test("a terminal ring cannot ride alongside a ready component or a pass", () => {
-        const terminal = { ...healthySharedMemory(), state: "terminal", error_class: "peer_death" };
-        expect(() =>
-            parseDaemonResult(
-                JSON.stringify(
-                    validResult({
-                        readiness: { shared_memory: { state: "ready", reason: "healthy" } },
-                        shared_memory: terminal,
-                    }),
-                ),
-            ),
-        ).toThrow(/terminal shared memory contradicts a ready/);
-        expect(() =>
-            parseDaemonResult(
-                JSON.stringify(
-                    validResult({
-                        ok: true,
-                        readiness: {
-                            shared_memory: {
-                                state: "unavailable",
-                                reason: "native_probe_unavailable",
-                            },
-                        },
-                        shared_memory: terminal,
-                    }),
-                ),
-            ),
-        ).toThrow(/terminal shared memory contradicts a successful result/);
-    });
-
-    test("unobserved bounds parse as unknown rather than zero", () => {
-        // A setup that fails before `host.status` observes neither bounds nor
-        // accounting, so unknown is only legal on a terminal record.
-        const terminal = {
-            ...healthySharedMemory(),
-            state: "terminal",
-            error_class: "missing_addon",
-            bounds: null,
-            accounting: null,
-        };
-        const parsed = parseDaemonResult(
-            JSON.stringify(
-                validResult({
-                    ok: false,
-                    reason: "native_probe_unavailable",
-                    remediation: "run_daemon_restart",
-                    readiness: {
-                        shared_memory: {
-                            state: "unavailable",
-                            reason: "native_probe_unavailable",
-                        },
-                    },
-                    shared_memory: terminal,
-                }),
-            ),
-        );
-        expect(parsed.shared_memory?.bounds).toBeNull();
-        expect(() =>
-            parseDaemonResult(
-                JSON.stringify(
-                    validResult({ shared_memory: { ...healthySharedMemory(), bounds: null } }),
-                ),
-            ),
-        ).toThrow(/shared_memory/);
-    });
-
     test("accepts a fully populated conforming result", () => {
         const parsed = parseDaemonResult(JSON.stringify(validResult()));
         expect(parsed.command).toBe("status");
@@ -201,54 +107,21 @@ describe("parseDaemonResult", () => {
             );
         expect(() =>
             parseDaemonResult(
-                withReadiness({ shared_memory: { state: "ready", reason: "internal_error" } }),
+                withReadiness({ transport: { state: "ready", reason: "internal_error" } }),
             ),
-        ).toThrow(/readiness\.shared_memory is ready with a failing reason/);
+        ).toThrow(/readiness\.transport is ready with a failing reason/);
         // The converse stays legal, and must: `unsupported` with
         // `synapse_unsupported` is a non-failing pairing for a non-ready state,
         // and every `starting` reason is a failing one.
         const legal = parseDaemonResult(
             withReadiness({
-                shared_memory: { state: "ready", reason: "healthy" },
+                transport: { state: "ready", reason: "healthy" },
                 storage: { state: "starting", reason: "storage_starting" },
                 synapse: { state: "unsupported", reason: "synapse_unsupported" },
             }),
         );
-        expect(legal.readiness?.shared_memory?.state).toBe("ready");
+        expect(legal.readiness?.transport?.state).toBe("ready");
         expect(legal.readiness?.synapse?.reason).toBe("synapse_unsupported");
-    });
-
-    test("an unhealthy ring parses with the reason both emitters produce", () => {
-        // `probeManagedReadiness` and `policy.ts` emit `native_probe_unavailable`
-        // for an unavailable ring, so rejecting the pair here would make CLI
-        // status and doctor output unparseable.
-        const parsed = parseDaemonResult(
-            JSON.stringify(
-                validResult({
-                    command: "status",
-                    ok: false,
-                    state: "running",
-                    reason: "native_probe_unavailable",
-                    remediation: "run_daemon_restart",
-                    readiness: {
-                        shared_memory: {
-                            state: "unavailable",
-                            reason: "native_probe_unavailable",
-                        },
-                    },
-                    checks: [
-                        {
-                            id: "readiness.shared_memory",
-                            status: "fail",
-                            reason: "native_probe_unavailable",
-                            remediation: "run_daemon_restart",
-                        },
-                    ],
-                }),
-            ),
-        );
-        expect(parsed.readiness?.shared_memory?.state).toBe("unavailable");
-        expect(parsed.readiness?.shared_memory?.reason).toBe("native_probe_unavailable");
     });
 
     test("binds pass and fail checks to their reason classes, leaving warn and skip free", () => {
@@ -432,7 +305,7 @@ describe("parseDaemonResult", () => {
             }),
             readiness_reason_mismatch: validResult({
                 readiness: {
-                    shared_memory: { state: "ready", reason: "not_running" },
+                    transport: { state: "ready", reason: "not_running" },
                 },
             }),
             successful_result_with_failed_check: validResult({
@@ -451,7 +324,7 @@ describe("parseDaemonResult", () => {
             extra_top_level_field: validResult({ extra: 1 }),
             unknown_readiness_component: validResult({
                 readiness: {
-                    shared_memory: { state: "ready", reason: "healthy" },
+                    transport: { state: "ready", reason: "healthy" },
                     gpu: { state: "ready", reason: "healthy" },
                 },
             }),

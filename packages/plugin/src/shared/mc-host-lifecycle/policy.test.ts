@@ -36,8 +36,7 @@ function startResultJson(command: string): string {
         // reported null here would be rejected by the parser and land as
         // `internal_error` — passing any test that only checks `command`.
         effects: command === "restart" ? { stop_committed: true, start_committed: true } : null,
-        readiness: { shared_memory: { state: "ready", reason: "healthy" } },
-        shared_memory: null,
+        readiness: { transport: { state: "ready", reason: "healthy" } },
         checks: [],
         versions: {
             release: "0.38.0",
@@ -60,7 +59,6 @@ function missingPayloadResultJson(): string {
         remediation: "install_native_payload",
         effects: null,
         readiness: null,
-        shared_memory: null,
         checks: [],
         versions: {
             release: "0.38.0",
@@ -480,9 +478,8 @@ describe("native invocation mapping", () => {
                 launchTarget: { kind: "test-binary", path: binary },
                 readinessProbe: async () => ({
                     ...compatibleObservation(),
-                    sharedMemory: healthySharedMemory(),
                     readiness: {
-                        shared_memory: { state: "ready", reason: "healthy" },
+                        transport: { state: "ready", reason: "healthy" },
                         storage: { state: "unavailable", reason: "storage_unavailable" },
                         synapse: { state: "degraded", reason: "synapse_degraded" },
                     },
@@ -499,9 +496,9 @@ describe("native invocation mapping", () => {
                     ["compatibility.daemon", "pass"],
                     ["compatibility.epochs", "pass"],
                     ["compatibility.modules", "pass"],
-                    ["readiness.shared_memory", "pass"],
                     ["readiness.storage", "fail"],
                     ["readiness.synapse", "fail"],
+                    ["readiness.transport", "pass"],
                 ]);
             }
         } finally {
@@ -553,9 +550,8 @@ describe("native invocation mapping", () => {
                     launchTarget: { kind: "test-binary", path: binary },
                     readinessProbe: async () => ({
                         ...observation,
-                        sharedMemory: healthySharedMemory(),
                         readiness: {
-                            shared_memory: { state: "ready", reason: "healthy" },
+                            transport: { state: "ready", reason: "healthy" },
                             storage: { state: "ready", reason: "healthy" },
                             synapse: { state: "ready", reason: "healthy" },
                         },
@@ -594,7 +590,7 @@ describe("native invocation mapping", () => {
                     catalog: [],
                     epochs: {},
                     evaluatedThrough: "daemon" as const,
-                    readiness: { shared_memory: { state: "ready", reason: "healthy" } },
+                    readiness: { transport: { state: "ready", reason: "healthy" } },
                 }),
             });
 
@@ -615,7 +611,11 @@ describe("native invocation mapping", () => {
         }
     });
 
-    test("a failing readiness probe reports one redacted terminal class", async () => {
+    test("a failing readiness probe keeps the observation it already proved", async () => {
+        // The native probe child already answered and was validated, so a
+        // readiness failure on top of it must not be reported as an internal
+        // error for a daemon this call verifiably observed. Same rule the
+        // storage probe follows: degrade, never erase a successful observation.
         const root = tempDir("mc-policy-readiness-failure-");
         const { binary } = fakeBinary(root);
         try {
@@ -627,40 +627,16 @@ describe("native invocation mapping", () => {
                 },
             });
             for (const result of [await policy.status(), await policy.doctor()]) {
-                expect(result.ok).toBe(false);
+                expect(result.ok).toBe(true);
                 expect(result.state).toBe("running");
-                expect(result.reason).toBe("native_probe_unavailable");
-                expect(result.shared_memory?.state).toBe("terminal");
-                expect(result.shared_memory?.error_class).toBe("setup_failure");
-                expect(JSON.stringify(result)).not.toContain("route collapsed mid-probe");
-            }
-        } finally {
-            rmSync(root, { recursive: true, force: true });
-        }
-    });
-
-    test("a control-probe failure leaves the ring diagnostics unstated", async () => {
-        // Control-probe failures do not diagnose ring health.
-        const root = tempDir("mc-policy-readiness-control-");
-        const { binary } = fakeBinary(root);
-        try {
-            const policy = policyFor({
-                env: { XDG_DATA_HOME: root },
-                launchTarget: { kind: "test-binary", path: binary },
-                readinessProbe: async () => {
-                    throw new ReadinessProbeControlError(
-                        new Error("compatibility probe deadline expired"),
-                    );
-                },
-            });
-            for (const result of [await policy.status(), await policy.doctor()]) {
-                expect(result.state).toBe("running");
-                expect(result.reason).not.toBe("native_probe_unavailable");
-                expect(result.shared_memory).toBeNull();
-                expect(result.checks.some((check) => check.id === "readiness.shared_memory")).toBe(
+                expect(result.reason).not.toBe("internal_error");
+                // The native result's own readiness survives untouched, and no
+                // probe-derived component is invented on top of it.
+                expect(result.readiness?.storage).toBeUndefined();
+                expect(result.readiness?.synapse).toBeUndefined();
+                expect(result.checks.some((check) => check.id.startsWith("readiness."))).toBe(
                     false,
                 );
-                expect(JSON.stringify(result)).not.toContain("deadline expired");
             }
         } finally {
             rmSync(root, { recursive: true, force: true });
@@ -686,9 +662,8 @@ describe("native invocation mapping", () => {
                     budgets.push(budgetMs);
                     return {
                         ...compatibleObservation(),
-                        sharedMemory: healthySharedMemory(),
                         readiness: {
-                            shared_memory: { state: "ready", reason: "healthy" },
+                            transport: { state: "ready", reason: "healthy" },
                         },
                     };
                 },
@@ -720,9 +695,8 @@ describe("native invocation mapping", () => {
                     ...compatibleObservation(),
                     // Every component is ready, so only the version can fail it.
                     authenticatedPeer: authenticatedPeerAt("mc-host/9.9.9"),
-                    sharedMemory: healthySharedMemory(),
                     readiness: {
-                        shared_memory: { state: "ready", reason: "healthy" },
+                        transport: { state: "ready", reason: "healthy" },
                         storage: { state: "ready", reason: "healthy" },
                     },
                 }),
@@ -749,15 +723,11 @@ describe("native invocation mapping", () => {
                 launchTarget: { kind: "test-binary", path: binary },
                 readinessProbe: async () => ({
                     ...compatibleObservation(),
-                    sharedMemory: healthySharedMemory(),
                     readiness: {
-                        // Check-id order differs from reason precedence,
+                        // `readiness.storage` sorts before `readiness.transport`,
                         // but `authentication_failed` outranks `storage_unavailable`
                         // in the release contract's failing-reason precedence.
-                        shared_memory: {
-                            state: "unavailable",
-                            reason: "authentication_failed",
-                        },
+                        transport: { state: "unavailable", reason: "authentication_failed" },
                         storage: { state: "unavailable", reason: "storage_unavailable" },
                         synapse: { state: "degraded", reason: "synapse_degraded" },
                     },
@@ -774,9 +744,9 @@ describe("native invocation mapping", () => {
                     "compatibility.daemon",
                     "compatibility.epochs",
                     "compatibility.modules",
-                    "readiness.shared_memory",
                     "readiness.storage",
                     "readiness.synapse",
+                    "readiness.transport",
                 ]);
             }
         } finally {

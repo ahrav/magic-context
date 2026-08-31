@@ -21,7 +21,6 @@ function result(
         remediation: null,
         effects: command === "restart" ? { stop_committed: true, start_committed: true } : null,
         readiness: null,
-        shared_memory: null,
         checks: [],
         versions: {
             release: "0.38.0",

@@ -39,9 +39,9 @@ export const releaseContract = {
       "lifecycle.fences",
       "lifecycle.publication",
       "platform.support",
-      "readiness.shared_memory",
       "readiness.storage",
-      "readiness.synapse"
+      "readiness.synapse",
+      "readiness.transport"
     ],
     "check_statuses": [
       "pass",
@@ -69,11 +69,6 @@ export const releaseContract = {
       "usage": 2
     },
     "readiness_states": {
-      "shared_memory": [
-        "ready",
-        "starting",
-        "unavailable"
-      ],
       "storage": [
         "ready",
         "starting",
@@ -84,6 +79,11 @@ export const releaseContract = {
         "starting",
         "degraded",
         "unsupported"
+      ],
+      "transport": [
+        "ready",
+        "starting",
+        "unavailable"
       ]
     },
     "reasons": {
